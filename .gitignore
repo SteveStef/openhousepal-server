@@ -1,0 +1,121 @@
+# Database files - SQLite
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+collections.db
+
+# Environment variables and secrets
+.env
+.env.local
+.env.production
+.env.test
+
+# Python virtual environment
+venv/
+env/
+.venv/
+.env/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Logs
+*.log
+logs/
+*.out
+*.err
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+temp/
+
+# API keys and sensitive data
+rapidapi_key.txt
+api_keys.txt
+secrets.json
+
+# Backup files
+*.backup
+*.bak
+*~.nib
+
+# Alembic backup and cache files
+alembic/versions/__pycache__/
+alembic/versions/*.pyc
+alembic.ini.backup
+*.alembic
+
+# Development/example files
+propertyapi-current.json
+listingapi-example.json
+notes.md
+zillowAPI.md
+
+# FastAPI development
+*.pid
+*.seed
+*.pid.lock
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
