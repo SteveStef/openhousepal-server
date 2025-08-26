@@ -41,7 +41,16 @@ def run_migrations_offline() -> None:
     script output.
 
     """
+    # Get database URL from config or environment
     url = config.get_main_option("sqlalchemy.url")
+    if not url:
+        # Convert async URL to sync URL for migrations
+        async_url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./collections.db")
+        if "sqlite+aiosqlite" in async_url:
+            url = async_url.replace("sqlite+aiosqlite", "sqlite")
+        else:
+            url = "sqlite:///./collections.db"
+    
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -60,8 +69,19 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
+    # Get configuration and set database URL if not present
+    configuration = config.get_section(config.config_ini_section, {})
+    if "sqlalchemy.url" not in configuration:
+        # Convert async URL to sync URL for migrations
+        async_url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./collections.db")
+        if "sqlite+aiosqlite" in async_url:
+            sync_url = async_url.replace("sqlite+aiosqlite", "sqlite")
+        else:
+            sync_url = "sqlite:///./collections.db"
+        configuration["sqlalchemy.url"] = sync_url
+    
     connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
+        configuration,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )

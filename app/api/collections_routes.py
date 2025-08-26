@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from datetime import datetime
 
 from app.database import get_db
-from app.schemas.collection import Collection as CollectionSchema, CollectionResponse
+from app.schemas.collection import CollectionCreate, CollectionResponse
 from app.schemas.property_interactions import (
     PropertyInteractionUpdate,
     PropertyCommentCreate,
@@ -15,8 +15,9 @@ from app.schemas.property_interactions import (
     PropertyInteractionSummary
 )
 from app.services.collections_service import CollectionsService
-from app.services.open_house_service import OpenHouseService
 from app.services.property_interactions_service import PropertyInteractionsService
+from app.services.collection_preferences_service import CollectionPreferencesService
+from app.services.open_house_service import OpenHouseService
 from app.utils.auth import get_current_active_user
 from app.models.database import User
 
@@ -97,7 +98,7 @@ async def get_collection(
 
 @router.post("/", response_model=CollectionResponse, status_code=status.HTTP_201_CREATED)
 async def create_collection(
-    collection_data: CollectionSchema,
+    collection_data: CollectionCreate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
@@ -106,6 +107,14 @@ async def create_collection(
     """
     try:
         collection = await CollectionsService.create_collection(db, collection_data, current_user.id)
+        
+        # Auto-generate preferences if collection has an original property
+        if collection.get("original_property_id"):
+            try:
+                await CollectionPreferencesService.auto_generate_preferences(db, collection["id"])
+            except Exception as e:
+                print(f"Warning: Failed to auto-generate preferences for collection {collection['id']}: {e}")
+        
         return collection
         
     except ValueError as e:
@@ -202,7 +211,8 @@ async def create_collection_from_address(
         
         await db.commit()
         
-        # Map the request to open house form submission format
+        # Create open house form submission
+        from app.schemas.open_house import OpenHouseFormSubmission
         form_submission = OpenHouseFormSubmission(
             full_name=request.visitor_name,
             email=request.visitor_email,
@@ -210,19 +220,14 @@ async def create_collection_from_address(
             visiting_reason=request.visiting_reason,
             timeframe=request.timeframe,
             has_agent=request.has_agent,
-            additional_comments=request.additional_comments,
             interested_in_similar=request.interested_in_similar,
             property_id=property_id,
             agent_id=current_user.id
         )
         
-        # Create visitor record (this will be used for collection creation)
+        # Create visitor record and collection using the open house service
         visitor = await OpenHouseService.create_visitor(db, form_submission)
-        
-        # Create collection using existing logic
-        collection_created = await OpenHouseService.create_collection_for_visitor(
-            db, visitor, form_submission
-        )
+        collection_created = await OpenHouseService.create_collection_for_visitor(db, visitor, form_submission)
         
         if not collection_created:
             raise HTTPException(

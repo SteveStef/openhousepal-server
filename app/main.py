@@ -4,6 +4,7 @@ import uvicorn
 import os
 from dotenv import load_dotenv
 from app.api import router
+from app.scheduler import start_scheduler, stop_scheduler
 
 load_dotenv()
 
@@ -19,6 +20,21 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# Startup and shutdown events
+@app.on_event("startup")
+async def startup_event():
+    """Start the property sync scheduler on application startup"""
+    try:
+        await start_scheduler()
+    except Exception as e:
+        print(f"Warning: Failed to start property sync scheduler: {e}")
+        # Continue startup even if scheduler fails
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Stop the property sync scheduler on application shutdown"""
+    await stop_scheduler()
 
 # Include API routes
 app.include_router(router)

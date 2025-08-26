@@ -108,6 +108,7 @@ alembic.ini.backup
 # Development/example files
 propertyapi-current.json
 listingapi-example.json
+search_by_cords.json
 notes.md
 zillowAPI.md
 

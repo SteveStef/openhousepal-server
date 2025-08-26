@@ -19,7 +19,9 @@ class UserService:
             email=user_data.email,
             hashed_password=hashed_password,
             first_name=user_data.first_name,
-            last_name=user_data.last_name
+            last_name=user_data.last_name,
+            state=user_data.state,
+            brokerage=user_data.brokerage
         )
         
         try:

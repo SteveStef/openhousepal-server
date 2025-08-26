@@ -1,11 +1,10 @@
 from pydantic import BaseModel, EmailStr
 from typing import Optional
 from enum import Enum
-from datetime import datetime
 
 class VisitingReason(str, Enum):
     BUYING_SOON = "BUYING_SOON"
-    BROWSING = "BROWSING" 
+    BROWSING = "BROWSING"
     NEIGHBORHOOD = "NEIGHBORHOOD"
     INVESTMENT = "INVESTMENT"
     CURIOUS = "CURIOUS"
@@ -24,7 +23,7 @@ class HasAgent(str, Enum):
     NO = "NO"
     LOOKING = "LOOKING"
 
-class OpenHouseFormSubmission(BaseModel):
+class PropertyVisitFormSubmission(BaseModel):
     # Personal info
     full_name: str
     email: EmailStr
@@ -42,25 +41,7 @@ class OpenHouseFormSubmission(BaseModel):
     # Collection preference
     interested_in_similar: bool = False
 
-class OpenHouseFormResponse(BaseModel):
+class PropertyVisitFormResponse(BaseModel):
     success: bool
     message: str
-    visitor_id: Optional[str] = None
-    collection_created: Optional[bool] = False
-
-# Open house management schemas
-class OpenHouseCreateRequest(BaseModel):
-    property_id: str
-    property_data: dict
-    address: str
-    cover_image_url: str
-    qr_code_url: str
-
-class OpenHouseResponse(BaseModel):
-    id: str
-    property_id: str
-    address: str
-    cover_image_url: str
-    qr_code_url: str
-    form_url: str
-    created_at: datetime
+    collection_id: Optional[str] = None

@@ -21,6 +21,8 @@ class User(Base):
     hashed_password = Column(String, nullable=False)
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
+    state = Column(String, nullable=True)  # Agent's state
+    brokerage = Column(String, nullable=True)  # Agent's brokerage
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -37,13 +39,13 @@ class Collection(Base):
     owner_id = Column(String, ForeignKey('users.id'), nullable=True)  # Allow null for anonymous collections
     share_token = Column(String, unique=True, nullable=True)
     is_public = Column(Boolean, default=False)
+    status = Column(String, default="ACTIVE")  # ACTIVE, PAUSED, INACTIVE
     
     # Anonymous visitor info (for open house collections)
     visitor_email = Column(String, nullable=True)
     visitor_name = Column(String, nullable=True)
     visitor_phone = Column(String, nullable=True)
     original_property_id = Column(String, ForeignKey('properties.id'), nullable=True)
-    preferences = Column(JSON, nullable=True)
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -52,6 +54,7 @@ class Collection(Base):
     owner = relationship("User", back_populates="collections")
     properties = relationship("Property", secondary=collection_properties, back_populates="collections")
     original_property = relationship("Property", foreign_keys=[original_property_id])
+    preferences = relationship("CollectionPreferences", back_populates="collection", uselist=False)
 
 class Property(Base):
     __tablename__ = "properties"
@@ -124,6 +127,7 @@ class OpenHouseEvent(Base):
     end_time = Column(DateTime(timezone=True), nullable=False)
     is_active = Column(Boolean, default=True)
     form_url = Column(String, nullable=True)  # Store the form link
+    cover_image_url = Column(String, nullable=True)  # Store the selected cover image
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
@@ -151,7 +155,6 @@ class OpenHouseVisitor(Base):
     form_url = Column(String, nullable=True)  # Store the form link
     
     # Preferences
-    additional_comments = Column(Text, nullable=True)
     interested_in_similar = Column(Boolean, default=False)
     
     # Metadata
@@ -214,3 +217,37 @@ class PropertyComment(Base):
     collection = relationship("Collection")
     property = relationship("Property")
     user = relationship("User")
+
+
+class CollectionPreferences(Base):
+    __tablename__ = "collection_preferences"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    collection_id = Column(String, ForeignKey('collections.id'), nullable=False, unique=True)
+    
+    # Property criteria
+    min_beds = Column(Integer, nullable=True)
+    max_beds = Column(Integer, nullable=True)
+    min_baths = Column(Float, nullable=True)
+    max_baths = Column(Float, nullable=True)
+    min_price = Column(Integer, nullable=True)
+    max_price = Column(Integer, nullable=True)
+    
+    # Location criteria
+    lat = Column(Float, nullable=True)
+    long = Column(Float, nullable=True)
+    diameter = Column(Float, default=2.0)  # Search diameter in miles
+    
+    # Additional features
+    special_features = Column(Text, default="")
+    
+    # Visitor form data
+    timeframe = Column(String, nullable=True)  # IMMEDIATELY, 1_3_MONTHS, 3_6_MONTHS, etc.
+    visiting_reason = Column(String, nullable=True)  # BUYING_SOON, BROWSING, NEIGHBORHOOD, etc.
+    has_agent = Column(String, nullable=True)  # YES, NO, LOOKING
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    
+    # Relationships
+    collection = relationship("Collection", back_populates="preferences")

@@ -1,7 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 from sqlalchemy.orm import selectinload
-from sqlalchemy.orm.attributes import flag_modified
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 import uuid
@@ -9,7 +8,7 @@ import secrets
 import string
 
 from app.models.database import Collection, Property, User
-from app.schemas.collection import Collection as CollectionSchema
+from app.schemas.collection import CollectionCreate
 
 
 class CollectionsService:
@@ -19,7 +18,10 @@ class CollectionsService:
         """Get all collections for a user"""
         try:
             # Query collections for the user including anonymous ones assigned to them
-            query = select(Collection).where(
+            # Include the preferences relationship to avoid lazy loading issues
+            query = select(Collection).options(
+                selectinload(Collection.preferences)
+            ).where(
                 (Collection.owner_id == user_id) | 
                 (Collection.owner_id.is_(None))  # Include anonymous collections for now
             ).order_by(Collection.created_at.desc())
@@ -32,6 +34,51 @@ class CollectionsService:
                 # Get property count (mock for now)
                 property_count = 0  # Would count actual properties in a real implementation
                 
+                # Get original property data if available
+                original_property_data = None
+                if collection.original_property_id:
+                    try:
+                        property_query = select(Property).where(Property.id == str(collection.original_property_id))
+                        property_result = await db.execute(property_query)
+                        original_property = property_result.scalar_one_or_none()
+                        
+                        if original_property:
+                            # Extract property data from both stored fields and zillow_data JSON
+                            zillow_data = original_property.zillow_data or {}
+                            original_property_data = {
+                                "id": original_property.id,
+                                "address": original_property.street_address or "Unknown Address",
+                                "city": zillow_data.get("city") or original_property.city,
+                                "state": zillow_data.get("state") or original_property.state,
+                                "zipCode": zillow_data.get("zipCode") or original_property.zipcode,
+                                "price": original_property.price or zillow_data.get("price"),
+                                "beds": original_property.bedrooms or zillow_data.get("beds"),
+                                "baths": original_property.bathrooms or zillow_data.get("baths"),
+                                "squareFeet": original_property.living_area or zillow_data.get("sqft"),
+                                "propertyType": original_property.home_type or zillow_data.get("propertyType") or "Unknown"
+                            }
+                    except Exception as e:
+                        print(f"Warning: Could not fetch original property data for collection {collection.id}: {e}")
+                
+                # Get preferences data if available
+                preferences_data = {}
+                if collection.preferences:
+                    preferences_data = {
+                        "min_beds": collection.preferences.min_beds,
+                        "max_beds": collection.preferences.max_beds,
+                        "min_baths": collection.preferences.min_baths,
+                        "max_baths": collection.preferences.max_baths,
+                        "min_price": collection.preferences.min_price,
+                        "max_price": collection.preferences.max_price,
+                        "lat": collection.preferences.lat,
+                        "long": collection.preferences.long,
+                        "diameter": collection.preferences.diameter,
+                        "special_features": collection.preferences.special_features,
+                        "timeframe": collection.preferences.timeframe,
+                        "visiting_reason": collection.preferences.visiting_reason,
+                        "has_agent": collection.preferences.has_agent
+                    }
+
                 # Convert to response format  
                 collection_data = {
                     "id": collection.id,
@@ -40,7 +87,8 @@ class CollectionsService:
                     "visitor_name": collection.visitor_name,
                     "visitor_email": collection.visitor_email,
                     "visitor_phone": collection.visitor_phone,
-                    "preferences": collection.preferences or {},
+                    "original_property": original_property_data,
+                    "preferences": preferences_data,
                     "property_count": property_count,
                     "is_anonymous": collection.owner_id is None,
                     "is_public": bool(collection.is_public) if collection.is_public is not None else False,
@@ -64,7 +112,9 @@ class CollectionsService:
     ) -> Optional[Dict[str, Any]]:
         """Get a specific collection by ID"""
         try:
-            query = select(Collection).where(
+            query = select(Collection).options(
+                selectinload(Collection.preferences)
+            ).where(
                 Collection.id == collection_id,
                 (Collection.owner_id == user_id) | (Collection.owner_id.is_(None))
             )
@@ -78,6 +128,22 @@ class CollectionsService:
             # Get properties in this collection (mock for now)
             properties = []  # Would load actual properties
             
+            # Get preferences data if available
+            preferences_data = {}
+            if collection.preferences:
+                preferences_data = {
+                    "min_beds": collection.preferences.min_beds,
+                    "max_beds": collection.preferences.max_beds,
+                    "min_baths": collection.preferences.min_baths,
+                    "max_baths": collection.preferences.max_baths,
+                    "min_price": collection.preferences.min_price,
+                    "max_price": collection.preferences.max_price,
+                    "lat": collection.preferences.lat,
+                    "long": collection.preferences.long,
+                    "diameter": collection.preferences.diameter,
+                    "special_features": collection.preferences.special_features
+                }
+            
             return {
                 "id": collection.id,
                 "name": collection.name,
@@ -85,7 +151,7 @@ class CollectionsService:
                 "visitor_name": collection.visitor_name,
                 "visitor_email": collection.visitor_email,
                 "visitor_phone": collection.visitor_phone,
-                "preferences": collection.preferences or {},
+                "preferences": preferences_data,
                 "properties": properties,
                 "property_count": len(properties),
                 "is_anonymous": collection.owner_id is None,
@@ -102,7 +168,7 @@ class CollectionsService:
     @staticmethod
     async def create_collection(
         db: AsyncSession,
-        collection_data: CollectionSchema,
+        collection_data: CollectionCreate,
         user_id: str
     ) -> Dict[str, Any]:
         """Create a new collection"""
@@ -112,7 +178,7 @@ class CollectionsService:
                 name=collection_data.name,
                 description=collection_data.description,
                 owner_id=user_id,
-                preferences=collection_data.preferences if hasattr(collection_data, 'preferences') else {},
+                is_public=collection_data.is_public,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )
@@ -125,9 +191,14 @@ class CollectionsService:
                 "id": collection.id,
                 "name": collection.name,
                 "description": collection.description or "",
-                "preferences": collection.preferences or {},
+                "visitor_name": collection.visitor_name,
+                "visitor_email": collection.visitor_email,
+                "visitor_phone": collection.visitor_phone,
+                "preferences": {},  # No preferences relationship created yet
                 "property_count": 0,
                 "is_anonymous": False,
+                "is_public": collection.is_public,
+                "share_token": collection.share_token,
                 "created_at": collection.created_at.isoformat(),
                 "updated_at": collection.updated_at.isoformat()
             }
@@ -157,12 +228,8 @@ class CollectionsService:
             if not collection:
                 return False
             
-            # Update preferences to store status since there's no direct status column
-            preferences = collection.preferences or {}
-            preferences['status'] = status
-            collection.preferences = preferences
-            # Flag the JSON column as modified so SQLAlchemy knows to update it
-            flag_modified(collection, 'preferences')
+            # Update the status column directly
+            collection.status = status
             collection.updated_at = datetime.utcnow()
             
             await db.commit()
@@ -249,10 +316,14 @@ class CollectionsService:
         """Get a shared collection by share token (for anonymous access)"""
         try:
             print(f"[DEBUG SERVICE] Looking for collection with share_token: {share_token}")
-            # Query collection with properties and ensure it's public
+            # Query collection with properties and preferences, ensure it's public
+            from sqlalchemy.orm import joinedload
             query = (
                 select(Collection)
-                .options(selectinload(Collection.properties))
+                .options(
+                    selectinload(Collection.properties),
+                    joinedload(Collection.preferences)
+                )
                 .where(
                     and_(
                         Collection.share_token == share_token,
@@ -277,6 +348,20 @@ class CollectionsService:
                 return None
             
             print(f"[DEBUG SERVICE] Found collection: {collection.id} - {collection.name} - public: {collection.is_public}")
+            print(f"[DEBUG SERVICE] Preferences loaded: {collection.preferences is not None}")
+            if collection.preferences:
+                print(f"[DEBUG SERVICE] Timeframe: {collection.preferences.timeframe}, Visiting reason: {collection.preferences.visiting_reason}")
+            else:
+                # Manual query for preferences to debug the issue
+                from app.models.database import CollectionPreferences
+                prefs_query = select(CollectionPreferences).where(CollectionPreferences.collection_id == collection.id)
+                prefs_result = await db.execute(prefs_query)
+                manual_prefs = prefs_result.scalar_one_or_none()
+                print(f"[DEBUG SERVICE] Manual preferences query result: {manual_prefs is not None}")
+                if manual_prefs:
+                    print(f"[DEBUG SERVICE] Manual - Timeframe: {manual_prefs.timeframe}, Visiting reason: {manual_prefs.visiting_reason}")
+                    # Use the manually loaded preferences
+                    collection.preferences = manual_prefs
             
             # Transform to response format similar to get_user_collections
             properties_data = []
@@ -328,8 +413,22 @@ class CollectionsService:
                 'matchedProperties': properties_data,
                 'createdAt': collection.created_at.isoformat(),
                 'updatedAt': collection.updated_at.isoformat() if collection.updated_at else collection.created_at.isoformat(),
-                'status': collection.preferences.get('status', 'ACTIVE') if collection.preferences else 'ACTIVE',
-                'preferences': collection.preferences or {},
+                'status': collection.status or 'ACTIVE',
+                'preferences': {
+                    'min_beds': collection.preferences.min_beds,
+                    'max_beds': collection.preferences.max_beds,
+                    'min_baths': collection.preferences.min_baths,
+                    'max_baths': collection.preferences.max_baths,
+                    'min_price': collection.preferences.min_price,
+                    'max_price': collection.preferences.max_price,
+                    'lat': collection.preferences.lat,
+                    'long': collection.preferences.long,
+                    'diameter': collection.preferences.diameter,
+                    'special_features': collection.preferences.special_features,
+                    'timeframe': collection.preferences.timeframe,
+                    'visiting_reason': collection.preferences.visiting_reason,
+                    'has_agent': collection.preferences.has_agent
+                } if collection.preferences else {},
                 'stats': {
                     'totalProperties': total_properties,
                     'viewedProperties': 0,

@@ -42,6 +42,7 @@ class CollectionResponse(BaseModel):
     visitor_name: Optional[str] = None
     visitor_email: Optional[str] = None
     visitor_phone: Optional[str] = None
+    original_property: Optional[dict] = None
     preferences: dict = {}
     property_count: int = 0
     is_anonymous: bool = False

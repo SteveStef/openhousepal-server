@@ -42,7 +42,9 @@ async def signup(
                 "id": new_user.id,
                 "email": new_user.email,
                 "first_name": new_user.first_name,
-                "last_name": new_user.last_name
+                "last_name": new_user.last_name,
+                "state": new_user.state,
+                "brokerage": new_user.brokerage
             }
         }
         
@@ -118,7 +120,9 @@ async def login(
                 "id": user.id,
                 "email": user.email,
                 "first_name": user.first_name,
-                "last_name": user.last_name
+                "last_name": user.last_name,
+                "state": user.state,
+                "brokerage": user.brokerage
             }
         }
         

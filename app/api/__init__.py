@@ -1,15 +1,19 @@
 from fastapi import APIRouter
 from .routes import router as property_router
 from .auth_routes import router as auth_router
-from .open_house_routes import router as open_house_router
+from .property_visit_routes import router as property_visit_router
 from .collections_routes import router as collections_router
 from .properties_routes import router as properties_router
+from .collection_preferences_routes import router as collection_preferences_router
+from .property_sync_routes import router as property_sync_router
 from .open_houses_routes import router as open_houses_router
 
 router = APIRouter()
 router.include_router(property_router)
 router.include_router(auth_router)
-router.include_router(open_house_router)
+router.include_router(property_visit_router)
 router.include_router(collections_router)
 router.include_router(properties_router)
+router.include_router(collection_preferences_router)
+router.include_router(property_sync_router)
 router.include_router(open_houses_router)

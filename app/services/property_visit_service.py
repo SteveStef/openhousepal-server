@@ -3,63 +3,39 @@ from sqlalchemy import select
 from datetime import datetime
 from typing import Optional
 
-from app.models.database import Property, OpenHouseVisitor, Collection
-from app.schemas.open_house import OpenHouseFormSubmission
+from app.models.database import Property, Collection
+from app.schemas.property_visit import PropertyVisitFormSubmission
 from app.services.collection_preferences_service import CollectionPreferencesService
 
 
-class OpenHouseService:
+class PropertyVisitService:
     
     @staticmethod
-    async def create_visitor(db: AsyncSession, form_data: OpenHouseFormSubmission) -> OpenHouseVisitor:
-        """Create a visitor record from open house form submission"""
-        
-        visitor = OpenHouseVisitor(
-            full_name=form_data.full_name,
-            email=form_data.email,
-            phone=form_data.phone,
-            visiting_reason=form_data.visiting_reason.value,
-            timeframe=form_data.timeframe.value,
-            has_agent=form_data.has_agent.value,
-            property_id=form_data.property_id,
-            qr_code="",  # Will be updated by the calling code
-            interested_in_similar=form_data.interested_in_similar,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
-        )
-        
-        db.add(visitor)
-        await db.commit()
-        await db.refresh(visitor)
-        return visitor
-    
-    @staticmethod
-    async def create_collection_for_visitor(
+    async def create_collection_from_visit(
         db: AsyncSession, 
-        visitor: OpenHouseVisitor, 
-        form_data: OpenHouseFormSubmission
-    ) -> bool:
-        """Create a collection for a visitor if they're interested in similar properties"""
+        form_data: PropertyVisitFormSubmission
+    ) -> Optional[str]:
+        """Create a collection directly from a property visit form submission"""
         
         if not form_data.interested_in_similar or not form_data.property_id:
-            return False
+            return None
             
         try:
             # Get the original property to create smart filters
-            visited_property = await OpenHouseService.get_property_by_id(db, form_data.property_id)
+            visited_property = await PropertyVisitService.get_property_by_id(db, form_data.property_id)
             
             if not visited_property:
                 print(f"Could not find property {form_data.property_id} to create collection")
-                return False
+                return None
             
-            # Create collection
+            # Create collection directly
             collection = Collection(
                 owner_id=form_data.agent_id if form_data.agent_id else None,  # Link to agent if provided
                 name=visited_property.get('address', 'Unknown Property'),
-                description=f"Properties similar to {visited_property.get('address', 'the visited property')} based on {visitor.full_name}'s preferences",
-                visitor_email=visitor.email,
-                visitor_name=visitor.full_name,
-                visitor_phone=visitor.phone,
+                description=f"Properties similar to {visited_property.get('address', 'the visited property')} based on your preferences",
+                visitor_email=form_data.email,
+                visitor_name=form_data.full_name,
+                visitor_phone=form_data.phone,
                 original_property_id=form_data.property_id,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
@@ -77,13 +53,13 @@ class OpenHouseService:
                 print(f"Warning: Failed to auto-generate preferences for collection {collection.id}: {e}")
                 # Collection creation should still succeed even if preferences fail
             
-            print(f"Created collection {collection.id} for visitor {visitor.full_name}")
-            return True
+            print(f"Created collection {collection.id} from property visit")
+            return collection.id
             
         except Exception as e:
-            print(f"Error creating collection for visitor: {e}")
+            print(f"Error creating collection from property visit: {e}")
             await db.rollback()
-            return False
+            return None
     
     @staticmethod
     async def get_property_by_id(db: AsyncSession, property_id: str) -> Optional[dict]:
@@ -116,17 +92,4 @@ class OpenHouseService:
             
         except Exception as e:
             print(f"Error fetching property by ID: {e}")
-            return None
-
-    @staticmethod
-    async def get_property_by_qr_code(db: AsyncSession, qr_code: str) -> Optional[dict]:
-        """Get property information by QR code (for compatibility with existing routes)"""
-        # For now, we'll assume the QR code contains the property ID
-        # In a full implementation, you might have a QR code lookup table
-        try:
-            # Extract property ID from QR code or form URL
-            # This is a simplified implementation
-            return await OpenHouseService.get_property_by_id(db, qr_code)
-        except Exception as e:
-            print(f"Error fetching property by QR code: {e}")
             return None
