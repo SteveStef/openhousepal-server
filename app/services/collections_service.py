@@ -1,13 +1,13 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, joinedload
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 import uuid
 import secrets
 import string
 
-from app.models.database import Collection, Property, User
+from app.models.database import Collection, Property, User, PropertyInteraction, PropertyComment
 from app.schemas.collection import CollectionCreate
 
 
@@ -18,9 +18,10 @@ class CollectionsService:
         """Get all collections for a user"""
         try:
             # Query collections for the user including anonymous ones assigned to them
-            # Include the preferences relationship to avoid lazy loading issues
+            # Include both preferences and properties relationships to avoid lazy loading issues
             query = select(Collection).options(
-                selectinload(Collection.preferences)
+                selectinload(Collection.preferences),
+                selectinload(Collection.properties)
             ).where(
                 (Collection.owner_id == user_id) | 
                 (Collection.owner_id.is_(None))  # Include anonymous collections for now
@@ -31,31 +32,29 @@ class CollectionsService:
             
             collections_data = []
             for collection in collections:
-                # Get property count (mock for now)
-                property_count = 0  # Would count actual properties in a real implementation
+                # Get actual property count from loaded relationship
+                property_count = len(collection.properties) if collection.properties else 0
                 
-                # Get original property data if available
+                # Get original open house event data if available
                 original_property_data = None
-                if collection.original_property_id:
+                if collection.original_open_house_event_id:
                     try:
-                        property_query = select(Property).where(Property.id == str(collection.original_property_id))
-                        property_result = await db.execute(property_query)
-                        original_property = property_result.scalar_one_or_none()
+                        # Use the existing relationship to get OpenHouseEvent
+                        original_open_house = collection.original_open_house_event
                         
-                        if original_property:
-                            # Extract property data from both stored fields and zillow_data JSON
-                            zillow_data = original_property.zillow_data or {}
+                        if original_open_house:
+                            # Extract property data from OpenHouseEvent metadata
                             original_property_data = {
-                                "id": original_property.id,
-                                "address": original_property.street_address or "Unknown Address",
-                                "city": zillow_data.get("city") or original_property.city,
-                                "state": zillow_data.get("state") or original_property.state,
-                                "zipCode": zillow_data.get("zipCode") or original_property.zipcode,
-                                "price": original_property.price or zillow_data.get("price"),
-                                "beds": original_property.bedrooms or zillow_data.get("beds"),
-                                "baths": original_property.bathrooms or zillow_data.get("baths"),
-                                "squareFeet": original_property.living_area or zillow_data.get("sqft"),
-                                "propertyType": original_property.home_type or zillow_data.get("propertyType") or "Unknown"
+                                "id": original_open_house.id,
+                                "address": original_open_house.address or "Unknown Address",
+                                "city": original_open_house.city,
+                                "state": original_open_house.state,
+                                "zipCode": original_open_house.zipcode,
+                                "price": original_open_house.price,
+                                "beds": original_open_house.bedrooms,
+                                "baths": original_open_house.bathrooms,
+                                "squareFeet": original_open_house.living_area,
+                                "propertyType": original_open_house.house_type or "Unknown"
                             }
                     except Exception as e:
                         print(f"Warning: Could not fetch original property data for collection {collection.id}: {e}")
@@ -79,6 +78,34 @@ class CollectionsService:
                         "has_agent": collection.preferences.has_agent
                     }
 
+                # Transform properties for this collection (similar to get_shared_collection)
+                properties_data = []
+                for prop in collection.properties:
+                    property_dict = {
+                        'id': prop.id,
+                        'address': prop.street_address or 'Unknown Address',
+                        'city': prop.city,
+                        'state': prop.state,
+                        'zipCode': prop.zipcode,
+                        'price': prop.price,
+                        'beds': prop.bedrooms,
+                        'baths': prop.bathrooms,
+                        'squareFeet': prop.living_area,
+                        'lotSize': prop.lot_size,
+                        'propertyType': prop.home_type,
+                        'imageUrl': prop.img_src,
+                        'description': '',
+                        'listingUpdated': prop.updated_at.isoformat() if prop.updated_at else None,
+                        'status': prop.home_status,
+                        # 'daysOnMarket': prop.days_on_zillow,
+                        # 'liked': False,
+                        # 'disliked': False,
+                        # 'favorited': False,
+                        # 'viewed': False,
+                        # 'comments': []
+                    }
+                    properties_data.append(property_dict)
+
                 # Convert to response format  
                 collection_data = {
                     "id": collection.id,
@@ -89,6 +116,7 @@ class CollectionsService:
                     "visitor_phone": collection.visitor_phone,
                     "original_property": original_property_data,
                     "preferences": preferences_data,
+                    "matchedProperties": properties_data,  # Add actual properties data
                     "property_count": property_count,
                     "is_anonymous": collection.owner_id is None,
                     "is_public": bool(collection.is_public) if collection.is_public is not None else False,
@@ -113,7 +141,8 @@ class CollectionsService:
         """Get a specific collection by ID"""
         try:
             query = select(Collection).options(
-                selectinload(Collection.preferences)
+                selectinload(Collection.preferences),
+                selectinload(Collection.properties)
             ).where(
                 Collection.id == collection_id,
                 (Collection.owner_id == user_id) | (Collection.owner_id.is_(None))
@@ -125,8 +154,39 @@ class CollectionsService:
             if not collection:
                 return None
             
-            # Get properties in this collection (mock for now)
-            properties = []  # Would load actual properties
+            # Transform properties to frontend format (similar to get_shared_collection)
+            properties = []
+            for prop in collection.properties:
+                property_dict = {
+                    'id': prop.id,
+                    'address': prop.street_address or 'Unknown Address',
+                    'city': prop.city,
+                    'state': prop.state,
+                    'zipCode': prop.zipcode,
+                    'price': prop.price,
+                    'beds': prop.bedrooms,
+                    'baths': prop.bathrooms,
+                    'squareFeet': prop.living_area,
+                    'lotSize': prop.lot_size,
+                    'propertyType': prop.home_type,
+                    'imageUrl': prop.img_src,
+                    'images': prop.original_photos or [],
+                    'description': '',
+                    'listingUpdated': prop.updated_at.isoformat() if prop.updated_at else None,
+                    'status': prop.home_status,
+                    'yearBuilt': prop.year_built,
+                    'taxes': prop.tax_assessed_value,
+                    'hoaFees': prop.hoa_fee,
+                    'daysOnMarket': prop.days_on_zillow,
+                    'county': '',
+                    # Initialize interaction states - these will be populated by frontend
+                    'liked': False,
+                    'disliked': False,
+                    'favorited': False,
+                    'viewed': False,
+                    'comments': []
+                }
+                properties.append(property_dict)
             
             # Get preferences data if available
             preferences_data = {}
@@ -186,6 +246,27 @@ class CollectionsService:
             db.add(collection)
             await db.commit()
             await db.refresh(collection)
+            
+            # Try to populate properties if preferences exist for this collection
+            try:
+                from app.services.property_sync_service import PropertySyncService
+                from app.services.collection_preferences_service import CollectionPreferencesService
+                
+                # Check if preferences exist for this collection
+                preferences = await CollectionPreferencesService.get_preferences_by_collection_id(db, collection.id)
+                
+                if preferences:
+                    sync_service = PropertySyncService()
+                    result = await sync_service.populate_new_collection(db, collection.id)
+                    
+                    if result['success']:
+                        print(f"Successfully populated collection {collection.id} with {result['new_properties_added']} properties")
+                    else:
+                        print(f"Warning: Failed to populate collection {collection.id} with properties: {result.get('error', 'Unknown error')}")
+                        
+            except Exception as e:
+                print(f"Warning: Failed to populate collection {collection.id} with properties: {e}")
+                # Collection creation should still succeed even if property population fails
             
             return {
                 "id": collection.id,
@@ -317,7 +398,6 @@ class CollectionsService:
         try:
             print(f"[DEBUG SERVICE] Looking for collection with share_token: {share_token}")
             # Query collection with properties and preferences, ensure it's public
-            from sqlalchemy.orm import joinedload
             query = (
                 select(Collection)
                 .options(
@@ -363,6 +443,53 @@ class CollectionsService:
                     # Use the manually loaded preferences
                     collection.preferences = manual_prefs
             
+            # Get all property IDs for batch querying interactions
+            property_ids = [prop.id for prop in collection.properties]
+            
+            # Initialize lookup dictionaries
+            interactions_lookup = {}
+            comments_lookup = {}
+            
+            # Only query if we have properties
+            if property_ids:
+                # Fetch all interactions for this collection in a single query
+                interactions_query = select(PropertyInteraction).where(
+                    and_(
+                        PropertyInteraction.collection_id == collection.id,
+                        PropertyInteraction.property_id.in_(property_ids)
+                    )
+                )
+                
+                interactions_result = await db.execute(interactions_query)
+                interactions = interactions_result.scalars().all()
+                
+                # Create lookup dictionary for interactions by property_id
+                for interaction in interactions:
+                    interactions_lookup[interaction.property_id] = interaction
+                
+                # Fetch all comments for this collection in a single query
+                comments_query = select(PropertyComment).where(
+                    and_(
+                        PropertyComment.collection_id == collection.id,
+                        PropertyComment.property_id.in_(property_ids)
+                    )
+                )
+                
+                comments_result = await db.execute(comments_query)
+                comments = comments_result.scalars().all()
+                
+                # Create lookup dictionary for comments by property_id
+                for comment in comments:
+                    if comment.property_id not in comments_lookup:
+                        comments_lookup[comment.property_id] = []
+                    comment_dict = {
+                        'id': comment.id,
+                        'content': comment.content,
+                        'author': comment.visitor_name or 'Anonymous',
+                        'createdAt': comment.created_at.isoformat()
+                    }
+                    comments_lookup[comment.property_id].append(comment_dict)
+
             # Transform to response format similar to get_user_collections
             properties_data = []
             for prop in collection.properties:
@@ -384,16 +511,14 @@ class CollectionsService:
                     'listingUpdated': prop.updated_at.isoformat() if prop.updated_at else None,
                     'status': prop.home_status,
                     'yearBuilt': prop.year_built,
-                    'taxes': prop.tax_assessed_value,
-                    'hoaFees': prop.hoa_fee,
                     'daysOnMarket': prop.days_on_zillow,
                     'county': '',
-                    # Initialize interaction states - these will be populated by frontend
-                    'liked': False,
-                    'disliked': False,
-                    'favorited': False,
-                    'viewed': False,
-                    'comments': []
+                    # Real interaction data from database
+                    'liked': interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
+                    'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
+                    'favorited': interactions_lookup[prop.id].favorited if prop.id in interactions_lookup else False,
+                    'viewed': prop.id in interactions_lookup,  # True if any interaction exists
+                    'comments': comments_lookup.get(prop.id, [])
                 }
                 properties_data.append(property_dict)
             
@@ -473,3 +598,107 @@ class CollectionsService:
             print(f"Error deleting collection: {e}")
             await db.rollback()
             raise e
+
+
+    @staticmethod
+    async def get_properties(
+        collectionId: str,
+        db: AsyncSession
+    ):
+        try:
+            # Get all the properties that have a relation to the collectionId
+            query = (
+                select(Collection)
+                .options(selectinload(Collection.properties))
+                .where(Collection.id == collectionId)
+            )
+            result = await db.execute(query)
+            collection = result.scalar_one_or_none()
+
+            if not collection:
+                print(f"[DEBUG SERVICE] No collection found with ID: {collectionId}")
+                return []
+
+            # Get all property IDs for batch querying interactions
+            property_ids = [prop.id for prop in collection.properties]
+            
+            # Fetch all interactions for this collection in a single query
+            interactions_query = select(PropertyInteraction).where(
+                and_(
+                    PropertyInteraction.collection_id == collectionId,
+                    PropertyInteraction.property_id.in_(property_ids)
+                )
+            )
+            
+            
+            interactions_result = await db.execute(interactions_query)
+            interactions = interactions_result.scalars().all()
+            
+            # Create lookup dictionary for interactions by property_id
+            interactions_lookup = {}
+            for interaction in interactions:
+                interactions_lookup[interaction.property_id] = interaction
+            
+            # Fetch all comments for this collection in a single query
+            comments_query = select(PropertyComment).where(
+                and_(
+                    PropertyComment.collection_id == collectionId,
+                    PropertyComment.property_id.in_(property_ids)
+                )
+            ).order_by(PropertyComment.created_at.asc())
+            
+            comments_result = await db.execute(comments_query)
+            comments = comments_result.scalars().all()
+            
+            # Create lookup dictionary for comments by property_id
+            comments_lookup = {}
+            for comment in comments:
+                if comment.property_id not in comments_lookup:
+                    comments_lookup[comment.property_id] = []
+                comments_lookup[comment.property_id].append({
+                    'id': comment.id,
+                    'author': comment.visitor_name or 'Anonymous',
+                    'content': comment.content,
+                    'createdAt': comment.created_at.isoformat()
+                })
+
+            properties_data = []
+            for prop in collection.properties:
+                property_dict = {
+                    'id': prop.id,
+                    'zpid': prop.zpid,
+                    'address': prop.street_address or 'Unknown Address',
+                    'city': prop.city,
+                    'state': prop.state,
+                    'zipCode': prop.zipcode,
+                    'price': prop.price,
+                    'beds': prop.bedrooms,
+                    'baths': prop.bathrooms,
+                    'squareFeet': prop.living_area,
+                    'lotSize': prop.lot_size,
+                    'propertyType': prop.home_type,
+                    'imageUrl': prop.img_src,
+                    'images': prop.original_photos or [],
+                    'description': '',
+                    'listingUpdated': prop.updated_at.isoformat() if prop.updated_at else None,
+                    'status': prop.home_status,
+                    'yearBuilt': prop.year_built,
+                    #'taxes': prop.tax_assessed_value,
+                    #'hoaFees': prop.hoa_fee,
+                    'daysOnMarket': prop.days_on_zillow,
+                    'county': '',
+                    # Real interaction data from database
+                    'liked': interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
+                    'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
+                    'favorited': interactions_lookup[prop.id].favorited if prop.id in interactions_lookup else False,
+                    'viewed': prop.id in interactions_lookup,  # True if any interaction exists
+                    'comments': comments_lookup.get(prop.id, [])
+                }
+                properties_data.append(property_dict)
+
+            return properties_data
+        except Exception as e:
+            print(e)
+            return []
+
+

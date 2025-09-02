@@ -3,7 +3,7 @@ from sqlalchemy import select
 from typing import Optional
 import math
 
-from app.models.database import CollectionPreferences, Collection, Property
+from app.models.database import CollectionPreferences, Collection, Property, OpenHouseEvent
 from app.schemas.collection_preferences import CollectionPreferencesCreate, CollectionPreferencesUpdate
 
 class CollectionPreferencesService:
@@ -56,38 +56,48 @@ class CollectionPreferencesService:
     
     @staticmethod
     async def auto_generate_preferences(db: AsyncSession, collection_id: str, form_data: Optional[object] = None) -> Optional[CollectionPreferences]:
-        """Auto-generate preferences based on the original property of a collection"""
-        # Get collection with original property
+        """Auto-generate preferences based on the original open house event of a collection"""
+        # Get collection with original open house event
         result = await db.execute(
             select(Collection).where(Collection.id == collection_id)
         )
         collection = result.scalar_one_or_none()
         
-        if not collection or not collection.original_property_id:
+        if not collection or not collection.original_open_house_event_id:
             return None
         
-        # Get the original property
+        # Get the original open house event
         result = await db.execute(
-            select(Property).where(Property.id == collection.original_property_id)
+            select(OpenHouseEvent).where(OpenHouseEvent.id == collection.original_open_house_event_id)
         )
-        original_property = result.scalar_one_or_none()
+        original_open_house = result.scalar_one_or_none()
         
-        if not original_property:
+        if not original_open_house:
             return None
         
-        # Calculate preferences based on original property and form data
+        # Calculate preferences based on original open house event metadata and form data
+        single_family = original_open_house.house_type == "SINGLE_FAMILY"
+
         preferences_data_dict = {
             "collection_id": collection_id,
-            "min_beds": max(1, (original_property.bedrooms or 3) - 1),
-            "max_beds": (original_property.bedrooms or 3) + 1,
-            "min_baths": max(1.0, (original_property.bathrooms or 2.5) - 0.5),
-            "max_baths": (original_property.bathrooms or 2.5) + 0.5,
-            "min_price": int((original_property.price or 1000000) * 0.8),  # 20% less
-            "max_price": int((original_property.price or 1000000) * 1.2),  # 20% more
-            "lat": original_property.latitude,
-            "long": original_property.longitude,
-            "diameter": 2.0,  # Default 2 miles diameter
-            "special_features": ""
+            "min_beds": max(1, (original_open_house.bedrooms or 3) - 1),
+            "max_beds": 100, # (original_open_house.bedrooms or 3) + 1,
+            "min_baths": 0, # max(1.0, (original_open_house.bathrooms or 2.5) - 0.5),
+            "max_baths": 100, # (original_open_house.bathrooms or 2.5) + 0.5,
+            "min_price": int((original_open_house.price or 1000000) * 0.8),  # 20% less
+            "max_price": int((original_open_house.price or 1000000) * 1.2),  # 20% more
+            "lat": original_open_house.latitude,
+            "long": original_open_house.longitude,
+            "diameter": 15,
+            "special_features": "",
+
+            "is_town_house": not single_family,
+            "is_condo": not single_family,
+            "is_single_family": single_family,
+
+            "is_lot_land": False,
+            "is_multi_family": False,
+            "is_apartment": False,
         }
         
         # Add visitor form data if provided

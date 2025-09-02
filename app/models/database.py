@@ -45,7 +45,7 @@ class Collection(Base):
     visitor_email = Column(String, nullable=True)
     visitor_name = Column(String, nullable=True)
     visitor_phone = Column(String, nullable=True)
-    original_property_id = Column(String, ForeignKey('properties.id'), nullable=True)
+    original_open_house_event_id = Column(String, ForeignKey('open_house_events.id'), nullable=True)
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -53,7 +53,7 @@ class Collection(Base):
     # Relationships
     owner = relationship("User", back_populates="collections")
     properties = relationship("Property", secondary=collection_properties, back_populates="collections")
-    original_property = relationship("Property", foreign_keys=[original_property_id])
+    original_open_house_event = relationship("OpenHouseEvent", foreign_keys=[original_open_house_event_id])
     preferences = relationship("CollectionPreferences", back_populates="collection", uselist=False)
 
 class Property(Base):
@@ -74,9 +74,8 @@ class Property(Base):
     zestimate = Column(Integer, nullable=True)
     bedrooms = Column(Integer, nullable=True)
     bathrooms = Column(Float, nullable=True)
-    living_area = Column(Integer, nullable=True)  # Square footage
+    living_area = Column(Integer, nullable=True)
     lot_size = Column(Integer, nullable=True)
-    year_built = Column(Integer, nullable=True)
     home_type = Column(String, nullable=True)
     home_status = Column(String, nullable=True)
     
@@ -84,35 +83,10 @@ class Property(Base):
     latitude = Column(Float, nullable=True)
     longitude = Column(Float, nullable=True)
     
-    # Images and media
     img_src = Column(String, nullable=True)
-    original_photos = Column(JSON, nullable=True)
-    
-    # Property features
-    has_garage = Column(Boolean, nullable=True)
-    has_pool = Column(Boolean, nullable=True)
-    has_fireplace = Column(Boolean, nullable=True)
-    parking_capacity = Column(Integer, nullable=True)
-    
-    # Financial info
-    tax_assessed_value = Column(Integer, nullable=True)
-    property_tax_rate = Column(Float, nullable=True)
-    hoa_fee = Column(Float, nullable=True)
-    
-    # Market info
-    days_on_zillow = Column(Integer, nullable=True)
-    price_change = Column(Integer, nullable=True)
-    date_price_changed = Column(Integer, nullable=True)  # Unix timestamp
-    
-    # External API data cache
-    zillow_data = Column(JSON, nullable=True)  # Store full Zillow API response
-    
-    # Metadata
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-    last_synced = Column(DateTime(timezone=True), nullable=True)  # When data was last fetched from API
     
-    # Relationships
     collections = relationship("Collection", secondary=collection_properties, back_populates="properties")
 
 
@@ -121,17 +95,38 @@ class OpenHouseEvent(Base):
     
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     qr_code = Column(String, unique=True, nullable=False)
-    property_id = Column(String, ForeignKey('properties.id'), nullable=False)
     agent_id = Column(String, ForeignKey('users.id'), nullable=False)
     start_time = Column(DateTime(timezone=True), nullable=False)
     end_time = Column(DateTime(timezone=True), nullable=False)
     is_active = Column(Boolean, default=True)
     form_url = Column(String, nullable=True)  # Store the form link
     cover_image_url = Column(String, nullable=True)  # Store the selected cover image
+    
+    # Property metadata (replaces property_id relationship)
+    address = Column(String, nullable=True)
+    abbreviated_address = Column(String, nullable=True)
+    image_src = Column(String, nullable=True)
+    house_type = Column(String, nullable=True)
+    
+    # Location data for collection searching
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    city = Column(String, nullable=True)
+    state = Column(String, nullable=True)
+    zipcode = Column(String, nullable=True)
+    
+    # Property details for PDF generation and collection preferences
+    bedrooms = Column(Integer, nullable=True)
+    bathrooms = Column(Float, nullable=True)
+    living_area = Column(Integer, nullable=True)  # Square feet
+    price = Column(Integer, nullable=True)
+    lot_size = Column(Integer, nullable=True)
+    year_built = Column(Integer, nullable=True)
+    home_status = Column(String, nullable=True)
+    
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
-    property = relationship("Property")
     agent = relationship("User")
 
 
@@ -149,8 +144,8 @@ class OpenHouseVisitor(Base):
     timeframe = Column(String, nullable=False)
     has_agent = Column(String, nullable=False)  # YES, NO, LOOKING
     
-    # Property Context
-    property_id = Column(String, ForeignKey('properties.id'), nullable=True)
+    # Open House Context
+    open_house_event_id = Column(String, ForeignKey('open_house_events.id'), nullable=True)
     qr_code = Column(String, nullable=False)
     form_url = Column(String, nullable=True)  # Store the form link
     
@@ -162,7 +157,7 @@ class OpenHouseVisitor(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     
     # Relationships
-    property = relationship("Property")
+    open_house_event = relationship("OpenHouseEvent")
 
 
 class PropertyInteraction(Base):
@@ -171,8 +166,6 @@ class PropertyInteraction(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     collection_id = Column(String, ForeignKey('collections.id'), nullable=False)
     property_id = Column(String, ForeignKey('properties.id'), nullable=False)
-    user_id = Column(String, ForeignKey('users.id'), nullable=True)  # Null for anonymous interactions
-    visitor_email = Column(String, nullable=True)  # For anonymous visitors
     
     # Interaction types
     liked = Column(Boolean, default=False)
@@ -180,22 +173,11 @@ class PropertyInteraction(Base):
     favorited = Column(Boolean, default=False)
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     
     # Relationships
     collection = relationship("Collection")
     property = relationship("Property")
-    user = relationship("User")
-    
-    # Ensure one interaction per user/visitor per property in a collection
-    __table_args__ = (
-        # For authenticated users
-        Index('idx_property_interaction_user', 'collection_id', 'property_id', 'user_id', unique=True, 
-              postgresql_where=Column('user_id').isnot(None)),
-        # For anonymous visitors
-        Index('idx_property_interaction_visitor', 'collection_id', 'property_id', 'visitor_email', unique=True,
-              postgresql_where=Column('visitor_email').isnot(None)),
-    )
 
 
 class PropertyComment(Base):
@@ -204,9 +186,6 @@ class PropertyComment(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     collection_id = Column(String, ForeignKey('collections.id'), nullable=False)
     property_id = Column(String, ForeignKey('properties.id'), nullable=False)
-    user_id = Column(String, ForeignKey('users.id'), nullable=True)  # Null for anonymous comments
-    visitor_email = Column(String, nullable=True)  # For anonymous visitors
-    visitor_name = Column(String, nullable=True)   # For anonymous visitors
     
     content = Column(Text, nullable=False)
     
@@ -216,7 +195,6 @@ class PropertyComment(Base):
     # Relationships
     collection = relationship("Collection")
     property = relationship("Property")
-    user = relationship("User")
 
 
 class CollectionPreferences(Base):
@@ -240,6 +218,14 @@ class CollectionPreferences(Base):
     
     # Additional features
     special_features = Column(Text, default="")
+    
+    # Home type preferences
+    is_town_house = Column(Boolean, nullable=True, default=False)
+    is_lot_land = Column(Boolean, nullable=True, default=False)
+    is_condo = Column(Boolean, nullable=True, default=False)
+    is_multi_family = Column(Boolean, nullable=True, default=False)
+    is_single_family = Column(Boolean, nullable=True, default=False)
+    is_apartment = Column(Boolean, nullable=True, default=False)
     
     # Visitor form data
     timeframe = Column(String, nullable=True)  # IMMEDIATELY, 1_3_MONTHS, 3_6_MONTHS, etc.

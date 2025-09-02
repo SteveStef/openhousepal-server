@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import Dict, Any, Optional
@@ -6,8 +6,14 @@ from pydantic import BaseModel
 
 from app.database import get_db
 from app.models.database import Property
+from app.services.zillow_service import ZillowService
 import json
 from datetime import datetime
+
+try:
+    from ..models.property import PropertyDetailResponse, PropertySaveResponse, PropertyLookupRequest
+except ImportError:
+    from models.property import PropertyDetailResponse, PropertySaveResponse, PropertyLookupRequest
 
 router = APIRouter()
 
@@ -37,7 +43,6 @@ async def store_property(
         if existing_property:
             # Update existing property
             existing_property.street_address = request.address
-            existing_property.zillow_data = request.property_data
             existing_property.updated_at = datetime.utcnow()
             existing_property.last_synced = datetime.utcnow()
             
@@ -72,7 +77,6 @@ async def store_property(
             new_property = Property(
                 id=request.property_id,
                 street_address=request.address,
-                zillow_data=request.property_data,
                 img_src=request.cover_image_url,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow(),
@@ -126,11 +130,8 @@ async def get_property(
         if not property_record:
             raise HTTPException(status_code=404, detail="Property not found")
         
-        # Return the stored zillow_data along with basic info
-        property_data = property_record.zillow_data or {}
-        
-        # Add any additional fields that might not be in zillow_data
-        property_data.update({
+        # Build property data from database fields
+        property_data = {
             "id": property_record.id,
             "address": property_record.street_address,
             "price": property_record.price,
@@ -143,7 +144,7 @@ async def get_property(
             "latitude": property_record.latitude,
             "longitude": property_record.longitude,
             "zpid": property_record.zpid
-        })
+        }
         
         return PropertyResponse(
             id=property_record.id,
@@ -156,3 +157,12 @@ async def get_property(
     except Exception as e:
         print(f"Error getting property: {e}")
         raise HTTPException(status_code=500, detail="Failed to get property")
+
+@router.post("/api/property", response_model=PropertyDetailResponse)
+async def get_property_details(
+    request: PropertyLookupRequest
+):
+    """Fetch property details from Zillow API without saving to database"""
+    zillow_service = ZillowService()
+    return await zillow_service.get_property_by_address(request.address)
+

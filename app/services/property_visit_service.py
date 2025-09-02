@@ -36,7 +36,7 @@ class PropertyVisitService:
                 visitor_email=form_data.email,
                 visitor_name=form_data.full_name,
                 visitor_phone=form_data.phone,
-                original_property_id=form_data.property_id,
+                original_open_house_event_id=form_data.property_id,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )
@@ -72,22 +72,20 @@ class PropertyVisitService:
             if not property_record:
                 return None
             
-            # Extract data from both stored fields and zillow_data JSON
-            property_data = property_record.zillow_data or {}
-            
+            # Use structured database fields directly (zillow_data field was removed)
             return {
                 "id": property_record.id,
                 "address": property_record.street_address,
-                "city": property_data.get("city") or property_record.city,
-                "state": property_data.get("state") or property_record.state,
-                "zipCode": property_data.get("zipCode") or property_record.zipcode,
-                "price": property_record.price or property_data.get("price"),
-                "beds": property_record.bedrooms or property_data.get("beds"),
-                "baths": property_record.bathrooms or property_data.get("baths"),
-                "squareFeet": property_record.living_area or property_data.get("sqft"),
-                "lotSize": property_record.lot_size or property_data.get("lotSize"),
-                "propertyType": property_record.home_type or property_data.get("propertyType"),
-                "description": property_data.get("description", "Beautiful property")
+                "city": property_record.city,
+                "state": property_record.state,
+                "zipCode": property_record.zipcode,
+                "price": property_record.price,
+                "beds": property_record.bedrooms,
+                "baths": property_record.bathrooms,
+                "squareFeet": property_record.living_area,
+                "lotSize": property_record.lot_size,
+                "propertyType": property_record.home_type,
+                "description": "Beautiful property"  # Default description since zillow_data was removed
             }
             
         except Exception as e:

@@ -8,9 +8,6 @@ class PropertyInteractionUpdate(BaseModel):
     liked: Optional[bool] = None
     disliked: Optional[bool] = None
     favorited: Optional[bool] = None
-    # Anonymous visitor support
-    visitor_email: Optional[str] = None
-    visitor_name: Optional[str] = None
     
     # Alternative format for frontend compatibility
     interaction_type: Optional[str] = None  # 'like', 'dislike', 'favorite'
@@ -20,9 +17,6 @@ class PropertyInteractionUpdate(BaseModel):
 class PropertyCommentCreate(BaseModel):
     """Schema for creating a new property comment"""
     content: str
-    # Anonymous visitor support
-    visitor_email: Optional[str] = None
-    visitor_name: Optional[str] = None
     
     # Alternative format for frontend compatibility
     comment: Optional[str] = None  # Alternative field name
@@ -33,8 +27,6 @@ class PropertyInteractionResponse(BaseModel):
     id: str
     collection_id: str
     property_id: str
-    user_id: Optional[str] = None
-    visitor_email: Optional[str] = None
     liked: bool
     disliked: bool
     favorited: bool
@@ -50,11 +42,7 @@ class PropertyCommentResponse(BaseModel):
     id: str
     collection_id: str
     property_id: str
-    user_id: Optional[str] = None
-    visitor_email: Optional[str] = None
-    visitor_name: Optional[str] = None
     content: str
-    author: str  # Computed field for display name
     created_at: datetime
     updated_at: datetime
 
@@ -73,6 +61,5 @@ class PropertyInteractionStats(BaseModel):
 
 class PropertyInteractionSummary(BaseModel):
     """Summary response for property interactions"""
-    interaction: Optional[PropertyInteractionResponse] = None
     stats: PropertyInteractionStats
     comments: List[PropertyCommentResponse]

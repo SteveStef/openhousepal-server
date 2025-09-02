@@ -3,11 +3,15 @@ import os
 from typing import List, Optional, Dict, Any
 import logging
 from datetime import datetime
+from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+import uuid
 
-from app.models.database import CollectionPreferences, Property, Collection
+from app.models.database import CollectionPreferences, Property, Collection, OpenHouseEvent
 from app.schemas.collection_preferences import CollectionPreferences as CollectionPreferencesSchema
+from datetime import datetime
+from app.models.property import PropertyDetailResponse, PropertySaveResponse
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -46,7 +50,13 @@ class ZillowService:
             'output': 'json',
             'sort': 'priorityscore',
             'listing_type': 'by_agent',
-            'doz': 'any'
+            'doz': 'any',
+            'isTownhouse': preferences.is_town_house or False,
+            'isLotLand': preferences.is_lot_land or False,
+            'isCondo': preferences.is_condo or False,
+            'isMultiFamily': preferences.is_multi_family or False,
+            'isSingleFamily': preferences.is_single_family or False,
+            'isApartment': preferences.is_apartment or False,
         }
         
         # Add price range
@@ -54,19 +64,19 @@ class ZillowService:
             params['price_min'] = preferences.min_price
         if preferences.max_price:
             params['price_max'] = preferences.max_price
-        
+
         # Add bed range
         if preferences.min_beds:
             params['beds_min'] = preferences.min_beds
         if preferences.max_beds:
             params['beds_max'] = preferences.max_beds
-        
+
         # Add bath range
         if preferences.min_baths:
             params['baths_min'] = int(preferences.min_baths)
         if preferences.max_baths:
             params['baths_max'] = int(preferences.max_baths)
-        
+
         url = f"{self.base_url}/search_coordinates"
         
         try:
@@ -76,6 +86,7 @@ class ZillowService:
                 if response.status_code == 200:
                     data = response.json()
                     logger.info(f"Zillow API returned {len(data.get('results', []))} properties")
+                    
                     return data
                 elif response.status_code == 401:
                     raise ValueError("Invalid Zillow API key")
@@ -112,15 +123,8 @@ class ZillowService:
                 'home_status': zillow_data.get('homeStatus', ''),
                 'latitude': zillow_data.get('latitude'),
                 'longitude': zillow_data.get('longitude'),
-                'year_built': zillow_data.get('yearBuilt'),
-                'days_on_market': zillow_data.get('daysOnZillow', -1),
                 'image_url': zillow_data.get('imgSrc', ''),
                 'zestimate': zillow_data.get('zestimate'),
-                'rent_zestimate': zillow_data.get('rentZestimate'),
-                'tax_assessed_value': zillow_data.get('taxAssessedValue'),
-                'is_featured': zillow_data.get('isFeatured', False),
-                'is_premier_builder': zillow_data.get('isPremierBuilder', False),
-                'last_updated': datetime.now().isoformat()
             }
             
             return property_data
@@ -152,3 +156,47 @@ class ZillowService:
         except Exception as e:
             logger.error(f"Error fetching matching properties: {str(e)}")
             raise e
+    
+    async def get_property_by_address(self, address: str) -> PropertyDetailResponse:
+        """
+        Get property details from Zillow API by address
+        """
+        if not self.api_key:
+            raise HTTPException(status_code=500, detail="RapidAPI key not configured")
+        
+        headers = {
+            'x-rapidapi-key': self.api_key,
+            'x-rapidapi-host': "zillow56.p.rapidapi.com"
+        }
+        
+        params = {
+            "address": address
+        }
+        
+        url = f"{self.base_url}/search_address"
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, headers=headers, params=params, timeout=30.0)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    return PropertyDetailResponse(**data)
+                elif response.status_code == 401:
+                    raise HTTPException(status_code=401, detail="Invalid RapidAPI key")
+                elif response.status_code == 404:
+                    raise HTTPException(status_code=404, detail="Property not found")
+                elif response.status_code == 429:
+                    raise HTTPException(status_code=429, detail="Rate limit exceeded")
+                else:
+                    raise HTTPException(status_code=response.status_code, detail=f"External API error: {response.text}")
+                    
+        except httpx.TimeoutException:
+            raise HTTPException(status_code=504, detail="Request to external API timed out")
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"Failed to connect to external API: {str(e)}")
+        except ValueError as e:
+            raise HTTPException(status_code=502, detail=f"Invalid response from external API: {str(e)}")
+    
+# Removed unused methods: create_property_and_open_house and create_property_and_open_house_from_data
+    # These are no longer needed since open houses now store metadata directly instead of creating Property records

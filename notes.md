@@ -1,11 +1,11 @@
-9. Add another section to the open-house page on the frontend
-11. setup/payment switch it from dark theme to light
-12. AI chat is dark themed, make it light
-13. Edit the footer to look like the header
-14. Add tos, privacy
-15. Center the form for the customer
-16. Add a last viewed for each collection to know when the visitor visited the collection
-17. Change the logo to a house
-18. Add something with a profile in the header
 
-When should the sync function run?
+Here is the flow:
+1. Agent signup/login (makes a entry in users table)
+2. Agent makes a open house pdf (creates open house event entry)
+3. Buyer fills out form -> (creates open house visitor and collection and fills collection with related properties)
+3.5. in the background, the collection auto refreshes with the collection preferences
+4. Agent make the link public and sends to client the link
+5. Buyer likes, dislikes, and comments on properties.
+6. Agent removes properties from collection.
+7. Buyer requests a tour of a house
+8. After finished with collection, agent deactives it

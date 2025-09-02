@@ -23,7 +23,7 @@ class PropertyCreate(PropertyBase):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     img_src: Optional[str] = None
-    zillow_data: Optional[Dict[str, Any]] = None
+    # Note: zillow_data field was removed from Property model
 
 class PropertyUpdate(BaseModel):
     street_address: Optional[str] = None

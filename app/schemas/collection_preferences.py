@@ -14,6 +14,14 @@ class CollectionPreferencesBase(BaseModel):
     diameter: float = 2.0
     special_features: str = ""
     
+    # Home type preferences
+    is_town_house: Optional[bool] = False
+    is_lot_land: Optional[bool] = False
+    is_condo: Optional[bool] = False
+    is_multi_family: Optional[bool] = False
+    is_single_family: Optional[bool] = False
+    is_apartment: Optional[bool] = False
+    
     # Visitor form data
     timeframe: Optional[str] = None
     visiting_reason: Optional[str] = None
@@ -33,6 +41,13 @@ class CollectionPreferencesUpdate(BaseModel):
     long: Optional[float] = None
     diameter: Optional[float] = None
     special_features: Optional[str] = None
+
+    is_town_house: Optional[bool] = False,
+    is_lot_land: Optional[bool] = False,
+    is_condo: Optional[bool] = False,
+    is_multi_family: Optional[bool] = False,
+    is_single_family: Optional[bool] = False,
+    is_apartment: Optional[bool] = False,
     
     # Visitor form data
     timeframe: Optional[str] = None

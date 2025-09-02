@@ -1,15 +1,16 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
 
-from app.models.database import Property, OpenHouseVisitor, Collection
+from app.models.database import Property, OpenHouseVisitor, Collection, collection_properties, OpenHouseEvent
 from app.schemas.open_house import OpenHouseFormSubmission
 from app.services.collection_preferences_service import CollectionPreferencesService
-
+from app.services.zillow_service import ZillowService
+from app.schemas.collection_preferences import CollectionPreferences as CollectionPreferencesSchema
 
 class OpenHouseService:
-    
+
     @staticmethod
     async def create_visitor(db: AsyncSession, form_data: OpenHouseFormSubmission) -> OpenHouseVisitor:
         """Create a visitor record from open house form submission"""
@@ -21,7 +22,7 @@ class OpenHouseService:
             visiting_reason=form_data.visiting_reason.value,
             timeframe=form_data.timeframe.value,
             has_agent=form_data.has_agent.value,
-            property_id=form_data.property_id,
+            open_house_event_id=form_data.open_house_event_id,
             qr_code="",  # Will be updated by the calling code
             interested_in_similar=form_data.interested_in_similar,
             created_at=datetime.utcnow(),
@@ -38,29 +39,29 @@ class OpenHouseService:
         db: AsyncSession, 
         visitor: OpenHouseVisitor, 
         form_data: OpenHouseFormSubmission
-    ) -> bool:
-        """Create a collection for a visitor if they're interested in similar properties"""
+    ) -> Dict[str, Any]:
+        """Create a collection for a visitor and immediately populate it with matching properties"""
         
-        if not form_data.interested_in_similar or not form_data.property_id:
-            return False
+        if not form_data.interested_in_similar or not form_data.open_house_event_id:
+            return {"success": False, "properties_added": 0}
             
         try:
-            # Get the original property to create smart filters
-            visited_property = await OpenHouseService.get_property_by_id(db, form_data.property_id)
+            # Get the original open house event to create smart filters
+            visited_open_house = await OpenHouseService.get_open_house_event_by_id(db, form_data.open_house_event_id)
             
-            if not visited_property:
-                print(f"Could not find property {form_data.property_id} to create collection")
-                return False
+            if not visited_open_house:
+                print(f"Could not find open house event {form_data.open_house_event_id} to create collection")
+                return {"success": False, "properties_added": 0}
             
             # Create collection
             collection = Collection(
                 owner_id=form_data.agent_id if form_data.agent_id else None,  # Link to agent if provided
-                name=visited_property.get('address', 'Unknown Property'),
-                description=f"Properties similar to {visited_property.get('address', 'the visited property')} based on {visitor.full_name}'s preferences",
+                name=visited_open_house.get('address', 'Unknown Property'),
+                description=f"Properties similar to {visited_open_house.get('address', 'the visited property')} based on {visitor.full_name}'s preferences",
                 visitor_email=visitor.email,
                 visitor_name=visitor.full_name,
                 visitor_phone=visitor.phone,
-                original_property_id=form_data.property_id,
+                original_open_house_event_id=form_data.open_house_event_id,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )
@@ -71,62 +72,233 @@ class OpenHouseService:
             
             # Auto-generate preferences based on the original property and form data
             try:
-                await CollectionPreferencesService.auto_generate_preferences(db, collection.id, form_data)
-                print(f"Auto-generated preferences for collection {collection.id}")
+                preferences = await CollectionPreferencesService.auto_generate_preferences(db, collection.id, form_data)
+                
+                if preferences:
+                    print(f"Auto-generated preferences for collection {collection.id}")
+                    
+                    # Immediately fetch and populate properties using ZillowService
+                    properties_added = await OpenHouseService._populate_collection_with_zillow_properties(
+                        db, collection, preferences
+                    )
+                    
+                    print(f"Successfully populated collection {collection.id} with {properties_added} properties")
+                    return {"success": True, "properties_added": properties_added, "collection_id": collection.id}
+                else:
+                    print(f"Warning: Failed to auto-generate preferences for collection {collection.id}")
+                    return {"success": True, "properties_added": 0, "collection_id": collection.id}
+                    
             except Exception as e:
                 print(f"Warning: Failed to auto-generate preferences for collection {collection.id}: {e}")
                 # Collection creation should still succeed even if preferences fail
-            
-            print(f"Created collection {collection.id} for visitor {visitor.full_name}")
-            return True
+                return {"success": True, "properties_added": 0, "collection_id": collection.id}
             
         except Exception as e:
             print(f"Error creating collection for visitor: {e}")
             await db.rollback()
-            return False
+            return {"success": False, "properties_added": 0}
     
     @staticmethod
-    async def get_property_by_id(db: AsyncSession, property_id: str) -> Optional[dict]:
-        """Get property details by ID from database"""
+    async def _populate_collection_with_zillow_properties(
+        db: AsyncSession,
+        collection: Collection,
+        preferences: CollectionPreferencesSchema
+    ) -> int:
+        """Populate collection with properties from Zillow API"""
         try:
-            stmt = select(Property).where(Property.id == property_id)
-            result = await db.execute(stmt)
-            property_record = result.scalar_one_or_none()
+            zillow_service = ZillowService()
             
-            if not property_record:
+            # Get matching properties from Zillow
+            matching_properties = await zillow_service.get_matching_properties(preferences)
+            
+            properties_added = 0
+            
+            for property_data in matching_properties:
+                zpid = property_data.get('zpid')
+                if not zpid:
+                    continue
+                
+                if await OpenHouseService._property_exists_in_collection(db, collection.id, zpid):
+                    continue
+
+                property_obj = await OpenHouseService._create_property_from_zillow_data(db, property_data)
+                await OpenHouseService._add_property_to_collection(db, collection.id, property_obj.id)
+                properties_added += 1
+            
+            return properties_added
+            
+        except Exception as e:
+            print(f"Error populating collection {collection.id} with Zillow properties: {e}")
+            return 0
+    
+    @staticmethod
+    async def _property_exists_in_collection(db: AsyncSession, collection_id: str, zpid: str) -> bool:
+        """Check if a property (by zpid) already exists in a collection"""
+        result = await db.execute(
+            select(Property.id)
+            .join(collection_properties)
+            .where(
+                collection_properties.c.collection_id == collection_id,
+                Property.zpid == zpid
+            )
+        )
+        return result.scalar_one_or_none() is not None
+    
+    @staticmethod
+    async def _create_property_from_zillow_data(db: AsyncSession, property_data: Dict[str, Any]) -> Property:
+        """Create a new Property record from Zillow data"""
+        # Check if property already exists by zpid
+        result = await db.execute(
+            select(Property).where(Property.zpid == property_data.get('zpid'))
+        )
+        existing_property = result.scalar_one_or_none()
+        
+        if existing_property:
+            # Update existing property with latest data - map field names correctly
+            field_mapping = {
+                'address': 'street_address',
+                'image_url': 'img_src',
+                'days_on_market': 'days_on_zillow',
+                'last_updated': 'last_synced'
+            }
+            
+            # Special handling for zpid (string to int conversion)
+            zpid_value = property_data.get('zpid')
+            if zpid_value and str(zpid_value).isdigit():
+                existing_property.zpid = int(zpid_value)
+            
+            for key, value in property_data.items():
+                if value is not None:
+                    # Map field name if necessary
+                    actual_field = field_mapping.get(key, key)
+                    if hasattr(existing_property, actual_field):
+                        setattr(existing_property, actual_field, value)
+            
+            # Update sync timestamp (zillow_data field was removed)
+            existing_property.last_synced = datetime.now()
+            
+            await db.commit()
+            await db.refresh(existing_property)
+            return existing_property
+        
+        # Create new property - map Zillow data fields to Property model fields
+        zpid_value = property_data.get('zpid')
+        zpid_int = int(zpid_value) if zpid_value and str(zpid_value).isdigit() else None
+        
+        property_obj = Property(
+            zpid=zpid_int,
+            street_address=property_data.get('address'),  # ✅ Fixed: address -> street_address
+            city=property_data.get('city'),
+            state=property_data.get('state'),
+            zipcode=property_data.get('zipcode'),
+            price=property_data.get('price'),
+            bedrooms=property_data.get('bedrooms'),
+            bathrooms=property_data.get('bathrooms'),
+            living_area=property_data.get('living_area'),
+            lot_size=property_data.get('lot_size'),
+            home_type=property_data.get('home_type'),
+            home_status=property_data.get('home_status'),
+            latitude=property_data.get('latitude'),
+            longitude=property_data.get('longitude'),
+            img_src=property_data.get('image_url'),
+            zestimate=property_data.get('zestimate'),
+        )
+        
+        db.add(property_obj)
+        await db.commit()
+        await db.refresh(property_obj)
+        return property_obj
+    
+    @staticmethod 
+    async def _add_property_to_collection(db: AsyncSession, collection_id: str, property_id: str):
+        """Add a property to a collection (many-to-many relationship)"""
+        # Check if relationship already exists
+        result = await db.execute(
+            select(collection_properties)
+            .where(
+                collection_properties.c.collection_id == collection_id,
+                collection_properties.c.property_id == property_id
+            )
+        )
+        
+        if result.fetchone() is None:
+            # Insert new relationship
+            await db.execute(
+                collection_properties.insert().values(
+                    collection_id=collection_id,
+                    property_id=property_id
+                )
+            )
+            await db.commit()
+    
+    @staticmethod
+    async def get_open_house_event_by_id(db: AsyncSession, open_house_event_id: str) -> Optional[dict]:
+        """Get open house event details by ID from database"""
+        try:
+            stmt = select(OpenHouseEvent).where(OpenHouseEvent.id == open_house_event_id)
+            result = await db.execute(stmt)
+            open_house_record = result.scalar_one_or_none()
+            
+            if not open_house_record:
                 return None
             
-            # Extract data from both stored fields and zillow_data JSON
-            property_data = property_record.zillow_data or {}
-            
+            # Use open house event metadata fields
             return {
-                "id": property_record.id,
-                "address": property_record.street_address,
-                "city": property_data.get("city") or property_record.city,
-                "state": property_data.get("state") or property_record.state,
-                "zipCode": property_data.get("zipCode") or property_record.zipcode,
-                "price": property_record.price or property_data.get("price"),
-                "beds": property_record.bedrooms or property_data.get("beds"),
-                "baths": property_record.bathrooms or property_data.get("baths"),
-                "squareFeet": property_record.living_area or property_data.get("sqft"),
-                "lotSize": property_record.lot_size or property_data.get("lotSize"),
-                "propertyType": property_record.home_type or property_data.get("propertyType"),
-                "description": property_data.get("description", "Beautiful property")
+                "id": open_house_record.id,
+                "address": open_house_record.address,
+                "city": open_house_record.city,
+                "state": open_house_record.state,
+                "zipCode": open_house_record.zipcode,
+                "price": open_house_record.price,
+                "beds": open_house_record.bedrooms,
+                "baths": open_house_record.bathrooms,
+                "squareFeet": open_house_record.living_area,
+                "lotSize": open_house_record.lot_size,
+                "propertyType": open_house_record.house_type,
+                "description": "Beautiful property",  # Default description
+                "latitude": open_house_record.latitude,
+                "longitude": open_house_record.longitude,
+                "yearBuilt": open_house_record.year_built,
+                "homeStatus": open_house_record.home_status
             }
             
         except Exception as e:
-            print(f"Error fetching property by ID: {e}")
+            print(f"Error fetching open house event by ID: {e}")
             return None
 
     @staticmethod
     async def get_property_by_qr_code(db: AsyncSession, qr_code: str) -> Optional[dict]:
-        """Get property information by QR code (for compatibility with existing routes)"""
-        # For now, we'll assume the QR code contains the property ID
-        # In a full implementation, you might have a QR code lookup table
+        """Get property information by open house event ID from OpenHouseEvent metadata"""
         try:
-            # Extract property ID from QR code or form URL
-            # This is a simplified implementation
-            return await OpenHouseService.get_property_by_id(db, qr_code)
+            # Find OpenHouseEvent by ID (the parameter is actually the open house event ID)
+            stmt = select(OpenHouseEvent).where(OpenHouseEvent.id == qr_code)
+            result = await db.execute(stmt)
+            open_house_record = result.scalar_one_or_none()
+            
+            if not open_house_record:
+                return None
+            
+            # Return property data from OpenHouseEvent metadata
+            return {
+                "id": open_house_record.id,
+                "address": open_house_record.address,
+                "city": open_house_record.city,
+                "state": open_house_record.state,
+                "zipCode": open_house_record.zipcode,
+                "price": open_house_record.price,
+                "beds": open_house_record.bedrooms,
+                "baths": open_house_record.bathrooms,
+                "squareFeet": open_house_record.living_area,
+                "lotSize": open_house_record.lot_size,
+                "propertyType": open_house_record.house_type,
+                "description": "Beautiful property",  # Default description
+                "latitude": open_house_record.latitude,
+                "longitude": open_house_record.longitude,
+                "yearBuilt": open_house_record.year_built,
+                "homeStatus": open_house_record.home_status,
+                "imageSrc": open_house_record.image_src
+            }
+            
         except Exception as e:
             print(f"Error fetching property by QR code: {e}")
             return None

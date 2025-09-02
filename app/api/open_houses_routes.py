@@ -6,10 +6,18 @@ from pydantic import BaseModel
 from datetime import datetime
 
 from app.database import get_db
-from app.models.database import Property, OpenHouseEvent, User
+from app.models.database import OpenHouseEvent, User
 from app.utils.auth import get_current_active_user
 from app.schemas.open_house import OpenHouseCreateRequest, OpenHouseResponse, OpenHouseFormSubmission, OpenHouseFormResponse
 from app.services.open_house_service import OpenHouseService
+import urllib.parse
+import uuid
+from datetime import datetime, timedelta
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 router = APIRouter()
 
@@ -19,42 +27,53 @@ async def create_open_house(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
-    """Create a new open house record"""
+    """Create a new open house record with property metadata"""
     try:
-        # Store or update property data first
-        stmt = select(Property).where(Property.id == request.property_id)
-        result = await db.execute(stmt)
-        existing_property = result.scalar_one_or_none()
+        open_house_id = request.open_house_event_id or str(uuid.uuid4())
+        form_url = f"/open-house/{open_house_id}"
+        qr_code_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={urllib.parse.quote(os.getenv("CLIENT_URL") + form_url)}"
         
-        if existing_property:
-            # Update existing property with new data
-            existing_property.street_address = request.address
-            existing_property.zillow_data = request.property_data
-            existing_property.updated_at = datetime.utcnow()
-        else:
-            # Create new property record
-            property_record = Property(
-                id=request.property_id,
-                street_address=request.address,
-                zillow_data=request.property_data,
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow()
-            )
-            db.add(property_record)
+        property_data = request.property_data
+        address_data = property_data.get('address', {})
+        is_nested_address = isinstance(address_data, dict)
         
-        # Create the open house record
-        form_url = f"/open-house/{current_user.id}/{request.property_id}"
+        street_address = address_data.get('streetAddress') if is_nested_address else address_data
+        city = address_data.get('city') if is_nested_address else property_data.get('city')
+        state = address_data.get('state') if is_nested_address else property_data.get('state')
+        zipcode = address_data.get('zipcode') if is_nested_address else property_data.get('zipCode')
+        
+        abbreviated_addr = property_data.get('abbreviatedAddress')
+        if not abbreviated_addr and is_nested_address:
+            abbreviated_addr = f"{street_address}, {city}, {state}"
+        elif not abbreviated_addr:
+            abbreviated_addr = street_address
         
         open_house = OpenHouseEvent(
-            property_id=request.property_id,
+            id=open_house_id,
             agent_id=current_user.id,
-            qr_code=request.qr_code_url,
+            qr_code=qr_code_url,
             form_url=form_url,
             cover_image_url=request.cover_image_url,
-            start_time=datetime.utcnow(),  # Default values for now
-            end_time=datetime.utcnow(),    # These could be made configurable
-            is_active=True,
-            created_at=datetime.utcnow()
+            start_time=datetime.now(),
+            end_time=datetime.now() + timedelta(hours=2),
+            
+            # Property metadata from request - use extracted string fields
+            address=street_address,
+            abbreviated_address=abbreviated_addr,
+            image_src=request.cover_image_url,
+            house_type=property_data.get('homeType'),
+            latitude=property_data.get('latitude'),
+            longitude=property_data.get('longitude'),
+            city=city,
+            state=state,
+            zipcode=zipcode,
+            bedrooms=property_data.get('bedrooms'),
+            bathrooms=property_data.get('bathrooms'),
+            living_area=property_data.get('livingArea'),
+            price=property_data.get('price'),
+            lot_size=property_data.get('lotSize'),
+            year_built=property_data.get('yearBuilt'),
+            home_status=property_data.get('homeStatus')
         )
         
         db.add(open_house)
@@ -63,16 +82,26 @@ async def create_open_house(
         
         return OpenHouseResponse(
             id=open_house.id,
-            property_id=open_house.property_id,
-            address=request.address,
-            cover_image_url=request.cover_image_url,
-            qr_code_url=request.qr_code_url,
-            form_url=form_url,
+            open_house_event_id=open_house.id,
+            address=open_house.address,
+            cover_image_url=open_house.cover_image_url,
+            qr_code_url=open_house.qr_code,
+            form_url=open_house.form_url,
+            bedrooms=open_house.bedrooms,
+            bathrooms=open_house.bathrooms,
+            living_area=open_house.living_area,
+            price=open_house.price,
             created_at=open_house.created_at
         )
         
     except Exception as e:
         print(f"Error creating open house: {e}")
+        print(f"Property data that caused error: {property_data}")
+        
+        if "Error binding parameter" in str(e):
+            print("Database parameter binding error - likely trying to store complex object in simple field")
+            raise HTTPException(status_code=500, detail="Invalid property data structure for database storage")
+        
         raise HTTPException(status_code=500, detail="Failed to create open house")
 
 @router.get("/api/open-houses", response_model=List[OpenHouseResponse])
@@ -91,30 +120,19 @@ async def get_open_houses(
         
         response_list = []
         for oh in open_houses:
-            # Get property details
-            prop_stmt = select(Property).where(Property.id == oh.property_id)
-            prop_result = await db.execute(prop_stmt)
-            property_record = prop_result.scalar_one_or_none()
-            
-            if property_record:
-                # Use stored cover_image_url, with fallback to zillow_data if needed
-                cover_image = oh.cover_image_url
-                if not cover_image:
-                    # Fallback to zillow_data photos if no stored cover image
-                    zillow_data = property_record.zillow_data or {}
-                    original_photos = zillow_data.get('originalPhotos', [])
-                    if isinstance(original_photos, list) and len(original_photos) > 0:
-                        cover_image = original_photos[0].get('url', '')
-                
-                response_list.append(OpenHouseResponse(
-                    id=oh.id,
-                    property_id=oh.property_id,
-                    address=property_record.street_address or "Unknown Address",
-                    cover_image_url=cover_image or "",
-                    qr_code_url=oh.qr_code,
-                    form_url=oh.form_url or f"/open-house/{current_user.id}/{oh.property_id}",
-                    created_at=oh.created_at
-                ))
+            response_list.append(OpenHouseResponse(
+                id=oh.id,
+                open_house_event_id=oh.id,
+                address=oh.address or "Unknown Address",
+                cover_image_url=oh.cover_image_url or oh.image_src or "",
+                qr_code_url=oh.qr_code,
+                form_url=oh.form_url or f"/open-house/{oh.id}",
+                bedrooms=oh.bedrooms,
+                bathrooms=oh.bathrooms,
+                living_area=oh.living_area,
+                price=oh.price,
+                created_at=oh.created_at
+            ))
         
         return response_list
         
@@ -166,18 +184,25 @@ async def submit_open_house_form(
         # Create visitor record and handle collection creation
         visitor = await OpenHouseService.create_visitor(db, form_data)
         
-        # If user is interested in similar properties, create a collection
-        collection_created = False
-        if form_data.interested_in_similar and form_data.property_id:
-            collection_created = await OpenHouseService.create_collection_for_visitor(
+        # If user is interested in similar properties, create a collection and fetch properties immediately
+        collection_result = {"success": False, "properties_added": 0}
+        if form_data.interested_in_similar and form_data.open_house_event_id:
+            collection_result = await OpenHouseService.create_collection_for_visitor(
                 db, visitor, form_data
             )
         
+        # Customize message based on collection creation result
+        message = "Thank you for visiting! We'll be in touch soon."
+        if collection_result["success"] and collection_result["properties_added"] > 0:
+            message = f"Thank you for visiting! We've found {collection_result['properties_added']} similar properties for you. We'll be in touch soon with your personalized collection."
+        elif collection_result["success"]:
+            message = "Thank you for visiting! We've created a personalized collection for you and will be in touch soon with matching properties."
+        
         return OpenHouseFormResponse(
             success=True,
-            message="Thank you for visiting! We'll be in touch soon.",
+            message=message,
             visitor_id=visitor.id,
-            collection_created=collection_created
+            collection_created=collection_result["success"]
         )
         
     except ValueError as e:
@@ -193,21 +218,21 @@ async def submit_open_house_form(
         )
 
 
-@router.get("/open-house/property/{qr_code}")
+@router.get("/open-house/property/{open_house_event_id}")
 async def get_property_by_qr(
-    qr_code: str,
+    open_house_event_id: str,
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Get property information by QR code
+    Get property information by open house event ID
     """
     try:
-        property_data = await OpenHouseService.get_property_by_qr_code(db, qr_code)
+        property_data = await OpenHouseService.get_property_by_qr_code(db, open_house_event_id)
         
         if not property_data:
             raise HTTPException(
                 status_code=404,
-                detail="Property not found for this QR code"
+                detail="Property not found for this open house event ID"
             )
             
         return {

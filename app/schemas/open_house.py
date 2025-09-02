@@ -35,8 +35,8 @@ class OpenHouseFormSubmission(BaseModel):
     timeframe: Timeframe
     has_agent: HasAgent
     
-    # Property and agent context
-    property_id: str
+    # Open house and agent context
+    open_house_event_id: str
     agent_id: Optional[str] = None
     
     # Collection preference
@@ -50,17 +50,22 @@ class OpenHouseFormResponse(BaseModel):
 
 # Open house management schemas
 class OpenHouseCreateRequest(BaseModel):
-    property_id: str
-    property_data: dict
     address: str
+    property_data: dict  # Full PropertyDetailResponse data from Zillow API
     cover_image_url: str
-    qr_code_url: str
+    open_house_event_id: Optional[str] = None  # UUID provided by frontend for consistent QR codes
+    qr_code_url: Optional[str] = None  # Optional since backend will generate it
 
 class OpenHouseResponse(BaseModel):
     id: str
-    property_id: str
+    open_house_event_id: str
     address: str
     cover_image_url: str
     qr_code_url: str
     form_url: str
+    # Property details for PDF generation
+    bedrooms: Optional[int] = None
+    bathrooms: Optional[float] = None
+    living_area: Optional[int] = None
+    price: Optional[int] = None
     created_at: datetime

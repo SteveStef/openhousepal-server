@@ -62,18 +62,38 @@ class PropertySyncService:
         existing_property = result.scalar_one_or_none()
         
         if existing_property:
-            # Update existing property with latest data
+            field_mapping = {
+                'address': 'street_address',
+                'image_url': 'img_src',
+                'days_on_market': 'days_on_zillow',
+                'last_updated': 'last_synced'
+            }
+            
+            # Special handling for zpid (string to int conversion)
+            zpid_value = property_data.get('zpid')
+            if zpid_value and str(zpid_value).isdigit():
+                existing_property.zpid = int(zpid_value)
+            
             for key, value in property_data.items():
-                if hasattr(existing_property, key) and value is not None:
-                    setattr(existing_property, key, value)
+                if value is not None:
+                    # Map field name if necessary
+                    actual_field = field_mapping.get(key, key)
+                    if hasattr(existing_property, actual_field):
+                        setattr(existing_property, actual_field, value)
+            
+            # Update sync timestamp (zillow_data field was removed)
+            existing_property.last_synced = datetime.now()
+            
             await db.commit()
             await db.refresh(existing_property)
             return existing_property
         
-        # Create new property
+        zpid_value = property_data.get('zpid')
+        zpid_int = int(zpid_value) if zpid_value and str(zpid_value).isdigit() else None
+        
         property_obj = Property(
-            zpid=property_data.get('zpid'),
-            address=property_data.get('address'),
+            zpid=zpid_int,
+            street_address=property_data.get('address'),  # ✅ Fixed: address -> street_address
             city=property_data.get('city'),
             state=property_data.get('state'),
             zipcode=property_data.get('zipcode'),
@@ -87,9 +107,9 @@ class PropertySyncService:
             latitude=property_data.get('latitude'),
             longitude=property_data.get('longitude'),
             year_built=property_data.get('year_built'),
-            image_url=property_data.get('image_url'),
+            img_src=property_data.get('image_url'),
             zestimate=property_data.get('zestimate'),
-            last_updated=datetime.now()
+            last_synced=datetime.now()  # ✅ Fixed: last_updated -> last_synced
         )
         
         db.add(property_obj)
@@ -271,3 +291,52 @@ class PropertySyncService:
             except Exception as e:
                 logger.error(f"Error syncing single collection {collection_id}: {str(e)}")
                 return {'success': False, 'error': str(e)}
+    
+    async def populate_new_collection(self, db: AsyncSession, collection_id: str) -> Dict[str, Any]:
+        """
+        Immediately populate a newly created collection with properties based on its preferences.
+        This is called right after collection creation to provide initial properties.
+        """
+        logger.info(f"Populating new collection {collection_id} with properties")
+        
+        try:
+            # Get collection and preferences
+            result = await db.execute(
+                select(Collection).where(Collection.id == collection_id)
+            )
+            collection = result.scalar_one_or_none()
+            
+            if not collection:
+                return {'success': False, 'error': 'Collection not found'}
+            
+            preferences = await CollectionPreferencesService.get_preferences_by_collection_id(
+                db, collection_id
+            )
+            
+            if not preferences:
+                logger.warning(f"No preferences found for new collection {collection_id}, skipping property population")
+                return {'success': True, 'new_properties_added': 0, 'message': 'No preferences to populate from'}
+            
+            # Sync properties using existing logic
+            new_properties_count = await self.sync_collection_properties(
+                db, collection, preferences
+            )
+            
+            logger.info(f"Successfully populated new collection {collection_id} with {new_properties_count} properties")
+            
+            return {
+                'success': True,
+                'collection_id': collection_id,
+                'new_properties_added': new_properties_count,
+                'populated_at': datetime.now()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error populating new collection {collection_id}: {str(e)}")
+            # Don't raise the exception - collection creation should succeed even if population fails
+            return {
+                'success': False, 
+                'collection_id': collection_id,
+                'error': str(e),
+                'new_properties_added': 0
+            }

@@ -313,5 +313,22 @@ class PropertyDetailResponse(BaseModel):
     priceHistory: Optional[List[Dict[str, Any]]] = None
     originalPhotos: Optional[List[OriginalPhoto]] = None
     openHouseSchedule: Optional[List[Dict[str, Any]]] = None
+    daysOnZillow: Optional[int] = None
+
+class PropertySaveResponse(BaseModel):
+    property_id: str
+    zpid: Optional[int] = None
+    abbreviatedAddress: Optional[str] = None
+    price: Optional[int] = None
+    bedrooms: Optional[int] = None
+    bathrooms: Optional[float] = None
+    livingArea: Optional[int] = None
+    yearBuilt: Optional[int] = None
+    homeType: Optional[str] = None
+    lotSize: Optional[int] = None
+    originalPhotos: Optional[List[OriginalPhoto]] = None
+
+class PropertyLookupRequest(BaseModel):
+    address: str
     newConstructionType: Optional[str] = None
     resoFacts: Optional[ResoFacts] = None

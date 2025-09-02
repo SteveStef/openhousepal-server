@@ -93,3 +93,32 @@ async def get_current_active_user(current_user = Depends(get_current_user)):
             detail="Inactive user"
         )
     return current_user
+
+async def get_current_user_optional(
+    request: Request,
+    db: AsyncSession = Depends(get_db)
+) -> Optional:
+    """Get the current user if authenticated, otherwise return None"""
+    try:
+        # Check if Authorization header exists
+        auth_header = request.headers.get("authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return None
+            
+        token = auth_header.replace("Bearer ", "")
+        user_id = verify_token(token)
+        if user_id is None:
+            return None
+            
+        # Import here to avoid circular imports
+        from app.services.user_service import UserService
+        
+        user = await UserService.get_user_by_id(db, user_id=user_id)
+        if user is None or not user.is_active:
+            return None
+            
+        return user
+        
+    except Exception:
+        # If anything fails, just return None (anonymous user)
+        return None

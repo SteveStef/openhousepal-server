@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel
 from datetime import datetime
 
@@ -18,7 +18,7 @@ from app.services.collections_service import CollectionsService
 from app.services.property_interactions_service import PropertyInteractionsService
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.open_house_service import OpenHouseService
-from app.utils.auth import get_current_active_user
+from app.utils.auth import get_current_active_user, get_current_user_optional
 from app.models.database import User
 
 router = APIRouter(prefix="/collections", tags=["collections"])
@@ -108,8 +108,8 @@ async def create_collection(
     try:
         collection = await CollectionsService.create_collection(db, collection_data, current_user.id)
         
-        # Auto-generate preferences if collection has an original property
-        if collection.get("original_property_id"):
+        # Auto-generate preferences if collection has an original open house event
+        if collection.get("original_open_house_event_id"):
             try:
                 await CollectionPreferencesService.auto_generate_preferences(db, collection["id"])
             except Exception as e:
@@ -196,14 +196,12 @@ async def create_collection_from_address(
         if existing_property:
             # Update existing property
             existing_property.street_address = request.address
-            existing_property.zillow_data = property_data
             existing_property.updated_at = datetime.utcnow()
         else:
             # Create new property
             property_record = Property(
                 id=property_id,
                 street_address=request.address,
-                zillow_data=property_data,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )
@@ -334,24 +332,14 @@ async def update_property_interaction(
     collection_id: str,
     property_id: str,
     interaction_data: PropertyInteractionUpdate,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """
     Update user interaction with a property within a collection (like, dislike, favorite)
-    Supports both authenticated users and anonymous visitors
+    For both authenticated users (agents) and anonymous visitors (shared collections)
     """
     try:
-        # Try to get current user, but don't require authentication for shared collections
-        current_user = None
-        try:
-            from fastapi import Request
-            from app.utils.auth import get_current_active_user
-            # This is a simplified approach - in practice you'd need request context
-            pass  # For now, handle via visitor_email
-        except:
-            pass  # Anonymous access allowed
-        
-        # Handle alternative frontend format
         if interaction_data.interaction_type and interaction_data.value is not None:
             if interaction_data.interaction_type == 'like':
                 interaction_data.liked = interaction_data.value
@@ -359,20 +347,10 @@ async def update_property_interaction(
                 interaction_data.disliked = interaction_data.value
             elif interaction_data.interaction_type == 'favorite':
                 interaction_data.favorited = interaction_data.value
-        
-        # For shared collections, use visitor_email identification
-        if interaction_data.visitor_email:
-            interaction = await PropertyInteractionsService.update_property_interaction(
-                db, collection_id, property_id, 
-                visitor_email=interaction_data.visitor_email, 
-                interaction_data=interaction_data
-            )
-        else:
-            # This would be for authenticated users - for now require visitor_email
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="visitor_email is required for property interactions"
-            )
+
+        interaction = await PropertyInteractionsService.create_property_interaction(
+            db, collection_id, property_id, interaction_data
+        )
         
         return {
             "success": True,
@@ -405,19 +383,10 @@ async def add_property_comment(
         if comment_data.comment and not comment_data.content:
             comment_data.content = comment_data.comment
         
-        # For shared collections, use visitor_email identification
-        if comment_data.visitor_email:
-            comment = await PropertyInteractionsService.add_property_comment(
-                db, collection_id, property_id, comment_data,
-                visitor_email=comment_data.visitor_email,
-                visitor_name=comment_data.visitor_name
-            )
-        else:
-            # This would be for authenticated users - for now require visitor_email
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="visitor_email is required for property comments"
-            )
+        # Create anonymous comment - no user identification required
+        comment = await PropertyInteractionsService.add_property_comment(
+            db, collection_id, property_id, comment_data
+        )
         
         return {
             "success": True,
@@ -471,7 +440,7 @@ async def get_property_interaction_summary(
     """
     try:
         summary = await PropertyInteractionsService.get_property_interaction_summary(
-            db, collection_id, property_id, user_id=current_user.id
+            db, collection_id, property_id
         )
         
         return summary
@@ -555,3 +524,22 @@ async def get_shared_collection(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get shared collection"
         )
+
+@router.get("/{collectionId}/properties")
+async def get_properties_from_collection(
+    collectionId: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional)
+):
+    try:
+        return await CollectionsService.get_properties(
+            collectionId, 
+            db
+        )
+    except Exception as e:
+        print(f"[ERROR] Error getting properties from collection: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get properties from collection"
+        )
+
