@@ -68,13 +68,13 @@ class ZillowService:
         # Add bed range
         if preferences.min_beds:
             params['beds_min'] = preferences.min_beds
-        if preferences.max_beds:
+        if preferences.max_beds > 0:
             params['beds_max'] = preferences.max_beds
 
         # Add bath range
         if preferences.min_baths:
             params['baths_min'] = int(preferences.min_baths)
-        if preferences.max_baths:
+        if preferences.max_baths > 0:
             params['baths_max'] = int(preferences.max_baths)
 
         url = f"{self.base_url}/search_coordinates"

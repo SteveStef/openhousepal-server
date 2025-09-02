@@ -3,6 +3,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
 from pydantic import BaseModel
 from datetime import datetime
+import httpx
+import os
 
 from app.database import get_db
 from app.schemas.collection import CollectionCreate, CollectionResponse
@@ -140,9 +142,6 @@ async def create_collection_from_address(
     Create a new collection by looking up property data from address
     """
     try:
-        # First, fetch property data from the address using Zillow API
-        import httpx
-        import os
         
         RAPID_API_KEY = os.getenv("RAPID_API_KEY")
         if not RAPID_API_KEY:

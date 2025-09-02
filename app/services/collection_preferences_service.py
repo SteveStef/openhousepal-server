@@ -81,9 +81,9 @@ class CollectionPreferencesService:
         preferences_data_dict = {
             "collection_id": collection_id,
             "min_beds": max(1, (original_open_house.bedrooms or 3) - 1),
-            "max_beds": 100, # (original_open_house.bedrooms or 3) + 1,
+            "max_beds": 0, # (original_open_house.bedrooms or 3) + 1,
             "min_baths": 0, # max(1.0, (original_open_house.bathrooms or 2.5) - 0.5),
-            "max_baths": 100, # (original_open_house.bathrooms or 2.5) + 0.5,
+            "max_baths": 0, # (original_open_house.bathrooms or 2.5) + 0.5,
             "min_price": int((original_open_house.price or 1000000) * 0.8),  # 20% less
             "max_price": int((original_open_house.price or 1000000) * 1.2),  # 20% more
             "lat": original_open_house.latitude,

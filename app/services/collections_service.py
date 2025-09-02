@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
-from sqlalchemy.orm import selectinload, joinedload
+from sqlalchemy.orm import selectinload, joinedload, load_only
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 import uuid
@@ -17,31 +17,28 @@ class CollectionsService:
     async def get_user_collections(db: AsyncSession, user_id: str) -> List[Dict[str, Any]]:
         """Get all collections for a user"""
         try:
-            # Query collections for the user including anonymous ones assigned to them
-            # Include both preferences and properties relationships to avoid lazy loading issues
-            query = select(Collection).options(
-                selectinload(Collection.preferences),
-                selectinload(Collection.properties)
-            ).where(
-                (Collection.owner_id == user_id) | 
-                (Collection.owner_id.is_(None))  # Include anonymous collections for now
-            ).order_by(Collection.created_at.desc())
-            
+            query = (
+                select(Collection)
+                .options(
+                    selectinload(Collection.preferences),
+                    selectinload(Collection.properties),
+                    selectinload(Collection.original_open_house_event),  # no load_only here
+                )
+                .where((Collection.owner_id == user_id) | (Collection.owner_id.is_(None)))
+                .order_by(Collection.created_at.desc())
+            )
+
             result = await db.execute(query)
             collections = result.scalars().all()
-            
+
             collections_data = []
             for collection in collections:
-                # Get actual property count from loaded relationship
                 property_count = len(collection.properties) if collection.properties else 0
-                
-                # Get original open house event data if available
                 original_property_data = None
                 if collection.original_open_house_event_id:
                     try:
-                        # Use the existing relationship to get OpenHouseEvent
                         original_open_house = collection.original_open_house_event
-                        
+
                         if original_open_house:
                             # Extract property data from OpenHouseEvent metadata
                             original_property_data = {
@@ -58,8 +55,7 @@ class CollectionsService:
                             }
                     except Exception as e:
                         print(f"Warning: Could not fetch original property data for collection {collection.id}: {e}")
-                
-                # Get preferences data if available
+
                 preferences_data = {}
                 if collection.preferences:
                     preferences_data = {
@@ -75,7 +71,14 @@ class CollectionsService:
                         "special_features": collection.preferences.special_features,
                         "timeframe": collection.preferences.timeframe,
                         "visiting_reason": collection.preferences.visiting_reason,
-                        "has_agent": collection.preferences.has_agent
+                        "has_agent": collection.preferences.has_agent,
+
+                        "is_town_house": collection.preferences.is_town_house,
+                        "is_condo": collection.preferences.is_condo,
+                        "is_single_family": collection.preferences.is_single_family,
+                        "is_lot_land": collection.preferences.is_lot_land,
+                        "is_multi_family": collection.preferences.is_multi_family,
+                        "is_apartment": collection.preferences.is_apartment
                     }
 
                 # Transform properties for this collection (similar to get_shared_collection)
@@ -97,12 +100,6 @@ class CollectionsService:
                         'description': '',
                         'listingUpdated': prop.updated_at.isoformat() if prop.updated_at else None,
                         'status': prop.home_status,
-                        # 'daysOnMarket': prop.days_on_zillow,
-                        # 'liked': False,
-                        # 'disliked': False,
-                        # 'favorited': False,
-                        # 'viewed': False,
-                        # 'comments': []
                     }
                     properties_data.append(property_dict)
 
@@ -125,13 +122,13 @@ class CollectionsService:
                     "updated_at": collection.updated_at.isoformat() if collection.updated_at else collection.created_at.isoformat()
                 }
                 collections_data.append(collection_data)
-            
+
             return collections_data
-            
+
         except Exception as e:
             print(f"Error fetching user collections: {e}")
             raise e
-    
+
     @staticmethod
     async def get_collection_by_id(
         db: AsyncSession, 
@@ -147,18 +144,17 @@ class CollectionsService:
                 Collection.id == collection_id,
                 (Collection.owner_id == user_id) | (Collection.owner_id.is_(None))
             )
-            
+
             result = await db.execute(query)
             collection = result.scalar_one_or_none()
-            
+
             if not collection:
                 return None
-            
+
             # Transform properties to frontend format (similar to get_shared_collection)
             properties = []
             for prop in collection.properties:
                 property_dict = {
-                    'id': prop.id,
                     'address': prop.street_address or 'Unknown Address',
                     'city': prop.city,
                     'state': prop.state,
@@ -170,24 +166,12 @@ class CollectionsService:
                     'lotSize': prop.lot_size,
                     'propertyType': prop.home_type,
                     'imageUrl': prop.img_src,
-                    'images': prop.original_photos or [],
                     'description': '',
                     'listingUpdated': prop.updated_at.isoformat() if prop.updated_at else None,
                     'status': prop.home_status,
-                    'yearBuilt': prop.year_built,
-                    'taxes': prop.tax_assessed_value,
-                    'hoaFees': prop.hoa_fee,
-                    'daysOnMarket': prop.days_on_zillow,
-                    'county': '',
-                    # Initialize interaction states - these will be populated by frontend
-                    'liked': False,
-                    'disliked': False,
-                    'favorited': False,
-                    'viewed': False,
-                    'comments': []
                 }
                 properties.append(property_dict)
-            
+
             # Get preferences data if available
             preferences_data = {}
             if collection.preferences:
@@ -203,7 +187,7 @@ class CollectionsService:
                     "diameter": collection.preferences.diameter,
                     "special_features": collection.preferences.special_features
                 }
-            
+
             return {
                 "id": collection.id,
                 "name": collection.name,
@@ -220,11 +204,11 @@ class CollectionsService:
                 "created_at": collection.created_at.isoformat(),
                 "updated_at": collection.updated_at.isoformat() if collection.updated_at else collection.created_at.isoformat()
             }
-            
+
         except Exception as e:
             print(f"Error fetching collection by ID: {e}")
             raise e
-    
+
     @staticmethod
     async def create_collection(
         db: AsyncSession,
@@ -242,32 +226,32 @@ class CollectionsService:
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )
-            
+
             db.add(collection)
             await db.commit()
             await db.refresh(collection)
-            
+
             # Try to populate properties if preferences exist for this collection
             try:
                 from app.services.property_sync_service import PropertySyncService
                 from app.services.collection_preferences_service import CollectionPreferencesService
-                
+
                 # Check if preferences exist for this collection
                 preferences = await CollectionPreferencesService.get_preferences_by_collection_id(db, collection.id)
-                
+
                 if preferences:
                     sync_service = PropertySyncService()
                     result = await sync_service.populate_new_collection(db, collection.id)
-                    
+
                     if result['success']:
                         print(f"Successfully populated collection {collection.id} with {result['new_properties_added']} properties")
                     else:
                         print(f"Warning: Failed to populate collection {collection.id} with properties: {result.get('error', 'Unknown error')}")
-                        
+
             except Exception as e:
                 print(f"Warning: Failed to populate collection {collection.id} with properties: {e}")
                 # Collection creation should still succeed even if property population fails
-            
+
             return {
                 "id": collection.id,
                 "name": collection.name,
@@ -283,12 +267,12 @@ class CollectionsService:
                 "created_at": collection.created_at.isoformat(),
                 "updated_at": collection.updated_at.isoformat()
             }
-            
+
         except Exception as e:
             print(f"Error creating collection: {e}")
             await db.rollback()
             raise e
-    
+
     @staticmethod
     async def update_collection_status(
         db: AsyncSession,
@@ -302,20 +286,20 @@ class CollectionsService:
                 Collection.id == collection_id,
                 (Collection.owner_id == user_id) | (Collection.owner_id.is_(None))
             )
-            
+
             result = await db.execute(query)
             collection = result.scalar_one_or_none()
-            
+
             if not collection:
                 return False
-            
+
             # Update the status column directly
             collection.status = status
             collection.updated_at = datetime.utcnow()
-            
+
             await db.commit()
             return True
-            
+
         except Exception as e:
             print(f"Error updating collection status: {e}")
             await db.rollback()
@@ -343,13 +327,13 @@ class CollectionsService:
                 Collection.id == collection_id,
                 (Collection.owner_id == user_id) | (Collection.owner_id.is_(None))
             )
-            
+
             result = await db.execute(query)
             collection = result.scalar_one_or_none()
-            
+
             if not collection:
                 return {"success": False, "message": "Collection not found"}
-            
+
             if make_public:
                 # Generate new share token if making public or forced regeneration
                 if not collection.share_token or force_regenerate:
@@ -363,7 +347,7 @@ class CollectionsService:
                         if not token_check.scalar_one_or_none():
                             collection.share_token = new_token
                             break
-                
+
                 collection.is_public = True
                 share_url = f"/collection/{collection.share_token}"
                 message = "Collection is now public and shareable"
@@ -372,10 +356,10 @@ class CollectionsService:
                 collection.is_public = False
                 share_url = None
                 message = "Collection is now private"
-            
+
             collection.updated_at = datetime.utcnow()
             await db.commit()
-            
+
             return {
                 "success": True,
                 "message": message,
@@ -383,7 +367,7 @@ class CollectionsService:
                 "share_token": collection.share_token if collection.is_public else None,
                 "share_url": share_url
             }
-            
+
         except Exception as e:
             print(f"Error toggling collection share status: {e}")
             await db.rollback()
@@ -411,10 +395,10 @@ class CollectionsService:
                     )
                 )
             )
-            
+
             result = await db.execute(query)
             collection = result.scalar_one_or_none()
-            
+
             if not collection:
                 print(f"[DEBUG SERVICE] No collection found for token: {share_token}")
                 # Let's also check if collection exists but is not public
@@ -426,7 +410,7 @@ class CollectionsService:
                 else:
                     print(f"[DEBUG SERVICE] No collection exists with this token at all")
                 return None
-            
+
             print(f"[DEBUG SERVICE] Found collection: {collection.id} - {collection.name} - public: {collection.is_public}")
             print(f"[DEBUG SERVICE] Preferences loaded: {collection.preferences is not None}")
             if collection.preferences:
@@ -442,14 +426,14 @@ class CollectionsService:
                     print(f"[DEBUG SERVICE] Manual - Timeframe: {manual_prefs.timeframe}, Visiting reason: {manual_prefs.visiting_reason}")
                     # Use the manually loaded preferences
                     collection.preferences = manual_prefs
-            
+
             # Get all property IDs for batch querying interactions
             property_ids = [prop.id for prop in collection.properties]
-            
+
             # Initialize lookup dictionaries
             interactions_lookup = {}
             comments_lookup = {}
-            
+
             # Only query if we have properties
             if property_ids:
                 # Fetch all interactions for this collection in a single query
@@ -459,14 +443,14 @@ class CollectionsService:
                         PropertyInteraction.property_id.in_(property_ids)
                     )
                 )
-                
+
                 interactions_result = await db.execute(interactions_query)
                 interactions = interactions_result.scalars().all()
-                
+
                 # Create lookup dictionary for interactions by property_id
                 for interaction in interactions:
                     interactions_lookup[interaction.property_id] = interaction
-                
+
                 # Fetch all comments for this collection in a single query
                 comments_query = select(PropertyComment).where(
                     and_(
@@ -474,10 +458,10 @@ class CollectionsService:
                         PropertyComment.property_id.in_(property_ids)
                     )
                 )
-                
+
                 comments_result = await db.execute(comments_query)
                 comments = comments_result.scalars().all()
-                
+
                 # Create lookup dictionary for comments by property_id
                 for comment in comments:
                     if comment.property_id not in comments_lookup:
@@ -521,10 +505,10 @@ class CollectionsService:
                     'comments': comments_lookup.get(prop.id, [])
                 }
                 properties_data.append(property_dict)
-            
+
             # Calculate stats
             total_properties = len(properties_data)
-            
+
             collection_data = {
                 'id': collection.id,
                 'name': collection.name,
@@ -563,13 +547,13 @@ class CollectionsService:
                 'shareToken': collection.share_token,
                 'isPublic': collection.is_public
             }
-            
+
             return collection_data
-            
+
         except Exception as e:
             print(f"Error getting shared collection: {e}")
             raise e
-    
+
     @staticmethod
     async def delete_collection(
         db: AsyncSession,
@@ -582,18 +566,18 @@ class CollectionsService:
                 Collection.id == collection_id,
                 Collection.owner_id == user_id
             )
-            
+
             result = await db.execute(query)
             collection = result.scalar_one_or_none()
-            
+
             if not collection:
                 return False
-            
+
             await db.delete(collection)
             await db.commit()
-            
+
             return True
-            
+
         except Exception as e:
             print(f"Error deleting collection: {e}")
             await db.rollback()
@@ -619,26 +603,23 @@ class CollectionsService:
                 print(f"[DEBUG SERVICE] No collection found with ID: {collectionId}")
                 return []
 
-            # Get all property IDs for batch querying interactions
             property_ids = [prop.id for prop in collection.properties]
-            
-            # Fetch all interactions for this collection in a single query
             interactions_query = select(PropertyInteraction).where(
                 and_(
                     PropertyInteraction.collection_id == collectionId,
                     PropertyInteraction.property_id.in_(property_ids)
                 )
             )
-            
-            
+
+
             interactions_result = await db.execute(interactions_query)
             interactions = interactions_result.scalars().all()
-            
+
             # Create lookup dictionary for interactions by property_id
             interactions_lookup = {}
             for interaction in interactions:
                 interactions_lookup[interaction.property_id] = interaction
-            
+
             # Fetch all comments for this collection in a single query
             comments_query = select(PropertyComment).where(
                 and_(
@@ -646,10 +627,10 @@ class CollectionsService:
                     PropertyComment.property_id.in_(property_ids)
                 )
             ).order_by(PropertyComment.created_at.asc())
-            
+
             comments_result = await db.execute(comments_query)
             comments = comments_result.scalars().all()
-            
+
             # Create lookup dictionary for comments by property_id
             comments_lookup = {}
             for comment in comments:
@@ -678,16 +659,9 @@ class CollectionsService:
                     'lotSize': prop.lot_size,
                     'propertyType': prop.home_type,
                     'imageUrl': prop.img_src,
-                    'images': prop.original_photos or [],
                     'description': '',
                     'listingUpdated': prop.updated_at.isoformat() if prop.updated_at else None,
                     'status': prop.home_status,
-                    'yearBuilt': prop.year_built,
-                    #'taxes': prop.tax_assessed_value,
-                    #'hoaFees': prop.hoa_fee,
-                    'daysOnMarket': prop.days_on_zillow,
-                    'county': '',
-                    # Real interaction data from database
                     'liked': interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
                     'favorited': interactions_lookup[prop.id].favorited if prop.id in interactions_lookup else False,
