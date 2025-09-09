@@ -490,13 +490,9 @@ class CollectionsService:
                     'lotSize': prop.lot_size,
                     'propertyType': prop.home_type,
                     'imageUrl': prop.img_src,
-                    'images': prop.original_photos or [],
                     'description': '',
                     'listingUpdated': prop.updated_at.isoformat() if prop.updated_at else None,
                     'status': prop.home_status,
-                    'yearBuilt': prop.year_built,
-                    'daysOnMarket': prop.days_on_zillow,
-                    'county': '',
                     # Real interaction data from database
                     'liked': interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,

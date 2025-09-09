@@ -84,6 +84,12 @@ class Property(Base):
     longitude = Column(Float, nullable=True)
     
     img_src = Column(String, nullable=True)
+    
+    # Property details caching
+    detailed_property= Column(JSON, nullable=True)  # Store detailed Zillow API response
+    detailed_data_cached = Column(Boolean, default=False)
+    detailed_data_cached_at = Column(DateTime(timezone=True), nullable=True)
+    
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     

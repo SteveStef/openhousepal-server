@@ -10,7 +10,7 @@ import uuid
 from app.models.database import CollectionPreferences, Property, Collection, OpenHouseEvent
 from app.schemas.collection_preferences import CollectionPreferences as CollectionPreferencesSchema
 from datetime import datetime
-from app.models.property import PropertyDetailResponse, PropertySaveResponse
+from app.models.property import PropertyDetailResponse, PropertySaveResponse, ZillowPropertyDetailResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -157,7 +157,7 @@ class ZillowService:
             logger.error(f"Error fetching matching properties: {str(e)}")
             raise e
     
-    async def get_property_by_address(self, address: str) -> PropertyDetailResponse:
+    async def get_property_by_address(self, address: str, details: bool = False) -> PropertyDetailResponse:
         """
         Get property details from Zillow API by address
         """
@@ -181,7 +181,10 @@ class ZillowService:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    return PropertyDetailResponse(**data)
+                    if not details:
+                        return PropertyDetailResponse(**data)
+                    else:
+                        return ZillowPropertyDetailResponse(**data)
                 elif response.status_code == 401:
                     raise HTTPException(status_code=401, detail="Invalid RapidAPI key")
                 elif response.status_code == 404:
@@ -197,6 +200,3 @@ class ZillowService:
             raise HTTPException(status_code=502, detail=f"Failed to connect to external API: {str(e)}")
         except ValueError as e:
             raise HTTPException(status_code=502, detail=f"Invalid response from external API: {str(e)}")
-    
-# Removed unused methods: create_property_and_open_house and create_property_and_open_house_from_data
-    # These are no longer needed since open houses now store metadata directly instead of creating Property records

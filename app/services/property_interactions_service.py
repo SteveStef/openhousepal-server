@@ -1,6 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
 from typing import List
+from datetime import datetime
 
 from app.models.database import PropertyInteraction, PropertyComment
 from app.schemas.property_interactions import (
@@ -27,12 +28,15 @@ class PropertyInteractionsService:
         """Create a new anonymous property interaction"""
         
         # Create new interaction - no user tracking, so multiple interactions allowed
+        current_time = datetime.now()
         interaction = PropertyInteraction(
             collection_id=collection_id,
             property_id=property_id,
             liked=interaction_data.liked or False,
             disliked=interaction_data.disliked or False,
-            favorited=interaction_data.favorited or False
+            favorited=interaction_data.favorited or False,
+            created_at=current_time,
+            updated_at=current_time
         )
         
         # Apply mutual exclusivity rules
@@ -62,10 +66,13 @@ class PropertyInteractionsService:
         if not content:
             raise ValueError("Comment content is required")
         
+        current_time = datetime.now()
         comment = PropertyComment(
             collection_id=collection_id,
             property_id=property_id,
-            content=content
+            content=content,
+            created_at=current_time,
+            updated_at=current_time
         )
         
         db.add(comment)

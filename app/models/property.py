@@ -113,7 +113,7 @@ class ResoFacts(BaseModel):
     associationAmenities: Optional[str] = None
     associationFee: Optional[str] = None
     associationFee2: Optional[str] = None
-    associationFeeIncludes: Optional[str] = None
+    associationFeeIncludes: Optional[List[str]] = None
     associationName: Optional[str] = None
     associationName2: Optional[str] = None
     associationPhone: Optional[str] = None
@@ -161,11 +161,11 @@ class ResoFacts(BaseModel):
     elevationUnits: Optional[str] = None
     entryLevel: Optional[str] = None
     entryLocation: Optional[str] = None
-    exclusions: Optional[str] = None
+    exclusions: Optional[List[str]] = None
     exteriorFeatures: Optional[List[str]] = None
     feesAndDues: Optional[List[Dict[str, Any]]] = None
     fencing: Optional[str] = None
-    fireplaceFeatures: Optional[str] = None
+    fireplaceFeatures: Optional[List[str]] = None
     fireplaces: Optional[int] = None
     flooring: Optional[List[str]] = None
     foundationArea: Optional[str] = None
@@ -227,7 +227,7 @@ class ResoFacts(BaseModel):
     livingAreaRange: Optional[str] = None
     livingAreaRangeUnits: Optional[str] = None
     livingQuarters: Optional[List[str]] = None
-    lotFeatures: Optional[str] = None
+    lotFeatures: Optional[List[str]] = None
     lotSize: Optional[str] = None
     lotSizeDimensions: Optional[str] = None
     mainLevelBathrooms: Optional[int] = None
@@ -252,7 +252,7 @@ class ResoFacts(BaseModel):
     parkName: Optional[str] = None
     parkingCapacity: Optional[int] = None
     parkingFeatures: Optional[List[str]] = None
-    patioAndPorchFeatures: Optional[str] = None
+    patioAndPorchFeatures: Optional[List[str]] = None
     petsMaxWeight: Optional[int] = None
     poolFeatures: Optional[List[str]] = None
     pricePerSquareFoot: Optional[int] = None
@@ -262,7 +262,7 @@ class ResoFacts(BaseModel):
     roofType: Optional[str] = None
     roomTypes: Optional[str] = None
     rooms: Optional[List[Dict[str, Any]]] = None
-    securityFeatures: Optional[str] = None
+    securityFeatures: Optional[List[str]] = None
     sewer: Optional[List[str]] = None
     spaFeatures: Optional[str] = None
     specialListingConditions: Optional[str] = None
@@ -330,5 +330,62 @@ class PropertySaveResponse(BaseModel):
 
 class PropertyLookupRequest(BaseModel):
     address: str
+    newConstructionType: Optional[str] = None
+    resoFacts: Optional[ResoFacts] = None
+
+
+class TaxHistoryEntry(BaseModel):
+    taxIncreaseRate: Optional[float] = None
+    taxPaid: Optional[float] = None
+    time: Optional[int] = None
+    value: Optional[int] = None
+    valueIncreaseRate: Optional[float] = None
+
+
+class PriceHistoryEntry(BaseModel):
+    buyerAgent: Optional[str] = None
+    date: Optional[str] = None
+    event: Optional[str] = None
+    postingIsRental: Optional[bool] = None
+    price: Optional[int] = None
+    priceChangeRate: Optional[float] = None
+    pricePerSquareFoot: Optional[int] = None
+    sellerAgent: Optional[str] = None
+    showCountyLink: Optional[bool] = None
+    source: Optional[str] = None
+    time: Optional[int] = None
+
+
+class ZillowPropertyDetailResponse(BaseModel):
+    """Comprehensive model matching the complete Zillow API response structure"""
+    
+    # Core property information
+    abbreviatedAddress: Optional[str] = None
+    address: Optional[PropertyAddress] = None
+    bathrooms: Optional[float] = None
+    bedrooms: Optional[int] = None
+    city: Optional[str] = None
+    homeStatus: Optional[str] = None
+    homeType: Optional[str] = None
+    livingArea: Optional[int] = None
+    lotSize: Optional[int] = None
+    price: Optional[int] = None
+    zestimate: Optional[int] = None
+    yearBuilt: Optional[int] = None
+    zpid: Optional[int] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    description: Optional[str] = None
+    
+    # Financial and tax information
+    propertyTaxRate: Optional[float] = None
+    taxHistory: Optional[List[TaxHistoryEntry]] = None
+    priceHistory: Optional[List[PriceHistoryEntry]] = None
+    
+    # Media and schedule information
+    originalPhotos: Optional[List[OriginalPhoto]] = None
+    openHouseSchedule: Optional[List[Dict[str, Any]]] = None
+    
+    # Construction and facts
     newConstructionType: Optional[str] = None
     resoFacts: Optional[ResoFacts] = None

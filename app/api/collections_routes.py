@@ -8,6 +8,7 @@ import os
 
 from app.database import get_db
 from app.schemas.collection import CollectionCreate, CollectionResponse
+from app.schemas.collection_preferences import CollectionPreferencesCreate
 from app.schemas.property_interactions import (
     PropertyInteractionUpdate,
     PropertyCommentCreate,
@@ -19,16 +20,20 @@ from app.schemas.property_interactions import (
 from app.services.collections_service import CollectionsService
 from app.services.property_interactions_service import PropertyInteractionsService
 from app.services.collection_preferences_service import CollectionPreferencesService
-from app.services.open_house_service import OpenHouseService
+from app.services.property_sync_service import PropertySyncService
+from app.services.zillow_service import ZillowService
 from app.utils.auth import get_current_active_user, get_current_user_optional
-from app.models.database import User
+from app.models.database import User, Collection
+from sqlalchemy import select
 
 router = APIRouter(prefix="/collections", tags=["collections"])
 
 
-class CreateFromAddressRequest(BaseModel):
+class CreateCollectionWithPreferencesRequest(BaseModel):
+    # Collection info
     name: str
-    address: str
+    
+    # Customer info
     visitor_name: str
     visitor_email: str
     visitor_phone: str
@@ -36,7 +41,24 @@ class CreateFromAddressRequest(BaseModel):
     timeframe: str
     has_agent: str
     additional_comments: str = ""
-    interested_in_similar: bool = False
+    
+    # Preferences
+    min_beds: Optional[int] = None
+    max_beds: Optional[int] = None
+    min_baths: Optional[float] = None
+    max_baths: Optional[float] = None
+    min_price: Optional[int] = None
+    max_price: Optional[int] = None
+    address: str
+    diameter: float = 2.0
+    
+    # Home type preferences
+    is_town_house: Optional[bool] = False
+    is_lot_land: Optional[bool] = False
+    is_condo: Optional[bool] = False
+    is_multi_family: Optional[bool] = False
+    is_single_family: Optional[bool] = False
+    is_apartment: Optional[bool] = False
 
 
 class UpdateStatusRequest(BaseModel):
@@ -133,109 +155,99 @@ async def create_collection(
 
 
 @router.post("/create-from-address", response_model=CollectionResponse, status_code=status.HTTP_201_CREATED)
-async def create_collection_from_address(
-    request: CreateFromAddressRequest,
+async def create_collection_with_preferences(
+    request: CreateCollectionWithPreferencesRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
     """
-    Create a new collection by looking up property data from address
+    Create a new collection with customer preferences using address for coordinate lookup
     """
     try:
-        
-        RAPID_API_KEY = os.getenv("RAPID_API_KEY")
-        if not RAPID_API_KEY:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Property lookup service not configured"
-            )
-        
-        headers = {
-            'x-rapidapi-key': RAPID_API_KEY,
-            'x-rapidapi-host': "zillow56.p.rapidapi.com"
-        }
-        
-        params = {"address": request.address}
-        url = "https://zillow56.p.rapidapi.com/search_address"
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, params=params, timeout=30.0)
-            if response.status_code == 404:
+        # Lookup coordinates from address using Zillow API
+        zillow_service = ZillowService()
+        try:
+            property_details = await zillow_service.get_property_by_address(request.address)
+            latitude = property_details.latitude
+            longitude = property_details.longitude
+            
+            if not latitude or not longitude:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Could not determine coordinates for the provided address"
+                )
+        except HTTPException as e:
+            if e.status_code == 404:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Property not found for the provided address"
                 )
-            elif response.status_code != 200:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to fetch property data"
-                )
-            
-            property_data = response.json()
-        
-        # Create OpenHouseFormSubmission-like object to reuse existing collection creation logic
-        from app.schemas.open_house import OpenHouseFormSubmission
-        
-        # Extract property ID from Zillow response
-        property_id = str(property_data.get("zpid") or property_data.get("id", ""))
-        if not property_id:
+            else:
+                raise e
+        except Exception as e:
+            print(f"Error looking up address coordinates: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Property ID not found in API response"
+                detail="Failed to lookup property coordinates"
             )
         
-        # Store property data in database for collection creation
-        from app.models.database import Property
-        from sqlalchemy import select
-        
-        stmt = select(Property).where(Property.id == property_id)
-        result = await db.execute(stmt)
-        existing_property = result.scalar_one_or_none()
-        
-        if existing_property:
-            # Update existing property
-            existing_property.street_address = request.address
-            existing_property.updated_at = datetime.utcnow()
-        else:
-            # Create new property
-            property_record = Property(
-                id=property_id,
-                street_address=request.address,
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow()
-            )
-            db.add(property_record)
-        
-        await db.commit()
-        
-        # Create open house form submission
-        from app.schemas.open_house import OpenHouseFormSubmission
-        form_submission = OpenHouseFormSubmission(
-            full_name=request.visitor_name,
-            email=request.visitor_email,
-            phone=request.visitor_phone,
-            visiting_reason=request.visiting_reason,
-            timeframe=request.timeframe,
-            has_agent=request.has_agent,
-            interested_in_similar=request.interested_in_similar,
-            property_id=property_id,
-            agent_id=current_user.id
+        # Create collection directly
+        collection = Collection(
+            owner_id=current_user.id,
+            name=request.name,
+            description=f"Properties for {request.visitor_name} near {request.address}",
+            visitor_email=request.visitor_email,
+            visitor_name=request.visitor_name,
+            visitor_phone=request.visitor_phone,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
         )
         
-        # Create visitor record and collection using the open house service
-        visitor = await OpenHouseService.create_visitor(db, form_submission)
-        collection_created = await OpenHouseService.create_collection_for_visitor(db, visitor, form_submission)
+        db.add(collection)
+        await db.commit()
+        await db.refresh(collection)
         
-        if not collection_created:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create collection"
-            )
+        # Create collection preferences with looked up coordinates
+        preferences_data = CollectionPreferencesCreate(
+            collection_id=collection.id,
+            min_beds=request.min_beds,
+            max_beds=request.max_beds,
+            min_baths=request.min_baths,
+            max_baths=request.max_baths,
+            min_price=request.min_price,
+            max_price=request.max_price,
+            lat=latitude,
+            long=longitude,
+            diameter=request.diameter,
+            is_town_house=request.is_town_house,
+            is_lot_land=request.is_lot_land,
+            is_condo=request.is_condo,
+            is_multi_family=request.is_multi_family,
+            is_single_family=request.is_single_family,
+            is_apartment=request.is_apartment,
+            special_features=request.additional_comments,
+            timeframe=request.timeframe,
+            visiting_reason=request.visiting_reason,
+            has_agent=request.has_agent
+        )
         
-        # Get the created collection to return
+        await CollectionPreferencesService.create_preferences(db, preferences_data)
+        
+        # Populate collection with properties immediately after creation
+        try:
+            sync_service = PropertySyncService()
+            population_result = await sync_service.populate_new_collection(db, collection.id)
+            
+            if population_result['success']:
+                print(f"Successfully populated collection {collection.id} with {population_result['new_properties_added']} properties")
+            else:
+                print(f"Warning: Failed to populate collection {collection.id} with properties: {population_result.get('error', 'Unknown error')}")
+        except Exception as e:
+            print(f"Warning: Exception during property population for collection {collection.id}: {e}")
+            # Continue - collection creation should succeed even if population fails
+        
         collections = await CollectionsService.get_user_collections(db, current_user.id)
         
-        # Return the most recently created collection
         if collections:
             latest_collection = max(collections, key=lambda x: x['created_at'])
             return latest_collection
@@ -541,4 +553,3 @@ async def get_properties_from_collection(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get properties from collection"
         )
-
