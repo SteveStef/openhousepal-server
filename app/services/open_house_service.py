@@ -25,8 +25,7 @@ class OpenHouseService:
             open_house_event_id=form_data.open_house_event_id,
             qr_code="",  # Will be updated by the calling code
             interested_in_similar=form_data.interested_in_similar,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
+            created_at=datetime.utcnow()
         )
         
         db.add(visitor)
@@ -62,8 +61,7 @@ class OpenHouseService:
                 visitor_name=visitor.full_name,
                 visitor_phone=visitor.phone,
                 original_open_house_event_id=form_data.open_house_event_id,
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow()
+                created_at=datetime.utcnow()
             )
             
             db.add(collection)
@@ -252,13 +250,13 @@ class OpenHouseService:
                 "price": open_house_record.price,
                 "beds": open_house_record.bedrooms,
                 "baths": open_house_record.bathrooms,
-                "squareFeet": open_house_record.living_area,
-                "lotSize": open_house_record.lot_size,
+                "squareFeet": None,  # Column dropped from database
+                "lotSize": None,  # Column dropped from database
                 "propertyType": open_house_record.house_type,
                 "description": "Beautiful property",  # Default description
                 "latitude": open_house_record.latitude,
                 "longitude": open_house_record.longitude,
-                "yearBuilt": open_house_record.year_built,
+                "yearBuilt": None,  # Column dropped from database
                 "homeStatus": open_house_record.home_status
             }
             
@@ -288,15 +286,15 @@ class OpenHouseService:
                 "price": open_house_record.price,
                 "beds": open_house_record.bedrooms,
                 "baths": open_house_record.bathrooms,
-                "squareFeet": open_house_record.living_area,
-                "lotSize": open_house_record.lot_size,
+                "squareFeet": None,  # Column dropped from database
+                "lotSize": None,  # Column dropped from database
                 "propertyType": open_house_record.house_type,
                 "description": "Beautiful property",  # Default description
                 "latitude": open_house_record.latitude,
                 "longitude": open_house_record.longitude,
-                "yearBuilt": open_house_record.year_built,
+                "yearBuilt": None,  # Column dropped from database
                 "homeStatus": open_house_record.home_status,
-                "imageSrc": open_house_record.image_src
+                "imageSrc": None  # Column dropped from database
             }
             
         except Exception as e:

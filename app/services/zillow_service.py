@@ -2,6 +2,7 @@ import httpx
 import os
 from typing import List, Optional, Dict, Any
 import logging
+import asyncio
 from datetime import datetime
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -68,13 +69,13 @@ class ZillowService:
         # Add bed range
         if preferences.min_beds:
             params['beds_min'] = preferences.min_beds
-        if preferences.max_beds > 0:
+        if preferences.max_beds and preferences.max_beds > 0:
             params['beds_max'] = preferences.max_beds
 
         # Add bath range
         if preferences.min_baths:
             params['baths_min'] = int(preferences.min_baths)
-        if preferences.max_baths > 0:
+        if preferences.max_baths and preferences.max_baths > 0:
             params['baths_max'] = int(preferences.max_baths)
 
         url = f"{self.base_url}/search_coordinates"
@@ -100,6 +101,84 @@ class ZillowService:
             raise ValueError("Zillow API request timed out")
         except httpx.RequestError as e:
             logger.error(f"Failed to connect to Zillow API: {str(e)}")
+            raise ValueError(f"Failed to connect to Zillow API: {str(e)}")
+    
+    async def search_properties_by_location(
+        self, 
+        location: str,
+        preferences: CollectionPreferencesSchema
+    ) -> Dict[str, Any]:
+        """
+        Search properties using Zillow API with location-based search
+        """
+        if not self.api_key:
+            raise ValueError("Zillow API key not configured")
+        
+        if not location or not location.strip():
+            raise ValueError("Location is required for location search")
+        
+        headers = {
+            'x-rapidapi-key': self.api_key,
+            'x-rapidapi-host': "zillow56.p.rapidapi.com"
+        }
+        
+        # Build query parameters based on preferences (same as coordinates search, minus lat/long/diameter)
+        params = {
+            'location': location.strip(),
+            'status': 'forSale',
+            'output': 'json',
+            'sort': 'priorityscore',
+            'listing_type': 'by_agent',
+            'doz': 'any',
+            'isTownhouse': preferences.is_town_house or False,
+            'isLotLand': preferences.is_lot_land or False,
+            'isCondo': preferences.is_condo or False,
+            'isMultiFamily': preferences.is_multi_family or False,
+            'isSingleFamily': preferences.is_single_family or False,
+            'isApartment': preferences.is_apartment or False,
+        }
+        
+        # Add price range
+        if preferences.min_price:
+            params['price_min'] = preferences.min_price
+        if preferences.max_price:
+            params['price_max'] = preferences.max_price
+
+        # Add bed range
+        if preferences.min_beds:
+            params['beds_min'] = preferences.min_beds
+        if preferences.max_beds and preferences.max_beds > 0:
+            params['beds_max'] = preferences.max_beds
+
+        # Add bath range
+        if preferences.min_baths:
+            params['baths_min'] = int(preferences.min_baths)
+        if preferences.max_baths and preferences.max_baths > 0:
+            params['baths_max'] = int(preferences.max_baths)
+
+        url = f"{self.base_url}/search"
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url, headers=headers, params=params)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    logger.info(f"Zillow API returned {len(data.get('results', []))} properties for location: {location}")
+                    
+                    return data
+                elif response.status_code == 401:
+                    raise ValueError("Invalid Zillow API key")
+                elif response.status_code == 429:
+                    raise ValueError("Zillow API rate limit exceeded")
+                else:
+                    logger.error(f"Zillow API error for location {location}: {response.status_code} - {response.text}")
+                    raise ValueError(f"Zillow API error: {response.status_code}")
+                    
+        except httpx.TimeoutException:
+            raise ValueError(f"Zillow API request timed out for location: {location}")
+        except httpx.RequestError as e:
+            logger.error(f"Failed to connect to Zillow API for location {location}: {str(e)}")
             raise ValueError(f"Failed to connect to Zillow API: {str(e)}")
     
     def parse_zillow_property(self, zillow_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -133,29 +212,135 @@ class ZillowService:
             logger.error(f"Error parsing Zillow property data: {str(e)}")
             return {}
     
+    async def get_matching_properties_by_locations(
+        self, 
+        preferences: CollectionPreferencesSchema
+    ) -> List[Dict[str, Any]]:
+        """
+        Get matching properties from Zillow based on cities and townships in preferences.
+        Makes separate API calls for each location with rate limiting and retry logic.
+        """
+        all_properties = []
+        seen_zpids = set()  # Track zpids to avoid duplicates
+        
+        # Combine cities and townships into single list
+        locations = []
+        if preferences.cities:
+            locations.extend(preferences.cities)
+        if preferences.townships:
+            locations.extend(preferences.townships)
+        
+        if not locations:
+            logger.info("No cities or townships specified for location search")
+            return []
+        
+        logger.info(f"Starting location search for {len(locations)} locations: {locations}")
+        
+        for i, location in enumerate(locations):
+            try:
+                logger.info(f"Searching location {i+1}/{len(locations)}: {location}")
+                
+                # First attempt
+                try:
+                    zillow_response = await self.search_properties_by_location(location, preferences)
+                except Exception as e:
+                    logger.warning(f"First attempt failed for location {location}: {str(e)}")
+                    
+                    # Second attempt (retry once)
+                    try:
+                        logger.info(f"Retrying location {location}")
+                        await asyncio.sleep(1)  # Brief pause before retry
+                        zillow_response = await self.search_properties_by_location(location, preferences)
+                    except Exception as retry_error:
+                        logger.error(f"Second attempt also failed for location {location}: {str(retry_error)}")
+                        # Skip this location and continue with next
+                        continue
+                
+                # Parse properties from this location
+                location_properties = []
+                results = zillow_response.get('results', [])
+                
+                for zillow_property in results:
+                    try:
+                        parsed_property = self.parse_zillow_property(zillow_property)
+                        if parsed_property and parsed_property.get('zpid'):
+                            zpid = parsed_property['zpid']
+                            
+                            # Check for duplicates
+                            if zpid not in seen_zpids:
+                                seen_zpids.add(zpid)
+                                location_properties.append(parsed_property)
+                            else:
+                                logger.debug(f"Skipping duplicate property with zpid: {zpid}")
+                                
+                    except Exception as parse_error:
+                        logger.warning(f"Failed to parse property from location {location}: {str(parse_error)}")
+                        continue
+                
+                all_properties.extend(location_properties)
+                logger.info(f"Location {location}: {len(location_properties)} properties added ({len(all_properties)} total so far)")
+                
+                # Rate limiting: 1 second between requests (except for the last one)
+                if i < len(locations) - 1:
+                    await asyncio.sleep(1)
+                    
+            except Exception as location_error:
+                logger.error(f"Unexpected error processing location {location}: {str(location_error)}")
+                continue
+        
+        logger.info(f"Location search completed. Total properties found: {len(all_properties)} from {len(locations)} locations")
+        logger.info(f"Deduplication: {len(seen_zpids)} unique properties after removing duplicates")
+        
+        return all_properties
+    
     async def get_matching_properties(
         self, 
         preferences: CollectionPreferencesSchema
     ) -> List[Dict[str, Any]]:
         """
-        Get matching properties from Zillow based on collection preferences
+        Get matching properties from Zillow based on collection preferences.
+        
+        Supports two search methods:
+        1. Address-based search: Uses coordinates (lat/long) and diameter
+        2. Location-based search: Uses cities and/or townships lists
         """
         try:
-            # Search properties using Zillow API
-            zillow_response = await self.search_properties_by_coordinates(preferences)
-            
-            # Parse and return property data
-            properties = []
-            for zillow_property in zillow_response.get('results', []):
-                parsed_property = self.parse_zillow_property(zillow_property)
-                if parsed_property:  # Only add if parsing was successful
-                    properties.append(parsed_property)
-            
-            return properties
+            # Determine which search method to use based on available data
+            if preferences.lat and preferences.long:
+                # Use coordinate-based search (existing method)
+                logger.info("Using coordinate-based search (address + diameter)")
+                zillow_response = await self.search_properties_by_coordinates(preferences)
+                
+                properties = []
+                results = zillow_response.get('results', [])
+                
+                for i, zillow_property in enumerate(results):
+                    try:
+                        parsed_property = self.parse_zillow_property(zillow_property)
+                        if parsed_property:  # Only add if parsing was successful
+                            properties.append(parsed_property)
+                    except Exception as parse_error:
+                        logger.warning(f"Failed to parse property {i+1}/{len(results)}: {str(parse_error)}")
+                        continue  # Skip this property but continue with others
+                
+                logger.info(f"Coordinate search: Successfully parsed {len(properties)}/{len(results)} properties")
+                return properties
+                
+            elif (preferences.cities and len(preferences.cities) > 0) or (preferences.townships and len(preferences.townships) > 0):
+                # Use location-based search (new method)
+                logger.info("Using location-based search (cities + townships)")
+                return await self.get_matching_properties_by_locations(preferences)
+                
+            else:
+                # No search criteria provided
+                logger.warning("No search criteria provided - neither coordinates nor cities/townships")
+                return []
             
         except Exception as e:
             logger.error(f"Error fetching matching properties: {str(e)}")
-            raise e
+            # Instead of raising, return empty list to allow collection creation to succeed
+            logger.warning("Returning empty property list to allow collection creation to proceed")
+            return []
     
     async def get_property_by_address(self, address: str, details: bool = False) -> PropertyDetailResponse:
         """

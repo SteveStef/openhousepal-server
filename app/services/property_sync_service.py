@@ -81,8 +81,8 @@ class PropertySyncService:
                     if hasattr(existing_property, actual_field):
                         setattr(existing_property, actual_field, value)
             
-            # Update sync timestamp (zillow_data field was removed)
-            existing_property.last_synced = datetime.now()
+            # Note: last_synced field doesn't exist in Property model, using updated_at instead
+            # The updated_at field is automatically updated by SQLAlchemy onupdate
             
             await db.commit()
             await db.refresh(existing_property)
@@ -106,10 +106,8 @@ class PropertySyncService:
             home_status=property_data.get('home_status'),
             latitude=property_data.get('latitude'),
             longitude=property_data.get('longitude'),
-            year_built=property_data.get('year_built'),
             img_src=property_data.get('image_url'),
-            zestimate=property_data.get('zestimate'),
-            last_synced=datetime.now()  # ✅ Fixed: last_updated -> last_synced
+            zestimate=property_data.get('zestimate')
         )
         
         db.add(property_obj)

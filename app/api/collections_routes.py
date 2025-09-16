@@ -49,8 +49,10 @@ class CreateCollectionWithPreferencesRequest(BaseModel):
     max_baths: Optional[float] = None
     min_price: Optional[int] = None
     max_price: Optional[int] = None
+    cities: Optional[list[str]] = None
+    townships: Optional[list[str]] = None
     address: str
-    diameter: float = 2.0
+    diameter: float = 0
     
     # Home type preferences
     is_town_house: Optional[bool] = False
@@ -154,44 +156,51 @@ async def create_collection(
         )
 
 
-@router.post("/create-from-address", response_model=CollectionResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/create-manually", response_model=CollectionResponse, status_code=status.HTTP_201_CREATED)
 async def create_collection_with_preferences(
     request: CreateCollectionWithPreferencesRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
-    """
-    Create a new collection with customer preferences using address for coordinate lookup
-    """
     try:
-        # Lookup coordinates from address using Zillow API
+        print(request)
+        '''
+            If address is used, then make a requests like before to get lat and long of the property
+            If City or Township is used, make a zillow request per city/township
+        '''
         zillow_service = ZillowService()
-        try:
-            property_details = await zillow_service.get_property_by_address(request.address)
-            latitude = property_details.latitude
-            longitude = property_details.longitude
-            
-            if not latitude or not longitude:
+        latitude = 0
+        longitude = 0
+        if len(request.address) > 0:
+            try:
+                property_details = await zillow_service.get_property_by_address(request.address)
+                latitude = property_details.latitude
+                longitude = property_details.longitude
+
+                if not latitude or not longitude:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Could not determine coordinates for the provided address"
+                    )
+            except HTTPException as e:
+                if e.status_code == 404:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Property not found for the provided address"
+                    )
+                else:
+                    raise e
+            except Exception as e:
+                print(f"Error looking up address coordinates: {e}")
                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Could not determine coordinates for the provided address"
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to lookup property coordinates"
                 )
-        except HTTPException as e:
-            if e.status_code == 404:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Property not found for the provided address"
-                )
-            else:
-                raise e
-        except Exception as e:
-            print(f"Error looking up address coordinates: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to lookup property coordinates"
-            )
         
-        # Create collection directly
+        # Generate share token for public access
+        share_token = CollectionsService.generate_share_token()
+
+        # Create collection directly with auto-generated share token
         collection = Collection(
             owner_id=current_user.id,
             name=request.name,
@@ -199,6 +208,8 @@ async def create_collection_with_preferences(
             visitor_email=request.visitor_email,
             visitor_name=request.visitor_name,
             visitor_phone=request.visitor_phone,
+            share_token=share_token,
+            is_public=True,  # Default to public with share link
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()
         )
@@ -216,8 +227,11 @@ async def create_collection_with_preferences(
             max_baths=request.max_baths,
             min_price=request.min_price,
             max_price=request.max_price,
+            cities=request.cities,
+            townships=request.townships,
             lat=latitude,
             long=longitude,
+            address=request.address,  # Add missing address field
             diameter=request.diameter,
             is_town_house=request.is_town_house,
             is_lot_land=request.is_lot_land,

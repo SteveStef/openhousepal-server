@@ -54,25 +54,20 @@ async def create_open_house(
             qr_code=qr_code_url,
             form_url=form_url,
             cover_image_url=request.cover_image_url,
-            start_time=datetime.now(),
-            end_time=datetime.now() + timedelta(hours=2),
             
             # Property metadata from request - use extracted string fields
             address=street_address,
             abbreviated_address=abbreviated_addr,
-            image_src=request.cover_image_url,
             house_type=property_data.get('homeType'),
             latitude=property_data.get('latitude'),
             longitude=property_data.get('longitude'),
+            lot_size=property_data.get('lot_size'),
             city=city,
             state=state,
             zipcode=zipcode,
             bedrooms=property_data.get('bedrooms'),
             bathrooms=property_data.get('bathrooms'),
-            living_area=property_data.get('livingArea'),
             price=property_data.get('price'),
-            lot_size=property_data.get('lotSize'),
-            year_built=property_data.get('yearBuilt'),
             home_status=property_data.get('homeStatus')
         )
         
@@ -89,7 +84,7 @@ async def create_open_house(
             form_url=open_house.form_url,
             bedrooms=open_house.bedrooms,
             bathrooms=open_house.bathrooms,
-            living_area=open_house.living_area,
+            living_area=open_house.lot_size,
             price=open_house.price,
             created_at=open_house.created_at
         )
@@ -124,12 +119,12 @@ async def get_open_houses(
                 id=oh.id,
                 open_house_event_id=oh.id,
                 address=oh.address or "Unknown Address",
-                cover_image_url=oh.cover_image_url or oh.image_src or "",
+                cover_image_url=oh.cover_image_url or "",
                 qr_code_url=oh.qr_code,
                 form_url=oh.form_url or f"/open-house/{oh.id}",
                 bedrooms=oh.bedrooms,
                 bathrooms=oh.bathrooms,
-                living_area=oh.living_area,
+                living_area=oh.lot_size,  # Column dropped from database
                 price=oh.price,
                 created_at=oh.created_at
             ))

@@ -22,7 +22,6 @@ class UserUpdate(BaseModel):
 
 class User(UserBase):
     id: str
-    is_active: bool
     created_at: datetime
     updated_at: Optional[datetime] = None
     

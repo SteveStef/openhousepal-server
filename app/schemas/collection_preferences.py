@@ -11,6 +11,11 @@ class CollectionPreferencesBase(BaseModel):
     max_price: Optional[int] = None
     lat: Optional[float] = None
     long: Optional[float] = None
+    address: Optional[str] = None
+
+    cities: Optional[list[str]] = None
+    townships: Optional[list[str]] = None
+
     diameter: float = 2.0
     special_features: str = ""
     
@@ -39,15 +44,20 @@ class CollectionPreferencesUpdate(BaseModel):
     max_price: Optional[int] = None
     lat: Optional[float] = None
     long: Optional[float] = None
+    address: Optional[str] = None
+    
+    cities: Optional[list[str]] = None
+    townships: Optional[list[str]] = None
+    
     diameter: Optional[float] = None
     special_features: Optional[str] = None
 
-    is_town_house: Optional[bool] = False,
-    is_lot_land: Optional[bool] = False,
-    is_condo: Optional[bool] = False,
-    is_multi_family: Optional[bool] = False,
-    is_single_family: Optional[bool] = False,
-    is_apartment: Optional[bool] = False,
+    is_town_house: Optional[bool] = None
+    is_lot_land: Optional[bool] = None
+    is_condo: Optional[bool] = None
+    is_multi_family: Optional[bool] = None
+    is_single_family: Optional[bool] = None
+    is_apartment: Optional[bool] = None
     
     # Visitor form data
     timeframe: Optional[str] = None

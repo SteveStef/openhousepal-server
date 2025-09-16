@@ -23,9 +23,7 @@ class User(Base):
     last_name = Column(String, nullable=True)
     state = Column(String, nullable=True)  # Agent's state
     brokerage = Column(String, nullable=True)  # Agent's brokerage
-    is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     
     # Relationships
     collections = relationship("Collection", back_populates="owner")
@@ -38,7 +36,7 @@ class Collection(Base):
     description = Column(Text, nullable=True)
     owner_id = Column(String, ForeignKey('users.id'), nullable=True)  # Allow null for anonymous collections
     share_token = Column(String, unique=True, nullable=True)
-    is_public = Column(Boolean, default=False)
+    is_public = Column(Boolean, default=True)
     status = Column(String, default="ACTIVE")  # ACTIVE, PAUSED, INACTIVE
     
     # Anonymous visitor info (for open house collections)
@@ -102,8 +100,6 @@ class OpenHouseEvent(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     qr_code = Column(String, unique=True, nullable=False)
     agent_id = Column(String, ForeignKey('users.id'), nullable=False)
-    start_time = Column(DateTime(timezone=True), nullable=False)
-    end_time = Column(DateTime(timezone=True), nullable=False)
     is_active = Column(Boolean, default=True)
     form_url = Column(String, nullable=True)  # Store the form link
     cover_image_url = Column(String, nullable=True)  # Store the selected cover image
@@ -111,8 +107,8 @@ class OpenHouseEvent(Base):
     # Property metadata (replaces property_id relationship)
     address = Column(String, nullable=True)
     abbreviated_address = Column(String, nullable=True)
-    image_src = Column(String, nullable=True)
     house_type = Column(String, nullable=True)
+    lot_size = Column(Integer, nullable=True)
     
     # Location data for collection searching
     latitude = Column(Float, nullable=True)
@@ -124,10 +120,7 @@ class OpenHouseEvent(Base):
     # Property details for PDF generation and collection preferences
     bedrooms = Column(Integer, nullable=True)
     bathrooms = Column(Float, nullable=True)
-    living_area = Column(Integer, nullable=True)  # Square feet
     price = Column(Integer, nullable=True)
-    lot_size = Column(Integer, nullable=True)
-    year_built = Column(Integer, nullable=True)
     home_status = Column(String, nullable=True)
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -155,12 +148,8 @@ class OpenHouseVisitor(Base):
     qr_code = Column(String, nullable=False)
     form_url = Column(String, nullable=True)  # Store the form link
     
-    # Preferences
     interested_in_similar = Column(Boolean, default=False)
-    
-    # Metadata
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     
     # Relationships
     open_house_event = relationship("OpenHouseEvent")
@@ -220,6 +209,9 @@ class CollectionPreferences(Base):
     # Location criteria
     lat = Column(Float, nullable=True)
     long = Column(Float, nullable=True)
+    address = Column(String, nullable=True)
+    cities = Column(JSON, nullable=True)
+    townships = Column(JSON, nullable=True)
     diameter = Column(Float, default=2.0)  # Search diameter in miles
     
     # Additional features

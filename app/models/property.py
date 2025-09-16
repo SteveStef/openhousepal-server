@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from datetime import datetime
 from enum import Enum
 
@@ -110,7 +110,7 @@ class ResoFacts(BaseModel):
     additionalParcelsDescription: Optional[str] = None
     appliances: Optional[List[str]] = None
     architecturalStyle: Optional[str] = None
-    associationAmenities: Optional[str] = None
+    associationAmenities: Optional[Union[str, List[str]]] = None
     associationFee: Optional[str] = None
     associationFee2: Optional[str] = None
     associationFeeIncludes: Optional[List[str]] = None
@@ -153,7 +153,7 @@ class ResoFacts(BaseModel):
     cropsIncludedYN: Optional[bool] = None
     cumulativeDaysOnMarket: Optional[int] = None
     developmentStatus: Optional[str] = None
-    doorFeatures: Optional[str] = None
+    doorFeatures: Optional[List[str]] = None
     electric: Optional[List[str]] = None
     elementarySchool: Optional[str] = None
     elementarySchoolDistrict: Optional[str] = None
@@ -206,7 +206,7 @@ class ResoFacts(BaseModel):
     hoaFee: Optional[str] = None
     hoaFeeTotal: Optional[str] = None
     homeType: Optional[str] = None
-    horseAmenities: Optional[str] = None
+    horseAmenities: Optional[Union[str, List[str]]] = None
     horseYN: Optional[bool] = None
     inclusions: Optional[List[str]] = None
     incomeIncludes: Optional[str] = None
@@ -233,7 +233,7 @@ class ResoFacts(BaseModel):
     mainLevelBathrooms: Optional[int] = None
     mainLevelBedrooms: Optional[int] = None
     marketingType: Optional[str] = None
-    media: Optional[List[str]] = None
+    media: Optional[List[Dict[str, Any]]] = None
     middleOrJuniorSchool: Optional[str] = None
     middleOrJuniorSchoolDistrict: Optional[str] = None
     municipality: Optional[str] = None
@@ -244,7 +244,7 @@ class ResoFacts(BaseModel):
     openParkingCapacity: Optional[int] = None
     otherEquipment: Optional[str] = None
     otherFacts: Optional[List[OtherFact]] = None
-    otherParking: Optional[str] = None
+    otherParking: Optional[list[str]] = None
     otherStructures: Optional[List[str]] = None
     ownership: Optional[str] = None
     ownershipType: Optional[str] = None
@@ -258,13 +258,13 @@ class ResoFacts(BaseModel):
     pricePerSquareFoot: Optional[int] = None
     propertyCondition: Optional[str] = None
     propertySubType: Optional[List[str]] = None
-    roadSurfaceType: Optional[str] = None
+    roadSurfaceType: Optional[List[str]] = None
     roofType: Optional[str] = None
-    roomTypes: Optional[str] = None
+    roomTypes: Optional[List[str]] = None
     rooms: Optional[List[Dict[str, Any]]] = None
     securityFeatures: Optional[List[str]] = None
     sewer: Optional[List[str]] = None
-    spaFeatures: Optional[str] = None
+    spaFeatures: Optional[Union[str, List[str]]] = None
     specialListingConditions: Optional[str] = None
     stories: Optional[int] = None
     storiesDecimal: Optional[float] = None
@@ -284,8 +284,8 @@ class ResoFacts(BaseModel):
     waterSource: Optional[List[str]] = None
     waterView: Optional[str] = None
     waterViewYN: Optional[bool] = None
-    waterfrontFeatures: Optional[str] = None
-    windowFeatures: Optional[str] = None
+    waterfrontFeatures: Optional[Union[str, List[str]]] = None
+    windowFeatures: Optional[List[str]] = None
     woodedArea: Optional[str] = None
     yearBuilt: Optional[int] = None
     yearBuiltEffective: Optional[int] = None
@@ -343,14 +343,14 @@ class TaxHistoryEntry(BaseModel):
 
 
 class PriceHistoryEntry(BaseModel):
-    buyerAgent: Optional[str] = None
+    buyerAgent: Optional[Dict[str, Any]] = None
     date: Optional[str] = None
     event: Optional[str] = None
     postingIsRental: Optional[bool] = None
     price: Optional[int] = None
     priceChangeRate: Optional[float] = None
     pricePerSquareFoot: Optional[int] = None
-    sellerAgent: Optional[str] = None
+    sellerAgent: Optional[Dict[str, Any]] = None
     showCountyLink: Optional[bool] = None
     source: Optional[str] = None
     time: Optional[int] = None

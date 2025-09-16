@@ -87,11 +87,11 @@ async def get_current_user(
 
 async def get_current_active_user(current_user = Depends(get_current_user)):
     """Get the current authenticated and active user"""
-    if not current_user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Inactive user"
-        )
+    # if not current_user.is_active:
+    #     raise HTTPException(
+    #         status_code=status.HTTP_400_BAD_REQUEST,
+    #         detail="Inactive user"
+    #     )
     return current_user
 
 async def get_current_user_optional(
@@ -114,8 +114,8 @@ async def get_current_user_optional(
         from app.services.user_service import UserService
         
         user = await UserService.get_user_by_id(db, user_id=user_id)
-        if user is None or not user.is_active:
-            return None
+        # if user is None or not user.is_active:
+        #     return None
             
         return user
         
