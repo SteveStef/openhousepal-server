@@ -88,7 +88,8 @@ class CollectionPreferencesService:
             "max_price": int((original_open_house.price or 1000000) * 1.2),  # 20% more
             "lat": original_open_house.latitude,
             "long": original_open_house.longitude,
-            "diameter": 15,
+            "address": original_open_house.address,  # Store the original address
+            "diameter": 5,
             "special_features": "",
 
             "is_town_house": not single_family,

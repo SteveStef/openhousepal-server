@@ -34,7 +34,7 @@ class Collection(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     name = Column(String, nullable=False)
     description = Column(Text, nullable=True)
-    owner_id = Column(String, ForeignKey('users.id'), nullable=True)  # Allow null for anonymous collections
+    owner_id = Column(String, ForeignKey('users.id'), nullable=True)  # Required - agent who owns the collection
     share_token = Column(String, unique=True, nullable=True)
     is_public = Column(Boolean, default=True)
     status = Column(String, default="ACTIVE")  # ACTIVE, PAUSED, INACTIVE
@@ -52,7 +52,9 @@ class Collection(Base):
     owner = relationship("User", back_populates="collections")
     properties = relationship("Property", secondary=collection_properties, back_populates="collections")
     original_open_house_event = relationship("OpenHouseEvent", foreign_keys=[original_open_house_event_id])
-    preferences = relationship("CollectionPreferences", back_populates="collection", uselist=False)
+    preferences = relationship("CollectionPreferences", back_populates="collection", uselist=False, cascade="all, delete-orphan")
+    property_interactions = relationship("PropertyInteraction", back_populates="collection", cascade="all, delete-orphan")
+    property_comments = relationship("PropertyComment", back_populates="collection", cascade="all, delete-orphan")
 
 class Property(Base):
     __tablename__ = "properties"
@@ -96,11 +98,13 @@ class Property(Base):
 
 class OpenHouseEvent(Base):
     __tablename__ = "open_house_events"
-    
+
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     qr_code = Column(String, unique=True, nullable=False)
     agent_id = Column(String, ForeignKey('users.id'), nullable=False)
     is_active = Column(Boolean, default=True)
+    is_deleted = Column(Boolean, default=False)  # Soft delete flag
+    deleted_at = Column(DateTime(timezone=True), nullable=True)  # Track when deleted
     form_url = Column(String, nullable=True)  # Store the form link
     cover_image_url = Column(String, nullable=True)  # Store the selected cover image
     
@@ -157,9 +161,9 @@ class OpenHouseVisitor(Base):
 
 class PropertyInteraction(Base):
     __tablename__ = "property_interactions"
-    
+
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    collection_id = Column(String, ForeignKey('collections.id'), nullable=False)
+    collection_id = Column(String, ForeignKey('collections.id', ondelete='CASCADE'), nullable=False)
     property_id = Column(String, ForeignKey('properties.id'), nullable=False)
     
     # Interaction types
@@ -169,26 +173,26 @@ class PropertyInteraction(Base):
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    
+
     # Relationships
-    collection = relationship("Collection")
+    collection = relationship("Collection", back_populates="property_interactions")
     property = relationship("Property")
 
 
 class PropertyComment(Base):
     __tablename__ = "property_comments"
-    
+
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    collection_id = Column(String, ForeignKey('collections.id'), nullable=False)
+    collection_id = Column(String, ForeignKey('collections.id', ondelete='CASCADE'), nullable=False)
     property_id = Column(String, ForeignKey('properties.id'), nullable=False)
     
     content = Column(Text, nullable=False)
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-    
+
     # Relationships
-    collection = relationship("Collection")
+    collection = relationship("Collection", back_populates="property_comments")
     property = relationship("Property")
 
 
@@ -196,7 +200,7 @@ class CollectionPreferences(Base):
     __tablename__ = "collection_preferences"
     
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    collection_id = Column(String, ForeignKey('collections.id'), nullable=False, unique=True)
+    collection_id = Column(String, ForeignKey('collections.id', ondelete='CASCADE'), nullable=False, unique=True)
     
     # Property criteria
     min_beds = Column(Integer, nullable=True)

@@ -10,6 +10,8 @@ import string
 from app.models.database import Collection, Property, User, PropertyInteraction, PropertyComment
 from app.schemas.collection import CollectionCreate
 
+from app.services.property_sync_service import PropertySyncService
+from app.services.collection_preferences_service import CollectionPreferencesService
 
 class CollectionsService:
     
@@ -24,7 +26,7 @@ class CollectionsService:
                     selectinload(Collection.properties),
                     selectinload(Collection.original_open_house_event),  # no load_only here
                 )
-                .where((Collection.owner_id == user_id) | (Collection.owner_id.is_(None)))
+                .where(Collection.owner_id == user_id)
                 .order_by(Collection.created_at.desc())
             )
 
@@ -50,7 +52,7 @@ class CollectionsService:
                                 "price": original_open_house.price,
                                 "beds": original_open_house.bedrooms,
                                 "baths": original_open_house.bathrooms,
-                                "squareFeet": original_open_house.living_area,
+                                "squareFeet": original_open_house.lot_size,  # Use lot_size since living_area doesn't exist
                                 "propertyType": original_open_house.house_type or "Unknown"
                             }
                     except Exception as e:
@@ -67,6 +69,9 @@ class CollectionsService:
                         "max_price": collection.preferences.max_price,
                         "lat": collection.preferences.lat,
                         "long": collection.preferences.long,
+                        "address": collection.preferences.address,  # Add missing address field
+                        "cities": collection.preferences.cities,
+                        "townships": collection.preferences.townships,
                         "diameter": collection.preferences.diameter,
                         "special_features": collection.preferences.special_features,
                         "timeframe": collection.preferences.timeframe,
@@ -142,7 +147,7 @@ class CollectionsService:
                 selectinload(Collection.properties)
             ).where(
                 Collection.id == collection_id,
-                (Collection.owner_id == user_id) | (Collection.owner_id.is_(None))
+                Collection.owner_id == user_id
             )
 
             result = await db.execute(query)
@@ -184,8 +189,21 @@ class CollectionsService:
                     "max_price": collection.preferences.max_price,
                     "lat": collection.preferences.lat,
                     "long": collection.preferences.long,
+                    "address": collection.preferences.address,  # Add missing address field
+                    "cities": collection.preferences.cities,
+                    "townships": collection.preferences.townships,
                     "diameter": collection.preferences.diameter,
-                    "special_features": collection.preferences.special_features
+                    "special_features": collection.preferences.special_features,
+                    "timeframe": collection.preferences.timeframe,
+                    "visiting_reason": collection.preferences.visiting_reason,
+                    "has_agent": collection.preferences.has_agent,
+
+                    "is_town_house": collection.preferences.is_town_house,
+                    "is_condo": collection.preferences.is_condo,
+                    "is_single_family": collection.preferences.is_single_family,
+                    "is_lot_land": collection.preferences.is_lot_land,
+                    "is_multi_family": collection.preferences.is_multi_family,
+                    "is_apartment": collection.preferences.is_apartment
                 }
 
             return {
@@ -231,12 +249,7 @@ class CollectionsService:
             await db.commit()
             await db.refresh(collection)
 
-            # Try to populate properties if preferences exist for this collection
             try:
-                from app.services.property_sync_service import PropertySyncService
-                from app.services.collection_preferences_service import CollectionPreferencesService
-
-                # Check if preferences exist for this collection
                 preferences = await CollectionPreferencesService.get_preferences_by_collection_id(db, collection.id)
 
                 if preferences:
@@ -284,7 +297,7 @@ class CollectionsService:
         try:
             query = select(Collection).where(
                 Collection.id == collection_id,
-                (Collection.owner_id == user_id) | (Collection.owner_id.is_(None))
+                Collection.owner_id == user_id
             )
 
             result = await db.execute(query)
@@ -325,7 +338,7 @@ class CollectionsService:
         try:
             query = select(Collection).where(
                 Collection.id == collection_id,
-                (Collection.owner_id == user_id) | (Collection.owner_id.is_(None))
+                Collection.owner_id == user_id
             )
 
             result = await db.execute(query)
@@ -528,11 +541,21 @@ class CollectionsService:
                     'max_price': collection.preferences.max_price,
                     'lat': collection.preferences.lat,
                     'long': collection.preferences.long,
+                    'address': collection.preferences.address,  # Add missing address field
+                    'cities': collection.preferences.cities,
+                    'townships': collection.preferences.townships,
                     'diameter': collection.preferences.diameter,
                     'special_features': collection.preferences.special_features,
                     'timeframe': collection.preferences.timeframe,
                     'visiting_reason': collection.preferences.visiting_reason,
-                    'has_agent': collection.preferences.has_agent
+                    'has_agent': collection.preferences.has_agent,
+
+                    'is_town_house': collection.preferences.is_town_house,
+                    'is_condo': collection.preferences.is_condo,
+                    'is_single_family': collection.preferences.is_single_family,
+                    'is_lot_land': collection.preferences.is_lot_land,
+                    'is_multi_family': collection.preferences.is_multi_family,
+                    'is_apartment': collection.preferences.is_apartment
                 } if collection.preferences else {},
                 'stats': {
                     'totalProperties': total_properties,

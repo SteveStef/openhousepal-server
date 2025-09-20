@@ -104,12 +104,15 @@ async def get_open_houses(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
-    """Get all open houses for the current agent"""
+    """Get all active (non-deleted) open houses for the current agent"""
     try:
         stmt = select(OpenHouseEvent).where(
-            OpenHouseEvent.agent_id == current_user.id
+            and_(
+                OpenHouseEvent.agent_id == current_user.id,
+                OpenHouseEvent.is_deleted == False  # Only show active listings
+            )
         ).order_by(OpenHouseEvent.created_at.desc())
-        
+
         result = await db.execute(stmt)
         open_houses = result.scalars().all()
         
@@ -141,30 +144,38 @@ async def delete_open_house(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
-    """Delete an open house record"""
+    """Soft delete an open house record (preserves data integrity with collections)"""
     try:
         stmt = select(OpenHouseEvent).where(
             and_(
                 OpenHouseEvent.id == open_house_id,
-                OpenHouseEvent.agent_id == current_user.id
+                OpenHouseEvent.agent_id == current_user.id,
+                OpenHouseEvent.is_deleted == False  # Only allow deleting non-deleted records
             )
         )
         result = await db.execute(stmt)
         open_house = result.scalar_one_or_none()
-        
+
         if not open_house:
             raise HTTPException(status_code=404, detail="Open house not found")
-        
-        await db.delete(open_house)
+
+        # Soft delete: mark as deleted and set timestamp
+        open_house.is_deleted = True
+        open_house.deleted_at = datetime.utcnow()
+
         await db.commit()
-        
-        return {"success": True, "message": "Open house deleted successfully"}
-        
+
+        return {
+            "success": True,
+            "message": "Open house removed from your listings. All related collections and visitor data are preserved.",
+            "deleted_at": open_house.deleted_at
+        }
+
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error deleting open house: {e}")
-        raise HTTPException(status_code=500, detail="Failed to delete open house")
+        print(f"Error soft deleting open house: {e}")
+        raise HTTPException(status_code=500, detail="Failed to remove open house")
 
 
 @router.post("/open-house/submit", response_model=OpenHouseFormResponse)

@@ -328,13 +328,86 @@ class PropertySyncService:
                 'new_properties_added': new_properties_count,
                 'populated_at': datetime.now()
             }
-            
+
         except Exception as e:
             logger.error(f"Error populating new collection {collection_id}: {str(e)}")
             # Don't raise the exception - collection creation should succeed even if population fails
             return {
-                'success': False, 
+                'success': False,
                 'collection_id': collection_id,
                 'error': str(e),
                 'new_properties_added': 0
+            }
+
+    async def replace_collection_properties(self, db: AsyncSession, collection_id: str) -> Dict[str, Any]:
+        """
+        Replace all properties in a collection with new ones based on updated preferences.
+        This removes all existing property associations and adds new matching properties.
+        """
+        logger.info(f"Replacing all properties for collection {collection_id}")
+
+        try:
+            # Get collection and preferences
+            result = await db.execute(
+                select(Collection).where(Collection.id == collection_id)
+            )
+            collection = result.scalar_one_or_none()
+
+            if not collection:
+                return {'success': False, 'error': 'Collection not found'}
+
+            # Get preferences for this collection
+            preferences = await CollectionPreferencesService.get_preferences_by_collection_id(db, collection_id)
+
+            if not preferences:
+                return {'success': False, 'error': 'No preferences found for collection'}
+
+            # Step 1: Remove all existing property associations for this collection
+            await db.execute(
+                collection_properties.delete().where(
+                    collection_properties.c.collection_id == collection_id
+                )
+            )
+            await db.commit()
+            logger.info(f"Removed all existing property associations for collection {collection_id}")
+
+            # Step 2: Get matching properties from Zillow based on current preferences
+            matching_properties = await self.zillow_service.get_matching_properties(preferences)
+
+            properties_added = 0
+
+            # Step 3: Add new matching properties to the collection
+            for property_data in matching_properties:
+                zpid = property_data.get('zpid')
+                if not zpid:
+                    continue
+
+                try:
+                    # Create or update property in database
+                    property_obj = await self.create_property_from_zillow_data(db, property_data)
+
+                    # Add property to collection
+                    await self.add_property_to_collection(db, collection_id, property_obj.id)
+                    properties_added += 1
+
+                except Exception as e:
+                    logger.warning(f"Failed to add property {zpid} to collection {collection_id}: {str(e)}")
+                    continue
+
+            logger.info(f"Successfully replaced properties for collection {collection_id}: {properties_added} properties added")
+
+            return {
+                'success': True,
+                'collection_id': collection_id,
+                'properties_replaced': properties_added,
+                'message': f'Collection updated with {properties_added} matching properties'
+            }
+
+        except Exception as e:
+            logger.error(f"Error replacing properties for collection {collection_id}: {str(e)}")
+            await db.rollback()
+            return {
+                'success': False,
+                'collection_id': collection_id,
+                'error': str(e)
             }

@@ -19,7 +19,12 @@ class PropertyVisitService:
         
         if not form_data.interested_in_similar or not form_data.property_id:
             return None
-            
+
+        # Require agent_id for collection creation since owner_id cannot be NULL
+        if not form_data.agent_id:
+            print("Cannot create collection without agent_id - owner_id is required")
+            return None
+
         try:
             # Get the original property to create smart filters
             visited_property = await PropertyVisitService.get_property_by_id(db, form_data.property_id)
@@ -30,7 +35,7 @@ class PropertyVisitService:
             
             # Create collection directly
             collection = Collection(
-                owner_id=form_data.agent_id if form_data.agent_id else None,  # Link to agent if provided
+                owner_id=form_data.agent_id,  # Agent ID is required and validated above
                 name=visited_property.get('address', 'Unknown Property'),
                 description=f"Properties similar to {visited_property.get('address', 'the visited property')} based on your preferences",
                 visitor_email=form_data.email,

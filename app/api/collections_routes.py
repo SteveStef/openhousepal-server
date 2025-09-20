@@ -558,7 +558,7 @@ async def get_properties_from_collection(
 ):
     try:
         return await CollectionsService.get_properties(
-            collectionId, 
+            collectionId,
             db
         )
     except Exception as e:
@@ -566,4 +566,56 @@ async def get_properties_from_collection(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get properties from collection"
+        )
+
+@router.post("/{collection_id}/refresh-properties")
+async def refresh_collection_properties(
+    collection_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Replace all properties in a collection with new ones based on current preferences.
+    This removes existing property associations and adds new matching properties.
+    """
+    try:
+        # Verify user owns the collection or has access to it
+        collection = await db.execute(
+            select(Collection).where(
+                Collection.id == collection_id,
+                Collection.owner_id == current_user.id
+            )
+        )
+        collection_obj = collection.scalar_one_or_none()
+
+        if not collection_obj:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Collection not found or access denied"
+            )
+
+        # Use PropertySyncService to replace all properties
+        sync_service = PropertySyncService()
+        result = await sync_service.replace_collection_properties(db, collection_id)
+
+        if result['success']:
+            return {
+                "success": True,
+                "message": result['message'],
+                "properties_replaced": result['properties_replaced'],
+                "collection_id": collection_id
+            }
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to refresh properties: {result.get('error', 'Unknown error')}"
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Error refreshing collection properties: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to refresh collection properties"
         )

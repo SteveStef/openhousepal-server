@@ -54,7 +54,7 @@ class OpenHouseService:
             
             # Create collection
             collection = Collection(
-                owner_id=form_data.agent_id if form_data.agent_id else None,  # Link to agent if provided
+                owner_id=visited_open_house.get('agent_id'),  # Use agent_id from the open house event
                 name=visited_open_house.get('address', 'Unknown Property'),
                 description=f"Properties similar to {visited_open_house.get('address', 'the visited property')} based on {visitor.full_name}'s preferences",
                 visitor_email=visitor.email,
@@ -243,6 +243,7 @@ class OpenHouseService:
             # Use open house event metadata fields
             return {
                 "id": open_house_record.id,
+                "agent_id": open_house_record.agent_id,  # Include agent_id for collection ownership
                 "address": open_house_record.address,
                 "city": open_house_record.city,
                 "state": open_house_record.state,
