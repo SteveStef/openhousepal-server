@@ -37,7 +37,7 @@ class Collection(Base):
     owner_id = Column(String, ForeignKey('users.id'), nullable=True)  # Required - agent who owns the collection
     share_token = Column(String, unique=True, nullable=True)
     is_public = Column(Boolean, default=True)
-    status = Column(String, default="ACTIVE")  # ACTIVE, PAUSED, INACTIVE
+    status = Column(String, default="ACTIVE")  # ACTIVE, INACTIVE
     
     # Anonymous visitor info (for open house collections)
     visitor_email = Column(String, nullable=True)

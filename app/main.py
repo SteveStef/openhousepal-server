@@ -19,12 +19,6 @@ scheduler = AsyncIOScheduler()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan - handles startup and shutdown"""
-    # NOTE: Old asyncio scheduler is disabled - now using APScheduler below
-    # try:
-    #     await start_scheduler()
-    #     print("Property sync scheduler started")
-    # except Exception as e:
-    #     print(f"Warning: Failed to start property sync scheduler: {e}")
 
     print("Using APScheduler for all scheduled tasks (cache cleanup + property sync)")
 
@@ -55,13 +49,13 @@ async def lifespan(app: FastAPI):
     print(f"APScheduler started:")
     print(f"  - Cache cleanup: Daily at {cache_hour:02d}:{cache_mins:02d}")
     print(f"  - Property sync: Every {sync_interval_hours} hours")
+    print("  - Orphaned cleanup: Inline with collection deletion")
 
     yield
 
     # Shutdown
     print("Shutting down application...")
     scheduler.shutdown()
-    # await stop_scheduler()  # Old scheduler disabled
     print("APScheduler stopped")
 
 app = FastAPI(title="Open House Pal API", lifespan=lifespan)

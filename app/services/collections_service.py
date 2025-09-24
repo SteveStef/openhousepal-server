@@ -1,11 +1,12 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, delete, text, func
 from sqlalchemy.orm import selectinload, joinedload, load_only
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 import uuid
 import secrets
 import string
+import os
 
 from app.models.database import Collection, Property, User, PropertyInteraction, PropertyComment
 from app.schemas.collection import CollectionCreate
@@ -14,7 +15,55 @@ from app.services.property_sync_service import PropertySyncService
 from app.services.collection_preferences_service import CollectionPreferencesService
 
 class CollectionsService:
-    
+
+    @staticmethod
+    async def count_active_collections(db: AsyncSession, user_id: str) -> int:
+        """Count the number of active collections for a user"""
+        try:
+            result = await db.execute(
+                select(func.count(Collection.id)).where(
+                    and_(
+                        Collection.owner_id == user_id,
+                        Collection.status == 'ACTIVE'
+                    )
+                )
+            )
+            return result.scalar() or 0
+        except Exception as e:
+            print(f"Error counting active collections: {e}")
+            return 0
+
+    @staticmethod
+    async def should_create_as_active(db: AsyncSession, user_id: str) -> bool:
+        """Check if a new collection should be created as active (under the limit)"""
+        max_active = int(os.getenv("MAX_ACTIVE_COLLECTIONS_PER_USER", "10"))
+        active_count = await CollectionsService.count_active_collections(db, user_id)
+        return active_count < max_active
+
+    @staticmethod
+    async def can_activate_collection(db: AsyncSession, user_id: str, collection_id: str) -> bool:
+        """Check if a collection can be activated without exceeding the limit"""
+        max_active = int(os.getenv("MAX_ACTIVE_COLLECTIONS_PER_USER", "10"))
+
+        # Get current collection status
+        current_collection = await db.execute(
+            select(Collection.status).where(
+                and_(
+                    Collection.id == collection_id,
+                    Collection.owner_id == user_id
+                )
+            )
+        )
+        current_status = current_collection.scalar()
+
+        # If already active, allow the "activation" (no change)
+        if current_status == 'ACTIVE':
+            return True
+
+        # If inactive, check if activating would exceed limit
+        active_count = await CollectionsService.count_active_collections(db, user_id)
+        return active_count < max_active
+
     @staticmethod
     async def get_user_collections(db: AsyncSession, user_id: str) -> List[Dict[str, Any]]:
         """Get all collections for a user"""
@@ -233,14 +282,22 @@ class CollectionsService:
         collection_data: CollectionCreate,
         user_id: str
     ) -> Dict[str, Any]:
-        """Create a new collection"""
+        """Create a new collection with intelligent status assignment"""
         try:
+            # Determine if this collection should be active or inactive based on current count
+            should_be_active = await CollectionsService.should_create_as_active(db, user_id)
+            status = 'ACTIVE' if should_be_active else 'INACTIVE'
+
+            active_count = await CollectionsService.count_active_collections(db, user_id)
+            print(f"[CREATE_COLLECTION] User {user_id} has {active_count} active collections, creating new collection as {status}")
+
             collection = Collection(
                 id=str(uuid.uuid4()),
                 name=collection_data.name,
                 description=collection_data.description,
                 owner_id=user_id,
                 is_public=collection_data.is_public,
+                status=status,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )
@@ -277,6 +334,7 @@ class CollectionsService:
                 "is_anonymous": False,
                 "is_public": collection.is_public,
                 "share_token": collection.share_token,
+                "status": collection.status,
                 "created_at": collection.created_at.isoformat(),
                 "updated_at": collection.updated_at.isoformat()
             }
@@ -579,9 +637,12 @@ class CollectionsService:
         collection_id: str,
         user_id: str
     ) -> bool:
-        """Delete a collection"""
+        """Delete a collection and clean up orphaned properties"""
         try:
-            query = select(Collection).where(
+            # First, get the collection with its properties
+            query = select(Collection).options(
+                selectinload(Collection.properties)
+            ).where(
                 Collection.id == collection_id,
                 Collection.owner_id == user_id
             )
@@ -592,8 +653,64 @@ class CollectionsService:
             if not collection:
                 return False
 
+            print(f"[DELETE_COLLECTION] Deleting collection {collection_id} with {len(collection.properties)} properties")
+
+            # Get all property IDs in this collection
+            property_ids_in_collection = [prop.id for prop in collection.properties]
+
+            # Find properties that will become orphaned after this collection is deleted
+            orphaned_properties = []
+
+            if property_ids_in_collection:
+                print(f"[DELETE_COLLECTION] Checking {len(property_ids_in_collection)} properties for orphaned status")
+
+                for property_id in property_ids_in_collection:
+                    # Count how many other collections this property belongs to
+                    count_query = text("""
+                        SELECT COUNT(*)
+                        FROM collection_properties
+                        WHERE property_id = :property_id AND collection_id != :collection_id
+                    """)
+
+                    count_result = await db.execute(count_query, {
+                        "property_id": property_id,
+                        "collection_id": collection_id
+                    })
+                    other_collection_count = count_result.scalar()
+
+                    # If this property has no other collection associations, it will be orphaned
+                    if other_collection_count == 0:
+                        orphaned_properties.append(property_id)
+
+                print(f"[DELETE_COLLECTION] Found {len(orphaned_properties)} properties that will become orphaned")
+
+            # Delete the collection (this will cascade delete the collection_properties relationships)
             await db.delete(collection)
+
+            # Clean up orphaned properties and their dependencies
+            if orphaned_properties:
+                print(f"[DELETE_COLLECTION] Cleaning up {len(orphaned_properties)} orphaned properties")
+
+                # Delete PropertyInteractions for orphaned properties
+                interactions_result = await db.execute(
+                    delete(PropertyInteraction).where(PropertyInteraction.property_id.in_(orphaned_properties))
+                )
+                print(f"[DELETE_COLLECTION] Deleted {interactions_result.rowcount} property interactions")
+
+                # Delete PropertyComments for orphaned properties
+                comments_result = await db.execute(
+                    delete(PropertyComment).where(PropertyComment.property_id.in_(orphaned_properties))
+                )
+                print(f"[DELETE_COLLECTION] Deleted {comments_result.rowcount} property comments")
+
+                # Delete the orphaned properties themselves
+                properties_result = await db.execute(
+                    delete(Property).where(Property.id.in_(orphaned_properties))
+                )
+                print(f"[DELETE_COLLECTION] Deleted {properties_result.rowcount} orphaned properties")
+
             await db.commit()
+            print(f"[DELETE_COLLECTION] Successfully deleted collection {collection_id}")
 
             return True
 

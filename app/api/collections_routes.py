@@ -200,6 +200,13 @@ async def create_collection_with_preferences(
         # Generate share token for public access
         share_token = CollectionsService.generate_share_token()
 
+        # Determine if this collection should be active or inactive based on current count
+        should_be_active = await CollectionsService.should_create_as_active(db, current_user.id)
+        status = 'ACTIVE' if should_be_active else 'INACTIVE'
+
+        active_count = await CollectionsService.count_active_collections(db, current_user.id)
+        print(f"[CREATE_COLLECTION_MANUALLY] User {current_user.id} has {active_count} active collections, creating new collection as {status}")
+
         # Create collection directly with auto-generated share token
         collection = Collection(
             owner_id=current_user.id,
@@ -210,6 +217,7 @@ async def create_collection_with_preferences(
             visitor_phone=request.visitor_phone,
             share_token=share_token,
             is_public=True,  # Default to public with share link
+            status=status,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()
         )
@@ -299,7 +307,20 @@ async def update_collection_status(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}"
             )
-        
+
+        # Check active collection limit when trying to activate
+        if request.status == 'ACTIVE':
+            can_activate = await CollectionsService.can_activate_collection(
+                db, current_user.id, collection_id
+            )
+            if not can_activate:
+                active_count = await CollectionsService.count_active_collections(db, current_user.id)
+                max_active = int(os.getenv("MAX_ACTIVE_COLLECTIONS_PER_USER", "10"))
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Cannot activate collection. You have reached the maximum of {max_active} active collections (currently {active_count}). Please deactivate another collection first."
+                )
+
         success = await CollectionsService.update_collection_status(
             db, collection_id, current_user.id, request.status
         )
