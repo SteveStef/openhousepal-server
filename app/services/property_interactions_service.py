@@ -61,25 +61,31 @@ class PropertyInteractionsService:
         comment_data: PropertyCommentCreate
     ) -> PropertyCommentResponse:
         """Add an anonymous comment to a property"""
-        
+
         content = comment_data.content or comment_data.comment
         if not content:
             raise ValueError("Comment content is required")
-        
+
         current_time = datetime.now()
         comment = PropertyComment(
             collection_id=collection_id,
             property_id=property_id,
             content=content,
+            visitor_name=comment_data.visitor_name,
+            visitor_email=comment_data.visitor_email,
             created_at=current_time,
             updated_at=current_time
         )
-        
+
         db.add(comment)
         await db.commit()
         await db.refresh(comment)
-        
-        return PropertyCommentResponse.from_orm(comment)
+
+        # Create response and populate author field from visitor_name
+        response = PropertyCommentResponse.from_orm(comment)
+        response.author = comment.visitor_name or "Anonymous"
+
+        return response
     
     @classmethod
     async def get_property_comments(
@@ -89,7 +95,7 @@ class PropertyInteractionsService:
         property_id: str
     ) -> List[PropertyCommentResponse]:
         """Get all comments for a property in a collection"""
-        
+
         result = await db.execute(
             select(PropertyComment)
             .where(
@@ -101,8 +107,15 @@ class PropertyInteractionsService:
             .order_by(PropertyComment.created_at.desc())
         )
         comments = result.scalars().all()
-        
-        return [PropertyCommentResponse.from_orm(comment) for comment in comments]
+
+        # Convert to response models and populate author field
+        response_comments = []
+        for comment in comments:
+            response = PropertyCommentResponse.from_orm(comment)
+            response.author = comment.visitor_name or "Anonymous"
+            response_comments.append(response)
+
+        return response_comments
     
     @classmethod
     async def get_property_stats(

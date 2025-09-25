@@ -17,7 +17,9 @@ class PropertyInteractionUpdate(BaseModel):
 class PropertyCommentCreate(BaseModel):
     """Schema for creating a new property comment"""
     content: str
-    
+    visitor_name: Optional[str] = None
+    visitor_email: Optional[str] = None
+
     # Alternative format for frontend compatibility
     comment: Optional[str] = None  # Alternative field name
 
@@ -43,6 +45,9 @@ class PropertyCommentResponse(BaseModel):
     collection_id: str
     property_id: str
     content: str
+    visitor_name: Optional[str] = None
+    visitor_email: Optional[str] = None
+    author: Optional[str] = None  # Computed field for frontend compatibility
     created_at: datetime
     updated_at: datetime
 

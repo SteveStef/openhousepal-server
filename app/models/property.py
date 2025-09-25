@@ -121,7 +121,7 @@ class ResoFacts(BaseModel):
     associations: Optional[List[Dict[str, Any]]] = None
     atAGlanceFacts: Optional[List[Any]] = None  # Keep as-is unless you provide AtAGlanceFact model
     attic: Optional[Union[List[str], str]] = None
-    availabilityDate: Optional[Union[List[str], str]] = None
+    availabilityDate: Optional[Union[List[str], str, int]] = None
     basement: Optional[Union[List[str], str]] = None
     basementYN: Optional[bool] = None
     bathrooms: Optional[int] = None

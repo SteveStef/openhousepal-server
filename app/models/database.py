@@ -185,9 +185,13 @@ class PropertyComment(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     collection_id = Column(String, ForeignKey('collections.id', ondelete='CASCADE'), nullable=False)
     property_id = Column(String, ForeignKey('properties.id'), nullable=False)
-    
+
+    # Visitor identification fields
+    visitor_name = Column(String, nullable=True)
+    visitor_email = Column(String, nullable=True)
+
     content = Column(Text, nullable=False)
-    
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
