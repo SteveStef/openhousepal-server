@@ -14,3 +14,8 @@ Next Steps:
 5. Check if the property details actually delete after 48 hours
 6. Make the active tag work based off the visitors last visiting
 7. Paypal payments
+
+
+
+This is the problem: 
+ValueError: the greenlet library is required to use this function. No module named 'greenlet'
