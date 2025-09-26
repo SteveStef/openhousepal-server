@@ -33,6 +33,9 @@ RUN mkdir -p /app/data
 COPY alembic.ini .
 COPY alembic/ ./alembic/
 
+# Run database migrations
+RUN python -m alembic upgrade head
+
 # Expose port
 EXPOSE 8000
 
