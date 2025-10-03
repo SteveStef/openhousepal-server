@@ -6,9 +6,9 @@ from pydantic import BaseModel
 from datetime import datetime
 
 from app.database import get_db
-from app.models.database import OpenHouseEvent, User
+from app.models.database import OpenHouseEvent, User, OpenHouseVisitor
 from app.utils.auth import get_current_active_user
-from app.schemas.open_house import OpenHouseCreateRequest, OpenHouseResponse, OpenHouseFormSubmission, OpenHouseFormResponse
+from app.schemas.open_house import OpenHouseCreateRequest, OpenHouseResponse, OpenHouseFormSubmission, OpenHouseFormResponse, VisitorResponse
 from app.services.open_house_service import OpenHouseService
 import urllib.parse
 import uuid
@@ -189,10 +189,10 @@ async def submit_open_house_form(
     try:
         # Create visitor record and handle collection creation
         visitor = await OpenHouseService.create_visitor(db, form_data)
-        
-        # If user is interested in similar properties, create a collection and fetch properties immediately
+
+        # If user is interested in similar properties and doesn't already have an agent, create a collection
         collection_result = {"success": False, "properties_added": 0}
-        if form_data.interested_in_similar and form_data.open_house_event_id:
+        if form_data.interested_in_similar and form_data.open_house_event_id and form_data.has_agent.value != "YES":
             collection_result = await OpenHouseService.create_collection_for_visitor(
                 db, visitor, form_data
             )
@@ -234,18 +234,18 @@ async def get_property_by_qr(
     """
     try:
         property_data = await OpenHouseService.get_property_by_qr_code(db, open_house_event_id)
-        
+
         if not property_data:
             raise HTTPException(
                 status_code=404,
                 detail="Property not found for this open house event ID"
             )
-            
+
         return {
             "success": True,
             "property": property_data
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -254,3 +254,52 @@ async def get_property_by_qr(
             status_code=500,
             detail="Failed to fetch property information"
         )
+
+@router.get("/api/open-houses/{open_house_id}/visitors", response_model=List[VisitorResponse])
+async def get_open_house_visitors(
+    open_house_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Get all visitors for a specific open house (must be owned by current agent)"""
+    try:
+        # First verify the open house exists and belongs to the current user
+        stmt = select(OpenHouseEvent).where(
+            and_(
+                OpenHouseEvent.id == open_house_id,
+                OpenHouseEvent.agent_id == current_user.id
+            )
+        )
+        result = await db.execute(stmt)
+        open_house = result.scalar_one_or_none()
+
+        if not open_house:
+            raise HTTPException(status_code=404, detail="Open house not found")
+
+        # Get all visitors for this open house
+        visitor_stmt = select(OpenHouseVisitor).where(
+            OpenHouseVisitor.open_house_event_id == open_house_id
+        ).order_by(OpenHouseVisitor.created_at.desc())
+
+        visitor_result = await db.execute(visitor_stmt)
+        visitors = visitor_result.scalars().all()
+
+        return [
+            VisitorResponse(
+                id=visitor.id,
+                full_name=visitor.full_name,
+                email=visitor.email,
+                phone=visitor.phone,
+                timeframe=visitor.timeframe,
+                has_agent=visitor.has_agent,
+                interested_in_similar=visitor.interested_in_similar,
+                created_at=visitor.created_at
+            )
+            for visitor in visitors
+        ]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching visitors: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch visitors")

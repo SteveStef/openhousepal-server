@@ -291,12 +291,16 @@ class CollectionsService:
             active_count = await CollectionsService.count_active_collections(db, user_id)
             print(f"[CREATE_COLLECTION] User {user_id} has {active_count} active collections, creating new collection as {status}")
 
+            # Generate share token for public access
+            share_token = CollectionsService.generate_share_token()
+
             collection = Collection(
                 id=str(uuid.uuid4()),
                 name=collection_data.name,
                 description=collection_data.description,
                 owner_id=user_id,
-                is_public=collection_data.is_public,
+                is_public=collection_data.is_public if collection_data.is_public is not None else True,
+                share_token=share_token,
                 status=status,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()

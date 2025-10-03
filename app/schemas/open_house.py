@@ -3,14 +3,6 @@ from typing import Optional
 from enum import Enum
 from datetime import datetime
 
-class VisitingReason(str, Enum):
-    BUYING_SOON = "BUYING_SOON"
-    BROWSING = "BROWSING" 
-    NEIGHBORHOOD = "NEIGHBORHOOD"
-    INVESTMENT = "INVESTMENT"
-    CURIOUS = "CURIOUS"
-    OTHER = "OTHER"
-
 class Timeframe(str, Enum):
     IMMEDIATELY = "IMMEDIATELY"
     ONE_TO_THREE_MONTHS = "1_3_MONTHS"
@@ -29,16 +21,15 @@ class OpenHouseFormSubmission(BaseModel):
     full_name: str
     email: EmailStr
     phone: str
-    
+
     # Visit context
-    visiting_reason: VisitingReason
     timeframe: Timeframe
     has_agent: HasAgent
-    
+
     # Open house and agent context
     open_house_event_id: str
     agent_id: Optional[str] = None
-    
+
     # Collection preference
     interested_in_similar: bool = False
 
@@ -68,4 +59,14 @@ class OpenHouseResponse(BaseModel):
     bathrooms: Optional[float] = None
     living_area: Optional[int] = None
     price: Optional[int] = None
+    created_at: datetime
+
+class VisitorResponse(BaseModel):
+    id: str
+    full_name: str
+    email: str
+    phone: str
+    timeframe: str
+    has_agent: str
+    interested_in_similar: bool
     created_at: datetime

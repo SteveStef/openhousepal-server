@@ -55,6 +55,7 @@ class Collection(Base):
     preferences = relationship("CollectionPreferences", back_populates="collection", uselist=False, cascade="all, delete-orphan")
     property_interactions = relationship("PropertyInteraction", back_populates="collection", cascade="all, delete-orphan")
     property_comments = relationship("PropertyComment", back_populates="collection", cascade="all, delete-orphan")
+    property_tours = relationship("PropertyTour", back_populates="collection", cascade="all, delete-orphan")
 
 class Property(Base):
     __tablename__ = "properties"
@@ -135,26 +136,25 @@ class OpenHouseEvent(Base):
 
 class OpenHouseVisitor(Base):
     __tablename__ = "open_house_visitors"
-    
+
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    
+
     full_name = Column(String, nullable=False)
     email = Column(String, nullable=False)
     phone = Column(String, nullable=False)
-    
+
     # Visit Information
-    visiting_reason = Column(String, nullable=False)
     timeframe = Column(String, nullable=False)
     has_agent = Column(String, nullable=False)  # YES, NO, LOOKING
-    
+
     # Open House Context
     open_house_event_id = Column(String, ForeignKey('open_house_events.id'), nullable=True)
     qr_code = Column(String, nullable=False)
     form_url = Column(String, nullable=True)  # Store the form link
-    
+
     interested_in_similar = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    
+
     # Relationships
     open_house_event = relationship("OpenHouseEvent")
 
@@ -197,6 +197,38 @@ class PropertyComment(Base):
 
     # Relationships
     collection = relationship("Collection", back_populates="property_comments")
+    property = relationship("Property")
+
+
+class PropertyTour(Base):
+    __tablename__ = "property_tours"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    collection_id = Column(String, ForeignKey('collections.id', ondelete='CASCADE'), nullable=False)
+    property_id = Column(String, ForeignKey('properties.id'), nullable=False)
+
+    # Visitor contact information
+    visitor_name = Column(String, nullable=False)
+    visitor_email = Column(String, nullable=False)
+    visitor_phone = Column(String, nullable=False)
+
+    # Tour scheduling details
+    preferred_date = Column(String, nullable=False)
+    preferred_time = Column(String, nullable=False)
+    preferred_date_2 = Column(String, nullable=True)
+    preferred_time_2 = Column(String, nullable=True)
+    preferred_date_3 = Column(String, nullable=True)
+    preferred_time_3 = Column(String, nullable=True)
+    message = Column(Text, nullable=True)
+
+    # Tour status
+    status = Column(String, default="PENDING")  # PENDING, CONFIRMED, COMPLETED, CANCELLED
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    # Relationships
+    collection = relationship("Collection", back_populates="property_tours")
     property = relationship("Property")
 
 

@@ -14,12 +14,11 @@ class OpenHouseService:
     @staticmethod
     async def create_visitor(db: AsyncSession, form_data: OpenHouseFormSubmission) -> OpenHouseVisitor:
         """Create a visitor record from open house form submission"""
-        
+
         visitor = OpenHouseVisitor(
             full_name=form_data.full_name,
             email=form_data.email,
             phone=form_data.phone,
-            visiting_reason=form_data.visiting_reason.value,
             timeframe=form_data.timeframe.value,
             has_agent=form_data.has_agent.value,
             open_house_event_id=form_data.open_house_event_id,
@@ -27,7 +26,7 @@ class OpenHouseService:
             interested_in_similar=form_data.interested_in_similar,
             created_at=datetime.utcnow()
         )
-        
+
         db.add(visitor)
         await db.commit()
         await db.refresh(visitor)

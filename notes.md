@@ -10,12 +10,11 @@ Here is the flow:
 8. After finished with collection, agent deactives it
 
 Next Steps:
-4. After updating preferences, make a zillow request to refresh the properties with the new preferences (test)
-5. Check if the property details actually delete after 48 hours
-6. Make the active tag work based off the visitors last visiting
-7. Paypal payments
-
-
-
-This is the problem: 
-ValueError: the greenlet library is required to use this function. No module named 'greenlet'
+- Make the database persist on docker rebuild on the VPS and add backups to this
+- After updating preferences, make a zillow request to refresh the properties with the new preferences (test)
+- Make the active tag work based off the visitors last visiting
+- Paypal payments
+- Send emails
+- Add retry logic to the zillow service
+- Fix the dates on the comments
+- Fix the preferences modal diameter not being able to be blank (also not intuitive for switching the type of search)

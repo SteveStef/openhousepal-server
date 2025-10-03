@@ -17,11 +17,17 @@ from app.schemas.property_interactions import (
     PropertyInteractionStats,
     PropertyInteractionSummary
 )
+from app.schemas.property_tour import (
+    PropertyTourCreate,
+    PropertyTourResponse,
+    PropertyTourStatusUpdate
+)
 from app.services.collections_service import CollectionsService
 from app.services.property_interactions_service import PropertyInteractionsService
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.property_sync_service import PropertySyncService
 from app.services.zillow_service import ZillowService
+from app.services.property_tour_service import PropertyTourService
 from app.utils.auth import get_current_active_user, get_current_user_optional
 from app.models.database import User, Collection
 from sqlalchemy import select
@@ -639,4 +645,109 @@ async def refresh_collection_properties(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to refresh collection properties"
+        )
+
+
+@router.post("/{collection_id}/properties/{property_id}/schedule-tour", response_model=PropertyTourResponse)
+async def schedule_property_tour(
+    collection_id: str,
+    property_id: str,
+    tour_data: PropertyTourCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Schedule a tour for a property in a collection (public endpoint for visitors)
+    """
+    try:
+        tour = await PropertyTourService.create_tour_request(
+            db, collection_id, property_id, tour_data
+        )
+        return tour
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        print(f"Error scheduling property tour: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to schedule property tour"
+        )
+
+
+@router.get("/{collection_id}/tours", response_model=List[PropertyTourResponse])
+async def get_collection_tours(
+    collection_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Get all tour requests for a collection (agent only)
+    """
+    try:
+        # Verify user owns the collection
+        collection = await db.execute(
+            select(Collection).where(
+                Collection.id == collection_id,
+                Collection.owner_id == current_user.id
+            )
+        )
+        collection_obj = collection.scalar_one_or_none()
+
+        if not collection_obj:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Collection not found or access denied"
+            )
+
+        tours = await PropertyTourService.get_collection_tours(db, collection_id)
+        return tours
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching collection tours: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch collection tours"
+        )
+
+
+@router.patch("/tours/{tour_id}/status", response_model=PropertyTourResponse)
+async def update_tour_status(
+    tour_id: str,
+    status_update: PropertyTourStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Update the status of a tour request (agent only)
+    """
+    try:
+        tour = await PropertyTourService.update_tour_status(
+            db, tour_id, status_update, current_user.id
+        )
+
+        if not tour:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Tour request not found"
+            )
+
+        return tour
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating tour status: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update tour status"
         )
