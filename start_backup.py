@@ -1,5 +1,5 @@
 import boto3
-import subprocess
+import sqlite3
 import os
 from datetime import datetime
 import sys
@@ -15,11 +15,12 @@ def backup_to_s3():
         date = datetime.now().strftime("%Y%m%d-%H%M%S")
         backup_file = f"/tmp/collections-{date}.db"
 
-        subprocess.run(
-            f'sqlite3 {DB_PATH} ".backup \'{backup_file}\'"',
-            shell=True,
-            check=True
-        )
+        # Create backup using Python's sqlite3 module
+        source = sqlite3.connect(DB_PATH)
+        dest = sqlite3.connect(backup_file)
+        source.backup(dest)
+        dest.close()
+        source.close()
 
         s3 = boto3.client('s3')
         s3.upload_file(
