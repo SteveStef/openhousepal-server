@@ -10,6 +10,7 @@ from app.models.database import OpenHouseEvent, User, OpenHouseVisitor
 from app.utils.auth import get_current_active_user
 from app.schemas.open_house import OpenHouseCreateRequest, OpenHouseResponse, OpenHouseFormSubmission, OpenHouseFormResponse, VisitorResponse
 from app.services.open_house_service import OpenHouseService
+from app.utils.emails import send_visitor_confirmation_email
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta
@@ -203,7 +204,30 @@ async def submit_open_house_form(
             message = f"Thank you for visiting! We've found {collection_result['properties_added']} similar properties for you. We'll be in touch soon with your personalized collection."
         elif collection_result["success"]:
             message = "Thank you for visiting! We've created a personalized collection for you and will be in touch soon with matching properties."
-        
+
+        # Send confirmation email to visitor
+        try:
+            # Get property details for the email
+            property_data = await OpenHouseService.get_property_by_qr_code(db, form_data.open_house_event_id)
+
+            if property_data:
+                property_address = property_data.get('address', 'the property')
+                share_token = collection_result.get('share_token') if collection_result["success"] else None
+                properties_added = collection_result.get('properties_added', 0) if collection_result["success"] else 0
+
+                status_code, response = send_visitor_confirmation_email(
+                    visitor_name=visitor.full_name,
+                    visitor_email=visitor.email,
+                    property_address=property_address,
+                    share_token=share_token,
+                    properties_added=properties_added
+                )
+
+                print(f"Confirmation email sent to {visitor.email}: Status {status_code}")
+        except Exception as e:
+            # Log error but don't fail the form submission
+            print(f"Error sending confirmation email: {e}")
+
         return OpenHouseFormResponse(
             success=True,
             message=message,

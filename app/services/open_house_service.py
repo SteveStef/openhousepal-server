@@ -6,6 +6,7 @@ from typing import Optional, Dict, Any
 from app.models.database import Property, OpenHouseVisitor, Collection, collection_properties, OpenHouseEvent
 from app.schemas.open_house import OpenHouseFormSubmission
 from app.services.collection_preferences_service import CollectionPreferencesService
+from app.services.collections_service import CollectionsService
 from app.services.zillow_service import ZillowService
 from app.schemas.collection_preferences import CollectionPreferences as CollectionPreferencesSchema
 
@@ -60,6 +61,7 @@ class OpenHouseService:
                 visitor_name=visitor.full_name,
                 visitor_phone=visitor.phone,
                 original_open_house_event_id=form_data.open_house_event_id,
+                share_token=CollectionsService.generate_share_token(),
                 created_at=datetime.utcnow()
             )
             
@@ -80,15 +82,15 @@ class OpenHouseService:
                     )
                     
                     print(f"Successfully populated collection {collection.id} with {properties_added} properties")
-                    return {"success": True, "properties_added": properties_added, "collection_id": collection.id}
+                    return {"success": True, "properties_added": properties_added, "collection_id": collection.id, "share_token": collection.share_token}
                 else:
                     print(f"Warning: Failed to auto-generate preferences for collection {collection.id}")
-                    return {"success": True, "properties_added": 0, "collection_id": collection.id}
-                    
+                    return {"success": True, "properties_added": 0, "collection_id": collection.id, "share_token": collection.share_token}
+
             except Exception as e:
                 print(f"Warning: Failed to auto-generate preferences for collection {collection.id}: {e}")
                 # Collection creation should still succeed even if preferences fail
-                return {"success": True, "properties_added": 0, "collection_id": collection.id}
+                return {"success": True, "properties_added": 0, "collection_id": collection.id, "share_token": collection.share_token}
             
         except Exception as e:
             print(f"Error creating collection for visitor: {e}")
@@ -257,7 +259,8 @@ class OpenHouseService:
                 "latitude": open_house_record.latitude,
                 "longitude": open_house_record.longitude,
                 "yearBuilt": None,  # Column dropped from database
-                "homeStatus": open_house_record.home_status
+                "homeStatus": open_house_record.home_status,
+                "imageSrc": open_house_record.cover_image_url
             }
             
         except Exception as e:
@@ -294,7 +297,7 @@ class OpenHouseService:
                 "longitude": open_house_record.longitude,
                 "yearBuilt": None,  # Column dropped from database
                 "homeStatus": open_house_record.home_status,
-                "imageSrc": None  # Column dropped from database
+                "imageSrc": open_house_record.cover_image_url
             }
             
         except Exception as e:

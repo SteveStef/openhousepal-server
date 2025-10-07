@@ -8,7 +8,7 @@ import secrets
 import string
 import os
 
-from app.models.database import Collection, Property, User, PropertyInteraction, PropertyComment
+from app.models.database import Collection, Property, User, PropertyInteraction, PropertyComment, PropertyTour
 from app.schemas.collection import CollectionCreate
 
 from app.services.property_sync_service import PropertySyncService
@@ -508,6 +508,7 @@ class CollectionsService:
             # Initialize lookup dictionaries
             interactions_lookup = {}
             comments_lookup = {}
+            tours_lookup = {}
 
             # Only query if we have properties
             if property_ids:
@@ -549,6 +550,21 @@ class CollectionsService:
                     }
                     comments_lookup[comment.property_id].append(comment_dict)
 
+                # Fetch all tours for this collection in a single query
+                tours_query = select(PropertyTour).where(
+                    and_(
+                        PropertyTour.collection_id == collection.id,
+                        PropertyTour.property_id.in_(property_ids)
+                    )
+                )
+
+                tours_result = await db.execute(tours_query)
+                tours = tours_result.scalars().all()
+
+                # Create lookup dictionary for tours by property_id (just track existence)
+                for tour in tours:
+                    tours_lookup[tour.property_id] = True
+
             # Transform to response format similar to get_user_collections
             properties_data = []
             for prop in collection.properties:
@@ -573,7 +589,9 @@ class CollectionsService:
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
                     'favorited': interactions_lookup[prop.id].favorited if prop.id in interactions_lookup else False,
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
-                    'comments': comments_lookup.get(prop.id, [])
+                    'comments': comments_lookup.get(prop.id, []),
+                    # Tour status
+                    'hasTourScheduled': tours_lookup.get(prop.id, False)
                 }
                 properties_data.append(property_dict)
 
@@ -783,6 +801,25 @@ class CollectionsService:
                     'createdAt': comment.created_at.isoformat()
                 })
 
+            # Fetch tour counts for each property in this collection
+            tours_query = select(
+                PropertyTour.property_id,
+                func.count(PropertyTour.id).label('tour_count')
+            ).where(
+                and_(
+                    PropertyTour.collection_id == collectionId,
+                    PropertyTour.property_id.in_(property_ids)
+                )
+            ).group_by(PropertyTour.property_id)
+
+            tours_result = await db.execute(tours_query)
+            tours_data = tours_result.all()
+
+            # Create lookup dictionary for tour counts by property_id
+            tours_lookup = {}
+            for tour_row in tours_data:
+                tours_lookup[tour_row.property_id] = tour_row.tour_count
+
             properties_data = []
             for prop in collection.properties:
                 property_dict = {
@@ -806,7 +843,8 @@ class CollectionsService:
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
                     'favorited': interactions_lookup[prop.id].favorited if prop.id in interactions_lookup else False,
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
-                    'comments': comments_lookup.get(prop.id, [])
+                    'comments': comments_lookup.get(prop.id, []),
+                    'tourCount': tours_lookup.get(prop.id, 0)
                 }
                 properties_data.append(property_dict)
 

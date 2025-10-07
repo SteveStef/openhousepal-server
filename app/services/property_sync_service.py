@@ -1,13 +1,15 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from typing import List, Dict, Any
 import logging
 import asyncio
 from datetime import datetime
 
-from app.models.database import Collection, CollectionPreferences, Property, collection_properties
+from app.models.database import Collection, CollectionPreferences, Property, collection_properties, User
 from app.services.zillow_service import ZillowService
 from app.services.collection_preferences_service import CollectionPreferencesService
+from app.utils.emails import send_agent_new_properties_notification
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -20,10 +22,12 @@ class PropertySyncService:
     async def get_active_collections_with_preferences(self, db: AsyncSession) -> List[tuple]:
         """
         Get all active collections that have preferences set
+        Eagerly loads the owner relationship for email notifications
         """
         result = await db.execute(
             select(Collection, CollectionPreferences)
             .join(CollectionPreferences)
+            .options(selectinload(Collection.owner))
             .where(Collection.status == 'ACTIVE')
         )
         return result.fetchall()
@@ -145,45 +149,57 @@ class PropertySyncService:
             logger.info(f"Added property {property_id} to collection {collection_id}")
     
     async def sync_collection_properties(
-        self, 
-        db: AsyncSession, 
-        collection: Collection, 
+        self,
+        db: AsyncSession,
+        collection: Collection,
         preferences: CollectionPreferences
-    ) -> int:
+    ) -> Dict[str, Any]:
         """
         Sync properties for a single collection based on its preferences
-        Returns the number of new properties added
+        Returns dict with new_properties_count, collection, and total_properties
         """
         logger.info(f"Syncing properties for collection {collection.id}")
-        
+
         try:
             # Get matching properties from Zillow
             matching_properties = await self.zillow_service.get_matching_properties(preferences)
-            
+
             new_properties_count = 0
-            
+
             for property_data in matching_properties:
                 zpid = property_data.get('zpid')
                 if not zpid:
                     continue
-                
+
                 # Check if property already exists in this collection
                 if await self.property_exists_in_collection(db, collection.id, zpid):
                     continue
-                
+
                 # Create or update property
                 property_obj = await self.create_property_from_zillow_data(db, property_data)
-                
+
                 # Add property to collection
                 await self.add_property_to_collection(db, collection.id, property_obj.id)
                 new_properties_count += 1
-            
+
+            # Refresh collection to get updated property count
+            await db.refresh(collection)
+            total_properties = len(collection.properties)
+
             logger.info(f"Added {new_properties_count} new properties to collection {collection.id}")
-            return new_properties_count
-            
+            return {
+                'new_properties_count': new_properties_count,
+                'collection': collection,
+                'total_properties': total_properties
+            }
+
         except Exception as e:
             logger.error(f"Error syncing collection {collection.id}: {str(e)}")
-            return 0
+            return {
+                'new_properties_count': 0,
+                'collection': collection,
+                'total_properties': 0
+            }
     
     async def sync_all_active_collections(self) -> Dict[str, Any]:
         """
@@ -211,13 +227,39 @@ class PropertySyncService:
                     
                     for collection, preferences in collections_with_preferences:
                         try:
-                            new_props = await self.sync_collection_properties(db, collection, preferences)
+                            sync_result = await self.sync_collection_properties(db, collection, preferences)
                             sync_results['collections_processed'] += 1
-                            sync_results['total_new_properties'] += new_props
-                            
+                            sync_results['total_new_properties'] += sync_result['new_properties_count']
+
+                            # Send email notification to agent if new properties were added
+                            if sync_result['new_properties_count'] > 0 and collection.owner and collection.owner.email:
+                                try:
+                                    agent_name = collection.owner.full_name or collection.owner.email
+                                    visitor_name = collection.visitor_name or "Anonymous Visitor"
+                                    visitor_email = collection.visitor_email or "Not provided"
+
+                                    status_code, response = send_agent_new_properties_notification(
+                                        agent_name=agent_name,
+                                        agent_email=collection.owner.email,
+                                        collection_name=collection.name,
+                                        visitor_name=visitor_name,
+                                        visitor_email=visitor_email,
+                                        new_properties_count=sync_result['new_properties_count'],
+                                        total_properties=sync_result['total_properties'],
+                                        collection_id=collection.id,
+                                        share_token=collection.share_token
+                                    )
+
+                                    logger.info(
+                                        f"Email notification sent to agent {collection.owner.email} "
+                                        f"for collection {collection.id}: Status {status_code}"
+                                    )
+                                except Exception as email_error:
+                                    logger.error(f"Failed to send email notification for collection {collection.id}: {email_error}")
+
                             # Add small delay between collection syncs to be respectful to API
                             await asyncio.sleep(2)
-                            
+
                         except Exception as e:
                             error_msg = f"Failed to sync collection {collection.id}: {str(e)}"
                             logger.error(error_msg)
@@ -275,14 +317,14 @@ class PropertySyncService:
                     return {'success': False, 'error': 'No preferences found for collection'}
                 
                 # Sync properties
-                new_properties_count = await self.sync_collection_properties(
+                sync_result = await self.sync_collection_properties(
                     db, collection, preferences
                 )
-                
+
                 return {
                     'success': True,
                     'collection_id': collection_id,
-                    'new_properties_added': new_properties_count,
+                    'new_properties_added': sync_result['new_properties_count'],
                     'synced_at': datetime.now()
                 }
                 
@@ -316,16 +358,16 @@ class PropertySyncService:
                 return {'success': True, 'new_properties_added': 0, 'message': 'No preferences to populate from'}
             
             # Sync properties using existing logic
-            new_properties_count = await self.sync_collection_properties(
+            sync_result = await self.sync_collection_properties(
                 db, collection, preferences
             )
-            
-            logger.info(f"Successfully populated new collection {collection_id} with {new_properties_count} properties")
-            
+
+            logger.info(f"Successfully populated new collection {collection_id} with {sync_result['new_properties_count']} properties")
+
             return {
                 'success': True,
                 'collection_id': collection_id,
-                'new_properties_added': new_properties_count,
+                'new_properties_added': sync_result['new_properties_count'],
                 'populated_at': datetime.now()
             }
 

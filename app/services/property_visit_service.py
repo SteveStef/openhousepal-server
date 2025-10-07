@@ -6,6 +6,7 @@ from typing import Optional
 from app.models.database import Property, Collection
 from app.schemas.property_visit import PropertyVisitFormSubmission
 from app.services.collection_preferences_service import CollectionPreferencesService
+from app.services.collections_service import CollectionsService
 
 
 class PropertyVisitService:
@@ -42,6 +43,7 @@ class PropertyVisitService:
                 visitor_name=form_data.full_name,
                 visitor_phone=form_data.phone,
                 original_open_house_event_id=form_data.property_id,
+                share_token=CollectionsService.generate_share_token(),
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )

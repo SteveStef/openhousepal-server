@@ -105,7 +105,6 @@ class CollectionPreferencesService:
         if form_data:
             preferences_data_dict.update({
                 "timeframe": form_data.timeframe if isinstance(form_data.timeframe, str) else form_data.timeframe.value,
-                "visiting_reason": form_data.visiting_reason if isinstance(form_data.visiting_reason, str) else form_data.visiting_reason.value,
                 "has_agent": form_data.has_agent if isinstance(form_data.has_agent, str) else form_data.has_agent.value
             })
         

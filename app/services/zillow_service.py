@@ -94,7 +94,20 @@ class ZillowService:
                 elif response.status_code == 429:
                     raise ValueError("Zillow API rate limit exceeded")
                 else:
-                    logger.error(f"Zillow API error: {response.status_code} - {response.text}")
+                    # Enhanced error logging with full details
+                    logger.error(f"Zillow API error: {response.status_code}")
+                    logger.error(f"Response text: {response.text}")
+                    logger.error(f"Request URL: {url}")
+                    logger.error(f"Request params: {params}")
+                    logger.error(f"Response headers: {dict(response.headers)}")
+
+                    # Try to parse JSON error response
+                    try:
+                        error_json = response.json()
+                        logger.error(f"Response JSON: {error_json}")
+                    except:
+                        pass
+
                     raise ValueError(f"Zillow API error: {response.status_code}")
                     
         except httpx.TimeoutException:
@@ -172,7 +185,20 @@ class ZillowService:
                 elif response.status_code == 429:
                     raise ValueError("Zillow API rate limit exceeded")
                 else:
-                    logger.error(f"Zillow API error for location {location}: {response.status_code} - {response.text}")
+                    # Enhanced error logging with full details
+                    logger.error(f"Zillow API error for location {location}: {response.status_code}")
+                    logger.error(f"Response text: {response.text}")
+                    logger.error(f"Request URL: {url}")
+                    logger.error(f"Request params: {params}")
+                    logger.error(f"Response headers: {dict(response.headers)}")
+
+                    # Try to parse JSON error response
+                    try:
+                        error_json = response.json()
+                        logger.error(f"Response JSON: {error_json}")
+                    except:
+                        pass
+
                     raise ValueError(f"Zillow API error: {response.status_code}")
                     
         except httpx.TimeoutException:
@@ -378,6 +404,20 @@ class ZillowService:
                 elif response.status_code == 429:
                     raise HTTPException(status_code=429, detail="Rate limit exceeded")
                 else:
+                    # Enhanced error logging with full details
+                    logger.error(f"Zillow API error for address {address}: {response.status_code}")
+                    logger.error(f"Response text: {response.text}")
+                    logger.error(f"Request URL: {url}")
+                    logger.error(f"Request params: {params}")
+                    logger.error(f"Response headers: {dict(response.headers)}")
+
+                    # Try to parse JSON error response
+                    try:
+                        error_json = response.json()
+                        logger.error(f"Response JSON: {error_json}")
+                    except:
+                        pass
+
                     raise HTTPException(status_code=response.status_code, detail=f"External API error: {response.text}")
                     
         except httpx.TimeoutException:

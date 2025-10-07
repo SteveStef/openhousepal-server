@@ -50,6 +50,20 @@ class PropertyTourService:
         if not property_obj:
             raise ValueError("Property not found")
 
+        # Check if a tour already exists for this collection + property
+        existing_tour_result = await db.execute(
+            select(PropertyTour).where(
+                and_(
+                    PropertyTour.collection_id == collection_id,
+                    PropertyTour.property_id == property_id
+                )
+            )
+        )
+        existing_tour = existing_tour_result.scalar_one_or_none()
+
+        if existing_tour:
+            raise ValueError("A tour has already been requested for this property")
+
         # Create tour request using visitor info from collection
         current_time = datetime.now()
         tour = PropertyTour(

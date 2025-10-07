@@ -25,31 +25,51 @@ class PropertyInteractionsService:
         property_id: str,
         interaction_data: PropertyInteractionUpdate
     ) -> PropertyInteractionResponse:
-        """Create a new anonymous property interaction"""
-        
-        # Create new interaction - no user tracking, so multiple interactions allowed
-        current_time = datetime.now()
-        interaction = PropertyInteraction(
-            collection_id=collection_id,
-            property_id=property_id,
-            liked=interaction_data.liked or False,
-            disliked=interaction_data.disliked or False,
-            favorited=interaction_data.favorited or False,
-            created_at=current_time,
-            updated_at=current_time
+        """Create or update a property interaction"""
+
+        # Try to find existing interaction for this collection and property
+        result = await db.execute(
+            select(PropertyInteraction)
+            .where(
+                and_(
+                    PropertyInteraction.collection_id == collection_id,
+                    PropertyInteraction.property_id == property_id
+                )
+            )
         )
-        
-        # Apply mutual exclusivity rules
+        interaction = result.scalar_one_or_none()
+
+        current_time = datetime.now()
+
+        if interaction:
+            # Update existing interaction
+            interaction.liked = interaction_data.liked if interaction_data.liked is not None else interaction.liked
+            interaction.disliked = interaction_data.disliked if interaction_data.disliked is not None else interaction.disliked
+            interaction.favorited = interaction_data.favorited if interaction_data.favorited is not None else interaction.favorited
+            interaction.updated_at = current_time
+        else:
+            # Create new interaction
+            interaction = PropertyInteraction(
+                collection_id=collection_id,
+                property_id=property_id,
+                liked=interaction_data.liked or False,
+                disliked=interaction_data.disliked or False,
+                favorited=interaction_data.favorited or False,
+                created_at=current_time,
+                updated_at=current_time
+            )
+            db.add(interaction)
+
+        # Apply mutual exclusivity rules (liked and disliked can't both be true)
         if interaction.liked and interaction.disliked:
             if interaction_data.liked:
                 interaction.disliked = False
             else:
                 interaction.liked = False
-        
-        db.add(interaction)
+
         await db.commit()
         await db.refresh(interaction)
-        
+
         return PropertyInteractionResponse.from_orm(interaction)
     
     @classmethod
