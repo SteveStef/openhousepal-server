@@ -9,7 +9,8 @@ from datetime import datetime
 from app.models.database import Collection, CollectionPreferences, Property, collection_properties, User
 from app.services.zillow_service import ZillowService
 from app.services.collection_preferences_service import CollectionPreferencesService
-from app.utils.emails import send_agent_new_properties_notification
+from app.utils.emails import send_visitor_new_properties_notification
+from sqlalchemy import func
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -182,9 +183,13 @@ class PropertySyncService:
                 await self.add_property_to_collection(db, collection.id, property_obj.id)
                 new_properties_count += 1
 
-            # Refresh collection to get updated property count
-            await db.refresh(collection)
-            total_properties = len(collection.properties)
+            # Get total property count without lazy loading
+            count_result = await db.execute(
+                select(func.count()).select_from(collection_properties).where(
+                    collection_properties.c.collection_id == collection.id
+                )
+            )
+            total_properties = count_result.scalar()
 
             logger.info(f"Added {new_properties_count} new properties to collection {collection.id}")
             return {
@@ -227,35 +232,35 @@ class PropertySyncService:
                     
                     for collection, preferences in collections_with_preferences:
                         try:
+                            # Capture attributes before any async operations that might detach the object
+                            collection_id = collection.id
+                            visitor_email = collection.visitor_email
+                            visitor_name = collection.visitor_name or "Valued Visitor"
+                            share_token = collection.share_token
+                            collection_name = collection.name
+
                             sync_result = await self.sync_collection_properties(db, collection, preferences)
                             sync_results['collections_processed'] += 1
                             sync_results['total_new_properties'] += sync_result['new_properties_count']
 
-                            # Send email notification to agent if new properties were added
-                            if sync_result['new_properties_count'] > 0 and collection.owner and collection.owner.email:
+                            # Send email notification to visitor if new properties were added
+                            if sync_result['new_properties_count'] > 0 and visitor_email and share_token:
                                 try:
-                                    agent_name = collection.owner.full_name or collection.owner.email
-                                    visitor_name = collection.visitor_name or "Anonymous Visitor"
-                                    visitor_email = collection.visitor_email or "Not provided"
-
-                                    status_code, response = send_agent_new_properties_notification(
-                                        agent_name=agent_name,
-                                        agent_email=collection.owner.email,
-                                        collection_name=collection.name,
+                                    status_code, response = send_visitor_new_properties_notification(
                                         visitor_name=visitor_name,
                                         visitor_email=visitor_email,
+                                        collection_name=collection_name,
                                         new_properties_count=sync_result['new_properties_count'],
                                         total_properties=sync_result['total_properties'],
-                                        collection_id=collection.id,
-                                        share_token=collection.share_token
+                                        share_token=share_token
                                     )
 
                                     logger.info(
-                                        f"Email notification sent to agent {collection.owner.email} "
-                                        f"for collection {collection.id}: Status {status_code}"
+                                        f"Email notification sent to visitor {visitor_email} "
+                                        f"for collection {collection_id}: Status {status_code}"
                                     )
                                 except Exception as email_error:
-                                    logger.error(f"Failed to send email notification for collection {collection.id}: {email_error}")
+                                    logger.error(f"Failed to send email notification for collection {collection_id}: {email_error}")
 
                             # Add small delay between collection syncs to be respectful to API
                             await asyncio.sleep(2)

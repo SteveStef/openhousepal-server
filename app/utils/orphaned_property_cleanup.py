@@ -1,9 +1,15 @@
 import os
+import sys
 import asyncio
 from datetime import datetime
 from typing import Dict, Any, List
+from pathlib import Path
 from sqlalchemy import select, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+# Add server directory to Python path so script can be run from anywhere
+server_dir = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(server_dir))
 
 from app.database import AsyncSessionLocal
 from app.models.database import Property, PropertyInteraction, PropertyComment, collection_properties

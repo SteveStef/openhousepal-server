@@ -1,7 +1,13 @@
 import asyncio
 import os
+import sys
 from datetime import datetime
 from typing import Dict, Any
+from pathlib import Path
+
+# Add server directory to Python path so script can be run from anywhere
+server_dir = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(server_dir))
 
 from app.database import AsyncSessionLocal
 from app.services.property_sync_service import PropertySyncService
@@ -51,14 +57,14 @@ async def sync_all_collections_with_rate_limit() -> Dict[str, Any]:
                     print(f"[PROPERTY_SYNC] Processing collection {i}/{len(collections_with_preferences)}: {collection.name}")
 
                     # Use your existing sync_collection_properties method
-                    new_properties = await property_sync_service.sync_collection_properties(
+                    sync_result = await property_sync_service.sync_collection_properties(
                         db, collection, preferences
                     )
 
-                    sync_results['total_new_properties'] += new_properties
+                    sync_results['total_new_properties'] += sync_result['new_properties_count']
                     sync_results['collections_processed'] += 1
 
-                    print(f"[PROPERTY_SYNC] Added {new_properties} new properties to collection '{collection.name}'")
+                    print(f"[PROPERTY_SYNC] Added {sync_result['new_properties_count']} new properties to collection '{collection.name}'")
 
                     # Rate limiting: wait between collections to respect API limits
                     if i < len(collections_with_preferences):  # Don't wait after the last collection
@@ -128,9 +134,19 @@ async def list_all_collections():
         for i, (collection, preferences) in enumerate(collections, 1):
             print(f"{i:2d}. {collection.name:<35} | Status: {collection.status}")
             if preferences:
-                location = f"{preferences.city}, {preferences.state}" if preferences.city and preferences.state else "No location set"
+                # Display location info
+                location = preferences.address if preferences.address else "No location set"
                 print(f"     └─ Location: {location}")
-                print(f"     └─ Price range: ${preferences.min_price:,} - ${preferences.max_price:,}")
+
+                # Display cities if available (cities is a JSON array)
+                if preferences.cities:
+                    cities_str = ', '.join(preferences.cities) if isinstance(preferences.cities, list) else str(preferences.cities)
+                    print(f"     └─ Cities: {cities_str}")
+
+                # Display price range
+                min_price = preferences.min_price if preferences.min_price else 0
+                max_price = preferences.max_price if preferences.max_price else 0
+                print(f"     └─ Price range: ${min_price:,} - ${max_price:,}")
 
         print("-" * 70)
         print(f"Total: {len(collections)} collections ready for sync")

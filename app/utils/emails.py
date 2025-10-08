@@ -67,6 +67,65 @@ The Open House Pal</p>
     )
 
 
+def send_visitor_new_properties_notification(
+    visitor_name: str,
+    visitor_email: str,
+    collection_name: str,
+    new_properties_count: int,
+    total_properties: int,
+    share_token: str
+) -> Tuple[int, str]:
+    """
+    Send email notification to visitor when new properties are added to their collection
+
+    Args:
+        visitor_name: Name of the visitor
+        visitor_email: Email address of the visitor
+        collection_name: Name of the collection
+        new_properties_count: Number of new properties added
+        total_properties: Total number of properties in collection
+        share_token: Share token for visitor view link
+
+    Returns:
+        Tuple of (status_code, response_text)
+    """
+    # Get frontend URL from environment or use default
+    frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+    share_link = f"{frontend_url}/showcase/{share_token}"
+
+    # Build email body (HTML format)
+    email_body = f"""<!DOCTYPE html>
+<html>
+<body>
+<p>Dear {visitor_name},</p>
+
+<p>Great news! We've found {new_properties_count} new {'property' if new_properties_count == 1 else 'properties'} that match your preferences for "{collection_name}".</p>
+
+<p><strong>Your Collection Update:</strong></p>
+<ul>
+<li>New Properties Added: {new_properties_count}</li>
+<li>Total Properties in Your Collection: {total_properties}</li>
+</ul>
+
+<p>View your updated personalized collection here:<br>
+<a href="{share_link}">{share_link}</a></p>
+
+<p>You can like, dislike, favorite properties, and leave comments. We'll be in touch soon to discuss your preferences and answer any questions.</p>
+
+<p>Best regards,<br>
+Open House Pal</p>
+</body>
+</html>"""
+
+    # Send the email
+    return send_simple_message(
+        from_email="noreply@openhousepal.com",
+        to_email=visitor_email,
+        subject=f"New properties added to your collection: {collection_name}",
+        message=email_body
+    )
+
+
 def send_agent_new_properties_notification(
     agent_name: str,
     agent_email: str,

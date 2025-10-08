@@ -75,6 +75,7 @@ app.include_router(router)
 
 @app.get("/health")
 async def health():
+    #await scheduled_property_sync()
     return {"status": "ok"}
 
 
