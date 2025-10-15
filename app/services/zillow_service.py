@@ -392,7 +392,6 @@ class ZillowService:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    print(data["homeType"])
                     if not details:
                         return PropertyDetailResponse(**data)
                     else:

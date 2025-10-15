@@ -208,10 +208,10 @@ async def create_collection_with_preferences(
 
         # Determine if this collection should be active or inactive based on current count
         should_be_active = await CollectionsService.should_create_as_active(db, current_user.id)
-        status = 'ACTIVE' if should_be_active else 'INACTIVE'
+        collection_status = 'ACTIVE' if should_be_active else 'INACTIVE'
 
         active_count = await CollectionsService.count_active_collections(db, current_user.id)
-        print(f"[CREATE_COLLECTION_MANUALLY] User {current_user.id} has {active_count} active collections, creating new collection as {status}")
+        print(f"[CREATE_COLLECTION_MANUALLY] User {current_user.id} has {active_count} active collections, creating new collection as {collection_status}")
 
         # Create collection directly with auto-generated share token
         collection = Collection(
@@ -223,7 +223,7 @@ async def create_collection_with_preferences(
             visitor_phone=request.visitor_phone,
             share_token=share_token,
             is_public=True,  # Default to public with share link
-            status=status,
+            status=collection_status,
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc)
         )
