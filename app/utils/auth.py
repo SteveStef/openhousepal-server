@@ -94,6 +94,63 @@ async def get_current_active_user(current_user = Depends(get_current_user)):
     #     )
     return current_user
 
+async def require_premium_plan(current_user = Depends(get_current_active_user)):
+    """
+    Require user to have an active Premium plan subscription.
+    Handles trial expiration, grace periods for cancelled subscriptions, and plan tier validation.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    has_access = False
+
+    # Case 1: ACTIVE subscription
+    if current_user.subscription_status == "ACTIVE":
+        has_access = True
+
+    # Case 2: TRIAL - check if not expired
+    elif current_user.subscription_status == "TRIAL":
+        if current_user.trial_ends_at and current_user.trial_ends_at > now:
+            has_access = True
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your free trial has expired. Please subscribe to continue using Premium features."
+            )
+
+    # Case 3: CANCELLED - check grace period (they paid through a certain date)
+    elif current_user.subscription_status == "CANCELLED":
+        if current_user.next_billing_date and current_user.next_billing_date > now:
+            has_access = True  # Still in paid period
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your subscription has ended. Please resubscribe to continue using Premium features."
+            )
+
+    # Case 4: All other statuses (SUSPENDED, EXPIRED, etc.)
+    else:
+        status_text = current_user.subscription_status.lower() if current_user.subscription_status else "inactive"
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Your subscription is {status_text}. Please renew your subscription to access this feature."
+        )
+
+    # If we got here, check plan tier is PREMIUM
+    if not has_access:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Premium subscription required to access this feature."
+        )
+
+    if current_user.plan_tier != "PREMIUM":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This feature requires a Premium plan. Please upgrade to access Showcases."
+        )
+
+    return current_user
+
 async def get_current_user_optional(
     request: Request,
     db: AsyncSession = Depends(get_db)

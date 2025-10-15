@@ -1,12 +1,42 @@
 import os
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy import TypeDecorator, DateTime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./collections.db")
+
+
+class TZDateTime(TypeDecorator):
+    """
+    A DateTime type that ensures all datetimes are timezone-aware (UTC).
+    Fixes SQLite's limitation of storing datetimes as naive strings.
+    """
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        """When saving to database - ensure UTC"""
+        if value is not None:
+            if value.tzinfo is None:
+                # If somehow a naive datetime gets here, assume UTC
+                value = value.replace(tzinfo=timezone.utc)
+            else:
+                # Convert to UTC before storing
+                value = value.astimezone(timezone.utc)
+        return value
+
+    def process_result_value(self, value, dialect):
+        """When reading from database - force UTC timezone"""
+        if value is not None and value.tzinfo is None:
+            # SQLite returns naive datetimes - force UTC
+            value = value.replace(tzinfo=timezone.utc)
+        return value
+
 
 # Create async engine
 engine = create_async_engine(

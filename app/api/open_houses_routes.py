@@ -205,28 +205,32 @@ async def submit_open_house_form(
         elif collection_result["success"]:
             message = "Thank you for visiting! We've created a personalized collection for you and will be in touch soon with matching properties."
 
-        # Send confirmation email to visitor
-        try:
-            # Get property details for the email
-            property_data = await OpenHouseService.get_property_by_qr_code(db, form_data.open_house_event_id)
+        # Send confirmation email to visitor (only for Premium agents with successful collection creation)
+        # Skip email for Basic plan agents (they only get lead capture, not collections)
+        if collection_result.get("reason") != "basic_plan":
+            try:
+                # Get property details for the email
+                property_data = await OpenHouseService.get_property_by_qr_code(db, form_data.open_house_event_id)
 
-            if property_data:
-                property_address = property_data.get('address', 'the property')
-                share_token = collection_result.get('share_token') if collection_result["success"] else None
-                properties_added = collection_result.get('properties_added', 0) if collection_result["success"] else 0
+                if property_data:
+                    property_address = property_data.get('address', 'the property')
+                    share_token = collection_result.get('share_token') if collection_result["success"] else None
+                    properties_added = collection_result.get('properties_added', 0) if collection_result["success"] else 0
 
-                status_code, response = send_visitor_confirmation_email(
-                    visitor_name=visitor.full_name,
-                    visitor_email=visitor.email,
-                    property_address=property_address,
-                    share_token=share_token,
-                    properties_added=properties_added
-                )
+                    status_code, response = send_visitor_confirmation_email(
+                        visitor_name=visitor.full_name,
+                        visitor_email=visitor.email,
+                        property_address=property_address,
+                        share_token=share_token,
+                        properties_added=properties_added
+                    )
 
-                print(f"Confirmation email sent to {visitor.email}: Status {status_code}")
-        except Exception as e:
-            # Log error but don't fail the form submission
-            print(f"Error sending confirmation email: {e}")
+                    print(f"Confirmation email sent to {visitor.email}: Status {status_code}")
+            except Exception as e:
+                # Log error but don't fail the form submission
+                print(f"Error sending confirmation email: {e}")
+        else:
+            print(f"Skipping confirmation email for {visitor.email} - agent has Basic plan (lead capture only)")
 
         return OpenHouseFormResponse(
             success=True,

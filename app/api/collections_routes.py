@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timezone
 import httpx
 import os
 
@@ -28,7 +28,7 @@ from app.services.collection_preferences_service import CollectionPreferencesSer
 from app.services.property_sync_service import PropertySyncService
 from app.services.zillow_service import ZillowService
 from app.services.property_tour_service import PropertyTourService
-from app.utils.auth import get_current_active_user, get_current_user_optional
+from app.utils.auth import get_current_active_user, get_current_user_optional, require_premium_plan
 from app.models.database import User, Collection
 from sqlalchemy import select
 
@@ -81,7 +81,7 @@ class ShareToggleRequest(BaseModel):
 @router.get("/", response_model=List[CollectionResponse])
 async def get_all_collections(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     """
     Get all collections for the authenticated user
@@ -102,7 +102,7 @@ async def get_all_collections(
 async def get_collection(
     collection_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     """
     Get a specific collection by ID
@@ -132,7 +132,7 @@ async def get_collection(
 async def create_collection(
     collection_data: CollectionCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     """
     Create a new collection
@@ -166,7 +166,7 @@ async def create_collection(
 async def create_collection_with_preferences(
     request: CreateCollectionWithPreferencesRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     try:
         print(request)
@@ -224,8 +224,8 @@ async def create_collection_with_preferences(
             share_token=share_token,
             is_public=True,  # Default to public with share link
             status=status,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc)
         )
         
         db.add(collection)
@@ -300,7 +300,7 @@ async def update_collection_status(
     collection_id: str,
     request: UpdateStatusRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     """
     Update the status of a collection (ACTIVE/INACTIVE)
@@ -353,7 +353,7 @@ async def update_collection_status(
 async def delete_collection(
     collection_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     """
     Delete a collection
@@ -485,7 +485,7 @@ async def get_property_interaction_summary(
     collection_id: str,
     property_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     """
     Get complete interaction summary for a property within a collection
@@ -510,7 +510,7 @@ async def toggle_collection_share(
     collection_id: str,
     request: ShareToggleRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     """
     Toggle collection share status (public/private) and manage share token
@@ -599,7 +599,7 @@ async def get_properties_from_collection(
 async def refresh_collection_properties(
     collection_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     """
     Replace all properties in a collection with new ones based on current preferences.
@@ -681,7 +681,7 @@ async def schedule_property_tour(
 async def get_collection_tours(
     collection_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     """
     Get all tour requests for a collection (agent only)
@@ -720,7 +720,7 @@ async def update_tour_status(
     tour_id: str,
     status_update: PropertyTourStatusUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     """
     Update the status of a tour request (agent only)

@@ -1,20 +1,42 @@
-Here is the flow:
-1. Agent signup/login (makes a entry in users table)
-2. Agent makes a open house pdf (creates open house event entry)
-3. Buyer fills out form -> (creates open house visitor and collection and fills collection with related properties)
-3.5. in the background, the collection auto refreshes with the collection preferences
-4. Agent make the link public and sends to client the link
-5. Buyer likes, dislikes, and comments on properties.
-6. Agent removes properties from collection.
-7. Buyer requests a tour of a house
-8. After finished with collection, agent deactives it
-
-Next Steps:
-- Make the database persist on docker rebuild on the VPS and add backups to this
-- After updating preferences, make a zillow request to refresh the properties with the new preferences (test)
-- Make the active tag work based off the visitors last visiting
-- Paypal payments
-- Send emails
-- Add retry logic to the zillow service
-- Fix the dates on the comments
-- Fix the preferences modal diameter not being able to be blank (also not intuitive for switching the type of search)
+<div id="paypal-button-container-P-4KN61644XJ8589200NDUAG6A"></div>
+<script src="https://www.paypal.com/sdk/js?client-id=ASpVhylrQzWRIYKocjJT2Iq9CRRS5OOrlJrQwbu78XvNMV8XDvR62Vdq-nFAbqnN9N8cDiz5rKNEcrka&vault=true&intent=subscription" data-sdk-integration-source="button-factory"></script>
+<script>
+  paypal.Buttons({
+      style: {
+          shape: 'pill',
+          color: 'gold',
+          layout: 'vertical',
+          label: 'subscribe'
+      },
+      createSubscription: function(data, actions) {
+        return actions.subscription.create({
+          /* Creates the subscription */
+          plan_id: 'P-4KN61644XJ8589200NDUAG6A'
+        });
+      },
+      onApprove: function(data, actions) {
+        alert(data.subscriptionID); // You can add optional success message for the subscriber here
+      }
+  }).render('#paypal-button-container-P-4KN61644XJ8589200NDUAG6A'); // Renders the PayPal button
+</script>
+<div id="paypal-button-container-P-50796747YK1489053NDT7TXQ"></div>
+<script src="https://www.paypal.com/sdk/js?client-id=ASpVhylrQzWRIYKocjJT2Iq9CRRS5OOrlJrQwbu78XvNMV8XDvR62Vdq-nFAbqnN9N8cDiz5rKNEcrka&vault=true&intent=subscription" data-sdk-integration-source="button-factory"></script>
+<script>
+  paypal.Buttons({
+      style: {
+          shape: 'pill',
+          color: 'gold',
+          layout: 'vertical',
+          label: 'subscribe'
+      },
+      createSubscription: function(data, actions) {
+        return actions.subscription.create({
+          /* Creates the subscription */
+          plan_id: 'P-50796747YK1489053NDT7TXQ'
+        });
+      },
+      onApprove: function(data, actions) {
+        alert(data.subscriptionID); // You can add optional success message for the subscriber here
+      }
+  }).render('#paypal-button-container-P-50796747YK1489053NDT7TXQ'); // Renders the PayPal button
+</script>

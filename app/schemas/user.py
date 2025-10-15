@@ -24,7 +24,16 @@ class User(UserBase):
     id: str
     created_at: datetime
     updated_at: Optional[datetime] = None
-    
+
+    # PayPal subscription fields
+    subscription_id: Optional[str] = None
+    subscription_status: Optional[str] = None
+    plan_id: Optional[str] = None
+    plan_tier: Optional[str] = None  # BASIC or PREMIUM
+    trial_ends_at: Optional[datetime] = None
+    subscription_started_at: Optional[datetime] = None
+    last_billing_date: Optional[datetime] = None
+
     class Config:
         from_attributes = True
 

@@ -10,10 +10,10 @@ from app.api import router
 from app.scheduler import start_scheduler, stop_scheduler
 from app.utils.clean_cache import cleanup_expired_property_cache
 from app.utils.property_sync_scheduler import scheduled_property_sync
+from app.services.paypal_service import PayPalService
 
 load_dotenv()
 
-# Global scheduler instance
 scheduler = AsyncIOScheduler()
 
 @asynccontextmanager

@@ -1,7 +1,7 @@
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Text, ForeignKey, Table, JSON, Index
+from sqlalchemy import Column, Integer, String, Float, Boolean, Text, ForeignKey, Table, JSON, Index
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from app.database import Base
+from app.database import Base, TZDateTime
 from typing import Optional
 import uuid
 
@@ -15,7 +15,7 @@ collection_properties = Table(
 
 class User(Base):
     __tablename__ = "users"
-    
+
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
@@ -23,8 +23,19 @@ class User(Base):
     last_name = Column(String, nullable=True)
     state = Column(String, nullable=True)  # Agent's state
     brokerage = Column(String, nullable=True)  # Agent's brokerage
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    
+    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+
+    # PayPal subscription fields
+    subscription_id = Column(String, nullable=True)  # PayPal subscription ID
+    subscription_status = Column(String, default="TRIAL")  # TRIAL, ACTIVE, SUSPENDED, CANCELLED, EXPIRED
+    plan_id = Column(String, nullable=True)  # PayPal plan ID (P-50796747... or P-4KN61644...)
+    plan_tier = Column(String, nullable=True)  # BASIC or PREMIUM
+    trial_ends_at = Column(TZDateTime(timezone=True), nullable=True)
+    subscription_started_at = Column(TZDateTime(timezone=True), nullable=True)
+    last_billing_date = Column(TZDateTime(timezone=True), nullable=True)
+    next_billing_date = Column(TZDateTime(timezone=True), nullable=True)  # For grace period after cancellation
+    last_paypal_sync = Column(TZDateTime(timezone=True), nullable=True)  # Track when last synced with PayPal
+
     # Relationships
     collections = relationship("Collection", back_populates="owner")
 
@@ -45,8 +56,8 @@ class Collection(Base):
     visitor_phone = Column(String, nullable=True)
     original_open_house_event_id = Column(String, ForeignKey('open_house_events.id'), nullable=True)
     
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+    updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
     
     # Relationships
     owner = relationship("User", back_populates="collections")
@@ -89,10 +100,10 @@ class Property(Base):
     # Property details caching
     detailed_property= Column(JSON, nullable=True)  # Store detailed Zillow API response
     detailed_data_cached = Column(Boolean, default=False)
-    detailed_data_cached_at = Column(DateTime(timezone=True), nullable=True)
+    detailed_data_cached_at = Column(TZDateTime(timezone=True), nullable=True)
     
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+    updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
     
     collections = relationship("Collection", secondary=collection_properties, back_populates="properties")
 
@@ -105,7 +116,7 @@ class OpenHouseEvent(Base):
     agent_id = Column(String, ForeignKey('users.id'), nullable=False)
     is_active = Column(Boolean, default=True)
     is_deleted = Column(Boolean, default=False)  # Soft delete flag
-    deleted_at = Column(DateTime(timezone=True), nullable=True)  # Track when deleted
+    deleted_at = Column(TZDateTime(timezone=True), nullable=True)  # Track when deleted
     form_url = Column(String, nullable=True)  # Store the form link
     cover_image_url = Column(String, nullable=True)  # Store the selected cover image
     
@@ -128,7 +139,7 @@ class OpenHouseEvent(Base):
     price = Column(Integer, nullable=True)
     home_status = Column(String, nullable=True)
     
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
     
     # Relationships
     agent = relationship("User")
@@ -153,7 +164,7 @@ class OpenHouseVisitor(Base):
     form_url = Column(String, nullable=True)  # Store the form link
 
     interested_in_similar = Column(Boolean, default=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
 
     # Relationships
     open_house_event = relationship("OpenHouseEvent")
@@ -171,8 +182,8 @@ class PropertyInteraction(Base):
     disliked = Column(Boolean, default=False)
     favorited = Column(Boolean, default=False)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+    updated_at = Column(TZDateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     # Relationships
     collection = relationship("Collection", back_populates="property_interactions")
@@ -192,8 +203,8 @@ class PropertyComment(Base):
 
     content = Column(Text, nullable=False)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+    updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
 
     # Relationships
     collection = relationship("Collection", back_populates="property_comments")
@@ -224,8 +235,8 @@ class PropertyTour(Base):
     # Tour status
     status = Column(String, default="PENDING")  # PENDING, CONFIRMED, COMPLETED, CANCELLED
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+    updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
 
     # Relationships
     collection = relationship("Collection", back_populates="property_tours")
@@ -270,8 +281,8 @@ class CollectionPreferences(Base):
     visiting_reason = Column(String, nullable=True)  # BUYING_SOON, BROWSING, NEIGHBORHOOD, etc.
     has_agent = Column(String, nullable=True)  # YES, NO, LOOKING
     
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+    updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
     
     # Relationships
     collection = relationship("Collection", back_populates="preferences")

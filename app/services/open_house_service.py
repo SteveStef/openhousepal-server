@@ -3,7 +3,7 @@ from sqlalchemy import select
 from datetime import datetime
 from typing import Optional, Dict, Any
 
-from app.models.database import Property, OpenHouseVisitor, Collection, collection_properties, OpenHouseEvent
+from app.models.database import Property, OpenHouseVisitor, Collection, collection_properties, OpenHouseEvent, User
 from app.schemas.open_house import OpenHouseFormSubmission
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.collections_service import CollectionsService
@@ -51,7 +51,22 @@ class OpenHouseService:
             if not visited_open_house:
                 print(f"Could not find open house event {form_data.open_house_event_id} to create collection")
                 return {"success": False, "properties_added": 0}
-            
+
+            # Check if agent has PREMIUM plan (collections are a Premium-only feature)
+            agent_id = visited_open_house.get('agent_id')
+            agent_query = select(User).where(User.id == agent_id)
+            agent_result = await db.execute(agent_query)
+            agent = agent_result.scalar_one_or_none()
+
+            if not agent:
+                print(f"Could not find agent {agent_id} for open house event {form_data.open_house_event_id}")
+                return {"success": False, "properties_added": 0, "reason": "agent_not_found"}
+
+            # Only create collections for PREMIUM plan agents
+            if agent.plan_tier != "PREMIUM":
+                print(f"Agent {agent_id} has {agent.plan_tier} plan - collections are Premium-only. Skipping collection creation.")
+                return {"success": False, "properties_added": 0, "reason": "basic_plan"}
+
             # Create collection
             collection = Collection(
                 owner_id=visited_open_house.get('agent_id'),  # Use agent_id from the open house event
