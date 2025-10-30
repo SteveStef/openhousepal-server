@@ -94,6 +94,29 @@ async def get_current_active_user(current_user = Depends(get_current_user)):
     #     )
     return current_user
 
+async def require_basic_plan(current_user = Depends(get_current_active_user)):
+    """
+    Require user to have an active subscription (BASIC or PREMIUM).
+    Handles trial expiration and grace periods for cancelled subscriptions.
+    """
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+
+    if current_user.subscription_status in ["TRIAL", "ACTIVE"]:
+        return current_user
+
+    if current_user.subscription_status == "CANCELLED":
+        if current_user.trial_ends_at and current_user.trial_ends_at > now:
+            return current_user
+        if current_user.next_billing_date and current_user.next_billing_date > now:
+            return current_user
+
+    # No valid subscription - deny access
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Your subscription has ended. Please resubscribe to continue using this feature."
+    )
+
 async def require_premium_plan(current_user = Depends(get_current_active_user)):
     """
     Require user to have an active Premium plan subscription.

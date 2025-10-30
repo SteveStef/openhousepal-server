@@ -1,14 +1,14 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, delete, text, func
 from sqlalchemy.orm import selectinload, joinedload, load_only
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 import uuid
 import secrets
 import string
 import os
 
-from app.models.database import Collection, Property, User, PropertyInteraction, PropertyComment, PropertyTour
+from app.models.database import Collection, Property, User, PropertyInteraction, PropertyComment, PropertyTour, collection_properties
 from app.schemas.collection import CollectionCreate
 
 from app.services.property_sync_service import PropertySyncService
@@ -762,13 +762,36 @@ class CollectionsService:
                 return []
 
             property_ids = [prop.id for prop in collection.properties]
+
+            # Fetch added_at timestamps for each property from collection_properties
+            added_at_query = select(
+                collection_properties.c.property_id,
+                collection_properties.c.added_at
+            ).where(
+                and_(
+                    collection_properties.c.collection_id == collectionId,
+                    collection_properties.c.property_id.in_(property_ids)
+                )
+            )
+            added_at_result = await db.execute(added_at_query)
+            added_at_data = added_at_result.all()
+
+            # Create lookup dictionary for added_at timestamps
+            added_at_lookup = {}
+            for row in added_at_data:
+                added_at_lookup[row.property_id] = row.added_at
+
+            # Calculate "new" threshold (properties added in last 7 days)
+            now = datetime.now(timezone.utc)
+            new_threshold_days = int(os.getenv("NEW_PROPERTY_DAYS", "7"))
+            new_threshold = now - timedelta(days=new_threshold_days)
+
             interactions_query = select(PropertyInteraction).where(
                 and_(
                     PropertyInteraction.collection_id == collectionId,
                     PropertyInteraction.property_id.in_(property_ids)
                 )
             )
-
 
             interactions_result = await db.execute(interactions_query)
             interactions = interactions_result.scalars().all()
@@ -822,6 +845,14 @@ class CollectionsService:
 
             properties_data = []
             for prop in collection.properties:
+                added_at = added_at_lookup.get(prop.id)
+                is_new = False
+                if added_at:
+                    # Make added_at timezone-aware if it isn't already
+                    if added_at.tzinfo is None:
+                        added_at = added_at.replace(tzinfo=timezone.utc)
+                    is_new = added_at >= new_threshold
+
                 property_dict = {
                     'id': prop.id,
                     'zpid': prop.zpid,
@@ -844,7 +875,9 @@ class CollectionsService:
                     'favorited': interactions_lookup[prop.id].favorited if prop.id in interactions_lookup else False,
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
                     'comments': comments_lookup.get(prop.id, []),
-                    'tourCount': tours_lookup.get(prop.id, 0)
+                    'tourCount': tours_lookup.get(prop.id, 0),
+                    'added_at': added_at.isoformat() if added_at else None,
+                    'is_new': is_new
                 }
                 properties_data.append(property_dict)
 

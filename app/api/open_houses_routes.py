@@ -7,7 +7,7 @@ from datetime import datetime
 
 from app.database import get_db
 from app.models.database import OpenHouseEvent, User, OpenHouseVisitor
-from app.utils.auth import get_current_active_user
+from app.utils.auth import get_current_active_user, require_basic_plan
 from app.schemas.open_house import OpenHouseCreateRequest, OpenHouseResponse, OpenHouseFormSubmission, OpenHouseFormResponse, VisitorResponse
 from app.services.open_house_service import OpenHouseService
 from app.utils.emails import send_visitor_confirmation_email
@@ -22,11 +22,12 @@ load_dotenv()
 
 router = APIRouter()
 
+# is this route authed for people that have trial, premium, or basic
 @router.post("/api/open-houses", response_model=OpenHouseResponse)
 async def create_open_house(
     request: OpenHouseCreateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_basic_plan)
 ):
     """Create a new open house record with property metadata"""
     try:

@@ -106,8 +106,56 @@ class PayPalService:
                 "brand_name": "Open House Pal",
                 "shipping_preference": "NO_SHIPPING",
                 "user_action": "SUBSCRIBE_NOW",
-                "return_url": f"{os.getenv(CLIENT_URL)}/open-houses",
-                "cancel_url": f"{os.getenv(CLIENT_URL)}/register"
+                "return_url": f"{os.getenv('CLIENT_URL')}/open-houses",
+                "cancel_url": f"{os.getenv('CLIENT_URL')}/register"
+            }
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._base_url}/v1/billing/subscriptions",
+                headers=headers,
+                json=data,
+                timeout=30.0
+            )
+
+            if response.status_code not in [200, 201]:
+                raise Exception(f"Failed to create subscription: {response.status_code} - {response.text}")
+
+            return response.json()
+
+    async def create_subscription_with_urls(self, plan_id: str, return_url: str, cancel_url: str) -> dict:
+        """
+        Create a PayPal subscription with custom return URLs.
+
+        This is used when users need to create a new subscription (e.g., after cancelling).
+
+        Args:
+            plan_id: The PayPal plan ID to subscribe to
+            return_url: URL to redirect after user approves subscription
+            cancel_url: URL to redirect if user cancels
+
+        Returns:
+            dict: Subscription creation response with subscription ID and approval links
+
+        Raises:
+            Exception: If the request fails
+        """
+        token = await self.get_token()
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        data = {
+            "plan_id": plan_id,
+            "application_context": {
+                "brand_name": "Open House Pal",
+                "shipping_preference": "NO_SHIPPING",
+                "user_action": "SUBSCRIBE_NOW",
+                "return_url": return_url,
+                "cancel_url": cancel_url
             }
         }
 

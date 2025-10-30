@@ -4,7 +4,7 @@ from sqlalchemy.orm import selectinload
 from typing import List, Dict, Any
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.models.database import Collection, CollectionPreferences, Property, collection_properties, User
 from app.services.zillow_service import ZillowService
@@ -121,13 +121,14 @@ class PropertySyncService:
         return property_obj
     
     async def add_property_to_collection(
-        self, 
-        db: AsyncSession, 
-        collection_id: str, 
+        self,
+        db: AsyncSession,
+        collection_id: str,
         property_id: str
     ):
         """
-        Add a property to a collection (many-to-many relationship)
+        Add a property to a collection (many-to-many relationship) with timestamp.
+        Used for scheduled property sync - properties will show "NEW" badge.
         """
         # Check if relationship already exists
         result = await db.execute(
@@ -137,18 +138,50 @@ class PropertySyncService:
                 collection_properties.c.property_id == property_id
             )
         )
-        
+
         if result.fetchone() is None:
-            # Insert new relationship
+            # Insert new relationship with timestamp
             await db.execute(
                 collection_properties.insert().values(
                     collection_id=collection_id,
-                    property_id=property_id
+                    property_id=property_id,
+                    added_at=datetime.now(timezone.utc)
                 )
             )
             await db.commit()
             logger.info(f"Added property {property_id} to collection {collection_id}")
-    
+
+    async def add_property_to_collection_initial(
+        self,
+        db: AsyncSession,
+        collection_id: str,
+        property_id: str
+    ):
+        """
+        Add a property to a collection WITHOUT timestamp (for initial population).
+        Used when creating a new showcase - properties will NOT show "NEW" badge.
+        """
+        # Check if relationship already exists
+        result = await db.execute(
+            select(collection_properties)
+            .where(
+                collection_properties.c.collection_id == collection_id,
+                collection_properties.c.property_id == property_id
+            )
+        )
+
+        if result.fetchone() is None:
+            # Insert new relationship WITHOUT added_at (NULL = no "NEW" badge)
+            await db.execute(
+                collection_properties.insert().values(
+                    collection_id=collection_id,
+                    property_id=property_id
+                    # No added_at field = NULL in database
+                )
+            )
+            await db.commit()
+            logger.info(f"Added initial property {property_id} to collection {collection_id} (no timestamp)")
+
     async def sync_collection_properties(
         self,
         db: AsyncSession,
@@ -341,38 +374,55 @@ class PropertySyncService:
         """
         Immediately populate a newly created collection with properties based on its preferences.
         This is called right after collection creation to provide initial properties.
+        Initial properties are added WITHOUT timestamps (no "NEW" badge).
         """
-        logger.info(f"Populating new collection {collection_id} with properties")
-        
+        logger.info(f"Populating new collection {collection_id} with initial properties")
+
         try:
             # Get collection and preferences
             result = await db.execute(
                 select(Collection).where(Collection.id == collection_id)
             )
             collection = result.scalar_one_or_none()
-            
+
             if not collection:
                 return {'success': False, 'error': 'Collection not found'}
-            
+
             preferences = await CollectionPreferencesService.get_preferences_by_collection_id(
                 db, collection_id
             )
-            
+
             if not preferences:
                 logger.warning(f"No preferences found for new collection {collection_id}, skipping property population")
                 return {'success': True, 'new_properties_added': 0, 'message': 'No preferences to populate from'}
-            
-            # Sync properties using existing logic
-            sync_result = await self.sync_collection_properties(
-                db, collection, preferences
-            )
 
-            logger.info(f"Successfully populated new collection {collection_id} with {sync_result['new_properties_count']} properties")
+            # Get matching properties from Zillow
+            matching_properties = await self.zillow_service.get_matching_properties(preferences)
+
+            properties_added = 0
+
+            for property_data in matching_properties:
+                zpid = property_data.get('zpid')
+                if not zpid:
+                    continue
+
+                # Check if property already exists in this collection
+                if await self.property_exists_in_collection(db, collection.id, zpid):
+                    continue
+
+                # Create or update property
+                property_obj = await self.create_property_from_zillow_data(db, property_data)
+
+                # Add property WITHOUT timestamp (initial population - no "NEW" badge)
+                await self.add_property_to_collection_initial(db, collection.id, property_obj.id)
+                properties_added += 1
+
+            logger.info(f"Successfully populated new collection {collection_id} with {properties_added} initial properties (no timestamps)")
 
             return {
                 'success': True,
                 'collection_id': collection_id,
-                'new_properties_added': sync_result['new_properties_count'],
+                'new_properties_added': properties_added,
                 'populated_at': datetime.now()
             }
 

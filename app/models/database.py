@@ -10,7 +10,8 @@ collection_properties = Table(
     'collection_properties',
     Base.metadata,
     Column('collection_id', String, ForeignKey('collections.id'), primary_key=True),
-    Column('property_id', String, ForeignKey('properties.id'), primary_key=True)
+    Column('property_id', String, ForeignKey('properties.id'), primary_key=True),
+    Column('added_at', TZDateTime(timezone=True), server_default=func.now())
 )
 
 class User(Base):
@@ -245,10 +246,10 @@ class PropertyTour(Base):
 
 class CollectionPreferences(Base):
     __tablename__ = "collection_preferences"
-    
+
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     collection_id = Column(String, ForeignKey('collections.id', ondelete='CASCADE'), nullable=False, unique=True)
-    
+
     # Property criteria
     min_beds = Column(Integer, nullable=True)
     max_beds = Column(Integer, nullable=True)
@@ -256,7 +257,7 @@ class CollectionPreferences(Base):
     max_baths = Column(Float, nullable=True)
     min_price = Column(Integer, nullable=True)
     max_price = Column(Integer, nullable=True)
-    
+
     # Location criteria
     lat = Column(Float, nullable=True)
     long = Column(Float, nullable=True)
@@ -264,10 +265,10 @@ class CollectionPreferences(Base):
     cities = Column(JSON, nullable=True)
     townships = Column(JSON, nullable=True)
     diameter = Column(Float, default=2.0)  # Search diameter in miles
-    
+
     # Additional features
     special_features = Column(Text, default="")
-    
+
     # Home type preferences
     is_town_house = Column(Boolean, nullable=True, default=False)
     is_lot_land = Column(Boolean, nullable=True, default=False)
@@ -275,14 +276,28 @@ class CollectionPreferences(Base):
     is_multi_family = Column(Boolean, nullable=True, default=False)
     is_single_family = Column(Boolean, nullable=True, default=False)
     is_apartment = Column(Boolean, nullable=True, default=False)
-    
+
     # Visitor form data
     timeframe = Column(String, nullable=True)  # IMMEDIATELY, 1_3_MONTHS, 3_6_MONTHS, etc.
     visiting_reason = Column(String, nullable=True)  # BUYING_SOON, BROWSING, NEIGHBORHOOD, etc.
     has_agent = Column(String, nullable=True)  # YES, NO, LOOKING
-    
+
     created_at = Column(TZDateTime(timezone=True), server_default=func.now())
     updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
-    
+
     # Relationships
     collection = relationship("Collection", back_populates="preferences")
+
+
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    token = Column(String, unique=True, index=True, nullable=False)
+    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+    expires_at = Column(TZDateTime(timezone=True), nullable=False)
+    used = Column(Boolean, default=False, nullable=False)
+
+    # Relationship
+    user = relationship("User")

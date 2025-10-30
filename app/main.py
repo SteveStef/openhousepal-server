@@ -12,6 +12,7 @@ from app.utils.clean_cache import cleanup_expired_property_cache
 from app.utils.property_sync_scheduler import scheduled_property_sync
 from app.services.paypal_service import PayPalService
 
+CLIENT_URL = os.getenv("CLIENT_URL", "http://localhost:3000")
 load_dotenv()
 
 scheduler = AsyncIOScheduler()
@@ -60,7 +61,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Open House Pal API", lifespan=lifespan)
 
-CLIENT_URL = os.getenv("CLIENT_URL", "http://localhost:3000")
 
 app.add_middleware(
     CORSMiddleware,

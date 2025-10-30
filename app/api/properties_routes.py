@@ -8,7 +8,7 @@ from app.database import get_db
 from app.models.database import Property
 from app.services.zillow_service import ZillowService
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict
 from app.models.property import PropertyDetailResponse, PropertySaveResponse, PropertyLookupRequest
 
@@ -51,8 +51,8 @@ async def store_property(
         if existing_property:
             # Update existing property
             existing_property.street_address = request.address
-            existing_property.updated_at = datetime.utcnow()
-            existing_property.last_synced = datetime.utcnow()
+            existing_property.updated_at = datetime.now(timezone.utc)
+            existing_property.last_synced = datetime.now(timezone.utc)
             
             # Update cover image if provided
             if request.cover_image_url:
@@ -86,9 +86,9 @@ async def store_property(
                 id=request.property_id,
                 street_address=request.address,
                 img_src=request.cover_image_url,
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow(),
-                last_synced=datetime.utcnow()
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+                last_synced=datetime.now(timezone.utc)
             )
             
             # Set specific fields from property data
@@ -199,7 +199,7 @@ async def cache_property_details(
             from datetime import timedelta
             expiry_time = property_record.detailed_data_cached_at + timedelta(days=1)
             
-            if datetime.utcnow() < expiry_time and property_record.detailed_property:
+            if datetime.now(timezone.utc) < expiry_time and property_record.detailed_property:
                 print(f"[CACHE] Cache is valid, returning cached data")
                 # Validate that cached data is not None/empty before returning
                 try:
@@ -255,8 +255,8 @@ async def cache_property_details(
         try:
             property_record.detailed_property = details_dict
             property_record.detailed_data_cached = True
-            property_record.detailed_data_cached_at = datetime.utcnow()
-            property_record.updated_at = datetime.utcnow()
+            property_record.detailed_data_cached_at = datetime.now(timezone.utc)
+            property_record.updated_at = datetime.now(timezone.utc)
             
             await db.commit()
             print(f"[CACHE] Successfully committed to database")
