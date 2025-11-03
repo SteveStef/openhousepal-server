@@ -98,6 +98,7 @@ secrets.json
 *.backup
 *.bak
 *~.nib
+.prod.env
 
 # Alembic backup and cache files
 alembic/versions/__pycache__/
