@@ -439,7 +439,7 @@ async def add_property_comment(
         comment = await PropertyInteractionsService.add_property_comment(
             db, collection_id, property_id, comment_data
         )
-        
+
         return {
             "success": True,
             "comment": comment

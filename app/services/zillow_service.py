@@ -12,6 +12,7 @@ from app.models.database import CollectionPreferences, Property, Collection, Ope
 from app.schemas.collection_preferences import CollectionPreferences as CollectionPreferencesSchema
 from datetime import datetime
 from app.models.property import PropertyDetailResponse, PropertySaveResponse, ZillowPropertyDetailResponse
+from app.utils.rate_limiter import RateLimiter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,6 +21,7 @@ class ZillowService:
     def __init__(self):
         self.api_key = os.getenv("RAPID_API_KEY")
         self.base_url = "https://zillow56.p.rapidapi.com"
+        self.rate_limiter = RateLimiter()
         
         if not self.api_key:
             logger.warning("RAPID_API_KEY not found in environment variables")
@@ -82,6 +84,7 @@ class ZillowService:
         
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
+                await self.rate_limiter.acquire_token()
                 response = await client.get(url, headers=headers, params=params)
                 
                 if response.status_code == 200:
@@ -173,6 +176,7 @@ class ZillowService:
         
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
+                await self.rate_limiter.acquire_token()
                 response = await client.get(url, headers=headers, params=params)
                 
                 if response.status_code == 200:
@@ -388,6 +392,7 @@ class ZillowService:
         
         try:
             async with httpx.AsyncClient() as client:
+                await self.rate_limiter.acquire_token()
                 response = await client.get(url, headers=headers, params=params, timeout=30.0)
                 
                 if response.status_code == 200:
