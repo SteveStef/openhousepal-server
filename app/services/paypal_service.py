@@ -15,12 +15,12 @@ class PayPalService:
         else:
             self._base_url = "https://api-m.sandbox.paypal.com"
 
-        self._access_token = None
-        self._expired_date = None
+        # self._access_token = None
+        # self._expired_date = None
 
     async def get_token(self) -> str:
-        if self._access_token and self._expired_date and datetime.now(timezone.utc) < self._expired_date:
-            return self._access_token
+        # if self._access_token and self._expired_date and datetime.now(timezone.utc) < self._expired_date:
+        #     return self._access_token
         credentials = f"{self._client_id}:{self._secret}"
         encoded_creds = base64.b64encode(credentials.encode()).decode()
         headers = {
@@ -35,14 +35,16 @@ class PayPalService:
                 data=data,
                 timeout=30.0
             )
+
             if response.status_code != 200:
                 raise Exception(f"PayPal OAuth failed: {response.status_code} - {response.text}")
-            token_data = response.json()
-            self._access_token = token_data["access_token"]
-            expires_in = token_data.get("expires_in", 32400)
-            self._expired_date = datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)
 
-            return self._access_token
+            token_data = response.json()
+            access_token = token_data["access_token"]
+            #expires_in = token_data.get("expires_in", 32400)
+            #self._expired_date = datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)
+
+            return access_token
 
     async def get_subscription(self, subscription_id: str) -> dict:
         """
