@@ -1,6 +1,9 @@
 # Use Python 3.13 slim image as base
 FROM python:3.13-slim
 
+# Build argument to invalidate cache (set to current timestamp)
+ARG CACHEBUST=1
+
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -23,15 +26,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Create directories before copying code
+RUN mkdir -p /app/data /app/logs
+
+# Copy application code (invalidates cache when code changes)
 COPY . .
-
-# Create directory for SQLite database
-RUN mkdir -p /app/data
-
-# Copy alembic configuration
-COPY alembic.ini .
-COPY alembic/ ./alembic/
 
 # Run database migrations
 RUN python -m alembic upgrade head
