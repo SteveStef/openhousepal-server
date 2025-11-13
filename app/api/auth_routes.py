@@ -108,8 +108,8 @@ async def send_verification_code(
             subject="Verify Your Email - Open House Pal",
             template="verify_code",
             template_variables={
-                "recipient_name": user_data.first_name,
-                "verification_code": code,
+                "agent_name": user_data.first_name,
+                "verify_code": code,
                 "expiration_minutes": "15"
             }
         )
@@ -210,8 +210,8 @@ async def resend_verification_code(
         subject="Your New Verification Code - Open House Pal",
         template="verify_code",
         template_variables={
-            "recipient_name": first_name,
-            "verification_code": new_code,
+            "agent_name": first_name
+            "verify_code": new_code,
             "expiration_minutes": "15"
         }
     )
