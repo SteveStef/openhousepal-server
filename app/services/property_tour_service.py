@@ -9,7 +9,7 @@ from app.schemas.property_tour import (
     PropertyTourResponse,
     PropertyTourStatusUpdate
 )
-from app.utils.emails import send_simple_message
+from app.services.email_service import EmailService
 
 
 class PropertyTourService:
@@ -89,55 +89,35 @@ class PropertyTourService:
         await db.refresh(tour)
 
         # Send email notification to the agent
-        try:
-            # Get agent info from collection owner
-            agent_result = await db.execute(
-                select(User).where(User.id == collection.owner_id)
+        agent_result = await db.execute(
+            select(User).where(User.id == collection.owner_id)
+        )
+        agent = agent_result.scalar_one_or_none()
+        if agent and agent.email:
+            # Build preferred dates list
+            preferred_dates = []
+            if tour_data.preferred_date and tour_data.preferred_time:
+                preferred_dates.append(f"{tour_data.preferred_date} at {tour_data.preferred_time}")
+            if tour_data.preferred_date_2 and tour_data.preferred_time_2:
+                preferred_dates.append(f"{tour_data.preferred_date_2} at {tour_data.preferred_time_2}")
+            if tour_data.preferred_date_3 and tour_data.preferred_time_3:
+                preferred_dates.append(f"{tour_data.preferred_date_3} at {tour_data.preferred_time_3}")
+
+            email_service = EmailService()
+            email_service.send_simple_message(
+                to_email=agent.email,
+                subject=f"New Tour Request - {property_obj.street_address}",
+                template="tour_request",
+                template_variables={
+                    "agent_name": agent.first_name,
+                    "visitor_name": collection.visitor_name,
+                    "visitor_email": collection.visitor_email,
+                    "visitor_phone": collection.visitor_phone or "Not provided",
+                    "property_address": property_obj.street_address,
+                    "preferred_dates": ", ".join(preferred_dates) if preferred_dates else "No specific dates provided",
+                    "message": tour_data.message or ""
+                }
             )
-            agent = agent_result.scalar_one_or_none()
-
-            if agent and agent.email:
-                # Build email content
-                email_body = f"""You have a new tour request!
-
-Property: {property_obj.street_address}, {property_obj.city}, {property_obj.state}
-Collection: {collection.name}
-
-Visitor Information:
-Name: {tour.visitor_name}
-Email: {tour.visitor_email}
-Phone: {tour.visitor_phone}
-
-Preferred Times:
-1. {tour.preferred_date} at {tour.preferred_time}"""
-
-                # Add second preferred time if provided
-                if tour.preferred_date_2 and tour.preferred_time_2:
-                    email_body += f"\n2. {tour.preferred_date_2} at {tour.preferred_time_2}"
-
-                # Add third preferred time if provided
-                if tour.preferred_date_3 and tour.preferred_time_3:
-                    email_body += f"\n3. {tour.preferred_date_3} at {tour.preferred_time_3}"
-
-                # Add message if provided
-                if tour.message:
-                    email_body += f"\n\nMessage from visitor:\n{tour.message}"
-
-                email_body += "\n\nPlease contact the visitor to confirm the tour."
-
-                # Send the email
-                status_code, response = send_simple_message(
-                    from_email="noreply@entrypoint.com",
-                    to_email=agent.email,
-                    subject=f"New Tour Request for {property_obj.street_address}",
-                    message=email_body
-                )
-
-                print(f"Email sent to agent {agent.email}: Status {status_code}")
-
-        except Exception as e:
-            # Log error but don't fail the tour request
-            print(f"Error sending tour notification email: {e}")
 
         return PropertyTourResponse.from_orm(tour)
 

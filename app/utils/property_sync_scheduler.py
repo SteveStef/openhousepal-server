@@ -161,3 +161,4 @@ if __name__ == "__main__":
     """For testing - run this script directly to list collections"""
     print("🔍 Testing property sync scheduler...")
     asyncio.run(list_all_collections())
+

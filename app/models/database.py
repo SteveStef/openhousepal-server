@@ -11,7 +11,7 @@ collection_properties = Table(
     Base.metadata,
     Column('collection_id', String, ForeignKey('collections.id'), primary_key=True),
     Column('property_id', String, ForeignKey('properties.id'), primary_key=True),
-    Column('added_at', TZDateTime(timezone=True), server_default=func.now())
+    Column('added_at', TZDateTime(timezone=True), nullable=True)  # NULL = initial property (no NEW badge)
 )
 
 class User(Base):
@@ -27,7 +27,7 @@ class User(Base):
     created_at = Column(TZDateTime(timezone=True), server_default=func.now())
 
     # PayPal subscription fields
-    subscription_id = Column(String, nullable=True)  # PayPal subscription ID
+    subscription_id = Column(String, nullable=True, unique=True, index=True)  # PayPal subscription ID (unique to prevent hijacking)
     subscription_status = Column(String, default="TRIAL")  # TRIAL, ACTIVE, SUSPENDED, CANCELLED, EXPIRED
     plan_id = Column(String, nullable=True)  # PayPal plan ID (P-50796747... or P-4KN61644...)
     plan_tier = Column(String, nullable=True)  # BASIC or PREMIUM
@@ -264,7 +264,7 @@ class CollectionPreferences(Base):
     address = Column(String, nullable=True)
     cities = Column(JSON, nullable=True)
     townships = Column(JSON, nullable=True)
-    diameter = Column(Float, default=2.0)  # Search diameter in miles
+    diameter = Column(Float, default=6.0)  # Search diameter in miles
 
     # Additional features
     special_features = Column(Text, default="")
@@ -301,3 +301,11 @@ class PasswordResetToken(Base):
 
     # Relationship
     user = relationship("User")
+
+class WebhookEvent(Base):
+    __tablename__ = "webhook_events"
+
+    id = Column(String, primary_key=True)  # PayPal event ID
+    event_type = Column(String, nullable=False)  # For debugging/monitoring
+    processed_at = Column(TZDateTime(timezone=True), server_default=func.now())
+

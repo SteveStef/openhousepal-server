@@ -89,7 +89,7 @@ class CollectionPreferencesService:
             "lat": original_open_house.latitude,
             "long": original_open_house.longitude,
             "address": original_open_house.address,  # Store the original address
-            "diameter": 10,
+            "diameter": 6,
             "special_features": "",
 
             "is_town_house": not single_family,

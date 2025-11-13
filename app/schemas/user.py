@@ -33,6 +33,7 @@ class User(UserBase):
     trial_ends_at: Optional[datetime] = None
     subscription_started_at: Optional[datetime] = None
     last_billing_date: Optional[datetime] = None
+    next_billing_date: Optional[datetime] = None  # For grace period after cancellation
 
     class Config:
         from_attributes = True

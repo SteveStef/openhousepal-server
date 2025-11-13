@@ -15,12 +15,8 @@ class PayPalService:
         else:
             self._base_url = "https://api-m.sandbox.paypal.com"
 
-        # self._access_token = None
-        # self._expired_date = None
-
+    # This needs to be in try catch
     async def get_token(self) -> str:
-        # if self._access_token and self._expired_date and datetime.now(timezone.utc) < self._expired_date:
-        #     return self._access_token
         credentials = f"{self._client_id}:{self._secret}"
         encoded_creds = base64.b64encode(credentials.encode()).decode()
         headers = {
@@ -41,8 +37,6 @@ class PayPalService:
 
             token_data = response.json()
             access_token = token_data["access_token"]
-            #expires_in = token_data.get("expires_in", 32400)
-            #self._expired_date = datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)
 
             return access_token
 
@@ -368,6 +362,69 @@ class PayPalService:
                 return True
             else:
                 raise Exception(f"Failed to cancel subscription: {response.status_code} - {response.text}")
+
+    async def verify_webhook_signature(
+        self,
+        transmission_id: str,
+        transmission_time: str,
+        cert_url: str,
+        auth_algo: str,
+        transmission_sig: str,
+        webhook_id: str,
+        webhook_event: dict
+    ) -> bool:
+        """
+        Verify PayPal webhook signature to ensure the webhook came from PayPal.
+
+        This prevents attackers from sending fake webhook events to manipulate subscriptions.
+
+        Args:
+            transmission_id: PAYPAL-TRANSMISSION-ID header
+            transmission_time: PAYPAL-TRANSMISSION-TIME header
+            cert_url: PAYPAL-CERT-URL header
+            auth_algo: PAYPAL-AUTH-ALGO header
+            transmission_sig: PAYPAL-TRANSMISSION-SIG header
+            webhook_id: Your webhook ID from PayPal dashboard
+            webhook_event: The full webhook event body (as dict)
+
+        Returns:
+            bool: True if signature is valid, False otherwise
+
+        Raises:
+            Exception: If the verification request fails
+        """
+        token = await self.get_token()
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        data = {
+            "transmission_id": transmission_id,
+            "transmission_time": transmission_time,
+            "cert_url": cert_url,
+            "auth_algo": auth_algo,
+            "transmission_sig": transmission_sig,
+            "webhook_id": webhook_id,
+            "webhook_event": webhook_event
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._base_url}/v1/notifications/verify-webhook-signature",
+                headers=headers,
+                json=data,
+                timeout=30.0
+            )
+
+            if response.status_code != 200:
+                raise Exception(f"Failed to verify webhook signature: {response.status_code} - {response.text}")
+
+            result = response.json()
+            verification_status = result.get("verification_status")
+
+            return verification_status == "SUCCESS"
 
 
 paypal_service = PayPalService()

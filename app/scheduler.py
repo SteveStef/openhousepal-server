@@ -1,14 +1,13 @@
 import asyncio
-import logging
 import os
 from datetime import datetime, timedelta
 from typing import Optional
 
 from app.services.property_sync_service import PropertySyncService
+from app.config.logging import get_logger
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Get logger from centralized config
+logger = get_logger(__name__)
 
 class PropertySyncScheduler:
     def __init__(self, interval_hours: int = 3):
@@ -38,7 +37,7 @@ class PropertySyncScheduler:
                     logger.error(f"Scheduled sync completed with errors: {result['errors']}")
                 
             except Exception as e:
-                logger.error(f"Critical error during scheduled sync: {str(e)}")
+                logger.error("Critical error during scheduled sync", exc_info=True)
             
             # Wait for the next sync interval
             await asyncio.sleep(self.interval_hours * 3600)  # Convert hours to seconds

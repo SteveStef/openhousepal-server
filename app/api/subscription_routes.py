@@ -10,8 +10,10 @@ from app.schemas.user import User
 from app.services.paypal_service import paypal_service
 from app.utils.auth import get_current_active_user
 from app.models.database import User as UserModel
+from app.config.logging import get_logger
 
 router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
+logger = get_logger(__name__)
 
 # PayPal Plan ID Constants (from environment variables)
 BASIC_PLAN_ID = os.getenv("PAYPAL_BASIC_PLAN_ID")
@@ -60,16 +62,20 @@ async def upgrade_subscription(
         return_url = f"{CLIENT_URL}/settings/subscription"
         cancel_url = f"{CLIENT_URL}/settings/subscription"
 
+        # Always use no-trial plan for upgrades to prevent PayPal from resetting trials
+        # Our database preserves the original trial_ends_at, so trial users keep their trial
+        premium_plan = PREMIUM_PLAN_NO_TRIAL_ID
+
         # Call PayPal Revise API
         try:
             result = await paypal_service.revise_subscription(
                 subscription_id=current_user.subscription_id,
-                new_plan_id=PREMIUM_PLAN_ID,
+                new_plan_id=premium_plan,
                 return_url=return_url,
                 cancel_url=cancel_url
             )
         except Exception as e:
-            print(f"PayPal API error during upgrade: {e}")
+            logger.error("PayPal API error during upgrade", exc_info=True, extra={"user_id": current_user.id})
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to initiate upgrade with PayPal. Please try again."
@@ -83,7 +89,7 @@ async def upgrade_subscription(
             )
             user = user_result.scalar_one()
             user.plan_tier = "PREMIUM"
-            user.plan_id = PREMIUM_PLAN_ID
+            user.plan_id = premium_plan
             user.last_paypal_sync = datetime.now(timezone.utc)
             await db.commit()
 
@@ -148,11 +154,15 @@ async def downgrade_subscription(
         return_url = f"{CLIENT_URL}/settings/subscription"
         cancel_url = f"{CLIENT_URL}/settings/subscription"
 
+        # Always use no-trial plan for downgrades to prevent PayPal from resetting trials
+        # Our database preserves the original trial_ends_at, so trial users keep their trial
+        basic_plan = BASIC_PLAN_NO_TRIAL_ID
+
         # Call PayPal Revise API
         try:
             result = await paypal_service.revise_subscription(
                 subscription_id=current_user.subscription_id,
-                new_plan_id=BASIC_PLAN_ID,
+                new_plan_id=basic_plan,
                 return_url=return_url,
                 cancel_url=cancel_url
             )
@@ -171,7 +181,7 @@ async def downgrade_subscription(
             )
             user = user_result.scalar_one()
             user.plan_tier = "BASIC"
-            user.plan_id = BASIC_PLAN_ID
+            user.plan_id = basic_plan
             user.last_paypal_sync = datetime.now(timezone.utc)
             await db.commit()
 
@@ -270,6 +280,21 @@ async def cancel_subscription(
                 print(f"Grace period set until: {next_billing_time}")
             except Exception as e:
                 print(f"Warning: Failed to parse next_billing_time: {e}")
+        else:
+            # Fallback: Calculate grace period manually if PayPal doesn't provide it
+            # This ensures users always keep access until end of their paid period
+            if user.last_billing_date:
+                # User was billed recently - add 30 days from last billing
+                user.next_billing_date = user.last_billing_date + timedelta(days=30)
+                print(f"Grace period calculated from last_billing_date: {user.next_billing_date}")
+            elif user.subscription_started_at:
+                # Calculate from subscription start date + 30 days
+                user.next_billing_date = user.subscription_started_at + timedelta(days=30)
+                print(f"Grace period calculated from subscription_started_at: {user.next_billing_date}")
+            else:
+                # Safety fallback: Give 30 days from now
+                user.next_billing_date = datetime.now(timezone.utc) + timedelta(days=30)
+                print(f"Grace period calculated from current time (fallback): {user.next_billing_date}")
 
         await db.commit()
 
@@ -379,7 +404,20 @@ async def complete_new_subscription(
     try:
         subscription_id = request.subscription_id
 
-        # Step 1: Validate subscription with PayPal API
+        # Step 1: Check if subscription is already claimed by another user (prevents hijacking)
+        existing_user_result = await db.execute(
+            select(UserModel).where(UserModel.subscription_id == subscription_id)
+        )
+        existing_user = existing_user_result.scalar_one_or_none()
+
+        if existing_user and existing_user.id != current_user.id:
+            print(f"🚨 SECURITY: Subscription {subscription_id} already claimed by user {existing_user.email}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This subscription is already claimed by another account"
+            )
+
+        # Step 2: Validate subscription with PayPal API
         try:
             subscription_details = await paypal_service.get_subscription(subscription_id)
         except Exception as e:
@@ -389,12 +427,17 @@ async def complete_new_subscription(
                 detail="Invalid subscription ID or PayPal service unavailable"
             )
 
-        # Step 2: Get plan details from PayPal
+        # Step 3: Get plan details from PayPal
         paypal_plan_id = subscription_details.get('plan_id')
         subscription_status = subscription_details.get('status')
 
+        # Extract billing information for new subscription
+        billing_info = subscription_details.get('billing_info', {})
+        next_billing_time = billing_info.get('next_billing_time')
+
         print(f"📝 Completing subscription {subscription_id} for user {current_user.email}")
         print(f"   Plan ID: {paypal_plan_id}, Status: {subscription_status}")
+        print(f"   Next Billing Time: {next_billing_time}")
 
         # Step 3: Verify subscription status is valid
         if subscription_status not in ['ACTIVE', 'APPROVAL_PENDING', 'APPROVED']:
@@ -433,7 +476,7 @@ async def complete_new_subscription(
 
         if has_trial:
             # New customer with trial
-            trial_end = now + timedelta(days=14)
+            trial_end = now + timedelta(days=30)  # 30-day trial period
             user.subscription_status = "TRIAL"
             user.trial_ends_at = trial_end
             trial_end_iso = trial_end.isoformat()
@@ -445,10 +488,35 @@ async def complete_new_subscription(
             trial_end_iso = None
             print(f"✅ Subscription completed: {user.email} -> {plan_tier} (ACTIVE - no trial)")
 
+        # Clear old subscription billing data and set new subscription billing info
+        user.last_billing_date = None  # No payment made yet for new subscription
+
+        # Set next billing date for new subscription
+        if next_billing_time:
+            # PayPal provided next billing time - use it
+            try:
+                user.next_billing_date = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
+                print(f"   Next billing date set from PayPal: {next_billing_time}")
+            except Exception as e:
+                print(f"   Warning: Failed to parse next_billing_time: {e}")
+                # Fallback to calculation
+                if has_trial:
+                    user.next_billing_date = trial_end  # First billing when trial ends
+                else:
+                    user.next_billing_date = now + timedelta(days=30)  # Monthly billing cycle
+        else:
+            # PayPal didn't provide next billing time - calculate it
+            if has_trial:
+                user.next_billing_date = trial_end  # First billing when trial ends
+                print(f"   Next billing date set to trial end: {trial_end}")
+            else:
+                user.next_billing_date = now + timedelta(days=30)  # Monthly billing cycle
+                print(f"   Next billing date calculated: {now + timedelta(days=30)}")
+
         await db.commit()
 
         # Return appropriate message
-        trial_message = "with 14-day trial!" if has_trial else "(no trial - billing starts immediately)"
+        trial_message = "with 30-day trial!" if has_trial else "(no trial - billing starts immediately)"
 
         return {
             "success": True,

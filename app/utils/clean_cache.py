@@ -3,15 +3,19 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.database import Property
 from app.database import AsyncSessionLocal
+from app.config.logging import get_logger
 import os
 
-print(os.getenv("CACHE_EXPIRY_DAYS"))
+logger = get_logger(__name__)
+
 async def cleanup_expired_property_cache():
     """Remove expired property cache data older than 7 days"""
-    print(f"[CLEANUP] Starting cache cleanup at {datetime.utcnow()}")
+    cache_expiry_days = int(os.getenv("CACHE_EXPIRY_DAYS", 7))
+    logger.info("Starting property cache cleanup", extra={"cache_expiry_days": cache_expiry_days})
+
     try:
         async with AsyncSessionLocal() as db:
-            cutoff_time = datetime.utcnow() - timedelta(days=int(os.getenv("CACHE_EXPIRY_DAYS", 7)))
+            cutoff_time = datetime.utcnow() - timedelta(days=cache_expiry_days)
 
             stmt = update(Property).where(
                 Property.detailed_data_cached_at < cutoff_time
@@ -24,9 +28,9 @@ async def cleanup_expired_property_cache():
             result = await db.execute(stmt)
             await db.commit()
 
-            print(f"[CLEANUP] Successfully cleaned up {result.rowcount} expired cache entries")
+            logger.info("Property cache cleanup completed", extra={"entries_cleaned": result.rowcount})
             return result.rowcount
 
     except Exception as e:
-        print(f"[CLEANUP] Error during cache cleanup: {str(e)}")
+        logger.error("Property cache cleanup failed", exc_info=True)
         raise

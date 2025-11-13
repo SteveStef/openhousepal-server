@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import timedelta, datetime, timezone
 import os
 import secrets
-from app.utils.emails import send_simple_message
+from app.services.email_service import EmailService
 
 from app.database import get_db
 from app.schemas.user import UserCreate, User, UserLogin, Token, ForgotPasswordRequest, ResetPasswordRequest
@@ -11,8 +11,11 @@ from app.services.user_service import UserService
 from app.services.paypal_service import paypal_service
 from app.utils.auth import create_access_token, get_current_active_user, hash_password
 from app.models.database import User as UserModel
+from app.services.verification_service import verification_service
+from app.config.logging import get_logger
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
+logger = get_logger(__name__)
 
 # PayPal Plan ID Constants (from environment variables)
 BASIC_PLAN_ID = os.getenv("PAYPAL_BASIC_PLAN_ID")
@@ -43,11 +46,180 @@ async def validate_signup(
         # Re-raise HTTP exceptions
         raise
     except Exception as e:
-        print(f"Validation error: {e}")
+        logger.error("Validation error", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Validation failed"
         )
+
+@router.post("/send-verification-code", status_code=status.HTTP_200_OK)
+async def send_verification_code(
+    user_data: UserCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Send a 6-digit verification code to the user's email.
+    Stores form data temporarily for registration completion.
+    """
+    try:
+        # Check if email is already registered
+        existing_user = await UserService.get_user_by_email(db, user_data.email)
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
+            )
+
+        # Check rate limit
+        can_send, error_msg = verification_service.can_send_code(user_data.email)
+        if not can_send:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=error_msg
+            )
+
+        # Generate verification code
+        code = verification_service.generate_code()
+
+        # Store code and form data
+        form_data = {
+            "first_name": user_data.first_name,
+            "last_name": user_data.last_name,
+            "state": user_data.state,
+            "brokerage": user_data.brokerage,
+            "password": user_data.password  # Will be hashed by verification_service
+        }
+        verification_service.store_code(user_data.email, code, form_data)
+
+        # Log code in development mode (emails are auto-masked by logging filter)
+        if os.getenv("MAILGUN_DEV", "yes") == "yes":
+            logger.info(
+                "DEV MODE: Verification code generated",
+                extra={
+                    "code": code,
+                    "recipient": f"{user_data.first_name} {user_data.last_name}"
+                }
+            )
+
+        # Send email with verification code
+        email_service = EmailService()
+        email_service.send_simple_message(
+            to_email=user_data.email,
+            subject="Verify Your Email - Open House Pal",
+            template="email_verification_code",
+            template_variables={
+                "recipient_name": user_data.first_name,
+                "verification_code": code,
+                "expiration_minutes": "15"
+            }
+        )
+
+        return {
+            "success": True,
+            "message": f"Verification code sent to {user_data.email}"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error sending verification code: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send verification code"
+        )
+
+@router.post("/verify-code", status_code=status.HTTP_200_OK)
+async def verify_code(
+    request: dict
+):
+    """
+    Verify the 6-digit code sent to user's email.
+    """
+    email = request.get("email")
+    code = request.get("code")
+
+    if not email or not code:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email and code are required"
+        )
+
+    # Verify the code
+    is_valid, error_msg = verification_service.verify_code(email, code)
+
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=error_msg
+        )
+
+    return {
+        "success": True,
+        "verified": True,
+        "message": "Email verified successfully"
+    }
+
+@router.post("/resend-verification-code", status_code=status.HTTP_200_OK)
+async def resend_verification_code(
+    request: dict
+):
+    """
+    Resend a new verification code to the user's email.
+    """
+    email = request.get("email")
+
+    if not email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email is required"
+        )
+
+    # Resend code
+    success, new_code, error_msg = verification_service.resend_code(email)
+
+    if not success:
+        if "Too many" in error_msg:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=error_msg
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=error_msg
+            )
+
+    # Get form data to retrieve first name
+    entry = verification_service._cache.get(email)
+    first_name = entry['form_data'].get('first_name', 'User') if entry else 'User'
+
+    # Print code to console in development mode
+    if os.getenv("MAILGUN_DEV", "yes") == "yes":
+        print(f"\n{'='*60}")
+        print(f"🔐 RESENT VERIFICATION CODE (DEV MODE)")
+        print(f"{'='*60}")
+        print(f"Email: {email}")
+        print(f"Code:  {new_code}")
+        print(f"Name:  {first_name}")
+        print(f"{'='*60}\n")
+
+    # Send email with new code
+    email_service = EmailService()
+    email_service.send_simple_message(
+        to_email=email,
+        subject="Your New Verification Code - Open House Pal",
+        template="email_verification_code",
+        template_variables={
+            "recipient_name": first_name,
+            "verification_code": new_code,
+            "expiration_minutes": "15"
+        }
+    )
+
+    return {
+        "success": True,
+        "message": "Verification code resent successfully"
+    }
 
 @router.post("/signup-with-subscription", response_model=Token, status_code=status.HTTP_201_CREATED)
 async def signup_with_subscription(
@@ -61,6 +233,13 @@ async def signup_with_subscription(
     All-or-nothing: account and subscription are linked together or neither is created.
     """
     try:
+        # Step 0: Check if email is verified
+        if not verification_service.is_verified(user_data.email):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email not verified. Please verify your email first."
+            )
+
         # Step 1: Validate subscription with PayPal API
         try:
             subscription_details = await paypal_service.get_subscription(subscription_id)
@@ -122,7 +301,7 @@ async def signup_with_subscription(
 
             # Create user with subscription data
             now = datetime.now(timezone.utc)
-            trial_end = now + timedelta(days=14)
+            trial_end = now + timedelta(days=30)  # 30-day trial period
 
             new_user = UserModel(
                 email=user_data.email,
@@ -145,6 +324,21 @@ async def signup_with_subscription(
             await db.refresh(new_user)
 
         # Transaction committed successfully - account and subscription linked atomically!
+
+        # Clear verification data now that account is created
+        verification_service.clear_verification(new_user.email)
+
+        # Send welcome email
+        email_service = EmailService()
+        email_service.send_simple_message(
+            to_email=new_user.email,
+            subject="Welcome to OpenHousePal!",
+            template="agent_welcome",
+            template_variables={
+                "agent_name": new_user.first_name,
+                "plan_tier": new_user.plan_tier
+            }
+        )
 
         # Create access token
         access_token = create_access_token(data={"sub": new_user.id})
@@ -172,62 +366,6 @@ async def signup_with_subscription(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create account with subscription"
-        )
-
-
-@router.post("/signup", response_model=Token, status_code=status.HTTP_201_CREATED)
-async def signup(
-    user_data: UserCreate,
-    db: AsyncSession = Depends(get_db)
-):
-
-    """
-    Create a new user account and return access token
-    """
-    try:
-        # Check if user already exists
-        existing_user = await UserService.get_user_by_email(db, user_data.email)
-        if existing_user:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Email already registered"
-            )
-        
-        # Create new user
-        new_user = await UserService.create_user(db, user_data)
-        
-        # Create access token for the new user
-        access_token = create_access_token(
-            data={"sub": new_user.id}
-        )
-        
-        return {
-            "access_token": access_token,
-            "token_type": "bearer",
-            "user": {
-                "id": new_user.id,
-                "email": new_user.email,
-                "first_name": new_user.first_name,
-                "last_name": new_user.last_name,
-                "state": new_user.state,
-                "brokerage": new_user.brokerage
-            }
-        }
-        
-    except HTTPException:
-        # Re-raise HTTP exceptions (like the 400 above)
-        raise
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
-    except Exception as e:
-        # Log the actual error for debugging
-        print(f"Signup error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create user"
         )
 
 @router.get("/users/{user_id}", response_model=User)
@@ -348,47 +486,39 @@ async def forgot_password(
         from sqlalchemy import select
         from app.models.database import PasswordResetToken
 
-        # Find user by email
         result = await db.execute(
             select(UserModel).where(UserModel.email == email)
         )
         user = result.scalar_one_or_none()
 
-        # Always return success message (don't reveal if email exists)
         success_response = {"message": "If an account exists with this email, you will receive a password reset link shortly."}
 
         if not user:
-            # Email doesn't exist, but don't tell the user
             return success_response
 
         # Generate secure token
         token = secrets.token_urlsafe(32)
 
-        # Set expiration (1 hour from now)
         now = datetime.now(timezone.utc)
         expires_at = now + timedelta(hours=1)
 
-        # Save token to database
         reset_token = PasswordResetToken(
             user_id=user.id,
             token=token,
             expires_at=expires_at,
             used=False
         )
+
         db.add(reset_token)
         await db.commit()
 
-        # Build reset link
         reset_link = f"{os.getenv('CLIENT_URL')}/reset-password?token={token}"
-
-        # Simple text message
-        message_body = f"Click this link to reset your password: {reset_link}"
-
-        send_simple_message(
-            os.getenv("MAILGUN_SANDBOX_FROM"),
-            email,
-            "Reset Your Password - Open House Pal",
-            message_body
+        email_service = EmailService()
+        status_code, response = email_service.send_simple_message(
+            to_email=email,
+            subject="Reset Your Password - OpenHousePal",
+            template="reset_password",
+            template_variables={"reset_link": reset_link}
         )
 
         return success_response

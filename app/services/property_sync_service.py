@@ -2,23 +2,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from typing import List, Dict, Any
-import logging
 import asyncio
 from datetime import datetime, timezone
 
 from app.models.database import Collection, CollectionPreferences, Property, collection_properties, User
 from app.services.zillow_service import ZillowService
 from app.services.collection_preferences_service import CollectionPreferencesService
-from app.utils.emails import send_visitor_new_properties_notification
+from app.services.email_service import EmailService
+from app.config.logging import get_logger
+import os
 from sqlalchemy import func
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Get logger from centralized config
+logger = get_logger(__name__)
 
 class PropertySyncService:
     def __init__(self):
         self.zillow_service = ZillowService()
+        self.email_service = EmailService()
     
     async def get_active_collections_with_preferences(self, db: AsyncSession) -> List[tuple]:
         """
@@ -73,7 +74,7 @@ class PropertySyncService:
                 'days_on_market': 'days_on_zillow',
                 'last_updated': 'last_synced'
             }
-            
+
             # Special handling for zpid (string to int conversion)
             zpid_value = property_data.get('zpid')
             if zpid_value and str(zpid_value).isdigit():
@@ -207,7 +208,54 @@ class PropertySyncService:
 
                 # Check if property already exists in this collection
                 if await self.property_exists_in_collection(db, collection.id, zpid):
-                    continue
+                    # Property exists - check for price drop
+                    result = await db.execute(
+                        select(Property).where(Property.zpid == zpid)
+                    )
+                    existing_property = result.scalar_one_or_none()
+
+                    if existing_property:
+                        old_price = existing_property.price  # OLD price from database
+                        new_price = property_data.get('price')  # NEW price from Zillow
+
+                        # Check for price drop
+                        if old_price and new_price and new_price < old_price:
+                            # Price dropped! Send notification
+                            visitor_email = collection.visitor_email
+                            visitor_name = collection.visitor_name or "Valued Visitor"
+                            collection_name = collection.name
+
+                            # Build collection link
+                            frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
+                            collection_link = f"{frontend_url}/showcase/{collection.share_token}"
+
+                            # Calculate savings
+                            savings = old_price - new_price
+                            discount_percent = round((savings / old_price) * 100, 1)
+
+                            if visitor_email:
+                                email_service = EmailService()
+                                email_service.send_simple_message(
+                                    to_email=visitor_email,
+                                    subject=f"Price Drop Alert - {collection_name}",
+                                    template="price_drop_alert",
+                                    template_variables={
+                                        "recipient_name": visitor_name,
+                                        "collection_name": collection_name,
+                                        "collection_link": collection_link,
+                                        "property_address": existing_property.street_address,
+                                        "property_image": existing_property.img_src,
+                                        "old_price": f"${old_price:,}",
+                                        "new_price": f"${new_price:,}",
+                                        "savings": f"${savings:,}",
+                                        "discount_percent": f"{discount_percent}%"
+                                    }
+                                )
+                                logger.info(f"Price drop email sent for property {zpid}: ${old_price:,} → ${new_price:,}")
+
+                    # Update property with new data
+                    property_obj = await self.create_property_from_zillow_data(db, property_data)
+                    continue  # Don't count as new property
 
                 # Create or update property
                 property_obj = await self.create_property_from_zillow_data(db, property_data)
@@ -232,7 +280,7 @@ class PropertySyncService:
             }
 
         except Exception as e:
-            logger.error(f"Error syncing collection {collection.id}: {str(e)}")
+            logger.error(f"Error syncing collection {collection.id}", exc_info=True, extra={"collection_id": collection.id})
             return {
                 'new_properties_count': 0,
                 'collection': collection,
@@ -276,24 +324,52 @@ class PropertySyncService:
                             sync_results['collections_processed'] += 1
                             sync_results['total_new_properties'] += sync_result['new_properties_count']
 
-                            # Send email notification to visitor if new properties were added
+                            # Send email notifications to visitor and agent if new properties were added
                             if sync_result['new_properties_count'] > 0 and visitor_email and share_token:
-                                try:
-                                    status_code, response = send_visitor_new_properties_notification(
-                                        visitor_name=visitor_name,
-                                        visitor_email=visitor_email,
-                                        collection_name=collection_name,
-                                        new_properties_count=sync_result['new_properties_count'],
-                                        total_properties=sync_result['total_properties'],
-                                        share_token=share_token
+                                # Get agent info
+                                agent_result = await db.execute(
+                                    select(User).where(User.id == collection.owner_id)
+                                )
+                                agent = agent_result.scalar_one_or_none()
+
+                                # Build collection link
+                                frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
+                                collection_link = f"{frontend_url}/showcase/{share_token}"
+
+                                # Send to visitor
+                                self.email_service.send_simple_message(
+                                    to_email=visitor_email,
+                                    subject=f"New Properties Added to Your Collection - {collection_name}",
+                                    template="new_properties_synced",
+                                    template_variables={
+                                        "recipient_name": visitor_name,
+                                        "collection_name": collection_name,
+                                        "new_count": sync_result['new_properties_count'],
+                                        "total_count": sync_result['total_properties'],
+                                        "collection_link": collection_link
+                                    }
+                                )
+
+                                # Send to agent (same template, different recipient)
+                                if agent and agent.email:
+                                    self.email_service.send_simple_message(
+                                        to_email=agent.email,
+                                        subject=f"New Properties Added to {visitor_name}'s Collection",
+                                        template="new_properties_synced",
+                                        template_variables={
+                                            "recipient_name": agent.first_name,
+                                            "collection_name": collection_name,
+                                            "new_count": sync_result['new_properties_count'],
+                                            "total_count": sync_result['total_properties'],
+                                            "collection_link": collection_link,
+                                            "visitor_name": visitor_name
+                                        }
                                     )
 
-                                    logger.info(
-                                        f"Email notification sent to visitor {visitor_email} "
-                                        f"for collection {collection_id}: Status {status_code}"
-                                    )
-                                except Exception as email_error:
-                                    logger.error(f"Failed to send email notification for collection {collection_id}: {email_error}")
+                                logger.info(
+                                    f"Email notifications sent for collection {collection_id}: "
+                                    f"{sync_result['new_properties_count']} new properties"
+                                )
 
                             # Add small delay between collection syncs to be respectful to API
                             await asyncio.sleep(2)
@@ -367,7 +443,7 @@ class PropertySyncService:
                 }
                 
             except Exception as e:
-                logger.error(f"Error syncing single collection {collection_id}: {str(e)}")
+                logger.error(f"Error syncing single collection {collection_id}", exc_info=True, extra={"collection_id": collection_id})
                 return {'success': False, 'error': str(e)}
     
     async def populate_new_collection(self, db: AsyncSession, collection_id: str) -> Dict[str, Any]:
@@ -427,7 +503,7 @@ class PropertySyncService:
             }
 
         except Exception as e:
-            logger.error(f"Error populating new collection {collection_id}: {str(e)}")
+            logger.error(f"Error populating new collection {collection_id}", exc_info=True, extra={"collection_id": collection_id})
             # Don't raise the exception - collection creation should succeed even if population fails
             return {
                 'success': False,
@@ -501,7 +577,7 @@ class PropertySyncService:
             }
 
         except Exception as e:
-            logger.error(f"Error replacing properties for collection {collection_id}: {str(e)}")
+            logger.error(f"Error replacing properties for collection {collection_id}", exc_info=True, extra={"collection_id": collection_id})
             await db.rollback()
             return {
                 'success': False,

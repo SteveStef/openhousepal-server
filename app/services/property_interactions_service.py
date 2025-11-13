@@ -2,8 +2,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
 from typing import List
 from datetime import datetime
+import os
 
-from app.models.database import PropertyInteraction, PropertyComment
+from app.models.database import PropertyInteraction, PropertyComment, Collection, Property, User
 from app.schemas.property_interactions import (
     PropertyInteractionUpdate,
     PropertyCommentCreate,
@@ -12,6 +13,7 @@ from app.schemas.property_interactions import (
     PropertyInteractionStats,
     PropertyInteractionSummary
 )
+from app.services.email_service import EmailService
 
 
 class PropertyInteractionsService:
@@ -70,6 +72,41 @@ class PropertyInteractionsService:
         await db.commit()
         await db.refresh(interaction)
 
+        # Send email to agent if visitor liked the property
+        if interaction.liked:
+            collection_result = await db.execute(
+                select(Collection).where(Collection.id == collection_id)
+            )
+            collection = collection_result.scalar_one_or_none()
+
+            if collection:
+                agent_result = await db.execute(
+                    select(User).where(User.id == collection.owner_id)
+                )
+                agent = agent_result.scalar_one_or_none()
+
+                property_result = await db.execute(
+                    select(Property).where(Property.id == property_id)
+                )
+                property_obj = property_result.scalar_one_or_none()
+
+                if agent and agent.email and property_obj:
+                    frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
+                    collection_link = f"{frontend_url}/showcases/{collection_id}"
+
+                    email_service = EmailService()
+                    email_service.send_simple_message(
+                        to_email=agent.email,
+                        subject=f"A Visitor Liked a Property - {property_obj.street_address}",
+                        template="visitor_liked_property",
+                        template_variables={
+                            "agent_name": agent.first_name,
+                            "visitor_name": collection.visitor_name or "A visitor",
+                            "property_address": property_obj.street_address,
+                            "collection_link": collection_link
+                        }
+                    )
+
         return PropertyInteractionResponse.from_orm(interaction)
     
     @classmethod
@@ -100,6 +137,41 @@ class PropertyInteractionsService:
         db.add(comment)
         await db.commit()
         await db.refresh(comment)
+
+        # Send email notification to agent
+        collection_result = await db.execute(
+            select(Collection).where(Collection.id == collection_id)
+        )
+        collection = collection_result.scalar_one_or_none()
+
+        if collection:
+            agent_result = await db.execute(
+                select(User).where(User.id == collection.owner_id)
+            )
+            agent = agent_result.scalar_one_or_none()
+
+            property_result = await db.execute(
+                select(Property).where(Property.id == property_id)
+            )
+            property_obj = property_result.scalar_one_or_none()
+
+            if agent and agent.email and property_obj:
+                frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
+                collection_link = f"{frontend_url}/showcases/{collection_id}"
+
+                email_service = EmailService()
+                email_service.send_simple_message(
+                    to_email=agent.email,
+                    subject=f"New Comment on Property - {property_obj.street_address}",
+                    template="property_comment",
+                    template_variables={
+                        "recipient_name": agent.first_name,
+                        "commenter_name": comment.visitor_name or "A visitor",
+                        "property_address": property_obj.street_address,
+                        "comment_text": content,
+                        "collection_link": collection_link
+                    }
+                )
 
         # Create response and populate author field from visitor_name
         response = PropertyCommentResponse.from_orm(comment)

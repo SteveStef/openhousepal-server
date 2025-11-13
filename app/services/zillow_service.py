@@ -1,7 +1,6 @@
 import httpx
 import os
 from typing import List, Optional, Dict, Any
-import logging
 import asyncio
 from datetime import datetime
 from fastapi import HTTPException
@@ -13,9 +12,10 @@ from app.schemas.collection_preferences import CollectionPreferences as Collecti
 from datetime import datetime
 from app.models.property import PropertyDetailResponse, PropertySaveResponse, ZillowPropertyDetailResponse
 from app.utils.rate_limiter import RateLimiter
+from app.config.logging import get_logger
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Get logger from centralized config
+logger = get_logger(__name__)
 
 class ZillowService:
     def __init__(self):
@@ -116,7 +116,7 @@ class ZillowService:
         except httpx.TimeoutException:
             raise ValueError("Zillow API request timed out")
         except httpx.RequestError as e:
-            logger.error(f"Failed to connect to Zillow API: {str(e)}")
+            logger.error("Failed to connect to Zillow API", exc_info=True)
             raise ValueError(f"Failed to connect to Zillow API: {str(e)}")
     
     async def search_properties_by_location(
@@ -208,7 +208,7 @@ class ZillowService:
         except httpx.TimeoutException:
             raise ValueError(f"Zillow API request timed out for location: {location}")
         except httpx.RequestError as e:
-            logger.error(f"Failed to connect to Zillow API for location {location}: {str(e)}")
+            logger.error(f"Failed to connect to Zillow API for location {location}", exc_info=True, extra={"location": location})
             raise ValueError(f"Failed to connect to Zillow API: {str(e)}")
     
     def parse_zillow_property(self, zillow_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -239,7 +239,7 @@ class ZillowService:
             return property_data
             
         except Exception as e:
-            logger.error(f"Error parsing Zillow property data: {str(e)}")
+            logger.error("Error parsing Zillow property data", exc_info=True)
             return {}
     
     async def get_matching_properties_by_locations(
@@ -282,7 +282,7 @@ class ZillowService:
                         await asyncio.sleep(1)  # Brief pause before retry
                         zillow_response = await self.search_properties_by_location(location, preferences)
                     except Exception as retry_error:
-                        logger.error(f"Second attempt also failed for location {location}: {str(retry_error)}")
+                        logger.error(f"Second attempt also failed for location {location}", exc_info=True, extra={"location": location})
                         # Skip this location and continue with next
                         continue
                 
@@ -315,7 +315,7 @@ class ZillowService:
                     await asyncio.sleep(1)
                     
             except Exception as location_error:
-                logger.error(f"Unexpected error processing location {location}: {str(location_error)}")
+                logger.error(f"Unexpected error processing location {location}", exc_info=True, extra={"location": location})
                 continue
         
         logger.info(f"Location search completed. Total properties found: {len(all_properties)} from {len(locations)} locations")
@@ -367,7 +367,7 @@ class ZillowService:
                 return []
             
         except Exception as e:
-            logger.error(f"Error fetching matching properties: {str(e)}")
+            logger.error("Error fetching matching properties", exc_info=True)
             # Instead of raising, return empty list to allow collection creation to succeed
             logger.warning("Returning empty property list to allow collection creation to proceed")
             return []
