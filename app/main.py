@@ -83,16 +83,19 @@ async def logging_middleware(request: Request, call_next):
     request_id = str(uuid.uuid4())
     set_request_id(request_id)
 
-    # Log incoming request
-    logger.info(
-        "Request received",
-        extra={
-            "method": request.method,
-            "path": request.url.path,
-            "query_params": str(request.url.query) if request.url.query else None,
-            "client_host": request.client.host if request.client else None,
-        }
-    )
+    # Extract user_id from JWT token if present
+    user_id = None
+    try:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.split(" ")[1]
+            from jose import jwt
+            from app.auth.dependencies import SECRET_KEY, ALGORITHM
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            user_id = payload.get("sub")
+    except Exception:
+        # If token decode fails, just continue without user_id
+        pass
 
     # Process request and measure duration
     start_time = time.time()
@@ -111,6 +114,11 @@ async def logging_middleware(request: Request, call_next):
         log_level(
             "Request completed",
             extra={
+                "method": request.method,
+                "path": request.url.path,
+                #"query_params": str(request.url.query) if request.url.query else None,
+                #"client_host": request.client.host if request.client else None,
+                "user_id": user_id,
                 "status_code": response.status_code,
                 "duration_ms": round(duration_ms, 2),
             }
@@ -123,6 +131,9 @@ async def logging_middleware(request: Request, call_next):
             "Request failed with exception",
             exc_info=True,
             extra={
+                "method": request.method,
+                "path": request.url.path,
+                "user_id": user_id,
                 "duration_ms": round(duration_ms, 2),
                 "error": str(e),
             }
@@ -145,7 +156,6 @@ app.include_router(router)
 
 @app.get("/health")
 async def health():
-    #await scheduled_property_sync()
     return {"status": "ok"}
 
 

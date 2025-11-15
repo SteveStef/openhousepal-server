@@ -122,7 +122,7 @@ async def send_verification_code(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error sending verification code: {e}")
+        logger.error("sending verification code failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to send verification code"
@@ -195,13 +195,7 @@ async def resend_verification_code(
 
     # Print code to console in development mode
     if os.getenv("MAILGUN_DEV", "yes") == "yes":
-        print(f"\n{'='*60}")
-        print(f"🔐 RESENT VERIFICATION CODE (DEV MODE)")
-        print(f"{'='*60}")
-        print(f"Email: {email}")
-        print(f"Code:  {new_code}")
-        print(f"Name:  {first_name}")
-        print(f"{'='*60}\n")
+        logger.info("Verification code generated", extra={"user_email": email, "code": verification_code})
 
     # Send email with new code
     email_service = EmailService()
@@ -244,7 +238,6 @@ async def signup_with_subscription(
         try:
             subscription_details = await paypal_service.get_subscription(subscription_id)
         except Exception as e:
-            print(f"PayPal API error: {e}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid subscription ID or PayPal service unavailable"
@@ -362,7 +355,6 @@ async def signup_with_subscription(
         # Re-raise HTTP exceptions
         raise
     except Exception as e:
-        print(f"Signup with subscription error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create account with subscription"
@@ -434,7 +426,6 @@ async def login(
         # Re-raise HTTP exceptions
         raise
     except Exception as e:
-        print(f"Login error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Login failed"
@@ -524,7 +515,7 @@ async def forgot_password(
         return success_response
 
     except Exception as e:
-        print(f"Error in forgot_password: {e}")
+        logger.error("in forgot_password failed", extra={"error": str(e)})
         # Don't reveal errors to prevent information leakage
         return {"message": "If an account exists with this email, you will receive a password reset link shortly."}
 
@@ -594,7 +585,7 @@ async def reset_password(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error in reset_password: {e}")
+        logger.error("in reset_password failed", extra={"error": str(e)})
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

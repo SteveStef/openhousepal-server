@@ -3,6 +3,9 @@ import httpx
 import base64
 from typing import Optional
 from datetime import datetime, timedelta, timezone
+from app.config.logging import get_logger
+
+logger = get_logger(__name__)
 
 class PayPalService:
     def __init__(self):
@@ -218,19 +221,16 @@ class PayPalService:
             result = response.json()
 
             # Debug: Print full response
-            print(f"[DEBUG] PayPal revise response: {result}")
 
             # Extract approval URL from links
             approval_url = None
             for link in result.get("links", []):
-                print(f"[DEBUG] Link: rel={link.get('rel')}, href={link.get('href')}")
                 if link.get("rel") == "approve":
                     approval_url = link.get("href")
                     break
 
             # Check if plan change was applied immediately (no approval needed)
             if not approval_url:
-                print(f"[INFO] No approval URL - plan change applied immediately")
                 # Return None for approval_url to indicate immediate change
                 return {
                     "approval_url": None,

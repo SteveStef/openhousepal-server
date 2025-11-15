@@ -31,6 +31,9 @@ from app.services.property_tour_service import PropertyTourService
 from app.utils.auth import get_current_active_user, get_current_user_optional, require_premium_plan
 from app.models.database import User, Collection
 from sqlalchemy import select
+from app.config.logging import get_logger
+
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/collections", tags=["collections"])
 
@@ -91,7 +94,7 @@ async def get_all_collections(
         return collections
         
     except Exception as e:
-        print(f"Error fetching collections: {e}")
+        logger.error("fetching collections failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch collections"
@@ -121,7 +124,7 @@ async def get_collection(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error fetching collection: {e}")
+        logger.error("fetching collection failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch collection"
@@ -145,7 +148,7 @@ async def create_collection(
             try:
                 await CollectionPreferencesService.auto_generate_preferences(db, collection["id"])
             except Exception as e:
-                print(f"Warning: Failed to auto-generate preferences for collection {collection['id']}: {e}")
+                pass
         
         return collection
         
@@ -155,7 +158,7 @@ async def create_collection(
             detail=str(e)
         )
     except Exception as e:
-        print(f"Error creating collection: {e}")
+        logger.error("creating collection failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create collection"
@@ -169,7 +172,6 @@ async def create_collection_with_preferences(
     current_user: User = Depends(require_premium_plan)
 ):
     try:
-        print(request)
         '''
             If address is used, then make a requests like before to get lat and long of the property
             If City or Township is used, make a zillow request per city/township
@@ -197,7 +199,7 @@ async def create_collection_with_preferences(
                 else:
                     raise e
             except Exception as e:
-                print(f"Error looking up address coordinates: {e}")
+                logger.error("looking up address coordinates failed", extra={"error": str(e)})
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="Failed to lookup property coordinates"
@@ -211,7 +213,6 @@ async def create_collection_with_preferences(
         collection_status = 'ACTIVE' if should_be_active else 'INACTIVE'
 
         active_count = await CollectionsService.count_active_collections(db, current_user.id)
-        print(f"[CREATE_COLLECTION_MANUALLY] User {current_user.id} has {active_count} active collections, creating new collection as {collection_status}")
 
         # Create collection directly with auto-generated share token
         collection = Collection(
@@ -267,13 +268,13 @@ async def create_collection_with_preferences(
             population_result = await sync_service.populate_new_collection(db, collection.id)
             
             if population_result['success']:
-                print(f"Successfully populated collection {collection.id} with {population_result['new_properties_added']} properties")
+                pass
             else:
-                print(f"Warning: Failed to populate collection {collection.id} with properties: {population_result.get('error', 'Unknown error')}")
+                pass
         except Exception as e:
-            print(f"Warning: Exception during property population for collection {collection.id}: {e}")
             # Continue - collection creation should succeed even if population fails
-        
+            pass
+
         collections = await CollectionsService.get_user_collections(db, current_user.id)
         
         if collections:
@@ -288,7 +289,7 @@ async def create_collection_with_preferences(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error creating collection from address: {e}")
+        logger.error("creating collection from address failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create collection"
@@ -342,7 +343,7 @@ async def update_collection_status(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error updating collection status: {e}")
+        logger.error("updating collection status failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update collection status"
@@ -372,7 +373,7 @@ async def delete_collection(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error deleting collection: {e}")
+        logger.error("deleting collection failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete collection"
@@ -412,7 +413,7 @@ async def update_property_interaction(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error updating property interaction: {e}")
+        logger.error("updating property interaction failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update property interaction"
@@ -448,7 +449,7 @@ async def add_property_comment(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error adding property comment: {e}")
+        logger.error("adding property comment failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to add property comment"
@@ -473,7 +474,7 @@ async def get_property_comments(
         return comments
         
     except Exception as e:
-        print(f"Error getting property comments: {e}")
+        logger.error("getting property comments failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get property comments"
@@ -498,7 +499,7 @@ async def get_property_interaction_summary(
         return summary
         
     except Exception as e:
-        print(f"Error getting property interaction summary: {e}")
+        logger.error("getting property interaction summary failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get property interaction summary"
@@ -537,7 +538,7 @@ async def toggle_collection_share(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error toggling collection share: {e}")
+        logger.error("toggling collection share failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update collection sharing settings"
@@ -553,25 +554,21 @@ async def get_shared_collection(
     Get a shared collection by share token (no authentication required)
     """
     try:
-        print(f"[DEBUG] Getting shared collection for token: {share_token}")
         collection_data = await CollectionsService.get_shared_collection(
             db, share_token
         )
         
         if not collection_data:
-            print(f"[DEBUG] No collection found for token: {share_token}")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Collection not found or not available for sharing"
             )
         
-        print(f"[DEBUG] Found collection: {collection_data.get('id')} - {collection_data.get('name')}")
         return collection_data
         
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] Error getting shared collection: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get shared collection"
@@ -589,7 +586,6 @@ async def get_properties_from_collection(
             db
         )
     except Exception as e:
-        print(f"[ERROR] Error getting properties from collection: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get properties from collection"
@@ -641,7 +637,6 @@ async def refresh_collection_properties(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] Error refreshing collection properties: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to refresh collection properties"
@@ -670,7 +665,7 @@ async def schedule_property_tour(
             detail=str(e)
         )
     except Exception as e:
-        print(f"Error scheduling property tour: {e}")
+        logger.error("scheduling property tour failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to schedule property tour"
@@ -708,7 +703,7 @@ async def get_collection_tours(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error fetching collection tours: {e}")
+        logger.error("fetching collection tours failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch collection tours"
@@ -746,7 +741,7 @@ async def update_tour_status(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error updating tour status: {e}")
+        logger.error("updating tour status failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update tour status"

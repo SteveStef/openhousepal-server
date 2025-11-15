@@ -10,9 +10,12 @@ import os
 
 from app.models.database import Collection, Property, User, PropertyInteraction, PropertyComment, PropertyTour, collection_properties
 from app.schemas.collection import CollectionCreate
+from app.config.logging import get_logger
 
 from app.services.property_sync_service import PropertySyncService
 from app.services.collection_preferences_service import CollectionPreferencesService
+
+logger = get_logger(__name__)
 
 class CollectionsService:
 
@@ -30,7 +33,7 @@ class CollectionsService:
             )
             return result.scalar() or 0
         except Exception as e:
-            print(f"Error counting active collections: {e}")
+            logger.error("Failed to count active collections", extra={"error": str(e)})
             return 0
 
     @staticmethod
@@ -105,7 +108,7 @@ class CollectionsService:
                                 "propertyType": original_open_house.house_type or "Unknown"
                             }
                     except Exception as e:
-                        print(f"Warning: Could not fetch original property data for collection {collection.id}: {e}")
+                        pass
 
                 preferences_data = {}
                 if collection.preferences:
@@ -180,7 +183,7 @@ class CollectionsService:
             return collections_data
 
         except Exception as e:
-            print(f"Error fetching user collections: {e}")
+            logger.error("Operation failed", extra={"error": str(e)})
             raise e
 
     @staticmethod
@@ -273,7 +276,7 @@ class CollectionsService:
             }
 
         except Exception as e:
-            print(f"Error fetching collection by ID: {e}")
+            logger.error("Operation failed", extra={"error": str(e)})
             raise e
 
     @staticmethod
@@ -289,7 +292,6 @@ class CollectionsService:
             status = 'ACTIVE' if should_be_active else 'INACTIVE'
 
             active_count = await CollectionsService.count_active_collections(db, user_id)
-            print(f"[CREATE_COLLECTION] User {user_id} has {active_count} active collections, creating new collection as {status}")
 
             # Generate share token for public access
             share_token = CollectionsService.generate_share_token()
@@ -317,14 +319,9 @@ class CollectionsService:
                     sync_service = PropertySyncService()
                     result = await sync_service.populate_new_collection(db, collection.id)
 
-                    if result['success']:
-                        print(f"Successfully populated collection {collection.id} with {result['new_properties_added']} properties")
-                    else:
-                        print(f"Warning: Failed to populate collection {collection.id} with properties: {result.get('error', 'Unknown error')}")
-
             except Exception as e:
-                print(f"Warning: Failed to populate collection {collection.id} with properties: {e}")
                 # Collection creation should still succeed even if property population fails
+                pass
 
             return {
                 "id": collection.id,
@@ -344,7 +341,7 @@ class CollectionsService:
             }
 
         except Exception as e:
-            print(f"Error creating collection: {e}")
+            logger.error("Operation failed", extra={"error": str(e)})
             await db.rollback()
             raise e
 
@@ -376,7 +373,7 @@ class CollectionsService:
             return True
 
         except Exception as e:
-            print(f"Error updating collection status: {e}")
+            logger.error("Operation failed", extra={"error": str(e)})
             await db.rollback()
             raise e
 
@@ -444,7 +441,7 @@ class CollectionsService:
             }
 
         except Exception as e:
-            print(f"Error toggling collection share status: {e}")
+            logger.error("Operation failed", extra={"error": str(e)})
             await db.rollback()
             raise e
 
@@ -455,7 +452,6 @@ class CollectionsService:
     ) -> Optional[Dict[str, Any]]:
         """Get a shared collection by share token (for anonymous access)"""
         try:
-            print(f"[DEBUG SERVICE] Looking for collection with share_token: {share_token}")
             # Query collection with properties and preferences, ensure it's public
             query = (
                 select(Collection)
@@ -475,30 +471,25 @@ class CollectionsService:
             collection = result.scalar_one_or_none()
 
             if not collection:
-                print(f"[DEBUG SERVICE] No collection found for token: {share_token}")
                 # Let's also check if collection exists but is not public
                 debug_query = select(Collection).where(Collection.share_token == share_token)
                 debug_result = await db.execute(debug_query)
                 debug_collection = debug_result.scalar_one_or_none()
                 if debug_collection:
-                    print(f"[DEBUG SERVICE] Collection exists but is_public={debug_collection.is_public}")
+                    pass
                 else:
-                    print(f"[DEBUG SERVICE] No collection exists with this token at all")
+                    pass
                 return None
 
-            print(f"[DEBUG SERVICE] Found collection: {collection.id} - {collection.name} - public: {collection.is_public}")
-            print(f"[DEBUG SERVICE] Preferences loaded: {collection.preferences is not None}")
             if collection.preferences:
-                print(f"[DEBUG SERVICE] Timeframe: {collection.preferences.timeframe}, Visiting reason: {collection.preferences.visiting_reason}")
+                pass
             else:
                 # Manual query for preferences to debug the issue
                 from app.models.database import CollectionPreferences
                 prefs_query = select(CollectionPreferences).where(CollectionPreferences.collection_id == collection.id)
                 prefs_result = await db.execute(prefs_query)
                 manual_prefs = prefs_result.scalar_one_or_none()
-                print(f"[DEBUG SERVICE] Manual preferences query result: {manual_prefs is not None}")
                 if manual_prefs:
-                    print(f"[DEBUG SERVICE] Manual - Timeframe: {manual_prefs.timeframe}, Visiting reason: {manual_prefs.visiting_reason}")
                     # Use the manually loaded preferences
                     collection.preferences = manual_prefs
 
@@ -650,7 +641,7 @@ class CollectionsService:
             return collection_data
 
         except Exception as e:
-            print(f"Error getting shared collection: {e}")
+            logger.error("Operation failed", extra={"error": str(e)})
             raise e
 
     @staticmethod
@@ -675,7 +666,6 @@ class CollectionsService:
             if not collection:
                 return False
 
-            print(f"[DELETE_COLLECTION] Deleting collection {collection_id} with {len(collection.properties)} properties")
 
             # Get all property IDs in this collection
             property_ids_in_collection = [prop.id for prop in collection.properties]
@@ -684,7 +674,6 @@ class CollectionsService:
             orphaned_properties = []
 
             if property_ids_in_collection:
-                print(f"[DELETE_COLLECTION] Checking {len(property_ids_in_collection)} properties for orphaned status")
 
                 for property_id in property_ids_in_collection:
                     # Count how many other collections this property belongs to
@@ -704,40 +693,34 @@ class CollectionsService:
                     if other_collection_count == 0:
                         orphaned_properties.append(property_id)
 
-                print(f"[DELETE_COLLECTION] Found {len(orphaned_properties)} properties that will become orphaned")
 
             # Delete the collection (this will cascade delete the collection_properties relationships)
             await db.delete(collection)
 
             # Clean up orphaned properties and their dependencies
             if orphaned_properties:
-                print(f"[DELETE_COLLECTION] Cleaning up {len(orphaned_properties)} orphaned properties")
 
                 # Delete PropertyInteractions for orphaned properties
                 interactions_result = await db.execute(
                     delete(PropertyInteraction).where(PropertyInteraction.property_id.in_(orphaned_properties))
                 )
-                print(f"[DELETE_COLLECTION] Deleted {interactions_result.rowcount} property interactions")
 
                 # Delete PropertyComments for orphaned properties
                 comments_result = await db.execute(
                     delete(PropertyComment).where(PropertyComment.property_id.in_(orphaned_properties))
                 )
-                print(f"[DELETE_COLLECTION] Deleted {comments_result.rowcount} property comments")
 
                 # Delete the orphaned properties themselves
                 properties_result = await db.execute(
                     delete(Property).where(Property.id.in_(orphaned_properties))
                 )
-                print(f"[DELETE_COLLECTION] Deleted {properties_result.rowcount} orphaned properties")
 
             await db.commit()
-            print(f"[DELETE_COLLECTION] Successfully deleted collection {collection_id}")
 
             return True
 
         except Exception as e:
-            print(f"Error deleting collection: {e}")
+            logger.error("Operation failed", extra={"error": str(e)})
             await db.rollback()
             raise e
 
@@ -758,7 +741,6 @@ class CollectionsService:
             collection = result.scalar_one_or_none()
 
             if not collection:
-                print(f"[DEBUG SERVICE] No collection found with ID: {collectionId}")
                 return []
 
             property_ids = [prop.id for prop in collection.properties]
@@ -883,7 +865,6 @@ class CollectionsService:
 
             return properties_data
         except Exception as e:
-            print(e)
             return []
 
 

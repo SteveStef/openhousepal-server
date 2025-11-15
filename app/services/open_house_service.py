@@ -9,6 +9,9 @@ from app.services.collection_preferences_service import CollectionPreferencesSer
 from app.services.collections_service import CollectionsService
 from app.services.zillow_service import ZillowService
 from app.schemas.collection_preferences import CollectionPreferences as CollectionPreferencesSchema
+from app.config.logging import get_logger
+
+logger = get_logger(__name__)
 
 class OpenHouseService:
 
@@ -49,7 +52,6 @@ class OpenHouseService:
             visited_open_house = await OpenHouseService.get_open_house_event_by_id(db, form_data.open_house_event_id)
             
             if not visited_open_house:
-                print(f"Could not find open house event {form_data.open_house_event_id} to create collection")
                 return {"success": False, "properties_added": 0}
 
             # Check if agent has PREMIUM plan (collections are a Premium-only feature)
@@ -59,12 +61,10 @@ class OpenHouseService:
             agent = agent_result.scalar_one_or_none()
 
             if not agent:
-                print(f"Could not find agent {agent_id} for open house event {form_data.open_house_event_id}")
                 return {"success": False, "properties_added": 0, "reason": "agent_not_found"}
 
             # Only create collections for PREMIUM plan agents
             if agent.plan_tier != "PREMIUM":
-                print(f"Agent {agent_id} has {agent.plan_tier} plan - collections are Premium-only. Skipping collection creation.")
                 return {"success": False, "properties_added": 0, "reason": "basic_plan"}
 
             # Create collection
@@ -89,26 +89,21 @@ class OpenHouseService:
                 preferences = await CollectionPreferencesService.auto_generate_preferences(db, collection.id, form_data)
                 
                 if preferences:
-                    print(f"Auto-generated preferences for collection {collection.id}")
                     
                     # Immediately fetch and populate properties using ZillowService
                     properties_added = await OpenHouseService._populate_collection_with_zillow_properties(
                         db, collection, preferences
                     )
-                    
-                    print(f"Successfully populated collection {collection.id} with {properties_added} properties")
                     return {"success": True, "properties_added": properties_added, "collection_id": collection.id, "share_token": collection.share_token}
                 else:
-                    print(f"Warning: Failed to auto-generate preferences for collection {collection.id}")
                     return {"success": True, "properties_added": 0, "collection_id": collection.id, "share_token": collection.share_token}
 
             except Exception as e:
-                print(f"Warning: Failed to auto-generate preferences for collection {collection.id}: {e}")
                 # Collection creation should still succeed even if preferences fail
                 return {"success": True, "properties_added": 0, "collection_id": collection.id, "share_token": collection.share_token}
             
         except Exception as e:
-            print(f"Error creating collection for visitor: {e}")
+            logger.error("creating collection for visitor failed", extra={"error": str(e)})
             await db.rollback()
             return {"success": False, "properties_added": 0}
     
@@ -142,7 +137,7 @@ class OpenHouseService:
             return properties_added
             
         except Exception as e:
-            print(f"Error populating collection {collection.id} with Zillow properties: {e}")
+            logger.error("populating collection {collection.id} with Zillow properties failed", extra={"error": str(e)})
             return 0
     
     @staticmethod
@@ -279,7 +274,7 @@ class OpenHouseService:
             }
             
         except Exception as e:
-            print(f"Error fetching open house event by ID: {e}")
+            logger.error("fetching open house event by ID failed", extra={"error": str(e)})
             return None
 
     @staticmethod
@@ -316,5 +311,5 @@ class OpenHouseService:
             }
             
         except Exception as e:
-            print(f"Error fetching property by QR code: {e}")
+            logger.error("fetching property by QR code failed", extra={"error": str(e)})
             return None

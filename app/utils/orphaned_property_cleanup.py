@@ -13,6 +13,9 @@ sys.path.insert(0, str(server_dir))
 
 from app.database import AsyncSessionLocal
 from app.models.database import Property, PropertyInteraction, PropertyComment, collection_properties
+from app.config.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 async def find_orphaned_properties(db: AsyncSession, batch_size: int = 100) -> List[str]:
@@ -83,8 +86,6 @@ async def cleanup_orphaned_properties_batch(dry_run: bool = False, batch_size: i
     Clean up orphaned properties in batches
     This is the main cleanup function
     """
-    print(f"[ORPHANED_CLEANUP] Starting orphaned property cleanup at {datetime.utcnow()}")
-    print(f"[ORPHANED_CLEANUP] Mode: {'DRY RUN' if dry_run else 'LIVE'}, Batch size: {batch_size}")
 
     cleanup_results = {
         'started_at': datetime.utcnow(),
@@ -108,17 +109,14 @@ async def cleanup_orphaned_properties_batch(dry_run: bool = False, batch_size: i
                 orphaned_ids = await find_orphaned_properties(db, batch_size)
 
                 if not orphaned_ids:
-                    print(f"[ORPHANED_CLEANUP] No more orphaned properties found")
                     break
 
                 batch_count += 1
                 cleanup_results['batches_processed'] = batch_count
                 cleanup_results['total_orphaned_found'] += len(orphaned_ids)
 
-                print(f"[ORPHANED_CLEANUP] Batch {batch_count}: Found {len(orphaned_ids)} orphaned properties")
 
                 if dry_run:
-                    print(f"[ORPHANED_CLEANUP] DRY RUN - Would delete properties: {orphaned_ids[:5]}{'...' if len(orphaned_ids) > 5 else ''}")
                     continue
 
                 try:
@@ -127,13 +125,9 @@ async def cleanup_orphaned_properties_batch(dry_run: bool = False, batch_size: i
                     cleanup_results['total_interactions_deleted'] += dependency_stats['interactions_deleted']
                     cleanup_results['total_comments_deleted'] += dependency_stats['comments_deleted']
 
-                    print(f"[ORPHANED_CLEANUP] Cleaned up {dependency_stats['interactions_deleted']} interactions, {dependency_stats['comments_deleted']} comments")
-
                     # Delete the orphaned properties
                     deleted_count = await delete_orphaned_properties(db, orphaned_ids)
                     cleanup_results['total_properties_deleted'] += deleted_count
-
-                    print(f"[ORPHANED_CLEANUP] Deleted {deleted_count} orphaned properties")
 
                     # Commit the batch
                     await db.commit()
@@ -145,7 +139,6 @@ async def cleanup_orphaned_properties_batch(dry_run: bool = False, batch_size: i
                 except Exception as e:
                     await db.rollback()
                     error_msg = f"Error processing batch {batch_count}: {str(e)}"
-                    print(f"[ORPHANED_CLEANUP] ERROR: {error_msg}")
                     cleanup_results['errors'].append(error_msg)
                     # Continue with next batch instead of failing completely
                     continue
@@ -155,17 +148,15 @@ async def cleanup_orphaned_properties_batch(dry_run: bool = False, batch_size: i
             cleanup_results['completed_at'] - cleanup_results['started_at']
         ).total_seconds()
 
-        print(f"[ORPHANED_CLEANUP] Completed! Processed {cleanup_results['batches_processed']} batches")
-        print(f"[ORPHANED_CLEANUP] Found {cleanup_results['total_orphaned_found']} orphaned properties")
-
         if not dry_run:
-            print(f"[ORPHANED_CLEANUP] Deleted {cleanup_results['total_properties_deleted']} properties")
-            print(f"[ORPHANED_CLEANUP] Deleted {cleanup_results['total_interactions_deleted']} interactions")
-            print(f"[ORPHANED_CLEANUP] Deleted {cleanup_results['total_comments_deleted']} comments")
+            logger.info("Orphaned property cleanup completed", extra={
+                "event": "orphaned_cleanup_completed",
+                "total_orphaned_found": cleanup_results['total_orphaned_found'],
+                "total_deleted": cleanup_results['total_properties_deleted']
+            })
 
     except Exception as e:
         error_msg = f"Critical error during orphaned property cleanup: {str(e)}"
-        print(f"[ORPHANED_CLEANUP] CRITICAL ERROR: {error_msg}")
         cleanup_results['success'] = False
         cleanup_results['errors'].append(error_msg)
 
@@ -178,7 +169,6 @@ async def scheduled_orphaned_property_cleanup():
     Checks configuration and runs cleanup
     """
     if not os.getenv("ORPHANED_CLEANUP_ENABLED", "false").lower() == "true":
-        print("[ORPHANED_CLEANUP] Orphaned property cleanup is disabled (ORPHANED_CLEANUP_ENABLED=false)")
         return
 
     # Get configuration
@@ -190,14 +180,26 @@ async def scheduled_orphaned_property_cleanup():
 
         if result['success']:
             if dry_run:
-                print(f"[ORPHANED_CLEANUP] ✅ Dry run completed - Found {result['total_orphaned_found']} orphaned properties")
+                logger.info("Orphaned property cleanup dry run completed", extra={
+                    "event": "orphaned_cleanup_dry_run",
+                    "total_orphaned_found": result['total_orphaned_found']
+                })
             else:
-                print(f"[ORPHANED_CLEANUP] ✅ Cleanup completed - Deleted {result['total_properties_deleted']} properties")
+                logger.info("Orphaned property cleanup completed", extra={
+                    "event": "orphaned_cleanup_success",
+                    "total_deleted": result['total_properties_deleted']
+                })
         else:
-            print(f"[ORPHANED_CLEANUP] ❌ Cleanup completed with errors: {result['errors']}")
+            logger.error("Orphaned property cleanup failed", extra={
+                "event": "orphaned_cleanup_failed",
+                "errors": result.get('errors', [])
+            })
 
     except Exception as e:
-        print(f"[ORPHANED_CLEANUP] 💥 Critical error in scheduled cleanup: {str(e)}")
+        logger.error("Scheduled orphaned cleanup failed", extra={
+            "event": "scheduled_cleanup_error",
+            "error": str(e)
+        })
 
 
 async def count_orphaned_properties() -> int:
@@ -216,16 +218,12 @@ async def count_orphaned_properties() -> int:
 
             result = await db.execute(query)
             count = result.scalar()
-
-            print(f"📊 Found {count} orphaned properties in database")
             return count
 
     except Exception as e:
-        print(f"❌ Error counting orphaned properties: {str(e)}")
         return 0
 
 
 if __name__ == "__main__":
     """For testing - run this script directly to count orphaned properties"""
-    print("🔍 Checking for orphaned properties...")
     asyncio.run(count_orphaned_properties())

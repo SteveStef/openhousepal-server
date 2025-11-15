@@ -11,6 +11,9 @@ sys.path.insert(0, str(server_dir))
 
 from app.database import AsyncSessionLocal
 from app.services.property_sync_service import PropertySyncService
+from app.config.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 async def sync_all_collections_with_rate_limit() -> Dict[str, Any]:
@@ -18,10 +21,9 @@ async def sync_all_collections_with_rate_limit() -> Dict[str, Any]:
     Wrapper function that uses existing PropertySyncService with rate limiting
     This will be called by APScheduler every 5 hours
     """
-    print(f"[PROPERTY_SYNC] Starting property sync at {datetime.utcnow()}")
+    logger.info("Property sync started", extra={"event": "property_sync_started"})
 
     # Get configuration from environment
-    rate_limit_delay = float(os.getenv("API_RATE_LIMIT_DELAY_SECONDS", "0.5"))  # 0.5s = 2 req/sec
     max_collections_per_sync = int(os.getenv("MAX_COLLECTIONS_PER_SYNC", "0"))  # 0 = no limit
 
     sync_results = {
@@ -43,19 +45,14 @@ async def sync_all_collections_with_rate_limit() -> Dict[str, Any]:
             collections_with_preferences = await property_sync_service.get_active_collections_with_preferences(db)
             sync_results['collections_found'] = len(collections_with_preferences)
 
-            print(f"[PROPERTY_SYNC] Found {len(collections_with_preferences)} active collections with preferences")
-
             # Apply max collection limit if set
             if max_collections_per_sync > 0 and len(collections_with_preferences) > max_collections_per_sync:
-                print(f"[PROPERTY_SYNC] Limiting to {max_collections_per_sync} collections per sync")
                 collections_with_preferences = collections_with_preferences[:max_collections_per_sync]
                 sync_results['collections_skipped'] = sync_results['collections_found'] - len(collections_with_preferences)
 
             # Process each collection using your existing method
             for i, (collection, preferences) in enumerate(collections_with_preferences, 1):
                 try:
-                    print(f"[PROPERTY_SYNC] Processing collection {i}/{len(collections_with_preferences)}: {collection.name}")
-
                     # Use your existing sync_collection_properties method
                     sync_result = await property_sync_service.sync_collection_properties(
                         db, collection, preferences
@@ -64,16 +61,9 @@ async def sync_all_collections_with_rate_limit() -> Dict[str, Any]:
                     sync_results['total_new_properties'] += sync_result['new_properties_count']
                     sync_results['collections_processed'] += 1
 
-                    print(f"[PROPERTY_SYNC] Added {sync_result['new_properties_count']} new properties to collection '{collection.name}'")
-
-                    # Rate limiting: wait between collections to respect API limits
-                    if i < len(collections_with_preferences):  # Don't wait after the last collection
-                        print(f"[PROPERTY_SYNC] Rate limiting: waiting {rate_limit_delay}s before next collection")
-                        await asyncio.sleep(rate_limit_delay)
-
                 except Exception as e:
                     error_msg = f"Failed to sync collection {collection.name}: {str(e)}"
-                    print(f"[PROPERTY_SYNC] ERROR: {error_msg}")
+                    logger.error("Collection sync failed", extra={"collection_name": collection.name, "error": str(e)})
                     sync_results['errors'].append(error_msg)
 
         sync_results['completed_at'] = datetime.utcnow()
@@ -81,13 +71,20 @@ async def sync_all_collections_with_rate_limit() -> Dict[str, Any]:
             sync_results['completed_at'] - sync_results['started_at']
         ).total_seconds()
 
-        print(f"[PROPERTY_SYNC] Completed! Processed {sync_results['collections_processed']} collections, "
-              f"added {sync_results['total_new_properties']} new properties in "
-              f"{sync_results['duration_seconds']:.1f}s")
+        logger.info(
+            "Property sync completed",
+            extra={
+                "event": "property_sync_completed",
+                "collections_processed": sync_results['collections_processed'],
+                "new_properties_added": sync_results['total_new_properties'],
+                "duration_seconds": round(sync_results['duration_seconds'], 2),
+                "errors_count": len(sync_results['errors'])
+            }
+        )
 
     except Exception as e:
         error_msg = f"Critical error during property sync: {str(e)}"
-        print(f"[PROPERTY_SYNC] CRITICAL ERROR: {error_msg}")
+        logger.error("Property sync critical failure", exc_info=True, extra={"error": error_msg})
         sync_results['success'] = False
         sync_results['errors'].append(error_msg)
 
@@ -100,21 +97,13 @@ async def scheduled_property_sync():
     Checks if property sync is enabled before running
     """
     if not os.getenv("PROPERTY_SYNC_ENABLED", "false").lower() == "true":
-        print("[PROPERTY_SYNC] Property sync is disabled (PROPERTY_SYNC_ENABLED=false)")
+        logger.info("Property sync is disabled", extra={"event": "property_sync_disabled"})
         return
 
     try:
-        result = await sync_all_collections_with_rate_limit()
-
-        if result['success']:
-            print(f"[PROPERTY_SYNC] ✅ Sync completed successfully - "
-                  f"{result['collections_processed']} collections, "
-                  f"{result['total_new_properties']} new properties")
-        else:
-            print(f"[PROPERTY_SYNC] ❌ Sync completed with errors: {result['errors']}")
-
+        await sync_all_collections_with_rate_limit()
     except Exception as e:
-        print(f"[PROPERTY_SYNC] 💥 Critical error in scheduled sync: {str(e)}")
+        logger.error("Scheduled property sync failed", exc_info=True, extra={"error": str(e)})
 
 
 async def list_all_collections():
@@ -128,37 +117,27 @@ async def list_all_collections():
         async with AsyncSessionLocal() as db:
             collections = await property_sync_service.get_active_collections_with_preferences(db)
 
-        print(f"\n📋 Found {len(collections)} active collections with preferences:")
-        print("-" * 70)
 
         for i, (collection, preferences) in enumerate(collections, 1):
-            print(f"{i:2d}. {collection.name:<35} | Status: {collection.status}")
             if preferences:
                 # Display location info
                 location = preferences.address if preferences.address else "No location set"
-                print(f"     └─ Location: {location}")
 
                 # Display cities if available (cities is a JSON array)
                 if preferences.cities:
                     cities_str = ', '.join(preferences.cities) if isinstance(preferences.cities, list) else str(preferences.cities)
-                    print(f"     └─ Cities: {cities_str}")
 
                 # Display price range
                 min_price = preferences.min_price if preferences.min_price else 0
                 max_price = preferences.max_price if preferences.max_price else 0
-                print(f"     └─ Price range: ${min_price:,} - ${max_price:,}")
 
-        print("-" * 70)
-        print(f"Total: {len(collections)} collections ready for sync")
         return collections
 
     except Exception as e:
-        print(f"❌ Error listing collections: {str(e)}")
         return []
 
 
 if __name__ == "__main__":
     """For testing - run this script directly to list collections"""
-    print("🔍 Testing property sync scheduler...")
     asyncio.run(list_all_collections())
 

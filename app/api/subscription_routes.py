@@ -110,7 +110,6 @@ async def upgrade_subscription(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Upgrade subscription error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to process upgrade"
@@ -167,7 +166,6 @@ async def downgrade_subscription(
                 cancel_url=cancel_url
             )
         except Exception as e:
-            print(f"PayPal API error during downgrade: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to initiate downgrade with PayPal. Please try again."
@@ -202,7 +200,6 @@ async def downgrade_subscription(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Downgrade subscription error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to process downgrade"
@@ -233,7 +230,6 @@ async def cancel_subscription(
             subscription_details = await paypal_service.get_subscription(current_user.subscription_id)
             paypal_status = subscription_details.get("status")
         except Exception as e:
-            print(f"PayPal API error fetching subscription: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to verify subscription with PayPal. Please try again."
@@ -259,7 +255,6 @@ async def cancel_subscription(
             if not success:
                 raise Exception("PayPal returned failure")
         except Exception as e:
-            print(f"PayPal API error during cancellation: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to cancel subscription with PayPal. Please try again."
@@ -277,24 +272,20 @@ async def cancel_subscription(
         if next_billing_time:
             try:
                 user.next_billing_date = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
-                print(f"Grace period set until: {next_billing_time}")
             except Exception as e:
-                print(f"Warning: Failed to parse next_billing_time: {e}")
+                pass
         else:
             # Fallback: Calculate grace period manually if PayPal doesn't provide it
             # This ensures users always keep access until end of their paid period
             if user.last_billing_date:
                 # User was billed recently - add 30 days from last billing
                 user.next_billing_date = user.last_billing_date + timedelta(days=30)
-                print(f"Grace period calculated from last_billing_date: {user.next_billing_date}")
             elif user.subscription_started_at:
                 # Calculate from subscription start date + 30 days
                 user.next_billing_date = user.subscription_started_at + timedelta(days=30)
-                print(f"Grace period calculated from subscription_started_at: {user.next_billing_date}")
             else:
                 # Safety fallback: Give 30 days from now
                 user.next_billing_date = datetime.now(timezone.utc) + timedelta(days=30)
-                print(f"Grace period calculated from current time (fallback): {user.next_billing_date}")
 
         await db.commit()
 
@@ -306,7 +297,6 @@ async def cancel_subscription(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Cancel subscription error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to cancel subscription"
@@ -346,7 +336,6 @@ async def reactivate_subscription(
             if not success:
                 raise Exception("PayPal returned failure")
         except Exception as e:
-            print(f"PayPal API error during reactivation: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to reactivate subscription with PayPal. Please try again."
@@ -368,7 +357,6 @@ async def reactivate_subscription(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Reactivate subscription error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to reactivate subscription"
@@ -411,7 +399,6 @@ async def complete_new_subscription(
         existing_user = existing_user_result.scalar_one_or_none()
 
         if existing_user and existing_user.id != current_user.id:
-            print(f"🚨 SECURITY: Subscription {subscription_id} already claimed by user {existing_user.email}")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="This subscription is already claimed by another account"
@@ -421,7 +408,6 @@ async def complete_new_subscription(
         try:
             subscription_details = await paypal_service.get_subscription(subscription_id)
         except Exception as e:
-            print(f"PayPal API error: {e}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid subscription ID or PayPal service unavailable"
@@ -434,10 +420,6 @@ async def complete_new_subscription(
         # Extract billing information for new subscription
         billing_info = subscription_details.get('billing_info', {})
         next_billing_time = billing_info.get('next_billing_time')
-
-        print(f"📝 Completing subscription {subscription_id} for user {current_user.email}")
-        print(f"   Plan ID: {paypal_plan_id}, Status: {subscription_status}")
-        print(f"   Next Billing Time: {next_billing_time}")
 
         # Step 3: Verify subscription status is valid
         if subscription_status not in ['ACTIVE', 'APPROVAL_PENDING', 'APPROVED']:
@@ -480,13 +462,11 @@ async def complete_new_subscription(
             user.subscription_status = "TRIAL"
             user.trial_ends_at = trial_end
             trial_end_iso = trial_end.isoformat()
-            print(f"✅ Subscription completed: {user.email} -> {plan_tier} (TRIAL until {trial_end})")
         else:
             # Returning customer without trial
             user.subscription_status = "ACTIVE"
             user.trial_ends_at = None
             trial_end_iso = None
-            print(f"✅ Subscription completed: {user.email} -> {plan_tier} (ACTIVE - no trial)")
 
         # Clear old subscription billing data and set new subscription billing info
         user.last_billing_date = None  # No payment made yet for new subscription
@@ -496,9 +476,7 @@ async def complete_new_subscription(
             # PayPal provided next billing time - use it
             try:
                 user.next_billing_date = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
-                print(f"   Next billing date set from PayPal: {next_billing_time}")
             except Exception as e:
-                print(f"   Warning: Failed to parse next_billing_time: {e}")
                 # Fallback to calculation
                 if has_trial:
                     user.next_billing_date = trial_end  # First billing when trial ends
@@ -508,10 +486,8 @@ async def complete_new_subscription(
             # PayPal didn't provide next billing time - calculate it
             if has_trial:
                 user.next_billing_date = trial_end  # First billing when trial ends
-                print(f"   Next billing date set to trial end: {trial_end}")
             else:
                 user.next_billing_date = now + timedelta(days=30)  # Monthly billing cycle
-                print(f"   Next billing date calculated: {now + timedelta(days=30)}")
 
         await db.commit()
 
@@ -532,7 +508,6 @@ async def complete_new_subscription(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Complete new subscription error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to complete new subscription"
@@ -594,7 +569,6 @@ async def create_new_subscription(
                 cancel_url=cancel_url
             )
         except Exception as e:
-            print(f"PayPal API error during subscription creation: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to create subscription with PayPal. Please try again."
@@ -626,7 +600,6 @@ async def create_new_subscription(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Create new subscription error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create new subscription"

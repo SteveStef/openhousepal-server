@@ -39,7 +39,6 @@ async def submit_property_visit_form(
             detail=str(e)
         )
     except Exception as e:
-        print(f"Property visit form submission error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to process form submission"

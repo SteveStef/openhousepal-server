@@ -7,6 +7,9 @@ from app.models.database import Property, Collection
 from app.schemas.property_visit import PropertyVisitFormSubmission
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.collections_service import CollectionsService
+from app.config.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class PropertyVisitService:
@@ -23,7 +26,6 @@ class PropertyVisitService:
 
         # Require agent_id for collection creation since owner_id cannot be NULL
         if not form_data.agent_id:
-            print("Cannot create collection without agent_id - owner_id is required")
             return None
 
         try:
@@ -31,7 +33,6 @@ class PropertyVisitService:
             visited_property = await PropertyVisitService.get_property_by_id(db, form_data.property_id)
             
             if not visited_property:
-                print(f"Could not find property {form_data.property_id} to create collection")
                 return None
             
             # Create collection directly
@@ -55,16 +56,14 @@ class PropertyVisitService:
             # Auto-generate preferences based on the original property and form data
             try:
                 await CollectionPreferencesService.auto_generate_preferences(db, collection.id, form_data)
-                print(f"Auto-generated preferences for collection {collection.id}")
             except Exception as e:
-                print(f"Warning: Failed to auto-generate preferences for collection {collection.id}: {e}")
                 # Collection creation should still succeed even if preferences fail
-            
-            print(f"Created collection {collection.id} from property visit")
+                pass
+
             return collection.id
             
         except Exception as e:
-            print(f"Error creating collection from property visit: {e}")
+            logger.error("creating collection from property visit failed", extra={"error": str(e)})
             await db.rollback()
             return None
     
@@ -96,5 +95,5 @@ class PropertyVisitService:
             }
             
         except Exception as e:
-            print(f"Error fetching property by ID: {e}")
+            logger.error("fetching property by ID failed", extra={"error": str(e)})
             return None

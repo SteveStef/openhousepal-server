@@ -17,6 +17,9 @@ from datetime import datetime, timedelta
 
 import os
 from dotenv import load_dotenv
+from app.config.logging import get_logger
+
+logger = get_logger(__name__)
 
 load_dotenv()
 
@@ -92,11 +95,9 @@ async def create_open_house(
         )
         
     except Exception as e:
-        print(f"Error creating open house: {e}")
-        print(f"Property data that caused error: {property_data}")
+        logger.error("creating open house failed", extra={"error": str(e)})
         
         if "Error binding parameter" in str(e):
-            print("Database parameter binding error - likely trying to store complex object in simple field")
             raise HTTPException(status_code=500, detail="Invalid property data structure for database storage")
         
         raise HTTPException(status_code=500, detail="Failed to create open house")
@@ -137,7 +138,7 @@ async def get_open_houses(
         return response_list
         
     except Exception as e:
-        print(f"Error fetching open houses: {e}")
+        logger.error("fetching open houses failed", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail="Failed to fetch open houses")
 
 @router.delete("/api/open-houses/{open_house_id}")
@@ -176,7 +177,7 @@ async def delete_open_house(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error soft deleting open house: {e}")
+        logger.error("soft deleting open house failed", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail="Failed to remove open house")
 
 
@@ -239,7 +240,6 @@ async def submit_open_house_form(
             detail=str(e)
         )
     except Exception as e:
-        print(f"Open house form submission error: {e}")
         raise HTTPException(
             status_code=500,
             detail="Failed to process form submission"
@@ -271,7 +271,7 @@ async def get_property_by_qr(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error fetching property by QR code: {e}")
+        logger.error("fetching property by QR code failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=500,
             detail="Failed to fetch property information"
@@ -323,5 +323,5 @@ async def get_open_house_visitors(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error fetching visitors: {e}")
+        logger.error("fetching visitors failed", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail="Failed to fetch visitors")
