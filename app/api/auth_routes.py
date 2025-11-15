@@ -508,7 +508,7 @@ async def forgot_password(
         status_code, response = email_service.send_simple_message(
             to_email=email,
             subject="Reset Your Password - OpenHousePal",
-            template="reset_password",
+            template="password_reset",
             template_variables={"reset_link": reset_link}
         )
 
