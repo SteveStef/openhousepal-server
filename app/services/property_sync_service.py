@@ -70,9 +70,7 @@ class PropertySyncService:
         if existing_property:
             field_mapping = {
                 'address': 'street_address',
-                'image_url': 'img_src',
-                'days_on_market': 'days_on_zillow',
-                'last_updated': 'last_synced'
+                'image_url': 'img_src'
             }
 
             # Special handling for zpid (string to int conversion)

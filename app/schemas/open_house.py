@@ -14,7 +14,6 @@ class Timeframe(str, Enum):
 class HasAgent(str, Enum):
     YES = "YES"
     NO = "NO"
-    LOOKING = "LOOKING"
 
 class OpenHouseFormSubmission(BaseModel):
     # Personal info

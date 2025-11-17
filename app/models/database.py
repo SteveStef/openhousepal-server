@@ -91,7 +91,7 @@ class Property(Base):
     lot_size = Column(Integer, nullable=True)
     home_type = Column(String, nullable=True)
     home_status = Column(String, nullable=True)
-    
+
     # Location
     latitude = Column(Float, nullable=True)
     longitude = Column(Float, nullable=True)
@@ -234,7 +234,7 @@ class PropertyTour(Base):
     message = Column(Text, nullable=True)
 
     # Tour status
-    status = Column(String, default="PENDING")  # PENDING, CONFIRMED, COMPLETED, CANCELLED
+    status = Column(String, default="PENDING")  # PENDING, CONFIRMED, CANCELLED
 
     created_at = Column(TZDateTime(timezone=True), server_default=func.now())
     updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())

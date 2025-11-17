@@ -14,6 +14,8 @@ import os
 import re
 from contextvars import ContextVar
 from typing import Any, Dict, Optional
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from pythonjsonlogger import jsonlogger
 
@@ -93,11 +95,25 @@ class RequestContextFilter(logging.Filter):
 class CustomJsonFormatter(jsonlogger.JsonFormatter):
     """Custom JSON formatter with additional fields."""
 
+    def formatTime(self, record, datefmt=None):
+        """Override formatTime to convert UTC to Eastern Time (EST/EDT)."""
+        # Get the record time as a datetime object
+        dt = datetime.fromtimestamp(record.created, tz=ZoneInfo('UTC'))
+
+        # Convert to Eastern Time (automatically handles EST/EDT)
+        eastern_dt = dt.astimezone(ZoneInfo('America/New_York'))
+
+        # Format the timestamp
+        if datefmt:
+            return eastern_dt.strftime(datefmt)
+        else:
+            return eastern_dt.isoformat()
+
     def add_fields(self, log_record: Dict[str, Any], record: logging.LogRecord, message_dict: Dict[str, Any]) -> None:
         """Add custom fields to JSON log output."""
         super().add_fields(log_record, record, message_dict)
 
-        # Add timestamp in ISO format
+        # Add timestamp in ISO format (now in EST)
         log_record['timestamp'] = self.formatTime(record, self.datefmt)
 
         # Add log level

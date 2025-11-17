@@ -39,4 +39,4 @@ class PropertyTourResponse(BaseModel):
 
 class PropertyTourStatusUpdate(BaseModel):
     """Schema for updating tour status"""
-    status: str  # PENDING, CONFIRMED, COMPLETED, CANCELLED
+    status: str  # PENDING, CONFIRMED, CANCELLED

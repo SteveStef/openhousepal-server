@@ -15,6 +15,24 @@ from app.services.email_service import EmailService
 class PropertyTourService:
     """Service for managing property tour requests within collections"""
 
+    @staticmethod
+    def _format_date(date_str: str) -> str:
+        """Convert YYYY-MM-DD to MM/DD/YYYY"""
+        try:
+            date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+            return date_obj.strftime("%m/%d/%Y")
+        except:
+            return date_str  # Return original if parsing fails
+
+    @staticmethod
+    def _format_time(time_str: str) -> str:
+        """Convert HH:MM (24-hour) to 12-hour AM/PM format"""
+        try:
+            time_obj = datetime.strptime(time_str, "%H:%M")
+            return time_obj.strftime("%-I:%M %p")  # %-I removes leading zero from hour
+        except:
+            return time_str  # Return original if parsing fails
+
     @classmethod
     async def create_tour_request(
         cls,
@@ -94,14 +112,20 @@ class PropertyTourService:
         )
         agent = agent_result.scalar_one_or_none()
         if agent and agent.email:
-            # Build preferred dates list
+            # Build preferred dates list with formatted dates and times
             preferred_dates = []
             if tour_data.preferred_date and tour_data.preferred_time:
-                preferred_dates.append(f"{tour_data.preferred_date} at {tour_data.preferred_time}")
+                formatted_date = cls._format_date(tour_data.preferred_date)
+                formatted_time = cls._format_time(tour_data.preferred_time)
+                preferred_dates.append(f"{formatted_date} at {formatted_time}")
             if tour_data.preferred_date_2 and tour_data.preferred_time_2:
-                preferred_dates.append(f"{tour_data.preferred_date_2} at {tour_data.preferred_time_2}")
+                formatted_date = cls._format_date(tour_data.preferred_date_2)
+                formatted_time = cls._format_time(tour_data.preferred_time_2)
+                preferred_dates.append(f"{formatted_date} at {formatted_time}")
             if tour_data.preferred_date_3 and tour_data.preferred_time_3:
-                preferred_dates.append(f"{tour_data.preferred_date_3} at {tour_data.preferred_time_3}")
+                formatted_date = cls._format_date(tour_data.preferred_date_3)
+                formatted_time = cls._format_time(tour_data.preferred_time_3)
+                preferred_dates.append(f"{formatted_date} at {formatted_time}")
 
             email_service = EmailService()
             email_service.send_simple_message(
@@ -213,7 +237,7 @@ class PropertyTourService:
             raise ValueError("Unauthorized to update this tour request")
 
         # Validate status
-        valid_statuses = ["PENDING", "CONFIRMED", "COMPLETED", "CANCELLED"]
+        valid_statuses = ["PENDING", "CONFIRMED", "CANCELLED"]
         if status_update.status not in valid_statuses:
             raise ValueError(f"Invalid status. Must be one of: {', '.join(valid_statuses)}")
 

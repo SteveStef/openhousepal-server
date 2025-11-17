@@ -235,7 +235,6 @@ class ZillowService:
                 'image_url': zillow_data.get('imgSrc', ''),
                 'zestimate': zillow_data.get('zestimate'),
             }
-            
             return property_data
             
         except Exception as e:

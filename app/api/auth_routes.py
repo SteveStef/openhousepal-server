@@ -398,12 +398,6 @@ async def login(
                 detail="Incorrect email or password",
             )
         
-        # if not user.is_active:
-        #     raise HTTPException(
-        #         status_code=status.HTTP_400_BAD_REQUEST,
-        #         detail="Inactive user account"
-        #     )
-        
         # Create access token
         access_token = create_access_token(
             data={"sub": user.id}
