@@ -172,32 +172,14 @@ When I upgrade, to premium from the basic (active, not trial) it does not charge
     - Have these properties in the collection
 
 
-- In collections remove type of house top right of property image and replace with Days on market and be able to sort by Days on market (if easy).
-
-- add year built to collection filtering on creation so i can for example put in there   the year 2000+ meaning all homes built from the year 2000 and up or 2000-2025 make sure ranges work also
-
-- make it so if an open house guest says they have an agent during open house sign in they cant click Yes keep me updated at the end (as they already have an agent we dont want them to have a collection made for them)!!!! (i tested it)
-
-
-- remove what's your timeframe question from open house questions (no point) (ik i told u to put it but i recently removed it, more optimal) so on this page its just the do you have an agent and only have 2 responses (not drop down) make it 2 buttons Yes and a No button (make sure the No button is first and on top of the yes button. and the question should say "Do you have an active buyer's agreement with a real estate agent?"
-
-- when you click a collection inside the collection there is not branding to show its only for that specific client like Jakes Home Search (jake being the first name of open house guest)
-
-- also from the open house guest perspective the webpage is very laggy and delayed it like 10 hz moniter
-
 - when a tour is confirmed there is no notification for the agent on the website no sign of a tour request incase they missed the email.  (build notification system)
 
 - Fix the link in the tour email that says open in openhousepal or remove it
 
-- Schedule tour is not mobile responsive
-
-- Property details table is not mobile responsive
-
+- Make the PDF better
 
 ## Can't do without email template or it's not worth the trouble
 1. Agent should get email that someone signed into their open house form (not working)
-2. have intervals of 15min when selecting a time for a showing.
-3. send email that a showing has been confirmed to the client for the property they wanted to see
 4. welcome email template does not have agent name on it.
 5. at the bottom of every email maybe there should an agent signaturewith phone and email and say if you have any questions or contact me here if you need. 
 6. If the open house guest doesn't have an agent that an email should be sent to them 1 hr later inviting them to their personalized showcase (not sending the email right away) also if a showcase is being created for the guest there should be a (Similar Homes) Button that takes them to their showcase right away.
@@ -206,4 +188,4 @@ When I upgrade, to premium from the basic (active, not trial) it does not charge
 1. also jake should be able to edit the showcase perameters actually just give them showcase admin controls so if they want to add a city thery can and they can edit it.
 2. when a collection is made it says 3.3 miles (agents will see this and be like thats it? im making it 5 or 10.
 
-
+If the collection fails to create at the end of the openhousesignin form, I just want to say thank you not unable to load property

@@ -119,6 +119,8 @@ class CollectionsService:
                         "max_baths": collection.preferences.max_baths,
                         "min_price": collection.preferences.min_price,
                         "max_price": collection.preferences.max_price,
+                        "min_year_built": collection.preferences.min_year_built,
+                        "max_year_built": collection.preferences.max_year_built,
                         "lat": collection.preferences.lat,
                         "long": collection.preferences.long,
                         "address": collection.preferences.address,  # Add missing address field
@@ -126,7 +128,6 @@ class CollectionsService:
                         "townships": collection.preferences.townships,
                         "diameter": collection.preferences.diameter,
                         "special_features": collection.preferences.special_features,
-                        "timeframe": collection.preferences.timeframe,
                         "visiting_reason": collection.preferences.visiting_reason,
                         "has_agent": collection.preferences.has_agent,
 
@@ -239,6 +240,8 @@ class CollectionsService:
                     "max_baths": collection.preferences.max_baths,
                     "min_price": collection.preferences.min_price,
                     "max_price": collection.preferences.max_price,
+                    "min_year_built": collection.preferences.min_year_built,
+                    "max_year_built": collection.preferences.max_year_built,
                     "lat": collection.preferences.lat,
                     "long": collection.preferences.long,
                     "address": collection.preferences.address,  # Add missing address field
@@ -246,7 +249,6 @@ class CollectionsService:
                     "townships": collection.preferences.townships,
                     "diameter": collection.preferences.diameter,
                     "special_features": collection.preferences.special_features,
-                    "timeframe": collection.preferences.timeframe,
                     "visiting_reason": collection.preferences.visiting_reason,
                     "has_agent": collection.preferences.has_agent,
 
@@ -500,6 +502,31 @@ class CollectionsService:
             interactions_lookup = {}
             comments_lookup = {}
             tours_lookup = {}
+            added_at_lookup = {}
+
+            # Only query if we have properties
+            if property_ids:
+                # Fetch added_at timestamps for each property from collection_properties
+                added_at_query = select(
+                    collection_properties.c.property_id,
+                    collection_properties.c.added_at
+                ).where(
+                    and_(
+                        collection_properties.c.collection_id == collection.id,
+                        collection_properties.c.property_id.in_(property_ids)
+                    )
+                )
+                added_at_result = await db.execute(added_at_query)
+                added_at_data = added_at_result.all()
+
+                # Create lookup dictionary for added_at timestamps
+                for row in added_at_data:
+                    added_at_lookup[row.property_id] = row.added_at
+
+            # Calculate "new" threshold (properties added in last 7 days)
+            now = datetime.now(timezone.utc)
+            new_threshold_days = int(os.getenv("NEW_PROPERTY_DAYS", "7"))
+            new_threshold = now - timedelta(days=new_threshold_days)
 
             # Only query if we have properties
             if property_ids:
@@ -580,6 +607,8 @@ class CollectionsService:
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
                     'favorited': interactions_lookup[prop.id].favorited if prop.id in interactions_lookup else False,
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
+                    'viewCount': interactions_lookup[prop.id].view_count if prop.id in interactions_lookup else 0,
+                    'lastViewedAt': interactions_lookup[prop.id].last_viewed_at.isoformat() if prop.id in interactions_lookup and interactions_lookup[prop.id].last_viewed_at else None,
                     'comments': comments_lookup.get(prop.id, []),
                     # Tour status
                     'hasTourScheduled': tours_lookup.get(prop.id, False)
@@ -588,6 +617,8 @@ class CollectionsService:
 
             # Calculate stats
             total_properties = len(properties_data)
+            viewed_properties = sum(1 for prop in properties_data if prop.get('viewCount', 0) > 0)
+            liked_properties = sum(1 for prop in properties_data if prop.get('liked', False))
 
             collection_data = {
                 'id': collection.id,
@@ -610,6 +641,8 @@ class CollectionsService:
                     'max_baths': collection.preferences.max_baths,
                     'min_price': collection.preferences.min_price,
                     'max_price': collection.preferences.max_price,
+                    'min_year_built': collection.preferences.min_year_built,
+                    'max_year_built': collection.preferences.max_year_built,
                     'lat': collection.preferences.lat,
                     'long': collection.preferences.long,
                     'address': collection.preferences.address,  # Add missing address field
@@ -617,7 +650,6 @@ class CollectionsService:
                     'townships': collection.preferences.townships,
                     'diameter': collection.preferences.diameter,
                     'special_features': collection.preferences.special_features,
-                    'timeframe': collection.preferences.timeframe,
                     'visiting_reason': collection.preferences.visiting_reason,
                     'has_agent': collection.preferences.has_agent,
 
@@ -630,8 +662,8 @@ class CollectionsService:
                 } if collection.preferences else {},
                 'stats': {
                     'totalProperties': total_properties,
-                    'viewedProperties': 0,
-                    'likedProperties': 0,
+                    'viewedProperties': viewed_properties,
+                    'likedProperties': liked_properties,
                     'lastActivity': collection.updated_at.isoformat() if collection.updated_at else collection.created_at.isoformat()
                 },
                 'shareToken': collection.share_token,
@@ -856,6 +888,8 @@ class CollectionsService:
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
                     'favorited': interactions_lookup[prop.id].favorited if prop.id in interactions_lookup else False,
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
+                    'viewCount': interactions_lookup[prop.id].view_count if prop.id in interactions_lookup else 0,
+                    'lastViewedAt': interactions_lookup[prop.id].last_viewed_at.isoformat() if prop.id in interactions_lookup and interactions_lookup[prop.id].last_viewed_at else None,
                     'comments': comments_lookup.get(prop.id, []),
                     'tourCount': tours_lookup.get(prop.id, 0),
                     'added_at': added_at.isoformat() if added_at else None,

@@ -39,6 +39,7 @@ class User(Base):
 
     # Relationships
     collections = relationship("Collection", back_populates="owner")
+    notifications = relationship("Notification", back_populates="agent")
 
 class Collection(Base):
     __tablename__ = "collections"
@@ -156,7 +157,6 @@ class OpenHouseVisitor(Base):
     phone = Column(String, nullable=False)
 
     # Visit Information
-    timeframe = Column(String, nullable=False)
     has_agent = Column(String, nullable=False)  # YES, NO, LOOKING
 
     # Open House Context
@@ -182,6 +182,10 @@ class PropertyInteraction(Base):
     liked = Column(Boolean, default=False)
     disliked = Column(Boolean, default=False)
     favorited = Column(Boolean, default=False)
+
+    # View tracking
+    view_count = Column(Integer, default=0)
+    last_viewed_at = Column(TZDateTime(timezone=True), nullable=True)
 
     created_at = Column(TZDateTime(timezone=True), server_default=func.now())
     updated_at = Column(TZDateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -257,6 +261,8 @@ class CollectionPreferences(Base):
     max_baths = Column(Float, nullable=True)
     min_price = Column(Integer, nullable=True)
     max_price = Column(Integer, nullable=True)
+    min_year_built = Column(Integer, nullable=True)
+    max_year_built = Column(Integer, nullable=True)
 
     # Location criteria
     lat = Column(Float, nullable=True)
@@ -278,7 +284,6 @@ class CollectionPreferences(Base):
     is_apartment = Column(Boolean, nullable=True, default=False)
 
     # Visitor form data
-    timeframe = Column(String, nullable=True)  # IMMEDIATELY, 1_3_MONTHS, 3_6_MONTHS, etc.
     visiting_reason = Column(String, nullable=True)  # BUYING_SOON, BROWSING, NEIGHBORHOOD, etc.
     has_agent = Column(String, nullable=True)  # YES, NO, LOOKING
 
@@ -308,4 +313,38 @@ class WebhookEvent(Base):
     id = Column(String, primary_key=True)  # PayPal event ID
     event_type = Column(String, nullable=False)  # For debugging/monitoring
     processed_at = Column(TZDateTime(timezone=True), server_default=func.now())
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    agent_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+
+    # Notification type and reference
+    type = Column(String, nullable=False, index=True)  # OPEN_HOUSE_SIGN_IN, TOUR_REQUEST, PROPERTY_INTERACTION
+    reference_type = Column(String, nullable=False)  # VISITOR, TOUR, INTERACTION
+    reference_id = Column(String, nullable=False)  # ID of the referenced entity
+
+    # Notification content
+    title = Column(String, nullable=False)
+    message = Column(String, nullable=False)
+
+    # Denormalized fields for performance (avoid joins when fetching notifications)
+    collection_id = Column(String, ForeignKey('collections.id', ondelete='CASCADE'), nullable=True)
+    collection_name = Column(String, nullable=True)
+    property_id = Column(String, nullable=True)
+    property_address = Column(String, nullable=True)
+    visitor_name = Column(String, nullable=True)
+
+    # Read status
+    is_read = Column(Boolean, default=False, nullable=False, index=True)
+    read_at = Column(TZDateTime(timezone=True), nullable=True)
+
+    # Timestamps
+    created_at = Column(TZDateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    # Relationships
+    agent = relationship("User", back_populates="notifications")
+    collection = relationship("Collection")
 

@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from datetime import datetime
 
 from app.database import get_db
-from app.models.database import OpenHouseEvent, User, OpenHouseVisitor
+from app.models.database import OpenHouseEvent, User, OpenHouseVisitor, Notification
 from app.utils.auth import get_current_active_user, require_basic_plan
 from app.schemas.open_house import OpenHouseCreateRequest, OpenHouseResponse, OpenHouseFormSubmission, OpenHouseFormResponse, VisitorResponse
 from app.services.open_house_service import OpenHouseService
@@ -227,6 +227,38 @@ async def submit_open_house_form(
                     }
                 )
 
+        # Create notification for agent
+        if form_data.open_house_event_id:
+            try:
+                # Get the open house event to find the agent_id
+                open_house_query = select(OpenHouseEvent).where(OpenHouseEvent.id == form_data.open_house_event_id)
+                open_house_result = await db.execute(open_house_query)
+                open_house_event = open_house_result.scalar_one_or_none()
+
+                if open_house_event:
+                    property_data_for_notif = await OpenHouseService.get_property_by_qr_code(db, form_data.open_house_event_id)
+
+                    notification = Notification(
+                        agent_id=open_house_event.agent_id,
+                        type="OPEN_HOUSE_SIGN_IN",
+                        reference_type="VISITOR",
+                        reference_id=visitor.id,
+                        title=f"New Open House Visitor: {visitor.full_name}",
+                        message="Signed in at your open house" + (f" - {property_data_for_notif.get('address')}" if property_data_for_notif else ""),
+                        collection_id=collection_result.get('collection_id') if collection_result.get('success') else None,
+                        collection_name=collection_result.get('collection_id') if collection_result.get('success') else None,
+                        property_address=property_data_for_notif.get('address') if property_data_for_notif else None,
+                        visitor_name=visitor.full_name,
+                        is_read=False,
+                        created_at=datetime.utcnow()
+                    )
+
+                    db.add(notification)
+                    await db.commit()
+            except Exception as e:
+                logger.error("creating notification failed", extra={"error": str(e)})
+                # Don't fail the whole request if notification creation fails
+
         return OpenHouseFormResponse(
             success=True,
             message=message,
@@ -312,7 +344,6 @@ async def get_open_house_visitors(
                 full_name=visitor.full_name,
                 email=visitor.email,
                 phone=visitor.phone,
-                timeframe=visitor.timeframe,
                 has_agent=visitor.has_agent,
                 interested_in_similar=visitor.interested_in_similar,
                 created_at=visitor.created_at

@@ -32,6 +32,8 @@ class PropertyInteractionResponse(BaseModel):
     liked: bool
     disliked: bool
     favorited: bool
+    view_count: int = 0
+    last_viewed_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 

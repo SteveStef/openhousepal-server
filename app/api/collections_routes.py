@@ -8,7 +8,7 @@ import os
 
 from app.database import get_db
 from app.schemas.collection import CollectionCreate, CollectionResponse
-from app.schemas.collection_preferences import CollectionPreferencesCreate
+from app.schemas.collection_preferences import CollectionPreferencesCreate, CollectionPreferencesUpdate
 from app.schemas.property_interactions import (
     PropertyInteractionUpdate,
     PropertyCommentCreate,
@@ -47,7 +47,6 @@ class CreateCollectionWithPreferencesRequest(BaseModel):
     visitor_email: str
     visitor_phone: str
     visiting_reason: str
-    timeframe: str
     has_agent: str
     additional_comments: str = ""
     
@@ -58,11 +57,13 @@ class CreateCollectionWithPreferencesRequest(BaseModel):
     max_baths: Optional[float] = None
     min_price: Optional[int] = None
     max_price: Optional[int] = None
+    min_year_built: Optional[int] = None
+    max_year_built: Optional[int] = None
     cities: Optional[list[str]] = None
     townships: Optional[list[str]] = None
     address: str
     diameter: float = 0
-    
+
     # Home type preferences
     is_town_house: Optional[bool] = False
     is_lot_land: Optional[bool] = False
@@ -242,6 +243,8 @@ async def create_collection_with_preferences(
             max_baths=request.max_baths,
             min_price=request.min_price,
             max_price=request.max_price,
+            min_year_built=request.min_year_built,
+            max_year_built=request.max_year_built,
             cities=request.cities,
             townships=request.townships,
             lat=latitude,
@@ -255,7 +258,6 @@ async def create_collection_with_preferences(
             is_single_family=request.is_single_family,
             is_apartment=request.is_apartment,
             special_features=request.additional_comments,
-            timeframe=request.timeframe,
             visiting_reason=request.visiting_reason,
             has_agent=request.has_agent
         )
@@ -402,7 +404,8 @@ async def update_property_interaction(
                 interaction_data.favorited = interaction_data.value
 
         interaction = await PropertyInteractionsService.create_property_interaction(
-            db, collection_id, property_id, interaction_data
+            db, collection_id, property_id, interaction_data,
+            user_id=current_user.id if current_user else None
         )
         
         return {
@@ -420,12 +423,44 @@ async def update_property_interaction(
         )
 
 
+@router.post("/{collection_id}/properties/{property_id}/view")
+async def track_property_view(
+    collection_id: str,
+    property_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional)
+):
+    """
+    Track a property view by incrementing view_count and updating last_viewed_at.
+    For both authenticated users (agents) and anonymous visitors (shared collections)
+    """
+    try:
+        interaction = await PropertyInteractionsService.track_property_view(
+            db, collection_id, property_id
+        )
+
+        return {
+            "success": True,
+            "interaction": interaction
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("tracking property view failed", extra={"error": str(e)})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to track property view"
+        )
+
+
 @router.post("/{collection_id}/properties/{property_id}/comments")
 async def add_property_comment(
     collection_id: str,
     property_id: str,
     comment_data: PropertyCommentCreate,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """
     Add a comment to a property within a collection
@@ -438,7 +473,8 @@ async def add_property_comment(
         
         # Create anonymous comment - no user identification required
         comment = await PropertyInteractionsService.add_property_comment(
-            db, collection_id, property_id, comment_data
+            db, collection_id, property_id, comment_data,
+            user_id=current_user.id if current_user else None
         )
 
         return {
@@ -591,18 +627,20 @@ async def get_properties_from_collection(
             detail="Failed to get properties from collection"
         )
 
-@router.post("/{collection_id}/refresh-properties")
-async def refresh_collection_properties(
+@router.put("/{collection_id}/update-preferences-and-refresh")
+async def update_preferences_and_refresh(
     collection_id: str,
+    preferences_update: CollectionPreferencesUpdate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_premium_plan)
 ):
     """
-    Replace all properties in a collection with new ones based on current preferences.
-    This removes existing property associations and adds new matching properties.
+    Atomically update collection preferences and refresh properties.
+    Only commits changes if Zillow API succeeds. If Zillow fails, no changes are made.
+    This prevents the collection from being left empty when property fetching fails.
     """
     try:
-        # Verify user owns the collection or has access to it
+        # Verify user owns the collection
         collection = await db.execute(
             select(Collection).where(
                 Collection.id == collection_id,
@@ -617,29 +655,33 @@ async def refresh_collection_properties(
                 detail="Collection not found or access denied"
             )
 
-        # Use PropertySyncService to replace all properties
-        sync_service = PropertySyncService()
-        result = await sync_service.replace_collection_properties(db, collection_id)
+        # Perform atomic update of preferences and properties
+        result = await CollectionPreferencesService.update_preferences_and_refresh_properties(
+            db, collection_id, preferences_update
+        )
 
         if result['success']:
             return {
                 "success": True,
                 "message": result['message'],
-                "properties_replaced": result['properties_replaced'],
+                "preferences_updated": result['preferences_updated'],
+                "properties_refreshed": result['properties_refreshed'],
+                "properties_count": result['properties_count'],
                 "collection_id": collection_id
             }
         else:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to refresh properties: {result.get('error', 'Unknown error')}"
+                detail=result.get('error', 'Failed to update preferences and refresh properties')
             )
 
     except HTTPException:
         raise
     except Exception as e:
+        logger.error("updating preferences and refreshing properties failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to refresh collection properties"
+            detail="Failed to update preferences and refresh properties"
         )
 
 
@@ -648,14 +690,16 @@ async def schedule_property_tour(
     collection_id: str,
     property_id: str,
     tour_data: PropertyTourCreate,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """
     Schedule a tour for a property in a collection (public endpoint for visitors)
     """
     try:
         tour = await PropertyTourService.create_tour_request(
-            db, collection_id, property_id, tour_data
+            db, collection_id, property_id, tour_data,
+            user_id=current_user.id if current_user else None
         )
         return tour
 

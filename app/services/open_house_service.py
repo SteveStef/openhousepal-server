@@ -23,7 +23,6 @@ class OpenHouseService:
             full_name=form_data.full_name,
             email=form_data.email,
             phone=form_data.phone,
-            timeframe=form_data.timeframe.value,
             has_agent=form_data.has_agent.value,
             open_house_event_id=form_data.open_house_event_id,
             qr_code="",  # Will be updated by the calling code

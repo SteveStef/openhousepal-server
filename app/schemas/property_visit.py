@@ -10,14 +10,6 @@ class VisitingReason(str, Enum):
     CURIOUS = "CURIOUS"
     OTHER = "OTHER"
 
-class Timeframe(str, Enum):
-    IMMEDIATELY = "IMMEDIATELY"
-    ONE_TO_THREE_MONTHS = "1_3_MONTHS"
-    THREE_TO_SIX_MONTHS = "3_6_MONTHS"
-    SIX_TO_TWELVE_MONTHS = "6_12_MONTHS"
-    OVER_YEAR = "OVER_YEAR"
-    NOT_SURE = "NOT_SURE"
-
 class HasAgent(str, Enum):
     YES = "YES"
     NO = "NO"
@@ -28,16 +20,15 @@ class PropertyVisitFormSubmission(BaseModel):
     full_name: str
     email: EmailStr
     phone: str
-    
+
     # Visit context
     visiting_reason: VisitingReason
-    timeframe: Timeframe
     has_agent: HasAgent
-    
+
     # Property and agent context
     property_id: str
     agent_id: Optional[str] = None
-    
+
     # Collection preference
     interested_in_similar: bool = False
 

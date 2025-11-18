@@ -9,6 +9,8 @@ class CollectionPreferencesBase(BaseModel):
     max_baths: Optional[float] = None
     min_price: Optional[int] = None
     max_price: Optional[int] = None
+    min_year_built: Optional[int] = None
+    max_year_built: Optional[int] = None
     lat: Optional[float] = None
     long: Optional[float] = None
     address: Optional[str] = None
@@ -18,7 +20,7 @@ class CollectionPreferencesBase(BaseModel):
 
     diameter: float = 6.0
     special_features: str = ""
-    
+
     # Home type preferences
     is_town_house: Optional[bool] = False
     is_lot_land: Optional[bool] = False
@@ -26,9 +28,8 @@ class CollectionPreferencesBase(BaseModel):
     is_multi_family: Optional[bool] = False
     is_single_family: Optional[bool] = False
     is_apartment: Optional[bool] = False
-    
+
     # Visitor form data
-    timeframe: Optional[str] = None
     visiting_reason: Optional[str] = None
     has_agent: Optional[str] = None
 
@@ -42,13 +43,15 @@ class CollectionPreferencesUpdate(BaseModel):
     max_baths: Optional[float] = None
     min_price: Optional[int] = None
     max_price: Optional[int] = None
+    min_year_built: Optional[int] = None
+    max_year_built: Optional[int] = None
     lat: Optional[float] = None
     long: Optional[float] = None
     address: Optional[str] = None
-    
+
     cities: Optional[list[str]] = None
     townships: Optional[list[str]] = None
-    
+
     diameter: Optional[float] = None
     special_features: Optional[str] = None
 
@@ -58,9 +61,8 @@ class CollectionPreferencesUpdate(BaseModel):
     is_multi_family: Optional[bool] = None
     is_single_family: Optional[bool] = None
     is_apartment: Optional[bool] = None
-    
+
     # Visitor form data
-    timeframe: Optional[str] = None
     visiting_reason: Optional[str] = None
     has_agent: Optional[str] = None
 

@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from typing import Optional
+from typing import Optional, Dict, Any
 import math
 
 from app.models.database import CollectionPreferences, Collection, Property, OpenHouseEvent
@@ -25,6 +25,27 @@ class CollectionPreferencesService:
             select(CollectionPreferences).where(CollectionPreferences.collection_id == collection_id)
         )
         return result.scalar_one_or_none()
+
+    @staticmethod
+    async def can_view_preferences(db: AsyncSession, collection_id: str, user_id: Optional[str] = None) -> bool:
+        """Check if a user can view preferences (owns collection OR collection is publicly shared)"""
+        result = await db.execute(
+            select(Collection).where(Collection.id == collection_id)
+        )
+        collection = result.scalar_one_or_none()
+
+        if not collection:
+            return False
+
+        # User owns the collection
+        if user_id and collection.owner_id == user_id:
+            return True
+
+        # Collection is publicly shared
+        if collection.is_public:
+            return True
+
+        return False
     
     @staticmethod
     async def update_preferences(db: AsyncSession, collection_id: str, preferences_update: CollectionPreferencesUpdate) -> Optional[CollectionPreferences]:
@@ -104,7 +125,6 @@ class CollectionPreferencesService:
         # Add visitor form data if provided
         if form_data:
             preferences_data_dict.update({
-                "timeframe": form_data.timeframe if isinstance(form_data.timeframe, str) else form_data.timeframe.value,
                 "has_agent": form_data.has_agent if isinstance(form_data.has_agent, str) else form_data.has_agent.value
             })
         
@@ -119,3 +139,74 @@ class CollectionPreferencesService:
         else:
             # Create new preferences
             return await CollectionPreferencesService.create_preferences(db, preferences_data)
+
+    @staticmethod
+    async def update_preferences_and_refresh_properties(
+        db: AsyncSession,
+        collection_id: str,
+        preferences_update: CollectionPreferencesUpdate
+    ) -> Dict[str, Any]:
+        """
+        Atomically update preferences and refresh properties.
+        Only commits if Zillow API succeeds. If Zillow fails, rolls back everything.
+        """
+        from app.services.property_sync_service import PropertySyncService
+        from app.config.logging import get_logger
+
+        logger = get_logger(__name__)
+
+        try:
+            # Get existing preferences
+            preferences = await CollectionPreferencesService.get_preferences_by_collection_id(db, collection_id)
+            if not preferences:
+                return {
+                    'success': False,
+                    'error': 'Preferences not found for this collection'
+                }
+
+            # Update preferences fields in memory (not committed yet)
+            update_data = preferences_update.dict(exclude_unset=True)
+            for field, value in update_data.items():
+                setattr(preferences, field, value)
+
+            # Don't commit yet - let replace_collection_properties handle the transaction
+            # This ensures atomicity: either both preferences and properties update, or neither does
+
+            # Now attempt to refresh properties with the updated preferences
+            # This will fetch from Zillow and commit everything if successful
+            sync_service = PropertySyncService()
+            result = await sync_service.replace_collection_properties(db, collection_id)
+
+            if not result['success']:
+                # Zillow failed - rollback preference changes too
+                await db.rollback()
+                logger.error(f"Failed to refresh properties, rolling back preference changes: {result.get('error')}")
+                return {
+                    'success': False,
+                    'error': f"Failed to update: {result.get('error')}",
+                    'preferences_updated': False,
+                    'properties_refreshed': False
+                }
+
+            # Success! Both preferences and properties were updated and committed
+            await db.refresh(preferences)
+            logger.info(f"Successfully updated preferences and refreshed properties for collection {collection_id}")
+
+            return {
+                'success': True,
+                'message': f"Updated preferences and refreshed {result['properties_replaced']} properties",
+                'preferences_updated': True,
+                'properties_refreshed': True,
+                'properties_count': result['properties_replaced'],
+                'preferences': preferences
+            }
+
+        except Exception as e:
+            logger.error(f"Error in atomic preferences/properties update for collection {collection_id}", exc_info=True)
+            await db.rollback()
+            return {
+                'success': False,
+                'error': str(e),
+                'preferences_updated': False,
+                'properties_refreshed': False
+            }

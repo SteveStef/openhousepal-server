@@ -539,7 +539,7 @@ class PropertySyncService:
                     collection_properties.c.collection_id == collection_id
                 )
             )
-            await db.commit()
+            # Note: Do not commit yet - wait until new properties are successfully fetched
             logger.info(f"Removed all existing property associations for collection {collection_id}")
 
             # Step 2: Get matching properties from Zillow based on current preferences
@@ -565,6 +565,8 @@ class PropertySyncService:
                     logger.warning(f"Failed to add property {zpid} to collection {collection_id}: {str(e)}")
                     continue
 
+            # Commit the transaction only after all properties are successfully added
+            await db.commit()
             logger.info(f"Successfully replaced properties for collection {collection_id}: {properties_added} properties added")
 
             return {

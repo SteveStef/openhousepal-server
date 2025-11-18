@@ -3,14 +3,6 @@ from typing import Optional
 from enum import Enum
 from datetime import datetime
 
-class Timeframe(str, Enum):
-    IMMEDIATELY = "IMMEDIATELY"
-    ONE_TO_THREE_MONTHS = "1_3_MONTHS"
-    THREE_TO_SIX_MONTHS = "3_6_MONTHS"
-    SIX_TO_TWELVE_MONTHS = "6_12_MONTHS"
-    OVER_YEAR = "OVER_YEAR"
-    NOT_SURE = "NOT_SURE"
-
 class HasAgent(str, Enum):
     YES = "YES"
     NO = "NO"
@@ -22,7 +14,6 @@ class OpenHouseFormSubmission(BaseModel):
     phone: str
 
     # Visit context
-    timeframe: Timeframe
     has_agent: HasAgent
 
     # Open house and agent context
@@ -65,7 +56,6 @@ class VisitorResponse(BaseModel):
     full_name: str
     email: str
     phone: str
-    timeframe: str
     has_agent: str
     interested_in_similar: bool
     created_at: datetime

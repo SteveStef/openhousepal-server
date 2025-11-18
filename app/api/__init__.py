@@ -7,6 +7,7 @@ from .collection_preferences_routes import router as collection_preferences_rout
 from .open_houses_routes import router as open_houses_router
 from .subscription_routes import router as subscription_router
 from .webhook_routes import router as webhook_router
+from .notifications_routes import router as notifications_router
 
 router = APIRouter()
 router.include_router(auth_router)
@@ -17,3 +18,4 @@ router.include_router(collection_preferences_router)
 router.include_router(open_houses_router)
 router.include_router(subscription_router)
 router.include_router(webhook_router)
+router.include_router(notifications_router)

@@ -1,10 +1,10 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
-from typing import List
+from typing import List, Optional
 from datetime import datetime
 import os
 
-from app.models.database import PropertyInteraction, PropertyComment, Collection, Property, User
+from app.models.database import PropertyInteraction, PropertyComment, Collection, Property, User, Notification
 from app.schemas.property_interactions import (
     PropertyInteractionUpdate,
     PropertyCommentCreate,
@@ -14,6 +14,9 @@ from app.schemas.property_interactions import (
     PropertyInteractionSummary
 )
 from app.services.email_service import EmailService
+from app.config.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class PropertyInteractionsService:
@@ -25,7 +28,8 @@ class PropertyInteractionsService:
         db: AsyncSession,
         collection_id: str,
         property_id: str,
-        interaction_data: PropertyInteractionUpdate
+        interaction_data: PropertyInteractionUpdate,
+        user_id: Optional[str] = None
     ) -> PropertyInteractionResponse:
         """Create or update a property interaction"""
 
@@ -107,15 +111,119 @@ class PropertyInteractionsService:
                         }
                     )
 
+        # Create in-app notification for property interactions (like, dislike, favorite)
+        if interaction.liked or interaction.disliked or interaction.favorited:
+            try:
+                # Get collection and agent info for notification
+                collection_result = await db.execute(
+                    select(Collection).where(Collection.id == collection_id)
+                )
+                collection = collection_result.scalar_one_or_none()
+
+                if collection:
+                    # Skip notification if the user is the agent (owner) themselves
+                    if user_id and user_id == collection.owner_id:
+                        return PropertyInteractionResponse.from_orm(interaction)
+
+                    property_result = await db.execute(
+                        select(Property).where(Property.id == property_id)
+                    )
+                    property_obj = property_result.scalar_one_or_none()
+
+                    if property_obj:
+                        # Determine interaction type for notification message
+                        if interaction.liked:
+                            interaction_type = "liked"
+                            title = f"{collection.visitor_name or 'A visitor'} liked a property"
+                        elif interaction.favorited:
+                            interaction_type = "favorited"
+                            title = f"{collection.visitor_name or 'A visitor'} favorited a property"
+                        elif interaction.disliked:
+                            interaction_type = "disliked"
+                            title = f"{collection.visitor_name or 'A visitor'} disliked a property"
+                        else:
+                            interaction_type = "interacted with"
+                            title = f"{collection.visitor_name or 'A visitor'} interacted with a property"
+
+                        notification = Notification(
+                            agent_id=collection.owner_id,
+                            type="PROPERTY_INTERACTION",
+                            reference_type="INTERACTION",
+                            reference_id=interaction.id,
+                            title=title,
+                            message=f"{interaction_type.capitalize()} {property_obj.street_address}",
+                            collection_id=collection_id,
+                            collection_name=collection.name,
+                            property_id=property_id,
+                            property_address=property_obj.street_address,
+                            visitor_name=collection.visitor_name,
+                            is_read=False,
+                            created_at=datetime.utcnow()
+                        )
+                        db.add(notification)
+                        await db.commit()
+            except Exception as e:
+                logger.error("Failed to create property interaction notification", extra={"error": str(e)})
+                # Don't fail the interaction if notification creation fails
+
         return PropertyInteractionResponse.from_orm(interaction)
-    
+
+    @classmethod
+    async def track_property_view(
+        cls,
+        db: AsyncSession,
+        collection_id: str,
+        property_id: str
+    ) -> PropertyInteractionResponse:
+        """Track a property view by incrementing view_count and updating last_viewed_at"""
+
+        # Try to find existing interaction for this collection and property
+        result = await db.execute(
+            select(PropertyInteraction)
+            .where(
+                and_(
+                    PropertyInteraction.collection_id == collection_id,
+                    PropertyInteraction.property_id == property_id
+                )
+            )
+        )
+        interaction = result.scalar_one_or_none()
+
+        current_time = datetime.now()
+
+        if interaction:
+            # Update existing interaction
+            interaction.view_count = (interaction.view_count or 0) + 1
+            interaction.last_viewed_at = current_time
+            interaction.updated_at = current_time
+        else:
+            # Create new interaction with view tracking
+            interaction = PropertyInteraction(
+                collection_id=collection_id,
+                property_id=property_id,
+                liked=False,
+                disliked=False,
+                favorited=False,
+                view_count=1,
+                last_viewed_at=current_time,
+                created_at=current_time,
+                updated_at=current_time
+            )
+            db.add(interaction)
+
+        await db.commit()
+        await db.refresh(interaction)
+
+        return PropertyInteractionResponse.from_orm(interaction)
+
     @classmethod
     async def add_property_comment(
         cls,
         db: AsyncSession,
         collection_id: str,
         property_id: str,
-        comment_data: PropertyCommentCreate
+        comment_data: PropertyCommentCreate,
+        user_id: Optional[str] = None
     ) -> PropertyCommentResponse:
         """Add an anonymous comment to a property"""
 
@@ -172,6 +280,37 @@ class PropertyInteractionsService:
                         "collection_link": collection_link
                     }
                 )
+
+                # Create in-app notification for agent
+                try:
+                    # Skip notification if the user is the agent (owner) themselves
+                    if user_id and user_id == collection.owner_id:
+                        # Don't create notification for agent's own comment
+                        pass
+                    else:
+                        # Truncate comment for notification if it's too long
+                        comment_preview = content[:100] + "..." if len(content) > 100 else content
+
+                        notification = Notification(
+                            agent_id=collection.owner_id,
+                            type="PROPERTY_COMMENT",
+                            reference_type="COMMENT",
+                            reference_id=comment.id,
+                            title=f"New Comment: {comment.visitor_name or 'Anonymous'}",
+                            message=f"Commented on {property_obj.street_address}: \"{comment_preview}\"",
+                            collection_id=collection_id,
+                            collection_name=collection.name,
+                            property_id=property_id,
+                            property_address=property_obj.street_address,
+                            visitor_name=comment.visitor_name,
+                            is_read=False,
+                            created_at=datetime.utcnow()
+                        )
+                        db.add(notification)
+                        await db.commit()
+                except Exception as e:
+                    logger.error("Failed to create property comment notification", extra={"error": str(e)})
+                    # Don't fail the comment creation if notification creation fails
 
         # Create response and populate author field from visitor_name
         response = PropertyCommentResponse.from_orm(comment)

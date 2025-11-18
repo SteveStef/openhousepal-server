@@ -3,13 +3,16 @@ from sqlalchemy import select, and_
 from typing import List, Optional
 from datetime import datetime
 
-from app.models.database import PropertyTour, Collection, Property, User
+from app.models.database import PropertyTour, Collection, Property, User, Notification
 from app.schemas.property_tour import (
     PropertyTourCreate,
     PropertyTourResponse,
     PropertyTourStatusUpdate
 )
 from app.services.email_service import EmailService
+from app.config.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class PropertyTourService:
@@ -39,7 +42,8 @@ class PropertyTourService:
         db: AsyncSession,
         collection_id: str,
         property_id: str,
-        tour_data: PropertyTourCreate
+        tour_data: PropertyTourCreate,
+        user_id: Optional[str] = None
     ) -> PropertyTourResponse:
         """Create a new property tour request"""
 
@@ -142,6 +146,38 @@ class PropertyTourService:
                     "message": tour_data.message or ""
                 }
             )
+
+        # Create in-app notification for agent
+        try:
+            # Skip notification if the user is the agent (owner) themselves
+            if not (user_id and user_id == collection.owner_id):
+                # Format first preferred date for notification
+                preferred_date_str = ""
+                if tour_data.preferred_date and tour_data.preferred_time:
+                    formatted_date = cls._format_date(tour_data.preferred_date)
+                    formatted_time = cls._format_time(tour_data.preferred_time)
+                    preferred_date_str = f" for {formatted_date} at {formatted_time}"
+
+                notification = Notification(
+                    agent_id=collection.owner_id,
+                    type="TOUR_REQUEST",
+                    reference_type="TOUR",
+                    reference_id=tour.id,
+                    title=f"New Tour Request: {collection.visitor_name}",
+                    message=f"Requested tour at {property_obj.street_address}{preferred_date_str}",
+                    collection_id=collection.id,
+                    collection_name=collection.name,
+                    property_id=property_id,
+                    property_address=property_obj.street_address,
+                    visitor_name=collection.visitor_name,
+                    is_read=False,
+                    created_at=datetime.utcnow()
+                )
+                db.add(notification)
+                await db.commit()
+        except Exception as e:
+            logger.error("Failed to create tour request notification", extra={"error": str(e)})
+            # Don't fail the tour request if notification creation fails
 
         return PropertyTourResponse.from_orm(tour)
 

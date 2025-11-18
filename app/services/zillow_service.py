@@ -80,6 +80,12 @@ class ZillowService:
         if preferences.max_baths and preferences.max_baths > 0:
             params['baths_max'] = int(preferences.max_baths)
 
+        # Add year built range
+        if preferences.min_year_built:
+            params['built_min'] = preferences.min_year_built
+        if preferences.max_year_built and preferences.max_year_built > 0:
+            params['built_max'] = preferences.max_year_built
+
         url = f"{self.base_url}/search_coordinates"
         
         try:
@@ -171,6 +177,12 @@ class ZillowService:
             params['baths_min'] = int(preferences.min_baths)
         if preferences.max_baths and preferences.max_baths > 0:
             params['baths_max'] = int(preferences.max_baths)
+
+        # Add year built range
+        if preferences.min_year_built:
+            params['built_min'] = preferences.min_year_built
+        if preferences.max_year_built and preferences.max_year_built > 0:
+            params['built_max'] = preferences.max_year_built
 
         url = f"{self.base_url}/search"
         
