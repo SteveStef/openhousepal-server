@@ -138,6 +138,7 @@ class OpenHouseEvent(Base):
     # Property details for PDF generation and collection preferences
     bedrooms = Column(Integer, nullable=True)
     bathrooms = Column(Float, nullable=True)
+    living_area = Column(Integer, nullable=True)
     price = Column(Integer, nullable=True)
     home_status = Column(String, nullable=True)
     

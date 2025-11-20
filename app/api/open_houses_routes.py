@@ -72,6 +72,7 @@ async def create_open_house(
             zipcode=zipcode,
             bedrooms=property_data.get('bedrooms'),
             bathrooms=property_data.get('bathrooms'),
+            living_area=property_data.get('livingArea'),
             price=property_data.get('price'),
             home_status=property_data.get('homeStatus')
         )
@@ -130,7 +131,7 @@ async def get_open_houses(
                 form_url=oh.form_url or f"/open-house/{oh.id}",
                 bedrooms=oh.bedrooms,
                 bathrooms=oh.bathrooms,
-                living_area=oh.lot_size,  # Column dropped from database
+                living_area=oh.living_area,
                 price=oh.price,
                 created_at=oh.created_at
             ))
