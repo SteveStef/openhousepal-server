@@ -92,6 +92,7 @@ async def create_open_house(
             bathrooms=open_house.bathrooms,
             living_area=open_house.lot_size,
             price=open_house.price,
+            city=open_house.city,
             created_at=open_house.created_at
         )
         
@@ -133,6 +134,7 @@ async def get_open_houses(
                 bathrooms=oh.bathrooms,
                 living_area=oh.living_area,
                 price=oh.price,
+                city=oh.city,
                 created_at=oh.created_at
             ))
         

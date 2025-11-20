@@ -49,6 +49,7 @@ class OpenHouseResponse(BaseModel):
     bathrooms: Optional[float] = None
     living_area: Optional[int] = None
     price: Optional[int] = None
+    city: Optional[str] = None
     created_at: datetime
 
 class VisitorResponse(BaseModel):
