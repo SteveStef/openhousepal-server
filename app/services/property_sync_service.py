@@ -198,6 +198,7 @@ class PropertySyncService:
             matching_properties = await self.zillow_service.get_matching_properties(preferences)
 
             new_properties_count = 0
+            first_new_property = None
 
             for property_data in matching_properties:
                 zpid = property_data.get('zpid')
@@ -231,6 +232,15 @@ class PropertySyncService:
                             savings = old_price - new_price
                             discount_percent = round((savings / old_price) * 100, 1)
 
+                            # Get agent info
+                            agent_result = await db.execute(
+                                select(User).where(User.id == collection.owner_id)
+                            )
+                            agent = agent_result.scalar_one_or_none()
+                            agent_name = f"{agent.first_name or ''} {agent.last_name or ''}".strip() if agent else ""
+                            agent_email = agent.email if agent else ""
+                            agent_phone = ""  # User model doesn't have phone field
+
                             if visitor_email:
                                 email_service = EmailService()
                                 email_service.send_simple_message(
@@ -246,7 +256,10 @@ class PropertySyncService:
                                         "old_price": f"${old_price:,}",
                                         "new_price": f"${new_price:,}",
                                         "savings": f"${savings:,}",
-                                        "discount_percent": f"{discount_percent}%"
+                                        "discount_percent": f"{discount_percent}%",
+                                        "agent_name": agent_name,
+                                        "agent_email": agent_email,
+                                        "agent_phone": agent_phone
                                     }
                                 )
                                 logger.info(f"Price drop email sent for property {zpid}: ${old_price:,} → ${new_price:,}")
@@ -262,6 +275,17 @@ class PropertySyncService:
                 await self.add_property_to_collection(db, collection.id, property_obj.id)
                 new_properties_count += 1
 
+                # Track the first new property for email template
+                if new_properties_count == 1:
+                    first_new_property = {
+                        'address': property_obj.street_address,
+                        'beds': property_obj.bedrooms,
+                        'baths': property_obj.bathrooms,
+                        'price': property_obj.price,
+                        'sqft': property_obj.living_area,
+                        'image': property_obj.img_src
+                    }
+
             # Get total property count without lazy loading
             count_result = await db.execute(
                 select(func.count()).select_from(collection_properties).where(
@@ -274,7 +298,8 @@ class PropertySyncService:
             return {
                 'new_properties_count': new_properties_count,
                 'collection': collection,
-                'total_properties': total_properties
+                'total_properties': total_properties,
+                'first_new_property': first_new_property if new_properties_count > 0 else None
             }
 
         except Exception as e:
@@ -334,6 +359,20 @@ class PropertySyncService:
                                 frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
                                 collection_link = f"{frontend_url}/showcase/{share_token}"
 
+                                # Extract agent info for email
+                                agent_name = f"{agent.first_name or ''} {agent.last_name or ''}".strip() if agent else ""
+                                agent_email = agent.email if agent else ""
+                                agent_phone = ""  # User model doesn't have phone field
+
+                                # Extract first property details for email
+                                first_prop = sync_result.get('first_new_property') or {}
+                                property_address = first_prop.get('address', '')
+                                property_beds = first_prop.get('beds', '')
+                                property_baths = first_prop.get('baths', '')
+                                property_price = f"${first_prop['price']:,}" if first_prop.get('price') else ''
+                                property_sqft = f"{first_prop['sqft']:,}" if first_prop.get('sqft') else ''
+                                property_image = first_prop.get('image', '')
+
                                 # Send to visitor
                                 self.email_service.send_simple_message(
                                     to_email=visitor_email,
@@ -344,23 +383,38 @@ class PropertySyncService:
                                         "collection_name": collection_name,
                                         "new_count": sync_result['new_properties_count'],
                                         "total_count": sync_result['total_properties'],
-                                        "collection_link": collection_link
+                                        "collection_link": collection_link,
+                                        "agent_name": agent_name,
+                                        "agent_email": agent_email,
+                                        "agent_phone": agent_phone,
+                                        "property_address": property_address,
+                                        "property_beds": property_beds,
+                                        "property_baths": property_baths,
+                                        "property_price": property_price,
+                                        "property_sqft": property_sqft,
+                                        "property_image": property_image
                                     }
                                 )
 
-                                # Send to agent (same template, different recipient)
+                                # Send to agent (different template)
                                 if agent and agent.email:
                                     self.email_service.send_simple_message(
                                         to_email=agent.email,
                                         subject=f"New Properties Added to {visitor_name}'s Collection",
-                                        template="new_properties_synced",
+                                        template="new_properties_synced_agent",
                                         template_variables={
                                             "recipient_name": agent.first_name,
                                             "collection_name": collection_name,
                                             "new_count": sync_result['new_properties_count'],
                                             "total_count": sync_result['total_properties'],
                                             "collection_link": collection_link,
-                                            "visitor_name": visitor_name
+                                            "visitor_name": visitor_name,
+                                            "property_address": property_address,
+                                            "property_beds": property_beds,
+                                            "property_baths": property_baths,
+                                            "property_price": property_price,
+                                            "property_sqft": property_sqft,
+                                            "property_image": property_image
                                         }
                                     )
 

@@ -218,6 +218,23 @@ async def submit_open_house_form(
                 frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
                 showcase_link = f"{frontend_url}/showcase/{collection_result['share_token']}"
 
+                # Get agent information for the email
+                agent_name = ""
+                agent_email = ""
+                agent_phone = ""
+                if form_data.open_house_event_id:
+                    oh_query = select(OpenHouseEvent).where(OpenHouseEvent.id == form_data.open_house_event_id)
+                    oh_result = await db.execute(oh_query)
+                    oh_event = oh_result.scalar_one_or_none()
+                    if oh_event:
+                        agent_query = select(User).where(User.id == oh_event.agent_id)
+                        agent_result = await db.execute(agent_query)
+                        agent = agent_result.scalar_one_or_none()
+                        if agent:
+                            agent_name = f"{agent.first_name or ''} {agent.last_name or ''}".strip()
+                            agent_email = agent.email or ""
+                            # Note: User model doesn't have phone field currently
+
                 email_service.send_simple_message(
                     to_email=visitor.email,
                     subject=f"Your Personalized Property Collection - {property_data.get('address', 'Open House')}",
@@ -226,7 +243,10 @@ async def submit_open_house_form(
                         "visitor_name": visitor.full_name,
                         "property_address": property_data.get('address', 'the property'),
                         "showcase_link": showcase_link,
-                        "properties_count": collection_result.get('properties_added', 0)
+                        "properties_count": collection_result.get('properties_added', 0),
+                        "agent_name": agent_name,
+                        "agent_email": agent_email,
+                        "agent_phone": agent_phone
                     }
                 )
 
