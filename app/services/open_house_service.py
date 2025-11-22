@@ -66,6 +66,10 @@ class OpenHouseService:
             if agent.plan_tier != "PREMIUM":
                 return {"success": False, "properties_added": 0, "reason": "basic_plan"}
 
+            # Check if agent already has 10 active collections
+            should_be_active = await CollectionsService.should_create_as_active(db, agent_id)
+            collection_status = 'ACTIVE' if should_be_active else 'INACTIVE'
+
             # Create collection
             collection = Collection(
                 owner_id=visited_open_house.get('agent_id'),  # Use agent_id from the open house event
@@ -76,6 +80,7 @@ class OpenHouseService:
                 visitor_phone=visitor.phone,
                 original_open_house_event_id=form_data.open_house_event_id,
                 share_token=CollectionsService.generate_share_token(),
+                status=collection_status,
                 created_at=datetime.utcnow()
             )
             

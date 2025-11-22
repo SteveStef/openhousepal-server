@@ -161,11 +161,12 @@ class CollectionsService:
                     }
                     properties_data.append(property_dict)
 
-                # Convert to response format  
+                # Convert to response format
                 collection_data = {
                     "id": collection.id,
                     "name": collection.name,
                     "description": collection.description or "",
+                    "status": collection.status or "ACTIVE",
                     "visitor_name": collection.visitor_name,
                     "visitor_email": collection.visitor_email,
                     "visitor_phone": collection.visitor_phone,

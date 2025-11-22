@@ -39,6 +39,7 @@ class CollectionResponse(BaseModel):
     id: str
     name: str
     description: str
+    status: str = "ACTIVE"
     visitor_name: Optional[str] = None
     visitor_email: Optional[str] = None
     visitor_phone: Optional[str] = None
