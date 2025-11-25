@@ -32,9 +32,7 @@ RUN mkdir -p /app/data /app/logs
 # Copy application code (invalidates cache when code changes)
 COPY . .
 
-# Run database migrations
-RUN python -m alembic upgrade head
-
 EXPOSE 8000
 
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run migrations at startup, then start the application
+CMD ["sh", "-c", "python -m alembic upgrade head && python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"]

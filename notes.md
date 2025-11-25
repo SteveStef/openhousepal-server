@@ -19,3 +19,7 @@ When I upgrade, to premium from the basic (active, not trial) it does not charge
     - Generate embeddings and store in the vector database
     - Query top-N similar property vectors
     - Have these properties in the collection
+
+Things that still need to be tested:
+1. Getting emails when property updates/new property
+2. All email links (should work)
