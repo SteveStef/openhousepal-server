@@ -337,6 +337,7 @@ class Notification(Base):
     property_id = Column(String, nullable=True)
     property_address = Column(String, nullable=True)
     visitor_name = Column(String, nullable=True)
+    link = Column(String, nullable=True)  # Frontend URL path where the event occurred
 
     # Read status
     is_read = Column(Boolean, default=False, nullable=False, index=True)

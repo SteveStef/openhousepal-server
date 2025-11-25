@@ -96,7 +96,7 @@ class PropertyInteractionsService:
 
                 if agent and agent.email and property_obj:
                     frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
-                    collection_link = f"{frontend_url}/showcases/{collection_id}"
+                    collection_link = f"{frontend_url}/showcases?showcase={collection_id}"
 
                     email_service = EmailService()
                     email_service.send_simple_message(
@@ -157,6 +157,7 @@ class PropertyInteractionsService:
                             property_id=property_id,
                             property_address=property_obj.street_address,
                             visitor_name=collection.visitor_name,
+                            link=f"/showcases?showcase={collection_id}&property={property_id}",
                             is_read=False,
                             created_at=datetime.utcnow()
                         )
@@ -265,7 +266,7 @@ class PropertyInteractionsService:
 
             if agent and agent.email and property_obj:
                 frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
-                collection_link = f"{frontend_url}/showcases/{collection_id}"
+                collection_link = f"{frontend_url}/showcases"
 
                 email_service = EmailService()
                 email_service.send_simple_message(
@@ -303,6 +304,7 @@ class PropertyInteractionsService:
                             property_id=property_id,
                             property_address=property_obj.street_address,
                             visitor_name=comment.visitor_name,
+                            link=f"/showcases?showcase={collection_id}&property={property_id}",
                             is_read=False,
                             created_at=datetime.utcnow()
                         )

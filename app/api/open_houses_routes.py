@@ -261,6 +261,11 @@ async def submit_open_house_form(
                 if open_house_event:
                     property_data_for_notif = await OpenHouseService.get_property_by_qr_code(db, form_data.open_house_event_id)
 
+                    # Build link for notification
+                    notification_link = None
+                    if collection_result.get('success') and collection_result.get('collection_id'):
+                        notification_link = f"/showcases?showcase={collection_result.get('collection_id')}"
+
                     notification = Notification(
                         agent_id=open_house_event.agent_id,
                         type="OPEN_HOUSE_SIGN_IN",
@@ -272,6 +277,7 @@ async def submit_open_house_form(
                         collection_name=collection_result.get('collection_id') if collection_result.get('success') else None,
                         property_address=property_data_for_notif.get('address') if property_data_for_notif else None,
                         visitor_name=visitor.full_name,
+                        link=notification_link,
                         is_read=False,
                         created_at=datetime.utcnow()
                     )

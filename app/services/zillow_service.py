@@ -18,11 +18,14 @@ from app.config.logging import get_logger
 logger = get_logger(__name__)
 
 class ZillowService:
+    # Maximum properties to collect for location-based searches
+    MAX_LOCATION_SEARCH_PROPERTIES = 41
+
     def __init__(self):
         self.api_key = os.getenv("RAPID_API_KEY")
         self.base_url = "https://zillow56.p.rapidapi.com"
         self.rate_limiter = RateLimiter()
-        
+
         if not self.api_key:
             logger.warning("RAPID_API_KEY not found in environment variables")
     
@@ -254,8 +257,9 @@ class ZillowService:
             return {}
     
     async def get_matching_properties_by_locations(
-        self, 
-        preferences: CollectionPreferencesSchema
+        self,
+        preferences: CollectionPreferencesSchema,
+        max_properties: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
         Get matching properties from Zillow based on cities and townships in preferences.
@@ -263,6 +267,9 @@ class ZillowService:
         """
         all_properties = []
         seen_zpids = set()  # Track zpids to avoid duplicates
+
+        # Use provided limit or default to class constant
+        property_limit = max_properties if max_properties is not None else self.MAX_LOCATION_SEARCH_PROPERTIES
         
         # Combine cities and townships into single list
         locations = []
@@ -306,21 +313,34 @@ class ZillowService:
                         parsed_property = self.parse_zillow_property(zillow_property)
                         if parsed_property and parsed_property.get('zpid'):
                             zpid = parsed_property['zpid']
-                            
+
                             # Check for duplicates
                             if zpid not in seen_zpids:
                                 seen_zpids.add(zpid)
                                 location_properties.append(parsed_property)
+
+                                # Check if we've reached the property limit
+                                if len(all_properties) + len(location_properties) >= property_limit:
+                                    logger.info(
+                                        f"Reached property limit of {property_limit}. "
+                                        f"Stopping search at location {i+1}/{len(locations)} ({location})"
+                                    )
+                                    break  # Stop processing this location's results
                             else:
                                 logger.debug(f"Skipping duplicate property with zpid: {zpid}")
-                                
+
                     except Exception as parse_error:
                         logger.warning(f"Failed to parse property from location {location}: {str(parse_error)}")
                         continue
                 
                 all_properties.extend(location_properties)
                 logger.info(f"Location {location}: {len(location_properties)} properties added ({len(all_properties)} total so far)")
-                
+
+                # If we've reached or exceeded the limit, stop searching more locations
+                if len(all_properties) >= property_limit:
+                    logger.info(f"Property limit of {property_limit} reached. Skipping remaining {len(locations) - i - 1} locations.")
+                    break  # Stop processing remaining locations
+
                 # Rate limiting: 1 second between requests (except for the last one)
                 if i < len(locations) - 1:
                     await asyncio.sleep(1)
@@ -329,9 +349,17 @@ class ZillowService:
                 logger.error(f"Unexpected error processing location {location}", exc_info=True, extra={"location": location})
                 continue
         
-        logger.info(f"Location search completed. Total properties found: {len(all_properties)} from {len(locations)} locations")
+        logger.info(
+            f"Location search completed. Found {len(all_properties)} properties from {len(locations)} locations "
+            f"(limit: {property_limit})"
+        )
         logger.info(f"Deduplication: {len(seen_zpids)} unique properties after removing duplicates")
-        
+
+        # Safety: Ensure we don't return more than the limit
+        if len(all_properties) > property_limit:
+            logger.warning(f"Truncating results from {len(all_properties)} to {property_limit}")
+            all_properties = all_properties[:property_limit]
+
         return all_properties
     
     async def get_matching_properties(

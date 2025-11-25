@@ -16,6 +16,7 @@ class NotificationCreate(BaseModel):
     property_id: Optional[str] = None
     property_address: Optional[str] = None
     visitor_name: Optional[str] = None
+    link: Optional[str] = None
 
 
 class NotificationResponse(BaseModel):
@@ -32,6 +33,7 @@ class NotificationResponse(BaseModel):
     property_id: Optional[str] = None
     property_address: Optional[str] = None
     visitor_name: Optional[str] = None
+    link: Optional[str] = None
     is_read: bool
     read_at: Optional[datetime] = None
     created_at: datetime

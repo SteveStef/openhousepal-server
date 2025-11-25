@@ -358,6 +358,7 @@ class PropertySyncService:
                                 # Build collection link
                                 frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
                                 collection_link = f"{frontend_url}/showcase/{share_token}"
+                                collection_link_agent = f"{frontend_url}/showcase?showcase={collection_id}"
 
                                 # Extract agent info for email
                                 agent_name = f"{agent.first_name or ''} {agent.last_name or ''}".strip() if agent else ""

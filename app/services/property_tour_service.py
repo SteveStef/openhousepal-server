@@ -170,6 +170,7 @@ class PropertyTourService:
                     property_id=property_id,
                     property_address=property_obj.street_address,
                     visitor_name=collection.visitor_name,
+                    link=f"/showcases?showcase={collection.id}&property={property_id}",
                     is_read=False,
                     created_at=datetime.utcnow()
                 )
