@@ -1,6 +1,7 @@
 import boto3
 import os
 import sys
+import subprocess
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -49,6 +50,22 @@ def restore_backup(backup_key=None):
         # Restore the backup
         os.rename(temp_file, DB_PATH)
         print(f"✓ Database restored from: {backup_key}")
+
+        # Run migrations to bring schema up to date
+        print("\nRunning database migrations...")
+        result = subprocess.run(
+            ["python", "-m", "alembic", "upgrade", "head"],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode == 0:
+            print("✓ Database migrations completed successfully")
+            if result.stdout.strip():
+                print(result.stdout)
+        else:
+            print(f"✗ Migration failed: {result.stderr}", file=sys.stderr)
+            sys.exit(1)
 
     except Exception as e:
         print(f"✗ Restore failed: {e}", file=sys.stderr)
