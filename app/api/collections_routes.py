@@ -391,7 +391,7 @@ async def update_property_interaction(
     current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """
-    Update user interaction with a property within a collection (like, dislike, favorite)
+    Update user interaction with a property within a collection (like, dislike)
     For both authenticated users (agents) and anonymous visitors (shared collections)
     """
     try:
@@ -400,8 +400,6 @@ async def update_property_interaction(
                 interaction_data.liked = interaction_data.value
             elif interaction_data.interaction_type == 'dislike':
                 interaction_data.disliked = interaction_data.value
-            elif interaction_data.interaction_type == 'favorite':
-                interaction_data.favorited = interaction_data.value
 
         interaction = await PropertyInteractionsService.create_property_interaction(
             db, collection_id, property_id, interaction_data,

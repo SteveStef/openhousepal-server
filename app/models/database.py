@@ -182,7 +182,6 @@ class PropertyInteraction(Base):
     # Interaction types
     liked = Column(Boolean, default=False)
     disliked = Column(Boolean, default=False)
-    favorited = Column(Boolean, default=False)
 
     # View tracking
     view_count = Column(Integer, default=0)

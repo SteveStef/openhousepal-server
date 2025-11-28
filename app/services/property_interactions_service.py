@@ -51,7 +51,6 @@ class PropertyInteractionsService:
             # Update existing interaction
             interaction.liked = interaction_data.liked if interaction_data.liked is not None else interaction.liked
             interaction.disliked = interaction_data.disliked if interaction_data.disliked is not None else interaction.disliked
-            interaction.favorited = interaction_data.favorited if interaction_data.favorited is not None else interaction.favorited
             interaction.updated_at = current_time
         else:
             # Create new interaction
@@ -60,7 +59,6 @@ class PropertyInteractionsService:
                 property_id=property_id,
                 liked=interaction_data.liked or False,
                 disliked=interaction_data.disliked or False,
-                favorited=interaction_data.favorited or False,
                 created_at=current_time,
                 updated_at=current_time
             )
@@ -111,8 +109,8 @@ class PropertyInteractionsService:
                         }
                     )
 
-        # Create in-app notification for property interactions (like, dislike, favorite)
-        if interaction.liked or interaction.disliked or interaction.favorited:
+        # Create in-app notification for property interactions (like, dislike)
+        if interaction.liked or interaction.disliked:
             try:
                 # Get collection and agent info for notification
                 collection_result = await db.execute(
@@ -135,9 +133,6 @@ class PropertyInteractionsService:
                         if interaction.liked:
                             interaction_type = "liked"
                             title = f"{collection.visitor_name or 'A visitor'} liked a property"
-                        elif interaction.favorited:
-                            interaction_type = "favorited"
-                            title = f"{collection.visitor_name or 'A visitor'} favorited a property"
                         elif interaction.disliked:
                             interaction_type = "disliked"
                             title = f"{collection.visitor_name or 'A visitor'} disliked a property"
@@ -383,19 +378,7 @@ class PropertyInteractionsService:
             )
         )
         dislikes = dislikes_result.scalar() or 0
-        
-        favorites_result = await db.execute(
-            select(func.count(PropertyInteraction.id))
-            .where(
-                and_(
-                    PropertyInteraction.collection_id == collection_id,
-                    PropertyInteraction.property_id == property_id,
-                    PropertyInteraction.favorited == True
-                )
-            )
-        )
-        favorites = favorites_result.scalar() or 0
-        
+
         # Get comment count
         comments_result = await db.execute(
             select(func.count(PropertyComment.id))
@@ -412,7 +395,6 @@ class PropertyInteractionsService:
             property_id=property_id,
             likes=likes,
             dislikes=dislikes,
-            favorites=favorites,
             comments=comments
         )
     

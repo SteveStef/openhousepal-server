@@ -4,13 +4,12 @@ from typing import Optional, List
 
 
 class PropertyInteractionUpdate(BaseModel):
-    """Schema for updating property interactions (likes, dislikes, favorites)"""
+    """Schema for updating property interactions (likes, dislikes)"""
     liked: Optional[bool] = None
     disliked: Optional[bool] = None
-    favorited: Optional[bool] = None
-    
+
     # Alternative format for frontend compatibility
-    interaction_type: Optional[str] = None  # 'like', 'dislike', 'favorite'
+    interaction_type: Optional[str] = None  # 'like', 'dislike'
     value: Optional[bool] = None
 
 
@@ -31,7 +30,6 @@ class PropertyInteractionResponse(BaseModel):
     property_id: str
     liked: bool
     disliked: bool
-    favorited: bool
     view_count: int = 0
     last_viewed_at: Optional[datetime] = None
     created_at: datetime
@@ -62,7 +60,6 @@ class PropertyInteractionStats(BaseModel):
     property_id: str
     likes: int
     dislikes: int
-    favorites: int
     comments: int
 
 
