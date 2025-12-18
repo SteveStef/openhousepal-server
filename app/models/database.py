@@ -60,7 +60,8 @@ class Collection(Base):
     
     created_at = Column(TZDateTime(timezone=True), server_default=func.now())
     updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
-    
+    last_synced_at = Column(TZDateTime(timezone=True), nullable=True)  # Track when properties were last synced
+
     # Relationships
     owner = relationship("User", back_populates="collections")
     properties = relationship("Property", secondary=collection_properties, back_populates="collections")

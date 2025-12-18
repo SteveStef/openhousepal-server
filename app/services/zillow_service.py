@@ -89,6 +89,9 @@ class ZillowService:
         if preferences.max_year_built and preferences.max_year_built > 0:
             params['built_max'] = preferences.max_year_built
 
+        if preferences.special_features:
+            params["keywords"] = preferences.special_features
+
         url = f"{self.base_url}/search_coordinates"
         
         try:
@@ -186,6 +189,9 @@ class ZillowService:
             params['built_min'] = preferences.min_year_built
         if preferences.max_year_built and preferences.max_year_built > 0:
             params['built_max'] = preferences.max_year_built
+
+        if preferences.special_features:
+            params["keywords"] = preferences.special_features
 
         url = f"{self.base_url}/search"
         

@@ -169,16 +169,16 @@ class CollectionPreferencesService:
             for field, value in update_data.items():
                 setattr(preferences, field, value)
 
-            # Don't commit yet - let replace_collection_properties handle the transaction
-            # This ensures atomicity: either both preferences and properties update, or neither does
+            # Don't commit yet - this ensures atomicity
+            # Either both preferences and properties update, or neither does
 
             # Now attempt to refresh properties with the updated preferences
-            # This will fetch from Zillow and commit everything if successful
+            # This will fetch from Zillow and prepare properties (but NOT commit)
             sync_service = PropertySyncService()
             result = await sync_service.replace_collection_properties(db, collection_id)
 
             if not result['success']:
-                # Zillow failed - rollback preference changes too
+                # Zillow failed or no properties found - rollback preference changes too
                 await db.rollback()
                 logger.error(f"Failed to refresh properties, rolling back preference changes: {result.get('error')}")
                 return {
@@ -187,6 +187,9 @@ class CollectionPreferencesService:
                     'preferences_updated': False,
                     'properties_refreshed': False
                 }
+
+            # Commit both preferences and properties atomically
+            await db.commit()
 
             # Success! Both preferences and properties were updated and committed
             await db.refresh(preferences)

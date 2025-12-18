@@ -16,8 +16,9 @@ from app.services.paypal_service import PayPalService
 from app.utils.create_admin import create_admin_user
 from app.config.logging import configure_logging, get_logger, set_request_id, clear_request_id
 
-CLIENT_URL = os.getenv("CLIENT_URL", "http://localhost:3000")
 load_dotenv()
+
+CLIENT_URL = os.getenv("CLIENT_URL", "http://localhost:3000")
 
 # Configure logging
 configure_logging()
@@ -46,12 +47,10 @@ async def lifespan(app: FastAPI):
         replace_existing=True
     )
 
-    # This is for the property sync (every 5 hours)
-    sync_interval_hours = int(os.getenv("PROPERTY_SYNC_INTERVAL_HOURS", 5))
-
+    # This is for the property sync (every hour at :00)
     scheduler.add_job(
         scheduled_property_sync,
-        CronTrigger(hour=f"*/{sync_interval_hours}"),  # Every 5 hours: 0, 5, 10, 15, 20
+        CronTrigger(hour="*", minute="0"),  # Every hour at the top of the hour
         id="property_sync",
         name="Sync properties from Zillow API",
         replace_existing=True
@@ -62,7 +61,7 @@ async def lifespan(app: FastAPI):
         "APScheduler started",
         extra={
             "cache_cleanup_schedule": f"Daily at {cache_hour:02d}:{cache_mins:02d}",
-            "property_sync_interval": f"Every {sync_interval_hours} hours"
+            "property_sync_interval": "Every hour at :00"
         }
     )
 
@@ -157,7 +156,6 @@ app.include_router(router)
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)

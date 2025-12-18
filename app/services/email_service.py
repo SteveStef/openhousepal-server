@@ -23,8 +23,19 @@ class EmailService:
         template: str,
         template_variables: Dict[str, Any]
     ) -> Tuple[int, str]:
-        try:
+        # Skip sending in dev mode
+        if self.is_dev:
+            logger.info(
+                f"[DEV MODE] Email not sent - would have sent to: {to_email}",
+                extra={
+                    "subject": subject,
+                    "template": template,
+                    "to_email": to_email
+                }
+            )
+            return 200, "Dev mode - email not sent"
 
+        try:
             response = httpx.post(
                 self.mailgun_url,
                 auth=("api", self.mailgun_api_key),

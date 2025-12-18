@@ -1,9 +1,10 @@
 import asyncio
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any
 from pathlib import Path
+import httpx
 
 # Add server directory to Python path so script can be run from anywhere
 server_dir = Path(__file__).resolve().parent.parent.parent
@@ -18,42 +19,50 @@ logger = get_logger(__name__)
 
 async def sync_all_collections_with_rate_limit() -> Dict[str, Any]:
     """
-    Wrapper function that uses existing PropertySyncService with rate limiting
-    This will be called by APScheduler every 5 hours
+    Batch-based property sync that processes N oldest collections per run.
+    Uses last_synced_at to determine which collections need syncing.
+    Called by APScheduler every X minutes (default: 60).
     """
     logger.info("Property sync started", extra={"event": "property_sync_started"})
 
     # Get configuration from environment
-    max_collections_per_sync = int(os.getenv("MAX_COLLECTIONS_PER_SYNC", "0"))  # 0 = no limit
+    max_collections_per_sync = int(os.getenv("MAX_COLLECTIONS_PER_SYNC", "10"))  # Default: 10 collections per run
 
     sync_results = {
-        'started_at': datetime.utcnow(),
+        'started_at': datetime.now(timezone.utc),
         'collections_found': 0,
         'collections_processed': 0,
-        'collections_skipped': 0,
         'total_new_properties': 0,
         'errors': [],
         'success': True
     }
 
     try:
-        # Use your existing PropertySyncService
+        # Use existing PropertySyncService
         property_sync_service = PropertySyncService()
 
         async with AsyncSessionLocal() as db:
-            # Use your existing method to get active collections with preferences
-            collections_with_preferences = await property_sync_service.get_active_collections_with_preferences(db)
+            # Get N oldest collections (ordered by last_synced_at, NULL first)
+            # This automatically limits to max_collections_per_sync
+            collections_with_preferences = await property_sync_service.get_active_collections_with_preferences(
+                db,
+                max_collections=max_collections_per_sync
+            )
             sync_results['collections_found'] = len(collections_with_preferences)
 
-            # Apply max collection limit if set
-            if max_collections_per_sync > 0 and len(collections_with_preferences) > max_collections_per_sync:
-                collections_with_preferences = collections_with_preferences[:max_collections_per_sync]
-                sync_results['collections_skipped'] = sync_results['collections_found'] - len(collections_with_preferences)
-
-            # Process each collection using your existing method
+            # Process each collection
             for i, (collection, preferences) in enumerate(collections_with_preferences, 1):
                 try:
-                    # Use your existing sync_collection_properties method
+                    logger.info(
+                        f"Syncing collection {i}/{len(collections_with_preferences)}",
+                        extra={
+                            "collection_id": collection.id,
+                            "collection_name": collection.name,
+                            "last_synced_at": collection.last_synced_at.isoformat() if collection.last_synced_at else "Never"
+                        }
+                    )
+
+                    # Sync collection (this also updates last_synced_at)
                     sync_result = await property_sync_service.sync_collection_properties(
                         db, collection, preferences
                     )
@@ -66,10 +75,12 @@ async def sync_all_collections_with_rate_limit() -> Dict[str, Any]:
                     logger.error("Collection sync failed", extra={"collection_name": collection.name, "error": str(e)})
                     sync_results['errors'].append(error_msg)
 
-        sync_results['completed_at'] = datetime.utcnow()
+        sync_results['completed_at'] = datetime.now(timezone.utc)
         sync_results['duration_seconds'] = (
             sync_results['completed_at'] - sync_results['started_at']
         ).total_seconds()
+
+        await discord_message(sync_results)
 
         logger.info(
             "Property sync completed",
@@ -106,38 +117,53 @@ async def scheduled_property_sync():
         logger.error("Scheduled property sync failed", exc_info=True, extra={"error": str(e)})
 
 
-async def list_all_collections():
-    """
-    Utility function to list all active collections with preferences
-    Useful for debugging and monitoring
-    """
+async def discord_message(sync_results):
+    discord_webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "")
+
     try:
-        property_sync_service = PropertySyncService()
+        if not discord_webhook_url:
+            logger.warning("DISCORD_WEBHOOK_URL not configured, skipping Discord notification")
+            return
 
-        async with AsyncSessionLocal() as db:
-            collections = await property_sync_service.get_active_collections_with_preferences(db)
+        emoji = "✅" if sync_results['success'] and not sync_results['errors'] else "⚠️" if sync_results['errors'] else "❌"
+        status = "Completed successfully" if sync_results['success'] and not sync_results['errors'] else "Completed with errors" if sync_results['errors'] else "Failed"
 
+        message_lines = [
+            f"{emoji} **Property Sync {status}**",
+            f"",
+            f"**Collections Processed:** {sync_results['collections_processed']}",
+            f"**New Properties Added:** {sync_results['total_new_properties']}",
+            f"**Duration:** {sync_results['duration_seconds']:.1f}s",
+        ]
 
-        for i, (collection, preferences) in enumerate(collections, 1):
-            if preferences:
-                # Display location info
-                location = preferences.address if preferences.address else "No location set"
+        # Add errors if any
+        if sync_results['errors']:
+            message_lines.append(f"")
+            message_lines.append(f"**Errors ({len(sync_results['errors'])}):**")
+            for error in sync_results['errors'][:5]:  # Limit to first 5 errors
+                message_lines.append(f"• {error}")
+            if len(sync_results['errors']) > 5:
+                message_lines.append(f"• ... and {len(sync_results['errors']) - 5} more errors")
 
-                # Display cities if available (cities is a JSON array)
-                if preferences.cities:
-                    cities_str = ', '.join(preferences.cities) if isinstance(preferences.cities, list) else str(preferences.cities)
+        # Build message and send (THIS IS OUTSIDE THE ERROR LOOP)
+        content = "\n".join(message_lines)
 
-                # Display price range
-                min_price = preferences.min_price if preferences.min_price else 0
-                max_price = preferences.max_price if preferences.max_price else 0
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                discord_webhook_url,
+                json={"content": content}
+            )
 
-        return collections
+            if response.status_code in [200, 204]:
+                logger.info("Discord webhook sent successfully")
+            else:
+                logger.error(f"Discord webhook failed: {response.status_code} - {response.text}")
 
     except Exception as e:
-        return []
+        logger.error(f"Failed to send Discord webhook: {str(e)}", exc_info=True)
 
 
 if __name__ == "__main__":
     """For testing - run this script directly to list collections"""
-    asyncio.run(list_all_collections())
+    asyncio.run(sync_all_collections_with_rate_limit())
 

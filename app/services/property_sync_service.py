@@ -6,7 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 
 from app.models.database import Collection, CollectionPreferences, Property, collection_properties, User
-from app.services.zillow_service import ZillowService
+from app.services.zillow_working_service import ZillowWorkingService
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.email_service import EmailService
 from app.config.logging import get_logger
@@ -18,20 +18,37 @@ logger = get_logger(__name__)
 
 class PropertySyncService:
     def __init__(self):
-        self.zillow_service = ZillowService()
+        self.zillow_service = ZillowWorkingService()
         self.email_service = EmailService()
     
-    async def get_active_collections_with_preferences(self, db: AsyncSession) -> List[tuple]:
+    async def get_active_collections_with_preferences(
+        self,
+        db: AsyncSession,
+        max_collections: int = None
+    ) -> List[tuple]:
         """
-        Get all active collections that have preferences set
+        Get active collections that have preferences set, ordered by last_synced_at (oldest first)
         Eagerly loads the owner relationship for email notifications
+
+        Args:
+            db: Database session
+            max_collections: Maximum number of collections to return (for batch processing)
+
+        Returns:
+            List of (Collection, CollectionPreferences) tuples, ordered by last_synced_at
         """
-        result = await db.execute(
+        query = (
             select(Collection, CollectionPreferences)
             .join(CollectionPreferences)
             .options(selectinload(Collection.owner))
             .where(Collection.status == 'ACTIVE')
+            .order_by(Collection.last_synced_at.asc().nullsfirst())  # NULL = never synced (highest priority)
         )
+
+        if max_collections and max_collections > 0:
+            query = query.limit(max_collections)
+
+        result = await db.execute(query)
         return result.fetchall()
     
     async def property_exists_in_collection(
@@ -148,7 +165,8 @@ class PropertySyncService:
                 )
             )
             await db.commit()
-            logger.info(f"Added property {property_id} to collection {collection_id}")
+            # Verbose logging disabled - use summary logs instead
+            # logger.info(f"Added property {property_id} to collection {collection_id}")
 
     async def add_property_to_collection_initial(
         self,
@@ -180,6 +198,42 @@ class PropertySyncService:
             )
             await db.commit()
             logger.info(f"Added initial property {property_id} to collection {collection_id} (no timestamp)")
+
+    async def invalidate_collection_property_cache(
+        self,
+        db: AsyncSession,
+        collection_id: str
+    ) -> int:
+        """
+        Invalidate cached property data for all properties in a collection.
+        Returns count of properties with invalidated cache.
+        """
+        from sqlalchemy import update
+
+        # Get all property IDs in this collection
+        result = await db.execute(
+            select(collection_properties.c.property_id)
+            .where(collection_properties.c.collection_id == collection_id)
+        )
+        property_ids = [row[0] for row in result.fetchall()]
+
+        if not property_ids:
+            return 0
+
+        # Invalidate cache for all these properties
+        stmt = update(Property).where(
+            Property.id.in_(property_ids)
+        ).values(
+            detailed_property=None,
+            detailed_data_cached=False,
+            detailed_data_cached_at=None
+        )
+
+        update_result = await db.execute(stmt)
+        await db.commit()
+
+        logger.info(f"Invalidated cache for {update_result.rowcount} properties in collection {collection_id}")
+        return update_result.rowcount
 
     async def sync_collection_properties(
         self,
@@ -295,6 +349,15 @@ class PropertySyncService:
             total_properties = count_result.scalar()
 
             logger.info(f"Added {new_properties_count} new properties to collection {collection.id}")
+
+            # Invalidate cache for all properties in this collection
+            await self.invalidate_collection_property_cache(db, collection.id)
+
+            # Update last_synced_at timestamp
+            collection.last_synced_at = datetime.now(timezone.utc)
+            await db.commit()
+            await db.refresh(collection)
+
             return {
                 'new_properties_count': new_properties_count,
                 'collection': collection,
@@ -304,6 +367,15 @@ class PropertySyncService:
 
         except Exception as e:
             logger.error(f"Error syncing collection {collection.id}", exc_info=True, extra={"collection_id": collection.id})
+
+            # Update last_synced_at even on failure to prevent this collection from blocking others
+            try:
+                collection.last_synced_at = datetime.now(timezone.utc)
+                await db.commit()
+                await db.refresh(collection)
+            except Exception as commit_error:
+                logger.error(f"Failed to update last_synced_at for collection {collection.id}", exc_info=True)
+
             return {
                 'new_properties_count': 0,
                 'collection': collection,
@@ -569,6 +641,7 @@ class PropertySyncService:
         """
         Replace all properties in a collection with new ones based on updated preferences.
         This removes all existing property associations and adds new matching properties.
+        Note: Does NOT commit - caller must handle commit for atomic updates with preferences.
         """
         logger.info(f"Replacing all properties for collection {collection_id}")
 
@@ -588,21 +661,30 @@ class PropertySyncService:
             if not preferences:
                 return {'success': False, 'error': 'No preferences found for collection'}
 
-            # Step 1: Remove all existing property associations for this collection
+            # Step 1: Get matching properties from Zillow FIRST (validate before deleting)
+            matching_properties = await self.zillow_service.get_matching_properties(preferences)
+
+            # Step 2: Validate that properties were found - fail fast if none match
+            if not matching_properties or len(matching_properties) == 0:
+                logger.warning(f"No matching properties found for collection {collection_id}")
+                return {
+                    'success': False,
+                    'error': 'No properties match the updated preferences',
+                    'properties_replaced': 0
+                }
+
+            # Step 3: Now safe to delete existing properties (we have new ones to replace with)
             await db.execute(
                 collection_properties.delete().where(
                     collection_properties.c.collection_id == collection_id
                 )
             )
-            # Note: Do not commit yet - wait until new properties are successfully fetched
-            logger.info(f"Removed all existing property associations for collection {collection_id}")
-
-            # Step 2: Get matching properties from Zillow based on current preferences
-            matching_properties = await self.zillow_service.get_matching_properties(preferences)
+            # Verbose logging disabled - use summary logs instead
+            # logger.info(f"Removed all existing property associations for collection {collection_id}")
 
             properties_added = 0
 
-            # Step 3: Add new matching properties to the collection
+            # Step 4: Add new matching properties to the collection
             for property_data in matching_properties:
                 zpid = property_data.get('zpid')
                 if not zpid:
@@ -620,15 +702,15 @@ class PropertySyncService:
                     logger.warning(f"Failed to add property {zpid} to collection {collection_id}: {str(e)}")
                     continue
 
-            # Commit the transaction only after all properties are successfully added
-            await db.commit()
-            logger.info(f"Successfully replaced properties for collection {collection_id}: {properties_added} properties added")
+            # CRITICAL: Do NOT commit here - let the caller handle commit
+            # This ensures atomic updates with preferences
+            logger.info(f"Successfully prepared properties for collection {collection_id}: {properties_added} properties ready to commit")
 
             return {
                 'success': True,
                 'collection_id': collection_id,
                 'properties_replaced': properties_added,
-                'message': f'Collection updated with {properties_added} matching properties'
+                'message': f'Collection prepared with {properties_added} matching properties'
             }
 
         except Exception as e:

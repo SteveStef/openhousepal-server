@@ -7,7 +7,7 @@ from app.models.database import Property, OpenHouseVisitor, Collection, collecti
 from app.schemas.open_house import OpenHouseFormSubmission
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.collections_service import CollectionsService
-from app.services.zillow_service import ZillowService
+from app.services.zillow_working_service import ZillowWorkingService
 from app.schemas.collection_preferences import CollectionPreferences as CollectionPreferencesSchema
 from app.config.logging import get_logger
 
@@ -119,7 +119,7 @@ class OpenHouseService:
     ) -> int:
         """Populate collection with properties from Zillow API"""
         try:
-            zillow_service = ZillowService()
+            zillow_service = ZillowWorkingService()
             
             # Get matching properties from Zillow
             matching_properties = await zillow_service.get_matching_properties(preferences)

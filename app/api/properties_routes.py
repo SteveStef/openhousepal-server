@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from app.database import get_db
 from app.models.database import Property
-from app.services.zillow_service import ZillowService
+from app.services.zillow_working_service import ZillowWorkingService
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -173,7 +173,7 @@ async def get_property_details(
     request: PropertyLookupRequest
 ):
     """Fetch property details from Zillow API without saving to database"""
-    zillow_service = ZillowService()
+    zillow_service = ZillowWorkingService()
     return await zillow_service.get_property_by_address(request.address)
 
 @router.get("/properties/{property_id}/cache")
@@ -217,7 +217,7 @@ async def cache_property_details(
             raise HTTPException(status_code=400, detail="Property missing address for Zillow lookup")
 
         # Fetch from Zillow
-        zillow_service = ZillowService()
+        zillow_service = ZillowWorkingService()
         details = await zillow_service.get_property_by_address(property_record.street_address, True)
 
         if not details:
