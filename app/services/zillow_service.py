@@ -7,8 +7,7 @@ from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
 
-from app.models.database import CollectionPreferences, Property, Collection, OpenHouseEvent
-from app.schemas.collection_preferences import CollectionPreferences as CollectionPreferencesSchema
+from app.models.database import CollectionPreferences, Property, Collection, OpenHouseEvent from app.schemas.collection_preferences import CollectionPreferences as CollectionPreferencesSchema
 from datetime import datetime
 from app.models.property import PropertyDetailResponse, PropertySaveResponse, ZillowPropertyDetailResponse
 from app.utils.rate_limiter import RateLimiter

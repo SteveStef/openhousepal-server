@@ -43,6 +43,29 @@ Current Problems:
 1. The township search does not work for the new API and it is a piece of functionality that I cannot afford to lose. May need to revert back to old api for either primary or just to get the township but are we okay with spending 20 more dollars? it would also allow more fault tolorance
 2. Make sure the new radius works properly for the new API as it it being multiplied by 1.8 then divided by 2.
 
-The viewed property is not working. It is not counting as a view for the agent view or the client to no longer display (new)
 
 
+API restrictions
+Maps JavaScript API
+Maps Embed API
+Places API
+
+
+Billing subscription activated, 
+Billing subscription cancelled, 
+Billing subscription created, 
+Billing subscription expired, 
+Billing subscription payment failed, 
+Billing subscription re-activated, 
+Billing subscription suspended, 
+Payment sale completed, 
+Payment sale denied, 
+Billing subscription updated
+
+
+Mount Type
+BIND
+Host Path
+/var/log/openhousepal_server
+Mount Path
+/app/logs

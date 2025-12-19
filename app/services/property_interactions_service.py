@@ -199,7 +199,6 @@ class PropertyInteractionsService:
                 property_id=property_id,
                 liked=False,
                 disliked=False,
-                favorited=False,
                 view_count=1,
                 last_viewed_at=current_time,
                 created_at=current_time,
