@@ -253,7 +253,7 @@ class ZillowWorkingService:
             'page': 1,
             'homeType': self._build_home_types(preferences),
             'listingType': 'By_Agent',
-            'listingTypeOptions': 'Agent listed',
+            'listingTypeOptions': 'Agent listed,New Construction,Fore-closures,Auctions',
             'daysOnZillow': 'Any',
         }
 
@@ -348,7 +348,7 @@ class ZillowWorkingService:
             'page': 1,
             'homeType': self._build_home_types(preferences),
             'listingType': 'By_Agent',
-            'listingTypeOptions': 'Agent listed',
+            'listingTypeOptions': 'Agent listed,New Construction,Fore-closures,Auctions',
             'daysOnZillow': 'Any',
         }
 
