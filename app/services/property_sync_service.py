@@ -21,6 +21,19 @@ class PropertySyncService:
         self.zillow_service = ZillowWorkingService()
         self.email_service = EmailService()
     
+    async def get_total_active_collections_count(self, db: AsyncSession) -> int:
+        """
+        Get total count of active collections that have preferences
+        """
+        query = (
+            select(func.count())
+            .select_from(Collection)
+            .join(CollectionPreferences)
+            .where(Collection.status == 'ACTIVE')
+        )
+        result = await db.execute(query)
+        return result.scalar() or 0
+
     async def get_active_collections_with_preferences(
         self,
         db: AsyncSession,
@@ -497,7 +510,7 @@ class PropertySyncService:
                                 )
 
                             # Add small delay between collection syncs to be respectful to API
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(0.2)
 
                         except Exception as e:
                             error_msg = f"Failed to sync collection {collection.id}: {str(e)}"

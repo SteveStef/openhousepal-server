@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import Dict, Any, Optional
 from pydantic import BaseModel
+import os
 
 from app.database import get_db
 from app.models.database import Property
@@ -191,10 +192,11 @@ async def cache_property_details(
         if not property_record:
             raise HTTPException(status_code=404, detail="Property not found")
 
-        # Check if cache is still valid (1 day expiry)
+        # Check if cache is still valid (based on CACHE_EXPIRY_DAYS environment variable)
         if property_record.detailed_data_cached and property_record.detailed_data_cached_at:
             from datetime import timedelta
-            expiry_time = property_record.detailed_data_cached_at + timedelta(days=1)
+            cache_expiry_days = int(os.getenv("CACHE_EXPIRY_DAYS", 3))
+            expiry_time = property_record.detailed_data_cached_at + timedelta(days=cache_expiry_days)
 
             if datetime.now(timezone.utc) < expiry_time and property_record.detailed_property:
                 # Validate that cached data is not None/empty before returning
@@ -218,7 +220,19 @@ async def cache_property_details(
 
         # Fetch from Zillow
         zillow_service = ZillowWorkingService()
-        details = await zillow_service.get_property_by_address(property_record.street_address, True)
+
+        # Construct full address for search to avoid ambiguity
+        search_address = property_record.street_address
+        if property_record.city:
+            search_address += f", {property_record.city}"
+        
+        if property_record.state:
+            search_address += f", {property_record.state}"
+
+        if property_record.zipcode:
+            search_address += f" {property_record.zipcode}"
+
+        details = await zillow_service.get_property_by_address(search_address, True)
 
         if not details:
             raise HTTPException(status_code=404, detail="Property details not found on Zillow")

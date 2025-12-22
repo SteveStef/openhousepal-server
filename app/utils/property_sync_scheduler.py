@@ -6,6 +6,8 @@ from typing import Dict, Any
 from pathlib import Path
 import httpx
 
+import math
+
 # Add server directory to Python path so script can be run from anywhere
 server_dir = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(server_dir))
@@ -25,9 +27,6 @@ async def sync_all_collections_with_rate_limit() -> Dict[str, Any]:
     """
     logger.info("Property sync started", extra={"event": "property_sync_started"})
 
-    # Get configuration from environment
-    max_collections_per_sync = int(os.getenv("MAX_COLLECTIONS_PER_SYNC", "10"))  # Default: 10 collections per run
-
     sync_results = {
         'started_at': datetime.now(timezone.utc),
         'collections_found': 0,
@@ -42,6 +41,35 @@ async def sync_all_collections_with_rate_limit() -> Dict[str, Any]:
         property_sync_service = PropertySyncService()
 
         async with AsyncSessionLocal() as db:
+            # 1. Calculate dynamic batch size
+            total_collections = await property_sync_service.get_total_active_collections_count(db)
+            
+            # Goal: Cycle through ALL collections every 24 hours
+            # Runs every hour, so we need to process 1/24th of the total each time
+            calculated_batch_size = math.ceil(total_collections / 24)
+            
+            # 2. Apply safety cap based on monthly API limit
+            # Limit: 25,000 requests / month
+            # Daily Limit: ~800 requests / day
+            # Hourly Limit: ~33 requests / hour (800 / 24)
+            HOURLY_API_CAP = 33
+            
+            # Use the calculated batch size, but cap it at the hourly limit
+            # Ensure at least 1 collection is processed if there are any
+            max_collections_per_sync = min(calculated_batch_size, HOURLY_API_CAP)
+            if total_collections > 0:
+                max_collections_per_sync = max(max_collections_per_sync, 1)
+            
+            logger.info(
+                f"Dynamic Batch Sizing: Processing {max_collections_per_sync} collections",
+                extra={
+                    "total_collections": total_collections,
+                    "calculated_ideal_batch": calculated_batch_size,
+                    "hourly_cap": HOURLY_API_CAP,
+                    "final_batch_size": max_collections_per_sync
+                }
+            )
+
             # Get N oldest collections (ordered by last_synced_at, NULL first)
             # This automatically limits to max_collections_per_sync
             collections_with_preferences = await property_sync_service.get_active_collections_with_preferences(
