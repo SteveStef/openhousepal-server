@@ -45,6 +45,8 @@ htmlcov/
 *.log
 logs/
 
+mailgun_templates/
+
 # Documentation
 *.md
 !README.md
@@ -56,5 +58,3 @@ tests/
 
 # Development files
 notes.md
-DATABASE_COMMANDS.md
-zillowAPI.md

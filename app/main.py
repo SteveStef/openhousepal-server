@@ -7,6 +7,7 @@ import uvicorn
 import os
 import time
 import uuid
+import subprocess
 from dotenv import load_dotenv
 from app.api import router
 from app.utils.clean_cache import cleanup_expired_property_cache
@@ -28,6 +29,26 @@ scheduler = AsyncIOScheduler()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan - handles startup and shutdown"""
+
+    # Check if we need to restore backup on startup
+    if os.getenv("RESTORE_BACKUP_ON_STARTUP", "").lower() == "true":
+        logger.info("RESTORE_BACKUP_ON_STARTUP is true. Attempting to restore latest backup...")
+        try:
+            # We assume the server is run from the 'server' directory
+            result = subprocess.run(
+                ["python", "restore_backup.py"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            logger.info("Backup restoration successful")
+            if result.stdout:
+                logger.info(f"Restore output: {result.stdout}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Backup restoration failed: {e.stderr}")
+            # Decide if we want to stop startup here. For now, we continue but log the error.
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during backup restoration: {e}")
 
     # Create admin user if it doesn't exist
     await create_admin_user()

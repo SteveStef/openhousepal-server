@@ -67,6 +67,8 @@ logs/
 *.out
 *.err
 
+mailgun_templates/
+
 # IDE files
 .vscode/
 .idea/
