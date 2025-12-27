@@ -207,6 +207,7 @@ def configure_logging(log_level: Optional[str] = None) -> logging.Logger:
     logging.getLogger('uvicorn.access').setLevel(logging.WARNING)
     logging.getLogger('httpx').setLevel(logging.WARNING)
     logging.getLogger('httpcore').setLevel(logging.WARNING)
+    logging.getLogger('apscheduler').setLevel(logging.WARNING)
 
     return root_logger
 

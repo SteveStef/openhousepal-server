@@ -72,7 +72,6 @@ class EmailSchedulerService:
 
 async def start_scheduler_loop():
     """Background task to run the scheduler every 60 seconds"""
-    logger.info("Starting email scheduler loop...")
     while True:
         try:
             await EmailSchedulerService.process_due_emails()
