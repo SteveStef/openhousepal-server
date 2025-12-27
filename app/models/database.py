@@ -350,3 +350,23 @@ class Notification(Base):
     agent = relationship("User", back_populates="notifications")
     collection = relationship("Collection")
 
+class ScheduledEmail(Base):
+    __tablename__ = "scheduled_emails"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    recipient_email = Column(String, nullable=False)
+    subject = Column(String, nullable=False)
+    template_name = Column(String, nullable=False)
+    template_variables = Column(JSON, nullable=False)
+    
+    # Status tracking
+    status = Column(String, default="PENDING", index=True)  # PENDING, SENT, FAILED
+    
+    # Scheduling
+    scheduled_for = Column(TZDateTime(timezone=True), nullable=False, index=True)
+    sent_at = Column(TZDateTime(timezone=True), nullable=True)
+    
+    # Error tracking
+    error_message = Column(Text, nullable=True)
+    
+    created_at = Column(TZDateTime(timezone=True), server_default=func.now())

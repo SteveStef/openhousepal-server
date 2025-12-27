@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from datetime import datetime
 
 from app.database import get_db
-from app.models.database import OpenHouseEvent, User, OpenHouseVisitor, Notification
+from app.models.database import OpenHouseEvent, User, OpenHouseVisitor, Notification, ScheduledEmail
 from app.utils.auth import get_current_active_user, require_basic_plan
 from app.schemas.open_house import OpenHouseCreateRequest, OpenHouseResponse, OpenHouseFormSubmission, OpenHouseFormResponse, VisitorResponse
 from app.services.open_house_service import OpenHouseService
@@ -235,20 +235,31 @@ async def submit_open_house_form(
                             agent_email = agent.email or ""
                             # Note: User model doesn't have phone field currently
 
-                email_service.send_simple_message(
-                    to_email=visitor.email,
+                # Schedule visitor confirmation email for 1 hour later
+                scheduled_time = datetime.utcnow() + timedelta(hours=1)
+                
+                # Get agent information for the email (already fetched above if available)
+                template_vars = {
+                    "visitor_name": visitor.full_name,
+                    "property_address": property_data.get('address', 'the property'),
+                    "showcase_link": showcase_link,
+                    "properties_count": collection_result.get('properties_added', 0),
+                    "agent_name": agent_name,
+                    "agent_email": agent_email,
+                    "agent_phone": agent_phone
+                }
+                
+                scheduled_email = ScheduledEmail(
+                    recipient_email=visitor.email,
                     subject=f"Your Personalized Property Collection - {property_data.get('address', 'Open House')}",
-                    template="visitor_confirmation",
-                    template_variables={
-                        "visitor_name": visitor.full_name,
-                        "property_address": property_data.get('address', 'the property'),
-                        "showcase_link": showcase_link,
-                        "properties_count": collection_result.get('properties_added', 0),
-                        "agent_name": agent_name,
-                        "agent_email": agent_email,
-                        "agent_phone": agent_phone
-                    }
+                    template_name="visitor_confirmation",
+                    template_variables=template_vars,
+                    scheduled_for=scheduled_time,
+                    status="PENDING"
                 )
+                
+                db.add(scheduled_email)
+                await db.commit()
 
         # Create notification for agent
         if form_data.open_house_event_id:

@@ -13,6 +13,7 @@ from app.api import router
 from app.utils.clean_cache import cleanup_expired_property_cache
 from app.utils.property_sync_scheduler import scheduled_property_sync
 from app.services.paypal_service import PayPalService
+from app.services.email_scheduler_service import EmailSchedulerService
 from app.utils.create_admin import create_admin_user
 from app.config.logging import configure_logging, get_logger, set_request_id, clear_request_id
 
@@ -50,6 +51,17 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"An unexpected error occurred during backup restoration: {e}")
 
+    # ALWAYS run migrations after potential restore to ensure DB is up to date
+    logger.info("Running database migrations...")
+    try:
+        subprocess.run(["alembic", "upgrade", "head"], check=True)
+        logger.info("Database migrations applied successfully")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Database migration failed: {e}")
+        # We might want to stop here, but for now let's log and continue
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during migration: {e}")
+
     # Create admin user if it doesn't exist
     await create_admin_user()
 
@@ -76,12 +88,23 @@ async def lifespan(app: FastAPI):
         replace_existing=True
     )
 
+    # Schedule email processing every minute
+    scheduler.add_job(
+        EmailSchedulerService.process_due_emails,
+        'interval',
+        minutes=1,
+        id="email_processing",
+        name="Process scheduled emails",
+        replace_existing=True
+    )
+
     scheduler.start()
     logger.info(
         "APScheduler started",
         extra={
             "cache_cleanup_schedule": f"Daily at {cache_hour:02d}:{cache_mins:02d}",
-            "property_sync_interval": "Every hour at :00"
+            "property_sync_interval": "Every hour at :00",
+            "email_processing_interval": "Every 1 minute"
         }
     )
 
