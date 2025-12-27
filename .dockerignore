@@ -9,6 +9,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+maintain.md
 
 # Virtual environments
 .venv

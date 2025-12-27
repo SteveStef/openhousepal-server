@@ -4,6 +4,7 @@
 *.db-wal
 *.db-shm
 collections.db
+maintain.md
 
 # Environment variables and secrets
 .env
