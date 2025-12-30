@@ -106,13 +106,25 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
         logger.info("Processing webhook for user", extra={"subscription_id": subscription_id, "user_id": user.id})
 
         # Handle different event types
+        now_utc = datetime.now(timezone.utc)
         if event_type == "BILLING.SUBSCRIPTION.ACTIVATED":
             # Trial converted to paid, or subscription reactivated
-            user.subscription_status = "ACTIVE"
+            # FIX: Don't overwrite TRIAL status if trial is still valid (prevents race condition with signup)
+            is_in_trial = (
+                user.subscription_status == "TRIAL" and 
+                user.trial_ends_at is not None and 
+                user.trial_ends_at > now_utc
+            )
+            
+            if not is_in_trial:
+                user.subscription_status = "ACTIVE"
+                logger.info("Subscription set to ACTIVE", extra={"subscription_id": subscription_id, "user_id": user.id})
+            else:
+                logger.info("Subscription activated but user is in valid trial, preserving TRIAL status", extra={"subscription_id": subscription_id, "user_id": user.id})
+
             if not user.subscription_started_at:
-                user.subscription_started_at = datetime.now(timezone.utc)
-            user.last_paypal_sync = datetime.now(timezone.utc)
-            logger.info("Subscription activated", extra={"subscription_id": subscription_id, "user_id": user.id})
+                user.subscription_started_at = now_utc
+            user.last_paypal_sync = now_utc
 
         elif event_type == "BILLING.SUBSCRIPTION.CANCELLED":
             # User cancelled subscription

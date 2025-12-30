@@ -407,6 +407,7 @@ async def complete_new_subscription(
         # Step 2: Validate subscription with PayPal API
         try:
             subscription_details = await paypal_service.get_subscription(subscription_id)
+            # logger.info(f"PAYPAL DEBUG: Full Subscription Details: {subscription_details}") # Added for debugging
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -457,11 +458,20 @@ async def complete_new_subscription(
         user.last_paypal_sync = now
 
         if has_trial:
-            # New customer with trial
-            trial_end = now + timedelta(days=30)  # 30-day trial period
+            # New customer with trial - set trial end date from PayPal data
             user.subscription_status = "TRIAL"
+            
+            if next_billing_time:
+                try:
+                    trial_end = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
+                except Exception:
+                    trial_end = now + timedelta(days=30)
+            else:
+                trial_end = now + timedelta(days=30)
+                
             user.trial_ends_at = trial_end
             trial_end_iso = trial_end.isoformat()
+            user.next_billing_date = trial_end
         else:
             # Returning customer without trial
             user.subscription_status = "ACTIVE"

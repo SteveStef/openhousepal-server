@@ -215,11 +215,51 @@ async def resend_verification_code(
         "message": "Verification code resent successfully"
     }
 
+@router.post("/verify-bundle-code")
+async def verify_bundle_code(
+    request: dict,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Verify a bundle/promo code and return the special plan ID if valid.
+    """
+    code_str = request.get("code")
+    if not code_str:
+        raise HTTPException(status_code=400, detail="Code is required")
+
+    from app.models.database import BundleCode
+    from sqlalchemy import select
+
+    result = await db.execute(
+        select(BundleCode).where(BundleCode.code == code_str)
+    )
+    bundle_code = result.scalar_one_or_none()
+
+    if not bundle_code:
+        raise HTTPException(status_code=404, detail="Invalid promo code")
+
+    if bundle_code.is_used:
+        raise HTTPException(status_code=400, detail="This code has already been used")
+
+    # Return the special bundle plan ID from environment
+    bundle_plan_id = os.getenv("PAYPAL_BUNDLE_PLAN_ID")
+    if not bundle_plan_id:
+        logger.error("PAYPAL_BUNDLE_PLAN_ID not set in environment")
+        raise HTTPException(status_code=500, detail="Special plan configuration missing")
+
+    return {
+        "valid": True,
+        "plan_id": bundle_plan_id,
+        "message": "Promo code applied successfully!"
+    }
+
+
 @router.post("/signup-with-subscription", response_model=Token, status_code=status.HTTP_201_CREATED)
 async def signup_with_subscription(
     subscription_id: str,
     plan_id: str,
     user_data: UserCreate,
+    bundle_code: str = None,  # Optional bundle code
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -237,6 +277,7 @@ async def signup_with_subscription(
         # Step 1: Validate subscription with PayPal API
         try:
             subscription_details = await paypal_service.get_subscription(subscription_id)
+            logger.info(f"PAYPAL DEBUG (SIGNUP): Full Subscription Details: {subscription_details}") # Debug log added
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -260,10 +301,15 @@ async def signup_with_subscription(
             )
 
         # Step 4: Determine plan tier from plan_id
+        # Also check for bundle plan ID
+        BUNDLE_PLAN_ID = os.getenv("PAYPAL_BUNDLE_PLAN_ID")
+        
         if plan_id == BASIC_PLAN_ID:
             plan_tier = "BASIC"
         elif plan_id == PREMIUM_PLAN_ID:
             plan_tier = "PREMIUM"
+        elif BUNDLE_PLAN_ID and plan_id == BUNDLE_PLAN_ID:
+            plan_tier = "PREMIUM" # Bundle is typically Premium
         else:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -292,9 +338,34 @@ async def signup_with_subscription(
                     detail="Subscription already linked to another account"
                 )
 
+            # Handle Bundle Code marking as used
+            if bundle_code:
+                from app.models.database import BundleCode
+                code_result = await db.execute(
+                    select(BundleCode).where(BundleCode.code == bundle_code)
+                )
+                db_code = code_result.scalar_one_or_none()
+                if db_code:
+                    if db_code.is_used:
+                        raise HTTPException(status_code=400, detail="Promo code already used")
+                    db_code.is_used = True
+                    db_code.used_at = datetime.now(timezone.utc)
+
             # Create user with subscription data
             now = datetime.now(timezone.utc)
-            trial_end = now + timedelta(days=30)  # 30-day trial period
+            
+            # Extract next billing time from PayPal for accurate trial/billing tracking
+            billing_info = subscription_details.get('billing_info', {})
+            next_billing_time = billing_info.get('next_billing_time')
+            
+            if next_billing_time:
+                try:
+                    trial_end = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
+                except Exception:
+                    logger.warning("Failed to parse PayPal next_billing_time, falling back to 30 days")
+                    trial_end = now + timedelta(days=30)
+            else:
+                trial_end = now + timedelta(days=30)
 
             new_user = UserModel(
                 email=user_data.email,
@@ -309,7 +380,9 @@ async def signup_with_subscription(
                 plan_tier=plan_tier,
                 subscription_status="TRIAL",
                 subscription_started_at=now,
-                trial_ends_at=trial_end
+                trial_ends_at=trial_end,
+                next_billing_date=trial_end, # Set initial next billing date
+                last_paypal_sync=now
             )
 
             db.add(new_user)

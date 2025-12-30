@@ -316,6 +316,15 @@ class WebhookEvent(Base):
     processed_at = Column(TZDateTime(timezone=True), server_default=func.now())
 
 
+class BundleCode(Base):
+    __tablename__ = "bundle_codes"
+
+    code = Column(String, primary_key=True)
+    is_used = Column(Boolean, default=False, nullable=False)
+    used_at = Column(TZDateTime(timezone=True), nullable=True)
+    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+
+
 class Notification(Base):
     __tablename__ = "notifications"
 
