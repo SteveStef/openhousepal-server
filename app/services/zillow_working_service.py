@@ -226,6 +226,65 @@ class ZillowWorkingService:
             logger.error(f"Error parsing Zillow property data: {str(e)}", exc_info=True)
             return {}
 
+    def _get_dummy_search_results(self) -> Dict[str, Any]:
+        """
+        Returns dummy search results for testing.
+        """
+        return {
+            'searchResults': [
+                {
+                    'zpid': '1234567890',
+                    'property': {
+                        'zpid': '1234567890',
+                        'address': {
+                            'streetAddress': '123 Dummy St',
+                            'city': 'Test City',
+                            'state': 'TS',
+                            'zipcode': '12345'
+                        },
+                        'location': {
+                            'latitude': 34.0522,
+                            'longitude': -118.2437
+                        },
+                        'price': {'value': 500000},
+                        'lotSizeWithUnit': {'lotSize': 5000},
+                        'estimates': {'zestimate': 510000},
+                        'listing': {'listingStatus': 'FOR_SALE'},
+                        'bedrooms': 3,
+                        'bathrooms': 2,
+                        'livingArea': 2000,
+                        'propertyType': 'SINGLE_FAMILY',
+                        'media': {'propertyPhotoLinks': {'highResolutionLink': 'https://img.freepik.com/free-vector/charming-house-with-tree-illustration_1308-176337.jpg?semt=ais_hybrid&w=740&q=80'}}
+                    }
+                },
+                {
+                    'zpid': '0987654321',
+                    'property': {
+                        'zpid': '0987654321',
+                        'address': {
+                            'streetAddress': '456 Mock Ave',
+                            'city': 'Mocktown',
+                            'state': 'TS',
+                            'zipcode': '67890'
+                        },
+                        'location': {
+                            'latitude': 34.0622,
+                            'longitude': -118.2537
+                        },
+                        'price': {'value': 750000},
+                        'lotSizeWithUnit': {'lotSize': 7000},
+                        'estimates': {'zestimate': 760000},
+                        'listing': {'listingStatus': 'FOR_SALE'},
+                        'bedrooms': 4,
+                        'bathrooms': 3,
+                        'livingArea': 3000,
+                        'propertyType': 'SINGLE_FAMILY',
+                        'media': {'propertyPhotoLinks': {'highResolutionLink': 'https://img.freepik.com/free-vector/charming-house-with-tree-illustration_1308-176337.jpg?semt=ais_hybrid&w=740&q=80'}}
+                    }
+                }
+            ]
+        }
+
     async def search_properties_by_location(
         self,
         location: str,
@@ -233,90 +292,10 @@ class ZillowWorkingService:
     ) -> Dict[str, Any]:
         """
         Search properties using new Zillow API with location-based search.
+        RETURNS DUMMY DATA.
         """
-        if not self.api_key:
-            raise ValueError("Zillow API key not configured")
-
-        if not location or not location.strip():
-            raise ValueError("Location is required for location search")
-
-        headers = {
-            'x-rapidapi-key': self.api_key,
-            'x-rapidapi-host': "zllw-working-api.p.rapidapi.com"
-        }
-
-        # Build query parameters
-        params = {
-            'location': location.strip(),
-            'listingStatus': 'For_Sale',
-            'sortOrder': 'Homes_for_you',
-            'page': 1,
-            'homeType': self._build_home_types(preferences),
-            'listingType': 'By_Agent',
-            'listingTypeOptions': 'Agent listed,New Construction,Fore-closures,Auctions',
-            'daysOnZillow': 'Any',
-        }
-
-        # Add price range
-        if preferences.min_price and preferences.max_price:
-            params['listPriceRange'] = f"min:{preferences.min_price}, max:{preferences.max_price}"
-        elif preferences.min_price:
-            params['listPriceRange'] = f"min:{preferences.min_price}"
-        elif preferences.max_price:
-            params['listPriceRange'] = f"max:{preferences.max_price}"
-
-        # Add bedroom filters
-        if preferences.min_beds:
-            params['bed_min'] = str(preferences.min_beds)
-        if preferences.max_beds and preferences.max_beds > 0:
-            params['bed_max'] = str(preferences.max_beds)
-
-        # Add bathroom filter
-        if preferences.min_baths:
-            params['bathrooms'] = self._format_bathrooms(preferences.min_baths)
-
-        # Add year built range
-        if preferences.min_year_built and preferences.max_year_built:
-            params['yearBuiltRange'] = f"min:{preferences.min_year_built}, max:{preferences.max_year_built}"
-        elif preferences.min_year_built:
-            params['yearBuiltRange'] = f"min:{preferences.min_year_built}"
-        elif preferences.max_year_built:
-            params['yearBuiltRange'] = f"max:{preferences.max_year_built}"
-
-        # Add keywords (special features)
-        if preferences.special_features:
-            params['keywords'] = preferences.special_features
-
-        url = f"{self.base_url}/search/byaddress"
-
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                await self.rate_limiter.acquire_token()
-                response = await client.get(url, headers=headers, params=params)
-
-                if response.status_code == 200:
-                    return response.json()
-                else:
-                    logger.error(f"Zillow API error: {response.status_code}")
-                    logger.error(f"Response text: {response.text}")
-                    logger.error(f"Request URL: {url}")
-                    logger.error(f"Request params: {params}")
-
-                    try:
-                        error_json = response.json()
-                        logger.error(f"Response JSON: {error_json}")
-                    except:
-                        pass
-
-                    # Return empty result for non-blocking behavior
-                    return {'searchResults': []}
-
-        except httpx.TimeoutException:
-            logger.error("Zillow API request timed out")
-            return {'searchResults': []}
-        except httpx.RequestError as e:
-            logger.error(f"Failed to connect to Zillow API: {str(e)}", exc_info=True)
-            return {'searchResults': []}
+        logger.info(f"Returning dummy data for location search: {location}")
+        return self._get_dummy_search_results()
 
     async def search_properties_by_coordinates(
         self,
@@ -324,94 +303,10 @@ class ZillowWorkingService:
     ) -> Dict[str, Any]:
         """
         Search properties using new Zillow API with coordinate-based search.
+        RETURNS DUMMY DATA.
         """
-        if not self.api_key:
-            raise ValueError("Zillow API key not configured")
-
-        if not preferences.lat or not preferences.long:
-            raise ValueError("Latitude and longitude are required for coordinate search")
-
-        headers = {
-            'x-rapidapi-key': self.api_key,
-            'x-rapidapi-host': "zllw-working-api.p.rapidapi.com"
-        }
-
-        # Build query parameters
-        # Convert diameter to radius (divide by 2)
-        radius = (preferences.diameter / 2) if preferences.diameter else 5
-        params = {
-            'latitude': str(preferences.lat),
-            'longitude': str(preferences.long),
-            'radius': str(radius),  # Diameter divided by 2
-            'listingStatus': 'For_Sale',
-            'sortOrder': 'Homes_for_you',
-            'page': 1,
-            'homeType': self._build_home_types(preferences),
-            'listingType': 'By_Agent',
-            'listingTypeOptions': 'Agent listed,New Construction,Fore-closures,Auctions',
-            'daysOnZillow': 'Any',
-        }
-
-        # Add price range
-        if preferences.min_price and preferences.max_price:
-            params['listPriceRange'] = f"min:{preferences.min_price}, max:{preferences.max_price}"
-        elif preferences.min_price:
-            params['listPriceRange'] = f"min:{preferences.min_price}"
-        elif preferences.max_price:
-            params['listPriceRange'] = f"max:{preferences.max_price}"
-
-        # Add bedroom filters
-        if preferences.min_beds:
-            params['bed_min'] = str(preferences.min_beds)
-        if preferences.max_beds and preferences.max_beds > 0:
-            params['bed_max'] = str(preferences.max_beds)
-
-        # Add bathroom filter
-        if preferences.min_baths:
-            params['bathrooms'] = self._format_bathrooms(preferences.min_baths)
-
-        # Add year built range
-        if preferences.min_year_built and preferences.max_year_built:
-            params['yearBuiltRange'] = f"min:{preferences.min_year_built}, max:{preferences.max_year_built}"
-        elif preferences.min_year_built:
-            params['yearBuiltRange'] = f"min:{preferences.min_year_built}"
-        elif preferences.max_year_built:
-            params['yearBuiltRange'] = f"max:{preferences.max_year_built}"
-
-        # Add keywords (special features)
-        if preferences.special_features:
-            params['keywords'] = preferences.special_features
-
-        url = f"{self.base_url}/search/bycoordinates"
-
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                await self.rate_limiter.acquire_token()
-                response = await client.get(url, headers=headers, params=params)
-
-                if response.status_code == 200:
-                    return response.json()
-                else:
-                    logger.error(f"Zillow API error: {response.status_code}")
-                    logger.error(f"Response text: {response.text}")
-                    logger.error(f"Request URL: {url}")
-                    logger.error(f"Request params: {params}")
-
-                    try:
-                        error_json = response.json()
-                        logger.error(f"Response JSON: {error_json}")
-                    except:
-                        pass
-
-                    # Return empty result for non-blocking behavior
-                    return {'searchResults': []}
-
-        except httpx.TimeoutException:
-            logger.error("Zillow API request timed out")
-            return {'searchResults': []}
-        except httpx.RequestError as e:
-            logger.error(f"Failed to connect to Zillow API: {str(e)}", exc_info=True)
-            return {'searchResults': []}
+        logger.info("Returning dummy data for coordinate search")
+        return self._get_dummy_search_results()
 
     async def get_matching_properties(
         self,
@@ -428,6 +323,7 @@ class ZillowWorkingService:
         # Use location search if cities or townships available
         elif preferences.cities or preferences.townships:
             logger.info("Using location-based batch search")
+            # For dummy data, we can just call the batch search which uses the dummy location search
             return await self.get_matching_properties_by_locations(preferences)
         else:
             logger.warning("No coordinates or locations specified in preferences")
@@ -454,141 +350,80 @@ class ZillowWorkingService:
         Get matching properties from Zillow based on cities and townships in preferences.
         Uses the new API's multi-location feature (up to 5 locations separated by semicolons).
         """
+        # Since we are returning dummy data, we can just make one call to get the dummy list
+        # We don't need to actually loop through batches if we just want to return the same test data
+        
+        logger.info("Returning dummy data for location batch search")
+        zillow_response = await self.search_properties_by_location("dummy", preferences)
+        
+        search_results = zillow_response.get('searchResults', [])
         all_properties = []
-        seen_zpids = set()  # Track zpids to avoid duplicates
-
-        # Combine cities and townships into single list
-        locations = []
-        if preferences.cities:
-            locations.extend(preferences.cities)
-        if preferences.townships:
-            locations.extend(preferences.townships)
-
-        if not locations:
-            logger.info("No cities or townships specified for location search")
-            return []
-
-        logger.info(f"Starting location search for {len(locations)} locations: {locations}")
-
-        # Process locations in batches of 5 (API limit)
-        batch_size = 5
-        for batch_start in range(0, len(locations), batch_size):
-            batch_locations = locations[batch_start:batch_start + batch_size]
-
-            # Join locations with semicolon as per API spec
-            location_string = "; ".join(batch_locations)
-
-            logger.info(f"Searching batch: {location_string}")
-
-            try:
-                # First attempt
-                try:
-                    zillow_response = await self.search_properties_by_location(location_string, preferences)
-                except Exception as e:
-                    logger.warning(f"First attempt failed for batch {batch_locations}: {str(e)}")
-
-                    # Second attempt (retry once)
-                    try:
-                        logger.info(f"Retrying batch {batch_locations}")
-                        await asyncio.sleep(1)  # Brief pause before retry
-                        zillow_response = await self.search_properties_by_location(location_string, preferences)
-                    except Exception as retry_error:
-                        logger.error(f"Second attempt also failed for batch {batch_locations}", exc_info=True)
-                        # Skip this batch and continue with next
-                        continue
-
-                # Parse results from searchResults array
-                search_results = zillow_response.get('searchResults', [])
-                logger.info(f"Batch returned {len(search_results)} results")
-
-                batch_property_count = 0
-                for result in search_results:
-                    # Parse the property
-                    parsed_property = self.parse_zillow_property(result)
-
-                    if not parsed_property:
-                        continue
-
-                    # Check for duplicates
-                    zpid = parsed_property.get('zpid')
-                    if zpid and zpid not in seen_zpids:
-                        all_properties.append(parsed_property)
-                        seen_zpids.add(zpid)
-                        batch_property_count += 1
-
-                logger.info(f"Added {batch_property_count} unique properties from batch")
-
-                # Rate limiting between batches (1 second delay)
-                if batch_start + batch_size < len(locations):  # Not the last batch
-                    await asyncio.sleep(1)
-
-            except Exception as e:
-                logger.error(f"Unexpected error processing batch {batch_locations}", exc_info=True)
-                continue  # Continue with next batch
-
-        logger.info(f"Total unique properties found across all locations: {len(all_properties)}")
+        
+        for result in search_results:
+            parsed_property = self.parse_zillow_property(result)
+            if parsed_property:
+                all_properties.append(parsed_property)
+                
         return all_properties
 
     async def get_property_by_address(self, address: str, details: bool = False):
         """
         Get property details from new Zillow API by address.
         Returns PropertyDetailResponse or ZillowPropertyDetailResponse to match old API format.
+        RETURNS DUMMY DATA.
         """
-        if not self.api_key:
-            raise HTTPException(status_code=500, detail="RapidAPI key not configured")
-
-        headers = {
-            'x-rapidapi-key': self.api_key,
-            'x-rapidapi-host': "zllw-working-api.p.rapidapi.com"
+        logger.info(f"Returning dummy data for property address: {address}")
+        
+        dummy_data = {
+            'propertyDetails': {
+                'zpid': '1234567890',
+                'address': {
+                    'streetAddress': '123 Dummy St',
+                    'city': 'Test City',
+                    'state': 'TS',
+                    'zipcode': '12345',
+                    'neighborhood': 'Dummy Hood',
+                    'community': 'Dummy Comm',
+                    'subdivision': 'Dummy Sub'
+                },
+                'bedrooms': 3,
+                'bathrooms': 2,
+                'homeStatus': 'FOR_SALE',
+                'homeType': 'SINGLE_FAMILY',
+                'livingArea': 2000,
+                'lotSize': 5000,
+                'price': 500000,
+                'zestimate': 510000,
+                'yearBuilt': 2000,
+                'latitude': 34.0522,
+                'longitude': -118.2437,
+                'daysOnZillow': 5,
+                'description': 'This is a lovely dummy home with great features.',
+                'newConstructionType': None,
+                'resoFacts': {
+                    'heating': ['Forced air'],
+                    'cooling': ['Central']
+                },
+                'taxHistory': [],
+                'priceHistory': [],
+                'originalPhotos': [
+                    {
+                        'caption': 'Front View',
+                        'mixedSources': {
+                            'jpeg': [{'url': 'https://img.freepik.com/free-vector/charming-house-with-tree-illustration_1308-176337.jpg?semt=ais_hybrid&w=740&q=80', 'width': 1024}]
+                        }
+                    }
+                ]
+            }
         }
 
-        # URL encode the address
-        import urllib.parse
-        encoded_address = urllib.parse.quote(address)
+        # Transform new API response to match old API structure
+        transformed_data = self._transform_property_details(dummy_data, details)
 
-        url = f"{self.base_url}/pro/byaddress?propertyaddress={encoded_address}"
-
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                await self.rate_limiter.acquire_token()
-                response = await client.get(url, headers=headers)
-
-                if response.status_code == 200:
-                    data = response.json()
-
-                    # Transform new API response to match old API structure
-                    transformed_data = self._transform_property_details(data, details)
-
-                    if not details:
-                        return PropertyDetailResponse(**transformed_data)
-                    else:
-                        return ZillowPropertyDetailResponse(**transformed_data)
-
-                elif response.status_code == 401:
-                    raise HTTPException(status_code=401, detail="Invalid RapidAPI key")
-                elif response.status_code == 404:
-                    raise HTTPException(status_code=404, detail="Property not found")
-                elif response.status_code == 429:
-                    raise HTTPException(status_code=429, detail="Rate limit exceeded")
-                else:
-                    logger.error(f"Zillow API error for address {address}: {response.status_code}")
-                    logger.error(f"Response text: {response.text}")
-                    logger.error(f"Request URL: {url}")
-
-                    try:
-                        error_json = response.json()
-                        logger.error(f"Response JSON: {error_json}")
-                    except:
-                        pass
-
-                    raise HTTPException(status_code=response.status_code, detail=f"External API error: {response.text}")
-
-        except httpx.TimeoutException:
-            raise HTTPException(status_code=504, detail="Request to external API timed out")
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=502, detail=f"Failed to connect to external API: {str(e)}")
-        except ValueError as e:
-            raise HTTPException(status_code=502, detail=f"Invalid response from external API: {str(e)}")
+        if not details:
+            return PropertyDetailResponse(**transformed_data)
+        else:
+            return ZillowPropertyDetailResponse(**transformed_data)
 
     def _transform_property_details(self, api_response: Dict[str, Any], include_details: bool) -> Dict[str, Any]:
         """

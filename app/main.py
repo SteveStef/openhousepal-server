@@ -1,8 +1,6 @@
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 import uvicorn
 import os
 import time
@@ -10,11 +8,9 @@ import uuid
 import subprocess
 from dotenv import load_dotenv
 from app.api import router
-from app.utils.clean_cache import cleanup_expired_property_cache
-from app.utils.property_sync_scheduler import scheduled_property_sync
-from app.services.paypal_service import PayPalService
-from app.services.email_scheduler_service import EmailSchedulerService
+from app.database import init_db
 from app.utils.create_admin import create_admin_user
+from app.utils.seed_dummy_data import seed_dummy_data
 from app.config.logging import configure_logging, get_logger, set_request_id, clear_request_id
 
 load_dotenv()
@@ -25,95 +21,18 @@ CLIENT_URL = os.getenv("CLIENT_URL", "http://localhost:3000")
 configure_logging()
 logger = get_logger(__name__)
 
-scheduler = AsyncIOScheduler()
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan - handles startup and shutdown"""
-
-    # Check if we need to restore backup on startup
-    if os.getenv("RESTORE_BACKUP_ON_STARTUP", "").lower() == "true":
-        logger.info("RESTORE_BACKUP_ON_STARTUP is true. Attempting to restore latest backup...")
-        try:
-            # We assume the server is run from the 'server' directory
-            result = subprocess.run(
-                ["python", "restore_backup.py"],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            logger.info("Backup restoration successful")
-            if result.stdout:
-                logger.info(f"Restore output: {result.stdout}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Backup restoration failed: {e.stderr}")
-            # Decide if we want to stop startup here. For now, we continue but log the error.
-        except Exception as e:
-            logger.error(f"An unexpected error occurred during backup restoration: {e}")
-
-    # ALWAYS run migrations after potential restore to ensure DB is up to date
-    logger.info("Running database migrations...")
-    try:
-        subprocess.run(["alembic", "upgrade", "head"], check=True)
-        logger.info("Database migrations applied successfully")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Database migration failed: {e}")
-        # We might want to stop here, but for now let's log and continue
-    except Exception as e:
-        logger.error(f"An unexpected error occurred during migration: {e}")
-
-    # Create admin user if it doesn't exist
+    # Startup: Initialize resources
+    await init_db()
     await create_admin_user()
-
-    logger.info("Initializing APScheduler for scheduled tasks")
-
-    # This is for the property details cache
-    cache_hour = int(os.getenv("CACHE_CLEANUP_HOUR", 2))
-    cache_mins = int(os.getenv("CACHE_CLEANUP_MINUTE", 0))
-
-    scheduler.add_job(
-        cleanup_expired_property_cache,
-        CronTrigger(hour=cache_hour, minute=cache_mins),  # Daily at 2:00 AM
-        id="cleanup_property_cache",
-        name="Clean up expired property cache",
-        replace_existing=True
-    )
-
-    # This is for the property sync (every hour at :00)
-    scheduler.add_job(
-        scheduled_property_sync,
-        CronTrigger(hour="*", minute="0"),  # Every hour at the top of the hour
-        id="property_sync",
-        name="Sync properties from Zillow API",
-        replace_existing=True
-    )
-
-    # Schedule email processing every minute
-    scheduler.add_job(
-        EmailSchedulerService.process_due_emails,
-        'interval',
-        minutes=1,
-        id="email_processing",
-        name="Process scheduled emails",
-        replace_existing=True
-    )
-
-    scheduler.start()
-    logger.info(
-        "APScheduler started",
-        extra={
-            "cache_cleanup_schedule": f"Daily at {cache_hour:02d}:{cache_mins:02d}",
-            "property_sync_interval": "Every hour at :00",
-            "email_processing_interval": "Every 1 minute"
-        }
-    )
+    await seed_dummy_data()
 
     yield
 
-    # Shutdown
+    # Shutdown: Clean up resources
     logger.info("Shutting down application")
-    scheduler.shutdown()
-    logger.info("APScheduler stopped")
+
 
 app = FastAPI(title="Open House Pal API", lifespan=lifespan)
 
