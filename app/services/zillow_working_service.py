@@ -253,13 +253,13 @@ class ZillowWorkingService:
             'page': 1,
             'homeType': self._build_home_types(preferences),
             'listingType': 'By_Agent',
-            'listingTypeOptions': 'Agent listed,New Construction,Fore-closures,Auctions',
+            'listingTypeOptions': 'Agent listed,New Construction,Foreclosures,Auctions',
             'daysOnZillow': 'Any',
         }
 
         # Add price range
         if preferences.min_price and preferences.max_price:
-            params['listPriceRange'] = f"min:{preferences.min_price}, max:{preferences.max_price}"
+            params['listPriceRange'] = f"min:{preferences.min_price},max:{preferences.max_price}"
         elif preferences.min_price:
             params['listPriceRange'] = f"min:{preferences.min_price}"
         elif preferences.max_price:
@@ -273,7 +273,9 @@ class ZillowWorkingService:
 
         # Add bathroom filter
         if preferences.min_baths:
-            params['bathrooms'] = self._format_bathrooms(preferences.min_baths)
+            params['baths_min'] = str(int(preferences.min_baths))
+        if preferences.max_baths and preferences.max_baths > 0:
+            params['baths_max'] = str(int(preferences.max_baths))
 
         # Add year built range
         if preferences.min_year_built and preferences.max_year_built:
@@ -354,7 +356,7 @@ class ZillowWorkingService:
 
         # Add price range
         if preferences.min_price and preferences.max_price:
-            params['listPriceRange'] = f"min:{preferences.min_price}, max:{preferences.max_price}"
+            params['listPriceRange'] = f"min:{preferences.min_price},max:{preferences.max_price}"
         elif preferences.min_price:
             params['listPriceRange'] = f"min:{preferences.min_price}"
         elif preferences.max_price:
@@ -368,7 +370,9 @@ class ZillowWorkingService:
 
         # Add bathroom filter
         if preferences.min_baths:
-            params['bathrooms'] = self._format_bathrooms(preferences.min_baths)
+            params['baths_min'] = str(int(preferences.min_baths))
+        if preferences.max_baths and preferences.max_baths > 0:
+            params['baths_max'] = str(int(preferences.max_baths))
 
         # Add year built range
         if preferences.min_year_built and preferences.max_year_built:
