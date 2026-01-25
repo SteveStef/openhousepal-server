@@ -50,6 +50,7 @@ class OpenHouseResponse(BaseModel):
     living_area: Optional[int] = None
     price: Optional[int] = None
     city: Optional[str] = None
+    notes: Optional[str] = None
     created_at: datetime
 
 class VisitorResponse(BaseModel):
@@ -59,4 +60,8 @@ class VisitorResponse(BaseModel):
     phone: str
     has_agent: str
     interested_in_similar: bool
+    notes: Optional[str] = None
     created_at: datetime
+
+class NoteUpdate(BaseModel):
+    notes: str

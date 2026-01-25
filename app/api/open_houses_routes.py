@@ -8,7 +8,7 @@ from datetime import datetime
 from app.database import get_db
 from app.models.database import OpenHouseEvent, User, OpenHouseVisitor, Notification, ScheduledEmail
 from app.utils.auth import get_current_active_user, require_basic_plan
-from app.schemas.open_house import OpenHouseCreateRequest, OpenHouseResponse, OpenHouseFormSubmission, OpenHouseFormResponse, VisitorResponse
+from app.schemas.open_house import OpenHouseCreateRequest, OpenHouseResponse, OpenHouseFormSubmission, OpenHouseFormResponse, VisitorResponse, NoteUpdate
 from app.services.open_house_service import OpenHouseService
 from app.services.email_service import EmailService
 import urllib.parse
@@ -135,6 +135,7 @@ async def get_open_houses(
                 living_area=oh.living_area,
                 price=oh.price,
                 city=oh.city,
+                notes=oh.notes,
                 created_at=oh.created_at
             ))
         
@@ -386,6 +387,7 @@ async def get_open_house_visitors(
                 phone=visitor.phone,
                 has_agent=visitor.has_agent,
                 interested_in_similar=visitor.interested_in_similar,
+                notes=visitor.notes,
                 created_at=visitor.created_at
             )
             for visitor in visitors
@@ -396,3 +398,68 @@ async def get_open_house_visitors(
     except Exception as e:
         logger.error("fetching visitors failed", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail="Failed to fetch visitors")
+
+@router.put("/api/open-houses/{open_house_id}/note")
+async def update_open_house_note(
+    open_house_id: str,
+    note_update: NoteUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Update the note for a specific open house event"""
+    try:
+        stmt = select(OpenHouseEvent).where(
+            and_(
+                OpenHouseEvent.id == open_house_id,
+                OpenHouseEvent.agent_id == current_user.id
+            )
+        )
+        result = await db.execute(stmt)
+        open_house = result.scalar_one_or_none()
+
+        if not open_house:
+            raise HTTPException(status_code=404, detail="Open house not found")
+
+        open_house.notes = note_update.notes
+        await db.commit()
+
+        return {"success": True, "message": "Note updated successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("updating open house note failed", extra={"error": str(e)})
+        raise HTTPException(status_code=500, detail="Failed to update note")
+
+@router.put("/api/visitors/{visitor_id}/note")
+async def update_visitor_note(
+    visitor_id: str,
+    note_update: NoteUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Update the note for a specific visitor"""
+    try:
+        # First ensure the visitor belongs to an open house owned by the current user
+        stmt = select(OpenHouseVisitor).join(OpenHouseEvent).where(
+            and_(
+                OpenHouseVisitor.id == visitor_id,
+                OpenHouseEvent.agent_id == current_user.id
+            )
+        )
+        result = await db.execute(stmt)
+        visitor = result.scalar_one_or_none()
+
+        if not visitor:
+            raise HTTPException(status_code=404, detail="Visitor not found or access denied")
+
+        visitor.notes = note_update.notes
+        await db.commit()
+
+        return {"success": True, "message": "Visitor note updated successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("updating visitor note failed", extra={"error": str(e)})
+        raise HTTPException(status_code=500, detail="Failed to update visitor note")

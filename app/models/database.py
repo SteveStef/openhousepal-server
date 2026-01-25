@@ -142,6 +142,7 @@ class OpenHouseEvent(Base):
     living_area = Column(Integer, nullable=True)
     price = Column(Integer, nullable=True)
     home_status = Column(String, nullable=True)
+    notes = Column(Text, nullable=True)
     
     created_at = Column(TZDateTime(timezone=True), server_default=func.now())
     
@@ -160,6 +161,7 @@ class OpenHouseVisitor(Base):
 
     # Visit Information
     has_agent = Column(String, nullable=False)  # YES, NO, LOOKING
+    notes = Column(Text, nullable=True)
 
     # Open House Context
     open_house_event_id = Column(String, ForeignKey('open_house_events.id'), nullable=True)
