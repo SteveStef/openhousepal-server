@@ -869,7 +869,7 @@ class CollectionsService:
 
                 property_dict = {
                     'id': prop.id,
-                    'zpid': prop.zpid,
+                    'listing_key': prop.listing_key,
                     'address': prop.street_address or 'Unknown Address',
                     'city': prop.city,
                     'state': prop.state,

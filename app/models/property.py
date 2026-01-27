@@ -53,7 +53,7 @@ class PropertyListing(BaseModel):
     lotAreaValue: Optional[float] = None
     openHouse: Optional[str] = None
     open_house_info: Optional[OpenHouseInfo] = None
-    price: Optional[int] = None
+    price: Optional[Union[int, float]] = None
     priceChange: Optional[int] = None
     priceForHDP: Optional[int] = None
     priceReduction: Optional[str] = None
@@ -66,7 +66,7 @@ class PropertyListing(BaseModel):
     unit: Optional[str] = None
     zestimate: Optional[int] = None
     zipcode: Optional[str] = None
-    zpid: Optional[int] = None
+    listing_key: Optional[Union[str, int]] = None
 
 class ZillowSearchResponse(BaseModel):
     results: List[PropertyListing]
@@ -302,10 +302,10 @@ class PropertyDetailResponse(BaseModel):
     homeType: Optional[str] = None
     livingArea: Optional[int] = None
     lotSize: Optional[int] = None
-    price: Optional[int] = None
+    price: Optional[Union[int, float]] = None
     zestimate: Optional[int] = None
     yearBuilt: Optional[int] = None
-    zpid: Optional[int] = None
+    listing_key: Optional[Union[str, int]] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     propertyTaxRate: Optional[float] = None
@@ -317,9 +317,9 @@ class PropertyDetailResponse(BaseModel):
 
 class PropertySaveResponse(BaseModel):
     property_id: str
-    zpid: Optional[int] = None
+    listing_key: Optional[Union[str, int]] = None
     abbreviatedAddress: Optional[str] = None
-    price: Optional[int] = None
+    price: Optional[Union[int, float]] = None
     bedrooms: Optional[int] = None
     bathrooms: Optional[float] = None
     livingArea: Optional[int] = None
@@ -369,10 +369,10 @@ class ZillowPropertyDetailResponse(BaseModel):
     homeType: Optional[str] = None
     livingArea: Optional[int] = None
     lotSize: Optional[int] = None
-    price: Optional[int] = None
+    price: Optional[Union[int, float]] = None
     zestimate: Optional[int] = None
     yearBuilt: Optional[int] = None
-    zpid: Optional[int] = None
+    listing_key: Optional[Union[str, int]] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     description: Optional[str] = None

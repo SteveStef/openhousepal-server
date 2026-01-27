@@ -3,7 +3,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 class PropertyBase(BaseModel):
-    zpid: Optional[int] = None
+    listing_key: Optional[str] = None
     street_address: Optional[str] = None
     city: Optional[str] = None
     state: Optional[str] = None
@@ -89,5 +89,5 @@ class Property(PropertyBase):
 class AddPropertyToCollection(BaseModel):
     collection_id: str
     property_id: Optional[str] = None  # If property already exists in DB
-    zpid: Optional[int] = None  # If we need to fetch from Zillow first
+    listing_key: Optional[str] = None  # If we need to fetch from MLS first
 

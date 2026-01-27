@@ -7,7 +7,7 @@ from app.models.database import Property, OpenHouseVisitor, Collection, collecti
 from app.schemas.open_house import OpenHouseFormSubmission
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.collections_service import CollectionsService
-from app.services.zillow_working_service import ZillowWorkingService
+from app.services.bright_mls_service import BrightMlsService
 from app.schemas.collection_preferences import CollectionPreferences as CollectionPreferencesSchema
 from app.config.logging import get_logger
 
@@ -94,8 +94,8 @@ class OpenHouseService:
                 
                 if preferences:
                     
-                    # Immediately fetch and populate properties using ZillowService
-                    properties_added = await OpenHouseService._populate_collection_with_zillow_properties(
+                    # Immediately fetch and populate properties using BrightMlsService
+                    properties_added = await OpenHouseService._populate_collection_with_properties(
                         db, collection, preferences
                     )
                     return {"success": True, "properties_added": properties_added, "collection_id": collection.id, "share_token": collection.share_token}
@@ -112,29 +112,29 @@ class OpenHouseService:
             return {"success": False, "properties_added": 0}
     
     @staticmethod
-    async def _populate_collection_with_zillow_properties(
+    async def _populate_collection_with_properties(
         db: AsyncSession,
         collection: Collection,
         preferences: CollectionPreferencesSchema
     ) -> int:
-        """Populate collection with properties from Zillow API"""
+        """Populate collection with properties from Bright MLS API"""
         try:
-            zillow_service = ZillowWorkingService()
+            mls_service = BrightMlsService()
             
-            # Get matching properties from Zillow
-            matching_properties = await zillow_service.get_matching_properties(preferences)
+            # Get matching properties from Bright MLS
+            matching_properties = await mls_service.get_matching_properties(preferences)
             
             properties_added = 0
             
             for property_data in matching_properties:
-                zpid = property_data.get('zpid')
-                if not zpid:
+                listing_key = property_data.get('listing_key')
+                if not listing_key:
                     continue
                 
-                if await OpenHouseService._property_exists_in_collection(db, collection.id, zpid):
+                if await OpenHouseService._property_exists_in_collection(db, collection.id, listing_key):
                     continue
 
-                property_obj = await OpenHouseService._create_property_from_zillow_data(db, property_data)
+                property_obj = await OpenHouseService._create_property_from_mls_data(db, property_data)
                 await OpenHouseService._add_property_to_collection(db, collection.id, property_obj.id)
                 properties_added += 1
             
@@ -145,40 +145,39 @@ class OpenHouseService:
             return 0
     
     @staticmethod
-    async def _property_exists_in_collection(db: AsyncSession, collection_id: str, zpid: str) -> bool:
-        """Check if a property (by zpid) already exists in a collection"""
+    async def _property_exists_in_collection(db: AsyncSession, collection_id: str, listing_key: str) -> bool:
+        """Check if a property (by listing_key) already exists in a collection"""
         result = await db.execute(
             select(Property.id)
             .join(collection_properties)
             .where(
                 collection_properties.c.collection_id == collection_id,
-                Property.zpid == zpid
+                Property.listing_key == listing_key
             )
         )
         return result.scalar_one_or_none() is not None
     
     @staticmethod
-    async def _create_property_from_zillow_data(db: AsyncSession, property_data: Dict[str, Any]) -> Property:
-        """Create a new Property record from Zillow data"""
-        # Check if property already exists by zpid
+    async def _create_property_from_mls_data(db: AsyncSession, property_data: Dict[str, Any]) -> Property:
+        """Create a new Property record from MLS data"""
+        # Check if property already exists by listing_key
         result = await db.execute(
-            select(Property).where(Property.zpid == property_data.get('zpid'))
+            select(Property).where(Property.listing_key == property_data.get('listing_key'))
         )
         existing_property = result.scalar_one_or_none()
         
         if existing_property:
-            # Update existing property with latest data - map field names correctly
+            # Update existing property with latest data
             field_mapping = {
                 'address': 'street_address',
                 'image_url': 'img_src',
-                'days_on_market': 'days_on_zillow',
-                'last_updated': 'last_synced'
+                'days_on_market': 'days_on_zillow', # Keep for compatibility if needed
+                'last_updated': 'updated_at' # Map to updated_at
             }
             
-            # Special handling for zpid (string to int conversion)
-            zpid_value = property_data.get('zpid')
-            if zpid_value and str(zpid_value).isdigit():
-                existing_property.zpid = int(zpid_value)
+            # Update listing_key if needed (should match)
+            if property_data.get('listing_key'):
+                 existing_property.listing_key = property_data.get('listing_key')
             
             for key, value in property_data.items():
                 if value is not None:
@@ -187,20 +186,14 @@ class OpenHouseService:
                     if hasattr(existing_property, actual_field):
                         setattr(existing_property, actual_field, value)
             
-            # Update sync timestamp (zillow_data field was removed)
-            existing_property.last_synced = datetime.now()
-            
             await db.commit()
             await db.refresh(existing_property)
             return existing_property
         
-        # Create new property - map Zillow data fields to Property model fields
-        zpid_value = property_data.get('zpid')
-        zpid_int = int(zpid_value) if zpid_value and str(zpid_value).isdigit() else None
-        
+        # Create new property
         property_obj = Property(
-            zpid=zpid_int,
-            street_address=property_data.get('address'),  # ✅ Fixed: address -> street_address
+            listing_key=property_data.get('listing_key'),
+            street_address=property_data.get('address'),
             city=property_data.get('city'),
             state=property_data.get('state'),
             zipcode=property_data.get('zipcode'),

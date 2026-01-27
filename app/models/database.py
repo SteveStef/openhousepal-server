@@ -75,7 +75,7 @@ class Property(Base):
     __tablename__ = "properties"
     
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    zpid = Column(Integer, unique=True, index=True, nullable=True)  # Zillow Property ID
+    listing_key = Column(String, unique=True, index=True, nullable=True)  # Renamed from zpid for MLS compatibility
     
     # Basic property info
     street_address = Column(String, nullable=True)
@@ -101,14 +101,83 @@ class Property(Base):
     img_src = Column(String, nullable=True)
     
     # Property details caching
-    detailed_property= Column(JSON, nullable=True)  # Store detailed Zillow API response
+    detailed_property= Column(JSON, nullable=True)  # Keep for backward compatibility/caching
     detailed_data_cached = Column(Boolean, default=False)
     detailed_data_cached_at = Column(TZDateTime(timezone=True), nullable=True)
     
     created_at = Column(TZDateTime(timezone=True), server_default=func.now())
     updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
     
+    # Relationships
     collections = relationship("Collection", secondary=collection_properties, back_populates="properties")
+    reso_facts = relationship("ResoFacts", back_populates="property", uselist=False, cascade="all, delete-orphan")
+
+
+class ResoFacts(Base):
+    __tablename__ = "reso_facts"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    property_id = Column(String, ForeignKey('properties.id', ondelete='CASCADE'), unique=True, nullable=False)
+
+    # Core Structural & Exterior
+    architectural_style = Column(String, nullable=True)
+    construction_materials = Column(String, nullable=True) # Stored as comma-separated string or JSON if preferred, using String for simplicity
+    roof_type = Column(String, nullable=True)
+    foundation_details = Column(String, nullable=True)
+    structure_type = Column(String, nullable=True)
+    levels = Column(String, nullable=True)
+    
+    # Interior & Features
+    interior_features = Column(JSON, nullable=True) # List of features
+    exterior_features = Column(JSON, nullable=True) # List of features
+    flooring = Column(JSON, nullable=True)
+    appliances = Column(JSON, nullable=True)
+    fireplaces = Column(Integer, nullable=True)
+    fireplace_features = Column(JSON, nullable=True)
+    door_features = Column(JSON, nullable=True)
+    window_features = Column(JSON, nullable=True)
+    
+    # Utilities & Systems
+    cooling = Column(JSON, nullable=True)
+    heating = Column(JSON, nullable=True)
+    water_source = Column(JSON, nullable=True)
+    sewer = Column(JSON, nullable=True)
+    electric = Column(JSON, nullable=True)
+    utilities = Column(JSON, nullable=True)
+    
+    # Parking
+    garage_spaces = Column(Float, nullable=True)
+    parking_features = Column(JSON, nullable=True)
+    has_garage = Column(Boolean, nullable=True)
+    
+    # Community & HOA
+    association_fee = Column(Integer, nullable=True)
+    association_fee_frequency = Column(String, nullable=True)
+    association_amenities = Column(JSON, nullable=True)
+    association_fee_includes = Column(JSON, nullable=True)
+    has_association = Column(Boolean, nullable=True)
+    
+    # Lot & Location
+    lot_features = Column(JSON, nullable=True)
+    topography = Column(String, nullable=True)
+    view = Column(JSON, nullable=True)
+    waterfront_features = Column(JSON, nullable=True)
+    has_waterfront_view = Column(Boolean, nullable=True)
+    has_view = Column(Boolean, nullable=True)
+    
+    # Tax & Financial
+    tax_annual_amount = Column(Integer, nullable=True)
+    tax_year = Column(Integer, nullable=True)
+    
+    # Dates
+    year_built = Column(Integer, nullable=True)
+    modification_timestamp = Column(TZDateTime(timezone=True), nullable=True)
+    
+    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+    updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
+
+    # Relationship
+    property = relationship("Property", back_populates="reso_facts")
 
 
 class OpenHouseEvent(Base):

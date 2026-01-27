@@ -6,7 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 
 from app.models.database import Collection, CollectionPreferences, Property, collection_properties, User
-from app.services.zillow_working_service import ZillowWorkingService
+from app.services.bright_mls_service import BrightMlsService
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.email_service import EmailService
 from app.config.logging import get_logger
@@ -18,7 +18,7 @@ logger = get_logger(__name__)
 
 class PropertySyncService:
     def __init__(self):
-        self.zillow_service = ZillowWorkingService()
+        self.mls_service = BrightMlsService()
         self.email_service = EmailService()
     
     async def get_total_active_collections_count(self, db: AsyncSession) -> int:
@@ -68,32 +68,32 @@ class PropertySyncService:
         self, 
         db: AsyncSession, 
         collection_id: str, 
-        zpid: str
+        listing_key: str
     ) -> bool:
         """
-        Check if a property (by zpid) already exists in a collection
+        Check if a property (by listing_key) already exists in a collection
         """
         result = await db.execute(
             select(Property.id)
             .join(collection_properties)
             .where(
                 collection_properties.c.collection_id == collection_id,
-                Property.zpid == zpid
+                Property.listing_key == listing_key
             )
         )
         return result.scalar_one_or_none() is not None
     
-    async def create_property_from_zillow_data(
+    async def create_property_from_mls_data(
         self, 
         db: AsyncSession, 
         property_data: Dict[str, Any]
     ) -> Property:
         """
-        Create a new Property record from Zillow data
+        Create a new Property record from MLS data
         """
-        # Check if property already exists by zpid
+        # Check if property already exists by listing_key
         result = await db.execute(
-            select(Property).where(Property.zpid == property_data.get('zpid'))
+            select(Property).where(Property.listing_key == property_data.get('listing_key'))
         )
         existing_property = result.scalar_one_or_none()
         
@@ -103,10 +103,9 @@ class PropertySyncService:
                 'image_url': 'img_src'
             }
 
-            # Special handling for zpid (string to int conversion)
-            zpid_value = property_data.get('zpid')
-            if zpid_value and str(zpid_value).isdigit():
-                existing_property.zpid = int(zpid_value)
+            # Update listing_key if needed
+            if property_data.get('listing_key'):
+                 existing_property.listing_key = property_data.get('listing_key')
             
             for key, value in property_data.items():
                 if value is not None:
@@ -122,12 +121,9 @@ class PropertySyncService:
             await db.refresh(existing_property)
             return existing_property
         
-        zpid_value = property_data.get('zpid')
-        zpid_int = int(zpid_value) if zpid_value and str(zpid_value).isdigit() else None
-        
         property_obj = Property(
-            zpid=zpid_int,
-            street_address=property_data.get('address'),  # ✅ Fixed: address -> street_address
+            listing_key=property_data.get('listing_key'),
+            street_address=property_data.get('address'),
             city=property_data.get('city'),
             state=property_data.get('state'),
             zipcode=property_data.get('zipcode'),
@@ -261,28 +257,28 @@ class PropertySyncService:
         logger.info(f"Syncing properties for collection {collection.id}")
 
         try:
-            # Get matching properties from Zillow
-            matching_properties = await self.zillow_service.get_matching_properties(preferences)
+            # Get matching properties from Bright MLS
+            matching_properties = await self.mls_service.get_matching_properties(preferences)
 
             new_properties_count = 0
             first_new_property = None
 
             for property_data in matching_properties:
-                zpid = property_data.get('zpid')
-                if not zpid:
+                listing_key = property_data.get('listing_key')
+                if not listing_key:
                     continue
 
                 # Check if property already exists in this collection
-                if await self.property_exists_in_collection(db, collection.id, zpid):
+                if await self.property_exists_in_collection(db, collection.id, listing_key):
                     # Property exists - check for price drop
                     result = await db.execute(
-                        select(Property).where(Property.zpid == zpid)
+                        select(Property).where(Property.listing_key == listing_key)
                     )
                     existing_property = result.scalar_one_or_none()
 
                     if existing_property:
                         old_price = existing_property.price  # OLD price from database
-                        new_price = property_data.get('price')  # NEW price from Zillow
+                        new_price = property_data.get('price')  # NEW price from MLS
 
                         # Check for price drop
                         if old_price and new_price and new_price < old_price:
@@ -329,14 +325,14 @@ class PropertySyncService:
                                         "agent_phone": agent_phone
                                     }
                                 )
-                                logger.info(f"Price drop email sent for property {zpid}: ${old_price:,} → ${new_price:,}")
+                                logger.info(f"Price drop email sent for property {listing_key}: ${old_price:,} → ${new_price:,}")
 
                     # Update property with new data
-                    property_obj = await self.create_property_from_zillow_data(db, property_data)
+                    property_obj = await self.create_property_from_mls_data(db, property_data)
                     continue  # Don't count as new property
 
                 # Create or update property
-                property_obj = await self.create_property_from_zillow_data(db, property_data)
+                property_obj = await self.create_property_from_mls_data(db, property_data)
 
                 # Add property to collection
                 await self.add_property_to_collection(db, collection.id, property_obj.id)
@@ -610,22 +606,22 @@ class PropertySyncService:
                 logger.warning(f"No preferences found for new collection {collection_id}, skipping property population")
                 return {'success': True, 'new_properties_added': 0, 'message': 'No preferences to populate from'}
 
-            # Get matching properties from Zillow
-            matching_properties = await self.zillow_service.get_matching_properties(preferences)
+            # Get matching properties from Bright MLS
+            matching_properties = await self.mls_service.get_matching_properties(preferences)
 
             properties_added = 0
 
             for property_data in matching_properties:
-                zpid = property_data.get('zpid')
-                if not zpid:
+                listing_key = property_data.get('listing_key')
+                if not listing_key:
                     continue
 
                 # Check if property already exists in this collection
-                if await self.property_exists_in_collection(db, collection.id, zpid):
+                if await self.property_exists_in_collection(db, collection.id, listing_key):
                     continue
 
                 # Create or update property
-                property_obj = await self.create_property_from_zillow_data(db, property_data)
+                property_obj = await self.create_property_from_mls_data(db, property_data)
 
                 # Add property WITHOUT timestamp (initial population - no "NEW" badge)
                 await self.add_property_to_collection_initial(db, collection.id, property_obj.id)
@@ -674,8 +670,8 @@ class PropertySyncService:
             if not preferences:
                 return {'success': False, 'error': 'No preferences found for collection'}
 
-            # Step 1: Get matching properties from Zillow FIRST (validate before deleting)
-            matching_properties = await self.zillow_service.get_matching_properties(preferences)
+            # Step 1: Get matching properties from Bright MLS FIRST (validate before deleting)
+            matching_properties = await self.mls_service.get_matching_properties(preferences)
 
             # Step 2: Validate that properties were found - fail fast if none match
             if not matching_properties or len(matching_properties) == 0:
@@ -699,20 +695,20 @@ class PropertySyncService:
 
             # Step 4: Add new matching properties to the collection
             for property_data in matching_properties:
-                zpid = property_data.get('zpid')
-                if not zpid:
+                listing_key = property_data.get('listing_key')
+                if not listing_key:
                     continue
 
                 try:
                     # Create or update property in database
-                    property_obj = await self.create_property_from_zillow_data(db, property_data)
+                    property_obj = await self.create_property_from_mls_data(db, property_data)
 
                     # Add property to collection
                     await self.add_property_to_collection(db, collection_id, property_obj.id)
                     properties_added += 1
 
                 except Exception as e:
-                    logger.warning(f"Failed to add property {zpid} to collection {collection_id}: {str(e)}")
+                    logger.warning(f"Failed to add property {listing_key} to collection {collection_id}: {str(e)}")
                     continue
 
             # CRITICAL: Do NOT commit here - let the caller handle commit

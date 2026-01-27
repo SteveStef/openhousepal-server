@@ -7,7 +7,7 @@ import os
 
 from app.database import get_db
 from app.models.database import Property
-from app.services.zillow_working_service import ZillowWorkingService
+from app.services.bright_mls_service import BrightMlsService
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -80,8 +80,8 @@ async def store_property(
                 existing_property.latitude = request.property_data["latitude"]
             if "longitude" in request.property_data:
                 existing_property.longitude = request.property_data["longitude"]
-            if "zpid" in request.property_data:
-                existing_property.zpid = request.property_data["zpid"]
+            if "listing_key" in request.property_data:
+                existing_property.listing_key = request.property_data["listing_key"]
                 
         else:
             # Create new property
@@ -90,8 +90,7 @@ async def store_property(
                 street_address=request.address,
                 img_src=request.cover_image_url,
                 created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-                last_synced=datetime.now(timezone.utc)
+                updated_at=datetime.now(timezone.utc)
             )
             
             # Set specific fields from property data
@@ -113,8 +112,8 @@ async def store_property(
                 new_property.latitude = request.property_data["latitude"]
             if "longitude" in request.property_data:
                 new_property.longitude = request.property_data["longitude"]
-            if "zpid" in request.property_data:
-                new_property.zpid = request.property_data["zpid"]
+            if "listing_key" in request.property_data:
+                new_property.listing_key = request.property_data["listing_key"]
                 
             db.add(new_property)
         
@@ -154,7 +153,7 @@ async def get_property(
             "propertyType": property_record.home_type,
             "latitude": property_record.latitude,
             "longitude": property_record.longitude,
-            "zpid": property_record.zpid
+            "listing_key": property_record.listing_key
         }
         
         return PropertyResponse(
@@ -173,9 +172,9 @@ async def get_property(
 async def get_property_details(
     request: PropertyLookupRequest
 ):
-    """Fetch property details from Zillow API without saving to database"""
-    zillow_service = ZillowWorkingService()
-    return await zillow_service.get_property_by_address(request.address)
+    """Fetch property details from Bright MLS API without saving to database"""
+    mls_service = BrightMlsService()
+    return await mls_service.get_property_by_address(request.address)
 
 @router.get("/properties/{property_id}/cache")
 async def cache_property_details(
@@ -216,10 +215,10 @@ async def cache_property_details(
                     pass  # Fall through to fetch fresh data
 
         if not property_record.street_address:
-            raise HTTPException(status_code=400, detail="Property missing address for Zillow lookup")
+            raise HTTPException(status_code=400, detail="Property missing address for MLS lookup")
 
-        # Fetch from Zillow
-        zillow_service = ZillowWorkingService()
+        # Fetch from Bright MLS
+        mls_service = BrightMlsService()
 
         # Construct full address for search to avoid ambiguity
         search_address = property_record.street_address
@@ -232,10 +231,10 @@ async def cache_property_details(
         if property_record.zipcode:
             search_address += f" {property_record.zipcode}"
 
-        details = await zillow_service.get_property_by_address(search_address, True)
+        details = await mls_service.get_property_by_address(search_address, True)
 
         if not details:
-            raise HTTPException(status_code=404, detail="Property details not found on Zillow")
+            raise HTTPException(status_code=404, detail="Property details not found on MLS")
 
         # Convert Pydantic model to dict
         try:
