@@ -277,15 +277,16 @@ async def cancel_subscription(
         else:
             # Fallback: Calculate grace period manually if PayPal doesn't provide it
             # This ensures users always keep access until end of their paid period
+            trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
             if user.last_billing_date:
-                # User was billed recently - add 30 days from last billing
-                user.next_billing_date = user.last_billing_date + timedelta(days=30)
+                # User was billed recently - add trial_days from last billing
+                user.next_billing_date = user.last_billing_date + timedelta(days=trial_days)
             elif user.subscription_started_at:
-                # Calculate from subscription start date + 30 days
-                user.next_billing_date = user.subscription_started_at + timedelta(days=30)
+                # Calculate from subscription start date + trial_days
+                user.next_billing_date = user.subscription_started_at + timedelta(days=trial_days)
             else:
-                # Safety fallback: Give 30 days from now
-                user.next_billing_date = datetime.now(timezone.utc) + timedelta(days=30)
+                # Safety fallback: Give trial_days from now
+                user.next_billing_date = datetime.now(timezone.utc) + timedelta(days=trial_days)
 
         await db.commit()
 
@@ -461,13 +462,14 @@ async def complete_new_subscription(
             # New customer with trial - set trial end date from PayPal data
             user.subscription_status = "TRIAL"
             
+            trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
             if next_billing_time:
                 try:
                     trial_end = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
                 except Exception:
-                    trial_end = now + timedelta(days=30)
+                    trial_end = now + timedelta(days=trial_days)
             else:
-                trial_end = now + timedelta(days=30)
+                trial_end = now + timedelta(days=trial_days)
                 
             user.trial_ends_at = trial_end
             trial_end_iso = trial_end.isoformat()
@@ -491,18 +493,18 @@ async def complete_new_subscription(
                 if has_trial:
                     user.next_billing_date = trial_end  # First billing when trial ends
                 else:
-                    user.next_billing_date = now + timedelta(days=30)  # Monthly billing cycle
+                    user.next_billing_date = now + timedelta(days=trial_days)  # Monthly billing cycle
         else:
             # PayPal didn't provide next billing time - calculate it
             if has_trial:
                 user.next_billing_date = trial_end  # First billing when trial ends
             else:
-                user.next_billing_date = now + timedelta(days=30)  # Monthly billing cycle
+                user.next_billing_date = now + timedelta(days=trial_days)  # Monthly billing cycle
 
         await db.commit()
 
         # Return appropriate message
-        trial_message = "with 30-day trial!" if has_trial else "(no trial - billing starts immediately)"
+        trial_message = f"with {trial_days}-day trial!" if has_trial else "(no trial - billing starts immediately)"
 
         return {
             "success": True,

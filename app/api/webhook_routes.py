@@ -87,7 +87,9 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
 
         # Extract subscription ID from different possible locations
         resource = body.get("resource", {})
-        subscription_id = resource.get("id") or resource.get("billing_agreement_id")
+        # Prioritize billing_agreement_id because payment events use 'id' for the transaction ID
+        # Subscription events don't have billing_agreement_id, so they will fall back to 'id'
+        subscription_id = resource.get("billing_agreement_id") or resource.get("id")
 
         if not subscription_id:
             logger.warning("Webhook missing subscription_id", extra={"event_type": event_type})
@@ -105,22 +107,64 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
 
         logger.info("Processing webhook for user", extra={"subscription_id": subscription_id, "user_id": user.id})
 
+        # Extract plan_id from resource
+        plan_id = resource.get("plan_id")
+
         # Handle different event types
         now_utc = datetime.now(timezone.utc)
         if event_type == "BILLING.SUBSCRIPTION.ACTIVATED":
             # Trial converted to paid, or subscription reactivated
-            # FIX: Don't overwrite TRIAL status if trial is still valid (prevents race condition with signup)
-            is_in_trial = (
-                user.subscription_status == "TRIAL" and 
-                user.trial_ends_at is not None and 
-                user.trial_ends_at > now_utc
-            )
+            # Determine Tier and Status based on Plan ID
+            is_trial = False
             
-            if not is_in_trial:
+            if plan_id == BASIC_PLAN_ID:
+                user.plan_tier = "BASIC"
+                user.subscription_status = "TRIAL"
+                is_trial = True
+            elif plan_id == PREMIUM_PLAN_ID:
+                user.plan_tier = "PREMIUM"
+                user.subscription_status = "TRIAL"
+                is_trial = True
+            elif plan_id == BASIC_PLAN_NO_TRIAL_ID:
+                user.plan_tier = "BASIC"
                 user.subscription_status = "ACTIVE"
-                logger.info("Subscription set to ACTIVE", extra={"subscription_id": subscription_id, "user_id": user.id})
+            elif plan_id == PREMIUM_PLAN_NO_TRIAL_ID:
+                user.plan_tier = "PREMIUM"
+                user.subscription_status = "ACTIVE"
             else:
-                logger.info("Subscription activated but user is in valid trial, preserving TRIAL status", extra={"subscription_id": subscription_id, "user_id": user.id})
+                # Unknown plan (fallback to active if not recognized)
+                logger.warning(f"Unknown plan_id {plan_id}, defaulting to ACTIVE", extra={"subscription_id": subscription_id})
+                user.subscription_status = "ACTIVE"
+
+            logger.info(
+                f"Subscription activated: {user.plan_tier} - {user.subscription_status}", 
+                extra={"subscription_id": subscription_id, "user_id": user.id}
+            )
+
+            # Set Trial End Date if applicable
+            if is_trial:
+                billing_info = resource.get("billing_info", {})
+                next_billing_time = billing_info.get("next_billing_time")
+                
+                if next_billing_time:
+                    try:
+                        user.trial_ends_at = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
+                        user.next_billing_date = user.trial_ends_at
+                    except Exception:
+                        # Fallback if parsing fails
+                        trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
+                        user.trial_ends_at = now_utc + timedelta(days=trial_days)
+                        user.next_billing_date = user.trial_ends_at
+                else:
+                    # Fallback if no billing time provided
+                    trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
+                    user.trial_ends_at = now_utc + timedelta(days=trial_days)
+                    user.next_billing_date = user.trial_ends_at
+            else:
+                # If active (no trial), clear trial data
+                user.trial_ends_at = None
+                # Set next billing date (approx 1 month out for new active subs)
+                user.next_billing_date = now_utc + timedelta(days=30)
 
             if not user.subscription_started_at:
                 user.subscription_started_at = now_utc
@@ -151,17 +195,18 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
                     logger.warning("Failed to parse next_billing_time", exc_info=True)
             else:
                 # Fallback: Calculate grace period manually if PayPal doesn't provide it
+                trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
                 if user.last_billing_date:
-                    # User was billed recently - add 30 days from last billing
-                    user.next_billing_date = user.last_billing_date + timedelta(days=30)
+                    # User was billed recently - add trial_days from last billing
+                    user.next_billing_date = user.last_billing_date + timedelta(days=trial_days)
                     grace_source = "last_billing_date"
                 elif user.subscription_started_at:
-                    # Calculate from subscription start date + 30 days
-                    user.next_billing_date = user.subscription_started_at + timedelta(days=30)
+                    # Calculate from subscription start date + trial_days
+                    user.next_billing_date = user.subscription_started_at + timedelta(days=trial_days)
                     grace_source = "subscription_started_at"
                 else:
-                    # Safety fallback: Give 30 days from now
-                    user.next_billing_date = datetime.now(timezone.utc) + timedelta(days=30)
+                    # Safety fallback: Give trial_days from now
+                    user.next_billing_date = datetime.now(timezone.utc) + timedelta(days=trial_days)
                     grace_source = "current_time"
 
                 logger.info(

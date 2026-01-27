@@ -195,7 +195,7 @@ async def resend_verification_code(
 
     # Print code to console in development mode
     if os.getenv("MAILGUN_DEV", "yes") == "yes":
-        logger.info("Verification code generated", extra={"user_email": email, "code": verification_code})
+        logger.info("Verification code generated", extra={"user_email": email, "code": new_code})
 
     # Send email with new code
     email_service = EmailService()
@@ -362,10 +362,13 @@ async def signup_with_subscription(
                 try:
                     trial_end = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
                 except Exception:
-                    logger.warning("Failed to parse PayPal next_billing_time, falling back to 30 days")
-                    trial_end = now + timedelta(days=30)
+                    logger.warning("Failed to parse PayPal next_billing_time, falling back to trial period")
+                    # Fallback to 30 days or environment variable
+                    trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
+                    trial_end = now + timedelta(days=trial_days)
             else:
-                trial_end = now + timedelta(days=30)
+                trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
+                trial_end = now + timedelta(days=trial_days)
 
             new_user = UserModel(
                 email=user_data.email,
