@@ -191,17 +191,22 @@ async def cache_property_details(
         if not property_record:
             raise HTTPException(status_code=404, detail="Property not found")
 
-        # Check if cache is still valid (based on CACHE_EXPIRY_DAYS environment variable)
+        # Check if cache is still valid (based on CACHE_EXPIRY_HOURS environment variable)
         if property_record.detailed_data_cached and property_record.detailed_data_cached_at:
             from datetime import timedelta
-            cache_expiry_days = int(os.getenv("CACHE_EXPIRY_DAYS", 3))
-            expiry_time = property_record.detailed_data_cached_at + timedelta(days=cache_expiry_days)
+            cache_expiry_hours = int(os.getenv("CACHE_EXPIRY_HOURS", 3))
+            expiry_time = property_record.detailed_data_cached_at + timedelta(hours=cache_expiry_hours)
 
             if datetime.now(timezone.utc) < expiry_time and property_record.detailed_property:
                 # Validate that cached data is not None/empty before returning
                 try:
                     cached_data = property_record.detailed_property
                     if cached_data and isinstance(cached_data, dict) and len(cached_data) > 0:
+                        # Ensure updated_at is present in cached data
+                        if "resoFacts" in cached_data and cached_data["resoFacts"]:
+                            if "updated_at" not in cached_data["resoFacts"] or not cached_data["resoFacts"]["updated_at"]:
+                                cached_data["resoFacts"]["updated_at"] = property_record.detailed_data_cached_at.isoformat()
+                        
                         return {
                             "success": True,
                             "message": "Property details already cached and still valid",
@@ -243,6 +248,10 @@ async def cache_property_details(
             else:
                 details_dict = details.dict()
                 details_dict = _convert_datetimes_to_strings(details_dict)
+            
+            # Add updated_at to resoFacts for frontend display
+            if "resoFacts" in details_dict and details_dict["resoFacts"]:
+                details_dict["resoFacts"]["updated_at"] = datetime.now(timezone.utc).isoformat()
         except Exception as e:
             raise HTTPException(status_code=500, detail="Failed to process property details")
 

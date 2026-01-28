@@ -9,13 +9,13 @@ import os
 logger = get_logger(__name__)
 
 async def cleanup_expired_property_cache():
-    """Remove expired property cache data older than 7 days"""
-    cache_expiry_days = int(os.getenv("CACHE_EXPIRY_DAYS", 7))
-    logger.info("Starting property cache cleanup", extra={"cache_expiry_days": cache_expiry_days})
+    """Remove expired property cache data"""
+    cache_expiry_hours = int(os.getenv("CACHE_EXPIRY_HOURS", 3))
+    logger.info("Starting property cache cleanup", extra={"cache_expiry_hours": cache_expiry_hours})
 
     try:
         async with AsyncSessionLocal() as db:
-            cutoff_time = datetime.utcnow() - timedelta(days=cache_expiry_days)
+            cutoff_time = datetime.utcnow() - timedelta(hours=cache_expiry_hours)
 
             stmt = update(Property).where(
                 Property.detailed_data_cached_at < cutoff_time

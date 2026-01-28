@@ -13,96 +13,96 @@ load_dotenv()
 async def test_bright_service():
     print("Initializing BrightMlsService...")
     service = BrightMlsService()
+    # 
+    # # Mock preferences
+    # preferences = CollectionPreferencesSchema(
+    #     id="test-pref-id",
+    #     collection_id="test-col-id",
+    #     created_at=datetime.utcnow(),
+    #     cities=["Villanova"],
+    #     min_price=500000,
+    #     max_price=2000000,
+    #     min_beds=3,
+    #     is_single_family=True
+    # )
+    #
+    # # 0. Broad Discovery Search
+    # print("\n--- 0. Discovery Search (No Filters) ---")
+    # try:
+    #     # Check if we want to test PROD
+    #     if os.getenv("BRIGHT_MLS_ENV", "").lower() == "prod":
+    #         print("⚠️  WARNING: Running against PRODUCTION environment ⚠️")
+    #         # Load prod env vars if needed
+    #         from dotenv import dotenv_values
+    #         prod_env = dotenv_values(".prod.env")
+    #         if prod_env:
+    #             os.environ["BRIGHT_MLS_CLIENT"] = prod_env.get("BRIGHT_MLS_CLIENT", "")
+    #             os.environ["BRIGHT_MLS_SECRET"] = prod_env.get("BRIGHT_MLS_SECRET", "")
+    #             # Re-init service with new env vars
+    #             service = BrightMlsService()
+    #
+    #     # Create empty preferences to get ANY property
+    #     broad_prefs = CollectionPreferencesSchema(
+    #         id="test-broad", collection_id="test-broad", created_at=datetime.utcnow()
+    #     )
+    #     # We need to manually call the internal method or pass empty lists
+    #     # But get_matching_properties requires cities/townships to do anything
+    #     # So we'll use the service's internal helper or just a direct URL for this test script context
+    #     # Actually, let's just try to find *anything* in PA
+    #     preferences.cities = [] # Clear city
+    #     # preferences.townships = [] 
+    #     # Note: The service might return empty if no location is provided. 
+    #     # Let's try a very common city if Villanova fails, or just use the known ListingKey.
+    #     
+    #     # Strategy: Use the known ListingKey from previous debug session to verify details
+    #     known_key = "240243016499" 
+    #     print(f"Skipping broad search, using known valid ListingKey from debug: {known_key}")
+    #     
+    # except Exception as e:
+    #     print(f"Discovery failed: {e}")
+    #
+    # # 1. Test Search by Location (Villanova, PA)
+    # print("\n--- Testing Search by Location (Villanova, PA) ---")
     
     # Mock preferences
-    preferences = CollectionPreferencesSchema(
-        id="test-pref-id",
-        collection_id="test-col-id",
-        created_at=datetime.utcnow(),
-        cities=["Villanova"],
-        min_price=500000,
-        max_price=2000000,
-        min_beds=3,
-        is_single_family=True
-    )
-
-    # 0. Broad Discovery Search
-    print("\n--- 0. Discovery Search (No Filters) ---")
-    try:
-        # Check if we want to test PROD
-        if os.getenv("BRIGHT_MLS_ENV", "").lower() == "prod":
-            print("⚠️  WARNING: Running against PRODUCTION environment ⚠️")
-            # Load prod env vars if needed
-            from dotenv import dotenv_values
-            prod_env = dotenv_values(".prod.env")
-            if prod_env:
-                os.environ["BRIGHT_MLS_CLIENT"] = prod_env.get("BRIGHT_MLS_CLIENT", "")
-                os.environ["BRIGHT_MLS_SECRET"] = prod_env.get("BRIGHT_MLS_SECRET", "")
-                # Re-init service with new env vars
-                service = BrightMlsService()
-
-        # Create empty preferences to get ANY property
-        broad_prefs = CollectionPreferencesSchema(
-            id="test-broad", collection_id="test-broad", created_at=datetime.utcnow()
-        )
-        # We need to manually call the internal method or pass empty lists
-        # But get_matching_properties requires cities/townships to do anything
-        # So we'll use the service's internal helper or just a direct URL for this test script context
-        # Actually, let's just try to find *anything* in PA
-        preferences.cities = [] # Clear city
-        # preferences.townships = [] 
-        # Note: The service might return empty if no location is provided. 
-        # Let's try a very common city if Villanova fails, or just use the known ListingKey.
-        
-        # Strategy: Use the known ListingKey from previous debug session to verify details
-        known_key = "240243016499" 
-        print(f"Skipping broad search, using known valid ListingKey from debug: {known_key}")
-        
-    except Exception as e:
-        print(f"Discovery failed: {e}")
-
-    # 1. Test Search by Location (Villanova, PA)
-    print("\n--- Testing Search by Location (Villanova, PA) ---")
-    
-    # Mock preferences
-    preferences = CollectionPreferencesSchema(
-        id="test-pref-id",
-        collection_id="test-col-id",
-        created_at=datetime.utcnow(),
-        cities=["Villanova"],
-        min_price=500000,
-        max_price=2000000,
-        min_beds=3,
-        is_single_family=True
-    )
-    
-    try:
-        results = await service.get_matching_properties(preferences)
-        print(f"Found {len(results)} properties in Villanova.")
-        
-        if results:
-            first_prop = results[0]
-            print("First property sample:")
-            print(json.dumps(first_prop, indent=2, default=str))
-            
-            # Check for listing_key
-            if 'listing_key' in first_prop:
-                print(f"\n✅ listing_key present: {first_prop['listing_key']}")
-            else:
-                print("\n❌ listing_key MISSING!")
-    except Exception as e:
-        print(f"❌ Search failed: {e}")
-        if hasattr(e, 'response') and e.response is not None:
-            print(f"Response Body: {e.response.text}")
-
-    # 2. Test Get Property by Address
+    # preferences = CollectionPreferencesSchema(
+    #     id="test-pref-id",
+    #     collection_id="test-col-id",
+    #     created_at=datetime.utcnow(),
+    #     cities=["Villanova"],
+    #     min_price=500000,
+    #     max_price=2000000,
+    #     min_beds=3,
+    #     is_single_family=True
+    # )
+    # 
+    # try:
+    #     results = await service.get_matching_properties(preferences)
+    #     print(f"Found {len(results)} properties in Villanova.")
+    #     
+    #     if results:
+    #         first_prop = results[0]
+    #         print("First property sample:")
+    #         print(json.dumps(first_prop, indent=2, default=str))
+    #         
+    #         # Check for listing_key
+    #         if 'listing_key' in first_prop:
+    #             print(f"\n✅ listing_key present: {first_prop['listing_key']}")
+    #         else:
+    #             print("\n❌ listing_key MISSING!")
+    # except Exception as e:
+    #     print(f"❌ Search failed: {e}")
+    #     if hasattr(e, 'response') and e.response is not None:
+    #         print(f"Response Body: {e.response.text}")
+    #
+    # # 2. Test Get Property by Address
     # Fetch a real address from the API first to ensure success
     print("\n--- Fetching a real address from API for testing ---")
     headers = {
         "Authorization": f"Bearer {await service._get_access_token()}",
         "Accept": "application/json"
     }
-    # Get one active property
+    # # Get one active property
     url = f"{service.api_base_url}/BrightProperties?$top=1&$filter=MlsStatus eq 'ACTIVE-BRIGHT'"
     async with httpx.AsyncClient() as client:
         resp = await client.get(url, headers=headers)
@@ -137,6 +137,12 @@ async def test_bright_service():
             print(f"Tax Annual Amount: {data['resoFacts'].get('tax_annual_amount')}")
         else:
             print("\n❌ ResoFacts MISSING!")
+
+        # Verify new Agent/Office fields
+        print(f"\nOffice Name: {data.get('listOfficeName')}")
+        print(f"Office Phone: {data.get('listOfficePhone')}")
+        print(f"Agent Name: {data.get('listAgentFullName')}")
+        print(f"Agent Email: {data.get('listAgentEmail')}")
             
         # Verify ListPictureURL usage
         # We can't see the internal API call here, but we can check if we got photos

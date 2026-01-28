@@ -291,6 +291,7 @@ class ResoFacts(BaseModel):
     yearBuiltEffective: Optional[int] = None
     zoning: Optional[Union[List[str], str]] = None
     zoningDescription: Optional[Union[List[str], str]] = None
+    updated_at: Optional[Union[datetime, str]] = None
 
 class PropertyDetailResponse(BaseModel):
     abbreviatedAddress: Optional[str] = None
@@ -376,6 +377,10 @@ class ZillowPropertyDetailResponse(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     description: Optional[str] = None
+    listOfficeName: Optional[str] = None
+    listOfficePhone: Optional[str] = None
+    listAgentFullName: Optional[str] = None
+    listAgentEmail: Optional[str] = None
     
     # Financial and tax information
     propertyTaxRate: Optional[float] = None

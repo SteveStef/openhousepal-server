@@ -8,7 +8,6 @@ from datetime import datetime
 
 from app.schemas.collection_preferences import CollectionPreferences as CollectionPreferencesSchema
 from app.models.property import PropertyDetailResponse, ZillowPropertyDetailResponse
-from app.utils.rate_limiter import RateLimiter
 from app.config.logging import get_logger
 
 # Get logger from centralized config
@@ -35,14 +34,13 @@ class BrightMlsService:
             self.token_url = "https://brightmls-test.okta.com/oauth2/default/v1/token"
             self.api_base_url = "https://bright-reso.tst.brightmls.com/RESO/OData/bright"
 
-        self.rate_limiter = RateLimiter()
         self._access_token = None
         self._token_expires_at = 0
 
         if not self.client_id or not self.client_secret:
             logger.warning("BRIGHT_MLS_CLIENT_ID or BRIGHT_MLS_SECRET not found in environment")
 
-    async def get_access_token(self) -> str:
+    async def _get_access_token(self) -> str:
         """
         Retrieves a valid access token, refreshing if necessary.
         """
@@ -210,7 +208,11 @@ class BrightMlsService:
             'latitude': item.get("Latitude"),
             'longitude': item.get("Longitude"),
             'image_url': image_url,
-            'yearBuilt': year_built
+            'yearBuilt': year_built,
+            'listOfficeName': item.get("ListOfficeName"),
+            'listOfficePhone': item.get("ListOfficePhone"),
+            'listAgentFullName': item.get("ListAgentFullName"),
+            'listAgentEmail': item.get("ListAgentEmail")
         }
 
     def _map_reso_facts(self, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -324,7 +326,8 @@ class BrightMlsService:
             "ListingKey", "ListingId", "ListPrice", "UnparsedAddress", "City", 
             "StateOrProvince", "PostalCode", "BedroomsTotal", "BathroomsTotalInteger", 
             "BathroomsFull", "BathroomsHalf", "LivingArea", "LotSizeSquareFeet", 
-            "YearBuilt", "MlsStatus", "PropertyType", "ListPictureURL",
+            "YearBuilt", "MlsStatus", "PropertyType", "ListPictureURL", 
+            #"ListOfficeName", "ListOfficePhone", "ListAgentFullName", 
             "Latitude", "Longitude"
         ]
         
@@ -346,7 +349,7 @@ class BrightMlsService:
         
         try:
             async with httpx.AsyncClient() as client:
-                await self.rate_limiter.acquire_token() 
+                # Rate limiting removed
                 response = await client.get(url, headers=headers, params=params)
                 response.raise_for_status()
                 data = response.json()
@@ -464,6 +467,10 @@ class BrightMlsService:
                         'latitude': mapped_data['latitude'],
                         'longitude': mapped_data['longitude'],
                         'description': item.get("PublicRemarks", ""),
+                        'listOfficeName': mapped_data.get('listOfficeName'),
+                        'listOfficePhone': mapped_data.get('listOfficePhone'),
+                        'listAgentFullName': mapped_data.get('listAgentFullName'),
+                        'listAgentEmail': mapped_data.get('listAgentEmail'),
                         'originalPhotos': original_photos, # Populate photos
                         'resoFacts': self._map_reso_facts(item) if details else None
                     }
@@ -471,8 +478,6 @@ class BrightMlsService:
                     if details:
                         return ZillowPropertyDetailResponse(**response_data)
                     else:
-                        # For simple response, ensure image_url is set if it was missing in map
-                        # PropertyDetailResponse doesn't have image_url field, usually it relies on originalPhotos or similar
                         return PropertyDetailResponse(**response_data)
                 else:
                     raise HTTPException(status_code=response.status_code, detail="Provider Error")
