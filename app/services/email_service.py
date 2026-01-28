@@ -23,18 +23,10 @@ class EmailService:
         template: str,
         template_variables: Dict[str, Any]
     ) -> Tuple[int, str]:
-        # Skip sending in dev mode
-
-        # if self.is_dev:
-        #     logger.info(
-        #         f"[DEV MODE] Email not sent - would have sent to: {to_email}",
-        #         extra={
-        #             "subject": subject,
-        #             "template": template,
-        #             "to_email": to_email
-        #         }
-        #     )
-        #     return 200, "Dev mode - email not sent"
+        # Inject today's date for all templates
+        from datetime import datetime
+        if "today_date" not in template_variables:
+            template_variables["today_date"] = datetime.now().strftime("%m/%d/%Y")
 
         try:
             response = httpx.post(
