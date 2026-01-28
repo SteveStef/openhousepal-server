@@ -52,6 +52,14 @@ async def create_open_house(
             abbreviated_addr = f"{street_address}, {city}, {state}"
         elif not abbreviated_addr:
             abbreviated_addr = street_address
+            
+        # Helper to safely cast to int
+        def safe_int(val):
+            try:
+                if val is None: return None
+                return int(float(val))
+            except (ValueError, TypeError):
+                return None
         
         open_house = OpenHouseEvent(
             id=open_house_id,
@@ -70,10 +78,10 @@ async def create_open_house(
             city=city,
             state=state,
             zipcode=zipcode,
-            bedrooms=property_data.get('bedrooms'),
+            bedrooms=safe_int(property_data.get('bedrooms')),
             bathrooms=property_data.get('bathrooms'),
-            living_area=property_data.get('livingArea'),
-            price=property_data.get('price'),
+            living_area=safe_int(property_data.get('livingArea')),
+            price=safe_int(property_data.get('price')),
             home_status=property_data.get('homeStatus')
         )
         
@@ -121,6 +129,14 @@ async def get_open_houses(
         result = await db.execute(stmt)
         open_houses = result.scalars().all()
         
+        # Helper to safely cast to int
+        def safe_int(val):
+            try:
+                if val is None: return None
+                return int(float(val))
+            except (ValueError, TypeError):
+                return None
+        
         response_list = []
         for oh in open_houses:
             response_list.append(OpenHouseResponse(
@@ -130,10 +146,10 @@ async def get_open_houses(
                 cover_image_url=oh.cover_image_url or "",
                 qr_code_url=oh.qr_code,
                 form_url=oh.form_url or f"/open-house/{oh.id}",
-                bedrooms=oh.bedrooms,
+                bedrooms=safe_int(oh.bedrooms),
                 bathrooms=oh.bathrooms,
-                living_area=oh.living_area,
-                price=oh.price,
+                living_area=safe_int(oh.living_area),
+                price=safe_int(oh.price),
                 city=oh.city,
                 notes=oh.notes,
                 created_at=oh.created_at

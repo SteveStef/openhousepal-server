@@ -438,7 +438,13 @@ class BrightMlsService:
                     primary_photo = images[0] if images else None
                     
                     # Format photos for ZillowPropertyDetailResponse
+
                     original_photos = []
+
+                    # TODO
+                    image_url = item.get("ListPictureURL") # removes this line in prod
+                    images.append(image_url) # remove this line in prod
+
                     for img_url in images:
                         original_photos.append({
                             "caption": "",
