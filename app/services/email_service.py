@@ -28,6 +28,18 @@ class EmailService:
         if "today_date" not in template_variables:
             template_variables["today_date"] = datetime.now().strftime("%m/%d/%Y")
 
+        if self.is_dev:
+            logger.info(
+                "DEV MODE: Email suppressed", 
+                extra={
+                    "to": to_email, 
+                    "subject": subject, 
+                    "template": template, 
+                    "variables": template_variables
+                }
+            )
+            return 200, "Email suppressed in dev mode"
+
         try:
             response = httpx.post(
                 self.mailgun_url,

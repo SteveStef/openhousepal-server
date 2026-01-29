@@ -1,9 +1,12 @@
 import random
 import string
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, delete, and_
 from passlib.context import CryptContext
 from app.config.logging import get_logger
+from app.models.database import SignupVerification
 
 # Get logger from centralized config
 logger = get_logger(__name__)
@@ -14,8 +17,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 class VerificationService:
     def __init__(self):
-        # In-memory cache: {email: {code, expires_at, verified, form_data, attempts, last_sent}}
-        self._cache: Dict[str, Dict[str, Any]] = {}
+        # Configuration
         self.code_expiration_minutes = 15
         self.rate_limit_window_minutes = 15
         self.max_attempts_per_window = 3
@@ -24,10 +26,9 @@ class VerificationService:
         """Generate a random 6-digit verification code"""
         return ''.join(random.choices(string.digits, k=6))
 
-    def store_code(self, email: str, code: str, form_data: Dict[str, Any]) -> None:
+    async def store_code(self, email: str, code: str, form_data: Dict[str, Any], db: AsyncSession) -> None:
         """
-        Store verification code with form data in cache
-        Form data should include: first_name, last_name, state, brokerage, password
+        Store verification code with form data in database
         """
         # Hash password before storing
         if 'password' in form_data:
@@ -36,152 +37,176 @@ class VerificationService:
         now = datetime.now(timezone.utc)
         expires_at = now + timedelta(minutes=self.code_expiration_minutes)
 
-        # Check if entry exists to preserve attempts counter
-        existing = self._cache.get(email, {})
-        attempts = existing.get('attempts', 0) + 1
+        # Check for existing entry
+        stmt = select(SignupVerification).where(SignupVerification.email == email)
+        result = await db.execute(stmt)
+        existing = result.scalar_one_or_none()
 
-        # Check if this is within the same rate limit window
-        last_sent = existing.get('last_sent')
-        if last_sent:
-            time_since_last = (now - last_sent).total_seconds() / 60
+        if existing:
+            # Check rate limit window
+            time_since_last = (now - existing.last_sent_at).total_seconds() / 60
             if time_since_last >= self.rate_limit_window_minutes:
-                # Reset attempts if we're in a new window
-                attempts = 1
+                # New window, reset attempts
+                existing.attempts = 1
+            else:
+                existing.attempts += 1
+            
+            # Update existing
+            existing.code = code
+            existing.form_data = form_data
+            existing.expires_at = expires_at
+            existing.last_sent_at = now
+            existing.verified = False  # Reset verified status on new code
+        else:
+            # Create new
+            new_entry = SignupVerification(
+                email=email,
+                code=code,
+                form_data=form_data,
+                verified=False,
+                attempts=1,
+                last_sent_at=now,
+                expires_at=expires_at
+            )
+            db.add(new_entry)
 
-        self._cache[email] = {
-            'code': code,
-            'expires_at': expires_at,
-            'verified': False,
-            'form_data': form_data,
-            'attempts': attempts,
-            'last_sent': now
-        }
+        await db.commit()
+        logger.info(f"Stored verification code for {email}")
 
-        logger.info(f"Stored verification code for {email} (attempt {attempts})")
-
-    def can_send_code(self, email: str) -> tuple[bool, Optional[str]]:
+    async def can_send_code(self, email: str, db: AsyncSession) -> Tuple[bool, Optional[str]]:
         """
         Check if email can receive a new verification code
-        Returns (can_send, error_message)
         """
-        entry = self._cache.get(email)
+        stmt = select(SignupVerification).where(SignupVerification.email == email)
+        result = await db.execute(stmt)
+        entry = result.scalar_one_or_none()
 
         if not entry:
             return True, None
 
         now = datetime.now(timezone.utc)
-        last_sent = entry.get('last_sent')
-        attempts = entry.get('attempts', 0)
+        time_since_last = (now - entry.last_sent_at).total_seconds() / 60
 
         # Check if we're in the same rate limit window
-        if last_sent:
-            time_since_last = (now - last_sent).total_seconds() / 60
-
-            if time_since_last < self.rate_limit_window_minutes:
-                # Still in the same window - check attempt count
-                if attempts >= self.max_attempts_per_window:
-                    return False, f"Too many verification emails sent. Please try again in {int(self.rate_limit_window_minutes - time_since_last)} minutes."
+        if time_since_last < self.rate_limit_window_minutes:
+            if entry.attempts >= self.max_attempts_per_window:
+                wait_time = int(self.rate_limit_window_minutes - time_since_last)
+                return False, f"Too many verification emails sent. Please try again in {wait_time} minutes."
 
         return True, None
 
-    def verify_code(self, email: str, code: str) -> tuple[bool, Optional[str]]:
+    async def verify_code(self, email: str, code: str, db: AsyncSession) -> Tuple[bool, Optional[str]]:
         """
         Verify the code for an email
-        Returns (is_valid, error_message)
         """
-        entry = self._cache.get(email)
+        stmt = select(SignupVerification).where(SignupVerification.email == email)
+        result = await db.execute(stmt)
+        entry = result.scalar_one_or_none()
 
         if not entry:
             return False, "No verification code found for this email"
 
         # Check if already verified
-        if entry.get('verified'):
+        if entry.verified:
             return False, "Email already verified"
 
         # Check if expired
         now = datetime.now(timezone.utc)
-        if now > entry['expires_at']:
+        if now > entry.expires_at:
             return False, "Verification code has expired. Please request a new one."
 
         # Check if code matches
-        if entry['code'] != code:
+        if entry.code != code:
             return False, "Invalid verification code"
 
         # Mark as verified
-        entry['verified'] = True
+        entry.verified = True
+        await db.commit()
+        
         logger.info(f"Email verified successfully: {email}")
-
         return True, None
 
-    def is_verified(self, email: str) -> bool:
+    async def is_verified(self, email: str, db: AsyncSession) -> bool:
         """Check if email is verified"""
-        entry = self._cache.get(email)
+        stmt = select(SignupVerification).where(SignupVerification.email == email)
+        result = await db.execute(stmt)
+        entry = result.scalar_one_or_none()
+        
         if not entry:
             return False
-        return entry.get('verified', False)
+        return entry.verified
 
-    def get_form_data(self, email: str) -> Optional[Dict[str, Any]]:
+    async def get_form_data(self, email: str, db: AsyncSession) -> Optional[Dict[str, Any]]:
         """Retrieve stored form data for verified email"""
-        entry = self._cache.get(email)
-        if not entry or not entry.get('verified'):
+        stmt = select(SignupVerification).where(SignupVerification.email == email)
+        result = await db.execute(stmt)
+        entry = result.scalar_one_or_none()
+        
+        if not entry or not entry.verified:
             return None
-        return entry.get('form_data')
+        return entry.form_data
 
-    def resend_code(self, email: str) -> tuple[bool, Optional[str], Optional[str]]:
+    async def resend_code(self, email: str, db: AsyncSession) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Generate and store a new code for existing verification entry
         Returns (success, new_code, error_message)
         """
-        entry = self._cache.get(email)
+        stmt = select(SignupVerification).where(SignupVerification.email == email)
+        result = await db.execute(stmt)
+        entry = result.scalar_one_or_none()
 
         if not entry:
             return False, None, "No verification pending for this email"
 
         # Check rate limit
-        can_send, error = self.can_send_code(email)
+        can_send, error = await self.can_send_code(email, db)
         if not can_send:
             return False, None, error
 
         # Generate new code
         new_code = self.generate_code()
-
-        # Update entry with new code and expiration
         now = datetime.now(timezone.utc)
-        entry['code'] = new_code
-        entry['expires_at'] = now + timedelta(minutes=self.code_expiration_minutes)
-        entry['verified'] = False
-        entry['attempts'] = entry.get('attempts', 0) + 1
-        entry['last_sent'] = now
 
+        # Update entry
+        entry.code = new_code
+        entry.expires_at = now + timedelta(minutes=self.code_expiration_minutes)
+        entry.verified = False
+        
+        # Increment attempts (logic duplicated slightly from store_code but needed here)
+        time_since_last = (now - entry.last_sent_at).total_seconds() / 60
+        if time_since_last >= self.rate_limit_window_minutes:
+            entry.attempts = 1
+        else:
+            entry.attempts += 1
+            
+        entry.last_sent_at = now
+
+        await db.commit()
         logger.info(f"Resent verification code for {email}")
 
         return True, new_code, None
 
-    def clear_verification(self, email: str) -> None:
+    async def clear_verification(self, email: str, db: AsyncSession) -> None:
         """Clear verification data for an email (after successful signup)"""
-        if email in self._cache:
-            del self._cache[email]
-            logger.info(f"Cleared verification data for {email}")
+        stmt = delete(SignupVerification).where(SignupVerification.email == email)
+        await db.execute(stmt)
+        # Caller handles commit to ensure atomicity with user creation
+        logger.info(f"Cleared verification data for {email}")
 
-    def cleanup_expired(self) -> int:
+    async def cleanup_expired(self, db: AsyncSession) -> int:
         """
-        Remove expired verification entries from cache
-        Returns number of entries removed
+        Remove expired verification entries
         """
         now = datetime.now(timezone.utc)
-        expired_emails = []
-
-        for email, entry in self._cache.items():
-            if now > entry['expires_at']:
-                expired_emails.append(email)
-
-        for email in expired_emails:
-            del self._cache[email]
-
-        if expired_emails:
-            logger.info(f"Cleaned up {len(expired_emails)} expired verification entries")
-
-        return len(expired_emails)
+        stmt = delete(SignupVerification).where(SignupVerification.expires_at < now)
+        result = await db.execute(stmt)
+        await db.commit()
+        
+        count = result.rowcount
+        if count > 0:
+            logger.info(f"Cleaned up {count} expired verification entries")
+        
+        return count
 
 
 # Global instance

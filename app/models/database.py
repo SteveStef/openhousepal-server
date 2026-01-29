@@ -450,3 +450,18 @@ class ScheduledEmail(Base):
     error_message = Column(Text, nullable=True)
     
     created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+
+
+class SignupVerification(Base):
+    __tablename__ = "signup_verifications"
+
+    email = Column(String, primary_key=True)
+    code = Column(String, nullable=False)
+    form_data = Column(JSON, nullable=False)
+    verified = Column(Boolean, default=False, nullable=False)
+    attempts = Column(Integer, default=0, nullable=False)
+    last_sent_at = Column(TZDateTime(timezone=True), nullable=False)
+    expires_at = Column(TZDateTime(timezone=True), nullable=False)
+    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+
+

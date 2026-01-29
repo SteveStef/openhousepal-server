@@ -67,16 +67,6 @@ class EmailSchedulerService:
                 return sent_count
                 
             except Exception as e:
-                logger.error(f"Error in email scheduler loop: {str(e)}")
                 return 0
 
-async def start_scheduler_loop():
-    """Background task to run the scheduler every 60 seconds"""
-    while True:
-        try:
-            await EmailSchedulerService.process_due_emails()
-        except Exception as e:
-            logger.error(f"Critical error in scheduler loop: {e}")
-        
-        # Wait for 60 seconds before next check
-        await asyncio.sleep(60)
+

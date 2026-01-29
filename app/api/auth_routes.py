@@ -71,7 +71,7 @@ async def send_verification_code(
             )
 
         # Check rate limit
-        can_send, error_msg = verification_service.can_send_code(user_data.email)
+        can_send, error_msg = await verification_service.can_send_code(user_data.email, db)
         if not can_send:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -89,7 +89,7 @@ async def send_verification_code(
             "brokerage": user_data.brokerage,
             "password": user_data.password  # Will be hashed by verification_service
         }
-        verification_service.store_code(user_data.email, code, form_data)
+        await verification_service.store_code(user_data.email, code, form_data, db)
 
         # Log code in development mode (emails are auto-masked by logging filter)
         if os.getenv("MAILGUN_DEV", "yes") == "yes":
@@ -130,7 +130,8 @@ async def send_verification_code(
 
 @router.post("/verify-code", status_code=status.HTTP_200_OK)
 async def verify_code(
-    request: dict
+    request: dict,
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Verify the 6-digit code sent to user's email.
@@ -145,7 +146,7 @@ async def verify_code(
         )
 
     # Verify the code
-    is_valid, error_msg = verification_service.verify_code(email, code)
+    is_valid, error_msg = await verification_service.verify_code(email, code, db)
 
     if not is_valid:
         raise HTTPException(
@@ -161,7 +162,8 @@ async def verify_code(
 
 @router.post("/resend-verification-code", status_code=status.HTTP_200_OK)
 async def resend_verification_code(
-    request: dict
+    request: dict,
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Resend a new verification code to the user's email.
@@ -175,7 +177,7 @@ async def resend_verification_code(
         )
 
     # Resend code
-    success, new_code, error_msg = verification_service.resend_code(email)
+    success, new_code, error_msg = await verification_service.resend_code(email, db)
 
     if not success:
         if "Too many" in error_msg:
@@ -190,8 +192,8 @@ async def resend_verification_code(
             )
 
     # Get form data to retrieve first name
-    entry = verification_service._cache.get(email)
-    first_name = entry['form_data'].get('first_name', 'User') if entry else 'User'
+    form_data = await verification_service.get_form_data(email, db)
+    first_name = form_data.get('first_name', 'User') if form_data else 'User'
 
     # Print code to console in development mode
     if os.getenv("MAILGUN_DEV", "yes") == "yes":
@@ -268,7 +270,8 @@ async def signup_with_subscription(
     """
     try:
         # Step 0: Check if email is verified
-        if not verification_service.is_verified(user_data.email):
+        is_verified = await verification_service.is_verified(user_data.email, db)
+        if not is_verified:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Email not verified. Please verify your email first."
@@ -316,86 +319,84 @@ async def signup_with_subscription(
                 detail="Invalid plan ID"
             )
 
-        # Step 5: Start atomic transaction
-        async with db.begin():
-            # Check if email already exists (database will lock this row)
-            existing_user = await UserService.get_user_by_email(db, user_data.email)
-            if existing_user:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Email already registered"
-                )
-
-            # Check if subscription already linked to another user
-            from sqlalchemy import select
-            result = await db.execute(
-                select(UserModel).where(UserModel.subscription_id == subscription_id)
+        # Step 5: Create User (Atomic with clearing verification via implicit transaction)
+        
+        # Check if email already exists (database will lock this row)
+        existing_user = await UserService.get_user_by_email(db, user_data.email)
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
             )
-            existing_subscription = result.scalar_one_or_none()
-            if existing_subscription:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Subscription already linked to another account"
-                )
 
-            # Handle Bundle Code marking as used
-            if bundle_code:
-                from app.models.database import BundleCode
-                code_result = await db.execute(
-                    select(BundleCode).where(BundleCode.code == bundle_code)
-                )
-                db_code = code_result.scalar_one_or_none()
-                if db_code:
-                    if db_code.is_used:
-                        raise HTTPException(status_code=400, detail="Promo code already used")
-                    db_code.is_used = True
-                    db_code.used_at = datetime.now(timezone.utc)
+        # Check if subscription already linked to another user
+        from sqlalchemy import select
+        result = await db.execute(
+            select(UserModel).where(UserModel.subscription_id == subscription_id)
+        )
+        existing_subscription = result.scalar_one_or_none()
+        if existing_subscription:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Subscription already linked to another account"
+            )
 
-            # Create user with subscription data
-            now = datetime.now(timezone.utc)
-            
-            # Extract next billing time from PayPal for accurate trial/billing tracking
-            billing_info = subscription_details.get('billing_info', {})
-            next_billing_time = billing_info.get('next_billing_time')
-            
-            if next_billing_time:
-                try:
-                    trial_end = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
-                except Exception:
-                    logger.warning("Failed to parse PayPal next_billing_time, falling back to trial period")
-                    # Fallback to 30 days or environment variable
-                    trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
-                    trial_end = now + timedelta(days=trial_days)
-            else:
+        # Handle Bundle Code marking as used
+        if bundle_code:
+            from app.models.database import BundleCode
+            code_result = await db.execute(
+                select(BundleCode).where(BundleCode.code == bundle_code)
+            )
+            db_code = code_result.scalar_one_or_none()
+            if db_code:
+                if db_code.is_used:
+                    raise HTTPException(status_code=400, detail="Promo code already used")
+                db_code.is_used = True
+                db_code.used_at = datetime.now(timezone.utc)
+
+        # Create user with subscription data
+        now = datetime.now(timezone.utc)
+        
+        # Extract next billing time from PayPal for accurate trial/billing tracking
+        billing_info = subscription_details.get('billing_info', {})
+        next_billing_time = billing_info.get('next_billing_time')
+        
+        if next_billing_time:
+            try:
+                trial_end = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
+            except Exception:
+                logger.warning("Failed to parse PayPal next_billing_time, falling back to trial period")
+                # Fallback to 30 days or environment variable
                 trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
                 trial_end = now + timedelta(days=trial_days)
+        else:
+            trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
+            trial_end = now + timedelta(days=trial_days)
 
-            new_user = UserModel(
-                email=user_data.email,
-                hashed_password=hash_password(user_data.password),
-                first_name=user_data.first_name,
-                last_name=user_data.last_name,
-                state=user_data.state,
-                brokerage=user_data.brokerage,
-                # Subscription fields
-                subscription_id=subscription_id,
-                plan_id=plan_id,
-                plan_tier=plan_tier,
-                subscription_status="TRIAL",
-                subscription_started_at=now,
-                trial_ends_at=trial_end,
-                next_billing_date=trial_end, # Set initial next billing date
-                last_paypal_sync=now
-            )
+        new_user = UserModel(
+            email=user_data.email,
+            hashed_password=hash_password(user_data.password),
+            first_name=user_data.first_name,
+            last_name=user_data.last_name,
+            state=user_data.state,
+            brokerage=user_data.brokerage,
+            # Subscription fields
+            subscription_id=subscription_id,
+            plan_id=plan_id,
+            plan_tier=plan_tier,
+            subscription_status="TRIAL",
+            subscription_started_at=now,
+            trial_ends_at=trial_end,
+            next_billing_date=trial_end, # Set initial next billing date
+            last_paypal_sync=now
+        )
 
-            db.add(new_user)
-            await db.flush()  # Get the ID before commit
-            await db.refresh(new_user)
-
-        # Transaction committed successfully - account and subscription linked atomically!
+        db.add(new_user)
+        await db.flush()  # Get the ID before commit
+        await db.refresh(new_user)
 
         # Clear verification data now that account is created
-        verification_service.clear_verification(new_user.email)
+        await verification_service.clear_verification(new_user.email, db)
 
         # Send welcome email
         email_service = EmailService()
@@ -431,9 +432,10 @@ async def signup_with_subscription(
         # Re-raise HTTP exceptions
         raise
     except Exception as e:
+        logger.error("Signup failed", exc_info=True, extra={"error": str(e), "email": user_data.email})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create account with subscription"
+            detail=f"Failed to create account with subscription: {str(e)}" 
         )
 
 @router.get("/users/{user_id}", response_model=User)
