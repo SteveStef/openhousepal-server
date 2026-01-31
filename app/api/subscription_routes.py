@@ -335,11 +335,18 @@ async def reactivate_subscription(
                 reason="Customer requested reactivation"
             )
             if not success:
-                raise Exception("PayPal returned failure")
+                logger.error(f"PayPal activation returned failure for subscription {current_user.subscription_id}")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="PayPal activation failed. The subscription may be in a state that cannot be reactivated."
+                )
         except Exception as e:
+            logger.error(f"Exception during PayPal reactivation for user {current_user.id}: {str(e)}", exc_info=True)
+            if isinstance(e, HTTPException):
+                raise e
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to reactivate subscription with PayPal. Please try again."
+                detail="Failed to reactivate subscription with PayPal. Please try again or contact support."
             )
 
         # Update database - set status to ACTIVE
@@ -552,12 +559,12 @@ async def create_new_subscription(
                 detail="Invalid plan_tier. Must be 'BASIC' or 'PREMIUM'"
             )
 
-        # Verify user has a cancelled or expired subscription
-        valid_statuses = ["CANCELLED", "EXPIRED"]
+        # Verify user has a cancelled, expired, or suspended subscription
+        valid_statuses = ["CANCELLED", "EXPIRED", "SUSPENDED"]
         if current_user.subscription_status not in valid_statuses:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot create new subscription with status: {current_user.subscription_status}. This endpoint is only for CANCELLED or EXPIRED subscriptions."
+                detail=f"Cannot create new subscription with status: {current_user.subscription_status}. This endpoint is for CANCELLED, EXPIRED, or SUSPENDED subscriptions."
             )
 
         # Get the appropriate no-trial plan ID (returning customers don't get trials)

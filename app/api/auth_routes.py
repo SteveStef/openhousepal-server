@@ -12,6 +12,7 @@ from app.services.paypal_service import paypal_service
 from app.utils.auth import create_access_token, get_current_active_user, hash_password
 from app.models.database import User as UserModel
 from app.services.verification_service import verification_service
+from app.services.discord_notifier import notifier 
 from app.config.logging import get_logger
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
@@ -366,11 +367,10 @@ async def signup_with_subscription(
                 trial_end = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
             except Exception:
                 logger.warning("Failed to parse PayPal next_billing_time, falling back to trial period")
-                # Fallback to 30 days or environment variable
-                trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
+                trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "14"))
                 trial_end = now + timedelta(days=trial_days)
         else:
-            trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
+            trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "14"))
             trial_end = now + timedelta(days=trial_days)
 
         new_user = UserModel(
@@ -412,6 +412,9 @@ async def signup_with_subscription(
 
         # Create access token
         access_token = create_access_token(data={"sub": new_user.id})
+        notifier.send(
+            f"{new_user.first_name} {new_user.last_name} from {new_user.brokerage} in {new_user.state}, has subscribed to OpenHousePal with {new_user.plan_tier} plan"
+        )
 
         return {
             "access_token": access_token,

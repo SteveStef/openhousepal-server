@@ -113,8 +113,7 @@ alembic.ini.backup
 propertyapi-current.json
 listingapi-example.json
 search_by_cords.json
-zillowAPI.md
-notes.md
+*.md
 
 # FastAPI development
 *.pid

@@ -10,7 +10,7 @@ import uuid
 import subprocess
 from dotenv import load_dotenv
 from app.api import router
-from app.utils.clean_cache import cleanup_expired_property_cache
+from app.utils.clean_cache import cleanup_expired_property_cache, cleanup_expired_signup_verifications
 from app.utils.property_sync_scheduler import scheduled_property_sync
 from app.services.paypal_service import PayPalService
 from app.services.email_scheduler_service import EmailSchedulerService
@@ -76,6 +76,14 @@ async def lifespan(app: FastAPI):
         CronTrigger(hour=cache_hour, minute=cache_mins),  # Daily at 2:00 AM
         id="cleanup_property_cache",
         name="Clean up expired property cache",
+        replace_existing=True
+    )
+
+    scheduler.add_job(
+        cleanup_expired_signup_verifications,
+        CronTrigger(hour=cache_hour, minute=cache_mins),  # Daily at 2:00 AM
+        id="cleanup_signup_verifications",
+        name="Clean up expired signup verifications",
         replace_existing=True
     )
 
