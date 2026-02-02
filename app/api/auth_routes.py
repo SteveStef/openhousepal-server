@@ -13,6 +13,7 @@ from app.utils.auth import create_access_token, get_current_active_user, hash_pa
 from app.models.database import User as UserModel
 from app.services.verification_service import verification_service
 from app.services.discord_notifier import notifier 
+from app.utils.subscription_sync import sync_subscription_status
 from app.config.logging import get_logger
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
@@ -479,6 +480,13 @@ async def login(
                 detail="Incorrect email or password",
             )
         
+        # This is for just incase the webhook for this user misses
+        if user.subscription_id:
+            try:
+                await sync_subscription_status(user, db)
+            except Exception as e:
+                logger.error(f"Failed to sync subscription on login for user {user.id}", exc_info=True)
+
         # Create access token
         access_token = create_access_token(
             data={"sub": user.id}

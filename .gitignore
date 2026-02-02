@@ -6,6 +6,9 @@
 collections.db
 maintain.md
 
+bright_test.py
+test_bright_service.py
+
 # Environment variables and secrets
 .env
 .env.local

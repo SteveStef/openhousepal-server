@@ -293,6 +293,9 @@ async def submit_open_house_form(
                     notification_link = None
                     if collection_result.get('success') and collection_result.get('collection_id'):
                         notification_link = f"/showcases?showcase={collection_result.get('collection_id')}"
+                    else:
+                        # Fallback to visitor list if no collection
+                        notification_link = f"/open-houses/visitors/{form_data.open_house_event_id}"
 
                     notification = Notification(
                         agent_id=open_house_event.agent_id,

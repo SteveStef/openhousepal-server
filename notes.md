@@ -89,3 +89,5 @@ Mount Path
 
 Also if payment fails -> you can reactivate or do cancel and start fresh (needs testing though)
 try every type of failure card: https://developer.paypal.com/tools/sandbox/card-testing/
+
+The case where the webhook does not send to the server, when the user logins in it will update all that users subscriptions stuff
