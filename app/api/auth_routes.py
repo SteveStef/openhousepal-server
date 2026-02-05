@@ -89,6 +89,7 @@ async def send_verification_code(
             "last_name": user_data.last_name,
             "state": user_data.state,
             "brokerage": user_data.brokerage,
+            "mls_id": user_data.mls_id,
             "password": user_data.password  # Will be hashed by verification_service
         }
         await verification_service.store_code(user_data.email, code, form_data, db)
@@ -381,6 +382,7 @@ async def signup_with_subscription(
             last_name=user_data.last_name,
             state=user_data.state,
             brokerage=user_data.brokerage,
+            mls_id=user_data.mls_id,
             # Subscription fields
             subscription_id=subscription_id,
             plan_id=plan_id,
@@ -427,6 +429,7 @@ async def signup_with_subscription(
                 "last_name": new_user.last_name,
                 "state": new_user.state,
                 "brokerage": new_user.brokerage,
+                "mls_id": new_user.mls_id,
                 "plan_tier": new_user.plan_tier,
                 "subscription_status": new_user.subscription_status
             }
@@ -501,7 +504,8 @@ async def login(
                 "first_name": user.first_name,
                 "last_name": user.last_name,
                 "state": user.state,
-                "brokerage": user.brokerage
+                "brokerage": user.brokerage,
+                "mls_id": user.mls_id
             }
         }
         

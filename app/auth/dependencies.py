@@ -29,7 +29,6 @@ async def get_current_user(
     )
     
     try:
-        # Decode JWT token
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
         if user_id is None:
@@ -37,13 +36,9 @@ async def get_current_user(
     except JWTError:
         raise credentials_exception
     
-    # Get user from database
     stmt = select(User).where(User.id == user_id)
     result = await db.execute(stmt)
     user = result.scalar_one_or_none()
-    
-    # if user is None or not user.is_active:
-    #     raise credentials_exception
     
     return user
 
@@ -58,3 +53,4 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+

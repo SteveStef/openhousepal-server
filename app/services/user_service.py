@@ -21,7 +21,8 @@ class UserService:
             first_name=user_data.first_name,
             last_name=user_data.last_name,
             state=user_data.state,
-            brokerage=user_data.brokerage
+            brokerage=user_data.brokerage,
+            mls_id=user_data.mls_id
         )
         
         try:

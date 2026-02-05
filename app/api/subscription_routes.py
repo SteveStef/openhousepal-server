@@ -57,8 +57,6 @@ async def upgrade_subscription(
                 detail="No subscription found for this user"
             )
 
-        # Build return URLs - just redirect back to subscription page
-        # Webhook will handle updating the database with new plan
         return_url = f"{CLIENT_URL}/settings/subscription"
         cancel_url = f"{CLIENT_URL}/settings/subscription"
 

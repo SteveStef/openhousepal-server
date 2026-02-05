@@ -24,6 +24,7 @@ class User(Base):
     last_name = Column(String, nullable=True)
     state = Column(String, nullable=True)  # Agent's state
     brokerage = Column(String, nullable=True)  # Agent's brokerage
+    mls_id = Column(String, nullable=True)  # Agent's MLS ID
     created_at = Column(TZDateTime(timezone=True), server_default=func.now())
 
     # PayPal subscription fields

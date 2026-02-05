@@ -324,7 +324,7 @@ async def update_collection_status(
             )
             if not can_activate:
                 active_count = await CollectionsService.count_active_collections(db, current_user.id)
-                max_active = int(os.getenv("MAX_ACTIVE_COLLECTIONS_PER_USER", "10"))
+                max_active = int(os.getenv("MAX_ACTIVE_COLLECTIONS_PER_USER", "50"))
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Cannot activate collection. You have reached the maximum of {max_active} active collections (currently {active_count}). Please deactivate another collection first."

@@ -39,14 +39,14 @@ class CollectionsService:
     @staticmethod
     async def should_create_as_active(db: AsyncSession, user_id: str) -> bool:
         """Check if a new collection should be created as active (under the limit)"""
-        max_active = int(os.getenv("MAX_ACTIVE_COLLECTIONS_PER_USER", "10"))
+        max_active = int(os.getenv("MAX_ACTIVE_COLLECTIONS_PER_USER", "50"))
         active_count = await CollectionsService.count_active_collections(db, user_id)
         return active_count < max_active
 
     @staticmethod
     async def can_activate_collection(db: AsyncSession, user_id: str, collection_id: str) -> bool:
         """Check if a collection can be activated without exceeding the limit"""
-        max_active = int(os.getenv("MAX_ACTIVE_COLLECTIONS_PER_USER", "10"))
+        max_active = int(os.getenv("MAX_ACTIVE_COLLECTIONS_PER_USER", "50"))
 
         # Get current collection status
         current_collection = await db.execute(
