@@ -215,17 +215,43 @@ class BrightMlsService:
             'listAgentEmail': item.get("ListAgentEmail")
         }
 
-    def _map_reso_facts(self, item: Dict[str, Any]) -> Dict[str, Any]:
+    def _map_property_details(self, item: Dict[str, Any], images: List[str] = None) -> Dict[str, Any]:
         """
-        Maps Bright MLS fields to the ResoFacts table structure.
+        Maps Bright MLS fields to the PropertyDetails table structure.
         """
+        # Format photos for storage
+        photos = []
+        if images:
+            for img_url in images:
+                photos.append({
+                    "caption": "",
+                    "url": img_url,
+                    "mixedSources": {
+                        "jpeg": [{"url": img_url, "width": 0}],
+                        "webp": []
+                    }
+                })
+
         return {
+            # Narrative & Media
+            "description": item.get("PublicRemarks", ""),
+            "photos": photos,
+            
+            # Listing Agent & Office
+            "list_agent_full_name": item.get("ListAgentFullName"),
+            "list_agent_email": item.get("ListAgentEmail"),
+            "list_office_name": item.get("ListOfficeName"),
+            "list_office_phone": item.get("ListOfficePhone"),
+
+            # Core Structural & Exterior
             "architectural_style": item.get("ArchitecturalStyle"),
             "construction_materials": item.get("ConstructionMaterials"),
             "roof_type": item.get("Roof"),
             "foundation_details": item.get("FoundationDetails"),
             "structure_type": item.get("StructureType"),
             "levels": item.get("Levels"),
+            
+            # Interior & Features
             "interior_features": item.get("InteriorFeatures"),
             "exterior_features": item.get("ExteriorFeatures"),
             "flooring": item.get("Flooring"),
@@ -234,28 +260,40 @@ class BrightMlsService:
             "fireplace_features": item.get("FireplaceFeatures"),
             "door_features": item.get("DoorFeatures"),
             "window_features": item.get("WindowFeatures"),
+            
+            # Utilities & Systems
             "cooling": item.get("Cooling"),
             "heating": item.get("Heating"),
             "water_source": item.get("WaterSource"),
             "sewer": item.get("Sewer"),
             "electric": item.get("Electric"),
             "utilities": item.get("Utilities"),
+            
+            # Parking
             "garage_spaces": item.get("GarageSpaces"),
             "parking_features": item.get("ParkingFeatures"),
             "has_garage": item.get("GarageYN"),
+            
+            # Community & HOA
             "association_fee": item.get("AssociationFee"),
             "association_fee_frequency": item.get("AssociationFeeFrequency"),
             "association_amenities": item.get("AssociationAmenities"),
             "association_fee_includes": item.get("AssociationFeeIncludes"),
             "has_association": item.get("AssociationYN"),
+            
+            # Lot & Location
             "lot_features": item.get("LotFeatures"),
             "topography": item.get("Topography"),
             "view": item.get("View"),
             "waterfront_features": item.get("WaterfrontFeatures"),
             "has_waterfront_view": item.get("WaterfrontYN"),
             "has_view": item.get("ViewYN"),
+            
+            # Tax & Financial
             "tax_annual_amount": item.get("TaxAnnualAmount"),
             "tax_year": item.get("TaxYear"),
+            
+            # Dates
             "year_built": item.get("YearBuilt"),
             "modification_timestamp": item.get("ModificationTimestamp")
         }
@@ -445,15 +483,10 @@ class BrightMlsService:
                     image_url = item.get("ListPictureURL") # removes this line in prod
                     images.append(image_url) # remove this line in prod
 
-                    for img_url in images:
-                        original_photos.append({
-                            "caption": "",
-                            "mixedSources": {
-                                "jpeg": [{"url": img_url, "width": 0}],
-                                "webp": []
-                            }
-                        })
+                    # Map to PropertyDetails structure
+                    details_data = self._map_property_details(item, images)
                     
+                    # Merge with basic property data for immediate use
                     response_data = {
                         'listing_key': mapped_data['listing_key'],
                         'abbreviatedAddress': mapped_data['address'],
@@ -472,19 +505,10 @@ class BrightMlsService:
                         'homeType': mapped_data['home_type'],
                         'latitude': mapped_data['latitude'],
                         'longitude': mapped_data['longitude'],
-                        'description': item.get("PublicRemarks", ""),
-                        'listOfficeName': mapped_data.get('listOfficeName'),
-                        'listOfficePhone': mapped_data.get('listOfficePhone'),
-                        'listAgentFullName': mapped_data.get('listAgentFullName'),
-                        'listAgentEmail': mapped_data.get('listAgentEmail'),
-                        'originalPhotos': original_photos, # Populate photos
-                        'resoFacts': self._map_reso_facts(item) if details else None
+                        'details': details_data # Include full details
                     }
 
-                    if details:
-                        return ZillowPropertyDetailResponse(**response_data)
-                    else:
-                        return PropertyDetailResponse(**response_data)
+                    return response_data
                 else:
                     raise HTTPException(status_code=response.status_code, detail="Provider Error")
         except Exception as e:

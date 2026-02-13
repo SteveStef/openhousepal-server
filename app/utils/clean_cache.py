@@ -1,7 +1,7 @@
-from datetime import datetime, timedelta
-from sqlalchemy import update
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.models.database import Property
+from app.models.database import PropertyDetails
 from app.database import AsyncSessionLocal
 from app.config.logging import get_logger
 from app.services.verification_service import verification_service
@@ -10,20 +10,17 @@ import os
 logger = get_logger(__name__)
 
 async def cleanup_expired_property_cache():
-    """Remove expired property cache data"""
+    """Remove expired property cache data from PropertyDetails table"""
     cache_expiry_hours = int(os.getenv("CACHE_EXPIRY_HOURS", 3))
     logger.info("Starting property cache cleanup", extra={"cache_expiry_hours": cache_expiry_hours})
 
     try:
         async with AsyncSessionLocal() as db:
-            cutoff_time = datetime.utcnow() - timedelta(hours=cache_expiry_hours)
+            cutoff_time = datetime.now(timezone.utc) - timedelta(hours=cache_expiry_hours)
 
-            stmt = update(Property).where(
-                Property.detailed_data_cached_at < cutoff_time
-            ).values(
-                detailed_property=None,
-                detailed_data_cached=False,
-                detailed_data_cached_at=None
+            # Now we delete the entire record from PropertyDetails when it expires
+            stmt = delete(PropertyDetails).where(
+                PropertyDetails.updated_at < cutoff_time
             )
 
             result = await db.execute(stmt)

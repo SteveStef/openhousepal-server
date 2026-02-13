@@ -101,36 +101,46 @@ class Property(Base):
     
     img_src = Column(String, nullable=True)
     
-    # Property details caching
-    detailed_property= Column(JSON, nullable=True)  # Keep for backward compatibility/caching
-    detailed_data_cached = Column(Boolean, default=False)
-    detailed_data_cached_at = Column(TZDateTime(timezone=True), nullable=True)
-    
     created_at = Column(TZDateTime(timezone=True), server_default=func.now())
     updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
     
     # Relationships
     collections = relationship("Collection", secondary=collection_properties, back_populates="properties")
-    reso_facts = relationship("ResoFacts", back_populates="property", uselist=False, cascade="all, delete-orphan")
+    details = relationship("PropertyDetails", back_populates="property", uselist=False, cascade="all, delete-orphan")
 
 
-class ResoFacts(Base):
-    __tablename__ = "reso_facts"
+class PropertyDetails(Base):
+    __tablename__ = "property_details"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     property_id = Column(String, ForeignKey('properties.id', ondelete='CASCADE'), unique=True, nullable=False)
 
+    # Narrative & Media
+    description = Column(Text, nullable=True)
+    photos = Column(JSON, nullable=True)  # List of photo objects/URLs
+    
+    # Listing Agent & Office
+    list_agent_full_name = Column(String, nullable=True)
+    list_agent_email = Column(String, nullable=True)
+    list_office_name = Column(String, nullable=True)
+    list_office_phone = Column(String, nullable=True)
+
+    # History
+    price_history = Column(JSON, nullable=True)
+    tax_history = Column(JSON, nullable=True)
+    open_house_schedule = Column(JSON, nullable=True)
+
     # Core Structural & Exterior
-    architectural_style = Column(String, nullable=True)
-    construction_materials = Column(String, nullable=True) # Stored as comma-separated string or JSON if preferred, using String for simplicity
-    roof_type = Column(String, nullable=True)
-    foundation_details = Column(String, nullable=True)
-    structure_type = Column(String, nullable=True)
-    levels = Column(String, nullable=True)
+    architectural_style = Column(JSON, nullable=True)
+    construction_materials = Column(JSON, nullable=True)
+    roof_type = Column(JSON, nullable=True)
+    foundation_details = Column(JSON, nullable=True)
+    structure_type = Column(JSON, nullable=True)
+    levels = Column(JSON, nullable=True)
     
     # Interior & Features
-    interior_features = Column(JSON, nullable=True) # List of features
-    exterior_features = Column(JSON, nullable=True) # List of features
+    interior_features = Column(JSON, nullable=True)
+    exterior_features = Column(JSON, nullable=True)
     flooring = Column(JSON, nullable=True)
     appliances = Column(JSON, nullable=True)
     fireplaces = Column(Integer, nullable=True)
@@ -160,7 +170,7 @@ class ResoFacts(Base):
     
     # Lot & Location
     lot_features = Column(JSON, nullable=True)
-    topography = Column(String, nullable=True)
+    topography = Column(JSON, nullable=True)
     view = Column(JSON, nullable=True)
     waterfront_features = Column(JSON, nullable=True)
     has_waterfront_view = Column(Boolean, nullable=True)
@@ -178,7 +188,7 @@ class ResoFacts(Base):
     updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
 
     # Relationship
-    property = relationship("Property", back_populates="reso_facts")
+    property = relationship("Property", back_populates="details")
 
 
 class OpenHouseEvent(Base):
