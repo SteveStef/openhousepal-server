@@ -82,7 +82,8 @@ async def create_open_house(
             bathrooms=property_data.get('bathrooms'),
             living_area=safe_int(property_data.get('livingArea')),
             price=safe_int(property_data.get('price')),
-            home_status=property_data.get('homeStatus')
+            home_status=property_data.get('homeStatus'),
+            similar_properties_snapshot=request.similar_properties_snapshot
         )
         
         db.add(open_house)
@@ -92,15 +93,17 @@ async def create_open_house(
         return OpenHouseResponse(
             id=open_house.id,
             open_house_event_id=open_house.id,
+            agent_id=open_house.agent_id,
             address=open_house.address,
             cover_image_url=open_house.cover_image_url,
             qr_code_url=open_house.qr_code,
             form_url=open_house.form_url,
             bedrooms=open_house.bedrooms,
             bathrooms=open_house.bathrooms,
-            living_area=open_house.lot_size,
+            living_area=open_house.living_area,
             price=open_house.price,
             city=open_house.city,
+            similar_properties_snapshot=open_house.similar_properties_snapshot,
             created_at=open_house.created_at
         )
         
@@ -142,16 +145,18 @@ async def get_open_houses(
             response_list.append(OpenHouseResponse(
                 id=oh.id,
                 open_house_event_id=oh.id,
+                agent_id=oh.agent_id,
                 address=oh.address or "Unknown Address",
                 cover_image_url=oh.cover_image_url or "",
-                qr_code_url=oh.qr_code,
+                qr_code_url=oh.qr_code or "",
                 form_url=oh.form_url or f"/open-house/{oh.id}",
-                bedrooms=safe_int(oh.bedrooms),
+                bedrooms=oh.bedrooms,
                 bathrooms=oh.bathrooms,
-                living_area=safe_int(oh.living_area),
-                price=safe_int(oh.price),
+                living_area=oh.living_area,
+                price=oh.price,
                 city=oh.city,
                 notes=oh.notes,
+                similar_properties_snapshot=oh.similar_properties_snapshot,
                 created_at=oh.created_at
             ))
         

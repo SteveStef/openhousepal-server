@@ -6,8 +6,8 @@ import asyncio
 from fastapi import HTTPException
 from datetime import datetime
 
-from app.schemas.collection_preferences import CollectionPreferences as CollectionPreferencesSchema
-from app.models.property import PropertyDetailResponse, ZillowPropertyDetailResponse
+from app.schemas.collection_preferences import CollectionPreferencesBase as CollectionPreferencesSchema
+from app.models.property import PropertyDetailResponse
 from app.config.logging import get_logger
 
 # Get logger from centralized config
@@ -28,8 +28,8 @@ class BrightMlsService:
         self.is_prod = os.getenv("BRIGHT_MLS_ENV", "test").lower() == "prod"
         
         if self.is_prod:
-            self.token_url = "https://brightmls.okta.com/oauth2/default/v1/token"
-            self.api_base_url = "https://bright-reso.brightmls.com/RESO/OData/bright"
+            self.token_url = os.getenv("BRIGHT_TOKEN_URL")
+            self.api_base_url = os.getenv("BRIGHT_BASE_URL")
         else:
             self.token_url = "https://brightmls-test.okta.com/oauth2/default/v1/token"
             self.api_base_url = "https://bright-reso.tst.brightmls.com/RESO/OData/bright"
@@ -58,7 +58,7 @@ class BrightMlsService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(self.token_url, data=payload)
                 response.raise_for_status()
                 data = response.json()
@@ -193,11 +193,12 @@ class BrightMlsService:
         
         return {
             'listing_key': listing_key,
-            'mlsId': listing_id,
+            'mls_id': listing_id,
             'address': address,
             'city': city,
             'state': state,
             'zipcode': zipcode,
+            'county': item.get("County"),
             'price': price,
             'bedrooms': bedrooms,
             'bathrooms': bathrooms,
@@ -205,14 +206,15 @@ class BrightMlsService:
             'lot_size': lot_size,
             'home_type': home_type,
             'home_status': home_status,
+            'days_on_market': item.get("DaysOnMarket"),
             'latitude': item.get("Latitude"),
             'longitude': item.get("Longitude"),
             'image_url': image_url,
-            'yearBuilt': year_built,
-            'listOfficeName': item.get("ListOfficeName"),
-            'listOfficePhone': item.get("ListOfficePhone"),
-            'listAgentFullName': item.get("ListAgentFullName"),
-            'listAgentEmail': item.get("ListAgentEmail")
+            'year_built': year_built,
+            'list_office_name': item.get("ListOfficeName"),
+            'list_office_phone': item.get("ListOfficePhone"),
+            'list_agent_full_name': item.get("ListAgentFullName"),
+            'list_agent_email': item.get("ListAgentEmail")
         }
 
     def _map_property_details(self, item: Dict[str, Any], images: List[str] = None) -> Dict[str, Any]:
@@ -271,11 +273,14 @@ class BrightMlsService:
             
             # Parking
             "garage_spaces": item.get("GarageSpaces"),
+            "garage_parking_capacity": item.get("GarageSpaces"),
+            "parking_capacity": item.get("GarageSpaces"),
             "parking_features": item.get("ParkingFeatures"),
             "has_garage": item.get("GarageYN"),
             
             # Community & HOA
             "association_fee": item.get("AssociationFee"),
+            "hoa_fee": item.get("AssociationFee"),
             "association_fee_frequency": item.get("AssociationFeeFrequency"),
             "association_amenities": item.get("AssociationAmenities"),
             "association_fee_includes": item.get("AssociationFeeIncludes"),
@@ -283,11 +288,15 @@ class BrightMlsService:
             
             # Lot & Location
             "lot_features": item.get("LotFeatures"),
+            "lot_size": item.get("LotSizeSquareFeet"),
             "topography": item.get("Topography"),
             "view": item.get("View"),
             "waterfront_features": item.get("WaterfrontFeatures"),
             "has_waterfront_view": item.get("WaterfrontYN"),
             "has_view": item.get("ViewYN"),
+            
+            # Dimensions
+            "living_area": item.get("LivingArea"),
             
             # Tax & Financial
             "tax_annual_amount": item.get("TaxAnnualAmount"),
@@ -295,7 +304,51 @@ class BrightMlsService:
             
             # Dates
             "year_built": item.get("YearBuilt"),
-            "modification_timestamp": item.get("ModificationTimestamp")
+            "modification_timestamp": item.get("ModificationTimestamp"),
+            
+            # Education
+            "elementary_school": item.get("ElementarySchool"),
+            "elementary_school_district": item.get("ElementarySchoolDistrict"),
+            "middle_or_junior_school_district": item.get("MiddleOrJuniorSchoolDistrict"),
+            "middle_or_junior_school": item.get("MiddleOrJuniorSchool"),
+            "high_school": item.get("HighSchool"),
+            "high_school_district": item.get("HighSchoolDistrict"),
+            "school_district_name": item.get("SchoolDistrictName"),
+            
+            # Neighborhood & Location
+            "county": item.get("County"),
+            "directions": item.get("Directions"),
+            "cross_street": item.get("CrossStreet"),
+            "walk_score": item.get("WalkScore"),
+            "zoning": item.get("Zoning"),
+            "direction_faces": item.get("DirectionFaces"),
+            
+            # Financials
+            "tax_assessment_amount": item.get("TaxAssessmentAmount"),
+            "land_assessment_amount": item.get("LandAssessmentAmount"),
+            "improvement_assessment_amount": item.get("ImprovementAssessmentAmount"),
+            "assessment_year": item.get("AssessmentYear"),
+            "capital_contribution_fee": item.get("CapitalContributionFee"),
+            "possession": item.get("Possession"),
+            
+            # Detailed Features
+            "cooling_fuel": item.get("CoolingFuel"),
+            "heating_fuel": item.get("HeatingFuel"),
+            "lot_size_acres": item.get("LotSizeAcres"),
+            "attached_garage_yn": item.get("AttachedGarageYN"),
+            "new_construction_yn": item.get("NewConstructionYN"),
+            "senior_community_yn": item.get("SeniorCommunityYN"),
+            "pets_allowed": item.get("PetsAllowed"),
+            
+            # Listing Intelligence
+            "original_list_price": item.get("OriginalListPrice"),
+            "days_on_market": item.get("DaysOnMarket"),
+            "cumulative_days_on_market": item.get("CumulativeDaysOnMarket"),
+            "standard_status": item.get("StandardStatus"),
+            
+            # Structure
+            "stories": item.get("Stories"),
+            "stories_total": item.get("StoriesTotal")
         }
 
     async def _fetch_property_images(self, listing_key: str, limit: int = 1) -> List[str]:
@@ -312,18 +365,19 @@ class BrightMlsService:
         }
         
         # Query BrightMedia linked to the listing
-        # ResourceRecordKey is the standard foreign key to the Property table
+        # ResourceRecordKey is an integer in Bright MLS RESO API
         url = f"{self.api_base_url}/BrightMedia"
         params = {
-            "$filter": f"ResourceRecordKey eq '{listing_key}' and MediaCategory eq 'Photo'",
-            "$orderby": "Order",
+            "$filter": f"ResourceRecordKey eq {listing_key} and MediaCategory eq 'Photo'",
+            "$orderby": "MediaDisplayOrder",
             "$top": limit,
             "$select": "MediaURL"
         }
         
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(url, headers=headers, params=params)
+                
                 if response.status_code == 200:
                     data = response.json()
                     return [item.get("MediaURL") for item in data.get("value", []) if item.get("MediaURL")]
@@ -331,6 +385,89 @@ class BrightMlsService:
             logger.warning(f"Failed to fetch images for listing {listing_key}: {e}")
         
         return []
+
+    async def get_properties_by_keys(self, listing_keys: List[str]) -> List[Dict[str, Any]]:
+        """
+        Fetch multiple properties by their listing keys.
+        Useful for retrieving curated neighbor lists.
+        """
+        if not listing_keys:
+            return []
+            
+        token = await self._get_access_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json"
+        }
+        
+        # OData 'in' operator for multiple keys
+        # Format: ListingKey in (123, 456, ...)
+        formatted_keys = []
+        for key in listing_keys:
+            # Handle numeric vs string keys for OData
+            if isinstance(key, str) and not key.isdigit():
+                formatted_keys.append(f"'{key}'")
+            else:
+                formatted_keys.append(str(key))
+                
+        odata_filter = f"ListingKey in ({','.join(formatted_keys)})"
+        
+        select_fields = [
+            "ListingKey", "ListingId", "ListPrice", "UnparsedAddress", "City", 
+            "StateOrProvince", "PostalCode", "BedroomsTotal", "BathroomsTotalInteger", 
+            "BathroomsFull", "BathroomsHalf", "LivingArea", "LotSizeSquareFeet", 
+            "YearBuilt", "MlsStatus", "PropertyType", "ListPictureURL", 
+            "Latitude", "Longitude", "DaysOnMarket"
+        ]
+        
+        url = f"{self.api_base_url}/BrightProperties"
+        params = {
+            "$filter": odata_filter,
+            "$select": ",".join(select_fields)
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url, headers=headers, params=params)
+                if response.status_code != 200:
+                    logger.error(f"MLS API Error {response.status_code}: {response.text}")
+                    return []
+                
+                data = response.json()
+                mapped_items = []
+                
+                # Pre-map everything
+                for item in data.get("value", []):
+                    mapped_items.append(self._map_bright_to_app_model(item))
+                
+                # Batch fetch images only for those that need them
+                # Limit concurrency to 5 at a time to prevent timeout/rate-limiting
+                semaphore = asyncio.Semaphore(5)
+                
+                async def fetch_with_sem(listing_key):
+                    async with semaphore:
+                        return await self._fetch_property_images(listing_key, limit=1)
+
+                image_tasks = []
+                task_indices = []
+                
+                for i, mapped in enumerate(mapped_items):
+                    if not mapped.get('image_url'):
+                        image_tasks.append(fetch_with_sem(mapped['listing_key']))
+                        task_indices.append(i)
+                
+                if image_tasks:
+                    image_results = await asyncio.gather(*image_tasks, return_exceptions=True)
+                    for result, idx in zip(image_results, task_indices):
+                        if isinstance(result, list) and len(result) > 0:
+                            mapped_items[idx]['image_url'] = result[0]
+                        elif isinstance(result, Exception):
+                            logger.warning(f"Failed image fetch for {mapped_items[idx]['listing_key']}: {result}")
+                            
+                return mapped_items
+        except Exception as e:
+            logger.error(f"Error fetching properties by keys ({odata_filter}): {str(e)}", exc_info=True)
+            return []
 
     async def get_matching_properties_by_locations(
         self,
@@ -386,10 +523,13 @@ class BrightMlsService:
             }
         
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 # Rate limiting removed
                 response = await client.get(url, headers=headers, params=params)
-                response.raise_for_status()
+                if response.status_code != 200:
+                    logger.error(f"Bright MLS Search Failed: {response.status_code} - {response.text}")
+                    return []
+                
                 data = response.json()
                 
                 results = []
@@ -431,9 +571,9 @@ class BrightMlsService:
             logger.error(f"Error searching Bright MLS: {e}")
             return []
 
-    async def get_property_by_address(self, address: str, details: bool = False):
+    async def get_property_by_address(self, address: str, details: bool = False, listing_key: str = None):
         """
-        Get property details by address.
+        Get property details by address or listing_key.
         """
         token = await self._get_access_token()
         headers = {
@@ -444,54 +584,99 @@ class BrightMlsService:
         url = f"{self.api_base_url}/BrightProperties"
         
         if not self.is_prod:
-            logger.info(f"BrightMlsService: Running in TEST mode. Ignoring address '{address}' and returning top 1.")
+            logger.info(f"BrightMlsService: Running in TEST mode. Ignoring search criteria and returning top 1.")
             params = {
                 "$top": 1
             }
+        elif listing_key:
+            logger.info(f"BrightMlsService: Searching by listing_key: {listing_key}")
+            params = {
+                "$filter": f"ListingKey eq {listing_key}",
+                "$top": 1
+            }
         else:
-            # Construct filter
-            # Note: Ideally we parse the address into Number, Street, etc. for better accuracy
-            # For now, we try UnparsedAddress
-            filter_str = f"UnparsedAddress eq '{address}'"
+            # Robust address parsing for optimized OData query
+            import re
+            parts = [p.strip() for p in address.split(',')]
+            street_part = parts[0]
+            
+            # 1. Extract Zip Code (usually the last part or near it)
+            zip_code = None
+            for part in reversed(parts):
+                zip_match = re.search(r'\b\d{5}\b', part)
+                if zip_match:
+                    zip_code = zip_match.group(0)
+                    break
+            
+            # 2. Try to split Street Part into Number and Name
+            # StreetNumber and PostalCode are highly indexed in Bright MLS
+            street_match = re.match(r'^(\d+)\s+(.*)$', street_part)
+            
+            if street_match:
+                number = street_match.group(1)
+                full_name = street_match.group(2).strip()
+                
+                # Take only the first word of the street name to be more resilient to suffixes
+                # e.g. "Camp Woods Rd" -> "Camp"
+                first_word = full_name.split(' ')[0]
+                
+                # Build the highly optimized compound filter
+                conditions = [f"StreetNumber eq '{number}'"]
+                
+                if first_word:
+                    conditions.append(f"contains(StreetName, '{first_word}')")
+                
+                if zip_code:
+                    conditions.append(f"PostalCode eq '{zip_code}'")
+                
+                filter_str = " and ".join(conditions)
+                logger.info(f"BrightMlsService: Optimized search: {filter_str}")
+            else:
+                # Fallback to UnparsedAddress if we can't parse the number
+                logger.info(f"BrightMlsService: Falling back to UnparsedAddress search for: {street_part}")
+                filter_str = f"contains(UnparsedAddress, '{street_part}')"
+                if zip_code:
+                    filter_str += f" and PostalCode eq '{zip_code}'"
+            
             params = {
                 "$filter": filter_str,
                 "$top": 1
             }
         
         try:
-            async with httpx.AsyncClient() as client:
+            start_time = datetime.now()
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                logger.info(f"BrightMlsService: Requesting {url} with params: {params}")
                 response = await client.get(url, headers=headers, params=params)
+                fetch_time = (datetime.now() - start_time).total_seconds()
+                logger.info(f"BrightMlsService: Property fetch took {fetch_time:.2f}s (Status: {response.status_code})")
                 
                 if response.status_code == 200:
                     data = response.json()
                     items = data.get("value", [])
                     if not items:
-                        raise HTTPException(status_code=404, detail="Property not found")
+                        logger.warning(f"BrightMlsService: No properties found for filter: {params.get('$filter')}")
+                        raise HTTPException(status_code=404, detail="Property not found on MLS")
                     
                     item = items[0]
                     mapped_data = self._map_bright_to_app_model(item)
                     
                     # Fetch images
+                    img_start = datetime.now()
                     images = await self._fetch_property_images(mapped_data['listing_key'], limit=10)
-                    primary_photo = images[0] if images else None
+                    img_time = (datetime.now() - img_start).total_seconds()
+                    logger.info(f"BrightMlsService: Image fetch took {img_time:.2f}s")
                     
-                    # Format photos for ZillowPropertyDetailResponse
-
-                    original_photos = []
-
-                    # TODO
-                    image_url = item.get("ListPictureURL") # removes this line in prod
-                    images.append(image_url) # remove this line in prod
-
-                    # Map to PropertyDetails structure
+                    # Map to PropertyDetails structure (snake_case for DB compatibility)
                     details_data = self._map_property_details(item, images)
                     
                     # Merge with basic property data for immediate use
                     response_data = {
                         'listing_key': mapped_data['listing_key'],
-                        'abbreviatedAddress': mapped_data['address'],
+                        'mls_id': mapped_data['mls_id'],
+                        'abbreviated_address': mapped_data['address'],
                         'address': {
-                            'streetAddress': mapped_data['address'],
+                            'street_address': mapped_data['address'],
                             'city': mapped_data['city'],
                             'state': mapped_data['state'],
                             'zipcode': mapped_data['zipcode']
@@ -499,20 +684,39 @@ class BrightMlsService:
                         'price': mapped_data['price'],
                         'bedrooms': mapped_data['bedrooms'],
                         'bathrooms': mapped_data['bathrooms'],
-                        'livingArea': mapped_data['living_area'],
-                        'yearBuilt': mapped_data['yearBuilt'],
-                        'homeStatus': mapped_data['home_status'],
-                        'homeType': mapped_data['home_type'],
+                        'living_area': mapped_data['living_area'],
+                        'year_built': mapped_data['year_built'],
+                        'home_status': mapped_data['home_status'],
+                        'home_type': mapped_data['home_type'],
+                        'days_on_market': mapped_data.get('days_on_market'),
                         'latitude': mapped_data['latitude'],
                         'longitude': mapped_data['longitude'],
-                        'details': details_data # Include full details
+                        'description': details_data.get('description'),
+                        'list_office_name': mapped_data['list_office_name'],
+                        'list_office_phone': mapped_data['list_office_phone'],
+                        'list_agent_full_name': mapped_data['list_agent_full_name'],
+                        'list_agent_email': mapped_data['list_agent_email'],
+                        'original_photos': [
+                            {
+                                "caption": p.get("caption", ""),
+                                "mixed_sources": {
+                                    "jpeg": [{"url": p.get("url"), "width": 0}],
+                                    "webp": []
+                                }
+                            } for p in (details_data.get('photos') or [])
+                        ],
+                        'reso_facts': details_data,
+                        'details': details_data # Keep for backward compatibility
                     }
 
                     return response_data
                 else:
-                    raise HTTPException(status_code=response.status_code, detail="Provider Error")
+                    logger.error(f"BrightMlsService: API returned error {response.status_code}: {response.text}")
+                    raise HTTPException(status_code=response.status_code, detail="MLS Provider Error")
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error(f"Error fetching property details: {e}")
+            logger.error("Error fetching property details", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
     async def get_matching_properties(self, preferences: CollectionPreferencesSchema, max_properties: Optional[int] = None) -> List[Dict[str, Any]]:

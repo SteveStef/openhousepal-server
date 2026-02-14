@@ -90,8 +90,8 @@ class Property(Base):
     zestimate = Column(Integer, nullable=True)
     bedrooms = Column(Integer, nullable=True)
     bathrooms = Column(Float, nullable=True)
-    living_area = Column(Integer, nullable=True)
-    lot_size = Column(Integer, nullable=True)
+    living_area = Column(Float, nullable=True)
+    lot_size = Column(Float, nullable=True)
     home_type = Column(String, nullable=True)
     home_status = Column(String, nullable=True)
 
@@ -184,6 +184,48 @@ class PropertyDetails(Base):
     year_built = Column(Integer, nullable=True)
     modification_timestamp = Column(TZDateTime(timezone=True), nullable=True)
     
+    # Education
+    elementary_school = Column(String, nullable=True)
+    middle_or_junior_school = Column(String, nullable=True)
+    high_school = Column(String, nullable=True)
+    school_district_name = Column(String, nullable=True)
+    
+    # Neighborhood & Location
+    county = Column(String, nullable=True)
+    directions = Column(Text, nullable=True)
+    cross_street = Column(String, nullable=True)
+    walk_score = Column(Integer, nullable=True)
+    zoning = Column(String, nullable=True)
+    direction_faces = Column(String, nullable=True)
+    
+    # Financials (More detail)
+    tax_assessment_amount = Column(Integer, nullable=True)
+    land_assessment_amount = Column(Integer, nullable=True)
+    improvement_assessment_amount = Column(Integer, nullable=True)
+    assessment_year = Column(Integer, nullable=True)
+    capital_contribution_fee = Column(Integer, nullable=True)
+    possession = Column(JSON, nullable=True)
+    
+    # Detailed Features
+    cooling_fuel = Column(JSON, nullable=True)
+    heating_fuel = Column(JSON, nullable=True)
+    lot_size_acres = Column(Float, nullable=True)
+    attached_garage_yn = Column(Boolean, nullable=True)
+    new_construction_yn = Column(Boolean, nullable=True)
+    senior_community_yn = Column(Boolean, nullable=True)
+    pets_allowed = Column(JSON, nullable=True)
+    
+    # Listing Intelligence
+    original_list_price = Column(Integer, nullable=True)
+    days_on_market = Column(Integer, nullable=True)
+    cumulative_days_on_market = Column(Integer, nullable=True)
+    standard_status = Column(String, nullable=True)
+    
+    # Structure
+    stories = Column(Float, nullable=True)
+    stories_total = Column(Float, nullable=True)
+    lot_size = Column(Float, nullable=True)
+    
     created_at = Column(TZDateTime(timezone=True), server_default=func.now())
     updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
 
@@ -223,6 +265,7 @@ class OpenHouseEvent(Base):
     price = Column(Integer, nullable=True)
     home_status = Column(String, nullable=True)
     notes = Column(Text, nullable=True)
+    similar_properties_snapshot = Column(JSON, nullable=True) # Full property data snapshot
     
     created_at = Column(TZDateTime(timezone=True), server_default=func.now())
     

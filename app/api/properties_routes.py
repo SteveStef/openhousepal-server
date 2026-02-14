@@ -2,8 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
-from typing import Dict, Any, Optional
-from pydantic import BaseModel
+from typing import Dict, Any, Optional, Union, List
+from pydantic import BaseModel, ConfigDict
+from pydantic.alias_generators import to_camel
 import os
 
 from app.database import get_db
@@ -12,7 +13,15 @@ from app.services.bright_mls_service import BrightMlsService
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict
-from app.models.property import PropertyDetailResponse, PropertySaveResponse, PropertyLookupRequest
+from app.models.property import (
+    PropertyDetailResponse, 
+    PropertySaveResponse, 
+    PropertyLookupRequest,
+    ResoFacts,
+    OriginalPhoto,
+    MixedSources,
+    ImageSource
+)
 from app.config.logging import get_logger
 
 router = APIRouter()
@@ -174,8 +183,94 @@ async def get_property_details(
     request: PropertyLookupRequest
 ):
     """Fetch property details from Bright MLS API without saving to database"""
+    if not request.listing_key and not request.address:
+        raise HTTPException(status_code=400, detail="Either listing_key or address must be provided")
+        
     mls_service = BrightMlsService()
-    return await mls_service.get_property_by_address(request.address)
+    return await mls_service.get_property_by_address(
+        address=request.address, 
+        listing_key=request.listing_key
+    )
+
+class SimilarPropertiesRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    listing_key: Optional[Union[str, int]] = None
+    listing_keys: Optional[List[Union[str, int]]] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    zipcode: Optional[str] = None
+    price: Optional[Union[float, int]] = None
+    bedrooms: Optional[Union[float, int]] = None
+
+@router.post("/api/properties/similar")
+async def get_similar_properties(
+    request: SimilarPropertiesRequest
+):
+    """Find similar properties or fetch curated properties by keys"""
+    mls_service = BrightMlsService()
+    
+    # If specific keys are provided, fetch those exactly (Curation Mode)
+    if request.listing_keys:
+        logger.info(f"Fetching curated properties by keys: {request.listing_keys}")
+        results = await mls_service.get_properties_by_keys([str(k) for k in request.listing_keys])
+        return {"success": True, "properties": results}
+
+    # Otherwise, perform a similarity search (Discovery Mode)
+    logger.info(f"Finding similar properties for: {request.listing_key} in {request.zipcode or request.city}")
+    mls_service = BrightMlsService()
+    
+    # Create a mock preference object for the search service
+    from app.schemas.collection_preferences import CollectionPreferencesBase
+    
+    # Safely handle numeric conversions
+    try:
+        bedrooms = int(float(request.bedrooms)) if request.bedrooms is not None else 0
+        price = float(request.price) if request.price is not None else 0
+    except (ValueError, TypeError):
+        bedrooms = 0
+        price = 0
+    
+    # Calculate a price range (+/- 20%)
+    min_price = int(price * 0.8) if price > 0 else None
+    max_price = int(price * 1.2) if price > 0 else None
+    
+    # We use the existing get_matching_properties logic but scoped to the zip/city
+    # Use the first word of city if it contains commas
+    city_name = request.city.split(',')[0].strip() if request.city else None
+    
+    prefs = CollectionPreferencesBase(
+        cities=[f"{city_name}, {request.state}"] if city_name and request.state else [],
+        min_price=min_price,
+        max_price=max_price,
+        min_beds=max(0, bedrooms - 1),
+        max_beds=bedrooms + 1
+    )
+    
+    logger.info(f"Similar Search Filters: City={city_name}, Price={min_price}-{max_price}, Beds={prefs.min_beds}-{prefs.max_beds}")
+    
+    results = await mls_service.get_matching_properties(prefs, max_properties=12)
+    
+    # Filter out the original property if it's in the results
+    if request.listing_key:
+        results = [p for p in results if str(p.get('listing_key')) != str(request.listing_key)]
+        
+    # Convert results to camelCase for frontend compatibility
+    camel_results = []
+    for p in results:
+        camel_p = {}
+        for k, v in p.items():
+            # Convert snake_case key to camelCase
+            components = k.split('_')
+            camel_key = components[0] + ''.join(x.title() for x in components[1:])
+            camel_p[camel_key] = v
+            
+        # Ensure image_url is also available as imageUrl and coverImageUrl
+        if 'imageUrl' in camel_p:
+            camel_p['coverImageUrl'] = camel_p['imageUrl']
+            
+        camel_results.append(camel_p)
+        
+    return {"success": True, "properties": camel_results}
 
 @router.get("/properties/{property_id}/cache")
 async def cache_property_details(
@@ -196,58 +291,42 @@ async def cache_property_details(
         # Check if details already exist and are fresh (e.g., < 24 hours old)
         # For now, we'll just check if they exist to avoid re-fetching on every load
         if property_record.details:
-            # Construct response from DB to match frontend expectations
+            # Use Pydantic model for standardized serialization
             details = property_record.details
             
-            # Map DB fields back to the nested structure the frontend expects
-            response_details = {
-                "description": details.description,
-                "listAgentFullName": details.list_agent_full_name,
-                "listAgentEmail": details.list_agent_email,
-                "listOfficeName": details.list_office_name,
-                "listOfficePhone": details.list_office_phone,
-                "originalPhotos": [], # Map photos back to originalPhotos structure
-                "resoFacts": {
-                    "yearBuilt": details.year_built,
-                    "architecturalStyle": details.architectural_style,
-                    "constructionMaterials": details.construction_materials,
-                    "stories": details.levels, # Mapping levels to stories for display
-                    "livingArea": property_record.living_area,
-                    "appliances": details.appliances,
-                    "interiorFeatures": details.interior_features,
-                    "flooring": details.flooring,
-                    "windowFeatures": details.window_features,
-                    "fireplaceFeatures": details.fireplace_features,
-                    "heating": details.heating,
-                    "cooling": details.cooling,
-                    "waterSource": details.water_source,
-                    "sewer": details.sewer,
-                    "electric": details.electric,
-                    "parkingCapacity": details.garage_spaces, # Approx
-                    "garageParkingCapacity": details.garage_spaces,
-                    "parkingFeatures": details.parking_features,
-                    "hasAssociation": details.has_association,
-                    "hoaFee": f"${details.association_fee}" if details.association_fee else None,
-                    "taxAnnualAmount": details.tax_annual_amount,
-                    "associationFeeIncludes": details.association_fee_includes,
-                    # Add schools if available in DB columns (need to add if missing)
-                    "exteriorFeatures": details.exterior_features,
-                    "lotFeatures": details.lot_features,
-                    "communityFeatures": details.association_amenities, # Approx
-                    "updated_at": details.updated_at.isoformat() if details.updated_at else None
-                }
-            }
+            # Construct PropertyDetailResponse structure
+            # Bridge the gap between Property and PropertyDetails models
+            reso_facts = ResoFacts.model_validate(details)
+            # Add living area from the main property record
+            reso_facts.living_area = property_record.living_area
             
-            # Reconstruct photo structure
-            if details.photos:
-                for photo in details.photos:
-                    response_details["originalPhotos"].append({
-                        "caption": photo.get("caption", ""),
-                        "mixedSources": {
-                            "jpeg": [{"url": photo.get("url"), "width": 0}],
-                            "webp": []
-                        }
-                    })
+            # Map garage spaces to parking capacity fields
+            reso_facts.parking_capacity = details.garage_spaces
+            reso_facts.garage_parking_capacity = details.garage_spaces
+            
+            # Map association fee to hoa fee for frontend compatibility
+            if details.association_fee:
+                reso_facts.hoa_fee = f"${details.association_fee}"
+            
+            response_details = PropertyDetailResponse.model_validate(property_record)
+            response_details.days_on_market = details.days_on_market
+            response_details.year_built = details.year_built
+            response_details.description = details.description
+            response_details.standard_status = details.standard_status
+            response_details.list_office_name = details.list_office_name
+            response_details.list_office_phone = details.list_office_phone
+            response_details.list_agent_full_name = details.list_agent_full_name
+            response_details.list_agent_email = details.list_agent_email
+            response_details.original_photos = [
+                OriginalPhoto(
+                    caption=p.get("caption", ""),
+                    mixed_sources=MixedSources(
+                        jpeg=[ImageSource(url=p.get("url"), width=0)],
+                        webp=[]
+                    )
+                ) for p in (details.photos or [])
+            ]
+            response_details.reso_facts = reso_facts
 
             return {
                 "success": True,
@@ -255,28 +334,32 @@ async def cache_property_details(
                 "cached_at": details.updated_at.isoformat() if details.updated_at else None,
                 "property_id": property_id,
                 "from_cache": True,
-                "details": response_details
+                "details": response_details.model_dump(by_alias=True, exclude_none=True)
             }
 
-        if not property_record.street_address:
-            raise HTTPException(status_code=400, detail="Property missing address for MLS lookup")
+        if not property_record.street_address and not property_record.listing_key:
+            raise HTTPException(status_code=400, detail="Property missing address or listing key for MLS lookup")
 
         # Fetch from Bright MLS
         mls_service = BrightMlsService()
 
         # Construct full address for search to avoid ambiguity
         search_address = property_record.street_address
-        if property_record.city:
+        if search_address and property_record.city:
             search_address += f", {property_record.city}"
         
-        if property_record.state:
+        if search_address and property_record.state:
             search_address += f", {property_record.state}"
 
-        if property_record.zipcode:
+        if search_address and property_record.zipcode:
             search_address += f" {property_record.zipcode}"
 
         # Get full data package
-        fetched_data = await mls_service.get_property_by_address(search_address, True)
+        fetched_data = await mls_service.get_property_by_address(
+            search_address, 
+            details=True, 
+            listing_key=property_record.listing_key
+        )
         
         if not fetched_data or 'details' not in fetched_data:
              raise HTTPException(status_code=404, detail="Property details not found on MLS")
@@ -310,21 +393,42 @@ async def cache_property_details(
         duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
         
         # Construct response similar to cached version
-        # (For brevity, reusing the construction logic logic or returning mapped data)
-        # Ideally refactor the response construction into a helper function
+        response_details = PropertyDetailResponse.model_validate(property_record)
+        response_details.days_on_market = new_details.days_on_market
+        response_details.year_built = new_details.year_built
+        response_details.description = new_details.description
+        response_details.standard_status = new_details.standard_status
+        response_details.list_office_name = new_details.list_office_name
+        response_details.list_office_phone = new_details.list_office_phone
+        response_details.list_agent_full_name = new_details.list_agent_full_name
+        response_details.list_agent_email = new_details.list_agent_email
+        response_details.reso_facts = ResoFacts.model_validate(new_details)
+        response_details.reso_facts.living_area = property_record.living_area
         
-        # ... (Return structure mirroring the cache hit block) ...
+        # Map garage spaces to parking capacity fields
+        response_details.reso_facts.parking_capacity = new_details.garage_spaces
+        response_details.reso_facts.garage_parking_capacity = new_details.garage_spaces
+        
+        # Map association fee to hoa fee for frontend compatibility
+        if new_details.association_fee:
+            response_details.reso_facts.hoa_fee = f"${new_details.association_fee}"
+        
+        response_details.original_photos = [
+            OriginalPhoto(
+                caption=p.get("caption", ""),
+                mixed_sources=MixedSources(
+                    jpeg=[ImageSource(url=p.get("url"), width=0)],
+                    webp=[]
+                )
+            ) for p in (new_details.photos or [])
+        ]
         
         return {
             "success": True,
             "message": "Property details cached successfully",
             "property_id": property_id,
             "from_cache": False,
-            # Return the same structure as above
-            "details": {
-                "description": new_details.description,
-                "resoFacts": details_data # This is a bit of a shortcut, ideally we map it back
-            }
+            "details": response_details.model_dump(by_alias=True, exclude_none=True)
         }
 
     except HTTPException:
@@ -348,4 +452,43 @@ async def cache_property_details(
         except Exception:
             pass
         raise HTTPException(status_code=500, detail=f"Failed to cache property details: {str(e)}")
+
+class PropertyAgentResponse(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, from_attributes=True)
+    property: PropertyDetailResponse
+    agent_name: str
+
+@router.get("/properties/agent/{agent_id}/listing/{listing_key}", response_model=PropertyAgentResponse)
+async def get_property_for_agent(
+    agent_id: str,
+    listing_key: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Get property data and agent name by agent ID and listing key"""
+    try:
+        # Get agent details
+        from app.services.user_service import UserService
+        agent = await UserService.get_user_by_id(db, agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        
+        agent_name = f"{agent.first_name} {agent.last_name}"
+        
+        # Get property details
+        mls_service = BrightMlsService()
+        property_data = await mls_service.get_property_by_address("", details=True, listing_key=listing_key)
+        
+        if not property_data:
+            raise HTTPException(status_code=404, detail="Property not found")
+            
+        return PropertyAgentResponse(
+            property=property_data,
+            agent_name=agent_name
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to get property for agent", extra={"agent_id": agent_id, "listing_key": listing_key, "error": str(e)})
+        raise HTTPException(status_code=500, detail=f"Failed to get property for agent: {str(e)}")
 
