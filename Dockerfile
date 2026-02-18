@@ -1,8 +1,8 @@
 # Use Python 3.13 slim image as base
 FROM python:3.13-slim
 
-# Build argument to invalidate cache (set to current timestamp)
-ARG CACHEBUST=1
+# Install uv for extremely fast dependency management
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -12,27 +12,31 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Set work directory
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies (needed for some Python packages)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
-COPY requirements.txt .
+# Copy pyproject.toml and uv.lock first for optimal caching
+COPY pyproject.toml uv.lock ./
 
-# Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+# Install dependencies without installing the project itself
+# This layer is cached unless pyproject.toml or uv.lock changes
+RUN uv sync --frozen --no-install-project
 
 # Create directories before copying code
 RUN mkdir -p /app/data /app/logs
 
-# Copy application code (invalidates cache when code changes)
+# Copy application code
 COPY . .
+
+# Final sync to install the project
+RUN uv sync --frozen
 
 EXPOSE 8000
 
+# Use uv run to ensure the virtual environment is used
 # Run migrations at startup, then start the application
-CMD ["sh", "-c", "python -m alembic upgrade head && python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+CMD ["sh", "-c", "uv run alembic upgrade head && uv run uvicorn app.main:app --host 0.0.0.0 --port 8000"]

@@ -1,9 +1,18 @@
+import asyncio
 from logging.config import fileConfig
-
-from sqlalchemy import engine_from_config
 from sqlalchemy import pool
-
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import async_engine_from_config, create_async_engine
 from alembic import context
+
+
+# I added
+import os
+import sys
+sys.path.insert(0, os.path.realpath(os.path.join(os.path.dirname(__file__), '..')))
+from app.models.database import Base
+from app.database import DATABASE_URL
+
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -16,11 +25,8 @@ if config.config_file_name is not None:
 
 # add your model's MetaData object here
 # for 'autogenerate' support
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from app.models.database import Base
+# from myapp import mymodel
+# target_metadata = mymodel.Base.metadata
 target_metadata = Base.metadata
 
 # other values from the config, defined by the needs of env.py,
@@ -41,60 +47,54 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    # Get database URL from config or environment
-    url = config.get_main_option("sqlalchemy.url")
-    if not url:
-        # Convert async URL to sync URL for migrations
-        async_url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./collections.db")
-        if "sqlite+aiosqlite" in async_url:
-            url = async_url.replace("sqlite+aiosqlite", "sqlite")
-        else:
-            url = "sqlite:///./collections.db"
-    
+    url = url = DATABASE_URL # config.get_main_option("sqlalchemy.url")
     context.configure(
         url=url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
-        render_as_batch=True,
     )
 
     with context.begin_transaction():
         context.run_migrations()
 
 
-def run_migrations_online() -> None:
-    """Run migrations in 'online' mode.
+def do_run_migrations(connection: Connection) -> None:
+    context.configure(connection=connection, target_metadata=target_metadata)
 
-    In this scenario we need to create an Engine
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+async def run_async_migrations() -> None:
+    """In this scenario we need to create an Engine
     and associate a connection with the context.
 
     """
-    # Get configuration and set database URL if not present
-    configuration = config.get_section(config.config_ini_section, {})
-    if "sqlalchemy.url" not in configuration:
-        # Convert async URL to sync URL for migrations
-        async_url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./collections.db")
-        if "sqlite+aiosqlite" in async_url:
-            sync_url = async_url.replace("sqlite+aiosqlite", "sqlite")
-        else:
-            sync_url = "sqlite:///./collections.db"
-        configuration["sqlalchemy.url"] = sync_url
-    
-    connectable = engine_from_config(
-        configuration,
-        prefix="sqlalchemy.",
+
+    # This was here 
+    # connectable = async_engine_from_config(
+    #     config.get_section(config.config_ini_section, {}),
+    #     prefix="sqlalchemy.",
+    #     poolclass=pool.NullPool,
+    # )
+
+    # I added this to use the DATABASE_URL from app/database.py
+    connectable = create_async_engine(
+        DATABASE_URL,
         poolclass=pool.NullPool,
     )
 
-    with connectable.connect() as connection:
-        context.configure(
-            connection=connection, target_metadata=target_metadata,
-            render_as_batch=True
-        )
+    async with connectable.connect() as connection:
+        await connection.run_sync(do_run_migrations)
 
-        with context.begin_transaction():
-            context.run_migrations()
+    await connectable.dispose()
+
+
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode."""
+
+    asyncio.run(run_async_migrations())
 
 
 if context.is_offline_mode():

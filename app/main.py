@@ -51,18 +51,6 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"An unexpected error occurred during backup restoration: {e}")
 
-    # ALWAYS run migrations after potential restore to ensure DB is up to date
-    logger.info("Running database migrations...")
-    try:
-        subprocess.run(["alembic", "upgrade", "head"], check=True)
-        logger.info("Database migrations applied successfully")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Database migration failed: {e}")
-        # We might want to stop here, but for now let's log and continue
-    except Exception as e:
-        logger.error(f"An unexpected error occurred during migration: {e}")
-
-    # Create admin user if it doesn't exist
     await create_admin_user()
 
     logger.info("Initializing APScheduler for scheduled tasks")
@@ -196,9 +184,7 @@ async def logging_middleware(request: Request, call_next):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        CLIENT_URL,
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
+        CLIENT_URL
     ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],

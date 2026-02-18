@@ -1,0 +1,16 @@
+services:
+  db:
+    image: postgres:17
+    container_name: openhousepal_db
+    restart: always
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: flp3lOQ0HbOp521Wq3Bubt6wuBB6s3
+      POSTGRES_DB: openhousepal_postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

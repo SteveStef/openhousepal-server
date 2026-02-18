@@ -1,7 +1,8 @@
-from sqlalchemy import Column, Integer, String, Float, Boolean, Text, ForeignKey, Table, JSON, Index
+from sqlalchemy import Column, Integer, String, Float, Boolean, Text, ForeignKey, Table, Index, DateTime
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from app.database import Base, TZDateTime
+from sqlalchemy.dialects.postgresql import JSONB
+from app.database import Base
 from typing import Optional
 import uuid
 
@@ -11,7 +12,7 @@ collection_properties = Table(
     Base.metadata,
     Column('collection_id', String, ForeignKey('collections.id'), primary_key=True),
     Column('property_id', String, ForeignKey('properties.id'), primary_key=True),
-    Column('added_at', TZDateTime(timezone=True), nullable=True)  # NULL = initial property (no NEW badge)
+    Column('added_at', DateTime(timezone=True), nullable=True)  # NULL = initial property (no NEW badge)
 )
 
 class User(Base):
@@ -25,18 +26,18 @@ class User(Base):
     state = Column(String, nullable=True)  # Agent's state
     brokerage = Column(String, nullable=True)  # Agent's brokerage
     mls_id = Column(String, nullable=True)  # Agent's MLS ID
-    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # PayPal subscription fields
     subscription_id = Column(String, nullable=True, unique=True, index=True)  # PayPal subscription ID (unique to prevent hijacking)
     subscription_status = Column(String, default="TRIAL")  # TRIAL, ACTIVE, SUSPENDED, CANCELLED, EXPIRED
     plan_id = Column(String, nullable=True)  # PayPal plan ID (P-50796747... or P-4KN61644...)
     plan_tier = Column(String, nullable=True)  # BASIC or PREMIUM
-    trial_ends_at = Column(TZDateTime(timezone=True), nullable=True)
-    subscription_started_at = Column(TZDateTime(timezone=True), nullable=True)
-    last_billing_date = Column(TZDateTime(timezone=True), nullable=True)
-    next_billing_date = Column(TZDateTime(timezone=True), nullable=True)  # For grace period after cancellation
-    last_paypal_sync = Column(TZDateTime(timezone=True), nullable=True)  # Track when last synced with PayPal
+    trial_ends_at = Column(DateTime(timezone=True), nullable=True)
+    subscription_started_at = Column(DateTime(timezone=True), nullable=True)
+    last_billing_date = Column(DateTime(timezone=True), nullable=True)
+    next_billing_date = Column(DateTime(timezone=True), nullable=True)  # For grace period after cancellation
+    last_paypal_sync = Column(DateTime(timezone=True), nullable=True)  # Track when last synced with PayPal
 
     # Relationships
     collections = relationship("Collection", back_populates="owner")
@@ -59,9 +60,9 @@ class Collection(Base):
     visitor_phone = Column(String, nullable=True)
     original_open_house_event_id = Column(String, ForeignKey('open_house_events.id'), nullable=True)
     
-    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
-    updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
-    last_synced_at = Column(TZDateTime(timezone=True), nullable=True)  # Track when properties were last synced
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    last_synced_at = Column(DateTime(timezone=True), nullable=True)  # Track when properties were last synced
 
     # Relationships
     owner = relationship("User", back_populates="collections")
@@ -101,8 +102,8 @@ class Property(Base):
     
     img_src = Column(String, nullable=True)
     
-    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
-    updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     
     # Relationships
     collections = relationship("Collection", secondary=collection_properties, back_populates="properties")
@@ -117,7 +118,7 @@ class PropertyDetails(Base):
 
     # Narrative & Media
     description = Column(Text, nullable=True)
-    photos = Column(JSON, nullable=True)  # List of photo objects/URLs
+    photos = Column(JSONB, nullable=True)  # List of photo objects/URLs
     
     # Listing Agent & Office
     list_agent_full_name = Column(String, nullable=True)
@@ -126,53 +127,53 @@ class PropertyDetails(Base):
     list_office_phone = Column(String, nullable=True)
 
     # History
-    price_history = Column(JSON, nullable=True)
-    tax_history = Column(JSON, nullable=True)
-    open_house_schedule = Column(JSON, nullable=True)
+    price_history = Column(JSONB, nullable=True)
+    tax_history = Column(JSONB, nullable=True)
+    open_house_schedule = Column(JSONB, nullable=True)
 
     # Core Structural & Exterior
-    architectural_style = Column(JSON, nullable=True)
-    construction_materials = Column(JSON, nullable=True)
-    roof_type = Column(JSON, nullable=True)
-    foundation_details = Column(JSON, nullable=True)
-    structure_type = Column(JSON, nullable=True)
-    levels = Column(JSON, nullable=True)
+    architectural_style = Column(JSONB, nullable=True)
+    construction_materials = Column(JSONB, nullable=True)
+    roof_type = Column(JSONB, nullable=True)
+    foundation_details = Column(JSONB, nullable=True)
+    structure_type = Column(JSONB, nullable=True)
+    levels = Column(JSONB, nullable=True)
     
     # Interior & Features
-    interior_features = Column(JSON, nullable=True)
-    exterior_features = Column(JSON, nullable=True)
-    flooring = Column(JSON, nullable=True)
-    appliances = Column(JSON, nullable=True)
+    interior_features = Column(JSONB, nullable=True)
+    exterior_features = Column(JSONB, nullable=True)
+    flooring = Column(JSONB, nullable=True)
+    appliances = Column(JSONB, nullable=True)
     fireplaces = Column(Integer, nullable=True)
-    fireplace_features = Column(JSON, nullable=True)
-    door_features = Column(JSON, nullable=True)
-    window_features = Column(JSON, nullable=True)
+    fireplace_features = Column(JSONB, nullable=True)
+    door_features = Column(JSONB, nullable=True)
+    window_features = Column(JSONB, nullable=True)
     
     # Utilities & Systems
-    cooling = Column(JSON, nullable=True)
-    heating = Column(JSON, nullable=True)
-    water_source = Column(JSON, nullable=True)
-    sewer = Column(JSON, nullable=True)
-    electric = Column(JSON, nullable=True)
-    utilities = Column(JSON, nullable=True)
+    cooling = Column(JSONB, nullable=True)
+    heating = Column(JSONB, nullable=True)
+    water_source = Column(JSONB, nullable=True)
+    sewer = Column(JSONB, nullable=True)
+    electric = Column(JSONB, nullable=True)
+    utilities = Column(JSONB, nullable=True)
     
     # Parking
     garage_spaces = Column(Float, nullable=True)
-    parking_features = Column(JSON, nullable=True)
+    parking_features = Column(JSONB, nullable=True)
     has_garage = Column(Boolean, nullable=True)
     
     # Community & HOA
     association_fee = Column(Integer, nullable=True)
     association_fee_frequency = Column(String, nullable=True)
-    association_amenities = Column(JSON, nullable=True)
-    association_fee_includes = Column(JSON, nullable=True)
+    association_amenities = Column(JSONB, nullable=True)
+    association_fee_includes = Column(JSONB, nullable=True)
     has_association = Column(Boolean, nullable=True)
     
     # Lot & Location
-    lot_features = Column(JSON, nullable=True)
-    topography = Column(JSON, nullable=True)
-    view = Column(JSON, nullable=True)
-    waterfront_features = Column(JSON, nullable=True)
+    lot_features = Column(JSONB, nullable=True)
+    topography = Column(JSONB, nullable=True)
+    view = Column(JSONB, nullable=True)
+    waterfront_features = Column(JSONB, nullable=True)
     has_waterfront_view = Column(Boolean, nullable=True)
     has_view = Column(Boolean, nullable=True)
     
@@ -182,7 +183,7 @@ class PropertyDetails(Base):
     
     # Dates
     year_built = Column(Integer, nullable=True)
-    modification_timestamp = Column(TZDateTime(timezone=True), nullable=True)
+    modification_timestamp = Column(DateTime(timezone=True), nullable=True)
     
     # Education
     elementary_school = Column(String, nullable=True)
@@ -204,16 +205,16 @@ class PropertyDetails(Base):
     improvement_assessment_amount = Column(Integer, nullable=True)
     assessment_year = Column(Integer, nullable=True)
     capital_contribution_fee = Column(Integer, nullable=True)
-    possession = Column(JSON, nullable=True)
+    possession = Column(JSONB, nullable=True)
     
     # Detailed Features
-    cooling_fuel = Column(JSON, nullable=True)
-    heating_fuel = Column(JSON, nullable=True)
+    cooling_fuel = Column(JSONB, nullable=True)
+    heating_fuel = Column(JSONB, nullable=True)
     lot_size_acres = Column(Float, nullable=True)
     attached_garage_yn = Column(Boolean, nullable=True)
     new_construction_yn = Column(Boolean, nullable=True)
     senior_community_yn = Column(Boolean, nullable=True)
-    pets_allowed = Column(JSON, nullable=True)
+    pets_allowed = Column(JSONB, nullable=True)
     
     # Listing Intelligence
     original_list_price = Column(Integer, nullable=True)
@@ -226,8 +227,8 @@ class PropertyDetails(Base):
     stories_total = Column(Float, nullable=True)
     lot_size = Column(Float, nullable=True)
     
-    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
-    updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     # Relationship
     property = relationship("Property", back_populates="details")
@@ -241,7 +242,7 @@ class OpenHouseEvent(Base):
     agent_id = Column(String, ForeignKey('users.id'), nullable=False)
     is_active = Column(Boolean, default=True)
     is_deleted = Column(Boolean, default=False)  # Soft delete flag
-    deleted_at = Column(TZDateTime(timezone=True), nullable=True)  # Track when deleted
+    deleted_at = Column(DateTime(timezone=True), nullable=True)  # Track when deleted
     form_url = Column(String, nullable=True)  # Store the form link
     cover_image_url = Column(String, nullable=True)  # Store the selected cover image
     
@@ -265,9 +266,9 @@ class OpenHouseEvent(Base):
     price = Column(Integer, nullable=True)
     home_status = Column(String, nullable=True)
     notes = Column(Text, nullable=True)
-    similar_properties_snapshot = Column(JSON, nullable=True) # Full property data snapshot
+    similar_properties_snapshot = Column(JSONB, nullable=True) # Full property data snapshot
     
-    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
     agent = relationship("User")
@@ -292,7 +293,7 @@ class OpenHouseVisitor(Base):
     form_url = Column(String, nullable=True)  # Store the form link
 
     interested_in_similar = Column(Boolean, default=False)
-    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # Relationships
     open_house_event = relationship("OpenHouseEvent")
@@ -311,10 +312,10 @@ class PropertyInteraction(Base):
 
     # View tracking
     view_count = Column(Integer, default=0)
-    last_viewed_at = Column(TZDateTime(timezone=True), nullable=True)
+    last_viewed_at = Column(DateTime(timezone=True), nullable=True)
 
-    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
-    updated_at = Column(TZDateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     # Relationships
     collection = relationship("Collection", back_populates="property_interactions")
@@ -334,8 +335,8 @@ class PropertyComment(Base):
 
     content = Column(Text, nullable=False)
 
-    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
-    updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     # Relationships
     collection = relationship("Collection", back_populates="property_comments")
@@ -366,8 +367,8 @@ class PropertyTour(Base):
     # Tour status
     status = Column(String, default="PENDING")  # PENDING, CONFIRMED, CANCELLED
 
-    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
-    updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     # Relationships
     collection = relationship("Collection", back_populates="property_tours")
@@ -394,8 +395,8 @@ class CollectionPreferences(Base):
     lat = Column(Float, nullable=True)
     long = Column(Float, nullable=True)
     address = Column(String, nullable=True)
-    cities = Column(JSON, nullable=True)
-    townships = Column(JSON, nullable=True)
+    cities = Column(JSONB, nullable=True)
+    townships = Column(JSONB, nullable=True)
     diameter = Column(Float, default=6.0)  # Search diameter in miles
 
     # Additional features
@@ -413,8 +414,8 @@ class CollectionPreferences(Base):
     visiting_reason = Column(String, nullable=True)  # BUYING_SOON, BROWSING, NEIGHBORHOOD, etc.
     has_agent = Column(String, nullable=True)  # YES, NO, LOOKING
 
-    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
-    updated_at = Column(TZDateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     # Relationships
     collection = relationship("Collection", back_populates="preferences")
@@ -426,8 +427,8 @@ class PasswordResetToken(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
     token = Column(String, unique=True, index=True, nullable=False)
-    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
-    expires_at = Column(TZDateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=False)
     used = Column(Boolean, default=False, nullable=False)
 
     # Relationship
@@ -438,7 +439,7 @@ class WebhookEvent(Base):
 
     id = Column(String, primary_key=True)  # PayPal event ID
     event_type = Column(String, nullable=False)  # For debugging/monitoring
-    processed_at = Column(TZDateTime(timezone=True), server_default=func.now())
+    processed_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class BundleCode(Base):
@@ -446,8 +447,8 @@ class BundleCode(Base):
 
     code = Column(String, primary_key=True)
     is_used = Column(Boolean, default=False, nullable=False)
-    used_at = Column(TZDateTime(timezone=True), nullable=True)
-    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+    used_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class Notification(Base):
@@ -475,10 +476,10 @@ class Notification(Base):
 
     # Read status
     is_read = Column(Boolean, default=False, nullable=False, index=True)
-    read_at = Column(TZDateTime(timezone=True), nullable=True)
+    read_at = Column(DateTime(timezone=True), nullable=True)
 
     # Timestamps
-    created_at = Column(TZDateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
     # Relationships
     agent = relationship("User", back_populates="notifications")
@@ -491,19 +492,19 @@ class ScheduledEmail(Base):
     recipient_email = Column(String, nullable=False)
     subject = Column(String, nullable=False)
     template_name = Column(String, nullable=False)
-    template_variables = Column(JSON, nullable=False)
+    template_variables = Column(JSONB, nullable=False)
     
     # Status tracking
     status = Column(String, default="PENDING", index=True)  # PENDING, SENT, FAILED
     
     # Scheduling
-    scheduled_for = Column(TZDateTime(timezone=True), nullable=False, index=True)
-    sent_at = Column(TZDateTime(timezone=True), nullable=True)
+    scheduled_for = Column(DateTime(timezone=True), nullable=False, index=True)
+    sent_at = Column(DateTime(timezone=True), nullable=True)
     
     # Error tracking
     error_message = Column(Text, nullable=True)
     
-    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class SignupVerification(Base):
@@ -511,11 +512,9 @@ class SignupVerification(Base):
 
     email = Column(String, primary_key=True)
     code = Column(String, nullable=False)
-    form_data = Column(JSON, nullable=False)
+    form_data = Column(JSONB, nullable=False)
     verified = Column(Boolean, default=False, nullable=False)
     attempts = Column(Integer, default=0, nullable=False)
-    last_sent_at = Column(TZDateTime(timezone=True), nullable=False)
-    expires_at = Column(TZDateTime(timezone=True), nullable=False)
-    created_at = Column(TZDateTime(timezone=True), server_default=func.now())
-
-
+    last_sent_at = Column(DateTime(timezone=True), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
