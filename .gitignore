@@ -123,3 +123,4 @@ dummy.json
 docs/
 docker-compose.yml
 mls_service.py
+notes.md
