@@ -26,7 +26,7 @@ COPY pyproject.toml uv.lock ./
 
 # Install dependencies without installing the project itself
 # This layer is cached unless pyproject.toml or uv.lock changes
-RUN uv sync --frozen --no-install-project
+RUN uv sync --system --frozen --no-install-project
 
 # Create directories before copying code
 RUN mkdir -p /app/data /app/logs
@@ -35,7 +35,7 @@ RUN mkdir -p /app/data /app/logs
 COPY . .
 
 # Final sync to install the project
-RUN uv sync --frozen
+RUN uv sync --system --frozen
 
 EXPOSE 8000
 
