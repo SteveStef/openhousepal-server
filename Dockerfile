@@ -40,5 +40,5 @@ RUN uv sync --frozen
 EXPOSE 8000
 
 # Run migrations at startup, then start the application
-# We don't need 'uv run' since we're using the system python
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+# Use 'python -m' to ensure we use the packages installed in the system python
+CMD ["sh", "-c", "python -m alembic upgrade head && python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"]
