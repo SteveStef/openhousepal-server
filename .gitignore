@@ -1,13 +1,5 @@
 # Database files - SQLite
-*.db
-*.db-journal
-*.db-wal
-*.db-shm
-collections.db
 maintain.md
-
-bright_test.py
-test_bright_service.py
 
 # Environment variables and secrets
 .env
@@ -127,7 +119,7 @@ search_by_cords.json
 dmypy.json
 .pyre/
 dummy.json
-collections.db.pre-restore
-docker-comppose.yml
 
 docs/
+docker-compose.yml
+mls_service.py
