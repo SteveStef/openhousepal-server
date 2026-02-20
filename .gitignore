@@ -1,5 +1,6 @@
 # Database files - SQLite
 maintain.md
+test_philadelphia_search.py
 
 # Environment variables and secrets
 .env

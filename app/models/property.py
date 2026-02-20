@@ -103,6 +103,7 @@ class MixedSources(BaseModel):
 class OriginalPhoto(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, from_attributes=True)
     caption: Optional[str] = None
+    url: Optional[str] = None
     mixed_sources: Optional[MixedSources] = None
 
 class AtAGlanceFact(BaseModel):
@@ -124,7 +125,7 @@ class ResoFacts(BaseModel):
     appliances: Optional[List[str]] = None
     architectural_style: Optional[Union[List[str], str]] = None
     association_amenities: Optional[Union[str, List[str]]] = None
-    association_fee: Optional[Union[List[str], str, int]] = None
+    association_fee: Optional[Union[List[str], str, int, float]] = None
     association_fee_2: Optional[Union[List[str], str]] = None
     association_fee_includes: Optional[List[str]] = None
     association_name: Optional[Union[List[str], str]] = None
@@ -164,7 +165,7 @@ class ResoFacts(BaseModel):
     cooling: Optional[List[str]] = None
     covered_parking_capacity: Optional[Union[int, float]] = None
     crops_included_yn: Optional[bool] = None
-    cumulative_days_on_market: Optional[Union[str, List[str]]] = None
+    cumulative_days_on_market: Optional[Union[str, List[str], int]] = None
     development_status: Optional[Union[List[str], str]] = None
     door_features: Optional[List[str]] = None
     electric: Optional[List[str]] = None
@@ -187,6 +188,7 @@ class ResoFacts(BaseModel):
     frontage_type: Optional[Union[List[str], str]] = None
     furnished: Optional[bool] = None
     garage_parking_capacity: Optional[Union[int, float]] = None
+    garage_spaces: Optional[Union[int, float]] = None
     gas: Optional[Union[List[str], str]] = None
     green_building_verification_type: Optional[Union[List[str], str]] = None
     green_energy_efficient: Optional[Union[List[str], str]] = None
@@ -219,6 +221,7 @@ class ResoFacts(BaseModel):
     hoa_fee: Optional[Union[List[str], str, int, float]] = None
     hoa_fee_total: Optional[Union[List[str], str]] = None
     home_type: Optional[Union[List[str], str]] = None
+    home_status: Optional[str] = None
     horse_amenities: Optional[Union[str, List[str]]] = None
     horse_yn: Optional[bool] = None
     inclusions: Optional[List[str]] = None
@@ -278,6 +281,7 @@ class ResoFacts(BaseModel):
     security_features: Optional[List[str]] = None
     sewer: Optional[List[str]] = None
     spa_features: Optional[Union[str, List[str]]] = None
+    special_features: Optional[str] = None
     special_listing_conditions: Optional[Union[List[str], str]] = None
     stories: Optional[Union[int, float]] = None
     stories_decimal: Optional[float] = None
@@ -306,10 +310,6 @@ class ResoFacts(BaseModel):
     zoning_description: Optional[Union[List[str], str]] = None
     
     # New Standardized Fields
-    elementary_school: Optional[str] = None
-    middle_or_junior_school: Optional[str] = None
-    high_school: Optional[str] = None
-    school_district_name: Optional[str] = None
     county: Optional[str] = None
     directions: Optional[str] = None
     cross_street: Optional[str] = None
@@ -363,10 +363,12 @@ class PropertyDetailResponse(BaseModel):
     
     # Core property information
     abbreviated_address: Optional[str] = None
-    address: Optional[PropertyAddress] = None
+    address: Optional[Union[PropertyAddress, str]] = None
     bathrooms: Optional[Union[int, float]] = None
     bedrooms: Optional[Union[int, float]] = None
     city: Optional[str] = None
+    state: Optional[str] = None
+    zipcode: Optional[str] = None
     home_status: Optional[str] = None
     home_type: Optional[str] = None
     living_area: Optional[Union[int, float]] = None
@@ -390,7 +392,7 @@ class PropertyDetailResponse(BaseModel):
     price_history: Optional[List[PriceHistoryEntry]] = None
     
     # Media and schedule information
-    original_photos: Optional[List[OriginalPhoto]] = None
+    photos: Optional[List[OriginalPhoto]] = Field(None, alias="originalPhotos")
     open_house_schedule: Optional[List[Dict[str, Any]]] = None
     days_on_zillow: Optional[int] = None
     days_on_market: Optional[int] = None

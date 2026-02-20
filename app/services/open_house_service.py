@@ -118,11 +118,10 @@ class OpenHouseService:
         preferences: CollectionPreferencesSchema
     ) -> int:
         """Populate collection with properties from Bright MLS API"""
+        mls_service = BrightMlsService()
         try:
-            mls_service = BrightMlsService()
-            
-            # Get matching properties from Bright MLS
-            matching_properties = await mls_service.get_matching_properties(preferences)
+            # Get matching properties from Bright MLS using the new method name
+            matching_properties = await mls_service.get_properties_by_preferences(preferences)
             
             properties_added = 0
             
@@ -141,18 +140,21 @@ class OpenHouseService:
             return properties_added
             
         except Exception as e:
-            logger.error("populating collection {collection.id} with Zillow properties failed", extra={"error": str(e)})
+            logger.error(f"populating collection {collection.id} with Bright MLS properties failed", extra={"error": str(e)})
             return 0
+        finally:
+            await mls_service.close()
     
     @staticmethod
     async def _property_exists_in_collection(db: AsyncSession, collection_id: str, listing_key: str) -> bool:
         """Check if a property (by listing_key) already exists in a collection"""
+        # listing_key is a string in the new service
         result = await db.execute(
             select(Property.id)
             .join(collection_properties)
             .where(
                 collection_properties.c.collection_id == collection_id,
-                Property.listing_key == listing_key
+                Property.listing_key == str(listing_key)
             )
         )
         return result.scalar_one_or_none() is not None
@@ -160,9 +162,12 @@ class OpenHouseService:
     @staticmethod
     async def _create_property_from_mls_data(db: AsyncSession, property_data: Dict[str, Any]) -> Property:
         """Create a new Property record from MLS data"""
+        # listing_key is already standardized as a string in property_data
+        listing_key = str(property_data.get('listing_key'))
+        
         # Check if property already exists by listing_key
         result = await db.execute(
-            select(Property).where(Property.listing_key == property_data.get('listing_key'))
+            select(Property).where(Property.listing_key == listing_key)
         )
         existing_property = result.scalar_one_or_none()
         
@@ -176,8 +181,8 @@ class OpenHouseService:
             }
             
             # Update listing_key if needed (should match)
-            if property_data.get('listing_key'):
-                 existing_property.listing_key = property_data.get('listing_key')
+            if listing_key:
+                 existing_property.listing_key = listing_key
             
             for key, value in property_data.items():
                 if value is not None:
@@ -192,7 +197,7 @@ class OpenHouseService:
         
         # Create new property
         property_obj = Property(
-            listing_key=property_data.get('listing_key'),
+            listing_key=listing_key,
             street_address=property_data.get('address'),
             city=property_data.get('city'),
             state=property_data.get('state'),

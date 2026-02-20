@@ -65,7 +65,6 @@ async def store_property(
             # Update existing property
             existing_property.street_address = request.address
             existing_property.updated_at = datetime.now(timezone.utc)
-            existing_property.last_synced = datetime.now(timezone.utc)
             
             # Update cover image if provided
             if request.cover_image_url:
@@ -91,7 +90,7 @@ async def store_property(
             if "longitude" in request.property_data:
                 existing_property.longitude = request.property_data["longitude"]
             if "listing_key" in request.property_data:
-                existing_property.listing_key = request.property_data["listing_key"]
+                existing_property.listing_key = str(request.property_data["listing_key"])
                 
         else:
             # Create new property
@@ -123,7 +122,7 @@ async def store_property(
             if "longitude" in request.property_data:
                 new_property.longitude = request.property_data["longitude"]
             if "listing_key" in request.property_data:
-                new_property.listing_key = request.property_data["listing_key"]
+                new_property.listing_key = str(request.property_data["listing_key"])
                 
             db.add(new_property)
         
@@ -187,10 +186,16 @@ async def get_property_details(
         raise HTTPException(status_code=400, detail="Either listing_key or address must be provided")
         
     mls_service = BrightMlsService()
-    return await mls_service.get_property_by_address(
-        address=request.address, 
-        listing_key=request.listing_key
-    )
+    try:
+        if request.listing_key:
+            property_data = await mls_service.get_property_by_id(request.listing_key)
+            if not property_data:
+                raise HTTPException(status_code=404, detail="Property not found by listing key")
+            return property_data
+        else:
+            return await mls_service.get_property_by_address(address=request.address)
+    finally:
+        await mls_service.close()
 
 class SimilarPropertiesRequest(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
@@ -209,68 +214,57 @@ async def get_similar_properties(
     """Find similar properties or fetch curated properties by keys"""
     mls_service = BrightMlsService()
     
-    # If specific keys are provided, fetch those exactly (Curation Mode)
-    if request.listing_keys:
-        logger.info(f"Fetching curated properties by keys: {request.listing_keys}")
-        results = await mls_service.get_properties_by_keys([str(k) for k in request.listing_keys])
-        return {"success": True, "properties": results}
-
-    # Otherwise, perform a similarity search (Discovery Mode)
-    logger.info(f"Finding similar properties for: {request.listing_key} in {request.zipcode or request.city}")
-    mls_service = BrightMlsService()
-    
-    # Create a mock preference object for the search service
-    from app.schemas.collection_preferences import CollectionPreferencesBase
-    
-    # Safely handle numeric conversions
     try:
-        bedrooms = int(float(request.bedrooms)) if request.bedrooms is not None else 0
-        price = float(request.price) if request.price is not None else 0
-    except (ValueError, TypeError):
-        bedrooms = 0
-        price = 0
-    
-    # Calculate a price range (+/- 20%)
-    min_price = int(price * 0.8) if price > 0 else None
-    max_price = int(price * 1.2) if price > 0 else None
-    
-    # We use the existing get_matching_properties logic but scoped to the zip/city
-    # Use the first word of city if it contains commas
-    city_name = request.city.split(',')[0].strip() if request.city else None
-    
-    prefs = CollectionPreferencesBase(
-        cities=[f"{city_name}, {request.state}"] if city_name and request.state else [],
-        min_price=min_price,
-        max_price=max_price,
-        min_beds=max(0, bedrooms - 1),
-        max_beds=bedrooms + 1
-    )
-    
-    logger.info(f"Similar Search Filters: City={city_name}, Price={min_price}-{max_price}, Beds={prefs.min_beds}-{prefs.max_beds}")
-    
-    results = await mls_service.get_matching_properties(prefs, max_properties=12)
-    
-    # Filter out the original property if it's in the results
-    if request.listing_key:
-        results = [p for p in results if str(p.get('listing_key')) != str(request.listing_key)]
+        # If specific keys are provided, fetch those exactly (Curation Mode)
+        if request.listing_keys:
+            logger.info(f"Fetching curated properties by keys: {request.listing_keys}")
+            results = await mls_service.get_properties_by_keys([str(k) for k in request.listing_keys])
+            return {"success": True, "properties": results}
+
+        # Otherwise, perform a similarity search (Discovery Mode)
+        logger.info(f"Finding similar properties for: {request.listing_key} in {request.zipcode or request.city}")
         
-    # Convert results to camelCase for frontend compatibility
-    camel_results = []
-    for p in results:
-        camel_p = {}
-        for k, v in p.items():
-            # Convert snake_case key to camelCase
-            components = k.split('_')
-            camel_key = components[0] + ''.join(x.title() for x in components[1:])
-            camel_p[camel_key] = v
-            
-        # Ensure image_url is also available as imageUrl and coverImageUrl
-        if 'imageUrl' in camel_p:
-            camel_p['coverImageUrl'] = camel_p['imageUrl']
-            
-        camel_results.append(camel_p)
+        from app.schemas.collection_preferences import CollectionPreferencesBase
         
-    return {"success": True, "properties": camel_results}
+        try:
+            bedrooms = int(float(request.bedrooms)) if request.bedrooms is not None else 0
+            price = float(request.price) if request.price is not None else 0
+        except (ValueError, TypeError):
+            bedrooms = 0
+            price = 0
+        
+        min_price = int(price * 0.8) if price > 0 else None
+        max_price = int(price * 1.2) if price > 0 else None
+        
+        city_name = request.city.split(',')[0].strip() if request.city else None
+        
+        prefs = CollectionPreferencesBase(
+            cities=[f"{city_name}, {request.state}"] if city_name and request.state else [],
+            min_price=min_price,
+            max_price=max_price,
+            min_beds=max(0, bedrooms - 1),
+            max_beds=bedrooms + 1
+        )
+        
+        results = await mls_service.get_properties_by_preferences(prefs, max_properties=12)
+        
+        if request.listing_key:
+            results = [p for p in results if str(p.get('listing_key')) != str(request.listing_key)]
+            
+        camel_results = []
+        for p in results:
+            camel_p = {}
+            for k, v in p.items():
+                components = k.split('_')
+                camel_key = components[0] + ''.join(x.title() for x in components[1:])
+                camel_p[camel_key] = v
+            if 'imageUrl' in camel_p:
+                camel_p['coverImageUrl'] = camel_p['imageUrl']
+            camel_results.append(camel_p)
+            
+        return {"success": True, "properties": camel_results}
+    finally:
+        await mls_service.close()
 
 @router.get("/properties/{property_id}/cache")
 async def cache_property_details(
@@ -278,7 +272,6 @@ async def cache_property_details(
     db: AsyncSession = Depends(get_db)
 ):
     """Cache detailed property information from Bright MLS"""
-    start_time = datetime.now(timezone.utc)
     try:
         # Eager load the details relationship
         stmt = select(Property).options(selectinload(Property.details)).where(Property.id == property_id)
@@ -288,23 +281,19 @@ async def cache_property_details(
         if not property_record:
             raise HTTPException(status_code=404, detail="Property not found")
 
-        # Check if details already exist and are fresh (e.g., < 24 hours old)
-        # For now, we'll just check if they exist to avoid re-fetching on every load
+        # 1. Return from Cache if exists
         if property_record.details:
-            # Use Pydantic model for standardized serialization
             details = property_record.details
             
-            # Construct PropertyDetailResponse structure
-            # Bridge the gap between Property and PropertyDetails models
+            # Construct standard response from DB
             reso_facts = ResoFacts.model_validate(details)
-            # Add living area from the main property record
             reso_facts.living_area = property_record.living_area
-            
-            # Map garage spaces to parking capacity fields
             reso_facts.parking_capacity = details.garage_spaces
             reso_facts.garage_parking_capacity = details.garage_spaces
+            reso_facts.standard_status = details.standard_status
+            reso_facts.home_status = property_record.home_status
+            reso_facts.days_on_market = details.days_on_market
             
-            # Map association fee to hoa fee for frontend compatibility
             if details.association_fee:
                 reso_facts.hoa_fee = f"${details.association_fee}"
             
@@ -313,144 +302,126 @@ async def cache_property_details(
             response_details.year_built = details.year_built
             response_details.description = details.description
             response_details.standard_status = details.standard_status
+            response_details.home_status = property_record.home_status
             response_details.list_office_name = details.list_office_name
             response_details.list_office_phone = details.list_office_phone
             response_details.list_agent_full_name = details.list_agent_full_name
             response_details.list_agent_email = details.list_agent_email
-            response_details.original_photos = [
+            response_details.listing_key = property_record.listing_key
+            
+            # Standardize photos from DB
+            response_details.photos = [
                 OriginalPhoto(
                     caption=p.get("caption", ""),
+                    url=p.get("url"),
                     mixed_sources=MixedSources(
-                        jpeg=[ImageSource(url=p.get("url"), width=0)],
-                        webp=[]
+                        jpeg=p.get("mixedSources", {}).get("jpeg", []),
+                        webp=p.get("mixedSources", {}).get("webp", [])
                     )
                 ) for p in (details.photos or [])
             ]
             response_details.reso_facts = reso_facts
 
+            # Return CLEAN structure frontend expects
             return {
                 "success": True,
                 "message": "Property details retrieved from cache",
                 "cached_at": details.updated_at.isoformat() if details.updated_at else None,
                 "property_id": property_id,
                 "from_cache": True,
-                "details": response_details.model_dump(by_alias=True, exclude_none=True)
+                "property": response_details.model_dump(by_alias=True, exclude_none=True)
             }
 
+        # 2. Not cached - Fetch from MLS
         if not property_record.street_address and not property_record.listing_key:
             raise HTTPException(status_code=400, detail="Property missing address or listing key for MLS lookup")
 
-        # Fetch from Bright MLS
         mls_service = BrightMlsService()
+        try:
+            if property_record.listing_key:
+                fetched_data = await mls_service.get_property_by_id(property_record.listing_key)
+            else:
+                fetched_data = await mls_service.get_property_by_address(property_record.street_address)
+            
+            if not fetched_data:
+                 raise HTTPException(status_code=404, detail="Property not found on MLS")
 
-        # Construct full address for search to avoid ambiguity
-        search_address = property_record.street_address
-        if search_address and property_record.city:
-            search_address += f", {property_record.city}"
-        
-        if search_address and property_record.state:
-            search_address += f", {property_record.state}"
+            # Extract facts
+            facts_src = fetched_data.get('reso_facts', {})
 
-        if search_address and property_record.zipcode:
-            search_address += f" {property_record.zipcode}"
+            # Create new PropertyDetails record
+            new_details = PropertyDetails(
+                property_id=property_id,
+                updated_at=datetime.now(timezone.utc)
+            )
+            
+            mapping = {
+                "description": "description",
+                "interiorFeatures": "interior_features",
+                "flooring": "flooring",
+                "appliances": "appliances",
+                "fireplaces": "fireplaces",
+                "levels": "levels",
+                "architecturalStyle": "architectural_style",
+                "constructionMaterials": "construction_materials",
+                "roofType": "roof_type",
+                "structureType": "structure_type",
+                "cooling": "cooling",
+                "heating": "heating",
+                "waterSource": "water_source",
+                "sewer": "sewer",
+                "garageSpaces": "garage_spaces",
+                "parkingFeatures": "parking_features",
+                "hasGarage": "has_garage",
+                "associationFee": "association_fee",
+                "associationFeeFrequency": "association_fee_frequency",
+                "associationAmenities": "association_amenities",
+                "hasAssociation": "has_association",
+                "schoolDistrictName": "school_district_name",
+                "elementarySchool": "elementary_school",
+                "highSchool": "high_school",
+                "county": "county",
+                "zoning": "zoning",
+                "taxAnnualAmount": "tax_annual_amount"
+            }
 
-        # Get full data package
-        fetched_data = await mls_service.get_property_by_address(
-            search_address, 
-            details=True, 
-            listing_key=property_record.listing_key
-        )
-        
-        if not fetched_data or 'details' not in fetched_data:
-             raise HTTPException(status_code=404, detail="Property details not found on MLS")
+            for src_key, db_col in mapping.items():
+                if hasattr(new_details, db_col) and src_key in facts_src:
+                    setattr(new_details, db_col, facts_src[src_key])
 
-        details_data = fetched_data['details']
+            # Standardized photo saving
+            new_details.photos = fetched_data.get('photos', [])
+            new_details.days_on_market = fetched_data.get('days_on_market')
+            new_details.year_built = fetched_data.get('year_built')
+            new_details.standard_status = fetched_data.get('home_status')
+            new_details.list_office_name = fetched_data.get('list_office_name')
+            new_details.list_agent_full_name = fetched_data.get('list_agent_full_name')
+            new_details.list_agent_email = fetched_data.get('list_agent_email')
+            new_details.list_office_phone = fetched_data.get('list_office_phone')
 
-        # Create new PropertyDetails record
-        new_details = PropertyDetails(
-            property_id=property_id,
-            updated_at=datetime.now(timezone.utc)
-        )
-        
-        # Populate the rest of the fields using a loop or direct mapping
-        for key, value in details_data.items():
-            if hasattr(new_details, key):
-                # Handle special timestamp fields that might be strings
-                if key in ['modification_timestamp'] and isinstance(value, str) and value:
-                    try:
-                        # Attempt to parse ISO string to datetime
-                        from dateutil.parser import parse
-                        value = parse(value)
-                    except Exception:
-                        value = None # Or keep as string if column allows, but TZDateTime doesn't
-                
-                setattr(new_details, key, value)
+            db.add(new_details)
+            await db.commit()
+            await db.refresh(new_details)
 
-        db.add(new_details)
-        await db.commit()
-        await db.refresh(new_details)
-
-        duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-        
-        # Construct response similar to cached version
-        response_details = PropertyDetailResponse.model_validate(property_record)
-        response_details.days_on_market = new_details.days_on_market
-        response_details.year_built = new_details.year_built
-        response_details.description = new_details.description
-        response_details.standard_status = new_details.standard_status
-        response_details.list_office_name = new_details.list_office_name
-        response_details.list_office_phone = new_details.list_office_phone
-        response_details.list_agent_full_name = new_details.list_agent_full_name
-        response_details.list_agent_email = new_details.list_agent_email
-        response_details.reso_facts = ResoFacts.model_validate(new_details)
-        response_details.reso_facts.living_area = property_record.living_area
-        
-        # Map garage spaces to parking capacity fields
-        response_details.reso_facts.parking_capacity = new_details.garage_spaces
-        response_details.reso_facts.garage_parking_capacity = new_details.garage_spaces
-        
-        # Map association fee to hoa fee for frontend compatibility
-        if new_details.association_fee:
-            response_details.reso_facts.hoa_fee = f"${new_details.association_fee}"
-        
-        response_details.original_photos = [
-            OriginalPhoto(
-                caption=p.get("caption", ""),
-                mixed_sources=MixedSources(
-                    jpeg=[ImageSource(url=p.get("url"), width=0)],
-                    webp=[]
-                )
-            ) for p in (new_details.photos or [])
-        ]
-        
-        return {
-            "success": True,
-            "message": "Property details cached successfully",
-            "property_id": property_id,
-            "from_cache": False,
-            "details": response_details.model_dump(by_alias=True, exclude_none=True)
-        }
+            # Build standardized response
+            response_details = PropertyDetailResponse.model_validate(fetched_data)
+            
+            return {
+                "success": True,
+                "message": "Property details cached successfully",
+                "property_id": property_id,
+                "from_cache": False,
+                "property": response_details.model_dump(by_alias=True, exclude_none=True)
+            }
+        finally:
+            await mls_service.close()
 
     except HTTPException:
-        try:
-            await db.rollback()
-        except Exception:
-            pass
+        await db.rollback()
         raise
     except Exception as e:
-        logger.error(
-            "Property cache failed",
-            exc_info=True,
-            extra={
-                "event": "property_cache_failed",
-                "property_id": property_id,
-                "error": str(e)
-            }
-        )
-        try:
-            await db.rollback()
-        except Exception:
-            pass
+        logger.error("Property cache failed", exc_info=True, extra={"property_id": property_id, "error": str(e)})
+        await db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to cache property details: {str(e)}")
 
 class PropertyAgentResponse(BaseModel):
@@ -466,7 +437,6 @@ async def get_property_for_agent(
 ):
     """Get property data and agent name by agent ID and listing key"""
     try:
-        # Get agent details
         from app.services.user_service import UserService
         agent = await UserService.get_user_by_id(db, agent_id)
         if not agent:
@@ -474,21 +444,18 @@ async def get_property_for_agent(
         
         agent_name = f"{agent.first_name} {agent.last_name}"
         
-        # Get property details
         mls_service = BrightMlsService()
-        property_data = await mls_service.get_property_by_address("", details=True, listing_key=listing_key)
-        
-        if not property_data:
-            raise HTTPException(status_code=404, detail="Property not found")
-            
-        return PropertyAgentResponse(
-            property=property_data,
-            agent_name=agent_name
-        )
+        try:
+            property_data = await mls_service.get_property_by_id(listing_key)
+            if not property_data:
+                raise HTTPException(status_code=404, detail="Property not found")
+                
+            return PropertyAgentResponse(property=property_data, agent_name=agent_name)
+        finally:
+            await mls_service.close()
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error("Failed to get property for agent", extra={"agent_id": agent_id, "listing_key": listing_key, "error": str(e)})
         raise HTTPException(status_code=500, detail=f"Failed to get property for agent: {str(e)}")
-

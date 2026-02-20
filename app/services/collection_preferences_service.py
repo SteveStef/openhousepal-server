@@ -175,7 +175,8 @@ class CollectionPreferencesService:
             # Now attempt to refresh properties with the updated preferences
             # This will fetch from Zillow and prepare properties (but NOT commit)
             sync_service = PropertySyncService()
-            result = await sync_service.replace_collection_properties(db, collection_id)
+            # Pass the updated preferences object so it doesn't re-fetch stale ones from DB
+            result = await sync_service.replace_collection_properties(db, collection_id, preferences=preferences)
 
             if not result['success']:
                 # Zillow failed or no properties found - rollback preference changes too
