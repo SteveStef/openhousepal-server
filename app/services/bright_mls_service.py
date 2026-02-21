@@ -113,6 +113,27 @@ class BrightMlsService:
             "PublicRemarks"
         ])
 
+    def _clean_address(self, address: str) -> str:
+        if not address:
+            return ""
+        
+        # Remove any leading state/city prefixes like "PA, PHILADELPHIA, ..."
+        # Bright MLS sometimes puts these at the beginning of UnparsedAddress
+        parts = [p.strip() for p in address.split(',')]
+        
+        # List of states to skip if they appear at the beginning
+        states = {"AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "DC", "PENNSYLVANIA", "DELAWARE", "MARYLAND", "NEW JERSEY", "VIRGINIA"}
+        
+        idx = 0
+        while idx < len(parts) and (parts[idx].upper() in states or not any(char.isdigit() for char in parts[idx])):
+            # If it's a state OR doesn't contain any digits (probably not a street address), skip it
+            # But don't skip if it's the only part left
+            if idx == len(parts) - 1:
+                break
+            idx += 1
+            
+        return parts[idx]
+
     def _map_to_app_model(self, item: Dict[str, Any]) -> Dict[str, Any]:
         raw_status = item.get("MlsStatus", "").upper()
         home_status = "FOR_SALE"
@@ -138,10 +159,13 @@ class BrightMlsService:
         baths_half = item.get("BathroomsHalf") or 0
         bathrooms = item.get("BathroomsTotalInteger") or (baths_full + (baths_half * 0.5))
 
+        raw_address = item.get("FullStreetAddress") or item.get("UnparsedAddress")
+        clean_street = self._clean_address(raw_address)
+
         return {
             "listing_key": str(item.get("ListingKey", "")),
             "mls_id": item.get("ListingId"),
-            "address": item.get("UnparsedAddress") or item.get("FullStreetAddress"),
+            "address": clean_street,
             "city": item.get("City"),
             "state": item.get("StateOrProvince"),
             "zipcode": item.get("PostalCode"),
@@ -349,9 +373,9 @@ class BrightMlsService:
         except Exception as e:
             logger.error(f"❌ Diagnostic failed: {str(e)}")
 
-if __name__ == "__main__":
-    async def main():
-        service = BrightMlsService()
-        try: await service.run_diagnostic_tests()
-        finally: await service.close()
-    asyncio.run(main())
+    async def bright_mls_id_exists(self, mls_id: str) -> bool:
+        params = {"$filter": f"MemberMlsId eq '{mls_id}'", "$select": "MemberNickname,MemberLastName", "$top": 1}
+        data = await self._make_request("BrightMembers", params=params)
+        return bool(data.get("value", []))
+
+bright_mls_service = BrightMlsService()

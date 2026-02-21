@@ -4,11 +4,11 @@ from datetime import datetime
 
 class UserBase(BaseModel):
     email: EmailStr
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    state: Optional[str] = None
-    brokerage: Optional[str] = None
-    mls_id: Optional[str] = None
+    first_name: str
+    last_name: str
+    state: str
+    brokerage: str
+    mls_id: str
 
 class UserCreate(UserBase):
     password: str

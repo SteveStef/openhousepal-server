@@ -7,7 +7,7 @@ from app.models.database import Property, OpenHouseVisitor, Collection, collecti
 from app.schemas.open_house import OpenHouseFormSubmission
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.collections_service import CollectionsService
-from app.services.bright_mls_service import BrightMlsService
+from app.services.bright_mls_service import bright_mls_service
 from app.schemas.collection_preferences import CollectionPreferences as CollectionPreferencesSchema
 from app.config.logging import get_logger
 
@@ -118,10 +118,9 @@ class OpenHouseService:
         preferences: CollectionPreferencesSchema
     ) -> int:
         """Populate collection with properties from Bright MLS API"""
-        mls_service = BrightMlsService()
         try:
             # Get matching properties from Bright MLS using the new method name
-            matching_properties = await mls_service.get_properties_by_preferences(preferences)
+            matching_properties = await bright_mls_service.get_properties_by_preferences(preferences)
             
             properties_added = 0
             
@@ -142,8 +141,6 @@ class OpenHouseService:
         except Exception as e:
             logger.error(f"populating collection {collection.id} with Bright MLS properties failed", extra={"error": str(e)})
             return 0
-        finally:
-            await mls_service.close()
     
     @staticmethod
     async def _property_exists_in_collection(db: AsyncSession, collection_id: str, listing_key: str) -> bool:

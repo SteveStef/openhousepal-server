@@ -17,11 +17,6 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # Admin user configuration from environment variables
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@openhousepal.com")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-ADMIN_FIRST_NAME = os.getenv("ADMIN_FIRST_NAME", "Admin")
-ADMIN_LAST_NAME = os.getenv("ADMIN_LAST_NAME", "User")
-ADMIN_STATE = os.getenv("ADMIN_STATE", "CA")
-ADMIN_BROKERAGE = os.getenv("ADMIN_BROKERAGE", "Open House Pal")
-
 
 async def create_admin_user():
     """
@@ -45,10 +40,11 @@ async def create_admin_user():
             admin_user = User(
                 email=ADMIN_EMAIL,
                 hashed_password=pwd_context.hash(ADMIN_PASSWORD),
-                first_name=ADMIN_FIRST_NAME,
-                last_name=ADMIN_LAST_NAME,
-                state=ADMIN_STATE,
-                brokerage=ADMIN_BROKERAGE,
+                first_name="admin",
+                last_name="user",
+                state="PA",
+                brokerage="NONE",
+                mls_id="123456",  # No MLS ID for admin
                 # Premium subscription with no expiration
                 subscription_id=None,  # No PayPal subscription needed
                 subscription_status="ACTIVE",  # Active, not trial
@@ -67,13 +63,6 @@ async def create_admin_user():
             print(f"\n{'='*60}")
             print(f"✓ Admin user created successfully!")
             print(f"{'='*60}")
-            print(f"Email:     {ADMIN_EMAIL}")
-            print(f"Password:  {ADMIN_PASSWORD}")
-            print(f"Plan Tier: PREMIUM")
-            print(f"Status:    ACTIVE")
-            print(f"{'='*60}")
-            print(f"⚠️  IMPORTANT: Change the admin password after first login!")
-            print(f"{'='*60}\n")
 
     except Exception as e:
         print(f"✗ Error creating admin user: {e}")

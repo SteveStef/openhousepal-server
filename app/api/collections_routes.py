@@ -26,7 +26,7 @@ from app.services.collections_service import CollectionsService
 from app.services.property_interactions_service import PropertyInteractionsService
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.property_sync_service import PropertySyncService
-from app.services.bright_mls_service import BrightMlsService
+from app.services.bright_mls_service import bright_mls_service
 from app.services.property_tour_service import PropertyTourService
 from app.utils.auth import get_current_active_user, get_current_user_optional, require_premium_plan
 from app.models.database import User, Collection
@@ -179,7 +179,6 @@ async def create_collection_with_preferences(
             If address is used, then make a requests like before to get lat and long of the property
             If City or Township is used, make a zillow request per city/township
         '''
-        mls_service = BrightMlsService()
         latitude = request.lat if request.lat is not None else 0
         longitude = request.long if request.long is not None else 0
         
@@ -187,7 +186,7 @@ async def create_collection_with_preferences(
             # Only perform MLS lookup if coordinates weren't provided by frontend
             if latitude == 0 and longitude == 0 and len(request.address) > 0:
                 try:
-                    property_details = await mls_service.get_property_by_address(request.address)
+                    property_details = await bright_mls_service.get_property_by_address(request.address)
                     latitude = property_details.get('latitude')
                     longitude = property_details.get('longitude')
 
@@ -292,8 +291,9 @@ async def create_collection_with_preferences(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="Collection created but could not retrieve"
                 )
-        finally:
-            await mls_service.close()
+        except Exception as e:
+            logger.error(f"Error in create_collection_with_preferences: {e}")
+            raise
         
     except HTTPException:
         raise

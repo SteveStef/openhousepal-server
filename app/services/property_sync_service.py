@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 import os
 
 from app.models.database import Collection, CollectionPreferences, Property, collection_properties, User, PropertyInteraction, PropertyComment, PropertyTour
-from app.services.bright_mls_service import BrightMlsService
+from app.services.bright_mls_service import BrightMlsService, bright_mls_service
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.email_service import EmailService
 from app.config.logging import get_logger
@@ -237,24 +237,23 @@ class PropertySyncService:
     async def sync_all_active_collections(self) -> Dict[str, Any]:
         """Scheduled task entry point"""
         from app.database import AsyncSessionLocal
-        mls_service = BrightMlsService()
         results = {'processed': 0, 'new_props': 0}
         
         try:
             async with AsyncSessionLocal() as db:
                 collections = await self.get_active_collections_with_preferences(db)
                 for col, pref in collections:
-                    res = await self.sync_collection_properties(db, col, pref, mls_service)
+                    res = await self.sync_collection_properties(db, col, pref, bright_mls_service)
                     results['processed'] += 1
                     results['new_props'] += res['new_count']
                     await asyncio.sleep(0.2)
             return results
-        finally:
-            await mls_service.close()
+        except Exception as e:
+            logger.error(f"Sync all collections failed: {e}")
+            return results
 
     async def populate_new_collection(self, db: AsyncSession, collection_id: str) -> Dict[str, Any]:
         """Initial population for newly created collections"""
-        mls_service = BrightMlsService()
         try:
             result = await db.execute(select(Collection).where(Collection.id == collection_id))
             collection = result.scalar_one_or_none()
@@ -263,25 +262,25 @@ class PropertySyncService:
             preferences = await CollectionPreferencesService.get_preferences_by_collection_id(db, collection_id)
             if not preferences: return {'success': True, 'new_properties_added': 0}
 
-            matching = await mls_service.get_properties_by_preferences(preferences)
+            matching = await bright_mls_service.get_properties_by_preferences(preferences)
             for prop_data in matching:
                 if not await self.property_exists_in_collection(db, collection.id, prop_data['listing_key']):
                     p_obj = await self.create_property_from_mls_data(db, prop_data)
                     await self.add_property_to_collection(db, collection.id, p_obj.id, initial=True)
 
             return {'success': True, 'new_properties_added': len(matching)}
-        finally:
-            await mls_service.close()
+        except Exception as e:
+            logger.error(f"Failed to populate collection {collection_id}: {e}")
+            return {'success': False, 'error': str(e)}
 
     async def replace_collection_properties(self, db: AsyncSession, collection_id: str, preferences: Optional[CollectionPreferences] = None) -> Dict[str, Any]:
         """Re-populate collection after preference change"""
-        mls_service = BrightMlsService()
         try:
             if not preferences:
                 preferences = await CollectionPreferencesService.get_preferences_by_collection_id(db, collection_id)
             if not preferences: return {'success': False, 'error': 'No preferences'}
 
-            matching = await mls_service.get_properties_by_preferences(preferences)
+            matching = await bright_mls_service.get_properties_by_preferences(preferences)
             
             # Clear existing associations
             await db.execute(collection_properties.delete().where(collection_properties.c.collection_id == collection_id))
@@ -291,5 +290,6 @@ class PropertySyncService:
                 await self.add_property_to_collection(db, collection_id, p_obj.id, initial=True)
 
             return {'success': True, 'properties_replaced': len(matching)}
-        finally:
-            await mls_service.close()
+        except Exception as e:
+            logger.error(f"Failed to replace properties for collection {collection_id}: {e}")
+            return {'success': False, 'error': str(e)}

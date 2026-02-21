@@ -21,11 +21,11 @@ class User(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
-    first_name = Column(String, nullable=True)
-    last_name = Column(String, nullable=True)
-    state = Column(String, nullable=True)  # Agent's state
-    brokerage = Column(String, nullable=True)  # Agent's brokerage
-    mls_id = Column(String, nullable=True)  # Agent's MLS ID
+    first_name = Column(String, nullable=False)
+    last_name = Column(String, nullable=False)
+    state = Column(String, nullable=False)  # Agent's state
+    brokerage = Column(String, nullable=False)  # Agent's brokerage
+    mls_id = Column(String, unique=True, index=True, nullable=False)  # Agent's MLS ID
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # PayPal subscription fields

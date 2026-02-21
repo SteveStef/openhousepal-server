@@ -14,6 +14,7 @@ from app.utils.clean_cache import cleanup_expired_property_cache, cleanup_expire
 from app.utils.property_sync_scheduler import scheduled_property_sync
 from app.services.paypal_service import PayPalService
 from app.services.email_scheduler_service import EmailSchedulerService
+from app.services.bright_mls_service import bright_mls_service
 from app.utils.create_admin import create_admin_user
 from app.config.logging import configure_logging, get_logger, set_request_id, clear_request_id
 
@@ -89,7 +90,8 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Shutting down application")
     scheduler.shutdown()
-    logger.info("APScheduler stopped")
+    await bright_mls_service.close()
+    logger.info("APScheduler and Bright MLS client stopped")
 
 app = FastAPI(title="Open House Pal API", lifespan=lifespan)
 

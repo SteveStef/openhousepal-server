@@ -9,7 +9,7 @@ import os
 
 from app.database import get_db
 from app.models.database import Property, PropertyDetails
-from app.services.bright_mls_service import BrightMlsService
+from app.services.bright_mls_service import bright_mls_service
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -185,17 +185,17 @@ async def get_property_details(
     if not request.listing_key and not request.address:
         raise HTTPException(status_code=400, detail="Either listing_key or address must be provided")
         
-    mls_service = BrightMlsService()
     try:
         if request.listing_key:
-            property_data = await mls_service.get_property_by_id(request.listing_key)
+            property_data = await bright_mls_service.get_property_by_id(request.listing_key)
             if not property_data:
                 raise HTTPException(status_code=404, detail="Property not found by listing key")
             return property_data
         else:
-            return await mls_service.get_property_by_address(address=request.address)
-    finally:
-        await mls_service.close()
+            return await bright_mls_service.get_property_by_address(address=request.address)
+    except Exception as e:
+        logger.error(f"MLS search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 class SimilarPropertiesRequest(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
@@ -212,13 +212,11 @@ async def get_similar_properties(
     request: SimilarPropertiesRequest
 ):
     """Find similar properties or fetch curated properties by keys"""
-    mls_service = BrightMlsService()
-    
     try:
         # If specific keys are provided, fetch those exactly (Curation Mode)
         if request.listing_keys:
             logger.info(f"Fetching curated properties by keys: {request.listing_keys}")
-            results = await mls_service.get_properties_by_keys([str(k) for k in request.listing_keys])
+            results = await bright_mls_service.get_properties_by_keys([str(k) for k in request.listing_keys])
             return {"success": True, "properties": results}
 
         # Otherwise, perform a similarity search (Discovery Mode)
@@ -246,7 +244,7 @@ async def get_similar_properties(
             max_beds=bedrooms + 1
         )
         
-        results = await mls_service.get_properties_by_preferences(prefs, max_properties=12)
+        results = await bright_mls_service.get_properties_by_preferences(prefs, max_properties=12)
         
         if request.listing_key:
             results = [p for p in results if str(p.get('listing_key')) != str(request.listing_key)]
@@ -263,8 +261,9 @@ async def get_similar_properties(
             camel_results.append(camel_p)
             
         return {"success": True, "properties": camel_results}
-    finally:
-        await mls_service.close()
+    except Exception as e:
+        logger.error(f"Similar properties search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/properties/{property_id}/cache")
 async def cache_property_details(
@@ -336,12 +335,11 @@ async def cache_property_details(
         if not property_record.street_address and not property_record.listing_key:
             raise HTTPException(status_code=400, detail="Property missing address or listing key for MLS lookup")
 
-        mls_service = BrightMlsService()
         try:
             if property_record.listing_key:
-                fetched_data = await mls_service.get_property_by_id(property_record.listing_key)
+                fetched_data = await bright_mls_service.get_property_by_id(property_record.listing_key)
             else:
-                fetched_data = await mls_service.get_property_by_address(property_record.street_address)
+                fetched_data = await bright_mls_service.get_property_by_address(property_record.street_address)
             
             if not fetched_data:
                  raise HTTPException(status_code=404, detail="Property not found on MLS")
@@ -413,8 +411,9 @@ async def cache_property_details(
                 "from_cache": False,
                 "property": response_details.model_dump(by_alias=True, exclude_none=True)
             }
-        finally:
-            await mls_service.close()
+        except Exception as e:
+            logger.error(f"Failed to fetch MLS data for cache: {e}")
+            raise
 
     except HTTPException:
         await db.rollback()
@@ -444,15 +443,15 @@ async def get_property_for_agent(
         
         agent_name = f"{agent.first_name} {agent.last_name}"
         
-        mls_service = BrightMlsService()
         try:
-            property_data = await mls_service.get_property_by_id(listing_key)
+            property_data = await bright_mls_service.get_property_by_id(listing_key)
             if not property_data:
                 raise HTTPException(status_code=404, detail="Property not found")
                 
             return PropertyAgentResponse(property=property_data, agent_name=agent_name)
-        finally:
-            await mls_service.close()
+        except Exception as e:
+            logger.error(f"MLS ID search for agent failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
         
     except HTTPException:
         raise

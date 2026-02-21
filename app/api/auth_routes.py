@@ -9,6 +9,7 @@ from app.database import get_db
 from app.schemas.user import UserCreate, User, UserLogin, Token, ForgotPasswordRequest, ResetPasswordRequest
 from app.services.user_service import UserService
 from app.services.paypal_service import paypal_service
+from app.services.bright_mls_service import bright_mls_service
 from app.utils.auth import create_access_token, get_current_active_user, hash_password
 from app.models.database import User as UserModel
 from app.services.verification_service import verification_service
@@ -22,37 +23,6 @@ logger = get_logger(__name__)
 # PayPal Plan ID Constants (from environment variables)
 BASIC_PLAN_ID = os.getenv("PAYPAL_BASIC_PLAN_ID")
 PREMIUM_PLAN_ID = os.getenv("PAYPAL_PREMIUM_PLAN_ID")
-
-@router.post("/validate-signup-form", status_code=status.HTTP_200_OK)
-async def validate_signup(
-    user_data: UserCreate,
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Validate signup form data before proceeding to payment.
-    Checks if email is already registered.
-    """
-    try:
-        existing_user = await UserService.get_user_by_email(db, user_data.email)
-        if existing_user:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Email already registered"
-            )
-
-        return {
-            "valid": True,
-            "message": "Email available"
-        }
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error("Validation error", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Validation failed"
-        )
 
 @router.post("/send-verification-code", status_code=status.HTTP_200_OK)
 async def send_verification_code(
@@ -70,6 +40,20 @@ async def send_verification_code(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Email already registered"
+            )
+
+        valid_bright_mls_id = await bright_mls_service.bright_mls_id_exists(user_data.mls_id)
+        if not valid_bright_mls_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The MLS ID is not listed with BRIGHT MLS."
+            )
+
+        existing_mls_id = await UserService.get_user_by_mls_id(db, user_data.mls_id)
+        if existing_mls_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This MLS ID is already associated with another account."
             )
 
         # Check rate limit
