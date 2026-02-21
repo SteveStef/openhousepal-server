@@ -94,6 +94,34 @@ async def get_current_active_user(current_user = Depends(get_current_user)):
     #     )
     return current_user
 
+async def require_broker_authorization(current_user = Depends(get_current_active_user)):
+    """
+    Require the user to have been authorized by a broker/admin.
+    Admins are always authorized.
+    """
+    ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@openhousepal.com")
+    
+    if current_user.email == ADMIN_EMAIL or current_user.broker_authorized:
+        return current_user
+        
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Broker authorization required to access this feature."
+    )
+
+async def require_admin_user(current_user = Depends(get_current_active_user)):
+    """
+    Require the user to be the master administrator.
+    """
+    ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@openhousepal.com")
+    
+    if current_user.email != ADMIN_EMAIL:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrative privileges required."
+        )
+    return current_user
+
 async def require_basic_plan(current_user = Depends(get_current_active_user)):
     """
     Require user to have an active subscription (BASIC or PREMIUM).

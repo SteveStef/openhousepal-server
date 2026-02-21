@@ -9,6 +9,7 @@ class UserBase(BaseModel):
     state: str
     brokerage: str
     mls_id: str
+    broker_authorized: bool = False
 
 class UserCreate(UserBase):
     password: str
@@ -24,12 +25,14 @@ class UserUpdate(BaseModel):
 
 class User(UserBase):
     id: str
+    is_admin: bool = False
     created_at: datetime
     updated_at: Optional[datetime] = None
 
     # PayPal subscription fields
     subscription_id: Optional[str] = None
     subscription_status: Optional[str] = None
+    broker_authorized: bool = False
     plan_id: Optional[str] = None
     plan_tier: Optional[str] = None  # BASIC or PREMIUM
     trial_ends_at: Optional[datetime] = None

@@ -7,7 +7,7 @@ from datetime import datetime
 
 from app.database import get_db
 from app.models.database import OpenHouseEvent, User, OpenHouseVisitor, Notification, ScheduledEmail
-from app.utils.auth import get_current_active_user, require_basic_plan
+from app.utils.auth import get_current_active_user, require_basic_plan, require_broker_authorization
 from app.schemas.open_house import OpenHouseCreateRequest, OpenHouseResponse, OpenHouseFormSubmission, OpenHouseFormResponse, VisitorResponse, NoteUpdate
 from app.services.open_house_service import OpenHouseService
 from app.services.email_service import EmailService
@@ -26,7 +26,7 @@ load_dotenv()
 router = APIRouter()
 
 # is this route authed for people that have trial, premium, or basic
-@router.post("/api/open-houses", response_model=OpenHouseResponse)
+@router.post("/api/open-houses", response_model=OpenHouseResponse, dependencies=[Depends(require_broker_authorization)])
 async def create_open_house(
     request: OpenHouseCreateRequest,
     db: AsyncSession = Depends(get_db),
@@ -115,7 +115,7 @@ async def create_open_house(
         
         raise HTTPException(status_code=500, detail="Failed to create open house")
 
-@router.get("/api/open-houses", response_model=List[OpenHouseResponse])
+@router.get("/api/open-houses", response_model=List[OpenHouseResponse], dependencies=[Depends(require_broker_authorization)])
 async def get_open_houses(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
@@ -166,7 +166,7 @@ async def get_open_houses(
         logger.error("fetching open houses failed", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail="Failed to fetch open houses")
 
-@router.delete("/api/open-houses/{open_house_id}")
+@router.delete("/api/open-houses/{open_house_id}", dependencies=[Depends(require_broker_authorization)])
 async def delete_open_house(
     open_house_id: str,
     db: AsyncSession = Depends(get_db),

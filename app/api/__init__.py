@@ -8,6 +8,7 @@ from .open_houses_routes import router as open_houses_router
 from .subscription_routes import router as subscription_router
 from .webhook_routes import router as webhook_router
 from .notifications_routes import router as notifications_router
+from .admin_routes import router as admin_router
 
 router = APIRouter()
 router.include_router(auth_router)
@@ -19,3 +20,4 @@ router.include_router(open_houses_router)
 router.include_router(subscription_router)
 router.include_router(webhook_router)
 router.include_router(notifications_router)
+router.include_router(admin_router)

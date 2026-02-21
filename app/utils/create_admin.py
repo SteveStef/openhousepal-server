@@ -45,6 +45,7 @@ async def create_admin_user():
                 state="PA",
                 brokerage="NONE",
                 mls_id="123456",  # No MLS ID for admin
+                broker_authorized=True,
                 # Premium subscription with no expiration
                 subscription_id=None,  # No PayPal subscription needed
                 subscription_status="ACTIVE",  # Active, not trial

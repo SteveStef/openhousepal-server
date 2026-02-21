@@ -28,7 +28,7 @@ from app.services.collection_preferences_service import CollectionPreferencesSer
 from app.services.property_sync_service import PropertySyncService
 from app.services.bright_mls_service import bright_mls_service
 from app.services.property_tour_service import PropertyTourService
-from app.utils.auth import get_current_active_user, get_current_user_optional, require_premium_plan
+from app.utils.auth import get_current_active_user, get_current_user_optional, require_premium_plan, require_broker_authorization
 from app.models.database import User, Collection
 from sqlalchemy import select
 from app.config.logging import get_logger
@@ -84,7 +84,7 @@ class ShareToggleRequest(BaseModel):
     force_regenerate: bool = False
 
 
-@router.get("/", response_model=List[CollectionResponse])
+@router.get("/", response_model=List[CollectionResponse], dependencies=[Depends(require_broker_authorization)])
 async def get_all_collections(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_premium_plan)
@@ -104,7 +104,7 @@ async def get_all_collections(
         )
 
 
-@router.get("/{collection_id}", response_model=CollectionResponse)
+@router.get("/{collection_id}", response_model=CollectionResponse, dependencies=[Depends(require_broker_authorization)])
 async def get_collection(
     collection_id: str,
     db: AsyncSession = Depends(get_db),
@@ -134,7 +134,7 @@ async def get_collection(
         )
 
 
-@router.post("/", response_model=CollectionResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/", response_model=CollectionResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_broker_authorization)])
 async def create_collection(
     collection_data: CollectionCreate,
     db: AsyncSession = Depends(get_db),
@@ -168,7 +168,7 @@ async def create_collection(
         )
 
 
-@router.post("/create-manually", response_model=CollectionResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/create-manually", response_model=CollectionResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_broker_authorization)])
 async def create_collection_with_preferences(
     request: CreateCollectionWithPreferencesRequest,
     db: AsyncSession = Depends(get_db),

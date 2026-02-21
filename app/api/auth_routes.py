@@ -10,7 +10,7 @@ from app.schemas.user import UserCreate, User, UserLogin, Token, ForgotPasswordR
 from app.services.user_service import UserService
 from app.services.paypal_service import paypal_service
 from app.services.bright_mls_service import bright_mls_service
-from app.utils.auth import create_access_token, get_current_active_user, hash_password
+from app.utils.auth import create_access_token, get_current_active_user, hash_password, require_broker_authorization
 from app.models.database import User as UserModel
 from app.services.verification_service import verification_service
 from app.services.discord_notifier import notifier 
@@ -121,7 +121,7 @@ async def verify_code(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Verify the 6-digit code sent to user's email.
+    Verify the 6-digit code and automatically create the user account.
     """
     email = request.get("email")
     code = request.get("code")
@@ -132,20 +132,58 @@ async def verify_code(
             detail="Email and code are required"
         )
 
-    # Verify the code
+    # 1. Verify the code
     is_valid, error_msg = await verification_service.verify_code(email, code, db)
-
     if not is_valid:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=error_msg
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error_msg)
 
-    return {
-        "success": True,
-        "verified": True,
-        "message": "Email verified successfully"
-    }
+    # 2. Retrieve the stored form data (which includes hashed password)
+    form_data = await verification_service.get_form_data(email, db)
+    if not form_data:
+        raise HTTPException(status_code=400, detail="Registration data expired. Please start over.")
+
+    # 3. Create the User (restricted status)
+    try:
+        new_user = UserModel(
+            email=email,
+            hashed_password=form_data["password"], # Already hashed by verification_service.store_code
+            first_name=form_data["first_name"],
+            last_name=form_data["last_name"],
+            state=form_data["state"],
+            brokerage=form_data["brokerage"],
+            mls_id=form_data["mls_id"],
+            subscription_status="PENDING_PAYMENT",
+            broker_authorized=False,
+            plan_tier=None
+        )
+        db.add(new_user)
+        await db.flush()
+        await db.refresh(new_user)
+
+        # 4. Clear verification data
+        await verification_service.clear_verification(email, db)
+        await db.commit()
+
+        # 5. Return access token
+        access_token = create_access_token(data={"sub": new_user.id})
+        
+        return {
+            "success": True,
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": {
+                "id": new_user.id,
+                "email": new_user.email,
+                "first_name": new_user.first_name,
+                "last_name": new_user.last_name,
+                "broker_authorized": new_user.broker_authorized,
+                "subscription_status": new_user.subscription_status
+            }
+        }
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"User creation during verification failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to finalize registration")
 
 @router.post("/resend-verification-code", status_code=status.HTTP_200_OK)
 async def resend_verification_code(
@@ -241,6 +279,105 @@ async def verify_bundle_code(
         "plan_id": bundle_plan_id,
         "message": "Promo code applied successfully!"
     }
+
+
+@router.post("/link-subscription")
+async def link_subscription(
+    subscription_id: str,
+    plan_id: str,
+    bundle_code: str = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserModel = Depends(require_broker_authorization)
+):
+    """
+    Link a PayPal subscription to an existing, authorized user account.
+    Reuses the exact PayPal validation logic from the previous flow.
+    """
+    try:
+        # Step 1: Validate subscription with PayPal API
+        try:
+            subscription_details = await paypal_service.get_subscription(subscription_id)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail="Invalid subscription ID or PayPal service unavailable")
+
+        # Step 2: Verify plan_id matches
+        if subscription_details.get('plan_id') != plan_id:
+            raise HTTPException(status_code=400, detail="Plan ID mismatch")
+
+        # Step 3: Check subscription status
+        if subscription_details.get('status') not in ['ACTIVE', 'APPROVAL_PENDING', 'APPROVED']:
+            raise HTTPException(status_code=400, detail="Invalid subscription status")
+
+        # Step 4: Determine plan tier
+        BUNDLE_PLAN_ID = os.getenv("PAYPAL_BUNDLE_PLAN_ID")
+        if plan_id == BASIC_PLAN_ID:
+            plan_tier = "BASIC"
+        elif plan_id == PREMIUM_PLAN_ID:
+            plan_tier = "PREMIUM"
+        elif BUNDLE_PLAN_ID and plan_id == BUNDLE_PLAN_ID:
+            if not bundle_code:
+                raise HTTPException(status_code=400, detail="Promo code required for this plan")
+            plan_tier = "PREMIUM"
+        else:
+            raise HTTPException(status_code=400, detail="Invalid plan configuration")
+
+        # Step 5: Check if subscription already linked
+        from sqlalchemy import select
+        stmt = select(UserModel).where(UserModel.subscription_id == subscription_id)
+        existing = await db.execute(stmt)
+        if existing.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Subscription already linked to another account")
+
+        # Handle Bundle Code marking
+        if bundle_code:
+            from app.models.database import BundleCode
+            code_res = await db.execute(select(BundleCode).where(BundleCode.code == bundle_code))
+            db_code = code_res.scalar_one_or_none()
+            if not db_code:
+                raise HTTPException(status_code=400, detail="Invalid promo code")
+            if db_code.is_used:
+                raise HTTPException(status_code=400, detail="Promo code already used")
+            
+            db_code.is_used = True
+            db_code.used_at = datetime.now(timezone.utc)
+
+        # Step 6: Update User Record
+        now = datetime.now(timezone.utc)
+        billing_info = subscription_details.get('billing_info', {})
+        next_billing_time = billing_info.get('next_billing_time')
+        
+        if next_billing_time:
+            trial_end = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
+        else:
+            trial_end = now + timedelta(days=int(os.getenv("TRIAL_PERIOD_DAYS", "14")))
+
+        current_user.subscription_id = subscription_id
+        current_user.plan_id = plan_id
+        current_user.plan_tier = plan_tier
+        current_user.subscription_status = "TRIAL"
+        current_user.subscription_started_at = now
+        current_user.trial_ends_at = trial_end
+        current_user.next_billing_date = trial_end
+        current_user.last_paypal_sync = now
+
+        await db.commit()
+        await db.refresh(current_user)
+
+        # Welcome notification
+        notifier.send(f"Agent {current_user.first_name} {current_user.last_name} has successfully linked a {plan_tier} subscription.")
+
+        return {
+            "success": True,
+            "subscription_status": current_user.subscription_status,
+            "plan_tier": current_user.plan_tier
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Subscription linking failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/signup-with-subscription", response_model=Token, status_code=status.HTTP_201_CREATED)

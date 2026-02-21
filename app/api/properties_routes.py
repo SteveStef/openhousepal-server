@@ -10,6 +10,7 @@ import os
 from app.database import get_db
 from app.models.database import Property, PropertyDetails
 from app.services.bright_mls_service import bright_mls_service
+from app.utils.auth import require_broker_authorization
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -135,7 +136,7 @@ async def store_property(
         logger.error("Failed to store property", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail="Failed to store property")
 
-@router.get("/api/properties/{property_id}")
+@router.get("/api/properties/{property_id}", dependencies=[Depends(require_broker_authorization)])
 async def get_property(
     property_id: str,
     db: AsyncSession = Depends(get_db)
@@ -177,7 +178,7 @@ async def get_property(
         logger.error("Failed to get property", extra={"property_id": property_id, "error": str(e)})
         raise HTTPException(status_code=500, detail="Failed to get property")
 
-@router.post("/api/property", response_model=PropertyDetailResponse)
+@router.post("/api/property", response_model=PropertyDetailResponse, dependencies=[Depends(require_broker_authorization)])
 async def get_property_details(
     request: PropertyLookupRequest
 ):
@@ -207,7 +208,7 @@ class SimilarPropertiesRequest(BaseModel):
     price: Optional[Union[float, int]] = None
     bedrooms: Optional[Union[float, int]] = None
 
-@router.post("/api/properties/similar")
+@router.post("/api/properties/similar", dependencies=[Depends(require_broker_authorization)])
 async def get_similar_properties(
     request: SimilarPropertiesRequest
 ):
@@ -265,7 +266,7 @@ async def get_similar_properties(
         logger.error(f"Similar properties search failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/properties/{property_id}/cache")
+@router.get("/properties/{property_id}/cache", dependencies=[Depends(require_broker_authorization)])
 async def cache_property_details(
     property_id: str,
     db: AsyncSession = Depends(get_db)
@@ -428,7 +429,7 @@ class PropertyAgentResponse(BaseModel):
     property: PropertyDetailResponse
     agent_name: str
 
-@router.get("/properties/agent/{agent_id}/listing/{listing_key}", response_model=PropertyAgentResponse)
+@router.get("/properties/agent/{agent_id}/listing/{listing_key}", response_model=PropertyAgentResponse, dependencies=[Depends(require_broker_authorization)])
 async def get_property_for_agent(
     agent_id: str,
     listing_key: str,

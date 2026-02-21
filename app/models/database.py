@@ -5,6 +5,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from app.database import Base
 from typing import Optional
 import uuid
+import os
 
 # Association table for many-to-many relationship between collections and properties
 collection_properties = Table(
@@ -26,7 +27,12 @@ class User(Base):
     state = Column(String, nullable=False)  # Agent's state
     brokerage = Column(String, nullable=False)  # Agent's brokerage
     mls_id = Column(String, unique=True, index=True, nullable=False)  # Agent's MLS ID
+    broker_authorized = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    @property
+    def is_admin(self) -> bool:
+        return self.email == os.getenv("ADMIN_EMAIL", "admin@openhousepal.com")
 
     # PayPal subscription fields
     subscription_id = Column(String, nullable=True, unique=True, index=True)  # PayPal subscription ID (unique to prevent hijacking)
