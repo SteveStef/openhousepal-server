@@ -192,6 +192,10 @@ class BrightMlsService:
         """
         base_info = self._map_to_app_model(item)
         
+        # If no images found in BrightMedia, at least use the primary one from the property record
+        if not images and base_info.get("image_url"):
+            images = [base_info["image_url"]]
+
         formatted_photos = []
         for img_url in images:
             formatted_photos.append({
@@ -280,7 +284,7 @@ class BrightMlsService:
             if len(loc_filters) > 1: filters.append(f"({' or '.join(loc_filters)})")
             else: filters.append(loc_filters[0].strip('()'))
                 
-        elif preferences.lat and preferences.long and preferences.diameter:
+        elif preferences.lat is not None and preferences.long is not None and preferences.diameter:
             lat_offset = float(preferences.diameter) / 69.0
             cos_lat = math.cos(math.radians(float(preferences.lat)))
             long_offset = float(preferences.diameter) / (69.0 * cos_lat) if abs(cos_lat) > 0.0001 else lat_offset
@@ -288,13 +292,14 @@ class BrightMlsService:
             filters.append(f"Longitude ge {float(preferences.long) - long_offset} and Longitude le {float(preferences.long) + long_offset}")
 
         filters.append("MlsStatus eq 'ACTIVE-BRIGHT'")
-        if preferences.min_price: filters.append(f"ListPrice ge {preferences.min_price}")
-        if preferences.max_price: filters.append(f"ListPrice le {preferences.max_price}")
-        if preferences.min_beds: filters.append(f"BedroomsTotal ge {preferences.min_beds}")
-        if preferences.max_beds: filters.append(f"BedroomsTotal le {preferences.max_beds}")
-        if preferences.min_baths: filters.append(f"BathroomsTotalInteger ge {int(preferences.min_baths)}")
-        if preferences.max_baths: filters.append(f"BathroomsTotalInteger le {int(preferences.max_baths)}")
-        if preferences.min_year_built: filters.append(f"YearBuilt ge {preferences.min_year_built}")
+        if preferences.min_price is not None: filters.append(f"ListPrice ge {preferences.min_price}")
+        if preferences.max_price is not None: filters.append(f"ListPrice le {preferences.max_price}")
+        if preferences.min_beds is not None and preferences.min_beds > 0: filters.append(f"BedroomsTotal ge {preferences.min_beds}")
+        if preferences.max_beds is not None and preferences.max_beds > 0: filters.append(f"BedroomsTotal le {preferences.max_beds}")
+        if preferences.min_baths is not None and preferences.min_baths > 0: filters.append(f"BathroomsTotalInteger ge {int(preferences.min_baths)}")
+        if preferences.max_baths is not None and preferences.max_baths > 0: filters.append(f"BathroomsTotalInteger le {int(preferences.max_baths)}")
+        if preferences.min_year_built is not None: filters.append(f"YearBuilt ge {preferences.min_year_built}")
+        if preferences.max_year_built is not None: filters.append(f"YearBuilt le {preferences.max_year_built}")
 
         type_options = []
         if preferences.is_single_family or preferences.is_town_house or preferences.is_condo: type_options.append("'Residential'")
@@ -318,6 +323,7 @@ class BrightMlsService:
         if not data.get("value"): return None
         item = data["value"][0]
         images = await self._fetch_all_media(listing_key)
+        print(images)
         return self._map_to_full_details(item, images)
 
     async def get_property_by_address(self, address: str) -> Dict[str, Any]:
@@ -362,7 +368,7 @@ class BrightMlsService:
     async def get_properties_by_preferences(self, preferences: CollectionPreferencesSchema, max_properties: int = 50) -> List[Dict[str, Any]]:
         odata_filter = self._build_filter_from_preferences(preferences)
         # Searches use $select for performance
-        params = {"$filter": odata_filter, "$top": max_properties, "$select": self._select_fields_for_properties(), "$orderby": "ListPrice desc"}
+        params = {"$filter": odata_filter, "$top": max_properties, "$select": self._select_fields_for_properties()}
         data = await self._make_request("BrightProperties", params=params)
         return [self._map_to_app_model(item) for item in data.get("value", [])]
 

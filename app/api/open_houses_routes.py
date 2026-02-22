@@ -308,7 +308,7 @@ async def submit_open_house_form(
                         reference_type="VISITOR",
                         reference_id=visitor.id,
                         title=f"New Open House Visitor: {visitor.full_name}",
-                        message="Signed in at your open house" + (f" - {property_data_for_notif.get('address')}" if property_data_for_notif else ""),
+                        message="Signed in at your open house",
                         collection_id=collection_result.get('collection_id') if collection_result.get('success') else None,
                         collection_name=collection_result.get('collection_id') if collection_result.get('success') else None,
                         property_address=property_data_for_notif.get('address') if property_data_for_notif else None,

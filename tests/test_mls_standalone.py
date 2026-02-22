@@ -30,5 +30,43 @@ async def test_member_id(mls_id: str = "3235372"):
     finally:
         print("\n🏁 Check complete.")
 
+async def test_media_fetching(listing_key: str):
+    print(f"🚀 Testing Media Fetching for ListingKey: {listing_key}...\n")
+    if not os.getenv("BRIGHT_MLS_CLIENT"):
+        print("❌ ERROR: BRIGHT_MLS_CLIENT not found in .env file.")
+        return
+
+    try:
+        print(f"--- Calling _fetch_all_media for {listing_key} ---")
+        images = await bright_mls_service._fetch_all_media(listing_key)
+        
+        if images:
+            print(f"✅ SUCCESS: Found {len(images)} images")
+            for i, url in enumerate(images[:3]): # Show first 3
+                print(f"  [{i+1}] {url[:80]}...")
+        else:
+            print("❌ FAILURE: No images returned. Checking raw response structure...")
+            # Let's do a more generic search to see what's available
+            raw_data = await bright_mls_service._make_request("BrightMedia", params={
+                "$filter": f"ResourceRecordKey eq {listing_key}",
+                "$top": 5
+            })
+            print(f"Raw response for ResourceRecordKey={listing_key}:")
+            import json
+            print(json.dumps(raw_data, indent=2))
+
+    except Exception as e:
+        print(f"\n❌ Media Fetch Error: {e}")
+    finally:
+        print("\n🏁 Media check complete.")
+
 if __name__ == "__main__":
-    asyncio.run(test_member_id("3372275"))
+    # You can change the listing_key here to test different properties
+    target_key = "804465427356" 
+    
+    async def main():
+        # await test_member_id("3372275")
+        await test_media_fetching(target_key)
+        await bright_mls_service.close()
+
+    asyncio.run(main())

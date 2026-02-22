@@ -9,6 +9,7 @@ import os
 
 from app.database import get_db
 from app.models.database import Property, PropertyDetails
+from app.schemas.collection_preferences import CollectionPreferencesBase
 from app.services.bright_mls_service import bright_mls_service
 from app.utils.auth import require_broker_authorization
 import json
@@ -207,6 +208,15 @@ class SimilarPropertiesRequest(BaseModel):
     zipcode: Optional[str] = None
     price: Optional[Union[float, int]] = None
     bedrooms: Optional[Union[float, int]] = None
+    
+    # New fields for radial and preference-based search
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    radius: Optional[float] = None
+    min_price: Optional[int] = None
+    max_price: Optional[int] = None
+    min_beds: Optional[int] = None
+    min_baths: Optional[float] = None
 
 @router.post("/api/properties/similar", dependencies=[Depends(require_broker_authorization)])
 async def get_similar_properties(
@@ -221,31 +231,42 @@ async def get_similar_properties(
             return {"success": True, "properties": results}
 
         # Otherwise, perform a similarity search (Discovery Mode)
-        logger.info(f"Finding similar properties for: {request.listing_key} in {request.zipcode or request.city}")
+        logger.info(f"Finding similar properties for: {request.listing_key} in {request.zipcode or request.city or (str(request.lat) + ',' + str(request.lng))}")
         
-        from app.schemas.collection_preferences import CollectionPreferencesBase
         
-        try:
-            bedrooms = int(float(request.bedrooms)) if request.bedrooms is not None else 0
-            price = float(request.price) if request.price is not None else 0
-        except (ValueError, TypeError):
-            bedrooms = 0
-            price = 0
+        # Use provided preferences or calculate defaults
+        if request.lat and request.lng:
+            prefs = CollectionPreferencesBase(
+                lat=request.lat,
+                long=request.lng,
+                diameter=request.radius or 5.0, # default 5 miles
+                min_price=request.min_price,
+                max_price=request.max_price,
+                min_beds=request.min_beds,
+                min_baths=request.min_baths
+            )
+        else:
+            # Fallback to city/zip based search (legacy behavior)
+            try:
+                bedrooms = int(float(request.bedrooms)) if request.bedrooms is not None else 0
+                price = float(request.price) if request.price is not None else 0
+            except (ValueError, TypeError):
+                bedrooms = 0
+                price = 0
+            
+            min_price = int(price * 0.8) if price > 0 else None
+            max_price = int(price * 1.2) if price > 0 else None
+            
+            city_name = request.city.split(',')[0].strip() if request.city else None
+            
+            prefs = CollectionPreferencesBase(
+                cities=[f"{city_name}, {request.state}"] if city_name and request.state else [],
+                min_price=min_price,
+                max_price=max_price,
+                min_beds=max(0, bedrooms - 1)
+            )
         
-        min_price = int(price * 0.8) if price > 0 else None
-        max_price = int(price * 1.2) if price > 0 else None
-        
-        city_name = request.city.split(',')[0].strip() if request.city else None
-        
-        prefs = CollectionPreferencesBase(
-            cities=[f"{city_name}, {request.state}"] if city_name and request.state else [],
-            min_price=min_price,
-            max_price=max_price,
-            min_beds=max(0, bedrooms - 1),
-            max_beds=bedrooms + 1
-        )
-        
-        results = await bright_mls_service.get_properties_by_preferences(prefs, max_properties=12)
+        results = await bright_mls_service.get_properties_by_preferences(prefs, max_properties=50)
         
         if request.listing_key:
             results = [p for p in results if str(p.get('listing_key')) != str(request.listing_key)]
