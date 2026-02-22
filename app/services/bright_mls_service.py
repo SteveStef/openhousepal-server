@@ -323,7 +323,6 @@ class BrightMlsService:
         if not data.get("value"): return None
         item = data["value"][0]
         images = await self._fetch_all_media(listing_key)
-        print(images)
         return self._map_to_full_details(item, images)
 
     async def get_property_by_address(self, address: str) -> Dict[str, Any]:

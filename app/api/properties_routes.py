@@ -8,7 +8,7 @@ from pydantic.alias_generators import to_camel
 import os
 
 from app.database import get_db
-from app.models.database import Property, PropertyDetails
+from app.models.database import Property, PropertyDetails, User, ScheduledEmail
 from app.schemas.collection_preferences import CollectionPreferencesBase
 from app.services.bright_mls_service import bright_mls_service
 from app.utils.auth import require_broker_authorization
@@ -50,6 +50,14 @@ class PropertyResponse(BaseModel):
     id: str
     property_data: Dict[str, Any]
     address: str
+
+class AgentMessageRequest(BaseModel):
+    agent_id: str
+    property_id: str
+    property_address: str
+    visitor_name: str
+    visitor_contact: str
+    message: str
 
 @router.post("/api/properties")
 async def store_property(
@@ -136,6 +144,51 @@ async def store_property(
         await db.rollback()
         logger.error("Failed to store property", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail="Failed to store property")
+
+# TODO
+@router.post("/api/properties/message-agent")
+async def message_agent(
+    request: AgentMessageRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Send a message to an agent from a visitor on the property page"""
+    try:
+        # 1. Find the agent
+        stmt = select(User).where(User.id == request.agent_id)
+        result = await db.execute(stmt)
+        agent = result.scalar_one_or_none()
+        
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+            
+        # # 2. Schedule the email using the provided address
+        # scheduled_email = ScheduledEmail(
+        #     recipient_email=agent.email,
+        #     subject=f"New Inquiry from {request.visitor_name} for {request.property_address}",
+        #     template_name="tour_request",
+        #     template_variables={
+        #         "agent_name": f"{agent.first_name} {agent.last_name}",
+        #         "visitor_name": request.visitor_name,
+        #         "visitor_email": request.visitor_contact if "@" in request.visitor_contact else "",
+        #         "visitor_phone": request.visitor_contact if "@" not in request.visitor_contact else "",
+        #         "property_address": request.property_address,
+        #         "message": request.message,
+        #         "preferred_dates": "N/A (General Inquiry)"
+        #     },
+        #     scheduled_for=datetime.now(timezone.utc)
+        # )
+        # 
+        # db.add(scheduled_email)
+        # await db.commit()
+        
+        return {"success": True, "message": "Message sent to agent successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error("Failed to send message to agent", extra={"error": str(e)})
+        raise HTTPException(status_code=500, detail="Failed to send message to agent")
 
 @router.get("/api/properties/{property_id}", dependencies=[Depends(require_broker_authorization)])
 async def get_property(

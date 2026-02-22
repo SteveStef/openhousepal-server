@@ -62,7 +62,7 @@ async def test_media_fetching(listing_key: str):
 
 if __name__ == "__main__":
     # You can change the listing_key here to test different properties
-    target_key = "804465427356" 
+    target_key = "804149848668" 
     
     async def main():
         # await test_member_id("3372275")
