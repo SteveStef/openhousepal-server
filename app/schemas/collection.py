@@ -46,6 +46,7 @@ class CollectionResponse(BaseModel):
     original_property: Optional[dict] = None
     preferences: dict = {}
     property_count: int = 0
+    active_property_count: int = 0
     is_anonymous: bool = False
     is_public: bool = False
     share_token: Optional[str] = None

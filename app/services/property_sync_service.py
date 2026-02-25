@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 import os
 
-from app.models.database import Collection, CollectionPreferences, Property, collection_properties, User, PropertyInteraction, PropertyComment, PropertyTour, ScheduledEmail
+from app.models.database import Collection, CollectionPreferences, Property, collection_properties, User, PropertyInteraction, PropertyComment, PropertyTour, ScheduledEmail, Notification
 from app.services.bright_mls_service import bright_mls_service
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.email_service import EmailService
@@ -242,13 +242,14 @@ class PropertySyncService:
         """
         Refactored core logic for syncing a single collection.
         Optimized with pre-fetch and batched notifications.
+        Now skips price drops for disliked properties.
         """
         logger.info(f"Syncing collection {collection.id} ({collection.name})")
 
         try:
-            # 1. PRE-FETCH OPTIMIZATION (Get all current props for this showcase in ONE query)
-            existing_props = await self._get_properties_for_collection(db, collection.id)
-            property_map = {str(p.listing_key): p for p in existing_props}
+            # 1. PRE-FETCH OPTIMIZATION (Get all current props + dislike status for this showcase)
+            existing_data = await self._get_properties_for_collection(db, collection.id)
+            property_map = {str(p.listing_key): {"obj": p, "disliked": bool(disliked)} for p, disliked in existing_data}
             
             # 2. Tracks all changes found during THIS sync run
             changes = {
@@ -263,10 +264,13 @@ class PropertySyncService:
                 listing_key = str(prop_data.get('listing_key'))
                 
                 # Check for existing property to detect price drops
-                existing_p = property_map.get(listing_key)
+                existing_entry = property_map.get(listing_key)
+                existing_p = existing_entry["obj"] if existing_entry else None
+                is_disliked = existing_entry["disliked"] if existing_entry else False
 
                 # 4. PRICE DROP DETECTION (Broadcast logic)
-                if existing_p and existing_p.price and prop_data.get('price'):
+                # Skip price drop notifications if the user has already disliked this property
+                if existing_p and not is_disliked and existing_p.price and prop_data.get('price'):
                     if prop_data['price'] < existing_p.price:
                         # Add to THIS collection's batch
                         changes["price_drops"].append(prop_data)
@@ -325,33 +329,47 @@ class PropertySyncService:
             await db.rollback()
             return {'new_count': 0, 'drop_count': 0, 'total': 0}
 
-    async def _get_properties_for_collection(self, db: AsyncSession, collection_id: str) -> List[Property]:
-        """Fetch all properties currently linked to a collection in ONE query."""
+    async def _get_properties_for_collection(self, db: AsyncSession, collection_id: str) -> List[tuple]:
+        """Fetch all properties and their dislike status linked to a collection in ONE query."""
         query = (
-            select(Property)
+            select(Property, PropertyInteraction.disliked)
             .join(collection_properties)
+            .outerjoin(PropertyInteraction, and_(
+                PropertyInteraction.collection_id == collection_id,
+                PropertyInteraction.property_id == Property.id
+            ))
             .where(collection_properties.c.collection_id == collection_id)
         )
         result = await db.execute(query)
-        return result.scalars().all()
+        return result.all()
 
     async def _broadcast_price_drop(self, db: AsyncSession, prop_data: Dict[str, Any], old_price: float, exclude_collection_id: str):
         """
         Notify ALL other active collections that contain this property about the price drop.
+        EXCLUDES collections where the property has been disliked.
         """
         listing_key = str(prop_data['listing_key'])
         
-        # 1. Find all active collections containing this property
+        # 1. Find all active collections containing this property that HAVEN'T disliked it
         query = (
             select(Collection)
             .join(collection_properties)
             .join(Property)
+            .outerjoin(PropertyInteraction, and_(
+                PropertyInteraction.collection_id == Collection.id,
+                PropertyInteraction.property_id == Property.id
+            ))
             .options(selectinload(Collection.owner))
             .where(
                 and_(
                     Property.listing_key == listing_key,
                     Collection.status == 'ACTIVE',
-                    Collection.id != exclude_collection_id
+                    Collection.id != exclude_collection_id,
+                    # Only notify if no interaction exists OR if it's not disliked
+                    or_(
+                        PropertyInteraction.id == None,
+                        PropertyInteraction.disliked == False
+                    )
                 )
             )
         )
@@ -361,18 +379,20 @@ class PropertySyncService:
         for col in target_collections:
             # Schedule a price drop email for this collection
             changes = {"new_properties": [], "price_drops": [prop_data]}
-            # We pass old_price for the specific property if we want to show savings in the template
-            # For simplicity in this broadcast, we reuse the combined notification logic
             await self._schedule_combined_notification(db, col, changes, is_broadcast=True)
 
     async def _schedule_combined_notification(self, db: AsyncSession, collection: Collection, changes: Dict[str, Any], is_broadcast: bool = False):
         """
         Schedules a single combined notification for the Agent and Visitor.
+        Also creates an in-app Notification for the agent.
         """
         frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
         new_count = len(changes["new_properties"])
         drop_count = len(changes["price_drops"])
         
+        if new_count == 0 and drop_count == 0:
+            return
+
         # Use first featured property for the thumbnail
         featured = changes["new_properties"][0] if new_count > 0 else changes["price_drops"][0]
         
@@ -419,7 +439,7 @@ class PropertySyncService:
                 template_name=template,
                 template_variables=visitor_vars,
                 status="PENDING",
-                scheduled_for=datetime.utcnow()
+                scheduled_for=datetime.now(timezone.utc)
             ))
 
         # 2. Schedule for Agent
@@ -436,8 +456,42 @@ class PropertySyncService:
                 template_name="new_properties_synced_agent",
                 template_variables=agent_vars,
                 status="PENDING",
-                scheduled_for=datetime.utcnow()
+                scheduled_for=datetime.now(timezone.utc)
             ))
+
+            # 3. Create In-App Notification for Agent
+            try:
+                # Build summary message
+                parts = []
+                if new_count > 0: parts.append(f"{new_count} new property{'ies' if new_count > 1 else ''}")
+                if drop_count > 0: parts.append(f"{drop_count} price drop{'s' if drop_count > 1 else ''}")
+                summary = " and ".join(parts)
+                
+                # Fetch internal property ID for linking
+                prop_id = None
+                featured_key = str(featured.get('listing_key'))
+                prop_res = await db.execute(select(Property.id).where(Property.listing_key == featured_key))
+                prop_id = prop_res.scalar()
+
+                notification = Notification(
+                    agent_id=collection.owner_id,
+                    type="PROPERTY_SYNC_UPDATE",
+                    reference_type="VISITOR",
+                    reference_id=collection.id,
+                    title=f"Showcase Updated: {collection.visitor_name or 'Visitor'}",
+                    message=f"Found {summary} for {collection.name}.",
+                    collection_id=collection.id,
+                    collection_name=collection.name,
+                    property_id=prop_id,
+                    property_address=featured.get('address'),
+                    visitor_name=collection.visitor_name,
+                    link=f"/showcases?showcase={collection.id}" + (f"&property={prop_id}" if prop_id else ""),
+                    is_read=False,
+                    created_at=datetime.now(timezone.utc)
+                )
+                db.add(notification)
+            except Exception as e:
+                logger.error(f"Failed to create agent notification: {e}")
 
     async def populate_new_collection(self, db: AsyncSession, collection_id: str) -> Dict[str, Any]:
         """Initial population for newly created collections"""

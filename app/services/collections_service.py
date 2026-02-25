@@ -69,14 +69,15 @@ class CollectionsService:
 
     @staticmethod
     async def get_user_collections(db: AsyncSession, user_id: str) -> List[Dict[str, Any]]:
-        """Get all collections for a user"""
+        """Get all collections for a user with total and active property counts"""
         try:
             query = (
                 select(Collection)
                 .options(
                     selectinload(Collection.preferences),
                     selectinload(Collection.properties),
-                    selectinload(Collection.original_open_house_event),  # no load_only here
+                    selectinload(Collection.original_open_house_event),
+                    selectinload(Collection.property_interactions),
                 )
                 .where(Collection.owner_id == user_id)
                 .order_by(Collection.created_at.desc())
@@ -87,7 +88,19 @@ class CollectionsService:
 
             collections_data = []
             for collection in collections:
-                property_count = len(collection.properties) if collection.properties else 0
+                # Calculate total vs active (non-disliked) properties
+                total_count = len(collection.properties) if collection.properties else 0
+                
+                disliked_property_ids = {
+                    interaction.property_id 
+                    for interaction in collection.property_interactions 
+                    if interaction.disliked
+                }
+                
+                active_count = 0
+                if collection.properties:
+                    active_count = sum(1 for p in collection.properties if p.id not in disliked_property_ids)
+
                 original_property_data = None
                 if collection.original_open_house_event_id:
                     try:
@@ -173,7 +186,8 @@ class CollectionsService:
                     "original_property": original_property_data,
                     "preferences": preferences_data,
                     "matchedProperties": properties_data,  # Add actual properties data
-                    "property_count": property_count,
+                    "property_count": total_count,
+                    "active_property_count": active_count,
                     "is_anonymous": collection.owner_id is None,
                     "is_public": bool(collection.is_public) if collection.is_public is not None else False,
                     "share_token": collection.share_token,
@@ -194,11 +208,12 @@ class CollectionsService:
         collection_id: str, 
         user_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Get a specific collection by ID"""
+        """Get a specific collection by ID with total and active property counts"""
         try:
             query = select(Collection).options(
                 selectinload(Collection.preferences),
-                selectinload(Collection.properties)
+                selectinload(Collection.properties),
+                selectinload(Collection.property_interactions)
             ).where(
                 Collection.id == collection_id,
                 Collection.owner_id == user_id
@@ -210,9 +225,22 @@ class CollectionsService:
             if not collection:
                 return None
 
+            # Calculate total vs active (non-disliked) properties
+            total_count = len(collection.properties) if collection.properties else 0
+            
+            disliked_property_ids = {
+                interaction.property_id 
+                for interaction in collection.property_interactions 
+                if interaction.disliked
+            }
+
             # Transform properties to frontend format (similar to get_shared_collection)
             properties = []
+            active_count = 0
             for prop in collection.properties:
+                if prop.id not in disliked_property_ids:
+                    active_count += 1
+
                 property_dict = {
                     'address': prop.street_address or 'Unknown Address',
                     'city': prop.city,
@@ -270,7 +298,8 @@ class CollectionsService:
                 "visitor_phone": collection.visitor_phone,
                 "preferences": preferences_data,
                 "properties": properties,
-                "property_count": len(properties),
+                "property_count": total_count,
+                "active_property_count": active_count,
                 "is_anonymous": collection.owner_id is None,
                 "is_public": collection.is_public or False,
                 "share_token": collection.share_token,
