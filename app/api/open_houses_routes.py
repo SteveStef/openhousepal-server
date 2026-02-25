@@ -45,7 +45,8 @@ async def create_open_house(
         street_address = address_data.get('streetAddress') if is_nested_address else address_data
         city = address_data.get('city') if is_nested_address else property_data.get('city')
         state = address_data.get('state') if is_nested_address else property_data.get('state')
-        zipcode = address_data.get('zipcode') if is_nested_address else property_data.get('zipCode')
+        # Support both casing variants to ensure it's captured
+        zipcode = address_data.get('zipcode') if is_nested_address else (property_data.get('zipCode') or property_data.get('zipcode'))
         
         abbreviated_addr = property_data.get('abbreviatedAddress')
         if not abbreviated_addr and is_nested_address:
@@ -74,13 +75,13 @@ async def create_open_house(
             house_type=property_data.get('homeType'),
             latitude=property_data.get('latitude'),
             longitude=property_data.get('longitude'),
-            lot_size=property_data.get('lot_size'),
+            lot_size=safe_int(property_data.get('lot_size') or property_data.get('lotSize')),
             city=city,
             state=state,
             zipcode=zipcode,
             bedrooms=safe_int(property_data.get('bedrooms')),
             bathrooms=property_data.get('bathrooms'),
-            living_area=safe_int(property_data.get('livingArea')),
+            living_area=safe_int(property_data.get('livingArea') or property_data.get('living_area')),
             price=safe_int(property_data.get('price')),
             home_status=property_data.get('homeStatus'),
             similar_properties_snapshot=request.similar_properties_snapshot
@@ -102,6 +103,7 @@ async def create_open_house(
             bathrooms=open_house.bathrooms,
             living_area=open_house.living_area,
             price=open_house.price,
+            lot_size=open_house.lot_size,
             city=open_house.city,
             similar_properties_snapshot=open_house.similar_properties_snapshot,
             created_at=open_house.created_at
@@ -154,6 +156,7 @@ async def get_open_houses(
                 bathrooms=oh.bathrooms,
                 living_area=oh.living_area,
                 price=oh.price,
+                lot_size=oh.lot_size,
                 city=oh.city,
                 notes=oh.notes,
                 similar_properties_snapshot=oh.similar_properties_snapshot,

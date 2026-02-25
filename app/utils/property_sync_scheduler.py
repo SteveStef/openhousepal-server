@@ -37,15 +37,9 @@ async def sync_all_collections_with_rate_limit() -> Dict[str, Any]:
     }
 
     try:
-        # Use existing PropertySyncService
         property_sync_service = PropertySyncService()
-
         async with AsyncSessionLocal() as db:
-            # 1. Calculate dynamic batch size
             total_collections = await property_sync_service.get_total_active_collections_count(db)
-            
-            # Goal: Cycle through ALL collections every 24 hours
-            # Runs every hour, so we need to process 1/24th of the total each time
             calculated_batch_size = math.ceil(total_collections / 24)
             
             # 2. Apply safety cap based on monthly API limit
@@ -95,7 +89,7 @@ async def sync_all_collections_with_rate_limit() -> Dict[str, Any]:
                         db, collection, preferences
                     )
 
-                    sync_results['total_new_properties'] += sync_result['new_properties_count']
+                    sync_results['total_new_properties'] += sync_result['new_count']
                     sync_results['collections_processed'] += 1
 
                 except Exception as e:

@@ -8,7 +8,7 @@ from pydantic.alias_generators import to_camel
 import os
 
 from app.database import get_db
-from app.models.database import Property, PropertyDetails, User, ScheduledEmail
+from app.models.database import Property, PropertyDetails, User, ScheduledEmail, Notification, Collection
 from app.schemas.collection_preferences import CollectionPreferencesBase
 from app.services.bright_mls_service import bright_mls_service
 from app.utils.auth import require_broker_authorization
@@ -58,6 +58,20 @@ class AgentMessageRequest(BaseModel):
     visitor_name: str
     visitor_contact: str
     message: str
+
+class ScheduleTourRequest(BaseModel):
+    agent_id: str
+    property_id: str
+    property_address: str
+    visitor_name: Optional[str] = None
+    visitor_contact: Optional[str] = None
+    preferred_date: str
+    preferred_time: str
+    preferred_date_2: Optional[str] = None
+    preferred_time_2: Optional[str] = None
+    preferred_date_3: Optional[str] = None
+    preferred_time_3: Optional[str] = None
+    message: Optional[str] = None
 
 @router.post("/api/properties")
 async def store_property(
@@ -161,25 +175,41 @@ async def message_agent(
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
             
-        # # 2. Schedule the email using the provided address
-        # scheduled_email = ScheduledEmail(
-        #     recipient_email=agent.email,
-        #     subject=f"New Inquiry from {request.visitor_name} for {request.property_address}",
-        #     template_name="tour_request",
-        #     template_variables={
-        #         "agent_name": f"{agent.first_name} {agent.last_name}",
-        #         "visitor_name": request.visitor_name,
-        #         "visitor_email": request.visitor_contact if "@" in request.visitor_contact else "",
-        #         "visitor_phone": request.visitor_contact if "@" not in request.visitor_contact else "",
-        #         "property_address": request.property_address,
-        #         "message": request.message,
-        #         "preferred_dates": "N/A (General Inquiry)"
-        #     },
-        #     scheduled_for=datetime.now(timezone.utc)
-        # )
-        # 
-        # db.add(scheduled_email)
-        # await db.commit()
+        # 2. Schedule the email inquiry
+        scheduled_email = ScheduledEmail(
+            recipient_email=agent.email,
+            subject=f"New Inquiry from {request.visitor_name} for {request.property_address}",
+            template_name="similar_property_visitor_message_template",
+            template_variables={
+                "agent_name": f"{agent.first_name} {agent.last_name}",
+                "visitor_name": request.visitor_name,
+                "visitor_contact": request.visitor_contact,
+                "property_address": request.property_address,
+                "message": request.message,
+                "today_date": datetime.now().strftime("%m/%d/%Y")
+            },
+            scheduled_for=datetime.now(timezone.utc)
+        )
+        
+        db.add(scheduled_email)
+
+        # 3. Create a dashboard notification for the agent
+        notification = Notification(
+            agent_id=agent.id,
+            type="PROPERTY_INQUIRY",
+            reference_type="PROPERTY",
+            reference_id=request.property_id,
+            title=f"New Inquiry: {request.visitor_name}",
+            message=f"Visitor sent a message about {request.property_address}",
+            property_id=request.property_id,
+            property_address=request.property_address,
+            visitor_name=request.visitor_name,
+            is_read=False,
+            created_at=datetime.now(timezone.utc)
+        )
+        db.add(notification)
+        
+        await db.commit()
         
         return {"success": True, "message": "Message sent to agent successfully"}
         
@@ -189,6 +219,80 @@ async def message_agent(
         await db.rollback()
         logger.error("Failed to send message to agent", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail="Failed to send message to agent")
+
+# TODO
+@router.post("/api/properties/schedule-tour")
+async def schedule_tour(
+    request: ScheduleTourRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Schedule a tour for a property and notify the agent"""
+    try:
+        # 1. Find the agent
+        stmt = select(User).where(User.id == request.agent_id)
+        result = await db.execute(stmt)
+        agent = result.scalar_one_or_none()
+        
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+            
+        # 2. Format preferred dates for the email
+        preferred_dates = f"1. {request.preferred_date} at {request.preferred_time}"
+        if request.preferred_date_2 and request.preferred_time_2:
+            preferred_dates += f"\n2. {request.preferred_date_2} at {request.preferred_time_2}"
+        if request.preferred_date_3 and request.preferred_time_3:
+            preferred_dates += f"\n3. {request.preferred_date_3} at {request.preferred_time_3}"
+
+        # 3. Schedule the email notification
+        scheduled_email = ScheduledEmail(
+            recipient_email=agent.email,
+            subject=f"Tour Request from {request.visitor_name or 'Visitor'} for {request.property_address}",
+            template_name="similar_property_visitor_tour_request",
+            template_variables={
+                "agent_name": f"{agent.first_name} {agent.last_name}",
+                "visitor_name": request.visitor_name or "Interested Visitor",
+                "visitor_contact": request.visitor_contact or "Not provided",
+                "property_address": request.property_address,
+                "preferred_dates": preferred_dates,
+                "today_date": datetime.now().strftime("%m/%d/%Y")
+            },
+            scheduled_for=datetime.now(timezone.utc)
+        )
+        db.add(scheduled_email)
+
+        # 4. Create a dashboard notification for the agent
+        notification = Notification(
+            agent_id=agent.id,
+            type="TOUR_REQUEST",
+            reference_type="TOUR",
+            reference_id=request.property_id,
+            title=f"Tour Request: {request.visitor_name or 'Visitor'}",
+            message=f"Visitor wants to tour {request.property_address}",
+            property_id=request.property_id,
+            property_address=request.property_address,
+            visitor_name=request.visitor_name,
+            is_read=False,
+            created_at=datetime.now(timezone.utc)
+        )
+        db.add(notification)
+        
+        await db.commit()
+        
+        return {"success": True, "message": "Tour scheduled and agent notified"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error("Failed to schedule tour", extra={"error": str(e)})
+        raise HTTPException(status_code=500, detail="Failed to schedule tour")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error("Failed to schedule tour", extra={"error": str(e)})
+        raise HTTPException(status_code=500, detail="Failed to schedule tour")
 
 @router.get("/api/properties/{property_id}", dependencies=[Depends(require_broker_authorization)])
 async def get_property(

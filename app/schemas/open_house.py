@@ -56,6 +56,7 @@ class OpenHouseResponse(BaseModel):
     bathrooms: Optional[Union[int, float]] = None
     living_area: Optional[Union[int, float]] = None
     price: Optional[Union[int, float]] = None
+    lot_size: Optional[Union[int, float]] = None
     city: Optional[str] = None
     notes: Optional[str] = None
     similar_properties_snapshot: Optional[List[Dict[str, Any]]] = None

@@ -371,6 +371,15 @@ class BrightMlsService:
         data = await self._make_request("BrightProperties", params=params)
         return [self._map_to_app_model(item) for item in data.get("value", [])]
 
+    async def get_properties_count_by_preferences(self, preferences: CollectionPreferencesSchema) -> int:
+        """Fetch only the count of matching properties without downloading records."""
+        odata_filter = self._build_filter_from_preferences(preferences)
+        # OData $count=true and $top=0 to get just the count
+        params = {"$filter": odata_filter, "$count": "true", "$top": 0}
+        data = await self._make_request("BrightProperties", params=params)
+        # RESO API returns the count in '@odata.count'
+        return data.get("@odata.count", 0)
+
     async def run_diagnostic_tests(self):
         try:
             await self._get_access_token()

@@ -1,9 +1,9 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
 from datetime import datetime
 from typing import Optional, Dict, Any
 
-from app.models.database import Property, OpenHouseVisitor, Collection, collection_properties, OpenHouseEvent, User
+from app.models.database import Property, OpenHouseVisitor, Collection, collection_properties, OpenHouseEvent, User, CollectionPreferences
 from app.schemas.open_house import OpenHouseFormSubmission
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.collections_service import CollectionsService
@@ -117,9 +117,46 @@ class OpenHouseService:
         collection: Collection,
         preferences: CollectionPreferencesSchema
     ) -> int:
-        """Populate collection with properties from Bright MLS API"""
+        """
+        Populate collection with properties from Bright MLS API.
+        Optimized with 'Smart Discovery' iterative radius tuning.
+        """
         try:
-            # Get matching properties from Bright MLS using the new method name
+            # 1. SMART DISCOVERY (Iterative Radius Tuning)
+            # Default is 6. If too many (>30), go to 3. If too few (<3), go to 12 then 20.
+            current_radius = 6.0
+            
+            # Initial count check
+            count = await bright_mls_service.get_properties_count_by_preferences(preferences)
+            logger.info(f"Smart Discovery: Initial count at 6 miles for collection {collection.id} is {count}")
+
+            if count > 30:
+                for r in [3.0, 1.5]:
+                    preferences.diameter = r
+                    count = await bright_mls_service.get_properties_count_by_preferences(preferences)
+                    current_radius = r
+                    logger.info(f"Smart Discovery: Low density. Expanded to {r} miles, found {count} properties.")
+                    if count < 30:
+                        break
+            elif count < 3:
+                # Try expanding the search
+                for r in [12.0, 20.0]:
+                    preferences.diameter = r
+                    count = await bright_mls_service.get_properties_count_by_preferences(preferences)
+                    current_radius = r
+                    logger.info(f"Smart Discovery: Low density. Expanded to {r} miles, found {count} properties.")
+                    if count >= 3:
+                        break
+
+            # 2. SAVE SMART RADIUS (Update the database so future syncs stay optimized)
+            await db.execute(
+                update(CollectionPreferences)
+                .where(CollectionPreferences.collection_id == collection.id)
+                .values(diameter=current_radius)
+            )
+            await db.commit()
+
+            # 3. FINAL FETCH (Get matching properties using the optimized radius)
             matching_properties = await bright_mls_service.get_properties_by_preferences(preferences)
             
             properties_added = 0
@@ -139,7 +176,7 @@ class OpenHouseService:
             return properties_added
             
         except Exception as e:
-            logger.error(f"populating collection {collection.id} with Bright MLS properties failed", extra={"error": str(e)})
+            logger.error(f"Smart Discovery population for collection {collection.id} failed", extra={"error": str(e)}, exc_info=True)
             return 0
     
     @staticmethod

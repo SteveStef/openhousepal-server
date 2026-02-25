@@ -1,16 +1,19 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, update, and_
-from sqlalchemy.orm import selectinload
+from sqlalchemy import select, func, update, and_, or_
+from sqlalchemy.orm import selectinload, joinedload
 from typing import List, Dict, Any, Optional
 import asyncio
+import json
+import uuid
 from datetime import datetime, timezone, timedelta
 import os
 
-from app.models.database import Collection, CollectionPreferences, Property, collection_properties, User, PropertyInteraction, PropertyComment, PropertyTour
-from app.services.bright_mls_service import BrightMlsService, bright_mls_service
+from app.models.database import Collection, CollectionPreferences, Property, collection_properties, User, PropertyInteraction, PropertyComment, PropertyTour, ScheduledEmail
+from app.services.bright_mls_service import bright_mls_service
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.email_service import EmailService
 from app.config.logging import get_logger
+from app.database import AsyncSessionLocal
 
 # Get logger from centralized config
 logger = get_logger(__name__)
@@ -74,7 +77,8 @@ class PropertySyncService:
     async def create_property_from_mls_data(
         self, 
         db: AsyncSession, 
-        property_data: Dict[str, Any]
+        property_data: Dict[str, Any],
+        commit: bool = True
     ) -> Property:
         """
         Upserts a Property record from standardized MLS data.
@@ -106,8 +110,12 @@ class PropertySyncService:
             existing_property.img_src = property_data.get('image_url')
             existing_property.updated_at = datetime.now(timezone.utc)
             
-            await db.commit()
-            await db.refresh(existing_property)
+            if commit:
+                await db.commit()
+                await db.refresh(existing_property)
+            else:
+                await db.flush()
+                
             return existing_property
         
         # Create new property
@@ -132,11 +140,15 @@ class PropertySyncService:
         )
         
         db.add(property_obj)
-        await db.commit()
-        await db.refresh(property_obj)
+        if commit:
+            await db.commit()
+            await db.refresh(property_obj)
+        else:
+            await db.flush()
+            
         return property_obj
     
-    async def add_property_to_collection(self, db: AsyncSession, collection_id: str, property_id: str, initial: bool = False):
+    async def add_property_to_collection(self, db: AsyncSession, collection_id: str, property_id: str, initial: bool = False, commit: bool = True):
         """Links a property to a collection with or without a NEW badge timestamp"""
         result = await db.execute(
             select(collection_properties).where(
@@ -153,104 +165,279 @@ class PropertySyncService:
                     added_at=None if initial else datetime.now(timezone.utc)
                 )
             )
-            await db.commit()
+            if commit:
+                await db.commit()
+            else:
+                await db.flush()
 
-    async def invalidate_collection_property_cache(self, db: AsyncSession, collection_id: str) -> int:
-        """Force detail refresh for all properties in a collection"""
-        logger.info(f"Cache invalidation requested for collection {collection_id}")
-        return 0
+    async def replace_collection_properties(
+        self,
+        db: AsyncSession,
+        collection_id: str,
+        preferences: CollectionPreferences
+    ) -> Dict[str, Any]:
+        """
+        Forcefully replaces collection properties based on new preferences.
+        Preserves properties that have user interactions (likes, comments, tours).
+        Does NOT commit, allowing for atomic operations in the caller.
+        """
+        logger.info(f"Replacing properties for collection {collection_id} based on updated preferences")
+        
+        try:
+            # 1. Fetch new matching properties from MLS using Smart Discovery if radius is provided
+            matching_properties = await bright_mls_service.get_properties_by_preferences(preferences)
+            
+            # 2. Identify IDs of properties to KEEP (those with user interactions)
+            # Find property IDs in THIS collection linked to interactions, comments, or tours
+            keep_query = select(Property.id).join(collection_properties).where(
+                collection_properties.c.collection_id == collection_id
+            ).where(
+                or_(
+                    Property.id.in_(select(PropertyInteraction.property_id).where(PropertyInteraction.collection_id == collection_id)),
+                    Property.id.in_(select(PropertyComment.property_id).where(PropertyComment.collection_id == collection_id)),
+                    Property.id.in_(select(PropertyTour.property_id).where(PropertyTour.collection_id == collection_id))
+                )
+            )
+            keep_ids_res = await db.execute(keep_query)
+            keep_ids = [r[0] for r in keep_ids_res.fetchall()]
+            
+            # 3. Clear non-kept property links
+            delete_stmt = collection_properties.delete().where(
+                and_(
+                    collection_properties.c.collection_id == collection_id,
+                    collection_properties.c.property_id.notin_(keep_ids)
+                )
+            )
+            await db.execute(delete_stmt)
+            
+            # 4. Link the new matching properties
+            properties_replaced = 0
+            for prop_data in matching_properties:
+                # Upsert property record (without committing)
+                property_obj = await self.create_property_from_mls_data(db, prop_data, commit=False)
+                
+                # Link to collection (without committing)
+                # Check if already linked (e.g., if it was in the "keep" set)
+                is_linked = await self.property_exists_in_collection(db, collection_id, prop_data['listing_key'])
+                if not is_linked:
+                    await self.add_property_to_collection(db, collection_id, property_obj.id, initial=True, commit=False)
+                    properties_replaced += 1
+            
+            return {
+                'success': True,
+                'properties_replaced': properties_replaced,
+                'total_new': len(matching_properties)
+            }
+            
+        except Exception as e:
+            logger.error(f"Replace properties failed for collection {collection_id}: {str(e)}", exc_info=True)
+            return {'success': False, 'error': str(e), 'properties_replaced': 0}
 
     async def sync_collection_properties(
         self,
         db: AsyncSession,
         collection: Collection,
-        preferences: CollectionPreferences,
-        mls_service: BrightMlsService
+        preferences: CollectionPreferences
     ) -> Dict[str, Any]:
-        """Core logic for syncing a single collection"""
-        logger.info(f"Syncing collection {collection.id}")
+        """
+        Refactored core logic for syncing a single collection.
+        Optimized with pre-fetch and batched notifications.
+        """
+        logger.info(f"Syncing collection {collection.id} ({collection.name})")
 
         try:
-            matching_properties = await mls_service.get_properties_by_preferences(preferences)
-            new_count = 0
-            first_new = None
+            # 1. PRE-FETCH OPTIMIZATION (Get all current props for this showcase in ONE query)
+            existing_props = await self._get_properties_for_collection(db, collection.id)
+            property_map = {str(p.listing_key): p for p in existing_props}
+            
+            # 2. Tracks all changes found during THIS sync run
+            changes = {
+                "new_properties": [],
+                "price_drops": []
+            }
 
+            # 3. Call MLS Service
+            matching_properties = await bright_mls_service.get_properties_by_preferences(preferences)
+            
             for prop_data in matching_properties:
                 listing_key = str(prop_data.get('listing_key'))
                 
                 # Check for existing property to detect price drops
-                existing_result = await db.execute(
-                    select(Property).where(Property.listing_key == listing_key)
-                )
-                existing_p = existing_result.scalar_one_or_none()
+                existing_p = property_map.get(listing_key)
 
+                # 4. PRICE DROP DETECTION (Broadcast logic)
                 if existing_p and existing_p.price and prop_data.get('price'):
                     if prop_data['price'] < existing_p.price:
-                        # Notify about price drop
-                        await self._send_price_drop_notification(collection, existing_p, prop_data['price'])
+                        # Add to THIS collection's batch
+                        changes["price_drops"].append(prop_data)
+                        # Notify ALL OTHER active showcases containing this property
+                        await self._broadcast_price_drop(db, prop_data, existing_p.price, exclude_collection_id=collection.id)
 
-                # Check if linked to this collection
-                if not await self.property_exists_in_collection(db, collection.id, listing_key):
+                # 5. NEW PROPERTY DETECTION
+                if listing_key not in property_map:
+                    # Link to this collection
                     property_obj = await self.create_property_from_mls_data(db, prop_data)
                     await self.add_property_to_collection(db, collection.id, property_obj.id)
-                    new_count += 1
-                    if new_count == 1:
-                        first_new = prop_data
+                    changes["new_properties"].append(prop_data)
                 else:
-                    # Just update the data
+                    # Just update the existing property data (e.g. status, image, price)
                     await self.create_property_from_mls_data(db, prop_data)
 
+            # 6. Schedule Combined Notifications (One email for Agent, one for Visitor)
+            if changes["new_properties"] or changes["price_drops"]:
+                await self._schedule_combined_notification(db, collection, changes)
+
+            # 7. OFF-MARKET CLEANUP (Optimization: Mark missing props as OFF_MARKET)
+            found_listing_keys = [str(p.get('listing_key')) for p in matching_properties]
+            if found_listing_keys:
+                # Find props in THIS collection that are currently marked as FOR_SALE but were NOT in the MLS results
+                missing_props_query = (
+                    select(Property)
+                    .join(collection_properties)
+                    .where(
+                        and_(
+                            collection_properties.c.collection_id == collection.id,
+                            Property.home_status == 'FOR_SALE',
+                            Property.listing_key.notin_(found_listing_keys)
+                        )
+                    )
+                )
+                missing_props = (await db.execute(missing_props_query)).scalars().all()
+                
+                for p in missing_props:
+                    logger.info(f"Marking property {p.listing_key} as OFF_MARKET (missing from MLS search)")
+                    p.home_status = 'OFF_MARKET'
+                    p.updated_at = datetime.now(timezone.utc)
+
+            # Update last_synced timestamp
             collection.last_synced_at = datetime.now(timezone.utc)
             await db.commit()
 
             return {
-                'new_count': new_count,
-                'first_new': first_new,
+                'new_count': len(changes["new_properties"]),
+                'drop_count': len(changes["price_drops"]),
+                'off_market_count': len(missing_props) if found_listing_keys else 0,
                 'total': len(matching_properties)
             }
 
         except Exception as e:
-            logger.error(f"Sync failed for {collection.id}: {e}", exc_info=True)
-            return {'new_count': 0, 'first_new': None, 'total': 0}
+            logger.error(f"Sync failed for collection {collection.id}: {str(e)}", exc_info=True)
+            await db.rollback()
+            return {'new_count': 0, 'drop_count': 0, 'total': 0}
 
-    async def _send_price_drop_notification(self, collection, property_obj, new_price):
-        """Helper to send price drop emails"""
-        if not collection.visitor_email: return
-        
-        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
-        self.email_service.send_simple_message(
-            to_email=collection.visitor_email,
-            subject=f"Price Drop! - {collection.name}",
-            template="price_drop_alert",
-            template_variables={
-                "recipient_name": collection.visitor_name or "Valued Visitor",
-                "collection_name": collection.name,
-                "collection_link": f"{frontend_url}/showcase/{collection.share_token}",
-                "property_address": property_obj.street_address,
-                "property_image": property_obj.img_src,
-                "old_price": f"${property_obj.price:,}",
-                "new_price": f"${new_price:,}",
-                "savings": f"${(property_obj.price - new_price):,}"
-            }
+    async def _get_properties_for_collection(self, db: AsyncSession, collection_id: str) -> List[Property]:
+        """Fetch all properties currently linked to a collection in ONE query."""
+        query = (
+            select(Property)
+            .join(collection_properties)
+            .where(collection_properties.c.collection_id == collection_id)
         )
+        result = await db.execute(query)
+        return result.scalars().all()
 
-    async def sync_all_active_collections(self) -> Dict[str, Any]:
-        """Scheduled task entry point"""
-        from app.database import AsyncSessionLocal
-        results = {'processed': 0, 'new_props': 0}
+    async def _broadcast_price_drop(self, db: AsyncSession, prop_data: Dict[str, Any], old_price: float, exclude_collection_id: str):
+        """
+        Notify ALL other active collections that contain this property about the price drop.
+        """
+        listing_key = str(prop_data['listing_key'])
         
-        try:
-            async with AsyncSessionLocal() as db:
-                collections = await self.get_active_collections_with_preferences(db)
-                for col, pref in collections:
-                    res = await self.sync_collection_properties(db, col, pref, bright_mls_service)
-                    results['processed'] += 1
-                    results['new_props'] += res['new_count']
-                    await asyncio.sleep(0.2)
-            return results
-        except Exception as e:
-            logger.error(f"Sync all collections failed: {e}")
-            return results
+        # 1. Find all active collections containing this property
+        query = (
+            select(Collection)
+            .join(collection_properties)
+            .join(Property)
+            .options(selectinload(Collection.owner))
+            .where(
+                and_(
+                    Property.listing_key == listing_key,
+                    Collection.status == 'ACTIVE',
+                    Collection.id != exclude_collection_id
+                )
+            )
+        )
+        result = await db.execute(query)
+        target_collections = result.scalars().all()
+
+        for col in target_collections:
+            # Schedule a price drop email for this collection
+            changes = {"new_properties": [], "price_drops": [prop_data]}
+            # We pass old_price for the specific property if we want to show savings in the template
+            # For simplicity in this broadcast, we reuse the combined notification logic
+            await self._schedule_combined_notification(db, col, changes, is_broadcast=True)
+
+    async def _schedule_combined_notification(self, db: AsyncSession, collection: Collection, changes: Dict[str, Any], is_broadcast: bool = False):
+        """
+        Schedules a single combined notification for the Agent and Visitor.
+        """
+        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        new_count = len(changes["new_properties"])
+        drop_count = len(changes["price_drops"])
+        
+        # Use first featured property for the thumbnail
+        featured = changes["new_properties"][0] if new_count > 0 else changes["price_drops"][0]
+        
+        # Get total property count for the showcase
+        total_count_query = select(func.count()).select_from(collection_properties).where(collection_properties.c.collection_id == collection.id)
+        total_count_res = await db.execute(total_count_query)
+        total_count = total_count_res.scalar() or 0
+
+        # Template shared variables
+        common_vars = {
+            "collection_name": collection.name,
+            "visitor_name": collection.visitor_name or "Valued Visitor",
+            "collection_link": f"{frontend_url}/showcase/{collection.share_token}",
+            "new_count": new_count,
+            "drop_count": drop_count,
+            "total_count": total_count,
+            "property_address": featured.get('address'),
+            "property_image": featured.get('image_url'),
+            "property_price": f"${featured.get('price', 0):,}",
+            "property_beds": featured.get('bedrooms'),
+            "property_baths": featured.get('bathrooms'),
+            "property_sqft": featured.get('living_area'),
+            "today_date": datetime.now().strftime("%m/%d/%Y")
+        }
+
+        # 1. Schedule for Visitor
+        if collection.visitor_email:
+            template = "price_drop_alert" if (is_broadcast or (drop_count > 0 and new_count == 0)) else "new_properties_synced"
+            
+            # If we have both, we prefer the 'new_properties_synced' template but could make a 'showcase_update' one later
+            
+            visitor_vars = {
+                **common_vars,
+                "recipient_name": collection.visitor_name or "Valued Visitor",
+                "agent_name": f"{collection.owner.first_name} {collection.owner.last_name}" if collection.owner else "Your Agent",
+                "agent_email": collection.owner.email if collection.owner else "",
+                "agent_phone": getattr(collection.owner, 'phone', "") if collection.owner else ""
+            }
+
+            db.add(ScheduledEmail(
+                id=str(uuid.uuid4()) if not hasattr(ScheduledEmail, 'id') else None, # Let DB handle if default is set
+                recipient_email=collection.visitor_email,
+                subject=f"Updates for your showcase: {collection.name}",
+                template_name=template,
+                template_variables=visitor_vars,
+                status="PENDING",
+                scheduled_for=datetime.utcnow()
+            ))
+
+        # 2. Schedule for Agent
+        if collection.owner and collection.owner.email:
+            agent_vars = {
+                **common_vars,
+                "recipient_name": collection.owner.first_name,
+                "visitor_name": collection.visitor_name or "An anonymous visitor"
+            }
+
+            db.add(ScheduledEmail(
+                recipient_email=collection.owner.email,
+                subject=f"Showcase Updated: {collection.visitor_name or 'Visitor'} - {collection.name}",
+                template_name="new_properties_synced_agent",
+                template_variables=agent_vars,
+                status="PENDING",
+                scheduled_for=datetime.utcnow()
+            ))
 
     async def populate_new_collection(self, db: AsyncSession, collection_id: str) -> Dict[str, Any]:
         """Initial population for newly created collections"""
@@ -273,23 +460,3 @@ class PropertySyncService:
             logger.error(f"Failed to populate collection {collection_id}: {e}")
             return {'success': False, 'error': str(e)}
 
-    async def replace_collection_properties(self, db: AsyncSession, collection_id: str, preferences: Optional[CollectionPreferences] = None) -> Dict[str, Any]:
-        """Re-populate collection after preference change"""
-        try:
-            if not preferences:
-                preferences = await CollectionPreferencesService.get_preferences_by_collection_id(db, collection_id)
-            if not preferences: return {'success': False, 'error': 'No preferences'}
-
-            matching = await bright_mls_service.get_properties_by_preferences(preferences)
-            
-            # Clear existing associations
-            await db.execute(collection_properties.delete().where(collection_properties.c.collection_id == collection_id))
-            
-            for prop_data in matching:
-                p_obj = await self.create_property_from_mls_data(db, prop_data)
-                await self.add_property_to_collection(db, collection_id, p_obj.id, initial=True)
-
-            return {'success': True, 'properties_replaced': len(matching)}
-        except Exception as e:
-            logger.error(f"Failed to replace properties for collection {collection_id}: {e}")
-            return {'success': False, 'error': str(e)}

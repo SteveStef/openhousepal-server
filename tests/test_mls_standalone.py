@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 # Load environment variables from server/.env
 load_dotenv(root_dir / ".env")
 
-async def test_member_id(mls_id: str = "3235372"):
+async def test_member_id(mls_id: str = ""):
     print(f"🚀 Testing Bright MLS Member ID: {mls_id}...\n")
     if not os.getenv("BRIGHT_MLS_CLIENT"):
         print("❌ ERROR: BRIGHT_MLS_CLIENT not found in .env file.")

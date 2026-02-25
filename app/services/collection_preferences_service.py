@@ -99,6 +99,25 @@ class CollectionPreferencesService:
         # Calculate preferences based on original open house event metadata and form data
         single_family = original_open_house.house_type == "SINGLE_FAMILY"
 
+        # Construct full address string for the search input
+        # Use components to ensure it includes City, State, and ZIP if available
+        address_parts = []
+        if original_open_house.address:
+            address_parts.append(original_open_house.address)
+        if original_open_house.city:
+            address_parts.append(original_open_house.city)
+        
+        state_zip_parts = []
+        if original_open_house.state:
+            state_zip_parts.append(original_open_house.state)
+        if original_open_house.zipcode:
+            state_zip_parts.append(original_open_house.zipcode)
+            
+        if state_zip_parts:
+            address_parts.append(" ".join(state_zip_parts))
+            
+        full_address = ", ".join(filter(None, address_parts))
+
         preferences_data_dict = {
             "collection_id": collection_id,
             "min_beds": max(1, (original_open_house.bedrooms or 3) - 1),
@@ -109,7 +128,7 @@ class CollectionPreferencesService:
             "max_price": int((original_open_house.price or 1000000) * 1.2),  # 20% more
             "lat": original_open_house.latitude,
             "long": original_open_house.longitude,
-            "address": original_open_house.address,  # Store the original address
+            "address": full_address or original_open_house.address,  # Use full address if built
             "diameter": 6,
             "special_features": "",
 
