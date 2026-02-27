@@ -97,7 +97,31 @@ class CollectionPreferencesService:
             return None
         
         # Calculate preferences based on original open house event metadata and form data
-        single_family = original_open_house.house_type == "SINGLE_FAMILY"
+        h_type = original_open_house.house_type or "SINGLE_FAMILY"
+        
+        # Initialize all booleans to False
+        is_sf = False
+        is_th = False
+        is_co = False
+        is_mf = False
+        is_ll = False
+        is_ap = False
+
+        # Map current home type to matching boolean
+        if h_type == "SINGLE_FAMILY":
+            is_sf = True
+        elif h_type == "TOWNHOUSE":
+            is_th = True
+        elif h_type == "CONDO":
+            is_co = True
+        elif h_type == "MULTI_FAMILY":
+            is_mf = True
+        elif h_type in ["LAND", "FARM"]:
+            is_ll = True
+        elif h_type == "RESIDENTIAL_LEASE":
+            is_ap = True
+        else:
+            is_sf = True # Default fallback
 
         # Construct full address string for the search input
         # Use components to ensure it includes City, State, and ZIP if available
@@ -121,30 +145,38 @@ class CollectionPreferencesService:
         preferences_data_dict = {
             "collection_id": collection_id,
             "min_beds": max(1, (original_open_house.bedrooms or 3) - 1),
-            "max_beds": 0, # (original_open_house.bedrooms or 3) + 1,
-            "min_baths": 0, # max(1.0, (original_open_house.bathrooms or 2.5) - 0.5),
-            "max_baths": 0, # (original_open_house.bathrooms or 2.5) + 0.5,
+            "max_beds": 0,
+            "min_baths": 0,
+            "max_baths": 0,
             "min_price": int((original_open_house.price or 1000000) * 0.8),  # 20% less
             "max_price": int((original_open_house.price or 1000000) * 1.2),  # 20% more
             "lat": original_open_house.latitude,
             "long": original_open_house.longitude,
-            "address": full_address or original_open_house.address,  # Use full address if built
+            "address": full_address or original_open_house.address,
             "diameter": 6,
             "special_features": "",
 
-            "is_town_house": not single_family,
-            "is_condo": not single_family,
-            "is_single_family": single_family,
-
-            "is_lot_land": False,
-            "is_multi_family": False,
-            "is_apartment": False,
+            "is_town_house": is_th,
+            "is_condo": is_co,
+            "is_single_family": is_sf,
+            "is_lot_land": is_ll,
+            "is_multi_family": is_mf,
+            "is_apartment": is_ap,
         }
         
         # Add visitor form data if provided
         if form_data:
+            # form_data is OpenHouseFormSubmission, has_agent is a HasAgent enum
+            # We want the string value for the database
+            h_agent = "NO"
+            if hasattr(form_data, 'has_agent'):
+                if isinstance(form_data.has_agent, str):
+                    h_agent = form_data.has_agent
+                else:
+                    h_agent = form_data.has_agent.value
+            
             preferences_data_dict.update({
-                "has_agent": form_data.has_agent if isinstance(form_data.has_agent, str) else form_data.has_agent.value
+                "has_agent": h_agent
             })
         
         preferences_data = CollectionPreferencesCreate(**preferences_data_dict)

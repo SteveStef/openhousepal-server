@@ -26,7 +26,7 @@ from app.services.collections_service import CollectionsService
 from app.services.property_interactions_service import PropertyInteractionsService
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.property_sync_service import PropertySyncService
-from app.services.bright_mls_service import bright_mls_service
+from app.services.property_service import property_service
 from app.services.property_tour_service import PropertyTourService
 from app.utils.auth import get_current_active_user, get_current_user_optional, require_premium_plan, require_broker_authorization
 from app.models.database import User, Collection
@@ -186,13 +186,15 @@ async def create_collection_with_preferences(
             # Only perform MLS lookup if coordinates weren't provided by frontend
             if latitude == 0 and longitude == 0 and len(request.address) > 0:
                 try:
-                    property_details = await bright_mls_service.get_property_by_address(request.address)
-                    latitude = property_details.get('latitude')
-                    longitude = property_details.get('longitude')
+                    # Try to fetch property details from mirror
+                    property_details = await property_service.get_property_by_address(db, request.address)
+                    if property_details:
+                        latitude = property_details.latitude
+                        longitude = property_details.longitude
 
                     if not latitude or not longitude:
                         raise HTTPException(
-                            status_code=status.HTTP_400_BAD_REQUEST,
+                            status_code=400,
                             detail="Could not determine coordinates for the provided address"
                         )
                 except HTTPException as e:

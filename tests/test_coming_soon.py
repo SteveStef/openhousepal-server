@@ -29,9 +29,9 @@ async def test_coming_soon():
         try:
             params = {
                 "$filter": f"MlsStatus eq '{status}'",
-                "$top": 3,
+                "$top": 1,
                 "$count": "true",
-                "$select": "ListingKey,ListingId,MlsStatus,FullStreetAddress,ListPrice,DaysOnComingSoon"
+                # "$select": "ListingKey,ListingId,MlsStatus,FullStreetAddress,ListPrice,DaysOnComingSoon"
             }
             
             print(f"--- Trying MlsStatus: '{status}' ---")
@@ -43,9 +43,10 @@ async def test_coming_soon():
             if count > 0:
                 print(f"✅ SUCCESS: Found {count} properties with status '{status}'")
                 print("Sample items:")
-                for item in value:
-                    print(f"  - {item.get('FullStreetAddress')} (${item.get('ListPrice'):,}) [Key: {item.get('ListingKey')}]")
-                # If we found it, no need to try others
+                print(value[0])
+                # for item in value:
+                #     print(f"  - {item.get('FullStreetAddress')} (${item.get('ListPrice'):,}) [Key: {item.get('ListingKey')}]")
+                # # If we found it, no need to try others
                 return
             else:
                 print(f"ℹ️ No properties found for '{status}'")

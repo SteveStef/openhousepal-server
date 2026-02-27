@@ -7,7 +7,7 @@ from app.models.database import Property, OpenHouseVisitor, Collection, collecti
 from app.schemas.open_house import OpenHouseFormSubmission
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.collections_service import CollectionsService
-from app.services.bright_mls_service import bright_mls_service
+from app.services.property_service import property_service
 from app.schemas.collection_preferences import CollectionPreferences as CollectionPreferencesSchema
 from app.config.logging import get_logger
 
@@ -90,19 +90,23 @@ class OpenHouseService:
             
             # Auto-generate preferences based on the original property and form data
             try:
-                preferences = await CollectionPreferencesService.auto_generate_preferences(db, collection.id, form_data)
+                preferences_model = await CollectionPreferencesService.auto_generate_preferences(db, collection.id, form_data)
                 
-                if preferences:
+                if preferences_model:
+                    # Convert model to schema for the population service
+                    preferences_schema = CollectionPreferencesSchema.model_validate(preferences_model)
                     
-                    # Immediately fetch and populate properties using BrightMlsService
+                    # Immediately fetch and populate properties
                     properties_added = await OpenHouseService._populate_collection_with_properties(
-                        db, collection, preferences
+                        db, collection, preferences_schema
                     )
                     return {"success": True, "properties_added": properties_added, "collection_id": collection.id, "share_token": collection.share_token}
                 else:
+                    logger.warning(f"Failed to generate preferences for collection {collection.id}")
                     return {"success": True, "properties_added": 0, "collection_id": collection.id, "share_token": collection.share_token}
 
             except Exception as e:
+                logger.error(f"Preference generation or population failed for collection {collection.id}: {str(e)}", exc_info=True)
                 # Collection creation should still succeed even if preferences fail
                 return {"success": True, "properties_added": 0, "collection_id": collection.id, "share_token": collection.share_token}
             
@@ -118,37 +122,34 @@ class OpenHouseService:
         preferences: CollectionPreferencesSchema
     ) -> int:
         """
-        Populate collection with properties from Bright MLS API.
+        Populate collection with properties from local mirror.
         Optimized with 'Smart Discovery' iterative radius tuning.
         """
         try:
             # 1. SMART DISCOVERY (Iterative Radius Tuning)
-            # Default is 6. If too many (>30), go to 3. If too few (<3), go to 12 then 20.
             current_radius = 6.0
             
             # Initial count check
-            count = await bright_mls_service.get_properties_count_by_preferences(preferences)
+            count = await property_service.get_properties_count_by_preferences(db, preferences)
             logger.info(f"Smart Discovery: Initial count at 6 miles for collection {collection.id} is {count}")
 
             if count > 30:
                 for r in [3.0, 1.5]:
                     preferences.diameter = r
-                    count = await bright_mls_service.get_properties_count_by_preferences(preferences)
+                    count = await property_service.get_properties_count_by_preferences(db, preferences)
                     current_radius = r
-                    logger.info(f"Smart Discovery: Low density. Expanded to {r} miles, found {count} properties.")
                     if count < 30:
                         break
             elif count < 3:
                 # Try expanding the search
                 for r in [12.0, 20.0]:
                     preferences.diameter = r
-                    count = await bright_mls_service.get_properties_count_by_preferences(preferences)
+                    count = await property_service.get_properties_count_by_preferences(db, preferences)
                     current_radius = r
-                    logger.info(f"Smart Discovery: Low density. Expanded to {r} miles, found {count} properties.")
                     if count >= 3:
                         break
 
-            # 2. SAVE SMART RADIUS (Update the database so future syncs stay optimized)
+            # 2. SAVE SMART RADIUS
             await db.execute(
                 update(CollectionPreferences)
                 .where(CollectionPreferences.collection_id == collection.id)
@@ -156,27 +157,33 @@ class OpenHouseService:
             )
             await db.commit()
 
-            # 3. FINAL FETCH (Get matching properties using the optimized radius)
-            matching_properties = await bright_mls_service.get_properties_by_preferences(preferences)
+            # 3. FINAL FETCH
+            matching_properties = await property_service.get_properties_by_preferences(db, preferences)
             
             properties_added = 0
             
-            for property_data in matching_properties:
-                listing_key = property_data.get('listing_key')
+            for p_summary in matching_properties:
+                listing_key = p_summary.listing_key
                 if not listing_key:
                     continue
                 
                 if await OpenHouseService._property_exists_in_collection(db, collection.id, listing_key):
                     continue
 
-                property_obj = await OpenHouseService._create_property_from_mls_data(db, property_data)
-                await OpenHouseService._add_property_to_collection(db, collection.id, property_obj.id)
-                properties_added += 1
+                # The new property_service already returns Pydantic models with data from our DB
+                # Since the data is ALREADY in the mirror, we just need the DB ID
+                stmt = select(Property.id).where(Property.listing_key == str(listing_key))
+                res = await db.execute(stmt)
+                p_id = res.scalar_one_or_none()
+                
+                if p_id:
+                    await OpenHouseService._add_property_to_collection(db, collection.id, p_id)
+                    properties_added += 1
             
             return properties_added
             
         except Exception as e:
-            logger.error(f"Smart Discovery population for collection {collection.id} failed", extra={"error": str(e)}, exc_info=True)
+            logger.error(f"Smart Discovery population failed: {e}")
             return 0
     
     @staticmethod
@@ -192,67 +199,6 @@ class OpenHouseService:
             )
         )
         return result.scalar_one_or_none() is not None
-    
-    @staticmethod
-    async def _create_property_from_mls_data(db: AsyncSession, property_data: Dict[str, Any]) -> Property:
-        """Create a new Property record from MLS data"""
-        # listing_key is already standardized as a string in property_data
-        listing_key = str(property_data.get('listing_key'))
-        
-        # Check if property already exists by listing_key
-        result = await db.execute(
-            select(Property).where(Property.listing_key == listing_key)
-        )
-        existing_property = result.scalar_one_or_none()
-        
-        if existing_property:
-            # Update existing property with latest data
-            field_mapping = {
-                'address': 'street_address',
-                'image_url': 'img_src',
-                'days_on_market': 'days_on_zillow', # Keep for compatibility if needed
-                'last_updated': 'updated_at' # Map to updated_at
-            }
-            
-            # Update listing_key if needed (should match)
-            if listing_key:
-                 existing_property.listing_key = listing_key
-            
-            for key, value in property_data.items():
-                if value is not None:
-                    # Map field name if necessary
-                    actual_field = field_mapping.get(key, key)
-                    if hasattr(existing_property, actual_field):
-                        setattr(existing_property, actual_field, value)
-            
-            await db.commit()
-            await db.refresh(existing_property)
-            return existing_property
-        
-        # Create new property
-        property_obj = Property(
-            listing_key=listing_key,
-            street_address=property_data.get('address'),
-            city=property_data.get('city'),
-            state=property_data.get('state'),
-            zipcode=property_data.get('zipcode'),
-            price=property_data.get('price'),
-            bedrooms=property_data.get('bedrooms'),
-            bathrooms=property_data.get('bathrooms'),
-            living_area=property_data.get('living_area'),
-            lot_size=property_data.get('lot_size'),
-            home_type=property_data.get('home_type'),
-            home_status=property_data.get('home_status'),
-            latitude=property_data.get('latitude'),
-            longitude=property_data.get('longitude'),
-            img_src=property_data.get('image_url'),
-            zestimate=property_data.get('zestimate'),
-        )
-        
-        db.add(property_obj)
-        await db.commit()
-        await db.refresh(property_obj)
-        return property_obj
     
     @staticmethod 
     async def _add_property_to_collection(db: AsyncSession, collection_id: str, property_id: str):
@@ -275,7 +221,7 @@ class OpenHouseService:
                 )
             )
             await db.commit()
-    
+
     @staticmethod
     async def get_open_house_event_by_id(db: AsyncSession, open_house_event_id: str) -> Optional[dict]:
         """Get open house event details by ID from database"""
@@ -287,65 +233,31 @@ class OpenHouseService:
             if not open_house_record:
                 return None
             
-            # Use open house event metadata fields
             return {
                 "id": open_house_record.id,
-                "agent_id": open_house_record.agent_id,  # Include agent_id for collection ownership
+                "agent_id": open_house_record.agent_id,
                 "address": open_house_record.address,
+                "abbreviated_address": open_house_record.abbreviated_address,
                 "city": open_house_record.city,
                 "state": open_house_record.state,
                 "zipCode": open_house_record.zipcode,
                 "price": open_house_record.price,
                 "beds": open_house_record.bedrooms,
                 "baths": open_house_record.bathrooms,
-                "squareFeet": None,  # Column dropped from database
-                "lotSize": None,  # Column dropped from database
+                "squareFeet": open_house_record.living_area,
+                "lotSize": open_house_record.lot_size,
                 "propertyType": open_house_record.house_type,
-                "description": "Beautiful property",  # Default description
-                "latitude": open_house_record.latitude,
-                "longitude": open_house_record.longitude,
-                "yearBuilt": None,  # Column dropped from database
                 "homeStatus": open_house_record.home_status,
-                "imageSrc": open_house_record.cover_image_url
+                "imageSrc": open_house_record.cover_image_url,
+                "listingKey": open_house_record.listing_key,
+                "created_at": open_house_record.created_at
             }
             
         except Exception as e:
-            logger.error("fetching open house event by ID failed", extra={"error": str(e)})
+            logger.error(f"Failed to fetch open house event: {e}")
             return None
 
     @staticmethod
     async def get_property_by_qr_code(db: AsyncSession, qr_code: str) -> Optional[dict]:
-        """Get property information by open house event ID from OpenHouseEvent metadata"""
-        try:
-            # Find OpenHouseEvent by ID (the parameter is actually the open house event ID)
-            stmt = select(OpenHouseEvent).where(OpenHouseEvent.id == qr_code)
-            result = await db.execute(stmt)
-            open_house_record = result.scalar_one_or_none()
-            
-            if not open_house_record:
-                return None
-            
-            # Return property data from OpenHouseEvent metadata
-            return {
-                "id": open_house_record.id,
-                "address": open_house_record.address,
-                "city": open_house_record.city,
-                "state": open_house_record.state,
-                "zipCode": open_house_record.zipcode,
-                "price": open_house_record.price,
-                "beds": open_house_record.bedrooms,
-                "baths": open_house_record.bathrooms,
-                "squareFeet": None,  # Column dropped from database
-                "lotSize": None,  # Column dropped from database
-                "propertyType": open_house_record.house_type,
-                "description": "Beautiful property",  # Default description
-                "latitude": open_house_record.latitude,
-                "longitude": open_house_record.longitude,
-                "yearBuilt": None,  # Column dropped from database
-                "homeStatus": open_house_record.home_status,
-                "imageSrc": open_house_record.cover_image_url
-            }
-            
-        except Exception as e:
-            logger.error("fetching property by QR code failed", extra={"error": str(e)})
-            return None
+        """Get property information by open house event ID"""
+        return await OpenHouseService.get_open_house_event_by_id(db, qr_code)

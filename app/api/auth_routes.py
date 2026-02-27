@@ -9,7 +9,7 @@ from app.database import get_db
 from app.schemas.user import UserCreate, User, UserLogin, Token, ForgotPasswordRequest, ResetPasswordRequest
 from app.services.user_service import UserService
 from app.services.paypal_service import paypal_service
-from app.services.bright_mls_service import bright_mls_service
+from app.services.property_service import property_service
 from app.utils.auth import create_access_token, get_current_active_user, hash_password, require_broker_authorization
 from app.models.database import User as UserModel
 from app.services.verification_service import verification_service
@@ -42,7 +42,7 @@ async def send_verification_code(
                 detail="Email already registered"
             )
 
-        valid_bright_mls_id = await bright_mls_service.bright_mls_id_exists(user_data.mls_id)
+        valid_bright_mls_id = await property_service.bright_mls_id_exists(db, user_data.mls_id)
         if not valid_bright_mls_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

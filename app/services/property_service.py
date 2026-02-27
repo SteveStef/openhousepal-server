@@ -1,0 +1,276 @@
+import re
+import math
+import logging
+from typing import List, Optional, Dict, Any, Union
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_, or_, func
+from app.schemas.collection_preferences import CollectionPreferencesBase as CollectionPreferencesSchema
+from app.models.database import Property
+from app.models.property import PropertySummaryResponse, PropertyDetailResponse
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+class PropertyService:
+    """
+    Local Search Engine that queries our mirrored 'properties' table.
+    Replaces BrightMlsService for all frontend lookups.
+    """
+
+    @staticmethod
+    async def get_property_by_listing_key(db: AsyncSession, listing_key: str) -> Optional[PropertyDetailResponse]:
+        """Fetch full property details from the local mirror."""
+        stmt = select(Property).where(Property.listing_key == str(listing_key))
+        result = await db.execute(stmt)
+        property_obj = result.scalar_one_or_none()
+        
+        if not property_obj:
+            return None
+            
+        return PropertyDetailResponse.model_validate(property_obj)
+
+    @staticmethod
+    async def get_property_by_address(db: AsyncSession, raw_address: str) -> Optional[PropertyDetailResponse]:
+        """
+        High-performance address search optimized for 'Street, City, State Zip'.
+        Uses anchors (House Number, Zip) to ensure index usage and abbreviation resilience.
+        """
+        if not raw_address:
+            return None
+
+        # 1. Clean and Split Input
+        parts = [p.strip() for p in raw_address.split(',')]
+        street_part = parts[0]
+        
+        # 2. Extract Zip Code (Looks for 5 digits)
+        zip_match = re.search(r'\b\d{5}\b', raw_address)
+        zip_code = zip_match.group(0) if zip_match else None
+
+        # 3. Parse House Number and Street Root (e.g., "71 Drummers" -> "71", "Drummers")
+        street_match = re.match(r'^(\d+)\s+([a-zA-Z0-9]+)', street_part)
+        
+        filters = []
+        
+        if street_match:
+            house_number = street_match.group(1)
+            street_root = street_match.group(2)
+            
+            # Anchor 1: Starts with House Number (Uses B-Tree index)
+            filters.append(Property.street_address.like(f"{house_number} %"))
+            # Anchor 2: Contains the primary street word (Handles Lane vs Ln)
+            filters.append(Property.street_address.ilike(f"%{street_root}%"))
+        else:
+            # Fallback to fuzzy if no house number detected
+            filters.append(Property.street_address.ilike(f"%{street_part}%"))
+
+        # 4. Geographic Anchor (Zip is best, City is fallback)
+        if zip_code:
+            filters.append(Property.zipcode == zip_code)
+        elif len(parts) > 1:
+            city = parts[1].strip()
+            filters.append(Property.city.ilike(city))
+
+        # 5. Execute
+        stmt = select(Property).where(and_(*filters)).limit(1)
+        result = await db.execute(stmt)
+        property_obj = result.scalar_one_or_none()
+
+        if not property_obj:
+            return None
+            
+        return PropertyDetailResponse.model_validate(property_obj)
+
+    @staticmethod
+    async def get_properties_by_preferences(
+        db: AsyncSession, 
+        preferences: CollectionPreferencesSchema, 
+        max_properties: int = 200
+    ) -> List[PropertySummaryResponse]:
+        """
+        Performs a local SQLAlchemy search against the mirrored 'properties' table.
+        Implements radius filtering (Bounding Box), price, beds/baths, and location filters.
+        """
+        query = select(Property)
+        filters = []
+
+        # 1. Location Filtering (City/State OR Radius)
+        combined_locations = (preferences.cities or []) + (preferences.townships or [])
+        if combined_locations:
+            loc_filters = []
+            for loc in combined_locations:
+                parts = [s.strip() for s in loc.split(',')]
+                city = parts[0]
+                state = parts[1] if len(parts) >= 2 else "PA"
+                loc_filters.append(and_(Property.city.ilike(city), Property.state.ilike(state)))
+            
+            if loc_filters:
+                filters.append(or_(*loc_filters))
+                
+        elif preferences.lat is not None and preferences.long is not None and preferences.diameter:
+            # Bounding Box Math for Radius (approximate)
+            radius_miles = float(preferences.diameter) / 2.0
+            lat_offset = radius_miles / 69.1
+            cos_lat = math.cos(math.radians(float(preferences.lat)))
+            long_offset = radius_miles / (69.1 * cos_lat) if abs(cos_lat) > 0.0001 else lat_offset
+            
+            filters.append(and_(
+                Property.latitude >= float(preferences.lat) - lat_offset,
+                Property.latitude <= float(preferences.lat) + lat_offset,
+                Property.longitude >= float(preferences.long) - long_offset,
+                Property.longitude <= float(preferences.long) + long_offset
+            ))
+
+        # 2. Status Filtering
+        filters.append(Property.home_status.in_(['ACTIVE-BRIGHT', 'COMING SOON-BRIGHT']))
+
+        # 3. Numeric Filters
+        if preferences.min_price is not None and preferences.min_price > 0:
+            filters.append(Property.price >= preferences.min_price)
+        if preferences.max_price is not None and preferences.max_price > 0:
+            filters.append(Property.price <= preferences.max_price)
+            
+        if preferences.min_beds is not None and preferences.min_beds > 0:
+            filters.append(Property.bedrooms >= preferences.min_beds)
+        if preferences.max_beds is not None and preferences.max_beds > 0:
+            filters.append(Property.bedrooms <= preferences.max_beds)
+            
+        if preferences.min_baths is not None and preferences.min_baths > 0:
+            filters.append(Property.bathrooms >= float(preferences.min_baths))
+        if preferences.max_baths is not None and preferences.max_baths > 0:
+            filters.append(Property.bathrooms <= float(preferences.max_baths))
+            
+        if preferences.min_year_built is not None:
+            filters.append(Property.year_built >= preferences.min_year_built)
+        if preferences.max_year_built is not None:
+            filters.append(Property.year_built <= preferences.max_year_built)
+
+        # 4. Property Type Filtering
+        selected_types = []
+        if preferences.is_single_family:
+            selected_types.append('SINGLE_FAMILY')
+        if preferences.is_town_house:
+            selected_types.append('TOWNHOUSE')
+        if preferences.is_condo:
+            selected_types.append('CONDO')
+        if preferences.is_multi_family:
+            selected_types.append('MULTI_FAMILY')
+        if preferences.is_lot_land:
+            selected_types.extend(['LAND', 'FARM'])
+        if preferences.is_apartment:
+            selected_types.append('RESIDENTIAL_LEASE')
+            
+        if selected_types:
+            filters.append(Property.home_type.in_(selected_types))
+
+        # Apply all filters
+        if filters:
+            query = query.where(and_(*filters))
+
+        # Sort by most recent update/sync
+        query = query.order_by(Property.modification_timestamp.desc().nulls_last())
+
+        # Execute
+        query = query.limit(max_properties)
+        result = await db.execute(query)
+        properties = result.scalars().all()
+
+        return [PropertySummaryResponse.model_validate(p) for p in properties]
+
+    @staticmethod
+    async def get_properties_count_by_preferences(db: AsyncSession, preferences: CollectionPreferencesSchema) -> int:
+        """Fetch only the count of matching properties without downloading records."""
+        query = select(func.count(Property.id))
+        filters = []
+
+        # 1. Location Filtering (City/State OR Radius)
+        combined_locations = (preferences.cities or []) + (preferences.townships or [])
+        if combined_locations:
+            loc_filters = []
+            for loc in combined_locations:
+                parts = [s.strip() for s in loc.split(',')]
+                city = parts[0]
+                state = parts[1] if len(parts) >= 2 else "PA"
+                loc_filters.append(and_(Property.city.ilike(city), Property.state.ilike(state)))
+            
+            if loc_filters:
+                filters.append(or_(*loc_filters))
+                
+        elif preferences.lat is not None and preferences.long is not None and preferences.diameter:
+            radius_miles = float(preferences.diameter) / 2.0
+            lat_offset = radius_miles / 69.1
+            cos_lat = math.cos(math.radians(float(preferences.lat)))
+            long_offset = radius_miles / (69.1 * cos_lat) if abs(cos_lat) > 0.0001 else lat_offset
+            
+            filters.append(and_(
+                Property.latitude >= float(preferences.lat) - lat_offset,
+                Property.latitude <= float(preferences.lat) + lat_offset,
+                Property.longitude >= float(preferences.long) - long_offset,
+                Property.longitude <= float(preferences.long) + long_offset
+            ))
+
+        # 2. Status Filtering
+        filters.append(Property.home_status.in_(['ACTIVE-BRIGHT', 'COMING SOON-BRIGHT']))
+
+        # 3. Numeric Filters
+        if preferences.min_price is not None and preferences.min_price > 0:
+            filters.append(Property.price >= preferences.min_price)
+        if preferences.max_price is not None and preferences.max_price > 0:
+            filters.append(Property.price <= preferences.max_price)
+            
+        if preferences.min_beds is not None and preferences.min_beds > 0:
+            filters.append(Property.bedrooms >= preferences.min_beds)
+        if preferences.max_beds is not None and preferences.max_beds > 0:
+            filters.append(Property.bedrooms <= preferences.max_beds)
+            
+        if preferences.min_baths is not None and preferences.min_baths > 0:
+            filters.append(Property.bathrooms >= float(preferences.min_baths))
+        if preferences.max_baths is not None and preferences.max_baths > 0:
+            filters.append(Property.bathrooms <= float(preferences.max_baths))
+            
+        if preferences.min_year_built is not None:
+            filters.append(Property.year_built >= preferences.min_year_built)
+        if preferences.max_year_built is not None:
+            filters.append(Property.year_built <= preferences.max_year_built)
+
+        # 4. Property Type Filtering
+        selected_types = []
+        if preferences.is_single_family:
+            selected_types.append('SINGLE_FAMILY')
+        if preferences.is_town_house:
+            selected_types.append('TOWNHOUSE')
+        if preferences.is_condo:
+            selected_types.append('CONDO')
+        if preferences.is_multi_family:
+            selected_types.append('MULTI_FAMILY')
+        if preferences.is_lot_land:
+            selected_types.extend(['LAND', 'FARM'])
+        if preferences.is_apartment:
+            selected_types.append('RESIDENTIAL_LEASE')
+            
+        if selected_types:
+            filters.append(Property.home_type.in_(selected_types))
+
+        if filters:
+            query = query.where(and_(*filters))
+
+        result = await db.execute(query)
+        return result.scalar() or 0
+
+    @staticmethod
+    async def bright_mls_id_exists(db: AsyncSession, mls_id: str) -> bool:
+        """
+        Validates if a Bright MLS ID exists.
+        Checks our local 'properties' mirror first (faster).
+        If not found, falls back to the Bright MLS API.
+        """
+        # 1. Check local mirror (as an agent email or listing key)
+        stmt = select(Property.id).where(or_(Property.list_agent_email.ilike(mls_id), Property.listing_key == mls_id)).limit(1)
+        result = await db.execute(stmt)
+        if result.scalar_one_or_none():
+            return True
+            
+        # 2. Fallback to API
+        from app.services.bright_mls_service import bright_mls_service
+        return await bright_mls_service.bright_mls_id_exists(mls_id)
+
+property_service = PropertyService()

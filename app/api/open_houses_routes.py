@@ -39,26 +39,46 @@ async def create_open_house(
         qr_code_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={urllib.parse.quote(os.getenv("CLIENT_URL") + form_url)}"
         
         property_data = request.property_data
+        
+        # Support both new RESO PascalCase and old camelCase/nested structures
         address_data = property_data.get('address', {})
         is_nested_address = isinstance(address_data, dict)
         
-        street_address = address_data.get('streetAddress') if is_nested_address else address_data
-        city = address_data.get('city') if is_nested_address else property_data.get('city')
-        state = address_data.get('state') if is_nested_address else property_data.get('state')
-        # Support both casing variants to ensure it's captured
-        zipcode = address_data.get('zipcode') if is_nested_address else (property_data.get('zipCode') or property_data.get('zipcode'))
+        street_address = (
+            property_data.get('FullStreetAddress') or 
+            address_data.get('streetAddress') or 
+            (address_data if not is_nested_address else None) or
+            request.address
+        )
+        
+        city = (
+            property_data.get('City') or 
+            address_data.get('city') or 
+            property_data.get('city')
+        )
+        
+        state = (
+            property_data.get('StateOrProvince') or 
+            address_data.get('state') or 
+            property_data.get('state')
+        )
+        
+        zipcode = (
+            property_data.get('PostalCode') or 
+            address_data.get('zipcode') or 
+            property_data.get('zipCode') or 
+            property_data.get('zipcode')
+        )
         
         abbreviated_addr = property_data.get('abbreviatedAddress')
-        if not abbreviated_addr and is_nested_address:
-            abbreviated_addr = f"{street_address}, {city}, {state}"
-        elif not abbreviated_addr:
+        if not abbreviated_addr:
             abbreviated_addr = street_address
             
-        # Helper to safely cast to int
-        def safe_int(val):
+        # Helper to safely cast to float/int
+        def safe_num(val):
             try:
                 if val is None: return None
-                return int(float(val))
+                return float(val)
             except (ValueError, TypeError):
                 return None
         
@@ -69,21 +89,22 @@ async def create_open_house(
             form_url=form_url,
             cover_image_url=request.cover_image_url,
             
-            # Property metadata from request - use extracted string fields
+            # Property metadata
             address=street_address,
             abbreviated_address=abbreviated_addr,
-            house_type=property_data.get('homeType'),
-            latitude=property_data.get('latitude'),
-            longitude=property_data.get('longitude'),
-            lot_size=safe_int(property_data.get('lot_size') or property_data.get('lotSize')),
+            house_type=property_data.get('home_type') or property_data.get('HomeType') or property_data.get('PropertyType') or property_data.get('homeType'),
+            latitude=safe_num(property_data.get('Latitude') or property_data.get('latitude')),
+            longitude=safe_num(property_data.get('Longitude') or property_data.get('longitude')),
+            lot_size=safe_num(property_data.get('LotSizeSquareFeet') or property_data.get('lot_size') or property_data.get('lotSize')),
             city=city,
             state=state,
             zipcode=zipcode,
-            bedrooms=safe_int(property_data.get('bedrooms')),
-            bathrooms=property_data.get('bathrooms'),
-            living_area=safe_int(property_data.get('livingArea') or property_data.get('living_area')),
-            price=safe_int(property_data.get('price')),
-            home_status=property_data.get('homeStatus'),
+            bedrooms=safe_num(property_data.get('BedroomsTotal') or property_data.get('bedrooms')),
+            bathrooms=safe_num(property_data.get('BathroomsTotal') or property_data.get('bathrooms')),
+            living_area=safe_num(property_data.get('LivingArea') or property_data.get('livingArea') or property_data.get('living_area')),
+            price=safe_num(property_data.get('ListPrice') or property_data.get('price')),
+            home_status=property_data.get('MlsStatus') or property_data.get('homeStatus'),
+            listing_key=str(property_data.get('ListingKey') or property_data.get('listing_key') or ''),
             similar_properties_snapshot=request.similar_properties_snapshot
         )
         

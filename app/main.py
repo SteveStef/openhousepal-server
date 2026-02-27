@@ -10,11 +10,10 @@ import uuid
 import subprocess
 from dotenv import load_dotenv
 from app.api import router
-from app.utils.clean_cache import cleanup_expired_property_cache, cleanup_expired_signup_verifications
+from app.utils.clean_cache import cleanup_expired_signup_verifications
 from app.utils.property_sync_scheduler import scheduled_property_sync
 from app.services.paypal_service import PayPalService
 from app.services.email_scheduler_service import EmailSchedulerService
-from app.services.bright_mls_service import bright_mls_service
 from app.utils.create_admin import create_admin_user
 from app.config.logging import configure_logging, get_logger, set_request_id, clear_request_id
 
@@ -39,14 +38,6 @@ async def lifespan(app: FastAPI):
     # This is for the property details cache
     cache_hour = int(os.getenv("CACHE_CLEANUP_HOUR", 2))
     cache_mins = int(os.getenv("CACHE_CLEANUP_MINUTE", 0))
-
-    scheduler.add_job(
-        cleanup_expired_property_cache,
-        CronTrigger(hour=cache_hour, minute=cache_mins),  # Daily at 2:00 AM
-        id="cleanup_property_cache",
-        name="Clean up expired property cache",
-        replace_existing=True
-    )
 
     scheduler.add_job(
         cleanup_expired_signup_verifications,
@@ -90,8 +81,7 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Shutting down application")
     scheduler.shutdown()
-    await bright_mls_service.close()
-    logger.info("APScheduler and Bright MLS client stopped")
+    logger.info("APScheduler stopped")
 
 app = FastAPI(title="Open House Pal API", lifespan=lifespan)
 

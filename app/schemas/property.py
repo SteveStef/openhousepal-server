@@ -1,92 +1,92 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic.alias_generators import to_camel
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 class PropertyBase(BaseModel):
-    listing_key: Optional[str] = None
-    street_address: Optional[str] = None
-    city: Optional[str] = None
-    state: Optional[str] = None
-    zipcode: Optional[str] = None
-    country: str = "US"
+    model_config = ConfigDict(
+        alias_generator=to_camel, 
+        populate_by_name=True, 
+        from_attributes=True
+    )
+    
+    listing_key: Optional[str] = Field(None, alias="ListingKey")
+    street_address: Optional[str] = Field(None, alias="FullStreetAddress")
+    unparsed_address: Optional[str] = Field(None, alias="UnparsedAddress")
+    city: Optional[str] = Field(None, alias="City")
+    state: Optional[str] = Field(None, alias="StateOrProvince")
+    zipcode: Optional[str] = Field(None, alias="PostalCode")
 
 class PropertyCreate(PropertyBase):
-    price: Optional[int] = None
-    zestimate: Optional[int] = None
-    bedrooms: Optional[int] = None
-    bathrooms: Optional[float] = None
-    living_area: Optional[int] = None
-    lot_size: Optional[int] = None
-    year_built: Optional[int] = None
-    home_type: Optional[str] = None
-    home_status: Optional[str] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    img_src: Optional[str] = None
+    price: Optional[float] = Field(None, alias="ListPrice")
+    bedrooms: Optional[float] = Field(None, alias="BedroomsTotal")
+    bathrooms: Optional[float] = Field(None, alias="BathroomsTotal")
+    living_area: Optional[float] = Field(None, alias="LivingArea")
+    lot_size: Optional[float] = Field(None, alias="LotSizeSquareFeet")
+    year_built: Optional[int] = Field(None, alias="YearBuilt")
+    home_type: Optional[str] = Field(None, alias="HomeType")
+    home_status: Optional[str] = Field(None, alias="MlsStatus")
+    latitude: Optional[float] = Field(None, alias="Latitude")
+    longitude: Optional[float] = Field(None, alias="Longitude")
+    img_src: Optional[str] = Field(None, alias="ListPictureURL")
+    
+    # Raw MLS data
+    mls_property_type: Optional[str] = Field(None, alias="MlsPropertyType")
+    mls_structure_design_type: Optional[str] = Field(None, alias="MlsStructureDesignType")
 
 class PropertyUpdate(BaseModel):
-    street_address: Optional[str] = None
-    city: Optional[str] = None
-    state: Optional[str] = None
-    zipcode: Optional[str] = None
-    price: Optional[int] = None
-    zestimate: Optional[int] = None
-    bedrooms: Optional[int] = None
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    
+    price: Optional[float] = None
+    bedrooms: Optional[float] = None
     bathrooms: Optional[float] = None
-    living_area: Optional[int] = None
-    lot_size: Optional[int] = None
-    year_built: Optional[int] = None
-    home_type: Optional[str] = None
+    living_area: Optional[float] = None
     home_status: Optional[str] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
     img_src: Optional[str] = None
 
 class PropertySummary(PropertyBase):
     id: str
-    price: Optional[int] = None
-    bedrooms: Optional[int] = None
-    bathrooms: Optional[float] = None
-    living_area: Optional[int] = None
-    img_src: Optional[str] = None
-    
-    class Config:
-        from_attributes = True
+    price: Optional[float] = Field(None, alias="ListPrice")
+    bedrooms: Optional[float] = Field(None, alias="BedroomsTotal")
+    bathrooms: Optional[float] = Field(None, alias="BathroomsTotal")
+    living_area: Optional[float] = Field(None, alias="LivingArea")
+    home_type: Optional[str] = Field(None, alias="HomeType")
+    home_status: Optional[str] = Field(None, alias="MlsStatus")
+    img_src: Optional[str] = Field(None, alias="ListPictureURL")
 
 class Property(PropertyBase):
     id: str
-    price: Optional[int] = None
-    zestimate: Optional[int] = None
-    bedrooms: Optional[int] = None
-    bathrooms: Optional[float] = None
-    living_area: Optional[int] = None
-    lot_size: Optional[int] = None
-    year_built: Optional[int] = None
-    home_type: Optional[str] = None
-    home_status: Optional[str] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    img_src: Optional[str] = None
-    original_photos: Optional[Dict[str, Any]] = None
+    price: Optional[float] = Field(None, alias="ListPrice")
+    bedrooms: Optional[float] = Field(None, alias="BedroomsTotal")
+    bathrooms: Optional[float] = Field(None, alias="BathroomsTotal")
+    living_area: Optional[float] = Field(None, alias="LivingArea")
+    lot_size: Optional[float] = Field(None, alias="LotSizeSquareFeet")
+    year_built: Optional[int] = Field(None, alias="YearBuilt")
+    home_type: Optional[str] = Field(None, alias="HomeType")
+    home_status: Optional[str] = Field(None, alias="MlsStatus")
+    latitude: Optional[float] = Field(None, alias="Latitude")
+    longitude: Optional[float] = Field(None, alias="Longitude")
+    img_src: Optional[str] = Field(None, alias="ListPictureURL")
+    description: Optional[str] = Field(None, alias="PublicRemarks")
+    photos: Optional[List[str]] = None
+    
+    # Raw MLS data
+    mls_property_type: Optional[str] = Field(None, alias="MlsPropertyType")
+    mls_structure_design_type: Optional[str] = Field(None, alias="MlsStructureDesignType")
+    
+    # Detailed fields
+    architectural_style: Optional[List[str]] = None
+    construction_materials: Optional[List[str]] = None
+    interior_features: Optional[List[str]] = None
+    exterior_features: Optional[List[str]] = None
+    garage_spaces: Optional[float] = None
     has_garage: Optional[bool] = None
-    has_pool: Optional[bool] = None
-    has_fireplace: Optional[bool] = None
-    parking_capacity: Optional[int] = None
-    tax_assessed_value: Optional[int] = None
-    property_tax_rate: Optional[float] = None
-    hoa_fee: Optional[float] = None
-    days_on_zillow: Optional[int] = None
-    price_change: Optional[int] = None
-    date_price_changed: Optional[int] = None
+    association_fee: Optional[float] = None
+    
     created_at: datetime
     updated_at: Optional[datetime] = None
-    last_synced: Optional[datetime] = None
-    
-    class Config:
-        from_attributes = True
 
 class AddPropertyToCollection(BaseModel):
     collection_id: str
-    property_id: Optional[str] = None  # If property already exists in DB
-    listing_key: Optional[str] = None  # If we need to fetch from MLS first
-
+    property_id: Optional[str] = None
+    listing_key: Optional[str] = None

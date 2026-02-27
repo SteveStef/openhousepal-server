@@ -6,6 +6,18 @@ from app.database import Base
 from typing import Optional
 import uuid
 import os
+import enum
+
+class HomeType(str, enum.Enum):
+    SINGLE_FAMILY = "SINGLE_FAMILY"
+    TOWNHOUSE = "TOWNHOUSE"
+    CONDO = "CONDO"
+    MULTI_FAMILY = "MULTI_FAMILY"
+    LAND = "LAND"
+    FARM = "FARM"
+    RESIDENTIAL_LEASE = "RESIDENTIAL_LEASE"
+    COMMERCIAL = "COMMERCIAL"
+    OTHER = "OTHER"
 
 # Association table for many-to-many relationship between collections and properties
 collection_properties = Table(
@@ -55,10 +67,10 @@ class Collection(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     name = Column(String, nullable=False)
     description = Column(Text, nullable=True)
-    owner_id = Column(String, ForeignKey('users.id'), nullable=True)  # Required - agent who owns the collection
+    owner_id = Column(String, ForeignKey('users.id'), nullable=False)  # Required - agent who owns the collection
     share_token = Column(String, unique=True, nullable=True)
     is_public = Column(Boolean, default=True)
-    status = Column(String, default="ACTIVE")  # ACTIVE, INACTIVE
+    status = Column(String, default="ACTIVE", nullable=False)  # ACTIVE, INACTIVE
     
     # Anonymous visitor info (for open house collections)
     visitor_email = Column(String, nullable=True)
@@ -66,7 +78,7 @@ class Collection(Base):
     visitor_phone = Column(String, nullable=True)
     original_open_house_event_id = Column(String, ForeignKey('open_house_events.id'), nullable=True)
     
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     last_synced_at = Column(DateTime(timezone=True), nullable=True)  # Track when properties were last synced
 
@@ -83,44 +95,36 @@ class Property(Base):
     __tablename__ = "properties"
     
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    listing_key = Column(String, unique=True, index=True, nullable=True)  # Renamed from zpid for MLS compatibility
+    listing_key = Column(String, unique=True, index=True, nullable=False)
     
     # Basic property info
-    street_address = Column(String, nullable=True)
-    city = Column(String, nullable=True)
-    state = Column(String, nullable=True)
-    zipcode = Column(String, nullable=True)
-    country = Column(String, default="US")
+    street_address = Column(String, nullable=False)
+    unparsed_address = Column(String, nullable=True)
+    city = Column(String, index=True, nullable=False)
+    state = Column(String, index=True, nullable=False)
+    zipcode = Column(String, index=True, nullable=True)
     
     # Property details
-    price = Column(Integer, nullable=True)
-    zestimate = Column(Integer, nullable=True)
-    bedrooms = Column(Integer, nullable=True)
-    bathrooms = Column(Float, nullable=True)
-    living_area = Column(Float, nullable=True)
+    price = Column(Float, index=True, nullable=True)
+    bedrooms = Column(Float, index=True, nullable=True)
+    bathrooms = Column(Float, index=True, nullable=True)
+    living_area = Column(Float, index=True, nullable=True)
     lot_size = Column(Float, nullable=True)
-    home_type = Column(String, nullable=True)
-    home_status = Column(String, nullable=True)
+    home_status = Column(String, index=True, nullable=False)
+    
+    # Standardized type for application logic
+    home_type = Column(String, index=True, nullable=True)
+    
+    # Raw MLS data for precise filtering and reference
+    mls_property_type = Column(String, index=True, nullable=True) # e.g., 'Residential'
+    mls_structure_design_type = Column(String, index=True, nullable=True) # e.g., 'Interior Row/Townhouse'
+
 
     # Location
-    latitude = Column(Float, nullable=True)
-    longitude = Column(Float, nullable=True)
+    latitude = Column(Float, index=True, nullable=True)
+    longitude = Column(Float, index=True, nullable=True)
     
     img_src = Column(String, nullable=True)
-    
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-    
-    # Relationships
-    collections = relationship("Collection", secondary=collection_properties, back_populates="properties")
-    details = relationship("PropertyDetails", back_populates="property", uselist=False, cascade="all, delete-orphan")
-
-
-class PropertyDetails(Base):
-    __tablename__ = "property_details"
-
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    property_id = Column(String, ForeignKey('properties.id', ondelete='CASCADE'), unique=True, nullable=False)
 
     # Narrative & Media
     description = Column(Text, nullable=True)
@@ -131,11 +135,6 @@ class PropertyDetails(Base):
     list_agent_email = Column(String, nullable=True)
     list_office_name = Column(String, nullable=True)
     list_office_phone = Column(String, nullable=True)
-
-    # History
-    price_history = Column(JSONB, nullable=True)
-    tax_history = Column(JSONB, nullable=True)
-    open_house_schedule = Column(JSONB, nullable=True)
 
     # Core Structural & Exterior
     architectural_style = Column(JSONB, nullable=True)
@@ -160,7 +159,6 @@ class PropertyDetails(Base):
     heating = Column(JSONB, nullable=True)
     water_source = Column(JSONB, nullable=True)
     sewer = Column(JSONB, nullable=True)
-    electric = Column(JSONB, nullable=True)
     utilities = Column(JSONB, nullable=True)
     
     # Parking
@@ -169,7 +167,7 @@ class PropertyDetails(Base):
     has_garage = Column(Boolean, nullable=True)
     
     # Community & HOA
-    association_fee = Column(Integer, nullable=True)
+    association_fee = Column(Float, nullable=True)
     association_fee_frequency = Column(String, nullable=True)
     association_amenities = Column(JSONB, nullable=True)
     association_fee_includes = Column(JSONB, nullable=True)
@@ -177,45 +175,58 @@ class PropertyDetails(Base):
     
     # Lot & Location
     lot_features = Column(JSONB, nullable=True)
-    topography = Column(JSONB, nullable=True)
     view = Column(JSONB, nullable=True)
     waterfront_features = Column(JSONB, nullable=True)
     has_waterfront_view = Column(Boolean, nullable=True)
     has_view = Column(Boolean, nullable=True)
     
     # Tax & Financial
-    tax_annual_amount = Column(Integer, nullable=True)
+    tax_annual_amount = Column(Float, nullable=True)
     tax_year = Column(Integer, nullable=True)
     
     # Dates
-    year_built = Column(Integer, nullable=True)
-    modification_timestamp = Column(DateTime(timezone=True), nullable=True)
+    year_built = Column(Integer, index=True, nullable=True)
+    mls_list_date = Column(DateTime(timezone=True), nullable=True)
+    price_change_timestamp = Column(DateTime(timezone=True), nullable=True)
     
     # Education
     elementary_school = Column(String, nullable=True)
     middle_or_junior_school = Column(String, nullable=True)
     high_school = Column(String, nullable=True)
-    school_district_name = Column(String, nullable=True)
+    school_district_name = Column(String, index=True, nullable=True)
     
     # Neighborhood & Location
-    county = Column(String, nullable=True)
+    county = Column(String, index=True, nullable=True)
+    subdivision_name = Column(String, index=True, nullable=True)
     directions = Column(Text, nullable=True)
-    cross_street = Column(String, nullable=True)
-    walk_score = Column(Integer, nullable=True)
     zoning = Column(String, nullable=True)
-    direction_faces = Column(String, nullable=True)
     
     # Financials (More detail)
-    tax_assessment_amount = Column(Integer, nullable=True)
-    land_assessment_amount = Column(Integer, nullable=True)
-    improvement_assessment_amount = Column(Integer, nullable=True)
+    tax_assessment_amount = Column(Float, nullable=True)
     assessment_year = Column(Integer, nullable=True)
-    capital_contribution_fee = Column(Integer, nullable=True)
     possession = Column(JSONB, nullable=True)
+    listing_tax_id = Column(String, nullable=True)
     
     # Detailed Features
     cooling_fuel = Column(JSONB, nullable=True)
     heating_fuel = Column(JSONB, nullable=True)
+    above_grade_finished_area = Column(Float, nullable=True)
+    below_grade_finished_area = Column(Float, nullable=True)
+    basement = Column(JSONB, nullable=True)
+    accessibility_features = Column(JSONB, nullable=True)
+    
+    # Booleans
+    has_basement = Column(Boolean, nullable=True)
+    has_central_air = Column(Boolean, nullable=True)
+    has_fireplace = Column(Boolean, nullable=True)
+    
+    # More Financials
+    association_fee_2 = Column(Float, nullable=True)
+    association_fee_2_frequency = Column(String, nullable=True)
+    
+    # More Agent Info
+    list_agent_preferred_phone = Column(String, nullable=True)
+    
     lot_size_acres = Column(Float, nullable=True)
     attached_garage_yn = Column(Boolean, nullable=True)
     new_construction_yn = Column(Boolean, nullable=True)
@@ -223,21 +234,25 @@ class PropertyDetails(Base):
     pets_allowed = Column(JSONB, nullable=True)
     
     # Listing Intelligence
-    original_list_price = Column(Integer, nullable=True)
-    days_on_market = Column(Integer, nullable=True)
+    original_list_price = Column(Float, nullable=True)
+    days_on_market = Column(Integer, index=True, nullable=True)
     cumulative_days_on_market = Column(Integer, nullable=True)
-    standard_status = Column(String, nullable=True)
     
     # Structure
     stories = Column(Float, nullable=True)
-    stories_total = Column(Float, nullable=True)
-    lot_size = Column(Float, nullable=True)
-    
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    modification_timestamp = Column(DateTime(timezone=True), index=True, nullable=True)
+    
+    # Relationships
+    collections = relationship("Collection", secondary=collection_properties, back_populates="properties")
 
-    # Relationship
-    property = relationship("Property", back_populates="details")
+    __table_args__ = (
+        Index('ix_properties_city_state', 'city', 'state'),
+        Index('ix_properties_lat_long', 'latitude', 'longitude'),
+        Index('ix_properties_status_price', 'home_status', 'price'),
+    )
 
 
 class OpenHouseEvent(Base):
@@ -257,20 +272,20 @@ class OpenHouseEvent(Base):
     abbreviated_address = Column(String, nullable=True)
     house_type = Column(String, nullable=True)
     lot_size = Column(Integer, nullable=True)
-    
-    # Location data for collection searching
-    latitude = Column(Float, nullable=True)
-    longitude = Column(Float, nullable=True)
     city = Column(String, nullable=True)
     state = Column(String, nullable=True)
     zipcode = Column(String, nullable=True)
-    
-    # Property details for PDF generation and collection preferences
-    bedrooms = Column(Integer, nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    price = Column(Float, nullable=True)
+    bedrooms = Column(Float, nullable=True)
     bathrooms = Column(Float, nullable=True)
     living_area = Column(Integer, nullable=True)
-    price = Column(Integer, nullable=True)
     home_status = Column(String, nullable=True)
+    listing_key = Column(String, nullable=True)
+    
+    # Property details for PDF generation and collection preferences
+
     notes = Column(Text, nullable=True)
     similar_properties_snapshot = Column(JSONB, nullable=True) # Full property data snapshot
     
@@ -524,3 +539,10 @@ class SignupVerification(Base):
     last_sent_at = Column(DateTime(timezone=True), nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class SystemSettings(Base):
+    __tablename__ = "system_settings"
+
+    key = Column(String, primary_key=True)
+    value = Column(JSONB, nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
