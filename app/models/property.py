@@ -36,6 +36,7 @@ class PropertySummaryResponse(BaseModel):
     home_status: str = Field(..., alias="MlsStatus")
     
     subdivision_name: Optional[str] = Field(None, alias="SubdivisionName")
+    township: Optional[str] = Field(None, alias="MLSAreaMajor")
     
     img_src: Optional[str] = Field(None, alias="ListPictureURL")
     latitude: Optional[float] = Field(None, alias="Latitude")
@@ -131,6 +132,7 @@ class PropertyDetailResponse(PropertySummaryResponse):
     
     # Neighborhood & Location
     county: Optional[str] = Field(None, alias="County")
+    township: Optional[str] = Field(None, alias="MLSAreaMajor")
     directions: Optional[str] = Field(None, alias="Directions")
     zoning: Optional[str] = Field(None, alias="Zoning")
     

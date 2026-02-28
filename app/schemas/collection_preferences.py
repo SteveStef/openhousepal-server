@@ -28,6 +28,8 @@ class CollectionPreferencesBase(BaseModel):
     is_multi_family: Optional[bool] = False
     is_single_family: Optional[bool] = False
     is_apartment: Optional[bool] = False
+    is_commercial: Optional[bool] = False
+    is_farm: Optional[bool] = False
 
     # Visitor form data
     visiting_reason: Optional[str] = None
@@ -61,6 +63,8 @@ class CollectionPreferencesUpdate(BaseModel):
     is_multi_family: Optional[bool] = None
     is_single_family: Optional[bool] = None
     is_apartment: Optional[bool] = None
+    is_commercial: Optional[bool] = None
+    is_farm: Optional[bool] = None
 
     # Visitor form data
     visiting_reason: Optional[str] = None

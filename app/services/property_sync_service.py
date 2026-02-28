@@ -494,22 +494,17 @@ class PropertySyncService:
                 logger.error(f"Failed to create agent notification: {e}")
 
     async def populate_new_collection(self, db: AsyncSession, collection_id: str) -> Dict[str, Any]:
-        """Initial population for newly created collections"""
+        """Initial population for newly created collections using standardized utility"""
+        from app.services.collections_service import CollectionsService
         try:
-            result = await db.execute(select(Collection).where(Collection.id == collection_id))
-            collection = result.scalar_one_or_none()
-            if not collection: return {'success': False, 'error': 'Not found'}
-
-            preferences = await CollectionPreferencesService.get_preferences_by_collection_id(db, collection_id)
-            if not preferences: return {'success': True, 'new_properties_added': 0}
-
-            matching = await bright_mls_service.get_properties_by_preferences(preferences)
-            for prop_data in matching:
-                if not await self.property_exists_in_collection(db, collection.id, prop_data['listing_key']):
-                    p_obj = await self.create_property_from_mls_data(db, prop_data)
-                    await self.add_property_to_collection(db, collection.id, p_obj.id, initial=True)
-
-            return {'success': True, 'new_properties_added': len(matching)}
+            result = await CollectionsService.repopulate_collection_from_preferences(
+                db, collection_id, commit=True
+            )
+            return {
+                'success': result['success'],
+                'new_properties_added': result.get('new_links_created', 0),
+                'error': result.get('error')
+            }
         except Exception as e:
             logger.error(f"Failed to populate collection {collection_id}: {e}")
             return {'success': False, 'error': str(e)}

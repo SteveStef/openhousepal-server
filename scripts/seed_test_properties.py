@@ -191,6 +191,7 @@ def map_reso_to_internal(item: Dict[str, Any]) -> Dict[str, Any]:
         "high_school": item.get("HighSchool"),
         "school_district_name": item.get("SchoolDistrictName"),
         "county": item.get("County"),
+        "township": re.sub(r'\s*\(\d+\)$', '', item.get("MLSAreaMajor", "")) if item.get("MLSAreaMajor") else None,
         "directions": item.get("Directions"),
         "zoning": item.get("Zoning"),
         
@@ -230,22 +231,34 @@ def map_reso_to_internal(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 async def seed_real_properties():
-    """Fetches 3 properties directly from Bright MLS and upserts them."""
+    """Fetches a variety of properties (5 of each type) directly from Bright MLS."""
     if not CLIENT_ID or not CLIENT_SECRET:
         print("Error: BRIGHT_MLS_CLIENT or BRIGHT_MLS_SECRET not set in .env")
         return
+
+    # Define categories to fetch
+    categories = [
+        {"name": "Single Family", "filter": "PropertyType eq 'Residential' and StructureDesignType eq 'Detached'"},
+        {"name": "Townhouse", "filter": "PropertyType eq 'Residential' and (contains(StructureDesignType, 'Townhouse') or contains(StructureDesignType, 'Row'))"},
+        {"name": "Condo", "filter": "PropertyType eq 'Residential' and (contains(StructureDesignType, 'Unit') or contains(StructureDesignType, 'Flat'))"},
+        {"name": "Multi-Family", "filter": "PropertyType eq 'Multi-Family'"},
+        {"name": "Land", "filter": "PropertyType eq 'Land'"},
+        {"name": "Farm", "filter": "PropertyType eq 'Farm'"},
+        {"name": "Rentals", "filter": "PropertyType eq 'Residential Lease'"},
+        {"name": "Commercial", "filter": "PropertyType eq 'Commercial Sale'"},
+    ]
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         print("--- Authenticating with Bright MLS ---")
         token = await get_access_token(client)
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
-        print("--- Fetching 3 properties from API ---")
         select_fields = ",".join([
             "ListingKey", "FullStreetAddress", "UnparsedAddress", "City", "StateOrProvince",
             "PostalCode", "ListPrice", "BedroomsTotal", "BathroomsFull",
             "BathroomsHalf", "BathroomsTotalInteger", "LivingArea", "LotSizeSquareFeet",
-            "PropertyType", "StructureDesignType", "MlsStatus", "Latitude", "Longitude", "ListPictureURL",
+            "PropertyType", "StructureDesignType", "MlsStatus", 
+            "Latitude", "Longitude", "ListPictureURL", "MLSAreaMajor",
             "PublicRemarks", "ListAgentFullName", "ListAgentEmail",
             "ListOfficeName", "ListOfficePhone", "ArchitecturalStyle", "ConstructionMaterials",
             "Roof", "FoundationDetails", "Levels", "InteriorFeatures",
@@ -267,25 +280,45 @@ async def seed_real_properties():
             "BasementYN", "Basement", "CentralAirYN", "FireplaceYN", "ListingTaxID",
             "ListAgentPreferredPhone"
         ])
-        params = {
-            "$filter": "MlsStatus in ('ACTIVE-BRIGHT', 'COMING SOON-BRIGHT') and City eq 'Wayne' and StateOrProvince eq 'PA'",
-            "$top": 20,
-            "$select": select_fields
-        }
-        url = f"{API_BASE_URL}/BrightProperties"
-        response = await client.get(url, headers=headers, params=params)
-        
-        if response.status_code != 200:
-            print(f"Error {response.status_code}: {response.text}")
-            response.raise_for_status()
-        
-        raw_properties = response.json().get("value", [])
-        print(f"Received {len(raw_properties)} properties.")
+
+        all_raw_properties = []
+
+        for cat in categories:
+            print(f"--- Fetching 5 properties for: {cat['name']} ---")
+            # Base filter for active properties
+            base_filter = "MlsStatus in ('ACTIVE-BRIGHT', 'COMING SOON-BRIGHT')"
+            full_filter = f"{base_filter} and {cat['filter']}"
+            
+            params = {
+                "$filter": full_filter,
+                "$top": 5,
+                "$select": select_fields
+            }
+            url = f"{API_BASE_URL}/BrightProperties"
+            
+            try:
+                response = await client.get(url, headers=headers, params=params)
+                if response.status_code == 200:
+                    props = response.json().get("value", [])
+                    print(f"  Found {len(props)} properties.")
+                    all_raw_properties.extend(props)
+                else:
+                    print(f"  Error fetching {cat['name']}: {response.status_code}")
+            except Exception as e:
+                print(f"  Exception fetching {cat['name']}: {e}")
+
+        if not all_raw_properties:
+            print("No properties found across all categories.")
+            return
+
+        print(f"Total properties retrieved: {len(all_raw_properties)}")
 
         # --- Batch Fetch Photos ---
-        listing_keys = [str(p["ListingKey"]) for p in raw_properties]
+        listing_keys = [str(p["ListingKey"]) for p in all_raw_properties]
         photo_map = {}
         
+        # OData might have limits on the length of 'in' lists, so we chunk it if necessary
+        # But for 40 properties (8 categories * 5), it should be fine.
         if listing_keys:
             print(f"--- Fetching photos for {len(listing_keys)} properties ---")
             media_params = {
@@ -294,25 +327,27 @@ async def seed_real_properties():
                 "$orderby": "MediaDisplayOrder asc"
             }
             media_url = f"{API_BASE_URL}/BrightMedia"
-            media_res = await client.get(media_url, headers=headers, params=media_params)
-            
-            if media_res.status_code == 200:
-                media_data = media_res.json().get("value", [])
-                for m in media_data:
-                    key = str(m["ResourceRecordKey"])
-                    if key not in photo_map:
-                        photo_map[key] = []
-                    photo_map[key].append(m["MediaURL"])
-            else:
-                print(f"Warning: Could not fetch photos ({media_res.status_code})")
+            try:
+                media_res = await client.get(media_url, headers=headers, params=media_params)
+                if media_res.status_code == 200:
+                    media_data = media_res.json().get("value", [])
+                    for m in media_data:
+                        key = str(m["ResourceRecordKey"])
+                        if key not in photo_map:
+                            photo_map[key] = []
+                        photo_map[key].append(m["MediaURL"])
+                else:
+                    print(f"Warning: Could not fetch photos ({media_res.status_code})")
+            except Exception as e:
+                print(f"Warning: Exception fetching photos: {e}")
 
         # Save raw data for debugging
         with open("mls_output.json", "w") as f:
-            json.dump(raw_properties, f, indent=4)
+            json.dump(all_raw_properties, f, indent=4)
         print("✓ Saved raw data to mls_output.json")
 
         async with AsyncSessionLocal() as db:
-            for item in raw_properties:
+            for item in all_raw_properties:
                 key = str(item["ListingKey"])
                 # Inject fetched photos into the item so map_reso_to_internal can find them
                 item["BrightMediaFetched"] = photo_map.get(key, [])

@@ -73,6 +73,8 @@ class CreateCollectionWithPreferencesRequest(BaseModel):
     is_multi_family: Optional[bool] = False
     is_single_family: Optional[bool] = False
     is_apartment: Optional[bool] = False
+    is_commercial: Optional[bool] = False
+    is_farm: Optional[bool] = False
 
 
 class UpdateStatusRequest(BaseModel):
@@ -263,6 +265,8 @@ async def create_collection_with_preferences(
                 is_multi_family=request.is_multi_family,
                 is_single_family=request.is_single_family,
                 is_apartment=request.is_apartment,
+                is_commercial=request.is_commercial,
+                is_farm=request.is_farm,
                 special_features=request.additional_comments,
                 visiting_reason=request.visiting_reason,
                 has_agent=request.has_agent
@@ -674,7 +678,8 @@ async def update_preferences_and_refresh(
                 "preferences_updated": result['preferences_updated'],
                 "properties_refreshed": result['properties_refreshed'],
                 "properties_count": result['properties_count'],
-                "collection_id": collection_id
+                "collection_id": collection_id,
+                "preferences": result.get('preferences')
             }
         else:
             raise HTTPException(

@@ -63,19 +63,28 @@ class PropertyService:
             # Fallback to fuzzy if no house number detected
             filters.append(Property.street_address.ilike(f"%{street_part}%"))
 
-        # 4. Geographic Anchor (Zip is best, City is fallback)
+        # 4. Geographic Anchor (Zip OR City for resilience)
+        geo_filters = []
         if zip_code:
-            filters.append(Property.zipcode == zip_code)
-        elif len(parts) > 1:
+            geo_filters.append(Property.zipcode == zip_code)
+        
+        if len(parts) > 1:
             city = parts[1].strip()
-            filters.append(Property.city.ilike(city))
+            geo_filters.append(Property.city.ilike(city))
+
+        if geo_filters:
+            filters.append(or_(*geo_filters))
 
         # 5. Execute
         stmt = select(Property).where(and_(*filters)).limit(1)
+        
+        logger.info(f"Address Lookup: {raw_address} | Street: {street_part} | Zip: {zip_code}")
+        
         result = await db.execute(stmt)
         property_obj = result.scalar_one_or_none()
 
         if not property_obj:
+            logger.warning(f"Address Lookup Failed: {raw_address}")
             return None
             
         return PropertyDetailResponse.model_validate(property_obj)
@@ -92,22 +101,33 @@ class PropertyService:
         """
         query = select(Property)
         filters = []
+        
+        # Types that typically don't have bathrooms or bedrooms (Exempt from numeric filters)
+        exempt_types = ['LAND', 'FARM', 'COMMERCIAL', 'RESIDENTIAL_LEASE', 'OTHER']
 
-        # 1. Location Filtering (City/State OR Radius)
-        combined_locations = (preferences.cities or []) + (preferences.townships or [])
-        if combined_locations:
+        # 1. Location Filtering (Cities OR Townships OR Radius)
+        if preferences.cities:
             loc_filters = []
-            for loc in combined_locations:
+            for loc in preferences.cities:
                 parts = [s.strip() for s in loc.split(',')]
                 city = parts[0]
                 state = parts[1] if len(parts) >= 2 else "PA"
                 loc_filters.append(and_(Property.city.ilike(city), Property.state.ilike(state)))
-            
+            if loc_filters:
+                filters.append(or_(*loc_filters))
+
+        elif preferences.townships:
+            loc_filters = []
+            for township in preferences.townships:
+                # Township search is usually just the name, e.g., "Radnor"
+                # We use ILIKE %name% to catch "Radnor Twp" or "Radnor Township"
+                loc_filters.append(Property.township.ilike(f"%{township.strip()}%"))
             if loc_filters:
                 filters.append(or_(*loc_filters))
                 
         elif preferences.lat is not None and preferences.long is not None and preferences.diameter:
             # Bounding Box Math for Radius (approximate)
+            # diameter = total width, so radius = diameter / 2
             radius_miles = float(preferences.diameter) / 2.0
             lat_offset = radius_miles / 69.1
             cos_lat = math.cos(math.radians(float(preferences.lat)))
@@ -121,28 +141,40 @@ class PropertyService:
             ))
 
         # 2. Status Filtering
-        filters.append(Property.home_status.in_(['ACTIVE-BRIGHT', 'COMING SOON-BRIGHT']))
+        # Match statuses starting with ACTIVE or COMING SOON
+        filters.append(or_(
+            Property.home_status.ilike('ACTIVE%'),
+            Property.home_status.ilike('COMING SOON%')
+        ))
 
-        # 3. Numeric Filters
+        # 3. Numeric Filters (with Smart Exemptions)
+        numeric_filters = []
         if preferences.min_price is not None and preferences.min_price > 0:
             filters.append(Property.price >= preferences.min_price)
         if preferences.max_price is not None and preferences.max_price > 0:
             filters.append(Property.price <= preferences.max_price)
             
         if preferences.min_beds is not None and preferences.min_beds > 0:
-            filters.append(Property.bedrooms >= preferences.min_beds)
+            numeric_filters.append(Property.bedrooms >= preferences.min_beds)
         if preferences.max_beds is not None and preferences.max_beds > 0:
-            filters.append(Property.bedrooms <= preferences.max_beds)
+            numeric_filters.append(Property.bedrooms <= preferences.max_beds)
             
         if preferences.min_baths is not None and preferences.min_baths > 0:
-            filters.append(Property.bathrooms >= float(preferences.min_baths))
+            numeric_filters.append(Property.bathrooms >= float(preferences.min_baths))
         if preferences.max_baths is not None and preferences.max_baths > 0:
-            filters.append(Property.bathrooms <= float(preferences.max_baths))
+            numeric_filters.append(Property.bathrooms <= float(preferences.max_baths))
             
         if preferences.min_year_built is not None:
-            filters.append(Property.year_built >= preferences.min_year_built)
+            numeric_filters.append(Property.year_built >= preferences.min_year_built)
         if preferences.max_year_built is not None:
-            filters.append(Property.year_built <= preferences.max_year_built)
+            numeric_filters.append(Property.year_built <= preferences.max_year_built)
+
+        # Apply numeric filters conditionally (either it's exempt or it matches)
+        if numeric_filters:
+            filters.append(or_(
+                Property.home_type.in_(exempt_types),
+                and_(*numeric_filters)
+            ))
 
         # 4. Property Type Filtering
         selected_types = []
@@ -156,6 +188,10 @@ class PropertyService:
             selected_types.append('MULTI_FAMILY')
         if preferences.is_lot_land:
             selected_types.extend(['LAND', 'FARM'])
+        if preferences.is_farm:
+            selected_types.append('FARM')
+        if preferences.is_commercial:
+            selected_types.append('COMMERCIAL')
         if preferences.is_apartment:
             selected_types.append('RESIDENTIAL_LEASE')
             
@@ -171,6 +207,9 @@ class PropertyService:
 
         # Execute
         query = query.limit(max_properties)
+        
+        logger.info(f"Discovery Search: filters={len(filters)} | types={selected_types}")
+        
         result = await db.execute(query)
         properties = result.scalars().all()
 
@@ -181,21 +220,28 @@ class PropertyService:
         """Fetch only the count of matching properties without downloading records."""
         query = select(func.count(Property.id))
         filters = []
+        exempt_types = ['LAND', 'FARM', 'COMMERCIAL', 'RESIDENTIAL_LEASE', 'OTHER']
 
-        # 1. Location Filtering (City/State OR Radius)
-        combined_locations = (preferences.cities or []) + (preferences.townships or [])
-        if combined_locations:
+        # 1. Location Filtering (Cities OR Townships OR Radius)
+        if preferences.cities:
             loc_filters = []
-            for loc in combined_locations:
+            for loc in preferences.cities:
                 parts = [s.strip() for s in loc.split(',')]
                 city = parts[0]
                 state = parts[1] if len(parts) >= 2 else "PA"
                 loc_filters.append(and_(Property.city.ilike(city), Property.state.ilike(state)))
-            
+            if loc_filters:
+                filters.append(or_(*loc_filters))
+
+        elif preferences.townships:
+            loc_filters = []
+            for township in preferences.townships:
+                loc_filters.append(Property.township.ilike(f"%{township.strip()}%"))
             if loc_filters:
                 filters.append(or_(*loc_filters))
                 
         elif preferences.lat is not None and preferences.long is not None and preferences.diameter:
+            # radius = diameter / 2
             radius_miles = float(preferences.diameter) / 2.0
             lat_offset = radius_miles / 69.1
             cos_lat = math.cos(math.radians(float(preferences.lat)))
@@ -209,28 +255,38 @@ class PropertyService:
             ))
 
         # 2. Status Filtering
-        filters.append(Property.home_status.in_(['ACTIVE-BRIGHT', 'COMING SOON-BRIGHT']))
+        filters.append(or_(
+            Property.home_status.ilike('ACTIVE%'),
+            Property.home_status.ilike('COMING SOON%')
+        ))
 
-        # 3. Numeric Filters
+        # 3. Numeric Filters (with Smart Exemptions)
+        numeric_filters = []
         if preferences.min_price is not None and preferences.min_price > 0:
             filters.append(Property.price >= preferences.min_price)
         if preferences.max_price is not None and preferences.max_price > 0:
             filters.append(Property.price <= preferences.max_price)
             
         if preferences.min_beds is not None and preferences.min_beds > 0:
-            filters.append(Property.bedrooms >= preferences.min_beds)
+            numeric_filters.append(Property.bedrooms >= preferences.min_beds)
         if preferences.max_beds is not None and preferences.max_beds > 0:
-            filters.append(Property.bedrooms <= preferences.max_beds)
+            numeric_filters.append(Property.bedrooms <= preferences.max_beds)
             
         if preferences.min_baths is not None and preferences.min_baths > 0:
-            filters.append(Property.bathrooms >= float(preferences.min_baths))
+            numeric_filters.append(Property.bathrooms >= float(preferences.min_baths))
         if preferences.max_baths is not None and preferences.max_baths > 0:
-            filters.append(Property.bathrooms <= float(preferences.max_baths))
+            numeric_filters.append(Property.bathrooms <= float(preferences.max_baths))
             
         if preferences.min_year_built is not None:
-            filters.append(Property.year_built >= preferences.min_year_built)
+            numeric_filters.append(Property.year_built >= preferences.min_year_built)
         if preferences.max_year_built is not None:
-            filters.append(Property.year_built <= preferences.max_year_built)
+            numeric_filters.append(Property.year_built <= preferences.max_year_built)
+
+        if numeric_filters:
+            filters.append(or_(
+                Property.home_type.in_(exempt_types),
+                and_(*numeric_filters)
+            ))
 
         # 4. Property Type Filtering
         selected_types = []
@@ -244,6 +300,10 @@ class PropertyService:
             selected_types.append('MULTI_FAMILY')
         if preferences.is_lot_land:
             selected_types.extend(['LAND', 'FARM'])
+        if preferences.is_farm:
+            selected_types.append('FARM')
+        if preferences.is_commercial:
+            selected_types.append('COMMERCIAL')
         if preferences.is_apartment:
             selected_types.append('RESIDENTIAL_LEASE')
             

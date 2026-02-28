@@ -5,6 +5,9 @@ import math
 
 from app.models.database import CollectionPreferences, Collection, Property, OpenHouseEvent
 from app.schemas.collection_preferences import CollectionPreferencesCreate, CollectionPreferencesUpdate
+from app.config.logging import get_logger
+
+logger = get_logger(__name__)
 
 class CollectionPreferencesService:
     
@@ -107,6 +110,16 @@ class CollectionPreferencesService:
         is_ll = False
         is_ap = False
 
+        # Initialize all booleans to False
+        is_sf = False
+        is_th = False
+        is_co = False
+        is_mf = False
+        is_ll = False
+        is_ap = False
+        is_farm = False
+        is_commercial = False
+
         # Map current home type to matching boolean
         if h_type == "SINGLE_FAMILY":
             is_sf = True
@@ -116,10 +129,15 @@ class CollectionPreferencesService:
             is_co = True
         elif h_type == "MULTI_FAMILY":
             is_mf = True
-        elif h_type in ["LAND", "FARM"]:
+        elif h_type == "LAND":
             is_ll = True
+        elif h_type == "FARM":
+            is_farm = True
+            is_ll = True # Often Land and Farm go together in our logic
         elif h_type == "RESIDENTIAL_LEASE":
             is_ap = True
+        elif h_type == "COMMERCIAL":
+            is_commercial = True
         else:
             is_sf = True # Default fallback
 
@@ -144,12 +162,12 @@ class CollectionPreferencesService:
 
         preferences_data_dict = {
             "collection_id": collection_id,
-            "min_beds": max(1, (original_open_house.bedrooms or 3) - 1),
+            "min_beds": max(0, (original_open_house.bedrooms or 0) - 1) if original_open_house.bedrooms else 0,
             "max_beds": 0,
             "min_baths": 0,
             "max_baths": 0,
-            "min_price": int((original_open_house.price or 1000000) * 0.8),  # 20% less
-            "max_price": int((original_open_house.price or 1000000) * 1.2),  # 20% more
+            "min_price": int((original_open_house.price or 0) * 0.8) if original_open_house.price else 0,  # 20% less
+            "max_price": int((original_open_house.price or 1000000) * 1.2) if original_open_house.price else 0,  # 20% more
             "lat": original_open_house.latitude,
             "long": original_open_house.longitude,
             "address": full_address or original_open_house.address,
@@ -162,6 +180,8 @@ class CollectionPreferencesService:
             "is_lot_land": is_ll,
             "is_multi_family": is_mf,
             "is_apartment": is_ap,
+            "is_commercial": is_commercial,
+            "is_farm": is_farm,
         }
         
         # Add visitor form data if provided
@@ -198,16 +218,13 @@ class CollectionPreferencesService:
         preferences_update: CollectionPreferencesUpdate
     ) -> Dict[str, Any]:
         """
-        Atomically update preferences and refresh properties.
-        Only commits if Zillow API succeeds. If Zillow fails, rolls back everything.
+        Atomically update preferences and refresh properties using the local database mirror.
+        Uses standardized repopulation logic.
         """
-        from app.services.property_sync_service import PropertySyncService
-        from app.config.logging import get_logger
-
-        logger = get_logger(__name__)
+        from app.services.collections_service import CollectionsService
 
         try:
-            # Get existing preferences
+            # 1. Get existing preferences
             preferences = await CollectionPreferencesService.get_preferences_by_collection_id(db, collection_id)
             if not preferences:
                 return {
@@ -215,44 +232,33 @@ class CollectionPreferencesService:
                     'error': 'Preferences not found for this collection'
                 }
 
-            # Update preferences fields in memory (not committed yet)
+            # 2. Update preferences fields in memory
             update_data = preferences_update.dict(exclude_unset=True)
             for field, value in update_data.items():
                 setattr(preferences, field, value)
 
-            # Don't commit yet - this ensures atomicity
-            # Either both preferences and properties update, or neither does
-
-            # Now attempt to refresh properties with the updated preferences
-            # This will fetch from Zillow and prepare properties (but NOT commit)
-            sync_service = PropertySyncService()
-            # Pass the updated preferences object so it doesn't re-fetch stale ones from DB
-            result = await sync_service.replace_collection_properties(db, collection_id, preferences=preferences)
+            # 3. Use standardized repopulation utility
+            # We pass commit=False because we want to commit preferences and property links together
+            result = await CollectionsService.repopulate_collection_from_preferences(
+                db, collection_id, commit=False
+            )
 
             if not result['success']:
-                # Zillow failed or no properties found - rollback preference changes too
                 await db.rollback()
-                logger.error(f"Failed to refresh properties, rolling back preference changes: {result.get('error')}")
-                return {
-                    'success': False,
-                    'error': f"Failed to update: {result.get('error')}",
-                    'preferences_updated': False,
-                    'properties_refreshed': False
-                }
+                return result
 
-            # Commit both preferences and properties atomically
+            # 4. Commit everything atomically
             await db.commit()
-
-            # Success! Both preferences and properties were updated and committed
             await db.refresh(preferences)
+            
             logger.info(f"Successfully updated preferences and refreshed properties for collection {collection_id}")
 
             return {
                 'success': True,
-                'message': f"Updated preferences and refreshed {result['properties_replaced']} properties",
+                'message': f"Updated preferences and refreshed {result['properties_found']} properties",
                 'preferences_updated': True,
                 'properties_refreshed': True,
-                'properties_count': result['properties_replaced'],
+                'properties_count': result['properties_found'],
                 'preferences': preferences
             }
 

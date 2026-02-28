@@ -157,71 +157,18 @@ class OpenHouseService:
             )
             await db.commit()
 
-            # 3. FINAL FETCH
-            matching_properties = await property_service.get_properties_by_preferences(db, preferences)
+            # 3. FINAL POPULATE using standardized utility
+            from app.services.collections_service import CollectionsService
+            population_result = await CollectionsService.repopulate_collection_from_preferences(
+                db, collection.id, commit=True
+            )
             
-            properties_added = 0
-            
-            for p_summary in matching_properties:
-                listing_key = p_summary.listing_key
-                if not listing_key:
-                    continue
-                
-                if await OpenHouseService._property_exists_in_collection(db, collection.id, listing_key):
-                    continue
-
-                # The new property_service already returns Pydantic models with data from our DB
-                # Since the data is ALREADY in the mirror, we just need the DB ID
-                stmt = select(Property.id).where(Property.listing_key == str(listing_key))
-                res = await db.execute(stmt)
-                p_id = res.scalar_one_or_none()
-                
-                if p_id:
-                    await OpenHouseService._add_property_to_collection(db, collection.id, p_id)
-                    properties_added += 1
-            
-            return properties_added
+            return population_result.get('properties_found', 0)
             
         except Exception as e:
-            logger.error(f"Smart Discovery population failed: {e}")
+            logger.error(f"Smart Discovery population failed: {e}", exc_info=True)
             return 0
     
-    @staticmethod
-    async def _property_exists_in_collection(db: AsyncSession, collection_id: str, listing_key: str) -> bool:
-        """Check if a property (by listing_key) already exists in a collection"""
-        # listing_key is a string in the new service
-        result = await db.execute(
-            select(Property.id)
-            .join(collection_properties)
-            .where(
-                collection_properties.c.collection_id == collection_id,
-                Property.listing_key == str(listing_key)
-            )
-        )
-        return result.scalar_one_or_none() is not None
-    
-    @staticmethod 
-    async def _add_property_to_collection(db: AsyncSession, collection_id: str, property_id: str):
-        """Add a property to a collection (many-to-many relationship)"""
-        # Check if relationship already exists
-        result = await db.execute(
-            select(collection_properties)
-            .where(
-                collection_properties.c.collection_id == collection_id,
-                collection_properties.c.property_id == property_id
-            )
-        )
-        
-        if result.fetchone() is None:
-            # Insert new relationship
-            await db.execute(
-                collection_properties.insert().values(
-                    collection_id=collection_id,
-                    property_id=property_id
-                )
-            )
-            await db.commit()
-
     @staticmethod
     async def get_open_house_event_by_id(db: AsyncSession, open_house_event_id: str) -> Optional[dict]:
         """Get open house event details by ID from database"""

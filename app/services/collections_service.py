@@ -1,5 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, delete, text, func
+from sqlalchemy import select, and_, or_, insert, delete, text, func, update
 from sqlalchemy.orm import selectinload, joinedload, load_only
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
@@ -8,7 +8,11 @@ import secrets
 import string
 import os
 
-from app.models.database import Collection, Property, User, PropertyInteraction, PropertyComment, PropertyTour, collection_properties
+from app.models.database import (
+    Collection, Property, User, PropertyInteraction, 
+    PropertyComment, PropertyTour, collection_properties,
+    Notification, ScheduledEmail
+)
 from app.schemas.collection import CollectionCreate
 from app.config.logging import get_logger
 
@@ -149,7 +153,9 @@ class CollectionsService:
                         "is_single_family": collection.preferences.is_single_family,
                         "is_lot_land": collection.preferences.is_lot_land,
                         "is_multi_family": collection.preferences.is_multi_family,
-                        "is_apartment": collection.preferences.is_apartment
+                        "is_apartment": collection.preferences.is_apartment,
+                        "is_commercial": collection.preferences.is_commercial,
+                        "is_farm": collection.preferences.is_farm
                     }
 
                 # Transform properties for this collection (similar to get_shared_collection)
@@ -289,7 +295,9 @@ class CollectionsService:
                     "is_single_family": collection.preferences.is_single_family,
                     "is_lot_land": collection.preferences.is_lot_land,
                     "is_multi_family": collection.preferences.is_multi_family,
-                    "is_apartment": collection.preferences.is_apartment
+                    "is_apartment": collection.preferences.is_apartment,
+                    "is_commercial": collection.preferences.is_commercial,
+                    "is_farm": collection.preferences.is_farm
                 }
 
             return {
@@ -691,7 +699,9 @@ class CollectionsService:
                     'is_single_family': collection.preferences.is_single_family,
                     'is_lot_land': collection.preferences.is_lot_land,
                     'is_multi_family': collection.preferences.is_multi_family,
-                    'is_apartment': collection.preferences.is_apartment
+                    'is_apartment': collection.preferences.is_apartment,
+                    'is_commercial': collection.preferences.is_commercial,
+                    'is_farm': collection.preferences.is_farm
                 } if collection.preferences else {},
                 'stats': {
                     'totalProperties': total_properties,
@@ -708,6 +718,175 @@ class CollectionsService:
         except Exception as e:
             logger.error("Operation failed", extra={"error": str(e)})
             raise e
+
+    @staticmethod
+    async def repopulate_collection_from_preferences(
+        db: AsyncSession,
+        collection_id: str,
+        commit: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Standardized utility to sync a collection's properties with its preferences.
+        1. Queries local mirror for matching properties.
+        2. Identifies 'Protected' properties (liked, commented, toured).
+        3. Removes stale links (not matching and not protected).
+        4. Bulk inserts new matching links.
+        """
+        from app.services.property_service import PropertyService
+        from app.services.collection_preferences_service import CollectionPreferencesService
+        from app.models.database import collection_properties, Property, PropertyInteraction, PropertyComment, PropertyTour
+        from sqlalchemy import and_, or_, insert, delete
+
+        try:
+            # 1. Get current preferences
+            preferences = await CollectionPreferencesService.get_preferences_by_collection_id(db, collection_id)
+            if not preferences:
+                return {'success': False, 'error': 'Preferences not found'}
+
+            # 2. Fetch new matching properties from the local MIRROR
+            matching_properties = await PropertyService.get_properties_by_preferences(db, preferences)
+            new_match_ids = {p.id for p in matching_properties}
+
+            # 3. Identify IDs of properties to PROTECT (those with user interactions)
+            keep_query = select(collection_properties.c.property_id).where(
+                collection_properties.c.collection_id == collection_id
+            ).where(
+                or_(
+                    collection_properties.c.property_id.in_(select(PropertyInteraction.property_id).where(PropertyInteraction.collection_id == collection_id)),
+                    collection_properties.c.property_id.in_(select(PropertyComment.property_id).where(PropertyComment.collection_id == collection_id)),
+                    collection_properties.c.property_id.in_(select(PropertyTour.property_id).where(PropertyTour.collection_id == collection_id))
+                )
+            )
+            keep_ids_res = await db.execute(keep_query)
+            protected_ids = {r[0] for r in keep_ids_res.fetchall()}
+            
+            # 4. Clear stale links (not a new match AND not protected)
+            delete_stmt = delete(collection_properties).where(
+                and_(
+                    collection_properties.c.collection_id == collection_id,
+                    collection_properties.c.property_id.notin_(new_match_ids),
+                    collection_properties.c.property_id.notin_(protected_ids)
+                )
+            )
+            await db.execute(delete_stmt)
+            
+            # 5. Identify which new matches need to be inserted 
+            # (skip those already linked/protected)
+            existing_links_query = select(collection_properties.c.property_id).where(
+                collection_properties.c.collection_id == collection_id
+            )
+            existing_res = await db.execute(existing_links_query)
+            already_linked_ids = {r[0] for r in existing_res.fetchall()}
+            
+            ids_to_insert = new_match_ids - already_linked_ids
+            
+            # 6. Bulk Insert
+            if ids_to_insert:
+                insert_data = [
+                    {"collection_id": collection_id, "property_id": p_id, "added_at": None}
+                    for p_id in ids_to_insert
+                ]
+                await db.execute(insert(collection_properties), insert_data)
+
+            if commit:
+                await db.commit()
+
+            return {
+                'success': True,
+                'properties_found': len(new_match_ids),
+                'new_links_created': len(ids_to_insert),
+                'protected_count': len(protected_ids)
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to repopulate collection {collection_id}: {e}", exc_info=True)
+            if commit:
+                await db.rollback()
+            return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    async def repopulate_collection_from_preferences(
+        db: AsyncSession,
+        collection_id: str,
+        commit: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Standardized utility to sync a collection's properties with its preferences.
+        Performs an EXCLUSIVE refresh:
+        1. Queries local mirror for matching properties.
+        2. Identifies 'Protected' properties (liked, commented, toured).
+        3. Removes stale links (those that don't match AND aren't protected).
+        4. Bulk inserts new matching links.
+        """
+        from app.services.property_service import PropertyService
+
+        try:
+            # 1. Get current preferences
+            preferences = await CollectionPreferencesService.get_preferences_by_collection_id(db, collection_id)
+            if not preferences:
+                return {'success': False, 'error': 'Preferences not found'}
+
+            # 2. Fetch new matching properties from the local MIRROR
+            matching_properties = await PropertyService.get_properties_by_preferences(db, preferences)
+            new_match_ids = {p.id for p in matching_properties}
+
+            # 3. Identify IDs of properties to PROTECT (those with user interactions)
+            # We don't want to remove properties the user has already engaged with
+            keep_query = select(collection_properties.c.property_id).where(
+                collection_properties.c.collection_id == collection_id
+            ).where(
+                or_(
+                    collection_properties.c.property_id.in_(select(PropertyInteraction.property_id).where(PropertyInteraction.collection_id == collection_id)),
+                    collection_properties.c.property_id.in_(select(PropertyComment.property_id).where(PropertyComment.collection_id == collection_id)),
+                    collection_properties.c.property_id.in_(select(PropertyTour.property_id).where(PropertyTour.collection_id == collection_id))
+                )
+            )
+            keep_ids_res = await db.execute(keep_query)
+            protected_ids = {r[0] for r in keep_ids_res.fetchall()}
+            
+            # 4. Clear stale links (not a new match AND not protected)
+            delete_stmt = delete(collection_properties).where(
+                and_(
+                    collection_properties.c.collection_id == collection_id,
+                    collection_properties.c.property_id.notin_(list(new_match_ids)),
+                    collection_properties.c.property_id.notin_(list(protected_ids))
+                )
+            )
+            await db.execute(delete_stmt)
+            
+            # 5. Identify which new matches need to be inserted 
+            # (skip those already linked/protected)
+            existing_links_query = select(collection_properties.c.property_id).where(
+                collection_properties.c.collection_id == collection_id
+            )
+            existing_res = await db.execute(existing_links_query)
+            already_linked_ids = {r[0] for r in existing_res.fetchall()}
+            
+            ids_to_insert = new_match_ids - already_linked_ids
+            
+            # 6. Bulk Insert
+            if ids_to_insert:
+                insert_data = [
+                    {"collection_id": collection_id, "property_id": p_id, "added_at": None}
+                    for p_id in ids_to_insert
+                ]
+                await db.execute(insert(collection_properties), insert_data)
+
+            if commit:
+                await db.commit()
+
+            return {
+                'success': True,
+                'properties_found': len(new_match_ids),
+                'new_links_created': len(ids_to_insert),
+                'protected_count': len(protected_ids)
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to repopulate collection {collection_id}: {e}", exc_info=True)
+            if commit:
+                await db.rollback()
+            return {'success': False, 'error': str(e)}
 
     @staticmethod
     async def delete_collection(

@@ -197,6 +197,7 @@ class Property(Base):
     
     # Neighborhood & Location
     county = Column(String, index=True, nullable=True)
+    township = Column(String, index=True, nullable=True)
     subdivision_name = Column(String, index=True, nullable=True)
     directions = Column(Text, nullable=True)
     zoning = Column(String, nullable=True)
@@ -430,6 +431,8 @@ class CollectionPreferences(Base):
     is_multi_family = Column(Boolean, nullable=True, default=False)
     is_single_family = Column(Boolean, nullable=True, default=False)
     is_apartment = Column(Boolean, nullable=True, default=False)
+    is_commercial = Column(Boolean, nullable=True, default=False)
+    is_farm = Column(Boolean, nullable=True, default=False)
 
     # Visitor form data
     visiting_reason = Column(String, nullable=True)  # BUYING_SOON, BROWSING, NEIGHBORHOOD, etc.
