@@ -1,5 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, update, and_, or_, insert, text
+from sqlalchemy import select, func, update, and_, or_, text
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import selectinload
 from typing import List, Dict, Any, Optional, Set
 import asyncio
@@ -12,7 +13,7 @@ import os
 from app.models.database import (
     Collection, CollectionPreferences, Property, collection_properties, 
     User, PropertyInteraction, PropertyComment, PropertyTour, 
-    ScheduledEmail, Notification, SystemSettings
+    ScheduledEmail, Notification, SystemSettings, SchoolDistrict
 )
 from app.services.bright_mls_service import bright_mls_service
 from app.services.email_service import EmailService
@@ -134,6 +135,21 @@ class PropertySyncService:
         l_key = str(raw_data["ListingKey"])
         mapped = bright_mls_service.map_reso_to_internal(raw_data, photo_map)
         
+        # --- NEW: Maintain School Districts Reference Table ---
+        sd_name = mapped.get("school_district_name")
+        sd_state = mapped.get("state")
+        if sd_name and sd_state:
+            try:
+                # Upsert school district into reference table
+                await db.execute(
+                    insert(SchoolDistrict)
+                    .values(name=sd_name, state=sd_state)
+                    .on_conflict_do_nothing()
+                )
+            except Exception as e:
+                logger.warning(f"Failed to auto-populate school district {sd_name}: {e}")
+        # ------------------------------------------------------
+
         # Get existing record to compare state
         stmt = select(Property).where(Property.listing_key == l_key)
         res = await db.execute(stmt)
@@ -240,6 +256,7 @@ class PropertySyncService:
         city = prop.get("city")
         state = prop.get("state")
         township = prop.get("township")
+        school_district = prop.get("school_district_name")
         h_type = prop.get("home_type")
         lat = prop.get("latitude")
         lng = prop.get("longitude")
@@ -276,6 +293,25 @@ class PropertySyncService:
                             AND (
                                 TRIM(SPLIT_PART(pref_town, ',', 2)) = '' 
                                 OR UPPER(TRIM(SPLIT_PART(pref_town, ',', 2))) = '{state.upper() if state else ""}'
+                            )
+                    )
+                """)
+            )
+
+        if school_district:
+            # Match school district name and state by splitting the user's preference string
+            # Format in DB: "RADNOR TOWNSHIP, PA"
+            # Property attributes: school_district="RADNOR TOWNSHIP", state="PA"
+            geo_conditions.append(
+                text(f"""
+                    EXISTS (
+                        SELECT 1 
+                        FROM jsonb_array_elements_text(collection_preferences.school_districts) AS sd 
+                        WHERE 
+                            UPPER(TRIM(SPLIT_PART(sd, ',', 1))) = '{school_district.upper()}'
+                            AND (
+                                TRIM(SPLIT_PART(sd, ',', 2)) = '' 
+                                OR UPPER(TRIM(SPLIT_PART(sd, ',', 2))) = '{state.upper() if state else ""}'
                             )
                     )
                 """)

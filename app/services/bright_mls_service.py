@@ -182,7 +182,12 @@ class BrightMlsService:
         else:
             township = None
 
-        # 5. Date Parsing
+        # 5. School District
+        school_district = item.get("SchoolDistrictName")
+        if school_district:
+            school_district = school_district.strip().upper()
+
+        # 6. Date Parsing
         def parse_dt(dt_str: str):
             if not dt_str: return None
             try:
@@ -253,7 +258,7 @@ class BrightMlsService:
             "elementary_school": item.get("ElementarySchool"),
             "middle_or_junior_school": item.get("MiddleOrJuniorSchool"),
             "high_school": item.get("HighSchool"),
-            "school_district_name": item.get("SchoolDistrictName"),
+            "school_district_name": school_district,
             "county": item.get("County"),
             "township": township,
             "directions": item.get("Directions"),

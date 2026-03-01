@@ -419,6 +419,7 @@ class CollectionPreferences(Base):
     address = Column(String, nullable=True)
     cities = Column(JSONB, nullable=True)
     townships = Column(JSONB, nullable=True)
+    school_districts = Column(JSONB, nullable=True)  # New column for school district preferences
     diameter = Column(Float, default=6.0)  # Search diameter in miles
 
     # Additional features
@@ -549,3 +550,11 @@ class SystemSettings(Base):
     key = Column(String, primary_key=True)
     value = Column(JSONB, nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+class SchoolDistrict(Base):
+    __tablename__ = "school_districts"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, unique=True, index=True, nullable=False)
+    state = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

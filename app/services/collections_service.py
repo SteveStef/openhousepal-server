@@ -142,6 +142,7 @@ class CollectionsService:
                         "address": collection.preferences.address,  # Add missing address field
                         "cities": collection.preferences.cities,
                         "townships": collection.preferences.townships,
+                        "school_districts": collection.preferences.school_districts,
                         "diameter": collection.preferences.diameter,
                         "special_features": collection.preferences.special_features,
                         "visiting_reason": collection.preferences.visiting_reason,
@@ -284,6 +285,7 @@ class CollectionsService:
                     "address": collection.preferences.address,  # Add missing address field
                     "cities": collection.preferences.cities,
                     "townships": collection.preferences.townships,
+                    "school_districts": collection.preferences.school_districts,
                     "diameter": collection.preferences.diameter,
                     "special_features": collection.preferences.special_features,
                     "visiting_reason": collection.preferences.visiting_reason,
@@ -688,6 +690,7 @@ class CollectionsService:
                     'address': collection.preferences.address,  # Add missing address field
                     'cities': collection.preferences.cities,
                     'townships': collection.preferences.townships,
+                    'school_districts': collection.preferences.school_districts,
                     'diameter': collection.preferences.diameter,
                     'special_features': collection.preferences.special_features,
                     'visiting_reason': collection.preferences.visiting_reason,

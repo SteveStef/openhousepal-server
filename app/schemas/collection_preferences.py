@@ -17,6 +17,7 @@ class CollectionPreferencesBase(BaseModel):
 
     cities: Optional[list[str]] = None
     townships: Optional[list[str]] = None
+    school_districts: Optional[list[str]] = None
 
     diameter: float = 6.0
     special_features: str = ""
@@ -53,6 +54,7 @@ class CollectionPreferencesUpdate(BaseModel):
 
     cities: Optional[list[str]] = None
     townships: Optional[list[str]] = None
+    school_districts: Optional[list[str]] = None
 
     diameter: Optional[float] = None
     special_features: Optional[str] = None

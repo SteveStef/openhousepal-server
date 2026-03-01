@@ -8,7 +8,7 @@ from pydantic.alias_generators import to_camel
 import os
 
 from app.database import get_db
-from app.models.database import Property, User, ScheduledEmail, Notification, Collection
+from app.models.database import Property, User, ScheduledEmail, Notification, Collection, SchoolDistrict
 from app.schemas.collection_preferences import CollectionPreferencesBase
 from app.services.property_service import property_service
 from app.utils.auth import require_broker_authorization, get_current_user_optional
@@ -257,6 +257,30 @@ async def schedule_tour(
         await db.rollback()
         logger.error("Failed to schedule tour", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail="Failed to schedule tour")
+
+@router.get("/school-districts", dependencies=[Depends(require_broker_authorization)])
+async def search_school_districts(
+    query: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db)
+):
+    """Autocomplete school districts from the reference table"""
+    try:
+        stmt = (
+            select(SchoolDistrict.name, SchoolDistrict.state)
+            .where(SchoolDistrict.name.ilike(f"%{query}%"))
+            .order_by(SchoolDistrict.name.asc())
+            .limit(10)
+        )
+        result = await db.execute(stmt)
+        districts = result.fetchall()
+        
+        return {
+            "success": True, 
+            "results": [f"{d[0]}, {d[1]}" for d in districts]
+        }
+    except Exception as e:
+        logger.error(f"School district autocomplete failed: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
 
 @router.get("/{property_id}", dependencies=[Depends(require_broker_authorization)])
 async def get_property(

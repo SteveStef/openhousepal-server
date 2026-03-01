@@ -135,6 +135,22 @@ class PropertyService:
                 else:
                     location_filters.append(Property.township == root_name)
 
+        if preferences.school_districts:
+            for sd_pref in preferences.school_districts:
+                # 1. Split to get name and state (e.g. "Radnor Township, PA" -> ["Radnor Township", "PA"])
+                parts = [s.strip() for s in sd_pref.split(',')]
+                raw_name = parts[0]
+                pref_state = parts[1].upper() if len(parts) >= 2 else None
+                
+                # 2. Clean and match exactly (case-insensitive)
+                if pref_state:
+                    location_filters.append(and_(
+                        Property.school_district_name.ilike(raw_name),
+                        Property.state.ilike(pref_state)
+                    ))
+                else:
+                    location_filters.append(Property.school_district_name.ilike(raw_name))
+
         if location_filters:
             # Join combined City/Township filters with OR
             filters.append(or_(*location_filters))
@@ -263,6 +279,22 @@ class PropertyService:
                     ))
                 else:
                     location_filters.append(Property.township == root_name)
+
+        if preferences.school_districts:
+            for sd_pref in preferences.school_districts:
+                # 1. Split to get name and state (e.g. "Radnor Township, PA" -> ["Radnor Township", "PA"])
+                parts = [s.strip() for s in sd_pref.split(',')]
+                raw_name = parts[0]
+                pref_state = parts[1].upper() if len(parts) >= 2 else None
+                
+                # 2. Clean and match exactly (case-insensitive)
+                if pref_state:
+                    location_filters.append(and_(
+                        Property.school_district_name.ilike(raw_name),
+                        Property.state.ilike(pref_state)
+                    ))
+                else:
+                    location_filters.append(Property.school_district_name.ilike(raw_name))
 
         if location_filters:
             filters.append(or_(*location_filters))
