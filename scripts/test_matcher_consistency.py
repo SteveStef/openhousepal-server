@@ -94,6 +94,7 @@ def _get_prop_dict(prop: Property) -> Dict[str, Any]:
         "city": prop.city,
         "state": prop.state,
         "township": prop.township,
+        "school_district_name": prop.school_district_name,
         "price": prop.price,
         "bedrooms": prop.bedrooms,
         "bathrooms": prop.bathrooms,

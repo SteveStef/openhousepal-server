@@ -271,11 +271,13 @@ class PropertySyncService:
 
         # 1. Geography Match (City OR Township OR Radius)
         geo_conditions = []
+        params = {}
         
         if city and state:
             city_state = f"{city}, {state}"
+            params["city_state"] = city_state
             geo_conditions.append(
-                text(f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(collection_preferences.cities) AS pref_city WHERE pref_city ILIKE '{city_state}')")
+                text("EXISTS (SELECT 1 FROM jsonb_array_elements_text(collection_preferences.cities) AS pref_city WHERE pref_city ILIKE :city_state)")
             )
         
         if township:
@@ -283,16 +285,18 @@ class PropertySyncService:
             # 1. Clean Name: SPLIT_PART(..., ',', 1) + REGEXP_REPLACE (removes state and suffixes)
             # 2. Extract State: TRIM(SPLIT_PART(..., ',', 2))
             # 3. Match: Both name and state (if state exists in pref) must match the property
+            params["township_name"] = township.upper()
+            params["state_name"] = state.upper() if state else ""
             geo_conditions.append(
-                text(f"""
+                text("""
                     EXISTS (
                         SELECT 1 
                         FROM jsonb_array_elements_text(collection_preferences.townships) AS pref_town 
                         WHERE 
-                            UPPER(TRIM(REGEXP_REPLACE(SPLIT_PART(pref_town, ',', 1), '\\s+(Township|Twp|Boro|Borough|City|Town)$', '', 'i'))) = '{township}'
+                            UPPER(TRIM(REGEXP_REPLACE(SPLIT_PART(pref_town, ',', 1), '\\s+(Township|Twp|Boro|Borough|City|Town)$', '', 'i'))) = :township_name
                             AND (
                                 TRIM(SPLIT_PART(pref_town, ',', 2)) = '' 
-                                OR UPPER(TRIM(SPLIT_PART(pref_town, ',', 2))) = '{state.upper() if state else ""}'
+                                OR UPPER(TRIM(SPLIT_PART(pref_town, ',', 2))) = :state_name
                             )
                     )
                 """)
@@ -302,16 +306,18 @@ class PropertySyncService:
             # Match school district name and state by splitting the user's preference string
             # Format in DB: "RADNOR TOWNSHIP, PA"
             # Property attributes: school_district="RADNOR TOWNSHIP", state="PA"
+            params["sd_name"] = school_district.upper()
+            params["sd_state"] = state.upper() if state else ""
             geo_conditions.append(
-                text(f"""
+                text("""
                     EXISTS (
                         SELECT 1 
                         FROM jsonb_array_elements_text(collection_preferences.school_districts) AS sd 
                         WHERE 
-                            UPPER(TRIM(SPLIT_PART(sd, ',', 1))) = '{school_district.upper()}'
+                            UPPER(TRIM(SPLIT_PART(sd, ',', 1))) = :sd_name
                             AND (
                                 TRIM(SPLIT_PART(sd, ',', 2)) = '' 
-                                OR UPPER(TRIM(SPLIT_PART(sd, ',', 2))) = '{state.upper() if state else ""}'
+                                OR UPPER(TRIM(SPLIT_PART(sd, ',', 2))) = :sd_state
                             )
                     )
                 """)
@@ -358,19 +364,21 @@ class PropertySyncService:
         # 5. Property Type Match
         # In standard search, Lot/Land includes both LAND and FARM
         type_match_conditions = []
-        if h_type == "SINGLE_FAMILY": type_match_conditions.append(CollectionPreferences.is_single_family == True)
-        elif h_type == "TOWNHOUSE": type_match_conditions.append(CollectionPreferences.is_town_house == True)
-        elif h_type == "CONDO": type_match_conditions.append(CollectionPreferences.is_condo == True)
-        elif h_type == "MULTI_FAMILY": type_match_conditions.append(CollectionPreferences.is_multi_family == True)
-        elif h_type == "LAND": type_match_conditions.append(CollectionPreferences.is_lot_land == True)
-        elif h_type == "FARM": type_match_conditions.append(or_(CollectionPreferences.is_lot_land == True, CollectionPreferences.is_farm == True))
-        elif h_type == "COMMERCIAL": type_match_conditions.append(CollectionPreferences.is_commercial == True)
-        elif h_type == "RESIDENTIAL_LEASE": type_match_conditions.append(CollectionPreferences.is_apartment == True)
+        if h_type:
+            h_type_upper = h_type.upper()
+            if h_type_upper == "SINGLE_FAMILY": type_match_conditions.append(CollectionPreferences.is_single_family == True)
+            elif h_type_upper == "TOWNHOUSE": type_match_conditions.append(CollectionPreferences.is_town_house == True)
+            elif h_type_upper == "CONDO": type_match_conditions.append(CollectionPreferences.is_condo == True)
+            elif h_type_upper == "MULTI_FAMILY": type_match_conditions.append(CollectionPreferences.is_multi_family == True)
+            elif h_type_upper == "LAND": type_match_conditions.append(CollectionPreferences.is_lot_land == True)
+            elif h_type_upper == "FARM": type_match_conditions.append(or_(CollectionPreferences.is_lot_land == True, CollectionPreferences.is_farm == True))
+            elif h_type_upper == "COMMERCIAL": type_match_conditions.append(CollectionPreferences.is_commercial == True)
+            elif h_type_upper == "RESIDENTIAL_LEASE": type_match_conditions.append(CollectionPreferences.is_apartment == True)
 
         if type_match_conditions:
             stmt = stmt.where(or_(*type_match_conditions))
 
-        result = await db.execute(stmt)
+        result = await db.execute(stmt, params)
         return result.scalars().all()
 
     async def _link_property_to_collection(self, db: AsyncSession, collection_id: str, property_id: str):

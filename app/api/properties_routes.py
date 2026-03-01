@@ -124,7 +124,7 @@ async def store_property(
         raise HTTPException(status_code=500, detail=f"Failed to store property: {str(e)}")
 
 # TODO
-@router.post("/api/properties/message-agent")
+@router.post("/message-agent")
 async def message_agent(
     request: AgentMessageRequest,
     db: AsyncSession = Depends(get_db)
@@ -185,7 +185,7 @@ async def message_agent(
         raise HTTPException(status_code=500, detail="Failed to send message to agent")
 
 # TODO
-@router.post("/api/properties/schedule-tour")
+@router.post("/schedule-tour")
 async def schedule_tour(
     request: ScheduleTourRequest,
     db: AsyncSession = Depends(get_db)
@@ -479,9 +479,21 @@ async def get_property_for_agent(
     """Get property data from mirror by agent and listing key"""
     try:
         from app.services.user_service import UserService
+        from app.models.database import Collection
+        
+        # 1. Try to find as a User ID first
         agent = await UserService.get_user_by_id(db, agent_id)
+        
+        # 2. If not found, try to find as a Collection ID and get its owner
         if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
+            stmt = select(Collection).where(Collection.id == agent_id)
+            result = await db.execute(stmt)
+            collection = result.scalar_one_or_none()
+            if collection:
+                agent = await UserService.get_user_by_id(db, collection.owner_id)
+        
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent or Collection not found")
         
         agent_name = f"{agent.first_name} {agent.last_name}"
         
