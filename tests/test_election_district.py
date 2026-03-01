@@ -4,7 +4,7 @@ import sys
 from typing import List
 
 # Add the server directory to the path so we can import our app
-sys.path.append(os.path.abspath(os.path.join(os.getcwd(), 'server')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.services.bright_mls_service import bright_mls_service
 
@@ -17,8 +17,8 @@ async def test_election_district():
     try:
         params = {
             "$filter": "MlsStatus eq 'ACTIVE-BRIGHT'",
-            "$top": 20,
-            "$select": "ListingKey,FullStreetAddress,City,ElectionDistrict,County,SubdivisionName"
+            "$top": 5,
+            "$select": "ListingKey,FullStreetAddress,City,MLSAreaMajor,SubdivisionName,County"
         }
         
         data = await bright_mls_service._make_request("BrightProperties", params=params)
@@ -29,7 +29,8 @@ async def test_election_district():
             for p in properties:
                 print(f"\n- Address: {p.get('FullStreetAddress')}")
                 print(f"  City: {p.get('City')}")
-                print(f"  ElectionDistrict: {p.get('ElectionDistrict')}")
+                print(f"  MLSAreaMajor: {p.get('MLSAreaMajor')}")
+                print(f"  MLSAreaMinor: {p.get('MLSAreaMinor')}")
                 print(f"  County: {p.get('County')}")
                 print(f"  Subdivision: {p.get('SubdivisionName')}")
         else:

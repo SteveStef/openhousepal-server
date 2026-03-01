@@ -7,7 +7,6 @@ import logging
 import re
 from typing import Dict, Any, List, Optional
 from fastapi import HTTPException
-from app.schemas.collection_preferences import CollectionPreferencesBase as CollectionPreferencesSchema
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -19,8 +18,8 @@ logger = logging.getLogger(__name__)
 
 class BrightMlsService:
     """
-    Service for interacting with Bright MLS RESO Web API.
-    Optimized for performance and standardized for frontend/database compatibility.
+    Lean Service for interacting with Bright MLS RESO Web API.
+    Focused on high-speed data extraction and standardized mapping.
     """
 
     def __init__(self):
@@ -33,6 +32,7 @@ class BrightMlsService:
             self.token_url = os.getenv("BRIGHT_TOKEN_URL")
             self.api_base_url = os.getenv("BRIGHT_BASE_URL")
         else:
+            # Test/SandBox URLs
             self.token_url = "https://brightmls-test.okta.com/oauth2/default/v1/token"
             self.api_base_url = "https://bright-reso.tst.brightmls.com/RESO/OData/bright"
 
@@ -40,10 +40,10 @@ class BrightMlsService:
         self._token_expires_at = 0
         
         # Persistent client for connection pooling
-        self.client = httpx.AsyncClient(timeout=30.0)
+        self.client = httpx.AsyncClient(timeout=60.0)
 
         if not self.client_id or not self.client_secret:
-            logger.warning("BRIGHT_MLS_CLIENT_ID or BRIGHT_MLS_SECRET not found in environment")
+            logger.warning("BRIGHT_MLS_CLIENT or BRIGHT_MLS_SECRET not found in environment")
 
     async def close(self):
         """Close the underlying httpx client"""
@@ -99,69 +99,101 @@ class BrightMlsService:
             logger.error(f"Request failed to {endpoint}: {e}")
             raise HTTPException(status_code=500, detail=f"MLS Request Failed: {str(e)}")
 
-    def _select_fields_for_properties(self) -> str:
-        """
-        Standard fields to retrieve for property LISTS (shallow view).
-        Optimized to reduce JSON size during search.
-        """
+    def _get_full_field_list(self) -> str:
+        """Centralized list of all 90+ fields we track for the Local Mirror."""
         return ",".join([
-            "ListingKey", "ListingId", "ListPrice", "UnparsedAddress", "FullStreetAddress", "City", 
-            "StateOrProvince", "PostalCode", "BedroomsTotal", "BathroomsTotalInteger", 
-            "BathroomsFull", "BathroomsHalf", "LivingArea", "LotSizeSquareFeet", 
-            "YearBuilt", "MlsStatus", "PropertyType", "ListPictureURL", 
-            "Latitude", "Longitude", "DaysOnMarket", "ListOfficeName", "ListAgentFullName",
-            "PublicRemarks"
+            "ListingKey", "FullStreetAddress", "UnparsedAddress", "City", "StateOrProvince",
+            "PostalCode", "ListPrice", "BedroomsTotal", "BathroomsFull", "BathroomsHalf",
+            "BathroomsTotalInteger", "LivingArea", "LotSizeSquareFeet", "PropertyType",
+            "StructureDesignType", "MlsStatus", "Latitude", "Longitude", "ListPictureURL",
+            "MLSAreaMajor", "IncorporatedCityName", "PublicRemarks", "ListAgentFullName", "ListAgentEmail",
+
+            "ListOfficeName", "ListOfficePhone", "ArchitecturalStyle", "ConstructionMaterials",
+            "Roof", "FoundationDetails", "Levels", "InteriorFeatures", "ExteriorFeatures",
+            "Flooring", "Appliances", "FireplacesTotal", "FireplaceFeatures", "DoorFeatures",
+            "WindowFeatures", "Cooling", "Heating", "WaterSource", "Sewer", "Utilities",
+            "GarageSpaces", "ParkingFeatures", "GarageYN", "AssociationFee",
+            "AssociationFeeFrequency", "AssociationAmenities", "AssociationFeeIncludes",
+            "AssociationYN", "LotFeatures", "View", "WaterfrontFeatures", "ViewYN",
+            "TaxAnnualAmount", "TaxYear", "YearBuilt", "ElementarySchool", "MiddleOrJuniorSchool",
+            "HighSchool", "SchoolDistrictName", "County", "Directions", "Zoning",
+            "TaxAssessmentAmount", "AssessmentYear", "Possession", "ListingTaxID",
+            "CoolingFuel", "HeatingFuel", "AboveGradeFinishedArea", "BelowGradeFinishedArea",
+            "Basement", "AccessibilityFeatures", "BasementYN", "CentralAirYN", "FireplaceYN",
+            "AssociationFee2", "AssociationFee2Frequency", "ListAgentPreferredPhone",
+            "LotSizeAcres", "AttachedGarageYN", "NewConstructionYN", "SeniorCommunityYN",
+            "PetsAllowed", "OriginalListPrice", "DaysOnMarket", "CumulativeDaysOnMarket",
+            "Stories", "SubdivisionName", "MLSListDate", "PriceChangeTimestamp", "ModificationTimestamp"
         ])
 
     def _clean_address(self, address: str) -> str:
-        """
-        Robust address cleaner.
-        Prioritizes the first part of the string that starts with a house number.
-        Fallback to the first part if no number is found.
-        """
         if not address: return ""
         parts = [p.strip() for p in address.split(',')]
-        
         for part in parts:
-            # Check if the part starts with a number (Standard US House Number)
-            if re.match(r'^\d+', part):
-                return part
-                
-        # Fallback: if no part starts with a number, return the first part
+            if re.match(r'^\d+', part): return part
         return parts[0]
 
-    def _map_to_app_model(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        raw_status = item.get("MlsStatus", "").upper()
-        home_status = "FOR_SALE"
-        if "CLOSED" in raw_status or "SOLD" in raw_status:
-            home_status = "SOLD"
-        elif "PENDING" in raw_status or "UNDER CONTRACT" in raw_status:
-            home_status = "PENDING"
-
-        prop_type = item.get("PropertyType", "")
-        struct_type = item.get("StructureType", "")
-        home_type = "SINGLE_FAMILY"
+    def map_reso_to_internal(self, item: Dict[str, Any], photo_map: Dict[str, List[str]] = None) -> Dict[str, Any]:
+        """
+        The Master Mapper. Converts RESO Web API fields to our internal snake_case database schema.
+        Handles complex logic like HomeType detection and date parsing.
+        """
+        listing_key = str(item.get("ListingKey", ""))
         
-        if any(x in struct_type or x in prop_type for x in ["Townhouse", "Town Home"]):
-            home_type = "TOWNHOUSE"
-        elif any(x in struct_type or x in prop_type for x in ["Condo", "Condominium", "Unit"]):
-            home_type = "CONDO"
-        elif "Multi-Family" in prop_type:
-            home_type = "MULTI_FAMILY"
-        elif any(x in prop_type for x in ["Land", "Farm", "Acreage"]):
-            home_type = "LOT_LAND"
+        # 1. HomeType Mapping
+        m_prop = item.get("PropertyType")
+        m_design = item.get("StructureDesignType")
+        home_type = "OTHER"
+        if m_prop == "Residential":
+            if m_design == "Detached": home_type = "SINGLE_FAMILY"
+            elif m_design and any(x in m_design for x in ["Townhouse", "Row", "Twin"]): home_type = "TOWNHOUSE"
+            elif m_design and any(x in m_design for x in ["Unit", "Flat", "Apartment", "Penthouse"]): home_type = "CONDO"
+            else: home_type = "SINGLE_FAMILY"
+        elif m_prop == "Multi-Family": home_type = "MULTI_FAMILY"
+        elif m_prop == "Land": home_type = "LAND"
+        elif m_prop == "Farm": home_type = "FARM"
+        elif m_prop == "Residential Lease": home_type = "RESIDENTIAL_LEASE"
+        elif m_prop and ("Commercial" in m_prop or "Industrial" in m_prop): home_type = "COMMERCIAL"
 
+        # 2. Bath calculation
         baths_full = item.get("BathroomsFull") or 0
         baths_half = item.get("BathroomsHalf") or 0
-        bathrooms = item.get("BathroomsTotalInteger") or (baths_full + (baths_half * 0.5))
+        bathrooms = item.get("BathroomsTotalInteger") or (float(baths_full) + (float(baths_half) * 0.5))
 
-        raw_address = item.get("FullStreetAddress") or item.get("UnparsedAddress")
-        clean_street = self._clean_address(raw_address)
+        # 3. Photo processing (Simplified list of strings)
+        fetched_photos = []
+        if photo_map and listing_key in photo_map:
+            fetched_photos = photo_map[listing_key]
+        elif item.get("ListPictureURL"):
+            fetched_photos = [item.get("ListPictureURL")]
+
+        # 4. Township Logic: IncorporatedCityName (cleaner) -> MLSAreaMajor (fallback)
+        township = item.get("IncorporatedCityName")
+        if not township:
+            township = item.get("MLSAreaMajor", "")
+            if township:
+                # Strip numeric codes like (10436)
+                township = re.sub(r'\s*\(\d+\)$', '', township).strip()
+        
+        if township:
+            # Final cleanup: Strip suffixes and convert to UPPERCASE for robust matching
+            township = re.sub(r'\s+(Twp|Township|Boro|Borough|City|Town)$', '', township, flags=re.I).strip()
+            township = township.upper()
+        else:
+            township = None
+
+        # 5. Date Parsing
+        def parse_dt(dt_str: str):
+            if not dt_str: return None
+            try:
+                return datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+            except:
+                return None
 
         return {
-            "listing_key": str(item.get("ListingKey", "")),
-            "mls_id": item.get("ListingId"),
-            "address": clean_street,
+            "listing_key": listing_key,
+            "street_address": self._clean_address(item.get("FullStreetAddress") or item.get("UnparsedAddress")),
+            "unparsed_address": item.get("UnparsedAddress"),
             "city": item.get("City"),
             "state": item.get("StateOrProvince"),
             "zipcode": item.get("PostalCode"),
@@ -171,157 +203,141 @@ class BrightMlsService:
             "living_area": item.get("LivingArea"),
             "lot_size": item.get("LotSizeSquareFeet"),
             "home_type": home_type,
-            "home_status": home_status,
-            "year_built": item.get("YearBuilt"),
-            "image_url": item.get("ListPictureURL"),
+            "home_status": item.get("MlsStatus"),
+            "mls_property_type": m_prop,
+            "mls_structure_design_type": m_design,
             "latitude": item.get("Latitude"),
             "longitude": item.get("Longitude"),
-            "days_on_market": item.get("DaysOnMarket"),
+            "img_src": item.get("ListPictureURL"),
+            "description": item.get("PublicRemarks"),
+            "photos": fetched_photos,
+            "list_agent_full_name": item.get("ListAgentFullName"),
+            "list_agent_email": item.get("ListAgentEmail"),
             "list_office_name": item.get("ListOfficeName"),
-            "list_agent_full_name": item.get("ListAgentFullName")
-        }
-
-    def _map_to_full_details(self, item: Dict[str, Any], images: List[str] = []) -> Dict[str, Any]:
-        """
-        Maps a raw MLS item to a clean, flat dictionary structure.
-        Ensures NO nested 'details' blob exists here to prevent data recursion.
-        """
-        base_info = self._map_to_app_model(item)
-        
-        # If no images found in BrightMedia, at least use the primary one from the property record
-        if not images and base_info.get("image_url"):
-            images = [base_info["image_url"]]
-
-        formatted_photos = []
-        for img_url in images:
-            formatted_photos.append({
-                "caption": "",
-                "url": img_url,
-                "mixedSources": {"jpeg": [{"url": img_url, "width": 0}], "webp": []}
-            })
-
-        reso_facts = {
-            "description": item.get("PublicRemarks", ""),
-            "standard_status": item.get("MlsStatus"),
-            "home_status": base_info["home_status"],
-            "interior_features": item.get("InteriorFeatures", []),
-            "flooring": item.get("Flooring", []),
-            "appliances": item.get("Appliances", []),
+            "list_office_phone": item.get("ListOfficePhone"),
+            "architectural_style": item.get("ArchitecturalStyle"),
+            "construction_materials": item.get("ConstructionMaterials"),
+            "roof_type": item.get("Roof"),
+            "foundation_details": item.get("FoundationDetails"),
+            "structure_type": item.get("StructureType"),
+            "levels": item.get("Levels"),
+            "interior_features": item.get("InteriorFeatures"),
+            "exterior_features": item.get("ExteriorFeatures"),
+            "flooring": item.get("Flooring"),
+            "appliances": item.get("Appliances"),
             "fireplaces": item.get("FireplacesTotal"),
-            "levels": item.get("Levels", []),
-            "architectural_style": item.get("ArchitecturalStyle", []),
-            "construction_materials": item.get("ConstructionMaterials", []),
-            "roof_type": item.get("Roof", []),
-            "structure_type": item.get("StructureType", []),
-            "cooling": item.get("Cooling", []),
-            "heating": item.get("Heating", []),
-            "water_source": item.get("WaterSource", []),
-            "sewer": item.get("Sewer", []),
+            "fireplace_features": item.get("FireplaceFeatures"),
+            "door_features": item.get("DoorFeatures"),
+            "window_features": item.get("WindowFeatures"),
+            "cooling": item.get("Cooling"),
+            "heating": item.get("Heating"),
+            "water_source": item.get("WaterSource"),
+            "sewer": item.get("Sewer"),
+            "utilities": item.get("Utilities"),
             "garage_spaces": item.get("GarageSpaces"),
-            "parking_features": item.get("ParkingFeatures", []),
+            "parking_features": item.get("ParkingFeatures"),
             "has_garage": item.get("GarageYN"),
             "association_fee": item.get("AssociationFee"),
             "association_fee_frequency": item.get("AssociationFeeFrequency"),
-            "association_amenities": item.get("AssociationAmenities", []),
+            "association_amenities": item.get("AssociationAmenities"),
+            "association_fee_includes": item.get("AssociationFeeIncludes"),
             "has_association": item.get("AssociationYN"),
-            "school_district_name": item.get("SchoolDistrictName"),
-            "elementary_school": item.get("ElementarySchool"),
-            "high_school": item.get("HighSchool"),
-            "county": item.get("County"),
-            "zoning": item.get("Zoning"),
-            "living_area": base_info["living_area"],
-            "year_built": base_info["year_built"],
+            "lot_features": item.get("LotFeatures"),
+            "view": item.get("View"),
+            "waterfront_features": item.get("WaterfrontFeatures"),
+            "has_waterfront_view": item.get("WaterfrontViewYN"),
+            "has_view": item.get("ViewYN"),
             "tax_annual_amount": item.get("TaxAnnualAmount"),
-            "price_per_square_foot": round(base_info["price"] / base_info["living_area"], 2) if base_info.get("price") and base_info.get("living_area") else None,
-            "days_on_market": base_info["days_on_market"],
-            "updated_at": datetime.now(timezone.utc).isoformat()
+            "tax_year": item.get("TaxYear"),
+            "year_built": item.get("YearBuilt"),
+            "elementary_school": item.get("ElementarySchool"),
+            "middle_or_junior_school": item.get("MiddleOrJuniorSchool"),
+            "high_school": item.get("HighSchool"),
+            "school_district_name": item.get("SchoolDistrictName"),
+            "county": item.get("County"),
+            "township": township,
+            "directions": item.get("Directions"),
+            "zoning": item.get("Zoning"),
+            "tax_assessment_amount": item.get("TaxAssessmentAmount"),
+            "assessment_year": item.get("AssessmentYear"),
+            "possession": item.get("Possession"),
+            "listing_tax_id": item.get("ListingTaxID"),
+            "cooling_fuel": item.get("CoolingFuel"),
+            "heating_fuel": item.get("HeatingFuel"),
+            "above_grade_finished_area": item.get("AboveGradeFinishedArea"),
+            "below_grade_finished_area": item.get("BelowGradeFinishedArea"),
+            "basement": item.get("Basement"),
+            "accessibility_features": item.get("AccessibilityFeatures"),
+            "has_basement": item.get("BasementYN"),
+            "has_central_air": item.get("CentralAirYN"),
+            "has_fireplace": item.get("FireplaceYN"),
+            "association_fee_2": item.get("AssociationFee2"),
+            "association_fee_2_frequency": item.get("AssociationFee2Frequency"),
+            "list_agent_preferred_phone": item.get("ListAgentPreferredPhone"),
+            "lot_size_acres": item.get("LotSizeAcres"),
+            "attached_garage_yn": item.get("AttachedGarageYN"),
+            "new_construction_yn": item.get("NewConstructionYN"),
+            "senior_community_yn": item.get("SeniorCommunityYN"),
+            "pets_allowed": item.get("PetsAllowed"),
+            "original_list_price": item.get("OriginalListPrice"),
+            "days_on_market": item.get("DaysOnMarket"),
+            "cumulative_days_on_market": item.get("CumulativeDaysOnMarket"),
+            "stories": item.get("Stories"),
+            "subdivision_name": item.get("SubdivisionName"),
+            "mls_list_date": parse_dt(item.get("MLSListDate")),
+            "price_change_timestamp": parse_dt(item.get("PriceChangeTimestamp")),
+            "modification_timestamp": parse_dt(item.get("ModificationTimestamp"))
         }
 
-        return {
-            **base_info,
-            "description": reso_facts["description"],
-            "list_agent_email": item.get("ListAgentEmail"),
-            "list_office_phone": item.get("ListOfficePhone"),
-            "photos": formatted_photos,
-            "original_photos": formatted_photos,
-            "reso_facts": reso_facts,
-            "abbreviated_address": base_info["address"]
-        }
-
-    async def _fetch_all_media(self, listing_key: str) -> List[str]:
+    async def get_properties_modified_since(self, since_timestamp: str, top: int = 200, skip: int = 0) -> List[Dict[str, Any]]:
+        """Fetch properties modified since a specific timestamp."""
         params = {
-            "$filter": f"ResourceRecordKey eq {listing_key} and MediaCategory eq 'Photo'",
-            "$orderby": "MediaDisplayOrder",
-            "$select": "MediaURL"
+            "$filter": f"MlsStatus in ('ACTIVE-BRIGHT', 'COMING SOON-BRIGHT') and ModificationTimestamp gt {since_timestamp}",
+            "$top": top,
+            "$skip": skip,
+            "$select": self._get_full_field_list(),
+            "$orderby": "ModificationTimestamp asc"
         }
-        try:
-            data = await self._make_request("BrightMedia", params=params)
-            return [i.get("MediaURL") for i in data.get("value", []) if i.get("MediaURL")]
-        except:
-            return []
+        data = await self._make_request("BrightProperties", params=params)
+        return data.get("value", [])
 
-    def _build_filter_from_preferences(self, preferences: CollectionPreferencesSchema) -> str:
-        filters = []
-        combined_locations = (preferences.cities or []) + (preferences.townships or [])
-        if combined_locations:
-            state_map = {}
-            for loc in combined_locations:
-                parts = [s.strip() for s in loc.split(',')]
-                city = parts[0]
-                state = parts[1] if len(parts) >= 2 else "PA"
-                if state not in state_map: state_map[state] = []
-                state_map[state].append(f"'{city}'")
-            
-            loc_filters = []
-            for state, cities in state_map.items():
-                if len(cities) > 1: loc_filters.append(f"(City in ({','.join(cities)}) and StateOrProvince eq '{state}')")
-                else: loc_filters.append(f"(City eq {cities[0]} and StateOrProvince eq '{state}')")
-            
-            if len(loc_filters) > 1: filters.append(f"({' or '.join(loc_filters)})")
-            else: filters.append(loc_filters[0].strip('()'))
-                
-        elif preferences.lat is not None and preferences.long is not None and preferences.diameter:
-            lat_offset = float(preferences.diameter) / 69.0
-            cos_lat = math.cos(math.radians(float(preferences.lat)))
-            long_offset = float(preferences.diameter) / (69.0 * cos_lat) if abs(cos_lat) > 0.0001 else lat_offset
-            filters.append(f"Latitude ge {float(preferences.lat) - lat_offset} and Latitude le {float(preferences.lat) + lat_offset}")
-            filters.append(f"Longitude ge {float(preferences.long) - long_offset} and Longitude le {float(preferences.long) + long_offset}")
-
-        filters.append("MlsStatus eq 'ACTIVE-BRIGHT'")
-        if preferences.min_price is not None: filters.append(f"ListPrice ge {preferences.min_price}")
-        if preferences.max_price is not None: filters.append(f"ListPrice le {preferences.max_price}")
-        if preferences.min_beds is not None and preferences.min_beds > 0: filters.append(f"BedroomsTotal ge {preferences.min_beds}")
-        if preferences.max_beds is not None and preferences.max_beds > 0: filters.append(f"BedroomsTotal le {preferences.max_beds}")
-        if preferences.min_baths is not None and preferences.min_baths > 0: filters.append(f"BathroomsTotalInteger ge {int(preferences.min_baths)}")
-        if preferences.max_baths is not None and preferences.max_baths > 0: filters.append(f"BathroomsTotalInteger le {int(preferences.max_baths)}")
-        if preferences.min_year_built is not None: filters.append(f"YearBuilt ge {preferences.min_year_built}")
-        if preferences.max_year_built is not None: filters.append(f"YearBuilt le {preferences.max_year_built}")
-
-        type_options = []
-        if preferences.is_single_family or preferences.is_town_house or preferences.is_condo: type_options.append("'Residential'")
-        if preferences.is_multi_family: type_options.append("'Multi-Family'")
-        if preferences.is_apartment: type_options.append("'Residential Lease'")
-        if preferences.is_lot_land: 
-            type_options.append("'Land'")
-            type_options.append("'Farm'")
-        
-        if type_options:
-            unique_types = sorted(list(set(type_options)))
-            if len(unique_types) > 1: filters.append(f"PropertyType in ({','.join(unique_types)})")
-            else: filters.append(f"PropertyType eq {unique_types[0]}")
-
-        return " and ".join(filters)
+    async def get_media_for_properties(self, listing_keys: List[str]) -> Dict[str, List[str]]:
+        """Batch fetch photos for multiple properties."""
+        if not listing_keys: return {}
+        photo_map = {}
+        chunk_size = 50
+        for i in range(0, len(listing_keys), chunk_size):
+            chunk = listing_keys[i:i + chunk_size]
+            params = {
+                "$filter": f"ResourceRecordKey in ({','.join(chunk)}) and MediaCategory eq 'Photo'",
+                "$select": "ResourceRecordKey,MediaURL",
+                "$orderby": "MediaDisplayOrder asc"
+            }
+            try:
+                data = await self._make_request("BrightMedia", params=params)
+                for m in data.get("value", []):
+                    key = str(m["ResourceRecordKey"])
+                    if key not in photo_map: photo_map[key] = []
+                    photo_map[key].append(m["MediaURL"])
+            except Exception as e:
+                logger.warning(f"Failed to fetch media chunk: {e}")
+        return photo_map
 
     async def get_property_by_id(self, listing_key: str) -> Optional[Dict[str, Any]]:
-        # NO $select here - Fetch FULL object
-        params = {"$filter": f"ListingKey eq {listing_key}", "$top": 1}
+        """Fetch a single property by ListingKey with full details."""
+        params = {
+            "$filter": f"ListingKey eq '{listing_key}'", 
+            "$top": 1,
+            "$select": self._get_full_field_list()
+        }
         data = await self._make_request("BrightProperties", params=params)
         if not data.get("value"): return None
         item = data["value"][0]
-        images = await self._fetch_all_media(listing_key)
-        return self._map_to_full_details(item, images)
+        photo_map = await self.get_media_for_properties([listing_key])
+        return self.map_reso_to_internal(item, photo_map)
 
-    async def get_property_by_address(self, address: str) -> Dict[str, Any]:
+    async def get_property_by_address(self, address: str) -> Optional[Dict[str, Any]]:
+        """Search by address and return full internal map (Fallback)."""
         parts = [p.strip() for p in address.split(',')]
         street_part = parts[0]
         zip_code = None
@@ -329,7 +345,6 @@ class BrightMlsService:
             zip_match = re.search(r'\b\d{5}\b', part)
             if zip_match: zip_code = zip_match.group(0); break
         
-        # Try Strategy 1: Precise Match (No $select)
         street_match = re.match(r'^(\d+)\s+(.*)$', street_part)
         if street_match:
             number, full_name = street_match.group(1), street_match.group(2).strip()
@@ -337,114 +352,32 @@ class BrightMlsService:
             cond = [f"StreetNumber eq '{number}'"]
             if first_word: cond.append(f"contains(StreetName, '{first_word}')")
             if zip_code: cond.append(f"PostalCode eq '{zip_code}'")
-            filter_str = " and ".join(cond)
-            data = await self._make_request("BrightProperties", params={"$filter": filter_str, "$top": 1})
+            params = {"$filter": " and ".join(cond), "$top": 1, "$select": self._get_full_field_list()}
+            data = await self._make_request("BrightProperties", params=params)
             if data.get("value"):
                 item = data["value"][0]
-                return self._map_to_full_details(item, await self._fetch_all_media(item["ListingKey"]))
+                photo_map = await self.get_media_for_properties([item["ListingKey"]])
+                return self.map_reso_to_internal(item, photo_map)
 
-        # Fallback (No $select)
         fallback_filter = f"contains(UnparsedAddress, '{street_part}')"
         if zip_code: fallback_filter += f" and PostalCode eq '{zip_code}'"
-        data = await self._make_request("BrightProperties", params={"$filter": fallback_filter, "$top": 1})
+        params = {"$filter": fallback_filter, "$top": 1, "$select": self._get_full_field_list()}
+        data = await self._make_request("BrightProperties", params=params)
         if data.get("value"):
             item = data["value"][0]
-            return self._map_to_full_details(item, await self._fetch_all_media(item["ListingKey"]))
+            photo_map = await self.get_media_for_properties([item["ListingKey"]])
+            return self.map_reso_to_internal(item, photo_map)
 
-        raise HTTPException(status_code=404, detail="Address not found in MLS records.")
+        return None
 
-    async def get_properties_by_keys(self, listing_keys: List[str]) -> List[Dict[str, Any]]:
-        if not listing_keys: return []
-        odata_filter = f"ListingKey in ({','.join([str(k) for k in listing_keys])})"
-        # Lists use $select for performance
-        data = await self._make_request("BrightProperties", params={"$filter": odata_filter, "$select": self._select_fields_for_properties()})
-        return [self._map_to_app_model(item) for item in data.get("value", [])]
-
-    async def get_properties_by_preferences(self, preferences: CollectionPreferencesSchema, max_properties: int = 50) -> List[Dict[str, Any]]:
-        odata_filter = self._build_filter_from_preferences(preferences)
-        # Searches use $select for performance
-        params = {"$filter": odata_filter, "$top": max_properties, "$select": self._select_fields_for_properties()}
-        data = await self._make_request("BrightProperties", params=params)
-        return [self._map_to_app_model(item) for item in data.get("value", [])]
-
-    async def get_properties_count_by_preferences(self, preferences: CollectionPreferencesSchema) -> int:
-        """Fetch only the count of matching properties without downloading records."""
-        odata_filter = self._build_filter_from_preferences(preferences)
-        # OData $count=true and $top=0 to get just the count
-        params = {"$filter": odata_filter, "$count": "true", "$top": 0}
-        data = await self._make_request("BrightProperties", params=params)
-        # RESO API returns the count in '@odata.count'
-        return data.get("@odata.count", 0)
-
-    async def run_diagnostic_tests(self):
-        try:
-            await self._get_access_token()
-            await self.get_property_by_address("300 Valley Pl, Radnor, PA 19087")
-        except Exception as e:
-            logger.error(f"❌ Diagnostic failed: {str(e)}")
-
-    async def get_all_active_properties(self, top: int = 100, skip: int = 0) -> List[Dict[str, Any]]:
-        """
-        Fetch all active properties for the initial seed.
-        Supports pagination via $top and $skip.
-        """
+    async def bright_mls_id_exists(self, mls_id: str) -> bool:
+        """Validates if a Bright MLS ID or Listing Key exists via API."""
         params = {
-            "$filter": "MlsStatus in ('ACTIVE-BRIGHT', 'COMING SOON-BRIGHT')",
-            "$top": top,
-            "$skip": skip,
-            "$orderby": "ListingKey asc"
+            "$filter": f"ListingId eq '{mls_id}' or ListingKey eq '{mls_id}'",
+            "$top": 1,
+            "$select": "ListingKey"
         }
         data = await self._make_request("BrightProperties", params=params)
-        return [self._map_reso_to_internal(item) for item in data.get("value", [])]
-
-    def _map_reso_to_internal(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Maps RESO Web API fields to our internal snake_case names for the database.
-        Includes 50+ fields for the Global Mirror.
-        """
-        # Basic mapping logic (minimal as requested)
-        raw_status = item.get("MlsStatus", "").upper()
-        
-        # Bath calculation
-        baths_full = item.get("BathroomsFull") or 0
-        baths_half = item.get("BathroomsHalf") or 0
-        bathrooms = item.get("BathroomsTotalInteger") or (baths_full + (baths_half * 0.5))
-
-        # Property type mapping
-        prop_type = item.get("PropertyType", "")
-        struct_type = item.get("StructureType", "")
-        home_type = "SINGLE_FAMILY"
-        if "Townhouse" in struct_type: home_type = "TOWNHOUSE"
-        elif "Condo" in struct_type: home_type = "CONDO"
-
-        return {
-            "listing_key": str(item.get("ListingKey", "")),
-            "street_address": self._clean_address(item.get("FullStreetAddress") or item.get("UnparsedAddress")),
-            "city": item.get("City"),
-            "state": item.get("StateOrProvince"),
-            "zipcode": item.get("PostalCode"),
-            "price": item.get("ListPrice"),
-            "bedrooms": item.get("BedroomsTotal"),
-            "bathrooms": bathrooms,
-            "living_area": item.get("LivingArea"),
-            "home_type": home_type,
-            "home_status": raw_status,
-            "latitude": item.get("Latitude"),
-            "longitude": item.get("Longitude"),
-            "img_src": item.get("ListPictureURL"),
-            "description": item.get("PublicRemarks"),
-            "year_built": item.get("YearBuilt"),
-            "modification_timestamp": item.get("ModificationTimestamp"),
-            
-            # 50+ additional fields mapping (simplified for example)
-            "architectural_style": item.get("ArchitecturalStyle"),
-            "construction_materials": item.get("ConstructionMaterials"),
-            "cooling": item.get("Cooling"),
-            "heating": item.get("Heating"),
-            "school_district_name": item.get("SchoolDistrictName"),
-            "list_agent_full_name": item.get("ListAgentFullName"),
-            "list_office_name": item.get("ListOfficeName")
-            # ... add more as needed by your Property model
-        }
+        return len(data.get("value", [])) > 0
 
 bright_mls_service = BrightMlsService()

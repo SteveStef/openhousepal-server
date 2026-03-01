@@ -4,11 +4,9 @@ import sys
 import httpx
 import logging
 import re
-import json
 from typing import Dict, Any, List
 from datetime import datetime
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy import text
 from dotenv import load_dotenv
 
 # Add the app directory to sys.path so we can import internal modules
@@ -20,8 +18,11 @@ from app.models.database import Property, HomeType
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("test_seed")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("property_seed")
 
 # --- Configuration ---
 CLIENT_ID = os.getenv("BRIGHT_MLS_CLIENT")
@@ -35,10 +36,17 @@ else:
     TOKEN_URL = "https://brightmls-test.okta.com/oauth2/default/v1/token"
     API_BASE_URL = "https://bright-reso.tst.brightmls.com/RESO/OData/bright"
 
+PAGE_SIZE = 200  # Number of properties to fetch per request
+
 # --- Helper Functions ---
 
 async def get_access_token(client: httpx.AsyncClient) -> str:
-    payload = {"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET}
+    """Authenticates with Bright MLS to get an access token."""
+    payload = {
+        "grant_type": "client_credentials",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+    }
     response = await client.post(TOKEN_URL, data=payload)
     response.raise_for_status()
     return response.json().get("access_token")
@@ -47,7 +55,8 @@ def clean_address(address: str) -> str:
     if not address: return ""
     parts = [p.strip() for p in address.split(',')]
     for part in parts:
-        if re.match(r'^\d+', part): return part
+        if re.match(r'^\d+', part):
+            return part
     return parts[0]
 
 def parse_dt(dt_str: str) -> datetime | None:
@@ -58,6 +67,9 @@ def parse_dt(dt_str: str) -> datetime | None:
         return None
 
 def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]]) -> Dict[str, Any]:
+    """
+    Exhaustive mapping of RESO fields to our internal snake_case schema.
+    """
     listing_key = str(item.get("ListingKey", ""))
     
     # HomeType Mapping
@@ -75,10 +87,12 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]]) 
     elif m_prop == "Residential Lease": h_type = HomeType.RESIDENTIAL_LEASE
     elif m_prop and ("Commercial" in m_prop or "Industrial" in m_prop): h_type = HomeType.COMMERCIAL
 
+    # Bath calculation
     baths_full = item.get("BathroomsFull") or 0
     baths_half = item.get("BathroomsHalf") or 0
     bathrooms = item.get("BathroomsTotalInteger") or (float(baths_full) + (float(baths_half) * 0.5))
 
+    # Photo processing
     fetched_photos = photo_map.get(listing_key, [])
     if not fetched_photos and item.get("ListPictureURL"):
         fetched_photos = [item.get("ListPictureURL")]
@@ -195,115 +209,116 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]]) 
         "modification_timestamp": parse_dt(item.get("ModificationTimestamp"))
     }
 
-async def seed_diverse_local_properties():
+async def fetch_media_for_keys(client: httpx.AsyncClient, headers: Dict[str, str], keys: List[str]) -> Dict[str, List[str]]:
+    if not keys: return {}
+    photo_map = {}
+    chunk_size = 50
+    for i in range(0, len(keys), chunk_size):
+        chunk = keys[i:i + chunk_size]
+        media_params = {
+            "$filter": f"ResourceRecordKey in ({','.join(chunk)}) and MediaCategory eq 'Photo'",
+            "$select": "ResourceRecordKey,MediaURL",
+            "$orderby": "MediaDisplayOrder asc"
+        }
+        try:
+            res = await client.get(f"{API_BASE_URL}/BrightMedia", headers=headers, params=media_params)
+            if res.status_code == 200:
+                for m in res.json().get("value", []):
+                    key = str(m["ResourceRecordKey"])
+                    if key not in photo_map: photo_map[key] = []
+                    photo_map[key].append(m["MediaURL"])
+        except Exception as e:
+            logger.warning(f"Media fetch failed for chunk: {e}")
+    return photo_map
+
+async def seed_properties():
     if not CLIENT_ID or not CLIENT_SECRET:
         logger.error("Missing Bright MLS credentials.")
         return
 
-    # Using Postal Codes to target a specific area
-    ZIPS = "'19406', '19446', '19001', '19087'"
-    
-    # We fetch by PropertyType and let our internal mapper handle the sub-types.
-    # This avoids the "Query Too Complex" OData error.
-    categories = [
-        {"name": "Residential", "filter": f"PostalCode in ({ZIPS}) and PropertyType eq 'Residential'", "top": 50},
-        {"name": "Multi-Family", "filter": f"PropertyType eq 'Multi-Family'", "top": 20},
-        {"name": "Land", "filter": f"PropertyType eq 'Land'", "top": 20},
-        {"name": "Rentals", "filter": f"PostalCode in ({ZIPS}) and PropertyType eq 'Residential Lease'", "top": 20},
-    ]
-
     async with httpx.AsyncClient(timeout=60.0) as client:
-        logger.info("--- Authenticating ---")
+        logger.info("Authenticating...")
         token = await get_access_token(client)
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
+        # Simple paging logic: no time-based filter.
+        base_filter = "MlsStatus in ('ACTIVE-BRIGHT', 'COMING SOON-BRIGHT')"
+        
         select_fields = ",".join([
             "ListingKey", "FullStreetAddress", "UnparsedAddress", "City", "StateOrProvince",
-            "PostalCode", "ListPrice", "BedroomsTotal", "BathroomsFull", "BathroomsHalf",
-            "BathroomsTotalInteger", "LivingArea", "LotSizeSquareFeet", "PropertyType",
-            "StructureDesignType", "MlsStatus", "Latitude", "Longitude", "ListPictureURL",
-            "MLSAreaMajor", "IncorporatedCityName", "PublicRemarks", "ListAgentFullName", "ListAgentEmail",
+            "PostalCode", "ListPrice", "BedroomsTotal", "BathroomsFull",
+            "BathroomsHalf", "BathroomsTotalInteger", "LivingArea", "LotSizeSquareFeet",
+            "PropertyType", "StructureDesignType", "MlsStatus", 
+            "Latitude", "Longitude", "ListPictureURL", "MLSAreaMajor", "IncorporatedCityName",
+            "PublicRemarks", "ListAgentFullName", "ListAgentEmail",
             "ListOfficeName", "ListOfficePhone", "ArchitecturalStyle", "ConstructionMaterials",
-            "Roof", "FoundationDetails", "Levels", "InteriorFeatures", "ExteriorFeatures",
-            "Flooring", "Appliances", "FireplacesTotal", "FireplaceFeatures", "DoorFeatures",
-            "WindowFeatures", "Cooling", "Heating", "WaterSource", "Sewer", "Utilities",
-            "GarageSpaces", "ParkingFeatures", "GarageYN", "AssociationFee",
-            "AssociationFeeFrequency", "AssociationAmenities", "AssociationFeeIncludes",
-            "AssociationYN", "LotFeatures", "View", "WaterfrontFeatures", "ViewYN",
-            "TaxAnnualAmount", "TaxYear", "YearBuilt", "ElementarySchool", "MiddleOrJuniorSchool",
-            "HighSchool", "SchoolDistrictName", "County", "Directions", "Zoning",
-            "TaxAssessmentAmount", "AssessmentYear", "Possession", "ListingTaxID",
-            "CoolingFuel", "HeatingFuel", "AboveGradeFinishedArea", "BelowGradeFinishedArea",
-            "Basement", "AccessibilityFeatures", "BasementYN", "CentralAirYN", "FireplaceYN",
-            "AssociationFee2", "AssociationFee2Frequency", "ListAgentPreferredPhone",
-            "LotSizeAcres", "AttachedGarageYN", "NewConstructionYN", "SeniorCommunityYN",
-            "PetsAllowed", "OriginalListPrice", "DaysOnMarket", "CumulativeDaysOnMarket",
-            "Stories", "SubdivisionName", "MLSListDate", "PriceChangeTimestamp", "ModificationTimestamp"
+            "Roof", "FoundationDetails", "Levels", "InteriorFeatures",
+            "ExteriorFeatures", "Flooring", "Appliances", "FireplacesTotal", "FireplaceFeatures",
+            "DoorFeatures", "WindowFeatures", "Cooling", "Heating", "WaterSource",
+            "Sewer", "Utilities", "GarageSpaces", "ParkingFeatures",
+            "GarageYN", "AssociationFee", "AssociationFeeFrequency", "AssociationAmenities",
+            "AssociationFeeIncludes", "AssociationYN", "LotFeatures", 
+            "View", "WaterfrontFeatures", "ViewYN", "TaxAnnualAmount",
+            "TaxYear", "YearBuilt", "ElementarySchool", "MiddleOrJuniorSchool",
+            "HighSchool", "SchoolDistrictName", "County", "Directions",
+            "Zoning", "TaxAssessmentAmount", "AssessmentYear", "Possession", 
+            "ListingTaxID", "CoolingFuel", "HeatingFuel", "AboveGradeFinishedArea", 
+            "BelowGradeFinishedArea", "Basement", "AccessibilityFeatures", "BasementYN", 
+            "CentralAirYN", "FireplaceYN", "AssociationFee2", "AssociationFee2Frequency", 
+            "ListAgentPreferredPhone", "LotSizeAcres", "AttachedGarageYN", 
+            "NewConstructionYN", "SeniorCommunityYN", "PetsAllowed", "OriginalListPrice", 
+            "DaysOnMarket", "CumulativeDaysOnMarket", "Stories", "SubdivisionName", 
+            "MLSListDate", "PriceChangeTimestamp", "ModificationTimestamp"
         ])
 
-        all_raw_properties = []
-        for cat in categories:
-            logger.info(f"--- Fetching {cat['top']} properties for: {cat['name']} ---")
-            # Flattened filter to keep it simple
+        skip = 0
+        total_seeded = 0
+        
+        while True:
+            logger.info(f"Seeding batch (skip={skip})...")
+            # Ordering by ListingKey to ensure stable pagination
             params = {
-                "$filter": f"MlsStatus in ('ACTIVE-BRIGHT', 'COMING SOON-BRIGHT') and {cat['filter']}",
-                "$top": cat['top'],
-                "$select": select_fields
+                "$filter": base_filter,
+                "$top": PAGE_SIZE,
+                "$skip": skip,
+                "$select": select_fields,
+                "$orderby": "ListingKey asc"
             }
+            
             try:
-                res = await client.get(f"{API_BASE_URL}/BrightProperties", headers=headers, params=params)
-                if res.status_code == 200:
-                    props = res.json().get("value", [])
-                    logger.info(f"  Found {len(props)} properties.")
-                    all_raw_properties.extend(props)
-                else:
-                    logger.error(f"  Error {res.status_code}: {res.text}")
+                response = await client.get(f"{API_BASE_URL}/BrightProperties", headers=headers, params=params)
+                if response.status_code != 200:
+                    logger.error(f"Error: {response.status_code} - {response.text}")
+                    break
+                
+                items = response.json().get("value", [])
+                if not items:
+                    logger.info("Done seeding all properties.")
+                    break
+
+                listing_keys = [str(item["ListingKey"]) for item in items]
+                photo_map = await fetch_media_for_keys(client, headers, listing_keys)
+
+                async with AsyncSessionLocal() as db:
+                    for item in items:
+                        mapped_data = map_reso_to_internal(item, photo_map)
+                        stmt = insert(Property).values(**mapped_data)
+                        update_dict = {k: v for k, v in mapped_data.items() if k not in ['id', 'listing_key']}
+                        stmt = stmt.on_conflict_do_update(index_elements=['listing_key'], set_=update_dict)
+                        await db.execute(stmt)
+                    await db.commit()
+                
+                total_seeded += len(items)
+                logger.info(f"✓ Seeded {len(items)} (Total: {total_seeded})")
+                
+                if len(items) < PAGE_SIZE:
+                    break
+                skip += PAGE_SIZE
+
             except Exception as e:
-                logger.error(f"  Exception: {e}")
-
-        if not all_raw_properties:
-            logger.warning("No properties found.")
-            return
-
-        # Batch Fetch Photos
-        listing_keys = [str(p["ListingKey"]) for p in all_raw_properties]
-        photo_map = {}
-        if listing_keys:
-            # Media fetching also needs to be chunked to avoid long URLs
-            chunk_size = 50
-            for i in range(0, len(listing_keys), chunk_size):
-                chunk = listing_keys[i:i + chunk_size]
-                logger.info(f"--- Fetching photos for chunk of {len(chunk)} ---")
-                media_params = {
-                    "$filter": f"ResourceRecordKey in ({','.join(chunk)}) and MediaCategory eq 'Photo'",
-                    "$select": "ResourceRecordKey,MediaURL",
-                    "$orderby": "MediaDisplayOrder asc"
-                }
-                try:
-                    media_res = await client.get(f"{API_BASE_URL}/BrightMedia", headers=headers, params=media_params)
-                    if media_res.status_code == 200:
-                        for m in media_res.json().get("value", []):
-                            key = str(m["ResourceRecordKey"])
-                            if key not in photo_map: photo_map[key] = []
-                            photo_map[key].append(m["MediaURL"])
-                except Exception as e:
-                    logger.warning(f"Media fetch failed: {e}")
-
-        async with AsyncSessionLocal() as db:
-            for item in all_raw_properties:
-                data = map_reso_to_internal(item, photo_map)
-                stmt = insert(Property).values(**data)
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=['listing_key'],
-                    set_={k: v for k, v in data.items() if k != 'listing_key'}
-                )
-                try:
-                    await db.execute(stmt)
-                    logger.info(f"✓ Upserted: {data['street_address']} ({data['listing_key']})")
-                except Exception as e:
-                    logger.error(f"✗ Failed {data['listing_key']}: {e}")
-            await db.commit()
-            logger.info(f"--- Test Seeding Complete: Total {len(all_raw_properties)} properties ---")
+                logger.exception(f"Seed failed: {e}")
+                break
 
 if __name__ == "__main__":
-    asyncio.run(seed_diverse_local_properties())
+    logger.info("Starting One-Time Seed (All fields included, sorted by ListingKey)...")
+    asyncio.run(seed_properties())

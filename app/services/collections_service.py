@@ -16,7 +16,6 @@ from app.models.database import (
 from app.schemas.collection import CollectionCreate
 from app.config.logging import get_logger
 
-from app.services.property_sync_service import PropertySyncService
 from app.services.collection_preferences_service import CollectionPreferencesService
 
 logger = get_logger(__name__)
@@ -359,8 +358,8 @@ class CollectionsService:
                 preferences = await CollectionPreferencesService.get_preferences_by_collection_id(db, collection.id)
 
                 if preferences:
-                    sync_service = PropertySyncService()
-                    result = await sync_service.populate_new_collection(db, collection.id)
+                    # Initial population for newly created collections
+                    await CollectionsService.repopulate_collection_from_preferences(db, collection.id, commit=True)
 
             except Exception as e:
                 # Collection creation should still succeed even if property population fails

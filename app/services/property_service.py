@@ -106,26 +106,41 @@ class PropertyService:
         exempt_types = ['LAND', 'FARM', 'COMMERCIAL', 'RESIDENTIAL_LEASE', 'OTHER']
 
         # 1. Location Filtering (Cities OR Townships OR Radius)
+        location_filters = []
+
         if preferences.cities:
-            loc_filters = []
             for loc in preferences.cities:
                 parts = [s.strip() for s in loc.split(',')]
                 city = parts[0]
                 state = parts[1] if len(parts) >= 2 else "PA"
-                loc_filters.append(and_(Property.city.ilike(city), Property.state.ilike(state)))
-            if loc_filters:
-                filters.append(or_(*loc_filters))
+                location_filters.append(and_(Property.city.ilike(city), Property.state.ilike(state)))
 
-        elif preferences.townships:
-            loc_filters = []
-            for township in preferences.townships:
-                # Township search is usually just the name, e.g., "Radnor"
-                # We use ILIKE %name% to catch "Radnor Twp" or "Radnor Township"
-                loc_filters.append(Property.township.ilike(f"%{township.strip()}%"))
-            if loc_filters:
-                filters.append(or_(*loc_filters))
+        if preferences.townships:
+            for township_pref in preferences.townships:
+                # 1. Split to get name and state (e.g. "Radnor Township, PA" -> ["Radnor Township", "PA"])
+                parts = [s.strip() for s in township_pref.split(',')]
+                raw_name = parts[0]
+                pref_state = parts[1].upper() if len(parts) >= 2 else None
+                
+                # 2. Clean the root name to match standardized DB format
+                root_name = re.sub(r'\s+(Township|Twp|Boro|Borough|City|Town)$', '', raw_name, flags=re.I).strip()
+                root_name = root_name.upper()
+                
+                # 3. Filter by both Township and State for geographical accuracy
+                if pref_state:
+                    location_filters.append(and_(
+                        Property.township == root_name,
+                        Property.state.ilike(pref_state)
+                    ))
+                else:
+                    location_filters.append(Property.township == root_name)
+
+        if location_filters:
+            # Join combined City/Township filters with OR
+            filters.append(or_(*location_filters))
                 
         elif preferences.lat is not None and preferences.long is not None and preferences.diameter:
+            # Bounding Box Math for Radius (only runs if no City/Township set)
             # Bounding Box Math for Radius (approximate)
             # diameter = total width, so radius = diameter / 2
             radius_miles = float(preferences.diameter) / 2.0
@@ -223,22 +238,34 @@ class PropertyService:
         exempt_types = ['LAND', 'FARM', 'COMMERCIAL', 'RESIDENTIAL_LEASE', 'OTHER']
 
         # 1. Location Filtering (Cities OR Townships OR Radius)
+        location_filters = []
+
         if preferences.cities:
-            loc_filters = []
             for loc in preferences.cities:
                 parts = [s.strip() for s in loc.split(',')]
                 city = parts[0]
                 state = parts[1] if len(parts) >= 2 else "PA"
-                loc_filters.append(and_(Property.city.ilike(city), Property.state.ilike(state)))
-            if loc_filters:
-                filters.append(or_(*loc_filters))
+                location_filters.append(and_(Property.city.ilike(city), Property.state.ilike(state)))
 
-        elif preferences.townships:
-            loc_filters = []
-            for township in preferences.townships:
-                loc_filters.append(Property.township.ilike(f"%{township.strip()}%"))
-            if loc_filters:
-                filters.append(or_(*loc_filters))
+        if preferences.townships:
+            for township_pref in preferences.townships:
+                parts = [s.strip() for s in township_pref.split(',')]
+                raw_name = parts[0]
+                pref_state = parts[1].upper() if len(parts) >= 2 else None
+                
+                root_name = re.sub(r'\s+(Township|Twp|Boro|Borough|City|Town)$', '', raw_name, flags=re.I).strip()
+                root_name = root_name.upper()
+                
+                if pref_state:
+                    location_filters.append(and_(
+                        Property.township == root_name,
+                        Property.state.ilike(pref_state)
+                    ))
+                else:
+                    location_filters.append(Property.township == root_name)
+
+        if location_filters:
+            filters.append(or_(*location_filters))
                 
         elif preferences.lat is not None and preferences.long is not None and preferences.diameter:
             # radius = diameter / 2

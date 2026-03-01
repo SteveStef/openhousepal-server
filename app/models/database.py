@@ -128,7 +128,7 @@ class Property(Base):
 
     # Narrative & Media
     description = Column(Text, nullable=True)
-    photos = Column(JSONB, nullable=True)  # List of photo objects/URLs
+    photos = Column(JSONB, nullable=True)  # List of URL strings
     
     # Listing Agent & Office
     list_agent_full_name = Column(String, nullable=True)

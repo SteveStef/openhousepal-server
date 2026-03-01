@@ -25,7 +25,6 @@ from app.schemas.property_tour import (
 from app.services.collections_service import CollectionsService
 from app.services.property_interactions_service import PropertyInteractionsService
 from app.services.collection_preferences_service import CollectionPreferencesService
-from app.services.property_sync_service import PropertySyncService
 from app.services.property_service import property_service
 from app.services.property_tour_service import PropertyTourService
 from app.utils.auth import get_current_active_user, get_current_user_optional, require_premium_plan, require_broker_authorization
@@ -276,8 +275,7 @@ async def create_collection_with_preferences(
             
             # Populate collection with properties immediately after creation
             try:
-                sync_service = PropertySyncService()
-                population_result = await sync_service.populate_new_collection(db, collection.id)
+                population_result = await CollectionsService.repopulate_collection_from_preferences(db, collection.id, commit=True)
                 
                 if population_result['success']:
                     pass

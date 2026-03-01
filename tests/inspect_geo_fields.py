@@ -17,7 +17,7 @@ async def discover_township_field():
     try:
         params = {
             "$filter": "MlsStatus eq 'ACTIVE-BRIGHT'",
-            "$top": 20,
+            "$top": 5,
             "$select": "ListingKey,FullStreetAddress,City,County,MLSAreaMajor,MLSAreaMinor,SubdivisionName"
         }
         
