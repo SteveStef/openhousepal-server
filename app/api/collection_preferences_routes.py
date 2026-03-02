@@ -25,9 +25,12 @@ async def create_preferences(
         preferences = await CollectionPreferencesService.create_preferences(db, preferences_data)
         return preferences
     except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Failed to create preferences: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to create preferences: {str(e)}"
+            detail="Failed to create preferences. Please verify your search criteria."
         )
 
 @router.get("/collection/{collection_id}", response_model=Optional[CollectionPreferences])

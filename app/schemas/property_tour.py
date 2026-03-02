@@ -29,7 +29,7 @@ class PropertyTourResponse(BaseModel):
     preferred_date_3: Optional[str] = None
     preferred_time_3: Optional[str] = None
     message: Optional[str] = None
-    status: str
+    is_completed: bool
     created_at: datetime
     updated_at: datetime
 
@@ -37,6 +37,6 @@ class PropertyTourResponse(BaseModel):
         from_attributes = True
 
 
-class PropertyTourStatusUpdate(BaseModel):
-    """Schema for updating tour status"""
-    status: str  # PENDING, CONFIRMED, CANCELLED
+class PropertyTourCompletionUpdate(BaseModel):
+    """Schema for updating tour completion status"""
+    is_completed: bool

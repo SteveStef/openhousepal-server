@@ -7,7 +7,7 @@ from app.models.database import PropertyTour, Collection, Property, User, Notifi
 from app.schemas.property_tour import (
     PropertyTourCreate,
     PropertyTourResponse,
-    PropertyTourStatusUpdate
+    PropertyTourCompletionUpdate
 )
 from app.services.email_service import EmailService
 from app.config.logging import get_logger
@@ -101,7 +101,7 @@ class PropertyTourService:
             preferred_date_3=tour_data.preferred_date_3,
             preferred_time_3=tour_data.preferred_time_3,
             message=tour_data.message,
-            status="PENDING",
+            is_completed=False,
             created_at=current_time,
             updated_at=current_time
         )
@@ -241,14 +241,14 @@ class PropertyTourService:
         return PropertyTourResponse.from_orm(tour)
 
     @classmethod
-    async def update_tour_status(
+    async def update_tour_completion(
         cls,
         db: AsyncSession,
         tour_id: str,
-        status_update: PropertyTourStatusUpdate,
+        completion_update: PropertyTourCompletionUpdate,
         user_id: str
     ) -> Optional[PropertyTourResponse]:
-        """Update the status of a tour request (agent only)"""
+        """Update the completion flag of a tour request (agent only)"""
 
         # Get the tour
         result = await db.execute(
@@ -273,13 +273,8 @@ class PropertyTourService:
         if not collection:
             raise ValueError("Unauthorized to update this tour request")
 
-        # Validate status
-        valid_statuses = ["PENDING", "CONFIRMED", "CANCELLED"]
-        if status_update.status not in valid_statuses:
-            raise ValueError(f"Invalid status. Must be one of: {', '.join(valid_statuses)}")
-
-        # Update status
-        tour.status = status_update.status
+        # Update completion flag
+        tour.is_completed = completion_update.is_completed
         tour.updated_at = datetime.now()
 
         await db.commit()

@@ -119,6 +119,10 @@ class Property(Base):
     mls_property_type = Column(String, index=True, nullable=True) # e.g., 'Residential'
     mls_structure_design_type = Column(String, index=True, nullable=True) # e.g., 'Interior Row/Townhouse'
 
+    # New added
+    price_per_square_feet = Column(Float, nullable=True)
+    mls_incorporated_city_name = Column(String, nullable=True)
+    raw_mls_data = Column(JSONB, nullable=True)
 
     # Location
     latitude = Column(Float, index=True, nullable=True)
@@ -306,7 +310,7 @@ class OpenHouseVisitor(Base):
     phone = Column(String, nullable=False)
 
     # Visit Information
-    has_agent = Column(String, nullable=False)  # YES, NO, LOOKING
+    has_agent = Column(String, nullable=False)  # YES, NO
     notes = Column(Text, nullable=True)
 
     # Open House Context
@@ -386,8 +390,8 @@ class PropertyTour(Base):
     preferred_time_3 = Column(String, nullable=True)
     message = Column(Text, nullable=True)
 
-    # Tour status
-    status = Column(String, default="PENDING")  # PENDING, CONFIRMED, CANCELLED
+    # Tour flag
+    is_completed = Column(Boolean, default=False, nullable=False)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

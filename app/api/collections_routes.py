@@ -20,7 +20,7 @@ from app.schemas.property_interactions import (
 from app.schemas.property_tour import (
     PropertyTourCreate,
     PropertyTourResponse,
-    PropertyTourStatusUpdate
+    PropertyTourCompletionUpdate
 )
 from app.services.collections_service import CollectionsService
 from app.services.property_interactions_service import PropertyInteractionsService
@@ -328,19 +328,7 @@ async def update_collection_status(
                 detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}"
             )
 
-        # Check active collection limit when trying to activate
-        if request.status == 'ACTIVE':
-            can_activate = await CollectionsService.can_activate_collection(
-                db, current_user.id, collection_id
-            )
-            if not can_activate:
-                active_count = await CollectionsService.count_active_collections(db, current_user.id)
-                max_active = int(os.getenv("MAX_ACTIVE_COLLECTIONS_PER_USER", "50"))
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Cannot activate collection. You have reached the maximum of {max_active} active collections (currently {active_count}). Please deactivate another collection first."
-                )
-
+        # Update collection status (no limit check)
         success = await CollectionsService.update_collection_status(
             db, collection_id, current_user.id, request.status
         )
@@ -764,19 +752,19 @@ async def get_collection_tours(
         )
 
 
-@router.patch("/tours/{tour_id}/status", response_model=PropertyTourResponse)
-async def update_tour_status(
+@router.patch("/tours/{tour_id}/completion", response_model=PropertyTourResponse)
+async def update_tour_completion(
     tour_id: str,
-    status_update: PropertyTourStatusUpdate,
+    completion_update: PropertyTourCompletionUpdate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_premium_plan)
 ):
     """
-    Update the status of a tour request (agent only)
+    Update the completion status of a tour request (agent only)
     """
     try:
-        tour = await PropertyTourService.update_tour_status(
-            db, tour_id, status_update, current_user.id
+        tour = await PropertyTourService.update_tour_completion(
+            db, tour_id, completion_update, current_user.id
         )
 
         if not tour:
@@ -795,8 +783,8 @@ async def update_tour_status(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("updating tour status failed", extra={"error": str(e)})
+        logger.error("updating tour completion failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update tour status"
+            detail="Failed to update tour completion status"
         )

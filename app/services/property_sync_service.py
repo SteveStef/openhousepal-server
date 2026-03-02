@@ -258,6 +258,7 @@ class PropertySyncService:
         township = prop.get("township")
         school_district = prop.get("school_district_name")
         h_type = prop.get("home_type")
+        h_type_upper = h_type.upper() if h_type else "OTHER"
         lat = prop.get("latitude")
         lng = prop.get("longitude")
 
@@ -269,22 +270,31 @@ class PropertySyncService:
             .where(Collection.status == 'ACTIVE')
         )
 
-        # 1. Geography Match (City OR Township OR Radius)
+        # 1. Geography Match (City OR Township OR School District OR Radius)
         geo_conditions = []
         params = {}
         
-        if city and state:
-            city_state = f"{city}, {state}"
-            params["city_state"] = city_state
+        if city:
+            params["city_name"] = city.upper()
+            params["state_name"] = state.upper() if state else ""
+            
+            # Match if any element in the 'cities' JSON array matches the property's city/state
+            # We split the preference (e.g. "Philadelphia, PA") and match components
             geo_conditions.append(
-                text("EXISTS (SELECT 1 FROM jsonb_array_elements_text(collection_preferences.cities) AS pref_city WHERE pref_city ILIKE :city_state)")
+                text("""
+                    EXISTS (
+                        SELECT 1 FROM jsonb_array_elements_text(collection_preferences.cities) AS pref_city 
+                        WHERE 
+                            UPPER(TRIM(SPLIT_PART(pref_city, ',', 1))) = :city_name
+                            AND (
+                                TRIM(SPLIT_PART(pref_city, ',', 2)) = '' 
+                                OR UPPER(TRIM(SPLIT_PART(pref_city, ',', 2))) = :state_name
+                            )
+                    )
+                """)
             )
         
         if township:
-            # On-the-fly normalization of user preferences in SQL:
-            # 1. Clean Name: SPLIT_PART(..., ',', 1) + REGEXP_REPLACE (removes state and suffixes)
-            # 2. Extract State: TRIM(SPLIT_PART(..., ',', 2))
-            # 3. Match: Both name and state (if state exists in pref) must match the property
             params["township_name"] = township.upper()
             params["state_name"] = state.upper() if state else ""
             geo_conditions.append(
@@ -303,9 +313,6 @@ class PropertySyncService:
             )
 
         if school_district:
-            # Match school district name and state by splitting the user's preference string
-            # Format in DB: "RADNOR TOWNSHIP, PA"
-            # Property attributes: school_district="RADNOR TOWNSHIP", state="PA"
             params["sd_name"] = school_district.upper()
             params["sd_state"] = state.upper() if state else ""
             geo_conditions.append(
@@ -340,32 +347,45 @@ class PropertySyncService:
         if geo_conditions:
             stmt = stmt.where(or_(*geo_conditions))
 
-        # 2. Financial Match
+        # 2. Financial & Size Match (with Smart Exemptions)
+        # Types that don't always have traditional bed/bath data (Exempt from numeric filters)
+        exempt_types = ['LAND', 'FARM', 'COMMERCIAL', 'OTHER']
+        numeric_conditions = []
+
         if price > 0:
-            stmt = stmt.where(and_(
+            numeric_conditions.append(and_(
                 or_(CollectionPreferences.min_price == None, CollectionPreferences.min_price <= price),
                 or_(CollectionPreferences.max_price == None, CollectionPreferences.max_price >= price)
             ))
 
-        # 3. Year Built Match
+        # Size Filters (apply even if property has 0 beds/baths)
+        numeric_conditions.append(or_(CollectionPreferences.min_beds == None, CollectionPreferences.min_beds <= (beds or 0)))
+        numeric_conditions.append(or_(CollectionPreferences.min_baths == None, CollectionPreferences.min_baths <= (baths or 0.0)))
+
+        # Year Built Match
         year = prop.get("year_built")
         if year:
-            stmt = stmt.where(and_(
+            numeric_conditions.append(and_(
                 or_(CollectionPreferences.min_year_built == None, CollectionPreferences.min_year_built <= year),
                 or_(CollectionPreferences.max_year_built == None, CollectionPreferences.max_year_built >= year)
             ))
 
-        # 4. Size Match
-        if beds > 0:
-            stmt = stmt.where(or_(CollectionPreferences.min_beds == None, CollectionPreferences.min_beds <= beds))
-        if baths > 0:
-            stmt = stmt.where(or_(CollectionPreferences.min_baths == None, CollectionPreferences.min_baths <= baths))
+        # Apply: (Is Exempt Type) OR (Matches all numeric filters)
+        if h_type_upper in exempt_types:
+            # If exempt, we only care about the price (if provided)
+            if price > 0:
+                stmt = stmt.where(and_(
+                    or_(CollectionPreferences.min_price == None, CollectionPreferences.min_price <= price),
+                    or_(CollectionPreferences.max_price == None, CollectionPreferences.max_price >= price)
+                ))
+        else:
+            # If not exempt (Residential, Condo, etc.), must match all numeric filters
+            stmt = stmt.where(and_(*numeric_conditions))
 
-        # 5. Property Type Match
+        # 3. Property Type Match
         # In standard search, Lot/Land includes both LAND and FARM
         type_match_conditions = []
         if h_type:
-            h_type_upper = h_type.upper()
             if h_type_upper == "SINGLE_FAMILY": type_match_conditions.append(CollectionPreferences.is_single_family == True)
             elif h_type_upper == "TOWNHOUSE": type_match_conditions.append(CollectionPreferences.is_town_house == True)
             elif h_type_upper == "CONDO": type_match_conditions.append(CollectionPreferences.is_condo == True)

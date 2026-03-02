@@ -33,6 +33,8 @@ class PropertyCreate(PropertyBase):
     # Raw MLS data
     mls_property_type: Optional[str] = Field(None, alias="MlsPropertyType")
     mls_structure_design_type: Optional[str] = Field(None, alias="MlsStructureDesignType")
+    price_per_square_feet: Optional[float] = Field(None, alias="PricePerSquareFoot")
+    mls_incorporated_city_name: Optional[str] = Field(None, alias="IncorporatedCityName")
 
 class PropertyUpdate(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
@@ -73,6 +75,8 @@ class Property(PropertyBase):
     # Raw MLS data
     mls_property_type: Optional[str] = Field(None, alias="MlsPropertyType")
     mls_structure_design_type: Optional[str] = Field(None, alias="MlsStructureDesignType")
+    price_per_square_feet: Optional[float] = Field(None, alias="PricePerSquareFoot")
+    mls_incorporated_city_name: Optional[str] = Field(None, alias="IncorporatedCityName")
     
     # Detailed fields
     architectural_style: Optional[List[str]] = None

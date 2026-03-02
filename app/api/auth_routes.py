@@ -376,8 +376,8 @@ async def link_subscription(
         raise
     except Exception as e:
         await db.rollback()
-        logger.error(f"Subscription linking failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Subscription linking failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to link subscription. Please contact support.")
 
 
 @router.post("/signup-with-subscription", response_model=Token, status_code=status.HTTP_201_CREATED)

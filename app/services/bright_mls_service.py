@@ -103,7 +103,7 @@ class BrightMlsService:
         """Centralized list of all 90+ fields we track for the Local Mirror."""
         return ",".join([
             "ListingKey", "FullStreetAddress", "UnparsedAddress", "City", "StateOrProvince",
-            "PostalCode", "ListPrice", "BedroomsTotal", "BathroomsFull", "BathroomsHalf",
+            "PostalCode", "ListPrice", "PricePerSquareFoot", "BedroomsTotal", "BathroomsFull", "BathroomsHalf",
             "BathroomsTotalInteger", "LivingArea", "LotSizeSquareFeet", "PropertyType",
             "StructureDesignType", "MlsStatus", "Latitude", "Longitude", "ListPictureURL",
             "MLSAreaMajor", "IncorporatedCityName", "PublicRemarks", "ListAgentFullName", "ListAgentEmail",
@@ -203,6 +203,8 @@ class BrightMlsService:
             "state": item.get("StateOrProvince"),
             "zipcode": item.get("PostalCode"),
             "price": item.get("ListPrice"),
+            "price_per_square_feet": item.get("PricePerSquareFoot"),
+            "mls_incorporated_city_name": item.get("IncorporatedCityName"),
             "bedrooms": item.get("BedroomsTotal"),
             "bathrooms": bathrooms,
             "living_area": item.get("LivingArea"),
@@ -291,7 +293,8 @@ class BrightMlsService:
             "subdivision_name": item.get("SubdivisionName"),
             "mls_list_date": parse_dt(item.get("MLSListDate")),
             "price_change_timestamp": parse_dt(item.get("PriceChangeTimestamp")),
-            "modification_timestamp": parse_dt(item.get("ModificationTimestamp"))
+            "modification_timestamp": parse_dt(item.get("ModificationTimestamp")),
+            "raw_mls_data": item
         }
 
     async def get_properties_modified_since(self, since_timestamp: str, top: int = 200, skip: int = 0) -> List[Dict[str, Any]]:

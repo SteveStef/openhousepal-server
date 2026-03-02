@@ -103,7 +103,7 @@ class PropertyService:
         filters = []
         
         # Types that typically don't have bathrooms or bedrooms (Exempt from numeric filters)
-        exempt_types = ['LAND', 'FARM', 'COMMERCIAL', 'RESIDENTIAL_LEASE', 'OTHER']
+        exempt_types = ['LAND', 'FARM', 'COMMERCIAL', 'OTHER']
 
         # 1. Location Filtering (Cities OR Townships OR Radius)
         location_filters = []

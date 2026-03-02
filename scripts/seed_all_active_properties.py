@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.database import AsyncSessionLocal
-from app.models.database import Property, HomeType
+from app.models.database import Property, HomeType, SchoolDistrict
 
 load_dotenv()
 
@@ -118,6 +118,8 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]]) 
         "state": item.get("StateOrProvince"),
         "zipcode": item.get("PostalCode"),
         "price": item.get("ListPrice"),
+        "price_per_square_feet": item.get("PricePerSquareFoot"),
+        "mls_incorporated_city_name": item.get("IncorporatedCityName"),
         "bedrooms": item.get("BedroomsTotal"),
         "bathrooms": bathrooms,
         "living_area": item.get("LivingArea"),
@@ -206,7 +208,8 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]]) 
         "subdivision_name": item.get("SubdivisionName"),
         "mls_list_date": parse_dt(item.get("MLSListDate")),
         "price_change_timestamp": parse_dt(item.get("PriceChangeTimestamp")),
-        "modification_timestamp": parse_dt(item.get("ModificationTimestamp"))
+        "modification_timestamp": parse_dt(item.get("ModificationTimestamp")),
+        "raw_mls_data": item
     }
 
 async def fetch_media_for_keys(client: httpx.AsyncClient, headers: Dict[str, str], keys: List[str]) -> Dict[str, List[str]]:
@@ -246,7 +249,7 @@ async def seed_properties():
         
         select_fields = ",".join([
             "ListingKey", "FullStreetAddress", "UnparsedAddress", "City", "StateOrProvince",
-            "PostalCode", "ListPrice", "BedroomsTotal", "BathroomsFull",
+            "PostalCode", "ListPrice", "PricePerSquareFoot", "BedroomsTotal", "BathroomsFull",
             "BathroomsHalf", "BathroomsTotalInteger", "LivingArea", "LotSizeSquareFeet",
             "PropertyType", "StructureDesignType", "MlsStatus", 
             "Latitude", "Longitude", "ListPictureURL", "MLSAreaMajor", "IncorporatedCityName",
@@ -302,10 +305,23 @@ async def seed_properties():
                 async with AsyncSessionLocal() as db:
                     for item in items:
                         mapped_data = map_reso_to_internal(item, photo_map)
+                        
+                        # 1. Upsert Property
                         stmt = insert(Property).values(**mapped_data)
                         update_dict = {k: v for k, v in mapped_data.items() if k not in ['id', 'listing_key']}
                         stmt = stmt.on_conflict_do_update(index_elements=['listing_key'], set_=update_dict)
                         await db.execute(stmt)
+
+                        # 2. Upsert School District Reference
+                        sd_name = mapped_data.get("school_district_name")
+                        sd_state = mapped_data.get("state")
+                        if sd_name and sd_state:
+                            sd_stmt = insert(SchoolDistrict).values(
+                                name=sd_name,
+                                state=sd_state
+                            ).on_conflict_do_nothing()
+                            await db.execute(sd_stmt)
+                            
                     await db.commit()
                 
                 total_seeded += len(items)

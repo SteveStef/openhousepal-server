@@ -32,6 +32,8 @@ class PropertySummaryResponse(BaseModel):
     # Raw MLS data
     mls_property_type: Optional[str] = Field(None, alias="MlsPropertyType")
     mls_structure_design_type: Optional[str] = Field(None, alias="MlsStructureDesignType")
+    price_per_square_feet: Optional[float] = Field(None, alias="PricePerSquareFoot")
+    mls_incorporated_city_name: Optional[str] = Field(None, alias="IncorporatedCityName")
     
     home_status: str = Field(..., alias="MlsStatus")
     

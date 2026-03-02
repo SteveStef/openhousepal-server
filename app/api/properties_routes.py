@@ -320,18 +320,18 @@ async def get_property_details(
         if request.listing_key:
             property_data = await property_service.get_property_by_listing_key(db, request.listing_key)
             if not property_data:
-                raise HTTPException(status_code=404, detail="Property not found in mirror by listing key")
+                raise HTTPException(status_code=404, detail="Property not found in database by listing key")
             return property_data
         else:
             property_data = await property_service.get_property_by_address(db, request.address)
             if not property_data:
-                raise HTTPException(status_code=404, detail="Property not found in mirror by address")
+                raise HTTPException(status_code=404, detail="Property not found in database by address")
             return property_data
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Mirror lookup failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Database lookup failed: {str(e)}")
+        logger.error(f"Mirror lookup failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Database lookup failed. Please verify the address format.")
 
 @router.post("/similar", dependencies=[Depends(require_broker_authorization)])
 async def get_similar_properties(
@@ -419,8 +419,8 @@ async def get_similar_properties(
             
         return {"success": True, "properties": results}
     except Exception as e:
-        logger.error(f"Mirror search failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Mirror search failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Search failed. Please try different filters.")
 
 @router.get("/{property_id}/cache")
 async def cache_property_details(
@@ -438,14 +438,14 @@ async def cache_property_details(
         property_record = result.scalar_one_or_none()
 
         if not property_record:
-            raise HTTPException(status_code=404, detail="Property not found in mirror")
+            raise HTTPException(status_code=404, detail="Property not found in database")
 
         # In the new architecture, everything is already 'cached' in the mirror
         response_details = PropertyDetailResponse.model_validate(property_record)
 
         return {
             "success": True,
-            "message": "Property details retrieved from mirror",
+            "message": "Property details retrieved from database",
             "property_id": property_id,
             "from_cache": True,
             "property": response_details.model_dump(by_alias=True, exclude_none=True)
@@ -454,16 +454,8 @@ async def cache_property_details(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Property mirror retrieval failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve property: {str(e)}")
-
-    except HTTPException:
-        await db.rollback()
-        raise
-    except Exception as e:
-        logger.error("Property cache failed", exc_info=True, extra={"property_id": property_id, "error": str(e)})
-        await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to cache property details: {str(e)}")
+        logger.error(f"Property mirror retrieval failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve property details.")
 
 class PropertyAgentResponse(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, from_attributes=True)
@@ -500,15 +492,18 @@ async def get_property_for_agent(
         try:
             property_data = await property_service.get_property_by_listing_key(db, listing_key)
             if not property_data:
-                raise HTTPException(status_code=404, detail="Property not found in mirror")
+                raise HTTPException(status_code=404, detail="Property not found in database")
                 
             return PropertyAgentResponse(property=property_data, agent_name=agent_name)
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error(f"Mirror lookup for agent failed: {e}")
-            raise HTTPException(status_code=500, detail=f"Database lookup failed: {str(e)}")
+            logger.error(f"Mirror lookup for agent failed: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Database lookup failed.")
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Failed to get property for agent", extra={"agent_id": agent_id, "listing_key": listing_key, "error": str(e)})
-        raise HTTPException(status_code=500, detail=f"Failed to get property for agent: {str(e)}")
+        logger.error("Failed to get property for agent", exc_info=True, extra={"agent_id": agent_id, "listing_key": listing_key})
+        raise HTTPException(status_code=500, detail="Failed to get property details.")
+
