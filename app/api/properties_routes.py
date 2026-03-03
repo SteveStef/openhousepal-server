@@ -88,6 +88,7 @@ async def store_property(
         
         fields = {
             "street_address": request.address,
+            "listing_id": data.get("listing_id") or data.get("ListingId"),
             "img_src": request.cover_image_url or data.get("imageUrl") or data.get("imgSrc"),
             "price": data.get("price") or data.get("ListPrice"),
             "bedrooms": data.get("beds") or data.get("BedroomsTotal"),
@@ -340,16 +341,7 @@ async def get_similar_properties(
 ):
     """Find matching properties from the local mirror using PropertyService"""
     try:
-        # 1. If specific keys are provided, fetch those exactly
-        if request.listing_keys:
-            logger.info(f"Fetching properties by keys from mirror: {request.listing_keys}")
-            results = []
-            for key in request.listing_keys:
-                p = await property_service.get_property_by_listing_key(db, str(key))
-                if p: results.append(p)
-            return {"success": True, "properties": results}
-
-        # 2. Discovery Mode (Search by preferences)
+        # Discovery Mode (Search by preferences)
         # Fetch the original property to get its exact home_type and price if not provided
         original_property = None
         if request.listing_key:
@@ -374,46 +366,34 @@ async def get_similar_properties(
             elif h_type == "RESIDENTIAL_LEASE": flags["is_apartment"] = True
             return flags
 
-        if request.lat and request.lng:
-            type_flags = get_type_flags(original_property.home_type if original_property else None)
-            prefs = CollectionPreferencesBase(
-                lat=request.lat,
-                long=request.lng,
-                diameter=request.radius or 5.0,
-                min_price=request.min_price if request.min_price and request.min_price > 0 else None,
-                max_price=request.max_price if request.max_price and request.max_price > 0 else None,
-                min_beds=request.min_beds if request.min_beds and request.min_beds > 0 else None,
-                min_baths=request.min_baths if request.min_baths and request.min_baths > 0 else None,
-                **type_flags
-            )
-        else:
-            # Fallback to city/zip based search
-            try:
-                # Use request values, fallback to original property, fallback to 0
-                bedrooms = int(float(request.bedrooms)) if request.bedrooms is not None else (original_property.bedrooms if original_property else 0)
-                price = float(request.price) if request.price is not None else (original_property.price if original_property else 0)
-            except (ValueError, TypeError):
-                bedrooms = 0
-                price = 0
-            
-            # Widen default window to 40% to catch local neighbors like Drummers Ln
-            min_price = int(price * 0.6) if price > 0 else None
-            max_price = int(price * 1.4) if price > 0 else None
-            city_name = request.city.split(',')[0].strip() if request.city else (original_property.city if original_property else None)
-            state_name = request.state if request.state else (original_property.state if original_property else "PA")
-            
-            type_flags = get_type_flags(original_property.home_type if original_property else None)
-            prefs = CollectionPreferencesBase(
-                cities=[f"{city_name}, {state_name}"] if city_name else [],
-                min_price=min_price,
-                max_price=max_price,
-                min_beds=max(0, bedrooms - 1),
-                **type_flags
-            )
+        # 1. Base preferences from request, then fallback to original property
+        min_price = request.min_price if request.min_price and request.min_price > 0 else None
+        max_price = request.max_price if request.max_price and request.max_price > 0 else None
+        min_beds = request.min_beds if request.min_beds and request.min_beds > 0 else None
+        min_baths = request.min_baths if request.min_baths and request.min_baths > 0 else None
         
-        results = await property_service.get_properties_by_preferences(db, prefs, max_properties=50)
+        # Determine coordinates (request or original property)
+        lat = request.lat if request.lat else (original_property.latitude if original_property else None)
+        long = request.lng if request.lng else (original_property.longitude if original_property else None)
+
+        if not lat or not long:
+            logger.warning(f"No coordinates found for similar property search. ListingKey: {request.listing_key}")
+            raise HTTPException(status_code=400, detail="Location coordinates are required to find similar properties.")
+
+        type_flags = get_type_flags(original_property.home_type if original_property else None)
+        prefs = CollectionPreferencesBase(
+            lat=float(lat),
+            long=float(long),
+            diameter=request.radius or 5.0,
+            min_price=min_price,
+            max_price=max_price,
+            min_beds=min_beds,
+            min_baths=min_baths,
+            **type_flags
+        )
         
-        # Filter out the current listing if provided
+        results = await property_service.get_properties_by_preferences(db, prefs, max_properties=100)
+        
         if request.listing_key:
             results = [p for p in results if str(p.listing_key) != str(request.listing_key)]
             

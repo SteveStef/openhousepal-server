@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional
 from fastapi import HTTPException
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from app.models.database import HomeType
 
 load_dotenv()
 
@@ -102,7 +103,7 @@ class BrightMlsService:
     def _get_full_field_list(self) -> str:
         """Centralized list of all 90+ fields we track for the Local Mirror."""
         return ",".join([
-            "ListingKey", "FullStreetAddress", "UnparsedAddress", "City", "StateOrProvince",
+            "ListingKey", "ListingId", "FullStreetAddress", "UnparsedAddress", "City", "StateOrProvince",
             "PostalCode", "ListPrice", "PricePerSquareFoot", "BedroomsTotal", "BathroomsFull", "BathroomsHalf",
             "BathroomsTotalInteger", "LivingArea", "LotSizeSquareFeet", "PropertyType",
             "StructureDesignType", "MlsStatus", "Latitude", "Longitude", "ListPictureURL",
@@ -143,22 +144,25 @@ class BrightMlsService:
         # 1. HomeType Mapping
         m_prop = item.get("PropertyType")
         m_design = item.get("StructureDesignType")
-        home_type = "OTHER"
+        h_type = HomeType.OTHER
         if m_prop == "Residential":
-            if m_design == "Detached": home_type = "SINGLE_FAMILY"
-            elif m_design and any(x in m_design for x in ["Townhouse", "Row", "Twin"]): home_type = "TOWNHOUSE"
-            elif m_design and any(x in m_design for x in ["Unit", "Flat", "Apartment", "Penthouse"]): home_type = "CONDO"
-            else: home_type = "SINGLE_FAMILY"
-        elif m_prop == "Multi-Family": home_type = "MULTI_FAMILY"
-        elif m_prop == "Land": home_type = "LAND"
-        elif m_prop == "Farm": home_type = "FARM"
-        elif m_prop == "Residential Lease": home_type = "RESIDENTIAL_LEASE"
-        elif m_prop and ("Commercial" in m_prop or "Industrial" in m_prop): home_type = "COMMERCIAL"
+            if m_design == "Detached": h_type = HomeType.SINGLE_FAMILY
+            elif m_design and ("Townhouse" in m_design or "Row" in m_design or "Twin" in m_design): h_type = HomeType.TOWNHOUSE
+            elif m_design and ("Unit" in m_design or "Flat" in m_design or "Apartment" in m_design or "Penthouse" in m_design): h_type = HomeType.CONDO
+            else: h_type = HomeType.SINGLE_FAMILY
+        elif m_prop == "Multi-Family": h_type = HomeType.MULTI_FAMILY
+        elif m_prop == "Land": h_type = HomeType.LAND
+        elif m_prop == "Farm": h_type = HomeType.FARM
+        elif m_prop == "Residential Lease": h_type = HomeType.RESIDENTIAL_LEASE
+        elif m_prop and ("Commercial" in m_prop or "Industrial" in m_prop): h_type = HomeType.COMMERCIAL
 
         # 2. Bath calculation
-        baths_full = item.get("BathroomsFull") or 0
-        baths_half = item.get("BathroomsHalf") or 0
-        bathrooms = item.get("BathroomsTotalInteger") or (float(baths_full) + (float(baths_half) * 0.5))
+        b_full = item.get("BathroomsFull")
+        b_half = item.get("BathroomsHalf")
+        if b_full is not None or b_half is not None:
+            bathrooms = float(b_full or 0) + (float(b_half or 0) * 0.5)
+        else:
+            bathrooms = float(item.get("BathroomsTotalInteger") or 0)
 
         # 3. Photo processing (Simplified list of strings)
         fetched_photos = []
@@ -197,6 +201,7 @@ class BrightMlsService:
 
         return {
             "listing_key": listing_key,
+            "listing_id": item.get("ListingId"),
             "street_address": self._clean_address(item.get("FullStreetAddress") or item.get("UnparsedAddress")),
             "unparsed_address": item.get("UnparsedAddress"),
             "city": item.get("City"),
@@ -209,7 +214,7 @@ class BrightMlsService:
             "bathrooms": bathrooms,
             "living_area": item.get("LivingArea"),
             "lot_size": item.get("LotSizeSquareFeet"),
-            "home_type": home_type,
+            "home_type": h_type.value,
             "home_status": item.get("MlsStatus"),
             "mls_property_type": m_prop,
             "mls_structure_design_type": m_design,
@@ -331,52 +336,52 @@ class BrightMlsService:
                 logger.warning(f"Failed to fetch media chunk: {e}")
         return photo_map
 
-    async def get_property_by_id(self, listing_key: str) -> Optional[Dict[str, Any]]:
-        """Fetch a single property by ListingKey with full details."""
-        params = {
-            "$filter": f"ListingKey eq '{listing_key}'", 
-            "$top": 1,
-            "$select": self._get_full_field_list()
-        }
-        data = await self._make_request("BrightProperties", params=params)
-        if not data.get("value"): return None
-        item = data["value"][0]
-        photo_map = await self.get_media_for_properties([listing_key])
-        return self.map_reso_to_internal(item, photo_map)
+    # async def get_property_by_id(self, listing_key: str) -> Optional[Dict[str, Any]]:
+    #     """Fetch a single property by ListingKey with full details."""
+    #     params = {
+    #         "$filter": f"ListingKey eq '{listing_key}'", 
+    #         "$top": 1,
+    #         "$select": self._get_full_field_list()
+    #     }
+    #     data = await self._make_request("BrightProperties", params=params)
+    #     if not data.get("value"): return None
+    #     item = data["value"][0]
+    #     photo_map = await self.get_media_for_properties([listing_key])
+    #     return self.map_reso_to_internal(item, photo_map)
 
-    async def get_property_by_address(self, address: str) -> Optional[Dict[str, Any]]:
-        """Search by address and return full internal map (Fallback)."""
-        parts = [p.strip() for p in address.split(',')]
-        street_part = parts[0]
-        zip_code = None
-        for part in reversed(parts):
-            zip_match = re.search(r'\b\d{5}\b', part)
-            if zip_match: zip_code = zip_match.group(0); break
-        
-        street_match = re.match(r'^(\d+)\s+(.*)$', street_part)
-        if street_match:
-            number, full_name = street_match.group(1), street_match.group(2).strip()
-            first_word = full_name.split(' ')[0]
-            cond = [f"StreetNumber eq '{number}'"]
-            if first_word: cond.append(f"contains(StreetName, '{first_word}')")
-            if zip_code: cond.append(f"PostalCode eq '{zip_code}'")
-            params = {"$filter": " and ".join(cond), "$top": 1, "$select": self._get_full_field_list()}
-            data = await self._make_request("BrightProperties", params=params)
-            if data.get("value"):
-                item = data["value"][0]
-                photo_map = await self.get_media_for_properties([item["ListingKey"]])
-                return self.map_reso_to_internal(item, photo_map)
-
-        fallback_filter = f"contains(UnparsedAddress, '{street_part}')"
-        if zip_code: fallback_filter += f" and PostalCode eq '{zip_code}'"
-        params = {"$filter": fallback_filter, "$top": 1, "$select": self._get_full_field_list()}
-        data = await self._make_request("BrightProperties", params=params)
-        if data.get("value"):
-            item = data["value"][0]
-            photo_map = await self.get_media_for_properties([item["ListingKey"]])
-            return self.map_reso_to_internal(item, photo_map)
-
-        return None
+    # async def get_property_by_address(self, address: str) -> Optional[Dict[str, Any]]:
+    #     """Search by address and return full internal map (Fallback)."""
+    #     parts = [p.strip() for p in address.split(',')]
+    #     street_part = parts[0]
+    #     zip_code = None
+    #     for part in reversed(parts):
+    #         zip_match = re.search(r'\b\d{5}\b', part)
+    #         if zip_match: zip_code = zip_match.group(0); break
+    #     
+    #     street_match = re.match(r'^(\d+)\s+(.*)$', street_part)
+    #     if street_match:
+    #         number, full_name = street_match.group(1), street_match.group(2).strip()
+    #         first_word = full_name.split(' ')[0]
+    #         cond = [f"StreetNumber eq '{number}'"]
+    #         if first_word: cond.append(f"contains(StreetName, '{first_word}')")
+    #         if zip_code: cond.append(f"PostalCode eq '{zip_code}'")
+    #         params = {"$filter": " and ".join(cond), "$top": 1, "$select": self._get_full_field_list()}
+    #         data = await self._make_request("BrightProperties", params=params)
+    #         if data.get("value"):
+    #             item = data["value"][0]
+    #             photo_map = await self.get_media_for_properties([item["ListingKey"]])
+    #             return self.map_reso_to_internal(item, photo_map)
+    #
+    #     fallback_filter = f"contains(UnparsedAddress, '{street_part}')"
+    #     if zip_code: fallback_filter += f" and PostalCode eq '{zip_code}'"
+    #     params = {"$filter": fallback_filter, "$top": 1, "$select": self._get_full_field_list()}
+    #     data = await self._make_request("BrightProperties", params=params)
+    #     if data.get("value"):
+    #         item = data["value"][0]
+    #         photo_map = await self.get_media_for_properties([item["ListingKey"]])
+    #         return self.map_reso_to_internal(item, photo_map)
+    #
+    #     return None
 
     async def bright_mls_id_exists(self, mls_id: str) -> bool:
         """Validates if a Bright MLS ID or Listing Key exists via API."""

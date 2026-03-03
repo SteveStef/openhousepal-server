@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.database import AsyncSessionLocal
-from app.models.database import Property, HomeType, SchoolDistrict
+from app.models.database import Property, HomeType, SchoolDistrict, SystemSettings
 
 load_dotenv()
 
@@ -75,9 +75,12 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]]) 
     elif m_prop == "Residential Lease": h_type = HomeType.RESIDENTIAL_LEASE
     elif m_prop and ("Commercial" in m_prop or "Industrial" in m_prop): h_type = HomeType.COMMERCIAL
 
-    baths_full = item.get("BathroomsFull") or 0
-    baths_half = item.get("BathroomsHalf") or 0
-    bathrooms = item.get("BathroomsTotalInteger") or (float(baths_full) + (float(baths_half) * 0.5))
+    b_full = item.get("BathroomsFull")
+    b_half = item.get("BathroomsHalf")
+    if b_full is not None or b_half is not None:
+        bathrooms = float(b_full or 0) + (float(b_half or 0) * 0.5)
+    else:
+        bathrooms = float(item.get("BathroomsTotalInteger") or 0)
 
     fetched_photos = photo_map.get(listing_key, [])
     if not fetched_photos and item.get("ListPictureURL"):
@@ -96,8 +99,14 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]]) 
         township = re.sub(r'\s+(Twp|Township|Boro|Borough|City|Town)$', '', township, flags=re.I).strip()
         township = township.upper()
 
+    # School District
+    school_district = item.get("SchoolDistrictName")
+    if school_district:
+        school_district = school_district.strip().upper()
+
     return {
         "listing_key": listing_key,
+        "listing_id": item.get("ListingId"),
         "street_address": clean_address(item.get("FullStreetAddress") or item.get("UnparsedAddress")),
         "unparsed_address": item.get("UnparsedAddress"),
         "city": item.get("City"),
@@ -161,7 +170,7 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]]) 
         "elementary_school": item.get("ElementarySchool"),
         "middle_or_junior_school": item.get("MiddleOrJuniorSchool"),
         "high_school": item.get("HighSchool"),
-        "school_district_name": item.get("SchoolDistrictName"),
+        "school_district_name": school_district,
         "county": item.get("County"),
         "township": township,
         "directions": item.get("Directions"),
@@ -204,7 +213,7 @@ async def seed_diverse_local_properties():
         return
 
     # Using Postal Codes to target a specific area
-    ZIPS = "'19406', '19446', '19001', '19087'"
+    ZIPS = "'19120', '19111', '19143', '19124'"
     
     # We fetch by PropertyType and let our internal mapper handle the sub-types.
     # This avoids the "Query Too Complex" OData error.
@@ -221,7 +230,7 @@ async def seed_diverse_local_properties():
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
         select_fields = ",".join([
-            "ListingKey", "FullStreetAddress", "UnparsedAddress", "City", "StateOrProvince",
+            "ListingKey", "ListingId", "FullStreetAddress", "UnparsedAddress", "City", "StateOrProvince",
             "PostalCode", "ListPrice", "PricePerSquareFoot", "BedroomsTotal", "BathroomsFull", "BathroomsHalf",
             "BathroomsTotalInteger", "LivingArea", "LotSizeSquareFeet", "PropertyType",
             "StructureDesignType", "MlsStatus", "Latitude", "Longitude", "ListPictureURL",
@@ -319,6 +328,24 @@ async def seed_diverse_local_properties():
                 except Exception as e:
                     logger.error(f"✗ Failed {data['listing_key']}: {e}")
             await db.commit()
+            
+            # 3. Initialize last_property_sync_time System Setting
+            # Find the latest ModificationTimestamp from the properties we just seeded
+            timestamps = [p.get("ModificationTimestamp") for p in all_raw_properties if p.get("ModificationTimestamp")]
+            if timestamps:
+                latest_ts = max(timestamps)
+                logger.info(f"Setting initial sync checkpoint to: {latest_ts}")
+                
+                ss_stmt = insert(SystemSettings).values(
+                    key="last_property_sync_time",
+                    value={"timestamp": latest_ts}
+                ).on_conflict_do_update(
+                    index_elements=['key'],
+                    set_={"value": {"timestamp": latest_ts}}
+                )
+                await db.execute(ss_stmt)
+                await db.commit()
+
             logger.info(f"--- Test Seeding Complete: Total {len(all_raw_properties)} properties ---")
 
 if __name__ == "__main__":

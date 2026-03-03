@@ -88,9 +88,12 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]]) 
     elif m_prop and ("Commercial" in m_prop or "Industrial" in m_prop): h_type = HomeType.COMMERCIAL
 
     # Bath calculation
-    baths_full = item.get("BathroomsFull") or 0
-    baths_half = item.get("BathroomsHalf") or 0
-    bathrooms = item.get("BathroomsTotalInteger") or (float(baths_full) + (float(baths_half) * 0.5))
+    b_full = item.get("BathroomsFull")
+    b_half = item.get("BathroomsHalf")
+    if b_full is not None or b_half is not None:
+        bathrooms = float(b_full or 0) + (float(b_half or 0) * 0.5)
+    else:
+        bathrooms = float(item.get("BathroomsTotalInteger") or 0)
 
     # Photo processing
     fetched_photos = photo_map.get(listing_key, [])
@@ -110,8 +113,14 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]]) 
         township = re.sub(r'\s+(Twp|Township|Boro|Borough|City|Town)$', '', township, flags=re.I).strip()
         township = township.upper()
 
+    # School District
+    school_district = item.get("SchoolDistrictName")
+    if school_district:
+        school_district = school_district.strip().upper()
+
     return {
         "listing_key": listing_key,
+        "listing_id": item.get("ListingId"),
         "street_address": clean_address(item.get("FullStreetAddress") or item.get("UnparsedAddress")),
         "unparsed_address": item.get("UnparsedAddress"),
         "city": item.get("City"),
@@ -175,7 +184,7 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]]) 
         "elementary_school": item.get("ElementarySchool"),
         "middle_or_junior_school": item.get("MiddleOrJuniorSchool"),
         "high_school": item.get("HighSchool"),
-        "school_district_name": item.get("SchoolDistrictName"),
+        "school_district_name": school_district,
         "county": item.get("County"),
         "township": township,
         "directions": item.get("Directions"),
@@ -248,7 +257,7 @@ async def seed_properties():
         base_filter = "MlsStatus in ('ACTIVE-BRIGHT', 'COMING SOON-BRIGHT')"
         
         select_fields = ",".join([
-            "ListingKey", "FullStreetAddress", "UnparsedAddress", "City", "StateOrProvince",
+            "ListingKey", "ListingId", "FullStreetAddress", "UnparsedAddress", "City", "StateOrProvince",
             "PostalCode", "ListPrice", "PricePerSquareFoot", "BedroomsTotal", "BathroomsFull",
             "BathroomsHalf", "BathroomsTotalInteger", "LivingArea", "LotSizeSquareFeet",
             "PropertyType", "StructureDesignType", "MlsStatus", 

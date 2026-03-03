@@ -96,6 +96,7 @@ class Property(Base):
     
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     listing_key = Column(String, unique=True, index=True, nullable=False)
+    listing_id = Column(String, nullable=True) # MLS Number
     
     # Basic property info
     street_address = Column(String, nullable=False)

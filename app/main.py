@@ -47,12 +47,12 @@ async def lifespan(app: FastAPI):
         replace_existing=True
     )
 
-    # This is for the property sync (every hour at :00)
+    # This is for the property sync (every 15 minutes)
     scheduler.add_job(
         scheduled_property_sync,
-        CronTrigger(hour="*", minute="0"),  # Every hour at the top of the hour
+        CronTrigger(minute="*/15"),  # Every 15 minutes
         id="property_sync",
-        name="Sync properties from Zillow API",
+        name="Sync properties from Bright MLS API",
         replace_existing=True
     )
 

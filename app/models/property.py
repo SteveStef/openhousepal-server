@@ -17,6 +17,7 @@ class PropertySummaryResponse(BaseModel):
     
     id: str
     listing_key: str = Field(..., alias="ListingKey")
+    listing_id: Optional[str] = Field(None, alias="ListingId") # MLS Number
     street_address: str = Field(..., alias="FullStreetAddress")
     unparsed_address: Optional[str] = Field(None, alias="UnparsedAddress")
     city: str = Field(..., alias="City")
@@ -171,7 +172,6 @@ class PropertyLookupRequest(BaseModel):
 class SimilarPropertiesRequest(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, from_attributes=True)
     listing_key: Optional[str] = None
-    listing_keys: Optional[List[str]] = None
     city: Optional[str] = None
     state: Optional[str] = None
     zipcode: Optional[str] = None
