@@ -47,10 +47,10 @@ async def lifespan(app: FastAPI):
         replace_existing=True
     )
 
-    # This is for the property sync (every 15 minutes)
+    # This is for the property sync (every 5 minutes)
     scheduler.add_job(
         scheduled_property_sync,
-        CronTrigger(minute="*/15"),  # Every 15 minutes
+        CronTrigger(minute="*/5"),  # Every 5 minutes
         id="property_sync",
         name="Sync properties from Bright MLS API",
         replace_existing=True

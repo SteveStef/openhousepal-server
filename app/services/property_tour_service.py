@@ -59,9 +59,31 @@ class PropertyTourService:
         if not collection.is_public:
             raise ValueError("Collection is not publicly accessible")
 
-        # Get visitor information from collection
-        if not collection.visitor_name or not collection.visitor_email or not collection.visitor_phone:
-            raise ValueError("Collection does not have complete visitor information")
+        # Determine visitor information (from collection or from request)
+        visitor_name = collection.visitor_name or tour_data.visitor_name
+        visitor_email = collection.visitor_email or tour_data.visitor_email
+        visitor_phone = collection.visitor_phone or tour_data.visitor_phone
+
+        # Get visitor information - if still missing, then fail
+        if not visitor_name or not visitor_email:
+            raise ValueError("Visitor name and email are required to schedule a tour")
+
+        # Update collection with visitor info if it was missing but provided in request
+        needs_update = False
+        if not collection.visitor_name and tour_data.visitor_name:
+            collection.visitor_name = tour_data.visitor_name
+            needs_update = True
+        if not collection.visitor_email and tour_data.visitor_email:
+            collection.visitor_email = tour_data.visitor_email
+            needs_update = True
+        if not collection.visitor_phone and tour_data.visitor_phone:
+            collection.visitor_phone = tour_data.visitor_phone
+            needs_update = True
+            
+        if needs_update:
+            db.add(collection)
+            await db.commit()
+            await db.refresh(collection)
 
         # Verify property exists
         property_result = await db.execute(
@@ -86,14 +108,14 @@ class PropertyTourService:
         if existing_tour:
             raise ValueError("A tour has already been requested for this property")
 
-        # Create tour request using visitor info from collection
+        # Create tour request using visitor info
         current_time = datetime.now()
         tour = PropertyTour(
             collection_id=collection_id,
             property_id=property_id,
-            visitor_name=collection.visitor_name,
-            visitor_email=collection.visitor_email,
-            visitor_phone=collection.visitor_phone,
+            visitor_name=visitor_name,
+            visitor_email=visitor_email,
+            visitor_phone=visitor_phone,
             preferred_date=tour_data.preferred_date,
             preferred_time=tour_data.preferred_time,
             preferred_date_2=tour_data.preferred_date_2,
@@ -138,9 +160,9 @@ class PropertyTourService:
                 template="tour_request",
                 template_variables={
                     "agent_name": agent.first_name,
-                    "visitor_name": collection.visitor_name,
-                    "visitor_email": collection.visitor_email,
-                    "visitor_phone": collection.visitor_phone or "Not provided",
+                    "visitor_name": visitor_name,
+                    "visitor_email": visitor_email,
+                    "visitor_phone": visitor_phone or "Not provided",
                     "property_address": property_obj.street_address,
                     "preferred_dates": ", ".join(preferred_dates) if preferred_dates else "No specific dates provided",
                     "message": tour_data.message or ""
@@ -163,13 +185,13 @@ class PropertyTourService:
                     type="TOUR_REQUEST",
                     reference_type="TOUR",
                     reference_id=tour.id,
-                    title=f"New Tour Request: {collection.visitor_name}",
+                    title=f"New Tour Request: {visitor_name}",
                     message=f"Requested tour at {property_obj.street_address}{preferred_date_str}",
                     collection_id=collection.id,
                     collection_name=collection.name,
                     property_id=property_id,
                     property_address=property_obj.street_address,
-                    visitor_name=collection.visitor_name,
+                    visitor_name=visitor_name,
                     link=f"/showcases?showcase={collection.id}&property={property_id}",
                     is_read=False,
                     created_at=datetime.utcnow()

@@ -380,7 +380,7 @@ class PropertyTour(Base):
     # Visitor contact information
     visitor_name = Column(String, nullable=False)
     visitor_email = Column(String, nullable=False)
-    visitor_phone = Column(String, nullable=False)
+    visitor_phone = Column(String, nullable=True)
 
     # Tour scheduling details
     preferred_date = Column(String, nullable=False)

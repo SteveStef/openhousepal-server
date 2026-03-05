@@ -16,6 +16,7 @@ from app.models.database import (
     ScheduledEmail, Notification, SystemSettings, SchoolDistrict
 )
 from app.services.bright_mls_service import bright_mls_service
+from app.utils.mls_mapper import map_reso_to_internal
 from app.services.email_service import EmailService
 from app.config.logging import get_logger
 from app.database import AsyncSessionLocal
@@ -82,7 +83,10 @@ class PropertySyncService:
                     # 1. Fetch modified batch from MLS
                     raw_properties = await bright_mls_service.get_properties_modified_since(last_sync, top=page_size, skip=skip)
                     if not raw_properties:
+                        logger.info("No more modified properties found.")
                         break
+                    
+                    logger.info(f"Found {len(raw_properties)} modified properties in this batch (skip={skip})")
 
                     # 2. Batch fetch media
                     listing_keys = [str(p["ListingKey"]) for p in raw_properties]
@@ -133,7 +137,7 @@ class PropertySyncService:
         Returns a 'sync_event' dict if successful.
         """
         l_key = str(raw_data["ListingKey"])
-        mapped = bright_mls_service.map_reso_to_internal(raw_data, photo_map)
+        mapped = map_reso_to_internal(raw_data, photo_map)
         
         # --- NEW: Maintain School Districts Reference Table ---
         sd_name = mapped.get("school_district_name")
@@ -168,11 +172,22 @@ class PropertySyncService:
             for key, value in mapped.items():
                 setattr(existing, key, value)
             existing.updated_at = datetime.now(timezone.utc)
+            logger.info(f"Updated existing property: {l_key} | {mapped['street_address']} | Status: {mapped['home_status']}")
         else:
+            # For NEW properties, only add them if they are ACTIVE or COMING SOON
+            # This prevents our DB from filling up with old CLOSED listings we never tracked
+            status = raw_data.get("MlsStatus", "")
+            is_active = status.startswith("ACTIVE") or status.startswith("COMING SOON")
+            
+            if not is_active:
+                logger.info(f"Skipping discovery for NEW inactive property: {l_key} | Status: {status}")
+                return None
+
             # New property to our system (Global Mirror)
             event_type = "NEW_GLOBAL"
             existing = Property(**mapped)
             db.add(existing)
+            logger.info(f"Added NEW property: {l_key} | {mapped['street_address']} | Status: {mapped['home_status']}")
         
         try:
             await db.commit()

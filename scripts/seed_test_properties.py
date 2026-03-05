@@ -55,10 +55,10 @@ async def seed_diverse_local_properties():
     # We fetch by PropertyType and let our internal mapper handle the sub-types.
     # This avoids the "Query Too Complex" OData error.
     categories = [
-        {"name": "Residential", "filter": f"PostalCode in ({ZIPS}) and PropertyType eq 'Residential'", "top": 50},
-        {"name": "Multi-Family", "filter": f"PropertyType eq 'Multi-Family'", "top": 20},
-        {"name": "Land", "filter": f"PropertyType eq 'Land'", "top": 20},
-        {"name": "Rentals", "filter": f"PostalCode in ({ZIPS}) and PropertyType eq 'Residential Lease'", "top": 20},
+        {"name": "Residential", "filter": f"PostalCode in ({ZIPS}) and PropertyType eq 'Residential'", "top": 10},
+        {"name": "Multi-Family", "filter": f"PropertyType eq 'Multi-Family'", "top": 5},
+        {"name": "Land", "filter": f"PropertyType eq 'Land'", "top": 5},
+        {"name": "Rentals", "filter": f"PostalCode in ({ZIPS}) and PropertyType eq 'Residential Lease'", "top": 5},
     ]
 
     async with httpx.AsyncClient(timeout=60.0) as client:

@@ -106,9 +106,10 @@ class BrightMlsService:
         return ",".join(BRIGHT_PROPERTY_SELECT_FIELDS)
 
     async def get_properties_modified_since(self, since_timestamp: str, top: int = 200, skip: int = 0) -> List[Dict[str, Any]]:
-        """Fetch properties modified since a specific timestamp."""
+        """Fetch all properties modified since a specific timestamp to capture status changes."""
         params = {
-            "$filter": f"MlsStatus in ('ACTIVE-BRIGHT', 'COMING SOON-BRIGHT') and ModificationTimestamp gt {since_timestamp}",
+            # REMOVED MlsStatus filter to capture transitions (e.g., ACTIVE -> PENDING)
+            "$filter": f"ModificationTimestamp gt {since_timestamp}",
             "$top": top,
             "$skip": skip,
             "$select": self._get_full_field_list(),

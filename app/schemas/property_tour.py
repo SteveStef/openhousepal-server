@@ -12,6 +12,9 @@ class PropertyTourCreate(BaseModel):
     preferred_date_3: Optional[str] = None
     preferred_time_3: Optional[str] = None
     message: Optional[str] = None
+    visitor_name: Optional[str] = None
+    visitor_email: Optional[str] = None
+    visitor_phone: Optional[str] = None
 
 
 class PropertyTourResponse(BaseModel):
@@ -21,7 +24,7 @@ class PropertyTourResponse(BaseModel):
     property_id: str
     visitor_name: str
     visitor_email: str
-    visitor_phone: str
+    visitor_phone: Optional[str] = None
     preferred_date: str
     preferred_time: str
     preferred_date_2: Optional[str] = None
