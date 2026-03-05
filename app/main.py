@@ -9,6 +9,7 @@ import time
 import uuid
 import subprocess
 from dotenv import load_dotenv
+from app.database import init_db
 from app.api import router
 from app.utils.clean_cache import cleanup_expired_signup_verifications
 from app.utils.property_sync_scheduler import scheduled_property_sync
@@ -31,6 +32,7 @@ scheduler = AsyncIOScheduler()
 async def lifespan(app: FastAPI):
     """Application lifespan - handles startup and shutdown"""
 
+    await init_db()
     await create_admin_user()
 
     logger.info("Initializing APScheduler for scheduled tasks")

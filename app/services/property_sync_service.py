@@ -177,7 +177,7 @@ class PropertySyncService:
             # For NEW properties, only add them if they are ACTIVE or COMING SOON
             # This prevents our DB from filling up with old CLOSED listings we never tracked
             status = raw_data.get("MlsStatus", "")
-            is_active = status.startswith("ACTIVE") or status.startswith("COMING SOON")
+            is_active = status.startswith("ACTIVE-BRIGHT") or status.startswith("COMING SOON")
             
             if not is_active:
                 logger.info(f"Skipping discovery for NEW inactive property: {l_key} | Status: {status}")
