@@ -123,5 +123,8 @@ dummy.json
 
 docs/
 docker-compose.yml
-mls_service.py
 notes.md
+
+raw_media_output.json
+raw_media_output_default.json
+raw_mls_output.json
