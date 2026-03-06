@@ -442,7 +442,7 @@ class PropertyAgentResponse(BaseModel):
     property: PropertyDetailResponse
     agent_name: str
 
-@router.get("/agent/{agent_id}/listing/{listing_key}", response_model=PropertyAgentResponse, dependencies=[Depends(require_broker_authorization)])
+@router.get("/agent/{agent_id}/listing/{listing_key}", response_model=PropertyAgentResponse)
 async def get_property_for_agent(
     agent_id: str,
     listing_key: str,

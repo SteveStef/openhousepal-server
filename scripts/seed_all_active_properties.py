@@ -26,6 +26,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("property_seed")
 
+# Suppress verbose httpx logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # --- Configuration ---
 CLIENT_ID = os.getenv("BRIGHT_MLS_CLIENT")
 CLIENT_SECRET = os.getenv("BRIGHT_MLS_SECRET")
@@ -49,7 +52,12 @@ async def fetch_media_for_keys(client: httpx.AsyncClient, headers: Dict[str, str
     if not keys: return {}
     photo_map = {}
     chunk_size = 50
+    total_chunks = (len(keys) + chunk_size - 1) // chunk_size
+    
     for i in range(0, len(keys), chunk_size):
+        chunk_num = (i // chunk_size) + 1
+        logger.info(f"  Fetching photos (chunk {chunk_num}/{total_chunks})...")
+        
         chunk = keys[i:i + chunk_size]
         media_params = {
             "$filter": f"ResourceRecordKey in ({','.join(chunk)}) and MediaCategory eq 'Photo'",
@@ -59,6 +67,8 @@ async def fetch_media_for_keys(client: httpx.AsyncClient, headers: Dict[str, str
         try:
             res = await client.get(f"{API_BASE_URL}/BrightMedia", headers=headers, params=media_params)
             res.raise_for_status()
+            logger.info(f"  Fetched photos (Status: {res.status_code} OK)")
+            
             for m in res.json().get("value", []):
                 key = str(m["ResourceRecordKey"])
                 if key not in photo_map: photo_map[key] = []
@@ -110,6 +120,8 @@ async def seed_properties(start_skip: int = 0):
                 if response.status_code != 200:
                     logger.error(f"API Error at skip={skip}: {response.status_code} - {response.text}")
                     break
+                
+                logger.info(f"Fetched properties batch (Status: {response.status_code} OK)")
                 
                 items = response.json().get("value", [])
                 if not items:
