@@ -27,14 +27,8 @@ logger = logging.getLogger("test_seed")
 # --- Configuration ---
 CLIENT_ID = os.getenv("BRIGHT_MLS_CLIENT")
 CLIENT_SECRET = os.getenv("BRIGHT_MLS_SECRET")
-IS_PROD = os.getenv("BRIGHT_MLS_ENV", "test").lower() == "prod"
-
-if IS_PROD:
-    TOKEN_URL = os.getenv("BRIGHT_TOKEN_URL")
-    API_BASE_URL = os.getenv("BRIGHT_BASE_URL")
-else:
-    TOKEN_URL = "https://brightmls-test.okta.com/oauth2/default/v1/token"
-    API_BASE_URL = "https://bright-reso.tst.brightmls.com/RESO/OData/bright"
+TOKEN_URL = os.getenv("BRIGHT_TOKEN_URL")
+API_BASE_URL = os.getenv("BRIGHT_BASE_URL")
 
 # --- Helper Functions ---
 

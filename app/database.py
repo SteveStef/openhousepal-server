@@ -1,9 +1,14 @@
 import os
+import asyncio
+import logging
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -42,6 +47,26 @@ async def get_db() -> AsyncSession:
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+async def wait_for_db(retries: int = 5, delay: int = 5):
+    """
+    Waits for the database to become available before proceeding.
+    Useful during startup to avoid race conditions.
+    """
+    for i in range(retries):
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+                logger.info("Database connection established.")
+                return True
+        except Exception as e:
+            if i < retries - 1:
+                logger.warning(f"Database connection attempt {i+1} failed. Retrying in {delay}s... Error: {e}")
+                await asyncio.sleep(delay)
+            else:
+                logger.error(f"Could not connect to database after {retries} attempts.")
+                raise e
+    return False
 
 # async def close_db():
 #     await engine.dispose()

@@ -4,6 +4,7 @@ import sys
 import httpx
 import logging
 import re
+import argparse
 from typing import Dict, Any, List
 from datetime import datetime
 from sqlalchemy.dialects.postgresql import insert
@@ -13,8 +14,8 @@ from dotenv import load_dotenv
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.database import AsyncSessionLocal
-from app.models.database import Property, HomeType, SchoolDistrict
-from app.utils.mls_mapper import BRIGHT_PROPERTY_SELECT_FIELDS, map_reso_to_internal, parse_dt, clean_address, get_best_photo_url
+from app.models.database import Property, SchoolDistrict, SystemSettings
+from app.utils.mls_mapper import BRIGHT_PROPERTY_SELECT_FIELDS, map_reso_to_internal, get_best_photo_url
 
 load_dotenv()
 
@@ -28,18 +29,10 @@ logger = logging.getLogger("property_seed")
 # --- Configuration ---
 CLIENT_ID = os.getenv("BRIGHT_MLS_CLIENT")
 CLIENT_SECRET = os.getenv("BRIGHT_MLS_SECRET")
-IS_PROD = os.getenv("BRIGHT_MLS_ENV", "test").lower() == "prod"
-
-if IS_PROD:
-    TOKEN_URL = os.getenv("BRIGHT_TOKEN_URL")
-    API_BASE_URL = os.getenv("BRIGHT_BASE_URL")
-else:
-    TOKEN_URL = "https://brightmls-test.okta.com/oauth2/default/v1/token"
-    API_BASE_URL = "https://bright-reso.tst.brightmls.com/RESO/OData/bright"
+TOKEN_URL = os.getenv("BRIGHT_TOKEN_URL")
+API_BASE_URL = os.getenv("BRIGHT_BASE_URL")
 
 PAGE_SIZE = 200  # Number of properties to fetch per request
-
-# --- Helper Functions ---
 
 async def get_access_token(client: httpx.AsyncClient) -> str:
     """Authenticates with Bright MLS to get an access token."""
@@ -65,26 +58,31 @@ async def fetch_media_for_keys(client: httpx.AsyncClient, headers: Dict[str, str
         }
         try:
             res = await client.get(f"{API_BASE_URL}/BrightMedia", headers=headers, params=media_params)
-            if res.status_code == 200:
-                for m in res.json().get("value", []):
-                    key = str(m["ResourceRecordKey"])
-                    if key not in photo_map: photo_map[key] = []
-                    # Use centralized helper to get best resolution
-                    photo_url = get_best_photo_url(m)
-                    if photo_url:
-                        photo_map[key].append(photo_url)
+            res.raise_for_status()
+            for m in res.json().get("value", []):
+                key = str(m["ResourceRecordKey"])
+                if key not in photo_map: photo_map[key] = []
+                # Use centralized helper to get best resolution
+                photo_url = get_best_photo_url(m)
+                if photo_url:
+                    photo_map[key].append(photo_url)
         except Exception as e:
-            logger.warning(f"Media fetch failed for chunk: {e}")
-    return photo_map
+            logger.error(f"FATAL: Media fetch failed for chunk. Aborting batch to prevent data without photos. Error: {e}")
+            raise  # Re-raise to trigger the break in the main loop
 
-async def seed_properties():
+async def seed_properties(start_skip: int = 0):
     if not CLIENT_ID or not CLIENT_SECRET:
         logger.error("Missing Bright MLS credentials.")
         return
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         logger.info("Authenticating...")
-        token = await get_access_token(client)
+        try:
+            token = await get_access_token(client)
+        except Exception as e:
+            logger.error(f"Authentication failed: {e}")
+            return
+
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
         # Simple paging logic: no time-based filter.
@@ -92,8 +90,9 @@ async def seed_properties():
         
         select_fields = ",".join(BRIGHT_PROPERTY_SELECT_FIELDS)
 
-        skip = 0
+        skip = start_skip
         total_seeded = 0
+        global_latest_ts = None
         
         while True:
             logger.info(f"Seeding batch (skip={skip})...")
@@ -109,7 +108,7 @@ async def seed_properties():
             try:
                 response = await client.get(f"{API_BASE_URL}/BrightProperties", headers=headers, params=params)
                 if response.status_code != 200:
-                    logger.error(f"Error: {response.status_code} - {response.text}")
+                    logger.error(f"API Error at skip={skip}: {response.status_code} - {response.text}")
                     break
                 
                 items = response.json().get("value", [])
@@ -117,7 +116,17 @@ async def seed_properties():
                     logger.info("Done seeding all properties.")
                     break
 
+                # Track the latest ModificationTimestamp in this batch
+                batch_timestamps = [item.get("ModificationTimestamp") for item in items if item.get("ModificationTimestamp")]
+                if batch_timestamps:
+                    batch_max = max(batch_timestamps)
+                    if not global_latest_ts or batch_max > global_latest_ts:
+                        global_latest_ts = batch_max
+
                 listing_keys = [str(item["ListingKey"]) for item in items]
+                
+                # Fetching media is now fatal—if it fails, the exception breaks the loop
+                # and the database commit below is never reached.
                 photo_map = await fetch_media_for_keys(client, headers, listing_keys)
 
                 async with AsyncSessionLocal() as db:
@@ -143,16 +152,36 @@ async def seed_properties():
                     await db.commit()
                 
                 total_seeded += len(items)
-                logger.info(f"✓ Seeded {len(items)} (Total: {total_seeded})")
+                logger.info(f"✓ Seeded {len(items)} (Total: {total_seeded}, Last Skip: {skip})")
                 
                 if len(items) < PAGE_SIZE:
                     break
                 skip += PAGE_SIZE
 
             except Exception as e:
-                logger.exception(f"Seed failed: {e}")
+                logger.error(f"!!! CRITICAL FAILURE at skip={skip} !!!")
+                logger.error(f"Error Details: {e}")
+                logger.info(f"To resume, run: python seed_all_active_properties.py --skip {skip}")
                 break
 
+        # --- Final Step: Update System Settings Checkpoint ---
+        if global_latest_ts:
+            logger.info(f"Setting final sync checkpoint to: {global_latest_ts}")
+            async with AsyncSessionLocal() as db:
+                ss_stmt = insert(SystemSettings).values(
+                    key="last_property_sync_time",
+                    value={"timestamp": global_latest_ts}
+                ).on_conflict_do_update(
+                    index_elements=['key'],
+                    set_={"value": {"timestamp": global_latest_ts}}
+                )
+                await db.execute(ss_stmt)
+                await db.commit()
+
 if __name__ == "__main__":
-    logger.info("Starting One-Time Seed (All fields included, sorted by ListingKey)...")
-    asyncio.run(seed_properties())
+    parser = argparse.ArgumentParser(description="Seed all active properties from Bright MLS.")
+    parser.add_argument("--skip", type=int, default=0, help="Number of records to skip (default: 0)")
+    args = parser.parse_args()
+
+    logger.info(f"Starting Seed from skip={args.skip} (All fields included, sorted by ListingKey)...")
+    asyncio.run(seed_properties(args.skip))
