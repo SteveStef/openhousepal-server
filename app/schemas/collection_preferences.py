@@ -19,7 +19,7 @@ class CollectionPreferencesBase(BaseModel):
     townships: Optional[list[str]] = None
     school_districts: Optional[list[str]] = None
 
-    diameter: float = 6.0
+    diameter: Optional[float] = None
     special_features: str = ""
 
     # Home type preferences

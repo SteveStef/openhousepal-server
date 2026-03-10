@@ -1,7 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, update, and_, or_, text
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, joinedload
 from typing import List, Dict, Any, Optional, Set
 import asyncio
 import json
@@ -17,6 +17,7 @@ from app.models.database import (
 )
 from app.services.bright_mls_service import bright_mls_service
 from app.utils.mls_mapper import map_reso_to_internal
+from app.utils.geo import get_lat_long_offsets, is_within_distance
 from app.services.email_service import EmailService
 from app.config.logging import get_logger
 from app.database import AsyncSessionLocal
@@ -281,83 +282,86 @@ class PropertySyncService:
         stmt = (
             select(Collection)
             .join(CollectionPreferences)
-            .options(selectinload(Collection.owner))
+            .options(
+                selectinload(Collection.owner),
+                joinedload(Collection.preferences)
+            )
             .where(Collection.status == 'ACTIVE')
         )
 
-        # 1. Geography Match (City OR Township OR School District OR Radius)
+        # 1. Geography Match (Exclusive Logic: Cities/Townships/Districts OR Radius)
         geo_conditions = []
+        location_filters = []
         params = {}
         
         if city:
             params["city_name"] = city.upper()
             params["state_name"] = state.upper() if state else ""
-            
-            # Match if any element in the 'cities' JSON array matches the property's city/state
-            # We split the preference (e.g. "Philadelphia, PA") and match components
-            geo_conditions.append(
-                text("""
-                    EXISTS (
-                        SELECT 1 FROM jsonb_array_elements_text(collection_preferences.cities) AS pref_city 
-                        WHERE 
-                            UPPER(TRIM(SPLIT_PART(pref_city, ',', 1))) = :city_name
-                            AND (
-                                TRIM(SPLIT_PART(pref_city, ',', 2)) = '' 
-                                OR UPPER(TRIM(SPLIT_PART(pref_city, ',', 2))) = :state_name
-                            )
-                    )
-                """)
-            )
+            location_filters.append(text("""
+                EXISTS (
+                    SELECT 1 FROM jsonb_array_elements_text(collection_preferences.cities) AS pref_city 
+                    WHERE 
+                        UPPER(TRIM(SPLIT_PART(pref_city, ',', 1))) = :city_name
+                        AND (
+                            TRIM(SPLIT_PART(pref_city, ',', 2)) = '' 
+                            OR UPPER(TRIM(SPLIT_PART(pref_city, ',', 2))) = :state_name
+                        )
+                )
+            """))
         
         if township:
             params["township_name"] = township.upper()
             params["state_name"] = state.upper() if state else ""
-            geo_conditions.append(
-                text("""
-                    EXISTS (
-                        SELECT 1 
-                        FROM jsonb_array_elements_text(collection_preferences.townships) AS pref_town 
-                        WHERE 
-                            UPPER(TRIM(REGEXP_REPLACE(SPLIT_PART(pref_town, ',', 1), '\\s+(Township|Twp|Boro|Borough|City|Town)$', '', 'i'))) = :township_name
-                            AND (
-                                TRIM(SPLIT_PART(pref_town, ',', 2)) = '' 
-                                OR UPPER(TRIM(SPLIT_PART(pref_town, ',', 2))) = :state_name
-                            )
-                    )
-                """)
-            )
+            location_filters.append(text("""
+                EXISTS (
+                    SELECT 1 
+                    FROM jsonb_array_elements_text(collection_preferences.townships) AS pref_town 
+                    WHERE 
+                        UPPER(TRIM(REGEXP_REPLACE(SPLIT_PART(pref_town, ',', 1), '\\s+(Township|Twp|Boro|Borough|City|Town)$', '', 'i'))) = :township_name
+                        AND (
+                            TRIM(SPLIT_PART(pref_town, ',', 2)) = '' 
+                            OR UPPER(TRIM(SPLIT_PART(pref_town, ',', 2))) = :state_name
+                        )
+                )
+            """))
 
         if school_district:
             params["sd_name"] = school_district.upper()
             params["sd_state"] = state.upper() if state else ""
-            geo_conditions.append(
-                text("""
-                    EXISTS (
-                        SELECT 1 
-                        FROM jsonb_array_elements_text(collection_preferences.school_districts) AS sd 
-                        WHERE 
-                            UPPER(TRIM(SPLIT_PART(sd, ',', 1))) = :sd_name
-                            AND (
-                                TRIM(SPLIT_PART(sd, ',', 2)) = '' 
-                                OR UPPER(TRIM(SPLIT_PART(sd, ',', 2))) = :sd_state
-                            )
-                    )
-                """)
-            )
+            location_filters.append(text("""
+                EXISTS (
+                    SELECT 1 
+                    FROM jsonb_array_elements_text(collection_preferences.school_districts) AS sd 
+                    WHERE 
+                        UPPER(TRIM(SPLIT_PART(sd, ',', 1))) = :sd_name
+                        AND (
+                            TRIM(SPLIT_PART(sd, ',', 2)) = '' 
+                            OR UPPER(TRIM(SPLIT_PART(sd, ',', 2))) = :sd_state
+                        )
+                )
+            """))
         
-        # Radius Match is checked only if no City/Township matches found OR if we want them to combine
-        # Based on search logic, Radius is a fallback, but here we combine them into the same OR block for maximum discovery
+        # Priority 1: If user has explicit location lists, only match those
+        if location_filters:
+            geo_conditions.append(or_(*location_filters))
+        
+        # Priority 2: Fallback to Radius only if no City/Township/District is provided
         if lat and lng:
-            lat_deg_per_mile = 1.0 / 69.1
-            lng_deg_per_mile = 1.0 / (69.1 * math.cos(math.radians(lat)))
+            lat_offset, long_offset = get_lat_long_offsets(lat, 1.0) # Get offsets for 1 mile
             
-            geo_conditions.append(and_(
+            radius_condition = and_(
+                # Ensure user hasn't specified other locations (The "Exclusive" part)
+                or_(CollectionPreferences.cities == None, func.jsonb_array_length(CollectionPreferences.cities) == 0),
+                or_(CollectionPreferences.townships == None, func.jsonb_array_length(CollectionPreferences.townships) == 0),
+                or_(CollectionPreferences.school_districts == None, func.jsonb_array_length(CollectionPreferences.school_districts) == 0),
+                # Standard radius box
                 CollectionPreferences.lat.isnot(None),
                 CollectionPreferences.long.isnot(None),
                 CollectionPreferences.diameter.isnot(None),
-                func.abs(CollectionPreferences.lat - lat) <= (CollectionPreferences.diameter * 0.5 * lat_deg_per_mile),
-                func.abs(CollectionPreferences.long - lng) <= (CollectionPreferences.diameter * 0.5 * lng_deg_per_mile)
-            ))
+                func.abs(CollectionPreferences.lat - lat) <= (CollectionPreferences.diameter * 0.5 * lat_offset * 2.0),
+                func.abs(CollectionPreferences.long - lng) <= (CollectionPreferences.diameter * 0.5 * long_offset * 2.0)
+            )
+            geo_conditions.append(radius_condition)
         
         if geo_conditions:
             stmt = stmt.where(or_(*geo_conditions))
@@ -414,7 +418,45 @@ class PropertySyncService:
             stmt = stmt.where(or_(*type_match_conditions))
 
         result = await db.execute(stmt, params)
-        return result.scalars().all()
+        collections = result.scalars().all()
+
+        # 4. Circular Post-Filtering (Trim the Corners)
+        # If the property has lat/long, ensure it's precisely within the radius of matching collections
+        if lat and lng:
+            refined_collections = []
+            for col in collections:
+                # If collection has a radius search, verify exact distance
+                if col.preferences and col.preferences.lat and col.preferences.long and col.preferences.diameter:
+                    # Skip circular check if collection matches via City/Township (inclusive logic)
+                    matches_via_city = False
+                    if city and col.preferences.cities:
+                        city_names = [c.split(',')[0].strip().upper() for c in col.preferences.cities]
+                        if city.upper() in city_names:
+                            matches_via_city = True
+                    
+                    if not matches_via_city and township and col.preferences.townships:
+                        # Simple check for townships
+                        town_names = [t.split(',')[0].strip().upper() for t in col.preferences.townships]
+                        if township.upper() in town_names:
+                            matches_via_city = True
+
+                    if matches_via_city:
+                        refined_collections.append(col)
+                    else:
+                        # Must match via Radius - perform precise check
+                        if is_within_distance(
+                            col.preferences.lat, col.preferences.long, 
+                            lat, lng, 
+                            col.preferences.diameter / 2.0
+                        ):
+                            refined_collections.append(col)
+                else:
+                    # Match via other criteria, keep it
+                    refined_collections.append(col)
+            
+            return refined_collections
+
+        return collections
 
     async def _link_property_to_collection(self, db: AsyncSession, collection_id: str, property_id: str):
         """Silently links a property to a collection if not already linked."""

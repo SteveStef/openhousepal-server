@@ -20,9 +20,17 @@ from app.utils.mls_mapper import BRIGHT_PROPERTY_SELECT_FIELDS, map_reso_to_inte
 load_dotenv()
 
 # Configure logging
+LOG_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'logs'))
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(LOG_DIR, 'seed_all_active.log')),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 logger = logging.getLogger("property_seed")
 
@@ -35,7 +43,7 @@ CLIENT_SECRET = os.getenv("BRIGHT_MLS_SECRET")
 TOKEN_URL = os.getenv("BRIGHT_TOKEN_URL")
 API_BASE_URL = os.getenv("BRIGHT_BASE_URL")
 
-PAGE_SIZE = 200  # Number of properties to fetch per request
+PAGE_SIZE = 500  # Number of properties to fetch per request
 
 async def get_access_token(client: httpx.AsyncClient) -> str:
     """Authenticates with Bright MLS to get an access token."""
@@ -51,13 +59,11 @@ async def get_access_token(client: httpx.AsyncClient) -> str:
 async def fetch_media_for_keys(client: httpx.AsyncClient, headers: Dict[str, str], keys: List[str]) -> Dict[str, List[str]]:
     if not keys: return {}
     photo_map = {}
-    chunk_size = 50
-    total_chunks = (len(keys) + chunk_size - 1) // chunk_size
+    chunk_size = 80
+    
+    logger.info(f"  Fetching photos for {len(keys)} properties...")
     
     for i in range(0, len(keys), chunk_size):
-        chunk_num = (i // chunk_size) + 1
-        logger.info(f"  Fetching photos (chunk {chunk_num}/{total_chunks})...")
-        
         chunk = keys[i:i + chunk_size]
         media_params = {
             "$filter": f"ResourceRecordKey in ({','.join(chunk)}) and MediaCategory eq 'Photo'",
@@ -67,7 +73,6 @@ async def fetch_media_for_keys(client: httpx.AsyncClient, headers: Dict[str, str
         try:
             res = await client.get(f"{API_BASE_URL}/BrightMedia", headers=headers, params=media_params)
             res.raise_for_status()
-            logger.info(f"  Fetched photos (Status: {res.status_code} OK)")
             
             for m in res.json().get("value", []):
                 key = str(m["ResourceRecordKey"])
@@ -79,6 +84,8 @@ async def fetch_media_for_keys(client: httpx.AsyncClient, headers: Dict[str, str
         except Exception as e:
             logger.error(f"FATAL: Media fetch failed for chunk. Aborting batch to prevent data without photos. Error: {e}")
             raise  # Re-raise to trigger the break in the main loop
+    
+    return photo_map
 
 async def seed_properties(start_skip: int = 0):
     if not CLIENT_ID or not CLIENT_SECRET:
@@ -103,22 +110,31 @@ async def seed_properties(start_skip: int = 0):
         skip = start_skip
         total_seeded = 0
         global_latest_ts = None
+        last_listing_key = None
         
         while True:
-            logger.info(f"Seeding batch (skip={skip})...")
+            current_filter = base_filter
+            if last_listing_key:
+                current_filter += f" and ListingKey gt {last_listing_key}"
+            
+            logger.info(f"Seeding batch (Total Seeded: {total_seeded}, Last Key: {last_listing_key or 'None'})...")
+            
             # Ordering by ListingKey to ensure stable pagination
             params = {
-                "$filter": base_filter,
+                "$filter": current_filter,
                 "$top": PAGE_SIZE,
-                "$skip": skip,
                 "$select": select_fields,
                 "$orderby": "ListingKey asc"
             }
             
+            # Use skip only for the initial start if specified
+            if not last_listing_key and skip > 0:
+                params["$skip"] = skip
+
             try:
                 response = await client.get(f"{API_BASE_URL}/BrightProperties", headers=headers, params=params)
                 if response.status_code != 200:
-                    logger.error(f"API Error at skip={skip}: {response.status_code} - {response.text}")
+                    logger.error(f"API Error at Total Seeded={total_seeded}: {response.status_code} - {response.text}")
                     break
                 
                 logger.info(f"Fetched properties batch (Status: {response.status_code} OK)")
@@ -127,6 +143,9 @@ async def seed_properties(start_skip: int = 0):
                 if not items:
                     logger.info("Done seeding all properties.")
                     break
+
+                # Update the last_listing_key for the next batch
+                last_listing_key = items[-1]["ListingKey"]
 
                 # Track the latest ModificationTimestamp in this batch
                 batch_timestamps = [item.get("ModificationTimestamp") for item in items if item.get("ModificationTimestamp")]
@@ -142,38 +161,53 @@ async def seed_properties(start_skip: int = 0):
                 photo_map = await fetch_media_for_keys(client, headers, listing_keys)
 
                 async with AsyncSessionLocal() as db:
-                    for item in items:
-                        mapped_data = map_reso_to_internal(item, photo_map)
-                        
-                        # 1. Upsert Property
-                        stmt = insert(Property).values(**mapped_data)
-                        update_dict = {k: v for k, v in mapped_data.items() if k not in ['id', 'listing_key']}
-                        stmt = stmt.on_conflict_do_update(index_elements=['listing_key'], set_=update_dict)
-                        await db.execute(stmt)
+                    # 1. Prepare all property data
+                    property_data_list = [map_reso_to_internal(item, photo_map) for item in items]
+                    
+                    if property_data_list:
+                        # 2. Bulk Upsert Properties in chunks of 250 to avoid Postgres parameter limit (32767)
+                        db_chunk_size = 250
+                        for i in range(0, len(property_data_list), db_chunk_size):
+                            chunk = property_data_list[i:i + db_chunk_size]
+                            
+                            stmt = insert(Property).values(chunk)
+                            update_columns = {
+                                col.name: getattr(stmt.excluded, col.name)
+                                for col in Property.__table__.columns
+                                if col.name not in ['id', 'listing_key']
+                            }
+                            
+                            stmt = stmt.on_conflict_do_update(
+                                index_elements=['listing_key'],
+                                set_=update_columns
+                            )
+                            await db.execute(stmt)
 
-                        # 2. Upsert School District Reference
-                        sd_name = mapped_data.get("school_district_name")
-                        sd_state = mapped_data.get("state")
-                        if sd_name and sd_state:
-                            sd_stmt = insert(SchoolDistrict).values(
-                                name=sd_name,
-                                state=sd_state
-                            ).on_conflict_do_nothing()
+                        # 3. Bulk Upsert School Districts
+                        sd_data = []
+                        seen_sds = set()
+                        for p in property_data_list:
+                            name, state = p.get("school_district_name"), p.get("state")
+                            if name and state and (name, state) not in seen_sds:
+                                sd_data.append({"name": name, "state": state})
+                                seen_sds.add((name, state))
+                        
+                        if sd_data:
+                            sd_stmt = insert(SchoolDistrict).values(sd_data).on_conflict_do_nothing()
                             await db.execute(sd_stmt)
                             
                     await db.commit()
                 
                 total_seeded += len(items)
-                logger.info(f"✓ Seeded {len(items)} (Total: {total_seeded}, Last Skip: {skip})")
+                logger.info(f"✓ Seeded {len(items)} (Total: {total_seeded}, Last Key: {last_listing_key})")
                 
                 if len(items) < PAGE_SIZE:
                     break
-                skip += PAGE_SIZE
 
             except Exception as e:
-                logger.error(f"!!! CRITICAL FAILURE at skip={skip} !!!")
+                logger.error(f"!!! CRITICAL FAILURE at Total Seeded={total_seeded} !!!")
                 logger.error(f"Error Details: {e}")
-                logger.info(f"To resume, run: python seed_all_active_properties.py --skip {skip}")
+                logger.info(f"Last successful ListingKey: {last_listing_key}")
                 break
 
         # --- Final Step: Update System Settings Checkpoint ---

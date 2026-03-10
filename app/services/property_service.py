@@ -7,6 +7,7 @@ from sqlalchemy import select, and_, or_, func
 from app.schemas.collection_preferences import CollectionPreferencesBase as CollectionPreferencesSchema
 from app.models.database import Property
 from app.models.property import PropertySummaryResponse, PropertyDetailResponse
+from app.utils.geo import get_lat_long_offsets, filter_properties_by_radius
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -93,7 +94,7 @@ class PropertyService:
     async def get_properties_by_preferences(
         db: AsyncSession, 
         preferences: CollectionPreferencesSchema, 
-        max_properties: int = 200
+        max_properties: int = 500
     ) -> List[PropertySummaryResponse]:
         """
         Performs a local SQLAlchemy search against the mirrored 'properties' table.
@@ -157,12 +158,7 @@ class PropertyService:
                 
         elif preferences.lat is not None and preferences.long is not None and preferences.diameter:
             # Bounding Box Math for Radius (only runs if no City/Township set)
-            # Bounding Box Math for Radius (approximate)
-            # diameter = total width, so radius = diameter / 2
-            radius_miles = float(preferences.diameter) / 2.0
-            lat_offset = radius_miles / 69.1
-            cos_lat = math.cos(math.radians(float(preferences.lat)))
-            long_offset = radius_miles / (69.1 * cos_lat) if abs(cos_lat) > 0.0001 else lat_offset
+            lat_offset, long_offset = get_lat_long_offsets(preferences.lat, preferences.diameter)
             
             filters.append(and_(
                 Property.latitude >= float(preferences.lat) - lat_offset,
@@ -244,6 +240,15 @@ class PropertyService:
         result = await db.execute(query)
         properties = result.scalars().all()
 
+        # 5. Circular Post-Filtering (Trim the Corners)
+        if not location_filters and preferences.lat is not None and preferences.long is not None and preferences.diameter:
+            properties = filter_properties_by_radius(
+                properties, 
+                float(preferences.lat), 
+                float(preferences.long), 
+                float(preferences.diameter)
+            )
+
         return [PropertySummaryResponse.model_validate(p) for p in properties]
 
     @staticmethod
@@ -301,10 +306,7 @@ class PropertyService:
                 
         elif preferences.lat is not None and preferences.long is not None and preferences.diameter:
             # radius = diameter / 2
-            radius_miles = float(preferences.diameter) / 2.0
-            lat_offset = radius_miles / 69.1
-            cos_lat = math.cos(math.radians(float(preferences.lat)))
-            long_offset = radius_miles / (69.1 * cos_lat) if abs(cos_lat) > 0.0001 else lat_offset
+            lat_offset, long_offset = get_lat_long_offsets(preferences.lat, preferences.diameter)
             
             filters.append(and_(
                 Property.latitude >= float(preferences.lat) - lat_offset,

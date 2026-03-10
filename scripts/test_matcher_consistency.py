@@ -74,6 +74,11 @@ async def audit_system_consistency():
                 matching_cols = await sync_service._discover_matching_collections(db, prop_data)
                 
                 if any(str(m.id) == str(col.id) for m in matching_cols):
+                    # Check if collection is at capacity (usually 500)
+                    if len(col.properties) >= 500:
+                        # Skip error for full collections - they match but aren't stored
+                        continue
+                        
                     total_fp_errors += 1
                     print(f"   🟠 FALSE POSITIVE: '{prop.street_address}' is NOT in collection but DISCOVERY ACCEPTED IT.")
                     print(f"      Specs: ${prop.price} | {prop.bedrooms}BR | {prop.home_type} | {prop.city}")

@@ -28,7 +28,7 @@ class PropertySummaryResponse(BaseModel):
     bedrooms: Optional[float] = Field(None, alias="BedroomsTotal")
     bathrooms: Optional[float] = Field(None, alias="BathroomsTotal")
     living_area: Optional[float] = Field(None, alias="LivingArea")
-    home_type: Optional[str] = Field(None, alias="HomeType")
+    home_type: Optional[str] = Field(None, alias="PropertyType")
     
     # Raw MLS data
     mls_property_type: Optional[str] = Field(None, alias="MlsPropertyType")

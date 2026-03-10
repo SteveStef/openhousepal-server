@@ -425,7 +425,7 @@ class CollectionPreferences(Base):
     cities = Column(JSONB, nullable=True)
     townships = Column(JSONB, nullable=True)
     school_districts = Column(JSONB, nullable=True)  # New column for school district preferences
-    diameter = Column(Float, default=6.0)  # Search diameter in miles
+    diameter = Column(Float, nullable=True)  # Search diameter in miles
 
     # Additional features
     special_features = Column(Text, default="")
