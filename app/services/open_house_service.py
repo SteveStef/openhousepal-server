@@ -132,16 +132,24 @@ class OpenHouseService:
             if count > 30:
                 for r in [3.0, 1.5]:
                     preferences.diameter = r
-                    count = await property_service.get_properties_count_by_preferences(db, preferences)
-                    current_radius = r
-                    if count < 30:
+                    new_count = await property_service.get_properties_count_by_preferences(db, preferences)
+                    # Only accept the smaller radius if it doesn't result in an empty collection
+                    if new_count > 0:
+                        current_radius = r
+                        count = new_count
+
+                    if count <= 30 or new_count == 0:
                         break
             elif count < 3:
                 # Try expanding the search
                 for r in [12.0, 20.0]:
                     preferences.diameter = r
-                    count = await property_service.get_properties_count_by_preferences(db, preferences)
-                    current_radius = r
+                    new_count = await property_service.get_properties_count_by_preferences(db, preferences)
+                    # Only accept the larger radius if it actually finds more properties
+                    if new_count >= count:
+                        current_radius = r
+                        count = new_count
+
                     if count >= 3:
                         break
 

@@ -358,8 +358,8 @@ class PropertySyncService:
                 CollectionPreferences.lat.isnot(None),
                 CollectionPreferences.long.isnot(None),
                 CollectionPreferences.diameter.isnot(None),
-                func.abs(CollectionPreferences.lat - lat) <= (CollectionPreferences.diameter * 0.5 * lat_offset * 2.0),
-                func.abs(CollectionPreferences.long - lng) <= (CollectionPreferences.diameter * 0.5 * long_offset * 2.0)
+                func.abs(CollectionPreferences.lat - lat) <= (CollectionPreferences.diameter * lat_offset),
+                func.abs(CollectionPreferences.long - lng) <= (CollectionPreferences.diameter * long_offset)
             )
             geo_conditions.append(radius_condition)
         
@@ -447,7 +447,7 @@ class PropertySyncService:
                         if is_within_distance(
                             col.preferences.lat, col.preferences.long, 
                             lat, lng, 
-                            col.preferences.diameter / 2.0
+                            col.preferences.diameter
                         ):
                             refined_collections.append(col)
                 else:
@@ -476,7 +476,7 @@ class PropertySyncService:
 
     async def _schedule_combined_notification(self, db: AsyncSession, collection: Collection, changes: Dict[str, Any], is_broadcast: bool = False):
         """Schedules emails and in-app alerts for a collection."""
-        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
         new_count = len(changes.get("new_properties", []))
         drop_count = len(changes.get("price_drops", []))
         

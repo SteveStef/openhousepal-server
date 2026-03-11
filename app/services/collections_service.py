@@ -181,7 +181,12 @@ class CollectionsService:
                     "is_public": bool(collection.is_public) if collection.is_public is not None else False,
                     "share_token": collection.share_token,
                     "created_at": collection.created_at.isoformat(),
-                    "updated_at": collection.updated_at.isoformat() if collection.updated_at else collection.created_at.isoformat()
+                    "updated_at": collection.updated_at.isoformat() if collection.updated_at else collection.created_at.isoformat(),
+                    "stats": {
+                        "totalProperties": total_count,
+                        "activeProperties": active_count,
+                        "lastActivity": collection.last_visitor_activity_at.isoformat() if collection.last_visitor_activity_at else collection.created_at.isoformat()
+                    }
                 }
                 collections_data.append(collection_data)
 
@@ -697,7 +702,7 @@ class CollectionsService:
                     'totalProperties': total_properties,
                     'viewedProperties': viewed_properties,
                     'likedProperties': liked_properties,
-                    'lastActivity': collection.updated_at.isoformat() if collection.updated_at else collection.created_at.isoformat()
+                    'lastActivity': collection.last_visitor_activity_at.isoformat() if collection.last_visitor_activity_at else collection.created_at.isoformat()
                 },
                 'shareToken': collection.share_token,
                 'isPublic': collection.is_public

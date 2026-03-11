@@ -128,3 +128,4 @@ notes.md
 raw_media_output.json
 raw_media_output_default.json
 raw_mls_output.json
+mailgun_templates_export/

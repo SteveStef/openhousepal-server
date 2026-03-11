@@ -9,9 +9,9 @@ EARTH_RADIUS_MILES = 3959.0
 def get_lat_long_offsets(lat: float, diameter_miles: float) -> Tuple[float, float]:
     """
     Calculates latitude and longitude offsets for a bounding box 
-    given a center latitude and a search diameter in miles.
+    given a center latitude and a search distance in miles.
     """
-    radius_miles = float(diameter_miles) / 2.0
+    radius_miles = float(diameter_miles)
     lat_offset = radius_miles / MILES_PER_LAT_DEGREE
     cos_lat = math.cos(math.radians(float(lat)))
     
@@ -59,7 +59,7 @@ def filter_properties_by_radius(properties: List[Any], center_lat: float,
     
     Works with both objects (p.latitude) and dictionaries (p['Latitude']).
     """
-    radius_miles = float(diameter_miles) / 2.0
+    radius_miles = float(diameter_miles)
     filtered = []
     
     for p in properties:

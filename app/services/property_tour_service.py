@@ -154,6 +154,10 @@ class PropertyTourService:
                 preferred_dates.append(f"{formatted_date} at {formatted_time}")
 
             email_service = EmailService()
+            
+            # Create full address string
+            full_address = f"{property_obj.street_address}, {property_obj.city}, {property_obj.state} {property_obj.zipcode or ''}".strip()
+            
             email_service.send_simple_message(
                 to_email=agent.email,
                 subject=f"New Tour Request - {property_obj.street_address}",
@@ -163,7 +167,8 @@ class PropertyTourService:
                     "visitor_name": visitor_name,
                     "visitor_email": visitor_email,
                     "visitor_phone": visitor_phone or "Not provided",
-                    "property_address": property_obj.street_address,
+                    "property_address": full_address,
+                    "property_image": property_obj.img_src,
                     "preferred_dates": ", ".join(preferred_dates) if preferred_dates else "No specific dates provided",
                     "message": tour_data.message or ""
                 }

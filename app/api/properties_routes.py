@@ -132,24 +132,47 @@ async def message_agent(
 ):
     """Send a message to an agent from a visitor on the property page"""
     try:
-        # 1. Find the agent
-        stmt = select(User).where(User.id == request.agent_id)
-        result = await db.execute(stmt)
-        agent = result.scalar_one_or_none()
+        # 1. Find the agent and property
+        agent_stmt = select(User).where(User.id == request.agent_id)
+        agent_result = await db.execute(agent_stmt)
+        agent = agent_result.scalar_one_or_none()
         
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
-            
+
+        property_stmt = select(Property).where(Property.id == request.property_id)
+        property_result = await db.execute(property_stmt)
+        property_obj = property_result.scalar_one_or_none()
+
+        # Create full address string and get image
+        if property_obj:
+            full_address = f"{property_obj.street_address}, {property_obj.city}, {property_obj.state} {property_obj.zipcode or ''}".strip()
+            property_image = property_obj.img_src
+        else:
+            full_address = request.property_address
+            property_image = None
+
+        # Handle visitor contact (split into email/phone)
+        visitor_email = None
+        visitor_phone = None
+        contact = (request.visitor_contact or "").strip()
+        if "@" in contact:
+            visitor_email = contact
+        else:
+            visitor_phone = contact
+
         # 2. Schedule the email inquiry
         scheduled_email = ScheduledEmail(
             recipient_email=agent.email,
             subject=f"New Inquiry from {request.visitor_name} for {request.property_address}",
-            template_name="similar_property_visitor_message_template",
+            template_name="similar_property_visitor_message",
             template_variables={
                 "agent_name": f"{agent.first_name} {agent.last_name}",
                 "visitor_name": request.visitor_name,
-                "visitor_contact": request.visitor_contact,
-                "property_address": request.property_address,
+                "visitor_email": visitor_email or "Not provided",
+                "visitor_phone": visitor_phone or "Not provided",
+                "property_address": full_address,
+                "property_image": property_image,
                 "message": request.message,
                 "today_date": datetime.now().strftime("%m/%d/%Y")
             },
@@ -186,6 +209,15 @@ async def message_agent(
         raise HTTPException(status_code=500, detail="Failed to send message to agent")
 
 # TODO
+def _format_tour_datetime(date_str: str, time_str: str) -> str:
+    """Format YYYY-MM-DD and HH:MM to M/D/YYYY h:mmam/pm"""
+    try:
+        dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        # Format: 2/2/2026 1:15pm
+        return dt.strftime("%-m/%-d/%Y %-I:%M%p").lower()
+    except Exception:
+        return f"{date_str} {time_str}"
+
 @router.post("/schedule-tour")
 async def schedule_tour(
     request: ScheduleTourRequest,
@@ -193,33 +225,61 @@ async def schedule_tour(
 ):
     """Schedule a tour for a property and notify the agent"""
     try:
-        # 1. Find the agent
-        stmt = select(User).where(User.id == request.agent_id)
-        result = await db.execute(stmt)
-        agent = result.scalar_one_or_none()
+        # 1. Find the agent and property
+        agent_stmt = select(User).where(User.id == request.agent_id)
+        agent_result = await db.execute(agent_stmt)
+        agent = agent_result.scalar_one_or_none()
         
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
-            
-        # 2. Format preferred dates for the email
-        preferred_dates = f"1. {request.preferred_date} at {request.preferred_time}"
-        if request.preferred_date_2 and request.preferred_time_2:
-            preferred_dates += f"\n2. {request.preferred_date_2} at {request.preferred_time_2}"
-        if request.preferred_date_3 and request.preferred_time_3:
-            preferred_dates += f"\n3. {request.preferred_date_3} at {request.preferred_time_3}"
 
-        # 3. Schedule the email notification
+        property_stmt = select(Property).where(Property.id == request.property_id)
+        property_result = await db.execute(property_stmt)
+        property_obj = property_result.scalar_one_or_none()
+
+        # Create full address string and get image
+        if property_obj:
+            full_address = f"{property_obj.street_address}, {property_obj.city}, {property_obj.state} {property_obj.zipcode or ''}".strip()
+            property_image = property_obj.img_src
+        else:
+            full_address = request.property_address
+            property_image = None
+            
+        # 2. Format preferred dates for the email (M/D/YYYY h:mmam/pm)
+        dates = []
+        if request.preferred_date and request.preferred_time:
+            dates.append(f"1. {_format_tour_datetime(request.preferred_date, request.preferred_time)}")
+        if request.preferred_date_2 and request.preferred_time_2:
+            dates.append(f"2. {_format_tour_datetime(request.preferred_date_2, request.preferred_time_2)}")
+        if request.preferred_date_3 and request.preferred_time_3:
+            dates.append(f"3. {_format_tour_datetime(request.preferred_date_3, request.preferred_time_3)}")
+        
+        preferred_dates_str = "\n".join(dates) if dates else "No specific dates provided"
+
+        # 3. Handle visitor contact (split into email/phone)
+        visitor_email = None
+        visitor_phone = None
+        contact = (request.visitor_contact or "").strip()
+        if "@" in contact:
+            visitor_email = contact
+        else:
+            visitor_phone = contact
+
+        # 4. Schedule the email notification
         scheduled_email = ScheduledEmail(
             recipient_email=agent.email,
             subject=f"Tour Request from {request.visitor_name or 'Visitor'} for {request.property_address}",
             template_name="similar_property_visitor_tour_request",
             template_variables={
                 "agent_name": f"{agent.first_name} {agent.last_name}",
+                "message": request.message or "I'm interested in touring this property!",
+                "preferred_dates": preferred_dates_str,
+                "property_address": full_address,
+                "property_image": property_image,
+                "today_date": datetime.now().strftime("%m/%d/%Y"),
+                "visitor_email": visitor_email or "Not provided",
                 "visitor_name": request.visitor_name or "Interested Visitor",
-                "visitor_contact": request.visitor_contact or "Not provided",
-                "property_address": request.property_address,
-                "preferred_dates": preferred_dates,
-                "today_date": datetime.now().strftime("%m/%d/%Y")
+                "visitor_phone": visitor_phone or "Not provided"
             },
             scheduled_for=datetime.now(timezone.utc)
         )

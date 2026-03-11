@@ -74,14 +74,15 @@ class PropertyInteractionsService:
         await db.commit()
         await db.refresh(interaction)
 
-        # Send email to agent if visitor liked the property
+        # Send email to agent if visitor liked the property (NOT if agent themselves liked it)
         if interaction.liked:
             collection_result = await db.execute(
                 select(Collection).where(Collection.id == collection_id)
             )
             collection = collection_result.scalar_one_or_none()
 
-            if collection:
+            # Only send email if the interaction was performed by an anonymous visitor
+            if collection and user_id is None:
                 agent_result = await db.execute(
                     select(User).where(User.id == collection.owner_id)
                 )
@@ -95,6 +96,9 @@ class PropertyInteractionsService:
                 if agent and agent.email and property_obj:
                     frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
                     collection_link = f"{frontend_url}/showcases?showcase={collection_id}"
+                    
+                    # Create full address string
+                    full_address = f"{property_obj.street_address}, {property_obj.city}, {property_obj.state} {property_obj.zipcode or ''}".strip()
 
                     email_service = EmailService()
                     email_service.send_simple_message(
@@ -104,7 +108,8 @@ class PropertyInteractionsService:
                         template_variables={
                             "agent_name": agent.first_name,
                             "visitor_name": collection.visitor_name or "A visitor",
-                            "property_address": property_obj.street_address,
+                            "property_address": full_address,
+                            "property_image": property_obj.img_src,
                             "collection_link": collection_link
                         }
                     )
@@ -162,6 +167,19 @@ class PropertyInteractionsService:
                 logger.error("Failed to create property interaction notification", extra={"error": str(e)})
                 # Don't fail the interaction if notification creation fails
 
+        # Update the collection's activity timestamp if this is a visitor
+        if user_id is None:
+            try:
+                from sqlalchemy import update
+                await db.execute(
+                    update(Collection)
+                    .where(Collection.id == collection_id)
+                    .values(last_visitor_activity_at=datetime.now())
+                )
+                await db.commit()
+            except Exception as e:
+                logger.error(f"Failed to update collection visitor activity timestamp: {e}")
+
         return PropertyInteractionResponse.from_orm(interaction)
 
     @classmethod
@@ -206,6 +224,17 @@ class PropertyInteractionsService:
             )
             db.add(interaction)
 
+        # Update the collection's activity timestamp to track last VISITOR activity
+        try:
+            from sqlalchemy import update
+            await db.execute(
+                update(Collection)
+                .where(Collection.id == collection_id)
+                .values(last_visitor_activity_at=current_time)
+            )
+        except Exception as e:
+            logger.error(f"Failed to update collection visitor activity timestamp: {e}")
+
         await db.commit()
         await db.refresh(interaction)
 
@@ -241,13 +270,14 @@ class PropertyInteractionsService:
         await db.commit()
         await db.refresh(comment)
 
-        # Send email notification to agent
+        # Send email notification to agent (NOT if agent themselves commented)
         collection_result = await db.execute(
             select(Collection).where(Collection.id == collection_id)
         )
         collection = collection_result.scalar_one_or_none()
 
-        if collection:
+        # Only send email and notification if the interaction was performed by an anonymous visitor
+        if collection and user_id is None:
             agent_result = await db.execute(
                 select(User).where(User.id == collection.owner_id)
             )
@@ -261,6 +291,9 @@ class PropertyInteractionsService:
             if agent and agent.email and property_obj:
                 frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
                 collection_link = f"{frontend_url}/showcases"
+                
+                # Create full address string
+                full_address = f"{property_obj.street_address}, {property_obj.city}, {property_obj.state} {property_obj.zipcode or ''}".strip()
 
                 email_service = EmailService()
                 email_service.send_simple_message(
@@ -268,44 +301,84 @@ class PropertyInteractionsService:
                     subject=f"New Comment on Property - {property_obj.street_address}",
                     template="property_comment",
                     template_variables={
-                        "recipient_name": agent.first_name,
-                        "commenter_name": comment.visitor_name or "A visitor",
-                        "property_address": property_obj.street_address,
-                        "comment_text": content,
+                        "agent_name": agent.first_name,
+                        "visitor_name": comment.visitor_name or "A visitor",
+                        "property_address": full_address,
+                        "property_image": property_obj.img_src,
+                        "message": content,
                         "collection_link": collection_link
                     }
                 )
 
                 # Create in-app notification for agent
                 try:
-                    # Skip notification if the user is the agent (owner) themselves
-                    if user_id and user_id == collection.owner_id:
-                        # Don't create notification for agent's own comment
-                        pass
-                    else:
-                        # Truncate comment for notification if it's too long
-                        comment_preview = content[:100] + "..." if len(content) > 100 else content
+                    # Truncate comment for notification if it's too long
+                    comment_preview = content[:100] + "..." if len(content) > 100 else content
 
-                        notification = Notification(
-                            agent_id=collection.owner_id,
-                            type="PROPERTY_COMMENT",
-                            reference_type="COMMENT",
-                            reference_id=comment.id,
-                            title=f"New Comment: {comment.visitor_name or 'Anonymous'}",
-                            message=f"Commented on {property_obj.street_address}: \"{comment_preview}\"",
-                            collection_id=collection_id,
-                            collection_name=collection.name,
-                            property_id=property_id,
-                            property_address=property_obj.street_address,
-                            visitor_name=comment.visitor_name,
-                            link=f"/showcases?showcase={collection_id}&property={property_id}",
-                            is_read=False,
-                            created_at=datetime.utcnow()
-                        )
-                        db.add(notification)
-                        await db.commit()
+                    notification = Notification(
+                        agent_id=collection.owner_id,
+                        type="PROPERTY_COMMENT",
+                        reference_type="COMMENT",
+                        reference_id=comment.id,
+                        title=f"New Comment: {comment.visitor_name or 'Anonymous'}",
+                        message=f"Commented on {property_obj.street_address}: \"{comment_preview}\"",
+                        is_read=False,
+                        created_at=datetime.utcnow()
+                    )
+                    db.add(notification)
+                    await db.commit()
                 except Exception as e:
                     logger.error("Failed to create property comment notification", extra={"error": str(e)})
+
+        # Update the collection's activity timestamp if this is a visitor
+        if user_id is None:
+            try:
+                from sqlalchemy import update
+                await db.execute(
+                    update(Collection)
+                    .where(Collection.id == collection_id)
+                    .values(last_visitor_activity_at=datetime.now())
+                )
+                await db.commit()
+            except Exception as e:
+                logger.error(f"Failed to update collection visitor activity timestamp: {e}")
+
+        # If the agent (owner) comments, email the visitor
+        elif collection and user_id == collection.owner_id and collection.visitor_email:
+            agent = collection.owner
+            property_result = await db.execute(
+                select(Property).where(Property.id == property_id)
+            )
+            property_obj = property_result.scalar_one_or_none()
+
+            if agent and property_obj:
+                frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
+                # Use public share link for visitor
+                collection_link = f"{frontend_url}/showcase/{collection.share_token}"
+                
+                # Create full address string
+                full_address = f"{property_obj.street_address}, {property_obj.city}, {property_obj.state} {property_obj.zipcode or ''}".strip()
+
+                email_service = EmailService()
+                email_service.send_simple_message(
+                    to_email=collection.visitor_email,
+                    subject=f"Your agent commented on a property: {property_obj.street_address}",
+                    template="agent_comment_response",
+                    template_variables={
+                        "agent_name": f"{agent.first_name} {agent.last_name}",
+                        "recipient_name": collection.visitor_name or "Valued Visitor",
+                        "message": content,
+                        "property_image": property_obj.img_src,
+                        "property_address": full_address,
+                        "property_beds": property_obj.bedrooms,
+                        "property_baths": property_obj.bathrooms,
+                        "property_sqft": property_obj.living_area,
+                        "property_price": f"${property_obj.price:,.0f}" if property_obj.price else "N/A",
+                        "collection_link": collection_link,
+                        "agent_email": agent.email,
+                        "agent_phone": getattr(agent, 'phone', "")
+                    }
+                )
                     # Don't fail the comment creation if notification creation fails
 
         # Create response and populate author field from visitor_name

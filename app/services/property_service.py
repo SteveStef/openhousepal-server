@@ -7,7 +7,7 @@ from sqlalchemy import select, and_, or_, func
 from app.schemas.collection_preferences import CollectionPreferencesBase as CollectionPreferencesSchema
 from app.models.database import Property
 from app.models.property import PropertySummaryResponse, PropertyDetailResponse
-from app.utils.geo import get_lat_long_offsets, filter_properties_by_radius
+from app.utils.geo import get_lat_long_offsets, filter_properties_by_radius, is_within_distance
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -254,7 +254,22 @@ class PropertyService:
     @staticmethod
     async def get_properties_count_by_preferences(db: AsyncSession, preferences: CollectionPreferencesSchema) -> int:
         """Fetch only the count of matching properties without downloading records."""
-        query = select(func.count(Property.id))
+        # Use precise circular filtering if searching by radius (no explicit locations)
+        # to ensure count matches actual discovery logic.
+        use_circular_filter = (
+            not preferences.cities and 
+            not preferences.townships and 
+            not preferences.school_districts and 
+            preferences.lat is not None and 
+            preferences.long is not None and 
+            preferences.diameter
+        )
+
+        if use_circular_filter:
+            query = select(Property.latitude, Property.longitude)
+        else:
+            query = select(func.count(Property.id))
+
         filters = []
         exempt_types = ['LAND', 'FARM', 'COMMERCIAL', 'RESIDENTIAL_LEASE', 'OTHER']
 
@@ -375,7 +390,21 @@ class PropertyService:
             query = query.where(and_(*filters))
 
         result = await db.execute(query)
-        return result.scalar() or 0
+        
+        if use_circular_filter:
+            # Perform precise circular filter on the bounding box results
+            rows = result.all()
+            center_lat = float(preferences.lat)
+            center_long = float(preferences.long)
+            radius_miles = float(preferences.diameter)
+            
+            count = 0
+            for p_lat, p_lon in rows:
+                if is_within_distance(center_lat, center_long, p_lat, p_lon, radius_miles):
+                    count += 1
+            return count
+        else:
+            return result.scalar() or 0
 
     @staticmethod
     async def bright_mls_id_exists(db: AsyncSession, mls_id: str) -> bool:
