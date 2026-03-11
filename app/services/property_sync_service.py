@@ -490,14 +490,16 @@ class PropertySyncService:
         total_count_res = await db.execute(total_count_query)
         total_count = total_count_res.scalar() or 0
 
+        # Create full address string
+        full_address = f"{featured.get('street_address')}, {featured.get('city')}, {featured.get('state')} {featured.get('zipcode', '')}".strip()
+
         common_vars = {
             "collection_name": collection.name,
             "visitor_name": collection.visitor_name or "Valued Visitor",
-            "collection_link": f"{frontend_url}/showcase/{collection.share_token}",
             "new_count": new_count,
             "drop_count": drop_count,
             "total_count": total_count,
-            "property_address": featured.get('street_address'),
+            "property_address": full_address,
             "property_image": featured.get('img_src'),
             "property_price": f"${featured.get('price', 0):,}",
             "property_beds": featured.get('bedrooms'),
@@ -511,6 +513,7 @@ class PropertySyncService:
             template = "price_drop_alert" if (is_broadcast or (drop_count > 0 and new_count == 0)) else "new_properties_synced"
             visitor_vars = {
                 **common_vars,
+                "collection_link": f"{frontend_url}/showcase/{collection.share_token}",
                 "recipient_name": collection.visitor_name or "Valued Visitor",
                 "agent_name": f"{collection.owner.first_name} {collection.owner.last_name}" if collection.owner else "Your Agent",
                 "agent_email": collection.owner.email if collection.owner else "",
@@ -527,7 +530,11 @@ class PropertySyncService:
 
         # 2. Agent Email
         if collection.owner and collection.owner.email:
-            agent_vars = {**common_vars, "recipient_name": collection.owner.first_name}
+            agent_vars = {
+                **common_vars, 
+                "collection_link": f"{frontend_url}/showcases?showcase={collection.id}",
+                "recipient_name": collection.owner.first_name
+            }
             db.add(ScheduledEmail(
                 recipient_email=collection.owner.email,
                 subject=f"Showcase Updated: {collection.visitor_name or 'Visitor'} - {collection.name}",
