@@ -158,7 +158,8 @@ class CollectionsService:
                         'AssociationYN': prop.has_association,
                         'ListPictureURL': prop.img_src,
                         'PublicRemarks': '',
-                        'ModificationTimestamp': prop.updated_at.isoformat() if prop.updated_at else None,
+                        'ModificationTimestamp': prop.modification_timestamp.isoformat() if prop.modification_timestamp else (prop.updated_at.isoformat() if prop.updated_at else None),
+                        'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,
                         'MlsStatus': prop.home_status,
                     }
                     properties_data.append(property_dict)
@@ -253,9 +254,9 @@ class CollectionsService:
                     'AssociationYN': prop.has_association,
                     'ListPictureURL': prop.img_src,
                     'PublicRemarks': '',
-                    'ModificationTimestamp': prop.updated_at.isoformat() if prop.updated_at else None,
-                    'MlsStatus': prop.home_status,
-                }
+                    'ModificationTimestamp': prop.modification_timestamp.isoformat() if prop.modification_timestamp else (prop.updated_at.isoformat() if prop.updated_at else None),
+                    'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,
+                    'MlsStatus': prop.home_status,                }
                 properties.append(property_dict)
 
             # Get preferences data if available
@@ -636,9 +637,9 @@ class CollectionsService:
                     'AssociationYN': prop.has_association,
                     'ListPictureURL': prop.img_src,
                     'PublicRemarks': '',
-                    'ModificationTimestamp': prop.updated_at.isoformat() if prop.updated_at else None,
-                    'MlsStatus': prop.home_status,
-                    # Real interaction data from database
+                    'ModificationTimestamp': prop.modification_timestamp.isoformat() if prop.modification_timestamp else (prop.updated_at.isoformat() if prop.updated_at else None),
+                    'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,
+                    'MlsStatus': prop.home_status,                    # Real interaction data from database
                     'liked': interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
@@ -1008,9 +1009,9 @@ class CollectionsService:
                     'AssociationYN': prop.has_association,
                     'ListPictureURL': prop.img_src,
                     'PublicRemarks': '',
-                    'ModificationTimestamp': prop.updated_at.isoformat() if prop.updated_at else None,
-                    'MlsStatus': prop.home_status,
-                    'liked': interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
+                    'ModificationTimestamp': prop.modification_timestamp.isoformat() if prop.modification_timestamp else (prop.updated_at.isoformat() if prop.updated_at else None),
+                    'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,
+                    'MlsStatus': prop.home_status,                    'liked': interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
                     'viewCount': interactions_lookup[prop.id].view_count if prop.id in interactions_lookup else 0,
