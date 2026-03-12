@@ -168,10 +168,10 @@ class PropertyService:
             ))
 
         # 2. Status Filtering
-        # Match statuses starting with ACTIVE or COMING SOON
+        # Match exact BRIGHT statuses
         filters.append(or_(
-            Property.home_status.ilike('ACTIVE%'),
-            Property.home_status.ilike('COMING SOON%')
+            Property.home_status == 'ACTIVE-BRIGHT',
+            Property.home_status == 'COMING SOON-BRIGHT'
         ))
 
         # 3. Numeric Filters (with Smart Exemptions)
@@ -332,8 +332,8 @@ class PropertyService:
 
         # 2. Status Filtering
         filters.append(or_(
-            Property.home_status.ilike('ACTIVE%'),
-            Property.home_status.ilike('COMING SOON%')
+            Property.home_status == 'ACTIVE-BRIGHT',
+            Property.home_status == 'COMING SOON-BRIGHT'
         ))
 
         # 3. Numeric Filters (with Smart Exemptions)

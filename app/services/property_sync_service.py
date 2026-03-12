@@ -252,7 +252,13 @@ class PropertySyncService:
         
         for col in existing_collections:
             if event["type"] == "PRICE_DROP":
-                changes = {"new_properties": [], "price_drops": [event["data"]]}
+                # Include price change info in the data
+                drop_data = {
+                    **event["data"],
+                    "old_price_raw": event.get("old_price"),
+                    "new_price_raw": event.get("new_price")
+                }
+                changes = {"new_properties": [], "price_drops": [drop_data]}
                 await self._schedule_combined_notification(db, col, changes, is_broadcast=True)
                 count += 1
                 
@@ -511,13 +517,24 @@ class PropertySyncService:
         # 1. Visitor Email
         if collection.visitor_email:
             template = "price_drop_alert" if (is_broadcast or (drop_count > 0 and new_count == 0)) else "new_properties_synced"
+            
+            # Calculate price drop variables if applicable
+            old_p = featured.get("old_price_raw")
+            new_p = featured.get("new_price_raw")
+            savings = 0
+            if old_p and new_p:
+                savings = old_p - new_p
+
             visitor_vars = {
                 **common_vars,
                 "collection_link": f"{frontend_url}/showcase/{collection.share_token}",
                 "recipient_name": collection.visitor_name or "Valued Visitor",
                 "agent_name": f"{collection.owner.first_name} {collection.owner.last_name}" if collection.owner else "Your Agent",
                 "agent_email": collection.owner.email if collection.owner else "",
-                "agent_phone": getattr(collection.owner, 'phone', "") if collection.owner else ""
+                "agent_phone": getattr(collection.owner, 'phone', "") if collection.owner else "",
+                "old_price": f"${old_p:,.0f}" if old_p else None,
+                "new_price": f"${new_p:,.0f}" if new_p else None,
+                "savings": f"${savings:,.0f}" if savings > 0 else None
             }
             db.add(ScheduledEmail(
                 recipient_email=collection.visitor_email,
