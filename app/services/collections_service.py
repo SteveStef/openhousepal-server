@@ -23,6 +23,20 @@ logger = get_logger(__name__)
 class CollectionsService:
 
     @staticmethod
+    def _calculate_dom(mls_list_date: Optional[datetime]) -> Optional[int]:
+        """Calculates days on market based on now and mls_list_date."""
+        if not mls_list_date:
+            return None
+        
+        now = datetime.now(timezone.utc)
+        list_date = mls_list_date
+        if list_date.tzinfo is None:
+            list_date = list_date.replace(tzinfo=timezone.utc)
+        
+        delta = now - list_date
+        return max(0, delta.days)
+
+    @staticmethod
     async def count_active_collections(db: AsyncSession, user_id: str) -> int:
         """Count the number of active collections for a user"""
         try:
@@ -154,7 +168,7 @@ class CollectionsService:
                         'LotSizeSquareFeet': prop.lot_size,
                         'PropertyType': prop.home_type,
                         'YearBuilt': prop.year_built,
-                        'DaysOnMarket': prop.days_on_market,
+                        'DaysOnMarket': CollectionsService._calculate_dom(prop.mls_list_date),
                         'AssociationYN': prop.has_association,
                         'ListPictureURL': prop.img_src,
                         'PublicRemarks': '',
@@ -170,6 +184,8 @@ class CollectionsService:
                     "name": collection.name,
                     "description": collection.description or "",
                     "status": collection.status or "ACTIVE",
+                    "notify_visitor": collection.notify_visitor if hasattr(collection, 'notify_visitor') else True,
+                    "notify_agent": collection.notify_agent if hasattr(collection, 'notify_agent') else True,
                     "visitor_name": collection.visitor_name,
                     "visitor_email": collection.visitor_email,
                     "visitor_phone": collection.visitor_phone,
@@ -250,7 +266,7 @@ class CollectionsService:
                     'LotSizeSquareFeet': prop.lot_size,
                     'PropertyType': prop.home_type,
                     'YearBuilt': prop.year_built,
-                    'DaysOnMarket': prop.days_on_market,
+                    'DaysOnMarket': CollectionsService._calculate_dom(prop.mls_list_date),
                     'AssociationYN': prop.has_association,
                     'ListPictureURL': prop.img_src,
                     'PublicRemarks': '',
@@ -306,6 +322,9 @@ class CollectionsService:
                 "is_anonymous": collection.owner_id is None,
                 "is_public": collection.is_public or False,
                 "share_token": collection.share_token,
+                "status": collection.status,
+                "notify_visitor": collection.notify_visitor if hasattr(collection, 'notify_visitor') else True,
+                "notify_agent": collection.notify_agent if hasattr(collection, 'notify_agent') else True,
                 "created_at": collection.created_at.isoformat(),
                 "updated_at": collection.updated_at.isoformat() if collection.updated_at else collection.created_at.isoformat()
             }
@@ -371,6 +390,8 @@ class CollectionsService:
                 "is_public": collection.is_public,
                 "share_token": collection.share_token,
                 "status": collection.status,
+                "notify_visitor": collection.notify_visitor if hasattr(collection, 'notify_visitor') else True,
+                "notify_agent": collection.notify_agent if hasattr(collection, 'notify_agent') else True,
                 "created_at": collection.created_at.isoformat(),
                 "updated_at": collection.updated_at.isoformat()
             }
@@ -400,8 +421,83 @@ class CollectionsService:
             if not collection:
                 return False
 
+            old_status = collection.status
+
             # Update the status column directly
             collection.status = status
+            collection.updated_at = datetime.utcnow()
+
+            await db.commit()
+
+            # If reactivating, catch up on missed properties that were listed while inactive
+            if status == 'ACTIVE' and old_status != 'ACTIVE':
+                try:
+                    await CollectionsService.repopulate_collection_from_preferences(db, collection_id, commit=True)
+                except Exception as e:
+                    logger.error(f"Failed to repopulate collection {collection_id} after reactivation: {e}")
+                    # We don't fail the status update if repopulation fails
+
+            return True
+
+        except Exception as e:
+            logger.error("Operation failed", extra={"error": str(e)})
+            await db.rollback()
+            raise e
+
+    @staticmethod
+    async def update_collection_notifications(
+        db: AsyncSession,
+        collection_id: str,
+        user_id: str,
+        notify_visitor: bool,
+        notify_agent: bool
+    ) -> bool:
+        """Update collection notification settings"""
+        try:
+            query = select(Collection).where(
+                Collection.id == collection_id,
+                Collection.owner_id == user_id
+            )
+
+            result = await db.execute(query)
+            collection = result.scalar_one_or_none()
+
+            if not collection:
+                return False
+
+            # Update the notification columns directly
+            collection.notify_visitor = notify_visitor
+            collection.notify_agent = notify_agent
+            collection.updated_at = datetime.utcnow()
+
+            await db.commit()
+            return True
+
+        except Exception as e:
+            logger.error("Operation failed", extra={"error": str(e)})
+            await db.rollback()
+            raise e
+
+    @staticmethod
+    async def update_shared_collection_notifications(
+        db: AsyncSession,
+        share_token: str,
+        notify_visitor: bool
+    ) -> bool:
+        """Update collection notification settings via share token (for visitors)"""
+        try:
+            query = select(Collection).where(
+                Collection.share_token == share_token
+            )
+
+            result = await db.execute(query)
+            collection = result.scalar_one_or_none()
+
+            if not collection:
+                return False
+
+            # Update the visitor notification column
+            collection.notify_visitor = notify_visitor
             collection.updated_at = datetime.utcnow()
 
             await db.commit()
@@ -633,7 +729,7 @@ class CollectionsService:
                     'LotSizeSquareFeet': prop.lot_size,
                     'PropertyType': prop.home_type,
                     'YearBuilt': prop.year_built,
-                    'DaysOnMarket': prop.days_on_market,
+                    'DaysOnMarket': CollectionsService._calculate_dom(prop.mls_list_date),
                     'AssociationYN': prop.has_association,
                     'ListPictureURL': prop.img_src,
                     'PublicRemarks': '',
@@ -670,6 +766,7 @@ class CollectionsService:
                 'createdAt': collection.created_at.isoformat(),
                 'updatedAt': collection.updated_at.isoformat() if collection.updated_at else collection.created_at.isoformat(),
                 'status': collection.status or 'ACTIVE',
+                'notifyVisitor': collection.notify_visitor if hasattr(collection, 'notify_visitor') else True,
                 'preferences': {
                     'min_beds': collection.preferences.min_beds,
                     'max_beds': collection.preferences.max_beds,
@@ -1005,7 +1102,7 @@ class CollectionsService:
                     'LotSizeSquareFeet': prop.lot_size,
                     'PropertyType': prop.home_type,
                     'YearBuilt': prop.year_built,
-                    'DaysOnMarket': prop.days_on_market,
+                    'DaysOnMarket': CollectionsService._calculate_dom(prop.mls_list_date),
                     'AssociationYN': prop.has_association,
                     'ListPictureURL': prop.img_src,
                     'PublicRemarks': '',

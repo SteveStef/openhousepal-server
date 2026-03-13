@@ -6,6 +6,8 @@ class CollectionBase(BaseModel):
     name: str
     description: Optional[str] = None
     is_public: bool = False
+    notify_visitor: bool = True
+    notify_agent: bool = True
 
 class CollectionCreate(CollectionBase):
     pass
@@ -14,6 +16,8 @@ class CollectionUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     is_public: Optional[bool] = None
+    notify_visitor: Optional[bool] = None
+    notify_agent: Optional[bool] = None
 
 class Collection(CollectionBase):
     id: str
@@ -40,6 +44,8 @@ class CollectionResponse(BaseModel):
     name: str
     description: str
     status: str = "ACTIVE"
+    notify_visitor: bool = True
+    notify_agent: bool = True
     visitor_name: Optional[str] = None
     visitor_email: Optional[str] = None
     visitor_phone: Optional[str] = None

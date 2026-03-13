@@ -1,7 +1,7 @@
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 from typing import Optional, List, Dict, Any, Union
-from datetime import datetime
+from datetime import datetime, timezone
 
 class PropertySummaryResponse(BaseModel):
     """
@@ -49,6 +49,17 @@ class PropertySummaryResponse(BaseModel):
     year_built: Optional[int] = Field(None, alias="YearBuilt")
     mls_list_date: Optional[datetime] = Field(None, alias="MLSListDate")
     price_change_timestamp: Optional[datetime] = Field(None, alias="PriceChangeTimestamp")
+
+    @model_validator(mode='after')
+    def calculate_dom(self) -> 'PropertySummaryResponse':
+        if self.mls_list_date:
+            now = datetime.now(timezone.utc)
+            list_date = self.mls_list_date
+            if list_date.tzinfo is None:
+                list_date = list_date.replace(tzinfo=timezone.utc)
+            delta = now - list_date
+            self.days_on_market = max(0, delta.days)
+        return self
 
 class PropertyDetailResponse(PropertySummaryResponse):
     """
@@ -163,6 +174,17 @@ class PropertyDetailResponse(PropertySummaryResponse):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     modification_timestamp: Optional[datetime] = Field(None, alias="ModificationTimestamp")
+
+    @model_validator(mode='after')
+    def calculate_dom(self) -> 'PropertyDetailResponse':
+        if self.mls_list_date:
+            now = datetime.now(timezone.utc)
+            list_date = self.mls_list_date
+            if list_date.tzinfo is None:
+                list_date = list_date.replace(tzinfo=timezone.utc)
+            delta = now - list_date
+            self.days_on_market = max(0, delta.days)
+        return self
 
 class PropertyLookupRequest(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, from_attributes=True)

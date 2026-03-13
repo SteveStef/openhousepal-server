@@ -19,6 +19,7 @@ from app.services.bright_mls_service import bright_mls_service
 from app.utils.mls_mapper import map_reso_to_internal
 from app.utils.geo import get_lat_long_offsets, is_within_distance
 from app.services.email_service import EmailService
+from app.services.blacklist_service import BlacklistService
 from app.config.logging import get_logger
 from app.database import AsyncSessionLocal
 
@@ -515,38 +516,43 @@ class PropertySyncService:
         }
 
         # 1. Visitor Email
-        if collection.visitor_email:
-            template = "price_drop_alert" if (is_broadcast or (drop_count > 0 and new_count == 0)) else "new_properties_synced"
-            
-            # Calculate price drop variables if applicable
-            old_p = featured.get("old_price_raw")
-            new_p = featured.get("new_price_raw")
-            savings = 0
-            if old_p and new_p:
-                savings = old_p - new_p
+        if collection.visitor_email and getattr(collection, 'notify_visitor', True):
+            # Check if visitor is blacklisted
+            if await BlacklistService.is_blacklisted(db, collection.visitor_email):
+                logger.info(f"Skipping scheduled email for blacklisted visitor: {collection.visitor_email}")
+            else:
+                template = "price_drop_alert" if (is_broadcast or (drop_count > 0 and new_count == 0)) else "new_properties_synced"
+                
+                # Calculate price drop variables if applicable
+                old_p = featured.get("old_price_raw")
+                new_p = featured.get("new_price_raw")
+                savings = 0
+                if old_p and new_p:
+                    savings = old_p - new_p
 
-            visitor_vars = {
-                **common_vars,
-                "collection_link": f"{frontend_url}/showcase/{collection.share_token}",
-                "recipient_name": collection.visitor_name or "Valued Visitor",
-                "agent_name": f"{collection.owner.first_name} {collection.owner.last_name}" if collection.owner else "Your Agent",
-                "agent_email": collection.owner.email if collection.owner else "",
-                "agent_phone": getattr(collection.owner, 'phone', "") if collection.owner else "",
-                "old_price": f"${old_p:,.0f}" if old_p else None,
-                "new_price": f"${new_p:,.0f}" if new_p else None,
-                "savings": f"${savings:,.0f}" if savings > 0 else None
-            }
-            db.add(ScheduledEmail(
-                recipient_email=collection.visitor_email,
-                subject=f"Updates for your showcase: {collection.name}",
-                template_name=template,
-                template_variables=visitor_vars,
-                status="PENDING",
-                scheduled_for=datetime.now(timezone.utc)
-            ))
+                visitor_vars = {
+                    **common_vars,
+                    "collection_link": f"{frontend_url}/showcase/{collection.share_token}",
+                    "recipient_name": collection.visitor_name or "Valued Visitor",
+                    "agent_name": f"{collection.owner.first_name} {collection.owner.last_name}" if collection.owner else "Your Agent",
+                    "agent_email": collection.owner.email if collection.owner else "",
+                    "agent_phone": getattr(collection.owner, 'phone', "") if collection.owner else "",
+                    "old_price": f"${old_p:,.0f}" if old_p else None,
+                    "new_price": f"${new_p:,.0f}" if new_p else None,
+                    "savings": f"${savings:,.0f}" if savings > 0 else None,
+                    "Unsub": f"{frontend_url}/unsubscribe?email={collection.visitor_email}"
+                }
+                db.add(ScheduledEmail(
+                    recipient_email=collection.visitor_email,
+                    subject="New Listing: A Property Was Added to Your Showcase",
+                    template_name=template,
+                    template_variables=visitor_vars,
+                    status="PENDING",
+                    scheduled_for=datetime.now(timezone.utc)
+                ))
 
         # 2. Agent Email
-        if collection.owner and collection.owner.email:
+        if collection.owner and collection.owner.email and getattr(collection, 'notify_agent', True):
             agent_vars = {
                 **common_vars, 
                 "collection_link": f"{frontend_url}/showcases?showcase={collection.id}",

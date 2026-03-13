@@ -41,6 +41,7 @@ class EmailService:
             return 200, "Email suppressed in dev mode"
 
         try:
+            client_url = os.getenv('CLIENT_URL', 'https://openhousepal.com')
             response = httpx.post(
                 self.mailgun_url,
                 auth=("api", self.mailgun_api_key),
@@ -49,7 +50,8 @@ class EmailService:
                     "to": to_email,
                     "subject": subject,
                     "template": template,
-                    "h:X-Mailgun-Variables": json.dumps(template_variables)
+                    "h:X-Mailgun-Variables": json.dumps(template_variables),
+                    "h:List-Unsubscribe": f"<{client_url}/unsubscribe?email=%recipient.email%>"
                 },
                 timeout=10.0
             )

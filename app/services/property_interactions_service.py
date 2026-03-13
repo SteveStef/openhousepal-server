@@ -14,6 +14,7 @@ from app.schemas.property_interactions import (
     PropertyInteractionSummary
 )
 from app.services.email_service import EmailService
+from app.services.blacklist_service import BlacklistService
 from app.config.logging import get_logger
 
 logger = get_logger(__name__)
@@ -345,6 +346,14 @@ class PropertyInteractionsService:
 
         # If the agent (owner) comments, email the visitor
         elif collection and user_id == collection.owner_id and collection.visitor_email:
+            # Check blacklist
+            if await BlacklistService.is_blacklisted(db, collection.visitor_email):
+                logger.info(f"Skipping agent comment email to blacklisted visitor: {collection.visitor_email}")
+                # Don't send email but return success as comment was saved
+                response = PropertyCommentResponse.from_orm(comment)
+                response.author = comment.visitor_name or "Anonymous"
+                return response
+
             agent = collection.owner
             property_result = await db.execute(
                 select(Property).where(Property.id == property_id)

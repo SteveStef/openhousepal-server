@@ -27,6 +27,7 @@ from app.services.property_interactions_service import PropertyInteractionsServi
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.property_service import property_service
 from app.services.property_tour_service import PropertyTourService
+from app.services.blacklist_service import BlacklistService
 from app.utils.auth import get_current_active_user, get_current_user_optional, require_premium_plan, require_broker_authorization
 from app.models.database import User, Collection
 from sqlalchemy import select
@@ -80,9 +81,35 @@ class UpdateStatusRequest(BaseModel):
     status: str
 
 
+class NotificationSettingsRequest(BaseModel):
+    notify_visitor: bool
+    notify_agent: bool
+
+
+class NotificationSettingsSharedRequest(BaseModel):
+    notify_visitor: bool
+
+
+class UnsubscribeRequest(BaseModel):
+    email: str
+
+
 class ShareToggleRequest(BaseModel):
     make_public: bool
     force_regenerate: bool = False
+
+
+@router.post("/unsubscribe")
+async def unsubscribe_visitor(request: UnsubscribeRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Adds the visitor's email to the blacklist to prevent future emails.
+    """
+    try:
+        await BlacklistService.blacklist_email(db, request.email)
+        return {"success": True, "message": f"Successfully unsubscribed {request.email}"}
+    except Exception as e:
+        logger.error(f"Error unsubscribing visitor {request.email}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/", response_model=List[CollectionResponse], dependencies=[Depends(require_broker_authorization)])
@@ -351,6 +378,44 @@ async def update_collection_status(
         )
 
 
+@router.patch("/{collection_id}/notifications")
+async def update_collection_notifications(
+    collection_id: str,
+    request: NotificationSettingsRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_premium_plan)
+):
+    """
+    Update the notification settings of a collection
+    """
+    try:
+        success = await CollectionsService.update_collection_notifications(
+            db, collection_id, current_user.id, request.notify_visitor, request.notify_agent
+        )
+        
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Collection not found or access denied"
+            )
+            
+        return {
+            "success": True,
+            "message": "Collection notifications updated successfully", 
+            "notify_visitor": request.notify_visitor,
+            "notify_agent": request.notify_agent
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("updating collection notifications failed", extra={"error": str(e)})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update collection notifications"
+        )
+
+
 @router.delete("/{collection_id}")
 async def delete_collection(
     collection_id: str,
@@ -606,6 +671,43 @@ async def get_shared_collection(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get shared collection"
         )
+
+
+@router.patch("/shared/{share_token}/notifications")
+async def update_shared_collection_notifications(
+    share_token: str,
+    request: NotificationSettingsSharedRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Update the visitor notification settings of a collection via share token
+    """
+    try:
+        success = await CollectionsService.update_shared_collection_notifications(
+            db, share_token, request.notify_visitor
+        )
+        
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Collection not found"
+            )
+            
+        return {
+            "success": True,
+            "message": "Notification settings updated successfully", 
+            "notify_visitor": request.notify_visitor
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("updating shared collection notifications failed", extra={"error": str(e)})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update notification settings"
+        )
+
 
 @router.get("/{collectionId}/properties")
 async def get_properties_from_collection(

@@ -72,6 +72,10 @@ class Collection(Base):
     is_public = Column(Boolean, default=True)
     status = Column(String, default="ACTIVE", nullable=False)  # ACTIVE, INACTIVE
     
+    # Notification Settings
+    notify_visitor = Column(Boolean, default=True, nullable=False)
+    notify_agent = Column(Boolean, default=True, nullable=False)
+    
     # Anonymous visitor info (for open house collections)
     visitor_email = Column(String, nullable=True)
     visitor_name = Column(String, nullable=True)
@@ -535,6 +539,13 @@ class ScheduledEmail(Base):
     # Error tracking
     error_message = Column(Text, nullable=True)
     
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class BlacklistedEmail(Base):
+    __tablename__ = "blacklisted_emails"
+
+    email = Column(String, primary_key=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
