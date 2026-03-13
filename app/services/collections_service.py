@@ -17,6 +17,7 @@ from app.schemas.collection import CollectionCreate
 from app.config.logging import get_logger
 
 from app.services.collection_preferences_service import CollectionPreferencesService
+from app.services.blacklist_service import BlacklistService
 
 logger = get_logger(__name__)
 
@@ -179,6 +180,10 @@ class CollectionsService:
                     properties_data.append(property_dict)
 
                 # Convert to response format
+                is_blacklisted = False
+                if collection.visitor_email:
+                    is_blacklisted = await BlacklistService.is_blacklisted(db, collection.visitor_email)
+                    
                 collection_data = {
                     "id": collection.id,
                     "name": collection.name,
@@ -186,6 +191,7 @@ class CollectionsService:
                     "status": collection.status or "ACTIVE",
                     "notify_visitor": collection.notify_visitor if hasattr(collection, 'notify_visitor') else True,
                     "notify_agent": collection.notify_agent if hasattr(collection, 'notify_agent') else True,
+                    "is_blacklisted": is_blacklisted,
                     "visitor_name": collection.visitor_name,
                     "visitor_email": collection.visitor_email,
                     "visitor_phone": collection.visitor_phone,
@@ -308,6 +314,10 @@ class CollectionsService:
                     "is_farm": collection.preferences.is_farm
                 }
 
+            is_blacklisted = False
+            if collection.visitor_email:
+                is_blacklisted = await BlacklistService.is_blacklisted(db, collection.visitor_email)
+
             return {
                 "id": collection.id,
                 "name": collection.name,
@@ -325,6 +335,7 @@ class CollectionsService:
                 "status": collection.status,
                 "notify_visitor": collection.notify_visitor if hasattr(collection, 'notify_visitor') else True,
                 "notify_agent": collection.notify_agent if hasattr(collection, 'notify_agent') else True,
+                "is_blacklisted": is_blacklisted,
                 "created_at": collection.created_at.isoformat(),
                 "updated_at": collection.updated_at.isoformat() if collection.updated_at else collection.created_at.isoformat()
             }
@@ -752,6 +763,10 @@ class CollectionsService:
             viewed_properties = sum(1 for prop in properties_data if prop.get('viewCount', 0) > 0)
             liked_properties = sum(1 for prop in properties_data if prop.get('liked', False))
 
+            is_blacklisted = False
+            if collection.visitor_email:
+                is_blacklisted = await BlacklistService.is_blacklisted(db, collection.visitor_email)
+
             collection_data = {
                 'id': collection.id,
                 'name': collection.name,
@@ -760,7 +775,8 @@ class CollectionsService:
                     'lastName': collection.visitor_name.split(' ')[-1] if collection.visitor_name and ' ' in collection.visitor_name else 'Visitor',
                     'email': collection.visitor_email or 'anonymous@visitor.com',
                     'phone': collection.visitor_phone or 'N/A',
-                    'preferredContact': 'EMAIL'
+                    'preferredContact': 'EMAIL',
+                    'is_blacklisted': is_blacklisted
                 },
                 'matchedProperties': properties_data,
                 'createdAt': collection.created_at.isoformat(),

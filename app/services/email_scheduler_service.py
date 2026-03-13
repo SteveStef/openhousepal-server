@@ -19,13 +19,17 @@ class EmailSchedulerService:
         """
         async with AsyncSessionLocal() as db:
             try:
-                # Find all PENDING emails that are past their scheduled time
+                # Find a limited number of PENDING emails to avoid rate limiting
                 now = datetime.now(timezone.utc)
-                stmt = select(ScheduledEmail).where(
-                    and_(
-                        ScheduledEmail.status == "PENDING",
-                        ScheduledEmail.scheduled_for <= now
+                stmt = (
+                    select(ScheduledEmail)
+                    .where(
+                        and_(
+                            ScheduledEmail.status == "PENDING",
+                            ScheduledEmail.scheduled_for <= now
+                        )
                     )
+                    .limit(15)  # Process max 15 emails per minute
                 )
 
                 result = await db.execute(stmt)
@@ -57,8 +61,12 @@ class EmailSchedulerService:
                         
                         if status_code == 200:
                             email_record.status = "SENT"
-                            email_record.sent_at = datetime.utcnow()
+                            email_record.sent_at = datetime.now(timezone.utc)
                             sent_count += 1
+                        elif status_code == 429 or "limit exceeded" in response_text.lower():
+                            # Stop processing this batch if we hit a rate limit
+                            logger.warning(f"Rate limit hit at email {email_record.id}. Stopping batch. Response: {response_text}")
+                            break
                         else:
                             email_record.status = "FAILED"
                             email_record.error_message = f"Status: {status_code}, Response: {response_text}"
@@ -71,6 +79,9 @@ class EmailSchedulerService:
                     
                     # Commit updates for each email to ensure progress is saved
                     await db.commit()
+                    
+                    # Small delay between sends to stay under burst limits
+                    await asyncio.sleep(2)
                     
                 return sent_count
                 
