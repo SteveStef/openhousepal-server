@@ -174,7 +174,7 @@ class PropertySyncService:
             for key, value in mapped.items():
                 setattr(existing, key, value)
             existing.updated_at = datetime.now(timezone.utc)
-            logger.info(f"Updated existing property: {l_key} | {mapped['street_address']} | Status: {mapped['home_status']}")
+            logger.debug(f"Updated existing property: {l_key} | {mapped['street_address']} | Status: {mapped['home_status']}")
         else:
             # For NEW properties, only add them if they are ACTIVE or COMING SOON
             # This prevents our DB from filling up with old CLOSED listings we never tracked
@@ -182,14 +182,14 @@ class PropertySyncService:
             is_active = status.startswith("ACTIVE-BRIGHT") or status.startswith("COMING SOON")
             
             if not is_active:
-                logger.info(f"Skipping discovery for NEW inactive property: {l_key} | Status: {status}")
+                logger.debug(f"Skipping discovery for NEW inactive property: {l_key} | Status: {status}")
                 return None
 
             # New property to our system (Global Mirror)
             event_type = "NEW_GLOBAL"
             existing = Property(**mapped)
             db.add(existing)
-            logger.info(f"Added NEW property: {l_key} | {mapped['street_address']} | Status: {mapped['home_status']}")
+            logger.debug(f"Added NEW property: {l_key} | {mapped['street_address']} | Status: {mapped['home_status']}")
         
         try:
             await db.commit()

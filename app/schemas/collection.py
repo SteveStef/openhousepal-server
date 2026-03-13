@@ -46,6 +46,7 @@ class CollectionResponse(BaseModel):
     status: str = "ACTIVE"
     notify_visitor: bool = True
     notify_agent: bool = True
+    is_blacklisted: bool = False
     visitor_name: Optional[str] = None
     visitor_email: Optional[str] = None
     visitor_phone: Optional[str] = None
