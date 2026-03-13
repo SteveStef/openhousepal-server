@@ -50,8 +50,8 @@ class EmailService:
                     "to": to_email,
                     "subject": subject,
                     "template": template,
-                    "h:X-Mailgun-Variables": json.dumps(template_variables),
-                    "h:List-Unsubscribe": f"<{client_url}/unsubscribe?email=%recipient.email%>"
+                    "t:variables": json.dumps(template_variables),
+                    # "h:List-Unsubscribe": f"<{client_url}/unsubscribe?email={to_email}>"
                 },
                 timeout=10.0
             )
