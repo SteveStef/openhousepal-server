@@ -569,7 +569,16 @@ class PropertySyncService:
 
             # 3. In-App Notification
             try:
-                summary = f"{drop_count} price drop{'s' if drop_count > 1 else ''}"
+                if new_count > 0 and drop_count > 0:
+                    title = f"Showcase Update: {collection.visitor_name or 'Visitor'}"
+                    message = f"Found {new_count} new and {drop_count} price drop{'s' if drop_count > 1 else ''} for {collection.name}."
+                elif new_count > 0:
+                    title = f"New Property Match: {collection.visitor_name or 'Visitor'}"
+                    message = f"Found {new_count} new property match{'es' if new_count > 1 else ''} for {collection.name}."
+                else:
+                    title = f"Price Drop Alert: {collection.visitor_name or 'Visitor'}"
+                    message = f"Found {drop_count} price drop{'s' if drop_count > 1 else ''} for {collection.name}."
+
                 prop_id_query = select(Property.id).where(Property.listing_key == str(featured.get('listing_key')))
                 prop_id = (await db.execute(prop_id_query)).scalar()
 
@@ -578,8 +587,8 @@ class PropertySyncService:
                     type="PROPERTY_SYNC_UPDATE",
                     reference_type="VISITOR",
                     reference_id=collection.id,
-                    title=f"Price Drop Alert: {collection.visitor_name or 'Visitor'}",
-                    message=f"Found {summary} for {collection.name}.",
+                    title=title,
+                    message=message,
                     collection_id=collection.id,
                     collection_name=collection.name,
                     property_id=prop_id,
