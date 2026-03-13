@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import AsyncSessionLocal
@@ -7,6 +7,8 @@ from app.models.database import ScheduledEmail
 from app.services.email_service import EmailService
 from app.services.blacklist_service import BlacklistService
 from app.config.logging import get_logger
+
+logger = get_logger(__name__)
 
 class EmailSchedulerService:
     @staticmethod
@@ -18,7 +20,7 @@ class EmailSchedulerService:
         async with AsyncSessionLocal() as db:
             try:
                 # Find all PENDING emails that are past their scheduled time
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 stmt = select(ScheduledEmail).where(
                     and_(
                         ScheduledEmail.status == "PENDING",
