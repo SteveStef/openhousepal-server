@@ -208,7 +208,7 @@ class CollectionsService:
                     "stats": {
                         "totalProperties": total_count,
                         "activeProperties": active_count,
-                        "lastActivity": collection.last_visitor_activity_at.isoformat() if collection.last_visitor_activity_at else collection.created_at.isoformat()
+                        "lastActivity": collection.last_visitor_activity_at.isoformat() if collection.last_visitor_activity_at else None
                     }
                 }
                 collections_data.append(collection_data)
@@ -337,7 +337,12 @@ class CollectionsService:
                 "notify_agent": collection.notify_agent if hasattr(collection, 'notify_agent') else True,
                 "is_blacklisted": is_blacklisted,
                 "created_at": collection.created_at.isoformat(),
-                "updated_at": collection.updated_at.isoformat() if collection.updated_at else collection.created_at.isoformat()
+                "updated_at": collection.updated_at.isoformat() if collection.updated_at else collection.created_at.isoformat(),
+                "stats": {
+                    "totalProperties": total_count,
+                    "activeProperties": active_count,
+                    "lastActivity": collection.last_visitor_activity_at.isoformat() if collection.last_visitor_activity_at else None
+                }
             }
 
         except Exception as e:
@@ -404,7 +409,12 @@ class CollectionsService:
                 "notify_visitor": collection.notify_visitor if hasattr(collection, 'notify_visitor') else True,
                 "notify_agent": collection.notify_agent if hasattr(collection, 'notify_agent') else True,
                 "created_at": collection.created_at.isoformat(),
-                "updated_at": collection.updated_at.isoformat()
+                "updated_at": collection.updated_at.isoformat(),
+                "stats": {
+                    "totalProperties": 0,
+                    "activeProperties": 0,
+                    "lastActivity": None
+                }
             }
 
         except Exception as e:
@@ -816,7 +826,7 @@ class CollectionsService:
                     'totalProperties': total_properties,
                     'viewedProperties': viewed_properties,
                     'likedProperties': liked_properties,
-                    'lastActivity': collection.last_visitor_activity_at.isoformat() if collection.last_visitor_activity_at else collection.created_at.isoformat()
+                    'lastActivity': collection.last_visitor_activity_at.isoformat() if collection.last_visitor_activity_at else None
                 },
                 'shareToken': collection.share_token,
                 'isPublic': collection.is_public

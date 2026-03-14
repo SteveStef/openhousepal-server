@@ -37,7 +37,8 @@ def test_send_email():
         "property_baths": 2,
         "property_sqft": 1800,
         "total_count": 5,
-        "today_date": "03/13/2026"
+        "today_date": "03/13/2026",
+        'Unsub': "https://openhousepal.com/unsubscribe"
     }
 
     print(f"Sending test email ({template}) to {test_email}...")

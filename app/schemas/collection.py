@@ -59,5 +59,6 @@ class CollectionResponse(BaseModel):
     share_token: Optional[str] = None
     created_at: str
     updated_at: str
+    stats: Optional[dict] = None
 
 # Forward reference for PropertySummary will be resolved when property schemas are imported
