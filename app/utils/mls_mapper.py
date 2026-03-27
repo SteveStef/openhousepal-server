@@ -32,7 +32,8 @@ BRIGHT_PROPERTY_SELECT_FIELDS = [
     "ListAgentPreferredPhone", "LotSizeAcres", "AttachedGarageYN", 
     "NewConstructionYN", "SeniorCommunityYN", "PetsAllowed", "OriginalListPrice", 
     "DaysOnMarket", "CumulativeDaysOnMarket", "Stories", "SubdivisionName", 
-    "MLSListDate", "PriceChangeTimestamp", "ModificationTimestamp"
+    "MLSListDate", "PriceChangeTimestamp", "ModificationTimestamp", 
+    "OneBedroomUnits", "TwoBedroomUnits", "ThreeBedroomUnits"
 ]
 
 def clean_address(address: str) -> str:
@@ -92,7 +93,16 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]] =
     else:
         bathrooms = float(item.get("BathroomsTotalInteger") or 0)
 
-    # 3. Photo processing (Simplified list of strings)
+    # 3. Bedroom calculation (Fallback for multi-unit properties)
+    bedrooms = item.get("BedroomsTotal")
+    if bedrooms is None:
+        u1 = item.get("OneBedroomUnits") or 0
+        u2 = item.get("TwoBedroomUnits") or 0
+        u3 = item.get("ThreeBedroomUnits") or 0
+        if u1 or u2 or u3:
+            bedrooms = float((1 * u1) + (2 * u2) + (3 * u3))
+
+    # 4. Photo processing (Simplified list of strings)
     fetched_photos = []
     if photo_map and listing_key in photo_map:
         fetched_photos = photo_map[listing_key]
@@ -103,7 +113,7 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]] =
         if primary:
             fetched_photos = [primary]
     
-    # 4. Township Logic: IncorporatedCityName (cleaner) -> MLSAreaMajor (fallback)
+    # 5. Township Logic: IncorporatedCityName (cleaner) -> MLSAreaMajor (fallback)
     township = item.get("IncorporatedCityName")
     if not township:
         township = item.get("MLSAreaMajor", "")
@@ -118,7 +128,7 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]] =
     else:
         township = None
 
-    # 5. School District
+    # 6. School District
     school_district = school_district.strip().upper() if (school_district := item.get("SchoolDistrictName")) else None
 
     return {
@@ -132,7 +142,7 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]] =
         "price": item.get("ListPrice"),
         "price_per_square_feet": item.get("PricePerSquareFoot"),
         "mls_incorporated_city_name": item.get("IncorporatedCityName"),
-        "bedrooms": item.get("BedroomsTotal"),
+        "bedrooms": bedrooms,
         "bathrooms": bathrooms,
         "living_area": item.get("LivingArea"),
         "lot_size": item.get("LotSizeSquareFeet"),
