@@ -147,18 +147,13 @@ class BrightMlsService:
         """Validates if a Bright Member (Agent) exists via the Members endpoint."""
 
         params = {
-            "$filter": f"MemberMlsId eq '{agent_mls_id}'",
-            "$top": 1,
-            "$select": "MemberKey"
-        }
-
-        url = "https://bright-reso.brightmls.com/RESO/OData/bright/Members"
+                "$filter": f"MemberMlsId eq '{agent_mls_id}'",
+                "$top": 1,
+                "$select": "MemberKey"
+                }
 
         try:
-            response = await self.client.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
-
+            data = await self._make_request("BrightMembers", params=params)
             return len(data.get("value", [])) > 0
 
         except Exception as e:
