@@ -93,7 +93,7 @@ async def fix_null_bedrooms():
                         total_updated += 1
                         #logger.info(f"Updated {l_key}: New Bedrooms = {new_bedrooms}")
                     else:
-                        #logger.info(f"Property {l_key} still has NULL bedrooms after re-fetch.")
+                        logger.info(f"Property {l_key} still has NULL bedrooms after re-fetch.")
 
                 # Commit each batch
                 await db.commit()
