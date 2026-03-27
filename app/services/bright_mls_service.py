@@ -143,14 +143,27 @@ class BrightMlsService:
                 logger.warning(f"Failed to fetch media chunk: {e}")
         return photo_map
 
-    async def bright_mls_id_exists(self, mls_id: str) -> bool:
-        """Validates if a Bright MLS ID or Listing Key exists via API."""
+    async def bright_mls_id_exists(self, agent_mls_id: str) -> bool:
+        """Validates if a Bright Member (Agent) exists via the Members endpoint."""
+
         params = {
-            "$filter": f"ListingId eq '{mls_id}' or ListingKey eq '{mls_id}'",
+            "$filter": f"MemberMlsId eq '{agent_mls_id}'",
             "$top": 1,
-            "$select": "ListingKey"
+            "$select": "MemberKey"
         }
-        data = await self._make_request("BrightProperties", params=params)
-        return len(data.get("value", [])) > 0
+
+        url = "https://bright-reso.brightmls.com/RESO/OData/bright/Members"
+
+        try:
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+            return len(data.get("value", [])) > 0
+
+        except Exception as e:
+            logger.error(f"Error validating Bright Agent ID: {e}")
+            return False
 
 bright_mls_service = BrightMlsService()
+

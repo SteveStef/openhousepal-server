@@ -414,12 +414,11 @@ class PropertyService:
         If not found, falls back to the Bright MLS API.
         """
         # 1. Check local mirror (as an agent email or listing key)
-        stmt = select(Property.id).where(or_(Property.list_agent_email.ilike(mls_id), Property.listing_key == mls_id)).limit(1)
-        result = await db.execute(stmt)
-        if result.scalar_one_or_none():
-            return True
+        # stmt = select(Property.id).where(or_(Property.list_agent_email.ilike(mls_id), Property.listing_key == mls_id)).limit(1)
+        # result = await db.execute(stmt)
+        # if result.scalar_one_or_none():
+        #     return True
             
-        # 2. Fallback to API
         from app.services.bright_mls_service import bright_mls_service
         return await bright_mls_service.bright_mls_id_exists(mls_id)
 
