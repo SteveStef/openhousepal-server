@@ -79,6 +79,7 @@ class PropertySyncService:
             skip = 0
             page_size = 200
             new_last_sync = last_sync
+            had_failure = False
 
             while True:
                 try:
@@ -96,25 +97,34 @@ class PropertySyncService:
 
                     # 3. Process each property
                     for raw_prop in raw_properties:
-                        l_key = str(raw_prop["ListingKey"])
+                        l_key = str(raw_prop.get("ListingKey"))
                         mod_ts = raw_prop.get("ModificationTimestamp")
                         
-                        # Track the latest modification timestamp found
-                        if mod_ts and mod_ts > new_last_sync:
-                            new_last_sync = mod_ts
-
-                        # Perform the local update and detect events
-                        sync_event = await self._sync_single_property(db, raw_prop, photo_map)
-                        if sync_event:
-                            stats["updated"] += 1
-                            stats["property_details"].append({
-                                "listing_key": sync_event["listing_key"],
-                                "home_type": sync_event["data"]["home_type"],
-                                "event": sync_event["type"]
-                            })
-                            # 4. Notify affected collections
-                            notified = await self._propagate_property_change(db, sync_event)
-                            stats["notifications_sent"] += notified
+                        try:
+                            # Perform the local update and detect events
+                            sync_event = await self._sync_single_property(db, raw_prop, photo_map)
+                            if sync_event:
+                                stats["updated"] += 1
+                                stats["property_details"].append({
+                                    "listing_key": sync_event["listing_key"],
+                                    "home_type": sync_event["data"]["home_type"],
+                                    "event": sync_event["type"]
+                                })
+                                # 4. Notify affected collections
+                                notified = await self._propagate_property_change(db, sync_event)
+                                stats["notifications_sent"] += notified
+                            
+                            # Only advance the checkpoint if we haven't hit any errors yet in this run.
+                            # This ensures that if a property fails, the next sync run will start
+                            # from before that property and retry it.
+                            if not had_failure and mod_ts and (not new_last_sync or mod_ts > new_last_sync):
+                                new_last_sync = mod_ts
+                                
+                        except Exception as prop_error:
+                            logger.error(f"Error syncing property {l_key}: {prop_error}", exc_info=True)
+                            stats["errors"] += 1
+                            had_failure = True
+                            # Continue to next property in the batch
 
                     # 5. Move to next page
                     if len(raw_properties) < page_size:
