@@ -15,9 +15,9 @@ class CollectionPreferencesBase(BaseModel):
     long: Optional[float] = None
     address: Optional[str] = None
 
-    cities: Optional[list[str]] = None
-    townships: Optional[list[str]] = None
-    school_districts: Optional[list[str]] = None
+    cities: list[str] = []
+    townships: list[str] = []
+    school_districts: list[str] = []
 
     diameter: Optional[float] = None
     special_features: str = ""

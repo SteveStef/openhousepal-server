@@ -306,7 +306,13 @@ class PropertySyncService:
             params["state_name"] = state.upper() if state else ""
             location_filters.append(text("""
                 EXISTS (
-                    SELECT 1 FROM jsonb_array_elements_text(collection_preferences.cities) AS pref_city 
+                    SELECT 1 FROM jsonb_array_elements_text(
+                        CASE 
+                            WHEN jsonb_typeof(collection_preferences.cities) = 'array' 
+                            THEN collection_preferences.cities 
+                            ELSE '[]'::jsonb 
+                        END
+                    ) AS pref_city 
                     WHERE 
                         UPPER(TRIM(SPLIT_PART(pref_city, ',', 1))) = :city_name
                         AND (
@@ -322,7 +328,13 @@ class PropertySyncService:
             location_filters.append(text("""
                 EXISTS (
                     SELECT 1 
-                    FROM jsonb_array_elements_text(collection_preferences.townships) AS pref_town 
+                    FROM jsonb_array_elements_text(
+                        CASE 
+                            WHEN jsonb_typeof(collection_preferences.townships) = 'array' 
+                            THEN collection_preferences.townships 
+                            ELSE '[]'::jsonb 
+                        END
+                    ) AS pref_town 
                     WHERE 
                         UPPER(TRIM(REGEXP_REPLACE(SPLIT_PART(pref_town, ',', 1), '\\s+(Township|Twp|Boro|Borough|City|Town)$', '', 'i'))) = :township_name
                         AND (
@@ -338,7 +350,13 @@ class PropertySyncService:
             location_filters.append(text("""
                 EXISTS (
                     SELECT 1 
-                    FROM jsonb_array_elements_text(collection_preferences.school_districts) AS sd 
+                    FROM jsonb_array_elements_text(
+                        CASE 
+                            WHEN jsonb_typeof(collection_preferences.school_districts) = 'array' 
+                            THEN collection_preferences.school_districts 
+                            ELSE '[]'::jsonb 
+                        END
+                    ) AS sd 
                     WHERE 
                         UPPER(TRIM(SPLIT_PART(sd, ',', 1))) = :sd_name
                         AND (
@@ -358,9 +376,30 @@ class PropertySyncService:
             
             radius_condition = and_(
                 # Ensure user hasn't specified other locations (The "Exclusive" part)
-                or_(CollectionPreferences.cities == None, func.jsonb_array_length(CollectionPreferences.cities) == 0),
-                or_(CollectionPreferences.townships == None, func.jsonb_array_length(CollectionPreferences.townships) == 0),
-                or_(CollectionPreferences.school_districts == None, func.jsonb_array_length(CollectionPreferences.school_districts) == 0),
+                or_(
+                    CollectionPreferences.cities == None, 
+                    and_(
+                        func.jsonb_typeof(CollectionPreferences.cities) == 'array',
+                        func.jsonb_array_length(CollectionPreferences.cities) == 0
+                    ),
+                    func.jsonb_typeof(CollectionPreferences.cities) != 'array'
+                ),
+                or_(
+                    CollectionPreferences.townships == None, 
+                    and_(
+                        func.jsonb_typeof(CollectionPreferences.townships) == 'array',
+                        func.jsonb_array_length(CollectionPreferences.townships) == 0
+                    ),
+                    func.jsonb_typeof(CollectionPreferences.townships) != 'array'
+                ),
+                or_(
+                    CollectionPreferences.school_districts == None, 
+                    and_(
+                        func.jsonb_typeof(CollectionPreferences.school_districts) == 'array',
+                        func.jsonb_array_length(CollectionPreferences.school_districts) == 0
+                    ),
+                    func.jsonb_typeof(CollectionPreferences.school_districts) != 'array'
+                ),
                 # Standard radius box
                 CollectionPreferences.lat.isnot(None),
                 CollectionPreferences.long.isnot(None),

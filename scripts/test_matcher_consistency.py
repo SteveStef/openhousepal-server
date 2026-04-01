@@ -51,6 +51,9 @@ async def audit_system_consistency():
         for col in collections:
             print(f"📂 Showcase: '{col.name}'")
             
+            # Get all interactions for this collection to check protection status
+            from app.models.database import PropertyInteraction, PropertyComment, PropertyTour
+            
             # --- Part 1: Check for False Negatives (Missing Matches) ---
             col_prop_ids = {p.id for p in col.properties}
             for prop in col.properties:
@@ -58,9 +61,35 @@ async def audit_system_consistency():
                 prop_data = _get_prop_dict(prop)
                 matching_cols = await sync_service._discover_matching_collections(db, prop_data)
                 
-                if not any(str(m.id) == str(col.id) for m in matching_cols):
-                    total_fn_errors += 1
-                    print(f"   🔴 FALSE NEGATIVE: '{prop.street_address}' is in collection but DISCOVERY REJECTED IT.")
+                is_match = any(str(m.id) == str(col.id) for m in matching_cols)
+                
+                if not is_match:
+                    # Check if this property is "Protected"
+                    # 1. Check for Interactions (Like/Dislike/View)
+                    int_res = await db.execute(select(PropertyInteraction).where(
+                        and_(PropertyInteraction.collection_id == col.id, PropertyInteraction.property_id == prop.id)
+                    ))
+                    has_int = int_res.first() is not None
+                    
+                    # 2. Check for Comments
+                    com_res = await db.execute(select(PropertyComment).where(
+                        and_(PropertyComment.collection_id == col.id, PropertyComment.property_id == prop.id)
+                    ))
+                    has_com = com_res.first() is not None
+                    
+                    # 3. Check for Tours
+                    tour_res = await db.execute(select(PropertyTour).where(
+                        and_(PropertyTour.collection_id == col.id, PropertyTour.property_id == prop.id)
+                    ))
+                    has_tour = tour_res.first() is not None
+
+                    if has_int or has_com or has_tour:
+                        # It's a mismatch, but it's PROTECTED. This is expected system behavior.
+                        # We don't increment total_fn_errors for these.
+                        print(f"   🛡️  PROTECTED MISMATCH: '{prop.street_address}' doesn't match current prefs but is kept due to interaction.")
+                    else:
+                        total_fn_errors += 1
+                        print(f"   🔴 FALSE NEGATIVE: '{prop.street_address}' is in collection but DISCOVERY REJECTED IT.")
 
             # --- Part 2: Check for False Positives (Incorrect Matches) ---
             # Sample properties NOT in this collection
