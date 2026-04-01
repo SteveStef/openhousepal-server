@@ -48,18 +48,68 @@ class PropertyService:
         zip_code = zip_match.group(0) if zip_match else None
 
         # 3. Parse House Number and Street Root (e.g., "71 Drummers" -> "71", "Drummers")
-        street_match = re.match(r'^(\d+)\s+([a-zA-Z0-9]+)', street_part)
+        street_tokens = street_part.split()
+        house_number = None
+        street_root = None
         
         filters = []
-        
-        if street_match:
-            house_number = street_match.group(1)
-            street_root = street_match.group(2)
+
+        if street_tokens and re.match(r'^\d+', street_tokens[0]):
+            # Extract just the numeric part of the house number (matches "42" or "42B")
+            house_number = re.match(r'^\d+', street_tokens[0]).group()
             
             # Anchor 1: Starts with House Number (Uses B-Tree index)
             filters.append(Property.street_address.like(f"{house_number} %"))
+
+            directionals = {'N', 'S', 'E', 'W', 'NW', 'NE', 'SW', 'SE', 'NORTH', 'SOUTH', 'EAST', 'WEST'}
+            
+            for i, token in enumerate(street_tokens[1:], 1):
+                clean_token = re.sub(r'[^a-zA-Z0-9]', '', token).upper()
+                
+                # MIRROR ADDRESS FIX: If the first token after the number is a directional,
+                # we add a strict prefix filter (e.g., "603 S %") to prevent matching "603 N %".
+                if i == 1 and clean_token in directionals:
+                    # Support both full word and abbreviation (e.g., "South" and "S")
+                    dir_options = [clean_token]
+                    if clean_token in {'NORTH', 'SOUTH', 'EAST', 'WEST'}:
+                        dir_options.append(clean_token[0])
+                    elif clean_token in {'N', 'S', 'E', 'W'}:
+                        full_map = {'N': 'NORTH', 'S': 'SOUTH', 'E': 'EAST', 'W': 'WEST'}
+                        dir_options.append(full_map[clean_token])
+                    
+                    filters.append(or_(*[Property.street_address.ilike(f"{house_number} {opt} %") for opt in dir_options]))
+                
+                # Identify Root (First non-directional word)
+                if not street_root and clean_token not in directionals and clean_token:
+                    street_root = token
+            
+            # If everything was a directional (unlikely), just use the first one after number
+            if not street_root and len(street_tokens) > 1:
+                street_root = street_tokens[1]
+            
             # Anchor 2: Contains the primary street word (Handles Lane vs Ln)
-            filters.append(Property.street_address.ilike(f"%{street_root}%"))
+            if street_root:
+                filters.append(Property.street_address.ilike(f"%{street_root}%"))
+
+            # 3.4 Suffix Mapping (ST/STREET, AVE/AVENUE, etc.)
+            suffix_map = {
+                'ST': 'STREET', 'STREET': 'ST',
+                'AVE': 'AVENUE', 'AVENUE': 'AVE',
+                'RD': 'ROAD', 'ROAD': 'RD',
+                'DR': 'DRIVE', 'DRIVE': 'DR',
+                'LN': 'LANE', 'LANE': 'LN',
+                'PL': 'PLACE', 'PLACE': 'PL',
+                'TER': 'TERRACE', 'TERRACE': 'TER',
+                'CT': 'COURT', 'COURT': 'CT',
+                'BLVD': 'BOULEVARD', 'BOULEVARD': 'BLVD',
+                'HWY': 'HIGHWAY', 'HIGHWAY': 'HWY'
+            }
+            
+            last_token = re.sub(r'[^a-zA-Z0-9]', '', street_tokens[-1]).upper()
+            if last_token in suffix_map:
+                suffix_options = [last_token, suffix_map[last_token]]
+                # Match suffix at the end of the address
+                filters.append(or_(*[Property.street_address.ilike(f"% {opt}") for opt in suffix_options]))
         else:
             # Fallback to fuzzy if no house number detected
             filters.append(Property.street_address.ilike(f"%{street_part}%"))
