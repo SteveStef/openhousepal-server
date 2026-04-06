@@ -51,12 +51,17 @@ class EmailSchedulerService:
                             await db.commit()
                             continue
 
-                        logger.info(f"Processing scheduled email {email_record.id} for {email_record.recipient_email}")                        
+                        logger.info(f"Processing scheduled email {email_record.id} for {email_record.recipient_email}")
+                        
+                        # Extract agent email for Reply-To header if available
+                        reply_to = email_record.template_variables.get("agent_email")
+                        
                         status_code, response_text = email_service.send_simple_message(
                             to_email=email_record.recipient_email,
                             subject=email_record.subject,
                             template=email_record.template_name,
-                            template_variables=email_record.template_variables
+                            template_variables=email_record.template_variables,
+                            reply_to=reply_to
                         )
                         
                         if status_code == 200:

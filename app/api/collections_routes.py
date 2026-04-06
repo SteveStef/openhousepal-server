@@ -103,6 +103,7 @@ class ShareToggleRequest(BaseModel):
 async def unsubscribe_visitor(request: UnsubscribeRequest, db: AsyncSession = Depends(get_db)):
     """
     Adds the visitor's email to the blacklist to prevent future emails.
+    Used by the frontend UI.
     """
     try:
         await BlacklistService.blacklist_email(db, request.email)
@@ -110,6 +111,24 @@ async def unsubscribe_visitor(request: UnsubscribeRequest, db: AsyncSession = De
     except Exception as e:
         logger.error(f"Error unsubscribing visitor {request.email}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/unsubscribe/one-click")
+async def unsubscribe_one_click(
+    email: str, 
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    RFC 8058 compliant one-click unsubscribe.
+    Gmail/Yahoo send a POST to this URL with the email in the query string.
+    """
+    try:
+        await BlacklistService.blacklist_email(db, email)
+        return {"success": True}
+    except Exception as e:
+        logger.error(f"One-click unsubscribe failed for {email}: {str(e)}")
+        # Return 200 anyway to satisfy mail servers, but log the error
+        return {"success": False}
 
 
 @router.get("/", response_model=List[CollectionResponse], dependencies=[Depends(require_broker_authorization)])

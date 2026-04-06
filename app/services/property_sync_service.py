@@ -530,6 +530,48 @@ class PropertySyncService:
                 added_at=datetime.now(timezone.utc) # Mark as NEW
             ))
 
+    def _format_price_compact(self, price: float) -> str:
+        """Formats price into a compact string like $750K or $2.1M"""
+        if not price:
+            return ""
+        if price >= 1000000:
+            val = price / 1000000
+            # If it's a whole number, don't show decimal
+            if val == int(val):
+                return f"${int(val)}M"
+            return f"${val:.1f}M"
+        if price >= 1000:
+            return f"${int(price / 1000)}K"
+        return f"${int(price)}"
+
+    def _generate_subject(self, featured: Dict[str, Any], template: str) -> str:
+        """Generates a dynamic subject line to avoid spam filters"""
+        import random
+        
+        price_raw = featured.get('price_raw') or featured.get('price') or 0
+        price_compact = self._format_price_compact(float(price_raw))
+        city = featured.get('city', '')
+        street = featured.get('street_address', '')
+        
+        if template == "price_drop_alert":
+            # For price drops, we want to be clear
+            subjects = [
+                f"Price drop: {street} in {city} is now {price_compact}",
+                f"Great news: Price drop on {street}!",
+                f"Price updated for {street}: {price_compact}",
+                f"Price reduced for the home in {city}: {street}"
+            ]
+            return random.choice(subjects)
+        
+        # New Listing styles
+        subjects = [
+            f"{price_compact} listing just came up in {city}",
+            f"New {price_compact} home in {city} you might like",
+            f"New listing: {street} in {city} for {price_compact}",
+            f"{street} just hit the market in {city} for {price_compact}"
+        ]
+        return random.choice(subjects)
+
     async def _schedule_combined_notification(self, db: AsyncSession, collection: Collection, changes: Dict[str, Any], is_broadcast: bool = False):
         """Schedules emails and in-app alerts for a collection."""
         frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
@@ -591,9 +633,12 @@ class PropertySyncService:
                     "savings": f"${savings:,.0f}" if savings > 0 else None,
                     "Unsub": f"{frontend_url}/unsubscribe?email={collection.visitor_email}"
                 }
+                
+                subject = self._generate_subject(featured, template)
+                
                 db.add(ScheduledEmail(
                     recipient_email=collection.visitor_email,
-                    subject="New Listing: A Property Was Added to Your Showcase",
+                    subject=subject,
                     template_name=template,
                     template_variables=visitor_vars,
                     status="PENDING",

@@ -386,7 +386,8 @@ class PropertyInteractionsService:
                         "collection_link": collection_link,
                         "agent_email": agent.email,
                         "agent_phone": getattr(agent, 'phone', "")
-                    }
+                    },
+                    reply_to=agent.email
                 )
                     # Don't fail the comment creation if notification creation fails
 

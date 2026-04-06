@@ -284,12 +284,17 @@ async def submit_open_house_form(
                 # Schedule visitor confirmation email for 1 hour later
                 scheduled_time = datetime.utcnow() + timedelta(hours=1)
                 
+                # Get count for subject
+                count = collection_result.get('properties_added', 0)
+                prop_addr = property_data.get('address', 'the open house')
+                subject = f"{agent_name} shared {count} homes you might like near {prop_addr}" if agent_name else f"Your collection: {count} homes near {prop_addr}"
+
                 # Get agent information for the email (already fetched above if available)
                 template_vars = {
                     "visitor_name": visitor.full_name,
-                    "property_address": property_data.get('address', 'the property'),
+                    "property_address": prop_addr,
                     "showcase_link": showcase_link,
-                    "properties_count": collection_result.get('properties_added', 0),
+                    "properties_count": count,
                     "agent_name": agent_name,
                     "agent_email": agent_email,
                     "agent_phone": agent_phone
@@ -297,7 +302,7 @@ async def submit_open_house_form(
                 
                 scheduled_email = ScheduledEmail(
                     recipient_email=visitor.email,
-                    subject=f"Your Personalized Property Collection - {property_data.get('address', 'Open House')}",
+                    subject=subject,
                     template_name="visitor_confirmation",
                     template_variables=template_vars,
                     scheduled_for=scheduled_time,

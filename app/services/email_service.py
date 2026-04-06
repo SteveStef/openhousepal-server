@@ -21,7 +21,8 @@ class EmailService:
         to_email: str,
         subject: str,
         template: str,
-        template_variables: Dict[str, Any]
+        template_variables: Dict[str, Any],
+        reply_to: Optional[str] = None
     ) -> Tuple[int, str]:
         # Inject today's date for all templates
         from datetime import datetime
@@ -35,24 +36,47 @@ class EmailService:
                     "to": to_email, 
                     "subject": subject, 
                     "template": template, 
-                    "variables": template_variables
+                    "variables": template_variables,
+                    "reply_to": reply_to
                 }
             )
             return 200, "Email suppressed in dev mode"
 
         try:
             client_url = os.getenv('CLIENT_URL', 'https://openhousepal.com')
+            api_url = os.getenv('API_URL', 'https://api.openhousepal.com')
+            
+            # 1. Professional "From" name - e.g., "Sarah from OpenHousePal"
+            agent_name = template_variables.get("agent_name")
+            from_name = f"{agent_name} from OpenHousePal" if agent_name else "OpenHousePal"
+            
+            # 2. Simple text version for better deliverability
+            text_body = f"Hello {template_variables.get('recipient_name', 'there')},\n\n"
+            text_body += f"You have a new update regarding: {template_variables.get('property_address', 'your showcase')}.\n\n"
+            text_body += f"View it here: {template_variables.get('collection_link', template_variables.get('showcase_link', client_url))}\n\n"
+            text_body += "Best regards,\nOpenHousePal Team"
+
+            data = {
+                "from": f"{from_name} <{self.mailgun_from}>",
+                "to": to_email,
+                "subject": subject,
+                "template": template,
+                "text": text_body,
+                "t:variables": json.dumps(template_variables),
+                "o:tag": template,
+                "o:tracking": "yes",
+                # 3. RFC 8058 One-Click Unsubscribe
+                "h:List-Unsubscribe": f"<{api_url}/api/collections/unsubscribe/one-click?email={to_email}>, <{client_url}/unsubscribe?email={to_email}>",
+                "h:List-Unsubscribe-Post": "List-Unsubscribe=One-Click"
+            }
+
+            if reply_to:
+                data["h:Reply-To"] = reply_to
+
             response = httpx.post(
                 self.mailgun_url,
                 auth=("api", self.mailgun_api_key),
-                data={
-                    "from": f"OpenHousePal <{self.mailgun_from}>",
-                    "to": to_email,
-                    "subject": subject,
-                    "template": template,
-                    "t:variables": json.dumps(template_variables),
-                    # "h:List-Unsubscribe": f"<{client_url}/unsubscribe?email={to_email}>"
-                },
+                data=data,
                 timeout=10.0
             )
             return response.status_code, response.text
