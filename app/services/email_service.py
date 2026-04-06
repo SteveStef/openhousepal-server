@@ -48,7 +48,7 @@ class EmailService:
             
             # 1. Professional "From" name - e.g., "Sarah from OpenHousePal"
             agent_name = template_variables.get("agent_name")
-            from_name = f"{agent_name} from OpenHousePal" if agent_name else "OpenHousePal"
+            from_name = f"{agent_name}" if agent_name else "OpenHousePal"
             
             # 2. Simple text version for better deliverability
             text_body = f"Hello {template_variables.get('recipient_name', 'there')},\n\n"
