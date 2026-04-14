@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request #, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -7,13 +7,12 @@ import uvicorn
 import os
 import time
 import uuid
-import subprocess
 from dotenv import load_dotenv
 from app.database import init_db, wait_for_db
 from app.api import router
 from app.utils.clean_cache import cleanup_expired_signup_verifications
 from app.utils.property_sync_scheduler import scheduled_property_sync
-from app.services.paypal_service import PayPalService
+# from app.services.paypal_service import PayPalService
 from app.services.email_scheduler_service import EmailSchedulerService
 from app.utils.create_admin import create_admin_user
 from app.config.logging import configure_logging, get_logger, set_request_id, clear_request_id

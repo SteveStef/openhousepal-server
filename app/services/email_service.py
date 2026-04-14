@@ -4,6 +4,7 @@ import json
 from typing import Tuple, Optional, Dict, Any
 from dotenv import load_dotenv
 from app.config.logging import get_logger
+from datetime import datetime
 
 load_dotenv()
 
@@ -25,7 +26,6 @@ class EmailService:
         reply_to: Optional[str] = None
     ) -> Tuple[int, str]:
         # Inject today's date for all templates
-        from datetime import datetime
         if "today_date" not in template_variables:
             template_variables["today_date"] = datetime.now().strftime("%m/%d/%Y")
 
@@ -64,7 +64,7 @@ class EmailService:
                 "text": text_body,
                 "t:variables": json.dumps(template_variables),
                 "o:tag": template,
-                "o:tracking": "yes",
+                "o:tracking": "no",
                 # 3. RFC 8058 One-Click Unsubscribe
                 "h:List-Unsubscribe": f"<{api_url}/api/collections/unsubscribe/one-click?email={to_email}>, <{client_url}/unsubscribe?email={to_email}>",
                 "h:List-Unsubscribe-Post": "List-Unsubscribe=One-Click"
