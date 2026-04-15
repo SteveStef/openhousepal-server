@@ -311,13 +311,6 @@ async def schedule_tour(
         await db.rollback()
         logger.error("Failed to schedule tour", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail="Failed to schedule tour")
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        await db.rollback()
-        logger.error("Failed to schedule tour", extra={"error": str(e)})
-        raise HTTPException(status_code=500, detail="Failed to schedule tour")
 
 @router.get("/school-districts", dependencies=[Depends(require_broker_authorization)])
 async def search_school_districts(
