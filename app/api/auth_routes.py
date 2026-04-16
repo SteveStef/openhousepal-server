@@ -42,19 +42,22 @@ async def send_verification_code(
                 detail="Email already registered"
             )
 
-        valid_bright_mls_id = await property_service.bright_mls_id_exists(db, user_data.mls_id)
-        if not valid_bright_mls_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="The MLS ID is not listed with BRIGHT MLS."
-            )
+        is_dev_mode = os.getenv("DEV", 'false') == 'true' # we are defaulting to prod
+        if not is_dev_mode:
+            logger.info("Skipping the mls id verification")
+            valid_bright_mls_id = await property_service.bright_mls_id_exists(db, user_data.mls_id)
+            if not valid_bright_mls_id:
+                raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="The MLS ID is not listed with BRIGHT MLS."
+                        )
 
-        existing_mls_id = await UserService.get_user_by_mls_id(db, user_data.mls_id)
-        if existing_mls_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="This MLS ID is already associated with another account."
-            )
+            existing_mls_id = await UserService.get_user_by_mls_id(db, user_data.mls_id)
+            if existing_mls_id:
+                raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="This MLS ID is already associated with another account."
+                        )
 
         # Check rate limit
         can_send, error_msg = await verification_service.can_send_code(user_data.email, db)
