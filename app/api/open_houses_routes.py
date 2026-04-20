@@ -427,7 +427,7 @@ async def get_open_house_visitors(
         # Get all visitors for this open house
         visitor_stmt = select(OpenHouseVisitor).where(
             OpenHouseVisitor.open_house_event_id == open_house_id
-        ).order_by(OpenHouseVisitor.created_at.desc())
+        ).order_by(OpenHouseVisitor.created_at.asc())
 
         visitor_result = await db.execute(visitor_stmt)
         visitors = visitor_result.scalars().all()
