@@ -152,12 +152,12 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
                         user.next_billing_date = user.trial_ends_at
                     except Exception:
                         # Fallback if parsing fails
-                        trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
+                        trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "14"))
                         user.trial_ends_at = now_utc + timedelta(days=trial_days)
                         user.next_billing_date = user.trial_ends_at
                 else:
                     # Fallback if no billing time provided
-                    trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
+                    trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "14"))
                     user.trial_ends_at = now_utc + timedelta(days=trial_days)
                     user.next_billing_date = user.trial_ends_at
             else:
@@ -195,7 +195,7 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
                     logger.warning("Failed to parse next_billing_time", exc_info=True)
             else:
                 # Fallback: Calculate grace period manually if PayPal doesn't provide it
-                trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
+                trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "14"))
                 if user.last_billing_date:
                     # User was billed recently - add trial_days from last billing
                     user.next_billing_date = user.last_billing_date + timedelta(days=trial_days)

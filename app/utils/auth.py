@@ -130,9 +130,21 @@ async def require_basic_plan(current_user = Depends(get_current_active_user)):
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
 
-    if current_user.subscription_status in ["TRIAL", "ACTIVE"]:
+    # Case 1: ACTIVE subscription
+    if current_user.subscription_status == "ACTIVE":
         return current_user
 
+    # Case 2: TRIAL - MUST check if not expired
+    if current_user.subscription_status == "TRIAL":
+        if current_user.trial_ends_at and current_user.trial_ends_at > now:
+            return current_user
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your free trial has expired. Please subscribe to continue using this feature."
+            )
+
+    # Case 3: CANCELLED - check grace period (they paid through a certain date)
     if current_user.subscription_status == "CANCELLED":
         if current_user.trial_ends_at and current_user.trial_ends_at > now:
             return current_user
