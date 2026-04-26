@@ -603,7 +603,7 @@ class PropertySyncService:
             "property_beds": featured.get('bedrooms'),
             "property_baths": featured.get('bathrooms'),
             "property_sqft": featured.get('living_area'),
-            "today_date": datetime.now().strftime("%m/%d/%Y")
+            "today_date": datetime.now(timezone.utc).strftime("%m/%d/%Y")
         }
 
         # 1. Visitor Email

@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.database import get_db
 from app.models.database import Notification, User
@@ -89,7 +89,7 @@ async def mark_as_read(
 
         # Mark as read
         notification.is_read = True
-        notification.read_at = datetime.utcnow()
+        notification.read_at = datetime.now(timezone.utc)
 
         await db.commit()
         await db.refresh(notification)
@@ -122,7 +122,7 @@ async def mark_all_as_read(
         notifications = result.scalars().all()
 
         # Mark all as read
-        read_time = datetime.utcnow()
+        read_time = datetime.now(timezone.utc)
         for notification in notifications:
             notification.is_read = True
             notification.read_at = read_time

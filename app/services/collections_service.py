@@ -374,8 +374,8 @@ class CollectionsService:
                 is_public=collection_data.is_public if collection_data.is_public is not None else True,
                 share_token=share_token,
                 status=status,
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow()
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc)
             )
 
             db.add(collection)
@@ -446,7 +446,7 @@ class CollectionsService:
 
             # Update the status column directly
             collection.status = status
-            collection.updated_at = datetime.utcnow()
+            collection.updated_at = datetime.now(timezone.utc)
 
             await db.commit()
 
@@ -489,7 +489,7 @@ class CollectionsService:
             # Update the notification columns directly
             collection.notify_visitor = notify_visitor
             collection.notify_agent = notify_agent
-            collection.updated_at = datetime.utcnow()
+            collection.updated_at = datetime.now(timezone.utc)
 
             await db.commit()
             return True
@@ -519,7 +519,7 @@ class CollectionsService:
 
             # Update the visitor notification column
             collection.notify_visitor = notify_visitor
-            collection.updated_at = datetime.utcnow()
+            collection.updated_at = datetime.now(timezone.utc)
 
             await db.commit()
             return True
@@ -581,7 +581,7 @@ class CollectionsService:
                 share_url = None
                 message = "Collection is now private"
 
-            collection.updated_at = datetime.utcnow()
+            collection.updated_at = datetime.now(timezone.utc)
             await db.commit()
 
             return {

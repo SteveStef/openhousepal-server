@@ -1,6 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import datetime
 
 from app.database import get_db
 from app.schemas.property_visit import PropertyVisitFormSubmission, PropertyVisitFormResponse

@@ -1,7 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 
 from app.models.database import PropertyInteraction, PropertyComment, Collection, Property, User, Notification
@@ -46,7 +46,7 @@ class PropertyInteractionsService:
         )
         interaction = result.scalar_one_or_none()
 
-        current_time = datetime.now()
+        current_time = datetime.now(timezone.utc)
 
         if interaction:
             # Update existing interaction
@@ -160,7 +160,7 @@ class PropertyInteractionsService:
                             visitor_name=collection.visitor_name,
                             link=f"/showcases?showcase={collection_id}&property={property_id}",
                             is_read=False,
-                            created_at=datetime.utcnow()
+                            created_at=datetime.now(timezone.utc)
                         )
                         db.add(notification)
                         await db.commit()
@@ -175,7 +175,7 @@ class PropertyInteractionsService:
                 await db.execute(
                     update(Collection)
                     .where(Collection.id == collection_id)
-                    .values(last_visitor_activity_at=datetime.now())
+                    .values(last_visitor_activity_at=datetime.now(timezone.utc))
                 )
                 await db.commit()
             except Exception as e:
@@ -204,7 +204,7 @@ class PropertyInteractionsService:
         )
         interaction = result.scalar_one_or_none()
 
-        current_time = datetime.now()
+        current_time = datetime.now(timezone.utc)
 
         if interaction:
             # Update existing interaction
@@ -256,7 +256,7 @@ class PropertyInteractionsService:
         if not content:
             raise ValueError("Comment content is required")
 
-        current_time = datetime.now()
+        current_time = datetime.now(timezone.utc)
         comment = PropertyComment(
             collection_id=collection_id,
             property_id=property_id,
@@ -323,8 +323,14 @@ class PropertyInteractionsService:
                         reference_id=comment.id,
                         title=f"New Comment: {comment.visitor_name or 'Anonymous'}",
                         message=f"Commented on {property_obj.street_address}: \"{comment_preview}\"",
+                        collection_id=collection.id,
+                        collection_name=collection.name,
+                        property_id=property_obj.id,
+                        property_address=property_obj.street_address,
+                        visitor_name=comment.visitor_name or "Anonymous",
+                        link=f"/showcases?showcase={collection.id}",
                         is_read=False,
-                        created_at=datetime.utcnow()
+                        created_at=datetime.now(timezone.utc)
                     )
                     db.add(notification)
                     await db.commit()
@@ -338,7 +344,7 @@ class PropertyInteractionsService:
                 await db.execute(
                     update(Collection)
                     .where(Collection.id == collection_id)
-                    .values(last_visitor_activity_at=datetime.now())
+                    .values(last_visitor_activity_at=datetime.now(timezone.utc))
                 )
                 await db.commit()
             except Exception as e:

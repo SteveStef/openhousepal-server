@@ -1,7 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.models.database import PropertyTour, Collection, Property, User, Notification
 from app.schemas.property_tour import (
@@ -109,7 +109,7 @@ class PropertyTourService:
             raise ValueError("A tour has already been requested for this property")
 
         # Create tour request using visitor info
-        current_time = datetime.now()
+        current_time = datetime.now(timezone.utc)
         tour = PropertyTour(
             collection_id=collection_id,
             property_id=property_id,
@@ -199,7 +199,7 @@ class PropertyTourService:
                     visitor_name=visitor_name,
                     link=f"/showcases?showcase={collection.id}&property={property_id}",
                     is_read=False,
-                    created_at=datetime.utcnow()
+                    created_at=datetime.now(timezone.utc)
                 )
                 db.add(notification)
                 await db.commit()
@@ -302,7 +302,7 @@ class PropertyTourService:
 
         # Update completion flag
         tour.is_completed = completion_update.is_completed
-        tour.updated_at = datetime.now()
+        tour.updated_at = datetime.now(timezone.utc)
 
         await db.commit()
         await db.refresh(tour)

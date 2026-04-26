@@ -4,7 +4,7 @@ import json
 from typing import Tuple, Optional, Dict, Any
 from dotenv import load_dotenv
 from app.config.logging import get_logger
-from datetime import datetime
+from datetime import datetime, timezone
 
 load_dotenv()
 
@@ -27,7 +27,7 @@ class EmailService:
     ) -> Tuple[int, str]:
         # Inject today's date for all templates
         if "today_date" not in template_variables:
-            template_variables["today_date"] = datetime.now().strftime("%m/%d/%Y")
+            template_variables["today_date"] = datetime.now(timezone.utc).strftime("%m/%d/%Y")
 
         if self.is_dev:
             logger.info(

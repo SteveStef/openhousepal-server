@@ -3,7 +3,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
-from datetime import datetime
 
 from app.database import get_db
 from app.models.database import OpenHouseEvent, User, OpenHouseVisitor, Notification, ScheduledEmail

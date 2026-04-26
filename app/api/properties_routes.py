@@ -174,7 +174,7 @@ async def message_agent(
                 "property_address": full_address,
                 "property_image": property_image,
                 "message": request.message,
-                "today_date": datetime.now().strftime("%m/%d/%Y")
+                "today_date": datetime.now(timezone.utc).strftime("%m/%d/%Y")
             },
             scheduled_for=datetime.now(timezone.utc)
         )
@@ -276,7 +276,7 @@ async def schedule_tour(
                 "preferred_dates": preferred_dates_str,
                 "property_address": full_address,
                 "property_image": property_image,
-                "today_date": datetime.now().strftime("%m/%d/%Y"),
+                "today_date": datetime.now(timezone.utc).strftime("%m/%d/%Y"),
                 "visitor_email": visitor_email or "Not provided",
                 "visitor_name": request.visitor_name or "Interested Visitor",
                 "visitor_phone": visitor_phone or "Not provided"

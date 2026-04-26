@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from app.models.database import Property, Collection
@@ -45,8 +45,8 @@ class PropertyVisitService:
                 visitor_phone=form_data.phone,
                 original_open_house_event_id=form_data.property_id,
                 share_token=CollectionsService.generate_share_token(),
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow()
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc)
             )
             
             db.add(collection)
