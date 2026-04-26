@@ -13,7 +13,7 @@ from app.services.open_house_service import OpenHouseService
 from app.services.email_service import EmailService
 import urllib.parse
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import os
 from dotenv import load_dotenv
@@ -213,7 +213,7 @@ async def delete_open_house(
 
         # Soft delete: mark as deleted and set timestamp
         open_house.is_deleted = True
-        open_house.deleted_at = datetime.utcnow()
+        open_house.deleted_at = datetime.now(timezone.utc)
 
         await db.commit()
 
@@ -282,7 +282,7 @@ async def submit_open_house_form(
                             # Note: User model doesn't have phone field currently
 
                 # Schedule visitor confirmation email for 1 hour later
-                scheduled_time = datetime.utcnow() + timedelta(hours=1)
+                scheduled_time = datetime.now(timezone.utc) + timedelta(hours=1)
                 
                 # Get count for subject
                 count = collection_result.get('properties_added', 0)
@@ -344,7 +344,7 @@ async def submit_open_house_form(
                         visitor_name=visitor.full_name,
                         link=notification_link,
                         is_read=False,
-                        created_at=datetime.utcnow()
+                        created_at=datetime.now(timezone.utc)
                     )
 
                     db.add(notification)

@@ -73,6 +73,13 @@ async def upgrade_subscription(
                 cancel_url=cancel_url
             )
         except Exception as e:
+            error_str = str(e)
+            if "PAYMENT_IN_PROGRESS" in error_str:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="A payment is currently being processed for your subscription. PayPal does not allow upgrades while a payment is in progress. Please try again in 30-60 minutes once the transaction is complete."
+                )
+            
             logger.error("PayPal API error during upgrade", exc_info=True, extra={"user_id": current_user.id})
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 from app.models.database import Property, OpenHouseVisitor, Collection, collection_properties, OpenHouseEvent, User, CollectionPreferences
@@ -27,7 +27,7 @@ class OpenHouseService:
             open_house_event_id=form_data.open_house_event_id,
             qr_code="",  # Will be updated by the calling code
             interested_in_similar=form_data.interested_in_similar,
-            created_at=datetime.utcnow()
+            created_at=datetime.now(timezone.utc)
         )
 
         db.add(visitor)
@@ -77,7 +77,7 @@ class OpenHouseService:
                 original_open_house_event_id=form_data.open_house_event_id,
                 share_token=CollectionsService.generate_share_token(),
                 status='ACTIVE',
-                created_at=datetime.utcnow()
+                created_at=datetime.now(timezone.utc)
             )
             
             db.add(collection)

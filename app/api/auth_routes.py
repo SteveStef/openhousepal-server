@@ -388,7 +388,7 @@ async def signup_with_subscription(
     subscription_id: str,
     plan_id: str,
     user_data: UserCreate,
-    bundle_code: str = None,  # Optional bundle code
+    bundle_code: str | None = None,  # Optional bundle code
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -651,11 +651,30 @@ async def logout():
 
 @router.get("/me", response_model=User)
 async def get_current_user_profile(
-    current_user: User = Depends(get_current_active_user)
+    current_user: UserModel = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """
-    Get current authenticated user's profile
+    Get current authenticated user's profile with "Smart Sync" to handle trial transitions.
+    Only syncs if the user has a subscription and their trial has expired.
     """
+    now = datetime.now(timezone.utc)
+    
+    # Check for the "Dead Zone" edge case (Trial expired but status not yet ACTIVE)
+    is_trial_expired = (
+        current_user.subscription_status == "TRIAL" and 
+        current_user.trial_ends_at and 
+        current_user.trial_ends_at < now
+    )
+
+    # Strictly only sync if they have an ID and we are in the trial-expired edge case
+    if current_user.subscription_id and is_trial_expired:
+        try:
+            # This updates the DB and the current_user object in-place
+            await sync_subscription_status(current_user, db)
+        except Exception as e:
+            logger.error(f"Background sync failed for user {current_user.id}: {e}")
+
     return current_user
 
 @router.get("/debug")
