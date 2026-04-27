@@ -1,6 +1,5 @@
 # Database files - SQLite
 maintain.md
-test_philadelphia_search.py
 
 # Environment variables and secrets
 .env
@@ -129,3 +128,4 @@ raw_media_output.json
 raw_media_output_default.json
 raw_mls_output.json
 mailgun_templates_export/
+scripts/sync_db_from_s3.sh

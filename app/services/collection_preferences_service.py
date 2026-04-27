@@ -240,7 +240,7 @@ class CollectionPreferencesService:
             # 3. Use standardized repopulation utility
             # We pass commit=False because we want to commit preferences and property links together
             result = await CollectionsService.repopulate_collection_from_preferences(
-                db, collection_id, commit=False
+                db, collection_id, commit=False, preferences=preferences
             )
 
             if not result['success']:

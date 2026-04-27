@@ -11,7 +11,7 @@ import os
 from app.models.database import (
     Collection, Property, User, PropertyInteraction, 
     PropertyComment, PropertyTour, collection_properties,
-    Notification, ScheduledEmail
+    Notification, ScheduledEmail, CollectionPreferences
 )
 from app.schemas.collection import CollectionCreate
 from app.config.logging import get_logger
@@ -908,22 +908,20 @@ class CollectionsService:
     async def repopulate_collection_from_preferences(
         db: AsyncSession,
         collection_id: str,
-        commit: bool = True
+        commit: bool = True,
+        preferences: Optional[CollectionPreferences] = None
     ) -> Dict[str, Any]:
         """
         Standardized utility to sync a collection's properties with its preferences.
-        Performs an EXCLUSIVE refresh:
-        1. Queries local database for matching properties.
-        2. Identifies 'Protected' properties (liked, commented, toured).
-        3. Removes stale links (those that don't match AND aren't protected).
-        4. Bulk inserts new matching links.
         """
         # Local import to avoid circular dependency
         from app.services.property_service import property_service
 
         try:
-            # 1. Get current preferences
-            preferences = await CollectionPreferencesService.get_preferences_by_collection_id(db, collection_id)
+            # 1. Get current preferences if not provided
+            if not preferences:
+                preferences = await CollectionPreferencesService.get_preferences_by_collection_id(db, collection_id)
+            
             if not preferences:
                 return {'success': False, 'error': 'Preferences not found'}
 
@@ -932,12 +930,20 @@ class CollectionsService:
             new_match_ids = {p.id for p in matching_properties}
 
             # 3. Identify IDs of properties to PROTECT (those with user interactions)
-            # We don't want to remove properties the user has already engaged with
+            # We don't want to remove properties the user has actually engaged with (Liked, Commented, Toured)
+            # A simple 'view' is NOT enough to protect a property from being cleared.
             keep_query = select(collection_properties.c.property_id).where(
                 collection_properties.c.collection_id == collection_id
             ).where(
                 or_(
-                    collection_properties.c.property_id.in_(select(PropertyInteraction.property_id).where(PropertyInteraction.collection_id == collection_id)),
+                    collection_properties.c.property_id.in_(
+                        select(PropertyInteraction.property_id).where(
+                            and_(
+                                PropertyInteraction.collection_id == collection_id,
+                                PropertyInteraction.liked == True
+                            )
+                        )
+                    ),
                     collection_properties.c.property_id.in_(select(PropertyComment.property_id).where(PropertyComment.collection_id == collection_id)),
                     collection_properties.c.property_id.in_(select(PropertyTour.property_id).where(PropertyTour.collection_id == collection_id))
                 )
@@ -946,13 +952,20 @@ class CollectionsService:
             protected_ids = {r[0] for r in keep_ids_res.fetchall()}
             
             # 4. Clear stale links (not a new match AND not protected)
+            # Combine everything we want to KEEP (Matches + Liked/Commented/Toured)
+            keep_ids = new_match_ids | protected_ids
+            
             delete_stmt = delete(collection_properties).where(
-                and_(
-                    collection_properties.c.collection_id == collection_id,
-                    collection_properties.c.property_id.notin_(list(new_match_ids)),
-                    collection_properties.c.property_id.notin_(list(protected_ids))
-                )
+                collection_properties.c.collection_id == collection_id
             )
+            
+            # If we have items to keep, exclude them from deletion. 
+            # If keep_ids is empty, the stmt above will correctly delete ALL properties.
+            if keep_ids:
+                delete_stmt = delete_stmt.where(
+                    collection_properties.c.property_id.notin_(list(keep_ids))
+                )
+            
             await db.execute(delete_stmt)
             
             # 5. Identify which new matches need to be inserted 

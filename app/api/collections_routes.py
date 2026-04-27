@@ -55,7 +55,8 @@ class CreateCollectionWithPreferencesRequest(BaseModel):
     max_year_built: Optional[int] = None
     cities: Optional[list[str]] = None
     townships: Optional[list[str]] = None
-    address: str
+    school_districts: Optional[list[str]] = None
+    address: Optional[str] = None
     lat: Optional[float] = None
     long: Optional[float] = None
     diameter: float = 0
@@ -224,8 +225,8 @@ async def create_collection_with_preferences(
         longitude = request.long if request.long is not None else 0
         
         try:
-            # Only perform MLS lookup if coordinates weren't provided by frontend
-            if latitude == 0 and longitude == 0 and len(request.address) > 0:
+            # Only perform MLS lookup if coordinates weren't provided by frontend and address exists
+            if latitude == 0 and longitude == 0 and request.address and len(request.address) > 0:
                 try:
                     # Try to fetch property details from mirror
                     property_details = await property_service.get_property_by_address(db, request.address)
@@ -294,6 +295,7 @@ async def create_collection_with_preferences(
                 max_year_built=request.max_year_built,
                 cities=request.cities,
                 townships=request.townships,
+                school_districts=request.school_districts,
                 lat=latitude,
                 long=longitude,
                 address=request.address,  # Add missing address field
