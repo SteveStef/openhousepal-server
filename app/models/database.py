@@ -86,6 +86,7 @@ class Collection(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     last_synced_at = Column(DateTime(timezone=True), nullable=True)  # Track when properties were last synced
     last_visitor_activity_at = Column(DateTime(timezone=True), nullable=True)  # Track when a visitor actually interacts with the collection
+    last_agent_dismissed_at = Column(DateTime(timezone=True), nullable=True)   # Track when the agent last "dismissed" new listings
 
     # Relationships
     owner = relationship("User", back_populates="collections")

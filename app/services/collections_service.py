@@ -95,8 +95,25 @@ class CollectionsService:
                 }
                 
                 active_count = 0
+                new_listings_count = 0
+                
+                # A property is "new" if mls_list_date > last_agent_dismissed_at (fallback to created_at)
+                dismiss_reference = collection.last_agent_dismissed_at or collection.created_at
+                if dismiss_reference.tzinfo is None:
+                    dismiss_reference = dismiss_reference.replace(tzinfo=timezone.utc)
+
                 if collection.properties:
-                    active_count = sum(1 for p in collection.properties if p.id not in disliked_property_ids)
+                    for p in collection.properties:
+                        if p.id not in disliked_property_ids:
+                            active_count += 1
+                        
+                        if p.mls_list_date:
+                            mls_date = p.mls_list_date
+                            if mls_date.tzinfo is None:
+                                mls_date = mls_date.replace(tzinfo=timezone.utc)
+                            
+                            if mls_date > dismiss_reference:
+                                new_listings_count += 1
 
                 original_property_data = None
                 if collection.original_open_house_event_id:
@@ -208,7 +225,9 @@ class CollectionsService:
                     "stats": {
                         "totalProperties": total_count,
                         "activeProperties": active_count,
-                        "lastActivity": collection.last_visitor_activity_at.isoformat() if collection.last_visitor_activity_at else None
+                        "newProperties": new_listings_count,
+                        "lastActivity": collection.last_visitor_activity_at.isoformat() if collection.last_visitor_activity_at else None,
+                        "lastAgentDismissedAt": collection.last_agent_dismissed_at.isoformat() if collection.last_agent_dismissed_at else None
                     }
                 }
                 collections_data.append(collection_data)
@@ -218,6 +237,36 @@ class CollectionsService:
         except Exception as e:
             logger.error("Operation failed", extra={"error": str(e)})
             raise e
+
+    @staticmethod
+    async def dismiss_new_listings(
+        db: AsyncSession,
+        collection_id: str,
+        user_id: str
+    ) -> Dict[str, Any]:
+        """Updates last_agent_dismissed_at to now for a collection."""
+        try:
+            query = select(Collection).where(
+                and_(
+                    Collection.id == collection_id,
+                    Collection.owner_id == user_id
+                )
+            )
+            result = await db.execute(query)
+            collection = result.scalar_one_or_none()
+
+            if not collection:
+                return {"success": False, "error": "Collection not found"}
+
+            collection.last_agent_dismissed_at = datetime.now(timezone.utc)
+            await db.commit()
+
+            return {"success": True}
+
+        except Exception as e:
+            logger.error("Operation failed", extra={"error": str(e)})
+            await db.rollback()
+            return {"success": False, "error": str(e)}
 
     @staticmethod
     async def get_collection_by_id(
@@ -254,9 +303,24 @@ class CollectionsService:
             # Transform properties to frontend format (similar to get_shared_collection)
             properties = []
             active_count = 0
+            new_listings_count = 0
+
+            # A property is "new" if mls_list_date > last_agent_dismissed_at (fallback to created_at)
+            dismiss_reference = collection.last_agent_dismissed_at or collection.created_at
+            if dismiss_reference.tzinfo is None:
+                dismiss_reference = dismiss_reference.replace(tzinfo=timezone.utc)
+
             for prop in collection.properties:
                 if prop.id not in disliked_property_ids:
                     active_count += 1
+                
+                if prop.mls_list_date:
+                    mls_date = prop.mls_list_date
+                    if mls_date.tzinfo is None:
+                        mls_date = mls_date.replace(tzinfo=timezone.utc)
+                    
+                    if mls_date > dismiss_reference:
+                        new_listings_count += 1
 
                 property_dict = {
                     'id': prop.id,
@@ -341,7 +405,9 @@ class CollectionsService:
                 "stats": {
                     "totalProperties": total_count,
                     "activeProperties": active_count,
-                    "lastActivity": collection.last_visitor_activity_at.isoformat() if collection.last_visitor_activity_at else None
+                    "newProperties": new_listings_count,
+                    "lastActivity": collection.last_visitor_activity_at.isoformat() if collection.last_visitor_activity_at else None,
+                    "lastAgentDismissedAt": collection.last_agent_dismissed_at.isoformat() if collection.last_agent_dismissed_at else None
                 }
             }
 

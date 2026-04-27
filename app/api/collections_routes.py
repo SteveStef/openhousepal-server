@@ -3,8 +3,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
 from pydantic import BaseModel
 from datetime import datetime, timezone
-import httpx
-import os
 
 from app.database import get_db
 from app.schemas.collection import CollectionCreate, CollectionResponse
@@ -12,10 +10,6 @@ from app.schemas.collection_preferences import CollectionPreferencesCreate, Coll
 from app.schemas.property_interactions import (
     PropertyInteractionUpdate,
     PropertyCommentCreate,
-    PropertyInteractionResponse,
-    PropertyCommentResponse,
-    PropertyInteractionStats,
-    PropertyInteractionSummary
 )
 from app.schemas.property_tour import (
     PropertyTourCreate,
@@ -434,6 +428,20 @@ async def update_collection_notifications(
             detail="Failed to update collection notifications"
         )
 
+
+@router.patch("/{collection_id}/dismiss")
+async def dismiss_new_listings(
+    collection_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    result = await CollectionsService.dismiss_new_listings(db, collection_id, str(current_user.id))
+    if not result["success"]:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND if result.get("error") == "Collection not found" else status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=result.get("error", "Failed to dismiss listings")
+        )
+    return {"success": True}
 
 @router.delete("/{collection_id}")
 async def delete_collection(
