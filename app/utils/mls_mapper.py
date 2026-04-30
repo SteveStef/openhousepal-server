@@ -131,14 +131,22 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]] =
     # 6. School District
     school_district = school_district.strip().upper() if (school_district := item.get("SchoolDistrictName")) else None
 
+    # 7. Construct Full Address
+    street = clean_address(item.get("FullStreetAddress") or item.get("UnparsedAddress"))
+    city = item.get("City", "")
+    state = item.get("StateOrProvince", "")
+    zipcode = item.get("PostalCode", "")
+    full_address = f"{street}, {city}, {state} {zipcode}".strip()
+
     return {
         "listing_key": listing_key,
         "listing_id": item.get("ListingId"),
-        "street_address": clean_address(item.get("FullStreetAddress") or item.get("UnparsedAddress")),
+        "street_address": street,
         "unparsed_address": item.get("UnparsedAddress"),
-        "city": item.get("City"),
-        "state": item.get("StateOrProvince"),
-        "zipcode": item.get("PostalCode"),
+        "city": city,
+        "state": state,
+        "zipcode": zipcode,
+        "full_address": full_address,
         "price": item.get("ListPrice"),
         "price_per_square_feet": item.get("PricePerSquareFoot"),
         "mls_incorporated_city_name": item.get("IncorporatedCityName"),

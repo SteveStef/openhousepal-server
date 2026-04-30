@@ -13,6 +13,7 @@ class PropertyBase(BaseModel):
     listing_key: Optional[str] = Field(None, alias="ListingKey")
     street_address: Optional[str] = Field(None, alias="FullStreetAddress")
     unparsed_address: Optional[str] = Field(None, alias="UnparsedAddress")
+    full_address: Optional[str] = Field(None, alias="FullAddress")
     city: Optional[str] = Field(None, alias="City")
     state: Optional[str] = Field(None, alias="StateOrProvince")
     zipcode: Optional[str] = Field(None, alias="PostalCode")

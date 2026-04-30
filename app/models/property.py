@@ -20,6 +20,7 @@ class PropertySummaryResponse(BaseModel):
     listing_id: Optional[str] = Field(None, alias="ListingId") # MLS Number
     street_address: str = Field(..., alias="FullStreetAddress")
     unparsed_address: Optional[str] = Field(None, alias="UnparsedAddress")
+    full_address: Optional[str] = Field(None, alias="FullAddress")
     city: str = Field(..., alias="City")
     state: str = Field(..., alias="StateOrProvince")
     zipcode: Optional[str] = Field(None, alias="PostalCode")

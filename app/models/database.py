@@ -132,6 +132,7 @@ class Property(Base):
     raw_mls_data = Column(JSONB, nullable=True)
 
     # Location
+    full_address = Column(String, index=True, nullable=True) # Combined address for fast searching
     latitude = Column(Float, index=True, nullable=True)
     longitude = Column(Float, index=True, nullable=True)
     

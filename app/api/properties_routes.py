@@ -1,23 +1,20 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_
-from sqlalchemy.orm import selectinload
-from typing import Dict, Any, Optional, Union, List
+from sqlalchemy import select, or_, func
+# from sqlalchemy.orm import selectinload
+from typing import Dict, Any, Optional
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
-import os
 
 from app.database import get_db
-from app.models.database import Property, User, ScheduledEmail, Notification, Collection, SchoolDistrict
+from app.models.database import Property, User, ScheduledEmail, Notification, SchoolDistrict
 from app.schemas.collection_preferences import CollectionPreferencesBase
 from app.services.property_service import property_service
-from app.utils.auth import require_broker_authorization, get_current_user_optional
-import json
+from app.utils.auth import require_basic_plan, require_broker_authorization, get_current_user_optional
 from datetime import datetime, timezone
 from typing import Any, Dict
 from app.models.property import (
     PropertyDetailResponse, 
-    PropertySummaryResponse,
     PropertyLookupRequest,
     SimilarPropertiesRequest
 )
@@ -312,6 +309,43 @@ async def schedule_tour(
         logger.error("Failed to schedule tour", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail="Failed to schedule tour")
 
+@router.get("/address", dependencies=[Depends(require_broker_authorization), Depends(require_basic_plan)])
+async def search_properties_by_address(
+    query: str = Query(..., min_length=2), 
+    db: AsyncSession = Depends(get_db)
+):
+    """Internal address search using Trigram similarity for typo-tolerant autocomplete"""
+    try:
+        # 1. Use the % operator (similarity) to filter using the Trigram index
+        # 2. Use func.similarity to rank the results so the best match is first
+        stmt = (
+            select(Property.full_address, Property.latitude, Property.longitude)
+            .where(
+                or_(
+                    Property.full_address.ilike(f"%{query}%"),
+                    Property.full_address.op("%")(query) # The similarity operator
+                )
+            )
+            .order_by(func.similarity(Property.full_address, query).desc())
+            .limit(5)
+        )
+        result = await db.execute(stmt)
+        records = result.fetchall()
+        
+        return {
+            "success": True, 
+            "results": [
+                {
+                    "address": r[0],
+                    "lat": r[1],
+                    "lng": r[2]
+                } for r in records
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Address search failed: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
+
 @router.get("/school-districts", dependencies=[Depends(require_broker_authorization)])
 async def search_school_districts(
     query: str = Query(..., min_length=1),
@@ -335,6 +369,15 @@ async def search_school_districts(
     except Exception as e:
         logger.error(f"School district autocomplete failed: {e}")
         raise HTTPException(status_code=500, detail="Search failed")
+
+
+@router.get("/address", dependencies=[Depends(require_broker_authorization), Depends(require_basic_plan)])
+async def get_property_from_address_query(query: str = Query(...), db: AsyncSession = Depends(get_db)):
+    try:
+        print(query)
+        return { "address": query, "latitude": 50, "longitude": 50, "propertyData": {} }
+    except HTTPException as e:
+        raise HTTPException(status_code=500, detail="Failed to get property details.")
 
 @router.get("/{property_id}", dependencies=[Depends(require_broker_authorization)])
 async def get_property(
