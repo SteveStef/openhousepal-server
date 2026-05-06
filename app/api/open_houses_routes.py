@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from app.database import get_db
 from app.models.database import OpenHouseEvent, User, OpenHouseVisitor, Notification, ScheduledEmail
 from app.utils.auth import get_current_active_user, require_basic_plan, require_broker_authorization
-from app.schemas.open_house import OpenHouseCreateRequest, OpenHouseResponse, OpenHouseFormSubmission, OpenHouseFormResponse, VisitorResponse, NoteUpdate
+from app.schemas.open_house import OpenHouseCreateRequest, OpenHouseResponse, OpenHouseFormSubmission, OpenHouseFormResponse, VisitorResponse, NoteUpdate, OpenHouseSnapshotUpdate
 from app.services.open_house_service import OpenHouseService
 from app.services.email_service import EmailService
 import urllib.parse
@@ -178,6 +178,11 @@ async def get_open_houses(
                 price=oh.price,
                 lot_size=oh.lot_size,
                 city=oh.city,
+                state=oh.state,
+                zipcode=oh.zipcode,
+                latitude=oh.latitude,
+                longitude=oh.longitude,
+                listing_key=oh.listing_key,
                 notes=oh.notes,
                 similar_properties_snapshot=oh.similar_properties_snapshot,
                 created_at=oh.created_at
@@ -515,3 +520,35 @@ async def update_visitor_note(
     except Exception as e:
         logger.error("updating visitor note failed", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail="Failed to update visitor note")
+
+@router.patch("/api/open-houses/{open_house_id}/snapshot", dependencies=[Depends(require_broker_authorization)])
+async def update_open_house_snapshot(
+    open_house_id: str,
+    update_data: OpenHouseSnapshotUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_basic_plan)
+):
+    """Update the similar properties snapshot for a specific open house"""
+    try:
+        stmt = select(OpenHouseEvent).where(
+            and_(
+                OpenHouseEvent.id == open_house_id,
+                OpenHouseEvent.agent_id == current_user.id
+            )
+        )
+        result = await db.execute(stmt)
+        open_house = result.scalar_one_or_none()
+
+        if not open_house:
+            raise HTTPException(status_code=404, detail="Open house not found")
+
+        open_house.similar_properties_snapshot = update_data.similar_properties_snapshot
+        await db.commit()
+
+        return {"success": True, "message": "Snapshot updated successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("updating open house snapshot failed", extra={"error": str(e)})
+        raise HTTPException(status_code=500, detail="Failed to update snapshot")

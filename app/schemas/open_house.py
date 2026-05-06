@@ -58,6 +58,11 @@ class OpenHouseResponse(BaseModel):
     price: Optional[Union[int, float]] = None
     lot_size: Optional[Union[int, float]] = None
     city: Optional[str] = None
+    state: Optional[str] = None
+    zipcode: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    listing_key: Optional[str] = None
     notes: Optional[str] = None
     similar_properties_snapshot: Optional[List[Dict[str, Any]]] = None
     created_at: datetime
@@ -74,3 +79,6 @@ class VisitorResponse(BaseModel):
 
 class NoteUpdate(BaseModel):
     notes: str
+
+class OpenHouseSnapshotUpdate(BaseModel):
+    similar_properties_snapshot: List[Dict[str, Any]]
