@@ -1,23 +1,21 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, update, and_, or_, text
+from sqlalchemy import select, func, and_, or_, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import selectinload, joinedload
-from typing import List, Dict, Any, Optional, Set
-import asyncio
-import json
-import uuid
-import math
+from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 import os
+import re
 
 from app.models.database import (
     Collection, CollectionPreferences, Property, collection_properties, 
-    User, PropertyInteraction, PropertyComment, PropertyTour, 
-    ScheduledEmail, Notification, SystemSettings, SchoolDistrict
+    PropertyInteraction, ScheduledEmail, Notification, SystemSettings, SchoolDistrict, 
+    City, Township, Brokerage
 )
 from app.services.bright_mls_service import bright_mls_service
 from app.utils.mls_mapper import map_reso_to_internal
 from app.utils.geo import get_lat_long_offsets, is_within_distance
+from app.utils.normalization import normalize_brokerage
 from app.services.email_service import EmailService
 from app.services.blacklist_service import BlacklistService
 from app.config.logging import get_logger
@@ -151,20 +149,64 @@ class PropertySyncService:
         l_key = str(raw_data["ListingKey"])
         mapped = map_reso_to_internal(raw_data, photo_map)
         
-        # --- NEW: Maintain School Districts Reference Table ---
-        sd_name = mapped.get("school_district_name")
-        sd_state = mapped.get("state")
-        if sd_name and sd_state:
+        # --- SAFE AUTO-POPULATION OF REFERENCE TABLES ---
+        state = (mapped.get("state") or "").upper().strip()
+
+        # 1. School Districts
+        sd_name = (mapped.get("school_district_name") or "").upper().strip()
+        if sd_name and state:
             try:
-                # Upsert school district into reference table
                 await db.execute(
                     insert(SchoolDistrict)
-                    .values(name=sd_name, state=sd_state)
+                    .values(name=sd_name, state=state)
                     .on_conflict_do_nothing()
                 )
             except Exception as e:
                 logger.warning(f"Failed to auto-populate school district {sd_name}: {e}")
-        # ------------------------------------------------------
+        
+        # 2. Cities
+        city_name = (mapped.get("city") or "").upper().strip()
+        if city_name and state:
+            try:
+                await db.execute(
+                    insert(City)
+                    .values(name=city_name, state=state)
+                    .on_conflict_do_nothing()
+                )
+            except Exception as e:
+                logger.warning(f"Failed to auto-populate city {city_name}: {e}")
+
+        # 3. Townships (Safe + Junk Filter)
+        township_name = (mapped.get("township") or "").upper().strip()
+        is_junk = (
+            not township_name or 
+            len(township_name) <= 1 or 
+            re.match(r'^[0-9.\-]+$', township_name) or 
+            township_name in ['NA', 'N/A', 'NO', 'NT']
+        )
+        if not is_junk and state:
+            try:
+                await db.execute(
+                    insert(Township)
+                    .values(name=township_name, state=state)
+                    .on_conflict_do_nothing()
+                )
+            except Exception as e:
+                logger.warning(f"Failed to auto-populate township {township_name}: {e}")
+
+        office_name = (mapped.get("list_office_name") or "")
+        off_name, parent_name = normalize_brokerage(office_name)
+
+        if off_name and parent_name:
+            try:
+                await db.execute(
+                    insert(Brokerage)
+                    .values(name=off_name, state=state, parent_name=parent_name)
+                    .on_conflict_do_nothing()
+                )
+            except Exception as e:
+                logger.warning(f"Failed to auto-populate brokerage {office_name} parent of {parent_name}: {e}")
+        # ------------------------------------------------
 
         # Get existing record to compare state
         stmt = select(Property).where(Property.listing_key == l_key)

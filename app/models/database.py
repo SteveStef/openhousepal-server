@@ -60,6 +60,7 @@ class User(Base):
     # Relationships
     collections = relationship("Collection", back_populates="owner")
     notifications = relationship("Notification", back_populates="agent")
+    discovery_preferences = relationship("DiscoveryPreferences", back_populates="user", uselist=False, cascade="all, delete-orphan")
 
 class Collection(Base):
     __tablename__ = "collections"
@@ -145,7 +146,7 @@ class Property(Base):
     # Listing Agent & Office
     list_agent_full_name = Column(String, nullable=True)
     list_agent_email = Column(String, nullable=True)
-    list_office_name = Column(String, nullable=True)
+    list_office_name = Column(String, index=True, nullable=True)
     list_office_phone = Column(String, nullable=True)
 
     # Core Structural & Exterior
@@ -577,3 +578,52 @@ class SchoolDistrict(Base):
     name = Column(String, unique=True, index=True, nullable=False)
     state = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class City(Base):
+    __tablename__ = "cities"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, unique=True, index=True, nullable=False)
+    state = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class Township(Base):
+    __tablename__ = "townships"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, unique=True, index=True, nullable=False)
+    state = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class Brokerage(Base):
+    __tablename__ = "brokerages"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, unique=True, index=True, nullable=False)
+    parent_name = Column(String, index=True, nullable=True)
+    state = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class DiscoveryPreferences(Base):
+    __tablename__ = "discovery_preferences"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, unique=True)
+    
+    landmark_address = Column(String, nullable=True)
+    miles = Column(Float, nullable=True)
+    latitude = Column(Float, index=True, nullable=True)
+    longitude = Column(Float, index=True, nullable=True)
+
+    # Array of strings
+    brokerages = Column(JSONB, nullable=True)
+    cities = Column(JSONB, nullable=True)
+    townships = Column(JSONB, nullable=True)
+    school_districts = Column(JSONB, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    # Relationship
+    user = relationship("User", back_populates="discovery_preferences")
+
