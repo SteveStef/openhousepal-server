@@ -1,16 +1,16 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, func
-# from sqlalchemy.orm import selectinload
+from sqlalchemy import select, or_, func, case
 from typing import Dict, Any, Optional
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
 from app.database import get_db
-from app.models.database import Property, User, ScheduledEmail, Notification, SchoolDistrict
+from app.models.database import Property, User, ScheduledEmail, Notification, SchoolDistrict, Brokerage
 from app.schemas.collection_preferences import CollectionPreferencesBase
 from app.services.property_service import property_service
 from app.utils.auth import require_basic_plan, require_broker_authorization, get_current_user_optional
+from app.utils.normalization import MAJOR_BRANDS
 from datetime import datetime, timezone
 from typing import Any, Dict
 from app.models.property import (
@@ -370,6 +370,64 @@ async def search_school_districts(
         logger.error(f"School district autocomplete failed: {e}")
         raise HTTPException(status_code=500, detail="Search failed")
 
+
+@router.get("/brokerages", dependencies=[])
+async def search_brokerages(
+        query: str = Query(..., min_length=1),
+        db: AsyncSession = Depends(get_db)
+):
+    '''Autocomplete for brokerage input with priority for major brands'''
+    try:
+        # 1. Standardize the incoming query for symbol-agnostic matching
+        # e.g., "RE/MAX" -> "REMAX", "C 21" -> "C21"
+        clean_query = query.replace("/", "").replace("-", "").replace(" ", "").replace(".", "")
+
+        # 2. Create a priority order: major brands first
+        priority = case(
+            {brand: 0 for brand in MAJOR_BRANDS},
+            value=Brokerage.parent_name,
+            else_=1
+        )
+
+        # 3. Create a "clean" version of the column in SQL to match against
+        # We strip '/', '-', ' ', and '.'
+        db_clean_name = func.replace(
+            func.replace(
+                func.replace(
+                    func.replace(Brokerage.parent_name, '/', ''),
+                    '-', ''
+                ),
+                ' ', ''
+            ),
+            '.', ''
+        )
+
+        # NOTE: For SELECT DISTINCT, all ORDER BY expressions must appear in the SELECT list
+        stmt = (
+            select(Brokerage.parent_name, priority.label("priority"))
+            .where(
+                or_(
+                    Brokerage.parent_name.ilike(f"{query}%"),
+                    db_clean_name.ilike(f"{clean_query}%")
+                )
+            )
+            .distinct()
+            .order_by(priority, Brokerage.parent_name.asc())
+            .limit(10)
+        )
+
+        results = await db.execute(stmt)
+        # Fetch the results and extract only the parent_name (the first column)
+        brokerages = [row[0] for row in results.fetchall()]
+
+        return {
+            "success": True,
+            "results": brokerages
+        }
+
+    except Exception as e:
+        logger.error(f"Brokerages autocomplete failed {e}")
+        raise HTTPException(status_code=500, detail="Search Failed")
 
 @router.get("/address", dependencies=[Depends(require_broker_authorization), Depends(require_basic_plan)])
 async def get_property_from_address_query(query: str = Query(...), db: AsyncSession = Depends(get_db)):
