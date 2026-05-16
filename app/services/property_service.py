@@ -1,7 +1,6 @@
 import re
-import math
 import logging
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func
 from app.schemas.collection_preferences import CollectionPreferencesBase as CollectionPreferencesSchema
@@ -141,6 +140,20 @@ class PropertyService:
         return PropertyDetailResponse.model_validate(property_obj)
 
     @staticmethod
+    def get_township_search_values(name: str) -> List[str]:
+        """
+        Maps standardized categorical names back to all possible raw MLS abbreviations.
+        This ensures that selecting 'ANNE ARUNDEL COUNTY' in the UI matches 'AA' in the DB.
+        """
+        mappings = {
+            'ANNE ARUNDEL COUNTY': ['ANNE ARUNDEL COUNTY', 'AA', 'AA COUNTY'],
+            'BALTIMORE CITY': ['BALTIMORE CITY', 'BA', 'BA COUNTY'],
+            'BALTIMORE COUNTY': ['BALTIMORE COUNTY', 'BC', 'BC COUNTY']
+        }
+        name_upper = name.upper()
+        return mappings.get(name_upper, [name_upper, name])
+
+    @staticmethod
     async def get_properties_by_preferences(
         db: AsyncSession, 
         preferences: CollectionPreferencesSchema, 
@@ -163,28 +176,26 @@ class PropertyService:
             for loc in preferences.cities:
                 parts = [s.strip() for s in loc.split(',')]
                 city = parts[0]
-                state = parts[1] if len(parts) >= 2 else "PA"
-                location_filters.append(and_(Property.city.ilike(city), Property.state.ilike(state)))
+                state = parts[1] if len(parts) >= 2 else None
+                
+                if state:
+                    location_filters.append(and_(Property.city.ilike(city), Property.state.ilike(state)))
+                else:
+                    location_filters.append(Property.city.ilike(city))
 
         if preferences.townships:
-            for township_pref in preferences.townships:
-                # 1. Split to get name and state (e.g. "Radnor Township, PA" -> ["Radnor Township", "PA"])
-                parts = [s.strip() for s in township_pref.split(',')]
-                raw_name = parts[0]
-                pref_state = parts[1].upper() if len(parts) >= 2 else None
+            for loc in preferences.townships:
+                parts = [s.strip() for s in loc.split(',')]
+                township = parts[0]
+                state = parts[1] if len(parts) >= 2 else None
                 
-                # 2. Clean the root name to match standardized DB format
-                root_name = re.sub(r'\s+(Township|Twp|Boro|Borough|City|Town)$', '', raw_name, flags=re.I).strip()
-                root_name = root_name.upper()
+                # Get all possible variations (aliases) for this township name
+                search_names = PropertyService.get_township_search_values(township)
                 
-                # 3. Filter by both Township and State for geographical accuracy
-                if pref_state:
-                    location_filters.append(and_(
-                        Property.township == root_name,
-                        Property.state.ilike(pref_state)
-                    ))
+                if state:
+                    location_filters.append(and_(Property.township.in_(search_names), Property.state.ilike(state)))
                 else:
-                    location_filters.append(Property.township == root_name)
+                    location_filters.append(Property.township.in_(search_names))
 
         if preferences.school_districts:
             for sd_pref in preferences.school_districts:

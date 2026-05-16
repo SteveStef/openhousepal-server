@@ -7,7 +7,7 @@ from sqlalchemy import text
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.database import engine
-from app.utils.normalization import MAJOR_BRANDS
+from app.utils.normalization import MAJOR_BRANDS, normalize_township
 
 async def seed_categorical_data():
     print("🚀 Starting cleaned categorical data seeding...")
@@ -24,11 +24,11 @@ async def seed_categorical_data():
             "name": "Cities",
             "query": """
                 INSERT INTO cities (id, name, state, created_at)
-                SELECT DISTINCT ON (UPPER(TRIM(city))) 
-                    gen_random_uuid()::text, UPPER(TRIM(city)), UPPER(state), NOW()
+                SELECT DISTINCT ON (UPPER(TRIM(city)), UPPER(TRIM(state))) 
+                    gen_random_uuid()::text, UPPER(TRIM(city)), UPPER(TRIM(state)), NOW()
                 FROM properties
                 WHERE city IS NOT NULL AND city != '' AND state IS NOT NULL
-                ON CONFLICT (name) DO NOTHING;
+                ON CONFLICT (name, state) DO NOTHING;
             """
         },
         
@@ -37,7 +37,7 @@ async def seed_categorical_data():
             "name": "Townships",
             "query": """
                 INSERT INTO townships (id, name, state, created_at)
-                SELECT DISTINCT ON (clean_township)
+                SELECT DISTINCT ON (clean_township, state)
                     gen_random_uuid()::text, clean_township, state, NOW()
                 FROM (
                     SELECT 
@@ -57,7 +57,7 @@ async def seed_categorical_data():
                     AND UPPER(TRIM(township)) NOT IN ('NA', 'N/A', 'NO', 'NT')
                 ) sub
                 WHERE clean_township != ''
-                ON CONFLICT (name) DO NOTHING;
+                ON CONFLICT (name, state) DO NOTHING;
             """
         },
         
@@ -75,7 +75,7 @@ async def seed_categorical_data():
                     FROM raw_brands
                 )
                 INSERT INTO brokerages (id, name, parent_name, state, created_at)
-                SELECT DISTINCT ON (clean_name)
+                SELECT DISTINCT ON (clean_name, state)
                     gen_random_uuid()::text, clean_name, parent_name, UPPER(state), NOW()
                 FROM (
                     SELECT 
@@ -119,7 +119,7 @@ async def seed_categorical_data():
                     ) raw_sub
                 ) sub
                 WHERE clean_name != ''
-                ON CONFLICT (name) DO NOTHING;
+                ON CONFLICT (name, state) DO NOTHING;
             """
         }
     ]

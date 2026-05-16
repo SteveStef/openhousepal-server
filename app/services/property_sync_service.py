@@ -15,7 +15,7 @@ from app.models.database import (
 from app.services.bright_mls_service import bright_mls_service
 from app.utils.mls_mapper import map_reso_to_internal
 from app.utils.geo import get_lat_long_offsets, is_within_distance
-from app.utils.normalization import normalize_brokerage
+from app.utils.normalization import normalize_brokerage, normalize_township, normalize_school_district
 from app.services.email_service import EmailService
 from app.services.blacklist_service import BlacklistService
 from app.config.logging import get_logger
@@ -153,7 +153,8 @@ class PropertySyncService:
         state = (mapped.get("state") or "").upper().strip()
 
         # 1. School Districts
-        sd_name = (mapped.get("school_district_name") or "").upper().strip()
+        raw_sd_name = (mapped.get("school_district_name") or "")
+        sd_name = normalize_school_district(raw_sd_name)
         if sd_name and state:
             try:
                 await db.execute(
@@ -177,7 +178,8 @@ class PropertySyncService:
                 logger.warning(f"Failed to auto-populate city {city_name}: {e}")
 
         # 3. Townships (Safe + Junk Filter)
-        township_name = (mapped.get("township") or "").upper().strip()
+        raw_township_name = (mapped.get("township") or "")
+        township_name = normalize_township(raw_township_name)
         is_junk = (
             not township_name or 
             len(township_name) <= 1 or 

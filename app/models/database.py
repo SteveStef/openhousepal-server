@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Boolean, Text, ForeignKey, Table, Index, DateTime
+from sqlalchemy import Column, Integer, String, Float, Boolean, Text, ForeignKey, Table, Index, DateTime, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import JSONB
@@ -575,34 +575,50 @@ class SchoolDistrict(Base):
     __tablename__ = "school_districts"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    name = Column(String, unique=True, index=True, nullable=False)
+    name = Column(String, index=True, nullable=False)
     state = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('name', 'state', name='unique_school_district_name_state'),
+    )
 
 class City(Base):
     __tablename__ = "cities"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    name = Column(String, unique=True, index=True, nullable=False)
+    name = Column(String, index=True, nullable=False)
     state = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('name', 'state', name='unique_city_name_state'),
+    )
 
 class Township(Base):
     __tablename__ = "townships"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    name = Column(String, unique=True, index=True, nullable=False)
+    name = Column(String, index=True, nullable=False)
     state = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('name', 'state', name='unique_township_name_state'),
+    )
 
 class Brokerage(Base):
     __tablename__ = "brokerages"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    name = Column(String, unique=True, index=True, nullable=False)
+    name = Column(String, index=True, nullable=False)
     parent_name = Column(String, index=True, nullable=True)
     state = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('name', 'state', name='unique_brokerage_name_state'),
+    )
 
 class DiscoveryPreferences(Base):
     __tablename__ = "discovery_preferences"

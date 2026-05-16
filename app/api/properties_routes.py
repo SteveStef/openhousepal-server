@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
 from app.database import get_db
-from app.models.database import Property, User, ScheduledEmail, Notification, SchoolDistrict, Brokerage
+from app.models.database import Property, User, ScheduledEmail, Notification, SchoolDistrict, Brokerage, City, Township
 from app.schemas.collection_preferences import CollectionPreferencesBase
 from app.services.property_service import property_service
 from app.utils.auth import require_basic_plan, require_broker_authorization, get_current_user_optional
@@ -370,6 +370,56 @@ async def search_school_districts(
         logger.error(f"School district autocomplete failed: {e}")
         raise HTTPException(status_code=500, detail="Search failed")
 
+
+@router.get("/cities", dependencies=[Depends(require_broker_authorization)])
+async def search_cities(
+    query: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db)
+):
+    """Autocomplete cities from the reference table"""
+    try:
+        stmt = (
+            select(City.name, City.state)
+            .where(City.name.ilike(f"%{query}%"))
+            .order_by(City.name.asc())
+            .limit(10)
+        )
+
+        result = await db.execute(stmt)
+        cities = result.fetchall()
+        
+        return {
+            "success": True, 
+            "results": [f"{c[0]}, {c[1]}" for c in cities]
+        }
+    except Exception as e:
+        logger.error(f"City autocomplete failed: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
+
+@router.get("/townships", dependencies=[Depends(require_broker_authorization)])
+async def search_townships(
+    query: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db)
+):
+    """Autocomplete cities from the reference table"""
+    try:
+        stmt = (
+            select(Township.name, Township.state)
+            .where(Township.name.ilike(f"%{query}%"))
+            .order_by(Township.name.asc())
+            .limit(10)
+        )
+
+        result = await db.execute(stmt)
+        townships = result.fetchall()
+        
+        return {
+            "success": True, 
+            "results": [f"{t[0]}, {t[1]}" for t in townships]
+        }
+    except Exception as e:
+        logger.error(f"City autocomplete failed: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
 
 @router.get("/brokerages", dependencies=[])
 async def search_brokerages(

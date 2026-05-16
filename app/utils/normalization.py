@@ -12,6 +12,31 @@ MAJOR_BRANDS = [
     "EXIT REALTY", "HOMESMART", "HOMESALE REALTY"
 ]
 
+def normalize_township(name: str) -> str:
+    """Standardizes township names and expands common abbreviations."""
+    if not name:
+        return ""
+    
+    val = name.upper().strip()
+    
+    # Expand known MLS abbreviations
+    mappings = {
+        'AA': 'ANNE ARUNDEL COUNTY',
+        'AA COUNTY': 'ANNE ARUNDEL COUNTY',
+        'BA': 'BALTIMORE CITY',
+        'BA COUNTY': 'BALTIMORE CITY',
+        'BC': 'BALTIMORE COUNTY',
+        'BC COUNTY': 'BALTIMORE COUNTY'
+    }
+    
+    return mappings.get(val, val)
+
+def normalize_school_district(name: str) -> str:
+    """Standardizes school district names."""
+    if not name:
+        return ""
+    return name.upper().strip()
+
 def normalize_brokerage(raw_name: str) -> Tuple[str, str]:
     """
     Standardizes the office name and determines its Parent Brand.
