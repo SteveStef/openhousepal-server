@@ -11,7 +11,7 @@ from app.services.user_service import UserService
 from app.services.paypal_service import paypal_service
 from app.services.property_service import property_service
 from app.utils.auth import create_access_token, get_current_active_user, hash_password, require_broker_authorization
-from app.models.database import User as UserModel
+from app.models.database import User as UserModel, DiscoveryPreferences
 from app.services.verification_service import verification_service
 from app.services.discord_notifier import notifier 
 from app.utils.subscription_sync import sync_subscription_status
@@ -163,7 +163,14 @@ async def verify_code(
         await db.flush()
         await db.refresh(new_user)
 
-        # 4. Clear verification data
+        # 4. Create Discovery Preferences
+        discovery_prefs = DiscoveryPreferences(
+            user_id=new_user.id,
+            brokerages=[new_user.brokerage] if new_user.brokerage else []
+        )
+        db.add(discovery_prefs)
+
+        # 5. Clear verification data
         await verification_service.clear_verification(email, db)
         await db.commit()
 
@@ -383,191 +390,6 @@ async def link_subscription(
         raise HTTPException(status_code=500, detail="Failed to link subscription. Please contact support.")
 
 
-@router.post("/signup-with-subscription", response_model=Token, status_code=status.HTTP_201_CREATED)
-async def signup_with_subscription(
-    subscription_id: str,
-    plan_id: str,
-    user_data: UserCreate,
-    bundle_code: str | None = None,  # Optional bundle code
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Atomically create user account with PayPal subscription.
-    All-or-nothing: account and subscription are linked together or neither is created.
-    """
-    try:
-        # Step 0: Check if email is verified
-        is_verified = await verification_service.is_verified(user_data.email, db)
-        if not is_verified:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Email not verified. Please verify your email first."
-            )
-
-        # Step 1: Validate subscription with PayPal API
-        try:
-            subscription_details = await paypal_service.get_subscription(subscription_id)
-            logger.info(f"PAYPAL DEBUG (SIGNUP): Full Subscription Details: {subscription_details}") # Debug log added
-        except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid subscription ID or PayPal service unavailable"
-            )
-
-        # Step 2: Verify plan_id matches what PayPal says
-        paypal_plan_id = subscription_details.get('plan_id')
-        if paypal_plan_id != plan_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Plan mismatch: expected {plan_id}, got {paypal_plan_id}"
-            )
-
-        # Step 3: Check subscription status is valid
-        subscription_status = subscription_details.get('status')
-        if subscription_status not in ['ACTIVE', 'APPROVAL_PENDING', 'APPROVED']:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid subscription status: {subscription_status}"
-            )
-
-        # Step 4: Determine plan tier from plan_id
-        # Also check for bundle plan ID
-        BUNDLE_PLAN_ID = os.getenv("PAYPAL_BUNDLE_PLAN_ID")
-        
-        if plan_id == BASIC_PLAN_ID:
-            plan_tier = "BASIC"
-        elif plan_id == PREMIUM_PLAN_ID:
-            plan_tier = "PREMIUM"
-        elif BUNDLE_PLAN_ID and plan_id == BUNDLE_PLAN_ID:
-            plan_tier = "PREMIUM" # Bundle is typically Premium
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid plan ID"
-            )
-
-        # Step 5: Create User (Atomic with clearing verification via implicit transaction)
-        
-        # Check if email already exists (database will lock this row)
-        existing_user = await UserService.get_user_by_email(db, user_data.email)
-        if existing_user:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Email already registered"
-            )
-
-        # Check if subscription already linked to another user
-        from sqlalchemy import select
-        result = await db.execute(
-            select(UserModel).where(UserModel.subscription_id == subscription_id)
-        )
-        existing_subscription = result.scalar_one_or_none()
-        if existing_subscription:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Subscription already linked to another account"
-            )
-
-        # Handle Bundle Code marking as used
-        if bundle_code:
-            from app.models.database import BundleCode
-            code_result = await db.execute(
-                select(BundleCode).where(BundleCode.code == bundle_code)
-            )
-            db_code = code_result.scalar_one_or_none()
-            if db_code:
-                if db_code.is_used:
-                    raise HTTPException(status_code=400, detail="Promo code already used")
-                db_code.is_used = True
-                db_code.used_at = datetime.now(timezone.utc)
-
-        # Create user with subscription data
-        now = datetime.now(timezone.utc)
-        
-        # Extract next billing time from PayPal for accurate trial/billing tracking
-        billing_info = subscription_details.get('billing_info', {})
-        next_billing_time = billing_info.get('next_billing_time')
-        
-        if next_billing_time:
-            try:
-                trial_end = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
-            except Exception:
-                logger.warning("Failed to parse PayPal next_billing_time, falling back to trial period")
-                trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "14"))
-                trial_end = now + timedelta(days=trial_days)
-        else:
-            trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "14"))
-            trial_end = now + timedelta(days=trial_days)
-
-        new_user = UserModel(
-            email=user_data.email,
-            hashed_password=hash_password(user_data.password),
-            first_name=user_data.first_name,
-            last_name=user_data.last_name,
-            state=user_data.state,
-            brokerage=user_data.brokerage,
-            mls_id=user_data.mls_id,
-            # Subscription fields
-            subscription_id=subscription_id,
-            plan_id=plan_id,
-            plan_tier=plan_tier,
-            subscription_status="TRIAL",
-            subscription_started_at=now,
-            trial_ends_at=trial_end,
-            next_billing_date=trial_end, # Set initial next billing date
-            last_paypal_sync=now
-        )
-
-        db.add(new_user)
-        await db.flush()  # Get the ID before commit
-        await db.refresh(new_user)
-
-        # Clear verification data now that account is created
-        await verification_service.clear_verification(new_user.email, db)
-
-        # Send welcome email
-        email_service = EmailService()
-        email_service.send_simple_message(
-            to_email=new_user.email,
-            subject="Welcome to OpenHousePal!",
-            template="agent_welcome",
-            template_variables={
-                "agent_name": new_user.first_name,
-                "plan_tier": new_user.plan_tier
-            }
-        )
-
-        # Create access token
-        access_token = create_access_token(data={"sub": new_user.id})
-        notifier.send(
-            f"{new_user.first_name} {new_user.last_name} from {new_user.brokerage} in {new_user.state}, has subscribed to OpenHousePal with {new_user.plan_tier} plan"
-        )
-
-        return {
-            "access_token": access_token,
-            "token_type": "bearer",
-            "user": {
-                "id": new_user.id,
-                "email": new_user.email,
-                "first_name": new_user.first_name,
-                "last_name": new_user.last_name,
-                "state": new_user.state,
-                "brokerage": new_user.brokerage,
-                "mls_id": new_user.mls_id,
-                "plan_tier": new_user.plan_tier,
-                "subscription_status": new_user.subscription_status
-            }
-        }
-
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error("Signup failed", exc_info=True, extra={"error": str(e), "email": user_data.email})
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create account with subscription: {str(e)}" 
-        )
 
 @router.get("/users/{user_id}", response_model=User)
 async def get_user(

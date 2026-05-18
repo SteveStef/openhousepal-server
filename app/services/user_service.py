@@ -3,7 +3,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from typing import Optional
 
-from app.models.database import User
+from app.models.database import User, DiscoveryPreferences
 from app.schemas.user import UserCreate
 from app.utils.auth import hash_password, verify_password
 
@@ -27,6 +27,15 @@ class UserService:
         
         try:
             db.add(db_user)
+            await db.flush()
+            
+            # Create discovery preferences
+            discovery_prefs = DiscoveryPreferences(
+                user_id=db_user.id,
+                brokerages=[db_user.brokerage] if db_user.brokerage else []
+            )
+            db.add(discovery_prefs)
+            
             await db.commit()
             await db.refresh(db_user)
             return db_user

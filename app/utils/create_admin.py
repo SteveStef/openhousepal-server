@@ -9,7 +9,7 @@ from sqlalchemy import select
 from passlib.context import CryptContext
 
 from app.database import AsyncSessionLocal
-from app.models.database import User
+from app.models.database import User, DiscoveryPreferences
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -43,7 +43,7 @@ async def create_admin_user():
                 first_name="admin",
                 last_name="user",
                 state="PA",
-                brokerage="NONE",
+                brokerage="COMPASS",
                 mls_id="123456",  # No MLS ID for admin
                 broker_authorized=True,
                 # Premium subscription with no expiration
@@ -58,6 +58,15 @@ async def create_admin_user():
             )
 
             db.add(admin_user)
+            await db.flush()
+            
+            # Create discovery preferences for admin
+            discovery_prefs = DiscoveryPreferences(
+                user_id=admin_user.id,
+                brokerages=[admin_user.brokerage] if admin_user.brokerage else []
+            )
+            db.add(discovery_prefs)
+            
             await db.commit()
             await db.refresh(admin_user)
 
