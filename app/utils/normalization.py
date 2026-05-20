@@ -48,15 +48,16 @@ def normalize_brokerage(raw_name: str) -> Tuple[str, str]:
         return "", ""
 
     # --- TIER 1: The 'Key' Name (Must match Property data) ---
-    # We only perform basic cleanup (upper/trim) to ensure it joins correctly 
-    # with the properties table.
-    name = raw_name.strip().upper()
+    # We only perform basic cleanup (trim) to ensure it joins correctly 
+    # with the properties table exactly as it is stored there.
+    name = raw_name.strip()
 
     # --- TIER 2: Determine Parent Brand (The Category) ---
     # We use a temporary cleaned version for detection logic only.
+    name_upper = name.upper()
     
     # 1. Remove hyphens/slashes/dots for better matching
-    clean_for_match = re.sub(r'[.,/\-]', ' ', name)
+    clean_for_match = re.sub(r'[.,/\-]', ' ', name_upper)
     # 2. Strip legal suffixes (LLC, INC)
     clean_for_match = re.sub(r'(,?\s*(LLC|INC|LTD)\.?)$', '', clean_for_match, flags=re.IGNORECASE)
     # 3. Collapse double spaces

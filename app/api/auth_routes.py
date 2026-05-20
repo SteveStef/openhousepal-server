@@ -166,7 +166,8 @@ async def verify_code(
         # 4. Create Discovery Preferences
         discovery_prefs = DiscoveryPreferences(
             user_id=new_user.id,
-            brokerages=[new_user.brokerage] if new_user.brokerage else []
+            brokerages=[new_user.brokerage] if new_user.brokerage else [],
+            state=new_user.state
         )
         db.add(discovery_prefs)
 

@@ -32,7 +32,8 @@ class UserService:
             # Create discovery preferences
             discovery_prefs = DiscoveryPreferences(
                 user_id=db_user.id,
-                brokerages=[db_user.brokerage] if db_user.brokerage else []
+                brokerages=[db_user.brokerage] if db_user.brokerage else [],
+                state=db_user.state
             )
             db.add(discovery_prefs)
             

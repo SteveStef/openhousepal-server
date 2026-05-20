@@ -63,7 +63,8 @@ async def create_admin_user():
             # Create discovery preferences for admin
             discovery_prefs = DiscoveryPreferences(
                 user_id=admin_user.id,
-                brokerages=[admin_user.brokerage] if admin_user.brokerage else []
+                brokerages=[admin_user.brokerage] if admin_user.brokerage else [],
+                state=admin_user.state
             )
             db.add(discovery_prefs)
             

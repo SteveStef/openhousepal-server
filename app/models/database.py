@@ -630,6 +630,13 @@ class DiscoveryPreferences(Base):
     miles = Column(Float, nullable=True)
     latitude = Column(Float, index=True, nullable=True)
     longitude = Column(Float, index=True, nullable=True)
+    state = Column(String, nullable=True)
+
+    # Criteria
+    min_bedrooms = Column(Integer, nullable=True)
+    min_bathrooms = Column(Integer, nullable=True)
+    min_square_feet = Column(Integer, nullable=True)
+    min_price = Column(Float, nullable=True)
 
     # Array of strings
     brokerages = Column(JSONB, nullable=True)
