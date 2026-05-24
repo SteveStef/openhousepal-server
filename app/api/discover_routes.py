@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from app.database import get_db
 from app.config.logging import get_logger
 from app.utils.auth import get_current_active_user, require_basic_plan, require_broker_authorization
-from app.utils.geo import get_lat_long_offsets, is_within_distance, haversine_distance
+from app.utils.geo import get_lat_long_offsets, is_within_distance, haversine_distance, filter_properties_by_radius
 import os
 
 logger = get_logger(__name__)
@@ -96,6 +96,29 @@ async def get_discovery(
         prop_stmt = select(Property)
         filters = []
 
+        # 1. Location Precedence: Radius (Bounding Box)
+        # If coordinates and miles are set, define a bounding box for performance
+        is_radius_search = prefs.latitude is not None and prefs.longitude is not None and prefs.miles
+        if is_radius_search:
+            lat_off, lon_off = get_lat_long_offsets(prefs.latitude, prefs.miles)
+            filters.append(and_(
+                Property.latitude >= float(prefs.latitude) - lat_off,
+                Property.latitude <= float(prefs.latitude) + lat_off,
+                Property.longitude >= float(prefs.longitude) - lon_off,
+                Property.longitude <= float(prefs.longitude) + lon_off
+            ))
+
+        # 2. Base Integrity Filters
+        # Only search for ACTIVE or COMING SOON listings
+        filters.append(or_(
+            Property.home_status == 'ACTIVE-BRIGHT',
+            Property.home_status == 'COMING SOON-BRIGHT'
+        ))
+
+        # Exclude LAND
+        filters.append(Property.home_type != 'LAND')
+
+        # 3. Inclusion Filters (These refine the radius search if it exists)
         # Apply state filter if set
         if prefs.state:
             filters.append(Property.state.ilike(prefs.state))
@@ -121,9 +144,8 @@ async def get_discovery(
             district_names = [d.split(',')[0].strip() for d in prefs.school_districts]
             filters.append(Property.school_district_name.in_(district_names))
 
-        # Apply ONLY brokerage filter
+        # Apply brokerage filter
         if prefs.brokerages and len(prefs.brokerages) > 0:
-            # 1. Find all specific office names that belong to these parent brokerages
             brokerage_stmt = select(Brokerage.name).where(
                 or_(
                     Brokerage.parent_name.in_(prefs.brokerages),
@@ -132,20 +154,27 @@ async def get_discovery(
             )
             brokerage_result = await db.execute(brokerage_stmt)
             specific_office_names = brokerage_result.scalars().all()
-            
-            # 2. Combine with user's specific strings
             unique_names = list(set(specific_office_names))
             filters.append(Property.list_office_name.in_(unique_names))
 
-        # Add filters if any (only brokerage in this case)
+        # Apply all filters
         if filters:
             prop_stmt = prop_stmt.where(and_(*filters))
 
-        # Limit results
-        prop_stmt = prop_stmt.limit(50)
+        # Limit results (fetch more for radius trim)
+        prop_stmt = prop_stmt.limit(200 if is_radius_search else 50)
         
         prop_result = await db.execute(prop_stmt)
         properties = prop_result.scalars().all()
+
+        # 4. Circular Post-Filtering (Trim the Corners)
+        if is_radius_search:
+            properties = filter_properties_by_radius(
+                properties, 
+                float(prefs.latitude), 
+                float(prefs.longitude), 
+                float(prefs.miles)
+            )
 
         # Map to response format
         now = datetime.now(timezone.utc)
@@ -162,6 +191,11 @@ async def get_discovery(
                 diff = now - list_date
                 is_new = diff < timedelta(days=3)
                 days_on_market = diff.days
+
+            # Calculate precise distance if landmark exists
+            dist = None
+            if is_radius_search and p.latitude and p.longitude:
+                dist = haversine_distance(prefs.latitude, prefs.longitude, p.latitude, p.longitude)
 
             response_data.append(DiscoveryPropertyResponse(
                 Street=str(p.street_address),
@@ -181,8 +215,18 @@ async def get_discovery(
                 ListingAgentEmail=str(p.list_agent_email) if p.list_agent_email is not None else "",
                 DaysOnMarket=days_on_market,
                 New=is_new,
-                DistanceFromLandmark=None
+                DistanceFromLandmark=dist
             ))
+
+        # Sort by distance if applicable
+        if is_radius_search:
+            response_data.sort(key=lambda x: x.DistanceFromLandmark if x.DistanceFromLandmark is not None else 999999)
+        else:
+            # Fallback sort by DOM (newest first)
+            response_data.sort(key=lambda x: x.DaysOnMarket)
+
+        # Truncate final results
+        response_data = response_data[:50]
 
         return {
             "success": True, 
@@ -231,32 +275,9 @@ async def update_discovery_preferences(
             db.add(prefs)
         
         # Update fields if provided
-        if request.landmark_address is not None:
-            prefs.landmark_address = request.landmark_address
-        if request.miles is not None:
-            prefs.miles = request.miles
-        if request.latitude is not None:
-            prefs.latitude = request.latitude
-        if request.longitude is not None:
-            prefs.longitude = request.longitude
-        if request.state is not None:
-            prefs.state = request.state
-        if request.min_bedrooms is not None:
-            prefs.min_bedrooms = request.min_bedrooms
-        if request.min_bathrooms is not None:
-            prefs.min_bathrooms = request.min_bathrooms
-        if request.min_square_feet is not None:
-            prefs.min_square_feet = request.min_square_feet
-        if request.min_price is not None:
-            prefs.min_price = request.min_price
-        if request.brokerages is not None:
-            prefs.brokerages = request.brokerages
-        if request.cities is not None:
-            prefs.cities = request.cities
-        if request.townships is not None:
-            prefs.townships = request.townships
-        if request.school_districts is not None:
-            prefs.school_districts = request.school_districts
+        update_data = request.model_dump(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(prefs, key, value)
 
         await db.commit()
         await db.refresh(prefs)
