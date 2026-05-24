@@ -8,8 +8,6 @@ from app.database import AsyncSessionLocal
 from app.models.database import User, OpenHouseVisitor
 
 async def update_user_brokerage(user_id, new_brokerage):
-    #user_id = "499f7670-d9d8-4570-821b-3762b53599b2"
-    #new_brokerage = "KELLER WILLIAMS"
     
     print(f"Connecting to database to update user {user_id}...")
     
@@ -52,10 +50,9 @@ async def update_visitor_email():
             print(f"❌ Error: Visitor with ID {visitor_id} was not found.")
 
 async def run_updates():
-    await update_user_brokerage("499f7670-d9d8-4570-821b-3762b53599b2", "COMPASS")
-    await update_user_brokerage("9210dcf2-9538-44f7-90fd-78199b49b978", "KELLER WILLIAMS")
+    await update_user_brokerage("499f7670-d9d8-4570-821b-3762b53599b2", "KELLER WILLIAMS")
+    await update_user_brokerage("9210dcf2-9538-44f7-90fd-78199b49b978", "COMPASS")
     await update_user_brokerage("18fb1af4-e128-4433-bb07-aea2db974bd4", "COMPASS")
-    await update_visitor_email()
 
 if __name__ == "__main__":
     try:
