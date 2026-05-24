@@ -21,6 +21,7 @@ async def seed_categorical_data():
             gen_random_uuid()::text, UPPER(TRIM(city)), UPPER(TRIM(state)), NOW()
         FROM properties
         WHERE city IS NOT NULL AND city != '' AND state IS NOT NULL
+        AND city ~ '[A-Za-z]'
         ON CONFLICT (name, state) DO NOTHING;
     """
     
@@ -45,6 +46,7 @@ async def seed_categorical_data():
             AND UPPER(TRIM(township)) NOT IN ('NA', 'N/A', 'NO', 'NT')
         ) sub
         WHERE clean_township != ''
+        AND clean_township ~ '[A-Za-z]'
         ON CONFLICT (name, state) DO NOTHING;
     """
 

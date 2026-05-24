@@ -165,9 +165,9 @@ class PropertySyncService:
             except Exception as e:
                 logger.warning(f"Failed to auto-populate school district {sd_name}: {e}")
         
-        # 2. Cities
+        # 2. Cities (Safe + Junk Filter)
         city_name = (mapped.get("city") or "").upper().strip()
-        if city_name and state:
+        if city_name and state and re.search(r"[A-Za-z]", city_name):
             try:
                 await db.execute(
                     insert(City)
@@ -184,6 +184,7 @@ class PropertySyncService:
             not township_name or 
             len(township_name) <= 1 or 
             re.match(r'^[0-9.\-]+$', township_name) or 
+            not re.search(r"[A-Za-z]", township_name) or
             township_name in ['NA', 'N/A', 'NO', 'NT']
         )
         if not is_junk and state:
