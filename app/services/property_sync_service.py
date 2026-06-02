@@ -1,5 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_, text
+from sqlalchemy import select, func, and_, or_, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import selectinload, joinedload
 from typing import List, Dict, Any, Optional
@@ -63,17 +63,31 @@ class PropertySyncService:
     async def run_global_sync(self) -> Dict[str, Any]:
         """
         The Main Sync Loop.
-        1. Fetches all changes from MLS since last run.
-        2. Updates local mirror.
-        3. Identifies and notifies affected collections.
+        1. Process Hard Deletions (Isolated).
+        2. Process Modifications & Status Changes (Paged).
+        3. Notify affected collections.
         """
-        logger.info("Starting Global Incremental Sync...")
-        stats = {"updated": 0, "notifications_sent": 0, "errors": 0, "property_details": []}
+        logger.info("Starting Global Synchronization Cycle...")
+        stats = {
+            "updated": 0, 
+            "notifications_sent": 0, 
+            "deletions": 0,
+            "errors": 0, 
+            "property_details": []
+        }
         
         async with AsyncSessionLocal() as db:
             last_sync = await self.get_last_sync_time(db)
-            logger.info(f"Syncing changes since: {last_sync}")
+            logger.info(f"Syncing from checkpoint: {last_sync}")
 
+            # --- PART A: PROCESS HARD DELETIONS (Isolated) ---
+            try:
+                await self._sync_deletions(db, last_sync, stats)
+            except Exception as e:
+                logger.error(f"Critical error in deletion sync (skipping to modifications): {e}")
+                stats["errors"] += 1
+
+            # --- PART B: PROCESS MODIFICATIONS (Existing Paged Loop) ---
             skip = 0
             page_size = 200
             new_last_sync = last_sync
@@ -112,34 +126,58 @@ class PropertySyncService:
                                 notified = await self._propagate_property_change(db, sync_event)
                                 stats["notifications_sent"] += notified
                             
-                            # Only advance the checkpoint if we haven't hit any errors yet in this run.
-                            # This ensures that if a property fails, the next sync run will start
-                            # from before that property and retry it.
                             if not had_failure and mod_ts and (not new_last_sync or mod_ts > new_last_sync):
                                 new_last_sync = mod_ts
                                 
                         except Exception as prop_error:
-                            logger.error(f"Error syncing property {l_key}: {prop_error}", exc_info=True)
+                            logger.error(f"Error syncing property {l_key}: {prop_error}")
                             stats["errors"] += 1
                             had_failure = True
-                            # Continue to next property in the batch
 
-                    # 5. Move to next page
                     if len(raw_properties) < page_size:
                         break
                     skip += page_size
 
                 except Exception as e:
-                    logger.error(f"Error in sync batch at skip {skip}: {e}", exc_info=True)
+                    logger.error(f"Error in sync batch at skip {skip}: {e}")
                     stats["errors"] += 1
                     break
 
-            # 6. Finalize sync state
+            # 4. Finalize sync state
             if new_last_sync != last_sync:
                 await self.update_last_sync_time(db, new_last_sync)
-                logger.info(f"Global Sync Complete. New Checkpoint: {new_last_sync}")
+                logger.info(f"Global Sync Cycle Complete. New Checkpoint: {new_last_sync}")
 
         return stats
+
+    async def _sync_deletions(self, db: AsyncSession, last_sync: str, stats: Dict[str, Any]):
+        """Helper to process hard-deleted properties from MLS."""
+        logger.info("Checking for hard deletions...")
+        deletion_keys = await bright_mls_service.get_recent_deletions(last_sync)
+        
+        if not deletion_keys:
+            logger.info("No hard deletions found.")
+            return
+
+        logger.warning(f"Detected {len(deletion_keys)} hard deletions. Marking as off-market.")
+        
+        # Batch update in database
+        batch_size = 500
+        for i in range(0, len(deletion_keys), batch_size):
+            batch = deletion_keys[i : i + batch_size]
+            stmt = (
+                update(Property)
+                .where(Property.listing_key.in_(batch))
+                .values(
+                    home_status='OFF_MARKET-BRIGHT',
+                    updated_at=datetime.now(timezone.utc)
+                )
+            )
+            result = await db.execute(stmt)
+            stats["deletions"] += result.rowcount
+        
+        await db.commit()
+        logger.info(f"Successfully processed {stats['deletions']} hard deletions.")
 
     async def _sync_single_property(self, db: AsyncSession, raw_data: Dict[str, Any], photo_map: Dict[str, List[str]]) -> Optional[Dict[str, Any]]:
         """
@@ -740,9 +778,3 @@ class PropertySyncService:
             except Exception as e:
                 logger.error(f"In-app notification failed: {e}")
 
-    async def cleanup_off_market_properties(self):
-        """
-        Optional task: Run once a week to mark properties as OFF_MARKET 
-        if they haven't been modified in Bright MLS for a long time.
-        """
-        pass
