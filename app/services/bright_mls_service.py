@@ -118,19 +118,19 @@ class BrightMlsService:
         data = await self._make_request("BrightProperties", params=params)
         return data.get("value", [])
 
-    async def get_recent_deletions(self, since_timestamp: str) -> List[str]:
+    async def get_recent_deletions(self, since_timestamp: str) -> List[Dict[str, str]]:
         """
         Fetches hard-deleted ListingKeys from the Deletion route.
         Table 'CWA_BRIGHT_ALL' contains the property deletions.
         """
         params = {
             "$filter": f"DeletionTimestamp gt {since_timestamp} and TableName eq 'CWA_BRIGHT_ALL'",
-            "$select": "DeleteKey",
+            "$select": "DeleteKey,DeletionTimestamp",
             "$orderby": "DeletionTimestamp asc"
         }
         try:
             data = await self._make_request("Deletion", params=params)
-            return [str(d["DeleteKey"]) for d in data.get("value", [])]
+            return [{"key": str(d["DeleteKey"]), "timestamp": d["DeletionTimestamp"]} for d in data.get("value", [])]
         except Exception as e:
             logger.error(f"Failed to fetch deletions: {e}")
             return []

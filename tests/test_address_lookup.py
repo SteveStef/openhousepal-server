@@ -39,7 +39,7 @@ async def test_address_lookup(address: str):
             traceback.print_exc()
 
 def main():
-    asyncio.run(test_address_lookup("603 South 17th Street, Philadelphia, PA 19146"))
+    asyncio.run(test_address_lookup("543 Foxglove Ln, WYNNEWOOD, PA 19096"))
 
 if __name__ == "__main__":
     main()

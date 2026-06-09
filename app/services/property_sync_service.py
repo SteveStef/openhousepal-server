@@ -13,7 +13,7 @@ from app.models.database import (
     City, Township, Brokerage
 )
 from app.services.bright_mls_service import bright_mls_service
-from app.utils.mls_mapper import map_reso_to_internal
+from app.utils.mls_mapper import map_reso_to_internal, parse_dt
 from app.utils.geo import get_lat_long_offsets, is_within_distance
 from app.utils.normalization import normalize_brokerage, normalize_township, normalize_school_district
 from app.services.email_service import EmailService
@@ -153,18 +153,41 @@ class PropertySyncService:
     async def _sync_deletions(self, db: AsyncSession, last_sync: str, stats: Dict[str, Any]):
         """Helper to process hard-deleted properties from MLS."""
         logger.info("Checking for hard deletions...")
-        deletion_keys = await bright_mls_service.get_recent_deletions(last_sync)
-        
-        if not deletion_keys:
+        deletions = await bright_mls_service.get_recent_deletions(last_sync)
+
+        if not deletions:
             logger.info("No hard deletions found.")
             return
 
-        logger.warning(f"Detected {len(deletion_keys)} hard deletions. Marking as off-market.")
-        
+        logger.info(f"Detected {len(deletions)} hard deletions. Validating timestamps...")
+
+        valid_deletion_keys = []
+        batch_keys = [d["key"] for d in deletions]
+        deletion_map = {d["key"]: parse_dt(d["timestamp"]) for d in deletions if parse_dt(d["timestamp"])}
+
+        # Fetch current timestamps from DB for these keys
+        stmt = select(Property.listing_key, Property.modification_timestamp).where(Property.listing_key.in_(batch_keys))
+        result = await db.execute(stmt)
+        local_props = {row.listing_key: row.modification_timestamp for row in result.all()}
+
+        for d_key, d_ts in deletion_map.items():
+            local_ts = local_props.get(d_key)
+            # If we don't have it, or our last modification is older than the deletion event
+            if not local_ts or (d_ts and d_ts > local_ts):
+                valid_deletion_keys.append(d_key)
+            else:
+                logger.debug(f"Skipping deletion for {d_key}: local mod ({local_ts}) is newer than deletion ({d_ts})")
+
+        if not valid_deletion_keys:
+            logger.info("All deletions were older than our local modifications. No updates needed.")
+            return
+
+        logger.warning(f"Applying {len(valid_deletion_keys)} verified hard deletions. Marking as off-market.")
+
         # Batch update in database
         batch_size = 500
-        for i in range(0, len(deletion_keys), batch_size):
-            batch = deletion_keys[i : i + batch_size]
+        for i in range(0, len(valid_deletion_keys), batch_size):
+            batch = valid_deletion_keys[i : i + batch_size]
             stmt = (
                 update(Property)
                 .where(Property.listing_key.in_(batch))
@@ -175,7 +198,7 @@ class PropertySyncService:
             )
             result = await db.execute(stmt)
             stats["deletions"] += result.rowcount
-        
+
         await db.commit()
         logger.info(f"Successfully processed {stats['deletions']} hard deletions.")
 
