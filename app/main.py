@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request #, Response
+from fastapi import FastAPI, Request  # , Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -14,7 +14,12 @@ from app.utils.clean_cache import cleanup_expired_signup_verifications
 from app.utils.property_sync_scheduler import scheduled_property_sync
 from app.services.email_scheduler_service import EmailSchedulerService
 from app.utils.create_admin import create_admin_user
-from app.config.logging import configure_logging, get_logger, set_request_id, clear_request_id
+from app.config.logging import (
+    configure_logging,
+    get_logger,
+    set_request_id,
+    clear_request_id,
+)
 
 load_dotenv()
 
@@ -25,6 +30,7 @@ configure_logging()
 logger = get_logger(__name__)
 
 scheduler = AsyncIOScheduler()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -44,7 +50,7 @@ async def lifespan(app: FastAPI):
         CronTrigger(hour=cache_hour, minute=cache_mins),  # Daily at 2:00 AM
         id="cleanup_signup_verifications",
         name="Clean up expired signup verifications",
-        replace_existing=True
+        replace_existing=True,
     )
 
     # This is for the property sync (every 5 minutes)
@@ -53,17 +59,17 @@ async def lifespan(app: FastAPI):
         CronTrigger(minute="*/5"),  # Every 5 minutes
         id="property_sync",
         name="Sync properties from Bright MLS API",
-        replace_existing=True
+        replace_existing=True,
     )
 
     # Schedule email processing every minute
     scheduler.add_job(
         EmailSchedulerService.process_due_emails,
-        'interval',
+        "interval",
         minutes=1,
         id="email_processing",
         name="Process scheduled emails",
-        replace_existing=True
+        replace_existing=True,
     )
 
     scheduler.start()
@@ -72,8 +78,8 @@ async def lifespan(app: FastAPI):
         extra={
             "cache_cleanup_schedule": f"Daily at {cache_hour:02d}:{cache_mins:02d}",
             "property_sync_interval": "Every hour at :00",
-            "email_processing_interval": "Every 1 minute"
-        }
+            "email_processing_interval": "Every 1 minute",
+        },
     )
 
     yield
@@ -82,6 +88,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down application")
     scheduler.shutdown()
     logger.info("APScheduler stopped")
+
 
 app = FastAPI(title="Open House Pal API", lifespan=lifespan)
 
@@ -101,6 +108,7 @@ async def logging_middleware(request: Request, call_next):
             token = auth_header.split(" ")[1]
             from jose import jwt
             from app.auth.dependencies import SECRET_KEY, ALGORITHM
+
             payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
             user_id = payload.get("sub")
     except Exception:
@@ -126,12 +134,12 @@ async def logging_middleware(request: Request, call_next):
             extra={
                 "method": request.method,
                 "path": request.url.path,
-                #"query_params": str(request.url.query) if request.url.query else None,
-                #"client_host": request.client.host if request.client else None,
+                # "query_params": str(request.url.query) if request.url.query else None,
+                # "client_host": request.client.host if request.client else None,
                 "user_id": user_id,
                 "status_code": response.status_code,
                 "duration_ms": round(duration_ms, 2),
-            }
+            },
         )
 
         return response
@@ -146,7 +154,7 @@ async def logging_middleware(request: Request, call_next):
                 "user_id": user_id,
                 "duration_ms": round(duration_ms, 2),
                 "error": str(e),
-            }
+            },
         )
         raise
     finally:
@@ -164,10 +172,12 @@ app.add_middleware(
 # Include API routes
 app.include_router(router)
 
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=os.getenv("PORT"))
 
+if __name__ == "__main__":
+    port: int = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
