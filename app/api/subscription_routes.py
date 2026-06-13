@@ -282,16 +282,23 @@ async def cancel_subscription(
         else:
             # Fallback: Calculate grace period manually if PayPal doesn't provide it
             # This ensures users always keep access until end of their paid period
-            trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
+            
+            # Determine if this was a trial or paid subscription
+            trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "14"))
+            # If they had a last_billing_date, they were definitely a paid user
+            is_paid_user = user.last_billing_date is not None
+            
+            grace_days = 30 if is_paid_user else trial_days
+            
             if user.last_billing_date:
-                # User was billed recently - add trial_days from last billing
-                user.next_billing_date = user.last_billing_date + timedelta(days=trial_days)
+                # User was billed recently - add grace_days from last billing
+                user.next_billing_date = user.last_billing_date + timedelta(days=grace_days)
             elif user.subscription_started_at:
-                # Calculate from subscription start date + trial_days
-                user.next_billing_date = user.subscription_started_at + timedelta(days=trial_days)
+                # Calculate from subscription start date + grace_days
+                user.next_billing_date = user.subscription_started_at + timedelta(days=grace_days)
             else:
-                # Safety fallback: Give trial_days from now
-                user.next_billing_date = datetime.now(timezone.utc) + timedelta(days=trial_days)
+                # Safety fallback: Give grace_days from now
+                user.next_billing_date = datetime.now(timezone.utc) + timedelta(days=grace_days)
 
         await db.commit()
 

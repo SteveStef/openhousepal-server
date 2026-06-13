@@ -19,6 +19,7 @@ BASIC_PLAN_NO_TRIAL_ID = os.getenv("PAYPAL_BASIC_NO_TRIAL_PLAN_ID")
 PREMIUM_PLAN_NO_TRIAL_ID = os.getenv("PAYPAL_PREMIUM_NO_TRIAL_PLAN_ID")
 PAYPAL_WEBHOOK_ID = os.getenv("PAYPAL_WEBHOOK_ID")
 
+
 @router.post("/webhooks/paypal")
 async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     """
@@ -45,9 +46,20 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
         body = await request.json()
 
         # Verify webhook signature BEFORE processing anything
-        if not all([transmission_id, transmission_time, cert_url, auth_algo, transmission_sig, PAYPAL_WEBHOOK_ID]):
+        if not all(
+            [
+                transmission_id,
+                transmission_time,
+                cert_url,
+                auth_algo,
+                transmission_sig,
+                PAYPAL_WEBHOOK_ID,
+            ]
+        ):
             logger.error("SECURITY: Missing webhook verification headers or webhook ID")
-            raise HTTPException(status_code=400, detail="Missing required webhook headers")
+            raise HTTPException(
+                status_code=400, detail="Missing required webhook headers"
+            )
 
         try:
             is_valid = await paypal_service.verify_webhook_signature(
@@ -57,14 +69,19 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
                 auth_algo=auth_algo,
                 transmission_sig=transmission_sig,
                 webhook_id=PAYPAL_WEBHOOK_ID,
-                webhook_event=body
+                webhook_event=body,
             )
 
             if not is_valid:
-                logger.error("SECURITY: Invalid webhook signature detected", extra={"transmission_id": transmission_id})
+                logger.error(
+                    "SECURITY: Invalid webhook signature detected",
+                    extra={"transmission_id": transmission_id},
+                )
                 raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
-            logger.info("Webhook signature verified", extra={"transmission_id": transmission_id})
+            logger.info(
+                "Webhook signature verified", extra={"transmission_id": transmission_id}
+            )
 
         except HTTPException:
             raise
@@ -72,17 +89,27 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
             logger.error("SECURITY: Webhook verification failed", exc_info=True)
             raise HTTPException(status_code=401, detail="Webhook verification failed")
 
-        event_id = body.get('id')
+        event_id = body.get("id")
         event_type = body.get("event_type")
-        logger.info("PayPal webhook received", extra={"event_type": event_type, "event_id": event_id})
+        logger.info(
+            "PayPal webhook received",
+            extra={"event_type": event_type, "event_id": event_id},
+        )
 
         if not event_id or not event_type:
             logger.warning("Webhook missing event_id or event_type")
-            raise HTTPException(status_code=400, detail="Missing event ID or event_type")
+            raise HTTPException(
+                status_code=400, detail="Missing event ID or event_type"
+            )
 
-        existing = await db.execute(select(WebhookEvent).where(WebhookEvent.id == event_id))
+        existing = await db.execute(
+            select(WebhookEvent).where(WebhookEvent.id == event_id)
+        )
         if existing.scalar_one_or_none():
-            logger.info("Webhook event already processed, skipping", extra={"event_id": event_id})
+            logger.info(
+                "Webhook event already processed, skipping",
+                extra={"event_id": event_id},
+            )
             return {"status": "already_processed", "event_id": event_id}
 
         # Extract subscription ID from different possible locations
@@ -92,7 +119,9 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
         subscription_id = resource.get("billing_agreement_id") or resource.get("id")
 
         if not subscription_id:
-            logger.warning("Webhook missing subscription_id", extra={"event_type": event_type})
+            logger.warning(
+                "Webhook missing subscription_id", extra={"event_type": event_type}
+            )
             return {"received": True, "warning": "No subscription_id"}
 
         # Find user by subscription_id
@@ -102,10 +131,16 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
         user = result.scalar_one_or_none()
 
         if not user:
-            logger.warning("User not found for subscription", extra={"subscription_id": subscription_id})
+            logger.warning(
+                "User not found for subscription",
+                extra={"subscription_id": subscription_id},
+            )
             return {"received": True, "warning": "User not found"}
 
-        logger.info("Processing webhook for user", extra={"subscription_id": subscription_id, "user_id": user.id})
+        logger.info(
+            "Processing webhook for user",
+            extra={"subscription_id": subscription_id, "user_id": user.id},
+        )
 
         # Extract plan_id from resource
         plan_id = resource.get("plan_id")
@@ -116,7 +151,7 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
             # Trial converted to paid, or subscription reactivated
             # Determine Tier and Status based on Plan ID
             is_trial = False
-            
+
             if plan_id == BASIC_PLAN_ID:
                 user.plan_tier = "BASIC"
                 user.subscription_status = "TRIAL"
@@ -133,22 +168,27 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
                 user.subscription_status = "ACTIVE"
             else:
                 # Unknown plan (fallback to active if not recognized)
-                logger.warning(f"Unknown plan_id {plan_id}, defaulting to ACTIVE", extra={"subscription_id": subscription_id})
+                logger.warning(
+                    f"Unknown plan_id {plan_id}, defaulting to ACTIVE",
+                    extra={"subscription_id": subscription_id},
+                )
                 user.subscription_status = "ACTIVE"
 
             logger.info(
-                f"Subscription activated: {user.plan_tier} - {user.subscription_status}", 
-                extra={"subscription_id": subscription_id, "user_id": user.id}
+                f"Subscription activated: {user.plan_tier} - {user.subscription_status}",
+                extra={"subscription_id": subscription_id, "user_id": user.id},
             )
 
             # Set Trial End Date if applicable
             if is_trial:
                 billing_info = resource.get("billing_info", {})
                 next_billing_time = billing_info.get("next_billing_time")
-                
+
                 if next_billing_time:
                     try:
-                        user.trial_ends_at = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
+                        user.trial_ends_at = datetime.fromisoformat(
+                            next_billing_time.replace("Z", "+00:00")
+                        )
                         user.next_billing_date = user.trial_ends_at
                     except Exception:
                         # Fallback if parsing fails
@@ -182,31 +222,49 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
             if next_billing_time:
                 try:
                     # Parse ISO 8601 datetime from PayPal
-                    user.next_billing_date = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
+                    user.next_billing_date = datetime.fromisoformat(
+                        next_billing_time.replace("Z", "+00:00")
+                    )
                     logger.info(
                         "Subscription cancelled with grace period",
                         extra={
                             "subscription_id": subscription_id,
                             "user_id": user.id,
-                            "grace_until": next_billing_time
-                        }
+                            "grace_until": next_billing_time,
+                        },
                     )
                 except Exception as e:
                     logger.warning("Failed to parse next_billing_time", exc_info=True)
             else:
                 # Fallback: Calculate grace period manually if PayPal doesn't provide it
+                # For ACTIVE users, we give a full month (30 days) from last billing
+                # For TRIAL users, we give the remainder of their trial period
+
                 trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "14"))
+                is_paid_user = (
+                    user.subscription_status == "ACTIVE"
+                    or user.last_billing_date is not None
+                )
+
+                grace_days = 30 if is_paid_user else trial_days
+
                 if user.last_billing_date:
-                    # User was billed recently - add trial_days from last billing
-                    user.next_billing_date = user.last_billing_date + timedelta(days=trial_days)
+                    # User was billed recently - add 30 days from last billing
+                    user.next_billing_date = user.last_billing_date + timedelta(
+                        days=grace_days
+                    )
                     grace_source = "last_billing_date"
                 elif user.subscription_started_at:
-                    # Calculate from subscription start date + trial_days
-                    user.next_billing_date = user.subscription_started_at + timedelta(days=trial_days)
+                    # Calculate from subscription start date + grace period
+                    user.next_billing_date = user.subscription_started_at + timedelta(
+                        days=grace_days
+                    )
                     grace_source = "subscription_started_at"
                 else:
-                    # Safety fallback: Give trial_days from now
-                    user.next_billing_date = datetime.now(timezone.utc) + timedelta(days=trial_days)
+                    # Safety fallback: Give grace period from now
+                    user.next_billing_date = datetime.now(timezone.utc) + timedelta(
+                        days=grace_days
+                    )
                     grace_source = "current_time"
 
                 logger.info(
@@ -215,21 +273,28 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
                         "subscription_id": subscription_id,
                         "user_id": user.id,
                         "grace_until": user.next_billing_date.isoformat(),
-                        "grace_calculated_from": grace_source
-                    }
+                        "grace_days": grace_days,
+                        "grace_calculated_from": grace_source,
+                    },
                 )
 
         elif event_type == "BILLING.SUBSCRIPTION.SUSPENDED":
             # Payment failed - subscription suspended
             user.subscription_status = "SUSPENDED"
             user.last_paypal_sync = datetime.now(timezone.utc)
-            logger.warning("Subscription suspended due to payment failure", extra={"subscription_id": subscription_id, "user_id": user.id})
+            logger.warning(
+                "Subscription suspended due to payment failure",
+                extra={"subscription_id": subscription_id, "user_id": user.id},
+            )
 
         elif event_type == "BILLING.SUBSCRIPTION.EXPIRED":
             # Subscription ended (after cancellation grace period)
             user.subscription_status = "EXPIRED"
             user.last_paypal_sync = datetime.now(timezone.utc)
-            logger.info("Subscription expired", extra={"subscription_id": subscription_id, "user_id": user.id})
+            logger.info(
+                "Subscription expired",
+                extra={"subscription_id": subscription_id, "user_id": user.id},
+            )
 
         elif event_type == "BILLING.SUBSCRIPTION.UPDATED":
             # Plan changed (upgrade/downgrade)
@@ -252,8 +317,8 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
                         "subscription_id": subscription_id,
                         "user_id": user.id,
                         "new_tier": new_tier,
-                        "new_plan_id": new_plan_id
-                    }
+                        "new_plan_id": new_plan_id,
+                    },
                 )
 
                 user.plan_id = new_plan_id
@@ -268,37 +333,53 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
             user.last_billing_date = datetime.now(timezone.utc)
             user.subscription_status = "ACTIVE"  # Ensure it's active
             user.last_paypal_sync = datetime.now(timezone.utc)
-            logger.info("Payment completed", extra={"subscription_id": subscription_id, "user_id": user.id})
+            logger.info(
+                "Payment completed",
+                extra={"subscription_id": subscription_id, "user_id": user.id},
+            )
 
         elif event_type in ["PAYMENT.SALE.DENIED", "PAYMENT.SALE.REFUNDED"]:
             # Payment failed or refunded
             user.subscription_status = "SUSPENDED"
             user.last_paypal_sync = datetime.now(timezone.utc)
-            logger.warning("Payment issue", extra={"subscription_id": subscription_id, "user_id": user.id, "issue_type": event_type})
+            logger.warning(
+                "Payment issue",
+                extra={
+                    "subscription_id": subscription_id,
+                    "user_id": user.id,
+                    "issue_type": event_type,
+                },
+            )
 
         else:
             # Unknown event type - log it but don't fail
-            logger.info("Unhandled webhook event type", extra={"event_type": event_type})
-            return {"received": True, "event_type": event_type, "message": "Event type not handled"}
+            logger.info(
+                "Unhandled webhook event type", extra={"event_type": event_type}
+            )
+            return {
+                "received": True,
+                "event_type": event_type,
+                "message": "Event type not handled",
+            }
 
         # Record that we processed this event (for idempotency)
-        webhook_record = WebhookEvent(
-            id=event_id,
-            event_type=event_type
-        )
+        webhook_record = WebhookEvent(id=event_id, event_type=event_type)
         db.add(webhook_record)
 
         # Save changes to database (both user updates and webhook event record)
         await db.commit()
 
-        logger.info("Webhook processed successfully", extra={"user_id": user.id, "event_type": event_type})
+        logger.info(
+            "Webhook processed successfully",
+            extra={"user_id": user.id, "event_type": event_type},
+        )
 
         return {
             "received": True,
             "event_type": event_type,
             "subscription_id": subscription_id,
             "user_email": user.email,
-            "new_status": user.subscription_status
+            "new_status": user.subscription_status,
         }
 
     except Exception as e:
