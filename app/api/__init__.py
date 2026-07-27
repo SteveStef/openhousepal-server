@@ -10,6 +10,7 @@ from .webhook_routes import router as webhook_router
 from .notifications_routes import router as notifications_router
 from .admin_routes import router as admin_router
 from .discover_routes import router as discover_router
+from .agent_hub_routes import router as agent_hub_router
 
 router = APIRouter()
 router.include_router(auth_router)
@@ -23,3 +24,4 @@ router.include_router(webhook_router)
 router.include_router(notifications_router)
 router.include_router(admin_router)
 router.include_router(discover_router)
+router.include_router(agent_hub_router)

@@ -61,6 +61,19 @@ class User(Base):
     collections = relationship("Collection", back_populates="owner")
     notifications = relationship("Notification", back_populates="agent")
     discovery_preferences = relationship("DiscoveryPreferences", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    agent_hub = relationship("AgentHub", back_populates="owner", uselist=False, cascade="all, delete-orphan")
+
+class AgentHub(Base):
+    __tablename__ = "agent_hubs"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), unique=True, nullable=False)
+    slug = Column(String, unique=True, index=True, nullable=False)
+    status = Column(String, default="DRAFT", nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    owner = relationship("User", back_populates="agent_hub")
 
 class Collection(Base):
     __tablename__ = "collections"
