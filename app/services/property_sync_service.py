@@ -60,12 +60,19 @@ class PropertySyncService:
         
         await db.commit()
 
-    async def run_global_sync(self) -> Dict[str, Any]:
+    async def run_global_sync(self, max_pages: Optional[int] = None) -> Dict[str, Any]:
         """
         The Main Sync Loop.
         1. Process Hard Deletions (Isolated).
         2. Process Modifications & Status Changes (Paged).
         3. Notify affected collections.
+
+        max_pages caps how many pages (of page_size properties each) this run will process before
+        stopping early - used by the on-demand "Refresh Listings" trigger so a stale/never-run
+        checkpoint (e.g. a big backlog) can't turn one button click into an unbounded, long-running
+        sync. The scheduled cron calls this with no cap, since it runs often enough that the
+        backlog per run stays small. Checkpoint progress made before an early stop is still saved
+        (see "Finalize sync state" below), so a follow-up run just continues from there.
         """
         logger.info("Starting Global Synchronization Cycle...")
         stats = {
@@ -92,8 +99,12 @@ class PropertySyncService:
             page_size = 200
             new_last_sync = last_sync
             had_failure = False
+            pages_processed = 0
 
             while True:
+                if max_pages is not None and pages_processed >= max_pages:
+                    logger.info(f"Reached max_pages={max_pages} for this run - stopping early, checkpoint saved so far.")
+                    break
                 try:
                     # 1. Fetch modified batch from MLS
                     raw_properties = await bright_mls_service.get_properties_modified_since(last_sync, top=page_size, skip=skip)
@@ -134,6 +145,7 @@ class PropertySyncService:
                             stats["errors"] += 1
                             had_failure = True
 
+                    pages_processed += 1
                     if len(raw_properties) < page_size:
                         break
                     skip += page_size

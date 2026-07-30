@@ -16,13 +16,21 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Admin user configuration from environment variables
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@openhousepal.com")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
 async def create_admin_user():
     """
     Create admin user if it doesn't exist.
     Admin user gets PREMIUM tier with ACTIVE status (no trial needed).
     """
+    if not ADMIN_PASSWORD:
+        if os.getenv("DEV", "false") == "true":
+            print("[WARN] ADMIN_PASSWORD not set - skipping admin user creation in DEV mode.")
+            return
+        raise RuntimeError(
+            "ADMIN_PASSWORD environment variable is not set. Refusing to create an admin "
+            "account with a guessable default password outside of DEV mode."
+        )
     try:
         async with AsyncSessionLocal() as db:
             # Check if admin user already exists
@@ -32,7 +40,7 @@ async def create_admin_user():
             existing_admin = result.scalar_one_or_none()
 
             if existing_admin:
-                print(f"✓ Admin user already exists: {ADMIN_EMAIL}")
+                print(f"[OK] Admin user already exists: {ADMIN_EMAIL}")
                 return
 
             # Create admin user
@@ -72,11 +80,11 @@ async def create_admin_user():
             await db.refresh(admin_user)
 
             print(f"\n{'='*60}")
-            print(f"✓ Admin user created successfully!")
+            print(f"[OK] Admin user created successfully!")
             print(f"{'='*60}")
 
     except Exception as e:
-        print(f"✗ Error creating admin user: {e}")
+        print(f"[ERROR] Error creating admin user: {e}")
         raise
 
 

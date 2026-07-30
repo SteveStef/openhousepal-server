@@ -187,6 +187,26 @@ class PropertyDetailResponse(PropertySummaryResponse):
             self.days_on_market = max(0, delta.days)
         return self
 
+class NearbyPlace(BaseModel):
+    name: str
+    address: Optional[str] = None
+    distance_miles: Optional[float] = None
+    place_type: Optional[str] = None  # e.g. "Hospital", "Urgent Care", "Primary Care", "Rehabilitation", "Medical Clinic" - only set for medical_care entries
+
+class NearbyAmenitiesResponse(BaseModel):
+    schools: List[NearbyPlace] = []
+    private_schools: List[NearbyPlace] = []
+    grocery_stores: List[NearbyPlace] = []
+    medical_care: List[NearbyPlace] = []  # hospitals, urgent care, primary care, rehab - see NearbyPlace.place_type for which
+    parks: List[NearbyPlace] = []
+    downtown_areas: List[NearbyPlace] = []  # nearby named town centers, e.g. "Downtown Wayne" - not businesses
+    airports: List[NearbyPlace] = []
+    # False when nothing could be looked up at all (no API key configured, or the lookup failed
+    # with no usable cache) - distinct from an empty list, which means "we looked, found nothing
+    # in that one category." The PDF omits the whole amenities section when this is False.
+    available: bool = True
+    cached_at: Optional[datetime] = None
+
 class PropertyLookupRequest(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, from_attributes=True)
     address: Optional[str] = None

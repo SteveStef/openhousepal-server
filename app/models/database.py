@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Boolean, Text, ForeignKey, Table, Index, DateTime, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Float, Boolean, Text, ForeignKey, Table, Index, DateTime, Date, Time, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import JSONB
@@ -40,6 +40,9 @@ class User(Base):
     brokerage = Column(String, nullable=False)  # Agent's brokerage
     mls_id = Column(String, unique=True, index=True, nullable=False)  # Agent's MLS ID
     broker_authorized = Column(Boolean, default=False, nullable=False)
+    photo_url = Column(String, nullable=True)  # Uploaded headshot, served from /uploads
+    professional_title = Column(String, nullable=True)  # e.g. "Real Estate Agent" - shown on Agent Hub + public forms
+    market = Column(String, nullable=True)  # e.g. "Philly Main Line & Suburbs" - shown on Agent Hub + public forms
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     @property
@@ -62,6 +65,7 @@ class User(Base):
     notifications = relationship("Notification", back_populates="agent")
     discovery_preferences = relationship("DiscoveryPreferences", back_populates="user", uselist=False, cascade="all, delete-orphan")
     agent_hub = relationship("AgentHub", back_populates="owner", uselist=False, cascade="all, delete-orphan")
+    agent_forms = relationship("AgentForm", back_populates="owner", cascade="all, delete-orphan")
 
 class AgentHub(Base):
     __tablename__ = "agent_hubs"
@@ -70,14 +74,76 @@ class AgentHub(Base):
     owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), unique=True, nullable=False)
     slug = Column(String, unique=True, index=True, nullable=False)
     status = Column(String, default="DRAFT", nullable=False)
+    # Full page-builder payload (profile, contact, social links, sales/video/tour/blog carousels,
+    # layout/visibility flags) - the single source of truth served to public visitors by slug.
+    config = Column(JSONB, nullable=False, server_default='{}')
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     owner = relationship("User", back_populates="agent_hub")
 
+class AgentForm(Base):
+    __tablename__ = "agent_forms"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    form_type = Column(String, nullable=False)  # 'buying' | 'selling' | 'home_value'
+    slug = Column(String, nullable=False)
+    title = Column(String, nullable=False)
+    headline = Column(String, nullable=True)  # Friendly on-screen intro heading, distinct from the admin-facing title
+    subtitle = Column(Text, nullable=True)
+    description = Column(Text, nullable=True)  # Short agent-editable blurb shown under the title in the Forms list; seeded from a default per form_type, then freely editable
+
+    questions = Column(JSONB, nullable=False, default=list)
+    success_heading = Column(String, nullable=False)
+    success_message = Column(Text, nullable=True)
+    accent_color = Column(String, nullable=True)
+    show_branding = Column(Boolean, default=True, nullable=False)  # Show agent photo/name/brokerage on the intro screen
+    dark_mode = Column(Boolean, default=False, nullable=False)  # Force dark theme for visitors on this form's public page
+    redirect_to_agent_hub = Column(Boolean, default=True, nullable=False)  # After submitting, auto-redirect the visitor to the agent's public Agent Hub
+    property_photo_carousel = Column(Boolean, default=False, nullable=False)  # Welcome screen cycles through the linked property's listing photos
+    branding_layout = Column(String, default='split', nullable=False)  # Question-page agent/property placement: 'top' | 'bottom' | 'split' (property header, agent footer) | 'split_reverse' | 'integrated' (single boxed card, like Open House sign-in)
+    is_enabled = Column(Boolean, default=True, nullable=False)
+    order_index = Column(Integer, default=0, nullable=False)
+    linked_property = Column(JSONB, nullable=True)  # Snapshot: {listing_key, address, city, state, price, beds, baths, sqft, image_url, photos, status}
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('owner_id', 'slug', name='uq_agent_forms_owner_slug'),
+    )
+
+    owner = relationship("User", back_populates="agent_forms")
+    submissions = relationship("FormSubmission", back_populates="form", cascade="all, delete-orphan")
+
+class FormSubmission(Base):
+    __tablename__ = "form_submissions"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    form_id = Column(String, ForeignKey('agent_forms.id', ondelete='CASCADE'), nullable=False, index=True)
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    form_type = Column(String, nullable=False)
+    answers = Column(JSONB, nullable=False)  # snapshot: [{questionId, label, type, value}]
+    contact_name = Column(String, nullable=True)
+    contact_email = Column(String, nullable=True)
+    contact_phone = Column(String, nullable=True)
+    property_address = Column(String, nullable=True)
+    is_reviewed = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    form = relationship("AgentForm", back_populates="submissions")
+
+class AgentHubEvent(Base):
+    __tablename__ = "agent_hub_events"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    event_type = Column(String, nullable=False)  # 'visit' | 'qr_scan'
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
 class Collection(Base):
     __tablename__ = "collections"
-    
+
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     name = Column(String, nullable=False)
     description = Column(Text, nullable=True)
@@ -145,6 +211,11 @@ class Property(Base):
     mls_incorporated_city_name = Column(String, nullable=True)
     raw_mls_data = Column(JSONB, nullable=True)
 
+    # Cached nearby-amenities lookup (Google Places) for the Open House Cheat Sheet PDF -
+    # persisted rather than in-memory so repeat kit downloads don't re-bill Google.
+    nearby_amenities = Column(JSONB, nullable=True)
+    nearby_amenities_cached_at = Column(DateTime(timezone=True), nullable=True)
+
     # Location
     full_address = Column(String, index=True, nullable=True) # Combined address for fast searching
     latitude = Column(Float, index=True, nullable=True)
@@ -161,6 +232,9 @@ class Property(Base):
     list_agent_email = Column(String, nullable=True)
     list_office_name = Column(String, index=True, nullable=True)
     list_office_phone = Column(String, nullable=True)
+    list_agent_mls_id = Column(String, index=True, nullable=True)  # Matches User.mls_id - lets us find "my listings"
+    co_list_agent_mls_id = Column(String, index=True, nullable=True)
+    is_manual = Column(Boolean, default=False, nullable=False)  # Agent-entered "My Listings" row (synthetic listing_key) - never touched by the Bright MLS sync
 
     # Core Structural & Exterior
     architectural_style = Column(JSONB, nullable=True)
@@ -293,6 +367,7 @@ class OpenHouseEvent(Base):
     deleted_at = Column(DateTime(timezone=True), nullable=True)  # Track when deleted
     form_url = Column(String, nullable=True)  # Store the form link
     cover_image_url = Column(String, nullable=True)  # Store the selected cover image
+    cheat_sheet_photos = Column(JSONB, nullable=True)  # Agent-selected photos for the Open House Cheat Sheet PDF
     
     # Property metadata (replaces property_id relationship)
     address = Column(String, nullable=True)
@@ -309,17 +384,29 @@ class OpenHouseEvent(Base):
     bathrooms = Column(Float, nullable=True)
     living_area = Column(Integer, nullable=True)
     home_status = Column(String, nullable=True)
-    listing_key = Column(String, nullable=True)
-    
+    listing_key = Column(String, nullable=True, index=True)
+
     # Property details for PDF generation and collection preferences
 
     notes = Column(Text, nullable=True)
     similar_properties_snapshot = Column(JSONB, nullable=True) # Full property data snapshot
-    
+
+    # Scheduling - only set when this open house came from an approved Open House Manager host
+    # request (a real booked date/time). Self-hosted opens created via the wizard leave these
+    # null, same as before - they remain evergreen QR pages with no fixed schedule.
+    scheduled_date = Column(Date, nullable=True)
+    scheduled_start_time = Column(Time, nullable=True)
+    scheduled_end_time = Column(Time, nullable=True)
+    # Snapshot of who owns/lists this property, distinct from `agent_id` (the hosting agent) when
+    # this open house was hosted by someone else's approved request. Denormalized on purpose (like
+    # the address/price fields above) so history stays correct even if the listing later changes hands.
+    listing_owner_agent_id = Column(String, ForeignKey('users.id'), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    
+
     # Relationships
-    agent = relationship("User")
+    agent = relationship("User", foreign_keys=[agent_id])
+    listing_owner_agent = relationship("User", foreign_keys=[listing_owner_agent_id])
 
 
 class OpenHouseVisitor(Base):
@@ -662,4 +749,91 @@ class DiscoveryPreferences(Base):
 
     # Relationship
     user = relationship("User", back_populates="discovery_preferences")
+
+
+class OpenHouseHostRequest(Base):
+    __tablename__ = "open_house_host_requests"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    listing_key = Column(String, nullable=False, index=True)
+
+    listing_owner_agent_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    requesting_agent_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+
+    requested_date = Column(Date, nullable=False)
+    requested_start_time = Column(Time, nullable=False)
+    requested_end_time = Column(Time, nullable=False)
+    message = Column(Text, nullable=True)
+
+    status = Column(String, default="pending", nullable=False, index=True)  # pending, approved, declined, countered
+
+    # Set once approved - links back to the OpenHouseEvent that got created for this request
+    open_house_event_id = Column(String, ForeignKey('open_house_events.id'), nullable=True)
+
+    # Set when the listing agent proposes a different date/time instead of approving as-is
+    counter_date = Column(Date, nullable=True)
+    counter_start_time = Column(Time, nullable=True)
+    counter_end_time = Column(Time, nullable=True)
+
+    # Set when this request was created from a team broadcast response, rather than a direct ask
+    broadcast_id = Column(String, ForeignKey('open_house_team_broadcasts.id', ondelete='SET NULL'), nullable=True, index=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    responded_at = Column(DateTime(timezone=True), nullable=True)
+
+    listing_owner_agent = relationship("User", foreign_keys=[listing_owner_agent_id])
+    requesting_agent = relationship("User", foreign_keys=[requesting_agent_id])
+    open_house_event = relationship("OpenHouseEvent")
+
+
+class OpenHouseTeamMember(Base):
+    __tablename__ = "open_house_team_members"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    member_agent_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    owner = relationship("User", foreign_keys=[owner_id])
+    member_agent = relationship("User", foreign_keys=[member_agent_id])
+
+    __table_args__ = (
+        UniqueConstraint('owner_id', 'member_agent_id', name='unique_team_owner_member'),
+    )
+
+
+class OpenHouseTeamBroadcast(Base):
+    __tablename__ = "open_house_team_broadcasts"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    listing_key = Column(String, nullable=False, index=True)
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+
+    requested_date = Column(Date, nullable=False)
+    requested_start_time = Column(Time, nullable=False)
+    requested_end_time = Column(Time, nullable=False)
+    message = Column(Text, nullable=True)
+
+    status = Column(String, default="open", nullable=False, index=True)  # open, filled, cancelled
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    owner = relationship("User", foreign_keys=[owner_id])
+
+
+class OpenHouseListingNote(Base):
+    __tablename__ = "open_house_listing_notes"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    listing_key = Column(String, nullable=False, unique=True, index=True)
+    agent_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+
+    notes = Column(Text, nullable=True)
+    # "Agent-defined priority" override - lets the listing agent manually flag a listing as
+    # high-priority regardless of what the computed priority logic says.
+    is_priority_override = Column(Boolean, default=False, nullable=False)
+
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    agent = relationship("User")
 

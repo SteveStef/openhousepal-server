@@ -1,0 +1,4547 @@
+[
+  {
+    "name": "Aleknagik / New Airport",
+    "lat": 59.2826004028,
+    "lon": -158.617996216,
+    "municipality": "Aleknagik",
+    "region": "AK",
+    "iata": "WKK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Boulder City Municipal Airport",
+    "lat": 35.947161,
+    "lon": -114.858799,
+    "municipality": "Boulder City",
+    "region": "NV",
+    "iata": "BLD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Lehigh Valley International Airport",
+    "lat": 40.651773,
+    "lon": -75.442797,
+    "municipality": "Allentown/Bethlehem",
+    "region": "PA",
+    "iata": "ABE",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Abilene Regional Airport",
+    "lat": 32.4113006592,
+    "lon": -99.68190002440001,
+    "municipality": "Abilene",
+    "region": "TX",
+    "iata": "ABI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Albuquerque International Sunport",
+    "lat": 35.039976,
+    "lon": -106.608925,
+    "municipality": "Albuquerque",
+    "region": "NM",
+    "iata": "ABQ",
+    "type": "large_airport"
+  },
+  {
+    "name": "Aberdeen Regional Airport",
+    "lat": 45.449100494384766,
+    "lon": -98.42179870605469,
+    "municipality": "Aberdeen",
+    "region": "SD",
+    "iata": "ABR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Southwest Georgia Regional Airport",
+    "lat": 31.532946,
+    "lon": -84.196215,
+    "municipality": "Albany",
+    "region": "GA",
+    "iata": "ABY",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Nantucket Memorial Airport",
+    "lat": 41.25310135,
+    "lon": -70.06020355,
+    "municipality": "Nantucket",
+    "region": "MA",
+    "iata": "ACK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Waco Regional Airport",
+    "lat": 31.611299514770508,
+    "lon": -97.23049926757812,
+    "municipality": "Waco",
+    "region": "TX",
+    "iata": "ACT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "California Redwood Coast-Humboldt County Airport",
+    "lat": 40.978101,
+    "lon": -124.109,
+    "municipality": "Arcata/Eureka",
+    "region": "CA",
+    "iata": "ACV",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Atlantic City International Airport",
+    "lat": 39.456201,
+    "lon": -74.577511,
+    "municipality": "Atlantic City",
+    "region": "NJ",
+    "iata": "ACY",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Alexandria International Airport",
+    "lat": 31.325828,
+    "lon": -92.546702,
+    "municipality": "Alexandria",
+    "region": "LA",
+    "iata": "AEX",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Augusta Regional At Bush Field",
+    "lat": 33.3699,
+    "lon": -81.9645,
+    "municipality": "Augusta",
+    "region": "GA",
+    "iata": "AGS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Alliance Municipal Airport",
+    "lat": 42.052543,
+    "lon": -102.803965,
+    "municipality": "Alliance",
+    "region": "NE",
+    "iata": "AIA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Albany International Airport",
+    "lat": 42.748299,
+    "lon": -73.801697,
+    "municipality": "Albany",
+    "region": "NY",
+    "iata": "ALB",
+    "type": "large_airport"
+  },
+  {
+    "name": "Waterloo Regional Airport",
+    "lat": 42.557098388671875,
+    "lon": -92.40029907226562,
+    "municipality": "Waterloo",
+    "region": "IA",
+    "iata": "ALO",
+    "type": "medium_airport"
+  },
+  {
+    "name": "San Luis Valley Regional Airport/Bergman Field",
+    "lat": 37.434898,
+    "lon": -105.866997,
+    "municipality": "Alamosa",
+    "region": "CO",
+    "iata": "ALS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Walla Walla Regional Airport",
+    "lat": 46.09489822,
+    "lon": -118.288002,
+    "municipality": "Walla Walla",
+    "region": "WA",
+    "iata": "ALW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Rick Husband Amarillo International Airport",
+    "lat": 35.217857,
+    "lon": -101.706444,
+    "municipality": "Amarillo",
+    "region": "TX",
+    "iata": "AMA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Altoona Blair County Airport",
+    "lat": 40.296398,
+    "lon": -78.32,
+    "municipality": "Altoona",
+    "region": "PA",
+    "iata": "AOO",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Alpena County Regional Airport",
+    "lat": 45.0780983,
+    "lon": -83.56030273,
+    "municipality": "Alpena",
+    "region": "MI",
+    "iata": "APN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Watertown International Airport",
+    "lat": 43.991901,
+    "lon": -76.021698,
+    "municipality": "Watertown",
+    "region": "NY",
+    "iata": "ART",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Aspen-Pitkin County Airport (Sardy Field)",
+    "lat": 39.223202,
+    "lon": -106.869003,
+    "municipality": "Aspen",
+    "region": "CO",
+    "iata": "ASE",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Hartsfield Jackson Atlanta International Airport",
+    "lat": 33.6367,
+    "lon": -84.428101,
+    "municipality": "Atlanta",
+    "region": "GA",
+    "iata": "ATL",
+    "type": "large_airport"
+  },
+  {
+    "name": "Appleton International Airport",
+    "lat": 44.258515,
+    "lon": -88.519,
+    "municipality": "Appleton",
+    "region": "WI",
+    "iata": "ATW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Watertown Regional Airport",
+    "lat": 44.91400146,
+    "lon": -97.15470123,
+    "municipality": "Watertown",
+    "region": "SD",
+    "iata": "ATY",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Augusta State Airport",
+    "lat": 44.320598602299995,
+    "lon": -69.7973022461,
+    "municipality": "Augusta",
+    "region": "ME",
+    "iata": "AUG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Austin Bergstrom International Airport",
+    "lat": 30.197535,
+    "lon": -97.662015,
+    "municipality": "Austin",
+    "region": "TX",
+    "iata": "AUS",
+    "type": "large_airport"
+  },
+  {
+    "name": "Asheville Regional Airport",
+    "lat": 35.435488,
+    "lon": -82.541853,
+    "municipality": "Asheville",
+    "region": "NC",
+    "iata": "AVL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Wilkes-Barre/Scranton International Airport",
+    "lat": 41.337064,
+    "lon": -75.724232,
+    "municipality": "Wilkes-Barre/Scranton",
+    "region": "PA",
+    "iata": "AVP",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Arlington Municipal Airport",
+    "lat": 48.161448,
+    "lon": -122.158442,
+    "municipality": "Arlington",
+    "region": "WA",
+    "iata": "",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Kalamazoo/Battle Creek International Airport",
+    "lat": 42.232105,
+    "lon": -85.549637,
+    "municipality": "Kalamazoo",
+    "region": "MI",
+    "iata": "AZO",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Branson Airport",
+    "lat": 36.532082,
+    "lon": -93.200544,
+    "municipality": "Branson",
+    "region": "MO",
+    "iata": "BKG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Bradley International Airport",
+    "lat": 41.938555,
+    "lon": -72.688016,
+    "municipality": "Hartford",
+    "region": "CT",
+    "iata": "BDL",
+    "type": "large_airport"
+  },
+  {
+    "name": "Laurence G Hanscom Field",
+    "lat": 42.470001,
+    "lon": -71.289001,
+    "municipality": "Bedford",
+    "region": "MA",
+    "iata": "BED",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Bradford Regional Airport",
+    "lat": 41.8031005859375,
+    "lon": -78.64009857177734,
+    "municipality": "Bradford",
+    "region": "PA",
+    "iata": "BFD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Western Neb. Rgnl/William B. Heilig Airport",
+    "lat": 41.87400055,
+    "lon": -103.5960007,
+    "municipality": "Scottsbluff",
+    "region": "NE",
+    "iata": "BFF",
+    "type": "medium_airport"
+  },
+  {
+    "name": "King County International Airport - Boeing Field",
+    "lat": 47.527042,
+    "lon": -122.29995,
+    "municipality": "Seattle",
+    "region": "WA",
+    "iata": "BFI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Meadows Field",
+    "lat": 35.433601,
+    "lon": -119.056999,
+    "municipality": "Bakersfield",
+    "region": "CA",
+    "iata": "BFL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Greater Binghamton/Edwin A Link field",
+    "lat": 42.20869827,
+    "lon": -75.97979736,
+    "municipality": "Binghamton",
+    "region": "NY",
+    "iata": "BGM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Bangor International Airport",
+    "lat": 44.806364,
+    "lon": -68.826668,
+    "municipality": "Bangor",
+    "region": "ME",
+    "iata": "BGR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Hancock County-Bar Harbor Airport",
+    "lat": 44.45000076,
+    "lon": -68.3615036,
+    "municipality": "Bar Harbor",
+    "region": "ME",
+    "iata": "BHB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Birmingham-Shuttlesworth International Airport",
+    "lat": 33.562877,
+    "lon": -86.750712,
+    "municipality": "Birmingham",
+    "region": "AL",
+    "iata": "BHM",
+    "type": "large_airport"
+  },
+  {
+    "name": "Eastern Sierra Regional Airport",
+    "lat": 37.3731,
+    "lon": -118.363998,
+    "municipality": "Bishop",
+    "region": "CA",
+    "iata": "BIH",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Billings Logan International Airport",
+    "lat": 45.808932,
+    "lon": -108.541242,
+    "municipality": "Billings",
+    "region": "MT",
+    "iata": "BIL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Bismarck Municipal Airport",
+    "lat": 46.772734,
+    "lon": -100.746874,
+    "municipality": "Bismarck",
+    "region": "ND",
+    "iata": "BIS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Rocky Mountain Metropolitan Airport",
+    "lat": 39.908798,
+    "lon": -105.116997,
+    "municipality": "Denver",
+    "region": "CO",
+    "iata": "BJC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Raleigh County Memorial Airport",
+    "lat": 37.7873,
+    "lon": -81.124199,
+    "municipality": "Beaver",
+    "region": "WV",
+    "iata": "BKW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Bellingham International Airport",
+    "lat": 48.79280090332031,
+    "lon": -122.53800201416016,
+    "municipality": "Bellingham",
+    "region": "WA",
+    "iata": "BLI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Scott AFB/Midamerica Airport",
+    "lat": 38.5452,
+    "lon": -89.835197,
+    "municipality": "Belleville",
+    "region": "IL",
+    "iata": "BLV",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Central Illinois Regional Airport at Bloomington-Normal",
+    "lat": 40.4771,
+    "lon": -88.915901,
+    "municipality": "Bloomington/Normal",
+    "region": "IL",
+    "iata": "BMI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Nashville International Airport",
+    "lat": 36.1245,
+    "lon": -86.6782,
+    "municipality": "Nashville",
+    "region": "TN",
+    "iata": "BNA",
+    "type": "large_airport"
+  },
+  {
+    "name": "Boise Air Terminal/Gowen Field",
+    "lat": 43.5644,
+    "lon": -116.223,
+    "municipality": "Boise",
+    "region": "ID",
+    "iata": "BOI",
+    "type": "large_airport"
+  },
+  {
+    "name": "Boston Logan International Airport",
+    "lat": 42.36197,
+    "lon": -71.0079,
+    "municipality": "Boston",
+    "region": "MA",
+    "iata": "BOS",
+    "type": "large_airport"
+  },
+  {
+    "name": "Jack Brooks Regional Airport",
+    "lat": 29.9508,
+    "lon": -94.020699,
+    "municipality": "Beaumont/Port Arthur",
+    "region": "TX",
+    "iata": "BPT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Brunswick Golden Isles Airport",
+    "lat": 31.258801,
+    "lon": -81.466499,
+    "municipality": "Brunswick",
+    "region": "GA",
+    "iata": "BQK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Brainerd Lakes Regional Airport",
+    "lat": 46.402861,
+    "lon": -94.129727,
+    "municipality": "Brainerd",
+    "region": "MN",
+    "iata": "BRD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Southeast Iowa Regional Airport",
+    "lat": 40.783199310302734,
+    "lon": -91.12550354003906,
+    "municipality": "Burlington",
+    "region": "IA",
+    "iata": "BRL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Brownsville South Padre Island International Airport",
+    "lat": 25.907238,
+    "lon": -97.425235,
+    "municipality": "Brownsville",
+    "region": "TX",
+    "iata": "BRO",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Bert Mooney Airport",
+    "lat": 45.95479965209961,
+    "lon": -112.49700164794922,
+    "municipality": "Butte",
+    "region": "MT",
+    "iata": "BTM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Baton Rouge Metropolitan Airport",
+    "lat": 30.533199,
+    "lon": -91.149597,
+    "municipality": "Baton Rouge",
+    "region": "LA",
+    "iata": "BTR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Patrick Leahy Burlington International Airport",
+    "lat": 44.471901,
+    "lon": -73.153297,
+    "municipality": "Burlington",
+    "region": "VT",
+    "iata": "BTV",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Buffalo Niagara International Airport",
+    "lat": 42.940498,
+    "lon": -78.732201,
+    "municipality": "Buffalo",
+    "region": "NY",
+    "iata": "BUF",
+    "type": "large_airport"
+  },
+  {
+    "name": "Hollywood Burbank/Bob Hope Airport",
+    "lat": 34.202834,
+    "lon": -118.35805,
+    "municipality": "Burbank",
+    "region": "CA",
+    "iata": "BUR",
+    "type": "large_airport"
+  },
+  {
+    "name": "Baltimore/Washington International Thurgood Marshall Airport",
+    "lat": 39.1754,
+    "lon": -76.668297,
+    "municipality": "Baltimore",
+    "region": "MD",
+    "iata": "BWI",
+    "type": "large_airport"
+  },
+  {
+    "name": "Bozeman Yellowstone International Airport",
+    "lat": 45.778853,
+    "lon": -111.153711,
+    "municipality": "Bozeman",
+    "region": "MT",
+    "iata": "BZN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Columbia Metropolitan Airport",
+    "lat": 33.938172,
+    "lon": -81.123022,
+    "municipality": "Columbia",
+    "region": "SC",
+    "iata": "CAE",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Akron Canton Regional Airport",
+    "lat": 40.916099548339844,
+    "lon": -81.44219970703125,
+    "municipality": "Akron",
+    "region": "OH",
+    "iata": "CAK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Buchanan Field",
+    "lat": 37.9897,
+    "lon": -122.056999,
+    "municipality": "Concord",
+    "region": "CA",
+    "iata": "CCR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Cedar City Regional Airport",
+    "lat": 37.70100021362305,
+    "lon": -113.0989990234375,
+    "municipality": "Cedar City",
+    "region": "UT",
+    "iata": "CDC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Chadron Municipal Airport",
+    "lat": 42.837601,
+    "lon": -103.095001,
+    "municipality": "Chadron",
+    "region": "NE",
+    "iata": "CDR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Jack Mc Namara Field Airport",
+    "lat": 41.778929,
+    "lon": -124.236403,
+    "municipality": "Crescent City",
+    "region": "CA",
+    "iata": "CEC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Cortez Municipal Airport",
+    "lat": 37.303001,
+    "lon": -108.627998,
+    "municipality": "Cortez",
+    "region": "CO",
+    "iata": "CEZ",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Cape Girardeau Regional Airport",
+    "lat": 37.2253,
+    "lon": -89.570801,
+    "municipality": "Cape Girardeau",
+    "region": "MO",
+    "iata": "CGI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Chattanooga Metropolitan Airport (Lovell Field)",
+    "lat": 35.035301,
+    "lon": -85.203796,
+    "municipality": "Chattanooga",
+    "region": "TN",
+    "iata": "CHA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Charlottesville Albemarle Airport",
+    "lat": 38.13859939575195,
+    "lon": -78.4529037475586,
+    "municipality": "Charlottesville",
+    "region": "VA",
+    "iata": "CHO",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Charleston International Airport",
+    "lat": 32.896159,
+    "lon": -80.038151,
+    "municipality": "Charleston",
+    "region": "SC",
+    "iata": "CHS",
+    "type": "large_airport"
+  },
+  {
+    "name": "The Eastern Iowa Airport",
+    "lat": 41.884701,
+    "lon": -91.7108,
+    "municipality": "Cedar Rapids",
+    "region": "IA",
+    "iata": "CID",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Chippewa County International Airport",
+    "lat": 46.242038,
+    "lon": -84.462082,
+    "municipality": "Kincheloe",
+    "region": "MI",
+    "iata": "CIU",
+    "type": "medium_airport"
+  },
+  {
+    "name": "North Central West Virginia Airport",
+    "lat": 39.2966,
+    "lon": -80.228104,
+    "municipality": "Bridgeport",
+    "region": "WV",
+    "iata": "CKB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Cleveland Hopkins International Airport",
+    "lat": 41.411701,
+    "lon": -81.8498,
+    "municipality": "Cleveland",
+    "region": "OH",
+    "iata": "CLE",
+    "type": "large_airport"
+  },
+  {
+    "name": "Easterwood Field",
+    "lat": 30.5886,
+    "lon": -96.3638,
+    "municipality": "College Station",
+    "region": "TX",
+    "iata": "CLL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Charlotte Douglas International Airport",
+    "lat": 35.2140007019043,
+    "lon": -80.94309997558594,
+    "municipality": "Charlotte",
+    "region": "NC",
+    "iata": "CLT",
+    "type": "large_airport"
+  },
+  {
+    "name": "John Glenn Columbus International Airport",
+    "lat": 39.998001,
+    "lon": -82.891899,
+    "municipality": "Columbus",
+    "region": "OH",
+    "iata": "CMH",
+    "type": "large_airport"
+  },
+  {
+    "name": "University of Illinois Willard Airport",
+    "lat": 40.039819,
+    "lon": -88.276249,
+    "municipality": "Savoy",
+    "region": "IL",
+    "iata": "CMI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Houghton County Memorial Airport",
+    "lat": 47.168399810791016,
+    "lon": -88.48909759521484,
+    "municipality": "Hancock",
+    "region": "MI",
+    "iata": "CMX",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Cavern City Air Terminal",
+    "lat": 32.337501525878906,
+    "lon": -104.26300048828125,
+    "municipality": "Carlsbad",
+    "region": "NM",
+    "iata": "CNM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Canyonlands Regional Airport",
+    "lat": 38.755001,
+    "lon": -109.754997,
+    "municipality": "Moab",
+    "region": "UT",
+    "iata": "CNY",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Yellowstone Regional Airport",
+    "lat": 44.520199,
+    "lon": -109.024002,
+    "municipality": "Cody",
+    "region": "WY",
+    "iata": "COD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "City of Colorado Springs Municipal Airport",
+    "lat": 38.805801,
+    "lon": -104.700996,
+    "municipality": "Colorado Springs",
+    "region": "CO",
+    "iata": "COS",
+    "type": "large_airport"
+  },
+  {
+    "name": "Columbia Regional Airport",
+    "lat": 38.8181,
+    "lon": -92.219597,
+    "municipality": "Columbia",
+    "region": "MO",
+    "iata": "COU",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Casper-Natrona County International Airport",
+    "lat": 42.907381,
+    "lon": -106.461609,
+    "municipality": "Casper",
+    "region": "WY",
+    "iata": "CPR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Corpus Christi International Airport",
+    "lat": 27.770399,
+    "lon": -97.501198,
+    "municipality": "Corpus Christi",
+    "region": "TX",
+    "iata": "CRP",
+    "type": "medium_airport"
+  },
+  {
+    "name": "McClellan-Palomar Airport",
+    "lat": 33.1283,
+    "lon": -117.279999,
+    "municipality": "Carlsbad",
+    "region": "CA",
+    "iata": "CLD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Yeager Airport",
+    "lat": 38.3731,
+    "lon": -81.593201,
+    "municipality": "Charleston",
+    "region": "WV",
+    "iata": "CRW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Columbus Airport",
+    "lat": 32.516415,
+    "lon": -84.939602,
+    "municipality": "Columbus",
+    "region": "GA",
+    "iata": "CSG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Cincinnati Northern Kentucky International Airport",
+    "lat": 39.048801,
+    "lon": -84.667801,
+    "municipality": "Cincinnati / Covington",
+    "region": "KY",
+    "iata": "CVG",
+    "type": "large_airport"
+  },
+  {
+    "name": "Clovis Municipal Airport",
+    "lat": 34.426594,
+    "lon": -103.078794,
+    "municipality": "Clovis",
+    "region": "NM",
+    "iata": "CVN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Central Wisconsin Airport",
+    "lat": 44.777448,
+    "lon": -89.670238,
+    "municipality": "Mosinee",
+    "region": "WI",
+    "iata": "CWA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Cheyenne Regional Jerry Olson Field",
+    "lat": 41.155701,
+    "lon": -104.811997,
+    "municipality": "Cheyenne",
+    "region": "WY",
+    "iata": "CYS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Daytona Beach International Airport",
+    "lat": 29.18255,
+    "lon": -81.059464,
+    "municipality": "Daytona Beach",
+    "region": "FL",
+    "iata": "DAB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Dallas Love Field",
+    "lat": 32.844776,
+    "lon": -96.847653,
+    "municipality": "Dallas",
+    "region": "TX",
+    "iata": "DAL",
+    "type": "large_airport"
+  },
+  {
+    "name": "James M. Cox Dayton International Airport",
+    "lat": 39.902401,
+    "lon": -84.219398,
+    "municipality": "Dayton",
+    "region": "OH",
+    "iata": "DAY",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Dubuque Regional Airport",
+    "lat": 42.402,
+    "lon": -90.709503,
+    "municipality": "Dubuque",
+    "region": "IA",
+    "iata": "DBQ",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Ronald Reagan Washington National Airport",
+    "lat": 38.8521,
+    "lon": -77.037697,
+    "municipality": "Washington",
+    "region": "DC",
+    "iata": "DCA",
+    "type": "large_airport"
+  },
+  {
+    "name": "Dodge City Regional Airport",
+    "lat": 37.76340103149414,
+    "lon": -99.9655990600586,
+    "municipality": "Dodge City",
+    "region": "KS",
+    "iata": "DDC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Decatur Airport",
+    "lat": 39.834598541259766,
+    "lon": -88.8656997680664,
+    "municipality": "Decatur",
+    "region": "IL",
+    "iata": "DEC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Denver International Airport",
+    "lat": 39.860027,
+    "lon": -104.673792,
+    "municipality": "Denver",
+    "region": "CO",
+    "iata": "DEN",
+    "type": "large_airport"
+  },
+  {
+    "name": "Dallas Fort Worth International Airport",
+    "lat": 32.896801,
+    "lon": -97.038002,
+    "municipality": "Dallas-Fort Worth",
+    "region": "TX",
+    "iata": "DFW",
+    "type": "large_airport"
+  },
+  {
+    "name": "Dothan Regional Airport",
+    "lat": 31.321300506591797,
+    "lon": -85.44960021972656,
+    "municipality": "Dothan",
+    "region": "AL",
+    "iata": "DHN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Dickinson Theodore Roosevelt Regional Airport",
+    "lat": 46.797533,
+    "lon": -102.801905,
+    "municipality": "Dickinson",
+    "region": "ND",
+    "iata": "DIK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Duluth International Airport",
+    "lat": 46.841873,
+    "lon": -92.198746,
+    "municipality": "Duluth",
+    "region": "MN",
+    "iata": "DLH",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Dover Civil Air Terminal/Dover Air Force Base",
+    "lat": 39.129501,
+    "lon": -75.466003,
+    "municipality": "Dover",
+    "region": "DE",
+    "iata": "DOV",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Durango La Plata County Airport",
+    "lat": 37.151501,
+    "lon": -107.753998,
+    "municipality": "Durango",
+    "region": "CO",
+    "iata": "DRO",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Des Moines International Airport",
+    "lat": 41.534027,
+    "lon": -93.656719,
+    "municipality": "Des Moines",
+    "region": "IA",
+    "iata": "DSM",
+    "type": "large_airport"
+  },
+  {
+    "name": "Destin Executive Airport",
+    "lat": 30.400101,
+    "lon": -86.471497,
+    "municipality": "Destin",
+    "region": "FL",
+    "iata": "DSI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Detroit Metropolitan Wayne County Airport",
+    "lat": 42.21377,
+    "lon": -83.353786,
+    "municipality": "Detroit",
+    "region": "MI",
+    "iata": "DTW",
+    "type": "large_airport"
+  },
+  {
+    "name": "DuBois Regional Airport",
+    "lat": 41.17829895,
+    "lon": -78.8986969,
+    "municipality": "Dubois",
+    "region": "PA",
+    "iata": "DUJ",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Devils Lake Regional Airport",
+    "lat": 48.115454,
+    "lon": -98.908796,
+    "municipality": "Devils Lake",
+    "region": "ND",
+    "iata": "DVL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Kearney Regional Airport",
+    "lat": 40.727001,
+    "lon": -99.006798,
+    "municipality": "Kearney",
+    "region": "NE",
+    "iata": "EAR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Pangborn Memorial Airport",
+    "lat": 47.398899,
+    "lon": -120.207001,
+    "municipality": "Wenatchee",
+    "region": "WA",
+    "iata": "EAT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Chippewa Valley Regional Airport",
+    "lat": 44.86579895019531,
+    "lon": -91.48429870605469,
+    "municipality": "Eau Claire",
+    "region": "WI",
+    "iata": "EAU",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Northwest Florida Beaches International Airport",
+    "lat": 30.357106,
+    "lon": -85.795414,
+    "municipality": "Panama City Beach",
+    "region": "FL",
+    "iata": "ECP",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Austin Executive Airport",
+    "lat": 30.398049,
+    "lon": -97.566909,
+    "municipality": "Pflugerville",
+    "region": "TX",
+    "iata": "",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Eagle County Regional Airport",
+    "lat": 39.64260101,
+    "lon": -106.9179993,
+    "municipality": "Eagle",
+    "region": "CO",
+    "iata": "EGE",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Elko Regional Airport",
+    "lat": 40.82490158081055,
+    "lon": -115.79199981689453,
+    "municipality": "Elko",
+    "region": "NV",
+    "iata": "EKO",
+    "type": "medium_airport"
+  },
+  {
+    "name": "South Arkansas Regional Airport at Goodwin Field",
+    "lat": 33.221001,
+    "lon": -92.813301,
+    "municipality": "El Dorado",
+    "region": "AR",
+    "iata": "ELD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Elmira Corning Regional Airport",
+    "lat": 42.1599006652832,
+    "lon": -76.8916015625,
+    "municipality": "Elmira/Corning",
+    "region": "NY",
+    "iata": "ELM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "El Paso International Airport",
+    "lat": 31.809908,
+    "lon": -106.375607,
+    "municipality": "El Paso",
+    "region": "TX",
+    "iata": "ELP",
+    "type": "large_airport"
+  },
+  {
+    "name": "Erie International Tom Ridge Field",
+    "lat": 42.083127,
+    "lon": -80.173867,
+    "municipality": "Erie",
+    "region": "PA",
+    "iata": "ERI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Delta County Airport",
+    "lat": 45.723199,
+    "lon": -87.088623,
+    "municipality": "Escanaba",
+    "region": "MI",
+    "iata": "ESC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Eugene Airport",
+    "lat": 44.124599,
+    "lon": -123.211998,
+    "municipality": "Eugene",
+    "region": "OR",
+    "iata": "EUG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Evansville Regional Airport",
+    "lat": 38.0369987488,
+    "lon": -87.5324020386,
+    "municipality": "Evansville",
+    "region": "IN",
+    "iata": "EVV",
+    "type": "medium_airport"
+  },
+  {
+    "name": "New Bedford Regional Airport",
+    "lat": 41.67610168457031,
+    "lon": -70.95690155029297,
+    "municipality": "New Bedford",
+    "region": "MA",
+    "iata": "EWB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Coastal Carolina Regional Airport",
+    "lat": 35.0730018616,
+    "lon": -77.04290008539999,
+    "municipality": "New Bern",
+    "region": "NC",
+    "iata": "EWN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Newark Liberty International Airport",
+    "lat": 40.6894,
+    "lon": -74.170545,
+    "municipality": "Newark",
+    "region": "NJ",
+    "iata": "EWR",
+    "type": "large_airport"
+  },
+  {
+    "name": "Key West International Airport",
+    "lat": 24.556119,
+    "lon": -81.759579,
+    "municipality": "Key West",
+    "region": "FL",
+    "iata": "EYW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Hector International Airport",
+    "lat": 46.9207,
+    "lon": -96.815804,
+    "municipality": "Fargo",
+    "region": "ND",
+    "iata": "FAR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Fresno Yosemite International Airport",
+    "lat": 36.775767,
+    "lon": -119.718018,
+    "municipality": "Fresno",
+    "region": "CA",
+    "iata": "FAT",
+    "type": "large_airport"
+  },
+  {
+    "name": "Fayetteville Regional Airport - Grannis Field",
+    "lat": 34.991199,
+    "lon": -78.880302,
+    "municipality": "Fayetteville",
+    "region": "NC",
+    "iata": "FAY",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Friday Harbor Airport",
+    "lat": 48.523654,
+    "lon": -123.024645,
+    "municipality": "Friday Harbor",
+    "region": "WA",
+    "iata": "FRD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Flagstaff Pulliam Airport",
+    "lat": 35.139757,
+    "lon": -111.669826,
+    "municipality": "Flagstaff",
+    "region": "AZ",
+    "iata": "FLG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Fort Lauderdale Hollywood International Airport",
+    "lat": 26.072599,
+    "lon": -80.152702,
+    "municipality": "Fort Lauderdale",
+    "region": "FL",
+    "iata": "FLL",
+    "type": "large_airport"
+  },
+  {
+    "name": "Florence Regional Airport",
+    "lat": 34.18539810180664,
+    "lon": -79.7238998413086,
+    "municipality": "Florence",
+    "region": "SC",
+    "iata": "FLO",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Bishop International Airport",
+    "lat": 42.969294,
+    "lon": -83.743355,
+    "municipality": "Flint",
+    "region": "MI",
+    "iata": "FNT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Fort Dodge Regional Airport",
+    "lat": 42.552624,
+    "lon": -94.191237,
+    "municipality": "Fort Dodge",
+    "region": "IA",
+    "iata": "FOD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Sioux Falls Regional Airport",
+    "lat": 43.585463,
+    "lon": -96.741152,
+    "municipality": "Sioux Falls",
+    "region": "SD",
+    "iata": "FSD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Fort Smith Regional Airport",
+    "lat": 35.336601,
+    "lon": -94.367401,
+    "municipality": "Fort Smith",
+    "region": "AR",
+    "iata": "FSM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Fort Worth Meacham International Airport",
+    "lat": 32.819919,
+    "lon": -97.360818,
+    "municipality": "Fort Worth",
+    "region": "TX",
+    "iata": "FTW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Fort Wayne International Airport",
+    "lat": 40.978896,
+    "lon": -85.194465,
+    "municipality": "Fort Wayne",
+    "region": "IN",
+    "iata": "FWA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Northeast Wyoming Regional Airport",
+    "lat": 44.3489,
+    "lon": -105.539001,
+    "municipality": "Gillette",
+    "region": "WY",
+    "iata": "GCC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Garden City Regional Airport",
+    "lat": 37.9275016785,
+    "lon": -100.723999023,
+    "municipality": "Garden City",
+    "region": "KS",
+    "iata": "GCK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Grand Canyon National Park Airport",
+    "lat": 35.9524,
+    "lon": -112.147003,
+    "municipality": "Grand Canyon - Tusayan",
+    "region": "AZ",
+    "iata": "GCN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Dawson Community Airport",
+    "lat": 47.137658,
+    "lon": -104.80691,
+    "municipality": "Glendive",
+    "region": "MT",
+    "iata": "GDV",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Spokane International Airport",
+    "lat": 47.6199,
+    "lon": -117.533997,
+    "municipality": "Spokane",
+    "region": "WA",
+    "iata": "GEG",
+    "type": "large_airport"
+  },
+  {
+    "name": "Grand Forks International Airport",
+    "lat": 47.949299,
+    "lon": -97.176102,
+    "municipality": "Grand Forks",
+    "region": "ND",
+    "iata": "GFK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "East Texas Regional Airport",
+    "lat": 32.38399887084961,
+    "lon": -94.71150207519531,
+    "municipality": "Longview",
+    "region": "TX",
+    "iata": "GGG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Glasgow Valley County Airport Wokal Field",
+    "lat": 48.212502,
+    "lon": -106.614998,
+    "municipality": "Glasgow",
+    "region": "MT",
+    "iata": "GGW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Grand Junction Regional Airport",
+    "lat": 39.126663,
+    "lon": -108.529387,
+    "municipality": "Grand Junction",
+    "region": "CO",
+    "iata": "GJT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Mid Delta Regional Airport",
+    "lat": 33.482899,
+    "lon": -90.985603,
+    "municipality": "Greenville",
+    "region": "MS",
+    "iata": "GLH",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Gainesville Regional Airport",
+    "lat": 29.6900997162,
+    "lon": -82.2717971802,
+    "municipality": "Gainesville",
+    "region": "FL",
+    "iata": "GNV",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Glacier Park International Airport",
+    "lat": 48.310501,
+    "lon": -114.255997,
+    "municipality": "Kalispell",
+    "region": "MT",
+    "iata": "FCA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Gulfport Biloxi International Airport",
+    "lat": 30.405582,
+    "lon": -89.069836,
+    "municipality": "Gulfport",
+    "region": "MS",
+    "iata": "GPT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Austin Straubel International Airport",
+    "lat": 44.483459,
+    "lon": -88.130805,
+    "municipality": "Green Bay",
+    "region": "WI",
+    "iata": "GRB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Central Nebraska Regional Airport",
+    "lat": 40.967498779296875,
+    "lon": -98.30960083007812,
+    "municipality": "Grand Island",
+    "region": "NE",
+    "iata": "GRI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Killeen Regional Airport / Robert Gray Army Airfield",
+    "lat": 31.0672,
+    "lon": -97.828903,
+    "municipality": "Fort Cavazos",
+    "region": "TX",
+    "iata": "GRK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Gerald R. Ford International Airport",
+    "lat": 42.880798,
+    "lon": -85.522797,
+    "municipality": "Grand Rapids",
+    "region": "MI",
+    "iata": "GRR",
+    "type": "large_airport"
+  },
+  {
+    "name": "Piedmont Triad International Airport",
+    "lat": 36.09937,
+    "lon": -79.937262,
+    "municipality": "Greensboro",
+    "region": "NC",
+    "iata": "GSO",
+    "type": "large_airport"
+  },
+  {
+    "name": "Greenville-Spartanburg International Airport",
+    "lat": 34.895699,
+    "lon": -82.218903,
+    "municipality": "Greenville/Greer/Spartanburg",
+    "region": "SC",
+    "iata": "GSP",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Great Falls International Airport",
+    "lat": 47.481998,
+    "lon": -111.371002,
+    "municipality": "Great Falls",
+    "region": "MT",
+    "iata": "GTF",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Golden Triangle Regional Airport",
+    "lat": 33.450298,
+    "lon": -88.5914,
+    "municipality": "Columbus/W Point/Starkville",
+    "region": "MS",
+    "iata": "GTR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Gunnison Crested Butte Regional Airport",
+    "lat": 38.534672,
+    "lon": -106.934566,
+    "municipality": "Gunnison",
+    "region": "CO",
+    "iata": "GUC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Gallup Municipal Airport",
+    "lat": 35.511653,
+    "lon": -108.788166,
+    "municipality": "Gallup",
+    "region": "NM",
+    "iata": "GUP",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Gary/Chicago International Airport",
+    "lat": 41.617087,
+    "lon": -87.413206,
+    "municipality": "Gary",
+    "region": "IN",
+    "iata": "GYY",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Yampa Valley Airport",
+    "lat": 40.481201,
+    "lon": -107.218002,
+    "municipality": "Hayden",
+    "region": "CO",
+    "iata": "HDN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Hagerstown Regional Richard A Henson Field",
+    "lat": 39.708771,
+    "lon": -77.728014,
+    "municipality": "Hagerstown",
+    "region": "MD",
+    "iata": "HGR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Jack Northrop Field Hawthorne Municipal Airport",
+    "lat": 33.922798,
+    "lon": -118.334999,
+    "municipality": "Hawthorne",
+    "region": "CA",
+    "iata": "HHR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Range Regional Airport",
+    "lat": 47.384831,
+    "lon": -92.836905,
+    "municipality": "Hibbing",
+    "region": "MN",
+    "iata": "HIB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Lake Havasu City Airport",
+    "lat": 34.570506,
+    "lon": -114.357745,
+    "municipality": "Lake Havasu City",
+    "region": "AZ",
+    "iata": "HII",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Helena Regional Airport",
+    "lat": 46.6068,
+    "lon": -111.983002,
+    "municipality": "Helena",
+    "region": "MT",
+    "iata": "HLN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Lea County Regional Airport",
+    "lat": 32.6875,
+    "lon": -103.217003,
+    "municipality": "Hobbs",
+    "region": "NM",
+    "iata": "HOB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Memorial Field Airport",
+    "lat": 34.4788,
+    "lon": -93.096262,
+    "municipality": "Hot Springs",
+    "region": "AR",
+    "iata": "HOT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "William P. Hobby Airport",
+    "lat": 29.645336,
+    "lon": -95.276812,
+    "municipality": "Houston",
+    "region": "TX",
+    "iata": "HOU",
+    "type": "large_airport"
+  },
+  {
+    "name": "Westchester County Airport",
+    "lat": 41.06700134277344,
+    "lon": -73.70760345458984,
+    "municipality": "White Plains",
+    "region": "NY",
+    "iata": "HPN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Valley International Airport",
+    "lat": 26.228500366210938,
+    "lon": -97.65440368652344,
+    "municipality": "Harlingen",
+    "region": "TX",
+    "iata": "HRL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Boone County Airport",
+    "lat": 36.26150131225586,
+    "lon": -93.15470123291016,
+    "municipality": "Harrison",
+    "region": "AR",
+    "iata": "HRO",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Huntsville International Airport",
+    "lat": 34.636244,
+    "lon": -86.774378,
+    "municipality": "Huntsville",
+    "region": "AL",
+    "iata": "HSV",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Tri-State Airport / Milton J. Ferguson Field",
+    "lat": 38.366699,
+    "lon": -82.557999,
+    "municipality": "Huntington",
+    "region": "WV",
+    "iata": "HTS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Tweed New Haven Airport",
+    "lat": 41.262869,
+    "lon": -72.887694,
+    "municipality": "New Haven",
+    "region": "CT",
+    "iata": "HVN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Havre City County Airport",
+    "lat": 48.541387,
+    "lon": -109.762859,
+    "municipality": "Havre",
+    "region": "MT",
+    "iata": "HVR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Hilton Head Airport",
+    "lat": 32.2244,
+    "lon": -80.697502,
+    "municipality": "Hilton Head Island",
+    "region": "SC",
+    "iata": "HHH",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Cape Cod Gateway Airport",
+    "lat": 41.6693,
+    "lon": -70.280403,
+    "municipality": "Hyannis",
+    "region": "MA",
+    "iata": "HYA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Hays Regional Airport",
+    "lat": 38.844521,
+    "lon": -99.273148,
+    "municipality": "Hays",
+    "region": "KS",
+    "iata": "HYS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Washington Dulles International Airport",
+    "lat": 38.9445,
+    "lon": -77.455803,
+    "municipality": "Dulles",
+    "region": "VA",
+    "iata": "IAD",
+    "type": "large_airport"
+  },
+  {
+    "name": "Niagara Falls International Airport",
+    "lat": 43.1073,
+    "lon": -78.946198,
+    "municipality": "Niagara Falls",
+    "region": "NY",
+    "iata": "IAG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "George Bush Intercontinental Airport",
+    "lat": 29.9844,
+    "lon": -95.3414,
+    "municipality": "Houston",
+    "region": "TX",
+    "iata": "IAH",
+    "type": "large_airport"
+  },
+  {
+    "name": "Wichita Dwight D. Eisenhower National Airport",
+    "lat": 37.650314,
+    "lon": -97.428583,
+    "municipality": "Wichita",
+    "region": "KS",
+    "iata": "ICT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Idaho Falls Regional Airport",
+    "lat": 43.514599,
+    "lon": -112.070999,
+    "municipality": "Idaho Falls",
+    "region": "ID",
+    "iata": "IDA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Wilmington Airport",
+    "lat": 39.678699,
+    "lon": -75.606499,
+    "municipality": "Wilmington",
+    "region": "DE",
+    "iata": "ILG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Wilmington International Airport",
+    "lat": 34.272345,
+    "lon": -77.905117,
+    "municipality": "Wilmington",
+    "region": "NC",
+    "iata": "ILM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Ford Airport",
+    "lat": 45.81911,
+    "lon": -88.114557,
+    "municipality": "Kingsford",
+    "region": "MI",
+    "iata": "IMT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Indianapolis International Airport",
+    "lat": 39.7173,
+    "lon": -86.294403,
+    "municipality": "Indianapolis",
+    "region": "IN",
+    "iata": "IND",
+    "type": "large_airport"
+  },
+  {
+    "name": "Falls International Airport",
+    "lat": 48.566200256347656,
+    "lon": -93.4030990600586,
+    "municipality": "International Falls",
+    "region": "MN",
+    "iata": "INL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Imperial County Airport",
+    "lat": 32.83539,
+    "lon": -115.574026,
+    "municipality": "Imperial",
+    "region": "CA",
+    "iata": "IPL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Williamsport Regional Airport",
+    "lat": 41.242126,
+    "lon": -76.92245,
+    "municipality": "Williamsport",
+    "region": "PA",
+    "iata": "IPT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Kirksville Regional Airport",
+    "lat": 40.09349822998047,
+    "lon": -92.5448989868164,
+    "municipality": "Kirksville",
+    "region": "MO",
+    "iata": "IRK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Long Island MacArthur Airport",
+    "lat": 40.796324,
+    "lon": -73.101703,
+    "municipality": "Islip",
+    "region": "NY",
+    "iata": "ISP",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Ithaca Tompkins Regional Airport",
+    "lat": 42.49100112915039,
+    "lon": -76.4583969116211,
+    "municipality": "Ithaca",
+    "region": "NY",
+    "iata": "ITH",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Mesa Gateway Airport",
+    "lat": 33.3078,
+    "lon": -111.654999,
+    "municipality": "Mesa",
+    "region": "AZ",
+    "iata": "AZA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Jackson Hole Airport",
+    "lat": 43.6073,
+    "lon": -110.737999,
+    "municipality": "Jackson",
+    "region": "WY",
+    "iata": "JAC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Jackson-Medgar Wiley Evers International Airport",
+    "lat": 32.311199,
+    "lon": -90.075897,
+    "municipality": "Jackson",
+    "region": "MS",
+    "iata": "JAN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Jacksonville International Airport",
+    "lat": 30.492469,
+    "lon": -81.687813,
+    "municipality": "Jacksonville",
+    "region": "FL",
+    "iata": "JAX",
+    "type": "large_airport"
+  },
+  {
+    "name": "Jonesboro Municipal Airport",
+    "lat": 35.83169937133789,
+    "lon": -90.64640045166016,
+    "municipality": "Jonesboro",
+    "region": "AR",
+    "iata": "JBR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "John F. Kennedy International Airport",
+    "lat": 40.639447,
+    "lon": -73.779317,
+    "municipality": "New York",
+    "region": "NY",
+    "iata": "JFK",
+    "type": "large_airport"
+  },
+  {
+    "name": "Joplin Regional Airport",
+    "lat": 37.151798,
+    "lon": -94.498299,
+    "municipality": "Joplin",
+    "region": "MO",
+    "iata": "JLN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Jamestown Regional Airport",
+    "lat": 46.92969894,
+    "lon": -98.67819977,
+    "municipality": "Jamestown",
+    "region": "ND",
+    "iata": "JMS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Concord-Padgett Regional Airport",
+    "lat": 35.387798,
+    "lon": -80.709099,
+    "municipality": "Concord",
+    "region": "NC",
+    "iata": "USA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "John Murtha Johnstown Cambria County Airport",
+    "lat": 40.31610107421875,
+    "lon": -78.83390045166016,
+    "municipality": "Johnstown",
+    "region": "PA",
+    "iata": "JST",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Purdue University Airport",
+    "lat": 40.412875,
+    "lon": -86.939363,
+    "municipality": "West Lafayette",
+    "region": "IN",
+    "iata": "LAF",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Lakeland Linder International Airport",
+    "lat": 27.989267,
+    "lon": -82.020715,
+    "municipality": "Lakeland",
+    "region": "FL",
+    "iata": "LAL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Capital Region International Airport",
+    "lat": 42.777582,
+    "lon": -84.585721,
+    "municipality": "Lansing",
+    "region": "MI",
+    "iata": "LAN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Laramie Regional Airport",
+    "lat": 41.31209945678711,
+    "lon": -105.67500305175781,
+    "municipality": "Laramie",
+    "region": "WY",
+    "iata": "LAR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Harry Reid International Airport",
+    "lat": 36.083361,
+    "lon": -115.151817,
+    "municipality": "Las Vegas",
+    "region": "NV",
+    "iata": "LAS",
+    "type": "large_airport"
+  },
+  {
+    "name": "Lawton Fort Sill Regional Airport",
+    "lat": 34.567699,
+    "lon": -98.416603,
+    "municipality": "Lawton",
+    "region": "OK",
+    "iata": "LAW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Los Angeles International Airport",
+    "lat": 33.942501,
+    "lon": -118.407997,
+    "municipality": "Los Angeles",
+    "region": "CA",
+    "iata": "LAX",
+    "type": "large_airport"
+  },
+  {
+    "name": "Lubbock Preston Smith International Airport",
+    "lat": 33.663601,
+    "lon": -101.822998,
+    "municipality": "Lubbock",
+    "region": "TX",
+    "iata": "LBB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Arnold Palmer Regional Airport",
+    "lat": 40.275902,
+    "lon": -79.4048,
+    "municipality": "Latrobe",
+    "region": "PA",
+    "iata": "LBE",
+    "type": "medium_airport"
+  },
+  {
+    "name": "North Platte Regional Airport Lee Bird Field",
+    "lat": 41.12620163,
+    "lon": -100.6839981,
+    "municipality": "North Platte",
+    "region": "NE",
+    "iata": "LBF",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Liberal Mid-America Regional Airport",
+    "lat": 37.0442009,
+    "lon": -100.9599991,
+    "municipality": "Liberal",
+    "region": "KS",
+    "iata": "LBL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Lake Charles Regional Airport",
+    "lat": 30.126100540161133,
+    "lon": -93.22329711914062,
+    "municipality": "Lake Charles",
+    "region": "LA",
+    "iata": "LCH",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Rickenbacker International Airport",
+    "lat": 39.813801,
+    "lon": -82.927803,
+    "municipality": "Columbus",
+    "region": "OH",
+    "iata": "LCK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Lebanon Municipal Airport",
+    "lat": 43.626098632799994,
+    "lon": -72.30419921880001,
+    "municipality": "Lebanon",
+    "region": "NH",
+    "iata": "LEB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Blue Grass Airport",
+    "lat": 38.035066,
+    "lon": -84.606738,
+    "municipality": "Lexington",
+    "region": "KY",
+    "iata": "LEX",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Lafayette Regional Airport",
+    "lat": 30.205299,
+    "lon": -91.987602,
+    "municipality": "Lafayette",
+    "region": "LA",
+    "iata": "LFT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "LaGuardia Airport",
+    "lat": 40.777199,
+    "lon": -73.872597,
+    "municipality": "New York",
+    "region": "NY",
+    "iata": "LGA",
+    "type": "large_airport"
+  },
+  {
+    "name": "Long Beach International Airport",
+    "lat": 33.816523,
+    "lon": -118.149891,
+    "municipality": "Long Beach",
+    "region": "CA",
+    "iata": "LGB",
+    "type": "large_airport"
+  },
+  {
+    "name": "Bill & Hillary Clinton National Airport/Adams Field",
+    "lat": 34.729222,
+    "lon": -92.223591,
+    "municipality": "Little Rock",
+    "region": "AR",
+    "iata": "LIT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Lincoln Airport",
+    "lat": 40.844882,
+    "lon": -96.76178,
+    "municipality": "Lincoln",
+    "region": "NE",
+    "iata": "LNK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Lancaster Airport",
+    "lat": 40.121700286865234,
+    "lon": -76.29609680175781,
+    "municipality": "Lancaster",
+    "region": "PA",
+    "iata": "LNS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Laredo International Airport",
+    "lat": 27.5438,
+    "lon": -99.461601,
+    "municipality": "Laredo",
+    "region": "TX",
+    "iata": "LRD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Las Cruces International Airport",
+    "lat": 32.289398,
+    "lon": -106.921997,
+    "municipality": "Las Cruces",
+    "region": "NM",
+    "iata": "LRU",
+    "type": "medium_airport"
+  },
+  {
+    "name": "La Crosse Regional Airport",
+    "lat": 43.879002,
+    "lon": -91.256699,
+    "municipality": "La Crosse",
+    "region": "WI",
+    "iata": "LSE",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Cincinnati Municipal Airport Lunken Field",
+    "lat": 39.102357,
+    "lon": -84.418945,
+    "municipality": "Cincinnati",
+    "region": "OH",
+    "iata": "LUK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Greenbrier Valley Airport",
+    "lat": 37.857914,
+    "lon": -80.400438,
+    "municipality": "Lewisburg",
+    "region": "WV",
+    "iata": "LWB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Lewiston Nez Perce County Airport",
+    "lat": 46.3745002746582,
+    "lon": -117.01499938964844,
+    "municipality": "Lewiston",
+    "region": "ID",
+    "iata": "LWS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Lynchburg Regional Airport - Preston Glenn Field",
+    "lat": 37.326698,
+    "lon": -79.200401,
+    "municipality": "Lynchburg",
+    "region": "VA",
+    "iata": "LYH",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Midland International Air and Space Port",
+    "lat": 31.942499,
+    "lon": -102.202003,
+    "municipality": "Midland",
+    "region": "TX",
+    "iata": "MAF",
+    "type": "medium_airport"
+  },
+  {
+    "name": "MBS International Airport",
+    "lat": 43.533181,
+    "lon": -84.083104,
+    "municipality": "Freeland",
+    "region": "MI",
+    "iata": "MBS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Merced Regional Macready Field",
+    "lat": 37.284698,
+    "lon": -120.514,
+    "municipality": "Merced",
+    "region": "CA",
+    "iata": "MCE",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Kansas City International Airport",
+    "lat": 39.301699,
+    "lon": -94.713893,
+    "municipality": "Kansas City",
+    "region": "MO",
+    "iata": "MCI",
+    "type": "large_airport"
+  },
+  {
+    "name": "McCook Ben Nelson Regional Airport",
+    "lat": 40.207787,
+    "lon": -100.592794,
+    "municipality": "McCook",
+    "region": "NE",
+    "iata": "MCK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Middle Georgia Regional Airport",
+    "lat": 32.69279861450195,
+    "lon": -83.64920043945312,
+    "municipality": "Macon",
+    "region": "GA",
+    "iata": "MCN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Orlando International Airport",
+    "lat": 28.429399490356445,
+    "lon": -81.30899810791016,
+    "municipality": "Orlando",
+    "region": "FL",
+    "iata": "MCO",
+    "type": "large_airport"
+  },
+  {
+    "name": "Mason City Municipal Airport",
+    "lat": 43.159801,
+    "lon": -93.329716,
+    "municipality": "Mason City",
+    "region": "IA",
+    "iata": "MCW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Harrisburg International Airport",
+    "lat": 40.192838,
+    "lon": -76.762333,
+    "municipality": "Harrisburg",
+    "region": "PA",
+    "iata": "MDT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Chicago Midway International Airport",
+    "lat": 41.785999,
+    "lon": -87.752403,
+    "municipality": "Chicago",
+    "region": "IL",
+    "iata": "MDW",
+    "type": "large_airport"
+  },
+  {
+    "name": "Key Field / Meridian Regional Airport",
+    "lat": 32.3326,
+    "lon": -88.7519,
+    "municipality": "Meridian",
+    "region": "MS",
+    "iata": "MEI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Memphis International Airport",
+    "lat": 35.043845,
+    "lon": -89.97634,
+    "municipality": "Memphis",
+    "region": "TN",
+    "iata": "MEM",
+    "type": "large_airport"
+  },
+  {
+    "name": "McAllen Miller International Airport",
+    "lat": 26.176141,
+    "lon": -98.237965,
+    "municipality": "McAllen",
+    "region": "TX",
+    "iata": "MFE",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Rogue Valley International-Medford Airport",
+    "lat": 42.374199,
+    "lon": -122.873001,
+    "municipality": "Medford",
+    "region": "OR",
+    "iata": "MFR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Michigan City Municipal Airport",
+    "lat": 41.7033,
+    "lon": -86.821198,
+    "municipality": "Michigan City",
+    "region": "IN",
+    "iata": "MGC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Montgomery Regional (Dannelly Field) Airport",
+    "lat": 32.300598,
+    "lon": -86.393997,
+    "municipality": "Montgomery",
+    "region": "AL",
+    "iata": "MGM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Morgantown Municipal Airport Walter L. (Bill) Hart Field",
+    "lat": 39.643305,
+    "lon": -79.917598,
+    "municipality": "Morgantown",
+    "region": "WV",
+    "iata": "MGW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Manhattan Regional Airport",
+    "lat": 39.14099884033203,
+    "lon": -96.6707992553711,
+    "municipality": "Manhattan",
+    "region": "KS",
+    "iata": "MHK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Manchester-Boston Regional Airport",
+    "lat": 42.932598,
+    "lon": -71.435699,
+    "municipality": "Manchester",
+    "region": "NH",
+    "iata": "MHT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Miami International Airport",
+    "lat": 25.796011,
+    "lon": -80.289751,
+    "municipality": "Miami",
+    "region": "FL",
+    "iata": "MIA",
+    "type": "large_airport"
+  },
+  {
+    "name": "General Mitchell International Airport",
+    "lat": 42.947201,
+    "lon": -87.896599,
+    "municipality": "Milwaukee",
+    "region": "WI",
+    "iata": "MKE",
+    "type": "large_airport"
+  },
+  {
+    "name": "Muskegon County Airport",
+    "lat": 43.169498,
+    "lon": -86.238197,
+    "municipality": "Muskegon",
+    "region": "MI",
+    "iata": "MKG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "McKellar-Sipes Regional Airport",
+    "lat": 35.599899,
+    "lon": -88.915604,
+    "municipality": "Jackson",
+    "region": "TN",
+    "iata": "MKL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Melbourne Orlando International Airport",
+    "lat": 28.102009,
+    "lon": -80.641088,
+    "municipality": "Melbourne",
+    "region": "FL",
+    "iata": "MLB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Quad City International Airport",
+    "lat": 41.448502,
+    "lon": -90.5075,
+    "municipality": "Moline",
+    "region": "IL",
+    "iata": "MLI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Monroe Regional Airport",
+    "lat": 32.510899,
+    "lon": -92.037697,
+    "municipality": "Monroe",
+    "region": "LA",
+    "iata": "MLU",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Mammoth Yosemite Airport",
+    "lat": 37.625381,
+    "lon": -118.84306,
+    "municipality": "Mammoth Lakes",
+    "region": "CA",
+    "iata": "MMH",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Mobile Regional Airport",
+    "lat": 30.6912,
+    "lon": -88.242798,
+    "municipality": "Mobile",
+    "region": "AL",
+    "iata": "MOB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Minot International Airport",
+    "lat": 48.25801,
+    "lon": -101.279123,
+    "municipality": "Minot",
+    "region": "ND",
+    "iata": "MOT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Monterey Regional Airport",
+    "lat": 36.586777,
+    "lon": -121.844183,
+    "municipality": "Monterey",
+    "region": "CA",
+    "iata": "MRY",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Northwest Alabama Regional Airport",
+    "lat": 34.745123,
+    "lon": -87.612981,
+    "municipality": "Muscle Shoals",
+    "region": "AL",
+    "iata": "MSL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Dane County Regional Truax Field",
+    "lat": 43.1399,
+    "lon": -89.337502,
+    "municipality": "Madison",
+    "region": "WI",
+    "iata": "MSN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Missoula Montana Airport",
+    "lat": 46.915816,
+    "lon": -114.091107,
+    "municipality": "Missoula",
+    "region": "MT",
+    "iata": "MSO",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Minneapolis\u2013Saint Paul International Airport / Wold\u2013Chamberlain Field",
+    "lat": 44.880081,
+    "lon": -93.221741,
+    "municipality": "Minneapolis",
+    "region": "MN",
+    "iata": "MSP",
+    "type": "large_airport"
+  },
+  {
+    "name": "Massena International Airport Richards Field",
+    "lat": 44.936157,
+    "lon": -74.844304,
+    "municipality": "Massena",
+    "region": "NY",
+    "iata": "MSS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Louis Armstrong New Orleans International Airport",
+    "lat": 29.993401,
+    "lon": -90.264673,
+    "municipality": "New Orleans",
+    "region": "LA",
+    "iata": "MSY",
+    "type": "large_airport"
+  },
+  {
+    "name": "Montrose Regional Airport",
+    "lat": 38.5098,
+    "lon": -107.893997,
+    "municipality": "Montrose",
+    "region": "CO",
+    "iata": "MTJ",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Veterans Airport of Southern Illinois",
+    "lat": 37.751208,
+    "lon": -89.016568,
+    "municipality": "Marion",
+    "region": "IL",
+    "iata": "MWA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Mineral Wells Regional Airport",
+    "lat": 32.781601,
+    "lon": -98.060204,
+    "municipality": "Mineral Wells",
+    "region": "TX",
+    "iata": "MWL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "McCall Municipal Airport",
+    "lat": 44.888837,
+    "lon": -116.101112,
+    "municipality": "McCall",
+    "region": "ID",
+    "iata": "MYL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Myrtle Beach International Airport",
+    "lat": 33.679699,
+    "lon": -78.928299,
+    "municipality": "Myrtle Beach",
+    "region": "SC",
+    "iata": "MYR",
+    "type": "large_airport"
+  },
+  {
+    "name": "Yuma International Airport / Marine Corps Air Station Yuma",
+    "lat": 32.650938,
+    "lon": -114.609375,
+    "municipality": "Yuma",
+    "region": "AZ",
+    "iata": "YUM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Albert J Ellis Airport",
+    "lat": 34.829201,
+    "lon": -77.612099,
+    "municipality": "Richlands",
+    "region": "NC",
+    "iata": "OAJ",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Oakland San Francisco Bay Airport",
+    "lat": 37.720085,
+    "lon": -122.221184,
+    "municipality": "Oakland",
+    "region": "CA",
+    "iata": "OAK",
+    "type": "large_airport"
+  },
+  {
+    "name": "Ogden Hinckley Airport",
+    "lat": 41.195899963379,
+    "lon": -112.0120010376,
+    "municipality": "Ogden",
+    "region": "UT",
+    "iata": "OGD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Ogdensburg International Airport",
+    "lat": 44.6819,
+    "lon": -75.4655,
+    "municipality": "Ogdensburg",
+    "region": "NY",
+    "iata": "OGS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "OKC Will Rogers World Airport",
+    "lat": 35.393388,
+    "lon": -97.598248,
+    "municipality": "Oklahoma City",
+    "region": "OK",
+    "iata": "OKC",
+    "type": "large_airport"
+  },
+  {
+    "name": "L M Clayton Airport",
+    "lat": 48.094501,
+    "lon": -105.574997,
+    "municipality": "Wolf Point",
+    "region": "MT",
+    "iata": "OLF",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Olympia Regional Airport",
+    "lat": 46.969399,
+    "lon": -122.903,
+    "municipality": "Olympia",
+    "region": "WA",
+    "iata": "OLM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Eppley Airfield",
+    "lat": 41.3032,
+    "lon": -95.894096,
+    "municipality": "Omaha",
+    "region": "NE",
+    "iata": "OMA",
+    "type": "large_airport"
+  },
+  {
+    "name": "Ontario International Airport",
+    "lat": 34.056,
+    "lon": -117.600998,
+    "municipality": "Ontario",
+    "region": "CA",
+    "iata": "ONT",
+    "type": "large_airport"
+  },
+  {
+    "name": "Miami-Opa Locka Executive Airport",
+    "lat": 25.907,
+    "lon": -80.278397,
+    "municipality": "Miami",
+    "region": "FL",
+    "iata": "OPF",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Chicago O'Hare International Airport",
+    "lat": 41.9786,
+    "lon": -87.9048,
+    "municipality": "Chicago",
+    "region": "IL",
+    "iata": "ORD",
+    "type": "large_airport"
+  },
+  {
+    "name": "Norfolk International Airport",
+    "lat": 36.895341,
+    "lon": -76.201,
+    "municipality": "Norfolk",
+    "region": "VA",
+    "iata": "ORF",
+    "type": "large_airport"
+  },
+  {
+    "name": "Worcester Regional Airport",
+    "lat": 42.2673,
+    "lon": -71.875702,
+    "municipality": "Worcester",
+    "region": "MA",
+    "iata": "ORH",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Orcas Island Airport",
+    "lat": 48.708199,
+    "lon": -122.910004,
+    "municipality": "Eastsound",
+    "region": "WA",
+    "iata": "ESD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Southwest Oregon Regional Airport",
+    "lat": 43.41709899902344,
+    "lon": -124.24600219726562,
+    "municipality": "North Bend",
+    "region": "OR",
+    "iata": "OTH",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Owensboro Daviess County Airport",
+    "lat": 37.74010086,
+    "lon": -87.16680145,
+    "municipality": "Owensboro",
+    "region": "KY",
+    "iata": "OWB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Ocean City Municipal Airport",
+    "lat": 38.310398,
+    "lon": -75.124001,
+    "municipality": "Ocean City",
+    "region": "MD",
+    "iata": "OCE",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Seattle Paine Field International Airport",
+    "lat": 47.9063,
+    "lon": -122.281998,
+    "municipality": "Everett",
+    "region": "WA",
+    "iata": "PAE",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Barkley Regional Airport",
+    "lat": 37.06079864501953,
+    "lon": -88.7738037109375,
+    "municipality": "Paducah",
+    "region": "KY",
+    "iata": "PAH",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Plattsburgh International Airport",
+    "lat": 44.650902,
+    "lon": -73.468102,
+    "municipality": "Plattsburgh",
+    "region": "NY",
+    "iata": "PBG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "President Donald J. Trump International Airport",
+    "lat": 26.683201,
+    "lon": -80.095596,
+    "municipality": "West Palm Beach",
+    "region": "FL",
+    "iata": "PBI",
+    "type": "large_airport"
+  },
+  {
+    "name": "Erie-Ottawa International Airport",
+    "lat": 41.515647,
+    "lon": -82.868328,
+    "municipality": "Port Clinton",
+    "region": "OH",
+    "iata": "",
+    "type": "medium_airport"
+  },
+  {
+    "name": "DeKalb Peachtree Airport",
+    "lat": 33.87633,
+    "lon": -84.30213,
+    "municipality": "Atlanta",
+    "region": "GA",
+    "iata": "PDK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Eastern Oregon Regional Airport at Pendleton",
+    "lat": 45.695099,
+    "lon": -118.841003,
+    "municipality": "Pendleton",
+    "region": "OR",
+    "iata": "PDT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Portland International Airport",
+    "lat": 45.588699,
+    "lon": -122.598,
+    "municipality": "Portland",
+    "region": "OR",
+    "iata": "PDX",
+    "type": "large_airport"
+  },
+  {
+    "name": "Page Municipal Airport",
+    "lat": 36.924234,
+    "lon": -111.447716,
+    "municipality": "Page",
+    "region": "AZ",
+    "iata": "PGA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Punta Gorda Airport",
+    "lat": 26.9202,
+    "lon": -81.990501,
+    "municipality": "Punta Gorda",
+    "region": "FL",
+    "iata": "PGD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Pitt-Greenville Airport",
+    "lat": 35.635535,
+    "lon": -77.384262,
+    "municipality": "Greenville",
+    "region": "NC",
+    "iata": "PGV",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Newport News Williamsburg International Airport",
+    "lat": 37.131901,
+    "lon": -76.492996,
+    "municipality": "Newport News",
+    "region": "VA",
+    "iata": "PHF",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Philadelphia International Airport",
+    "lat": 39.871899,
+    "lon": -75.241096,
+    "municipality": "Philadelphia",
+    "region": "PA",
+    "iata": "PHL",
+    "type": "large_airport"
+  },
+  {
+    "name": "Phoenix Sky Harbor International Airport",
+    "lat": 33.435302,
+    "lon": -112.005905,
+    "municipality": "Phoenix",
+    "region": "AZ",
+    "iata": "PHX",
+    "type": "large_airport"
+  },
+  {
+    "name": "General Wayne A. Downing Peoria International Airport",
+    "lat": 40.663841,
+    "lon": -89.692631,
+    "municipality": "Peoria",
+    "region": "IL",
+    "iata": "PIA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Hattiesburg Laurel Regional Airport",
+    "lat": 31.4671,
+    "lon": -89.337097,
+    "municipality": "Moselle",
+    "region": "MS",
+    "iata": "PIB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "St. Petersburg Clearwater International Airport",
+    "lat": 27.9102,
+    "lon": -82.687401,
+    "municipality": "Pinellas Park",
+    "region": "FL",
+    "iata": "PIE",
+    "type": "large_airport"
+  },
+  {
+    "name": "Pocatello Regional Airport",
+    "lat": 42.9098014831543,
+    "lon": -112.59600067138672,
+    "municipality": "Pocatello",
+    "region": "ID",
+    "iata": "PIH",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Pierre Regional Airport",
+    "lat": 44.38270187,
+    "lon": -100.2860031,
+    "municipality": "Pierre",
+    "region": "SD",
+    "iata": "PIR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Pittsburgh International Airport",
+    "lat": 40.491501,
+    "lon": -80.232903,
+    "municipality": "Pittsburgh",
+    "region": "PA",
+    "iata": "PIT",
+    "type": "large_airport"
+  },
+  {
+    "name": "Mid Ohio Valley Regional Airport",
+    "lat": 39.3451,
+    "lon": -81.439201,
+    "municipality": "Parkersburg (Williamstown)",
+    "region": "WV",
+    "iata": "PKB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Pellston Regional Airport of Emmet County Airport",
+    "lat": 45.57089996,
+    "lon": -84.79669952,
+    "municipality": "Pellston",
+    "region": "MI",
+    "iata": "PLN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Pensacola International Airport",
+    "lat": 30.472718,
+    "lon": -87.186639,
+    "municipality": "Pensacola",
+    "region": "FL",
+    "iata": "PNS",
+    "type": "large_airport"
+  },
+  {
+    "name": "Presque Isle International Airport",
+    "lat": 46.688999,
+    "lon": -68.0448,
+    "municipality": "Presque Isle",
+    "region": "ME",
+    "iata": "PQI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Prescott Regional Airport - Ernest A. Love Field",
+    "lat": 34.653502,
+    "lon": -112.419883,
+    "municipality": "Prescott",
+    "region": "AZ",
+    "iata": "PRC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Tri Cities Airport",
+    "lat": 46.264702,
+    "lon": -119.119003,
+    "municipality": "Pasco",
+    "region": "WA",
+    "iata": "PSC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Portsmouth International Airport at Pease",
+    "lat": 43.0779,
+    "lon": -70.823303,
+    "municipality": "Portsmouth",
+    "region": "NH",
+    "iata": "PSM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Palm Springs International Airport",
+    "lat": 33.8297,
+    "lon": -116.507004,
+    "municipality": "Palm Springs",
+    "region": "CA",
+    "iata": "PSP",
+    "type": "large_airport"
+  },
+  {
+    "name": "Pueblo Memorial Airport",
+    "lat": 38.289101,
+    "lon": -104.497002,
+    "municipality": "Pueblo",
+    "region": "CO",
+    "iata": "PUB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Pullman-Moscow Regional Airport",
+    "lat": 46.741601,
+    "lon": -117.11163,
+    "municipality": "Pullman",
+    "region": "WA",
+    "iata": "PUW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Rhode Island T. F. Green International Airport",
+    "lat": 41.725038,
+    "lon": -71.425668,
+    "municipality": "Providence/Warwick",
+    "region": "RI",
+    "iata": "PVD",
+    "type": "large_airport"
+  },
+  {
+    "name": "Provo Municipal Airport",
+    "lat": 40.218894,
+    "lon": -111.722445,
+    "municipality": "Provo",
+    "region": "UT",
+    "iata": "PVU",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Portland International Jetport",
+    "lat": 43.646198,
+    "lon": -70.309303,
+    "municipality": "Portland",
+    "region": "ME",
+    "iata": "PWM",
+    "type": "large_airport"
+  },
+  {
+    "name": "Rapid City Regional Airport",
+    "lat": 44.0452995300293,
+    "lon": -103.05699920654297,
+    "municipality": "Rapid City",
+    "region": "SD",
+    "iata": "RAP",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Redding Municipal Airport",
+    "lat": 40.50899887,
+    "lon": -122.2929993,
+    "municipality": "Redding",
+    "region": "CA",
+    "iata": "RDD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Roberts Field",
+    "lat": 44.254101,
+    "lon": -121.150002,
+    "municipality": "Redmond",
+    "region": "OR",
+    "iata": "RDM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Raleigh-Durham International Airport",
+    "lat": 35.878659,
+    "lon": -78.7873,
+    "municipality": "Raleigh/Durham",
+    "region": "NC",
+    "iata": "RDU",
+    "type": "large_airport"
+  },
+  {
+    "name": "Chicago Rockford International Airport",
+    "lat": 42.1954,
+    "lon": -89.097198,
+    "municipality": "Chicago/Rockford",
+    "region": "IL",
+    "iata": "RFD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Rhinelander Oneida County Airport",
+    "lat": 45.63119888305664,
+    "lon": -89.46749877929688,
+    "municipality": "Rhinelander",
+    "region": "WI",
+    "iata": "RHI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Richmond International Airport",
+    "lat": 37.505199,
+    "lon": -77.319702,
+    "municipality": "Richmond",
+    "region": "VA",
+    "iata": "RIC",
+    "type": "large_airport"
+  },
+  {
+    "name": "Central Wyoming Regional Airport",
+    "lat": 43.064201,
+    "lon": -108.459999,
+    "municipality": "Riverton",
+    "region": "WY",
+    "iata": "RIW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Knox County Regional Airport",
+    "lat": 44.060101,
+    "lon": -69.099197,
+    "municipality": "Rockland",
+    "region": "ME",
+    "iata": "RKD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Southwest Wyoming Regional Airport",
+    "lat": 41.5942,
+    "lon": -109.065001,
+    "municipality": "Rock Springs",
+    "region": "WY",
+    "iata": "RKS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Reno Tahoe International Airport",
+    "lat": 39.4991,
+    "lon": -119.767998,
+    "municipality": "Reno",
+    "region": "NV",
+    "iata": "RNO",
+    "type": "large_airport"
+  },
+  {
+    "name": "Roanoke\u2013Blacksburg Regional Airport",
+    "lat": 37.3255,
+    "lon": -79.975403,
+    "municipality": "Roanoke",
+    "region": "VA",
+    "iata": "ROA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Frederick Douglass Greater Rochester International Airport",
+    "lat": 43.1189,
+    "lon": -77.672401,
+    "municipality": "Rochester",
+    "region": "NY",
+    "iata": "ROC",
+    "type": "large_airport"
+  },
+  {
+    "name": "Roswell Air Center Airport",
+    "lat": 33.301601,
+    "lon": -104.530998,
+    "municipality": "Roswell",
+    "region": "NM",
+    "iata": "ROW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Rochester International Airport",
+    "lat": 43.908298,
+    "lon": -92.5,
+    "municipality": "Rochester",
+    "region": "MN",
+    "iata": "RST",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Southwest Florida International Airport",
+    "lat": 26.534685,
+    "lon": -81.752816,
+    "municipality": "Fort Myers",
+    "region": "FL",
+    "iata": "RSW",
+    "type": "large_airport"
+  },
+  {
+    "name": "Rutland - Southern Vermont Regional Airport",
+    "lat": 43.5294,
+    "lon": -72.9496,
+    "municipality": "Rutland",
+    "region": "VT",
+    "iata": "RUT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Santa Fe Municipal Airport",
+    "lat": 35.6171,
+    "lon": -106.088997,
+    "municipality": "Santa Fe",
+    "region": "NM",
+    "iata": "SAF",
+    "type": "medium_airport"
+  },
+  {
+    "name": "San Diego International Airport",
+    "lat": 32.733601,
+    "lon": -117.190002,
+    "municipality": "San Diego",
+    "region": "CA",
+    "iata": "SAN",
+    "type": "large_airport"
+  },
+  {
+    "name": "San Antonio International Airport",
+    "lat": 29.533701,
+    "lon": -98.469803,
+    "municipality": "San Antonio",
+    "region": "TX",
+    "iata": "SAT",
+    "type": "large_airport"
+  },
+  {
+    "name": "Savannah Hilton Head International Airport",
+    "lat": 32.126591,
+    "lon": -81.19998,
+    "municipality": "Savannah",
+    "region": "GA",
+    "iata": "SAV",
+    "type": "large_airport"
+  },
+  {
+    "name": "Marquette/Sawyer International Airport",
+    "lat": 46.351498,
+    "lon": -87.395884,
+    "municipality": "Gwinn",
+    "region": "MI",
+    "iata": "MQT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Santa Barbara Municipal Airport",
+    "lat": 34.426201,
+    "lon": -119.839996,
+    "municipality": "Santa Barbara",
+    "region": "CA",
+    "iata": "SBA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "San Bernardino International Airport",
+    "lat": 34.096717,
+    "lon": -117.236596,
+    "municipality": "San Bernardino",
+    "region": "CA",
+    "iata": "SBD",
+    "type": "large_airport"
+  },
+  {
+    "name": "South Bend International Airport",
+    "lat": 41.708304,
+    "lon": -86.316922,
+    "municipality": "South Bend",
+    "region": "IN",
+    "iata": "SBN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "San Luis County Regional Airport",
+    "lat": 35.236801147499996,
+    "lon": -120.641998291,
+    "municipality": "San Luis Obispo",
+    "region": "CA",
+    "iata": "SBP",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Salisbury Ocean City Wicomico Regional Airport",
+    "lat": 38.34049987792969,
+    "lon": -75.51029968261719,
+    "municipality": "Salisbury",
+    "region": "MD",
+    "iata": "SBY",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Stockton Metropolitan Airport",
+    "lat": 37.893279,
+    "lon": -121.238079,
+    "municipality": "Stockton",
+    "region": "CA",
+    "iata": "SCK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Louisville Muhammad Ali International Airport",
+    "lat": 38.1706,
+    "lon": -85.735076,
+    "municipality": "Louisville",
+    "region": "KY",
+    "iata": "SDF",
+    "type": "large_airport"
+  },
+  {
+    "name": "Sidney - Richland Regional Airport",
+    "lat": 47.705141,
+    "lon": -104.194422,
+    "municipality": "Sidney",
+    "region": "MT",
+    "iata": "SDY",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Seattle\u2013Tacoma International Airport",
+    "lat": 47.447943,
+    "lon": -122.310276,
+    "municipality": "Seattle",
+    "region": "WA",
+    "iata": "SEA",
+    "type": "large_airport"
+  },
+  {
+    "name": "Orlando Sanford International Airport",
+    "lat": 28.774277,
+    "lon": -81.234626,
+    "municipality": "Orlando",
+    "region": "FL",
+    "iata": "SFB",
+    "type": "large_airport"
+  },
+  {
+    "name": "San Francisco International Airport",
+    "lat": 37.619806,
+    "lon": -122.374821,
+    "municipality": "San Francisco",
+    "region": "CA",
+    "iata": "SFO",
+    "type": "large_airport"
+  },
+  {
+    "name": "Springfield Branson National Airport",
+    "lat": 37.245047,
+    "lon": -93.388596,
+    "municipality": "Springfield",
+    "region": "MO",
+    "iata": "SGF",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Northeast Florida Regional Airport",
+    "lat": 29.9592,
+    "lon": -81.339798,
+    "municipality": "St Augustine",
+    "region": "FL",
+    "iata": "UST",
+    "type": "medium_airport"
+  },
+  {
+    "name": "St George Regional Airport",
+    "lat": 37.036389,
+    "lon": -113.510306,
+    "municipality": "St George",
+    "region": "UT",
+    "iata": "SGU",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Shenandoah Valley Regional Airport",
+    "lat": 38.263802,
+    "lon": -78.8964,
+    "municipality": "Weyers Cave",
+    "region": "VA",
+    "iata": "SHD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Sheridan County Airport",
+    "lat": 44.76919937133789,
+    "lon": -106.9800033569336,
+    "municipality": "Sheridan",
+    "region": "WY",
+    "iata": "SHR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Shreveport Regional Airport",
+    "lat": 32.444747,
+    "lon": -93.826741,
+    "municipality": "Shreveport",
+    "region": "LA",
+    "iata": "SHV",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Norman Y. Mineta San Jose International Airport",
+    "lat": 37.362452,
+    "lon": -121.929188,
+    "municipality": "San Jose",
+    "region": "CA",
+    "iata": "SJC",
+    "type": "large_airport"
+  },
+  {
+    "name": "San Angelo Regional Mathis Field",
+    "lat": 31.35770034790039,
+    "lon": -100.49600219726562,
+    "municipality": "San Angelo",
+    "region": "TX",
+    "iata": "SJT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Taos Regional Airport",
+    "lat": 36.452494,
+    "lon": -105.67749,
+    "municipality": "Taos",
+    "region": "NM",
+    "iata": "TSM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Salt Lake City International Airport",
+    "lat": 40.78886,
+    "lon": -111.979866,
+    "municipality": "Salt Lake City",
+    "region": "UT",
+    "iata": "SLC",
+    "type": "large_airport"
+  },
+  {
+    "name": "Salem-Willamette Valley Airport/McNary Field",
+    "lat": 44.9095,
+    "lon": -123.002998,
+    "municipality": "Salem",
+    "region": "OR",
+    "iata": "SLE",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Adirondack Regional Airport",
+    "lat": 44.38691,
+    "lon": -74.204629,
+    "municipality": "Saranac Lake",
+    "region": "NY",
+    "iata": "SLK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Salina Municipal Airport",
+    "lat": 38.79100036621094,
+    "lon": -97.6521987915039,
+    "municipality": "Salina",
+    "region": "KS",
+    "iata": "SLN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Sacramento International Airport",
+    "lat": 38.6954,
+    "lon": -121.591003,
+    "municipality": "Sacramento",
+    "region": "CA",
+    "iata": "SMF",
+    "type": "large_airport"
+  },
+  {
+    "name": "Lemhi County Airport",
+    "lat": 45.122233,
+    "lon": -113.88196,
+    "municipality": "Salmon",
+    "region": "ID",
+    "iata": "SMN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Santa Maria Public Airport Captain G Allan Hancock Field",
+    "lat": 34.898899,
+    "lon": -120.457001,
+    "municipality": "Santa Maria",
+    "region": "CA",
+    "iata": "SMX",
+    "type": "medium_airport"
+  },
+  {
+    "name": "John Wayne Orange County International Airport",
+    "lat": 33.675063,
+    "lon": -117.869281,
+    "municipality": "Santa Ana",
+    "region": "CA",
+    "iata": "SNA",
+    "type": "large_airport"
+  },
+  {
+    "name": "Show Low Regional Airport",
+    "lat": 34.264062,
+    "lon": -110.007091,
+    "municipality": "Show Low",
+    "region": "AZ",
+    "iata": "SOW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Abraham Lincoln Capital Airport",
+    "lat": 39.844101,
+    "lon": -89.677902,
+    "municipality": "Springfield",
+    "region": "IL",
+    "iata": "SPI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Wichita Falls Municipal Airport / Sheppard Air Force Base",
+    "lat": 33.9888,
+    "lon": -98.491898,
+    "municipality": "Wichita Falls",
+    "region": "TX",
+    "iata": "SPS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "San Carlos Airport",
+    "lat": 37.51313,
+    "lon": -122.250838,
+    "municipality": "San Carlos",
+    "region": "CA",
+    "iata": "SQL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Sarasota Bradenton International Airport",
+    "lat": 27.394631,
+    "lon": -82.554359,
+    "municipality": "Sarasota/Bradenton",
+    "region": "FL",
+    "iata": "SRQ",
+    "type": "large_airport"
+  },
+  {
+    "name": "Saint Cloud Regional Airport",
+    "lat": 45.5466,
+    "lon": -94.059898,
+    "municipality": "Saint Cloud",
+    "region": "MN",
+    "iata": "STC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "St. Louis Lambert International Airport",
+    "lat": 38.748697,
+    "lon": -90.370003,
+    "municipality": "St Louis",
+    "region": "MO",
+    "iata": "STL",
+    "type": "large_airport"
+  },
+  {
+    "name": "Charles M. Schulz Sonoma County Airport",
+    "lat": 38.50899887,
+    "lon": -122.8130035,
+    "municipality": "Santa Rosa",
+    "region": "CA",
+    "iata": "STS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Friedman Memorial Airport",
+    "lat": 43.50439835,
+    "lon": -114.2959976,
+    "municipality": "Hailey",
+    "region": "ID",
+    "iata": "SUN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Sioux Gateway Airport / Brigadier General Bud Day Field",
+    "lat": 42.397605,
+    "lon": -96.382237,
+    "municipality": "Sioux City",
+    "region": "IA",
+    "iata": "SUX",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Grant County Airport",
+    "lat": 32.636701,
+    "lon": -108.154736,
+    "municipality": "Silver City",
+    "region": "NM",
+    "iata": "SVC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "New York Stewart International Airport",
+    "lat": 41.50421,
+    "lon": -74.108901,
+    "municipality": "Newburgh",
+    "region": "NY",
+    "iata": "SWF",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Stillwater Regional Airport",
+    "lat": 36.162132,
+    "lon": -97.085581,
+    "municipality": "Stillwater",
+    "region": "OK",
+    "iata": "SWO",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Syracuse Hancock International Airport",
+    "lat": 43.11119842529297,
+    "lon": -76.1063003540039,
+    "municipality": "Syracuse",
+    "region": "NY",
+    "iata": "SYR",
+    "type": "large_airport"
+  },
+  {
+    "name": "Waynesville-St. Robert Regional Airport-Forney Field",
+    "lat": 37.7416,
+    "lon": -92.140701,
+    "municipality": "Fort Leonard Wood",
+    "region": "MO",
+    "iata": "TBN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Teterboro Airport",
+    "lat": 40.850101,
+    "lon": -74.060799,
+    "municipality": "Teterboro",
+    "region": "NJ",
+    "iata": "TEB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Telluride Regional Airport",
+    "lat": 37.9538,
+    "lon": -107.907997,
+    "municipality": "Telluride",
+    "region": "CO",
+    "iata": "TEX",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Tacoma Narrows Airport",
+    "lat": 47.267407,
+    "lon": -122.577295,
+    "municipality": "Tacoma",
+    "region": "WA",
+    "iata": "TIW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Tallahassee International Airport",
+    "lat": 30.401209,
+    "lon": -84.35433,
+    "municipality": "Tallahassee",
+    "region": "FL",
+    "iata": "TLH",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Eugene F. Kranz Toledo Express Airport",
+    "lat": 41.5868,
+    "lon": -83.8078,
+    "municipality": "Toledo",
+    "region": "OH",
+    "iata": "TOL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Tampa International Airport",
+    "lat": 27.9755,
+    "lon": -82.533203,
+    "municipality": "Tampa",
+    "region": "FL",
+    "iata": "TPA",
+    "type": "large_airport"
+  },
+  {
+    "name": "Tri-Cities Regional TN/VA Airport",
+    "lat": 36.475201,
+    "lon": -82.407401,
+    "municipality": "Blountville",
+    "region": "TN",
+    "iata": "TRI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Truckee Tahoe Airport",
+    "lat": 39.318628,
+    "lon": -120.140562,
+    "municipality": "Truckee",
+    "region": "CA",
+    "iata": "TKF",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Trenton Mercer Airport",
+    "lat": 40.276699,
+    "lon": -74.813499,
+    "municipality": "Ewing Township",
+    "region": "NJ",
+    "iata": "TTN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Tulsa International Airport",
+    "lat": 36.197084,
+    "lon": -95.886225,
+    "municipality": "Tulsa",
+    "region": "OK",
+    "iata": "TUL",
+    "type": "large_airport"
+  },
+  {
+    "name": "Tupelo Regional Airport",
+    "lat": 34.26810073852539,
+    "lon": -88.7698974609375,
+    "municipality": "Tupelo",
+    "region": "MS",
+    "iata": "TUP",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Tucson International Airport",
+    "lat": 32.115004,
+    "lon": -110.938053,
+    "municipality": "Tucson",
+    "region": "AZ",
+    "iata": "TUS",
+    "type": "large_airport"
+  },
+  {
+    "name": "Cherry Capital Airport",
+    "lat": 44.741402,
+    "lon": -85.582199,
+    "municipality": "Traverse City",
+    "region": "MI",
+    "iata": "TVC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Thief River Falls Regional Airport",
+    "lat": 48.065701,
+    "lon": -96.184998,
+    "municipality": "Thief River Falls",
+    "region": "MN",
+    "iata": "TVF",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Joslin Field Magic Valley Regional Airport",
+    "lat": 42.4818,
+    "lon": -114.487999,
+    "municipality": "Twin Falls",
+    "region": "ID",
+    "iata": "TWF",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Texarkana Regional Airport (Webb Field)",
+    "lat": 33.453701,
+    "lon": -93.990997,
+    "municipality": "Texarkana",
+    "region": "AR",
+    "iata": "TXK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Tyler Pounds Regional Airport",
+    "lat": 32.35409927368164,
+    "lon": -95.40239715576172,
+    "municipality": "Tyler",
+    "region": "TX",
+    "iata": "TYR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "McGhee Tyson Airport",
+    "lat": 35.811001,
+    "lon": -83.994003,
+    "municipality": "Knoxville/Maryville",
+    "region": "TN",
+    "iata": "TYS",
+    "type": "large_airport"
+  },
+  {
+    "name": "Quincy Regional Airport Baldwin Field",
+    "lat": 39.942699,
+    "lon": -91.194603,
+    "municipality": "Quincy",
+    "region": "IL",
+    "iata": "UIN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "State College Regional Airport",
+    "lat": 40.849374,
+    "lon": -77.84852,
+    "municipality": "State College",
+    "region": "PA",
+    "iata": "SCE",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Newport State Airport",
+    "lat": 41.532207,
+    "lon": -71.281039,
+    "municipality": "Newport",
+    "region": "RI",
+    "iata": "NPT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Victoria Regional Airport",
+    "lat": 28.85260009765625,
+    "lon": -96.91850280761719,
+    "municipality": "Victoria",
+    "region": "TX",
+    "iata": "VCT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Vernal Regional Airport",
+    "lat": 40.436214,
+    "lon": -109.511661,
+    "municipality": "Vernal",
+    "region": "UT",
+    "iata": "VEL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Valdosta Regional Airport",
+    "lat": 30.782499313354492,
+    "lon": -83.27670288085938,
+    "municipality": "Valdosta",
+    "region": "GA",
+    "iata": "VLD",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Destin-Fort Walton Beach Airport",
+    "lat": 30.481315,
+    "lon": -86.515839,
+    "municipality": "Valparaiso",
+    "region": "FL",
+    "iata": "VPS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Vero Beach Regional Airport",
+    "lat": 27.6556,
+    "lon": -80.417901,
+    "municipality": "Vero Beach",
+    "region": "FL",
+    "iata": "VRB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Westerly State Airport",
+    "lat": 41.349602,
+    "lon": -71.803398,
+    "municipality": "Westerly",
+    "region": "RI",
+    "iata": "WST",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Yellowstone Airport",
+    "lat": 44.6884,
+    "lon": -111.117996,
+    "municipality": "West Yellowstone",
+    "region": "MT",
+    "iata": "WYS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Northwest Arkansas National Airport",
+    "lat": 36.281898,
+    "lon": -94.306801,
+    "municipality": "Fayetteville/Springdale/Rogers",
+    "region": "AR",
+    "iata": "XNA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Williston Basin International Airport",
+    "lat": 48.260863,
+    "lon": -103.75116,
+    "municipality": "Williston",
+    "region": "ND",
+    "iata": "XWA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Yakima Air Terminal McAllister Field",
+    "lat": 46.56819916,
+    "lon": -120.5439987,
+    "municipality": "Yakima",
+    "region": "WA",
+    "iata": "YKM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Barter Island Long Range Radar Station Airport",
+    "lat": 70.134003,
+    "lon": -143.582001,
+    "municipality": "Barter Island",
+    "region": "AK",
+    "iata": "BTI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Bethel Airport",
+    "lat": 60.77980042,
+    "lon": -161.8379974,
+    "municipality": "Bethel",
+    "region": "AK",
+    "iata": "BET",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Wiley Post Will Rogers Memorial Airport",
+    "lat": 71.285402,
+    "lon": -156.766008,
+    "municipality": "Utqia\u0121vik",
+    "region": "AK",
+    "iata": "BRW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Cold Bay Airport",
+    "lat": 55.207871,
+    "lon": -162.725029,
+    "municipality": "Cold Bay",
+    "region": "AK",
+    "iata": "CDB",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Merle K (Mudhole) Smith Airport",
+    "lat": 60.491798,
+    "lon": -145.477997,
+    "municipality": "Cordova",
+    "region": "AK",
+    "iata": "CDV",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Deering Airport",
+    "lat": 66.068901,
+    "lon": -162.766914,
+    "municipality": "Deering",
+    "region": "AK",
+    "iata": "DRG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Adak Airport",
+    "lat": 51.883564,
+    "lon": -176.642783,
+    "municipality": "Adak",
+    "region": "AK",
+    "iata": "ADK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Dillingham Airport",
+    "lat": 59.04470062,
+    "lon": -158.5050049,
+    "municipality": "Dillingham",
+    "region": "AK",
+    "iata": "DLG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Kodiak Airport",
+    "lat": 57.75,
+    "lon": -152.4940033,
+    "municipality": "Kodiak",
+    "region": "AK",
+    "iata": "ADQ",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Tom Madsen (Dutch Harbor) Airport",
+    "lat": 53.89881,
+    "lon": -166.544996,
+    "municipality": "Unalaska",
+    "region": "AK",
+    "iata": "DUT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Emmonak Airport",
+    "lat": 62.78609848,
+    "lon": -164.4909973,
+    "municipality": "Emmonak",
+    "region": "AK",
+    "iata": "EMK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Kenai Municipal Airport",
+    "lat": 60.570946,
+    "lon": -151.245174,
+    "municipality": "Kenai",
+    "region": "AK",
+    "iata": "ENA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Fairbanks International Airport",
+    "lat": 64.815102,
+    "lon": -147.856003,
+    "municipality": "Fairbanks",
+    "region": "AK",
+    "iata": "FAI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Ambler Airport",
+    "lat": 67.105529,
+    "lon": -157.855339,
+    "municipality": "Ambler",
+    "region": "AK",
+    "iata": "ABL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Edward G. Pitka Sr Airport",
+    "lat": 64.736198,
+    "lon": -156.936997,
+    "municipality": "Galena",
+    "region": "AK",
+    "iata": "GAL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Gulkana Airport",
+    "lat": 62.155859,
+    "lon": -145.454662,
+    "municipality": "Gulkana",
+    "region": "AK",
+    "iata": "GKN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Gambell Airport",
+    "lat": 63.767694,
+    "lon": -171.733303,
+    "municipality": "Gambell",
+    "region": "AK",
+    "iata": "GAM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Gustavus Airport",
+    "lat": 58.4253006,
+    "lon": -135.7070007,
+    "municipality": "Gustavus",
+    "region": "AK",
+    "iata": "GST",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Holy Cross Airport",
+    "lat": 62.18830108642578,
+    "lon": -159.77499389648438,
+    "municipality": "Holy Cross",
+    "region": "AK",
+    "iata": "HCR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Huslia Airport",
+    "lat": 65.697899,
+    "lon": -156.350998,
+    "municipality": "Huslia",
+    "region": "AK",
+    "iata": "HSL",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Haines Airport",
+    "lat": 59.243921,
+    "lon": -135.523925,
+    "municipality": "Haines",
+    "region": "AK",
+    "iata": "HNS",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Homer Airport",
+    "lat": 59.644456,
+    "lon": -151.479235,
+    "municipality": "Homer",
+    "region": "AK",
+    "iata": "HOM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Egegik Airport",
+    "lat": 58.184386,
+    "lon": -157.374873,
+    "municipality": "Egegik",
+    "region": "AK",
+    "iata": "EGX",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Bob Baker Memorial Airport",
+    "lat": 66.976128,
+    "lon": -160.439014,
+    "municipality": "Kiana",
+    "region": "AK",
+    "iata": "IAN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Iliamna Airport",
+    "lat": 59.754398,
+    "lon": -154.910996,
+    "municipality": "Iliamna",
+    "region": "AK",
+    "iata": "ILI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Indian Mountain LRRS Airport",
+    "lat": 65.992798,
+    "lon": -153.703995,
+    "municipality": "Utopia Creek",
+    "region": "AK",
+    "iata": "UTO",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Juneau International Airport",
+    "lat": 58.354935,
+    "lon": -134.574416,
+    "municipality": "Juneau",
+    "region": "AK",
+    "iata": "JNU",
+    "type": "medium_airport"
+  },
+  {
+    "name": "King Salmon Airport",
+    "lat": 58.677845,
+    "lon": -156.651965,
+    "municipality": "King Salmon",
+    "region": "AK",
+    "iata": "AKN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Anaktuvuk Pass Airport",
+    "lat": 68.133598,
+    "lon": -151.742996,
+    "municipality": "Anaktuvuk Pass",
+    "region": "AK",
+    "iata": "AKP",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Ketchikan International Airport",
+    "lat": 55.35559845,
+    "lon": -131.7140045,
+    "municipality": "Ketchikan",
+    "region": "AK",
+    "iata": "KTN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Klawock Airport",
+    "lat": 55.579201,
+    "lon": -133.076004,
+    "municipality": "Klawock",
+    "region": "AK",
+    "iata": "KLW",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Cape Lisburne LRRS Airport",
+    "lat": 68.875099,
+    "lon": -166.110001,
+    "municipality": "Cape Lisburne",
+    "region": "AK",
+    "iata": "LUR",
+    "type": "medium_airport"
+  },
+  {
+    "name": "McGrath Airport",
+    "lat": 62.95289993,
+    "lon": -155.6060028,
+    "municipality": "McGrath",
+    "region": "AK",
+    "iata": "MCG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Merrill Field",
+    "lat": 61.212792,
+    "lon": -149.843988,
+    "municipality": "Anchorage",
+    "region": "AK",
+    "iata": "MRI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Mekoryuk Airport",
+    "lat": 60.372338,
+    "lon": -166.269751,
+    "municipality": "Mekoryuk",
+    "region": "AK",
+    "iata": "MYU",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Ted Stevens Anchorage International Airport",
+    "lat": 61.179004,
+    "lon": -149.992561,
+    "municipality": "Anchorage",
+    "region": "AK",
+    "iata": "ANC",
+    "type": "large_airport"
+  },
+  {
+    "name": "Aniak Airport",
+    "lat": 61.581600189208984,
+    "lon": -159.54299926757812,
+    "municipality": "Aniak",
+    "region": "AK",
+    "iata": "ANI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Anvik Airport",
+    "lat": 62.646702,
+    "lon": -160.190994,
+    "municipality": "Anvik",
+    "region": "AK",
+    "iata": "ANV",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Nome Airport",
+    "lat": 64.51219940185547,
+    "lon": -165.44500732421875,
+    "municipality": "Nome",
+    "region": "AK",
+    "iata": "OME",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Northway Airport",
+    "lat": 62.9613,
+    "lon": -141.929001,
+    "municipality": "Northway",
+    "region": "AK",
+    "iata": "ORT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Ralph Wien Memorial Airport",
+    "lat": 66.88469696,
+    "lon": -162.598999,
+    "municipality": "Kotzebue",
+    "region": "AK",
+    "iata": "OTZ",
+    "type": "medium_airport"
+  },
+  {
+    "name": "St George Airport",
+    "lat": 56.577345,
+    "lon": -169.663823,
+    "municipality": "St George",
+    "region": "AK",
+    "iata": "STG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Petersburg James A Johnson Airport",
+    "lat": 56.80170059,
+    "lon": -132.9450073,
+    "municipality": "Petersburg",
+    "region": "AK",
+    "iata": "PSG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Port Heiden Airport",
+    "lat": 56.957893,
+    "lon": -158.630219,
+    "municipality": "Port Heiden",
+    "region": "AK",
+    "iata": "PTH",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Platinum Airport",
+    "lat": 59.017675,
+    "lon": -161.827927,
+    "municipality": "Platinum",
+    "region": "AK",
+    "iata": "PTU",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Nuiqsut Airport",
+    "lat": 70.209999,
+    "lon": -151.005998,
+    "municipality": "Nuiqsut",
+    "region": "AK",
+    "iata": "NUI",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Arctic Village Airport",
+    "lat": 68.1147,
+    "lon": -145.578995,
+    "municipality": "Arctic Village",
+    "region": "AK",
+    "iata": "ARC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Ruby Airport",
+    "lat": 64.727203,
+    "lon": -155.470001,
+    "municipality": "Ruby",
+    "region": "AK",
+    "iata": "RBY",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Savoonga Airport",
+    "lat": 63.686401,
+    "lon": -170.492996,
+    "municipality": "Savoonga",
+    "region": "AK",
+    "iata": "SVA",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Deadhorse Airport",
+    "lat": 70.19470215,
+    "lon": -148.4649963,
+    "municipality": "Deadhorse",
+    "region": "AK",
+    "iata": "SCC",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Sand Point Airport",
+    "lat": 55.313908,
+    "lon": -160.522099,
+    "municipality": "Sand Point",
+    "region": "AK",
+    "iata": "SDP",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Sitka Rocky Gutierrez Airport",
+    "lat": 57.04710006713867,
+    "lon": -135.36199951171875,
+    "municipality": "Sitka",
+    "region": "AK",
+    "iata": "SIT",
+    "type": "medium_airport"
+  },
+  {
+    "name": "St Paul Island Airport",
+    "lat": 57.166311,
+    "lon": -170.222555,
+    "municipality": "St Paul Island",
+    "region": "AK",
+    "iata": "SNP",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Atqasuk Edward Burnell Sr Memorial Airport",
+    "lat": 70.46704,
+    "lon": -157.436013,
+    "municipality": "Atqasuk",
+    "region": "AK",
+    "iata": "ATK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Unalakleet Airport",
+    "lat": 63.888401,
+    "lon": -160.798996,
+    "municipality": "Unalakleet",
+    "region": "AK",
+    "iata": "UNK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Valdez Pioneer Field",
+    "lat": 61.132712,
+    "lon": -146.246567,
+    "municipality": "Valdez",
+    "region": "AK",
+    "iata": "VDZ",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Wrangell Airport",
+    "lat": 56.48429871,
+    "lon": -132.3699951,
+    "municipality": "Wrangell",
+    "region": "AK",
+    "iata": "WRG",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Wainwright Airport",
+    "lat": 70.638,
+    "lon": -159.994995,
+    "municipality": "Wainwright",
+    "region": "AK",
+    "iata": "AIN",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Yakutat Airport",
+    "lat": 59.508717,
+    "lon": -139.660435,
+    "municipality": "Yakutat",
+    "region": "AK",
+    "iata": "YAK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Fort Yukon Airport",
+    "lat": 66.571651,
+    "lon": -145.249987,
+    "municipality": "Fort Yukon",
+    "region": "AK",
+    "iata": "FYU",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Hana Airport",
+    "lat": 20.795601,
+    "lon": -156.014008,
+    "municipality": "Hana",
+    "region": "HI",
+    "iata": "HNM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Kapalua Airport",
+    "lat": 20.9629,
+    "lon": -156.673004,
+    "municipality": "Lahaina",
+    "region": "HI",
+    "iata": "JHM",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Ellison Onizuka Kona International Airport at Ke\u0101hole",
+    "lat": 19.738783,
+    "lon": -156.045603,
+    "municipality": "Kailua-Kona",
+    "region": "HI",
+    "iata": "KOA",
+    "type": "large_airport"
+  },
+  {
+    "name": "Lihue Airport",
+    "lat": 21.974393,
+    "lon": -159.337146,
+    "municipality": "Lihue, Kauai",
+    "region": "HI",
+    "iata": "LIH",
+    "type": "large_airport"
+  },
+  {
+    "name": "Molokai Airport",
+    "lat": 21.152901,
+    "lon": -157.095993,
+    "municipality": "Kaunakakai",
+    "region": "HI",
+    "iata": "MKK",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Waimea Kohala Airport",
+    "lat": 20.001301,
+    "lon": -155.667999,
+    "municipality": "Waimea (Kamuela)",
+    "region": "HI",
+    "iata": "MUE",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Daniel K. Inouye International Airport",
+    "lat": 21.318387,
+    "lon": -157.92567,
+    "municipality": "Honolulu, Oahu",
+    "region": "HI",
+    "iata": "HNL",
+    "type": "large_airport"
+  },
+  {
+    "name": "Lanai Airport",
+    "lat": 20.785675,
+    "lon": -156.951324,
+    "municipality": "Lanai City",
+    "region": "HI",
+    "iata": "LNY",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Kahului International Airport",
+    "lat": 20.896263,
+    "lon": -156.431837,
+    "municipality": "Kahului",
+    "region": "HI",
+    "iata": "OGG",
+    "type": "large_airport"
+  },
+  {
+    "name": "Hilo International Airport",
+    "lat": 19.72135,
+    "lon": -155.045428,
+    "municipality": "Hilo",
+    "region": "HI",
+    "iata": "ITO",
+    "type": "medium_airport"
+  },
+  {
+    "name": "Point Lay LRRS Airport",
+    "lat": 69.732903,
+    "lon": -163.005005,
+    "municipality": "Point Lay",
+    "region": "AK",
+    "iata": "PIZ",
+    "type": "medium_airport"
+  }
+]

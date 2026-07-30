@@ -15,12 +15,12 @@ from app.config.logging import get_logger
 
 logger = get_logger(__name__)
 
-async def run_global_property_sync() -> Dict[str, Any]:
+async def run_global_property_sync(max_pages: int | None = None) -> Dict[str, Any]:
     """
     Triggers the high-efficiency global incremental property sync.
     Fetches all changes from Bright MLS and propagates to collections.
     """
-    logger.info("Global property sync triggered", extra={"event": "global_sync_started"})
+    logger.info("Global property sync triggered", extra={"event": "global_sync_started", "max_pages": max_pages})
 
     sync_results = {
         'started_at': datetime.now(timezone.utc),
@@ -34,7 +34,7 @@ async def run_global_property_sync() -> Dict[str, Any]:
         property_sync_service = PropertySyncService()
         
         # Execute the new global sync logic
-        results = await property_sync_service.run_global_sync()
+        results = await property_sync_service.run_global_sync(max_pages=max_pages)
         
         sync_results['properties_updated'] = results.get('updated', 0)
         sync_results['notifications_sent'] = results.get('notifications_sent', 0)

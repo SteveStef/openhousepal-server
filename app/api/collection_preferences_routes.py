@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
 
@@ -10,9 +11,19 @@ from app.schemas.collection_preferences import (
 )
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.utils.auth import require_premium_plan, get_current_user_optional
-from app.models.database import User
+from app.models.database import Collection, User
 
 router = APIRouter(prefix="/collection-preferences", tags=["collection-preferences"])
+
+
+async def _require_collection_owner(db: AsyncSession, collection_id: str, current_user: User) -> None:
+    """Raises 404 if the collection doesn't exist, 403 if it exists but isn't owned by current_user."""
+    result = await db.execute(select(Collection).where(Collection.id == collection_id))
+    collection = result.scalar_one_or_none()
+    if not collection:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found")
+    if collection.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have access to this collection")
 
 @router.post("/", response_model=CollectionPreferences, status_code=status.HTTP_201_CREATED)
 async def create_preferences(
@@ -21,6 +32,7 @@ async def create_preferences(
     current_user: User = Depends(require_premium_plan)
 ):
     """Create collection preferences"""
+    await _require_collection_owner(db, preferences_data.collection_id, current_user)
     try:
         preferences = await CollectionPreferencesService.create_preferences(db, preferences_data)
         return preferences
@@ -61,6 +73,7 @@ async def update_preferences(
     current_user: User = Depends(require_premium_plan)
 ):
     """Update collection preferences (owner/agent only)"""
+    await _require_collection_owner(db, collection_id, current_user)
     preferences = await CollectionPreferencesService.update_preferences(db, collection_id, preferences_update)
     if not preferences:
         raise HTTPException(
@@ -76,6 +89,7 @@ async def delete_preferences(
     current_user: User = Depends(require_premium_plan)
 ):
     """Delete collection preferences (owner/agent only)"""
+    await _require_collection_owner(db, collection_id, current_user)
     success = await CollectionPreferencesService.delete_preferences(db, collection_id)
     if not success:
         raise HTTPException(
@@ -90,6 +104,7 @@ async def auto_generate_preferences(
     current_user: User = Depends(require_premium_plan)
 ):
     """Auto-generate preferences based on collection's original property (owner/agent only)"""
+    await _require_collection_owner(db, collection_id, current_user)
     preferences = await CollectionPreferencesService.auto_generate_preferences(db, collection_id)
     if not preferences:
         raise HTTPException(

@@ -11,6 +11,8 @@ from .notifications_routes import router as notifications_router
 from .admin_routes import router as admin_router
 from .discover_routes import router as discover_router
 from .agent_hub_routes import router as agent_hub_router
+from .forms_routes import router as forms_router
+from .open_house_manager_routes import router as open_house_manager_router
 
 router = APIRouter()
 router.include_router(auth_router)
@@ -25,3 +27,5 @@ router.include_router(notifications_router)
 router.include_router(admin_router)
 router.include_router(discover_router)
 router.include_router(agent_hub_router)
+router.include_router(forms_router)
+router.include_router(open_house_manager_router)

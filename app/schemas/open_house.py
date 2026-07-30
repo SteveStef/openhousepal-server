@@ -41,6 +41,7 @@ class OpenHouseCreateRequest(BaseModel):
     open_house_event_id: Optional[str] = None  # UUID provided by frontend for consistent QR codes
     qr_code_url: Optional[str] = None  # Optional since backend will generate it
     similar_properties_snapshot: Optional[List[Dict[str, Any]]] = None
+    cheat_sheet_photos: Optional[List[str]] = None
 
 class OpenHouseResponse(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
@@ -65,6 +66,7 @@ class OpenHouseResponse(BaseModel):
     listing_key: Optional[str] = None
     notes: Optional[str] = None
     similar_properties_snapshot: Optional[List[Dict[str, Any]]] = None
+    cheat_sheet_photos: Optional[List[str]] = None
     created_at: datetime
 
 class VisitorResponse(BaseModel):

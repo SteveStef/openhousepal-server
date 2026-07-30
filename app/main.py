@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request  # , Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -91,6 +92,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Open House Pal API", lifespan=lifespan)
+
+os.makedirs(os.path.join("uploads", "agent-photos"), exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 
 @app.middleware("http")

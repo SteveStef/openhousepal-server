@@ -14,10 +14,12 @@ from app.utils.normalization import MAJOR_BRANDS
 from datetime import datetime, timezone
 from typing import Any, Dict
 from app.models.property import (
-    PropertyDetailResponse, 
+    PropertyDetailResponse,
     PropertyLookupRequest,
-    SimilarPropertiesRequest
+    SimilarPropertiesRequest,
+    NearbyAmenitiesResponse,
 )
+from app.services import nearby_amenities_service
 from app.config.logging import get_logger
 
 router = APIRouter(prefix="/api/properties", tags=["properties"])
@@ -70,7 +72,8 @@ class ScheduleTourRequest(BaseModel):
 @router.post("")
 async def store_property(
     request: PropertyStoreRequest,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_basic_plan)
 ):
     """Store property data for later retrieval by ID (Used for manual adds or snapshots)"""
     try:
@@ -537,6 +540,22 @@ async def get_property_details(
     except Exception as e:
         logger.error(f"Mirror lookup failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Database lookup failed. Please verify the address format.")
+
+@router.get("/{listing_key}/nearby-amenities", response_model=NearbyAmenitiesResponse, dependencies=[Depends(require_broker_authorization), Depends(require_basic_plan)])
+async def get_nearby_amenities(
+    listing_key: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Schools/grocery/medical care/parks/airports near a listing, for the Open House Cheat Sheet PDF.
+    Backed by Google Places and cached on the Property row - see nearby_amenities_service for the
+    graceful-degrade behavior when GOOGLE_PLACES_API_KEY isn't configured."""
+    result = await db.execute(select(Property).where(Property.listing_key == listing_key))
+    property_record = result.scalar_one_or_none()
+    if not property_record:
+        raise HTTPException(status_code=404, detail="Listing not found in database.")
+
+    return await nearby_amenities_service.get_nearby_amenities(db, property_record)
+
 
 @router.post("/similar", dependencies=[Depends(require_broker_authorization)])
 async def get_similar_properties(

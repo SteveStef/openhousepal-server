@@ -1,19 +1,25 @@
 import asyncio
 import html
+import json
 import logging
+import os
 import re
 import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Any, Dict
 
 from app.database import get_db
-from app.models.database import AgentHub, Property, User
+from app.models.database import AgentHub, AgentHubEvent, FormSubmission, Property, User
 from app.services.bright_mls_service import bright_mls_service
 from app.utils.auth import get_current_active_user
 
@@ -24,9 +30,37 @@ SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 RECENT_SALES_CACHE_TTL_SECONDS = 10 * 60
 recent_sales_cache: dict[str, tuple[float, list[dict]]] = {}
 
+PHOTO_UPLOAD_DIR = os.path.join("uploads", "agent-photos")
+PHOTO_CONTENT_TYPES = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+PHOTO_MAX_BYTES = 5 * 1024 * 1024
+
 
 class AgentHubSlugUpdate(BaseModel):
     slug: str
+
+
+class AgentHubProfileUpdate(BaseModel):
+    title: Optional[str] = None
+    market: Optional[str] = None
+
+
+class AgentHubConfigUpdate(BaseModel):
+    config: Dict[str, Any]
+
+
+# The config blob holds the whole page-builder payload (profile text, contact info, social
+# links, sales/video/tour/blog carousel data, layout/visibility flags). 300KB is generous for
+# that - large enough for dozens of carousel items with images/links, small enough to block
+# someone trying to stuff arbitrary data into an unbounded JSONB column.
+AGENT_HUB_CONFIG_MAX_BYTES = 300_000
+
+
+class AgentHubTrackEvent(BaseModel):
+    event_type: str  # 'visit' | 'qr_scan'
 
 
 def normalize_slug(slug: str) -> str:
@@ -213,6 +247,65 @@ async def check_slug(
     }
 
 
+@router.get("/public/{slug}")
+async def get_public_agent_hub(
+    slug: str,
+    db: AsyncSession = Depends(get_db),
+):
+    normalized = normalize_slug(slug)
+    result = await db.execute(select(AgentHub).where(AgentHub.slug == normalized))
+    hub = result.scalar_one_or_none()
+    if not hub:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This Agent Hub link isn't active.")
+
+    return {"slug": hub.slug, "config": hub.config or {}}
+
+
+@router.post("/public/{slug}/track", status_code=status.HTTP_204_NO_CONTENT)
+async def track_agent_hub_event(
+    slug: str,
+    payload: AgentHubTrackEvent,
+    db: AsyncSession = Depends(get_db),
+):
+    if payload.event_type not in {"visit", "qr_scan"}:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid event type.")
+
+    normalized = normalize_slug(slug)
+    result = await db.execute(select(AgentHub).where(AgentHub.slug == normalized))
+    hub = result.scalar_one_or_none()
+    if not hub:
+        return None
+
+    db.add(AgentHubEvent(owner_id=hub.owner_id, event_type=payload.event_type))
+    await db.commit()
+    return None
+
+
+@router.get("/me/analytics")
+async def get_my_agent_hub_analytics(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    since = datetime.now(timezone.utc) - timedelta(days=60)
+
+    events_result = await db.execute(
+        select(AgentHubEvent.event_type, AgentHubEvent.created_at)
+        .where(AgentHubEvent.owner_id == current_user.id, AgentHubEvent.created_at >= since)
+    )
+    events = [
+        {"type": "visit" if event_type == "visit" else "qr", "timestamp": created_at.isoformat()}
+        for event_type, created_at in events_result.all()
+    ]
+
+    submissions_result = await db.execute(
+        select(FormSubmission.created_at)
+        .where(FormSubmission.owner_id == current_user.id, FormSubmission.created_at >= since)
+    )
+    events.extend({"type": "form", "timestamp": created_at.isoformat()} for (created_at,) in submissions_result.all())
+
+    return events
+
+
 @router.get("/me")
 async def get_my_agent_hub(
     db: AsyncSession = Depends(get_db),
@@ -223,7 +316,35 @@ async def get_my_agent_hub(
     if not hub:
         return None
 
-    return {"id": hub.id, "slug": hub.slug, "status": hub.status}
+    return {"id": hub.id, "slug": hub.slug, "status": hub.status, "config": hub.config or {}}
+
+
+@router.put("/me/config")
+async def update_my_agent_hub_config(
+    payload: AgentHubConfigUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Persists the full Agent Hub page-builder payload so it's visible from any device/session,
+    and so it's what actually gets served to public visitors at /agent-hub/public/{slug}."""
+    serialized = json.dumps(payload.config)
+    if len(serialized.encode("utf-8")) > AGENT_HUB_CONFIG_MAX_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="This Agent Hub page is too large to save. Try removing some images or links.",
+        )
+
+    result = await db.execute(select(AgentHub).where(AgentHub.owner_id == current_user.id))
+    hub = result.scalar_one_or_none()
+    if not hub:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Set your Agent Hub URL before saving your page.",
+        )
+
+    hub.config = payload.config
+    await db.commit()
+    return {"config": hub.config}
 
 
 @router.get("/me/recent-sales")
@@ -389,6 +510,141 @@ async def get_link_preview(
     return {"title": title, "image": image}
 
 
+async def _fetch_recent_youtube_videos(
+    client: httpx.AsyncClient,
+    feed_url: str,
+    max_videos: int = 15,
+    fallback_title: str = "YouTube Video",
+) -> list[dict]:
+    feed = await client.get(feed_url)
+    feed.raise_for_status()
+
+    entries = []
+    for entry in re.findall(r"<entry>(.*?)</entry>", feed.text, flags=re.DOTALL):
+        video_id_match = re.search(r"<yt:videoId>(.*?)</yt:videoId>", entry)
+        title_match = re.search(r"<title>(.*?)</title>", entry, flags=re.DOTALL)
+        published_match = re.search(r"<published>(.*?)</published>", entry)
+        if video_id_match:
+            entries.append((video_id_match.group(1), title_match, published_match))
+
+    # Checking each entry for "is this a Short" requires a live request per video.
+    # Doing that sequentially for up to 15+ entries was slow enough to time out -
+    # run them concurrently (bounded, so we don't hammer YouTube) instead.
+    semaphore = asyncio.Semaphore(5)
+
+    async def is_short(video_id: str) -> bool:
+        async with semaphore:
+            try:
+                video_page = await client.get(f"https://www.youtube.com/watch?v={video_id}", headers={"User-Agent": "OpenHousePalBot/1.0"})
+                return bool(re.search(r'<link rel="canonical" href="https://www\.youtube\.com/shorts/', video_page.text))
+            except httpx.HTTPError:
+                return False
+
+    short_flags = await asyncio.gather(*(is_short(video_id) for video_id, _, _ in entries))
+
+    videos = []
+    for (video_id, title_match, published_match), short in zip(entries, short_flags):
+        if short:
+            continue
+        clean_title = html.unescape(re.sub(r"\s+", " ", title_match.group(1)).strip()) if title_match else fallback_title
+        videos.append({
+            "id": f"youtube-{video_id}",
+            "title": clean_title,
+            "description": published_match.group(1)[:10] if published_match else "YouTube",
+            "link": f"https://www.youtube.com/watch?v={video_id}",
+            "image": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+        })
+        if len(videos) >= max_videos:
+            break
+
+    return videos
+
+
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+)
+
+
+async def _fetch_channel_grid_videos(client: httpx.AsyncClient, channel_url: str, max_videos: int = 15) -> list[dict]:
+    # The RSS feed (`feeds/videos.xml?channel_id=...`) only ever exposes the channel's
+    # most recent 15 uploads *of any kind*, and on channels that post a lot of Shorts
+    # most of those 15 get filtered out by the Shorts check - leaving far fewer than 15
+    # real videos with no way to page further back via RSS. The channel's own "Videos"
+    # tab already excludes Shorts (they live under a separate "Shorts" tab), so scraping
+    # it directly gives us up to ~30 guaranteed-non-Short videos instead.
+    # Strip query strings / fragments (e.g. the "?si=..." tracking param YouTube's
+    # mobile share sheet adds) before appending "/videos" - otherwise it gets appended
+    # *after* the query string, producing a URL that 404s or serves an unparseable page.
+    parsed_url = urlparse(channel_url)
+    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+    normalized = re.sub(r"/(videos|shorts|streams|playlists|featured|community|about)/?$", "", base_url.rstrip("/"))
+    page = await client.get(f"{normalized}/videos", headers={"User-Agent": BROWSER_USER_AGENT})
+    page.raise_for_status()
+
+    data_match = re.search(r"var ytInitialData\s*=\s*(\{.*?\});\s*</script>", page.text, flags=re.DOTALL)
+    if not data_match:
+        return []
+
+    try:
+        data = json.loads(data_match.group(1))
+    except json.JSONDecodeError:
+        return []
+
+    tabs = data.get("contents", {}).get("twoColumnBrowseResultsRenderer", {}).get("tabs", [])
+    videos_tab = None
+    for tab in tabs:
+        tab_renderer = tab.get("tabRenderer")
+        if not tab_renderer:
+            continue
+        tab_url = tab_renderer.get("endpoint", {}).get("commandMetadata", {}).get("webCommandMetadata", {}).get("url", "")
+        if tab_url.endswith("/videos"):
+            videos_tab = tab_renderer
+            break
+    if not videos_tab:
+        return []
+
+    grid_items = videos_tab.get("content", {}).get("richGridRenderer", {}).get("contents", [])
+    videos = []
+    for item in grid_items:
+        lockup = item.get("richItemRenderer", {}).get("content", {}).get("lockupViewModel")
+        if not lockup or lockup.get("contentType") != "LOCKUP_CONTENT_TYPE_VIDEO":
+            continue
+        video_id = lockup.get("contentId")
+        if not video_id:
+            continue
+        title = lockup.get("metadata", {}).get("lockupMetadataViewModel", {}).get("title", {}).get("content")
+        videos.append({
+            "id": f"youtube-{video_id}",
+            "title": title or "YouTube Video",
+            "description": "YouTube",
+            "link": f"https://www.youtube.com/watch?v={video_id}",
+            "image": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+        })
+        if len(videos) >= max_videos:
+            break
+    return videos
+
+
+async def _resolve_channel_id(client: httpx.AsyncClient, channel_url: str) -> str:
+    channel_id_match = re.search(r"/channel/([^/?#]+)", channel_url)
+    if channel_id_match:
+        return channel_id_match.group(1)
+
+    page = await client.get(channel_url, headers={"User-Agent": "OpenHousePalBot/1.0"})
+    page.raise_for_status()
+    # Prefer the canonical/meta tags - they always describe the page's own
+    # channel. The generic "channelId":"UC..." pattern can match the first
+    # channel id referenced *anywhere* on the page (e.g. a related-channel
+    # suggestion), which silently pulled videos from the wrong channel.
+    channel_id_match = (
+        re.search(r'<link rel="canonical" href="https://www\.youtube\.com/channel/(UC[^"]+)"', page.text)
+        or re.search(r'<meta itemprop="channelId" content="([^"]+)"', page.text)
+        or re.search(r'"channelId":"(UC[^"]+)"', page.text)
+    )
+    return channel_id_match.group(1) if channel_id_match else ""
+
+
 @router.get("/youtube/videos")
 async def get_youtube_channel_videos(
     channel_url: str = Query(..., min_length=8, max_length=2048),
@@ -398,54 +654,54 @@ async def get_youtube_channel_videos(
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Use a valid YouTube URL.")
 
-    channel_id_match = re.search(r"/channel/([^/?#]+)", channel_url)
-    channel_id = channel_id_match.group(1) if channel_id_match else ""
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            videos = await _fetch_channel_grid_videos(client, channel_url)
+            if videos:
+                logger.info("Agent Hub youtube/videos: grid scrape returned %d videos", len(videos))
+            else:
+                # Structure changed or this channel didn't parse - fall back to the
+                # older RSS-feed approach rather than failing outright.
+                logger.warning("Agent Hub youtube/videos: grid scrape returned 0, falling back to RSS for %s", channel_url)
+                channel_id = await _resolve_channel_id(client, channel_url)
+                if channel_id:
+                    videos = await _fetch_recent_youtube_videos(client, f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}")
+                logger.warning("Agent Hub youtube/videos: RSS fallback returned %d videos", len(videos))
+    except httpx.HTTPError as exc:
+        logger.warning("Agent Hub youtube/videos: request failed for %s: %s", channel_url, exc)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unable to read this YouTube channel.")
+
+    if not videos:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Could not find this YouTube channel.")
+
+    return {"channel_url": channel_url, "videos": videos}
+
+
+@router.get("/youtube/playlist-videos")
+async def get_youtube_playlist_videos(
+    playlist_url: str = Query(..., min_length=8, max_length=2048),
+    current_user: User = Depends(get_current_active_user),
+):
+    parsed = urlparse(playlist_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Use a valid YouTube URL.")
+
+    playlist_id_match = re.search(r"[?&]list=([^&#]+)", playlist_url)
+    playlist_id = playlist_id_match.group(1) if playlist_id_match else ""
+    if not playlist_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Could not find a playlist in this link.")
 
     try:
         async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-            if not channel_id:
-                page = await client.get(channel_url, headers={"User-Agent": "OpenHousePalBot/1.0"})
-                page.raise_for_status()
-                channel_id_match = (
-                    re.search(r'"channelId":"(UC[^"]+)"', page.text)
-                    or re.search(r'<meta itemprop="channelId" content="([^"]+)"', page.text)
-                    or re.search(r"https://www\.youtube\.com/channel/(UC[^\"/?&]+)", page.text)
-                )
-                channel_id = channel_id_match.group(1) if channel_id_match else ""
-
-            if not channel_id:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Could not find this YouTube channel.")
-
-            feed = await client.get(f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}")
-            feed.raise_for_status()
-
-            videos = []
-            for entry in re.findall(r"<entry>(.*?)</entry>", feed.text, flags=re.DOTALL):
-                video_id = re.search(r"<yt:videoId>(.*?)</yt:videoId>", entry)
-                title = re.search(r"<title>(.*?)</title>", entry, flags=re.DOTALL)
-                published = re.search(r"<published>(.*?)</published>", entry)
-                if video_id:
-                    video_url = f"https://www.youtube.com/watch?v={video_id.group(1)}"
-                    try:
-                        video_page = await client.get(video_url, headers={"User-Agent": "OpenHousePalBot/1.0"})
-                        if re.search(r'<link rel="canonical" href="https://www\.youtube\.com/shorts/', video_page.text):
-                            continue
-                    except httpx.HTTPError:
-                        continue
-                    clean_title = html.unescape(re.sub(r"\s+", " ", title.group(1)).strip()) if title else "YouTube Video"
-                    videos.append({
-                        "id": f"youtube-{video_id.group(1)}",
-                        "title": clean_title,
-                        "description": published.group(1)[:10] if published else "YouTube",
-                        "link": video_url,
-                        "image": f"https://img.youtube.com/vi/{video_id.group(1)}/hqdefault.jpg",
-                    })
-                    if len(videos) >= 6:
-                        break
+            videos = await _fetch_recent_youtube_videos(
+                client,
+                f"https://www.youtube.com/feeds/videos.xml?playlist_id={playlist_id}",
+                fallback_title="House Tour",
+            )
     except httpx.HTTPError:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unable to read this YouTube channel.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unable to read this YouTube playlist.")
 
-    return {"channel_url": channel_url, "videos": videos}
+    return {"playlist_url": playlist_url, "videos": videos}
 
 
 @router.put("/me/slug")
@@ -481,3 +737,80 @@ async def update_my_agent_hub_slug(
         )
 
     return {"id": hub.id, "slug": hub.slug, "status": hub.status}
+
+
+@router.patch("/me/profile")
+async def update_my_profile(
+    payload: AgentHubProfileUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    if payload.title is not None:
+        current_user.professional_title = payload.title.strip() or None
+    if payload.market is not None:
+        current_user.market = payload.market.strip() or None
+    await db.commit()
+    return {"title": current_user.professional_title, "market": current_user.market}
+
+
+@router.post("/me/photo")
+async def upload_my_photo(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    extension = PHOTO_CONTENT_TYPES.get(file.content_type)
+    if not extension:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Please upload a JPG, PNG, or WEBP image.",
+        )
+
+    contents = await file.read()
+    if len(contents) > PHOTO_MAX_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Photo must be 5MB or smaller.",
+        )
+
+    os.makedirs(PHOTO_UPLOAD_DIR, exist_ok=True)
+
+    old_photo_url = current_user.photo_url
+    filename = f"{uuid.uuid4()}{extension}"
+    file_path = os.path.join(PHOTO_UPLOAD_DIR, filename)
+    with open(file_path, "wb") as out_file:
+        out_file.write(contents)
+
+    photo_url = f"/uploads/agent-photos/{filename}"
+    current_user.photo_url = photo_url
+    await db.commit()
+
+    if old_photo_url and old_photo_url.startswith("/uploads/agent-photos/"):
+        old_path = os.path.join("uploads", "agent-photos", os.path.basename(old_photo_url))
+        if os.path.exists(old_path):
+            try:
+                os.remove(old_path)
+            except OSError as e:
+                logger.warning("removing old agent photo failed", extra={"error": str(e)})
+
+    return {"photo_url": photo_url}
+
+
+@router.delete("/me/photo")
+async def delete_my_photo(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    old_photo_url = current_user.photo_url
+    current_user.photo_url = None
+    await db.commit()
+
+    if old_photo_url and old_photo_url.startswith("/uploads/agent-photos/"):
+        old_path = os.path.join("uploads", "agent-photos", os.path.basename(old_photo_url))
+        if os.path.exists(old_path):
+            try:
+                os.remove(old_path)
+            except OSError as e:
+                logger.warning("removing old agent photo failed", extra={"error": str(e)})
+
+    return {"photo_url": None}

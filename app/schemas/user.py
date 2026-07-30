@@ -10,6 +10,9 @@ class UserBase(BaseModel):
     brokerage: str
     mls_id: str
     broker_authorized: bool = False
+    photo_url: Optional[str] = None
+    professional_title: Optional[str] = None
+    market: Optional[str] = None
 
 class UserCreate(UserBase):
     password: str

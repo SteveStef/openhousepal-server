@@ -103,7 +103,8 @@ async def create_open_house(
             price=safe_num(property_data.get('ListPrice') or property_data.get('price')),
             home_status=property_data.get('MlsStatus') or property_data.get('homeStatus'),
             listing_key=str(property_data.get('ListingKey') or property_data.get('listing_key') or ''),
-            similar_properties_snapshot=request.similar_properties_snapshot
+            similar_properties_snapshot=request.similar_properties_snapshot,
+            cheat_sheet_photos=request.cheat_sheet_photos
         )
         
         db.add(open_house)
@@ -125,6 +126,7 @@ async def create_open_house(
             lot_size=open_house.lot_size,
             city=open_house.city,
             similar_properties_snapshot=open_house.similar_properties_snapshot,
+            cheat_sheet_photos=open_house.cheat_sheet_photos,
             created_at=open_house.created_at
         )
         
@@ -184,6 +186,7 @@ async def get_open_houses(
                 listing_key=oh.listing_key,
                 notes=oh.notes,
                 similar_properties_snapshot=oh.similar_properties_snapshot,
+                cheat_sheet_photos=oh.cheat_sheet_photos,
                 created_at=oh.created_at
             ))
         

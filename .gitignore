@@ -63,6 +63,9 @@ logs/
 *.out
 *.err
 
+# Uploaded user content
+uploads/
+
 mailgun_templates/
 
 # IDE files

@@ -19,6 +19,7 @@ load_dotenv()
 router = APIRouter(tags=["discovery"])
 
 class DiscoveryPropertyResponse(BaseModel):
+    ListingKey: str
     Street: str
     City: str
     State: str
@@ -198,6 +199,7 @@ async def get_discovery(
                 dist = haversine_distance(prefs.latitude, prefs.longitude, p.latitude, p.longitude)
 
             response_data.append(DiscoveryPropertyResponse(
+                ListingKey=str(p.listing_key),
                 Street=str(p.street_address),
                 City=str(p.city),
                 State=str(p.state),

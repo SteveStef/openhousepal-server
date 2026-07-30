@@ -17,9 +17,15 @@ load_dotenv()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # JWT Configuration
-JWT_SECRET_KEY = os.getenv(
-    "JWT_SECRET_KEY", "your-secret-key-here-change-in-production"
-)
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not JWT_SECRET_KEY:
+    if os.getenv("DEV", "false") == "true":
+        JWT_SECRET_KEY = "dev-only-secret-do-not-use-in-production"
+    else:
+        raise RuntimeError(
+            "JWT_SECRET_KEY environment variable is not set. Refusing to start with a "
+            "guessable default outside of DEV mode - set JWT_SECRET_KEY before deploying."
+        )
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24  # 24 hours
 
