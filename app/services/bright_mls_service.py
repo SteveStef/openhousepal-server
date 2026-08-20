@@ -5,6 +5,7 @@ import time
 import math
 import logging
 import re
+import xml.etree.ElementTree as ET
 from typing import Dict, Any, List, Optional
 from fastapi import HTTPException
 from datetime import datetime, timezone
@@ -101,6 +102,96 @@ class BrightMlsService:
             logger.error(f"Request failed to {endpoint}: {e}")
             raise HTTPException(status_code=500, detail=f"MLS Request Failed: {str(e)}")
 
+    async def get_metadata_entity_sets(self) -> List[str]:
+        """Read the Bright RESO metadata so we can confirm optional resources before syncing them."""
+        token = await self._get_access_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/xml",
+        }
+        response = await self.client.get(f"{self.api_base_url}/$metadata", headers=headers)
+        response.raise_for_status()
+
+        root = ET.fromstring(response.text)
+        entity_sets: List[str] = []
+        for elem in root.iter():
+            if elem.tag.endswith("EntitySet"):
+                name = elem.attrib.get("Name")
+                if name:
+                    entity_sets.append(name)
+        if not entity_sets:
+            entity_sets = re.findall(r"<EntitySet\s+Name=\"([^\"]+)\"", response.text)
+        return sorted(set(entity_sets))
+
+    async def discover_price_history_resources(self) -> List[str]:
+        """Return Bright resources whose names look related to price/listing history."""
+        candidates = []
+        for name in await self.get_metadata_entity_sets():
+            lowered = name.lower()
+            if ("history" in lowered or "event" in lowered or "change" in lowered) and (
+                "price" in lowered or "listing" in lowered or "property" in lowered
+            ):
+                candidates.append(name)
+        return candidates
+
+    async def get_active_properties_for_price_history_probe(self, top: int = 25) -> List[Dict[str, Any]]:
+        """Fetch active listings that have enough identifiers to probe Bright price history."""
+        params = {
+            "$filter": "MlsStatus eq 'ACTIVE-BRIGHT'",
+            "$top": top,
+            "$select": "ListingKey,ListingId,FullStreetAddress,UnparsedAddress,City,StateOrProvince,ListPrice,OriginalListPrice,PreviousListPrice,PriceChangeTimestamp,MajorChangeTimestamp,MajorChangeType,StatusChangeTimestamp",
+            "$orderby": "ModificationTimestamp desc",
+        }
+        data = await self._make_request("BrightProperties", params=params)
+        return data.get("value", [])
+
+    async def probe_price_history_for_listing(self, listing_key: str, listing_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Probe Bright for the exact price-history resource without wiring unconfirmed data into sync.
+        Set BRIGHT_PRICE_HISTORY_ENDPOINT once Bright confirms the endpoint name; otherwise this tries
+        metadata-discovered history-like resources and reports the first successful payload.
+        """
+        configured = os.getenv("BRIGHT_PRICE_HISTORY_ENDPOINT")
+        resources = [configured] if configured else await self.discover_price_history_resources()
+        filters = [
+            f"ListingKey eq '{listing_key}'",
+            f"ResourceRecordKey eq '{listing_key}'",
+        ]
+        if listing_id:
+            filters.append(f"ListingId eq '{listing_id}'")
+
+        attempts = []
+        for resource in [r for r in resources if r]:
+            for filter_expr in filters:
+                params = {
+                    "$filter": filter_expr,
+                    "$top": 25,
+                }
+                try:
+                    data = await self._make_request(resource, params=params)
+                    rows = data.get("value", [])
+                    attempts.append({"resource": resource, "filter": filter_expr, "count": len(rows)})
+                    if rows:
+                        return {"resource": resource, "filter": filter_expr, "rows": rows, "attempts": attempts}
+                except Exception as exc:
+                    attempts.append({"resource": resource, "filter": filter_expr, "error": str(exc)})
+
+        return {"resource": None, "filter": None, "rows": [], "attempts": attempts}
+
+    async def get_price_change_fields_for_listing(self, listing_key: str) -> Dict[str, Any]:
+        """
+        Bright's current metadata does not expose a separate full price-history resource.
+        This is the confirmed BrightProperties request for all available price-change fields.
+        """
+        params = {
+            "$filter": f"ListingKey eq {listing_key}",
+            "$top": 1,
+            "$select": "ListingKey,ListingId,ListPrice,OriginalListPrice,PreviousListPrice,PriceChangeTimestamp,MajorChangeTimestamp,MajorChangeType,StatusChangeTimestamp",
+        }
+        data = await self._make_request("BrightProperties", params=params)
+        rows = data.get("value", [])
+        return rows[0] if rows else {}
+
     def _get_full_field_list(self) -> str:
         """Centralized list of all 90+ fields from mls_mapper."""
         return ",".join(BRIGHT_PROPERTY_SELECT_FIELDS)
@@ -116,6 +207,37 @@ class BrightMlsService:
             "$orderby": "ModificationTimestamp asc"
         }
         data = await self._make_request("BrightProperties", params=params)
+        return data.get("value", [])
+
+    async def get_open_houses_modified_since(self, since_timestamp: str, top: int = 200, skip: int = 0) -> List[Dict[str, Any]]:
+        """Open house date/time isn't part of the Property/listing record in Bright's RESO model -
+        it lives in its own BrightOpenHouses resource, keyed off OpenHouseListingKey, with its own
+        OpenHouseModificationTimestamp. Needs its own incremental sync for the same reason
+        get_properties_modified_since exists for BrightProperties."""
+        params = {
+            "$filter": f"OpenHouseModificationTimestamp gt {since_timestamp}",
+            "$top": top,
+            "$skip": skip,
+            "$select": "OpenHouseListingKey,OpenHouseDate,OpenHouseStartTime,OpenHouseEndTime,OpenHouseModificationTimestamp,MlsStatus",
+            "$orderby": "OpenHouseModificationTimestamp asc"
+        }
+        data = await self._make_request("BrightOpenHouses", params=params)
+        return data.get("value", [])
+
+    async def get_upcoming_open_houses(self, top: int = 200, skip: int = 0) -> List[Dict[str, Any]]:
+        """Full (non-incremental) pull of every currently-scheduled future open house, regardless
+        of when it was last modified. Used for the one-time backfill - the incremental
+        get_open_houses_modified_since loop only catches opens that get touched *after* sync
+        starts, so anything already scheduled before that point would otherwise never show up."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        params = {
+            "$filter": f"OpenHouseDate ge {today}",
+            "$top": top,
+            "$skip": skip,
+            "$select": "OpenHouseListingKey,OpenHouseDate,OpenHouseStartTime,OpenHouseEndTime,OpenHouseModificationTimestamp,MlsStatus",
+            "$orderby": "OpenHouseDate asc"
+        }
+        data = await self._make_request("BrightOpenHouses", params=params)
         return data.get("value", [])
 
     async def get_recent_deletions(self, since_timestamp: str) -> List[Dict[str, str]]:
@@ -159,6 +281,40 @@ class BrightMlsService:
             except Exception as e:
                 logger.warning(f"Failed to fetch media chunk: {e}")
         return photo_map
+
+    @staticmethod
+    def _sold_filter(city: str, state: str, date_from: str, date_to: Optional[str] = None) -> str:
+        parts = [
+            f"City eq '{city}'", f"StateOrProvince eq '{state}'",
+            "MlsStatus eq 'CLOSED-BRIGHT'", f"CloseDate ge {date_from}",
+        ]
+        if date_to:
+            parts.append(f"CloseDate le {date_to}")
+        return " and ".join(parts)
+
+    async def count_sold_properties(self, city: str, state: str, date_from: str, date_to: Optional[str] = None) -> int:
+        """Cheap, no-property-data probe for how many CLOSED-BRIGHT listings match a city/state/
+        date range - see backend/scripts/pull_sold_comps.py. Uses $count=true + $top=0 (not the
+        /$count sub-path, which returns a bare integer rather than JSON and would break
+        _make_request's response.json() call), so this transfers no property rows or photos,
+        just a count."""
+        params = {"$filter": self._sold_filter(city, state, date_from, date_to), "$top": 0, "$count": "true"}
+        data = await self._make_request("BrightProperties", params=params)
+        return data.get("@odata.count", len(data.get("value", [])))
+
+    async def get_sold_properties(self, city: str, state: str, date_from: str, date_to: Optional[str] = None, top: int = 200, skip: int = 0) -> List[Dict[str, Any]]:
+        """Paginated full-data pull of CLOSED-BRIGHT listings for a city/state/date range - unlike
+        get_properties_modified_since, this deliberately queries by MlsStatus + CloseDate rather
+        than ModificationTimestamp, since a historical backfill needs listings regardless of when
+        they were last touched. See backend/scripts/pull_sold_comps.py."""
+        params = {
+            "$filter": self._sold_filter(city, state, date_from, date_to),
+            "$top": top, "$skip": skip,
+            "$select": self._get_full_field_list(),
+            "$orderby": "CloseDate desc",
+        }
+        data = await self._make_request("BrightProperties", params=params)
+        return data.get("value", [])
 
     async def bright_mls_id_exists(self, agent_mls_id: str) -> bool:
         """Validates if a Bright Member (Agent) exists via the Members endpoint."""

@@ -32,32 +32,33 @@ class PropertySyncService:
     def __init__(self):
         self.email_service = EmailService()
         self.SYNC_KEY = "last_property_sync_time"
+        self.OPEN_HOUSE_SYNC_KEY = "last_open_house_sync_time"
 
-    async def get_last_sync_time(self, db: AsyncSession) -> str:
+    async def get_last_sync_time(self, db: AsyncSession, key: Optional[str] = None) -> str:
         """Retrieves the last successful sync timestamp from SystemSettings."""
-        stmt = select(SystemSettings).where(SystemSettings.key == self.SYNC_KEY)
+        stmt = select(SystemSettings).where(SystemSettings.key == (key or self.SYNC_KEY))
         result = await db.execute(stmt)
         setting = result.scalar_one_or_none()
-        
+
         if setting and setting.value and "timestamp" in setting.value:
             return setting.value["timestamp"]
-        
+
         # Default fallback: 24 hours ago
         fallback = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
         return fallback
 
-    async def update_last_sync_time(self, db: AsyncSession, timestamp: str):
+    async def update_last_sync_time(self, db: AsyncSession, timestamp: str, key: Optional[str] = None):
         """Persists the last successful sync timestamp."""
-        stmt = select(SystemSettings).where(SystemSettings.key == self.SYNC_KEY)
+        stmt = select(SystemSettings).where(SystemSettings.key == (key or self.SYNC_KEY))
         result = await db.execute(stmt)
         setting = result.scalar_one_or_none()
-        
+
         val = {"timestamp": timestamp}
         if setting:
             setting.value = val
         else:
-            db.add(SystemSettings(key=self.SYNC_KEY, value=val))
-        
+            db.add(SystemSettings(key=(key or self.SYNC_KEY), value=val))
+
         await db.commit()
 
     async def run_global_sync(self, max_pages: Optional[int] = None) -> Dict[str, Any]:
@@ -162,6 +163,173 @@ class PropertySyncService:
 
         return stats
 
+    async def run_open_house_sync(self, max_pages: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Incrementally syncs Bright's separately-tracked open house schedule (BrightOpenHouses)
+        into Property.mls_open_house_* - a fallback so Discovery can show a date/time badge on
+        listings nobody has hosted inside OpenHousePal itself. Deliberately its own loop with its
+        own checkpoint (not folded into run_global_sync): scheduling a new open house doesn't
+        necessarily touch the listing's own ModificationTimestamp, only the open house record's.
+
+        Past dates are never scraped out of the columns here - callers (Discovery) filter to
+        "date >= today" at read time, same as the existing in-app OpenHouseEvent handling.
+        """
+        logger.info("Starting Open House Synchronization Cycle...")
+        stats = {"updated": 0, "errors": 0}
+
+        async with AsyncSessionLocal() as db:
+            last_sync = await self.get_last_sync_time(db, key=self.OPEN_HOUSE_SYNC_KEY)
+            logger.info(f"Syncing open houses from checkpoint: {last_sync}")
+
+            skip = 0
+            page_size = 200
+            new_last_sync = last_sync
+            had_failure = False
+            pages_processed = 0
+
+            while True:
+                if max_pages is not None and pages_processed >= max_pages:
+                    logger.info(f"Reached max_pages={max_pages} for open house sync - stopping early, checkpoint saved so far.")
+                    break
+                try:
+                    raw_open_houses = await bright_mls_service.get_open_houses_modified_since(last_sync, top=page_size, skip=skip)
+                    if not raw_open_houses:
+                        logger.info("No more modified open houses found.")
+                        break
+
+                    logger.info(f"Found {len(raw_open_houses)} modified open house records in this batch (skip={skip})")
+
+                    # A batch can contain several rows for the same listing (re-scheduled/duplicate
+                    # entries) - keep only the soonest one per listing from this batch.
+                    by_listing: Dict[str, Dict[str, Any]] = {}
+                    for row in raw_open_houses:
+                        l_key = str(row.get("OpenHouseListingKey") or "")
+                        if not l_key:
+                            continue
+
+                        mod_ts = row.get("OpenHouseModificationTimestamp")
+                        if not had_failure and mod_ts and (not new_last_sync or mod_ts > new_last_sync):
+                            new_last_sync = mod_ts
+
+                        existing_pick = by_listing.get(l_key)
+                        if existing_pick is None:
+                            by_listing[l_key] = row
+                        else:
+                            new_date = parse_dt(row.get("OpenHouseDate"))
+                            existing_date = parse_dt(existing_pick.get("OpenHouseDate"))
+                            if new_date and (not existing_date or new_date < existing_date):
+                                by_listing[l_key] = row
+
+                    for l_key, row in by_listing.items():
+                        try:
+                            await self._apply_open_house_row(db, l_key, row)
+                            stats["updated"] += 1
+                        except Exception as e:
+                            logger.error(f"Error syncing open house for {l_key}: {e}")
+                            stats["errors"] += 1
+                            had_failure = True
+
+                    pages_processed += 1
+                    if len(raw_open_houses) < page_size:
+                        break
+                    skip += page_size
+
+                except Exception as e:
+                    logger.error(f"Error in open house sync batch at skip {skip}: {e}")
+                    stats["errors"] += 1
+                    break
+
+            if new_last_sync != last_sync:
+                await self.update_last_sync_time(db, new_last_sync, key=self.OPEN_HOUSE_SYNC_KEY)
+                logger.info(f"Open House Sync Cycle Complete. New Checkpoint: {new_last_sync}")
+
+        return stats
+
+    async def run_open_house_backfill(self, max_pages: Optional[int] = None) -> Dict[str, Any]:
+        """
+        One-time (or occasionally re-run) full pull of every currently-scheduled future open
+        house, regardless of modification time. The incremental run_open_house_sync loop only
+        catches opens *modified after* its checkpoint starts tracking, so anything already
+        scheduled before that point needs this instead. Safe to run more than once - it's a plain
+        upsert of "soonest known open house" per listing, same as the incremental path.
+
+        On completion, advances the incremental checkpoint to now() so the regular loop doesn't
+        re-walk records this backfill already covered.
+        """
+        logger.info("Starting Open House Backfill...")
+        stats = {"updated": 0, "errors": 0}
+
+        async with AsyncSessionLocal() as db:
+            skip = 0
+            page_size = 200
+            pages_processed = 0
+
+            while True:
+                if max_pages is not None and pages_processed >= max_pages:
+                    logger.info(f"Reached max_pages={max_pages} for open house backfill - stopping early.")
+                    break
+                try:
+                    raw_open_houses = await bright_mls_service.get_upcoming_open_houses(top=page_size, skip=skip)
+                    if not raw_open_houses:
+                        break
+
+                    by_listing: Dict[str, Dict[str, Any]] = {}
+                    for row in raw_open_houses:
+                        l_key = str(row.get("OpenHouseListingKey") or "")
+                        if not l_key:
+                            continue
+                        existing_pick = by_listing.get(l_key)
+                        if existing_pick is None:
+                            by_listing[l_key] = row
+                        else:
+                            new_date = parse_dt(row.get("OpenHouseDate"))
+                            existing_date = parse_dt(existing_pick.get("OpenHouseDate"))
+                            if new_date and (not existing_date or new_date < existing_date):
+                                by_listing[l_key] = row
+
+                    for l_key, row in by_listing.items():
+                        try:
+                            await self._apply_open_house_row(db, l_key, row)
+                            stats["updated"] += 1
+                        except Exception as e:
+                            logger.error(f"Error backfilling open house for {l_key}: {e}")
+                            stats["errors"] += 1
+
+                    pages_processed += 1
+                    if len(raw_open_houses) < page_size:
+                        break
+                    skip += page_size
+
+                except Exception as e:
+                    logger.error(f"Error in open house backfill batch at skip {skip}: {e}")
+                    stats["errors"] += 1
+                    break
+
+            now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            await self.update_last_sync_time(db, now_ts, key=self.OPEN_HOUSE_SYNC_KEY)
+            logger.info(f"Open House Backfill Complete. Checkpoint advanced to: {now_ts}")
+
+        return stats
+
+    async def _apply_open_house_row(self, db: AsyncSession, listing_key: str, row: Dict[str, Any]):
+        """Upserts the soonest-known open house date/time onto the matching Property row. A no-op
+        if the listing isn't in our local mirror (e.g. inactive/never synced)."""
+        oh_date = parse_dt(row.get("OpenHouseDate"))
+        start_dt = parse_dt(row.get("OpenHouseStartTime"))
+        end_dt = parse_dt(row.get("OpenHouseEndTime"))
+
+        stmt = (
+            update(Property)
+            .where(Property.listing_key == listing_key)
+            .values(
+                mls_open_house_date=oh_date.date() if oh_date else None,
+                mls_open_house_start_time=start_dt.time() if start_dt else None,
+                mls_open_house_end_time=end_dt.time() if end_dt else None,
+            )
+        )
+        await db.execute(stmt)
+        await db.commit()
+
     async def _sync_deletions(self, db: AsyncSession, last_sync: str, stats: Dict[str, Any]):
         """Helper to process hard-deleted properties from MLS."""
         logger.info("Checking for hard deletions...")
@@ -214,10 +382,17 @@ class PropertySyncService:
         await db.commit()
         logger.info(f"Successfully processed {stats['deletions']} hard deletions.")
 
-    async def _sync_single_property(self, db: AsyncSession, raw_data: Dict[str, Any], photo_map: Dict[str, List[str]]) -> Optional[Dict[str, Any]]:
+    async def _sync_single_property(self, db: AsyncSession, raw_data: Dict[str, Any], photo_map: Dict[str, List[str]], allow_inactive_insert: bool = False) -> Optional[Dict[str, Any]]:
         """
         Updates local mirror and detects price drops.
         Returns a 'sync_event' dict if successful.
+
+        allow_inactive_insert: the recurring sync (run_global_sync) never passes this - a listing
+        not already in the mirror is only inserted if ACTIVE/COMING SOON, so the DB doesn't fill
+        up with old CLOSED listings we never tracked (see the is_active check below). A deliberate
+        historical backfill (see backend/scripts/pull_sold_comps.py) sets this True to insert
+        CLOSED-BRIGHT rows too - reusing this method's mapping/dedup/reference-table logic rather
+        than duplicating it.
         """
         l_key = str(raw_data["ListingKey"])
         mapped = map_reso_to_internal(raw_data, photo_map)
@@ -308,8 +483,8 @@ class PropertySyncService:
             # This prevents our DB from filling up with old CLOSED listings we never tracked
             status = raw_data.get("MlsStatus", "")
             is_active = status.startswith("ACTIVE-BRIGHT") or status.startswith("COMING SOON")
-            
-            if not is_active:
+
+            if not is_active and not allow_inactive_insert:
                 logger.debug(f"Skipping discovery for NEW inactive property: {l_key} | Status: {status}")
                 return None
 

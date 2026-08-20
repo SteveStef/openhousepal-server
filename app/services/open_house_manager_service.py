@@ -1,4 +1,3 @@
-import urllib.parse
 import uuid
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
@@ -20,6 +19,7 @@ from app.models.database import (
     User,
 )
 from app.schemas.open_house_manager import (
+    ActionCountsResponse,
     AddTeamMemberRequest,
     AgentSearchResult,
     BroadcastResponse,
@@ -85,6 +85,14 @@ def _format_date(d: date) -> str:
     return f"{d.strftime('%a, %b')} {d.day}"
 
 
+def _format_time(t) -> str:
+    if not t:
+        return ""
+    hour12 = t.hour % 12 or 12
+    period = "PM" if t.hour >= 12 else "AM"
+    return f"{hour12}:{t.minute:02d} {period}"
+
+
 def _owns_listing(user: User, prop: Property) -> bool:
     return bool(user.mls_id) and user.mls_id in {prop.list_agent_mls_id, prop.co_list_agent_mls_id}
 
@@ -97,19 +105,105 @@ async def _get_owned_property(db: AsyncSession, current_user: User, listing_key:
     return prop
 
 
-def _compute_open_house_status(events: List[OpenHouseEvent]) -> str:
+def _find_scheduled_event(events: List[OpenHouseEvent]) -> Optional[OpenHouseEvent]:
+    """The event that counts as 'has an open house lined up'. A real booked date that hasn't
+    passed takes priority over an evergreen, currently-active self-hosted open (no fixed date) -
+    if a listing somehow has both, showing the actual date/time is more useful than a generic
+    'always open' flag, and previously this just returned whichever came first in the (unordered)
+    query result. Soonest date wins among multiple dated events."""
     today = date.today()
+    dated = [e for e in events if e.scheduled_date is not None and e.scheduled_date >= today]
+    if dated:
+        return min(dated, key=lambda e: e.scheduled_date)
     for event in events:
         if event.is_active and event.scheduled_date is None:
-            return "scheduled"  # evergreen, currently-active self-hosted open
-        if event.scheduled_date is not None and event.scheduled_date >= today:
-            return "scheduled"
-    return "needs_host"
+            return event
+    return None
 
 
-async def get_listing_open_house_statuses(db: AsyncSession, listing_keys: List[str]) -> Dict[str, str]:
+def _compute_open_house_status(events: List[OpenHouseEvent]) -> str:
+    return "scheduled" if _find_scheduled_event(events) is not None else "needs_host"
+
+
+def _counts_toward_insights(event: OpenHouseEvent, visitor_count: int, today: date) -> bool:
+    """Whether a kit's guest data should still count toward the listing agent's insights. Deleting
+    a kit is just the host tidying up their own list - it must never erase what the listing agent
+    already has on record. An active kit always counts. A deleted kit still counts if it actually
+    happened (a past date) or drew real visitors; only a deleted kit that was cancelled before ever
+    being used (future/evergreen, zero visitors) is excluded, since nothing was actually hosted."""
+    if not event.is_deleted:
+        return True
+    if event.scheduled_date is not None and event.scheduled_date < today:
+        return True
+    return visitor_count > 0
+
+
+def _scheduled_open_previews(events: List[OpenHouseEvent], agents_by_id: Dict[str, User]) -> List[ScheduledOpenResponse]:
+    """Every still-upcoming open for a listing (same 'hasn't happened yet' rule as
+    _find_scheduled_event, but all matches instead of just the first) - drives the small
+    date/time chips shown directly on the My Listings card."""
+    today = date.today()
+    previews: List[ScheduledOpenResponse] = []
+    for event in events:
+        is_upcoming = (event.is_active and event.scheduled_date is None) or (
+            event.scheduled_date is not None and event.scheduled_date >= today
+        )
+        if not is_upcoming:
+            continue
+        agent = agents_by_id.get(event.agent_id)
+        previews.append(ScheduledOpenResponse(
+            id=event.id,
+            scheduled_date=event.scheduled_date,
+            scheduled_start_time=event.scheduled_start_time,
+            scheduled_end_time=event.scheduled_end_time,
+            hosting_agent_id=event.agent_id,
+            hosting_agent_name=_agent_name(agent) if agent else "Unknown agent",
+            hosting_agent_brokerage=agent.brokerage if agent else None,
+        ))
+    # Soonest date first; evergreen (no fixed date) opens sort after every dated one.
+    previews.sort(key=lambda p: (p.scheduled_date is None, p.scheduled_date or date.max))
+    return previews
+
+
+def _confirmed_pending_kit_previews(
+    approved_requests: List[OpenHouseHostRequest], events: List[OpenHouseEvent], agents_by_id: Dict[str, User]
+) -> List[ScheduledOpenResponse]:
+    """Approved requests whose host hasn't built a kit for that date yet - i.e. a time was agreed
+    on, but there's no OpenHouseEvent to show under scheduled_opens. Once the host builds their
+    kit, the matching OpenHouseEvent shows up and this entry naturally stops appearing here."""
+    today = date.today()
+    kit_exists = {
+        (e.listing_key, e.agent_id, e.scheduled_date) for e in events
+    }
+    previews: List[ScheduledOpenResponse] = []
+    for req in approved_requests:
+        if req.requested_date < today:
+            continue
+        if (req.listing_key, req.requesting_agent_id, req.requested_date) in kit_exists:
+            continue
+        agent = agents_by_id.get(req.requesting_agent_id)
+        previews.append(ScheduledOpenResponse(
+            id=req.id,
+            scheduled_date=req.requested_date,
+            scheduled_start_time=req.requested_start_time,
+            scheduled_end_time=req.requested_end_time,
+            hosting_agent_id=req.requesting_agent_id,
+            hosting_agent_name=_agent_name(agent) if agent else "Unknown agent",
+            hosting_agent_brokerage=agent.brokerage if agent else None,
+        ))
+    previews.sort(key=lambda p: p.scheduled_date or date.max)
+    return previews
+
+
+async def get_listing_open_house_statuses(db: AsyncSession, listing_keys: List[str]) -> Dict[str, dict]:
     """Used by Discovery to show 'No Open House' on listings that aren't yours - checks any
-    agent's OpenHouseEvent for that listing_key, not just the current user's."""
+    agent's OpenHouseEvent for that listing_key, not just the current user's. Also surfaces the
+    matched event's date/time so Discovery can show when a scheduled open actually is.
+
+    Falls back to Bright's own reported open house date/time (Property.mls_open_house_*, kept
+    fresh by the separate open house sync) when nobody has hosted the listing inside OpenHousePal
+    itself - most listings on Discovery belong to other agents who don't use this app, so an
+    in-app OpenHouseEvent alone would leave the vast majority of real open houses unlabeled."""
     if not listing_keys:
         return {}
     events_result = await db.execute(
@@ -118,7 +212,37 @@ async def get_listing_open_house_statuses(db: AsyncSession, listing_keys: List[s
     events_by_listing: Dict[str, List[OpenHouseEvent]] = {}
     for event in events_result.scalars().all():
         events_by_listing.setdefault(event.listing_key, []).append(event)
-    return {key: _compute_open_house_status(events_by_listing.get(key, [])) for key in listing_keys}
+
+    today = date.today()
+    mls_result = await db.execute(
+        select(Property.listing_key, Property.mls_open_house_date, Property.mls_open_house_start_time, Property.mls_open_house_end_time)
+        .where(Property.listing_key.in_(listing_keys), Property.mls_open_house_date >= today)
+    )
+    mls_open_houses = {row.listing_key: row for row in mls_result.all()}
+
+    result: Dict[str, dict] = {}
+    for key in listing_keys:
+        matched = _find_scheduled_event(events_by_listing.get(key, []))
+        if matched is not None:
+            result[key] = {
+                "status": "scheduled",
+                "scheduled_date": matched.scheduled_date,
+                "scheduled_start_time": matched.scheduled_start_time,
+                "scheduled_end_time": matched.scheduled_end_time,
+            }
+            continue
+
+        mls_row = mls_open_houses.get(key)
+        if mls_row is not None:
+            result[key] = {
+                "status": "scheduled",
+                "scheduled_date": mls_row.mls_open_house_date,
+                "scheduled_start_time": mls_row.mls_open_house_start_time,
+                "scheduled_end_time": mls_row.mls_open_house_end_time,
+            }
+        else:
+            result[key] = {"status": "needs_host"}
+    return result
 
 
 async def get_my_listings(db: AsyncSession, current_user: User) -> MyListingsResponse:
@@ -137,13 +261,19 @@ async def get_my_listings(db: AsyncSession, current_user: User) -> MyListingsRes
 
     listing_keys = [p.listing_key for p in properties]
 
+    # Fetch every kit, deleted or not - deleting a kit must not erase the listing agent's guest
+    # history for it (see _counts_toward_insights). Scheduling/status decisions below stay scoped
+    # to active-only kits via active_events_by_listing.
     events_result = await db.execute(
-        select(OpenHouseEvent).where(OpenHouseEvent.listing_key.in_(listing_keys), OpenHouseEvent.is_deleted.is_(False))
+        select(OpenHouseEvent).where(OpenHouseEvent.listing_key.in_(listing_keys))
     )
     events = events_result.scalars().all()
     events_by_listing: Dict[str, List[OpenHouseEvent]] = {}
+    active_events_by_listing: Dict[str, List[OpenHouseEvent]] = {}
     for event in events:
         events_by_listing.setdefault(event.listing_key, []).append(event)
+        if not event.is_deleted:
+            active_events_by_listing.setdefault(event.listing_key, []).append(event)
 
     event_ids = [e.id for e in events]
     visitors_by_event: Dict[str, List[OpenHouseVisitor]] = {}
@@ -151,6 +281,27 @@ async def get_my_listings(db: AsyncSession, current_user: User) -> MyListingsRes
         visitors_result = await db.execute(select(OpenHouseVisitor).where(OpenHouseVisitor.open_house_event_id.in_(event_ids)))
         for visitor in visitors_result.scalars().all():
             visitors_by_event.setdefault(visitor.open_house_event_id, []).append(visitor)
+
+    approved_result = await db.execute(
+        select(OpenHouseHostRequest).where(
+            OpenHouseHostRequest.listing_key.in_(listing_keys),
+            OpenHouseHostRequest.status == "approved",
+        )
+    )
+    approved_requests_by_listing: Dict[str, List[OpenHouseHostRequest]] = {}
+    for req in approved_result.scalars().all():
+        approved_requests_by_listing.setdefault(req.listing_key, []).append(req)
+
+    # Hosting agents can be different from the listing owner (whoever got approved to host) -
+    # needed to label the date/time chips on the My Listings card. Covers both agents already
+    # hosting a real kit (OpenHouseEvent) and agents who've been confirmed but haven't built one yet.
+    hosting_agent_ids = {e.agent_id for e in events}
+    for reqs in approved_requests_by_listing.values():
+        hosting_agent_ids.update(r.requesting_agent_id for r in reqs)
+    agents_by_id: Dict[str, User] = {}
+    if hosting_agent_ids:
+        agents_result = await db.execute(select(User).where(User.id.in_(hosting_agent_ids)))
+        agents_by_id = {u.id: u for u in agents_result.scalars().all()}
 
     pending_result = await db.execute(
         select(OpenHouseHostRequest.listing_key, func.count(OpenHouseHostRequest.id))
@@ -165,17 +316,24 @@ async def get_my_listings(db: AsyncSession, current_user: User) -> MyListingsRes
     listings: List[MyListingItem] = []
     total_guests_all = 0
     total_opens_all = 0
+    today = date.today()
 
     for prop in properties:
         listing_events = events_by_listing.get(prop.listing_key, [])
-        listing_guest_count = sum(len(visitors_by_event.get(e.id, [])) for e in listing_events)
-        opens_hosted_count = len(listing_events)
+        active_listing_events = active_events_by_listing.get(prop.listing_key, [])
+        insight_events = [e for e in listing_events if _counts_toward_insights(e, len(visitors_by_event.get(e.id, [])), today)]
+        listing_guest_count = sum(len(visitors_by_event.get(e.id, [])) for e in insight_events)
+        opens_hosted_count = len(insight_events)
         avg_guests = (listing_guest_count / opens_hosted_count) if opens_hosted_count else 0.0
 
         total_guests_all += listing_guest_count
         total_opens_all += opens_hosted_count
 
-        open_house_status = _compute_open_house_status(listing_events)
+        open_house_status = _compute_open_house_status(active_listing_events)
+        scheduled_opens = _scheduled_open_previews(active_listing_events, agents_by_id)
+        confirmed_pending_kit = _confirmed_pending_kit_previews(
+            approved_requests_by_listing.get(prop.listing_key, []), active_listing_events, agents_by_id
+        )
         note = notes_by_listing.get(prop.listing_key)
         manual_priority = bool(note and note.is_priority_override)
         # High priority = this listing has proven it draws guests (a past open had at least one
@@ -186,6 +344,7 @@ async def get_my_listings(db: AsyncSession, current_user: User) -> MyListingsRes
             listing_key=prop.listing_key,
             image=prop.img_src,
             days_on_market=prop.days_on_market,
+            status=prop.home_status,
             address=prop.street_address,
             city=prop.city,
             state=prop.state,
@@ -197,6 +356,9 @@ async def get_my_listings(db: AsyncSession, current_user: User) -> MyListingsRes
             open_house_status=open_house_status,
             avg_guests_per_open=round(avg_guests, 1),
             opens_hosted_count=opens_hosted_count,
+            scheduled_opens_count=len(scheduled_opens),
+            scheduled_opens=scheduled_opens,
+            confirmed_pending_kit=confirmed_pending_kit,
             is_high_priority=manual_priority or computed_priority,
             pending_request_count=pending_counts.get(prop.listing_key, 0),
             is_manual=prop.is_manual,
@@ -270,9 +432,16 @@ async def delete_manual_listing(db: AsyncSession, current_user: User, listing_ke
     await db.commit()
 
 
-async def _hydrate_host_request(db: AsyncSession, req: OpenHouseHostRequest, property_by_key: Dict[str, Property], requester_by_id: Dict[str, User]) -> HostRequestResponse:
+async def _hydrate_host_request(
+    db: AsyncSession,
+    req: OpenHouseHostRequest,
+    property_by_key: Dict[str, Property],
+    requester_by_id: Dict[str, User],
+    note_by_listing_key: Optional[Dict[str, OpenHouseListingNote]] = None,
+) -> HostRequestResponse:
     prop = property_by_key.get(req.listing_key)
     requester = requester_by_id.get(req.requesting_agent_id)
+    note = (note_by_listing_key or {}).get(req.listing_key)
     return HostRequestResponse(
         id=req.id,
         listing_key=req.listing_key,
@@ -293,8 +462,20 @@ async def _hydrate_host_request(db: AsyncSession, req: OpenHouseHostRequest, pro
         counter_date=req.counter_date,
         counter_start_time=req.counter_start_time,
         counter_end_time=req.counter_end_time,
+        counter_message=req.counter_message,
+        counter_date_2=req.counter_date_2,
+        counter_start_time_2=req.counter_start_time_2,
+        counter_end_time_2=req.counter_end_time_2,
         broadcast_id=req.broadcast_id,
+        listing_host_notes=note.notes if note else None,
     )
+
+
+async def _fetch_notes_by_listing_key(db: AsyncSession, listing_keys: List[str]) -> Dict[str, OpenHouseListingNote]:
+    if not listing_keys:
+        return {}
+    result = await db.execute(select(OpenHouseListingNote).where(OpenHouseListingNote.listing_key.in_(listing_keys)))
+    return {n.listing_key: n for n in result.scalars().all()}
 
 
 async def get_host_requests(db: AsyncSession, current_user: User, status_filter: Optional[str] = "pending") -> List[HostRequestResponse]:
@@ -313,22 +494,83 @@ async def get_host_requests(db: AsyncSession, current_user: User, status_filter:
     property_by_key = {p.listing_key: p for p in prop_result.scalars().all()}
     user_result = await db.execute(select(User).where(User.id.in_(requester_ids)))
     requester_by_id = {u.id: u for u in user_result.scalars().all()}
+    note_by_listing_key = await _fetch_notes_by_listing_key(db, listing_keys)
 
-    return [await _hydrate_host_request(db, r, property_by_key, requester_by_id) for r in requests]
+    return [await _hydrate_host_request(db, r, property_by_key, requester_by_id, note_by_listing_key) for r in requests]
+
+
+async def get_action_counts(db: AsyncSession, current_user: User) -> ActionCountsResponse:
+    # Scoped to listings that still have a real, active Property row - same definition of "my
+    # listings" get_my_listings uses - so this can't count a request the agent has no way to
+    # reach (e.g. a listing that's since gone inactive, or a dangling listing_key with no
+    # Property row at all) into a badge with nowhere for the agent to click it away.
+    pending_result = await db.execute(
+        select(func.count(OpenHouseHostRequest.id))
+        .join(Property, Property.listing_key == OpenHouseHostRequest.listing_key)
+        .where(
+            OpenHouseHostRequest.listing_owner_agent_id == current_user.id,
+            OpenHouseHostRequest.status == "pending",
+            Property.home_status.notin_(INACTIVE_STATUSES),
+        )
+    )
+    countered_result = await db.execute(
+        select(func.count(OpenHouseHostRequest.id)).where(
+            OpenHouseHostRequest.requesting_agent_id == current_user.id,
+            OpenHouseHostRequest.status == "countered",
+        )
+    )
+    # These two catch events that don't leave anything outstanding to derive a count from (e.g.
+    # the host already accepted/declined your proposed time) - notification read-state instead.
+    listing_agent_unseen_result = await db.execute(
+        select(func.count(Notification.id)).where(
+            Notification.agent_id == current_user.id,
+            Notification.is_read == False,
+            Notification.type == "HOST_REQUEST_COUNTER_RESPONSE",
+        )
+    )
+    host_unseen_result = await db.execute(
+        select(func.count(Notification.id)).where(
+            Notification.agent_id == current_user.id,
+            Notification.is_read == False,
+            Notification.type.in_(["HOST_REQUEST_APPROVED", "HOST_REQUEST_DECLINED"]),
+        )
+    )
+    # Unseen-notification-based, like the two above, so the badge clears the moment the Team
+    # Requests tab is opened (which marks TEAM_BROADCAST_RECEIVED read) rather than only once the
+    # agent actually accepts/declines the broadcast.
+    incoming_broadcast_unseen_result = await db.execute(
+        select(func.count(Notification.id)).where(
+            Notification.agent_id == current_user.id,
+            Notification.is_read == False,
+            Notification.type == "TEAM_BROADCAST_RECEIVED",
+        )
+    )
+    return ActionCountsResponse(
+        pending_as_listing_agent=pending_result.scalar() or 0,
+        countered_as_host=countered_result.scalar() or 0,
+        listing_agent_unseen_updates=listing_agent_unseen_result.scalar() or 0,
+        host_unseen_updates=host_unseen_result.scalar() or 0,
+        pending_incoming_broadcasts=incoming_broadcast_unseen_result.scalar() or 0,
+    )
 
 
 async def get_my_requests(db: AsyncSession, current_user: User) -> List[HostRequestResponse]:
-    """The current agent's own outgoing requests to host OTHER agents' listings (Discovery's 'My Requests')."""
+    """The current agent's own outgoing requests to host OTHER agents' listings (Discovery's 'My
+    Requests'). An approved request whose date has already passed is dropped - the open house
+    already happened, so there's nothing left to act on and the listing agent's host notes
+    (surfaced live below) should stop being relevant to this agent."""
+    today = date.today()
     stmt = select(OpenHouseHostRequest).where(OpenHouseHostRequest.requesting_agent_id == current_user.id).order_by(OpenHouseHostRequest.created_at.desc())
     result = await db.execute(stmt)
-    requests = result.scalars().all()
+    requests = [r for r in result.scalars().all() if not (r.status == "approved" and r.requested_date < today)]
     if not requests:
         return []
     listing_keys = list({r.listing_key for r in requests})
     prop_result = await db.execute(select(Property).where(Property.listing_key.in_(listing_keys)))
     property_by_key = {p.listing_key: p for p in prop_result.scalars().all()}
     requester_by_id = {current_user.id: current_user}
-    return [await _hydrate_host_request(db, r, property_by_key, requester_by_id) for r in requests]
+    note_by_listing_key = await _fetch_notes_by_listing_key(db, listing_keys)
+    return [await _hydrate_host_request(db, r, property_by_key, requester_by_id, note_by_listing_key) for r in requests]
 
 
 async def create_host_request(db: AsyncSession, current_user: User, payload: CreateHostRequestRequest) -> CreateHostRequestResult:
@@ -383,33 +625,6 @@ async def create_host_request(db: AsyncSession, current_user: User, payload: Cre
     return CreateHostRequestResult(on_platform=True, request=hydrated)
 
 
-def _create_event_for_request(request: OpenHouseHostRequest, prop: Optional[Property], listing_owner_agent_id: str) -> OpenHouseEvent:
-    event_id = str(uuid.uuid4())
-    form_url = f"/open-house/{event_id}"
-    qr_code_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={urllib.parse.quote((os.getenv('CLIENT_URL') or '') + form_url)}"
-
-    return OpenHouseEvent(
-        id=event_id,
-        agent_id=request.requesting_agent_id,
-        listing_owner_agent_id=listing_owner_agent_id,
-        qr_code=qr_code_url,
-        form_url=form_url,
-        address=prop.street_address if prop else None,
-        city=prop.city if prop else None,
-        state=prop.state if prop else None,
-        zipcode=prop.zipcode if prop else None,
-        price=prop.price if prop else None,
-        bedrooms=prop.bedrooms if prop else None,
-        bathrooms=prop.bathrooms if prop else None,
-        living_area=int(prop.living_area) if prop and prop.living_area is not None else None,
-        home_status=prop.home_status if prop else None,
-        listing_key=request.listing_key,
-        scheduled_date=request.requested_date,
-        scheduled_start_time=request.requested_start_time,
-        scheduled_end_time=request.requested_end_time,
-    )
-
-
 async def _fill_broadcast_and_decline_siblings(db: AsyncSession, request: OpenHouseHostRequest) -> None:
     """Once one team-broadcast response is approved, close out the rest so the owner doesn't have
     to manually decline every other agent who said they were interested in the same slot."""
@@ -457,12 +672,11 @@ async def approve_host_request(db: AsyncSession, current_user: User, request_id:
     prop_result = await db.execute(select(Property).where(Property.listing_key == request.listing_key))
     prop = prop_result.scalar_one_or_none()
 
-    event = _create_event_for_request(request, prop, current_user.id)
-    db.add(event)
-
+    # No OpenHouseEvent ("kit") is created here - the host builds their own kit for this date
+    # from the Open Houses > Your Opens flow when they're ready. Approving just confirms the
+    # date/time and notifies them; it doesn't generate a kit on their behalf.
     request.status = "approved"
     request.responded_at = datetime.now(timezone.utc)
-    request.open_house_event_id = event.id
 
     await _fill_broadcast_and_decline_siblings(db, request)
 
@@ -492,7 +706,8 @@ async def approve_host_request(db: AsyncSession, current_user: User, request_id:
     await db.refresh(request)
     requester_result = await db.execute(select(User).where(User.id == request.requesting_agent_id))
     requester = requester_result.scalar_one_or_none()
-    return await _hydrate_host_request(db, request, {request.listing_key: prop} if prop else {}, {requester.id: requester} if requester else {})
+    note_by_listing_key = {request.listing_key: note} if note else {}
+    return await _hydrate_host_request(db, request, {request.listing_key: prop} if prop else {}, {requester.id: requester} if requester else {}, note_by_listing_key)
 
 
 async def decline_host_request(db: AsyncSession, current_user: User, request_id: str) -> HostRequestResponse:
@@ -545,9 +760,17 @@ async def counter_host_request(db: AsyncSession, current_user: User, request_id:
     request.counter_date = payload.counter_date
     request.counter_start_time = payload.counter_start_time
     request.counter_end_time = payload.counter_end_time
+    request.counter_message = payload.counter_message
+    request.counter_date_2 = payload.counter_date_2
+    request.counter_start_time_2 = payload.counter_start_time_2
+    request.counter_end_time_2 = payload.counter_end_time_2
 
     prop_result = await db.execute(select(Property).where(Property.listing_key == request.listing_key))
     prop = prop_result.scalar_one_or_none()
+
+    has_second_option = bool(payload.counter_date_2 and payload.counter_start_time_2 and payload.counter_end_time_2)
+    counter_note_suffix = f' Note: "{payload.counter_message.strip()}"' if payload.counter_message and payload.counter_message.strip() else ""
+    counter_options_suffix = " Two options were proposed - take a look." if has_second_option else ""
 
     try:
         db.add(Notification(
@@ -556,7 +779,7 @@ async def counter_host_request(db: AsyncSession, current_user: User, request_id:
             reference_type="HOST_REQUEST",
             reference_id=request.id,
             title="A different time was proposed",
-            message=f"The listing agent for {prop.street_address if prop else 'this listing'} suggested {_format_date(payload.counter_date)} instead.",
+            message=f"The listing agent for {prop.street_address if prop else 'this listing'} suggested {_format_date(payload.counter_date)} instead.{counter_options_suffix}{counter_note_suffix}",
             property_id=prop.id if prop else None,
             property_address=prop.street_address if prop else None,
             link="/discovery",
@@ -572,29 +795,40 @@ async def counter_host_request(db: AsyncSession, current_user: User, request_id:
     return await _hydrate_host_request(db, request, {request.listing_key: prop} if prop else {}, {requester.id: requester} if requester else {})
 
 
-async def respond_to_counter(db: AsyncSession, current_user: User, request_id: str, accept: bool) -> HostRequestResponse:
-    """The requesting agent accepts or declines the listing agent's proposed alternate time."""
+async def respond_to_counter(db: AsyncSession, current_user: User, request_id: str, accept: bool, slot: int = 1) -> HostRequestResponse:
+    """The requesting agent accepts or declines the listing agent's proposed alternate time.
+    When the listing agent offered two options, `slot` picks which one (1 or 2) the host is
+    accepting - ignored when declining, since neither option is being taken."""
     result = await db.execute(select(OpenHouseHostRequest).where(OpenHouseHostRequest.id == request_id))
     request = result.scalar_one_or_none()
     if not request or request.requesting_agent_id != current_user.id:
         raise ValueError("Host request not found.")
     if request.status != "countered":
         raise ValueError("There's no proposed time to respond to on this request.")
+    if slot == 2 and not (request.counter_date_2 and request.counter_start_time_2 and request.counter_end_time_2):
+        raise ValueError("There's no second proposed time on this request.")
 
     prop_result = await db.execute(select(Property).where(Property.listing_key == request.listing_key))
     prop = prop_result.scalar_one_or_none()
 
     if accept:
-        request.requested_date = request.counter_date
-        request.requested_start_time = request.counter_start_time
-        request.requested_end_time = request.counter_end_time
+        if slot == 2:
+            request.requested_date = request.counter_date_2
+            request.requested_start_time = request.counter_start_time_2
+            request.requested_end_time = request.counter_end_time_2
+        else:
+            request.requested_date = request.counter_date
+            request.requested_start_time = request.counter_start_time
+            request.requested_end_time = request.counter_end_time
 
-        event = _create_event_for_request(request, prop, request.listing_owner_agent_id)
-        db.add(event)
+        # No auto-created kit here either - same reasoning as approve_host_request.
         request.status = "approved"
-        request.open_house_event_id = event.id
         notif_title = "New time confirmed"
-        notif_message = f"You're confirmed to host {prop.street_address if prop else 'this listing'} on {_format_date(request.requested_date)}"
+        # This notification goes to the listing agent, not the host - phrase it from their side.
+        notif_message = (
+            f"{_agent_name(current_user)} agreed to host {prop.street_address if prop else 'this listing'} on "
+            f"{_format_date(request.requested_date)} from {_format_time(request.requested_start_time)} to {_format_time(request.requested_end_time)}"
+        )
     else:
         request.status = "declined"
         notif_title = "Proposed time declined"
@@ -620,7 +854,8 @@ async def respond_to_counter(db: AsyncSession, current_user: User, request_id: s
 
     await db.commit()
     await db.refresh(request)
-    return await _hydrate_host_request(db, request, {request.listing_key: prop} if prop else {}, {current_user.id: current_user})
+    note_by_listing_key = await _fetch_notes_by_listing_key(db, [request.listing_key])
+    return await _hydrate_host_request(db, request, {request.listing_key: prop} if prop else {}, {current_user.id: current_user}, note_by_listing_key)
 
 
 async def search_agents(db: AsyncSession, current_user: User, query: str) -> List[AgentSearchResult]:
@@ -889,8 +1124,10 @@ async def cancel_broadcast(db: AsyncSession, current_user: User, broadcast_id: s
 async def get_listing_detail(db: AsyncSession, current_user: User, listing_key: str) -> ListingDetailResponse:
     prop = await _get_owned_property(db, current_user, listing_key)
 
+    # Include deleted kits too - deleting a kit must not erase the listing agent's guest history
+    # for it (see _counts_toward_insights). scheduled_opens below stays scoped to active kits only.
     events_result = await db.execute(
-        select(OpenHouseEvent).where(OpenHouseEvent.listing_key == listing_key, OpenHouseEvent.is_deleted.is_(False)).order_by(OpenHouseEvent.created_at.desc())
+        select(OpenHouseEvent).where(OpenHouseEvent.listing_key == listing_key).order_by(OpenHouseEvent.created_at.desc())
     )
     events = events_result.scalars().all()
 
@@ -914,6 +1151,7 @@ async def get_listing_detail(db: AsyncSession, current_user: User, listing_key: 
     total_unrepresented = 0
     total_requested_updates = 0
 
+    total_opens_hosted = 0
     for event in events:
         agent = agents_by_id.get(event.agent_id)
         agent_name = _agent_name(agent) if agent else "Unknown agent"
@@ -922,11 +1160,21 @@ async def get_listing_detail(db: AsyncSession, current_user: User, listing_key: 
         unrepresented = sum(1 for v in visitors if (v.has_agent or "").upper() == "NO")
         requested_updates = sum(1 for v in visitors if v.interested_in_similar)
 
+        if not _counts_toward_insights(event, guests, today):
+            continue  # deleted kit that was cancelled before ever being used - nothing to show
+
         total_guests += guests
         total_unrepresented += unrepresented
         total_requested_updates += requested_updates
+        total_opens_hosted += 1
 
-        if event.scheduled_date is not None and event.scheduled_date >= today:
+        # Same "still upcoming" rule as _find_scheduled_event/_scheduled_open_previews - an
+        # evergreen (no fixed date) active kit counts as scheduled too, not just dated ones.
+        is_upcoming = not event.is_deleted and (
+            (event.is_active and event.scheduled_date is None)
+            or (event.scheduled_date is not None and event.scheduled_date >= today)
+        )
+        if is_upcoming:
             scheduled_opens.append(ScheduledOpenResponse(
                 id=event.id,
                 scheduled_date=event.scheduled_date,
@@ -949,6 +1197,9 @@ async def get_listing_detail(db: AsyncSession, current_user: User, listing_key: 
                 unrepresented_guests=unrepresented,
                 requested_updates=requested_updates,
             ))
+
+    # Soonest date first, not creation order.
+    scheduled_opens.sort(key=lambda o: o.scheduled_date or date.max)
 
     pending_result = await db.execute(
         select(OpenHouseHostRequest).where(OpenHouseHostRequest.listing_key == listing_key, OpenHouseHostRequest.status == "pending").order_by(OpenHouseHostRequest.created_at.desc())
@@ -975,7 +1226,7 @@ async def get_listing_detail(db: AsyncSession, current_user: User, listing_key: 
             total_guests=total_guests,
             unrepresented_guests=total_unrepresented,
             requested_updates=total_requested_updates,
-            total_opens_hosted=len(events),
+            total_opens_hosted=total_opens_hosted,
         ),
         notes=ListingHostNoteResponse(
             notes=note.notes if note else None,
