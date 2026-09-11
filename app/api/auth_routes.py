@@ -67,47 +67,69 @@ async def send_verification_code(
                 detail=error_msg
             )
 
-        # Generate verification code
-        code = verification_service.generate_code()
+        # TEMP: skipping code generation and store — email verification bypassed
+        # code = verification_service.generate_code()
+        # form_data = { ... }
+        # await verification_service.store_code(user_data.email, code, form_data, db)
 
-        # Store code and form data
-        form_data = {
-            "first_name": user_data.first_name,
-            "last_name": user_data.last_name,
-            "state": user_data.state,
-            "brokerage": user_data.brokerage,
-            "mls_id": user_data.mls_id,
-            "password": user_data.password  # Will be hashed by verification_service
-        }
-        await verification_service.store_code(user_data.email, code, form_data, db)
+        # TEMP DISABLED - email service not working, bypassing verification step entirely
+        # email_service = EmailService()
+        # email_service.send_simple_message(
+        #     to_email=user_data.email,
+        #     subject="Verify Your Email - Open House Pal",
+        #     template="verify_code",
+        #     template_variables={
+        #         "agent_name": user_data.first_name,
+        #         "verify_code": code,
+        #         "expiration_minutes": "15"
+        #     }
+        # )
 
-        # Log code in development mode (emails are auto-masked by logging filter)
-        if os.getenv("MAILGUN_DEV", "yes") == "yes":
-            logger.info(
-                "DEV MODE: Verification code generated",
-                extra={
-                    "code": code,
-                    "recipient": f"{user_data.first_name} {user_data.last_name}"
-                }
+        # TEMP: Create user directly without requiring email verification
+        try:
+            new_user = UserModel(
+                email=user_data.email,
+                hashed_password=hash_password(user_data.password),
+                first_name=user_data.first_name,
+                last_name=user_data.last_name,
+                state=user_data.state,
+                brokerage=user_data.brokerage,
+                mls_id=user_data.mls_id,
+                subscription_status="PENDING_PAYMENT",
+                broker_authorized=False,
+                plan_tier=None
             )
+            db.add(new_user)
+            await db.flush()
+            await db.refresh(new_user)
 
-        # Send email with verification code
-        email_service = EmailService()
-        email_service.send_simple_message(
-            to_email=user_data.email,
-            subject="Verify Your Email - Open House Pal",
-            template="verify_code",
-            template_variables={
-                "agent_name": user_data.first_name,
-                "verify_code": code,
-                "expiration_minutes": "15"
+            discovery_prefs = DiscoveryPreferences(
+                user_id=new_user.id,
+                brokerages=[new_user.brokerage] if new_user.brokerage else [],
+                state=new_user.state
+            )
+            db.add(discovery_prefs)
+            await db.commit()
+
+            access_token = create_access_token(data={"sub": new_user.id})
+
+            return {
+                "success": True,
+                "access_token": access_token,
+                "token_type": "bearer",
+                "user": {
+                    "id": new_user.id,
+                    "email": new_user.email,
+                    "first_name": new_user.first_name,
+                    "last_name": new_user.last_name,
+                    "broker_authorized": new_user.broker_authorized,
+                    "subscription_status": new_user.subscription_status
+                }
             }
-        )
-
-        return {
-            "success": True,
-            "message": f"Verification code sent to {user_data.email}"
-        }
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"User creation during bypass registration failed: {e}")
+            raise HTTPException(status_code=500, detail="Failed to finalize registration")
 
     except HTTPException:
         raise
