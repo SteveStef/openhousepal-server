@@ -13,6 +13,7 @@ from app.api import router
 from app.utils.clean_cache import cleanup_expired_signup_verifications
 from app.utils.property_sync_scheduler import scheduled_property_sync
 from app.services.email_scheduler_service import EmailSchedulerService
+from app.services.digest_service import DailyDigestService
 from app.utils.create_admin import create_admin_user
 from app.config.logging import (
     configure_logging,
@@ -72,13 +73,29 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
+    # Daily showcase digest (one visitor email per changed showcase, one agent roll-up).
+    # Gated by DIGEST_ENABLED so it can be deployed dark and flipped on only after the
+    # Mailgun templates are uploaded. Pinned to UTC regardless of the server timezone.
+    digest_enabled = os.getenv("DIGEST_ENABLED", "false").lower() == "true"
+    digest_hour = int(os.getenv("DIGEST_HOUR", 13))
+    digest_min = int(os.getenv("DIGEST_MINUTE", 0))
+    if digest_enabled:
+        scheduler.add_job(
+            DailyDigestService.send_daily_digests,
+            CronTrigger(hour=digest_hour, minute=digest_min, timezone="UTC"),
+            id="daily_digest",
+            name="Send daily showcase digests",
+            replace_existing=True,
+        )
+
     scheduler.start()
     logger.info(
         "APScheduler started",
         extra={
             "cache_cleanup_schedule": f"Daily at {cache_hour:02d}:{cache_mins:02d}",
-            "property_sync_interval": "Every hour at :00",
+            "property_sync_interval": "Every 5 minutes",
             "email_processing_interval": "Every 1 minute",
+            "daily_digest_schedule": (f"Daily at {digest_hour:02d}:{digest_min:02d} UTC" if digest_enabled else "disabled"),
         },
     )
 

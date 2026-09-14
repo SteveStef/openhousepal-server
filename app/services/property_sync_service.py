@@ -8,16 +8,14 @@ import os
 import re
 
 from app.models.database import (
-    Collection, CollectionPreferences, Property, collection_properties, 
-    PropertyInteraction, ScheduledEmail, Notification, SystemSettings, SchoolDistrict, 
+    Collection, CollectionPreferences, Property, collection_properties,
+    PropertyInteraction, CollectionChange, Notification, SystemSettings, SchoolDistrict,
     City, Township, Brokerage
 )
 from app.services.bright_mls_service import bright_mls_service
 from app.utils.mls_mapper import map_reso_to_internal, parse_dt
 from app.utils.geo import get_lat_long_offsets, is_within_distance
 from app.utils.normalization import normalize_brokerage, normalize_township, normalize_school_district
-from app.services.email_service import EmailService
-from app.services.blacklist_service import BlacklistService
 from app.config.logging import get_logger
 from app.database import AsyncSessionLocal
 
@@ -30,7 +28,6 @@ class PropertySyncService:
     and notifies affected collections.
     """
     def __init__(self):
-        self.email_service = EmailService()
         self.SYNC_KEY = "last_property_sync_time"
 
     async def get_last_sync_time(self, db: AsyncSession) -> str:
@@ -338,10 +335,9 @@ class PropertySyncService:
             for col in discovered_collections:
                 # Link property to collection (Mark as NEW by setting added_at)
                 await self._link_property_to_collection(db, col.id, prop_id)
-                
-                # Schedule 'New Property' notification
-                changes = {"new_properties": [event["data"]], "price_drops": []}
-                await self._schedule_combined_notification(db, col, changes)
+
+                # Record change for the daily digest + real-time in-app notification
+                await self._record_collection_change(db, col, event, "NEW")
                 count += 1
 
         # 2. UPDATES: Find collections that already HAVE this property (Price Drops)
@@ -369,16 +365,9 @@ class PropertySyncService:
         
         for col in existing_collections:
             if event["type"] == "PRICE_DROP":
-                # Include price change info in the data
-                drop_data = {
-                    **event["data"],
-                    "old_price_raw": event.get("old_price"),
-                    "new_price_raw": event.get("new_price")
-                }
-                changes = {"new_properties": [], "price_drops": [drop_data]}
-                await self._schedule_combined_notification(db, col, changes, is_broadcast=True)
+                await self._record_collection_change(db, col, event, "PRICE_DROP")
                 count += 1
-                
+
         await db.commit()
         return count
 
@@ -636,151 +625,62 @@ class PropertySyncService:
                 added_at=datetime.now(timezone.utc) # Mark as NEW
             ))
 
-    def _format_price_compact(self, price: float) -> str:
-        """Formats price into a compact string like $750K or $2.1M"""
-        if not price:
-            return ""
-        if price >= 1000000:
-            val = price / 1000000
-            # If it's a whole number, don't show decimal
-            if val == int(val):
-                return f"${int(val)}M"
-            return f"${val:.1f}M"
-        if price >= 1000:
-            return f"${int(price / 1000)}K"
-        return f"${int(price)}"
+    async def _record_collection_change(self, db: AsyncSession, collection: Collection, event: Dict[str, Any], change_type: str):
+        """
+        Records an un-notified change for the daily digest (drained by DailyDigestService),
+        and creates a real-time in-app notification for the agent (unchanged behavior).
 
-    def _generate_subject(self, featured: Dict[str, Any], template: str) -> str:
-        """Generates a dynamic subject line to avoid spam filters"""
-        import random
-        
-        price_raw = featured.get('price_raw') or featured.get('price') or 0
-        price_compact = self._format_price_compact(float(price_raw))
-        city = featured.get('city', '')
-        street = featured.get('street_address', '')
-        
-        if template == "price_drop_alert":
-            # For price drops, we want to be clear
-            subjects = [
-                f"Price drop: {street} in {city} is now {price_compact}",
-                f"Great news: Price drop on {street}!",
-                f"Price updated for {street}: {price_compact}",
-                f"Price reduced for the home in {city}: {street}"
-            ]
-            return random.choice(subjects)
-        
-        # New Listing styles
-        subjects = [
-            f"{price_compact} listing just came up in {city}",
-            f"New {price_compact} home in {city} you might like",
-            f"New listing: {street} in {city} for {price_compact}",
-            f"{street} just hit the market in {city} for {price_compact}"
-        ]
-        return random.choice(subjects)
-
-    async def _schedule_combined_notification(self, db: AsyncSession, collection: Collection, changes: Dict[str, Any], is_broadcast: bool = False):
-        """Schedules emails and in-app alerts for a collection."""
-        frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
-        new_count = len(changes.get("new_properties", []))
-        drop_count = len(changes.get("price_drops", []))
-        
-        if new_count == 0 and drop_count == 0:
+        Emails are NOT sent here anymore; the digest job aggregates these into one email
+        per showcase (visitor) / one roll-up per agent per day.
+        """
+        # Respect opt-outs: if neither visitor nor agent wants notices, don't record anything.
+        notify_visitor = getattr(collection, 'notify_visitor', True)
+        notify_agent = getattr(collection, 'notify_agent', True)
+        if not notify_visitor and not notify_agent:
             return
 
-        featured = (changes["new_properties"] + changes["price_drops"])[0]
-        
-        # Total property count helper
-        total_count_query = select(func.count()).select_from(collection_properties).where(collection_properties.c.collection_id == collection.id)
-        total_count_res = await db.execute(total_count_query)
-        total_count = total_count_res.scalar() or 0
+        prop_id = event["property_id"]
+        old_price = event.get("old_price")
+        new_price = event.get("new_price")
 
-        # Create full address string
-        full_address = f"{featured.get('street_address')}, {featured.get('city')}, {featured.get('state')} {featured.get('zipcode', '')}".strip()
+        # Upsert the single OPEN (un-notified) row for this (collection, property).
+        # If an open row is already NEW, keep it NEW (still new to the visitor); otherwise
+        # apply the latest change type and refresh prices. The partial unique index
+        # `uq_collection_change_open` guards against duplicate open rows.
+        existing_stmt = select(CollectionChange).where(
+            and_(
+                CollectionChange.collection_id == collection.id,
+                CollectionChange.property_id == prop_id,
+                CollectionChange.notified_at.is_(None),
+            )
+        )
+        open_row = (await db.execute(existing_stmt)).scalar_one_or_none()
 
-        common_vars = {
-            "collection_name": collection.name,
-            "visitor_name": collection.visitor_name or "Valued Visitor",
-            "new_count": new_count,
-            "drop_count": drop_count,
-            "total_count": total_count,
-            "property_address": full_address,
-            "property_image": featured.get('img_src'),
-            "property_price": f"${featured.get('price', 0):,}",
-            "property_beds": featured.get('bedrooms'),
-            "property_baths": featured.get('bathrooms'),
-            "property_sqft": featured.get('living_area'),
-            "today_date": datetime.now(timezone.utc).strftime("%m/%d/%Y")
-        }
-
-        # 1. Visitor Email
-        if collection.visitor_email and getattr(collection, 'notify_visitor', True):
-            # Check if visitor is blacklisted
-            if await BlacklistService.is_blacklisted(db, collection.visitor_email):
-                logger.info(f"Skipping scheduled email for blacklisted visitor: {collection.visitor_email}")
-            else:
-                template = "price_drop_alert" if (is_broadcast or (drop_count > 0 and new_count == 0)) else "new_properties_synced"
-                
-                # Calculate price drop variables if applicable
-                old_p = featured.get("old_price_raw")
-                new_p = featured.get("new_price_raw")
-                savings = 0
-                if old_p and new_p:
-                    savings = old_p - new_p
-
-                visitor_vars = {
-                    **common_vars,
-                    "collection_link": f"{frontend_url}/showcase/{collection.share_token}",
-                    "recipient_name": collection.visitor_name or "Valued Visitor",
-                    "agent_name": f"{collection.owner.first_name} {collection.owner.last_name}" if collection.owner else "Your Agent",
-                    "agent_email": collection.owner.email if collection.owner else "",
-                    "agent_phone": getattr(collection.owner, 'phone', "") if collection.owner else "",
-                    "old_price": f"${old_p:,.0f}" if old_p else None,
-                    "new_price": f"${new_p:,.0f}" if new_p else None,
-                    "savings": f"${savings:,.0f}" if savings > 0 else None,
-                    "Unsub": f"{frontend_url}/unsubscribe?email={collection.visitor_email}"
-                }
-                
-                subject = self._generate_subject(featured, template)
-                
-                db.add(ScheduledEmail(
-                    recipient_email=collection.visitor_email,
-                    subject=subject,
-                    template_name=template,
-                    template_variables=visitor_vars,
-                    status="PENDING",
-                    scheduled_for=datetime.now(timezone.utc)
-                ))
-
-        # 2. Agent Email
-        if collection.owner and collection.owner.email and getattr(collection, 'notify_agent', True):
-            agent_vars = {
-                **common_vars, 
-                "collection_link": f"{frontend_url}/showcases?showcase={collection.id}",
-                "recipient_name": collection.owner.first_name
-            }
-            db.add(ScheduledEmail(
-                recipient_email=collection.owner.email,
-                subject=f"Showcase Updated: {collection.visitor_name or 'Visitor'} - {collection.name}",
-                template_name="new_properties_synced_agent",
-                template_variables=agent_vars,
-                status="PENDING",
-                scheduled_for=datetime.now(timezone.utc)
+        if open_row:
+            if open_row.change_type != "NEW":
+                open_row.change_type = change_type
+            if open_row.old_price is None:
+                open_row.old_price = old_price
+            open_row.new_price = new_price
+        else:
+            db.add(CollectionChange(
+                collection_id=collection.id,
+                property_id=prop_id,
+                change_type=change_type,
+                old_price=old_price,
+                new_price=new_price,
             ))
 
-            # 3. In-App Notification
+        # Real-time in-app notification for the agent (unchanged behavior).
+        if collection.owner and notify_agent:
             try:
-                if new_count > 0 and drop_count > 0:
-                    title = f"Showcase Update: {collection.visitor_name or 'Visitor'}"
-                    message = f"Found {new_count} new and {drop_count} price drop{'s' if drop_count > 1 else ''} for {collection.name}."
-                elif new_count > 0:
-                    title = f"New Property Match: {collection.visitor_name or 'Visitor'}"
-                    message = f"Found {new_count} new property match{'es' if new_count > 1 else ''} for {collection.name}."
-                else:
+                data = event.get("data", {})
+                if change_type == "PRICE_DROP":
                     title = f"Price Drop Alert: {collection.visitor_name or 'Visitor'}"
-                    message = f"Found {drop_count} price drop{'s' if drop_count > 1 else ''} for {collection.name}."
-
-                prop_id_query = select(Property.id).where(Property.listing_key == str(featured.get('listing_key')))
-                prop_id = (await db.execute(prop_id_query)).scalar()
+                    message = f"A price drop matched {collection.name}."
+                else:
+                    title = f"New Property Match: {collection.visitor_name or 'Visitor'}"
+                    message = f"A new property matched {collection.name}."
 
                 db.add(Notification(
                     agent_id=collection.owner_id,
@@ -792,9 +692,9 @@ class PropertySyncService:
                     collection_id=collection.id,
                     collection_name=collection.name,
                     property_id=prop_id,
-                    property_address=featured.get('street_address'),
+                    property_address=data.get('street_address'),
                     visitor_name=collection.visitor_name,
-                    link=f"/showcases?showcase={collection.id}" + (f"&property={prop_id}" if prop_id else ""),
+                    link=f"/showcases?showcase={collection.id}&property={prop_id}",
                     is_read=False,
                     created_at=datetime.now(timezone.utc)
                 ))

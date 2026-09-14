@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Boolean, Text, ForeignKey, Table, Index, DateTime, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Float, Boolean, Text, ForeignKey, Table, Index, DateTime, UniqueConstraint, text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import JSONB
@@ -95,6 +95,7 @@ class Collection(Base):
     original_open_house_event = relationship("OpenHouseEvent", foreign_keys=[original_open_house_event_id])
     preferences = relationship("CollectionPreferences", back_populates="collection", uselist=False, cascade="all, delete-orphan")
     property_interactions = relationship("PropertyInteraction", back_populates="collection", cascade="all, delete-orphan")
+    changes = relationship("CollectionChange", back_populates="collection", cascade="all, delete-orphan")
     property_comments = relationship("PropertyComment", back_populates="collection", cascade="all, delete-orphan")
     property_tours = relationship("PropertyTour", back_populates="collection", cascade="all, delete-orphan")
 
@@ -543,6 +544,40 @@ class ScheduledEmail(Base):
     error_message = Column(Text, nullable=True)
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CollectionChange(Base):
+    """
+    Un-notified changes to a showcase, recorded by the property sync and drained by the
+    daily digest job. One "open" row (notified_at IS NULL) per (collection, property).
+    """
+    __tablename__ = "collection_changes"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    collection_id = Column(String, ForeignKey('collections.id', ondelete='CASCADE'), index=True, nullable=False)
+    property_id = Column(String, ForeignKey('properties.id'), index=True, nullable=False)
+
+    change_type = Column(String, nullable=False)  # NEW, PRICE_DROP
+    old_price = Column(Float, nullable=True)
+    new_price = Column(Float, nullable=True)
+
+    # NULL = pending (not yet included in a digest)
+    notified_at = Column(DateTime(timezone=True), index=True, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        # Partial unique index: at most one OPEN (un-notified) row per (collection, property),
+        # while allowing many already-notified historical rows. Enables ON CONFLICT upsert.
+        Index(
+            'uq_collection_change_open',
+            'collection_id', 'property_id',
+            unique=True,
+            postgresql_where=text('notified_at IS NULL'),
+        ),
+    )
+
+    collection = relationship("Collection", back_populates="changes")
+    property = relationship("Property")
 
 
 class BlacklistedEmail(Base):
