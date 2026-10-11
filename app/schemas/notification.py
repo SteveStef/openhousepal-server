@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from datetime import datetime
-from typing import Optional
+from typing import Dict, List, Optional
 
 
 class NotificationCreate(BaseModel):
@@ -45,3 +45,27 @@ class NotificationResponse(BaseModel):
 class NotificationUnreadCountResponse(BaseModel):
     """Response schema for unread notification count"""
     unread_count: int
+
+
+class NotificationChannelPrefs(BaseModel):
+    email: bool
+    push: bool
+
+
+class NotificationPreferencesCategory(BaseModel):
+    id: str
+    label: str
+    help: str
+
+
+class NotificationPreferencesResponse(BaseModel):
+    """The resolved matrix (every category, every channel present) plus the row metadata the
+    Settings screen renders, and whether push is a live channel yet."""
+    categories: List[NotificationPreferencesCategory]
+    preferences: Dict[str, NotificationChannelPrefs]
+    push_available: bool = False
+
+
+class NotificationPreferencesUpdate(BaseModel):
+    """Partial is fine - any category/channel left out keeps its current (or default) value."""
+    preferences: Dict[str, Dict[str, bool]]

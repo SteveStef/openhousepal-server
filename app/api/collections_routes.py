@@ -1,12 +1,13 @@
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List, Optional
+from typing import Any, List, Optional
 from pydantic import BaseModel
 from datetime import datetime, timezone
 
 from app.database import get_db
 from app.schemas.collection import CollectionCreate, CollectionResponse
-from app.schemas.collection_preferences import CollectionPreferencesCreate, CollectionPreferencesUpdate
+from app.schemas.collection_preferences import CollectionPreferencesBase, CollectionPreferencesCreate, CollectionPreferencesUpdate, ShowcaseSelfServePreferencesUpdate
+from app.models.property import PropertySummaryResponse
 from app.schemas.property_interactions import (
     PropertyInteractionUpdate,
     PropertyCommentCreate,
@@ -14,7 +15,8 @@ from app.schemas.property_interactions import (
 from app.schemas.property_tour import (
     PropertyTourCreate,
     PropertyTourResponse,
-    PropertyTourCompletionUpdate
+    PropertyTourCompletionUpdate,
+    PropertyTourConfirmUpdate
 )
 from app.services.collections_service import CollectionsService
 from app.services.property_interactions_service import PropertyInteractionsService
@@ -22,9 +24,11 @@ from app.services.collection_preferences_service import CollectionPreferencesSer
 from app.services.property_service import property_service
 from app.services.property_tour_service import PropertyTourService
 from app.services.blacklist_service import BlacklistService
+from app.services.leads_service import upsert_lead
 from app.utils.auth import get_current_active_user, get_current_user_optional, require_premium_plan, require_broker_authorization
-from app.models.database import User, Collection
-from sqlalchemy import select
+from app.models.database import User, Collection, Notification
+from sqlalchemy import select, update, and_
+from sqlalchemy.orm import joinedload
 from app.config.logging import get_logger
 
 logger = get_logger(__name__)
@@ -71,6 +75,18 @@ class CreateCollectionWithPreferencesRequest(BaseModel):
     is_commercial: Optional[bool] = False
     is_farm: Optional[bool] = False
 
+    # The rest of the map editor's search (the create flow ends in the same editor as Edit).
+    # All optional - older callers that don't send them get the previous behaviour.
+    counties: Optional[list[str]] = None
+    search_polygon: Optional[dict[str, Any]] = None
+    min_sqft: Optional[float] = None
+    max_sqft: Optional[float] = None
+    min_acres: Optional[float] = None
+    max_acres: Optional[float] = None
+    special_features: Optional[str] = None
+    compare_property_listing_key: Optional[str] = None
+    show_match_score: bool = True
+
 
 class UpdateStatusRequest(BaseModel):
     status: str
@@ -94,18 +110,40 @@ class ShareToggleRequest(BaseModel):
     force_regenerate: bool = False
 
 
+async def _owner_id_if_owner(db: AsyncSession, collection_id: str, user: Optional[User]) -> Optional[str]:
+    """The public Showcase actions (like, view, comment, tour) treat the caller as the agent only
+    when they OWN this Showcase. Anyone else - even someone signed in to their own OpenHousePal
+    account in the same browser - is a visitor, so their actions alert the agent and log on the lead
+    like any guest's (a signed-in non-owner used to be silently skipped, or counted as the agent)."""
+    if user is None:
+        return None
+    owner_id = (await db.execute(select(Collection.owner_id).where(Collection.id == collection_id))).scalar_one_or_none()
+    return user.id if owner_id == user.id else None
+
+
 @router.post("/unsubscribe")
-async def unsubscribe_visitor(request: UnsubscribeRequest, db: AsyncSession = Depends(get_db)):
+async def unsubscribe_visitor(
+    request: Optional[UnsubscribeRequest] = None,
+    email: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
     """
     Adds the visitor's email to the blacklist to prevent future emails.
-    Used by the frontend UI.
+    Used by the /unsubscribe page (the link in every buyer email's footer), which sends the address
+    as ?email=... - this used to require a JSON body only, so the page's Confirm button always
+    failed (422) and nobody could unsubscribe from the footer link. Body still accepted.
     """
+    address = ((request.email if request else None) or email or "").strip()
+    if "@" not in address:
+        raise HTTPException(status_code=400, detail="That unsubscribe link is missing an email address.")
     try:
-        await BlacklistService.blacklist_email(db, request.email)
-        return {"success": True, "message": f"Successfully unsubscribed {request.email}"}
+        if await BlacklistService.blacklist_email(db, address):
+            from app.services.leads_service import log_unsubscribe
+            await log_unsubscribe(db, address)
+        return {"success": True, "message": f"Successfully unsubscribed {address}"}
     except Exception as e:
-        logger.error(f"Error unsubscribing visitor {request.email}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error unsubscribing visitor {address}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not unsubscribe right now. Please try again.")
 
 
 @router.post("/unsubscribe/one-click")
@@ -118,7 +156,9 @@ async def unsubscribe_one_click(
     Gmail/Yahoo send a POST to this URL with the email in the query string.
     """
     try:
-        await BlacklistService.blacklist_email(db, email)
+        if await BlacklistService.blacklist_email(db, email):
+            from app.services.leads_service import log_unsubscribe
+            await log_unsubscribe(db, email)
         return {"success": True}
     except Exception as e:
         logger.error(f"One-click unsubscribe failed for {email}: {str(e)}")
@@ -144,6 +184,80 @@ async def get_all_collections(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch collections"
         )
+
+
+class PreviewMatchesResponse(BaseModel):
+    properties: List[PropertySummaryResponse]
+    count: int
+
+
+@router.post("/preview-matches", response_model=PreviewMatchesResponse, dependencies=[Depends(require_broker_authorization)])
+async def preview_matches(
+    preferences: CollectionPreferencesBase,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Live, unsaved preview of what a set of search preferences would match - the map-first
+    Showcase editor calls this on every criteria change so the map/grid update instantly without
+    writing anything to the database. Deliberately calls the exact same PropertyService function
+    the real save path (update_preferences_and_refresh_properties) and the visitor self-serve path
+    both use, so the preview is never out of sync with what Save actually produces - no second
+    search implementation.
+    """
+    try:
+        properties = await property_service.get_properties_by_preferences(db, preferences, max_properties=200)
+        count = await property_service.get_properties_count_by_preferences(db, preferences)
+        return PreviewMatchesResponse(properties=properties, count=count)
+    except Exception as e:
+        logger.error("previewing showcase matches failed", extra={"error": str(e)})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to preview matching properties"
+        )
+
+
+@router.get("/refine-requests/count")
+async def get_pending_refine_requests_count(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Drives the Showcases nav badge - how many showcases have a visitor's refine-search
+    message still sitting unaddressed. Registered ahead of /{collection_id} so "refine-requests"
+    doesn't get swallowed as a collection_id path param."""
+    count = await CollectionsService.count_pending_refine_requests(db, str(current_user.id))
+    return {"count": count}
+
+
+@router.get("/inbox")
+async def get_showcases_inbox(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """The Showcases page header's Tour requests + Activity inboxes (registered ahead of
+    /{collection_id} so "inbox" isn't read as a collection id)."""
+    return await CollectionsService.get_inbox(db, str(current_user.id))
+
+
+@router.post("/inbox/read")
+async def mark_showcases_inbox_read(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    await CollectionsService.mark_inbox_read(db, str(current_user.id))
+    return {"success": True}
+
+
+@router.get("/{collection_id}/delete-preview")
+async def get_collection_delete_preview(
+    collection_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """What else goes when this Showcase is deleted - shown in the delete confirmation."""
+    preview = await CollectionsService.delete_preview(db, collection_id, str(current_user.id))
+    if preview is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found")
+    return preview
 
 
 @router.get("/{collection_id}", response_model=CollectionResponse, dependencies=[Depends(require_broker_authorization)])
@@ -267,7 +381,7 @@ async def create_collection_with_preferences(
             collection = Collection(
                 owner_id=current_user.id,
                 name=request.name,
-                description=f"Properties for {request.visitor_name} near {request.address}",
+                description=f"Properties for {request.visitor_name} near {request.address}" if request.address else f"Properties for {request.visitor_name}",
                 visitor_email=request.visitor_email,
                 visitor_name=request.visitor_name,
                 visitor_phone=request.visitor_phone,
@@ -281,7 +395,26 @@ async def create_collection_with_preferences(
             db.add(collection)
             await db.commit()
             await db.refresh(collection)
-            
+
+            matched_lead = await upsert_lead(
+                db,
+                owner_id=current_user.id,
+                name=request.visitor_name,
+                email=request.visitor_email,
+                phone=request.visitor_phone,
+                source_type="collection_visitor",
+                source_id=collection.id,
+                summary=f"Showcase created - {collection.name}",
+                occurred_at=collection.created_at,
+                represented='yes' if request.has_agent == 'YES' else ('no' if request.has_agent == 'NO' else None),
+                property_address=request.address,
+                collection_id=collection.id,
+            )
+            if matched_lead and matched_lead.showcase_deleted_at:
+                matched_lead.showcase_deleted_at = None
+                db.add(matched_lead)
+                await db.commit()
+
             # Create collection preferences with looked up coordinates
             preferences_data = CollectionPreferencesCreate(
                 collection_id=collection.id,
@@ -293,9 +426,11 @@ async def create_collection_with_preferences(
                 max_price=request.max_price,
                 min_year_built=request.min_year_built,
                 max_year_built=request.max_year_built,
-                cities=request.cities,
-                townships=request.townships,
-                school_districts=request.school_districts,
+                # These are list fields on CollectionPreferencesCreate - a caller that omits
+                # them sends None, which fails validation with a 500. Coerce to [].
+                cities=request.cities or [],
+                townships=request.townships or [],
+                school_districts=request.school_districts or [],
                 lat=latitude,
                 long=longitude,
                 address=request.address,  # Add missing address field
@@ -308,24 +443,36 @@ async def create_collection_with_preferences(
                 is_apartment=request.is_apartment,
                 is_commercial=request.is_commercial,
                 is_farm=request.is_farm,
-                special_features=request.additional_comments,
+                special_features=request.special_features if request.special_features is not None else request.additional_comments,
                 visiting_reason=request.visiting_reason,
-                has_agent=request.has_agent
+                has_agent=request.has_agent,
+                counties=request.counties or [],
+                search_polygon=request.search_polygon,
+                min_sqft=request.min_sqft,
+                max_sqft=request.max_sqft,
+                min_acres=request.min_acres,
+                max_acres=request.max_acres,
+                compare_property_listing_key=request.compare_property_listing_key,
+                show_match_score=request.show_match_score,
             )
             
             await CollectionPreferencesService.create_preferences(db, preferences_data)
             
-            # Populate collection with properties immediately after creation
+            # Populate collection with properties immediately after creation. Collection creation
+            # must still succeed even if population fails - but don't swallow it silently: log
+            # loudly (an empty showcase is a visible-to-the-agent quality issue, not a crash).
             try:
                 population_result = await CollectionsService.repopulate_collection_from_preferences(db, collection.id, commit=True)
-                
-                if population_result['success']:
-                    pass
-                else:
-                    pass
+                if not population_result.get('success'):
+                    logger.warning(
+                        "Showcase %s populated 0 properties (population reported failure): %s",
+                        collection.id, population_result,
+                    )
             except Exception as e:
-                # Continue - collection creation should succeed even if population fails
-                pass
+                logger.error(
+                    "Showcase %s population raised - collection kept but may be empty: %s",
+                    collection.id, e, exc_info=True,
+                )
 
             collections = await CollectionsService.get_user_collections(db, current_user.id)
             
@@ -445,6 +592,70 @@ async def dismiss_new_listings(
         )
     return {"success": True}
 
+
+@router.post("/{collection_id}/mark-seen")
+async def mark_collection_seen(
+    collection_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Called once when the agent opens a showcase (e.g. clicking into it from a Leads/Dashboard
+    alert) - clears every pending like/dislike/comment/tour-request tag on it at once."""
+    result = await CollectionsService.mark_collection_seen(db, collection_id, str(current_user.id))
+    if not result["success"]:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND if result.get("error") == "Collection not found" else status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=result.get("error", "Failed to mark collection seen")
+        )
+    return {"success": True}
+
+
+class RefineRequestIn(BaseModel):
+    message: str
+
+
+@router.post("/{collection_id}/refine-request")
+async def submit_refine_request(
+    collection_id: str,
+    payload: RefineRequestIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Visitor-facing: send the agent a free-text message asking them to change the search,
+    instead of (or alongside) editing the criteria themselves. No auth - same public access as
+    the other visitor showcase endpoints (interact, comments, view)."""
+    from app.services.public_rate_limit import check_public_submit
+    check_public_submit(request)  # bots can't flood the agent's leads/inbox
+    message = (payload.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message is required")
+    if len(message) > 2000:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message is too long")
+
+    result = await CollectionsService.submit_refine_request(db, collection_id, message)
+    if not result["success"]:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND if result.get("error") == "Collection not found" else status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=result.get("error", "Failed to send message")
+        )
+    return {"success": True}
+
+
+@router.post("/{collection_id}/refine-request/dismiss")
+async def dismiss_refine_request(
+    collection_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    result = await CollectionsService.dismiss_refine_request(db, collection_id, str(current_user.id))
+    if not result["success"]:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND if result.get("error") == "Collection not found" else status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=result.get("error", "Failed to dismiss message")
+        )
+    return {"success": True}
+
+
 @router.delete("/{collection_id}")
 async def delete_collection(
     collection_id: str,
@@ -496,7 +707,7 @@ async def update_property_interaction(
 
         interaction = await PropertyInteractionsService.create_property_interaction(
             db, collection_id, property_id, interaction_data,
-            user_id=current_user.id if current_user else None
+            user_id=await _owner_id_if_owner(db, collection_id, current_user)
         )
         
         return {
@@ -527,7 +738,8 @@ async def track_property_view(
     """
     try:
         interaction = await PropertyInteractionsService.track_property_view(
-            db, collection_id, property_id
+            db, collection_id, property_id,
+            user_id=await _owner_id_if_owner(db, collection_id, current_user)
         )
 
         return {
@@ -550,9 +762,15 @@ async def add_property_comment(
     collection_id: str,
     property_id: str,
     comment_data: PropertyCommentCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional)
 ):
+    owner_id = await _owner_id_if_owner(db, collection_id, current_user)
+    if owner_id is None:
+        from app.services.public_rate_limit import check_public_submit
+        check_public_submit(request)  # bots can't flood the agent's leads/inbox
+
     """
     Add a comment to a property within a collection
     Supports both authenticated users and anonymous visitors
@@ -561,11 +779,16 @@ async def add_property_comment(
         # Handle alternative frontend format
         if comment_data.comment and not comment_data.content:
             comment_data.content = comment_data.comment
+        comment_data.content = (comment_data.content or '').strip()
+        if not comment_data.content:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Write a comment first.")
+        if len(comment_data.content) > 4000:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That comment is too long.")
         
         # Create anonymous comment - no user identification required
         comment = await PropertyInteractionsService.add_property_comment(
             db, collection_id, property_id, comment_data,
-            user_id=current_user.id if current_user else None
+            user_id=owner_id
         )
 
         return {
@@ -587,19 +810,47 @@ async def add_property_comment(
 async def get_property_comments(
     collection_id: str,
     property_id: str,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """
     Get all comments for a property within a collection
-    Public endpoint for shared collections
+    Public endpoint for shared collections - also used by the agent's own showcase view,
+    which is how we tell the two apart below.
     """
     try:
         comments = await PropertyInteractionsService.get_property_comments(
             db, collection_id, property_id
         )
-        
+
+        if current_user:
+            # Only the agent actually reading this property's comments clears its "New
+            # Comment" signal and per-property unread badge - a guest hitting this same
+            # public endpoint on their own showcase must not clear the agent's notification.
+            collection_result = await db.execute(
+                select(Collection).where(Collection.id == collection_id)
+            )
+            collection_obj = collection_result.scalar_one_or_none()
+            if collection_obj and collection_obj.owner_id == current_user.id:
+                await db.execute(
+                    update(Notification)
+                    .where(
+                        Notification.agent_id == current_user.id,
+                        Notification.collection_id == collection_id,
+                        Notification.property_id == property_id,
+                        Notification.type == 'PROPERTY_COMMENT',
+                        Notification.is_read.is_(False),
+                    )
+                    .values(is_read=True, read_at=datetime.now(timezone.utc))
+                )
+                await db.commit()
+                await PropertyInteractionsService.mark_comments_read(db, collection_id, property_id, is_agent=True)
+        else:
+            # Anonymous caller = the visitor reading their own showcase's comment thread.
+            await PropertyInteractionsService.mark_comments_read(db, collection_id, property_id, is_agent=False)
+
         return comments
-        
+
     except Exception as e:
         logger.error("getting property comments failed", extra={"error": str(e)})
         raise HTTPException(
@@ -616,8 +867,10 @@ async def get_property_interaction_summary(
     current_user: User = Depends(require_premium_plan)
 ):
     """
-    Get complete interaction summary for a property within a collection
+    Get complete interaction summary for a property within a collection (its agent only)
     """
+    if await _owner_id_if_owner(db, collection_id, current_user) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found")
     try:
         summary = await PropertyInteractionsService.get_property_interaction_summary(
             db, collection_id, property_id
@@ -672,6 +925,22 @@ async def toggle_collection_share(
         )
 
 
+SHOWCASE_PAUSED_DETAIL = "showcase_paused"
+
+
+async def _assert_showcase_owner_active(db: AsyncSession, share_token: str) -> None:
+    """A client's showcase link only works while its agent is on a live Showcase plan. After a
+    downgrade to Basic or an ended subscription the page shows a friendly "paused - contact your
+    agent" state (410 + SHOWCASE_PAUSED_DETAIL) instead of the homes; the data is kept, so it
+    comes straight back if the agent upgrades/resubscribes."""
+    from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
+    owner = (await db.execute(
+        select(User).join(Collection, Collection.owner_id == User.id).where(Collection.share_token == share_token)
+    )).scalar_one_or_none()
+    if owner is not None and not owner_has_access(owner, SHOWCASE_ACCESS_TIERS):
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail=SHOWCASE_PAUSED_DETAIL)
+
+
 @router.get("/shared/{share_token}")
 async def get_shared_collection(
     share_token: str,
@@ -681,6 +950,7 @@ async def get_shared_collection(
     Get a shared collection by share token (no authentication required)
     """
     try:
+        await _assert_showcase_owner_active(db, share_token)
         collection_data = await CollectionsService.get_shared_collection(
             db, share_token
         )
@@ -700,6 +970,211 @@ async def get_shared_collection(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get shared collection"
         )
+
+
+async def _notify_search_changed(db: AsyncSession, collection_obj: Collection, changed: list) -> None:
+    """Bell notification for the agent when a client changes their own Showcase search. A burst of
+    saves (they tweak price, then beds...) folds into the one unread notification from the last
+    two hours instead of stacking up. The daily briefing email lists these too. Never raises."""
+    try:
+        from datetime import timedelta
+        from sqlalchemy import select as _select
+        now = datetime.now(timezone.utc)
+        who = collection_obj.visitor_name or "Your client"
+        message = " · ".join(f"{r['label']}: {r['value']}" for r in changed)[:500] or "They updated their search."
+        recent = (await db.execute(_select(Notification).where(
+            Notification.agent_id == collection_obj.owner_id, Notification.collection_id == collection_obj.id,
+            Notification.type == "SHOWCASE_SEARCH_CHANGED", Notification.is_read.is_(False),
+            Notification.created_at >= now - timedelta(hours=2)).limit(1))).scalar_one_or_none()
+        if recent is not None:
+            recent.message = message
+            recent.created_at = now
+        else:
+            db.add(Notification(
+                agent_id=collection_obj.owner_id, type="SHOWCASE_SEARCH_CHANGED", reference_type="COLLECTION",
+                reference_id=collection_obj.id, title=f"{who} changed their Showcase search", message=message,
+                collection_id=collection_obj.id, collection_name=collection_obj.name, visitor_name=collection_obj.visitor_name,
+                link=f"/showcases?showcase={collection_obj.id}", is_read=False, created_at=now,
+            ))
+        await db.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Could not notify search change: {e}")
+        await db.rollback()
+
+
+def _describe_search_change(payload: dict) -> list:
+    """A client's own Showcase search edit -> [{"label", "value"}] rows for their lead's activity."""
+    def money(v):
+        return f"${v:,.0f}" if isinstance(v, (int, float)) else None
+
+    def span(lo, hi, unit=""):
+        if lo and hi:
+            return f"{lo}-{hi}{unit}"
+        if lo:
+            return f"{lo}+{unit}"
+        if hi:
+            return f"Up to {hi}{unit}"
+        return "Any"
+    rows = []
+    if payload.get("compare_property_listing_key"):
+        rows.append({"label": "Built around", "value": str(payload.get("address") or "A different home")})
+    if "min_price" in payload or "max_price" in payload:
+        rows.append({"label": "Price", "value": span(money(payload.get("min_price")), money(payload.get("max_price")))})
+    if "min_beds" in payload or "max_beds" in payload:
+        rows.append({"label": "Bedrooms", "value": span(payload.get("min_beds"), payload.get("max_beds"))})
+    if "min_baths" in payload or "max_baths" in payload:
+        rows.append({"label": "Bathrooms", "value": span(payload.get("min_baths"), payload.get("max_baths"))})
+    if payload.get("address"):
+        rows.append({"label": "Near", "value": str(payload["address"])})
+    if payload.get("diameter"):
+        rows.append({"label": "Within", "value": f"{payload['diameter']:g} miles"})
+    if "cities" in payload:
+        rows.append({"label": "Towns", "value": ", ".join(payload.get("cities") or []) or "Any"})
+    if "school_districts" in payload:
+        rows.append({"label": "School districts", "value": ", ".join(payload.get("school_districts") or []) or "Any"})
+    return rows
+
+
+@router.put("/shared/{share_token}/update-preferences-and-refresh")
+async def update_shared_collection_preferences(
+    share_token: str,
+    preferences_update: ShowcaseSelfServePreferencesUpdate,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Let a showcase visitor tune their own basic search criteria (address, radius,
+    price, beds/baths) and re-run the real property match - no authentication
+    required, scoped to a public/active collection by its share token only (same
+    resolution rule as get_shared_collection above, not owner auth).
+    """
+    try:
+        await _assert_showcase_owner_active(db, share_token)
+        result = await db.execute(
+            select(Collection).options(joinedload(Collection.preferences)).where(
+                and_(
+                    Collection.share_token == share_token,
+                    Collection.is_public == True,
+                    Collection.status == "ACTIVE",
+                )
+            )
+        )
+        collection_obj = result.unique().scalar_one_or_none()
+
+        if not collection_obj or not collection_obj.preferences:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Showcase not found or not available"
+            )
+
+        # Don't let a visitor wipe the location filter to nothing - check the
+        # resulting state (payload field if set, else the existing value), not just
+        # the payload alone, since a partial update (e.g. price-only) shouldn't be
+        # rejected just because it didn't also resend the address/radius.
+        #
+        # Address itself is never required. A showcase can be entirely area-based (agent
+        # picked cities/townships/school districts, no address at all - see
+        # EditPreferencesModal's mutually-exclusive address-vs-area modes on the agent
+        # side), and a visitor refining price/beds/baths on one of those shouldn't be
+        # forced to invent an address just to save. Mirrors the agent's own rule exactly
+        # (EditPreferencesModal.validateLocationPreferences): a radius is only required
+        # alongside an address that's actually present, and SOME location method (address
+        # or area filters) must exist - never let an edit leave the showcase with neither.
+        payload = preferences_update.dict(exclude_unset=True)
+        # A visitor can build their search around a different home (2026-10-04: one step - it
+        # becomes the home the match % is measured against too), but never turn comparison off.
+        if not payload.get('compare_property_listing_key'):
+            payload.pop('compare_property_listing_key', None)
+        payload.pop('show_match_score', None)
+        # A search built around a home always shows the match % against it - even if comparison
+        # had been switched off.
+        if payload.get('compare_property_listing_key'):
+            payload['show_match_score'] = True
+        effective_diameter = payload.get('diameter', collection_obj.preferences.diameter)
+        effective_address = payload.get('address', collection_obj.preferences.address)
+        # The resulting areas (what they're sending, else what's saved) - switching from "near the
+        # home" to towns / school districts sends the new areas with an empty address.
+        has_area_filters = any(
+            payload.get(k, getattr(collection_obj.preferences, k, None))
+            for k in ('cities', 'townships', 'school_districts', 'counties')
+        )
+        if effective_address and (not effective_diameter or effective_diameter <= 0):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="A search radius is required when searching near an address"
+            )
+        if not effective_address and not has_area_filters:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This showcase needs either a search address or an area to search"
+            )
+
+        update_result = await CollectionPreferencesService.update_preferences_and_refresh_properties(
+            db, collection_obj.id, CollectionPreferencesUpdate(**payload)
+        )
+
+        if not update_result['success']:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=update_result.get('error', 'Failed to update your search criteria')
+            )
+
+        # On their lead's activity: what they changed it to, in words.
+        from app.services.leads_service import log_showcase_activity
+        changed = _describe_search_change(payload)
+        await log_showcase_activity(db, collection_obj.id, "showcase_search_changed", "Changed their Showcase search",
+                                    raw_snapshot={"answers": changed} if changed else None)
+        await _notify_search_changed(db, collection_obj, changed)
+
+        collection_data = await CollectionsService.get_shared_collection(db, share_token)
+        if not collection_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Showcase not found or not available"
+            )
+        return collection_data
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("updating shared collection preferences failed", extra={"error": str(e)})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update your search criteria"
+        )
+
+
+@router.post("/shared/{share_token}/preview-matches")
+async def preview_shared_collection_matches(
+    share_token: str,
+    preferences_update: ShowcaseSelfServePreferencesUpdate,
+    db: AsyncSession = Depends(get_db)
+):
+    """The visitor's search windows, live: how many homes their unsaved changes would match, and
+    where they are (for the dots on the distance picker). Nothing is saved - the same search the
+    real update runs, on their saved criteria with these changes laid over them."""
+    result = await db.execute(
+        select(Collection).options(joinedload(Collection.preferences)).where(
+            and_(Collection.share_token == share_token, Collection.is_public == True, Collection.status == "ACTIVE")
+        )
+    )
+    collection_obj = result.unique().scalar_one_or_none()
+    if not collection_obj or not collection_obj.preferences:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found or not available")
+    try:
+        saved = CollectionPreferencesBase.model_validate(collection_obj.preferences, from_attributes=True).model_dump()
+        merged = CollectionPreferencesBase(**{**saved, **preferences_update.model_dump(exclude_unset=True)})
+        properties = await property_service.get_properties_by_preferences(db, merged, max_properties=200)
+        count = await property_service.get_properties_count_by_preferences(db, merged)
+        return {
+            "count": count,
+            "points": [
+                {"id": p.listing_key, "lat": p.latitude, "lng": p.longitude}
+                for p in properties if p.latitude is not None and p.longitude is not None
+            ],
+        }
+    except Exception as e:
+        logger.error("previewing shared showcase matches failed", extra={"error": str(e)})
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to preview matches")
 
 
 @router.patch("/shared/{share_token}/notifications")
@@ -742,12 +1217,18 @@ async def update_shared_collection_notifications(
 async def get_properties_from_collection(
     collectionId: str,
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional)
+    current_user: User = Depends(get_current_active_user)
 ):
+    """The agent's own Showcase homes (their Showcases page). Guests load homes through
+    /shared/{share_token}, which honours a switched-off link and a paused plan - this used to answer
+    anyone with the id, signed in or not."""
+    if await _owner_id_if_owner(db, collectionId, current_user) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found")
     try:
         return await CollectionsService.get_properties(
             collectionId,
-            db
+            db,
+            viewer_user_id=current_user.id
         )
     except Exception as e:
         raise HTTPException(
@@ -819,16 +1300,22 @@ async def schedule_property_tour(
     collection_id: str,
     property_id: str,
     tour_data: PropertyTourCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional)
 ):
+    owner_id = await _owner_id_if_owner(db, collection_id, current_user)
+    if owner_id is None:
+        from app.services.public_rate_limit import check_public_submit
+        check_public_submit(request)  # bots can't flood the agent's leads/inbox
+
     """
     Schedule a tour for a property in a collection (public endpoint for visitors)
     """
     try:
         tour = await PropertyTourService.create_tour_request(
             db, collection_id, property_id, tour_data,
-            user_id=current_user.id if current_user else None
+            user_id=owner_id
         )
         return tour
 
@@ -843,6 +1330,18 @@ async def schedule_property_tour(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to schedule property tour"
         )
+
+
+@router.get("/{collection_id}/busy")
+async def showcase_agent_busy_times(collection_id: str, db: AsyncSession = Depends(get_db)):
+    """The Showcase agent's busy blocks for the next 8 days (start/end only) - see
+    calendar_sync_service.public_busy."""
+    from app.models.database import Collection
+    from app.services import calendar_sync_service
+    owner_id = (await db.execute(select(Collection.owner_id).where(Collection.id == collection_id))).scalar_one_or_none()
+    if not owner_id:
+        return {"busy": []}
+    return {"busy": await calendar_sync_service.public_busy(db, owner_id)}
 
 
 @router.get("/{collection_id}/tours", response_model=List[PropertyTourResponse])
@@ -870,6 +1369,21 @@ async def get_collection_tours(
                 detail="Collection not found or access denied"
             )
 
+        # Actually viewing the tours list is what clears the tour-requested signal (not just
+        # opening the showcase) - so the badge on the View Tours button / dashboard card
+        # persists until the agent has a chance to see it.
+        await db.execute(
+            update(Notification)
+            .where(
+                Notification.agent_id == current_user.id,
+                Notification.collection_id == collection_id,
+                Notification.type == 'TOUR_REQUEST',
+                Notification.is_read.is_(False),
+            )
+            .values(is_read=True, read_at=datetime.now(timezone.utc))
+        )
+        await db.commit()
+
         tours = await PropertyTourService.get_collection_tours(db, collection_id)
         return tours
 
@@ -877,6 +1391,41 @@ async def get_collection_tours(
         raise
     except Exception as e:
         logger.error("fetching collection tours failed", extra={"error": str(e)})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch collection tours"
+        )
+
+
+@router.get("/{collection_id}/tours/shared", response_model=List[PropertyTourResponse])
+async def get_shared_collection_tours(
+    collection_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get tour requests for a collection (public endpoint for the visitor's own showcase) - lets
+    the "Your Upcoming Tours" section show confirmed tours without requiring the agent's login.
+    """
+    try:
+        collection = await db.execute(
+            select(Collection).where(
+                Collection.id == collection_id,
+                Collection.is_public == True
+            )
+        )
+        if not collection.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Collection not found"
+            )
+
+        tours = await PropertyTourService.get_collection_tours(db, collection_id)
+        return tours
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("fetching shared collection tours failed", extra={"error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch collection tours"
@@ -918,4 +1467,78 @@ async def update_tour_completion(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update tour completion status"
+        )
+
+
+@router.patch("/tours/{tour_id}/confirm", response_model=PropertyTourResponse)
+async def confirm_tour_request(
+    tour_id: str,
+    confirm_update: PropertyTourConfirmUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_premium_plan)
+):
+    """
+    Confirm a tour request with the agreed date/time (agent only) - this is what surfaces it
+    to the visitor as an "Upcoming Tour" on their showcase.
+    """
+    try:
+        tour = await PropertyTourService.confirm_tour(
+            db, tour_id, confirm_update, current_user.id
+        )
+
+        if not tour:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Tour request not found"
+            )
+
+        return tour
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("confirming tour request failed", extra={"error": str(e)})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to confirm tour request"
+        )
+
+
+@router.patch("/tours/{tour_id}/unconfirm", response_model=PropertyTourResponse)
+async def unconfirm_tour_request(
+    tour_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_premium_plan)
+):
+    """
+    Clear a tour request's confirmation (agent only).
+    """
+    try:
+        tour = await PropertyTourService.unconfirm_tour(db, tour_id, current_user.id)
+
+        if not tour:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Tour request not found"
+            )
+
+        return tour
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("unconfirming tour request failed", extra={"error": str(e)})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to unconfirm tour request"
         )

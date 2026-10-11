@@ -25,8 +25,8 @@ BRIGHT_PROPERTY_SELECT_FIELDS = [
     "DoorFeatures", "WindowFeatures", "Cooling", "Heating", "WaterSource",
     "Sewer", "Utilities", "GarageSpaces", "ParkingFeatures",
     "GarageYN", "AssociationFee", "AssociationFeeFrequency", "AssociationAmenities",
-    "AssociationFeeIncludes", "AssociationYN", "LotFeatures", 
-    "View", "WaterfrontFeatures", "ViewYN", "TaxAnnualAmount",
+    "AssociationFeeIncludes", "AssociationYN", "LotFeatures",
+    "View", "WaterfrontFeatures", "WaterfrontYN", "ViewYN", "TaxAnnualAmount",
     "TaxYear", "YearBuilt", "ElementarySchool", "MiddleOrJuniorSchool",
     "HighSchool", "SchoolDistrictName", "County", "Directions",
     "Zoning", "TaxAssessmentAmount", "AssessmentYear", "Possession", 
@@ -36,8 +36,37 @@ BRIGHT_PROPERTY_SELECT_FIELDS = [
     "ListAgentPreferredPhone", "LotSizeAcres", "AttachedGarageYN", 
     "NewConstructionYN", "SeniorCommunityYN", "PetsAllowed", "OriginalListPrice", 
     "DaysOnMarket", "CumulativeDaysOnMarket", "Stories", "SubdivisionName", 
-    "MLSListDate", "PriceChangeTimestamp", "ModificationTimestamp", 
-    "OneBedroomUnits", "TwoBedroomUnits", "ThreeBedroomUnits"
+    "MLSListDate", "PreviousListPrice", "PriceChangeTimestamp", "MajorChangeTimestamp",
+    "MajorChangeType", "StatusChangeTimestamp", "ModificationTimestamp",
+    "OneBedroomUnits", "TwoBedroomUnits", "ThreeBedroomUnits",
+    # Authoritative listing-timeline fields - used by the CMA engine to compute the real
+    # active-market window (list -> under contract / list -> close) instead of naively doing
+    # today - list_date after a property has gone contingent/pending/closed. StandardStatus is
+    # the RESO-normalized status (no "-BRIGHT" suffix); PurchaseContractDate / ContractStatusChangeDate
+    # are when it went under agreement; ListingContractDate / OnMarketDate / OffMarketDate bracket
+    # the active period.
+    "StandardStatus", "PurchaseContractDate", "ContractStatusChangeDate",
+    "ListingContractDate", "OnMarketDate", "OffMarketDate",
+    # Coming Soon: the first day the home may be shown (showing requests start from it)
+    "ExpectedOnMarketDate",
+    # CMA accuracy: how a sale happened (regular / foreclosure / short sale), what the seller paid
+    # toward the buyer, financing, condition and level-by-level rooms - all offered in our feed.
+    "SaleType", "Concessions", "ConcessionInPriceYN", "SellerPaidClosingCostsTotal", "BuyerFinancing",
+    "PropertyCondition", "YearBuiltEffective", "StoriesTotal", "BasementFinishedPercent",
+    "UpperLevelsTotalBedrooms", "UpperLevelsTotalBaths", "LowerLevelsTotalBedrooms", "LowerLevelsTotalBaths",
+    "BuyerOfficeName",
+    # Structured facts used by the newer CMA/property-detail tooling. These remain in
+    # raw_mls_data even when there is no dedicated Property column, so downstream features can
+    # use Bright's explicit facts rather than trying to recover them from PublicRemarks.
+    "Pool", "PoolFeatures", "OtherStructuresList", "PatioAndPorchFeatures",
+    "HotWater", "Electric", "LaundryType", "ParkingTypes", "GarageType",
+    "NumAttachedGarageSpaces", "NumDrivewaySpaces", "TotalGarageAndParkingSpaces", "GarageSQFT",
+    "AreaTotal", "TaxTotalFinishedSqFt", "RoomsTotal",
+    # Seller's internet-display choices (Bright IDX rules) - the public IDX website hides
+    # opted-out listings and withheld addresses (content_adapters.apply_idx_rules). All four are
+    # in our feed's $metadata.
+    "InternetEntireListingDisplayYN", "InternetAddressDisplayYN",
+    "InternetAutomatedValuationDisplayYN", "InternetConsumerCommentYN",
 ]
 
 def clean_address(address: str) -> str:
@@ -177,7 +206,17 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]] =
         "construction_materials": item.get("ConstructionMaterials"),
         "roof_type": item.get("Roof"),
         "foundation_details": item.get("FoundationDetails"),
-        "structure_type": item.get("StructureType"),
+        # Bright exposes StructureDesignType, not the RESO-standard StructureType selector. Keep
+        # the normalized JSON shape list-valued like the rest of the structural feature fields.
+        "structure_type": (
+            item.get("StructureType")
+            if isinstance(item.get("StructureType"), list)
+            else [item.get("StructureType")]
+            if item.get("StructureType")
+            else [item.get("StructureDesignType")]
+            if item.get("StructureDesignType")
+            else None
+        ),
         "levels": item.get("Levels"),
         "interior_features": item.get("InteriorFeatures"),
         "exterior_features": item.get("ExteriorFeatures"),
@@ -203,7 +242,7 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]] =
         "lot_features": item.get("LotFeatures"),
         "view": item.get("View"),
         "waterfront_features": item.get("WaterfrontFeatures"),
-        "has_waterfront_view": item.get("WaterfrontViewYN"),
+        "has_waterfront_view": item.get("WaterfrontYN"),
         "has_view": item.get("ViewYN"),
         "tax_annual_amount": item.get("TaxAnnualAmount"),
         "tax_year": item.get("TaxYear"),

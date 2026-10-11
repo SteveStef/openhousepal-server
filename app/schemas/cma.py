@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List, Literal, Dict, Any
+from typing import Optional, List, Literal, Dict, Any, Union
 from datetime import datetime
 import uuid
 
@@ -7,16 +7,23 @@ CmaMode = Literal['listing', 'buyer']
 CmaStatus = Literal['DRAFT', 'READY', 'SHARED']
 CompSource = Literal['mls', 'manual']
 CompStatus = Literal['sold', 'pending', 'active_under_contract', 'active']
-CompStrength = Literal['primary', 'strong', 'supporting', 'weak']
-QualityRating = Literal['significantly_below', 'below', 'similar', 'above', 'significantly_above']
+# Valuation classification. Only three are canonical / ever shown to a client:
+#   strong      - a close, reliable local sale the value leans on
+#   supporting  - a reasonable comp, useful but with real differences (moderate weight)
+#   weak        - a genuine sale but a poor match / different product or market (little/no weight)
+# 'primary' / 'context' / 'excluded' are legacy values from an earlier 5-tier scheme still present
+# in older saved reports - normalised on read (primary->strong, context/excluded->weak). Never
+# emit them for new reports.
+CompStrength = Literal['strong', 'supporting', 'weak', 'primary', 'context', 'excluded']
 SimpleRating = Literal['below', 'similar', 'above']
-LocationRating = Literal['inferior', 'similar', 'superior']
+AreaRating = Literal['different_from_subject', 'similar_to_subject', 'same_as_subject']
 
 
 class CmaSubjectProperty(BaseModel):
     listing_key: Optional[str] = None
     source: CompSource = 'mls'
     photo_url: Optional[str] = None
+    photos: List[str] = []
     street_address: Optional[str] = None
     city: Optional[str] = None
     state: Optional[str] = None
@@ -27,9 +34,14 @@ class CmaSubjectProperty(BaseModel):
     beds: Optional[float] = None
     baths: Optional[float] = None
     sqft: Optional[float] = None
+    above_grade_finished_area: Optional[float] = None
+    below_grade_finished_area: Optional[float] = None
     lot_size: Optional[float] = None
     year_built: Optional[int] = None
     property_type: Optional[str] = None
+    architectural_style: Optional[Union[List[str], str]] = None
+    township: Optional[str] = None
+    subdivision_name: Optional[str] = None
     garage: Optional[str] = None
     basement: Optional[str] = None
     days_on_market: Optional[int] = None
@@ -38,19 +50,30 @@ class CmaSubjectProperty(BaseModel):
     last_sale_price: Optional[float] = None
     school_district: Optional[str] = None
     annual_taxes: Optional[float] = None
+    water_source: Optional[Union[List[str], str]] = None
+    sewer: Optional[Union[List[str], str]] = None
+    # MLS listing description (PublicRemarks) - fed to the AI analysis alongside the structured
+    # fields and photos (see cma_ai_service.py _SUBJECT_FIELDS).
+    public_remarks: Optional[str] = None
     # The agent's framing of the subject itself, shown before any comps in the client-facing
     # presentation - distinct from the pricing conclusion, which comes at the very end.
     agent_notes: Optional[str] = None
 
 
 class CmaQualityAssessment(BaseModel):
-    finish_quality: Optional[QualityRating] = None
+    finish_quality: Optional[SimpleRating] = None
     interior: Optional[SimpleRating] = None
     exterior: Optional[SimpleRating] = None
     lot: Optional[SimpleRating] = None
     amenities: Optional[SimpleRating] = None
     layout: Optional[SimpleRating] = None
-    location: Optional[LocationRating] = None
+    area: Optional[AreaRating] = None
+    # This comp's street/positional character vs. the subject (cul-de-sac/quiet street vs. a major
+    # road/highway) - a DIRECTIONAL rating (below/similar/above), the same shape as the other
+    # quality dimensions above and as the AI tool schema + _derive_street_context in
+    # cma_ai_service.py: 'above' = comp's street setting is quieter/more desirable than the
+    # subject's, 'below' = busier/less desirable. NOT AreaRating - that's the area-match field.
+    street_context: Optional[SimpleRating] = None
 
 
 class CmaComparable(BaseModel):
@@ -71,26 +94,64 @@ class CmaComparable(BaseModel):
     longitude: Optional[float] = None
     distance_miles: Optional[float] = None
 
-    sale_price: Optional[float] = None
+    sale_price: Optional[float] = None       # ONLY a verified closed price (never a list/pending fallback)
     list_price: Optional[float] = None
+    original_list_price: Optional[float] = None
+    close_price: Optional[float] = None
+    close_date: Optional[str] = None
     sale_date: Optional[str] = None
+    # True only when the transaction is confirmed closed AND the closing price is known. When
+    # False this comp must not feed any valuation math (see effectiveCompPrice / valuationComps).
+    price_verified: bool = True
     days_on_market: Optional[int] = None
+    cdom: Optional[int] = None
 
     sqft: Optional[float] = None
+    above_grade_finished_area: Optional[float] = None
+    below_grade_finished_area: Optional[float] = None
     lot_size: Optional[float] = None
     beds: Optional[float] = None
     baths: Optional[float] = None
     year_built: Optional[int] = None
+    architectural_style: Optional[Union[List[str], str]] = None
+    township: Optional[str] = None
+    subdivision_name: Optional[str] = None
     garage: Optional[str] = None
     basement: Optional[str] = None
     price_per_sqft: Optional[float] = None
     annual_taxes: Optional[float] = None
-    # Computed client-side by the same Similar Properties matching formula (not recomputed
-    # server-side) - persisted here purely for display in the analysis view and presentation.
+    school_district: Optional[str] = None
+    water_source: Optional[Union[List[str], str]] = None
+    sewer: Optional[Union[List[str], str]] = None
+    # MLS listing description (PublicRemarks) - fed to the AI analysis alongside the structured
+    # fields and photos (see cma_ai_service.py _COMP_FIELDS).
+    public_remarks: Optional[str] = None
+    property_type: Optional[str] = None
+    home_type: Optional[str] = None
+    # Deterministic continuous relevance percentage. CMA generation recomputes this from the
+    # immutable authoritative snapshot; pre-generation clients mirror the same shared formula.
     match_score: Optional[int] = None
+    similarity_details: Optional[Dict[str, Any]] = None
+    # OpenStreetMap road/street classification for this comp's location (road_context_service.py) -
+    # {verdict: quiet|neutral|through, road_types, max_speed_mph, nearby_road_names, summary}.
+    # `road_context_note` is the same thing pre-formatted for the AI prompt + agent display.
+    road_context: Optional[Dict[str, Any]] = None
+    road_context_note: Optional[str] = None
 
     quality: CmaQualityAssessment = Field(default_factory=CmaQualityAssessment)
     strength: Optional[CompStrength] = None
+    # Claude's proposed role is audit-only after generation. `strength` is the deterministic role
+    # derived from continuous relevance and is the role shown to clients.
+    ai_strength: Optional[CompStrength] = None
+    # Derived after the anchor is locked; tells renderers whether the comp carried valuation weight.
+    valuation_weight: Optional[float] = None
+    valuation_role: Optional[Literal['valuation_comp', 'context_only']] = None
+    # v10 Fix 2 - the AI's machine-checkable "keep this Strong despite a different market" override.
+    # Validated deterministically against structured evidence in cma_ai_service._v10_location_class_review;
+    # a thin/unsupported override is ignored and the comp is demoted to supporting.
+    strong_location_override: Optional[bool] = None
+    strong_location_override_reason: Optional[str] = None
+    market_equivalence_evidence: Optional[List[str]] = None
     commentary: Optional[str] = None
     # AI-drafted note for this comp (see cma_ai_service.py) - deliberately separate from
     # `commentary` above, never auto-written into it. The agent's own analysis is never silently
@@ -108,13 +169,27 @@ class CmaPricing(BaseModel):
     most_likely_value: Optional[float] = None
     recommended_list_price: Optional[float] = None
     pricing_commentary: Optional[str] = None
+    # Listing mode - the seller mirror of offer_suggestion_notes / inspection_concerns below.
+    # AI-filled once (non-destructively) from ai_estimate.listing_strategy_considerations /
+    # listing_prep_concerns; the agent's own edits always win.
+    listing_strategy_notes: Optional[str] = None
+    listing_prep_notes: Optional[str] = None
     # Buyer mode
     estimated_fair_value: Optional[float] = None
     suggested_offer_min: Optional[float] = None
     suggested_offer_max: Optional[float] = None
     strong_offer: Optional[float] = None
     max_recommended_price: Optional[float] = None
+    # AI-auto-filled (once, non-destructively) with its valuation reasoning in buyer mode - see
+    # cma_ai_service.py. Kept as "offer_strategy_commentary" for backward compatibility even
+    # though the buyer-mode UI now labels it "Buyer Valuation - Agent Notes".
     offer_strategy_commentary: Optional[str] = None
+    # Buyer mode - inspection/property-condition concerns separated from offer positioning so the
+    # public CMA/PDF can present due diligence separately from negotiating strategy.
+    inspection_concerns: Optional[str] = None
+    # Agent-only, never touched by AI - how the agent would actually structure an offer on this
+    # home (separate from the AI's fair-value reasoning above).
+    offer_suggestion_notes: Optional[str] = None
     # AI-proposed value + range for the subject (see cma_ai_service.py) - same non-destructive
     # pattern as CmaComparable.ai_commentary: the agent applies it into the real pricing fields
     # above via an explicit "Apply" action, it's never written there automatically.
@@ -139,12 +214,19 @@ class CmaImprovement(BaseModel):
     approx_size: Optional[str] = None
     estimated_value_context: Optional[str] = None
     agent_notes: Optional[str] = None
+    ai_generated: bool = False
 
 
 class CmaPresentationSettings(BaseModel):
     hidden_sections: List[str] = []
     hidden_comp_ids: List[str] = []
     cover_photo_url: Optional[str] = None
+    # Which theme the public share link opens in for a visitor by default - None means "dark"
+    # (the site's own current default), since that's the common case and not worth forcing every
+    # existing report to have this field set. The IDX-embedded view ignores this entirely and is
+    # always light regardless, since a client shouldn't see a dark page inside the agent's own
+    # branded site just because the agent picked dark as their default.
+    default_theme: Optional[Literal["light", "dark"]] = None
 
 
 class CmaAiAnalysisMeta(BaseModel):
@@ -172,6 +254,9 @@ class CmaReportResponse(BaseModel):
     presentation: CmaPresentationSettings = Field(default_factory=CmaPresentationSettings)
     ai_analysis: Optional[CmaAiAnalysisMeta] = None
     share_slug: Optional[str] = None
+    use_signature_card: bool = True
+    generation_status: Optional[Literal["generating", "complete", "failed"]] = None
+    generation_started_at: Optional[datetime] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
 
@@ -184,11 +269,17 @@ class CmaReportListItem(BaseModel):
     client_name: Optional[str] = None
     mode: CmaMode
     status: CmaStatus
+    share_slug: Optional[str] = None
     subject_address: Optional[str] = None
     subject_photo_url: Optional[str] = None
     comparable_count: int = 0
+    fair_value: Optional[float] = None
     value_range_min: Optional[float] = None
     value_range_max: Optional[float] = None
+    default_theme: Optional[Literal["light", "dark"]] = None
+    export_allowed: bool = True
+    qa_blocking_count: int = 0
+    generation_status: Optional[Literal["generating", "complete", "failed"]] = None
     updated_at: Optional[datetime] = None
     created_at: datetime
 
@@ -209,6 +300,11 @@ class CmaReportUpdate(BaseModel):
     market_context: Optional[CmaMarketContext] = None
     improvements: Optional[List[CmaImprovement]] = None
     presentation: Optional[CmaPresentationSettings] = None
+    use_signature_card: Optional[bool] = None
+
+
+class CmaThemeUpdate(BaseModel):
+    default_theme: Literal["light", "dark"]
 
 
 class CmaGenerateAiAnalysisRequest(BaseModel):
@@ -219,8 +315,11 @@ class CmaGenerateAiAnalysisRequest(BaseModel):
 
 class CmaCompSearchRequest(BaseModel):
     listing_key: Optional[str] = None
+    subject: Optional[CmaSubjectProperty] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    subject_sqft: Optional[float] = None
+    property_type: Optional[str] = None
     radius_miles: float = 1.0
     statuses: List[CompStatus] = ['sold']
     sale_date_from: Optional[str] = None
@@ -235,6 +334,8 @@ class CmaCompSearchRequest(BaseModel):
     min_baths: Optional[float] = None
     min_year_built: Optional[int] = None
     max_year_built: Optional[int] = None
+    school_district: Optional[str] = None
+    city: Optional[str] = None
     exclude_listing_keys: List[str] = []
 
 
@@ -251,21 +352,39 @@ class CmaCompCandidate(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     distance_miles: Optional[float] = None
-    sale_price: Optional[float] = None
+    sale_price: Optional[float] = None       # ONLY a verified closed price
     list_price: Optional[float] = None
+    original_list_price: Optional[float] = None
+    close_price: Optional[float] = None
+    close_date: Optional[str] = None
     sale_date: Optional[str] = None
+    price_verified: bool = True
     days_on_market: Optional[int] = None
+    cdom: Optional[int] = None
     sqft: Optional[float] = None
+    above_grade_finished_area: Optional[float] = None
+    below_grade_finished_area: Optional[float] = None
     lot_size: Optional[float] = None
     beds: Optional[float] = None
     baths: Optional[float] = None
     year_built: Optional[int] = None
+    architectural_style: Optional[Union[List[str], str]] = None
+    township: Optional[str] = None
+    subdivision_name: Optional[str] = None
     garage: Optional[str] = None
     basement: Optional[str] = None
     price_per_sqft: Optional[float] = None
     school_district: Optional[str] = None
+    water_source: Optional[Union[List[str], str]] = None
+    sewer: Optional[Union[List[str], str]] = None
     public_remarks: Optional[str] = None
     annual_taxes: Optional[float] = None
+    property_type: Optional[str] = None
+    similarity_context: Optional[Dict[str, Any]] = None
+    # Computed by the authoritative backend relevance engine for this exact subject snapshot.
+    # CMA clients display this value verbatim and never recreate it in the browser.
+    match_score: Optional[int] = None
+    similarity_details: Optional[Dict[str, Any]] = None
 
 
 class CmaShareResponse(BaseModel):
@@ -284,6 +403,7 @@ class CmaPublicAgent(BaseModel):
     primary_color: Optional[str] = None
     secondary_color: Optional[str] = None
     agent_hub_slug: Optional[str] = None
+    idx_site_url: Optional[str] = None
 
 
 class CmaPublicResponse(BaseModel):
@@ -297,3 +417,6 @@ class CmaPublicResponse(BaseModel):
     presentation: CmaPresentationSettings
     agent: CmaPublicAgent
     updated_at: Optional[datetime] = None
+    # Set when the web view should end with the agent's Email Signature card (site version):
+    # the report's switch is on, the plan has signatures and one is saved. The PDF ignores it.
+    signature_hub_slug: Optional[str] = None

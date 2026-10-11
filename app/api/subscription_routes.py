@@ -3,72 +3,229 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel
+from typing import Optional
 import os
 
 from app.database import get_db
 from app.schemas.user import User
 from app.services.paypal_service import paypal_service
 from app.utils.auth import get_current_active_user
-from app.models.database import User as UserModel
+from app.models.database import User as UserModel, PlanTier
+from app.utils.plan_ids import (
+    tier_for_plan_id, plan_id_has_trial, CURRENT_NO_TRIAL_PLAN_ID_BY_TIER, display_name_for_tier,
+    tier_allowed_for, NOT_IN_BRIGHT_MESSAGE,
+)
 from app.config.logging import get_logger
 
 router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 logger = get_logger(__name__)
 
-# PayPal Plan ID Constants (from environment variables)
+# Legacy Basic/Premium plan ID constants - still needed here only for /complete-new's has_trial
+# check (a legacy trial-bearing signup is still possible until those plan IDs are retired).
+# All new-signup/upgrade/downgrade plan selection goes through CURRENT_NO_TRIAL_PLAN_ID_BY_TIER
+# instead - see app.utils.plan_ids.
 BASIC_PLAN_ID = os.getenv("PAYPAL_BASIC_PLAN_ID")
 PREMIUM_PLAN_ID = os.getenv("PAYPAL_PREMIUM_PLAN_ID")
-
 BASIC_PLAN_NO_TRIAL_ID = os.getenv("PAYPAL_BASIC_NO_TRIAL_PLAN_ID")
 PREMIUM_PLAN_NO_TRIAL_ID = os.getenv("PAYPAL_PREMIUM_NO_TRIAL_PLAN_ID")
 
 CLIENT_URL = os.getenv("CLIENT_URL", "http://localhost:3000")
 
 
-@router.post("/upgrade")
-async def upgrade_subscription(
+class ChangePlanRequest(BaseModel):
+    target_tier: str  # NO_MLS | BASIC | PREMIUM | IDX
+    code: Optional[str] = None  # waives the one-time IDX setup fee
+
+
+IDX_SETUP_FEE_PLAN_ID = os.getenv("PAYPAL_IDX_PLAN_ID")  # IDX with the one-time setup fee
+
+
+def _owes_idx_setup_fee(user, target_tier: str) -> bool:
+    return target_tier == "IDX" and user.plan_tier != "IDX" and not getattr(user, "idx_setup_settled_at", None)
+
+
+async def _apply_idx_waiver(db, user_id: str, code: str):
+    """Check + count an IDX fee-waiver code for this agent. Returns the code's PayPal plan id."""
+    from app.services.promo_code_service import claim, idx_waiver
+    promo, why = await idx_waiver(db, code)
+    if promo is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=why)
+    if not await claim(db, promo.id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That code was just used up. Please contact us.")
+    u = (await db.execute(select(UserModel).where(UserModel.id == user_id))).scalar_one()
+    u.promo_code_id = promo.id
+    u.idx_setup_settled_at = datetime.now(timezone.utc)
+    if promo.billing_group_id:
+        u.billing_group_id = promo.billing_group_id
+    await db.commit()
+    return promo.paypal_plan_id
+
+
+@router.get("/impact")
+async def get_plan_change_impact(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The agent's live, client-facing footprint - what's actually riding on their plan right now.
+    Settings > Billing combines these counts with the tier-feature matrix to show a concrete,
+    specific warning before a downgrade or cancel ("12 clients will stop getting alerts", "your
+    3 forms' QR codes stop working"), instead of a generic "features will be disabled"."""
+    from sqlalchemy import func
+    from app.models.database import (
+        AgentForm, AgentHub, AgentReview, Blog, CalendarConnection, Collection, DesignProject,
+        EmailSignature, OpenHouseEvent, PropertyWebsite, Site, StudioMediaAsset,
+    )
+
+    async def count(stmt) -> int:
+        return int((await db.execute(stmt)).scalar() or 0)
+
+    uid = current_user.id
+    now = datetime.now(timezone.utc)
+    hub = (await db.execute(select(AgentHub).where(AgentHub.owner_id == uid))).scalar_one_or_none()
+    site = (await db.execute(select(Site).where(Site.owner_id == uid))).scalar_one_or_none()
+    return {
+        "active_showcases": await count(select(func.count(Collection.id)).where(Collection.owner_id == uid, Collection.status == "ACTIVE")),
+        "showcase_clients": await count(select(func.count(func.distinct(func.lower(Collection.visitor_email)))).where(
+            Collection.owner_id == uid, Collection.status == "ACTIVE", Collection.visitor_email.isnot(None))),
+        "forms": await count(select(func.count(AgentForm.id)).where(AgentForm.owner_id == uid, AgentForm.is_enabled.is_(True))),
+        "open_houses": await count(select(func.count(OpenHouseEvent.id)).where(OpenHouseEvent.agent_id == uid, OpenHouseEvent.is_deleted.is_(False))),
+        "agent_hub_slug": hub.slug if hub else None,
+        "has_signature": bool(await count(select(func.count(EmailSignature.id)).where(EmailSignature.owner_id == uid))),
+        "idx_site_published": bool(site and site.status == "PUBLISHED"),
+        "spotlights_published": await count(select(func.count(PropertyWebsite.id)).where(PropertyWebsite.owner_id == uid, PropertyWebsite.status == "PUBLISHED")),
+        "blogs_published": await count(select(func.count(Blog.id)).where(Blog.owner_id == uid, Blog.status == "PUBLISHED")),
+        "designs": await count(select(func.count(DesignProject.id)).where(DesignProject.owner_id == uid)),
+        "media_assets": await count(select(func.count(StudioMediaAsset.id)).where(StudioMediaAsset.owner_id == uid, StudioMediaAsset.status == "succeeded")),
+        "reviews": await count(select(func.count(AgentReview.id)).where(AgentReview.owner_id == uid)),
+        "calendar_connected": bool(await count(select(func.count(CalendarConnection.id)).where(CalendarConnection.owner_id == uid))),
+        "as_of": now.isoformat(),
+    }
+
+
+
+
+@router.get("/plan-terms")
+async def get_plan_terms(plan_id: str, current_user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
+    """The real terms of a plan as configured in PayPal (trial length, monthly price, one-time
+    setup fee), so checkout's order summary never promises something PayPal won't do."""
+    bundle_id = os.getenv("PAYPAL_BUNDLE_PLAN_ID")
+    if not (tier_for_plan_id(plan_id) or (bundle_id and plan_id == bundle_id)):
+        from app.services.promo_code_service import tier_for_promo_plan
+        if not (await tier_for_promo_plan(db, plan_id))[0]:
+            raise HTTPException(status_code=404, detail="Unknown plan")
+    from app.utils.paypal_plan_terms import get_plan_terms as _terms
+    try:
+        t = await _terms(plan_id)
+    except Exception:
+        raise HTTPException(status_code=502, detail="Couldn't reach PayPal")
+    return {"trial_days": t["trial_days"], "price": t["price"], "setup_fee": t["setup_fee"], "status": t["status"]}
+
+
+@router.post("/sync")
+async def sync_with_paypal(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-read the agent's subscription from PayPal right now - used when they come back from
+    approving a plan change, so the new plan shows without waiting for PayPal's webhook."""
+    if not current_user.subscription_id:
+        return {"success": True, "plan_tier": current_user.plan_tier, "status": current_user.subscription_status}
+    from app.utils.subscription_sync import sync_subscription_status
+    user = (await db.execute(select(UserModel).where(UserModel.id == current_user.id))).scalar_one()
+    ok = await sync_subscription_status(user, db)
+    return {"success": ok, "plan_tier": user.plan_tier, "plan_id": user.plan_id, "status": user.subscription_status}
+
+
+@router.post("/change-plan")
+async def change_plan(
+    payload: ChangePlanRequest,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Upgrade from Basic to Premium plan.
-    Returns PayPal approval URL that user must visit to consent to the upgrade.
+    Change tier - covers what used to be separate /upgrade and /downgrade endpoints, now
+    generalized across all 4 tiers (NO_MLS/BASIC/PREMIUM/IDX). Returns a PayPal approval URL
+    the user must visit to consent to the change (or applies immediately if PayPal allows it).
+
+    Always targets the CURRENT price for the destination tier, never a grandfathered legacy
+    rate - grandfathering only protects staying on your current tier, not moving to a new one.
     """
     try:
-        # Verify user is on BASIC plan
-        if current_user.plan_tier != "BASIC":
+        target_tier = payload.target_tier
+        if target_tier not in (t.value for t in PlanTier):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="You are not on the Basic plan. Cannot upgrade."
+                detail=f"Unknown plan tier: {target_tier}"
             )
 
-        # Verify subscription status is valid for upgrade
+        if not tier_allowed_for(current_user, target_tier):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=NOT_IN_BRIGHT_MESSAGE)
+
+        if current_user.plan_tier == target_tier:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"You are already on the {target_tier.replace('_', '-').title()} plan."
+            )
+
         valid_statuses = ["TRIAL", "ACTIVE"]
         if current_user.subscription_status not in valid_statuses:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot upgrade subscription with status: {current_user.subscription_status}"
+                detail=f"Cannot change subscription with status: {current_user.subscription_status}"
             )
 
-        # Verify subscription_id exists
         if not current_user.subscription_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No subscription found for this user"
             )
 
-        return_url = f"{CLIENT_URL}/settings/subscription"
+        new_plan_id = CURRENT_NO_TRIAL_PLAN_ID_BY_TIER.get(target_tier)
+        if not new_plan_id:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"The {target_tier.replace('_', '-').title()} plan isn't configured yet. Contact support."
+            )
+
+        return_url = f"{CLIENT_URL}/settings/subscription?plan_changed=1"
         cancel_url = f"{CLIENT_URL}/settings/subscription"
 
-        # Always use no-trial plan for upgrades to prevent PayPal from resetting trials
-        # Our database preserves the original trial_ends_at, so trial users keep their trial
-        premium_plan = PREMIUM_PLAN_NO_TRIAL_ID
+        # Moving onto IDX for the first time costs the one-time setup fee, unless a code waives it.
+        # PayPal never charges a setup fee on a plan change, so the fee path starts a new IDX
+        # subscription (fee charged on approval, first month on the date they're already paid up
+        # to) and the old one is cancelled when they come back (complete-new).
+        if _owes_idx_setup_fee(current_user, target_tier):
+            if payload.code:
+                new_plan_id = await _apply_idx_waiver(db, current_user.id, payload.code)
+            else:
+                if not IDX_SETUP_FEE_PLAN_ID:
+                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                        detail="The IDX plan isn't configured yet. Contact support.")
+                start = None
+                nb = current_user.next_billing_date
+                if nb and nb > datetime.now(timezone.utc) + timedelta(minutes=30):
+                    start = nb.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                try:
+                    created = await paypal_service.create_subscription_with_urls(
+                        plan_id=IDX_SETUP_FEE_PLAN_ID,
+                        return_url=f"{CLIENT_URL}/settings/subscription?resubscribed=true",
+                        cancel_url=cancel_url, start_time=start)
+                except Exception:
+                    logger.error("PayPal error starting the IDX upgrade", exc_info=True, extra={"user_id": current_user.id})
+                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                        detail="Failed to start the upgrade with PayPal. Please try again.")
+                approval = next((l.get("href") for l in created.get("links", []) if l.get("rel") == "approve"), None)
+                if not approval:
+                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="PayPal didn't return an approval link. Please try again.")
+                return {"success": True, "immediate": False, "approval_url": approval, "setup_fee": True,
+                        "message": "Please approve the IDX upgrade on PayPal"}
 
-        # Call PayPal Revise API
+        # Always use the no-trial plan variant for plan changes to prevent PayPal from resetting
+        # trials - our database preserves the original trial_ends_at, so trial users keep their trial.
         try:
             result = await paypal_service.revise_subscription(
                 subscription_id=current_user.subscription_id,
-                new_plan_id=premium_plan,
+                new_plan_id=new_plan_id,
                 return_url=return_url,
                 cancel_url=cancel_url
             )
@@ -77,34 +234,37 @@ async def upgrade_subscription(
             if "PAYMENT_IN_PROGRESS" in error_str:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail="A payment is currently being processed for your subscription. PayPal does not allow upgrades while a payment is in progress. Please try again in 30-60 minutes once the transaction is complete."
+                    detail="A payment is currently being processed for your subscription. PayPal does not allow plan changes while a payment is in progress. Please try again in 30-60 minutes once the transaction is complete."
                 )
-            
-            logger.error("PayPal API error during upgrade", exc_info=True, extra={"user_id": current_user.id})
+
+            logger.error("PayPal API error during plan change", exc_info=True, extra={"user_id": current_user.id, "target_tier": target_tier})
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to initiate upgrade with PayPal. Please try again."
+                detail="Failed to initiate the plan change with PayPal. Please try again."
             )
 
         # Check if change was applied immediately or requires approval
         if result.get("immediate"):
-            # Plan change applied immediately - update database
             user_result = await db.execute(
                 select(UserModel).where(UserModel.id == current_user.id)
             )
             user = user_result.scalar_one()
-            user.plan_tier = "PREMIUM"
-            user.plan_id = premium_plan
+            from app.services.website.site_service import reset_idx_site_question_on_upgrade
+            reset_idx_site_question_on_upgrade(user, user.plan_tier, target_tier)
+            user.plan_tier = target_tier
+            user.plan_id = new_plan_id
             user.last_paypal_sync = datetime.now(timezone.utc)
             await db.commit()
+            # Moving onto a Showcase plan: build + send every showcase they missed on Basic.
+            from app.services.open_house_service import schedule_showcase_backfill
+            schedule_showcase_backfill(user.id)
 
             return {
                 "success": True,
                 "immediate": True,
-                "message": "Plan upgraded to Premium successfully!"
+                "message": f"Plan changed to {target_tier.replace('_', '-').title()} successfully!"
             }
         else:
-            # Requires user approval
             return {
                 "success": True,
                 "immediate": False,
@@ -117,97 +277,7 @@ async def upgrade_subscription(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to process upgrade"
-        )
-
-
-@router.post("/downgrade")
-async def downgrade_subscription(
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Downgrade from Premium to Basic plan.
-    Returns PayPal approval URL that user must visit to consent to the downgrade.
-    """
-    try:
-        # Verify user is on PREMIUM plan
-        if current_user.plan_tier != "PREMIUM":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="You are not on the Premium plan. Cannot downgrade."
-            )
-
-        # Verify subscription status is valid for downgrade
-        valid_statuses = ["TRIAL", "ACTIVE"]
-        if current_user.subscription_status not in valid_statuses:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot downgrade subscription with status: {current_user.subscription_status}"
-            )
-
-        # Verify subscription_id exists
-        if not current_user.subscription_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No subscription found for this user"
-            )
-
-        # Build return URLs - just redirect back to subscription page
-        # Webhook will handle updating the database with new plan
-        return_url = f"{CLIENT_URL}/settings/subscription"
-        cancel_url = f"{CLIENT_URL}/settings/subscription"
-
-        # Always use no-trial plan for downgrades to prevent PayPal from resetting trials
-        # Our database preserves the original trial_ends_at, so trial users keep their trial
-        basic_plan = BASIC_PLAN_NO_TRIAL_ID
-
-        # Call PayPal Revise API
-        try:
-            result = await paypal_service.revise_subscription(
-                subscription_id=current_user.subscription_id,
-                new_plan_id=basic_plan,
-                return_url=return_url,
-                cancel_url=cancel_url
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to initiate downgrade with PayPal. Please try again."
-            )
-
-        # Check if change was applied immediately or requires approval
-        if result.get("immediate"):
-            # Plan change applied immediately - update database
-            user_result = await db.execute(
-                select(UserModel).where(UserModel.id == current_user.id)
-            )
-            user = user_result.scalar_one()
-            user.plan_tier = "BASIC"
-            user.plan_id = basic_plan
-            user.last_paypal_sync = datetime.now(timezone.utc)
-            await db.commit()
-
-            return {
-                "success": True,
-                "immediate": True,
-                "message": "Plan downgraded to Basic successfully!"
-            }
-        else:
-            # Requires user approval
-            return {
-                "success": True,
-                "immediate": False,
-                "approval_url": result["approval_url"],
-                "message": "Please approve the plan change on PayPal"
-            }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to process downgrade"
+            detail="Failed to process plan change"
         )
 
 
@@ -385,6 +455,7 @@ async def reactivate_subscription(
 
 class CreateSubscriptionRequest(BaseModel):
     plan_tier: str
+    code: Optional[str] = None  # waives the one-time IDX setup fee
 
 
 class CompleteSubscriptionRequest(BaseModel):
@@ -424,6 +495,30 @@ async def complete_new_subscription(
                 detail="This subscription is already claimed by another account"
             )
 
+        # Their own current subscription (a page refresh, or PayPal's return from approving a
+        # plan change) - just re-read it from PayPal, never restart it as a brand-new one.
+        if current_user.subscription_id == subscription_id:
+            from app.utils.subscription_sync import sync_subscription_status
+            fresh = (await db.execute(select(UserModel).where(UserModel.id == current_user.id))).scalar_one()
+            await sync_subscription_status(fresh, db)
+            return {
+                "success": True,
+                "message": f"You're on the {display_name_for_tier(fresh.plan_tier)} plan.",
+                "subscription": {"subscription_id": subscription_id, "plan_tier": fresh.plan_tier,
+                                 "status": fresh.subscription_status,
+                                 "trial_ends_at": fresh.trial_ends_at.isoformat() if fresh.trial_ends_at else None},
+            }
+
+        # A brand-new subscription is only for someone whose old one has ended or failed -
+        # otherwise they'd be paying for two at once. The one exception is the IDX upgrade with its
+        # setup fee: that new subscription replaces the live one (cancelled below).
+        live = current_user.subscription_status not in ("CANCELLED", "EXPIRED", "SUSPENDED", "PENDING_PAYMENT", None)
+        if live and not (current_user.plan_tier != "IDX" and IDX_SETUP_FEE_PLAN_ID):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You already have an active subscription. Change plans from Settings > Billing instead."
+            )
+
         # Step 2: Validate subscription with PayPal API
         try:
             subscription_details = await paypal_service.get_subscription(subscription_id)
@@ -442,23 +537,31 @@ async def complete_new_subscription(
         billing_info = subscription_details.get('billing_info', {})
         next_billing_time = billing_info.get('next_billing_time')
 
-        # Step 3: Verify subscription status is valid
-        if subscription_status not in ['ACTIVE', 'APPROVAL_PENDING', 'APPROVED']:
+        # Step 3: Verify subscription status is valid - approved on PayPal, not just started
+        if subscription_status not in ['ACTIVE', 'APPROVED']:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid subscription status: {subscription_status}"
+                detail="PayPal hasn't confirmed this subscription yet. Please finish approving it on PayPal."
             )
 
-        # Step 4: Determine plan tier from plan_id
-        if paypal_plan_id == BASIC_PLAN_ID or paypal_plan_id == BASIC_PLAN_NO_TRIAL_ID:
-            plan_tier = "BASIC"
-        elif paypal_plan_id == PREMIUM_PLAN_ID or paypal_plan_id == PREMIUM_PLAN_NO_TRIAL_ID:
-            plan_tier = "PREMIUM"
-        else:
+        if live and paypal_plan_id != IDX_SETUP_FEE_PLAN_ID:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You already have an active subscription. Change plans from Settings > Billing instead."
+            )
+
+        # Step 4: Determine plan tier from plan_id (legacy or current, any of the 4 tiers, or a code's plan)
+        plan_tier = tier_for_plan_id(paypal_plan_id)
+        if plan_tier is None:
+            from app.services.promo_code_service import tier_for_promo_plan
+            plan_tier = (await tier_for_promo_plan(db, paypal_plan_id))[0]
+        if plan_tier is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid plan ID from PayPal"
             )
+        if not tier_allowed_for(current_user, plan_tier):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=NOT_IN_BRIGHT_MESSAGE)
 
         # Step 5: Update user's subscription in database
         result = await db.execute(
@@ -467,21 +570,42 @@ async def complete_new_subscription(
         user = result.scalar_one()
 
         # Determine if this plan has a trial period
-        has_trial = paypal_plan_id in [BASIC_PLAN_ID, PREMIUM_PLAN_ID]
+        has_trial = plan_id_has_trial(paypal_plan_id)
+        trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
+
+        # The old subscription they're replacing (e.g. a suspended one after a failed card)
+        # must stop, or PayPal could retry/charge it alongside the new one.
+        old_subscription_id = user.subscription_id
+        if old_subscription_id and old_subscription_id != subscription_id:
+            try:
+                old_details = await paypal_service.get_subscription(old_subscription_id)
+                if old_details.get("status") in ("ACTIVE", "SUSPENDED", "APPROVED"):
+                    await paypal_service.cancel_subscription(old_subscription_id, reason="Replaced by a new subscription")
+            except Exception:
+                logger.error("Could not cancel the replaced PayPal subscription - cancel it by hand",
+                             exc_info=True, extra={"user_id": user.id, "old_subscription_id": old_subscription_id})
+                try:
+                    from app.services.discord_notifier import notifier
+                    notifier.send(f":warning: Couldn't cancel old PayPal subscription {old_subscription_id} for {user.email} after they resubscribed. Cancel it in PayPal so they aren't billed twice.")
+                except Exception:
+                    pass
 
         # Update subscription fields
         now = datetime.now(timezone.utc)
         user.subscription_id = subscription_id
         user.plan_id = paypal_plan_id
+        from app.services.website.site_service import reset_idx_site_question_on_upgrade
+        reset_idx_site_question_on_upgrade(user, user.plan_tier, plan_tier)
         user.plan_tier = plan_tier
         user.subscription_started_at = now
         user.last_paypal_sync = now
+        if plan_tier == "IDX" and not user.idx_setup_settled_at:
+            user.idx_setup_settled_at = now
 
         if has_trial:
             # New customer with trial - set trial end date from PayPal data
             user.subscription_status = "TRIAL"
-            
-            trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
+
             if next_billing_time:
                 try:
                     trial_end = datetime.fromisoformat(next_billing_time.replace('Z', '+00:00'))
@@ -512,22 +636,25 @@ async def complete_new_subscription(
                 if has_trial:
                     user.next_billing_date = trial_end  # First billing when trial ends
                 else:
-                    user.next_billing_date = now + timedelta(days=trial_days)  # Monthly billing cycle
+                    user.next_billing_date = now + timedelta(days=30)  # Monthly billing cycle
         else:
             # PayPal didn't provide next billing time - calculate it
             if has_trial:
                 user.next_billing_date = trial_end  # First billing when trial ends
             else:
-                user.next_billing_date = now + timedelta(days=trial_days)  # Monthly billing cycle
+                user.next_billing_date = now + timedelta(days=30)  # Monthly billing cycle
 
         await db.commit()
+        # A returning Basic agent resubscribing on a Showcase plan gets their backlog sent too.
+        from app.services.open_house_service import schedule_showcase_backfill
+        schedule_showcase_backfill(user.id)
 
         # Return appropriate message
         trial_message = f"with {trial_days}-day trial!" if has_trial else "(no trial - billing starts immediately)"
 
         return {
             "success": True,
-            "message": f"Successfully subscribed to {plan_tier.title()} plan {trial_message}",
+            "message": f"Successfully subscribed to {display_name_for_tier(plan_tier)} plan {trial_message}",
             "subscription": {
                 "subscription_id": subscription_id,
                 "plan_tier": plan_tier,
@@ -564,12 +691,15 @@ async def create_new_subscription(
     try:
         plan_tier = request.plan_tier
 
-        # Validate plan_tier
-        if plan_tier not in ["BASIC", "PREMIUM"]:
+        # Validate plan_tier - all 4 tiers, not just Basic/Premium
+        if plan_tier not in (t.value for t in PlanTier):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid plan_tier. Must be 'BASIC' or 'PREMIUM'"
+                detail=f"Invalid plan_tier: {plan_tier}"
             )
+
+        if not tier_allowed_for(current_user, plan_tier):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=NOT_IN_BRIGHT_MESSAGE)
 
         # Verify user has a cancelled, expired, or suspended subscription
         valid_statuses = ["CANCELLED", "EXPIRED", "SUSPENDED"]
@@ -579,8 +709,14 @@ async def create_new_subscription(
                 detail=f"Cannot create new subscription with status: {current_user.subscription_status}. This endpoint is for CANCELLED, EXPIRED, or SUSPENDED subscriptions."
             )
 
-        # Get the appropriate no-trial plan ID (returning customers don't get trials)
-        plan_id = PREMIUM_PLAN_NO_TRIAL_ID if plan_tier == "PREMIUM" else BASIC_PLAN_NO_TRIAL_ID
+        # Get the appropriate no-trial plan ID (returning customers don't get trials). Always
+        # the CURRENT price, never the legacy Basic/Premium IDs - a full resubscribe after
+        # cancellation is not covered by grandfathering (that only protects staying on your
+        # existing tier without ever lapsing).
+        plan_id = CURRENT_NO_TRIAL_PLAN_ID_BY_TIER.get(plan_tier)
+        # Coming back on IDX without ever having paid the setup fee: it applies, unless a code waives it.
+        if _owes_idx_setup_fee(current_user, plan_tier):
+            plan_id = (await _apply_idx_waiver(db, current_user.id, request.code)) if request.code else IDX_SETUP_FEE_PLAN_ID
 
         if not plan_id:
             raise HTTPException(
@@ -625,7 +761,7 @@ async def create_new_subscription(
             "success": True,
             "approval_url": approval_url,
             "plan_tier": plan_tier,
-            "message": f"Please approve your new {plan_tier.title()} subscription on PayPal"
+            "message": f"Please approve your new {display_name_for_tier(plan_tier)} subscription on PayPal"
         }
 
     except HTTPException:

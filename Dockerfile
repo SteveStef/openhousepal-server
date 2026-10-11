@@ -22,6 +22,11 @@ COPY requirements.txt ./
 # Install dependencies system-wide
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Chromium + its OS-level deps for Design Studio's server-side PDF export (Playwright renders the
+# real editor canvas headlessly - see app/services/design_export_service.py). Installed once here
+# rather than at container start, so a cold start never pays this download.
+RUN playwright install --with-deps chromium
+
 # Copy app code
 COPY . .
 

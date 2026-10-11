@@ -1,0 +1,82 @@
+"""APScheduler entry point that fires agent-task reminders (an in-app Notification) when a
+task's remind_at passes, even if the agent never opens the Leads page. Registered in
+app/main.py's lifespan(). Same shape as the other *_scheduler.py wrappers.
+
+Right after midnight (Eastern) it moves missed follow-ups onto the new day on the agent's calendar
+("Overdue - Reach Out") - the calendar event only moves when it's re-pushed, so doing this at 6 AM
+left yesterday's follow-ups sitting on yesterday all night.
+
+Once each (Eastern) morning it also:
+- deletes follow-ups completed more than COMPLETED_RETENTION_DAYS ago, so the list never stacks
+  up with old checked-off items,
+- clears the answers/contact details of unfinished form responses older than
+  forms_service.UNFINISHED_RETENTION_DAYS (the visits still count in form stats).
+
+Every minute it also sends any roll-ups that are due (agent_roundup_service): the hourly liked-homes
+email and each open house's wrap-up (2 hours after its last sign-in).
+
+And once each afternoon (4:30 PM Eastern) it sends the Showcase daily digest - every new match and
+price drop of the day in one email per buyer and one per agent (showcase_digest_service).
+"""
+from datetime import date, datetime
+
+from app.config.logging import get_logger
+from app.database import AsyncSessionLocal
+from app.services.tasks_service import (
+    EASTERN, carry_forward_overdue, fire_due_reminders, purge_old_completed,
+)
+
+logger = get_logger(__name__)
+
+MORNING_HOUR = 6  # Eastern - before the agent's day starts
+_last_daily: date | None = None
+_last_carry: date | None = None  # the just-after-midnight overdue move
+_last_digest: date | None = None  # 4:30 PM Showcase digest (showcase_digest_service)
+
+
+async def scheduled_task_reminders():
+    global _last_daily, _last_digest, _last_carry
+    try:
+        async with AsyncSessionLocal() as db:
+            fired = await fire_due_reminders(db)
+            if fired:
+                logger.info("Task reminders fired", extra={"event": "task_reminders", "count": fired})
+            local = datetime.now(EASTERN)
+            if _last_carry != local.date():
+                _last_carry = local.date()
+                moved = await carry_forward_overdue(db)
+                logger.info("Overdue follow-ups moved to the new day", extra={"event": "task_carry", "carried_forward": moved})
+            if _last_daily != local.date() and local.hour >= MORNING_HOUR:
+                _last_daily = local.date()
+                purged = await purge_old_completed(db)
+                from app.services.forms_service import purge_old_unfinished
+                cleared = await purge_old_unfinished(db)
+                try:
+                    from app.services.billing_notices_service import send_trial_ending_reminders
+                    await send_trial_ending_reminders(db)
+                except Exception:
+                    logger.error("trial-ending reminders failed", exc_info=True)
+                logger.info("Daily follow-up upkeep", extra={"event": "task_daily", "purged": purged,
+                                                             "unfinished_cleared": cleared})
+            try:
+                from app.services.agent_roundup_service import send_like_roundups, send_open_house_recaps
+                await send_like_roundups(db)
+                await send_open_house_recaps(db)
+            except Exception:
+                logger.error("agent roll-up emails failed", exc_info=True)
+            try:
+                from app.services.spotlight_alerts_service import send_daily_alerts, send_weekly_reports
+                await send_daily_alerts(db)  # Spotlight guests: price / open house / status news (10 AM)
+                await send_weekly_reports(db)  # agents: the Monday Spotlight report (8 AM)
+            except Exception:
+                logger.error("spotlight alerts / weekly report failed", exc_info=True)
+            if _last_digest != local.date():
+                from app.services.showcase_digest_service import is_digest_time, send_showcase_digests
+                if is_digest_time():
+                    _last_digest = local.date()
+                    try:
+                        await send_showcase_digests(db)
+                    except Exception:
+                        logger.error("showcase daily digest failed", exc_info=True)
+    except Exception as e:
+        logger.error("Scheduled task reminders failed", exc_info=True, extra={"error": str(e)})

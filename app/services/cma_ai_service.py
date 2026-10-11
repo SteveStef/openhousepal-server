@@ -1,7 +1,8 @@
-"""AI-generated CMA analysis: given a report's already-picked subject + comps (already narrowed
-and scored by the existing client-side match-score algorithm - see frontend/lib/matchScore.ts,
-persisted onto each comp as match_score), asks Claude to write a short note per comp explaining
-the price gap and propose one value estimate + range for the subject.
+"""AI-generated CMA analysis for an already-picked subject and comparable set.
+
+The client previews the shared continuous relevance score. After factual normalization, the
+backend recomputes that score from the immutable evidence snapshot and uses it for the persisted
+match badge, descriptive role, and deterministic benchmark weight.
 
 First vision (photo-reading) use case in this codebase. Follows the same reserve/reconcile cost-
 guardrail pattern as area_enrichment_service.py, and the same forced-tool-call structured-output
@@ -14,43 +15,554 @@ action for that.
 """
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import logging
+import os
+import re
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
 from fastapi import HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.database import CmaReport
+from app.models.database import CmaReport, Property
 from app.services import cma_service
+from app.services import road_context_service
+from app.services.cma_similarity_service import (
+    MATCH_DISPLAY_CALIBRATION_VERSION,
+    build_adaptive_proximity_context,
+    calibrate_match_percentage,
+    load_local_proximity_context,
+)
+from app.services.cma_artifact_service import stamp_final_artifact_qa
+from app.services.bright_mls_service import bright_mls_service
 from app.services.ai.ai_config_service import ai_config_service
 from app.services.ai.ai_orchestrator_service import _get_client
 from app.services.ai.ai_rate_limit_service import (
-    AIRateLimitExceeded, reconcile_budget, record_usage_event, reserve_cma_analysis,
+    AIRateLimitExceeded, classify_provider_error, reconcile_budget, record_usage_event, reserve_cma_analysis,
+    reserve_cma_reasoning,
 )
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v10"
+# v10 (hybrid) - see the "v10 HYBRID VALUATION ENGINE" section lower in this file for the full
+# pipeline. Short version: v5 dropped the old computed comp-anchor + bounded +-15% adjustment
+# model and let the AI return a fair-value dollar figure verbatim with no ceiling. That made the
+# final number a single opaque AI judgement with no deterministic use of the subject's own market
+# behaviour. v10 restores a deterministic comp ANCHOR (size-adjusted, evidence-weighted - NOT a
+# naive average), turns the subject's listing behaviour (active-market DOM vs. the comp set's own
+# median, price cuts, contract timing) into a structured ceiling, and confines the AI to itemised
+# +/- qualitative adjustments off the anchor - each with a basis_type + written basis, each
+# individually capped, sub-capped by evidence class, and bounded to +-12% of the anchor in total
+# (+-18% only when the AI files a written anchor dispute). An above-ask conclusion after real
+# market exposure is gated: it survives only to the extent paired-market-evidence adjustments
+# cover the gap, else it is pulled back down. Everything is written to ai_estimate.valuation_trace
+# for audit. Frozen-history rule: only a fresh generation or an explicit recompute runs this - an
+# already-generated CMA is never silently re-valued.
+# v5 note (kept for context): the tight +-15% cap was silently clipping the AI's estimate when a
+# property was genuinely mispriced vs. a naive comps average (major renovation, real defect, weak
+# comp set). v10's bound is on the AI's *qualitative adjustment layer* on top of a real anchor,
+# not on "distance from a naive average", and the anchor dispute path exists for the weak-comp-set
+# case specifically.
+_MIN_RANGE_PCT = 2.0
+_MAX_RANGE_PCT = 8.0
+_V10_RANGE_MAX_PCT = 12.0              # v10 range ceiling - wider than the legacy 8% when the comp evidence is genuinely thin
+_V10_RANGE_TIGHT_PCT = 2.0            # only an excellent, tight closed-comp set earns a range this narrow
+# Hard cap on how many comps ever go into one generation, regardless of how many the report has
+# marked is_included - matches the frontend's own MAX_COMPS (CompsStep can't add past this either),
+# defense in depth against generation cost/time growing unbounded on older or edge-case data.
+MAX_COMPS = 5
+# Bumped 1200 -> 1800 -> 2600 -> 3600: for a BUYER CMA this pass has to backfill methodology_summary
+# + value_drivers + qualitative_adjustments + inspection_concerns (multi-section) +
+# offer_strategy_considerations in one call when a truncated main tool call dropped them. At 2600 it
+# was itself running out of room and coming back with an empty value / offer section, so the retry
+# never actually recovered the report. 3600 covers all of them with headroom.
+_ESTIMATE_ONLY_OUTPUT_TOKENS = 3600
+
+# Appended verbatim to the end of _SYSTEM_PROMPT (and, by reference, the estimate-only prompt).
+# Kept as its own constant so the v10 valuation contract is reviewable in one place and the rest
+# of the (very large) system prompt is untouched. Pairs with _format_anchor_block(), which injects
+# the actual per-report anchor + exposure numbers into the user message.
+_V10_VALUATION_RULES = (
+    "\n\nVALUATION METHOD (v10) - this OVERRIDES the 'propose your own fair market value directly / "
+    "no percentage ceiling' language above wherever they differ:\n"
+    "A deterministic comp ANCHOR (a dollar figure computed from the Strong/Supporting comps - "
+    "size-adjusted and evidence-weighted, not a naive average) is given to you in the "
+    "'DETERMINISTIC VALUATION INPUTS' block in the data, together with the subject's MARKET "
+    "EXPOSURE state. Do not recompute the anchor or present it as your own derivation. Your job "
+    "for the number: (1) start from the anchor; (2) in `qualitative_adjustments`, itemise every "
+    "material difference the comp math cannot capture (renovation/condition gap, guest apartment "
+    "or ADU, pool, architectural pedigree, views, setting/grounds, unusual layout) as a signed "
+    "dollar range with a `basis_type` and a written `basis`; (3) set `value` to anchor + the sum "
+    "of your adjustments, as a cross-check. The system then bounds each adjustment, applies the "
+    "market-exposure constraint, and computes the authoritative FMV - your `value` is not used "
+    "verbatim.\n"
+    "basis_type MUST be one of: paired_market_evidence (TWO comps IN THIS ANCHOR SET differ mainly "
+    "by this ONE feature, are otherwise similar in size/area/type, and you cite the actual price or "
+    "$/sqft gap between them - your dollar amount must fall INSIDE that observed gap, and any "
+    "dollar figure in your basis must match a real comp price); comp_inferred (the supplied comps "
+    "let you bound the contribution indirectly and you explain how); model_judgment (you believe "
+    "the feature affects value but have NO market evidence in this comp set for the dollar amount). "
+    "A comp merely having or lacking a feature is NOT paired_market_evidence - that establishes "
+    "only that a difference exists, never its dollar value; label that model_judgment. The system "
+    "VERIFIES every paired_market_evidence claim against the comp data and downgrades it (to "
+    "comp_inferred or model_judgment, with the tighter cap) if the cited comps don't both exist in "
+    "the anchor set, the figures don't match, the pair is confounded by another big difference, or "
+    "the amount exceeds the observed gap. model_judgment items are capped tighter, get lower "
+    "confidence, and share a small combined budget. Several adjustments that describe the SAME "
+    "underlying difference (e.g. 'renovated kitchen' + 'superior interior' + 'turnkey condition') "
+    "are collapsed into one - do not split one difference into several items to get around the "
+    "caps, and do not adjust for raw square footage or lot-area differences at all (the anchor "
+    "already handles size). `confidence` is REQUIRED on every adjustment and reflects your "
+    "confidence in the DOLLAR AMOUNT, not that the factor matters; a missing/invalid confidence is "
+    "treated as low. Every adjustment needs a written `basis` or it is dropped. Do NOT write "
+    "invented dollar figures for these features into methodology_summary prose - the numbers live "
+    "only in qualitative_adjustments; methodology_summary stays qualitative about them and still "
+    "ends with one clear indicated value/range.\n"
+    "If the Strong/Supporting comps are genuinely a poor match for the subject and you believe "
+    "the anchor itself is materially wrong, set anchor_dispute=true with a specific "
+    "anchor_dispute_reason; that widens your total adjustment room from +-12% to +-18% of the "
+    "anchor and caps confidence at medium. Otherwise your adjustments net to at most +-12% of the "
+    "anchor.\n"
+    "MARKET EXPOSURE: when the subject has had real time on the market with no accepted offer, an "
+    "FMV above the current list price is hard to support. If you land above list, explain "
+    "explicitly - from verified evidence - why the exposure is misleading (a specific "
+    "paired-comp premium the market has not recognised, say). If you cannot explain it "
+    "convincingly, keep the value at or below list. A price reduction already taken is downward "
+    "evidence. A QUICK CONTRACT is evidence of strong DEMAND, not evidence of a price - it removes "
+    "negative time-on-market pressure and supports confidence around the asking price, but it does "
+    "NOT by itself justify an above-list value; the comps and adjustments decide that. Only a "
+    "VERIFIED accepted contract/closing price (if given) pins the value. Extended time on market "
+    "with no offer weighs hard against any above-list conclusion. Do not invent a hard day-count "
+    "adjustment - weigh exposure alongside the comps.\n"
+    "AUTHORITATIVE PROPERTY FACTS: each property includes an authoritative_property_features "
+    "snapshot derived only from structured MLS fields and public remarks. That snapshot owns hard "
+    "amenity/accessory-space presence, primary area, and documented system updates for comp notes, "
+    "quality ratings, adjustments, and final prose. Generated narrative is interpretation only and "
+    "must never create, negate, or overwrite one of those facts.\n"
+    "PHOTOS vs VERIFIED FACTS: photos are good for VISIBLE condition judgement - updated vs dated "
+    "finishes, renovation quality, curb appeal, architectural character, staging, obvious wear. "
+    "Photos are NOT evidence of roof age, HVAC/plumbing/electrical condition, structural "
+    "soundness, permits, or hidden defects - never infer those from a photo; state them only from "
+    "verified data, and phrase anything unconfirmed as 'verify X'. A home's age by itself is not "
+    "evidence of deferred maintenance or deficient systems. Unknown system ages/history are "
+    "unverified due-diligence items, not a downward qualitative adjustment; price a system issue "
+    "only when the supplied property record documents the condition or a specific market-supported "
+    "difference. Never call the subject's systems updated unless that update is documented. Keep detached/accessory space "
+    "(guest house, ADU) and finished basement area OUT of the primary square footage - value them "
+    "as separate qualitative_adjustments, never blended dollar-for-dollar with above-grade area.\n"
+    "HEDGE LANGUAGE: when a comp's structured quality rating for a SPECIFIC dimension is already "
+    "committed "
+    "(finish_quality / interior / exterior / street_context set to 'above' or 'below'), state the "
+    "comparison as fact in that comp's note and in value_drivers - e.g. 'Comp #1 is materially "
+    "superior in finish and renovation quality.' Do NOT write 'may exceed', 'might be superior', "
+    "'appears more updated', 'could be higher-end', 'potentially superior', or 'likely exceeds' "
+    "for a comparison your own ratings have already committed to. Reserve may / might / appears / "
+    "could / potentially strictly for genuinely uncertain inferences (e.g. a condition read from "
+    "a single photo).\n"
+    "SQUARE FOOTAGE COMPOSITION: the deterministic anchor already normalizes the comps' $/sqft to "
+    "an above-grade basis - it strips a below-grade contribution (a paired-comp rate when the set "
+    "supports one, otherwise a bounded fallback heuristic that also reduces that leg's confidence) "
+    "before comparing per-foot figures, and down-weights a comp whose finished-area split can't be "
+    "resolved. Do NOT then also file a qualitative_adjustment for raw finished-basement square "
+    "footage - that double-counts. A finished lower level's contribution over and above that "
+    "normalization (a true walk-out with a full second kitchen, say) can be one small "
+    "comp_inferred / model_judgment item, clearly described as the MARGINAL value only.\n"
+    "MARKET LOCATION vs. PHYSICAL MATCH: a comp that is an excellent physical match but sits in a "
+    "different school district or municipality, is rated 'Different Area', fronts a materially "
+    "busier street, or is materially farther than the rest of the set will be DEMOTED from strong "
+    "to supporting and/or have its weight reduced - physical similarity alone does not make a "
+    "reliable comp. To KEEP such a comp at 'strong', set strong_location_override=true with a "
+    "specific strong_location_override_reason AND a market_equivalence_evidence array of concrete, "
+    "checkable data points that the two locations trade the same (a same-tier sale on the comp's "
+    "street, matching $/sqft, a shared school, a shared commercial spine). A thin or generic "
+    "override is ignored and the comp is demoted anyway. Do NOT also file a separate large "
+    "dollar location adjustment for a comp whose weight was already reduced for location.\n"
+    "QUALITATIVE RECONCILIATION (applies to EVERY bucket, not just condition): if the comps "
+    "carrying most of the valuation weight are clearly one-sided vs. the subject on renovation / "
+    "condition, amenities (pool, spa, guest wing, garage), accessory space / ADU, layout, "
+    "lot / usable land, architectural quality, or street / location, the net effect on the number "
+    "for that bucket must NOT come out at ~$0. Resolve it in ONE of three explicit ways: "
+    "(A) file a signed adjustment IN that bucket sized to the gap (a 'down' when the weighted "
+    "comps are superior, an 'up' when they are inferior); (B) itemise the specific supported "
+    "subject advantages in OTHER buckets that genuinely offset it, each an 'up'/'down' item with a "
+    "real written basis; or (C) set captured_elsewhere on a filed item to one of "
+    "size_normalization / below_grade_normalization / location_weighting / comp_classification / "
+    "outlier_weighting / exposure when a deterministic mechanism already accounts for that "
+    "difference (do not also charge a dollar amount for it). A near-zero net with NONE of A/B/C is "
+    "rejected; offsets held up only by model_judgment are scaled back and the net is allowed to "
+    "move in the signalled direction. If a comp's note says the subject should trade below (or "
+    "above) that comp because it is more renovated, has amenities the subject lacks, has superior "
+    "land / architecture, or draws a broader buyer pool, that observation MUST also appear as a "
+    "filed adjustment or offset - the same fact cannot live only in a comp note or in "
+    "methodology_summary. Every offset you describe in methodology_summary (guest apartment / ADU, "
+    "pool, grounds, street, architectural pedigree) MUST exist as a filed qualitative_adjustments "
+    "item with a written basis - a deterministic check rejects the export otherwise. No "
+    "narrative-only valuation logic.\n"
+    "METHODOLOGY 'WHY THIS NUMBER': methodology_summary must walk the reader, in plain language "
+    "with no formulas or weights, through the actual forces that produced the value - the "
+    "comparable-sales anchor, the two or three comps that moved it most, any size or "
+    "finished-basement normalization, the renovation/condition read and how it was reflected or "
+    "offset, meaningful location/street differences, accessory-space value, market exposure, and "
+    "any list-price cap - then end with one clear indicated value/range. If the value is materially "
+    "above or below the asking price, say explicitly why the closed-sale evidence supports that.\n"
+)
 
 _SYSTEM_PROMPT = (
     "You are assisting a real estate agent by analyzing comparable sold properties against a "
     "subject property, for a Comparative Market Analysis (CMA). You will be given structured "
-    "data for a subject property and several comparable sold properties, plus listing photos and "
-    "(sometimes) a map/street-view image for each. "
+    "data for a subject property and several comparable sold properties (including each one's "
+    "MLS listing description, when available - read it for renovation/update claims, notable "
+    "features, or condition context that the data fields and photos alone might not fully "
+    "capture), plus listing photos for each and (when included) one small overhead location map "
+    "per property. That map only shows "
+    "roads, blocks, and nearby land use at a glance - use it only for a broad locational read "
+    "(e.g. corner lot, busy road frontage, backs to woods/water, distance to a visible commercial "
+    "strip), never to judge the property itself or anything a listing photo would show better. If "
+    "no map is included for a property, don't claim to have looked at its surroundings beyond what "
+    "the structured data (distance, city, school district) tells you. "
+    "Work in this order and do not skip steps: (1) read every subject and comp's full data fields, "
+    "MLS description, and photos first, before forming any opinion; (2) note each comp's exact "
+    "numeric facts (sale price, $/sqft, sale date, days on market, distance, lot size, year built) "
+    "so you have them to check against later; (3) determine every comp's strength and quality "
+    "ratings by comparing it directly against the subject on those facts and what the photos/"
+    "materials show; (4) only then write each comp's note and the subject's final estimate - before "
+    "submitting, cross-check every comp's note against the OTHER comps' actual numbers so two notes "
+    "never contradict each other or the final estimate (e.g. don't praise one comp's low price as a "
+    "bargain in one note while treating a similar price on another comp as a sign of inferiority). "
+    "Each subject/comp section header names exactly how you must refer to it in your prose - e.g. "
+    "\"Comp #2 (112 Dovecote Ln)\" - use that exact label (or just \"the subject\"/\"Comp #2\"), "
+    "never the property's internal listing_key or any other ID, and never invent your own "
+    "numbering. Each comp's data ALSO includes its own listing_key field - that field exists "
+    "solely so you can copy its exact value into the listing_key field of the matching comp "
+    "object in your submit_cma_analysis call; never write that value anywhere in your prose. "
     "Only reference facts present in the data or clearly visible in the images - never invent a "
-    "specific number (price, square footage, sale date, feature) that isn't given to you. If an "
+    "specific number (price, square footage, sale date, feature) that isn't given to you. Never "
+    "claim a property LACKS something (a basement, updates, a garage) or is original / never updated "
+    "unless the data says so - check authoritative_property_features (basement, "
+    "documented_finish_updates, documented_system_updates) first - and never treat a 'future' or "
+    "'potential' use in the remarks as a feature the home has. If an "
     "image shows a condition, finish quality, or location detail (e.g. busy road, cul-de-sac, "
     "backs to woods) worth noting, say so, but don't overstate what a photo can actually tell you. "
-    "For each comp, write 2-4 sentences explaining why it likely sold for more or less than the "
+    "Write every sentence the way an experienced agent would after personally walking the "
+    "comps and reviewing the file - never in a tone that sounds like an AI describing what it "
+    "detected. Specifically banned, in any form: 'reads as', 'reads more', 'reads like', "
+    "'appears to read'. Say the plain thing instead - 'The interior is more dated than the "
+    "subject.' / 'The renovation quality is superior.' / 'The home has a more suburban custom-"
+    "home feel.' / 'The property presents as a higher-end turnkey product.' Never mention that "
+    "you (the AI) saw a photo or inferred something, and never reference this system's own "
+    "internal field names, flags, or QA/verification terminology in your prose - if a fact needs "
+    "a caveat (e.g. an unverified closing price), phrase it the way an agent would talk to a "
+    "client, not the way a data pipeline would log it. "
+    "For each comp: write 2-4 sentences explaining why it likely sold for more or less than the "
     "subject would be expected to, referencing price per square foot, notable feature "
-    "differences, and any condition/location signal visible in its photos. Then give one overall "
-    "estimated value, a low-high range, a confidence level, and a short methodology summary for "
-    "the SUBJECT property. Call submit_cma_analysis with your results - do not respond with plain "
-    "text."
+    "differences, and any condition/location signal visible in its photos; only assert a "
+    "directional relationship (subject should price above/below this comp) if it is arithmetically "
+    "consistent with the actual $/sqft or sale price you were given for THIS comp - if this comp's "
+    "$/sqft is higher than the subject's own list-price $/sqft or your own estimate, you may not "
+    "say the subject should price above it without a specific, comp-specific, data-backed reason "
+    "(a stated feature difference - never a generic appeal to 'buyers prefer established character', "
+    "'mature trees/landscaping', 'scarcity value', or similar real-estate cliches that aren't tied to "
+    "a fact actually given to you); classify it with the `strength` field using EXACTLY three "
+    "labels - strong (a close, reliable local sale the value leans on: same area, close in "
+    "size, recent), supporting (a reasonable comp, genuinely useful but with real differences - "
+    "moderate weight), weak (a real sale but a poor match - different product/market, far, or "
+    "too dissimilar - shown for context, little or no weight). There is no 'primary', 'market "
+    "context', or 'excluded' label. Do NOT push a genuinely comparable sale down to weak just "
+    "because it is newer, or over one non-fatal difference - a same-school-district, similar-"
+    "size, recent sale is strong or supporting; adjust for the difference in the note instead "
+    "of dismissing it. A comp being materially MORE or LESS renovated / higher- or lower-finish "
+    "than the subject is by itself a reason for a directional renovation_condition ADJUSTMENT, "
+    "never a reason to drop an otherwise same-market, similar-size / age / type / lot / street, "
+    "recent, price-verified sale to weak - strength answers how RELEVANT the sale is as market "
+    "evidence (same micro-market, distance, property type, size, lot, age/style, street, sale "
+    "recency, data quality), and the adjustment layer carries the condition difference. Only "
+    "classify a close-in sale weak for condition when the PRODUCT itself is radically different "
+    "(a full luxury rebuild vs. an original-condition tear-down, say) so that no bounded "
+    "adjustment can bridge it. Your classification MUST agree with your own note AND with how you use "
+    "the comp in methodology_summary: a comp your methodology leans on to set the value must be "
+    "strong or supporting, never weak; a comp your note calls 'context only' / 'a different "
+    "market' / 'should not drive value' must be weak, and your methodology must not lean on it. "
+    "A comp whose closing price is marked unverified in its data_note is at most weak. Rate its "
+    "quality relative to the SUBJECT across finish quality, interior, exterior/curb appeal, lot/"
+    "land, amenities, and layout/usable space (below/similar/above for each), plus area and "
+    "street_context (see below) - base these on the data and whatever the photos actually show, and "
+    "leave a field out if there's truly nothing to judge it by. A smaller or larger lot is not "
+    "inherently more or less valuable just because it exists - only rate lot as above/below, or cite "
+    "lot size as a value driver in your note, if there's a concrete stated reason (e.g. the larger "
+    "lot fronts a major road, which many buyers see as a downside, or a specific usable-space "
+    "difference) - never assume a smaller lot is more desirable, or a larger one is, without that. "
+    "Call out qualitatively, wherever the data or photos show it, any of these concrete feature "
+    "differences that could matter to a buyer: a pool, a guest house/carriage house/pool house/ "
+    "accessory apartment, garage count, acreage, notable views, a cul-de-sac or quiet-street "
+    "position, and architectural style. Describe WHY each one matters (privacy, usable space, "
+    "scarcity, buyer appeal) - never attach an invented dollar figure or percentage to it; that "
+    "belongs only in premium_improvements' qualitative estimated_value_context field, never a "
+    "number you weren't given. "
+    "Each comp note must stand on that comp's sale, size, condition, location, and feature facts. "
+    "Never compare a comp with the conclusion you are trying to prove using circular wording such "
+    "as 'below what our estimate implies', 'above our indicated value', or equivalent language. "
+    "Do not infer deferred maintenance, worn systems, defects, or original components from year "
+    "built alone. When system age or condition is absent, call it unverified or uncertain. "
+    "Pay particular attention to how modern/recently updated vs. dated/needs-updating each "
+    "property looks - kitchen and bathroom fixtures, flooring, and finishes are the clearest "
+    "photo signal for this. Use each property's given age (property_age_years) as a reference "
+    "point, not a substitute for what you can actually see: an older property that's been "
+    "renovated should be treated as updated despite its age, and a newer property with worn or "
+    "original finishes should be treated as dated despite being newer. This is usually the single "
+    "biggest driver of finish_quality - weight it accordingly. "
+    "For exterior/curb appeal specifically: when given, trust construction_materials/"
+    "exterior_features/roof_type/architectural_style data over a visual guess from photos alone - "
+    "a listing's stated materials are more reliable than what a photo suggests. As a general "
+    "material-quality guide, stone and brick rank above siding, and siding ranks above stucco "
+    "(stucco is a lower-quality, higher-maintenance exterior material than the others, all else "
+    "equal) - don't rate a property's exterior 'above' a comp that is entirely stone or brick if "
+    "that property has any meaningful stucco, unless you have a specific stated reason to override "
+    "that. As a default (not an absolute rule), a property built within roughly the last 10 years "
+    "is usually 'above' an older, unrenovated comp on exterior quality - UNLESS it has meaningful "
+    "stucco, or the comp you're rating it against is built entirely of stone; state whichever fact "
+    "actually drove your rating rather than just asserting it. "
+    "Rate area as different_from_subject, similar_to_subject, or same_as_subject based ONLY on "
+    "school_district and city - same_as_subject only when both match the subject exactly, "
+    "similar_to_subject when one matches or the two are evidently close/adjacent, "
+    "different_from_subject otherwise. This is a factual comparison only, never a value judgment - "
+    "do not use 'better' or 'worse' language for area, and do not let it influence your estimate on "
+    "its own (school district/city match is informational, not a quality rating). Separately, rate "
+    "each comp's street_context as below/similar/above, the SAME direction-and-scale you use for "
+    "finish quality, interior, exterior, lot, amenities, and layout - unlike area, this one IS a "
+    "quality judgment: compare that comp's street/positional character (using its address and the "
+    "location map when available: a cul-de-sac or quiet interior street vs. a numbered highway/"
+    "route, a wide arterial road, or a street the map/address suggests carries real through-"
+    "traffic) against the SUBJECT's own street character, and rate the COMP relative to the "
+    "subject - above when the comp's street setting is quieter/more desirable than the subject's, "
+    "below when it's busier/less desirable, similar when they're comparable. This is a rating, not "
+    "a description, so commit to one of the three values rather than writing a sentence about it. "
+    "A road_context_note is given for the subject and most comps - an OpenStreetMap read of the "
+    "ACTUAL roads within ~30-180 m of each property (quiet residential / cul-de-sac vs. fronts or "
+    "sits near a major road / arterial / highway, with the posted speed when OSM has it). Treat "
+    "road_context_note as the PRIMARY signal for street_context; use the address and the location "
+    "map only to sanity-check or break a tie. "
+    "If the difference is an important factor - e.g. one of the two fronts a major road, highway, "
+    "or busy street where passing traffic around 30+ mph would be audible and the other doesn't - "
+    "say so explicitly in that comp's note as well, so the rating is never left unexplained; a "
+    "cul-de-sac or quiet interior street is generally a meaningfully better position and worth "
+    "calling out in the note when it's the difference-maker. A quiet interior street / cul-de-sac "
+    "generally supports a modest premium over an otherwise-identical home fronting a 30+ mph road "
+    "or one lot off a highway - buyers weigh whether kids can bike and walk the street - so when "
+    "street position MATERIALLY separates the subject from the comp set (e.g. subject on a "
+    "cul-de-sac, a strong comp fronting an arterial), reflect it in your value via a "
+    "views_setting adjustment in the correct direction AND name it in methodology_summary. Omit "
+    "street_context only if road_context_note is absent AND the map/address give no real signal - "
+    "don't guess. "
+    "Propose your own fair market value estimate for the subject property directly - like an "
+    "experienced appraiser would, not a mechanical average. Ground it in the comps' actual sale "
+    "prices and $/sqft (weight Strong comps most heavily, Supporting comps moderately; a Weak "
+    "comp should barely move your number), the subject's own data, and what the photos and "
+    "listing descriptions actually show. Do NOT anchor yourself to a simple average or median of "
+    "the comps' $/sqft - if the evidence clearly supports a value meaningfully above or below "
+    "that naive math (a stand-out renovation or feature, a real defect, a comp set that's "
+    "actually a poor match for the subject), say so specifically and estimate accordingly; there "
+    "is no percentage ceiling on how far your estimate can move from a naive comps average, only "
+    "on how well you can justify it. If the subject's own days_on_market is over 14, it has not "
+    "sold at its current list_price - that is real, meaningful negative evidence weighing against "
+    "an estimate above list_price, and you should generally need a specific, comp-backed reason "
+    "(not just optimism) to still land above it. It is NOT an absolute ceiling you are blocked "
+    "from crossing - if the comp evidence genuinely supports a value above a stale asking price "
+    "(e.g. the seller is simply under-priced relative to the market), say so explicitly and "
+    "explain why in methodology_summary; a deterministic check will flag (not block) an above-list "
+    "estimate on a stale listing either way, so your own reasoning is what the agent will judge it "
+    "by. Then set a confidence range width and level, and a methodology_summary that names the "
+    "specific comps and evidence that drove your number (not just 'consistent with the comps') - "
+    "then fill value_drivers with the 2-3 comps that most influenced that number, matching what "
+    "methodology_summary already says. "
+    "Fill in premium_improvements whenever you believe the subject's finishes/condition/features "
+    "justify a genuine premium over what a typical comp in this price tier would command. Return "
+    "one object per distinct improvement or feature - do NOT combine multiple items into one long "
+    "paragraph, and do NOT use a vague type like 'AI-Identified Premium'. Use specific type labels "
+    "such as 'Renovated Kitchen', 'Guest Apartment', 'Estate Lot', 'Pool & Terraces', or "
+    "'Historic Stone Colonial Character'. Each item's description should explain why that single "
+    "feature matters to value/resale appeal. Only include features that are part of the valuation "
+    "bridge - meaning they explain why the subject should price above otherwise similar comps or "
+    "why it should hold value despite age, condition, or other differences. Fill approx_size only "
+    "for true interior/building-area improvements when the data gives a real size "
+    "(e.g. 1,279 sqft guest apartment). Do not fill approx_size for yard, lot, acreage, pool, "
+    "terrace, patio, grounds, or other outdoor-living features - mention those scale details in "
+    "the description only if they matter. Leave premium_improvements empty or omitted if "
+    "there's no clear premium to call out. "
+    "If this CMA is for a BUYER (stated at the top of the data), the agent sees your output split "
+    "across three separate sections. Be strict about this: each section answers exactly one "
+    "question, must never repeat a fact (a comp, a $/sqft comparison, a feature, an inspection "
+    "item, the valuation reasoning) that belongs in another section, and should be as short as it "
+    "can be while still fully answering its own question - no restating, no throat-clearing, no "
+    "padding. Formatting: whenever a field covers more than one distinct topic, put a blank line "
+    "between each one - do not run multiple topics together in one dense paragraph. Use "
+    "'**Bold Header:**' at the start of a subsection only when it is genuinely a new topic, never "
+    "as inline emphasis mid-sentence (e.g. do not bold a dollar figure or short phrase inside an "
+    "ongoing sentence - that looks like a heading and breaks the paragraph apart). "
+    "(1) methodology_summary is the ONLY place for comparable sales, $/sqft comparisons, property "
+    "feature adjustments, and value justification. End it with one clear indicated value/range, "
+    "stated once. Nothing about inspection/condition or offer strategy belongs here. "
+    "(2) inspection_concerns identifies only property-specific items the buyer should investigate "
+    "- due diligence, condition, utilities, systems, roof/exterior, septic/well. Do not assume a "
+    "defect exists: phrase these as what to verify, not as a diagnosis. An unknown roof, septic, or "
+    "system condition is due-diligence uncertainty, not deferred maintenance or a defect - do not "
+    "describe it as either unless an actual defect is stated in the data. Clearly distinguish a "
+    "known fact from the data (e.g. sewer is septic) from something the buyer still needs to "
+    "confirm (e.g. roof age/condition unknown - request records). Consolidate a repeated concern "
+    "(e.g. septic) into one subsection rather than repeating it. Tie each recommendation to its "
+    "real cause - e.g. recommend a septic inspection because the property uses septic, not because "
+    "of the home's age. Separate each subsection (utilities, roof, structure, HVAC, etc.) with a "
+    "blank line and its own '**Header:**' - do not merge them into one continuous paragraph. No "
+    "valuation, pricing, or "
+    "negotiation commentary here. "
+    "(3) offer_strategy_considerations must NOT discuss individual comps or redo the valuation "
+    "analysis - start from the value already established in methodology_summary and cover only: "
+    "opening offer, likely negotiation range, important contingencies, and negotiation strategy. "
+    "Keep this substantially shorter than methodology_summary - a few sentences, not a full "
+    "write-up. Do not infer the seller's motivation, market interest level (e.g. 'moderate market "
+    "interest'), or firmness on price from days_on_market alone, and do not treat a long ownership "
+    "tenure (e.g. 40+ years) as evidence the seller will hold near list - neither is a reliable "
+    "signal on its own. Do not invent "
+    "standard contract terms or financing requirements beyond a brief, generic reference to "
+    "keeping an appropriate inspection contingency - if you don't have a specific, evidence-based "
+    "reason for a particular term, leave it out rather than filling space with boilerplate. Do not "
+    "reference named tests, reports, or terms (e.g. 'HST results') that were not provided in the "
+    "supplied data. "
+    "Utilities must be exact: if the subject water_source says public water, say public water; do "
+    "not call it a well or recommend a well test unless water_source/public_remarks explicitly "
+    "says well/private water. If sewer says septic/on-site septic, recommend septic inspection. If "
+    "sewer says public sewer, do not describe it as septic. Once you've stated public water and/or "
+    "on-site septic from the data, stay consistent for the rest of your answer - never later refer "
+    "to a 'sewer connection' or public sewer for the same property. If a utility is unknown, say to confirm "
+    "it rather than asserting it. Always recommend a general home inspection unless new/recent "
+    "construction. For stucco, base any specialized recommendation on build era, the documented "
+    "wall assembly, and actual evidence: pre-1980 stucco is commonly over masonry/stone and should "
+    "not trigger invasive testing merely because stucco is present; later stucco over wood framing "
+    "or sheathing makes moisture testing more relevant; and a home built within roughly the last "
+    "five years should not automatically receive an invasive-testing recommendation absent a stated "
+    "or visible concern. When the assembly is unknown, say it is unverified and recommend confirming "
+    "the construction before deciding whether invasive testing is warranted. Call out "
+    "slate or cedar roof specialist only if stated/visible. Same rule for any other specialized "
+    "inspection beyond the general one - a structural engineer report, for example - only "
+    "recommend it if the data/photos show an actual indicator (visible cracking, stated settlement, "
+    "documented water intrusion), never just because a home is old or has been renovated/added "
+    "onto; age or updates alone are covered by the general inspection already, not a separate "
+    "specialist. Likewise don't speculate about smart-home/tech risk (software glitches, vendor "
+    "lock-in, integration issues) just because a property has automated systems - that's generic "
+    "anxiety, not a real concern, unless the data actually says something is unreliable or "
+    "unsupported. Leave inspection_concerns and "
+    "offer_strategy_considerations out entirely if this CMA is for a SELLER/listing, not a buyer "
+    "(methodology_summary is still always required). "
+    "Before calling submit_cma_analysis, self-check every number and fact you're about to submit "
+    "for internal consistency across the comp notes and subject_estimate - these are real, "
+    "specific mistakes to catch, not hypothetical: a $/sqft figure that's numerically higher than "
+    "your indicated value's $/sqft must be labeled 'above' it, never 'below' (and a lower figure "
+    "is 'below', never 'above'); an earlier construction year is OLDER than a later one (a 1929 "
+    "property is older than one built in 1931), never describe it as younger; every dollar amount "
+    "and $/sqft figure must be attributed to the correct property - never state the subject's own "
+    "number as if it were a comp's, or one comp's number as if it were another comp's. Verify your "
+    "own arithmetic on any percentage you state - e.g. an offer range of $3.05M-$3.10M against a "
+    "$3.199M list price is roughly 3-5% below list, not 2-3%; recompute it rather than guessing a "
+    "round number. Fix any such error before submitting, then run one final pass across "
+    "methodology_summary, inspection_concerns, and offer_strategy_considerations together checking "
+    "that both the facts and the math agree with each other. "
+    "In that final pass also check, and fix, these cross-references: a comp's note must not "
+    "describe its lot as smaller/larger in the direction opposite to its actual lot_size vs. the "
+    "subject; a comp's note must not state a days-on-market figure that contradicts its own "
+    "days_on_market field; and a comp you rated 'strong' or 'supporting' must actually be among "
+    "the properties your methodology_summary leans on for the value - if it is really only "
+    "context, rate it 'weak'; if your methodology leans on a comp, it cannot be 'weak'. "
+    "UNVERIFIED SOLD PRICE: if a comp's status is Sold but you were given no sale_price for it "
+    "(its price_per_sqft will also be blank), its actual closing price could NOT be verified - "
+    "treat that comp as context only (rate it 'weak'): never use its price or $/sqft in the "
+    "valuation reasoning, the subject value, or premium_improvements, and state in its note that "
+    "its closing price is unverified. "
+    "PRICE PER SQUARE FOOT IS ONE INPUT, NOT THE ENGINE: $/sqft varies materially with home size "
+    "(larger luxury homes typically trade at a lower $/sqft - diminishing marginal value), "
+    "condition, lot, school district, new vs. historic construction, pool, and accessory "
+    "buildings. Never drive the subject value primarily off a comp's raw $/sqft, and never "
+    "compare a much smaller or much larger comp to the subject on $/sqft alone without adjusting "
+    "for the size gap and saying you did. "
+    "ACCESSORY / FINISHED AUXILIARY SPACE: if the subject or a comp has meaningful finished space "
+    "outside the primary reported living area (guest apartment, carriage house, pool house, "
+    "in-law suite, finished basement, detached finished office), identify it by name, state "
+    "whether the reported sqft and $/sqft appear to exclude it, and estimate its contributory "
+    "value separately - do NOT add that space to primary living area dollar-for-dollar. This is "
+    "often why a subject looks expensive per square foot: valuable accessory space is excluded "
+    "from its MLS square footage. "
+    "TRACEABLE FINAL VALUE: methodology_summary must name the 2-3 comps that most drive the "
+    "number, the value range those comps imply for the subject, and the specific adjustments "
+    "(condition, size, lot, accessory space, location) that move the subject up or down within "
+    "that range - so the final value is clearly traceable to the comp analysis, not just "
+    "asserted. "
+    "Treat confidence as a genuine VALUATION confidence driven by STRUCTURED factors: number of "
+    "strong comps, number of supporting comps, geographic proximity, same township / school "
+    "district, sale recency, data completeness, any conflicting MLS facts, how unusual the "
+    "subject is, accessory-space complexity, and how far you had to extrapolate. 'high' ONLY "
+    "with 2+ genuinely local, recent, closely-similar VERIFIED-price STRONG comps that agree; "
+    "'low' when you leaned on distant/dissimilar sales, had few verified comps, thin or "
+    "conflicting data, or the subject is highly unusual; 'medium' otherwise. Having MORE total "
+    "comps on the page does NOT raise confidence when the extra ones are weak. "
+    "SQUARE-FOOTAGE COMPOSITION: a comp's data_note may state that its reported sqft includes a "
+    "large below-grade / finished-basement portion, or that the subject's value-relevant living "
+    "area excludes a detached guest apartment. Never compare $/sqft one-for-one across a "
+    "materially different above-grade / below-grade / detached split - say in your reasoning "
+    "when the composition differs and adjust for it. "
+    "OFFER GUIDANCE (buyer): base it on the subject's VERIFIED days_on_market and actual "
+    "pending/contingent timing (a subject already under contract is NOT a stale listing - its "
+    "high DOM predates the contract and is not evidence of weak demand or seller flexibility), "
+    "the actual verified closing prices of nearby comps and whether they closed above or below "
+    "asking, and the final weighted value - not an inflated DOM figure. If a strong nearby comp "
+    "closed over asking quickly, treat that as evidence of stronger demand. "
+    "\n\nHARD RULES - these override anything above if they conflict:\n"
+    "(A) SUBJECT STATUS & DAYS ON MARKET. A \"SUBJECT LISTING STATUS\" block gives you the "
+    "authoritative current status and the real active-market day count. Use those exact numbers. "
+    "NEVER compute days on market as (today minus list date). NEVER describe the subject as "
+    "\"active\", \"X days active\", \"still available\", or \"not yet under contract\" if the "
+    "status block says it is contingent, pending, under contract, or closed. \"Active-market days\" "
+    "is list date to the date it went under contract (or closed) - use THAT figure for any "
+    "time-on-market or negotiation-leverage statement, never the calendar days since listing.\n"
+    "(B) NO INVENTED DOLLAR PRECISION. Never state a specific dollar figure or dollar range for a "
+    "feature's contributory value, a repair, or a capital/replacement cost unless it is (1) the "
+    "actual price delta of a comp in THIS set that has that feature, (2) a figure explicitly given "
+    "in the supplied data, or (3) an agent-provided assumption. BANNED: \"adds $150K-$200K\", "
+    "\"worth 30-50% of build/land cost\", \"replacement ~$25K-$40K\", \"roughly $Xk\", and any "
+    "similar fabricated appraisal-level number. Use qualitative language instead - e.g. \"a "
+    "detached 1,279 sq ft guest apartment is meaningful contributory value not captured in the "
+    "primary living-area figure\"; \"a shake roof on an estate this size is a significant capital "
+    "item - verify its age and remaining useful life\". estimated_value_context must be "
+    "qualitative, never a dollar amount or a percent-of-cost.\n"
+    "(C) COMP-VS-SUBJECT DIRECTION. finish_quality / interior / exterior / lot / amenities / "
+    "layout describe THIS COMP RELATIVE TO THE SUBJECT: \"above\" = the comp is superior to the "
+    "subject on that dimension, \"below\" = the comp is inferior to the subject, \"similar\" = "
+    "roughly equal. Your written note MUST agree with the ratings - if you rate a comp's finish "
+    "\"above\" (comp is superior), do not elsewhere call the subject the more updated / higher-end "
+    "of the two.\n"
+    "(D) DUE-DILIGENCE LANGUAGE. Every inspection_concerns item is phrased as something to VERIFY "
+    "or CONFIRM - never as an assertion that a defect exists. BANNED unless the data literally "
+    "states it: \"likely requires\", \"may need replacement\", \"will leak\", \"may experience "
+    "standing water\", \"shows signs of\", \"deferred maintenance\", \"near the end of its useful "
+    "life\". ALLOWED: \"Verify the age and condition of the roof\", \"Confirm basement "
+    "waterproofing and any history of water intrusion\".\n"
+    "(E) STATUS-AWARE OFFER GUIDANCE. If the subject is ACTIVE: normal opening-offer strategy. If "
+    "CONTINGENT / PENDING / ACTIVE UNDER CONTRACT: it is already under agreement - frame guidance "
+    "for a BACKUP offer or buyer/comparable analysis only, do not present a live negotiation, do "
+    "not use the pre-contract DOM as leverage. If CLOSED: no forward-looking offer guidance at all "
+    "- a brief retrospective note only.\n"
+    "(F) NUMBERS ARE TRACEABLE. Every number you write must come from the structured data or a "
+    "calculation you can show - never restate a figure from memory. A price-per-square-foot figure "
+    "is written \"$575/sq ft\", never \"$575M\". Re-read every dollar figure, percentage, unit, and "
+    "comp count against the data before submitting.\n\n"
+    + _V10_VALUATION_RULES +
+    "Call submit_cma_analysis with your results - do not "
+    "respond with plain text."
 )
 
 _SUBMIT_TOOL = {
@@ -66,6 +578,94 @@ _SUBMIT_TOOL = {
                     "properties": {
                         "listing_key": {"type": "string"},
                         "note": {"type": "string", "description": "2-4 sentences on why this comp likely sold higher/lower than the subject"},
+                        "strength": {
+                            "type": "string",
+                            "enum": ["strong", "supporting", "weak"],
+                            "description": (
+                                "Valuation classification - EXACTLY one of three, and it MUST match how you "
+                                "use the comp in methodology_summary: "
+                                "strong = a close, reliable local sale the value leans on (same area, close "
+                                "in size, recent); supporting = a reasonable comp, genuinely useful but with "
+                                "real differences - moderate weight; weak = a real sale but a poor match "
+                                "(different product/market, far, or too dissimilar) - shown for context, "
+                                "little or no weight in the number. "
+                                "Do NOT downgrade a genuinely comparable sale to weak just because it is "
+                                "newer or has one non-fatal difference - a same-school-district, similar-size, "
+                                "recent sale is strong or supporting; adjust for the difference in the note. "
+                                "If your methodology_summary leans on a comp to set the value, it MUST be "
+                                "strong or supporting here - never weak. If your note calls a comp 'context "
+                                "only' / 'a different market', it MUST be weak AND your methodology must not "
+                                "lean on it."
+                            ),
+                        },
+                        "quality": {
+                            "type": "object",
+                            "description": (
+                                "This comp's quality relative to the SUBJECT, per dimension: 'above' = the "
+                                "COMP is superior to the subject, 'below' = the COMP is inferior to the "
+                                "subject, 'similar' = roughly equal. Your written note MUST agree with these "
+                                "(don't rate a comp's finish 'above' and then call the subject the more "
+                                "updated one). Omit any field you can't judge from the given data/photos."
+                            ),
+                            "properties": {
+                                "finish_quality": {"type": "string", "enum": ["below", "similar", "above"], "description": "'above' = comp's finishes are superior to the subject's; 'below' = inferior."},
+                                "interior": {"type": "string", "enum": ["below", "similar", "above"], "description": "'above' = comp interior superior to subject."},
+                                "exterior": {"type": "string", "enum": ["below", "similar", "above"], "description": "'above' = comp exterior/curb appeal superior to subject."},
+                                "lot": {"type": "string", "enum": ["below", "similar", "above"], "description": "'above' = comp lot/land superior to subject (only with a concrete stated reason)."},
+                                "amenities": {"type": "string", "enum": ["below", "similar", "above"], "description": "'above' = comp amenities superior to subject."},
+                                "layout": {"type": "string", "enum": ["below", "similar", "above"], "description": "'above' = comp layout/usable space superior to subject."},
+                                "area": {
+                                    "type": "string",
+                                    "enum": ["different_from_subject", "similar_to_subject", "same_as_subject"],
+                                    "description": "Based ONLY on school_district and city match with the subject - never a value judgment.",
+                                },
+                                "street_context": {
+                                    "type": "string",
+                                    "enum": ["below", "similar", "above"],
+                                    "description": (
+                                        "This comp's street/positional character vs. the subject's own "
+                                        "(cul-de-sac/quiet interior street vs. a major road, highway, or busy "
+                                        "through-street) - a directional quality rating like the others above, "
+                                        "not a description: 'above' = the comp's street setting is quieter/more "
+                                        "desirable than the subject's, 'below' = busier/less desirable, "
+                                        "'similar' = comparable. If this is an important factor (e.g. one "
+                                        "property fronts real traffic and the other doesn't), also explain it in "
+                                        "this comp's note - don't leave it as a bare rating with no justification "
+                                        "anywhere. Omit if there's no real signal either way, don't guess."
+                                    ),
+                                },
+                            },
+                        },
+                        "strong_location_override": {
+                            "type": "boolean",
+                            "description": (
+                                "v10 Fix 2 - set true ONLY to keep a comp rated 'strong' when it carries "
+                                "multiple real location negatives vs. the subject (different school district or "
+                                "municipality, an explicitly 'different' area, a materially busier street, or "
+                                "materially farther than the rest of the set). The system will demote it to "
+                                "'supporting' UNLESS this override is set AND validated. Leave false/omitted "
+                                "otherwise - physical similarity alone is not enough."
+                            ),
+                        },
+                        "strong_location_override_reason": {
+                            "type": "string",
+                            "description": (
+                                "Required when strong_location_override is true - a specific, concrete "
+                                "explanation of why these two locations trade as the SAME micro-market "
+                                "(e.g. 'both feed the same downtown, same price tier, buyers cross-shop the "
+                                "two streets routinely'). A short or generic reason is rejected."
+                            ),
+                        },
+                        "market_equivalence_evidence": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Required when strong_location_override is true - 1+ concrete, checkable "
+                                "data points that the two locations trade equivalently: a same-tier sale on "
+                                "the comp's street vs. the subject's, matching $/sqft, a shared school, a "
+                                "shared commercial spine. Vague assertions are not evidence."
+                            ),
+                        },
                     },
                     "required": ["listing_key", "note"],
                 },
@@ -73,47 +673,3783 @@ _SUBMIT_TOOL = {
             "subject_estimate": {
                 "type": "object",
                 "properties": {
-                    "value": {"type": "number"},
-                    "range_min": {"type": "number"},
-                    "range_max": {"type": "number"},
+                    "value": {
+                        "type": "number",
+                        "description": (
+                            "Your own fair market value estimate for the subject property, in dollars. Base "
+                            "it on the comps' actual sale prices/$-per-sqft (weight Strong comps most "
+                            "heavily), the subject's own data, and what the photos/listing descriptions "
+                            "actually show - like an experienced appraiser would, not a mechanical average. "
+                            "No percentage ceiling on how far this can sit from a naive comps average if the "
+                            "evidence supports it - just explain your reasoning in methodology_summary."
+                        ),
+                    },
+                    "range_pct": {
+                        "type": "number",
+                        "description": f"Half-width of the confidence range as a percent of the final value, between {_MIN_RANGE_PCT} and {_V10_RANGE_MAX_PCT}. The system will not let the final range be TIGHTER than the deterministic comp anchor's own spread, and will widen it (up to {_V10_RANGE_MAX_PCT}%) when the comp evidence is thin or inconsistent - a range near {_V10_RANGE_TIGHT_PCT}% is only for an excellent, tight closed-sale comp set.",
+                    },
                     "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
-                    "methodology_summary": {"type": "string"},
+                    "methodology_summary": {
+                        "type": "string",
+                        "description": (
+                            "Answers ONLY 'what is it worth, and why' - all comp analysis, $/sqft "
+                            "comparisons, feature adjustments, and valuation reasoning belong here and "
+                            "ONLY here. No inspection/condition items, no offer/negotiation strategy. As "
+                            "short as it can be while still justifying the number - end with one clear "
+                            "indicated value/range, stated once, not repeated."
+                        ),
+                    },
+                    "value_drivers": {
+                        "type": "array",
+                        "description": (
+                            "The 2-3 comps that most influenced your value estimate. For each, name it "
+                            "EXACTLY as given to you (e.g. 'Comp #2'), say whether it pushed your estimate "
+                            "up, down, or was roughly neutral (compare ITS OWN $/sqft to your estimate's "
+                            "implied $/sqft - your direction will be checked against the real numbers), and "
+                            "explain why in one sentence - grounded in the numbers AND in anything numbers "
+                            "alone can't show (condition, amenities, accessory space, location character). "
+                            "Never invent a dollar figure not already given to you. Only reference a comp "
+                            "that actually carries weight in your valuation (rated strong or supporting)."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "comp_ref": {"type": "string", "description": "Exact label given to you, e.g. 'Comp #2'."},
+                                "direction": {"type": "string", "enum": ["up", "down", "neutral"]},
+                                "note": {"type": "string", "description": "One sentence, grounded in real data."},
+                            },
+                            "required": ["comp_ref", "direction", "note"],
+                        },
+                    },
+                    "qualitative_adjustments": {
+                        "type": "array",
+                        "description": (
+                            "v10 - the itemised +/- dollar differences between the subject and the "
+                            "deterministic comp ANCHOR that the comp math cannot capture on its own "
+                            "(renovation/condition gap, guest apartment or ADU, pool, architectural "
+                            "pedigree, views, setting/grounds, unusual layout). One object per distinct "
+                            "factor. The system applies these to the anchor under per-item caps, an "
+                            "evidence-class sub-cap, and an overall +-12% (or +-18% disputed) bound - do "
+                            "not try to reach a target number by stacking items. Omit entirely for a "
+                            "seller CMA with a clean comp set and no material qualitative differences."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "factor": {"type": "string", "description": "The single feature/difference, e.g. 'Detached 1,279 sqft guest apartment' or 'Kitchen/primary-bath renovation gap vs Comp #1'."},
+                                "direction": {"type": "string", "enum": ["up", "down"], "description": "'up' = raises the subject's value above the anchor, 'down' = lowers it."},
+                                "amount_low": {"type": "number", "description": "Low end of the dollar contribution (absolute dollars, positive number regardless of direction)."},
+                                "amount_high": {"type": "number", "description": "High end of the dollar contribution (absolute dollars)."},
+                                "basis_type": {
+                                    "type": "string",
+                                    "enum": ["paired_market_evidence", "comp_inferred", "model_judgment"],
+                                    "description": (
+                                        "paired_market_evidence = two comps IN THIS SET differ mainly by "
+                                        "this one feature and you cite the actual price/$-per-sqft gap; "
+                                        "your amount must fall inside that gap. comp_inferred = the comps "
+                                        "let you bound it indirectly and you explain how. model_judgment = "
+                                        "you believe it matters but have no market evidence in this set "
+                                        "for the amount (a comp merely lacking a feature is model_judgment, "
+                                        "never paired_market_evidence). model_judgment is capped tighter "
+                                        "and gets lower confidence."
+                                    ),
+                                },
+                                "basis": {"type": "string", "description": "One or two sentences citing the specific comps/figures/reasoning behind the dollar amount. REQUIRED - an item with no basis is dropped."},
+                                "confidence": {"type": "string", "enum": ["low", "medium", "high"], "description": "Your confidence in the DOLLAR AMOUNT (not that the factor matters). model_judgment should rarely be 'high'."},
+                                "captured_elsewhere": {
+                                    "type": "string",
+                                    "enum": ["size_normalization", "below_grade_normalization", "location_weighting", "comp_classification", "outlier_weighting", "exposure"],
+                                    "description": (
+                                        "Optional. Set this (with amount_low/high = 0) when a real, material one-sided "
+                                        "difference on this factor exists but a deterministic mechanism already accounts "
+                                        "for it, so no separate dollar amount should be charged - e.g. a busier-street comp "
+                                        "whose weight was already cut (location_weighting), or a finished-basement gap the "
+                                        "anchor already normalized (below_grade_normalization). The reconciliation accepts "
+                                        "this as the explanation for a ~$0 net on that bucket instead of demanding an "
+                                        "adjustment. Do NOT use it to wave off a difference nothing actually captured."
+                                    ),
+                                },
+                            },
+                            "required": ["factor", "direction", "amount_low", "amount_high", "basis_type", "basis", "confidence"],
+                        },
+                    },
+                    "anchor_dispute": {
+                        "type": "boolean",
+                        "description": (
+                            "v10 - set true ONLY if the Strong/Supporting comps are genuinely a poor "
+                            "match for the subject and you believe the deterministic anchor itself is "
+                            "materially wrong (not just that qualitative adjustments are needed). Widens "
+                            "the total adjustment bound from +-12% to +-18% of the anchor and caps "
+                            "confidence at medium. Leave false/omitted in the normal case."
+                        ),
+                    },
+                    "anchor_dispute_reason": {
+                        "type": "string",
+                        "description": "Required when anchor_dispute is true - the specific reason the comp anchor is unreliable for this subject (e.g. 'all three Strong comps are 1990s-2000s builds; the subject is a restored 1920s stone estate with no true peer in the set').",
+                    },
+                    "premium_improvements": {
+                        "type": "array",
+                        "description": (
+                            "Specific subject-property features/improvements that justify a premium. "
+                            "Return one object per distinct feature, never one combined paragraph. "
+                            "Only include features that explain why the subject should price above "
+                            "otherwise similar comps or hold value despite a meaningful difference."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {
+                                    "type": "string",
+                                    "description": "Specific feature label, e.g. 'Guest Apartment', not 'AI-Identified Premium'.",
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "description": "Why this one feature supports value/resale appeal.",
+                                },
+                                "approx_size": {
+                                    "type": "string",
+                                    "description": (
+                                        "Only if explicitly supported for an interior/building-area "
+                                        "improvement, e.g. '1,279 sqft guest apartment'. Leave blank "
+                                        "for yard, lot, acreage, pool, terrace, patio, grounds, or "
+                                        "other outdoor-living features."
+                                    ),
+                                },
+                                "estimated_value_context": {
+                                    "type": "string",
+                                    "description": (
+                                        "Brief QUALITATIVE value context only, e.g. 'Supports the value "
+                                        "estimate through scarcity and utility.' NEVER a dollar amount, "
+                                        "dollar range, or percent-of-cost figure."
+                                    ),
+                                },
+                            },
+                            "required": ["type", "description"],
+                        },
+                    },
+                    "premium_justification": {
+                        "type": "string",
+                        "description": (
+                            "Legacy fallback only. Prefer premium_improvements. If used, keep it to one "
+                            "specific feature, not a numbered list or combined paragraph."
+                        ),
+                    },
+                    "offer_strategy_considerations": {
+                        "type": "string",
+                        "description": (
+                            "BUYER CMAs only (leave out entirely for a seller/listing CMA) - answers ONLY "
+                            "'what should the buyer offer, and how should the offer be structured': "
+                            "opening offer, likely negotiation range, important contingencies, and "
+                            "negotiation strategy. Do NOT discuss individual comps or redo the valuation "
+                            "analysis - start from the value already established in methodology_summary "
+                            "(e.g. 'Given the $3.2M indicated value above, an opening offer of "
+                            "$3.05M-$3.10M...'). Do not infer seller motivation, market interest, or price "
+                            "firmness from days_on_market alone, and do not treat long ownership tenure (e.g. "
+                            "40+ years) as evidence the seller will hold near list. Verify any percentage you "
+                            "state against the actual numbers (e.g. $3.05M-$3.10M off a $3.199M list is "
+                            "roughly 3-5% below list, not 2-3%). Do not invent standard contract terms, "
+                            "financing requirements, or named tests/terms not present in the supplied data, "
+                            "beyond a brief generic reference to an inspection contingency. Keep this substantially "
+                            "shorter than methodology_summary - a few sentences, not a full write-up. Keep "
+                            "detailed inspection/condition concerns in inspection_concerns instead."
+                        ),
+                    },
+                    "inspection_concerns": {
+                        "type": "string",
+                        "description": (
+                            "BUYER CMAs only - REQUIRED and never empty for a buyer CMA, including "
+                            "when the subject is already under contract (the buyer analysis / backup "
+                            "position still needs it): always give at least the general home "
+                            "inspection plus the standard due-diligence items that apply from the "
+                            "subject's own data - water source, sewer/septic, HVAC/water heater/"
+                            "electrical age, and roof age. For stucco, recommend invasive moisture "
+                            "testing only when the build era, documented wood-framed/sheathing "
+                            "assembly, or actual moisture/damage evidence supports it; do not trigger "
+                            "it from the word stucco alone, especially for pre-1980 masonry/stone "
+                            "construction or homes built within roughly the last five years. "
+                            "Answers ONLY 'what should the buyer investigate or be "
+                            "concerned about'. Titled sections (each starting with its own "
+                            "'**Header:**' and separated from the next by a blank line - never run "
+                            "them together in one paragraph) covering inspection/property-condition "
+                            "concerns, utilities, septic/well, roof/exterior, structure, systems, and "
+                            "due-diligence items - no valuation or negotiation commentary. Do not assume a "
+                            "defect exists - phrase items as what to verify, not a diagnosis, and clearly "
+                            "distinguish a known fact from the data from something the buyer still needs to "
+                            "confirm. An unknown roof/septic/system condition is due-diligence uncertainty, "
+                            "not deferred maintenance or a defect, unless the data states an actual defect. "
+                            "Tie each recommendation to its real cause (e.g. recommend a septic inspection "
+                            "because the property uses septic, not because of the home's age). Consolidate a repeated concern (e.g. septic) into one subsection "
+                            "rather than repeating it under multiple headers. Be exact about water/sewer "
+                            "fields: public water is not a well; septic is not public sewer; unknown means "
+                            "confirm, not assert. Stay consistent - never state public water/septic and "
+                            "later refer to a sewer connection for the same property. Only recommend a "
+                            "specialized inspection beyond the general one (structural engineer, etc.) if the "
+                            "data/photos show an actual indicator - never just because a home is old or "
+                            "renovated. Don't speculate about smart-home/tech risk (software glitches, vendor "
+                            "lock-in) just because a property has automated systems - that's generic filler, "
+                            "not a real concern, unless the data says something is actually unreliable."
+                        ),
+                    },
                 },
-                "required": ["value", "range_min", "range_max", "confidence", "methodology_summary"],
+                "required": ["value", "range_pct", "confidence", "methodology_summary"],
             },
         },
         "required": ["comps", "subject_estimate"],
     },
 }
 
-# Fields pulled out of the subject/comp dicts for the text half of the prompt - deliberately just
-# the fields already on CmaSubjectProperty/CmaComparable (schemas/cma.py), nothing new invented.
+_ESTIMATE_ONLY_TOOL = {
+    "name": "submit_cma_estimate",
+    "description": "Submit only the final value estimate for the subject property.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "subject_estimate": _SUBMIT_TOOL["input_schema"]["properties"]["subject_estimate"],
+        },
+        "required": ["subject_estimate"],
+    },
+}
+
+
+def _tool_for_mode(tool: dict, mode: str) -> dict:
+    """Deep-copies a tool schema so a per-request tweak never leaks into the shared module-level
+    tool across concurrent requests, then - for a BUYER CMA - promotes inspection_concerns and
+    offer_strategy_considerations from optional to required. Without this, nothing stopped the
+    model from writing a thorough inspection_concerns and then simply omitting
+    offer_strategy_considerations entirely on a given generation - both fields were always
+    described as buyer-only in the prompt/schema text, but neither was ever enforced as
+    required, so the field silently disappearing was a schema gap, not a token-budget problem
+    (confirmed via the usage log: stop_reason was a clean "tool_use", nowhere near the output
+    token cap, when this was first reported missing). Anthropic's tool use guarantees the
+    generated arguments satisfy the schema, so marking these required is a hard guarantee the
+    key is present for a buyer report - not just a prompt nudge - the same way the 4 seller
+    fields already were."""
+    tool = copy.deepcopy(tool)
+    if mode != "buyer":
+        return _add_seller_guidance_fields(tool)
+    subject_estimate_schema = tool["input_schema"]["properties"].get("subject_estimate")
+    if isinstance(subject_estimate_schema, dict):
+        required = subject_estimate_schema.setdefault("required", [])
+        for field in ("inspection_concerns", "offer_strategy_considerations"):
+            if field not in required:
+                required.append(field)
+    return tool
+
+
+# The seller/listing mirror of the buyer's two narrative sections (offer strategy + inspection
+# concerns). Added ONLY to the per-request copy of the tool for a seller CMA - never to the shared
+# module-level schema - so a buyer request still sends a byte-identical tool and nothing about
+# buyer generation can shift. No dollar figures on purpose: the value/range can still move after
+# this text is drafted (reasoning authority, exposure gate, reconciliation), and the buyer side
+# needs a whole rebuild pipeline to keep its quoted offer numbers in sync - the seller sections sit
+# right under the authoritative numbers in the report, so they refer to them instead of restating.
+_SELLER_GUIDANCE_FIELDS = {
+    "listing_strategy_considerations": {
+        "type": "string",
+        "description": (
+            "SELLER/LISTING CMAs only - REQUIRED and never empty. Answers ONLY 'how should this home "
+            "be priced and positioned when it goes on the market'. Written to the homeowner, from the "
+            "listing agent's point of view, as a few short titled sections (each starting with its own "
+            "'**Header:**' and separated by a blank line) - e.g. **Pricing Position:** where the list "
+            "price should sit relative to the recommended value and why (the comps that set the ceiling "
+            "and floor, by their Comp # labels); **Competition:** how this home stacks up against the "
+            "active/recent alternatives a buyer will compare it to; **Overpricing Risk:** what happens "
+            "if it is listed meaningfully above the supported value (longer market time, price cuts, "
+            "weaker final sale) - grounded in the comps' own market times where available; **Launch:** "
+            "anything about this specific home a buyer will weigh first. Do NOT write any dollar figure, "
+            "price, percentage of price, or $/sqft number - refer to 'the recommended list price' or 'the "
+            "supported value range' instead, which are shown right above this section. Do NOT redo the "
+            "valuation analysis already in methodology_summary. Do not infer the owner's motivation or "
+            "timeline. Keep it substantially shorter than methodology_summary."
+        ),
+    },
+    "listing_prep_concerns": {
+        "type": "string",
+        "description": (
+            "SELLER/LISTING CMAs only - REQUIRED and never empty. The seller-side mirror of a buyer's "
+            "inspection concerns: answers ONLY 'what should the owner address, gather, or be ready to "
+            "disclose before listing, because a buyer's inspection and due diligence will surface it'. "
+            "Titled sections (each starting with its own '**Header:**', separated by a blank line) "
+            "tied to the subject's own data - water source, sewer/septic, HVAC/water heater/electrical "
+            "age, roof age, exterior/stucco by build era and construction type, and any condition gap "
+            "vs. the comps that will cost the owner at the negotiating table. Suggest a pre-listing "
+            "inspection or specific service record only where the data supports it. Do not assume a "
+            "defect exists - phrase items as what to verify or have documented, and clearly separate a "
+            "known fact from something to confirm. Be exact about water/sewer: public water is not a "
+            "well; septic is not public sewer; unknown means confirm. No dollar figures, no valuation or "
+            "pricing commentary."
+        ),
+    },
+}
+
+
+def _add_seller_guidance_fields(tool: dict) -> dict:
+    """Seller-only: adds + requires the two listing narrative fields on an already-deep-copied tool,
+    and drops the two buyer-only narrative fields from that same copy so the model can't confuse
+    inspection_concerns with listing_prep_concerns (neither buyer field is ever shown on a seller
+    report anyway)."""
+    subject_estimate_schema = tool["input_schema"]["properties"].get("subject_estimate")
+    if isinstance(subject_estimate_schema, dict):
+        props = subject_estimate_schema.setdefault("properties", {})
+        required = subject_estimate_schema.setdefault("required", [])
+        for buyer_only in ("offer_strategy_considerations", "inspection_concerns"):
+            props.pop(buyer_only, None)
+            if buyer_only in required:
+                required.remove(buyer_only)
+        for field, spec in _SELLER_GUIDANCE_FIELDS.items():
+            props[field] = copy.deepcopy(spec)
+            if field not in required:
+                required.append(field)
+    return tool
+
+_ESTIMATE_ONLY_SYSTEM_PROMPT = (
+    "You are assisting a real estate agent with a CMA. Return only the subject_estimate tool "
+    "payload: a numeric fair market value, a range_pct, confidence, methodology_summary, "
+    "value_drivers, the itemised qualitative_adjustments (one signed dollar item per material "
+    "difference vs. the deterministic comp ANCHOR that the comp math cannot capture - "
+    "renovation/condition gap, amenities, accessory space / ADU, pool, architectural pedigree, "
+    "views, setting/grounds, unusual layout - each with a basis_type and a written basis, per the "
+    "VALUATION METHOD rules below; do NOT leave a material one-sided difference your comp ratings "
+    "commit to unpriced, and do not put its dollar figure only in methodology_summary), "
+    "anchor_dispute / anchor_dispute_reason when the anchor itself is materially wrong, and buyer "
+    "inspection_concerns + buyer offer_strategy_considerations when "
+    "applicable. Do not write comp notes in this call. If the subject's days_on_market is over 14, "
+    "that is real negative evidence weighing against a value above list_price (not an absolute "
+    "ceiling) - only land above it with a specific, comp-backed reason stated in "
+    "methodology_summary. These text fields are shown to the agent as separate sections - "
+    "be strict, keep each as short as it can be while answering its own question, and never repeat "
+    "a fact across them: methodology_summary is the ONLY place for valuation reasoning (comps, "
+    "$/sqft, feature adjustments), ending with one clear indicated value/range stated once; "
+    "inspection_concerns is property-condition/due-diligence only - REQUIRED for a buyer CMA and "
+    "never empty, including when the subject is under contract (the backup-position analysis still "
+    "needs it): always give at least the general home inspection plus the standard items that "
+    "apply from the subject's own data (water source, sewer/septic, HVAC/water-heater/electrical "
+    "age and roof age). For stucco, use build era, documented construction type, and actual "
+    "condition evidence; do not automatically recommend invasive testing from stucco presence "
+    "alone, especially for pre-1980 masonry/stone construction or homes built within roughly the "
+    "last five years. Don't assume a defect exists, "
+    "distinguish known facts from things to verify, and consolidate a repeated concern (e.g. "
+    "septic) into one subsection, each subsection starting with its own '**Header:**' and "
+    "separated from the next by a blank line, never run together in one paragraph. Only recommend "
+    "a specialized inspection (structural engineer, etc.) beyond the general one if the data shows "
+    "an actual indicator, never just because a home is old/renovated, and don't speculate about "
+    "smart-home/tech risk without an actual reason from the data; "
+    "offer_strategy_considerations must NOT discuss comps or redo the "
+    "valuation - start from the value already given (e.g. 'Given the $3.2M indicated value "
+    "above...'), cover only opening offer/negotiation range/contingencies/strategy, don't infer "
+    "seller motivation, market interest, or price firmness from days_on_market alone or from long "
+    "ownership tenure, and don't invent contract/financing terms or named tests/terms not in the "
+    "supplied data. Keep it "
+    "substantially shorter than methodology_summary. Unknown roof/septic/system condition is "
+    "due-diligence uncertainty, not a defect, unless the data states an actual defect - and once "
+    "you've stated public water/septic, never later refer to a sewer connection for the same "
+    "property. Before answering, self-check that every "
+    "number is internally consistent and attributed to the correct property (a higher $/sqft than "
+    "your value must be called 'above' it, not 'below'; an earlier construction year is older, not "
+    "younger), and verify your own percentage math (e.g. $3.05M-$3.10M off a $3.199M list is "
+    "roughly 3-5% below list, not 2-3%). Run one final cross-section factual and mathematical "
+    "consistency check across all three text fields before returning the result. "
+    "HARD RULES: (A) a \"SUBJECT LISTING STATUS\" block gives the authoritative status and "
+    "active-market day count - use those, never compute DOM as (today - list date), and never call "
+    "the subject \"active\"/\"X days active\" if it is contingent/pending/closed. (B) never invent "
+    "a dollar figure or range for a feature's value, a repair, or a capital cost (\"adds "
+    "$150K-$200K\", \"replacement ~$25K-$40K\", \"30-50% of build cost\" are all banned) - use "
+    "qualitative language. (C) every inspection_concerns item is something to VERIFY, never a "
+    "diagnosis (\"likely requires\", \"may experience standing water\", \"deferred maintenance\" "
+    "are banned unless the data states it). (D) offer guidance must match status: active -> normal; "
+    "contingent/pending -> backup-offer framing only; closed -> brief retrospective note only. "
+    "(E) a $/sqft figure is \"$575/sq ft\", never \"$575M\"; every number must trace to the data."
+    + _V10_VALUATION_RULES
+)
+
+# Seller/listing only - appended to (never edits) the shared prompt above, which lists the buyer
+# sections by name. Seen live: without this, the seller retry returned only the four core fields and
+# skipped both listing sections despite the tool marking them required.
+_SELLER_ESTIMATE_ONLY_ADDENDUM = (
+    "\n\nTHIS IS A SELLER/LISTING CMA. Ignore the buyer inspection_concerns / "
+    "offer_strategy_considerations instructions above - those fields do not exist for this report. "
+    "You MUST also return listing_strategy_considerations and listing_prep_concerns (both required, "
+    "never empty), written for the homeowner and their listing agent, following each field's own "
+    "description exactly - including NO dollar figures in either."
+)
+
+
+def _estimate_only_system_prompt(mode: str) -> str:
+    return _ESTIMATE_ONLY_SYSTEM_PROMPT if mode == "buyer" else _ESTIMATE_ONLY_SYSTEM_PROMPT + _SELLER_ESTIMATE_ONLY_ADDENDUM
+
+
+
+def _guidance_fields(mode: str) -> dict:
+    if mode != "buyer":
+        return copy.deepcopy(_SELLER_GUIDANCE_FIELDS)
+    props = _SUBMIT_TOOL["input_schema"]["properties"]["subject_estimate"]["properties"]
+    return {k: copy.deepcopy(props[k]) for k in ("inspection_concerns", "offer_strategy_considerations") if k in props}
+
+
+def _guidance_system_prompt(mode: str) -> str:
+    if mode != "buyer":
+        return (
+            "You are a top listing agent writing two sections of a Comparative Market Analysis for a "
+            "HOMEOWNER who is deciding what to list their home for. The valuation is already done - you are "
+            "given the subject home, the comparable sales (with the analyst's notes on each) and the "
+            "methodology summary. Write listing_strategy_considerations and listing_prep_concerns exactly as "
+            "each field's description says: speak to the homeowner, plain confident language, refer to "
+            "comparables by their Comp # labels, NO dollar figures and NO percentages of price (the report "
+            "shows the authoritative numbers right above these sections). Never talk about making an offer, "
+            "negotiating as a buyer, or a buyer's inspection plan - this report is for the seller. Both "
+            "fields are required and must not be empty."
+            " FACTS ONLY: state only what the DOCUMENTED FACTS, listing remarks, or comp notes actually say. Never claim the home lacks something (a basement, updates, a garage), is original / never updated, or has a feature (an in-law suite, a finished basement) unless the data says exactly that - a 'future' or 'potential' use is not a feature. If something is unknown, say to confirm it rather than guessing."
+        )
+    return (
+        "You are a top buyer's agent writing two sections of a Comparative Market Analysis for a BUYER "
+        "deciding what to offer on the subject home. The valuation is already done - you are given the "
+        "subject home, the comparable sales (with the analyst's notes on each) and the methodology "
+        "summary. Write inspection_concerns and offer_strategy_considerations exactly as each field's "
+        "description says, in plain confident language for the buyer, referring to comparables by their "
+        "Comp # labels. Do NOT state specific dollar offer amounts (the report computes those from the "
+        "final value right beside this text) - describe the strategy and the reasons. "
+        "inspection_concerns must name at least three SPECIFIC things to have checked on THIS home, each "
+        "as '**Item:** why it matters here and what to ask the inspector to look at' - drawn from its age, "
+        "systems, roof, basement / lower level, water and sewer, lot and drainage, and anything the "
+        "listing remarks, photos or comps raise. A generic 'get a home inspection' line is not enough. "
+        "Both fields are required and must not be empty."
+        " FACTS ONLY: state only what the DOCUMENTED FACTS, listing remarks, or comp notes actually say. Never claim the home lacks something (a basement, updates, a garage), is original / never updated, or has a feature (an in-law suite, a finished basement) unless the data says exactly that - a 'future' or 'potential' use is not a feature. If something is unknown, say to confirm it rather than guessing."
+    )
+
+
+def _guidance_content(subject: dict, comps: list, ai_comps: list, se: dict) -> str:
+    """Compact, text-only brief for the seller guidance pass (no photos - cheap and focused)."""
+    lines = ["SUBJECT HOME:"]
+    s = subject or {}
+    lines.append(", ".join(str(x) for x in (
+        s.get("street_address"), s.get("city"), f"{s.get('beds') or '?'} bd", f"{s.get('baths') or '?'} ba",
+        f"{s.get('sqft') or '?'} sqft", f"built {s.get('year_built') or '?'}", s.get("property_type"),
+    ) if x))
+    for key in ("public_remarks", "basement", "below_grade_finished_area", "lot_size", "garage", "heating", "cooling",
+                "water_source", "sewer", "roof_type"):
+        if s.get(key):
+            lines.append(f"{key}: {str(s.get(key))[:700]}")
+    _feat = _authoritative_property_features(s)
+    lines.append("DOCUMENTED FACTS (from the MLS record - the only facts you may state about this home): "
+                 + json.dumps({k: _feat.get(k) for k in ("basement", "accessory_features", "documented_finish_updates",
+                                                          "documented_system_updates", "amenities")}, default=str))
+    _tl = s.get("_status_timeline") or {}
+    if _tl.get("summary_lines"):
+        lines.append("MARKET STATUS: " + " ".join(str(x) for x in _tl["summary_lines"])[:900])
+    notes = {c.get("listing_key"): (c.get("commentary") or c.get("ai_commentary") or "") for c in ai_comps if isinstance(c, dict)}
+    lines.append(chr(10) + "COMPARABLE SALES:")
+    for i, c in enumerate(comps or [], 1):
+        lines.append(
+            f"Comp #{i}: {c.get('street_address')}, {c.get('beds') or '?'} bd / {c.get('baths') or '?'} ba, "
+            f"{c.get('sqft') or '?'} sqft, status {c.get('status')}, days on market {c.get('days_on_market') or '?'}."
+            + (f" Analyst note: {notes.get(c.get('listing_key'))[:600]}" if notes.get(c.get("listing_key")) else "")
+        )
+    if se.get("methodology_summary"):
+        lines.append(chr(10) + "VALUATION SUMMARY (for context - do not restate numbers): " + str(se["methodology_summary"])[:1500])
+    return chr(10).join(lines)
+
+# Extra fields joined in from the raw Bright MLS Property row (see _enrich_with_property_data) -
+# construction/exterior detail that CmaSubjectProperty/CmaComparable never stored (those mirror
+# only what the report-builder UI shows), added specifically so exterior-material judgments
+# (stone/brick/siding/stucco) can be grounded in what Bright actually reported instead of a photo
+# guess alone. Not present for manually-added comps/subjects (no listing_key to join on) - _format_
+# block already skips any field whose value is None/empty, so those just render without them.
+_PROPERTY_ENRICHMENT_FIELDS = [
+    "architectural_style", "construction_materials", "roof_type", "foundation_details", "exterior_features",
+    # Above/below-grade split + new-construction flag - previously joined in but only used
+    # internally (a basement-composition data_note); now first-class AI-visible fields too, so the
+    # model can compare above-grade living area directly instead of only ever seeing one blended
+    # total sqft figure. See _comp_evidence_score for the deterministic side of the same split.
+    # home_type: CmaComparable's own schema has no property_type field (only the subject does) -
+    # this is the only way a comp's structural type (SINGLE_FAMILY/TOWNHOUSE/CONDO/...) reaches
+    # either the AI or _comp_evidence_score's property-type-compatibility check.
+    "above_grade_finished_area", "below_grade_finished_area", "new_construction_yn", "home_type",
+    # Structured MLS feature lists (JSONB) - where a pool / guest house / theater / sauna / wine
+    # cellar / elevator / sport court actually lives when it isn't spelled out in the marketing
+    # paragraph. Feeds both the AI's amenity read and the deterministic _derive_amenities_gap
+    # cross-check. public_remarks itself is backfilled separately in _merged() (the Property
+    # column is `description`, not `public_remarks`).
+    "interior_features", "lot_features", "association_amenities", "structure_type", "view",
+]
+# Hard location facts consumed only by the deterministic shadow relevance trace. They are kept
+# separate so enabling the shadow does not change Claude's or Astra's production prompt payload.
+_RELEVANCE_ENRICHMENT_FIELDS = ["township", "subdivision_name", "county"]
+
+# Newer high-value Bright fields that are intentionally retained in Property.raw_mls_data rather
+# than adding a database column for every RESO attribute. The canonical CMA evidence packet reads
+# them from the same freshly synced Property row as the column-backed fields above.
+_RAW_PROPERTY_ENRICHMENT_FIELDS = {
+    "pool": "Pool",
+    "pool_features": "PoolFeatures",
+    "other_structures": "OtherStructuresList",
+    "patio_and_porch_features": "PatioAndPorchFeatures",
+    "hot_water": "HotWater",
+    "electric": "Electric",
+    "laundry_type": "LaundryType",
+    "parking_types": "ParkingTypes",
+    "garage_type": "GarageType",
+    "attached_garage_spaces": "NumAttachedGarageSpaces",
+    "driveway_spaces": "NumDrivewaySpaces",
+    "total_parking_spaces": "TotalGarageAndParkingSpaces",
+    "garage_sqft": "GarageSQFT",
+    "area_total": "AreaTotal",
+    "tax_total_finished_sqft": "TaxTotalFinishedSqFt",
+    "rooms_total": "RoomsTotal",
+}
+_RAW_PROPERTY_ENRICHMENT_KEYS = tuple(_RAW_PROPERTY_ENRICHMENT_FIELDS)
+
+# Fields pulled out of the subject/comp dicts for the text half of the prompt - the fields already
+# on CmaSubjectProperty/CmaComparable (schemas/cma.py), property_age_years (see _with_age, computed
+# not stored), plus _PROPERTY_ENRICHMENT_FIELDS above (joined in at generation time, not stored on
+# the report itself).
 _SUBJECT_FIELDS = [
     "street_address", "city", "state", "zipcode", "list_price", "beds", "baths", "sqft",
-    "lot_size", "year_built", "property_type", "garage", "basement", "days_on_market",
-    "mls_status", "last_sale_date", "last_sale_price", "school_district", "annual_taxes",
+    "lot_size", "year_built", "property_age_years", "property_type", "garage", "basement",
+    "days_on_market", "mls_status", "last_sale_date", "last_sale_price", "school_district",
+    "annual_taxes", "water_source", "sewer", "public_remarks",
+    # OSM road/street classification summary (road_context_service) - so the model's street_context
+    # rating is grounded in actual nearby road types + speed, not just the address + a map guess.
+    "road_context_note", *_PROPERTY_ENRICHMENT_FIELDS, *_RAW_PROPERTY_ENRICHMENT_KEYS,
+    "authoritative_property_features",
 ]
 _COMP_FIELDS = [
-    "street_address", "city", "state", "zipcode", "distance_miles", "sale_price", "list_price",
-    "sale_date", "days_on_market", "sqft", "lot_size", "beds", "baths", "year_built", "garage",
-    "basement", "price_per_sqft", "annual_taxes", "match_score",
+    "street_address", "city", "state", "zipcode", "distance_miles", "status",
+    "verified_close_price", "original_list_price", "list_price", "close_date", "sale_date",
+    "days_on_market", "cdom", "data_note",
+    "sqft", "lot_size", "beds", "baths", "year_built",
+    "property_age_years", "garage", "basement", "price_per_sqft", "annual_taxes", "school_district", "water_source", "sewer", "match_score", "road_context_note",
+    # Computed by _comp_evidence_score (see below), not raw MLS data - grounds the AI's own
+    # classification in a real, deterministic read of how comparable this comp actually is,
+    # instead of relying on vibes from the data/photos alone.
+    "deterministic_evidence_note",
+    "public_remarks", *_PROPERTY_ENRICHMENT_FIELDS, *_RAW_PROPERTY_ENRICHMENT_KEYS,
+    "authoritative_property_features",
+    # Included so the AI can echo it back in the listing_key field of its submit_cma_analysis
+    # tool call (that's the ONLY thing this value is for - see the system prompt's explicit
+    # instruction never to write it in prose). Regression note: this was previously only visible
+    # via the old "COMPARABLE (listing_key):" section header; when that header was changed to the
+    # friendlier "Comp #N (address)" label (to stop the AI quoting raw listing_keys in its prose),
+    # listing_key silently disappeared from the prompt entirely, so the AI had nothing to put in
+    # its tool call - every comp's ai_by_key lookup came up empty and ai_commentary/strength/
+    # quality all silently stopped populating. Putting it back here as a plain data field (not a
+    # header) fixes the matching without reintroducing it into the prose.
+    "listing_key",
 ]
+
+# Only three classifications are canonical / ever shown: strong | supporting | weak.
+# primary/context/excluded are legacy 5-tier values still in old saved reports - accepted on
+# read, normalised via _normalize_strength (primary->strong, context/excluded->weak).
+_STRENGTH_VALUES = {"strong", "supporting", "weak", "primary", "context", "excluded"}
+_CANONICAL_STRENGTHS = ("strong", "supporting", "weak")
+_STRENGTH_ALIASES = {"primary": "strong", "context": "weak", "excluded": "weak"}
+# Weight each classification carries in the weighted valuation. Mirrors COMP_WEIGHT in
+# frontend/lib/cma.ts - keep the two in sync. weak = shown on the page but zero weight in the
+# number.
+_COMP_WEIGHT = {"strong": 1.0, "supporting": 0.5, "weak": 0.0, "primary": 1.0, "context": 0.0, "excluded": 0.0}
+
+
+def _normalize_strength(value) -> Optional[str]:
+    """Legacy 5-tier value -> one of the 3 canonical ones. None stays None (unrated)."""
+    if not value:
+        return None
+    v = str(value).lower()
+    return _STRENGTH_ALIASES.get(v, v if v in _CANONICAL_STRENGTHS else "supporting")
+_QUALITY_FIELD_VALUES = {
+    "finish_quality": {"below", "similar", "above"},
+    "interior": {"below", "similar", "above"},
+    "exterior": {"below", "similar", "above"},
+    "lot": {"below", "similar", "above"},
+    "amenities": {"below", "similar", "above"},
+    "layout": {"below", "similar", "above"},
+    "area": {"different_from_subject", "similar_to_subject", "same_as_subject"},
+    # Unlike area (a factual district/city match with no direction), street_context IS a
+    # directional quality judgment - same below/similar/above domain as finish_quality/interior/
+    # etc, so it renders with the correct Comp Inferior/Similar/Comp Superior client-facing labels
+    # (QUALITY_LABELS in frontend/lib/cma.ts) instead of the area-specific "Different Area" wording.
+    "street_context": {"below", "similar", "above"},
+}
+
+def _norm_token(value) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _derive_quality_from_data(subject: dict, comp: dict) -> dict:
+    """Coarse comp-vs-subject ratings for the OBJECTIVE dimensions only, straight from structured
+    fields we already have - used to fill a matrix cell the agent AND the AI both left blank so
+    the comparison table isn't empty on data we hold. Deliberately limited to:
+      - area: school_district + city exact match (schema defines it as exactly this)
+      - lot:  lot_size delta
+    layout is NEVER derived here (a sqft ratio is not the same thing as usable-space layout - a
+    photo/description-based judgment call belongs to the AI alone). finish_quality / interior /
+    exterior / amenities / street_context are likewise never derived here - those need photo or
+    feature evidence and must not be guessed (round-4 "verify, don't imagine"). Returns only the
+    dimensions it can actually judge."""
+    out: dict = {}
+
+    s_school, c_school = _norm_token(subject.get("school_district")), _norm_token(comp.get("school_district"))
+    s_city, c_city = _norm_token(subject.get("city")), _norm_token(comp.get("city"))
+    matches = [m for m in (
+        (s_school == c_school) if (s_school and c_school) else None,
+        (s_city == c_city) if (s_city and c_city) else None,
+    ) if m is not None]
+    if matches:
+        if all(matches):
+            out["area"] = "same_as_subject"
+        elif any(matches):
+            out["area"] = "similar_to_subject"
+        else:
+            out["area"] = "different_from_subject"
+
+    def _band(subj_val, comp_val, hi: float, lo: float) -> Optional[str]:
+        s, c = _as_float(subj_val), _as_float(comp_val)
+        if not s or not c or s <= 0 or c <= 0:
+            return None
+        r = c / s
+        return "above" if r >= hi else "below" if r <= lo else "similar"
+
+    lot = _band(subject.get("lot_size"), comp.get("lot_size"), 1.25, 0.80)
+    if lot:
+        out["lot"] = lot
+    return out
+
+
+# Conservative address-only street_context fallback (item 7 / 2.2) - fills a blank
+# quality.street_context cell the AI left unrated (usually because the location map gave no real
+# signal). Deliberately weak-signal-aware: it only ever asserts a difference when BOTH sides land
+# in a HIGH-CONFIDENCE tier and disagree. A street name that merely CONTAINS one of these words
+# (e.g. "Pike Street") is not what's being matched - only the address's actual street-type suffix.
+_STREET_SUFFIX_QUIET = {"ct", "court", "cir", "circle", "cul-de-sac", "cul de sac"}
+_STREET_SUFFIX_THROUGH = {"pike", "turnpike", "highway", "hwy", "bypass", "route", "rte"}
+_ROUTE_NUMBER_RE = re.compile(r"\b(?:US|PA|SR)[-\s]?\d+\b", re.IGNORECASE)
+
+
+def _street_suffix_tier(address) -> Optional[str]:
+    """'quiet' | 'through' | 'neutral' | None (unparseable). Looks only at the street TYPE word
+    (the suffix, e.g. 'Ct' in '112 Dovecote Ct') or an explicit route-number pattern (e.g.
+    'PA-113') - never the street NAME itself, so a street literally named 'Pike Street' reads by
+    its suffix ('Street' -> neutral), not by the word 'Pike' inside its name."""
+    addr = str(address or "").strip()
+    if not addr:
+        return None
+    if _ROUTE_NUMBER_RE.search(addr):
+        return "through"
+    body = re.sub(r"^\s*\d+\w*\s*", "", addr)  # drop a leading house number
+    body = re.sub(r"\b(?:apt|unit|suite|ste|#)\b.*$", "", body, flags=re.IGNORECASE).strip()
+    tokens = [t.lower().strip(".,") for t in body.replace("-", " ").split() if t.strip(".,")]
+    if not tokens:
+        return None
+    if len(tokens) >= 3 and " ".join(tokens[-3:]) == "cul de sac":
+        return "quiet"
+    last = tokens[-1]
+    if last in _STREET_SUFFIX_QUIET:
+        return "quiet"
+    if last in _STREET_SUFFIX_THROUGH:
+        return "through"
+    return "neutral"
+
+
+def _street_tier(d: dict) -> Optional[str]:
+    """'quiet' | 'neutral' | 'through' | None. Prefers the OpenStreetMap road classification
+    (road_context.verdict, from road_context_service - actual road types + speed within ~170m),
+    falls back to the address street-type suffix when there's no OSM result."""
+    rc = d.get("road_context") or {}
+    v = rc.get("verdict")
+    if v in ("quiet", "neutral", "through"):
+        return v
+    return _street_suffix_tier(d.get("street_address"))
+
+
+def _derive_street_context(subject: dict, comp: dict) -> Optional[str]:
+    """Conservative deterministic fallback for a blank quality.street_context - fills the matrix
+    cell only when the AI/agent left it blank, never overrides an existing rating. Directional,
+    same below/similar/above domain as every other quality dimension (quiet is more desirable
+    than a through-street): "above" when the comp sits on the quieter/more-desirable tier and the
+    subject doesn't, "below" for the reverse, "similar" when both land in the same tier or either
+    side is neutral/unknown, and None only when the subject's own street can't be judged at all."""
+    subject_tier = _street_tier(subject)
+    if subject_tier is None:
+        return None
+    comp_tier = _street_tier(comp) or "neutral"
+    if subject_tier in ("quiet", "through") and comp_tier in ("quiet", "through") and subject_tier != comp_tier:
+        return "above" if comp_tier == "quiet" else "below"
+    return "similar"
+
+
+# High-signal "big deal" amenities a listing at this price tier all but always spells out
+# somewhere in its text - so their ABSENCE from one side's listing is a usable (if imperfect)
+# signal of a real gap. Each entry: (name, compiled regex). Kept deliberately strict - a bare
+# "pool" is allowed but "pool table" / "carpool" / "whirlpool" are excluded, etc.
+_AMENITY_PATTERNS: list[tuple[str, "re.Pattern"]] = [
+    ("indoor_pool", re.compile(r"\bindoor(?:\s|-)pool\b|\bpool\b[^.]{0,20}\bindoor\b", re.IGNORECASE)),
+    ("pool", re.compile(
+        r"(?<!car\s)(?<!whirl)\b(?:in[-\s]?ground pool|swimming pool|heated pool|gunite pool|"
+        r"salt[-\s]?water pool|infinity pool|lap pool|pool\s*(?:house|/\s*spa|and spa|&\s*spa)|\bpool\b)(?!\s*table)",
+        re.IGNORECASE)),
+    ("spa_sauna", re.compile(r"\b(?:sauna|steam\s?room|hot\s?tub|(?<!salt)\bspa\b(?!ce)|jacuzzi)\b", re.IGNORECASE)),
+    ("accessory_dwelling", re.compile(
+        r"\b(?:guest\s(?:house|apartment|apt|suite|quarters|cottage)|carriage house|coach house|guest[-\s]+wing|pool\s+house|"
+        r"in[-\s]?law\s(?:suite|apartment|apt|quarters)|accessory dwelling(?:\s*unit)?|\badu\b|casita|"
+        r"au\s?pair\ssuite|(?:apartment|apt|studio|suite)\s(?:over|above)\s(?:the\s)?garage|"
+        r"detached\s(?:studio|apartment|apt|office|guest\s\w+))\b", re.IGNORECASE)),
+    ("home_theater", re.compile(r"\b(?:home\s?theat(?:er|re)|movie\s?theat(?:er|re)|media\s?room|screening\s?room|cinema\s?room)\b", re.IGNORECASE)),
+    ("wine_cellar", re.compile(r"\bwine\s(?:cellar|room|vault|grotto)\b", re.IGNORECASE)),
+    ("elevator", re.compile(r"\b(?:elevator|residential lift)\b", re.IGNORECASE)),
+    ("home_gym", re.compile(r"\b(?:home\s?gym|exercise\s?room|fitness\s?room|workout\s?room)\b", re.IGNORECASE)),
+    ("sport_court", re.compile(r"\b(?:tennis court|pickleball court|basketball court|sport court|bocce court|squash court)\b", re.IGNORECASE)),
+    ("guest_waterfront", re.compile(r"\b(?:private (?:dock|beach)|deep[-\s]?water dock|boat (?:slip|house))\b", re.IGNORECASE)),
+]
+
+# Every dict field that can carry amenity language - the marketing paragraph plus the MLS's
+# structured feature lists (JSONB list -> str() still contains the words, e.g. "['In Ground Pool',
+# 'Patio']"). _enrich_with_property_data backfills all of these from the freshest Property row.
+_AMENITY_TEXT_FIELDS = (
+    "public_remarks", "exterior_features", "interior_features", "lot_features",
+    "association_amenities", "structure_type", "view",
+)
+
+_AUTHORITATIVE_PROPERTY_TEXT_FIELDS = (
+    *_AMENITY_TEXT_FIELDS,
+    "pool", "pool_features", "other_structures", "patio_and_porch_features",
+    "guest_house", "guest_apartment", "accessory_space", "accessory_unit", "adu",
+    "remarks", "listing_remarks", "condition", "property_condition", "renovation_level",
+    "systems", "systems_condition",
+    "construction_materials", "architectural_style", "roof_type", "foundation_details",
+    "heating", "heating_type", "cooling", "cooling_type", "utilities",
+)
+_ACCESSORY_EXPLICIT_FIELDS = (
+    "guest_house", "guest_apartment", "accessory_space", "accessory_unit", "adu",
+)
+
+
+def _authoritative_property_fact_blob(d: Optional[dict]) -> str:
+    """Hard property facts from MLS/structured fields, never generated commentary or QA text."""
+    data = d or {}
+    return " ".join(str(data.get(f) or "") for f in _AUTHORITATIVE_PROPERTY_TEXT_FIELDS)
+
+
+def _positive_fact_matches(blob: str, rx: "re.Pattern") -> bool:
+    """Match a documented feature while rejecting simple local negations such as 'no pool'."""
+    for match in rx.finditer(blob or ""):
+        prefix = blob[max(0, match.start() - 70):match.start()].lower()
+        if re.search(r"(?:\bno\b|\bwithout\b|\blacks?\b|does\s+not\s+have)\s+(?:an?\s+|the\s+)?$", prefix):
+            continue
+        if re.search(
+            r"(?:potential|opportunity|option|plans?|proposed|possible|future|ready|roughed|plumbed|wired)"
+            r"\s+(?:in\s+place\s+)?(?:for|to\s+(?:add|create|build|convert))\s+(?:an?\s+|the\s+)?$",
+            prefix,
+        ):
+            continue
+        if re.search(
+            r"(?:could|can|may)\s+be\s+(?:used|finished|converted|developed)\s+"
+            r"(?:as|into)\s+(?:an?\s+|the\s+)?$",
+            prefix,
+        ):
+            continue
+        # Hypothetical, not a feature the home has: "a future in-law suite", "potential guest house",
+        # "would make a great in-law suite", "perfect for an in-law suite" (seen live 2026-10-05: a
+        # garage described as space for "a future in-law suite" became a documented, value-adding
+        # suite in a seller's CMA).
+        if re.search(r"\b(?:future|potential|possible|prospective|optional|planned|would-be)\s+$", prefix):
+            continue
+        if re.search(r"\b(?:would|could|might)\s+(?:make|serve\s+as|be|become)\s+(?:an?\s+|the\s+)?"
+                     r"(?:great|perfect|ideal|nice|wonderful)?\s*$", prefix):
+            continue
+        if re.search(r"\b(?:ideal|perfect|great|room|space|potential|use)\s+(?:for|as)\s+(?:an?\s+|the\s+)?$", prefix):
+            continue
+        return True
+    return False
+
+
+def _amenity_blob(d: dict) -> str:
+    return _authoritative_property_fact_blob(d)
+
+
+def _has_amenity_text(d: dict) -> bool:
+    """True when we actually have listing text/features to scan for this property - so a blank
+    result means 'nothing notable', not 'we couldn't look'."""
+    return bool(_amenity_blob(d).strip())
+
+
+def _amenity_signals(d: dict) -> set:
+    """The set of high-signal amenities this property's listing text + feature lists document."""
+    blob = _amenity_blob(d)
+    signals = {name for name, rx in _AMENITY_PATTERNS if _positive_fact_matches(blob, rx)}
+    pool_value = d.get("pool")
+    pool_text = str(pool_value or "").lower()
+    if pool_value is True or (
+        pool_value not in (None, "", False, [], {})
+        and not re.search(r"\b(?:no|without)\s+(?:a\s+)?pool\b", pool_text)
+        and bool(re.search(r"\b(?:yes|pool)\b", pool_text))
+    ):
+        signals.add("pool")
+    if any(d.get(k) is True for k in _ACCESSORY_EXPLICIT_FIELDS):
+        signals.add("accessory_dwelling")
+    return signals
+
+
+def _explicit_accessory_features(data: Optional[dict]) -> list[str]:
+    """Documented accessory features from the authoritative property fields only."""
+    data = data or {}
+    blob = _authoritative_property_fact_blob(data)
+    terms = (
+        ("guest wing", "guest wing"), ("guest house", "guest house"),
+        ("guest apartment", "guest apartment"), ("carriage house", "carriage house"),
+        ("pool house", "pool house"), ("in-law suite", "in-law suite"),
+        ("in law suite", "in-law suite"), ("accessory dwelling", "accessory dwelling"),
+        ("accessory unit", "accessory unit"), ("adu", "ADU"),
+        ("apartment above", "apartment above garage"), ("apartment over", "apartment above garage"),
+    )
+    found = []
+    for token, label in terms:
+        rx = re.compile(rf"\b{re.escape(token)}\b", re.IGNORECASE)
+        if _positive_fact_matches(blob, rx):
+            found.append(label)
+    if any(data.get(k) not in (None, "", False, [], {}) for k in _ACCESSORY_EXPLICIT_FIELDS):
+        found.append("accessory dwelling")
+    return list(dict.fromkeys(found))
+
+
+_SYSTEM_NAMES_RE = re.compile(
+    r"\b(?:systems?|hvac|heating|cooling|air conditioning|central air|electrical|wiring|"
+    r"plumbing|water heater|boiler|furnace|sewer line|water service|roof|windows|gutters?)\b",
+    re.IGNORECASE,
+)
+_SYSTEM_UPDATE_RE = re.compile(
+    r"\b(?:new|all[- ]new|updated|upgraded|replaced|modernized|rewired|renovated)\b",
+    re.IGNORECASE,
+)
+
+
+_FINISH_UPDATE_TERMS = (
+    (r"upgraded countertops?", "upgraded countertops"), (r"granite(?:\s+countertops?)?", "granite countertops"),
+    (r"quartz(?:\s+countertops?)?", "quartz countertops"), (r"marble countertops?", "marble countertops"),
+    (r"stainless(?:[- ]steel)?\s+appliances|\bss\s+(?:oven|appliances)", "stainless appliances"),
+    (r"(?:renovated|updated|remodeled|new)\s+kitchen|kitchen\s+(?:was\s+|has\s+been\s+)?(?:renovated|updated|remodeled)", "updated kitchen"),
+    (r"(?:renovated|updated|remodeled|new)\s+(?:primary\s+|master\s+)?bath(?:room)?s?", "updated bathroom(s)"),
+    (r"kitchen\s*-\s*island|kitchen\s+island", "kitchen island"),
+    (r"hardwood\s+floor(?:s|ing)?|wood\s+floors", "hardwood floors"),
+)
+
+
+def _documented_finish_updates(data: Optional[dict]) -> list[str]:
+    """Finish features the listing itself documents (countertops, appliances, updated kitchen/
+    baths). Without this the model only saw system updates and called a kitchen with "Upgraded
+    Countertops" + granite "original-era, never updated" (seen live 2026-10-05)."""
+    blob = _authoritative_property_fact_blob(data)
+    found: list[str] = []
+    for pattern, label in _FINISH_UPDATE_TERMS:
+        if _positive_fact_matches(blob, re.compile(rf"\b(?:{pattern})\b", re.IGNORECASE)):
+            found.append(label)
+    return list(dict.fromkeys(found))
+
+
+def _documented_system_updates(data: Optional[dict]) -> list[str]:
+    """System names whose update is explicitly documented in authoritative property facts."""
+    blob = _authoritative_property_fact_blob(data)
+    found: list[str] = []
+    for match in _SYSTEM_NAMES_RE.finditer(blob):
+        before = blob[max(0, match.start() - 80):match.start()]
+        after = blob[match.end():min(len(blob), match.end() + 48)]
+        # "newer roof and gutter helmets, hot water heater" - one update word covers a short list
+        # (seen live 2026-10-05: the water heater update went unrecognized, so the report said none).
+        update_before = re.search(
+            r"\b(?:new|newer|brand[- ]new|all[- ]new|updated|upgraded|replaced|modernized|rewired)"
+            r"(?:[\s,&]+(?:and\s+)?\w+){0,7}[\s,&]*$", before, re.IGNORECASE,
+        )
+        update_after = re.match(
+            r"\s*(?:was|were|is|are|has been|have been)?\s*"
+            r"(?:new|updated|upgraded|replaced|modernized|rewired)\b", after, re.IGNORECASE,
+        )
+        if update_before or update_after:
+            found.append(match.group(0).lower())
+    return list(dict.fromkeys(found))
+
+
+def _documented_original_systems(data: Optional[dict]) -> bool:
+    """True only when authoritative facts connect original/dated status to a building system."""
+    blob = _authoritative_property_fact_blob(data).lower()
+    systems = r"(?:systems?|hvac|heating|cooling|electrical|wiring|plumbing|boiler|furnace|water\s+heater)"
+    if re.search(
+        rf"\b(?:original|dated|unupdated)\b.{{0,45}}\b{systems}\b|"
+        rf"\b{systems}\b.{{0,45}}\b(?:original|dated|unupdated)\b",
+        blob, re.IGNORECASE,
+    ):
+        return True
+    # Specific fuel/technology terms that are themselves unambiguous evidence of a dated system,
+    # independent of whether the listing happens to also use the word "original"/"dated" - a
+    # description built from these facts is just as supported as one that quotes that word.
+    return bool(re.search(
+        r"\boil\s+heat\b|\boil[- ]fired\b|\bknob\s+and\s+tube\b|\bfuse\s+box\b|\b\d+\s*amp\s+(?:electric|"
+        r"service)\b|\bcast[- ]iron\s+radiators?\b|\bgalvanized\s+(?:pipes?|plumbing)\b",
+        blob, re.IGNORECASE,
+    ))
+
+
+def _documented_deferred_maintenance(data: Optional[dict]) -> bool:
+    """Matches the substring check _factual_prose_blocking uses to decide an age/deferred-
+    maintenance inference is actually backed by the authoritative record."""
+    blob = _authoritative_property_fact_blob(data).lower()
+    return any(x in blob for x in ("deferred maintenance", "deferred-maintenance", "needs repair", "damage"))
+
+
+def _documented_condition_deficit(data: Optional[dict]) -> bool:
+    """Require an explicit condition statement; age and absent modernization history are neutral."""
+    blob = _authoritative_property_fact_blob(data).lower()
+    return bool(re.search(
+        r"\b(?:largely\s+original|original\s+condition|un-?renovated|un-?updated|"
+        r"dated\s+(?:condition|interior|kitchen|baths?|finishes?)|estate\s+condition|"
+        r"needs?\s+(?:updat|renovat)\w*|as[\s-]?is|being\s+sold\s+as[\s-]?is)\b|"
+        r"\boriginal\s+(?:kitchen|baths?|interior|finishes?|systems?|hvac|heating|cooling|"
+        r"electrical|wiring|plumbing|boiler|furnace|water\s+heater)\b",
+        blob, re.IGNORECASE,
+    ))
+
+
+# Mirrors _documented_condition_deficit for the opposite pole - a claim that a property is
+# renovated/turnkey/move-in-ready needs the same kind of explicit authoritative support as a claim
+# that it's original/unrenovated. Reuses the same vocabulary already trusted elsewhere in this file
+# for comp narratives (_V10_COMP_RENO_RE) so "documented renovated" means the same thing everywhere.
+def _documented_condition_renovated(data: Optional[dict]) -> bool:
+    """Require an explicit renovated/turnkey statement; a bare 'updated' adjective alone is not
+    enough on its own to claim the strong, client-facing 'turnkey' framing."""
+    blob = _authoritative_property_fact_blob(data).lower()
+    return bool(re.search(
+        r"\b(?:turnkey|turn-key|move[\s-]?in[\s-]?ready|fully\s+renovat\w+|fully\s+updated|"
+        r"newly\s+built|extensively\s+renovat\w+|gut[\s-]?renovat\w+|completely\s+renovat\w+|"
+        r"total(?:ly)?\s+renovat\w+|newly\s+renovat\w+|recently\s+renovat\w+|"
+        r"renovated\s+(?:kitchen|bath)|new\s+(?:kitchen|bath\w*|roof|windows?|hvac|systems?))\b",
+        blob, re.IGNORECASE,
+    ))
+
+
+_STREET_SUFFIX_WORDS_RE = re.compile(
+    r"\b(?:street|st|avenue|ave|road|rd|lane|ln|drive|dr|court|ct|place|pl|way|circle|cir|"
+    r"boulevard|blvd|terrace|ter|trail|trl|path|run|crossing|xing|square|sq|highway|hwy|"
+    r"parkway|pkwy|pike|turnpike)\.?\b", re.IGNORECASE,
+)
+
+
+def _subject_reference_pattern(subject: Optional[dict]) -> str:
+    """A regex alternation matching every way generated prose plausibly refers to the subject: the
+    word "subject" itself, or the bare street name agents commonly use as shorthand (e.g. "Cherry"
+    for "100 Cherry Ln"). Text-level QA checks that only recognized the literal word "subject" were
+    blind to a claim phrased as "Cherry is original/unrenovated" - the AI is never instructed to
+    write "the subject," so this is the common case, not an edge case."""
+    names: list[str] = []
+    addr = str((subject or {}).get("street_address") or "").strip()
+    if addr:
+        body = re.sub(r"^\s*\d+[\d\-/]*\s*", "", addr)
+        body = _STREET_SUFFIX_WORDS_RE.sub("", body).strip(" ,.")
+        names.extend(t for t in re.split(r"\s+", body) if len(t) >= 3)
+    alternation = "|".join([r"subject", *(re.escape(n) for n in names)])
+    return rf"(?:{alternation})(?:'s|’s)?"
+
+
+def _documented_original_elements(data: Optional[dict]) -> bool:
+    """Require explicit original architectural-element evidence, not any use of 'original'."""
+    blob = _authoritative_property_fact_blob(data).lower()
+    return bool(re.search(
+        r"\boriginal\s+(?:architectural\s+)?(?:features?|elements?)\b|"
+        r"\b(?:architectural\s+)?(?:features?|elements?)\b.{0,35}\b(?:are|remain)\s+original\b",
+        blob, re.IGNORECASE,
+    ))
+
+
+def _authoritative_property_features(data: Optional[dict]) -> dict:
+    """Canonical feature snapshot shared by model packets, QA, adjustments, and narratives."""
+    data = data or {}
+    sqft = _exact_sqft_semantics(data)
+    return {
+        "amenities": sorted(_amenity_signals(data)),
+        "accessory_features": _explicit_accessory_features(data),
+        "documented_system_updates": _documented_system_updates(data),
+        "documented_finish_updates": _documented_finish_updates(data),
+        "basement": data.get("basement") or None,
+        "primary_sqft": sqft["primary_sqft"],
+        "primary_sqft_type": sqft["primary_sqft_type"],
+        "above_grade_sqft": sqft["above_grade_sqft"],
+        "below_grade_sqft": sqft["below_grade_sqft"],
+        "total_finished_sqft": sqft["total_finished_sqft"],
+        "has_exact_area_decomposition": sqft["has_exact_area_decomposition"],
+        "year_built": _as_float(data.get("year_built")),
+        "source": "structured_mls_fields_and_public_remarks",
+    }
+
+
+def _exact_sqft_semantics(data: Optional[dict]) -> dict:
+    """Keep total, above-grade, and below-grade area definitions separate.
+
+    `sqft` is a total/primary reported area and is never relabelled as above-grade. Likewise, no
+    subtraction is used to manufacture a basement figure. Exact component areas exist only when
+    their own authoritative fields are populated.
+    """
+    data = data or {}
+    above = _as_float(_first_present(data, "above_grade_finished_area", "above_grade_sqft"))
+    below = _as_float(_first_present(data, "below_grade_finished_area", "below_grade_sqft"))
+    total = _as_float(data.get("sqft"))
+    primary = above or total
+    return {
+        "primary_sqft": primary,
+        "primary_sqft_type": "above_grade" if above else ("total_finished" if total else None),
+        "above_grade_sqft": above,
+        "below_grade_sqft": below,
+        "total_finished_sqft": total,
+        "has_exact_area_decomposition": bool(above and below),
+    }
+
+
+_GENERATED_NARRATIVE_FIELDS = {
+    "ai_commentary", "commentary", "methodology_summary", "offer_strategy_considerations",
+    "inspection_concerns", "value_drivers", "qa_flags", "qa_blocking", "qa_result",
+}
+
+
+@dataclass(frozen=True)
+class _AuthoritativeEvidenceSnapshot:
+    """Immutable generation boundary for normalized CMA evidence.
+
+    The canonical payload is held as JSON text, so downstream code can only receive independent
+    materialized copies. Generated prose is intentionally absent; marketing remarks, structured
+    facts, and model judgments are identified separately in the persisted provenance metadata.
+    """
+
+    canonical_json: str
+    digest: str
+
+    def materialize(self) -> tuple[dict, list[dict], dict]:
+        payload = json.loads(self.canonical_json)
+        return payload["subject"], payload["comparables"], payload["status_timeline"]
+
+    def audit_metadata(self) -> dict:
+        payload = json.loads(self.canonical_json)
+        return {
+            "version": payload["version"],
+            "sha256": self.digest,
+            "immutable": True,
+            "created_before_downstream_prose": True,
+            "property_count": 1 + len(payload["comparables"]),
+            "provenance": payload["provenance"],
+        }
+
+
+def _build_authoritative_evidence_snapshot(
+    subject: dict, comps: list[dict], status_timeline: dict,
+) -> _AuthoritativeEvidenceSnapshot:
+    """Freeze normalized facts and structured judgments before valuation/client-output stages."""
+
+    def _without_generated_narrative(record: Optional[dict]) -> dict:
+        return {
+            key: copy.deepcopy(value)
+            for key, value in (record or {}).items()
+            if key not in _GENERATED_NARRATIVE_FIELDS
+        }
+
+    normalized_subject = _reconciled_subject_snapshot(
+        _without_generated_narrative(subject), status_timeline or {},
+    )
+    normalized_comps = [_without_generated_narrative(comp) for comp in (comps or [])]
+    payload = {
+        "version": "cma-authoritative-evidence-v1",
+        "subject": normalized_subject,
+        "comparables": normalized_comps,
+        "status_timeline": copy.deepcopy(status_timeline or {}),
+        "provenance": {
+            "verified_structured_facts": "normalized MLS/manual property fields",
+            "marketing_claims": "public/listing remarks; claims remain attributed and are not verified systems evidence",
+            "model_judgment": "strength and quality fields only",
+            "generated_commentary_is_evidence": False,
+        },
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return _AuthoritativeEvidenceSnapshot(
+        canonical_json=canonical,
+        digest=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    )
+
+
+def _merge_authoritative_property_facts(base: Optional[dict], enriched: Optional[dict]) -> dict:
+    """Overlay fresh property-table facts without copying generated narrative/QA fields."""
+    out = dict(base or {})
+    source = enriched or {}
+    keys = {
+        *_AUTHORITATIVE_PROPERTY_TEXT_FIELDS, *_ACCESSORY_EXPLICIT_FIELDS,
+        "sqft", "above_grade_finished_area", "above_grade_sqft",
+        "below_grade_finished_area", "below_grade_sqft", "year_built",
+        "pool", "pool_features", "garage", "garage_spaces", "parking_features",
+        "property_type", "home_type", "bedrooms", "bedrooms_total", "beds",
+        "bathrooms", "bathrooms_total", "baths", "lot_size", "lot_size_sqft", "acres",
+        "list_price", "original_list_price", "annual_taxes", "taxes", "tax_annual_amount",
+        "school_district", "water_source", "sewer", "days_on_market", "cumulative_days_on_market",
+        "township", "municipality", "subdivision_name", "neighborhood", "neighborhood_name", "county",
+        "mls_status", "last_sale_date", "last_sale_price", "basement",
+    }
+    for key in keys:
+        if source.get(key) not in (None, "", [], {}):
+            out[key] = copy.deepcopy(source[key])
+    return out
+
+
+def _derive_amenities_gap(subject: dict, comp: dict) -> Optional[str]:
+    """Deterministic amenities read from listing text + MLS feature lists:
+      'below'    - the SUBJECT documents a big-deal amenity (pool, guest house, theater, sauna,
+                   wine cellar, elevator, gym, sport court...) that the COMP's listing shows nowhere
+      'above'    - the reverse
+      'similar'  - both sides are readable AND document the same set (incl. both empty)
+      None       - can't call it: a side has no readable listing text, or each side has DIFFERENT
+                   extras (pool vs. theater - not our call to rank)
+    Caller trusts an AI 'above'/'below' over this (the AI saw photos); uses this to fix a blank or
+    a 'similar', and clears an unverifiable 'similar'."""
+    if not _has_amenity_text(subject) or not _has_amenity_text(comp):
+        return None
+    s_sig, c_sig = _amenity_signals(subject), _amenity_signals(comp)
+    only_subject = s_sig - c_sig
+    only_comp = c_sig - s_sig
+    if only_subject and not only_comp:
+        return "below"
+    if only_comp and not only_subject:
+        return "above"
+    if only_subject and only_comp:
+        return None  # each has something the other doesn't - ambiguous, leave it
+    return "similar"  # identical sets (or both empty) and both readable
+
+
+def _reconcile_amenities_quality(
+    subject: dict, comp: dict, quality: Optional[dict], label: str,
+) -> tuple[dict, list[str]]:
+    """Make the quality row agree with documented high-signal amenity presence."""
+    q = dict(quality or {})
+    flags: list[str] = []
+    current = q.get("amenities")
+    documented = _derive_amenities_gap(subject, comp)
+    if current in ("above", "below") and documented in ("above", "below") and current != documented:
+        q["amenities"] = documented
+        flags.append(
+            f"{label}: corrected amenities from AI '{current}' to documented '{documented}' "
+            "using the authoritative property-feature records."
+        )
+    elif current not in ("above", "below") and documented in ("above", "below"):
+        q["amenities"] = documented
+        relation = "inferior to" if documented == "below" else "superior to"
+        flags.append(
+            f"{label}: amenities set to '{documented}' from the authoritative property-feature "
+            f"records; this comp is {relation} the subject on documented high-signal amenities."
+        )
+    elif documented == "similar":
+        q["amenities"] = "similar"
+    elif current == "similar":
+        q.pop("amenities", None)
+        flags.append(
+            f"{label}: amenities rating cleared because the authoritative records do not support "
+            "a deterministic comparison; an agent call is required."
+        )
+    return q, flags
+
+
+# --------------------------------------------------------------------------------------------
+# Deterministic per-comp evidence (Phase B / B1-B4, B7-B8): a real, computed read of how
+# comparable each comp actually is, independent of the AI's own classification - grounds the
+# AI's classification in something concrete (fed into the prompt), challenges it non-circularly
+# after the fact (B7), and powers a materially richer confidence model (B4) and a traceable
+# "why this number" driver list (B8) than a bare count of Strong comps ever could.
+#
+# All computed once per generation/recompute (never on a page view - see the frozen-snapshot
+# rule) and never itself invents a number: every score here is a ratio or decay over real,
+# already-known fields.
+# --------------------------------------------------------------------------------------------
+
+_TYPE_FAMILY_CONDO = {"condo", "unit", "flat", "apartment", "penthouse"}
+_TYPE_FAMILY_ATTACHED = {"townhouse", "townhome", "row", "twin", "attached"}
+_TYPE_FAMILY_DETACHED = {"single family", "detached", "farm"}
+
+
+def _type_family(raw) -> Optional[str]:
+    """'condo' | 'attached' | 'detached' | None - same narrow classifier as the Match Score
+    rewrite's typeFamily (frontend/lib/matchScore.ts), kept as an independent Python
+    implementation since this runs server-side against Property/CmaComparable's own
+    home_type/property_type field. Deliberately does NOT also encode acreage or construction-era
+    signals - those already have their own weight elsewhere (see _comp_evidence_score) and would
+    be double-penalized if folded in here too."""
+    t = _norm_token(raw).replace("_", " ").replace("-", " ")
+    if not t:
+        return None
+    if any(k in t for k in _TYPE_FAMILY_CONDO):
+        return "condo"
+    if any(k in t for k in _TYPE_FAMILY_ATTACHED):
+        return "attached"
+    if any(k in t for k in _TYPE_FAMILY_DETACHED):
+        return "detached"
+    return None
+
+
+def _half_life_decay(delta: float, half_life: float) -> float:
+    if half_life <= 0:
+        return 0.0
+    return 0.5 ** (abs(delta) / half_life)
+
+
+def _comp_recency_weight(comp: dict) -> Optional[float]:
+    """Exponential half-life decay on sale age - ~6-month half-life, floored at 0.15 so an older
+    but still-relevant sale is discounted, never zeroed out entirely. None when there's no usable
+    sale date (comp isn't sold, or the date is missing)."""
+    sale_date = _parse_iso_date(comp.get("close_date") or comp.get("sale_date"))
+    if not sale_date:
+        return None
+    age_days = max(0, (datetime.now(timezone.utc).date() - sale_date).days)
+    return round(max(0.15, _half_life_decay(age_days, _V10_RECENCY_HALF_LIFE_DAYS)), 3)
+
+
+def _comp_evidence_score(subject: dict, comp: dict) -> dict:
+    """Deterministic evidence for ONE comp: proximity, area match, size similarity (above-grade
+    sqft preferred over a blended total), lot-size similarity, property-type compatibility,
+    recency, and verified-data quality. Missing data on either side excludes that one component
+    entirely (same rule as Match Score / _derive_quality_from_data) rather than scoring it 0.
+
+    Returns {score: 0-1 or None, components: {name: 0-1}, recency_weight, notes: list[str]}."""
+    components: dict[str, float] = {}
+    notes: list[str] = []
+
+    dist = _as_float(comp.get("distance_miles"))
+    if dist is not None:
+        components["proximity"] = _half_life_decay(dist, 2.5)
+        if dist > 5:
+            notes.append(f"{dist:.1f} mi away")
+
+    s_school, c_school = _norm_token(subject.get("school_district")), _norm_token(comp.get("school_district"))
+    s_city, c_city = _norm_token(subject.get("city")), _norm_token(comp.get("city"))
+    area_matches = [m for m in (
+        (s_school == c_school) if (s_school and c_school) else None,
+        (s_city == c_city) if (s_city and c_city) else None,
+    ) if m is not None]
+    if area_matches:
+        components["area"] = 1.0 if all(area_matches) else (0.5 if any(area_matches) else 0.0)
+
+    s_above = _as_float(subject.get("above_grade_finished_area")) or _as_float(subject.get("sqft"))
+    c_above = _as_float(comp.get("above_grade_finished_area")) or _as_float(comp.get("sqft"))
+    if s_above and c_above:
+        components["size"] = _half_life_decay(c_above - s_above, max(s_above * 0.22, 400))
+
+    s_lot, c_lot = _as_float(subject.get("lot_size")), _as_float(comp.get("lot_size"))
+    if s_lot and c_lot:
+        components["lot"] = _half_life_decay(c_lot - s_lot, max(s_lot * 0.4, 10890))  # 10890 sqft ~= 0.25 acre
+
+    s_type = _type_family(subject.get("property_type") or subject.get("home_type"))
+    c_type = _type_family(comp.get("property_type") or comp.get("home_type"))
+    if s_type and c_type:
+        components["property_type"] = 1.0 if s_type == c_type else 0.0
+        if s_type != c_type:
+            notes.append(f"{c_type} vs. subject's {s_type}")
+
+    recency = _comp_recency_weight(comp)
+    if recency is not None:
+        components["recency"] = recency
+        if recency < 0.35:
+            notes.append("an older sale")
+
+    components["data_quality"] = 1.0 if (comp.get("price_verified", True) and comp.get("sale_price")) else 0.3
+    if components["data_quality"] < 1.0:
+        notes.append("unverified closing price")
+
+    if not components:
+        return {"score": None, "components": {}, "recency_weight": recency, "notes": notes}
+    return {"score": round(sum(components.values()) / len(components), 3), "components": components, "recency_weight": recency, "notes": notes}
+
+
+def _build_evidence_by_key(subject: dict, comps: list[dict]) -> dict[str, dict]:
+    return {c["listing_key"]: _comp_evidence_score(subject, c) for c in comps if c.get("listing_key")}
+
+
+def _flag_psf_outliers(comps: list[dict]) -> dict[str, str]:
+    """B2 - $/sqft outlier detection across comps with a verified price, returning
+    {listing_key: note} for the caller to surface as a qa_flag, factor softly into confidence
+    (B4), and (via `row["outlier"]` in _compute_comp_anchor) apply _V10_OUTLIER_PENALTY to the
+    comp's weight in the anchor blend.
+
+    Two independent checks, since neither alone covers a CMA's typical 4-6 comp set:
+      - MAD (median absolute deviation) modified z-score, the standard robust-outlier measure -
+        good once there are enough points for MAD itself to be stable.
+      - A plain ratio-vs-median check (+-_V10_PSF_OUTLIER_RATIO). With only 4-6 comps the MAD
+        z-score is nearly powerless: the outlier's own deviation inflates the very MAD it's being
+        measured against, so a comp at ~3x the group's $/sqft can still score a z-value nowhere
+        near the z>3.5 cutoff. The ratio check catches that case directly, independent of how
+        noisy MAD is at this sample size."""
+    psf_by_key = {
+        c["listing_key"]: _as_float(c.get("price_per_sqft"))
+        for c in comps
+        if c.get("listing_key") and c.get("price_verified", True) and _as_float(c.get("price_per_sqft"))
+    }
+    if len(psf_by_key) < 4:  # too few points for either check to mean anything
+        return {}
+    values = sorted(psf_by_key.values())
+    n = len(values)
+    median = values[n // 2] if n % 2 else (values[n // 2 - 1] + values[n // 2]) / 2
+    abs_devs = sorted(abs(v - median) for v in values)
+    mad = abs_devs[n // 2] if n % 2 else (abs_devs[n // 2 - 1] + abs_devs[n // 2]) / 2
+    out: dict[str, str] = {}
+    for key, psf in psf_by_key.items():
+        if median > 0 and not (1 / _V10_PSF_OUTLIER_RATIO <= psf / median <= _V10_PSF_OUTLIER_RATIO):
+            out[key] = (f"${int(psf)}/sq ft is {'more than' if psf > median else 'less than'} "
+                        f"{_V10_PSF_OUTLIER_RATIO}x the comp set's median (${int(median)}/sq ft) - review before relying on it.")
+            continue
+        if mad > 0:
+            z = 0.6745 * (psf - median) / mad
+            if abs(z) > 3.5:
+                out[key] = f"${int(psf)}/sq ft is a statistical outlier vs. the comp set's median (${int(median)}/sq ft) - review before relying on it."
+    return out
+
+
+def _redundancy_adjusted_count(comps: list[dict]) -> float:
+    """B3 - how many genuinely INDEPENDENT Strong/Supporting comps the evidence set actually
+    contains, for the confidence model (B4): clusters near-duplicate evidence (very close $/sqft
+    AND close proximity to each other) and counts a cluster once, so three near-clones can't
+    mechanically buy a higher confidence tier than three genuinely diverse comps would. Never
+    touches any comp's own valuation weight or display - purely a confidence input."""
+    weighted = [c for c in comps if c.get("is_included", True) and _normalize_strength(c.get("strength")) in ("strong", "supporting")]
+    clusters: list[list[dict]] = []
+    for c in weighted:
+        psf = _as_float(c.get("price_per_sqft"))
+        dist = _as_float(c.get("distance_miles"))
+        placed = False
+        for cluster in clusters:
+            rep = cluster[0]
+            rep_psf = _as_float(rep.get("price_per_sqft"))
+            rep_dist = _as_float(rep.get("distance_miles"))
+            psf_close = psf is not None and rep_psf is not None and rep_psf > 0 and abs(psf - rep_psf) <= 0.05 * rep_psf
+            dist_close = dist is not None and rep_dist is not None and abs(dist - rep_dist) <= 0.5
+            if psf_close and dist_close:
+                cluster.append(c)
+                placed = True
+                break
+        if not placed:
+            clusters.append([c])
+    return float(len(clusters))
+
+
+def _condition_agreement_score(comps: list[dict]) -> Optional[float]:
+    """Honest stand-in for 'condition' in the confidence model - there's no structured condition
+    field, so this reuses the AI's own finish_quality/interior/exterior ratings already produced
+    per comp. High agreement (comps mostly read 'similar', not a wild above/below spread) is
+    treated as more confidence-worthy evidence than a wildly inconsistent condition read."""
+    labels = []
+    for c in comps:
+        if not c.get("is_included", True) or _normalize_strength(c.get("strength")) not in ("strong", "supporting"):
+            continue
+        q = c.get("quality") or {}
+        for field in ("finish_quality", "interior", "exterior"):
+            v = q.get(field)
+            if v in ("below", "similar", "above"):
+                labels.append(v)
+    if len(labels) < 2:
+        return None
+    return round(sum(1 for l in labels if l == "similar") / len(labels), 3)
+
+
+def _compute_confidence(
+    comps: list[dict], evidence_by_key: dict[str, dict], outliers: dict[str, str], ai_confidence: Optional[str],
+) -> tuple[str, list[str]]:
+    """B4 - weighted composite over proximity, area match, size similarity, property type,
+    condition-agreement, recency, verified-data quality, and the redundancy-adjusted breadth of
+    genuinely independent Strong/Supporting comps - replacing the old bare "count of Strong
+    comps" switch. Still outputs low/medium/high for minimal UI disruption. B6: an empty
+    valuation set (all-Weaker) is unconditionally Low - never force-promoted to reach a comp."""
+    flags: list[str] = []
+    valuation = [c for c in comps if c.get("is_included", True) and _normalize_strength(c.get("strength")) in ("strong", "supporting")]
+    if not valuation:
+        return "low", flags
+
+    independent_ct = _redundancy_adjusted_count(comps)
+    component_sums: dict[str, list[float]] = {}
+    for c in valuation:
+        ev = evidence_by_key.get(c.get("listing_key")) or {}
+        for name, val in (ev.get("components") or {}).items():
+            component_sums.setdefault(name, []).append(val)
+    avg_components = {name: sum(vals) / len(vals) for name, vals in component_sums.items()}
+    condition_agreement = _condition_agreement_score(comps)
+    if condition_agreement is not None:
+        avg_components["condition_agreement"] = condition_agreement
+    evidence_quality = (sum(avg_components.values()) / len(avg_components)) if avg_components else 0.5
+
+    outlier_ct = sum(1 for c in valuation if c.get("listing_key") in outliers)
+    if outlier_ct:
+        evidence_quality *= (1 - 0.15 * min(outlier_ct, 2))
+        flags.append(f"Confidence reduced - {outlier_ct} valuation comp(s) carry a statistical $/sqft outlier flag.")
+
+    if independent_ct >= 2 and evidence_quality >= 0.72:
+        confidence = "high"
+    elif independent_ct >= 1 and evidence_quality >= 0.5:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    # The AI's own confidence call can only pull this DOWN (more cautious than the numbers alone
+    # suggest is fine), never up past what the deterministic composite actually supports.
+    _rank = {"low": 0, "medium": 1, "high": 2}
+    if ai_confidence in _rank and _rank[ai_confidence] < _rank[confidence]:
+        confidence = ai_confidence
+
+    if independent_ct < len(valuation):
+        flags.append(
+            f"{len(valuation)} comp(s) carry valuation weight, but only ~{independent_ct:.1f} counted as "
+            "independent evidence for confidence - some are near-duplicate evidence of each other."
+        )
+    return confidence, flags
+
+
+def _non_circular_grading_check(new_comparables: list[dict], evidence_by_key: dict[str, dict], comp_num_by_key: dict) -> list[str]:
+    """B7 - a SECOND, data-driven check alongside classify_from_note: catches a confidently-wrong
+    AI classification even when its own note is internally consistent (the existing note-based
+    check can't see that). Flags (never silently overrides) a Strong/Supporting comp with a low
+    overall evidence score, since evidence quality is a genuinely soft signal with only 3-5 comps
+    to work with. Auto-demotes to Weaker ONLY for the one objective failure this function owns: a
+    major property-type mismatch (unverified price is already handled by the existing check)."""
+    flags: list[str] = []
+    for i, comp in enumerate(new_comparables):
+        if not comp.get("is_included", True):
+            continue
+        strength = _normalize_strength(comp.get("strength"))
+        if strength not in ("strong", "supporting"):
+            continue
+        key = comp.get("listing_key")
+        ev = evidence_by_key.get(key) or {}
+        label = _comp_label(i, comp)
+        if (ev.get("components") or {}).get("property_type") == 0.0:
+            comp["strength"] = "weak"
+            flags.append(f"{label}: rated {strength.capitalize()} by the AI, but it's a major property-type mismatch vs. the subject - demoted to Weaker.")
+            continue
+        score = ev.get("score")
+        if score is not None and score < 0.4:
+            reason = "; ".join(ev.get("notes") or []) or "several evidence factors are weak"
+            flags.append(f"{label}: rated {strength.capitalize()} by the AI, but its deterministic evidence score is low ({reason}) - review before relying on this classification.")
+    return flags
+
+
+def _reconcile_value_drivers(
+    raw_drivers, new_comparables: list[dict], comp_num_by_key: dict, addr_by_key: dict,
+    evidence_by_key: dict[str, dict], value: float, subject_sqft,
+) -> tuple[list[dict], list[str]]:
+    """B8 - validates and corrects the AI's own value_drivers list against real data: every
+    comp_ref must resolve to an actually-included comp carrying real valuation weight (a
+    Weak/excluded comp can't legitimately be a "driver" - dropped and flagged if claimed
+    otherwise), and `direction` is checked against that comp's real $/sqft vs. the final value's
+    own implied $/sqft, corrected if the AI's claim disagrees with the numbers. The AI's own
+    `note` (the qualitative why - condition, amenities, anything numbers alone can't show) is kept
+    as written; it still passes through the same prose-QA chain as every other narrative field.
+    Falls back to a fully deterministic top-3 pick (by comp weight x evidence x recency) with a
+    plain factual note when the AI didn't provide a usable list, so value_drivers is never empty
+    while at least one comp carries valuation weight."""
+    key_by_ref: dict[str, str] = {}
+    by_key = {c.get("listing_key"): c for c in new_comparables if c.get("listing_key")}
+    for key, num in comp_num_by_key.items():
+        key_by_ref[f"comp #{num}"] = key
+        addr = (addr_by_key.get(key) or "").strip().lower()
+        if addr:
+            key_by_ref[addr] = key
+
+    implied_psf = (value / subject_sqft) if (value and subject_sqft and subject_sqft > 0) else None
+
+    def _actual_direction(psf: Optional[float]) -> str:
+        if psf is None or implied_psf is None:
+            return "neutral"
+        if psf > implied_psf * 1.03:
+            return "up"
+        if psf < implied_psf * 0.97:
+            return "down"
+        return "neutral"
+
+    flags: list[str] = []
+    out: list[dict] = []
+    seen_keys: set[str] = set()
+    for item in (raw_drivers or [])[:5]:
+        if not isinstance(item, dict) or len(out) >= 3:
+            continue
+        ref = _norm_token(item.get("comp_ref"))
+        key = key_by_ref.get(ref)
+        comp = by_key.get(key) if key else None
+        if not comp or key in seen_keys:
+            if not comp:
+                flags.append(f"A value driver referenced \"{item.get('comp_ref')}\" which doesn't match any included comp - dropped.")
+            continue
+        strength = _normalize_strength(comp.get("strength"))
+        if _COMP_WEIGHT.get(strength or "", 0.0) <= 0:
+            label = _comp_label(comp_num_by_key.get(key, 1) - 1, comp)
+            flags.append(f"{label} was listed as a value driver, but it's rated {strength or 'unrated'} (no valuation weight) - dropped.")
+            continue
+        seen_keys.add(key)
+        psf = _as_float(comp.get("price_per_sqft"))
+        claimed = str(item.get("direction") or "neutral").lower()
+        actual = _actual_direction(psf)
+        label = _comp_label(comp_num_by_key.get(key, 1) - 1, comp)
+        if claimed != actual and psf is not None and implied_psf is not None:
+            flags.append(
+                f"{label}: value-driver direction said \"{claimed}\" but its ${int(psf)}/sq ft vs. the "
+                f"estimate's implied ${int(implied_psf)}/sq ft says \"{actual}\" - corrected."
+            )
+            claimed = actual
+        elif claimed not in ("up", "down", "neutral"):
+            claimed = actual
+        out.append({"comp_key": key, "comp_label": label, "direction": claimed, "note": (str(item.get("note") or "").strip() or None)})
+
+    if not out:
+        scored = []
+        for c in new_comparables:
+            if not c.get("is_included", True):
+                continue
+            key = c.get("listing_key")
+            strength = _normalize_strength(c.get("strength"))
+            w = _COMP_WEIGHT.get(strength or "", 0.0)
+            if w <= 0 or not key:
+                continue
+            ev = evidence_by_key.get(key) or {}
+            influence = w * (ev.get("score") or 0.3) * (ev.get("recency_weight") or 0.5)
+            scored.append((influence, key, c))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        for _influence, key, c in scored[:3]:
+            psf = _as_float(c.get("price_per_sqft"))
+            label = _comp_label(comp_num_by_key.get(key, 1) - 1, c)
+            direction = _actual_direction(psf)
+            if psf is not None and implied_psf is not None:
+                note = f"{label} sold at ${int(psf)}/sq ft, {'above' if direction == 'up' else 'below' if direction == 'down' else 'close to'} the estimate's implied ${int(implied_psf)}/sq ft."
+            else:
+                note = f"{label} carries {_normalize_strength(c.get('strength')) or 'supporting'}-tier weight in the valuation."
+            out.append({"comp_key": key, "comp_label": label, "direction": direction, "note": note})
+
+    return out, flags
+
+
+def _round_to_5k(value: float) -> int:
+    """Real offer numbers don't come in odd figures like $743,218 - round to the nearest $5,000
+    so the auto-filled buyer-mode offer fields read like an actual number an agent would suggest."""
+    return round(value / 5000) * 5000
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+_PCT_BELOW_LIST_RE = re.compile(
+    r"(?:approximately |roughly |about )?\d+(?:\.\d+)?\s*(?:[-–—]\s*\d+(?:\.\d+)?)?"
+    r"\s*%\s+(?:below|above|under|over)\s+(?:the\s+)?list(?:\s+price)?",
+    re.IGNORECASE,
+)
+_DOLLAR_RE = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?(?![A-Za-z])")
+
+
+def _parse_dollar(num_str: str, suffix: Optional[str]) -> float:
+    val = float(num_str.replace(",", ""))
+    if suffix and suffix.upper() == "M":
+        val *= 1_000_000
+    elif suffix and suffix.upper() == "K":
+        val *= 1_000
+    return val
+
+
+def _fix_pct_below_list(text: str, list_price: Optional[float], fallback_low: Optional[float], fallback_high: Optional[float]) -> str:
+    """Replaces any "X[-Y]% below/above list" claim in AI-written prose with the real percentage -
+    confirmed via real generations that the model estimates a plausible-sounding number here
+    rather than actually computing one, even when explicitly instructed to verify it (e.g. calling
+    a value "3-5% below list" when it's really 6.1% below, and separately an offer range "5-7%
+    below list" when it's really 7-8% below, in the same generation). Computed from whichever
+    dollar figure(s) the model itself just wrote in the same sentence (its own suggested opening
+    offer, say, isn't necessarily our stored offer_min/offer_max - trusting our own numbers instead
+    of its would silently "correct" the percentage to describe a different dollar amount than the
+    one actually in the sentence). Only falls back to the provided authoritative number
+    (value, or offer_min/offer_max) when no dollar figure appears nearby to parse; leaves the claim
+    untouched entirely if neither is available, rather than guessing."""
+    if not text or not list_price or list_price <= 0:
+        return text
+
+    def repl(match: re.Match) -> str:
+        preceding = text[max(0, match.start() - 100):match.start()]
+        dollars = list(_DOLLAR_RE.finditer(preceding))
+        if dollars:
+            recent = dollars[-2:] if len(dollars) >= 2 else dollars[-1:]
+            values = [_parse_dollar(d.group(1), d.group(2)) for d in recent]
+            low, high = min(values), max(values)
+        elif fallback_low is not None and fallback_high is not None:
+            low, high = min(fallback_low, fallback_high), max(fallback_low, fallback_high)
+        else:
+            return match.group(0)
+        pct_low = (list_price - low) / list_price * 100
+        pct_high = (list_price - high) / list_price * 100
+        lo, hi = sorted((abs(pct_low), abs(pct_high)))
+        direction = "below" if (pct_low + pct_high) >= 0 else "above"
+        if hi - lo > 0.15:
+            return f"{lo:.1f}–{hi:.1f}% {direction} list"
+        return f"{(lo + hi) / 2:.1f}% {direction} list"
+
+    return _PCT_BELOW_LIST_RE.sub(repl, text)
+
+
+def _as_float(value) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            cleaned = re.sub(r"[^0-9.\-]", "", value)
+            return float(cleaned) if cleaned else None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_blank(value) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _has_completed_ai_pricing(report: CmaReport) -> bool:
+    pricing = report.pricing or {}
+    ai_estimate = pricing.get("ai_estimate") if isinstance(pricing.get("ai_estimate"), dict) else {}
+    if _as_float(ai_estimate.get("value")):
+        return True
+    pricing_keys = (
+        ["estimated_fair_value", "suggested_offer_min", "suggested_offer_max", "strong_offer"]
+        if report.mode == "buyer" else
+        ["recommended_min", "recommended_max", "most_likely_value"]
+    )
+    return any(not _is_blank(pricing.get(key)) for key in pricing_keys)
+
+
+def _infer_improvement_type(text: str, index: int) -> str:
+    lower = text.lower()
+    if any(word in lower for word in ("garage", "apartment", "guest", "staff", "in-law", "carriage")):
+        return "Guest Apartment / Garage"
+    if any(word in lower for word in ("pool", "terrace", "outdoor", "lawn", "estate", "lot", "acre", "trees", "grounds")):
+        return "Estate Lot / Outdoor Living"
+    if any(word in lower for word in ("stone", "colonial", "historic", "millwork", "hardwood", "character", "preservation")):
+        return "Architectural Character"
+    if any(word in lower for word in ("kitchen", "bath", "renovat", "updated", "finish")):
+        return "Renovated Finishes"
+    if any(word in lower for word in ("addition", "suite", "primary", "expanded")):
+        return "Functional Expansion"
+    return f"Premium Feature {index + 1}"
+
+
+def _extract_size(text: str) -> Optional[str]:
+    match = re.search(r"\b[\d,]+(?:\.\d+)?\s*(?:sq\.?\s*ft|sqft|square feet|acres?|acre)\b", text, flags=re.I)
+    return match.group(0) if match else None
+
+
+def _is_outdoor_improvement(type_label: str, description: str) -> bool:
+    text = f"{type_label} {description}".lower()
+    indoor_space_words = ("apartment", "suite", "addition", "finished basement", "guest house", "carriage house")
+    if any(word in text for word in indoor_space_words):
+        return False
+    outdoor_words = (
+        "yard", "lot", "acre", "acres", "acreage", "pool", "terrace", "patio", "grounds",
+        "outdoor", "garden", "lawn", "landscap", "courtyard", "deck", "porch",
+    )
+    return any(word in text for word in outdoor_words)
+
+
+def _improvement_size(type_label: str, description: str, explicit_size: str | None = None) -> Optional[str]:
+    if _is_outdoor_improvement(type_label, description):
+        return None
+    return (explicit_size or "").strip() or _extract_size(description)
+
+
+def _split_premium_justification(text: str) -> list[dict]:
+    """Older prompt versions returned one numbered paragraph. Split that into editable rows so
+    existing reports don't keep showing one giant 'AI-Identified Premium' blob."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return []
+    matches = list(re.finditer(r"\(\d+\)\s*", cleaned))
+    if len(matches) < 2:
+        type_label = _infer_improvement_type(cleaned, 0)
+        return [{
+            "id": str(uuid.uuid4()),
+            "type": type_label,
+            "approx_size": _improvement_size(type_label, cleaned),
+            "description": cleaned,
+            "estimated_value_context": "Supports the AI value estimate.",
+            "agent_notes": None,
+        }]
+
+    rows = []
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(cleaned)
+        description = cleaned[start:end].strip(" ;.")
+        if not description:
+            continue
+        type_label = _infer_improvement_type(description, index)
+        rows.append({
+            "id": str(uuid.uuid4()),
+            "type": type_label,
+            "approx_size": _improvement_size(type_label, description),
+            "description": description,
+            "estimated_value_context": "Supports the AI value estimate.",
+            "agent_notes": None,
+            "ai_generated": True,
+        })
+    return rows
+
+
+def _premium_improvements_from_ai(subject_estimate: dict) -> list[dict]:
+    rows: list[dict] = []
+    for index, item in enumerate(subject_estimate.get("premium_improvements") or []):
+        if not isinstance(item, dict):
+            continue
+        description = (item.get("description") or "").strip()
+        if not description:
+            continue
+        type_label = (item.get("type") or "").strip()
+        if not type_label or type_label.lower() == "ai-identified premium":
+            type_label = _infer_improvement_type(description, index)
+        rows.append({
+            "id": str(uuid.uuid4()),
+            "type": type_label,
+            "approx_size": _improvement_size(type_label, description, item.get("approx_size")),
+            "description": description,
+            "estimated_value_context": (item.get("estimated_value_context") or "").strip() or "Supports the AI value estimate.",
+            "agent_notes": None,
+            "ai_generated": True,
+        })
+    if rows:
+        return rows
+    return _split_premium_justification((subject_estimate.get("premium_justification") or "").strip())
+
+
+def _guidance_sections(text: str) -> list[tuple[str, str]]:
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    if not cleaned:
+        return []
+    matches = list(re.finditer(r"\b([A-Z][A-Z0-9/&\-\s]{2,44}):\s*", cleaned))
+    if not matches:
+        return [("", cleaned)]
+    sections: list[tuple[str, str]] = []
+    if matches[0].start() > 0:
+        sections.append(("Overview", cleaned[:matches[0].start()].strip()))
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(cleaned)
+        body = cleaned[start:end].strip()
+        if body:
+            sections.append((match.group(1).strip().title(), body))
+    return sections
+
+
+def _is_inspection_guidance(title: str, body: str) -> bool:
+    text = f"{title} {body}".lower()
+    return any(
+        keyword in text
+        for keyword in (
+            "inspection", "septic", "well", "utilities", "water", "sewer", "roof", "exterior",
+            "stucco", "structural", "foundation", "mechanical", "systems", "plumbing",
+            "electrical", "hvac", "condition", "infiltration", "egress",
+        )
+    )
+
+
+def _format_guidance_sections(sections: list[tuple[str, str]]) -> str:
+    return "\n\n".join(f"{title}: {body}" if title else body for title, body in sections).strip()
+
+
+def _coerce_ai_text(v) -> str:
+    """A field the tool schema declares as a string sometimes comes back from the model as a
+    list or dict. Flatten it to a string so downstream .strip()/regex code doesn't blow up a
+    minute (and a paid call) into the run."""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (list, tuple)):
+        return "\n\n".join(_coerce_ai_text(x) for x in v if x not in (None, "", []))
+    if isinstance(v, dict):
+        parts = []
+        for k, val in v.items():
+            t = _coerce_ai_text(val)
+            if t.strip():
+                parts.append(t if str(k).isdigit() else f"**{k}:** {t}")
+        return "\n\n".join(parts)
+    return str(v)
+
+
+def _split_buyer_guidance(inspection_text, offer_text) -> tuple[str, str]:
+    inspection_text = _coerce_ai_text(inspection_text).strip()
+    offer_text = _coerce_ai_text(offer_text).strip()
+    sections = _guidance_sections(offer_text)
+    if len(sections) <= 1:
+        return inspection_text, offer_text
+    inspection_sections = [(title, body) for title, body in sections if _is_inspection_guidance(title, body)]
+    offer_sections = [(title, body) for title, body in sections if not _is_inspection_guidance(title, body)]
+    if inspection_sections and not inspection_text:
+        inspection_text = _format_guidance_sections(inspection_sections)
+    elif inspection_sections:
+        inspection_text = f"{inspection_text}\n\n{_format_guidance_sections(inspection_sections)}".strip()
+    if offer_sections:
+        offer_text = _format_guidance_sections(offer_sections)
+    elif inspection_sections:
+        offer_text = ""
+    return inspection_text, offer_text
+
+
+async def _enrich_with_property_data(db: AsyncSession, subject: dict, comps: list[dict]) -> tuple[dict, list[dict]]:
+    """Joins _PROPERTY_ENRICHMENT_FIELDS in from the raw synced Property row (by listing_key) onto
+    copies of the subject/comp dicts, so the AI sees Bright's actual construction_materials/
+    exterior_features/roof_type/architectural_style/foundation_details instead of only what
+    CmaSubjectProperty/CmaComparable already stored (a narrower set mirroring the report-builder
+    UI). Manually-added comps/subjects (no listing_key, is_manual MLS rows) simply get no match and
+    pass through unchanged - there's no raw MLS row to join for those. Never mutates the report's
+    own stored subject/comparables, only the copies handed to the prompt builder."""
+    keys = {k for k in (subject.get("listing_key"), *(c.get("listing_key") for c in comps)) if k}
+    if not keys:
+        return subject, comps
+    result = await db.execute(select(Property).where(Property.listing_key.in_(keys)))
+    by_key = {p.listing_key: p for p in result.scalars().all()}
+
+    def _merged(data: dict) -> dict:
+        prop = by_key.get(data.get("listing_key"))
+        if not prop:
+            return data
+        out = dict(data)
+        extra = {
+            f: getattr(prop, f)
+            for f in (*_PROPERTY_ENRICHMENT_FIELDS, *_RELEVANCE_ENRICHMENT_FIELDS)
+            if getattr(prop, f, None) not in (None, "", [], {})
+        }
+        out.update(extra)
+        # Basement from the MLS row itself - a subject saved through the report builder could carry
+        # "None" for a home with a full unfinished basement (field-name mismatch in the editor,
+        # fixed 2026-10-05), and the AI then told the seller the home had no basement.
+        _bsmt = getattr(prop, "basement", None)
+        if isinstance(_bsmt, list) and _bsmt:
+            out["basement"] = ", ".join(str(x) for x in _bsmt)
+        elif getattr(prop, "has_basement", None) is True and str(out.get("basement") or "").strip().lower() in ("", "none", "no"):
+            out["basement"] = "Yes"
+        # public_remarks: the Property column is `description`; fall back to the raw MLS
+        # PublicRemarks. Only fills a blank - a comp saved with its own remarks keeps them.
+        if not out.get("public_remarks"):
+            _pr = getattr(prop, "description", None) or (getattr(prop, "raw_mls_data", None) or {}).get("PublicRemarks")
+            if _pr:
+                out["public_remarks"] = _pr
+        # Re-verify a closed comp's sale price against the freshest mirror row (item 4: "verified
+        # sale not found even though it exists"). A comp captured into the report before the
+        # sold-data backfill can be stored with price_verified=False even though Bright now has a
+        # real ClosePrice - pull it in so the AI + valuation math use the verified number.
+        raw = getattr(prop, "raw_mls_data", None) or {}
+        out.update({
+            internal: copy.deepcopy(raw.get(reso))
+            for internal, reso in _RAW_PROPERTY_ENRICHMENT_FIELDS.items()
+            if raw.get(reso) not in (None, "", [], {})
+        })
+        status = str(getattr(prop, "home_status", "") or "").upper()
+        close_price = _as_float(raw.get("ClosePrice"))
+        if ("CLOSED" in status or "SOLD" in status) and close_price and close_price > 0 and not (data.get("price_verified") and data.get("sale_price")):
+            out["sale_price"] = close_price
+            out["close_price"] = close_price
+            cd = raw.get("CloseDate")
+            if cd:
+                out["close_date"] = cd
+                out["sale_date"] = cd
+            out["price_verified"] = True
+            sqft = _as_float(out.get("sqft"))
+            if sqft:
+                out["price_per_sqft"] = round(close_price / sqft, 2)
+        return out
+
+    subject_out = _merged(subject)
+
+    # Live, single-record status re-pull (subject only): the synced Property row can be stale by
+    # the time an agent runs the CMA (e.g. went under contract yesterday, sync hasn't caught up
+    # yet) - a bare $top=1 OData read of just this listing, not the bulk sync, no Discord webhook.
+    # Best-effort: any error/timeout keeps the stored data and leaves a note for the QA pass below
+    # instead of failing the whole generation. A manual subject has no listing_key, so it's
+    # naturally skipped.
+    listing_key = subject.get("listing_key")
+    live_overlay: Optional[dict] = None
+    live_status_note: Optional[str] = None
+    if listing_key:
+        try:
+            live = await bright_mls_service.get_property_by_listing_key(listing_key)
+        except Exception as exc:
+            logger.warning(
+                "CMA subject live status re-pull failed",
+                extra={"listing_key": listing_key, "error": str(exc)},
+            )
+            live = None
+            live_status_note = "Couldn't confirm the subject's live listing status via Bright - used the last synced data."
+        if live:
+            live_overlay = {k: v for k, v in live.items() if k != "ListingKey" and v not in (None, "")}
+
+    # Authoritative status/DOM timeline for the subject only - computed from the freshest joined
+    # Property row (raw_mls_data) when we have one, overlaid with the live re-pull above when it
+    # succeeded, else from the subject dict's own fields.
+    subject_out = {
+        **subject_out,
+        "_status_timeline": _subject_status_timeline(
+            subject_out, by_key.get(listing_key), live_overlay=live_overlay, live_status_note=live_status_note,
+        ),
+    }
+
+    comps_out = [_merged(c) for c in comps]
+
+    # Free OpenStreetMap road/street classification for the subject + every comp (quiet residential
+    # street vs. fronting a busy arterial/highway), cached ~1 year. Best-effort - a total failure
+    # just leaves road_context unset and _derive_street_context falls back to the address suffix.
+    try:
+        _pts = [(subject_out.get("latitude"), subject_out.get("longitude"))] + [
+            (c.get("latitude"), c.get("longitude")) for c in comps_out
+        ]
+        _rc = await road_context_service.get_road_contexts(db, _pts)
+
+        def _rc_note(ctx: dict) -> Optional[str]:
+            if not ctx or not ctx.get("summary"):
+                return None
+            bits = [ctx["summary"]]
+            if ctx.get("road_types"):
+                bits.append("nearby road types: " + ", ".join(ctx["road_types"]))
+            if ctx.get("max_speed_mph"):
+                bits.append(f"posted ~{ctx['max_speed_mph']} mph")
+            return " (".join([bits[0], "; ".join(bits[1:]) + ")"]) if len(bits) > 1 else bits[0]
+
+        if _rc and _rc[0]:
+            subject_out["road_context"] = _rc[0]
+            subject_out["road_context_note"] = _rc_note(_rc[0])
+        for _c, _ctx in zip(comps_out, _rc[1:] if _rc else []):
+            if _ctx:
+                _c["road_context"] = _ctx
+                _c["road_context_note"] = _rc_note(_ctx)
+    except Exception:  # noqa: BLE001
+        logger.debug("CMA road-context enrichment failed", exc_info=True)
+
+    return subject_out, comps_out
+
+
+def _with_age(data: dict) -> dict:
+    """Adds a computed property_age_years next to year_built so the AI has an immediate, concrete
+    number to reason from instead of doing the arithmetic itself or guessing - grounds its
+    modern/dated judgment call in an actual figure rather than a vibe from the photos alone."""
+    year_built = data.get("year_built")
+    if not year_built:
+        return data
+    try:
+        age = datetime.now(timezone.utc).year - int(year_built)
+    except (TypeError, ValueError):
+        return data
+    return {**data, "property_age_years": age}
+
+
+_CONTEXT_ONLY_PHRASES = (
+    "context only", "context-only", "market context", "different market", "different-market",
+    "not a valuation comp", "not a true comp", "limited valuation relevance",
+    "limited relevance to value", "should not drive", "should not influence",
+    "does not drive", "doesn't drive", "not comparable", "retained for context",
+    "for context", "outside this market", "distinct market", "separate market",
+)
+_EXCLUDE_PHRASES = (
+    "exclude from valuation", "excluded from valuation", "should be excluded",
+    "not usable as a comp", "disregard for value",
+)
+
+
+def classify_from_note(note: str) -> Optional[str]:
+    """Deterministic: if the AI's own prose calls a comp context-only / a different market /
+    something that shouldn't drive value, its shown classification must match - it can't sit as
+    'Strong Comp' while the words dismiss it. Returns 'weak' | None (the only 3 labels now are
+    strong / supporting / weak)."""
+    low = (note or "").lower()
+    if any(p in low for p in _EXCLUDE_PHRASES) or any(p in low for p in _CONTEXT_ONLY_PHRASES):
+        return "weak"
+    return None
+
+
+# --------------------------------------------------------------------------------------------
+# Deterministic subject listing status + DOM timeline
+#
+# The AI must never compute "days on market" as (today - list date) once a listing has gone
+# contingent / pending / closed - the active-market window ended when it went under agreement.
+# This builds an authoritative structured summary from the subject's own fields plus the freshest
+# joined Property row (raw_mls_data), and generate_ai_analysis feeds it to the model verbatim +
+# uses it to gate offer guidance.
+# --------------------------------------------------------------------------------------------
+
+_UNDER_CONTRACT_STATUSES = ("contingent", "active under contract", "under contract", "pending")
+_OFF_MARKET_STATUSES = ("closed", "sold", "withdrawn", "expired", "canceled", "cancelled", "temporarily off market", "off market")
+
+
+def _parse_iso_date(value):
+    """A date from an ISO string / datetime / date. None on anything unparseable."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if hasattr(value, "year") and not isinstance(value, str):  # datetime.date
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+    except (TypeError, ValueError):
+        try:
+            return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return None
+
+
+def _normalize_status_label(raw) -> str:
+    """A clean, human status from Bright's MlsStatus / StandardStatus ('ACTIVE UNDER CONTRACT-BRIGHT'
+    -> 'Active Under Contract', 'CLOSED-BRIGHT' -> 'Closed', 'PENDING' -> 'Pending')."""
+    s = str(raw or "").upper().replace("-BRIGHT", "").replace("_", " ").strip()
+    if not s:
+        return "Unknown"
+    if s.startswith("CLOSED") or s == "SOLD":
+        return "Closed"
+    if "ACTIVE" in s and "CONTRACT" in s:
+        return "Active Under Contract"
+    if s.startswith("CONTINGENT") or "CONTINGENT" in s:
+        return "Contingent"
+    if s.startswith("PENDING") or (("CONTRACT" in s) and "ACTIVE" not in s):
+        return "Pending"
+    if s.startswith("COMING SOON"):
+        return "Coming Soon"
+    if s.startswith("ACTIVE"):
+        return "Active"
+    if s.startswith("WITHDRAWN"):
+        return "Withdrawn"
+    if s.startswith("EXPIRED"):
+        return "Expired"
+    if s.startswith("CANCEL"):
+        return "Canceled"
+    return s.title()
+
+
+def _seller_not_listed(mode: str, subject: dict, timeline: dict) -> tuple[dict, dict]:
+    """Seller CMA for a home that ISN'T on the market right now (the usual case: the owner is deciding
+    what to list for). Its latest MLS record is a PAST listing - a sale years ago, or an expired /
+    withdrawn listing - and was being read as the current one: the old price became an "asking
+    price", the old days-on-market fed the exposure gate, and the pricing strategy was written in the
+    past tense about that old sale (seen live 2026-10-05). Returns (subject, timeline) rewritten so
+    the home is "not currently listed", with its last sale kept as history only."""
+    tl = timeline or {}
+    if mode == "buyer" or tl.get("is_under_contract"):
+        return subject, timeline
+    status = str(tl.get("current_status") or "").lower()
+    listed_now = bool(tl.get("is_active", False)) and not tl.get("is_closed") and not any(
+        w in status for w in ("expired", "withdrawn", "cancel", "off market", "off-market", "closed", "sold"))
+    if listed_now:
+        return subject, timeline
+    subj = dict(subject or {})
+    last_price = _as_float(subj.get("last_sale_price")) or _as_float(subj.get("close_price"))
+    close_date = tl.get("close_date") or subj.get("last_sale_date")
+    if tl.get("is_closed") and not last_price:
+        last_price = _as_float(subj.get("list_price"))
+    lines = ["Not currently on the market - this is the homeowner's own home, which they are getting ready to list now."]
+    if tl.get("is_closed") and (close_date or last_price):
+        lines.append("Last sold" + (f" {close_date}" if close_date else "") + (f" for ${last_price:,.0f}" if last_price else "") +
+                     " (its most recent recorded sale). That is history, not a current asking price.")
+    lines.append("The listing remarks and photos are from that past listing - describe features as documented there, and never "
+                 "claim the home's CURRENT condition goes beyond (or falls short of) what they and the MLS fields say.")
+    lines.append("There is NO current list price and no current days on market. Write every narrative in the present and future "
+                 "tense about listing it now - never about that past sale.")
+    new_tl = {
+        "current_status": "Not currently listed", "is_active": False, "is_under_contract": False, "is_closed": False,
+        "not_listed": True, "current_list_price": None, "active_market_days": None, "cumulative_dom": None,
+        "list_date": None, "under_contract_date": None, "close_date": None, "dom_source": None,
+        "summary_lines": lines, "live_status_note": tl.get("live_status_note"),
+    }
+    for _k in ("list_price", "original_list_price", "days_on_market", "cumulative_days_on_market", "close_price"):
+        subj[_k] = None
+    subj["status"] = "Not currently listed"
+    if last_price:
+        subj["last_sale_price"] = last_price
+    if close_date:
+        subj["last_sale_date"] = str(close_date)
+    subj["_status_timeline"] = new_tl
+    return subj, new_tl
+
+
+def _subject_status_timeline(
+    subject: dict, prop, live_overlay: Optional[dict] = None, live_status_note: Optional[str] = None,
+) -> dict:
+    """Structured, authoritative listing-status summary for the subject. `prop` is the joined
+    Property row (may be None for a manually-entered subject). `live_overlay` is a fresher,
+    single-listing Bright re-pull (see _enrich_with_property_data) applied on top of the stored
+    raw_mls_data so a status change that hasn't reached the synced mirror yet is still caught;
+    `live_status_note` carries a best-effort failure note through to the caller's qa_flags instead.
+
+    Returns keys: current_status, is_active, is_under_contract, is_closed, list_date,
+    under_contract_date, close_date, active_market_days, cumulative_dom, days_list_to_close,
+    calendar_days_since_list, dom_source, summary_lines (list[str]), live_status_note."""
+    raw = {}
+    if prop is not None:
+        raw = getattr(prop, "raw_mls_data", None) or {}
+    if live_overlay:
+        raw = {**raw, **live_overlay}
+
+    status_src = (
+        (raw.get("StandardStatus") or raw.get("MlsStatus"))
+        or (getattr(prop, "home_status", None) if prop is not None else None)
+        or subject.get("mls_status")
+    )
+    current_status = _normalize_status_label(status_src)
+    low = current_status.lower()
+    is_closed = low == "closed"
+    is_under_contract = low in _UNDER_CONTRACT_STATUSES
+    is_active = low in ("active", "coming soon")
+
+    today = datetime.now(timezone.utc).date()
+    list_date = (
+        _parse_iso_date(raw.get("ListingContractDate"))
+        or _parse_iso_date(raw.get("OnMarketDate"))
+        or _parse_iso_date(raw.get("MLSListDate"))
+        or _parse_iso_date(getattr(prop, "mls_list_date", None) if prop is not None else None)
+    )
+    under_contract_date = (
+        _parse_iso_date(raw.get("PurchaseContractDate"))
+        or _parse_iso_date(raw.get("ContractStatusChangeDate"))
+        # StatusChangeTimestamp is only a reliable "went under contract" proxy when the CURRENT
+        # status is itself the under-contract one (a later price change wouldn't move it, but a
+        # bounce back to Active would) - so only trust it in that case.
+        or (_parse_iso_date(raw.get("StatusChangeTimestamp")) if is_under_contract else None)
+    )
+    close_date = (
+        _parse_iso_date(raw.get("CloseDate"))
+        or _parse_iso_date(subject.get("last_sale_date") if is_closed else None)
+    )
+    off_market_date = _parse_iso_date(raw.get("OffMarketDate"))
+
+    mls_dom = _as_float(raw.get("DaysOnMarket"))
+    if mls_dom is None and prop is not None:
+        mls_dom = _as_float(getattr(prop, "days_on_market", None))
+    if mls_dom is None:
+        mls_dom = _as_float(subject.get("days_on_market"))
+    cdom = _as_float(raw.get("CumulativeDaysOnMarket"))
+    if cdom is None and prop is not None:
+        cdom = _as_float(getattr(prop, "cumulative_days_on_market", None))
+
+    # For a completed active period, explicit list/contract/off-market dates are the authoritative
+    # clock unless the MLS record also documents an interruption or relist. A raw DOM field can lag
+    # a status transition, which otherwise creates impossible statements such as 17 active days
+    # between dates that are 14 days apart. Current active listings still use MLS DOM because a
+    # single snapshot cannot reconstruct pauses.
+    active_market_days = None
+    dom_source = None
+    end_active = None
+    if under_contract_date:
+        end_active = under_contract_date
+        dom_source = "list date -> under-contract date"
+    elif close_date and not is_active:
+        end_active = close_date
+        dom_source = "list date -> close date"
+    elif off_market_date and not is_active:
+        end_active = off_market_date
+        dom_source = "list date -> off-market date"
+    elif is_active:
+        end_active = today
+        dom_source = "list date -> today (still active)"
+
+    explicit_span = (
+        (end_active - list_date).days
+        if list_date and end_active and end_active >= list_date else None
+    )
+    major_change = str(raw.get("MajorChangeType") or "").lower()
+    prior_status = _normalize_status_label(
+        raw.get("PreviousStandardStatus") or raw.get("PreviousMlsStatus")
+    )
+    raw_history = raw.get("StatusHistory") or raw.get("ListingHistory") or raw.get("History")
+    try:
+        history_blob = json.dumps(raw_history, default=str).lower() if raw_history else ""
+    except Exception:
+        history_blob = str(raw_history or "").lower()
+    documented_interruption = bool(
+        re.search(r"back\s+on\s+market|relist|listing\s+extended|extension", major_change)
+        or re.search(r"back[_\s-]+on[_\s-]+market|relist|withdrawn|expired|cancel", history_blob)
+        or (is_active and prior_status in ("Pending", "Contingent", "Active Under Contract"))
+    )
+    if explicit_span is not None and not is_active and not documented_interruption:
+        active_market_days = explicit_span
+        # dom_source was assigned with the matching endpoint above.
+    elif mls_dom is not None:
+        active_market_days = max(0, int(mls_dom))
+        dom_source = "MLS DaysOnMarket field"
+    elif explicit_span is not None:
+        active_market_days = explicit_span
+
+    days_list_to_close = (close_date - list_date).days if (list_date and close_date and close_date >= list_date) else None
+    calendar_days_since_list = (today - list_date).days if list_date else None
+
+    lines = [f"Current status: {current_status}"]
+    if list_date:
+        lines.append(f"List date: {list_date.isoformat()}")
+    if under_contract_date:
+        lines.append(f"Went under contract (contingent/pending): {under_contract_date.isoformat()}")
+    if close_date:
+        lines.append(f"Closed / settled: {close_date.isoformat()}")
+    if active_market_days is not None:
+        lines.append(f"Active-market days: {active_market_days}  ({dom_source})")
+    if cdom is not None and (active_market_days is None or abs(cdom - (active_market_days or 0)) > 1):
+        lines.append(f"Cumulative DOM (all listing periods): {int(cdom)}")
+    if days_list_to_close is not None:
+        lines.append(f"Days list to close: {days_list_to_close}")
+    if calendar_days_since_list is not None and not is_active:
+        lines.append(
+            f"Calendar days since original list date: {calendar_days_since_list} "
+            f"(NOT active-market time - the listing stopped being active on "
+            f"{(under_contract_date or close_date or off_market_date or today).isoformat()})"
+        )
+
+    # v10 - original list price + any price reduction taken since (market-exposure evidence).
+    orig_list_price = _as_float(
+        raw.get("OriginalListPrice") or raw.get("OriginalPrice")
+        or (getattr(prop, "original_list_price", None) if prop is not None else None)
+    )
+    cur_list_price = _as_float(
+        raw.get("ListPrice") or (getattr(prop, "list_price", None) if prop is not None else None)
+        or subject.get("list_price")
+    )
+    prev_list_price = _as_float(raw.get("PreviousListPrice"))
+    price_reduction = (
+        round((orig_list_price - cur_list_price) / orig_list_price * 100, 1)
+        if orig_list_price and cur_list_price and orig_list_price > cur_list_price else 0.0
+    )
+    if orig_list_price and cur_list_price and orig_list_price != cur_list_price:
+        lines.append(
+            f"Original list price: ${orig_list_price:,.0f}  ->  current list ${cur_list_price:,.0f}"
+            + (f"  (reduced {price_reduction}%)" if price_reduction else "")
+        )
+
+    # ---- first-class structured listing history (hardening item 11). Prefer explicit Bright /
+    # RESO fields; fall back to a labelled inference only where a structured field isn't present.
+    # NOTE: a relist / prior failed contract / back-on-market is CONTEXT, never an automatic
+    # negative - the interpretation stays with _compute_exposure / the prompt, this only records
+    # that the event happened.
+    history_events: list = []
+
+    def _hist(event, *, date=None, price=None, from_price=None, to_price=None, detail=None, source="mls"):
+        e = {"event": event, "source": source}
+        if date is not None:
+            e["date"] = date.isoformat() if hasattr(date, "isoformat") else str(date)
+        if price is not None:
+            e["price"] = round(float(price))
+        if from_price is not None:
+            e["from_price"] = round(float(from_price))
+        if to_price is not None:
+            e["to_price"] = round(float(to_price))
+        if detail:
+            e["detail"] = detail
+        history_events.append(e)
+
+    major_type = str(raw.get("MajorChangeType") or "").strip()
+    major_ts = _parse_iso_date(raw.get("MajorChangeTimestamp") or raw.get("ModificationTimestamp"))
+    price_change_ts = _parse_iso_date(raw.get("PriceChangeTimestamp"))
+    prev_status = _normalize_status_label(raw.get("PreviousStandardStatus") or raw.get("PreviousMlsStatus"))
+
+    if list_date:
+        _hist("listed", date=list_date, price=orig_list_price or cur_list_price)
+    # price moves: original -> previous -> current (up to two discrete deltas)
+    if orig_list_price and prev_list_price and prev_list_price not in (orig_list_price,):
+        _hist("price_decrease" if prev_list_price < orig_list_price else "price_increase",
+              from_price=orig_list_price, to_price=prev_list_price)
+    _last_from = prev_list_price or orig_list_price
+    if _last_from and cur_list_price and abs(cur_list_price - _last_from) > 1:
+        _hist("price_decrease" if cur_list_price < _last_from else "price_increase",
+              date=price_change_ts or major_ts, from_price=_last_from, to_price=cur_list_price)
+    # explicit status-history events from Bright's MajorChangeType
+    _mt = major_type.lower().replace("-bright", "").strip()
+    if "back on market" in _mt or _mt in ("bom", "back-on-market"):
+        _hist("back_on_market", date=major_ts, detail=major_type)
+    if "withdrawn" in _mt:
+        _hist("withdrawn", date=major_ts, detail=major_type)
+    if "cancel" in _mt:
+        _hist("cancelled", date=major_ts, detail=major_type)
+    if "extension" in _mt or "extended" in _mt:
+        _hist("listing_extended", date=major_ts, detail=major_type)
+    if "expired" in _mt:
+        _hist("expired", date=major_ts, detail=major_type)
+    # a prior under-contract that fell through (current status bounced back to active/on-market)
+    if (is_active or current_status in ("Active", "Coming Soon")) and prev_status in (
+        "Pending", "Contingent", "Active Under Contract",
+    ):
+        _hist("prior_failed_contract", date=major_ts,
+              detail=f"previous status was {prev_status}; listing returned to {current_status}")
+    if current_status in ("Withdrawn", "Expired", "Canceled") and "withdrawn" not in _mt and "cancel" not in _mt and "expired" not in _mt:
+        _hist(current_status.lower(), date=off_market_date or major_ts, detail="from current status")
+    if under_contract_date:
+        _hist("under_contract", date=under_contract_date, price=_as_float(raw.get("PurchaseContractPrice")))
+    if close_date:
+        _hist("closed", date=close_date, price=(_as_float(subject.get("last_sale_price")) if is_closed else None))
+
+    # inference fallback (labelled) ONLY when nothing structural said the listing re-listed
+    _has_relist_event = any(e["event"] in ("back_on_market", "prior_failed_contract", "listing_extended") for e in history_events)
+    if not _has_relist_event and cdom is not None and active_market_days is not None and cdom > active_market_days + 30:
+        _hist("relisted", detail=f"cumulative DOM {int(cdom)}d vs this period's {int(active_market_days)}d active - "
+              "listed before / went back on market at least once", source="inferred")
+
+    if history_events:
+        _label = {
+            "listed": "Listed", "price_decrease": "Price decrease", "price_increase": "Price increase",
+            "back_on_market": "Back on market", "withdrawn": "Withdrawn", "cancelled": "Cancelled",
+            "expired": "Expired", "listing_extended": "Listing extended", "prior_failed_contract": "Prior contract fell through",
+            "relisted": "Relisted", "under_contract": "Went under contract", "closed": "Closed",
+        }
+        lines.append("Listing history:")
+        for e in history_events:
+            _bits = [_label.get(e["event"], e["event"])]
+            if e.get("date"):
+                _bits.append(e["date"])
+            if e.get("from_price") and e.get("to_price"):
+                _bits.append(f"${e['from_price']:,.0f} -> ${e['to_price']:,.0f}")
+            elif e.get("price"):
+                _bits.append(f"${e['price']:,.0f}")
+            if e.get("detail"):
+                _bits.append(f"({e['detail']})")
+            if e.get("source") == "inferred":
+                _bits.append("[inferred]")
+            lines.append("  - " + "  ".join(_bits))
+
+    return {
+        "current_status": current_status,
+        "is_active": is_active,
+        "is_under_contract": is_under_contract,
+        "is_closed": is_closed,
+        "list_date": list_date.isoformat() if list_date else None,
+        "under_contract_date": under_contract_date.isoformat() if under_contract_date else None,
+        "close_date": close_date.isoformat() if close_date else None,
+        "active_market_days": active_market_days,
+        "cumulative_dom": int(cdom) if cdom is not None else None,
+        "days_list_to_close": days_list_to_close,
+        "calendar_days_since_list": calendar_days_since_list,
+        "dom_source": dom_source,
+        "original_list_price": orig_list_price,
+        "previous_list_price": prev_list_price,
+        "current_list_price": cur_list_price,
+        "price_reduction_pct": price_reduction,
+        "previous_status": prev_status if prev_status not in ("Unknown", current_status) else None,
+        "major_change_type": major_type or None,
+        "history_events": history_events or None,
+        "summary_lines": lines,
+        "live_status_note": live_status_note,
+    }
+
+
+def _format_status_block(timeline: dict) -> str:
+    body = "\n".join(f"  {ln}" for ln in timeline.get("summary_lines", []))
+    if timeline.get("not_listed"):
+        return (
+            f"SUBJECT LISTING STATUS (authoritative):\n{body}\n  The homeowner is deciding what to list for NOW. "
+            "listing_strategy_considerations must recommend how to price and launch the listing going forward; "
+            "listing_prep_concerns must say what to fix, document, or disclose before it goes live. Never call the "
+            "past sale price an asking/list price, never describe days on market, and never write as if the home "
+            "has already been listed or sold under this plan."
+        )
+    guidance = (
+        "Use these numbers as authoritative. Do NOT compute days on market as (today - list date). "
+        "When you discuss time on market, negotiation leverage, or offer strategy, use "
+        "\"active-market days\" above - not calendar days since listing. "
+    )
+    if timeline.get("history_events"):
+        guidance += (
+            "The Listing history above is structured MLS data. Treat a price cut, relist, back-on-market, or "
+            "prior fallen-through contract as CONTEXT to interpret carefully, not an automatic negative, and do "
+            "not invent history events that aren't listed. "
+        )
+    if timeline.get("is_under_contract"):
+        guidance += (
+            "This property is CURRENTLY UNDER AGREEMENT (contingent/pending). Do not describe it as "
+            "\"active\", \"still available\", \"X days active\", or \"not yet under contract\", and do "
+            "not present a normal opening-offer negotiation as if the seller is currently taking "
+            "offers - frame any offer guidance for a BACKUP-OFFER position or buyer/comparable "
+            "analysis only. Its pre-contract active-market days are not evidence of weak demand."
+        )
+    elif timeline.get("is_closed"):
+        guidance += (
+            "This property has already CLOSED. Do not produce forward-looking opening-offer guidance "
+            "- offer_strategy_considerations should be a brief retrospective note only (the sale is "
+            "done; the valuation is for reference / analysis of comparable properties)."
+        )
+    elif timeline.get("current_status") == "Coming Soon":
+        guidance += (
+            "This property is currently COMING SOON, not Active. Preserve that exact status in every "
+            "client-facing section; pre-market days are not active-market exposure."
+        )
+    elif timeline.get("is_active"):
+        guidance += "This property is currently ACTIVE on the market - standard offer strategy applies."
+    return f"SUBJECT LISTING STATUS (authoritative):\n{body}\n  {guidance}"
+
+
+def _reconciled_subject_snapshot(subject: dict, timeline: dict) -> dict:
+    """Persist the live Bright status/DOM used by analysis into an MLS subject snapshot."""
+    if not isinstance(subject, dict) or subject.get("source") != "mls":
+        return subject
+    reconciled = dict(subject)
+    active_dom = timeline.get("active_market_days")
+    if active_dom is not None:
+        reconciled["days_on_market"] = max(0, int(active_dom))
+    current_status = timeline.get("current_status")
+    if current_status and current_status != "Unknown":
+        reconciled["mls_status"] = current_status
+    if timeline.get("not_listed"):
+        # Seller report on a home that isn't for sale now (see _seller_not_listed) - its old
+        # listing's price/DOM must not be saved back as a current "List price" on the report.
+        reconciled["list_price"] = None
+        reconciled["days_on_market"] = None
+        reconciled["original_list_price"] = None
+        reconciled["cumulative_days_on_market"] = None
+        reconciled["status"] = current_status
+    return reconciled
+
+
+# --------------------------------------------------------------------------------------------
+# Deterministic prose / math QA, run on the AI's narrative BEFORE it lands in the report/PDF.
+# --------------------------------------------------------------------------------------------
+
+# A dollar amount/range sitting next to an adjustment / cost verb - "adds $150K-$200K",
+# "replacement ~$25K-$40K", "worth 30-50% of build cost". These are the fabricated-precision
+# figures the AI must not invent (item 2).
+_ADJ_CONTEXT_RE = re.compile(
+    r"(adds?|adding|add\s+(?:approximately|roughly|about)?|worth|values?\s+at|contribut\w*|"
+    r"premium\s+of|discount\s+of|adjust\w*|replacement|replace|repair|reca\w*|budget|"
+    r"cost\w*|estimate\w*|marginal|build\s+cost|land\s+cost)",
+    re.IGNORECASE,
+)
+_MONEY_TOKEN_RE = re.compile(
+    r"\$\s?\d[\d,]*(?:\.\d+)?\s?(?:[KkMm]|thousand|million)?"
+    r"(?:\s?(?:to|[-–—])\s?\$?\s?\d[\d,]*(?:\.\d+)?\s?(?:[KkMm]|thousand|million)?)?\+?"
+)
+_PCT_OF_COST_RE = re.compile(
+    r"\b\d{1,3}\s?(?:to|[-–—])\s?\d{1,3}\s?%\s+of\s+(?:marginal\s+)?(?:land|build|construction|replacement)\s+cost",
+    re.IGNORECASE,
+)
+# Trigger noun immediately AFTER a money figure - "$300K premium", "$50K discount".
+_ADJ_AFTER_RE = re.compile(r"\s*(?:premium|discount|adjustment|adder|uplift|bump|add-on)\b", re.IGNORECASE)
+
+
+def _known_dollar_values(ctx: dict) -> list[float]:
+    vals: list[float] = []
+    for v in (ctx.get("list_price"), ctx.get("value"), ctx.get("range_min"), ctx.get("range_max"),
+              ctx.get("offer_min"), ctx.get("offer_max")):
+        f = _as_float(v)
+        if f:
+            vals.append(f)
+    for p in ctx.get("comp_prices") or []:
+        f = _as_float(p)
+        if f:
+            vals.append(f)
+    return vals
+
+
+def _money_matches_known(text_val: float, known: list[float]) -> bool:
+    """True only if a dollar figure written in prose is within ~1.5% of a real structured value
+    (a comp price, the list price, the indicated value, a range/offer bound) - i.e. it's a number
+    we actually gave the model, not a fabricated adjustment. Deliberately does NOT match arbitrary
+    sums/differences of two knowns: with several comp prices in play, pairwise combos form a dense
+    net that would wave through fabricated round numbers like $150K by coincidence."""
+    if text_val <= 0:
+        return False
+    return any(abs(text_val - k) <= max(2500.0, 0.015 * k) for k in known)
+
+
+# A money figure followed closely by an explicit comparison to one of OUR anchors ("$550K below
+# the subject's indicated value") is a legitimate derived delta, not an invented adjustment.
+_TRACEABLE_DELTA_RE = re.compile(
+    r"^[^.]{0,44}?\b(?:below|above|under|over|beneath|less\s+than|more\s+than|vs\.?|versus|from|off)\s+"
+    r"(?:the\s+)?(?:subject|indicated|estimated|final|list|asking|recommended)\b",
+    re.IGNORECASE,
+)
+
+
+def _scrub_invented_adjustments(text: str, ctx: dict) -> tuple[str, list[str]]:
+    """Removes (and flags) fabricated dollar/percent adjustment precision the AI isn't entitled to
+    invent - a $ figure adjacent to an adjustment/cost verb that doesn't trace to any structured
+    value. A traceable figure ("about $200K above the $3.0M indicated value") is left alone."""
+    if not text:
+        return text, []
+    flags: list[str] = []
+    known = _known_dollar_values(ctx)
+
+    def repl_money(m: re.Match) -> str:
+        span_start = m.start()
+        window = text[max(0, span_start - 60):span_start]
+        after = text[m.end():m.end() + 30]
+        # Round 18: a $/sqft figure is NOT an invented adjustment dollar - it's a rate. Never scrub
+        # "$440/sqft", "$474 per sq ft", "$515/sq. ft.", "$396 psf". (A wrong $/sqft is caught by
+        # _v10_psf_denominator_check / the directional checks, not here.)
+        if re.match(r"\s*(?:/|per\b|psf\b)", after, re.IGNORECASE) or re.match(
+            r"\s*(?:sq\.?\s*ft|sqft|square\s+f(?:oo|ee)?t)\b", after.lstrip("/ "), re.IGNORECASE
+        ):
+            return m.group(0)
+        # trigger word before (adds / replacement / cost ...) OR right after ("$300K premium",
+        # "$50K discount", "$X adjustment/adder/uplift")
+        if not _ADJ_CONTEXT_RE.search(window) and not _ADJ_AFTER_RE.match(after):
+            return m.group(0)
+        # "$550K below the subject's indicated value" - a legit derived delta, not an invented
+        # adjustment - leave it.
+        if _TRACEABLE_DELTA_RE.match(text[m.end():m.end() + 48]):
+            return m.group(0)
+        # traceable to a real number? leave it.
+        nums = re.findall(r"\d[\d,]*(?:\.\d+)?", m.group(0))
+        suffix = "m" if re.search(r"[Mm]|million", m.group(0)) else ("k" if re.search(r"[Kk]|thousand", m.group(0)) else "")
+        parsed = []
+        for n in nums:
+            try:
+                val = float(n.replace(",", ""))
+            except ValueError:
+                continue
+            if suffix == "m":
+                val *= 1_000_000
+            elif suffix == "k":
+                val *= 1_000
+            parsed.append(val)
+        if parsed and all(_money_matches_known(v, known) for v in parsed):
+            return m.group(0)
+        flags.append(f"Removed an unsupported dollar adjustment from the analysis: \"{m.group(0).strip()}\".")
+        low_window = window.lower()
+        if _ADJ_AFTER_RE.match(after):
+            return "a meaningful"  # "-> a meaningful premium/discount over ..."
+        if any(w in low_window for w in ("cost", "replace", "repair", "budget")):
+            return "a significant capital expense"
+        return "meaningful contributory value"
+
+    out = _MONEY_TOKEN_RE.sub(repl_money, text)
+
+    def repl_pct(m: re.Match) -> str:
+        flags.append(f"Removed an unsupported '% of build/land cost' adjustment: \"{m.group(0).strip()}\".")
+        return "a portion of its replacement cost"
+
+    out = _PCT_OF_COST_RE.sub(repl_pct, out)
+    return out, flags
+
+
+# Final client-facing polish pass (same family/style as _scrub_invented_adjustments above -
+# deterministic pattern match, not a second AI call). Two independent problems, handled
+# differently on purpose:
+#  1. "reads as/reads like/reads more/appears to read" - the AI-sounding construction the system
+#     prompt now explicitly bans (see _SYSTEM_PROMPT), kept here as a safety net in case it slips
+#     through anyway. Safe to auto-replace: each banned phrase always sits in the same
+#     grammatical slot (verb + adjective/description), so swapping the verb phrase for a plain
+#     agent-toned equivalent can't break the sentence.
+#  2. A stray QA/debug-toned parenthetical (the exact pattern _scrub_invented_adjustments used to
+#     produce before A2's fix, in case the AI free-writes something similar unprompted) - only
+#     FLAGGED, never auto-stripped, since guessing at what surrounding text to keep risks
+#     mangling a sentence that happens to share a keyword for an innocent reason.
+_AI_SOUNDING_RE = re.compile(r"\breads?\s+(?:as|like|more)\b|\bappears?\s+to\s+read\b", re.IGNORECASE)
+_AI_SOUNDING_REPLACEMENTS = (
+    (re.compile(r"\breads\s+as\b", re.IGNORECASE), "presents as"),
+    (re.compile(r"\breads\s+like\b", re.IGNORECASE), "comes across as"),
+    (re.compile(r"\breads\s+more\b", re.IGNORECASE), "comes across more"),
+    (re.compile(r"\bappears?\s+to\s+read\b", re.IGNORECASE), "comes across"),
+)
+_QA_TONE_PARENTHETICAL_RE = re.compile(
+    r"\((?:[^()]*\b(?:verify actual figures|unverified|unconfirmed|TBD|internal note|per (?:the )?data[_ ]note)\b[^()]*)\)",
+    re.IGNORECASE,
+)
+
+
+def _final_polish_pass(text: str, label: str) -> tuple[str, list[str]]:
+    """Runs on methodology_summary/offer_strategy_considerations/inspection_concerns/comp notes
+    right before they're persisted - see call sites. Returns (possibly-rewritten text, qa_flags)."""
+    if not text:
+        return text, []
+    flags: list[str] = []
+    out = text
+    if _AI_SOUNDING_RE.search(out):
+        for pattern, replacement in _AI_SOUNDING_REPLACEMENTS:
+            out = pattern.sub(replacement, out)
+        flags.append(f"{label}: rewrote AI-sounding phrasing ('reads as/like/more') to plain agent language.")
+    if _QA_TONE_PARENTHETICAL_RE.search(out):
+        flags.append(f"{label}: leftover QA-toned parenthetical detected - review before sending to a client.")
+    # Internal engine jargon the reasoning model sometimes echoes into client prose.
+    out = re.sub(r"\b(?:current\s+)?subject[- ]market exposure\b", "the home's own time on the market", out, flags=re.IGNORECASE)
+    return out, flags
+
+
+# v10 hedge firm-up (concern #1, DIMENSION-SPECIFIC per the hardening pass). A hedge is only
+# firmed up when (a) it sits near a comp reference AND (b) the SPECIFIC quality dimension the
+# hedged phrase is about is committed ('above'/'below') for THAT comp. interior=above does NOT
+# license firming "the lot may be superior". `dims=None` means the phrase carries no dimension of
+# its own - fired only if finish_quality OR interior is committed (the common "overall condition"
+# case). Every (regex, replacement, dims) triple.
+_V10_HEDGE_SUBS = [
+    (re.compile(r"\b(may|might|could)\s+(exceed|surpass|outclass)\b", re.IGNORECASE), r"exceeds", None),
+    (re.compile(r"\b(may|might|could)\s+be\s+(more\s+updated|more\s+renovated|better\s+finished|more\s+dated|less\s+updated)\b", re.IGNORECASE), r"is \2", ("finish_quality",)),
+    (re.compile(r"\b(may|might|could)\s+be\s+(higher-end|superior)\b", re.IGNORECASE), r"is \2", None),
+    (re.compile(r"\b(appears|seems)\s+(?:to\s+be\s+)?(more\s+updated|more\s+renovated|better\s+finished|more\s+dated|less\s+updated)\b", re.IGNORECASE), r"is \2", ("finish_quality",)),
+    (re.compile(r"\b(appears|seems)\s+(?:to\s+be\s+)?(more\s+refined|more\s+dated)\s+(?:in\s+the\s+)?interior\b", re.IGNORECASE), r"is \2 interior", ("interior",)),
+    (re.compile(r"\b(appears|seems)\s+(?:to\s+be\s+)?(superior|higher-end|inferior)\b", re.IGNORECASE), r"is \2", None),
+    (re.compile(r"\bpotentially\s+(more\s+updated|more\s+renovated|more\s+dated)\b", re.IGNORECASE), r"\1", ("finish_quality",)),
+    (re.compile(r"\bpotentially\s+(superior|higher-end|inferior)\b", re.IGNORECASE), r"\1", None),
+    (re.compile(r"\blikely\s+(exceeds|surpasses|outclasses)\b", re.IGNORECASE), r"\1", None),
+    (re.compile(r"\b(may|might|could)\s+(?:have\s+)?(?:a\s+)?(better|stronger|superior)\s+(lot|parcel|grounds|acreage|land)\b", re.IGNORECASE), r"has a \2 \3", ("lot",)),
+    (re.compile(r"\b(may|might|could)\s+(?:have\s+)?(?:a\s+)?(quieter|better|calmer)\s+(street|road|setting|position)\b", re.IGNORECASE), r"has a \2 \3", ("street_context",)),
+    (re.compile(r"\b(may|might|could)\s+(?:have\s+)?(?:a\s+)?(better|stronger)\s+(curb\s+appeal|exterior|facade|façade)\b", re.IGNORECASE), r"has \2 \3", ("exterior",)),
+]
+_V10_ALL_DIMS = ("finish_quality", "interior", "exterior", "lot", "amenities", "layout", "street_context")
+
+
+def _firm_up_hedges(text: str, comps: list) -> tuple[str, list[str]]:
+    """v10 concern #1 - firm a hedged comparison ONLY where the exact structured quality dimension
+    it's about is already committed ('above'/'below') for the comp named nearby. Span-based, so
+    paragraph breaks / whitespace are preserved. `comps` are the report comparables (positional:
+    Comp #1 = first), each with .quality + .street_address."""
+    if not text or not comps:
+        return text, []
+    # per-comp: which dimensions are committed, and the tokens that name that comp
+    comp_dims: list[tuple[set, list[str]]] = []
+    for i, c in enumerate(comps):
+        q = c.get("quality") or {}
+        committed = {d for d in _V10_ALL_DIMS if str(q.get(d) or "") in ("above", "below")}
+        if not committed:
+            continue
+        toks = [f"comp #{i + 1}", f"comp #{i + 1} ", f"comp {i + 1}"]
+        addr = str(c.get("street_address") or "").strip().lower()
+        if len(addr) >= 6:
+            toks.append(addr)
+        comp_dims.append((committed, toks))
+    if not comp_dims:
+        return text, []
+
+    low = text.lower()
+
+    def _committed_near(start: int, end: int, needed: Optional[tuple]) -> bool:
+        window = low[max(0, start - 170):min(len(low), end + 100)]
+        for committed, toks in comp_dims:
+            if not any(t in window for t in toks):
+                continue
+            if needed is None:
+                if committed & {"finish_quality", "interior"}:
+                    return True
+            elif committed & set(needed):
+                return True
+        return False
+
+    out = text
+    changed = False
+    for pat, repl, dims in _V10_HEDGE_SUBS:
+        def _sub(m: "re.Match", _repl=repl, _dims=dims) -> str:
+            nonlocal changed
+            if _committed_near(m.start(), m.end(), _dims):
+                changed = True
+                return m.expand(_repl)
+            return m.group(0)
+        out = pat.sub(_sub, out)
+        low = out.lower()
+    if changed:
+        return out, ["Firmed up hedged wording where the comp's own committed quality rating for that exact "
+                     "dimension already establishes the comparison."]
+    return out, []
+
+
+_SPECULATIVE_DEFECT_RE = re.compile(
+    r"\b("
+    r"likely\s+(?:requires?|needs?|has|had)|"
+    r"probably\s+(?:requires?|needs?|has)|"
+    r"will\s+(?:need|require|likely)|"
+    r"may\s+(?:experience|suffer|have)\s+(?:standing\s+water|water\s+intrusion|flooding|leaks?|mold|settlement)|"
+    r"(?:is|are)\s+(?:failing|deteriorat\w+|undersized)|"
+    r"shows?\s+signs?\s+of|"
+    r"appears?\s+to\s+(?:be\s+)?(?:failing|leaking|settling)|"
+    r"deferred\s+maintenance|"
+    r"end\s+of\s+(?:its\s+)?(?:useful\s+)?life"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _flag_speculative_defects(text: str) -> list[str]:
+    """Item 5 - due-diligence language must be 'verify X', never 'X is probably broken'. Flags
+    speculative-defect phrasing so it's visible in the report's Data Notes even though the prose
+    itself is left for the agent to edit (rewriting a diagnosis into a verify-item safely is not
+    something a regex can do without mangling the sentence)."""
+    if not text:
+        return []
+    hits = {m.group(0).strip().lower() for m in _SPECULATIVE_DEFECT_RE.finditer(text)}
+    return [
+        f"Inspection section uses speculative-defect wording (\"{h}\") - it should read as an item "
+        "to verify, not a diagnosis; review before sharing."
+        for h in sorted(hits)
+    ]
+
+
+_PSF_MENTION_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s?([MmKk])?\s?(?:/|per\s+)\s?(?:sq\.?\s?ft|sqft|square\s?f(?:oo|ee)?t)", re.IGNORECASE)
+_BIG_M_RE = re.compile(r"\$\s?(\d{2,5})(?:\.0+)?\s?[Mm]\b")
+_COMP_COUNT_RE = re.compile(r"\b(\d{1,2})\s+(?:comparable\s+sales?|comparables?|comps?|closed\s+sales?|sold\s+comps?)\b", re.IGNORECASE)
+_BAD_PCT_RE = re.compile(r"\b(\d{2,4}(?:\.\d+)?)\s?%")
+
+
+def _prose_math_qa(text: str, field_label: str, ctx: dict) -> tuple[str, list[str]]:
+    """Validates AI prose against the deterministic structured numbers and auto-corrects the one
+    unambiguous, high-frequency error class (a $/sqft figure written as '$575M'); everything else
+    is flagged for review. ctx keys: comp_psf (list[float]), included_comp_count,
+    valuation_comp_count, list_price, value."""
+    if not text:
+        return text, []
+    flags: list[str] = []
+    out = text
+    psf_vals = [p for p in (ctx.get("comp_psf") or []) if p]
+    psf_lo = min(psf_vals) if psf_vals else None
+    psf_hi = max(psf_vals) if psf_vals else None
+
+    # 1) "$575M" that is really a $/sqft figure. If the integer is in a plausible $/sqft band
+    #    (and nowhere near a plausible whole-house price in millions), rewrite to "$575/sq ft".
+    def fix_big_m(m: re.Match) -> str:
+        n = float(m.group(1))
+        if 40 <= n <= 5000 and (psf_lo is None or n <= psf_hi * 3):
+            flags.append(f"{field_label}: corrected a unit error - \"{m.group(0).strip()}\" read as ${int(n)}/sq ft.")
+            return f"${int(n)}/sq ft"
+        if n > 100:  # >$100M house - almost certainly wrong, but don't guess the fix
+            flags.append(f"{field_label}: \"{m.group(0).strip()}\" is an implausible dollar figure - verify.")
+        return m.group(0)
+
+    out = _BIG_M_RE.sub(fix_big_m, out)
+
+    # 2) $/sqft figures outside the comp $/sqft range by a wide margin.
+    if psf_lo and psf_hi:
+        for m in _PSF_MENTION_RE.finditer(out):
+            raw = float(m.group(1).replace(",", ""))
+            if m.group(2) and m.group(2).lower() == "k":
+                raw *= 1000
+            if raw < psf_lo * 0.5 or raw > psf_hi * 1.8:
+                flags.append(
+                    f"{field_label}: stated ${int(raw)}/sq ft is outside the comparable $/sq ft range "
+                    f"(${int(psf_lo)}-${int(psf_hi)}) - verify."
+                )
+
+    # 3) comp-count claims that don't match the actual table.
+    inc = ctx.get("included_comp_count")
+    val_ct = ctx.get("valuation_comp_count")
+    if inc is not None:
+        for m in _COMP_COUNT_RE.finditer(out):
+            stated = int(m.group(1))
+            if stated not in {inc, val_ct} and not (val_ct is not None and stated == val_ct):
+                flags.append(
+                    f"{field_label}: prose says \"{m.group(0).strip()}\" but the report has {inc} included "
+                    f"comp(s)" + (f" ({val_ct} carrying valuation weight)" if val_ct is not None else "") + " - verify."
+                )
+                break
+
+    # 4) impossible percentages.
+    for m in _BAD_PCT_RE.finditer(out):
+        pct = float(m.group(1))
+        pre = out[max(0, m.start() - 24):m.start()].lower()
+        if pct > 100 and not any(w in pre for w in ("over ", "above ", "more than ", "grew ", "up ")):
+            flags.append(f"{field_label}: \"{m.group(0).strip()}\" is an impossible percentage - verify.")
+
+    return out, flags
+
+
+def _deterministic_inspection_baseline(subject: dict, timeline: dict) -> str:
+    """A guaranteed FLOOR for a buyer CMA's Inspection Concerns section, built from the subject's
+    OWN structured data - used when the AI (main call AND the estimate-only pass) leaves the field
+    empty. A buyer report must never ship with a blank 'what to investigate' section. Every item is
+    phrased as something to VERIFY, tied to a real field, never a diagnosis. Titled '**Header:**'
+    sections separated by blank lines - the same shape the AI is asked for, so it renders identically."""
+    def _s(v):
+        if isinstance(v, (list, tuple)):
+            return " ".join(str(x) for x in v).lower()
+        return str(v or "").lower()
+
+    water = _s(subject.get("water_source"))
+    sewer = _s(subject.get("sewer"))
+    roof = _s(subject.get("roof_type"))
+    yb = _as_float(subject.get("year_built"))
+    basement = _s(subject.get("basement"))
+    below_grade = _as_float(subject.get("below_grade_finished_area"))
+
+    parts: list = []
+    if (timeline or {}).get("is_under_contract"):
+        parts.append("This property is currently under contract; the due-diligence items below are for a "
+                     "backup-offer position or buyer analysis.")
+    parts.append("**General Home Inspection:** Retain a licensed home inspector and keep the offer "
+                 "contingent on a satisfactory whole-house inspection covering structure, roof, attic, "
+                 "foundation, drainage, and all major systems.")
+    if "well" in water or ("private" in water and "sewer" not in water):
+        parts.append("**Water Supply (Private Well):** The property is served by a well - test flow rate / "
+                     "recovery and water quality (bacteria, nitrates, and any locally recommended tests such "
+                     "as arsenic), and confirm the age and condition of the pump, pressure tank, and any "
+                     "treatment equipment.")
+    elif any(w in water for w in ("public", "city", "community")):
+        parts.append("**Water Supply:** On public / community water - confirm the account is current and ask "
+                     "about any recent service-line or water-pressure issues.")
+    else:
+        parts.append("**Water Supply:** The data does not settle the water source - confirm whether it is "
+                     "public or a private well and test accordingly.")
+    if any(w in sewer for w in ("septic", "mound", "cesspool", "on-site", "on site")) or ("private" in sewer):
+        parts.append("**Septic System:** The property is on septic - locate the tank and drainfield, have "
+                     "both pumped and inspected, and obtain the permit / as-built, rated capacity, and last-"
+                     "service records.")
+    elif any(w in sewer for w in ("public", "city")):
+        parts.append("**Sewer:** On public sewer - a camera scope of the lateral is worthwhile on an older "
+                     "home to rule out root intrusion or a break.")
+    else:
+        parts.append("**Sewer / Septic:** Confirm whether the property is on public sewer or septic and "
+                     "inspect accordingly.")
+    parts.append("**Mechanical Systems:** Verify the age and condition of the HVAC (heating and cooling), the "
+                 "water heater, and the electrical service and panel; request service records and confirm "
+                 "there is no active knob-and-tube or aluminum branch wiring.")
+    if roof and roof not in ("", "unknown", "none"):
+        parts.append(f"**Roof & Exterior:** Roof type on record is {roof} - have its age and remaining service "
+                     "life assessed and confirm flashing, gutters, and drainage are sound.")
+    else:
+        parts.append("**Roof & Exterior:** Have the roof's age and remaining service life assessed and confirm "
+                     "flashing and drainage are sound.")
+    stucco_guidance = _stucco_inspection_paragraph(subject)
+    if stucco_guidance:
+        parts.append(stucco_guidance)
+    if basement or below_grade:
+        parts.append("**Lower Level & Moisture:** Check the basement / lower level for any history of water "
+                     "intrusion, confirm exterior grading slopes away from the house, and verify the sump pump "
+                     "and any perimeter drainage are functional.")
+    if yb and yb < 1980:
+        parts.append("**Older-Home Items:** Built before 1980 - test for lead-based paint and asbestos ahead of "
+                     "any renovation or demolition, and confirm prior additions / renovations were permitted "
+                     "and closed out.")
+    parts.append("**Records & Permits:** Ask the seller for permits, warranties, and service records for the "
+                 "roof, systems, and any additions, and review the sellers' disclosures and any prior "
+                 "inspection reports.")
+    return "\n\n".join(parts)
+
+
+def _deterministic_listing_prep_baseline(subject: dict) -> str:
+    """Seller-side mirror of _deterministic_inspection_baseline: the guaranteed floor for a seller
+    CMA's Listing Prep section when the AI (main call AND estimate-only pass) leaves it empty. Same
+    subject fields, reworded for the owner - what a buyer's inspection will look at, so the owner
+    can document or address it before listing instead of negotiating it after."""
+    def _s(v):
+        if isinstance(v, (list, tuple)):
+            return " ".join(str(x) for x in v).lower()
+        return str(v or "").lower()
+
+    water = _s(subject.get("water_source"))
+    sewer = _s(subject.get("sewer"))
+    roof = _s(subject.get("roof_type"))
+    yb = _as_float(subject.get("year_built"))
+    basement = _s(subject.get("basement"))
+    below_grade = _as_float(subject.get("below_grade_finished_area"))
+
+    parts: list = [
+        "**Pre-Listing Inspection:** Consider a pre-listing whole-house inspection, so anything a buyer's "
+        "inspector will find is known, priced, or fixed before it becomes a negotiating point."
+    ]
+    if "well" in water or ("private" in water and "sewer" not in water):
+        parts.append("**Private Well:** Buyers will test the well - have a recent water-quality and flow test "
+                     "ready, along with the age and service history of the pump and any treatment equipment.")
+    elif not any(w in water for w in ("public", "city", "community")):
+        parts.append("**Water Source:** The records don't settle whether the home is on public water or a "
+                     "private well - confirm it so the listing states it correctly.")
+    if any(w in sewer for w in ("septic", "mound", "cesspool", "on-site", "on site")) or ("private" in sewer):
+        parts.append("**Septic System:** Have the system pumped and inspected ahead of listing, and gather the "
+                     "permit / as-built and last-service records - buyers will ask for all of it.")
+    elif not any(w in sewer for w in ("public", "city")):
+        parts.append("**Sewer / Septic:** Confirm whether the home is on public sewer or septic so it's "
+                     "disclosed correctly.")
+    parts.append("**Systems & Service Records:** Gather the age and service history of the HVAC, water heater, "
+                 "and electrical panel - documented, maintained systems remove a common buyer objection.")
+    if roof and roof not in ("", "unknown", "none"):
+        parts.append(f"**Roof & Exterior:** Roof type on record is {roof} - have its age and remaining life "
+                     "documented, and address any visible flashing, gutter, or drainage issues before photos.")
+    else:
+        parts.append("**Roof & Exterior:** Have the roof's age and remaining life documented, and address any "
+                     "visible flashing, gutter, or drainage issues before photos.")
+    if basement or below_grade:
+        parts.append("**Lower Level & Moisture:** Confirm there's no history of water in the lower level (or "
+                     "document how it was resolved) and that the sump and grading are working.")
+    if yb and yb < 1980:
+        parts.append("**Older-Home Disclosures:** Built before 1980 - be ready with the lead-based paint "
+                     "disclosure, and confirm past additions and renovations were permitted and closed out.")
+    parts.append("**Records & Permits:** Pull together permits, warranties, and records for any renovations "
+                 "or additions - buyers pay more confidently for improvements they can verify.")
+    return "\n\n".join(parts)
+
+
+_SELLER_TEXT_MONEY_RE = re.compile(r"\$\s?\d")
+
+
+def _process_seller_guidance(
+    se: Optional[dict], *, subject: dict, comps: list, value: float, status_timeline: dict,
+    comp_num_by_key: dict, addr_by_key: dict, qa_ctx: dict,
+) -> tuple[str, str, list[str], list[str]]:
+    """Seller-only: the listing strategy + listing prep narratives run through the SAME generic
+    prose QA the buyer narratives get (comp-reference scrub, prose math QA, invented-adjustment
+    scrub, polish, final consistency gate), in its own separate calls so the buyer's own pass is
+    never altered. Returns (strategy, prep, qa_flags, qa_blocking)."""
+    se = se or {}
+    flags: list[str] = []
+    blocking: list[str] = []
+    strategy = _coerce_ai_text(se.get("listing_strategy_considerations")).strip()
+    prep = _coerce_ai_text(se.get("listing_prep_concerns")).strip()
+    if not prep:
+        prep = _deterministic_listing_prep_baseline(subject)
+        flags.append(
+            "Listing Prep came back empty from the AI - filled a standard pre-listing checklist from the "
+            "subject's own data (water / sewer / systems / roof / age). Review and add anything "
+            "property-specific."
+        )
+    if not strategy:
+        flags.append("Pricing Strategy came back empty from the AI - write it in Studio before sharing.")
+    texts = {"s": strategy, "p": prep}
+    for key, label in (("s", "Pricing strategy"), ("p", "Listing prep")):
+        txt = _replace_raw_comp_references(texts[key], comps)
+        txt, f1 = _prose_math_qa(txt, label, qa_ctx)
+        txt, f2 = _scrub_invented_adjustments(txt, qa_ctx)
+        txt, f3 = _final_polish_pass(txt, label)
+        flags.extend(f1 + f2 + f3)
+        texts[key] = txt
+    gated, gate_flags, gate_blocking = _final_consistency_gate(
+        {"s": ("Pricing strategy", texts["s"]), "p": ("Listing prep", texts["p"])},
+        subject=subject, comps=comps, value=value, status_timeline=status_timeline or {},
+        comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key,
+    )
+    flags.extend(gate_flags)
+    blocking.extend(gate_blocking)
+    for key, label in (("s", "Pricing strategy"), ("p", "Listing prep")):
+        if _SELLER_TEXT_MONEY_RE.search(gated.get(key) or ""):
+            flags.append(
+                f"{label} quotes a dollar figure - it was asked not to, since the value can move after "
+                "it's drafted. Check it matches the final numbers shown above it."
+            )
+    return gated.get("s") or "", gated.get("p") or "", flags, blocking
+
+
+def _strip_under_contract_offer_frame(text: str) -> str:
+    """Remove prior generated status framing; one deterministic banner is added afterward."""
+    kept: list[str] = []
+    for match in re.finditer(r"[^.!?]*(?:[.!?]|$)", text or ""):
+        sentence = match.group(0).strip()
+        if not sentence:
+            continue
+        low = sentence.lower()
+        status_sentence = bool(re.search(
+            r"\b(?:property|home|listing)\s+is\s+(?:currently\s+)?(?:under\s+(?:contract|agreement)|"
+            r"pending|contingent|active\s+under\s+contract)\b", low,
+        ))
+        backup_frame = (
+            ("backup-offer" in low or "backup offer" in low or "buyer analysis only" in low)
+            and ("not actively negotiating" in low or "guidance" in low or "days on market" in low)
+        )
+        weak_demand_frame = "days on market are not a sign of weak demand" in low
+        if status_sentence or backup_frame or weak_demand_frame:
+            continue
+        kept.append(sentence)
+    return " ".join(kept).strip()
+
+
+def _status_aware_offer_guidance(offer_text: str, timeline: dict) -> tuple[str, list[str]]:
+    """Item 6 - the offer section must respect the subject's actual listing status. Prepends a
+    corrective frame (or, for a closed subject, replaces the section with a retrospective note)
+    rather than trusting the model to have done it."""
+    text = (offer_text or "").strip()
+    if timeline.get("is_closed"):
+        note = (
+            "This property has already sold. No live offer strategy applies. The valuation above is "
+            "provided for reference and for analyzing comparable properties."
+        )
+        if text and text.lower() not in note.lower():
+            return note, ["Offer guidance replaced with a retrospective note - the subject has already closed."]
+        return note, []
+    if timeline.get("is_under_contract"):
+        amd = timeline.get("active_market_days")
+        text = _strip_under_contract_offer_frame(text)
+        text = re.sub(r"\b(under\s+(?:contract|agreement)|pending|contingent)(\s+\1\b)+", r"\1", text, flags=re.IGNORECASE)
+        banner = (
+            "Note: this property is currently under contract (under agreement"
+            + (f" after {amd} active-market days" if amd is not None else "")
+            + "). The guidance below is for a backup-offer position or buyer analysis only - the "
+            "seller is not actively negotiating new offers, and the listing's earlier days on "
+            "market are not a sign of weak demand."
+        )
+        if not text:
+            return banner, ["Added an 'under agreement' frame to the (empty) offer section."]
+        if text.lower().startswith("note: this property is currently under contract"):
+            return text, []
+        return f"{banner}\n\n{text}", ["Prepended the authoritative 'under contract / backup-offer' frame to the offer section (subject is not active)."]
+    return text, []
+
+
+# --------------------------------------------------------------------------------------------
+# Final consistency gate: a last deterministic pass over the AI's prose against the authoritative
+# structured numbers, run just before the report/PDF are considered final. Distinct from
+# _prose_math_qa/_scrub_invented_adjustments above (which catch invented precision and unit
+# errors) - this pass catches the AI contradicting ITS OWN correct numbers: a comp card's $/sqft
+# vs. what the prose says about that same comp, a directional claim (bigger/smaller, newer/older)
+# that doesn't match the actual data, more than one "final" value floating around, and a stale
+# subject listing-status reference. Auto-corrects the safe, unambiguous classes and logs every
+# change to qa_flags; anything it can't safely rewrite goes to qa_blocking instead, which gates
+# PDF export in the frontend (see CmaPdfModal).
+# --------------------------------------------------------------------------------------------
+
+# Tiles a text into contiguous, non-overlapping "sentence" chunks (chunk text + its [start, end)
+# offset) that reassemble to the exact original string when concatenated in order - lets every
+# rewrite below operate within one sentence's scope without losing the surrounding formatting.
+# The `\.(?=\d)` alternative keeps a decimal point ("$3.25M") from being read as a sentence
+# terminator - only a period NOT followed by a digit ends the "body" group.
+_SENTENCE_CHUNK_RE = re.compile(r"(?:[^.!?;]|\.(?=\d))+[.!?;]*\s*")
+
+
+def _sentence_chunks(text: str) -> list[tuple[str, int, int]]:
+    return [(m.group(0), m.start(), m.end()) for m in _SENTENCE_CHUNK_RE.finditer(text) if m.group(0)]
+
+
+def _chunk_mentions_comp(chunk_lower: str, key: str, comp_num_by_key: dict, addr_by_key: dict) -> bool:
+    num = comp_num_by_key.get(key)
+    addr = (addr_by_key.get(key) or "").lower()
+    tokens = [t for t in ([f"comp #{num}", f"comp {num}"] if num else []) + ([addr] if len(addr) >= 5 else []) if t]
+    return any(tok in chunk_lower for tok in tokens)
+
+
+def _match_case(replacement: str, original: str) -> str:
+    if original.isupper():
+        return replacement.upper()
+    if original[:1].isupper():
+        return replacement[:1].upper() + replacement[1:]
+    return replacement
+
+
+# 2.3a - $/sqft card vs. prose. A sentence naming a specific comp that also states a $/sqft figure
+# must match that comp's OWN authoritative $/sqft (verified close price / sqft) - not just fall
+# within the overall comp range (that's what _prose_math_qa already checks).
+def _reconcile_comp_psf_mentions(
+    text: str, field_label: str, comps: list[dict], comp_num_by_key: dict, addr_by_key: dict,
+) -> tuple[str, list[str]]:
+    if not text:
+        return text, []
+    authoritative: dict[str, float] = {}
+    for c in comps:
+        key = c.get("listing_key")
+        price = _as_float(c.get("sale_price"))
+        sqft = _as_float(c.get("sqft"))
+        if key and c.get("price_verified", True) and price and sqft and sqft > 0:
+            authoritative[key] = round(price / sqft)
+    if not authoritative:
+        return text, []
+
+    flags: list[str] = []
+    out_parts: list[str] = []
+    for chunk, _start, _end in _sentence_chunks(text):
+        chunk_lower = chunk.lower()
+        matched_keys = [k for k in authoritative if _chunk_mentions_comp(chunk_lower, k, comp_num_by_key, addr_by_key)]
+        if len(matched_keys) != 1:
+            # Ambiguous (0 or 2+ comps named in one sentence) - don't guess which figure is whose.
+            out_parts.append(chunk)
+            continue
+        key = matched_keys[0]
+        true_psf = authoritative[key]
+
+        def repl(m: re.Match, _true=true_psf, _key=key) -> str:
+            # A $/sqft figure explicitly attributed to "the subject" in the same clause is the
+            # SUBJECT's own number, not this comp's, even though the sentence also names the comp
+            # once (e.g. "Comp #1 sold for $X/sqft, above the subject's own $Y/sqft") - never
+            # touch that one.
+            preceding = chunk[max(0, m.start() - 25):m.start()].lower()
+            if "subject" in preceding:
+                return m.group(0)
+            raw = float(m.group(1).replace(",", ""))
+            if m.group(2) and m.group(2).lower() == "k":
+                raw *= 1000
+            if raw <= 0 or abs(raw - _true) <= max(3.0, 0.15 * _true):
+                return m.group(0)
+            label = f"Comp #{comp_num_by_key.get(_key)}" if comp_num_by_key.get(_key) else (addr_by_key.get(_key) or "a comp")
+            flags.append(
+                f"{field_label}: {label}'s stated ${int(raw)}/sq ft didn't match its verified "
+                f"${_true}/sq ft ({label}'s close price divided by sqft) - corrected."
+            )
+            return f"${_true}/sq ft"
+
+        out_parts.append(_PSF_MENTION_RE.sub(repl, chunk))
+    return "".join(out_parts), flags
+
+
+# 2.3b - directional comparisons (item 3). A sentence naming a comp plus one of these field nouns
+# and a comparative adjective must agree with the actual subject-vs-comp numbers.
+_FIELD_NOUN_RE = {
+    "lot_size": (re.compile(r"\blots?\b", re.IGNORECASE), "lot"),
+    "sqft": (re.compile(r"\b(?:square\s?footage|sq\.?\s?ft|sqft|square\s?f(?:oo|ee)?t)\b", re.IGNORECASE), "square footage"),
+    "beds": (re.compile(r"\bbedrooms?\b", re.IGNORECASE), "bedroom count"),
+    "baths": (re.compile(r"\bbathrooms?\b", re.IGNORECASE), "bathroom count"),
+    "year_built": (re.compile(r"\bbuilt\b|\byear\s?built\b", re.IGNORECASE), "year built"),
+}
+_DIRECTION_WORDS = {
+    "lot_size": {"bigger": ("larger", "bigger", "greater"), "smaller": ("smaller",)},
+    "sqft": {"bigger": ("larger", "bigger", "more", "greater"), "smaller": ("smaller", "less")},
+    "beds": {"bigger": ("more",), "smaller": ("fewer", "less")},
+    "baths": {"bigger": ("more",), "smaller": ("fewer", "less")},
+    "year_built": {"bigger": ("newer",), "smaller": ("older",)},
+}
+_DIRECTION_OPPOSITE = {
+    "larger": "smaller", "bigger": "smaller", "greater": "smaller", "smaller": "larger",
+    "more": "fewer", "less": "more", "fewer": "more",
+    "newer": "older", "older": "newer",
+}
+
+
+def _actual_direction(subject_val, comp_val) -> Optional[str]:
+    s, c = _as_float(subject_val), _as_float(comp_val)
+    if s is None or c is None or s <= 0:
+        return None
+    ratio = c / s
+    if ratio >= 1.05:
+        return "bigger"
+    if ratio <= 0.95:
+        return "smaller"
+    return None  # too close to call - don't police a comparative on a near-tie
+
+
+def _reconcile_directional_claims(
+    text: str, field_label: str, subject: dict, comps: list[dict], comp_num_by_key: dict, addr_by_key: dict,
+) -> tuple[str, list[str], list[str]]:
+    if not text:
+        return text, [], []
+    by_key = {c.get("listing_key"): c for c in comps if c.get("listing_key")}
+    flags: list[str] = []
+    blocking: list[str] = []
+    out_parts: list[str] = []
+    for chunk, _start, _end in _sentence_chunks(text):
+        chunk_lower = chunk.lower()
+        matched_keys = [k for k in by_key if _chunk_mentions_comp(chunk_lower, k, comp_num_by_key, addr_by_key)]
+        if len(matched_keys) != 1:
+            out_parts.append(chunk)
+            continue
+        key = matched_keys[0]
+        comp = by_key[key]
+        label = f"Comp #{comp_num_by_key.get(key)}" if comp_num_by_key.get(key) else (addr_by_key.get(key) or "a comp")
+        new_chunk = chunk
+        for field, (noun_re, noun_label) in _FIELD_NOUN_RE.items():
+            if not noun_re.search(new_chunk):
+                continue
+            words = _DIRECTION_WORDS[field]
+            bigger_hits = [w for w in words["bigger"] if re.search(rf"\b{re.escape(w)}\b", new_chunk, re.IGNORECASE)]
+            smaller_hits = [w for w in words["smaller"] if re.search(rf"\b{re.escape(w)}\b", new_chunk, re.IGNORECASE)]
+            if bigger_hits and smaller_hits:
+                blocking.append(f"{label} {noun_label} direction is self-contradictory in the same sentence - review.")
+                continue
+            if not bigger_hits and not smaller_hits:
+                continue
+            claimed = "bigger" if bigger_hits else "smaller"
+            actual = _actual_direction(subject.get(field), comp.get(field))
+            if actual is None or actual == claimed:
+                continue
+            hit_word = (bigger_hits or smaller_hits)[0]
+            opposite = _DIRECTION_OPPOSITE.get(hit_word.lower())
+            if not opposite:
+                continue
+
+            def _sub(m: re.Match, _opp=opposite) -> str:
+                return _match_case(_opp, m.group(0))
+
+            new_chunk = re.sub(rf"\b{re.escape(hit_word)}\b", _sub, new_chunk, count=1, flags=re.IGNORECASE)
+            flags.append(f"{field_label}: {label} {noun_label} said \"{hit_word}\" but the data says {actual} - corrected to \"{opposite}\".")
+        out_parts.append(new_chunk)
+    return "".join(out_parts), flags, blocking
+
+
+# A value-driver note calling out busy/connector-road exposure for a comp the map data actually
+# shows is quiet contradicts that SAME comp's own narrative elsewhere in the report (its comp card
+# already describes the real cul-de-sac/quiet-street setting). road_context.verdict (OpenStreetMap
+# road classification, see road_context_service) is the one authoritative source for this - never
+# the AI's own free-text guess - so any claim that disagrees with it is removed, deterministically.
+_ROAD_NEGATIVE_EXPOSURE_RE = re.compile(
+    r"\bconnector[- ]road\b|\bbusy\s+road\b|\barterial(?:\s+road)?\b|\bthrough[- ]street\b|"
+    r"\bthrough[- ]traffic\b|\bmajor\s+road\b|\bheavy\s+traffic\b|\bhigh[- ]traffic\b|"
+    r"\btraffic\s+exposure\b|\bexposed\s+to\s+traffic\b|\bfronts?\s+a\s+(?:busy|major|arterial)\s+(?:road|street)\b",
+    re.IGNORECASE,
+)
+
+
+def _reconcile_road_exposure_claims(
+    value_drivers: Optional[list], comps: list[dict], comp_num_by_key: dict, addr_by_key: dict,
+) -> tuple[list, list[str]]:
+    """Cross-checks each value-driver note's road/street-exposure claim about a specific comp
+    against that comp's own authoritative road_context.verdict. Returns (corrected value_drivers,
+    flags) - never touches direction, comp_label, or anything but the note's negated claim."""
+    flags: list[str] = []
+    by_key = {c.get("listing_key"): c for c in comps if c.get("listing_key")}
+    out: list = []
+    for driver in value_drivers or []:
+        d = dict(driver)
+        note = str(d.get("note") or "")
+        if not note or not _ROAD_NEGATIVE_EXPOSURE_RE.search(note):
+            out.append(d)
+            continue
+        combined = f"{d.get('comp_label') or ''} {note}".lower()
+        matched_keys = [k for k in by_key if _chunk_mentions_comp(combined, k, comp_num_by_key, addr_by_key)]
+        if len(matched_keys) != 1:
+            out.append(d)
+            continue
+        key = matched_keys[0]
+        comp = by_key[key]
+        verdict = (comp.get("road_context") or {}).get("verdict")
+        if verdict == "quiet":
+            new_note = _ROAD_NEGATIVE_EXPOSURE_RE.sub("its quiet, low-traffic street position", note)
+            new_note = re.sub(r"\s{2,}", " ", new_note).strip()
+            if new_note != note:
+                ref = f"Comp #{comp_num_by_key.get(key)}" if comp_num_by_key.get(key) else (addr_by_key.get(key) or "a comp")
+                flags.append(
+                    f"Why this number: {ref}'s note claimed busy/connector-road exposure, but its "
+                    "own authoritative road data shows a quiet street - corrected."
+                )
+                d["note"] = new_note
+        out.append(d)
+    return out, flags
+
+
+# ---- Cross-section semantic consistency (general - not tied to any one property/report). ----
+# The passes above each police ONE field's numbers/directions/road-exposure claim against a single
+# authoritative source. This catches a different, broader failure mode: the SAME comp described in
+# fundamentally opposed ways in TWO DIFFERENT client-facing sections - e.g. "Comp #3 has a pool" in
+# its own narrative but treated as the no-pool/cheaper comp in "Why this number", or called a quiet
+# street in one place and busy-road exposure in another, superior condition in one place and
+# inferior in another, sold above the subject in one place and "sold materially lower" in another.
+# Four independently-detected claim families, each with a POSITIVE/NEGATIVE regex pair and (where
+# one exists) an authoritative ground-truth resolver:
+#   - pool: Bright's own Pool/PoolFeatures fields
+#   - road exposure: road_context.verdict (OSM classification) - reuses _ROAD_NEGATIVE_EXPOSURE_RE
+#   - condition: no reliable ground truth: same-comp cross-claim comparison only (block, don't guess which is right)
+#   - sale price vs. the subject: the comp's own verified sale_price vs. the report's final FMV
+_ROAD_POSITIVE_QUIET_RE = re.compile(
+    r"\bquiet(?:er)?\s+(?:street|setting|location|road|cul-?de-?sac)\b|\bcul-?de-?sac\b|"
+    r"\blow[- ]traffic\b|\bmore\s+protected\s+setting\b",
+    re.IGNORECASE,
+)
+_POOL_POSITIVE_RE = re.compile(
+    r"\b(?:has|with|featuring|features|includes?|boasts?)\s+(?:a\s+|an\s+|its\s+own\s+)?"
+    r"(?:in-?ground\s+|above-?ground\s+|heated\s+)?pool\b|\bswimming\s+pool\b",
+    re.IGNORECASE,
+)
+_POOL_NEGATIVE_RE = re.compile(
+    r"\bno\s+pool\b|\bwithout\s+a\s+pool\b|\block?ing\s+a\s+pool\b|\blacks?\s+a\s+pool\b|"
+    r"\bno-pool\b|\babsence\s+of\s+a\s+pool\b",
+    re.IGNORECASE,
+)
+_CONDITION_SUPERIOR_RE = re.compile(
+    r"\bsuperior\s+condition\b|\bin\s+(?:far\s+)?better\s+condition\b|\bmore\s+updated\s+condition\b|"
+    r"\brecently\s+renovated\b|\bturnkey\s+condition\b",
+    re.IGNORECASE,
+)
+_CONDITION_INFERIOR_RE = re.compile(
+    r"\binferior\s+condition\b|\bin\s+(?:far\s+)?worse\s+condition\b|\bneeds?\s+(?:significant\s+)?"
+    r"(?:work|updating|renovation)\b|\bdated\s+condition\b|\boriginal,?\s+unrenovated\s+condition\b",
+    re.IGNORECASE,
+)
+_SOLD_ABOVE_SUBJECT_RE = re.compile(
+    r"\bsold\s+(?:for\s+)?(?:materially\s+|significantly\s+|notably\s+)?above\s+the\s+subject\b|"
+    r"\bsold\s+higher\s+than\s+the\s+subject\b|\bpriced?\s+above\s+the\s+subject'?s?\s+(?:value|estimate)\b",
+    re.IGNORECASE,
+)
+_SOLD_BELOW_SUBJECT_RE = re.compile(
+    r"\bsold\s+(?:for\s+)?materially\s+lower\b|\bsold\s+(?:for\s+)?(?:significantly\s+|notably\s+)?"
+    r"below\s+the\s+subject\b|\bsold\s+lower\s+than\s+the\s+subject\b",
+    re.IGNORECASE,
+)
+
+_CROSS_CLAIM_FAMILIES = ("pool", "road", "condition", "sale_direction")
+_CROSS_CLAIM_LABELS = {
+    "pool": "pool", "road": "street exposure", "condition": "condition",
+    "sale_direction": "sale price relative to the subject",
+}
+_CROSS_CLAIM_PATTERNS = {
+    "pool": (_POOL_POSITIVE_RE, _POOL_NEGATIVE_RE),
+    "road": (_ROAD_POSITIVE_QUIET_RE, _ROAD_NEGATIVE_EXPOSURE_RE),
+    "condition": (_CONDITION_SUPERIOR_RE, _CONDITION_INFERIOR_RE),
+    "sale_direction": (_SOLD_ABOVE_SUBJECT_RE, _SOLD_BELOW_SUBJECT_RE),
+}
+
+
+def _v10_pool_ground_truth(prop: dict) -> Optional[bool]:
+    """True/False only when Bright's own fields make it unambiguous; None (don't police) when the
+    field is simply absent - blank is "unknown", never "confirmed no pool"."""
+    if prop.get("pool_features"):
+        return True
+    raw = prop.get("pool")
+    if raw in (None, "", [], {}):
+        return None
+    s = str(raw).strip().lower()
+    if s in ("yes", "y", "true", "1") or "pool" in s and s not in ("no pool", "none"):
+        return True
+    if s in ("no", "n", "false", "0", "none"):
+        return False
+    return None
+
+
+def _v10_sale_direction_ground_truth(comp: dict, value: Optional[float]) -> Optional[str]:
+    """'positive' (sold materially above the subject's FMV), 'negative' (materially below), or
+    None (too close to call, or no verified sale price) - never asserted on an unverified price."""
+    price = _as_float(comp.get("sale_price"))
+    if not price or not value or not comp.get("price_verified", True):
+        return None
+    ratio = price / value
+    if ratio >= 1.08:
+        return "positive"
+    if ratio <= 0.90:
+        return "negative"
+    return None
+
+
+def _v10_cross_section_semantic_consistency_check(
+    *, methodology: str, offer: str, inspection: str, value_drivers: Optional[list],
+    comps: list[dict], subject: dict, value: Optional[float],
+    comp_num_by_key: dict, addr_by_key: dict,
+) -> tuple[str, str, str, list, list[str], list[str]]:
+    """Runs on the EXACT final client-facing text (methodology/offer/inspection, every value-driver
+    note, and every comp's own narrative) right before the artifact is stamped Passed. For each of
+    four claim families, resolves every single-comp-attributed sentence's claim, then: (1) when an
+    authoritative ground truth exists (pool fields, road_context.verdict, verified sale price vs.
+    FMV) and a claim contradicts it, neutralizes that one claim in place; (2) regardless of ground
+    truth, if the SAME property still carries opposing claims for the same family across different
+    sections after step 1, blocks export - the report cannot confidently say which section is right,
+    so it must not guess. Never touches valuation, similarity, or pricing math - text only.
+    Returns (methodology, offer, inspection, value_drivers, flags, blocking); `comps` entries with a
+    neutralized narrative are mutated in place (same object the caller already holds)."""
+    by_key = {c.get("listing_key"): c for c in comps if c.get("listing_key")}
+    flags: list[str] = []
+    blocking: list[str] = []
+
+    # Ground truth per (comp_key, family): True/False/'positive'/'negative', or absent if unknown.
+    ground_truth: dict[tuple[str, str], Any] = {}
+    for key, comp in by_key.items():
+        pool_gt = _v10_pool_ground_truth(comp)
+        if pool_gt is not None:
+            ground_truth[(key, "pool")] = pool_gt
+        road_verdict = (comp.get("road_context") or {}).get("verdict")
+        if road_verdict in ("quiet", "through"):
+            ground_truth[(key, "road")] = road_verdict == "quiet"
+        sale_dir = _v10_sale_direction_ground_truth(comp, value)
+        if sale_dir is not None:
+            ground_truth[(key, "sale_direction")] = sale_dir == "positive"
+
+    def _polarity_of(family: str, matched_positive: bool) -> str:
+        return "positive" if matched_positive else "negative"
+
+    def _neutralize_or_flag(family: str, key: str, chunk: str) -> Optional[str]:
+        """If this family/comp has a known ground truth and the chunk's claim disagrees with it,
+        return a neutralized replacement for the offending phrase; else None (leave untouched)."""
+        gt = ground_truth.get((key, family))
+        if gt is None:
+            return None
+        pos_re, neg_re = _CROSS_CLAIM_PATTERNS[family]
+        hit_re, claim_is_positive = (pos_re, True) if pos_re.search(chunk) else (neg_re, False)
+        if claim_is_positive == bool(gt):
+            return None  # claim already agrees with ground truth
+        replacement = {
+            "pool": "its documented pool features" if gt else "the absence of a documented pool",
+            "road": "its quiet, low-traffic street position" if gt else "its documented road/traffic exposure",
+            "sale_direction": "its sale price relative to the subject's fair market value",
+        }.get(family)
+        if not replacement:
+            return None
+        return hit_re.sub(replacement, chunk, count=1)
+
+    label_of = {key: (f"Comp #{comp_num_by_key.get(key)}" if comp_num_by_key.get(key) else (addr_by_key.get(key) or "a comp"))
+                for key in by_key}
+
+    # Pass 1: scan every source, neutralizing any claim that disagrees with a known ground truth,
+    # and record every SURVIVING claim (post-neutralization) for the cross-claim comparison below.
+    surviving_claims: dict[tuple[str, str], list[tuple[str, str]]] = {}  # (key, family) -> [(polarity, source_label)]
+
+    def _apply_families(text: str, key: str, source_label: str) -> str:
+        """Runs the 4 family checks against one already-comp-resolved piece of text, neutralizing
+        any ground-truth contradiction and recording any surviving (unresolved) claim."""
+        new_text = text
+        for family in _CROSS_CLAIM_FAMILIES:
+            pos_re, neg_re = _CROSS_CLAIM_PATTERNS[family]
+            pos_hit, neg_hit = pos_re.search(new_text), neg_re.search(new_text)
+            if bool(pos_hit) == bool(neg_hit):
+                continue  # neither mentioned, or both in one sentence (self-contradiction - left to the directional-claims check)
+            fixed = _neutralize_or_flag(family, key, new_text)
+            if fixed is not None:
+                flags.append(
+                    f"{source_label}: {label_of[key]}'s {_CROSS_CLAIM_LABELS[family]} claim didn't match the "
+                    "authoritative record - corrected."
+                )
+                new_text = fixed
+                continue  # corrected - it now agrees with ground truth, nothing to record
+            surviving_claims.setdefault((key, family), []).append((_polarity_of(family, bool(pos_hit)), source_label))
+        return new_text
+
+    def _scan_and_fix(text: str, source_label: str) -> str:
+        """For multi-sentence prose (methodology/offer/inspection/comp narrative): resolve each
+        sentence to a comp independently, since one field can discuss several comps in turn."""
+        if not text:
+            return text
+        out_parts: list[str] = []
+        for chunk, _s, _e in _sentence_chunks(text):
+            matched_keys = [k for k in by_key if _chunk_mentions_comp(chunk.lower(), k, comp_num_by_key, addr_by_key)]
+            out_parts.append(_apply_families(chunk, matched_keys[0], source_label) if len(matched_keys) == 1 else chunk)
+        return "".join(out_parts)
+
+    methodology = _scan_and_fix(methodology, "Methodology summary")
+    offer = _scan_and_fix(offer, "Offer strategy")
+    inspection = _scan_and_fix(inspection, "Inspection concerns")
+
+    new_value_drivers = []
+    for driver in value_drivers or []:
+        d = dict(driver)
+        note = str(d.get("note") or "")
+        if note:
+            # comp_label carries the comp identity even when the note prose itself doesn't name it
+            # explicitly (e.g. "this comparable" rather than "Comp #3") - resolve against label+note
+            # together, but only ever rewrite the note text itself.
+            combined_lower = f"{d.get('comp_label') or ''} {note}".lower()
+            matched_keys = [k for k in by_key if _chunk_mentions_comp(combined_lower, k, comp_num_by_key, addr_by_key)]
+            if len(matched_keys) == 1:
+                d["note"] = _apply_families(note, matched_keys[0], "Why this number")
+        new_value_drivers.append(d)
+
+    for key, comp in by_key.items():
+        narrative = comp.get("ai_commentary") or comp.get("commentary") or ""
+        if not narrative:
+            continue
+        fixed_narrative = _scan_and_fix(narrative, f"{label_of[key]} narrative")
+        if fixed_narrative != narrative:
+            if comp.get("ai_commentary"):
+                comp["ai_commentary"] = fixed_narrative
+            else:
+                comp["commentary"] = fixed_narrative
+
+    # Pass 2: any property/family that STILL carries opposing claims from different sections after
+    # ground-truth correction cannot be resolved automatically - block rather than guess.
+    for (key, family), entries in surviving_claims.items():
+        polarities = {p for p, _ in entries}
+        if len(polarities) < 2:
+            continue
+        sources_desc = "; ".join(f"{src} says {pol}" for pol, src in entries)
+        blocking.append(
+            f"Cross-section consistency: {label_of[key]}'s {_CROSS_CLAIM_LABELS[family]} is described "
+            f"inconsistently across the report ({sources_desc}) - review before export."
+        )
+    return methodology, offer, inspection, new_value_drivers, flags, blocking
+
+
+# 2.3c - one authoritative FMV (item 4). Every prose reference to the final value must equal the
+# same number that headlines the report - never rewrites the DERIVED range/offer figures, which
+# are legitimately different numbers by design (see _check_pricing_range_consistency for those).
+_FMV_TRIGGER_RE = re.compile(
+    r"\bfair\s+market\s+value\b|\bFMV\b|\bfinal\s+value\b|\bsupported\s+value\b|\bvalue\s+is\b|"
+    r"\bconclud(?:e|ed|es|ing)\b|\brecommend(?:ed)?\s+value\b",
+    re.IGNORECASE,
+)
+
+
+def _format_dollar_like(target: float, sample: str) -> str:
+    if re.search(r"\d\s?[Mm]\b", sample):
+        return f"${target / 1_000_000:.2f}M"
+    return f"${target:,.0f}"
+
+
+def _reconcile_fmv_mentions(text: str, field_label: str, value: float) -> tuple[str, list[str]]:
+    if not text or not value or value <= 0:
+        return text, []
+    flags: list[str] = []
+    out_parts: list[str] = []
+    tol = max(2500.0, 0.01 * value)
+    for chunk, _start, _end in _sentence_chunks(text):
+        trigger = _FMV_TRIGGER_RE.search(chunk)
+        if not trigger:
+            out_parts.append(chunk)
+            continue
+        dollars = list(_DOLLAR_RE.finditer(chunk))
+        if not dollars:
+            out_parts.append(chunk)
+            continue
+        nearest = min(dollars, key=lambda m: abs(m.start() - trigger.start()))
+        parsed = _parse_dollar(nearest.group(1), nearest.group(2))
+        if abs(parsed - value) <= tol:
+            out_parts.append(chunk)
+            continue
+        replacement = _format_dollar_like(value, nearest.group(0))
+        new_chunk = chunk[:nearest.start()] + replacement + chunk[nearest.end():]
+        flags.append(
+            f"{field_label}: a stated value of {nearest.group(0).strip()} didn't match the report's "
+            f"one estimated fair value (${value:,.0f}) - corrected."
+        )
+        out_parts.append(new_chunk)
+    return "".join(out_parts), flags
+
+
+def _check_pricing_range_consistency(
+    mode: str, value: float, range_pct: float, range_min: float, range_max: float,
+    offer_min: Optional[float] = None, offer_max: Optional[float] = None,
+    recommended_min: Optional[float] = None, recommended_max: Optional[float] = None,
+) -> tuple[list[str], list[str]]:
+    """Defense-in-depth: the numbers checked here are derived FROM value by construction today, so
+    this should normally pass silently - cheap insurance against a future change (or a manually
+    edited report) breaking the bracket relationship. Never rewrites a number, only flags/blocks."""
+    flags: list[str] = []
+    blocking: list[str] = []
+    if range_max <= range_min:
+        blocking.append("Confidence range is inverted or degenerate - review.")
+    elif not (range_min < value < range_max):
+        blocking.append(
+            f"Confidence range (${range_min:,.0f}-${range_max:,.0f}) does not bracket the "
+            f"estimated fair value (${value:,.0f}) - review."
+        )
+
+    def _pct_ok(bound: float, expected: float) -> bool:
+        return abs(bound - expected) <= max(2500.0, 0.02 * value)
+
+    symmetric = abs((value - range_min) - (range_max - value)) <= max(2500.0, 0.02 * value)
+
+    if mode == "buyer":
+        if offer_min is not None and offer_max is not None:
+            if offer_min > offer_max:
+                blocking.append(f"Suggested offer range (${offer_min:,.0f}-${offer_max:,.0f}) is inverted - review.")
+            elif offer_max > range_max + max(2500.0, 0.02 * value):
+                flags.append(
+                    f"Suggested offer max (${offer_max:,.0f}) exceeds the confidence range high end "
+                    f"(${range_max:,.0f}) - verify."
+                )
+            if symmetric and not _pct_ok(offer_min, value * (1 - range_pct / 100)):
+                flags.append(f"Suggested offer min (${offer_min:,.0f}) doesn't match the configured range width - verify.")
+    elif recommended_min is not None and recommended_max is not None:
+        if recommended_min > recommended_max:
+            blocking.append(f"Recommended range (${recommended_min:,.0f}-${recommended_max:,.0f}) is inverted - review.")
+        elif not (recommended_min < value < recommended_max):
+            blocking.append(
+                f"Recommended range (${recommended_min:,.0f}-${recommended_max:,.0f}) does not bracket "
+                f"the estimated fair value (${value:,.0f}) - review."
+            )
+        elif symmetric and not (_pct_ok(recommended_min, value * (1 - range_pct / 100)) and _pct_ok(recommended_max, value * (1 + range_pct / 100))):
+            flags.append("Recommended range endpoints don't match the configured range width from the estimated value - verify.")
+    return flags, blocking
+
+
+# Post-AI status guard (item 1): if the subject went under contract/closed, the prose must not
+# still describe it as a live "active" listing, or use raw calendar days where active-market days
+# apply.
+_BARE_ACTIVE_RE = re.compile(
+    r"\b(?:is|remains?|currently)\s+active\b|\bactive\s+(?:on\s+the\s+market|listing)\b|\bstill\s+active\b",
+    re.IGNORECASE,
+)
+
+
+def _reconcile_status_mentions(text: str, field_label: str, timeline: dict) -> tuple[str, list[str], list[str]]:
+    if not text or not (timeline.get("is_under_contract") or timeline.get("is_closed")):
+        return text, [], []
+    flags: list[str] = []
+    blocking: list[str] = []
+    out = text
+    status = (timeline.get("current_status") or "").strip()
+
+    def _repl_active(m: re.Match) -> str:
+        return _match_case(f"currently {status.lower()}", m.group(0)) if status else m.group(0)
+
+    if _BARE_ACTIVE_RE.search(out):
+        if status:
+            out = _BARE_ACTIVE_RE.sub(_repl_active, out)
+            flags.append(f"{field_label}: referred to the subject as active - corrected to its current status ({status}).")
+        else:
+            blocking.append(f"{field_label}: refers to the subject as active but its current status couldn't be determined - review.")
+
+    calendar_days = timeline.get("calendar_days_since_list")
+    active_days = timeline.get("active_market_days")
+    if calendar_days is not None and active_days is not None and calendar_days != active_days:
+        cal_re = re.compile(rf"\b{calendar_days}\b(\s*(?:calendar\s+)?days?)\b", re.IGNORECASE)
+        if cal_re.search(out):
+            out = cal_re.sub(lambda m: f"{active_days}{m.group(1)}", out)
+            flags.append(
+                f"{field_label}: used {calendar_days} calendar days since list - corrected to "
+                f"{active_days} active-market days (the listing went {status.lower() or 'off market'} before today)."
+            )
+    return out, flags, blocking
+
+
+def _reconcile_closest_comp_claims(
+    text: str, field_label: str, comps: list[dict], comp_num_by_key: dict, addr_by_key: dict,
+) -> tuple[str, list[str]]:
+    """2.3c - a sentence that calls one specific comp the 'closest'/'nearest' comparable must
+    actually carry the shortest distance_miles among the comps that have a distance on record.
+    The reasoning model sometimes assigns this superlative to whichever comp it happens to be
+    discussing rather than the one the data supports - auto-correct rather than surface it as an
+    issue for the agent to deal with."""
+    if not text:
+        return text, []
+    dist_by_key: dict[str, float] = {}
+    for c in comps:
+        key = c.get("listing_key")
+        d = _as_float(c.get("distance_miles"))
+        if key and d is not None:
+            dist_by_key[key] = d
+    if len(dist_by_key) < 2:
+        return text, []
+    true_key = min(dist_by_key, key=dist_by_key.get)
+    true_dist = dist_by_key[true_key]
+
+    flags: list[str] = []
+    out_parts: list[str] = []
+    for chunk, _s, _e in _sentence_chunks(text):
+        if not re.search(r"\b(closest|nearest)\b", chunk, re.IGNORECASE):
+            out_parts.append(chunk)
+            continue
+        chunk_lower = chunk.lower()
+        matched_keys = [k for k in dist_by_key if _chunk_mentions_comp(chunk_lower, k, comp_num_by_key, addr_by_key)]
+        if len(matched_keys) != 1 or matched_keys[0] == true_key:
+            out_parts.append(chunk)
+            continue
+        claimed_key = matched_keys[0]
+        claimed_dist = dist_by_key[claimed_key]
+        if claimed_dist <= true_dist + 0.01:
+            out_parts.append(chunk)
+            continue
+        fixed = re.sub(r"\bclosest\b", "a nearby", chunk, flags=re.IGNORECASE)
+        fixed = re.sub(r"\bnearest\b", "a nearby", fixed, flags=re.IGNORECASE)
+        claimed_label = f"Comp #{comp_num_by_key.get(claimed_key)}" if comp_num_by_key.get(claimed_key) else (addr_by_key.get(claimed_key) or "that comp")
+        true_label = f"Comp #{comp_num_by_key.get(true_key)}" if comp_num_by_key.get(true_key) else (addr_by_key.get(true_key) or "another comp")
+        flags.append(
+            f"{field_label}: called {claimed_label} the closest/nearest comp ({claimed_dist} mi), but "
+            f"{true_label} is actually closer ({true_dist} mi) - removed the unsupported superlative."
+        )
+        out_parts.append(fixed)
+    return "".join(out_parts), flags
+
+
+def _reconcile_original_systems_claim(text: str, field_label: str, subject: dict) -> tuple[str, list[str]]:
+    """Mirrors _factual_prose_blocking's 'original wiring/plumbing/systems' hard-fact check for
+    subject-level prose (methodology/offer/inspection, as opposed to a comp's own card - see
+    _reconcile_comp_hard_facts for that side) - guarantees that check can never fire on this text
+    waiting on an AI rewrite, deterministically, with zero AI call, before the field is ever
+    scanned for blocking."""
+    if not text or _documented_original_systems(subject):
+        return text, []
+    revised = re.sub(
+        r"\boriginal\s+(wiring|plumbing|systems?)\b",
+        lambda m: f"unconfirmed-age {m.group(1)}",
+        text, flags=re.IGNORECASE,
+    )
+    if revised == text:
+        return text, []
+    return revised, [f"{field_label}: relabeled an unsupported 'original wiring/plumbing/systems' claim to honest uncertainty wording."]
+
+
+def _reconcile_age_condition_inference(text: str, field_label: str, subject: dict) -> tuple[str, list[str]]:
+    """Mirrors _factual_prose_blocking's 'infers a condition problem from age' hard-fact check for
+    subject-level prose (methodology/offer/inspection) - guarantees that check can never fire on
+    this text waiting on an AI rewrite, deterministically, with zero AI call, before the field is
+    ever scanned for blocking."""
+    if not text or _documented_deferred_maintenance(subject):
+        return text, []
+    revised = re.sub(
+        r"deferred[- ]maintenance",
+        "unverified condition items (no confirmed deferred-maintenance finding)",
+        text, flags=re.IGNORECASE,
+    )
+    revised = re.sub(
+        r"\bage[- ]related\s+(?:wear|defects?|deterioration)\b",
+        "age alone, without a documented inspection finding",
+        revised, flags=re.IGNORECASE,
+    )
+    if revised == text:
+        return text, []
+    return revised, [f"{field_label}: softened an age-based condition inference to honest uncertainty wording (no documented deferred-maintenance finding)."]
+
+
+def _final_consistency_gate(
+    fields: dict[str, tuple[str, str]], *, subject: dict, comps: list[dict], value: float, status_timeline: dict,
+    comp_num_by_key: dict, addr_by_key: dict,
+) -> tuple[dict[str, str], list[str], list[str]]:
+    """Runs every 2.3 + item-1 post-AI reconciliation pass over each of the report's narrative
+    fields. `fields` maps a short key to (display label, text), e.g. {'m': ('Methodology summary',
+    text), ...}. Returns (corrected text keyed the same way, qa_flags, qa_blocking)."""
+    qa_flags: list[str] = []
+    qa_blocking: list[str] = []
+    out: dict[str, str] = {}
+    for key, (label, text) in fields.items():
+        txt = text or ""
+        txt, f1 = _reconcile_comp_psf_mentions(txt, label, comps, comp_num_by_key, addr_by_key)
+        txt, f2, b2 = _reconcile_directional_claims(txt, label, subject, comps, comp_num_by_key, addr_by_key)
+        txt, f3 = _reconcile_fmv_mentions(txt, label, value)
+        txt, f4, b4 = _reconcile_status_mentions(txt, label, status_timeline)
+        txt, f5 = _reconcile_closest_comp_claims(txt, label, comps, comp_num_by_key, addr_by_key)
+        txt, f6 = _reconcile_original_systems_claim(txt, label, subject)
+        txt, f7 = _reconcile_age_condition_inference(txt, label, subject)
+        qa_flags.extend(f1 + f2 + f3 + f4 + f5 + f6 + f7)
+        qa_blocking.extend(b2 + b4)
+        out[key] = txt
+    return out, qa_flags, qa_blocking
+
+
+def _prep_comp_for_ai(comp: dict) -> dict:
+    """Normalises what the model sees so it's never handed an ambiguous or unverifiable price:
+    - a 'sale_price' only ever appears as 'verified_close_price', and only when price_verified.
+    - an unverified sold comp gets an explicit data_note telling the model to treat it as
+      market-context-only.
+    - a materially split square-footage composition (big finished basement / accessory area) is
+      called out so $/sqft isn't compared naively."""
+    c = dict(comp)
+    verified = c.get("price_verified", True) and c.get("sale_price")
+    notes: list[str] = []
+
+    if str(c.get("status") or "").lower() in ("sold", "closed") and not verified:
+        notes.append(
+            "closing price NOT verified from MLS - treat as MARKET CONTEXT ONLY: do not use its "
+            "price or $/sqft in valuation math, the subject value, or premium_improvements"
+        )
+        c.pop("price_per_sqft", None)
+        c["verified_close_price"] = None
+    elif verified:
+        c["verified_close_price"] = c.get("sale_price")
+    c.pop("sale_price", None)
+
+    above = _as_float(c.get("above_grade_finished_area"))
+    below = _as_float(c.get("below_grade_finished_area"))
+    total = _as_float(c.get("sqft"))
+    if below and total and below >= 0.15 * total:
+        notes.append(
+            f"reported sqft ~{int(total)} includes ~{int(below)} sqft below-grade/finished-basement "
+            f"({'~%d sqft above-grade' % int(above) if above else 'above-grade portion smaller'}) - "
+            f"do not compare $/sqft one-to-one with an all-above-grade property; weight the "
+            f"composition difference"
+        )
+    if c.get("data_note"):
+        notes.insert(0, str(c["data_note"]))
+    if notes:
+        c["data_note"] = "; ".join(notes)
+    return c
+
+
+def _comp_label(index: int, comp: dict) -> str:
+    """'Comp #2 (112 Dovecote Ln)' - ordinal (1-based, in this generation's own comp order) plus
+    street address only, no city and no raw MLS listing_key. This is the one identifier the AI
+    is given for a comp anywhere in the prompt, so it's also the only thing it can reference in
+    its prose."""
+    address = comp.get("street_address") or "address unknown"
+    return f"Comp #{index + 1} ({address})"
+
+
+def _static_map_url(lat: float, lng: float, size: str = "400x300") -> Optional[str]:
+    """Same staticmap.googleapis.com approach as buildCmaStaticMapUrl in frontend/lib/cma.ts
+    (used there for the PDF export), just built server-side with GOOGLE_PLACES_API_KEY - confirmed
+    this key works for the Static Maps API from a server context (this was wrongly assumed to be
+    blocked like the legacy Geocoding API; it isn't - a direct server-side request returns a real
+    map image, not a 403)."""
+    api_key = os.getenv("GOOGLE_PLACES_API_KEY") or os.getenv("GOOGLE_MAPS_API_KEY")
+    if not api_key:
+        return None
+    marker = f"color:0xC9A24D|{lat},{lng}"
+    return f"https://maps.googleapis.com/maps/api/staticmap?size={size}&scale=2&zoom=15&maptype=roadmap&markers={marker}&key={api_key}"
 
 
 def _format_block(label: str, data: dict, fields: list[str]) -> str:
     lines = [label]
     for field in fields:
         value = data.get(field)
-        if value not in (None, ""):
-            lines.append(f"  {field}: {value}")
+        if value in (None, "", [], {}):
+            continue
+        # JSONB feature lists render cleaner as "a, b, c" than "['a', 'b', 'c']"
+        if isinstance(value, (list, tuple)):
+            value = ", ".join(str(v) for v in value if v not in (None, ""))
+            if not value:
+                continue
+        lines.append(f"  {field}: {value}")
     return "\n".join(lines)
 
 
+_PHOTO_TAIL_COUNT = 2  # of max_photos, how many come from the END of the gallery instead of the top
+
+
 def _photo_urls(data: dict, max_photos: int) -> list[str]:
-    photos = data.get("photos") or []
+    """Picks which of a listing's photos to actually send, in Bright's own MediaDisplayOrder.
+    When the gallery has more than max_photos: the first (max_photos - 2) are the listing agent's
+    own lead shots (explicit product choice - the earliest photos are treated as the most
+    representative rather than sampled evenly), PLUS the last 2, which often carry different
+    content a pure top-N slice would miss entirely (a floor plan, an aerial/drone shot, a misc.
+    angle agents commonly tack on at the end of the gallery). Order is preserved (head first, then
+    tail) - not deduplicated against each other since a gallery longer than max_photos can't have
+    the two ranges overlap."""
+    photos = [p for p in (data.get("photos") or []) if p]
     if not photos and data.get("photo_url"):
         photos = [data["photo_url"]]
-    return [p for p in photos[:max_photos] if p]
+    if len(photos) <= max_photos:
+        return photos
+    head_count = max(0, max_photos - _PHOTO_TAIL_COUNT)
+    head = photos[:head_count]
+    tail = photos[len(photos) - (max_photos - head_count):] if max_photos > head_count else []
+    return head + tail
 
 
 def _compute_fingerprint(subject: dict, comps: list[dict], max_photos: int, include_map_images: bool) -> str:
@@ -127,63 +4463,7562 @@ def _compute_fingerprint(subject: dict, comps: list[dict], max_photos: int, incl
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
-async def _fetch_image_block(http: httpx.AsyncClient, url: str) -> Optional[dict]:
-    """Downloads and base64-encodes one photo rather than handing Claude the raw URL - MLS media
-    CDNs commonly disallow bot fetching in robots.txt, and Anthropic's url-source images respect
-    that (confirmed: Bright's own CDN 400s with "disallowed by the website's robots.txt file").
-    Fetching here and sending base64 sidesteps that entirely. Returns None (skip, don't fail the
-    whole generation) on any download/content-type problem."""
+_MAX_IMAGE_EDGE_PX = 1568  # Anthropic's own documented "no benefit beyond this" size for a single
+# image - also comfortably under the separate, stricter 2000px-per-image cap Anthropic enforces
+# specifically on requests with many images (confirmed by hitting it: MLS photos are frequently
+# 2048x1536+, and get_best_photo_url always picks the largest available variant). Resizing here
+# rather than requesting a smaller MLS URL variant, since the already-synced Property.photos URLs
+# only ever kept the one "best" size Bright offered - the smaller variants were never stored.
+
+
+def _image_token_estimate(width: int, height: int) -> int:
+    """Anthropic's own documented image-token formula: (width x height) / 750. Used to build a
+    REAL projected cost before ever calling the API (see cma_ai_max_cost_per_generation_usd in
+    generate_ai_analysis) - not a flat per-image guess, so it stays accurate regardless of photo
+    dimensions or how many images a given generation ends up sending."""
+    return max(1, (width * height) // 750)
+
+
+async def _fetch_image_block(http: httpx.AsyncClient, url: str) -> Optional[tuple[dict, int]]:
+    """Downloads, resizes if needed, and base64-encodes one photo rather than handing Claude the
+    raw URL - MLS media CDNs commonly disallow bot fetching in robots.txt, and Anthropic's
+    url-source images respect that (confirmed: Bright's own CDN 400s with "disallowed by the
+    website's robots.txt file"). Fetching here and sending base64 sidesteps that entirely.
+    Returns (content_block, estimated_tokens), or None (skip, don't fail the whole generation) on
+    any download/content-type problem."""
     try:
         resp = await http.get(url, timeout=15.0)
         resp.raise_for_status()
         content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
         if not content_type.startswith("image/"):
             return None
-        return {
+        image_bytes, content_type, width, height = _resize_if_needed(resp.content, content_type)
+        block = {
             "type": "image",
-            "source": {"type": "base64", "media_type": content_type, "data": base64.b64encode(resp.content).decode()},
+            "source": {"type": "base64", "media_type": content_type, "data": base64.b64encode(image_bytes).decode()},
         }
+        return block, _image_token_estimate(width, height)
     except Exception as exc:
         logger.info("Skipping unreachable CMA comp photo", extra={"url": url, "error": str(exc)})
         return None
 
 
-async def _build_content(subject: dict, comps: list[dict], max_photos: int, warnings: list[str]) -> tuple[list[dict], dict]:
-    """Builds the user message content blocks (text + image) and the images_sent transparency
-    record. Text blocks first (all context up front), then images grouped subject-first."""
-    content: list[dict] = [{"type": "text", "text": _format_block("SUBJECT PROPERTY:", subject, _SUBJECT_FIELDS)}]
-    for comp in comps:
-        content.append({"type": "text", "text": _format_block(f"COMPARABLE ({comp.get('listing_key', 'unknown')}):", comp, _COMP_FIELDS)})
+def _resize_if_needed(image_bytes: bytes, content_type: str) -> tuple[bytes, str, int, int]:
+    """Downscales an image to fit _MAX_IMAGE_EDGE_PX on its longest edge, preserving aspect ratio.
+    Returns (bytes, content_type, final_width, final_height) - the final dimensions feed the real
+    pre-flight cost projection (_image_token_estimate), not just the resized bytes. Returns the
+    original bytes/content_type/a 1568x1568 dimension guess if PIL can't read the image for any
+    reason (Claude still gets the original then, same as before this existed - errors here must
+    never break a generation over one oddly-formatted photo; the dimension guess is deliberately
+    the worst case so a cost projection never silently undercounts an image it couldn't measure)."""
+    try:
+        from io import BytesIO
+        from PIL import Image
+        with Image.open(BytesIO(image_bytes)) as img:
+            width, height = img.size
+            if max(width, height) <= _MAX_IMAGE_EDGE_PX:
+                return image_bytes, content_type, width, height
+            img = img.convert("RGB")
+            img.thumbnail((_MAX_IMAGE_EDGE_PX, _MAX_IMAGE_EDGE_PX), Image.LANCZOS)
+            out = BytesIO()
+            img.save(out, format="JPEG", quality=85)
+            return out.getvalue(), "image/jpeg", img.width, img.height
+    except Exception:
+        return image_bytes, content_type, _MAX_IMAGE_EDGE_PX, _MAX_IMAGE_EDGE_PX
+
+
+# ============================================================================================
+# v10 HYBRID VALUATION ENGINE
+# --------------------------------------------------------------------------------------------
+# Four stages, every dollar of AI discretion bounded and written to ai_estimate.valuation_trace:
+#
+#   Stage 1  _compute_comp_anchor    deterministic $ anchor from Strong/Supporting comps only -
+#                                    a weighted, size-normalised sale-price indication blended
+#                                    60/40 with a $/sqft indication. NOT a naive average.
+#   Stage 2  _compute_exposure       the subject's own listing behaviour (active-market DOM vs.
+#                                    the comp set's own median, price cuts, contract timing) ->
+#                                    an `exposure_ceiling` + optional hard_upper / pull_target.
+#   Stage 3  (AI) qualitative_adjustments   itemised +/- deltas the comp math can't capture,
+#                                    each with a basis_type + written basis.
+#   Stage 4  _apply_v10_valuation    per-item caps -> evidence-class sub-caps -> overall +-12%
+#                                    (+-18% disputed) bound -> above-ask gate -> final FMV.
+#
+# Callers: generate_ai_analysis (provisional anchor into the prompt, final anchor after the AI's
+# comp reclassification) and recompute_valuation (single anchor - strengths already settled).
+# ============================================================================================
+
+# ---- v10 tunable parameters -----------------------------------------------------------------
+# All grouped here so a historical backtest (scripts/cma_v10_backtest.py) can sweep them. Do NOT
+# hand-tune these to one report - defaults are conservative, changes should be evidence-driven.
+_V10_BETA = 0.55                       # fallback size elasticity: fractional $ change per fractional sqft change
+_V10_ADJ_BOUND = 0.12                  # normal cap on the summed AI adjustment, as a fraction of the anchor
+_V10_ADJ_BOUND_DISPUTED = 0.18         # cap when the AI files a written anchor_dispute
+_V10_ITEM_CAP = {                      # per-item cap by basis quality, as a fraction of the anchor
+    "paired_market_evidence": 0.06,
+    "comp_inferred": 0.04,
+    "model_judgment": 0.025,
+}
+_V10_WEAK_UP_SUBCAP = 0.05             # aggregate cap on non-paired-evidence, sub-high-confidence UP items
+_V10_MODEL_JUDGMENT_SUBCAP = 0.035     # aggregate cap on all model_judgment items (either direction)
+_V10_FAMILY_STACK_CAP = 1.30           # a same-feature-family group is capped at this x its largest single item
+_V10_ANCHOR_MIN_SPREAD = 0.04
+_V10_ANCHOR_MAX_SPREAD = 0.12
+# _V10_RANGE_MAX_PCT / _V10_RANGE_TIGHT_PCT are defined near _MIN_RANGE_PCT (they're referenced in
+# the tool schema, which is built earlier in the file).
+_V10_REGRESSION_MIN_COMPS = 4          # never prefer a 3-point regression over the fixed-elasticity fallback
+_V10_REGRESSION_MIN_R2 = 0.5
+_V10_MIN_CLOSED_FOR_ANCHOR = 2         # >= this many verified CLOSED sales -> closed-only anchor
+_V10_BELOW_GRADE_FLAG_FRAC = 0.15     # below-grade area > this fraction of total -> flag the sqft composition
+# additional tunables hoisted for the backtest sweep (were inline literals) -----------------
+_V10_ANCHOR_BLEND = 0.60              # anchor = blend*(size-adjusted sale indication) + (1-blend)*(naive $/sqft indication)
+_V10_OUTLIER_PENALTY = 0.5           # weight multiplier applied to a $/sqft-outlier comp
+# With a CMA's typical 4-6 comps, the MAD z-score in _flag_psf_outliers is nearly powerless: the
+# outlier's own deviation inflates the MAD it's being measured against, so even a comp at ~3x the
+# group's $/sqft scores a z-value nowhere near the 3.5 cutoff. This plain ratio check catches those
+# cases directly - flag anything beyond +-60% of the group median $/sqft, independent of the
+# small-sample-noisy z-score.
+_V10_PSF_OUTLIER_RATIO = 1.45
+_V10_REDUNDANCY_EXP = 0.5           # a cluster of N near-duplicate comps -> each member weight x (1 / N**this)
+_V10_RECENCY_HALF_LIFE_DAYS = 182   # sale-age half-life (days) for the recency weight
+_V10_DOM_SHORT_MULT = 0.4           # quick-contract / still-insufficient-exposure cutoff = this x comp-median DOM
+_V10_DOM_NORMAL_MULT = 1.5          # normal -> elevated exposure cutoff = this x comp-median DOM
+_V10_DOM_EXTENDED_MULT = 2.5        # elevated -> extended exposure cutoff = this x comp-median DOM
+_V10_DOM_FALLBACK = (14.0, 45.0, 75.0)   # absolute short / normal / extended day cutoffs when no comp DOM data
+# anchor-validity escape hatch: a mixed-mode anchor this thin is too weak to bound a value against
+_V10_WEAK_ANCHOR_MAX_WEIGHTED = 3     # <= this many weighted comps in mixed mode is a candidate for "weak"
+_V10_WEAK_ANCHOR_SPREAD_PCT = 10.0    # ...combined with a spread/divergence at least this wide
+_V10_WEAK_ANCHOR_DIVERGENCE_PCT = 12.0
+
+# --- Fix 1: mixed above/below-grade sqft normalization for the $/sqft leg ---------------------
+_V10_SQFT_MIXED_FRAC = 0.12          # a comp with finished below-grade area >= this frac of total is "materially mixed"
+_V10_SQFT_MIXED_GAP = 0.08          # ...but only distorts if its below-grade frac differs from the SUBJECT's by this much
+# FALLBACK HEURISTIC ONLY - NOT market-derived. Used to strip a bounded below-grade contribution
+# from a mixed comp's price before deriving an above-grade $/sqft, when no paired/local market
+# evidence for the below-grade rate is available. When the heuristic is used the comp is
+# down-weighted harder in the $/sqft leg AND the leg's confidence is reduced (see _compute_comp_anchor
+# / _apply_v10_valuation). A real paired-comp derivation or an explicit `below_grade_psf` on the
+# comp overrides it. Configurable + swept in cma_v10_backtest.py.
+_V10_BELOW_GRADE_CREDIT = 0.50      # fallback: finished below-grade sqft credited at this x the comp's BLENDED $/sqft
+_V10_BELOW_GRADE_PSF_MIN_FRAC = 0.15  # a PAIRED-derived below-grade $/sqft is only trusted between these fractions
+_V10_BELOW_GRADE_PSF_MAX_FRAC = 0.75  # ...of the comp's blended $/sqft (else fall back to the heuristic)
+_V10_SQFT_ADJ_MAX = 0.18           # an above-grade $/sqft normalization can lower the raw figure by at most this fraction
+_V10_PSF_LEG_MIXED_PENALTY = 0.60   # weight multiplier in the $/sqft leg when the FALLBACK HEURISTIC did the normalization
+_V10_PSF_LEG_PAIRED_PENALTY = 0.85  # ...lighter penalty when paired/local market evidence set the below-grade rate
+_V10_PSF_LEG_UNKNOWN_PENALTY = 0.45  # ...for a comp whose composition can't be resolved at all (blended $/sqft used)
+
+# --- Fix 2: market-location consistency between AI class, evidence score, and final weight -----
+_V10_LOC_NEG_DEMOTE = 2            # a Strong comp with >= this many location negatives + no valid override -> Supporting
+_V10_LOC_MIN_MULT = 0.55          # floor on the location weight penalty (a Strong comp never drops below this x weight for location alone)
+_V10_LOC_NEG_STEP = 0.12          # each location negative costs this much normalized weight
+_V10_LOC_DIFFERENT_AREA_STEP = 0.10  # an explicit "Different Area" rating costs this on top
+_V10_LOC_STREET_STEP = 0.08      # a materially busier/through street costs this on top
+_V10_LOC_ADJ_CAP_FRAC = 0.02     # a separate itemised location/street $ adjustment is capped at this x anchor unless paired evidence (already reflected in weight)
+_V10_STRONG_OVERRIDE_MIN_REASON = 40  # a strong_location_override_reason shorter than this many chars is not a real justification
+
+# --- round 12: a pure condition/renovation gap must not silently demote an otherwise same-market
+# comp out of the anchor - comparability answers "how useful as market evidence", the adjustment
+# layer carries the condition difference. _v10_condition_class_review re-promotes weak -> supporting
+# (never past supporting) when the ONLY material gap is finish/renovation.
+_V10_COND_PROMOTE_MIN_EV = 0.55        # a Weaker comp needs an overall evidence score >= this (when scored) to be re-promoted
+_V10_COND_PROMOTE_MIN_COMPONENT = 0.40  # ...and proximity / size / recency must each independently clear this
+
+# --- Fix 3 / round 13: weighted qualitative-signal vs. itemised-adjustment reconciliation ------
+# Round 13 generalizes the condition-only near-zero block to EVERY weighted qualitative bucket:
+# a material, one-sided weighted signal can no longer net to ~$0 in the valuation without an
+# explicit outcome - (A) a supported structured adjustment in that bucket, (B) supported offsets
+# in other buckets that cover it, or (C) a filed item marking it already captured mechanically
+# (comp weighting / size / below-grade normalization / classification / exposure).
+_V10_QUAL_SIGNAL_MATERIAL = 0.30    # |weighted signal| >= this (on a -1..+1 scale) is a "material directional imbalance"
+_V10_QUAL_SIGNAL_WEIGHT_COVER = 0.50  # ...and it only bites when >= this fraction of anchor weight is actually rated on that bucket
+_V10_QUAL_NEAR_ZERO_FRAC = 0.010   # a bucket's net $ adjustment within this x anchor counts as "netting to ~zero"
+_V10_QUAL_OFFSET_COVER = 0.60      # itemised offsets must cover >= this fraction of the implied gap to explain a near-zero net
+# round 17: the implied full-one-sided-gap fractions were calibrated far too low - an original,
+# never-renovated house vs. a set of updated comps is a 12-18% condition discount in real
+# practice, not 6%; a set that all has a pool/guest wing the subject lacks is ~8-10% on amenities,
+# not 4.5%. Under-sized fractions were the main reason a materially inferior subject kept pricing
+# near a comp set that is better than it on every axis.
+_V10_QUAL_CONDITION_GAP_FRAC = 0.15  # (kept by name for the backtest sweep) implied $ size of a full one-sided condition gap, as a frac of anchor
+_V10_QUAL_BUCKET_GAP_FRAC = {       # per-bucket implied full-signal $ gap, as a frac of anchor; condition mirrors the swept scalar above
+    "amenities": 0.09,
+    "accessory_space": 0.08,
+    "location": 0.06,
+}
+_V10_QUAL_RECON_BUCKETS = ("condition", "amenities", "accessory_space", "location")  # buckets the near-zero reconciliation runs for
+_V10_QUAL_UNSUPPORTED_OFFSET_CUT = 0.50  # unsupported (model_judgment) offsets are scaled by this when they're the only thing zeroing a real gap
+# round 17: qualitative-inferiority SHORTFALL. When the weighted comp set is materially superior to
+# the subject on a reconciliation bucket (high coverage) and the itemised adjustments have NOT
+# delivered the implied gap for it, apply a structured DOWN adjustment for the still-unpriced
+# remainder, per bucket, summed. The per-item caps + the +-12% bound are calibrated for a MIXED
+# set and systematically under-shoot when the subject is genuinely worse than its comps; this is
+# what stops the FMV drifting back up toward a comp set that is better than the subject on every
+# axis. Downward only; a broad SUPERIOR subject (rare) is left to the itemised layer.
+_V10_BROAD_INFERIORITY_MIN_BUCKETS = 1     # this many subject-inferior reconciliation buckets triggers it
+_V10_BROAD_INFERIORITY_SIGNAL_MIN = 0.25   # a bucket counts toward the shortfall at a slightly lower signal than
+#                                            the per-bucket block threshold (0.30) - a borderline-but-real
+#                                            one-sided read still belongs in the aggregate, just at a small size.
+_V10_BROAD_INFERIORITY_MIN_FRAC = 0.02     # ...and only if the still-unpriced shortfall exceeds this x anchor
+_V10_BROAD_INFERIORITY_APPLY_FRAC = 0.60   # apply this share of the shortfall - a nudge toward the low end of the
+#                                            range, NOT all the way to it; the market rarely discounts an inferior
+#                                            subject the full theoretical amount, and the exposure gate still acts on top.
+_V10_ADJ_BOUND_BROAD_INF = 0.22            # downward adjustment bound (only) when the shortfall mechanism applied
+
+# --- round 13: over-ask / bidding-war ("competitive sale") awareness -------------------------
+# A closed sale that went well over asking, fast, is still real market evidence and is NOT
+# discounted. But when such a sale is ALSO a dominant high-side weight driver with no corroboration
+# from ordinary closed comps, that is flagged and confidence is knocked a notch - it affects
+# interpretation, never the sale price itself.
+_V10_COMPETITIVE_LTS = 1.06        # closed sale/list >= this = sold materially over asking
+_V10_COMPETITIVE_DOM = 10          # ...within this many days on market = a "competitive-sale" event
+_V10_COMPETITIVE_DOMINANCE = 0.32  # a competitive-sale comp carrying >= this normalized weight is a high-side driver
+_V10_COMPETITIVE_ABOVE_FRAC = 0.04  # ...and its own indication sits at least this far above the median of the OTHER closed comps
+_V10_COMPETITIVE_CORROB_FRAC = 0.035  # a non-competitive closed comp within this fraction of the driver's indication corroborates it
+# round 16: a bidding-war sale is a NOISIER indication of sustainable market value than a sale that
+# closed at/under list after normal exposure - it stays in the anchor (never discarded) but at a
+# reduced weight so a single hot sale can't dominate the number. NOT applied when the whole set is
+# competitive (then it's simply the market and re-weighting is meaningless).
+_V10_COMPETITIVE_WEIGHT_MULT = 0.70
+
+# round 16: qualitative items whose basis CANNOT isolate a feature's contributory value (anything
+# not surviving as paired_market_evidence) are inherently imprecise. They are applied at the
+# CONSERVATIVE end of their stated range (the end that moves the anchor least) rather than the
+# midpoint - and an UNMEASURABLE UP offset (architectural pedigree, "grander feel", grounds
+# character - the kind of premium a hot comp set already reflects and an appraiser is most
+# skeptical of) is softened further, so speculative positives can't quietly neutralise concrete
+# observed feature deductions (missing pool, missing guest wing).
+_V10_SOFT_OFFSET_FACTOR = 0.60
+
+
+def _v10_median(values: list) -> Optional[float]:
+    vals = sorted(float(v) for v in values if v is not None)
+    if not vals:
+        return None
+    n = len(vals)
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+
+
+def _v10_sqft(row: dict) -> Optional[float]:
+    """Above-grade finished area, falling back to a blended total only when that's all there is."""
+    return _as_float(row.get("above_grade_finished_area")) or _as_float(row.get("sqft"))
+
+
+def _v10_below_grade_frac(row: dict) -> float:
+    below = _as_float(row.get("below_grade_finished_area")) or 0.0
+    total = (_as_float(row.get("sqft")) or 0.0) or (below + (_as_float(row.get("above_grade_finished_area")) or 0.0))
+    return (below / total) if total > 0 else 0.0
+
+
+def _v10_comp_price_basis(comp: dict) -> tuple:
+    """(price, basis) - basis is 'closed_verified' | 'list_context' | 'none'. Only a
+    'closed_verified' price is eligible for the PRIMARY deterministic anchor; a 'list_context'
+    price (active / pending / AUC, or a sold comp with no confirmed close) is market-positioning
+    evidence only and never carries anchor weight when >= _V10_MIN_CLOSED_FOR_ANCHOR closed
+    sales exist."""
+    status_ = str(comp.get("status") or "").lower()
+    if status_ in ("sold", "closed"):
+        if comp.get("price_verified", True) is False:
+            return _as_float(comp.get("list_price")), "list_context"  # unverified sold -> context only
+        p = _as_float(comp.get("sale_price")) or _as_float(comp.get("close_price"))
+        return (p, "closed_verified") if p else (_as_float(comp.get("list_price")), "list_context")
+    # active / pending / active-under-contract
+    return _as_float(comp.get("list_price")), "list_context"
+
+
+def _v10_score_ex_recency(ev: dict) -> float:
+    """The evidence score WITHOUT the recency component - recency is applied once, as its own
+    multiplier in _v10_comp_weight, so leaving it inside `score` too would penalise an older
+    comp twice (concern #2). Falls back to the full score, then 0.5, if components are missing."""
+    comps_ = (ev.get("components") or {}) if isinstance(ev, dict) else {}
+    vals = [v for k, v in comps_.items() if k != "recency"]
+    if vals:
+        return sum(vals) / len(vals)
+    s = ev.get("score") if isinstance(ev, dict) else None
+    return 0.5 if s is None else float(s)
+
+
+def _v10_comp_weight(comp: dict, ev: dict, is_outlier: bool, redundancy_penalty: float = 1.0) -> float:
+    """base(strength) x evidence-score(ex-recency) x recency x outlier-penalty x redundancy-penalty.
+    Weak/unrated -> 0. Recency is applied EXACTLY ONCE (see _v10_score_ex_recency)."""
+    base = {"strong": 1.0, "supporting": 0.5}.get(_normalize_strength(comp.get("strength")) or "", 0.0)
+    if base <= 0:
+        return 0.0
+    score = max(0.05, _v10_score_ex_recency(ev))
+    recency = ev.get("recency_weight") if isinstance(ev, dict) else None
+    recency = 0.6 if recency is None else max(0.15, float(recency))
+    return base * score * recency * (_V10_OUTLIER_PENALTY if is_outlier else 1.0) * max(0.35, min(1.0, redundancy_penalty))
+
+
+def _v10_fit_psf_size_slope(points: list) -> Optional[float]:
+    """OLS slope of $/sqft on sqft, returned ONLY when the fit is genuinely usable (a 3-point or
+    noisy fit is never preferred over the fixed-elasticity fallback - the user was explicit about
+    this). Requires: >= _V10_REGRESSION_MIN_COMPS points; real spread in size (x-range >= 15% of
+    mean size and >= 3 distinct sizes); a NEGATIVE slope (bigger homes trade at a lower $/sqft);
+    R^2 >= _V10_REGRESSION_MIN_R2; and a sane slope magnitude (implied $/sqft swing across the
+    observed size range under 55% of the mean $/sqft). None on any failure -> fixed _V10_BETA."""
+    if len(points) < _V10_REGRESSION_MIN_COMPS:
+        return None
+    xs = [float(x) for x, _ in points]
+    ys = [float(y) for _, y in points]
+    n = len(points)
+    mean_x, mean_y = sum(xs) / n, sum(ys) / n
+    x_range = max(xs) - min(xs)
+    if mean_x <= 0 or x_range < 0.15 * mean_x or len({round(x, -1) for x in xs}) < 3:
+        return None
+    sxx = sum((x - mean_x) ** 2 for x in xs)
+    if sxx <= 0:
+        return None
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in points) / sxx
+    if slope >= 0:
+        return None
+    intercept = mean_y - slope * mean_x
+    ss_tot = sum((y - mean_y) ** 2 for y in ys)
+    ss_res = sum((y - (intercept + slope * x)) ** 2 for x, y in points)
+    if ss_tot <= 0 or (1 - ss_res / ss_tot) < _V10_REGRESSION_MIN_R2:
+        return None
+    if abs(slope) * x_range > 0.55 * mean_y:
+        return None
+    return slope
+
+
+def _v10_redundancy_penalties(rows: list) -> dict:
+    """Per-comp multiplier in (0, 1]. Comps that overlap heavily on micro-location (same street),
+    sale period (<= ~45 days apart), size (<= ~10%), AND $/sqft (<= ~6%) are near-duplicate
+    evidence - a cluster of N such comps is worth ~sqrt(N) independent comps, not N, so each
+    member's weight is scaled by 1/sqrt(cluster_size). Diverse comps get 1.0. Keyed by listing_key."""
+    def _street(addr):
+        a = _norm_token(addr)
+        m = re.match(r"^\d+\s+(.*)$", a)
+        return m.group(1) if m else a
+
+    # Comps in a CMA are deliberately similar - so only NEAR-IDENTICAL evidence is treated as
+    # redundant: same street/subdivision, OR (very tight $/sqft AND very tight size AND close sale
+    # period). A merely-similar comp is still independent evidence and keeps full weight.
+    clusters: list[list[dict]] = []
+    for r in rows:
+        placed = False
+        for cl in clusters:
+            rep = cl[0]
+            psf_tight = rep["psf"] > 0 and abs(r["psf"] - rep["psf"]) <= 0.03 * rep["psf"]
+            size_tight = rep["sqft"] > 0 and abs(r["sqft"] - rep["sqft"]) <= 0.06 * rep["sqft"]
+            same_street = bool(_street(r.get("address")) and _street(r.get("address")) == _street(rep.get("address")))
+            d1, d2 = _parse_iso_date(r.get("sale_date")), _parse_iso_date(rep.get("sale_date"))
+            period_close = bool(d1 and d2 and abs((d1 - d2).days) <= 30)
+            if same_street or (psf_tight and size_tight and period_close):
+                cl.append(r)
+                placed = True
+                break
+        if not placed:
+            clusters.append([r])
+    pen: dict = {}
+    for cl in clusters:
+        f = 1.0 / (len(cl) ** _V10_REDUNDANCY_EXP)
+        for r in cl:
+            pen[r["key"]] = f
+    return pen
+
+
+def _rough_anchor_value(*price_groups) -> Optional[float]:
+    """Last-resort ballpark: the mean of whatever comp prices we actually have, tried across the
+    given groups in order. Used ONLY so an `insufficient` anchor still hands downstream pricing a
+    number to centre a provisional (agent-review-gated) range on, instead of returning None and
+    silently killing the whole pricing step. Never a real valuation - the caller flags it hard."""
+    for grp in price_groups:
+        prices = [p for c in (grp or [])
+                  for p in [_as_float(c.get("price") or c.get("sale_price") or c.get("list_price"))]
+                  if p and p > 0]
+        if prices:
+            return sum(prices) / len(prices)
+    return None
+
+
+def _v10_paired_below_grade_psf(rows: list) -> tuple:
+    """Fix 1 (round 10). Try to derive a MARKET below-grade $/sqft from the anchor comp set itself:
+    pairs of comps that are close in above-grade size and sale period but differ materially in
+    finished below-grade area imply a per-foot below-grade rate. Deliberately tight - returns
+    (rate, [pair_labels]) only when the pair is clean and the implied rate lands in a sane band vs
+    the set's blended $/sqft; otherwise (None, []) and the caller uses the labelled fallback
+    heuristic (and reduces $/sqft-leg confidence). Never fabricates a rate to make the math work."""
+    cand = []
+    for r in rows:
+        leg = r.get("psfleg") or {}
+        ag = _as_float(leg.get("above_grade_sqft"))
+        bg = leg.get("below_grade_sqft")
+        if ag and ag > 0 and bg is not None and r.get("price") and r.get("price_basis") == "closed_verified" and not r.get("outlier"):
+            cand.append((r, ag, float(bg)))
+    if len(cand) < 2:
+        return None, []
+    blended_psfs = [(r["price"] / (ag + bg)) for r, ag, bg in cand if (ag + bg) > 0]
+    mean_blended = sum(blended_psfs) / len(blended_psfs) if blended_psfs else 0.0
+    lo_band, hi_band = _V10_BELOW_GRADE_PSF_MIN_FRAC * mean_blended, _V10_BELOW_GRADE_PSF_MAX_FRAC * mean_blended
+    implied = []
+    labels = []
+    for i in range(len(cand)):
+        for j in range(i + 1, len(cand)):
+            (ra, aga, bga), (rb, agb, bgb) = cand[i], cand[j]
+            if abs(aga - agb) > 0.10 * max(aga, agb):
+                continue
+            if abs(bga - bgb) < 400:
+                continue
+            da, db = _parse_iso_date(ra.get("sale_date")), _parse_iso_date(rb.get("sale_date"))
+            if da and db and abs((da - db).days) > 270:
+                continue
+            hi, lo = (ra, aga, bga), (rb, agb, bgb)
+            if bgb > bga:
+                hi, lo = lo, hi
+            rate = (hi[0]["price"] - lo[0]["price"]) / (hi[2] - lo[2])
+            if rate <= 0 or not (lo_band <= rate <= hi_band):
+                continue
+            implied.append(rate)
+            labels.append(f"{lo[0].get('label')} vs {hi[0].get('label')}")
+    if not implied:
+        return None, []
+    return round(_v10_median(implied) or 0.0, 2), labels
+
+
+def _v10_psf_leg_treatment(c: dict, price: float, raw_basis_sqft: float, subj_below_frac: float,
+                           bg_psf_evidence: Optional[float] = None, bg_psf_evidence_src: Optional[list] = None) -> dict:
+    """Fix 1. A comp's full sale price divided by ONLY its above-grade sqft over-states the market's
+    above-grade $/sqft whenever that sale price also bought a large finished basement / auxiliary
+    space. Returns how that comp should feed the deterministic $/sqft LEG (the sale-price leg is
+    untouched): its normalized per-foot figure, a leg weight multiplier, and a full trace.
+
+    The below-grade contribution that gets stripped is sourced, in order: (1) an explicit
+    `below_grade_psf` on the comp (agent / data), (2) `bg_psf_evidence` - a rate derived from
+    PAIRED comps in this set - lighter leg down-weight, (3) the labelled FALLBACK HEURISTIC
+    (_V10_BELOW_GRADE_CREDIT x blended $/sqft) - harder leg down-weight AND reduced $/sqft-leg
+    confidence. Never invents a target number; composition-unknown -> blended figure, hard
+    down-weight."""
+    ag = _as_float(c.get("above_grade_finished_area"))
+    bg = _as_float(c.get("below_grade_finished_area")) or 0.0
+    blended_total = _as_float(c.get("sqft"))
+    total_finished = blended_total or ((ag or 0.0) + bg) or raw_basis_sqft
+    raw_psf = price / raw_basis_sqft if raw_basis_sqft else 0.0
+
+    known = True
+    if bg > 0 and total_finished > 0:
+        below_frac = bg / total_finished
+    elif ag and blended_total and blended_total > ag * (1 + _V10_SQFT_MIXED_FRAC):
+        # blended total materially exceeds above-grade but we have no confirmed below-grade area:
+        # there IS extra finished area inflating the above-grade $/sqft, we just can't size it.
+        below_frac = (blended_total - ag) / blended_total
+        known = False
+    else:
+        below_frac = 0.0
+
+    out = {
+        "above_grade_sqft": round(ag) if ag else None,
+        "below_grade_sqft": round(bg) if bg else 0,
+        "total_finished_sqft": round(total_finished) if total_finished else None,
+        "raw_psf": round(raw_psf, 2),
+        "psf_for_leg": round(raw_psf, 2),
+        "psf_leg_weight_mult": 1.0,
+        "adjusted_above_grade_psf_used": False,
+        "below_grade_contributory_value_applied": None,
+        "below_grade_basis": None,
+        "below_grade_rate_source": None,   # "explicit" | "paired_comps" | "fallback_heuristic"
+        "psf_leg_heuristic_used": False,
+        "psf_leg_eligibility": "full",
+        "psf_leg_exclusion_reason": None,
+        "below_grade_frac": round(below_frac, 3),
+    }
+
+    materially_mixed = below_frac >= _V10_SQFT_MIXED_FRAC and abs(below_frac - (subj_below_frac or 0.0)) >= _V10_SQFT_MIXED_GAP
+    if not materially_mixed or raw_psf <= 0:
+        return out
+
+    if known and ag and ag > 0 and total_finished > 0:
+        blended_psf = price / total_finished
+        explicit_psf = _as_float(c.get("below_grade_psf"))
+        if explicit_psf and explicit_psf > 0:
+            bg_psf, rate_source, heuristic = explicit_psf, "explicit", False
+        elif bg_psf_evidence and bg_psf_evidence > 0:
+            bg_psf, rate_source, heuristic = float(bg_psf_evidence), "paired_comps", False
+        else:
+            bg_psf, rate_source, heuristic = blended_psf * _V10_BELOW_GRADE_CREDIT, "fallback_heuristic", True
+        bg_val = bg * bg_psf
+        adj_psf = (price - bg_val) / ag
+        adj_psf = _clamp(adj_psf, raw_psf * (1 - _V10_SQFT_ADJ_MAX), raw_psf)
+        if rate_source == "explicit":
+            basis = f"{round(bg):,} sqft finished below-grade credited at an explicitly supplied ${round(bg_psf)}/sqft"
+            mult = _V10_PSF_LEG_PAIRED_PENALTY
+        elif rate_source == "paired_comps":
+            basis = (f"{round(bg):,} sqft finished below-grade credited at ${round(bg_psf)}/sqft, derived from paired "
+                     f"comps in this set ({'; '.join(bg_psf_evidence_src or []) or 'paired sales'})")
+            mult = _V10_PSF_LEG_PAIRED_PENALTY
+        else:
+            basis = (f"{round(bg):,} sqft finished below-grade credited at {int(_V10_BELOW_GRADE_CREDIT*100)}% of the comp's "
+                     f"blended ${round(blended_psf)}/sqft - FALLBACK HEURISTIC, not market-derived (no paired/local "
+                     f"below-grade evidence available); $/sqft-leg confidence reduced accordingly")
+            mult = _V10_PSF_LEG_MIXED_PENALTY
+        out.update({
+            "psf_for_leg": round(adj_psf, 2),
+            "psf_leg_weight_mult": mult,
+            "adjusted_above_grade_psf_used": True,
+            "below_grade_contributory_value_applied": round(bg_val),
+            "below_grade_basis": basis,
+            "below_grade_rate_source": rate_source,
+            "psf_leg_heuristic_used": heuristic,
+            "psf_leg_eligibility": "adjusted_downweighted",
+        })
+        return out
+
+    # composition unresolved -> use the blended figure (dilutes the inflation) and down-weight hard
+    blended_psf = price / total_finished if total_finished else raw_psf
+    out.update({
+        "psf_for_leg": round(blended_psf, 2),
+        "psf_leg_weight_mult": _V10_PSF_LEG_UNKNOWN_PENALTY,
+        "psf_leg_eligibility": "blended_downweighted",
+        "psf_leg_exclusion_reason": (
+            "blended total sqft materially exceeds above-grade but no finished below-grade area is "
+            "recorded - can't build a defensible above-grade $/sqft, blended figure used and down-weighted"
+        ),
+    })
+    return out
+
+
+def _compute_comp_anchor(
+    subject: dict, comps: list, evidence_by_key: dict, outliers: dict, *,
+    raw_weight_overrides: Optional[dict[str, float]] = None,
+) -> Optional[dict]:
+    """Stage 1. Deterministic dollar anchor. PRIMARY anchor is built from VERIFIED CLOSED SALES
+    only whenever >= _V10_MIN_CLOSED_FOR_ANCHOR of them exist (concern #1); active/pending/AUC and
+    unverified-sold comps are market-positioning context, not anchor weight. Returns a dict with
+    `mode`: 'closed_only' | 'mixed' (no closed majority) | 'insufficient' (< 2 usable rows - the
+    caller must NOT fall back to a free-form AI number; it produces a provisional range + Low
+    confidence + a review gate). Returns None only when the subject itself has no usable size."""
+    subj_sqft = _v10_sqft(subject)
+    subj_below_frac = _v10_below_grade_frac(subject)
+    if not subj_sqft or subj_sqft <= 0:
+        return None
+
+    all_rows, context_rows = [], []
+    for i, c in enumerate(comps):
+        if not c.get("is_included", True):
+            continue
+        key = c.get("listing_key")
+        ev = evidence_by_key.get(key) or {}
+        price, price_basis = _v10_comp_price_basis(c)
+        sqft = _v10_sqft(c)
+        strength = _normalize_strength(c.get("strength"))
+        override_w = (
+            _as_float(raw_weight_overrides.get(str(key)))
+            if raw_weight_overrides is not None and key is not None
+            else None
+        )
+        base_w = (
+            max(0.0, override_w or 0.0)
+            if raw_weight_overrides is not None
+            else {"strong": 1.0, "supporting": 0.5}.get(strength or "", 0.0)
+        )
+        if base_w <= 0 or not price or not sqft or sqft <= 0:
+            if price and sqft and sqft > 0:  # keep as pure context (e.g. an active listing nearby)
+                context_rows.append({"label": _comp_label(i, c), "price": round(price), "psf": round(price / sqft),
+                                     "status": str(c.get("status") or "").lower(), "basis": price_basis})
+            continue
+        row = {
+            "label": _comp_label(i, c), "key": key, "address": c.get("street_address") or "",
+            "price": price, "sqft": sqft, "psf": price / sqft, "strength": strength,
+            "price_basis": price_basis, "status": str(c.get("status") or "").lower(),
+            "sale_date": c.get("close_date") or c.get("sale_date"),
+            "distance_miles": _as_float(c.get("distance_miles")),
+            "ev_score_full": ev.get("score"), "ev_score_ex_recency": round(_v10_score_ex_recency(ev), 3),
+            "ev_components": {k: round(v, 3) for k, v in (ev.get("components") or {}).items()},
+            "recency": ev.get("recency_weight"), "outlier": key in (outliers or {}),
+            "below_grade_frac": round(_v10_below_grade_frac(c), 2),
+            "_c": c,
+            # Fix 1: how this comp feeds the $/sqft leg (blended-basement normalization). First pass
+            # with no paired below-grade evidence; re-run below once the row set is known.
+            "psfleg": _v10_psf_leg_treatment(c, price, sqft, subj_below_frac),
+            # Fix 2: market-location consistency penalty (set by _v10_location_class_review on the comp).
+            "loc_weight_penalty": float((c.get("_loc") or {}).get("weight_penalty", 1.0) or 1.0),
+            "loc_trace": (c.get("_loc") or {}),
+            # round 12 issue #1: was this comp re-promoted weak -> supporting because a pure
+            # condition/renovation gap had wrongly demoted it out of the anchor?
+            "cond_trace": (c.get("_cond") or {}),
+            "dom": _as_float(c.get("days_on_market")),
+            "raw_weight_override": base_w if raw_weight_overrides is not None else None,
+            "sale_to_list": (price / _as_float(c.get("list_price"))) if (price_basis == "closed_verified" and _as_float(c.get("list_price"))) else None,
+        }
+        # round 13: a verified closed sale that went well over asking, fast = a "competitive sale".
+        _lts = row["sale_to_list"]
+        row["competitive_sale"] = bool(
+            _lts and _lts >= _V10_COMPETITIVE_LTS
+            and row["dom"] is not None and row["dom"] <= _V10_COMPETITIVE_DOM
+        )
+        all_rows.append(row)
+
+    closed_rows = [r for r in all_rows if r["price_basis"] == "closed_verified"]
+    if len(closed_rows) >= _V10_MIN_CLOSED_FOR_ANCHOR:
+        rows, anchor_mode = closed_rows, "closed_only"
+        # move the non-closed weighted comps into context so they're still visible
+        for r in all_rows:
+            if r["price_basis"] != "closed_verified":
+                context_rows.append({"label": r["label"], "price": round(r["price"]), "psf": round(r["psf"]),
+                                     "status": r["status"], "basis": r["price_basis"]})
+    elif len(all_rows) >= 2:
+        rows, anchor_mode = all_rows, "mixed"
+    else:
+        _rough = _rough_anchor_value(all_rows, context_rows)
+        return {
+            "mode": "insufficient", "anchor_value": round(_rough) if _rough else None,
+            "anchor_value_is_rough": bool(_rough), "anchor_low": None, "anchor_high": None,
+            "subject_sqft_used": round(subj_sqft), "closed_comp_count": len(closed_rows),
+            "usable_comp_count": len(all_rows), "context_comps": context_rows,
+            "note": "Fewer than two usable Strong/Supporting comps - no deterministic anchor.",
+        }
+
+    # per-comp redundancy penalty, then the (recency-single-counted, redundancy-adjusted) weight
+    red_pen = _v10_redundancy_penalties(rows)
+    for r in rows:
+        r["redundancy_penalty"] = round(red_pen.get(r["key"], 1.0), 3)
+        if raw_weight_overrides is not None:
+            # Continuous relevance supplies a complete base weight that already includes
+            # location, recency, and reliability. Keep the production penalties for outliers and
+            # near-duplicate evidence, but do not apply role or location a second time.
+            r["weight"] = (
+                r["raw_weight_override"]
+                * (_V10_OUTLIER_PENALTY if r["outlier"] else 1.0)
+                * max(0.35, min(1.0, r["redundancy_penalty"]))
+            )
+        else:
+            r["weight"] = _v10_comp_weight(
+                {"strength": r["strength"]},
+                {"score": r["ev_score_full"], "components": r["ev_components"], "recency_weight": r["recency"]},
+                r["outlier"], r["redundancy_penalty"],
+            )
+            # Fix 2: market-location disadvantages reduce the final weight even when the comp is still
+            # (validated) Strong - classification does not erase the geographic evidence.
+            r["weight"] *= max(_V10_LOC_MIN_MULT, min(1.0, r.get("loc_weight_penalty", 1.0)))
+    # round 16: down-weight bidding-war sales so one hot over-ask sale can't dominate the anchor -
+    # but only when they are NOT the whole set (if every comp bid over ask, that IS the market).
+    _comp_ct = sum(1 for r in rows if r.get("competitive_sale"))
+    if 0 < _comp_ct < len(rows):
+        for r in rows:
+            if r.get("competitive_sale"):
+                r["weight"] *= _V10_COMPETITIVE_WEIGHT_MULT
+                r["competitive_weight_mult"] = _V10_COMPETITIVE_WEIGHT_MULT
+    rows = [r for r in rows if r["weight"] > 0]
+    if len(rows) < 2:
+        _rough = _rough_anchor_value(rows, all_rows, context_rows)
+        return {
+            "mode": "insufficient", "anchor_value": round(_rough) if _rough else None,
+            "anchor_value_is_rough": bool(_rough), "anchor_low": None, "anchor_high": None,
+            "subject_sqft_used": round(subj_sqft), "closed_comp_count": len(closed_rows),
+            "usable_comp_count": len(rows), "context_comps": context_rows,
+            "note": "Comps collapsed to fewer than two independent data points after redundancy adjustment.",
+        }
+
+    slope = _v10_fit_psf_size_slope([(r["sqft"], r["psf"]) for r in rows])
+    size_model = "regression" if slope is not None else "fixed_elasticity"
+    if anchor_mode == "mixed":
+        size_model += "+no_closed_majority"
+    total_w = sum(r["weight"] for r in rows)
+
+    # Two genuinely distinct indications for a cross-check:
+    #  - psf_indication:  naive weighted-mean comp $/sqft x subject sqft (NO size correction) -
+    #    the "what agents do" number.
+    #  - sale_indication: weighted-mean comp SALE PRICE, size-corrected toward the subject (via
+    #    the fitted slope, else the fixed elasticity), with each comp's correction hard-capped at
+    #    +-22% of its real sale price so a bad slope or an extreme size gap can't run away.
+    # They diverge exactly when the subject's size differs materially from the comps AND
+    # diminishing marginal $/sqft matters - which is the divergence worth flagging.
+    raw_psf_mean = sum(r["psf"] * r["weight"] for r in rows) / total_w
+
+    # ---- Fix 1: the $/sqft LEG is built from each comp's sqft-composition-NORMALIZED per-foot
+    # figure (finished-basement / auxiliary space stripped to a bounded above-grade basis, or
+    # blended + down-weighted when the split is unknown), NOT its raw price / above-grade-sqft.
+    # A materially-mixed comp whose composition can't be resolved is dropped from this leg entirely
+    # when >= 2 clean comps remain. The sale-price leg below is untouched (it size-adjusts real
+    # sale prices and hard-clamps each move to +-22%).
+    # Re-run the per-comp $/sqft-leg treatment now that the row set is settled, passing a
+    # below-grade $/sqft PAIRED from the comps themselves when the set supports one - that
+    # overrides the fallback heuristic and earns a lighter leg down-weight.
+    _bg_psf_ev, _bg_psf_src = _v10_paired_below_grade_psf(rows)
+    for r in rows:
+        r["psfleg"] = _v10_psf_leg_treatment(
+            r["_c"], r["price"], r["sqft"], subj_below_frac,
+            bg_psf_evidence=_bg_psf_ev, bg_psf_evidence_src=_bg_psf_src,
+        )
+
+    _full_leg = [r for r in rows if r["psfleg"]["psf_leg_eligibility"] == "full"]
+    for r in rows:
+        r["_psf_leg_mult"] = float(r["psfleg"]["psf_leg_weight_mult"])
+        if r["psfleg"]["psf_leg_eligibility"] == "blended_downweighted" and len(_full_leg) >= 2:
+            r["_psf_leg_mult"] = 0.0
+            r["psfleg"]["psf_leg_eligibility"] = "excluded_from_psf_leg"
+            r["psfleg"]["psf_leg_exclusion_reason"] = (
+                (r["psfleg"].get("psf_leg_exclusion_reason") or "") + "; excluded - enough clean-composition comps remain"
+            ).lstrip("; ")
+    _psf_leg_den = sum(r["weight"] * r["_psf_leg_mult"] for r in rows)
+    if _psf_leg_den > 0:
+        psf_leg_mean = sum(r["psfleg"]["psf_for_leg"] * r["weight"] * r["_psf_leg_mult"] for r in rows) / _psf_leg_den
+    else:  # everything got excluded (pathological) - fall back to the raw weighted mean
+        psf_leg_mean = raw_psf_mean
+    psf_indication = psf_leg_mean * subj_sqft
+    psf_indication_unnormalized = raw_psf_mean * subj_sqft
+    _psf_leg_norm_ct = sum(1 for r in rows if r["psfleg"]["psf_leg_eligibility"] not in ("full",))
+    _psf_leg_ct = sum(1 for r in rows if r["_psf_leg_mult"] > 0)
+    _psf_leg_heuristic_ct = sum(1 for r in rows if r["psfleg"].get("psf_leg_heuristic_used"))
+    _bg_rate_sources = sorted({r["psfleg"]["below_grade_rate_source"] for r in rows if r["psfleg"].get("below_grade_rate_source")})
+
+    sale_num = 0.0
+    for r in rows:
+        if slope is not None:
+            psf_at_subj = max(1.0, r["psf"] + slope * (subj_sqft - r["sqft"]))
+            price_adj = psf_at_subj * subj_sqft
+        else:
+            price_adj = r["price"] * (1 + _V10_BETA * (subj_sqft - r["sqft"]) / r["sqft"])
+        price_adj = _clamp(price_adj, r["price"] * 0.78, r["price"] * 1.22)
+        r["price_adj_to_subject"] = price_adj
+        sale_num += price_adj * r["weight"]
+
+    sale_indication = sale_num / total_w
+    anchor_value = _V10_ANCHOR_BLEND * sale_indication + (1.0 - _V10_ANCHOR_BLEND) * psf_indication
+
+    raw_price_mean = sum(r["price"] * r["weight"] for r in rows) / total_w
+    if raw_price_mean > 0 and not (0.6 * raw_price_mean <= anchor_value <= 1.8 * raw_price_mean):
+        anchor_value = _clamp(anchor_value, 0.6 * raw_price_mean, 1.8 * raw_price_mean)
+        size_model += "+sanity_clamped"
+    if anchor_value <= 0:
+        _rough = _rough_anchor_value(rows, all_rows, context_rows)
+        return {"mode": "insufficient", "anchor_value": round(_rough) if _rough else None,
+                "anchor_value_is_rough": bool(_rough), "anchor_low": None, "anchor_high": None,
+                "subject_sqft_used": round(subj_sqft), "closed_comp_count": len(closed_rows),
+                "usable_comp_count": len(rows), "context_comps": context_rows,
+                "note": "Anchor math produced a non-positive value."}
+
+    _var = sum(r["weight"] * (r["price_adj_to_subject"] - sale_indication) ** 2 for r in rows) / total_w
+    dispersion = (_var ** 0.5) / anchor_value if anchor_value else _V10_ANCHOR_MIN_SPREAD
+    divergence = abs(sale_indication - psf_indication) / anchor_value
+    _min_spread = _V10_ANCHOR_MIN_SPREAD + (0.02 if anchor_mode == "mixed" else 0.0)
+    spread = min(_V10_ANCHOR_MAX_SPREAD, max(_min_spread, dispersion, divergence if divergence > 0.08 else 0.0))
+
+    # per-comp dollar contribution to the blended anchor (normalized weight x its blended own
+    # indication), for a fully traceable "why did this comp move it $X" read.
+    _quality_by_key = {cc.get("listing_key"): (cc.get("quality") or {}) for cc in comps if cc.get("listing_key")}
+    comp_trace = []
+    for r in rows:
+        nw = r["weight"] / total_w
+        _leg = r["psfleg"]
+        own_indication = _V10_ANCHOR_BLEND * r["price_adj_to_subject"] + (1.0 - _V10_ANCHOR_BLEND) * (_leg["psf_for_leg"] * subj_sqft)
+        _lc = r.get("loc_trace") or {}
+        _cnd = r.get("cond_trace") or {}
+        _cq = _quality_by_key.get(r["key"]) or {}
+        _trace_row = {
+            "label": r["label"], "listing_key": r["key"], "strength": r["strength"], "price_basis": r["price_basis"],
+            "quality": {k: (str(_cq.get(k)).lower() if _cq.get(k) is not None else None) for k in _V10_ALL_DIMS},
+            "explicit_accessory_features": _explicit_accessory_features(r.get("_c")),
+            "status": r["status"], "distance_miles": r["distance_miles"],
+            "raw_sale_price": round(r["price"]), "raw_psf": round(r["psf"]),
+            "size_adjusted_price": round(r["price_adj_to_subject"]),
+            "sqft": round(r["sqft"]), "below_grade_frac": r["below_grade_frac"],
+            # Fix 1 - sqft-composition normalization for the $/sqft leg, fully traced.
+            # raw_total_finished_psf = price / TOTAL finished area (never call an above-grade rate
+            # a "total-area" rate); adjusted_above_grade_psf = the above-grade figure actually used.
+            "total_finished_sqft": _leg["total_finished_sqft"],
+            "above_grade_sqft": _leg["above_grade_sqft"],
+            "below_grade_sqft": _leg["below_grade_sqft"],
+            "raw_total_finished_psf": (round(r["price"] / _leg["total_finished_sqft"], 2)
+                                       if _leg.get("total_finished_sqft") else None),
+            "adjusted_above_grade_psf": _leg["psf_for_leg"],
+            "psf_used_in_leg": _leg["psf_for_leg"],
+            "adjusted_above_grade_psf_used": _leg["adjusted_above_grade_psf_used"],
+            "below_grade_contributory_value_applied": _leg["below_grade_contributory_value_applied"],
+            "below_grade_basis": _leg["below_grade_basis"],
+            "below_grade_rate_source": _leg.get("below_grade_rate_source"),
+            "psf_leg_heuristic_used": bool(_leg.get("psf_leg_heuristic_used")),
+            "psf_leg_eligibility": _leg["psf_leg_eligibility"],
+            "psf_leg_weight_mult": round(r.get("_psf_leg_mult", _leg["psf_leg_weight_mult"]), 2),
+            "psf_leg_exclusion_reason": _leg["psf_leg_exclusion_reason"],
+            # Fix 2 - market-location consistency, fully traced
+            "ai_class": _lc.get("ai_class") or r["strength"],
+            "validated_class": _lc.get("validated_class") or r["strength"],
+            "location_score": _lc.get("location_score"),
+            "street_context_score": _lc.get("street_score"),
+            "distance_score": _lc.get("distance_score"),
+            "area_compatibility": _lc.get("area_label"),
+            "school_township_compatibility": _lc.get("school_township"),
+            "location_negatives": _lc.get("negatives") or [],
+            "location_override": bool(_lc.get("override_applied")),
+            "location_weight_penalty": round(r.get("loc_weight_penalty", 1.0), 3),
+            # round 12 issue #1: condition-only re-promotion (kept the same-market evidence in the anchor)
+            "condition_class_promoted": bool(_cnd.get("now")),
+            "condition_class_change": (f'{_cnd.get("was")} → {_cnd.get("now")}' if _cnd.get("now") else None),
+            "condition_gap_direction": _cnd.get("condition_gap_direction"),
+            "ev_score_full": round(r["ev_score_full"], 3) if r["ev_score_full"] is not None else None,
+            "ev_score_ex_recency": r["ev_score_ex_recency"],
+            "ev_components": r["ev_components"],
+            "recency_weight": round(r["recency"], 3) if r["recency"] is not None else None,
+            "outlier": r["outlier"], "outlier_penalty": _V10_OUTLIER_PENALTY if r["outlier"] else 1.0,
+            "redundancy_penalty": r["redundancy_penalty"],
+            "competitive_weight_mult": r.get("competitive_weight_mult", 1.0),
+            "weight_raw": round(r["weight"], 4), "normalized_weight": round(nw, 3),
+            "dollar_contribution_to_anchor": round(nw * own_indication),
+            "sale_to_list": round(r["sale_to_list"], 3) if r["sale_to_list"] else None,
+            "dom": int(r["dom"]) if r["dom"] is not None else None,
+            "competitive_sale": bool(r.get("competitive_sale")),
+            "_own_indication": round(own_indication),
+        }
+        if r.get("raw_weight_override") is not None:
+            _trace_row["continuous_relevance_weight"] = round(r["raw_weight_override"], 4)
+        comp_trace.append(_trace_row)
+
+    # round 13: a competitive (well-over-ask, fast) closed sale that is ALSO a dominant high-side
+    # weight driver with no corroboration from an ordinary closed comp near its level. The sale
+    # price is kept as-is; this only surfaces a caution + knocks confidence a notch downstream.
+    _competitive_drivers = []
+    for ct in comp_trace:
+        if not (ct.get("competitive_sale") and (ct.get("normalized_weight") or 0) >= _V10_COMPETITIVE_DOMINANCE):
+            continue
+        others = [v for other in comp_trace
+                  for v in [other["_own_indication"]]
+                  if other is not ct and other["price_basis"] == "closed_verified"]
+        if not others:
+            continue
+        others_median = _v10_median(others) or 0
+        if ct["_own_indication"] <= others_median * (1 + _V10_COMPETITIVE_ABOVE_FRAC):
+            continue
+        corroborated = any(
+            other is not ct and other["price_basis"] == "closed_verified" and not other.get("competitive_sale")
+            and abs(other["_own_indication"] - ct["_own_indication"]) <= _V10_COMPETITIVE_CORROB_FRAC * ct["_own_indication"]
+            for other in comp_trace)
+        _competitive_drivers.append({
+            "label": ct["label"], "sale_to_list": ct["sale_to_list"], "dom": ct["dom"],
+            "normalized_weight": ct["normalized_weight"], "own_indication": ct["_own_indication"],
+            "other_closed_median": round(others_median), "corroborated": corroborated,
+        })
+    for ct in comp_trace:
+        ct.pop("_own_indication", None)
+
+    # ---- anchor-validity escape hatch (hardening: item 8). This is NOT "the AI may override a
+    # valid anchor" - it is "the comp set is objectively too thin/incoherent to bound a value
+    # against at all". A `closed_only` anchor is always at least 'ok'. Only a mixed-mode anchor
+    # (no closed-sale majority) with few weighted comps AND a wide spread / large sale-vs-$/sqft
+    # divergence / a sanity-clamped size model is downgraded. 'invalid' -> the caller routes it
+    # exactly like 'insufficient' (provisional wide range + forced Low + agent-review gate);
+    # 'weak' -> a real FMV still computes but confidence is forced Low, the range widened, and a
+    # blocking "agent review required" note is raised.
+    n_weighted = len(rows)
+    _wide = (spread * 100 >= _V10_WEAK_ANCHOR_SPREAD_PCT) or (divergence * 100 >= _V10_WEAK_ANCHOR_DIVERGENCE_PCT) \
+        or ("sanity_clamped" in size_model)
+    anchor_validity = "ok"
+    validity_reason = None
+    if anchor_mode == "mixed" and n_weighted <= _V10_WEAK_ANCHOR_MAX_WEIGHTED and _wide:
+        if n_weighted <= 2 and spread * 100 >= _V10_ANCHOR_MAX_SPREAD * 100 - 0.1:
+            anchor_validity = "invalid"
+        else:
+            anchor_validity = "weak"
+        validity_reason = (
+            f"no closed-sale majority, only {n_weighted} weighted comp(s), spread {round(spread*100,1)}% / "
+            f"sale-vs-$/sqft divergence {round(divergence*100,1)}%"
+            + (", size model was sanity-clamped" if "sanity_clamped" in size_model else "")
+        )
+
+    # authoritative descriptive stats over the weighted comp set - so any "average"/"median"
+    # figure in the narrative (or a frontend rollup) can be cross-checked against ONE source.
+    _ps = [r["price"] for r in rows]
+    _pf = [r["psf"] for r in rows]
+    comp_stats = {
+        "n": len(rows),
+        "weighted_mean_sale": round(raw_price_mean),
+        "weighted_mean_psf": round(raw_psf_mean, 2),
+        "simple_mean_sale": round(sum(_ps) / len(_ps)),
+        "simple_mean_psf": round(sum(_pf) / len(_pf), 2),
+        "median_sale": round(_v10_median(_ps) or 0),
+        "median_psf": round(_v10_median(_pf) or 0, 2),
+        "min_sale": round(min(_ps)), "max_sale": round(max(_ps)),
+        "method": (
+            "continuous relevance x outlier x redundancy, size-adjusted"
+            if raw_weight_overrides is not None
+            else "weighted mean (by classification x evidence x recency x redundancy), size-adjusted"
+        ),
+    }
+
+    return {
+        "mode": anchor_mode,
+        "anchor_validity": anchor_validity,
+        "anchor_validity_reason": validity_reason,
+        "comp_stats": comp_stats,
+        "anchor_value": round(anchor_value),
+        "anchor_low": round(anchor_value * (1 - spread)),
+        "anchor_high": round(anchor_value * (1 + spread)),
+        "sale_price_indication": round(sale_indication),
+        "psf_indication": round(psf_indication),
+        "psf_indication_per_sqft": round(psf_indication / subj_sqft, 2),
+        # Fix 1 - the $/sqft leg is sqft-composition-normalized; keep the un-normalized figure for QA/audit
+        "psf_indication_basis": "above-grade $/sqft, finished-below-grade normalized",
+        "psf_indication_unnormalized": round(psf_indication_unnormalized),
+        "psf_leg_comp_count": _psf_leg_ct,
+        "psf_leg_normalized_comp_count": _psf_leg_norm_ct,
+        "psf_leg_heuristic_comp_count": _psf_leg_heuristic_ct,
+        "below_grade_rate_sources": _bg_rate_sources or None,
+        "paired_below_grade_psf": _bg_psf_ev,
+        "weighted_raw_sale_mean": round(raw_price_mean),
+        "subject_sqft_used": round(subj_sqft),
+        "subject_below_grade_frac": round(subj_below_frac, 2),
+        "subject_explicit_accessory_features": _explicit_accessory_features(subject),
+        "closed_comp_count": len(closed_rows),
+        "weighted_comp_count": len(rows),
+        "context_comps": context_rows or None,
+        "size_model": size_model,
+        "regression_slope_psf_per_sqft": round(slope, 5) if slope is not None else None,
+        "size_elasticity_beta": None if slope is not None else _V10_BETA,
+        "sale_psf_divergence_pct": round(divergence * 100, 1),
+        "spread_pct": round(spread * 100, 1),
+        "comp_list_to_sale_median": (round(_v10_median([r["sale_to_list"] for r in rows if r["sale_to_list"]]), 3)
+                                     if any(r["sale_to_list"] for r in rows) else None),
+        "competitive_sale_drivers": _competitive_drivers or None,
+        "comps": comp_trace,
+    }
+
+
+_CONTINUOUS_RELEVANCE_VERSION = "continuous-relevance-v1"
+_CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS = {
+    "proximity": 22.0,
+    "market_area": 16.0,
+    "size": 20.0,
+    "property_type": 12.0,
+    "lot": 9.0,
+    "age_style": 10.0,
+    "recency": 7.0,
+    "data_reliability": 4.0,
+}
+
+
+def _relevance_lot_sqft(data: Optional[dict]) -> Optional[float]:
+    data = data or {}
+    sqft = _as_float(_first_present(data, "lot_size_sqft", "lot_size"))
+    if sqft and sqft > 0:
+        return sqft
+    acres = _as_float(_first_present(data, "acres", "lot_size_acres"))
+    return acres * 43560.0 if acres and acres > 0 else None
+
+
+def _relevance_style_family(value) -> Optional[str]:
+    text = _norm_token(value).replace("-", " ")
+    if not text:
+        return None
+    families = (
+        ("colonial_traditional", ("colonial", "traditional", "georgian", "federal")),
+        ("modern", ("modern", "contemporary", "mid century")),
+        ("tudor", ("tudor",)),
+        ("ranch", ("ranch", "split level", "bi level")),
+        ("cape", ("cape cod", "cape")),
+        ("victorian", ("victorian", "queen anne")),
+        ("craftsman", ("craftsman", "arts and crafts")),
+        ("farmhouse", ("farmhouse",)),
+        ("mediterranean", ("mediterranean", "spanish", "mission")),
+    )
+    for family, tokens in families:
+        if any(token in text for token in tokens):
+            return family
+    return text
+
+
+def _relevance_density_context(subject: dict, references: list[dict]) -> dict:
+    """Compatibility wrapper around the shared subject-level adaptive proximity policy."""
+    return build_adaptive_proximity_context(subject, references)
+
+
+def _relevance_market_area_score(subject: dict, comp: dict) -> tuple[Optional[float], dict]:
+    fields = (
+        ("school_district", ("school_district", "school_district_name"), 0.35),
+        ("township", ("township", "municipality"), 0.25),
+        ("neighborhood", ("subdivision_name", "neighborhood", "neighborhood_name"), 0.25),
+        ("city", ("city",), 0.15),
+    )
+    pieces = []
+    detail = {}
+    for label, keys, weight in fields:
+        subject_value = _norm_token(_first_present(subject, *keys))
+        comp_value = _norm_token(_first_present(comp, *keys))
+        if not subject_value or not comp_value:
+            detail[label] = None
+            continue
+        value = 1.0 if subject_value == comp_value else 0.0
+        detail[label] = value
+        pieces.append((value, weight))
+    if not pieces:
+        return None, detail
+    return sum(value * weight for value, weight in pieces) / sum(weight for _, weight in pieces), detail
+
+
+def _relevance_data_reliability(comp: dict) -> float:
+    status_value = str(comp.get("status") or "").lower()
+    price, basis = _v10_comp_price_basis(comp)
+    checks = (
+        (bool(price and (basis == "closed_verified" or status_value not in ("sold", "closed"))), 0.35),
+        (bool(_v10_sqft(comp)), 0.20),
+        (bool(comp.get("distance_miles") is not None or (comp.get("latitude") and comp.get("longitude"))), 0.15),
+        (bool(_parse_iso_date(comp.get("close_date") or comp.get("sale_date"))) if status_value in ("sold", "closed") else True, 0.15),
+        (bool(_type_family(comp.get("property_type") or comp.get("home_type"))), 0.10),
+        (bool(_relevance_lot_sqft(comp)), 0.05),
+    )
+    return sum(weight for passed, weight in checks if passed)
+
+
+def _continuous_relevance(
+    subject: dict, comps: list[dict], *, density_context: Optional[dict] = None,
+) -> dict:
+    """Stable production relevance independent of model roles and generated narratives."""
+    density = copy.deepcopy(density_context) if density_context else _relevance_density_context(subject, comps)
+    subject_sqft = _v10_sqft(subject)
+    subject_lot = _relevance_lot_sqft(subject)
+    subject_year = _as_float(subject.get("year_built"))
+    subject_style = _relevance_style_family(subject.get("architectural_style") or subject.get("structure_type"))
+    subject_type = _type_family(subject.get("property_type") or subject.get("home_type"))
+    rows = []
+    for i, comp in enumerate(comps):
+        key = str(comp.get("listing_key") or f"comp-{i + 1}")
+        components: dict[str, float] = {}
+        component_detail: dict[str, object] = {}
+        distance = _as_float(comp.get("distance_miles"))
+        if distance is not None:
+            components["proximity"] = _half_life_decay(distance, density["distance_half_life_miles"])
+        market_area, area_detail = _relevance_market_area_score(subject, comp)
+        component_detail["market_area"] = area_detail
+        if market_area is not None:
+            components["market_area"] = market_area
+        comp_sqft = _v10_sqft(comp)
+        if subject_sqft and comp_sqft:
+            components["size"] = _half_life_decay(comp_sqft - subject_sqft, max(subject_sqft * 0.22, 400))
+        comp_type = _type_family(comp.get("property_type") or comp.get("home_type"))
+        if subject_type and comp_type:
+            components["property_type"] = 1.0 if subject_type == comp_type else 0.0
+        # Eligibility-only, NOT a score input: condo/attached/detached are structurally different
+        # housing products (condo vs single-family, townhouse vs detached single-family, etc.) - a
+        # comp across that line can't become a Strong/primary comp no matter how high its Match %
+        # lands, but the % itself is untouched (property_type above already carries its normal 12
+        # points; this doesn't multiply or otherwise adjust base_score/adjusted_score).
+        structurally_incompatible_property_type = bool(subject_type and comp_type and subject_type != comp_type)
+        comp_lot = _relevance_lot_sqft(comp)
+        if subject_lot and comp_lot:
+            components["lot"] = _half_life_decay(comp_lot - subject_lot, max(subject_lot * 0.4, 10890))
+        age_style_parts = []
+        comp_year = _as_float(comp.get("year_built"))
+        if subject_year and comp_year:
+            age_style_parts.append((_half_life_decay(comp_year - subject_year, 22.0), 0.65))
+        comp_style = _relevance_style_family(comp.get("architectural_style") or comp.get("structure_type"))
+        if subject_style and comp_style:
+            age_style_parts.append((1.0 if subject_style == comp_style else 0.55, 0.35))
+        if age_style_parts:
+            components["age_style"] = (
+                sum(value * weight for value, weight in age_style_parts)
+                / sum(weight for _, weight in age_style_parts)
+            )
+        recency = _comp_recency_weight(comp)
+        if recency is not None:
+            components["recency"] = recency
+        components["data_reliability"] = _relevance_data_reliability(comp)
+        available = [(name, score, _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS[name]) for name, score in components.items()]
+        denominator = sum(weight for _, _, weight in available)
+        base_score = sum(score * weight for _, score, weight in available) / denominator if denominator else 0.0
+        component_points = {
+            name: round(score * _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS[name], 4)
+            for name, score in components.items()
+        }
+        # Match %/ranking/weighting is the 8 core components only - no post-score product or
+        # amenity modifier (pool, guest apartment/ADU, guest house, property-type mismatch, etc.)
+        # is applied here. That evidence still reaches Astra separately for valuation/adjustment
+        # (see _amenity_signals/_explicit_accessory_features call sites elsewhere in this module);
+        # it just no longer moves this deterministic similarity score.
+        adjusted_score = base_score
+        price, _ = _v10_comp_price_basis(comp)
+        mechanically_eligible = bool(comp.get("is_included", True) and price and comp_sqft and comp_sqft > 0)
+        if str(comp.get("status") or "").lower() in ("sold", "closed") and not (
+            comp.get("price_verified", True) and comp.get("sale_price")
+        ):
+            mechanically_eligible = False
+        rows.append({
+            "listing_key": key,
+            "label": _comp_label(i, comp),
+            "current_model_role": _normalize_strength(comp.get("ai_strength") or comp.get("strength")),
+            "components": {name: round(score, 4) for name, score in components.items()},
+            "component_points": component_points,
+            "component_detail": component_detail,
+            "available_component_weight": round(denominator, 4),
+            "candidate_distance_miles": round(distance, 3) if distance is not None else None,
+            "proximity_score_points": component_points.get("proximity"),
+            "proximity_max_points": _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["proximity"],
+            "local_market_half_life_miles": density.get("distance_half_life_miles"),
+            "base_relevance_score": round(base_score, 4),
+            "adjusted_relevance_score": round(adjusted_score, 4),
+            "mechanically_eligible": mechanically_eligible,
+            "structurally_incompatible_property_type": structurally_incompatible_property_type,
+        })
+    best = max((row["adjusted_relevance_score"] for row in rows if row["mechanically_eligible"]), default=0.0)
+    for row in rows:
+        score = row["adjusted_relevance_score"]
+        if (
+            not row["mechanically_eligible"]
+            or row["structurally_incompatible_property_type"]
+            or score < 0.45
+        ):
+            role = "weak"
+        elif score >= 0.72 and score >= best - 0.06:
+            role = "strong"
+        else:
+            role = "supporting"
+        row["proposed_role"] = role
+        row["continuous_weight_input"] = score if role in ("strong", "supporting") else 0.0
+    stable_payload = {
+        "version": _CONTINUOUS_RELEVANCE_VERSION,
+        "density": density,
+        "rows": [
+            {key: row[key] for key in (
+                "listing_key", "components", "base_relevance_score",
+                "adjusted_relevance_score", "mechanically_eligible",
+                "structurally_incompatible_property_type",
+                "proposed_role", "continuous_weight_input",
+            )}
+            for row in rows
+        ],
+    }
+    return {
+        "version": _CONTINUOUS_RELEVANCE_VERSION,
+        "density_context": density,
+        "component_weights": dict(_CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS),
+        "comps": rows,
+        "stability_fingerprint": hashlib.sha256(
+            json.dumps(stable_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _compute_continuous_relevance_anchor(
+    subject: dict, comps: list[dict], evidence_by_key: Optional[dict] = None,
+    outliers: Optional[dict] = None, *, source_snapshot_sha256: Optional[str] = None,
+    density_context: Optional[dict] = None,
+) -> dict:
+    """Compute the production anchor from deterministic continuous comp relevance."""
+    relevance = _continuous_relevance(subject, comps, density_context=density_context)
+    by_key = {row["listing_key"]: row for row in relevance["comps"]}
+    shadow_comps = []
+    weight_overrides = {}
+    for i, source in enumerate(comps):
+        comp = copy.deepcopy(source)
+        key = str(comp.get("listing_key") or f"comp-{i + 1}")
+        row = by_key[key]
+        comp["listing_key"] = key
+        comp["strength"] = row["proposed_role"]
+        shadow_comps.append(comp)
+        weight_overrides[key] = row["continuous_weight_input"]
+    evidence = evidence_by_key or _build_evidence_by_key(subject, shadow_comps)
+    shadow_anchor = _compute_comp_anchor(
+        subject, shadow_comps, evidence, outliers or _flag_psf_outliers(shadow_comps),
+        raw_weight_overrides=weight_overrides,
+    )
+    anchor_by_key = {
+        str(row.get("listing_key")): row for row in (shadow_anchor or {}).get("comps") or []
+        if row.get("listing_key") is not None
+    }
+    for row in relevance["comps"]:
+        anchor_row = anchor_by_key.get(row["listing_key"]) or {}
+        row["weight_after_anchor_penalties"] = anchor_row.get("weight_raw", 0.0)
+        row["normalized_weight"] = anchor_row.get("normalized_weight", 0.0)
+    weighted_rows = [row for row in relevance["comps"] if (row.get("normalized_weight") or 0) > 0]
+    dominance_flags = []
+    if len(weighted_rows) >= 4:
+        for row in weighted_rows:
+            if row["normalized_weight"] > 0.35:
+                dominance_flags.append(
+                    f"{row['label']} carries {round(row['normalized_weight'] * 100, 1)}% of the anchor "
+                    "with four or more usable comps; no concentration cap was applied."
+                )
+    return {
+        **relevance,
+        "mode": "production",
+        "weighting_authority": "continuous_relevance",
+        "authoritative_for_comp_weighting": True,
+        "final_valuation_authority": "reasoning_model",
+        "production_activated": True,
+        "source_snapshot_sha256": source_snapshot_sha256,
+        "anchor_value": (shadow_anchor or {}).get("anchor_value"),
+        "anchor": shadow_anchor,
+        "dominance_flags": dominance_flags,
+        "max_normalized_weight": max((row.get("normalized_weight") or 0.0 for row in weighted_rows), default=0.0),
+        "production_value_consumes_relevance": True,
+    }
+
+
+def _apply_continuous_relevance_weighting(
+    subject: dict, comps: list[dict], evidence_by_key: Optional[dict] = None,
+    outliers: Optional[dict] = None, *, source_snapshot_sha256: Optional[str] = None,
+    density_context: Optional[dict] = None,
+) -> tuple[list[dict], Optional[dict], dict]:
+    """Set visible scores/roles while keeping raw relevance authoritative for anchor weights."""
+    result = _compute_continuous_relevance_anchor(
+        subject, comps, evidence_by_key, outliers,
+        source_snapshot_sha256=source_snapshot_sha256,
+        density_context=density_context,
+    )
+    rows_by_key = {row["listing_key"]: row for row in result["comps"]}
+    updated: list[dict] = []
+    for i, source in enumerate(comps):
+        comp = copy.deepcopy(source)
+        key = str(comp.get("listing_key") or f"comp-{i + 1}")
+        row = rows_by_key[key]
+        comp["ai_strength"] = comp.get("ai_strength") or row.get("current_model_role")
+        comp["strength"] = row["proposed_role"]
+        raw_relevance = row["adjusted_relevance_score"]
+        comp["match_score"] = calibrate_match_percentage(raw_relevance)
+        comp["similarity_details"] = {
+            "version": result.get("version"),
+            "display_calibration_version": MATCH_DISPLAY_CALIBRATION_VERSION,
+            "density_context": copy.deepcopy(result.get("density_context")),
+            "candidate_distance_miles": row.get("candidate_distance_miles"),
+            "component_scores": copy.deepcopy(row.get("components")),
+            "component_points": copy.deepcopy(row.get("component_points")),
+            "available_component_weight": row.get("available_component_weight"),
+            "proximity_score_points": row.get("proximity_score_points"),
+            "proximity_max_points": row.get("proximity_max_points"),
+            "base_relevance_score": row.get("base_relevance_score"),
+            "raw_relevance_score": raw_relevance,
+            "display_match_score": comp["match_score"],
+            "final_similarity_score": comp["match_score"],
+        }
+        updated.append(comp)
+    return _annotate_comp_valuation_roles(updated, result.get("anchor")), result.get("anchor"), result
+
+
+def _v10_location_class_review(subject: dict, comps: list, evidence_by_key: dict) -> list:
+    """Fix 2. Deterministic consistency layer between the AI's `strength` label, the deterministic
+    evidence score, and the final valuation WEIGHT - with market LOCATION as a first-class input.
+    A comp that is an excellent PHYSICAL match but carries multiple real geographic negatives
+    (different school district / municipality, an explicit "Different Area" rating, a materially
+    busier through-street, or materially farther than the rest of the set) does not keep full
+    Strong influence unless the AI filed a machine-checkable market-equivalence override that
+    survives validation. Sets comp["_loc"] on every included Strong/Supporting comp (read by
+    _compute_comp_anchor for the weight penalty + trace) and returns qa_flags. It never promotes,
+    and never touches a comp already rated `weak`. NOT a crude "different township => never Strong"
+    rule - a single negative only trims weight; it takes >= _V10_LOC_NEG_DEMOTE to force a demote."""
+    flags: list = []
+    subj_school = _norm_token(subject.get("school_district"))
+    subj_city = _norm_token(subject.get("city"))
+    subj_street_tier = _street_tier(subject)
+
+    incl = [(i, c) for i, c in enumerate(comps)
+            if c.get("is_included", True) and _normalize_strength(c.get("strength")) in ("strong", "supporting")]
+    dists = [d for _, c in incl for d in [_as_float(c.get("distance_miles"))] if d is not None]
+    dist_median = _v10_median(dists) if dists else None
+    dist_mad = _v10_median([abs(d - dist_median) for d in dists]) if (dists and dist_median is not None) else None
+
+    for i, c in incl:
+        ev_comp = (evidence_by_key.get(c.get("listing_key")) or {}).get("components") or {}
+        ai_class = _normalize_strength(c.get("strength"))
+        q = c.get("quality") or {}
+        label = _comp_label(i, c)
+
+        dist = _as_float(c.get("distance_miles"))
+        distance_score = ev_comp.get("proximity")
+        area_score = ev_comp.get("area")
+        area_label = q.get("area")
+        street_q = q.get("street_context")
+        rc_verdict = (c.get("road_context") or {}).get("verdict")
+        street_score = {"above": 1.0, "similar": 0.72, "below": 0.32}.get(street_q)
+        if street_score is None and rc_verdict:
+            street_score = {"quiet": 0.9, "neutral": 0.6, "through": 0.3}.get(rc_verdict)
+
+        c_school = _norm_token(c.get("school_district"))
+        c_city = _norm_token(c.get("city"))
+        school_match = (c_school == subj_school) if (c_school and subj_school) else None
+        city_match = (c_city == subj_city) if (c_city and subj_city) else None
+        school_township = ("same" if (school_match and city_match) else
+                           "partial" if (school_match or city_match) else
+                           "different" if (school_match is not None or city_match is not None) else "unknown")
+
+        negatives: list = []
+        if school_match is False:
+            negatives.append("different school district")
+        if city_match is False:
+            negatives.append("different municipality")
+        if area_label == "different_from_subject":
+            negatives.append('rated "Different Area"')
+        _busier = street_q == "below" or (rc_verdict == "through" and subj_street_tier in ("quiet", "neutral", None))
+        if _busier:
+            negatives.append("materially busier / through-traffic street vs. the subject")
+        _far = (dist is not None and dist_median is not None and dist_mad is not None
+                and dist > dist_median + max(1.0, 1.5 * dist_mad))
+        if _far:
+            negatives.append(f"farther out ({dist:.1f} mi) than the rest of the set (~{dist_median:.1f} mi)")
+
+        _parts = [(distance_score, 0.35), (area_score, 0.40), (street_score, 0.25)]
+        _pv = [(v, w) for v, w in _parts if v is not None]
+        location_score = round(sum(v * w for v, w in _pv) / sum(w for _, w in _pv), 3) if _pv else None
+
+        ovr_flag = bool(c.get("strong_location_override"))
+        ovr_reason = _coerce_ai_text(c.get("strong_location_override_reason")).strip()
+        _oe = c.get("market_equivalence_evidence")
+        ovr_evidence = [e for e in (_oe if isinstance(_oe, list) else []) if isinstance(e, str) and e.strip()]
+        _ev_concrete = any(re.search(r"\d|\$|sold|psf|per (?:sq|square)|school|price|buyer pool|trade[sd]?|same market", e, re.I)
+                           for e in ovr_evidence)
+        override_valid = ovr_flag and len(ovr_reason) >= _V10_STRONG_OVERRIDE_MIN_REASON and _ev_concrete
+        if ovr_flag and not override_valid:
+            flags.append(f"{label}: a Strong market-location override was claimed but its justification is thin "
+                         "(reason too short or no concrete market-equivalence evidence) - not honored.")
+
+        weight_penalty = 1.0
+        if negatives:
+            weight_penalty = 1.0 - _V10_LOC_NEG_STEP * len(negatives)
+            if area_label == "different_from_subject":
+                weight_penalty -= _V10_LOC_DIFFERENT_AREA_STEP
+            if _busier:
+                weight_penalty -= _V10_LOC_STREET_STEP
+            weight_penalty = max(_V10_LOC_MIN_MULT, min(1.0, weight_penalty))
+
+        validated_class = ai_class
+        if ai_class == "strong" and len(negatives) >= _V10_LOC_NEG_DEMOTE and not override_valid:
+            validated_class = "supporting"
+            c["strength"] = "supporting"
+            flags.append(f"{label}: rated Strong, but carries {len(negatives)} location negatives "
+                         f"({'; '.join(negatives)}) with no validated market-equivalence override - demoted to Supporting.")
+        elif ai_class == "strong" and negatives and not override_valid:
+            flags.append(f"{label}: kept Strong, but location negatives ({'; '.join(negatives)}) "
+                         f"cut its valuation weight to ~{round(weight_penalty*100)}% of full.")
+        elif override_valid and negatives:
+            flags.append(f"{label}: location negatives present, but the AI's market-equivalence override was "
+                         f"accepted - kept {ai_class.capitalize()} (weight still ~{round(weight_penalty*100)}% of full).")
+
+        c["_loc"] = {
+            "ai_class": ai_class, "validated_class": validated_class,
+            "location_score": location_score,
+            "distance_score": round(distance_score, 3) if distance_score is not None else None,
+            "area_score": round(area_score, 3) if area_score is not None else None,
+            "street_score": round(street_score, 3) if street_score is not None else None,
+            "area_label": area_label, "school_township": school_township,
+            "negatives": negatives, "override_applied": bool(override_valid),
+            "override_reason": ovr_reason or None, "weight_penalty": round(weight_penalty, 3),
+        }
+    return flags
+
+
+def _v10_condition_class_review(subject: dict, comps: list, evidence_by_key: dict) -> list:
+    """Round 12 issue #1. Comparability/strength answers how USEFUL a sale is as market evidence;
+    a pure condition/renovation gap belongs in the ADJUSTMENT layer, not the class. This catches the
+    over-correction the round-11 run exposed: an otherwise same-market, similar size / age / type /
+    lot / street, recent, price-verified sale that was rated `weak` mainly because it is materially
+    more (or less) renovated than the subject is re-promoted to `supporting` so the anchor keeps the
+    evidence - a directional renovation/condition adjustment then carries the difference. It NEVER
+    promotes past Supporting, and never touches a comp with a real location negative (that is
+    _v10_location_class_review's job), a property-type mismatch, an unverified closing price, an
+    explicit AI dismissal in its own note, or a genuinely poor physical match. Sets comp["_cond"]
+    for the trace and returns qa_flags. Runs AFTER _v10_location_class_review."""
+    flags: list = []
+    subj_school = _norm_token(subject.get("school_district"))
+    subj_city = _norm_token(subject.get("city"))
+    for i, c in enumerate(comps):
+        if not c.get("is_included", True):
+            continue
+        if _normalize_strength(c.get("strength")) != "weak":
+            continue
+        label = _comp_label(i, c)
+        note = c.get("ai_commentary") or c.get("commentary") or ""
+        if classify_from_note(note) == "weak":
+            continue  # the AI's own prose explicitly dismisses it - respect that
+
+        ev = evidence_by_key.get(c.get("listing_key")) or {}
+        parts = ev.get("components") or {}
+        score = _as_float(ev.get("score"))
+        q = c.get("quality") or {}
+
+        price_ok = bool(c.get("price_verified", True) and c.get("sale_price")) \
+            or str(c.get("status") or "").lower() not in ("sold", "closed")
+        type_ok = parts.get("property_type") in (None, 1.0)
+        phys_ok = all(v is None or v >= _V10_COND_PROMOTE_MIN_COMPONENT
+                      for v in (parts.get("proximity"), parts.get("size"), parts.get("recency"))) \
+            and parts.get("area") in (None, 0.5, 1.0)
+        ev_ok = score is None or score >= _V10_COND_PROMOTE_MIN_EV
+
+        c_school = _norm_token(c.get("school_district"))
+        c_city = _norm_token(c.get("city"))
+        loc_bad = bool(
+            (c_school and subj_school and c_school != subj_school)
+            or (c_city and subj_city and c_city != subj_city)
+            or q.get("area") == "different_from_subject"
+            or q.get("street_context") == "below"
+            or (c.get("_loc") or {}).get("negatives")
+        )
+
+        cond_dims = [str(q.get(d) or "").lower() for d in ("finish_quality", "interior", "exterior")]
+        cond_gap = any(v in ("above", "below") for v in cond_dims)
+        other_gap = any(str(q.get(d) or "").lower() == "below" for d in ("lot", "amenities", "layout"))
+
+        if price_ok and type_ok and phys_ok and ev_ok and not loc_bad and cond_gap and not other_gap:
+            direction = ("more renovated / higher-finish" if cond_dims.count("above") >= cond_dims.count("below")
+                         else "more dated / lower-finish")
+            c["strength"] = "supporting"
+            c["_cond_promoted"] = True
+            c["_cond"] = {
+                "was": "weak", "now": "supporting",
+                "evidence_score": round(score, 3) if score is not None else None,
+                "condition_gap_direction": direction,
+                "reason": "same micro-market, similar size / age / type / lot / street, recent, price-verified; "
+                          "the only material gap vs. the subject is condition/renovation",
+            }
+            flags.append(
+                f"{label}: rated Weaker, but it's a same-market, similar-size, recent, price-verified sale whose "
+                f"only material gap vs. the subject is that it is {direction} - that belongs in the adjustment "
+                f"layer, not the class. Re-promoted to Supporting so the anchor keeps the evidence; a directional "
+                f"renovation/condition adjustment carries the difference."
+            )
+    return flags
+
+
+# --- round 15: structured finish-rating vs. narrative/fact consistency -------------------------
+# The weighted qualitative signal is only as good as the finish_quality / interior ratings that
+# feed it. Live runs showed the AI describing a comp as "fully renovated / turnkey" in prose while
+# rating finish_quality = Similar (or interior = Below on architectural grounds), which then
+# neutralises Stage 3 - the subject's real condition disadvantage disappears behind an inconsistent
+# label set. These pin the ratings to the comp's OWN narrative + verified facts. No dollar figure
+# is inferred; only the categorical rating is corrected.
+_V10_COMP_RENO_RE = re.compile(
+    r"\b(turnkey|turn-key|move[\s-]?in[\s-]?ready|fully\s+renovat\w+|fully\s+updated|newly\s+built|"
+    r"extensively\s+renovat\w+|gut[\s-]?renovat\w+|completely\s+renovat\w+|total(?:ly)?\s+renovat\w+|"
+    r"newly\s+renovat\w+|recently\s+renovat\w+|nothing\s+(?:left\s+)?to\s+do|renovated\s+(?:kitchen|bath)|"
+    r"(?:kitchen|bath)s?\s+(?:and|&|,)\s+baths?\b.{0,45}\b(?:renovat|updat|redone|rebuilt|new)\w*|"
+    r"recent\s+(?:capital\s+)?(?:upgrades|improvements|renovations?)|"
+    r"new\s+(?:heater|furnace|hvac|roof|windows?|systems?|mechanical\w*|kitchen|bath\w*))\b",
+    re.IGNORECASE,
+)
+# ...and that the SUBJECT is the more-original side (usually stated right in the comp's own note)
+_V10_SUBJ_ORIGINAL_RE = re.compile(
+    r"\bsubject('?s)?\b[^.]{0,90}\b(original|largely\s+original|dated|older\s+(?:systems|finish\w*|kitchen|bath\w*)|"
+    r"un-?renovated|un-?updated|behind|century-old|\d{2,3}[\s-]year[\s-]old|not\s+(?:been\s+)?(?:renovat|updat)\w*|"
+    r"should\s+not\s+exceed|character-driven)\b|"
+    r"\bcontrasts?\s+with\s+the\s+subject|\bbehind\s+the\s+subject|\bthan\s+the\s+subject('?s)?\b",
+    re.IGNORECASE,
+)
+# comp is a fixer / as-is / project - materially LESS finished than the subject. Deliberately
+# NARROW and comp-directed: a nuanced note often calls the SUBJECT dated/original ("contrasts with
+# the subject's dated systems"), so bare "dated systems" / "original condition" are NOT cues here -
+# only phrasing that can only be about the comp.
+_V10_COMP_ASIS_RE = re.compile(
+    r"\b(sold\s+as[\s-]?is|being\s+sold\s+as[\s-]?is|as[\s-]?is\s+(?:sale|condition|listing|purchase)|"
+    r"investor\s+(?:special|opportunity|project|grade)|(?:investor|contractor|handyman)\s+special|"
+    r"project\s+(?:home|opportunity|house|property)|marketed\s+as\s+(?:an?\s+)?(?:investor|project|fixer)|"
+    r"tear[\s-]?down|gut\s+job|needs?\s+(?:a\s+)?(?:total|full|complete|gut)\s+(?:renovat\w+|rehab\w*|overhaul)|"
+    r"deferred\s+maintenance|unfinished\s+aesthetic|"
+    r"condition\s+is\s+(?:well\s+)?behind\s+the\s+subject|"
+    r"(?:well\s+)?behind\s+the\s+subject'?s?\s+(?:own\s+)?(?:in\s+)?(?:condition|finish|updates?|renovation))\b",
+    re.IGNORECASE,
+)
+# explicit "on par" justification for a similar rating despite a renovation - respect it, no fix
+_V10_ON_PAR_RE = re.compile(
+    r"\b(on\s+par\s+with\s+the\s+subject|comparable\s+finish\s+to\s+the\s+subject|"
+    r"similar\s+(?:finish|quality|condition)\s+to\s+the\s+subject|finish\s+level\s+(?:is\s+)?(?:roughly\s+)?"
+    r"(?:on\s+par|comparable|similar)|matches?\s+the\s+subject'?s?\s+(?:finish|condition)|"
+    r"builder[\s-]?grade\s+finishes?\s+(?:on\s+par|comparable))\b",
+    re.IGNORECASE,
+)
+_V10_STRONG_RENO_RE = re.compile(
+    r"\b(turnkey|turn-key|gut[\s-]?renovat\w+|fully\s+renovat\w+|completely\s+renovat\w+|"
+    r"total(?:ly)?\s+renovat\w+|extensively\s+renovat\w+|nothing\s+(?:left\s+)?to\s+do|newly\s+built)\b",
+    re.IGNORECASE,
+)
+
+
+def _v10_condition_rating_consistency_check(subject: dict, comps: list) -> list:
+    """Runs right before the weighted qualitative signals are computed. The structured
+    finish_quality / interior / exterior ratings must not contradict a comp's OWN narrative and
+    verified facts: if the note / listing says a comp is fully renovated / turnkey / has
+    substantially updated kitchen+baths+systems while the subject is largely original, finish_quality
+    cannot be 'similar' / 'below' and interior cannot be 'below' without an explicit on-par
+    justification; likewise a fixer / as-is / project comp cannot be rated finish/interior superior
+    to the subject. A contradiction is CORRECTED deterministically (the categorical rating is pinned
+    to the narrative + fact evidence, never to a dollar figure) so an inconsistent label set can't
+    silently neutralise Stage 3. Mutates comp['quality'] in place, sets comp['_cond_rating_fix'] for
+    the trace, and returns qa_flags. Runs AFTER _v10_condition_class_review so strength is settled."""
+    flags: list = []
+    # Age and missing renovation history are not condition evidence. Only an explicit statement in
+    # the authoritative property record can establish that the subject is original/dated.
+    subj_original = _documented_condition_deficit(subject)
+    for i, c in enumerate(comps):
+        if not c.get("is_included", True):
+            continue
+        if _normalize_strength(c.get("strength")) not in ("strong", "supporting"):
+            continue
+        q = dict(c.get("quality") or {})
+        # Generated commentary is model judgment, never factual evidence for a correction. Only the
+        # comp's authoritative listing/structured fact record can trigger these normalizations.
+        remarks = _authoritative_property_fact_blob(c)
+        blob = remarks
+        label = _comp_label(i, c)
+
+        reno = bool(_V10_COMP_RENO_RE.search(blob))
+        asis = bool(_V10_COMP_ASIS_RE.search(blob))
+        on_par = bool(_V10_ON_PAR_RE.search(remarks))
+        subj_is_original_side = subj_original
+
+        if reno and asis:
+            flags.append(
+                f"{label}: its narrative describes the comp as both renovated and as-is / dated - the finish "
+                f"ratings can't be trusted either way. Set finish_quality / interior manually before relying on the value."
+            )
+            continue
+
+        fixes: dict = {}
+        if reno and subj_is_original_side and not on_par:
+            strong_reno = bool(_V10_STRONG_RENO_RE.search(blob))
+            if q.get("finish_quality") in (None, "", "similar", "below"):
+                fixes["finish_quality"] = "above"
+            if q.get("interior") == "below":
+                fixes["interior"] = "above" if strong_reno else "similar"
+            elif q.get("interior") in (None, "", "similar") and strong_reno:
+                fixes["interior"] = "above"
+        elif asis and not reno:
+            if q.get("finish_quality") in ("above", "similar", None, ""):
+                fixes["finish_quality"] = "below"
+            if q.get("interior") in ("above", "similar", None, ""):
+                fixes["interior"] = "below"
+            if q.get("exterior") == "above":
+                fixes["exterior"] = "similar"
+
+        if fixes:
+            _reno_context = "documented full renovation / turnkey vs. a documented lower-condition subject"
+            before = {k: q.get(k) for k in fixes}
+            q.update(fixes)
+            c["quality"] = q
+            c["_cond_rating_fix"] = {
+                "before": before, "after": dict(fixes),
+                "reason": _reno_context if reno
+                          else "sold as-is / project condition",
+            }
+            _pairs = ", ".join(f"{k.replace('_', ' ')} {before[k] or 'unrated'} -> {v}" for k, v in fixes.items())
+            flags.append(
+                f"{label}: structured finish ratings contradicted the comp's own narrative "
+                f"{(_reno_context if reno else 'sold as-is / project condition')} "
+                f"- corrected ({_pairs}) so the quality read matches the evidence before the valuation uses it."
+            )
+    return flags
+
+
+def _v10_comp_median_dom(comps: list) -> Optional[float]:
+    """Median marketing time of the SOLD comps - the yardstick the subject's own active-market
+    days are judged against, so a slow luxury segment isn't measured with a starter-home clock.
+    None when fewer than 3 sold comps carry a usable DOM (caller then uses absolute fallbacks)."""
+    vals = []
+    for c in comps:
+        if not c.get("is_included", True) or str(c.get("status") or "").lower() not in ("sold", "closed"):
+            continue
+        d = _as_float(c.get("days_on_market"))
+        if d and d > 0:
+            vals.append(d)
+    return _v10_median(vals) if len(vals) >= 3 else None
+
+
+def _v10_exposure_meaning(state: str, price_cut_pct: float, has_contract_price: bool = False) -> str:
+    m = {
+        "insufficient_exposure": "The listing is too new for its time on market to be evidence about price - the comps decide.",
+        "quick_contract": ("Under contract quickly - that is evidence of strong DEMAND, not evidence of a specific "
+                           "price. It removes negative time-on-market pressure and supports confidence in the "
+                           "current asking neighbourhood, but it does NOT by itself justify a value above list - "
+                           "the comps and itemised adjustments decide that."),
+        "under_contract_normal": "Under contract after normal/longer exposure - the accepted contract price (if verified) or the list price is the ceiling; don't argue materially above it.",
+        "normal_exposure": "On the market a normal amount of time with no accepted offer - an FMV above list is allowed but must be justified from verified evidence.",
+        "elevated_exposure": "On the market longer than typical for this comp set with no offer - be skeptical of any value above list; the FMV top is capped at the list price / anchor high.",
+        "extended_exposure": "Extended time on the market with no offer - strong evidence against a value above list; the conclusion should sit near the anchor/list unless paired-market evidence clearly overrides it.",
+        "closed": "Already closed - the valuation is retrospective / for comparable analysis only.",
+        "not_listed": "Not on the market yet - the owner is choosing a list price now, so the comps alone decide value.",
+    }.get(state, "")
+    if has_contract_price:
+        m += " A VERIFIED accepted contract price is available - it is the single strongest evidence point; the FMV should sit within a tight band of it."
+    if price_cut_pct and price_cut_pct >= 2:
+        m += f" The price has already been cut ~{price_cut_pct:.0f}% - that reduction is itself downward evidence, and the ceiling is the reduced list, never the original."
+    return m
+
+
+def _compute_exposure(subject: dict, status_timeline: dict, comp_median_dom: Optional[float], anchor: Optional[dict]) -> dict:
+    """Stage 2. The subject's own market behaviour -> a structured constraint. Never RAISES a
+    value; only caps or pulls down an above-anchor / above-list conclusion (or, when the listing
+    is too new / went quickly under contract, gets out of the way)."""
+    tl = status_timeline or {}
+    a_val = (anchor or {}).get("anchor_value")
+    a_high = (anchor or {}).get("anchor_high")
+    cur_list = _as_float(subject.get("list_price"))
+    orig_list = _as_float(tl.get("original_list_price")) or _as_float(subject.get("original_list_price")) or cur_list
+    prev_list = _as_float(tl.get("previous_list_price"))
+    active_dom = tl.get("active_market_days")
+    if active_dom is None:
+        active_dom = _as_float(subject.get("days_on_market"))
+    is_closed = bool(tl.get("is_closed"))
+    is_uc = bool(tl.get("is_under_contract"))
+    # A VERIFIED accepted price (closed price, or an explicitly-stored under-contract price) is the
+    # single strongest anchor-level evidence point. Bright rarely exposes an AUC/pending accepted
+    # price, so this is usually only set once the deal closes.
+    contract_price = _as_float(tl.get("contract_price")) or _as_float(subject.get("contract_price")) or \
+        (_as_float(subject.get("last_sale_price")) if is_closed else None)
+
+    price_cut_pct = ((orig_list - cur_list) / orig_list * 100) if (orig_list and cur_list and orig_list > cur_list) else 0.0
+    price_increase = bool(orig_list and cur_list and cur_list > orig_list * 1.01)
+    price_reduced = price_cut_pct >= 2.0
+
+    if comp_median_dom:
+        short_cut = max(10.0, _V10_DOM_SHORT_MULT * comp_median_dom)
+        normal_cut = _V10_DOM_NORMAL_MULT * comp_median_dom
+        extended_cut = _V10_DOM_EXTENDED_MULT * comp_median_dom
+        dom_basis = f"comp-set median DOM {int(comp_median_dom)}d (thresholds scale to this comp set)"
+    else:
+        short_cut, normal_cut, extended_cut = _V10_DOM_FALLBACK
+        dom_basis = (f"absolute fallback thresholds ({int(short_cut)} / {int(normal_cut)} / "
+                     f"{int(extended_cut)}d - no comp DOM data)")
+
+    ceiling = hard_upper = pull_target = None
+    demand_signal = None
+    if tl.get("not_listed"):
+        # Seller report on a home that isn't for sale yet - no exposure of its own to read.
+        state = "not_listed"
+    elif is_closed:
+        state = "closed"
+        ceiling = contract_price or cur_list
+    elif is_uc:
+        if active_dom is not None and active_dom <= max(21.0, short_cut):
+            state = "quick_contract"
+            demand_signal = "strong_demand"
+            # NO mechanical +5% allowance. A quick contract only removes DOM pressure; the comps +
+            # adjustments decide whether above-list is justified. If we know the real accepted
+            # price, THAT is the tight reference.
+            ceiling = contract_price  # None unless verified -> comps decide
+        else:
+            state = "under_contract_normal"
+            ceiling = contract_price or cur_list
+    elif active_dom is None or active_dom <= short_cut:
+        state = "insufficient_exposure"
+    elif active_dom <= normal_cut:
+        state = "normal_exposure"
+        ceiling = cur_list
+    elif active_dom <= extended_cut:
+        state = "elevated_exposure"
+        ceiling = cur_list
+        if a_high:
+            hard_upper = min(cur_list or a_high, a_high)
+    else:
+        state = "extended_exposure"
+        ceiling = cur_list
+        if a_high:
+            hard_upper = min(cur_list or a_high, a_high)
+        if a_val:
+            pull_target = min(cur_list or a_val, a_val)
+
+    if price_reduced and ceiling is not None and cur_list:
+        ceiling = cur_list  # the already-reduced list, never the original
+
+    relisted_note = None
+    cdom = tl.get("cumulative_dom")
+    if cdom and active_dom and cdom > active_dom + 30:
+        relisted_note = (f"Cumulative DOM ({int(cdom)}d) is well above this listing period's active-market days "
+                         f"({int(active_dom)}d) - the property has been listed before / went back on market. "
+                         "Interpret prior time on market carefully as context, not an automatic negative.")
+
+    # Structured subject market history (always from raw MLS via _subject_status_timeline, never
+    # inferred from prose). Prefer the first-class event list when the timeline built one.
+    history_events = tl.get("history_events") or []
+    price_history = []
+    if orig_list:
+        price_history.append({"event": "original_list", "price": round(orig_list)})
+    if prev_list and prev_list not in (orig_list, cur_list):
+        price_history.append({"event": "previous_list", "price": round(prev_list)})
+    if cur_list and (not orig_list or cur_list != orig_list):
+        price_history.append({"event": ("price_increase" if price_increase else "current_list"), "price": round(cur_list)})
+    if contract_price:
+        price_history.append({"event": "verified_contract_price", "price": round(contract_price)})
+
+    return {
+        "state": state,
+        "demand_signal": demand_signal,
+        "active_market_days": int(active_dom) if active_dom is not None else None,
+        "comp_median_dom": int(comp_median_dom) if comp_median_dom else None,
+        "dom_thresholds": {"short": round(short_cut), "normal": round(normal_cut), "extended": round(extended_cut)},
+        "dom_basis": dom_basis,
+        "current_list_price": round(cur_list) if cur_list else None,
+        "original_list_price": round(orig_list) if orig_list else None,
+        "previous_list_price": round(prev_list) if prev_list else None,
+        "price_cut_pct": round(price_cut_pct, 1),
+        "price_reduced": price_reduced,
+        "price_increase": price_increase,
+        "price_history": price_history,
+        "history_events": history_events or None,
+        "prior_failed_contract": any(e.get("event") == "prior_failed_contract" for e in history_events) or None,
+        "back_on_market": any(e.get("event") in ("back_on_market", "relisted") for e in history_events) or None,
+        "verified_contract_price": round(contract_price) if contract_price else None,
+        "cumulative_dom": int(cdom) if cdom else None,
+        "current_status": tl.get("current_status"),
+        "under_contract_date": tl.get("under_contract_date"),
+        "comp_list_to_sale_median": (anchor or {}).get("comp_list_to_sale_median"),
+        "exposure_ceiling": round(ceiling) if ceiling else None,
+        "hard_upper": round(hard_upper) if hard_upper else None,
+        "pull_target": round(pull_target) if pull_target else None,
+        "relisted_note": relisted_note,
+        "meaning": _v10_exposure_meaning(state, price_cut_pct, bool(contract_price)),
+    }
+
+
+# --- v10 adjustment guards --------------------------------------------------------------------
+_V10_ADJ_FAMILIES = [
+    ("renovation_condition", ("renovat", "reno ", "kitchen", "bath", "updated", "modern", "dated",
+                              "turnkey", "finish", "interior", "gut ", "remodel", "condition", "move-in")),
+    ("accessory_dwelling", ("guest house", "guest apartment", "guest suite", "adu", "accessory dwelling",
+                            "carriage house", "in-law", "casita", "pool house", "detached apartment", "coach house")),
+    ("pool_spa", ("pool", "spa", "hot tub", "sauna", "gym", "home theater", "theater", "tennis court", "wine cellar")),
+    ("lot_land", ("acre", "lot size", "grounds", "land", "estate lot", "parcel", "acreage")),
+    ("views_setting", ("view", "vista", "waterfront", "setting", "privacy", "cul-de-sac", "cul de sac")),
+    ("architecture_pedigree", ("architect", "pedigree", "historic", "stone colonial", "character", "provenance", "landmark")),
+    ("garage_parking", ("garage", "parking", "carport", "motor court")),
+    ("layout_space", ("layout", "floor plan", "floorplan", "flow", "ceiling height", "great room")),
+    ("systems_mechanical", ("hvac", "roof", "solar", "generator", "geothermal", "systems", "mechanical")),
+]
+
+
+def _v10_adj_family(factor: str, basis: str) -> str:
+    """Count-scored, not first-match. A mixed adjustment that names amenities (spa, pool, gym) on
+    three separate comps but only mentions "2016 renovation" once, in passing, while explaining
+    why one of those comps priced at a premium, is dominantly an amenity item - but first-match
+    against a fixed family order would classify it "renovation_condition" purely because that
+    family happened to be checked first and "renovat" appears once. Score every family by how
+    many keyword OCCURRENCES (not just presence) appear in the combined factor+basis text and
+    return the highest-scoring one; ties keep the original list order (first family checked wins),
+    so a genuinely single-family item classifies exactly as before this change."""
+    t = f"{factor} {basis}".lower()
+    best_name, best_score = "other", 0
+    for name, kws in _V10_ADJ_FAMILIES:
+        score = sum(t.count(k) for k in kws)
+        if score > best_score:
+            best_name, best_score = name, score
+    return best_name
+
+
+_V10_NUM_RE = re.compile(
+    r"(?:\$\s*(\d[\d,]*(?:\.\d+)?)\s*([mMkK])?(?![A-Za-z])|"
+    r"\b(\d[\d,]*(?:\.\d+)?)\s*([mMkK])\b)"
+)
+
+
+def _v10_extract_dollars(text: str) -> list:
+    out = []
+    for m in _V10_NUM_RE.finditer(text or ""):
+        try:
+            v = float((m.group(1) or m.group(3)).replace(",", ""))
+        except ValueError:
+            continue
+        raw_suffix = m.group(2) or m.group(4) or ""
+        # An unprefixed lowercase suffix is commonly a physical unit in property prose
+        # (for example, "40m from the road"), not financial shorthand. Currency with a
+        # dollar sign remains case-insensitive, as do the conventional bare "$1.5M"-style
+        # uppercase abbreviations.
+        if m.group(3) and raw_suffix in ("m", "k"):
+            continue
+        suf = raw_suffix.lower()
+        if suf == "m":
+            v *= 1_000_000
+        elif suf == "k":
+            v *= 1_000
+        if v > 0:
+            out.append(v)
+    return out
+
+
+def _validate_paired_evidence(adj: dict, anchor: Optional[dict]) -> tuple:
+    """Deterministic check that an adjustment the AI labelled `paired_market_evidence` actually
+    earns it (concern #4). A feature difference alone never establishes its dollar value. Returns
+    (effective_basis_type, note_or_None, capped_amount_or_None). Downgrades paired ->
+    comp_inferred on a soft failure, -> model_judgment on a hard one; the caller then applies the
+    tighter cap for the downgraded class."""
+    if adj.get("basis_type") != "paired_market_evidence":
+        return adj["basis_type"], None, None
+    comps = (anchor or {}).get("comps") or []
+    if not comps:
+        return "model_judgment", "no comp anchor to verify paired evidence against", None
+    basis = (adj.get("basis") or "").lower()
+
+    # resolve cited comps: "comp #N" and any anchor comp address substring
+    cited = []
+    for idx, c in enumerate(comps):
+        num = idx + 1
+        lbl = (c.get("label") or "").lower()
+        addr = lbl.split("(")[-1].rstrip(")").strip() if "(" in lbl else ""
+        if re.search(rf"comp\s*#?\s*{num}\b", basis) or (len(addr) >= 6 and addr in basis):
+            cited.append(c)
+    if len(cited) < 2:
+        return "comp_inferred", "basis cites fewer than two comps from the anchor set - can't be a paired comparison", None
+
+    a, b = cited[0], cited[1]
+    # confounded pair? (very different size, or an outlier is one of the pair)
+    sa, sb = a.get("sqft") or 0, b.get("sqft") or 0
+    if sa and sb and abs(sa - sb) > 0.28 * max(sa, sb):
+        return "comp_inferred", "the two cited comps differ >28% in size - the feature can't be isolated from the size difference", None
+    if a.get("outlier") or b.get("outlier"):
+        return "comp_inferred", "one of the cited comps carries a $/sqft outlier flag - the pair isn't clean enough for a dollar delta", None
+
+    # the observed market gap between the pair (size-adjusted to the subject)
+    prices = sorted(c.get("size_adjusted_price") or 0 for c in cited)
+    gap = prices[-1] - prices[0]
+    lo = _as_float(adj.get("amount_low")) or 0.0
+    hi = _as_float(adj.get("amount_high")) or 0.0
+    mid = abs((lo + hi) / 2)
+    if gap <= 0:
+        return "comp_inferred", "the cited comps are effectively the same price - no observable gap to attribute", None
+    if mid > 1.5 * gap:
+        return "comp_inferred", f"the claimed ${mid:,.0f} adjustment exceeds 1.5x the ${gap:,.0f} gap between the cited comps", None
+    capped = round(gap) if mid > gap else None
+
+    # any explicit $ figure in the basis must be near a real comp figure or the anchor
+    known = [c.get("raw_sale_price") or 0 for c in comps] + [c.get("size_adjusted_price") or 0 for c in comps]
+    known += [(anchor or {}).get("anchor_value") or 0]
+    for v in _v10_extract_dollars(adj.get("basis") or ""):
+        if v < 20000:  # a $/sqft or small figure - skip the price-match test
+            continue
+        if not any(k and abs(v - k) <= 0.05 * k for k in known):
+            return "comp_inferred", f"a ${v:,.0f} figure in the basis doesn't match any comp price in the anchor set", capped
+    return "paired_market_evidence", None, capped
+
+
+def _v10_weighted_qualitative_signals(anchor: Optional[dict]) -> dict:
+    """Fix 3. Direction of the WEIGHTED comp set vs. the subject on each qualitative bucket, from
+    the anchor comps' structured quality ratings and their FINAL normalized weights. Signal is on
+    a -1..+1 scale: POSITIVE = the weighted comps are SUPERIOR to the subject (subject inferior ->
+    a DOWN adjustment is expected); NEGATIVE = the subject is superior. `weight_covered` = the
+    fraction of anchor weight that actually carried a rating on that bucket (a signal from 10% of
+    the weight is not something to hold the valuation to)."""
+    comps = (anchor or {}).get("comps") or []
+    buckets = {
+        "condition": ("finish_quality", "interior", "exterior"),
+        "location": ("street_context",),
+        "amenities": ("amenities",),
+        "accessory_space": ("layout",),  # usable / auxiliary-space proxy - there is no structured ADU rating field
+    }
+    val = {"above": 1.0, "similar": 0.0, "below": -1.0}
+    out: dict = {}
+    for name, dims in buckets.items():
+        num = wsum = covered = 0.0
+        for c in comps:
+            w = c.get("normalized_weight") or 0.0
+            if w <= 0:
+                continue
+            q = c.get("quality") or {}
+            rated = [val[q[d]] for d in dims if q.get(d) in val]
+            if rated:
+                num += w * (sum(rated) / len(rated))
+                covered += w
+            wsum += w
+        signal = round(num / covered, 3) if covered > 0 else 0.0
+        direction = ("subject_inferior" if signal >= _V10_QUAL_SIGNAL_MATERIAL
+                     else "subject_superior" if signal <= -_V10_QUAL_SIGNAL_MATERIAL
+                     else "similar_or_mixed")
+        out[name] = {"signal": signal, "direction": direction,
+                     "weight_covered": round(covered / wsum, 3) if wsum > 0 else 0.0}
+        if name == "accessory_space":
+            explicit = [
+                {"comp": c.get("label"), "features": c.get("explicit_accessory_features")}
+                for c in comps if c.get("explicit_accessory_features")
+            ]
+            out[name].update({
+                # The signal remains available for the legacy benchmark math, but this display
+                # field must never turn a broad layout rating into a factual guest-space claim.
+                "direction": "proxy_only",
+                "metric_label": "layout / auxiliary-space proxy",
+                "basis": "legacy layout rating; not a factual accessory-space comparison",
+                "explicit_subject_accessory_evidence":
+                    (anchor or {}).get("subject_explicit_accessory_features") or [],
+                "explicit_comp_accessory_evidence": explicit,
+            })
+    return out
+
+
+# map an adjustment family (from _v10_adj_family) to a weighted-signal reconciliation bucket -
+# module-level twin of the local _bucket_of dicts inside _apply_v10_valuation / _v10_authoritative_valuation.
+_V10_FAMILY_BUCKET = {
+    "renovation_condition": "condition", "systems_mechanical": "condition",
+    "architecture_pedigree": "amenities", "pool_spa": "amenities", "garage_parking": "amenities",
+    "accessory_dwelling": "accessory_space", "layout_space": "accessory_space",
+    "views_setting": "location", "lot_land": "location",
+}
+
+
+def _v10_unfiled_material_qual_buckets(ai_comps: list, subject_estimate: Optional[dict]) -> list:
+    """Execution-path guard for the estimate retry (runs BEFORE the final anchor exists). Using the
+    AI's OWN comp quality ratings, strength-weighted (strong 1.0 / supporting 0.5 / weak 0), is any
+    reconciliation bucket materially one-sided vs. the subject while the AI's qualitative_adjustments
+    leave it COMPLETELY unaddressed - no in-bucket dollar item, no captured_elsewhere marker for it,
+    and no opposite-direction supported ( != model_judgment) offset in another bucket? Returns
+    [(bucket, signal, weight_covered), ...] for those buckets so the retry can re-request the
+    itemised adjustment the model skipped. This is only a "is a second, cheap call worth it"
+    decision - the authoritative A/B/C reconciliation still runs in _apply_v10_valuation against the
+    real anchor weights. Mirrors _v10_weighted_qualitative_signals' buckets/dims exactly."""
+    ai_comps = [c for c in (ai_comps or []) if isinstance(c, dict)]
+    if not ai_comps:
+        return []
+    dims = {
+        "condition": ("finish_quality", "interior", "exterior"),
+        "location": ("street_context",),
+        "amenities": ("amenities",),
+        "accessory_space": ("layout",),
+    }
+    sw = {"strong": 1.0, "supporting": 0.5, "weak": 0.0}
+    val = {"above": 1.0, "similar": 0.0, "below": -1.0}
+    sig: dict = {}
+    for name, ds in dims.items():
+        num = cov = wsum = 0.0
+        for c in ai_comps:
+            if not c.get("is_included", True):
+                continue
+            w = sw.get(_normalize_strength(c.get("strength")), 0.5)
+            if w <= 0:
+                continue
+            wsum += w
+            q = c.get("quality") or {}
+            rated = [val[q[d]] for d in ds if q.get(d) in val]
+            if rated:
+                num += w * (sum(rated) / len(rated))
+                cov += w
+        sig[name] = (round(num / cov, 3) if cov > 0 else 0.0,
+                     round(cov / wsum, 3) if wsum > 0 else 0.0)
+
+    items = [it for it in ((subject_estimate or {}).get("qualitative_adjustments") or []) if isinstance(it, dict)]
+    bucket_has_item: set = set()
+    bucket_captured: set = set()
+    supported_up = supported_down = False
+    for it in items:
+        fam = _v10_adj_family(_coerce_ai_text(it.get("factor")), _coerce_ai_text(it.get("basis")))
+        b = _V10_FAMILY_BUCKET.get(fam)
+        amt = (_as_float(it.get("amount_low")) or 0.0) + (_as_float(it.get("amount_high")) or 0.0)
+        direction = str(it.get("direction") or "").lower()
+        btype = str(it.get("basis_type") or "").lower()
+        if b and str(it.get("captured_elsewhere") or "").strip():
+            bucket_captured.add(b)
+        if b and amt > 0:
+            bucket_has_item.add(b)
+        if amt > 0 and btype in ("paired_market_evidence", "comp_inferred"):
+            if direction == "up":
+                supported_up = True
+            elif direction == "down":
+                supported_down = True
+
+    gaps = []
+    for b in _V10_QUAL_RECON_BUCKETS:
+        s, covered = sig.get(b, (0.0, 0.0))
+        if abs(s) < _V10_QUAL_SIGNAL_MATERIAL or covered < _V10_QUAL_SIGNAL_WEIGHT_COVER:
+            continue
+        if b in bucket_has_item or b in bucket_captured:
+            continue
+        # a supported offset in the signalled direction, in another bucket, would satisfy outcome B
+        if s >= _V10_QUAL_SIGNAL_MATERIAL and supported_up:
+            continue
+        if s <= -_V10_QUAL_SIGNAL_MATERIAL and supported_down:
+            continue
+        gaps.append((b, s, covered))
+    return gaps
+
+
+def _v10_qual_gap_directive(gaps: list) -> str:
+    """The pointed instruction appended to the estimate-only retry when the model's own comp ratings
+    commit to a one-sided qualitative difference it filed no adjustment for. Names the exact buckets
+    and directions; does NOT hand the model a dollar figure."""
+    lines = []
+    for b, s, cov in gaps:
+        side = "SUPERIOR to the subject" if s > 0 else "INFERIOR to the subject"
+        want = "down" if s > 0 else "up"
+        lines.append(
+            f"- {b.replace('_', ' ')}: the weight-carrying comps are materially {side} "
+            f"(signal {s:+g}, {round(cov * 100)}% of the rated weight), and your qualitative_adjustments "
+            f"contain no dollar item, offset, or captured_elsewhere marker for it. File a '{want}' "
+            f"adjustment in that bucket sized to the gap, OR itemise the specific supported subject "
+            f"advantages in OTHER buckets that offset it, OR set captured_elsewhere on a filed item if a "
+            f"deterministic mechanism already accounts for it."
+        )
+    return (
+        "REQUIRED BEFORE YOU ANSWER - resolve each qualitative difference your own comp quality "
+        "ratings already commit to. A material one-sided bucket that nets to ~$0 with none of "
+        "(A) an in-bucket adjustment, (B) itemised supported offsets, or (C) a captured_elsewhere "
+        "marker is rejected on export:\n" + "\n".join(lines)
+        + "\nUse the evidence hierarchy for any dollar amount: paired_market_evidence only when two "
+        "comps in the set isolate this one feature and you cite the real price/$-per-sqft gap; "
+        "otherwise comp_inferred; otherwise model_judgment (capped tighter). Do not leave the "
+        "difference only in methodology_summary prose."
+    )
+
+
+def _apply_v10_valuation(anchor: Optional[dict], exposure: dict, ai_estimate: Optional[dict],
+                         subject_asking: Optional[float], prov_anchor: Optional[dict] = None) -> dict:
+    """Stages 3-4. Validates + bounds the AI's qualitative_adjustments, applies the market-exposure
+    constraint, and returns {fmv, range_pct, confidence_seed, flags, blocking, trace}."""
+    import math as _math
+    flags: list = []
+    blocking: list = []
+
+    ai_value = _as_float((ai_estimate or {}).get("value"))
+
+    # ---- Step 8: NO free-form AI fallback. Insufficient comps -> a provisional wide range, forced
+    # Low confidence, "Insufficient Comparable Evidence", and a hard agent-review gate. An
+    # objectively INVALID anchor (comp set too thin/incoherent to bound a value against - NOT the
+    # AI disagreeing with a valid one) routes here too rather than being forced into the +-18% band
+    # around a bad number. -----------------------------------------------------------------------
+    _invalid_anchor = bool(anchor and anchor.get("anchor_validity") == "invalid")
+    if (not anchor) or anchor.get("mode") in (None, "insufficient") or not anchor.get("anchor_value") or _invalid_anchor:
+        _ncl = (anchor or {}).get("closed_comp_count", 0)
+        _reason = (anchor or {}).get("anchor_validity_reason")
+        centre = subject_asking or ai_value
+        centre_src = "the subject's current list price" if subject_asking else "the AI's estimate" if ai_value else None
+        if not centre and (anchor or {}).get("anchor_value"):
+            centre = float(anchor["anchor_value"])
+            centre_src = "the rough comp anchor" if (anchor or {}).get("anchor_value_is_rough") else "the (weak) comp anchor"
+        if not centre:
+            ctx_prices = [c["price"] for c in ((anchor or {}).get("context_comps") or []) if c.get("price")]
+            centre = (sum(ctx_prices) / len(ctx_prices)) if ctx_prices else None
+            centre_src = "nearby listing prices" if centre else None
+        band = 0.15 if subject_asking else 0.20
+        prov_lo = round(centre * (1 - band)) if centre else None
+        prov_hi = round(centre * (1 + band)) if centre else None
+        if _invalid_anchor:
+            blocking.append(
+                f"INSUFFICIENT COMPARABLE EVIDENCE - the deterministic anchor is not valid ({_reason}). "
+                f"This is a PROVISIONAL {int(band*200)}%-wide range"
+                + (f" around {centre_src}" if centre_src else "") + ", not a supported valuation. Rebuild the "
+                "comp set from broader defensible sales and regenerate, or complete an agent review before export."
+            )
+        else:
+            blocking.append(
+                f"INSUFFICIENT COMPARABLE EVIDENCE - only {_ncl} verified closed sale(s). This is a PROVISIONAL "
+                f"{int(band*200)}%-wide range" + (f" around {centre_src}" if centre_src else "") + ", not a supported "
+                "valuation. Review the comp set and the subject before sharing this report."
+            )
+        return {
+            "fmv": round(centre) if centre else None,
+            "range_pct": round(band * 100, 1),
+            "confidence_seed": "low",
+            "flags": [("Deterministic anchor INVALID (comp set inadequate) - " if _invalid_anchor
+                       else "Deterministic anchor unavailable - ")
+                      + "provisional range only, forced Low confidence, held for agent review."],
+            "blocking": blocking,
+            "insufficient_evidence": True,
+            "trace": {
+                "mode": "insufficient_evidence", "prompt_version": PROMPT_VERSION,
+                "anchor": anchor, "exposure": exposure,
+                "closed_comp_count": _ncl,
+                "anchor_validity": (anchor or {}).get("anchor_validity"),
+                "anchor_validity_reason": _reason,
+                "provisional_range": [prov_lo, prov_hi], "provisional_centre": round(centre) if centre else None,
+                "provisional_centre_source": centre_src,
+                "ai_value_cross_check": round(ai_value) if ai_value else None,
+                "final_fmv": round(centre) if centre else None, "requires_agent_review": True,
+            },
+        }
+
+    anchor_value = float(anchor["anchor_value"])
+    anchor_comps = anchor.get("comps") or []
+    processed: list = []
+    for it in ((ai_estimate or {}).get("qualitative_adjustments") or []):
+        if not isinstance(it, dict):
+            continue
+        factor = _coerce_ai_text(it.get("factor")).strip()
+        basis = _coerce_ai_text(it.get("basis")).strip()
+        direction = str(it.get("direction") or "").lower()
+        btype = str(it.get("basis_type") or "").lower()
+        if btype not in _V10_ITEM_CAP:
+            btype = "model_judgment"
+        # Step 5: confidence is REQUIRED - a missing/garbage value is treated as LOW, not medium.
+        raw_conf = str(it.get("confidence") or "").lower()
+        conf = raw_conf if raw_conf in ("low", "medium", "high") else "low"
+        if raw_conf not in ("low", "medium", "high"):
+            flags.append(f"Adjustment '{factor or 'blank'}' had no valid confidence - treated as LOW.")
+        if direction not in ("up", "down") or not factor:
+            flags.append(f"Dropped a qualitative adjustment with no usable factor/direction ({factor or 'blank'}).")
+            continue
+        if not basis:
+            flags.append(f"Dropped qualitative adjustment '{factor}' - no basis given for the dollar amount.")
+            continue
+        lo, hi = _as_float(it.get("amount_low")), _as_float(it.get("amount_high"))
+        # Step 5: finite, non-negative, ordered.
+        if lo is not None and not _math.isfinite(lo):
+            lo = None
+        if hi is not None and not _math.isfinite(hi):
+            hi = None
+        if lo is None and hi is None:
+            flags.append(f"Qualitative adjustment '{factor}' had no usable dollar range - kept as a narrative point at $0.")
+            lo = hi = 0.0
+        lo = abs(lo if lo is not None else hi)
+        hi = abs(hi if hi is not None else lo)
+        lo, hi = min(lo, hi), max(lo, hi)
+
+        # Step 4: verify a `paired_market_evidence` claim; downgrade + note on failure.
+        orig_btype = btype
+        val_note = None
+        eff_btype, val_note, pe_cap = _validate_paired_evidence(
+            {"basis_type": btype, "basis": basis, "amount_low": lo, "amount_high": hi}, anchor,
+        )
+        if eff_btype != btype:
+            flags.append(f"Adjustment '{factor}': downgraded {btype} -> {eff_btype} ({val_note}).")
+            btype = eff_btype
+        elif val_note:
+            flags.append(f"Adjustment '{factor}': {val_note}.")
+        if pe_cap is not None:
+            hi = min(hi, pe_cap)
+            lo = min(lo, pe_cap)
+
+        mid = (lo + hi) / 2
+        # round 16: only paired_market_evidence that SURVIVED validation actually isolates a
+        # feature's contributory value. Everything else (comp_inferred, model_judgment) is a bounded
+        # estimate the comp set can't pin down - apply its CONSERVATIVE end (the one that moves the
+        # anchor least) instead of the midpoint, and soften an UNMEASURABLE UP offset further, so a
+        # speculative positive (architectural pedigree, "grander feel", grounds character) can't
+        # quietly cancel a concrete observed deduction. The feature is still counted, just not with
+        # pseudo-appraisal precision.
+        _isolated = btype == "paired_market_evidence" and val_note is None
+        _soft = None
+        if not _isolated and hi > lo:
+            mid = lo
+            if direction == "up":
+                mid *= _V10_SOFT_OFFSET_FACTOR
+                _soft = "offset_softened"
+            else:
+                _soft = "conservative_end"
+        # Step 5: an adjustment about raw size / lot area is already the anchor's job - shrink it.
+        fam = _v10_adj_family(factor, basis)
+        if fam == "lot_land" and any(k in f"{factor} {basis}".lower() for k in ("acre", "lot size", "square foot", "sqft", "sq ft")):
+            if mid > 0.02 * anchor_value:
+                flags.append(f"Adjustment '{factor}': raw lot/size difference is already handled by the deterministic anchor - reduced.")
+                mid = min(mid, 0.02 * anchor_value)
+                lo, hi = min(lo, mid), min(hi, mid)
+
+        cap = _V10_ITEM_CAP[btype] * anchor_value
+        capped = mid > cap
+        if capped:
+            flags.append(f"Qualitative adjustment '{factor}' ({btype}) capped from ${mid:,.0f} to ${cap:,.0f} "
+                         "(per-item limit for its evidence class).")
+            mid = cap
+            lo, hi = min(lo, cap), min(hi, cap)
+        # round 13: an item may declare the difference it names is already captured by a
+        # deterministic mechanism (so no $ is charged for it) - the reconciliation honours this
+        # instead of demanding a fresh adjustment. Only a known mechanism string is kept.
+        _cap_elsewhere = str(it.get("captured_elsewhere") or "").strip().lower()
+        if _cap_elsewhere not in ("size_normalization", "below_grade_normalization", "location_weighting",
+                                  "comp_classification", "outlier_weighting", "exposure"):
+            _cap_elsewhere = None
+        if _soft:
+            flags.append(
+                f"Qualitative adjustment '{factor}' ({btype}, confidence {conf}) - the comp set can't isolate this "
+                f"feature's dollar value, so it was applied at its conservative end "
+                f"(${abs(round(mid)):,.0f}" + (", offset softened" if _soft == "offset_softened" else "") +
+                f") rather than the ${(lo + hi) / 2:,.0f} midpoint."
+            )
+        processed.append({
+            "factor": factor, "direction": direction, "basis_type": btype, "original_basis_type": orig_btype,
+            "family": fam, "basis": basis, "confidence": conf, "validation_note": val_note,
+            "amount_low": round(lo), "amount_high": round(hi), "soft_applied": _soft,
+            "applied": round(mid) * (1 if direction == "up" else -1), "capped": capped,
+            "captured_elsewhere": _cap_elsewhere,
+        })
+
+    # ---- Step 5: adjustment-family dedup. Several items describing substantially the same
+    # difference (e.g. "renovated kitchen" + "superior interior finish" + "turnkey") can't stack
+    # into three independent adjustments. Per family+direction, the largest single item stands;
+    # the rest collapse and the family total is capped at _V10_FAMILY_STACK_CAP x that largest. ----
+    from collections import defaultdict as _dd
+    _fam_groups = _dd(list)
+    for p in processed:
+        if p["family"] != "other" and p["applied"]:
+            _fam_groups[(p["family"], p["direction"])].append(p)
+    for (fam, _dir), grp in _fam_groups.items():
+        if len(grp) < 2:
+            continue
+        grp.sort(key=lambda x: abs(x["applied"]), reverse=True)
+        largest = abs(grp[0]["applied"])
+        fam_cap = _V10_FAMILY_STACK_CAP * largest
+        cur = sum(abs(x["applied"]) for x in grp)
+        if cur > fam_cap and cur > 0:
+            scale = fam_cap / cur
+            for x in grp:
+                x["applied"] = round(x["applied"] * scale)
+                x["family_deduped"] = True
+                x["confidence"] = min(x["confidence"], "low", key=lambda c: {"low": 0, "medium": 1, "high": 2}[c])
+            flags.append(f"{len(grp)} adjustments in the '{fam}' family ({_dir}) describe the same difference - "
+                         f"collapsed to ${fam_cap:,.0f} total so they don't triple-count.")
+
+    # Sub-cap 1: non-paired-evidence, sub-high-confidence UP items can't collectively lift FMV much.
+    weak_up = [p for p in processed if p["direction"] == "up" and p["basis_type"] != "paired_market_evidence" and p["confidence"] != "high"]
+    weak_sum = sum(p["applied"] for p in weak_up)
+    weak_cap = _V10_WEAK_UP_SUBCAP * anchor_value
+    if weak_sum > weak_cap > 0:
+        scale = weak_cap / weak_sum
+        for p in weak_up:
+            p["applied"] = round(p["applied"] * scale)
+            p["subcap_scaled"] = "weak_up"
+        flags.append(f"Speculative up-adjustments (not paired-market-evidence, below high confidence) scaled to "
+                     f"${weak_cap:,.0f} total so several soft judgments can't stack into a large premium.")
+
+    # Sub-cap 2: all model_judgment items share a tighter combined budget.
+    mj = [p for p in processed if p["basis_type"] == "model_judgment"]
+    mj_sum = sum(abs(p["applied"]) for p in mj)
+    mj_cap = _V10_MODEL_JUDGMENT_SUBCAP * anchor_value
+    if mj_sum > mj_cap > 0:
+        scale = mj_cap / mj_sum
+        for p in mj:
+            p["applied"] = round(p["applied"] * scale)
+            p["subcap_scaled"] = ((p.get("subcap_scaled") or "") + " model_judgment").strip()
+        flags.append(f"Model-judgment adjustments scaled to ${mj_cap:,.0f} total (no market evidence backs their amounts).")
+
+    total_adj = sum(p["applied"] for p in processed)
+    dispute_reason = _coerce_ai_text((ai_estimate or {}).get("anchor_dispute_reason")).strip()
+    disputed = bool((ai_estimate or {}).get("anchor_dispute")) and bool(dispute_reason)
+    bound = (_V10_ADJ_BOUND_DISPUTED if disputed else _V10_ADJ_BOUND) * anchor_value
+    bound_hit = abs(total_adj) > bound
+    if bound_hit:
+        flags.append(f"Total qualitative adjustment ${total_adj:,.0f} exceeded the "
+                     f"{'+-18% disputed-anchor' if disputed else '+-12%'} limit - clamped to "
+                     f"${(bound if total_adj > 0 else -bound):,.0f}.")
+        total_adj = bound if total_adj > 0 else -bound
+    if disputed:
+        flags.append(f"AI filed an anchor dispute: \"{dispute_reason}\" - adjustment room widened to +-18%, "
+                     "confidence capped at medium.")
+
+    # ---- Fix 3: weighted qualitative-signal vs. itemised-adjustment reconciliation. If the
+    # high-weight comp set is materially skewed one way on condition / amenities / location but
+    # the net itemised adjustment for that bucket is ~$0, the offsets must be explicit AND
+    # supported. Unsupported (model_judgment) UP offsets that are the ONLY thing zeroing a real
+    # condition gap are scaled back and the net is allowed to go negative; if there are no offsets
+    # at all, export is blocked pending an itemised down-adjustment or itemised offsets. A separate
+    # location $ item on top of a comp weight that was already location-penalized is capped (anti
+    # double-count). No dollar figure is invented here. -----------------------------------------
+    qsig = _v10_weighted_qualitative_signals(anchor)
+    _bucket_of = {
+        "renovation_condition": "condition", "systems_mechanical": "condition",
+        # pedigree / architectural character is a subject-advantage feature bucket, NOT a condition
+        # read - it legitimately offsets a condition gap, so it sits with the other premium features.
+        "architecture_pedigree": "amenities",
+        "accessory_dwelling": "accessory_space", "layout_space": "accessory_space",
+        "pool_spa": "amenities", "garage_parking": "amenities",
+        "views_setting": "location", "lot_land": "location",
+    }
+    _bucket_net = {"condition": 0.0, "location": 0.0, "amenities": 0.0, "accessory_space": 0.0}
+    for p in processed:
+        b = _bucket_of.get(p["family"])
+        if b:
+            _bucket_net[b] += p["applied"]
+    qual_recon: dict = {"signals": qsig, "conflicts": [], "omissions": [], "unresolved_buckets": [], "offsets_accepted": [],
+                        "adjustments_scaled": [], "captured_mechanically": [], "diagnostic_notes": []}
+    _acc_signal = qsig.get("accessory_space") or {}
+    _acc_evidence = _acc_signal.get("explicit_comp_accessory_evidence") or []
+    _acc_note = (
+        "The legacy accessory-space diagnostic is derived from the broad layout rating only and "
+        "must not be read as a factual comparison of guest wings, guest houses, or ADUs."
+    )
+    if _acc_evidence:
+        _acc_note += " Explicit comp evidence recorded separately: " + "; ".join(
+            f"{x.get('comp')}: {', '.join(x.get('features') or [])}" for x in _acc_evidence
+        ) + "."
+    qual_recon["diagnostic_notes"].append(_acc_note)
+    _mat = _V10_QUAL_SIGNAL_MATERIAL
+    _consumed_offsets: set = set()   # an offset item can only be credited against ONE bucket's gap
+    _bucket_resolution: dict = {}    # round 17: per-bucket {captured: bool, offset_credit: $} for the shortfall calc
+    for b, s in qsig.items():
+        net = _bucket_net.get(b, 0.0)
+        near_zero = abs(net) <= _V10_QUAL_NEAR_ZERO_FRAC * anchor_value
+        _bucket_label = s.get("metric_label") or b.replace("_", " ")
+        _signed_net = f"{'+' if net > 0 else '-'}${abs(net):,.0f}" if net else "$0"
+        _components = [
+            f"{p['factor']} {'+' if p['applied'] > 0 else '-'}${abs(p['applied']):,.0f}"
+            for p in processed if _bucket_of.get(p["family"]) == b and p.get("applied")
+        ]
+        _net_description = (
+            f"{_signed_net}, below the {_V10_QUAL_NEAR_ZERO_FRAC * 100:.1f}% materiality threshold"
+            + (f" (components: {'; '.join(_components)})" if _components else "")
+        )
+        material = abs(s["signal"]) >= _mat and s["weight_covered"] >= _V10_QUAL_SIGNAL_WEIGHT_COVER
+        if not near_zero and s["signal"] >= _mat and net > 0.01 * anchor_value:
+            qual_recon["conflicts"].append(
+                f"{b}: weighted comps are superior (signal +{s['signal']}) but the itemised {b} adjustment is UP "
+                f"${net:,.0f} - direction conflicts with the ratings.")
+            flags.append(qual_recon["conflicts"][-1])
+        elif not near_zero and s["signal"] <= -_mat and net < -0.01 * anchor_value:
+            qual_recon["conflicts"].append(
+                f"{b}: weighted comps are inferior (signal {s['signal']}) but the itemised {b} adjustment is DOWN "
+                f"${abs(net):,.0f} - direction conflicts with the ratings.")
+            flags.append(qual_recon["conflicts"][-1])
+        # ---- round 13: generalized near-zero reconciliation, for EVERY weighted bucket -----------
+        # A material, one-sided weighted signal that nets to ~$0 in the valuation must resolve to
+        # one of: (A) a supported in-bucket adjustment (then it isn't near-zero and we don't get
+        # here); (B) supported offsets in OTHER buckets covering the implied gap; (C) a filed item
+        # marking the difference already captured mechanically (comp weighting / size / below-grade
+        # normalization / classification / exposure). Failing all three: model_judgment-only
+        # offsets are scaled back with an omission flag, and with nothing at all the export blocks.
+        if material and near_zero and b in _V10_QUAL_RECON_BUCKETS:
+            gap_frac = (_V10_QUAL_CONDITION_GAP_FRAC if b == "condition"
+                        else _V10_QUAL_BUCKET_GAP_FRAC.get(b, 0.045))
+            implied_gap = gap_frac * anchor_value * min(1.0, abs(s["signal"]))
+            subj_inferior = s["signal"] >= _mat          # comps superior -> want a DOWN net or UP offsets
+            want_off_dir = "up" if subj_inferior else "down"
+            in_bucket_offsets = [
+                p for p in processed
+                if p["direction"] == want_off_dir and abs(p["applied"]) > 0
+                and _bucket_of.get(p["family"]) == b
+            ]
+            offsets = [p for p in processed
+                       if p["direction"] == want_off_dir and abs(p["applied"]) > 0
+                       and _bucket_of.get(p["family"]) != b
+                       and id(p) not in _consumed_offsets]
+            supported = [p for p in offsets if p["basis_type"] != "model_judgment"]
+            # coverage credit = the offset's stated conservative (low-end) amount, capped at 8% of
+            # anchor - NOT its softened `applied` value. Round-16 softening is a prudence haircut on
+            # FMV impact, not a claim the offsetting feature doesn't exist; the "is this near-zero
+            # net legitimately explained" question turns on the feature being real and bounded.
+            supported_sum = sum(min(abs(p["amount_low"] or 0), 0.08 * anchor_value) for p in supported)
+            # (C) already-captured: an explicit filed marker, or a mechanical penalty the comp set
+            # already carries for this exact difference.
+            _acomps = (anchor or {}).get("comps") or []
+            captured = None
+            for p in processed:
+                if _bucket_of.get(p["family"]) == b and p.get("captured_elsewhere"):
+                    captured = f"filed as captured_elsewhere={p['captured_elsewhere']} ('{p['factor']}')"
+                    break
+            if not captured and b == "location" and any((c.get("location_weight_penalty") or 1.0) < 0.98 for c in _acomps):
+                captured = "location comp-weight penalty"
+            if not captured and b in ("condition", "amenities", "accessory_space") and any(
+                    (c.get("validated_class") and c.get("strength") and c["validated_class"] != c["strength"]) for c in _acomps):
+                captured = "a superior comp was reclassified / weight-reduced"
+
+            if supported and supported_sum >= _V10_QUAL_OFFSET_COVER * implied_gap:
+                for p in supported:
+                    _consumed_offsets.add(id(p))
+                _bucket_resolution[b] = {"captured": False, "offset_credit": min(supported_sum, implied_gap)}
+                qual_recon["offsets_accepted"].append(
+                    f"{_bucket_label}: net {_net_description}, explained by supported offsets "
+                    f"({', '.join(p['factor'] for p in supported)}) ~${supported_sum:,.0f} vs an implied "
+                    f"~${implied_gap:,.0f} {b.replace('_', ' ')} gap - confirm.")
+                flags.append(qual_recon["offsets_accepted"][-1])
+            elif captured:
+                _bucket_resolution[b] = {"captured": True, "offset_credit": 0.0}
+                qual_recon["captured_mechanically"].append(
+                    f"{_bucket_label}: material one-sided signal ({s['signal']:+g}, {round(s['weight_covered']*100)}% of weight) "
+                    f"with itemised net {_net_description} - treated as already captured ({captured}).")
+                flags.append(qual_recon["captured_mechanically"][-1])
+            else:
+                unsupported = [p for p in offsets if p["basis_type"] == "model_judgment"]
+                if unsupported:
+                    for p in unsupported:
+                        _before = p["applied"]
+                        p["applied"] = round(p["applied"] * _V10_QUAL_UNSUPPORTED_OFFSET_CUT)
+                        p["qual_recon_scaled"] = True
+                        qual_recon["adjustments_scaled"].append(
+                            f"{p['factor']}: model-judgment {want_off_dir} offset cut ${_before:,.0f} -> "
+                            f"${p['applied']:,.0f} (only thing zeroing a real {b.replace('_', ' ')} gap, no market support).")
+                    flags.append(
+                        f"Weighted comps are materially {'superior' if subj_inferior else 'inferior'} on "
+                        f"{_bucket_label} (signal {s['signal']:+g}, {round(s['weight_covered']*100)}% of weight) "
+                        f"but the itemised net was {_net_description}, held up only by unsupported offsets - those were scaled "
+                        f"back and the net {_bucket_label} adjustment is allowed to move "
+                        f"{'down' if subj_inferior else 'up'}.")
+                    qual_recon["omissions"].append(
+                        f"{_bucket_label}: net {_net_description}; only unsupported offsets - offsets scaled back")
+                else:
+                    _in_bucket_offset_names = ", ".join(
+                        f"{p['factor']} {'+' if p['applied'] > 0 else '-'}${abs(p['applied']):,.0f}"
+                        for p in in_bucket_offsets
+                    )
+                    _listed_offset_text = (
+                        " The listed in-bucket offsets "
+                        f"({_in_bucket_offset_names}) "
+                        "are already included in that net; no additional supported cross-bucket offset resolves the remaining gap."
+                        if in_bucket_offsets else
+                        " No supported offsetting advantage is present in the structured adjustments."
+                    )
+                    blocking.append(
+                        f"{_bucket_label.upper()} RECONCILIATION - the high-weight comp set is materially "
+                        f"{'superior' if subj_inferior else 'inferior'} on {_bucket_label} (signal {s['signal']:+g}, "
+                        f"{round(s['weight_covered']*100)}% of weight) but the itemised net is {_net_description}."
+                        f"{_listed_offset_text} It is not captured through the comp weighting/normalization. File a "
+                        f"'{'down' if subj_inferior else 'up'}' {_bucket_label} adjustment sized to the gap, itemise "
+                        f"the supported offsets, or mark a filed item captured_elsewhere before export.")
+                    qual_recon["omissions"].append(
+                        f"{_bucket_label}: net {_net_description}; unresolved after listed components - export blocked")
+                    qual_recon["unresolved_buckets"].append(b)
+        if b == "location" and abs(net) > _V10_LOC_ADJ_CAP_FRAC * anchor_value:
+            _loc_pen_present = any((c.get("location_weight_penalty") or 1.0) < 0.98 for c in ((anchor or {}).get("comps") or []))
+            if _loc_pen_present:
+                cap = _V10_LOC_ADJ_CAP_FRAC * anchor_value
+                for p in processed:
+                    if _bucket_of.get(p["family"]) == "location" and p["basis_type"] != "paired_market_evidence" \
+                       and abs(p["applied"]) > cap:
+                        _before = p["applied"]
+                        p["applied"] = round(cap if p["applied"] > 0 else -cap)
+                        p["qual_recon_scaled"] = True
+                        qual_recon["adjustments_scaled"].append(
+                            f"{p['factor']}: location $ adjustment capped ${_before:,.0f} -> ${p['applied']:,.0f} "
+                            f"(location already reflected in the comp weighting - anti-double-count).")
+                if qual_recon["adjustments_scaled"]:
+                    flags.append("A separate location/street dollar adjustment was capped because the market-location "
+                                 "difference is already reflected in the comp weights (avoids double-counting).")
+
+    # ---- round 17: BROAD qualitative inferiority. The weighted comp set is materially superior to
+    # the subject on 2+ reconciliation buckets at once (high coverage) -> the subject is not an
+    # average member of it. Apply a structured aggregate DOWN adjustment for the portion of the
+    # combined per-bucket implied inferiority the itemised layer has NOT already delivered, so the
+    # subject prices toward the low end of the adjusted comp range instead of its weighted mean.
+    # Downward only; fires alongside (not instead of) the itemised items and clears the per-bucket
+    # "no offsets -> blocked" entries it now satisfies. -----------------------------------------
+    _inf_buckets = [(b, s) for b, s in qsig.items()
+                    if b in _V10_QUAL_RECON_BUCKETS
+                    and s["signal"] >= _V10_BROAD_INFERIORITY_SIGNAL_MIN
+                    and s["weight_covered"] >= _V10_QUAL_SIGNAL_WEIGHT_COVER
+                    and not (_bucket_resolution.get(b) or {}).get("captured")]  # a mechanically-captured bucket is done
+    if len(_inf_buckets) >= _V10_BROAD_INFERIORITY_MIN_BUCKETS:
+        def _bucket_gap(b, s):
+            # scale by BOTH the signal strength AND how much of the anchor weight actually carried a
+            # rating on this bucket - a signal of 1.0 from half the weight (the rest unrated) is not
+            # a full-strength gap.
+            return ((_V10_QUAL_CONDITION_GAP_FRAC if b == "condition" else _V10_QUAL_BUCKET_GAP_FRAC.get(b, 0.06))
+                    * anchor_value * min(1.0, s["signal"]) * min(1.0, s["weight_covered"]))
+        _implied_total = sum(_bucket_gap(b, s) for b, s in _inf_buckets)
+        # already priced in for these buckets: itemised DOWN in the bucket + any cross-bucket offsets
+        # the per-bucket reconciliation ACCEPTED as explaining this bucket's near-zero net.
+        _itemised_down = -sum(min(0.0, _bucket_net.get(b, 0.0)) for b, _s in _inf_buckets)
+        _offset_credit = sum((_bucket_resolution.get(b) or {}).get("offset_credit", 0.0) for b, _s in _inf_buckets)
+        _shortfall = max(0.0, _implied_total - _itemised_down - _offset_credit) * _V10_BROAD_INFERIORITY_APPLY_FRAC
+        if _shortfall > _V10_BROAD_INFERIORITY_MIN_FRAC * anchor_value:
+            _agg = -round(_shortfall)
+            _names = " + ".join(b.replace("_", " ") for b, _s in _inf_buckets)
+            _nb = len(_inf_buckets)
+            processed.append({
+                "factor": f"Qualitative inferiority shortfall vs. a comp set superior on {_names}",
+                "direction": "down", "basis_type": "comp_inferred", "family": "other",
+                "basis": ("the weight-carrying comps are materially superior to the subject on "
+                          + ", ".join(f"{b.replace('_', ' ')} (signal {s['signal']:+g}, "
+                                      f"{round(s['weight_covered'] * 100)}% of weight)" for b, s in _inf_buckets)
+                          + f"; combined implied inferiority ~${_implied_total:,.0f}, of which the itemised "
+                            f"adjustments already deliver ~${_itemised_down:,.0f}"
+                          + (f" and accepted offsets cover ~${_offset_credit:,.0f}" if _offset_credit else "")
+                          + ". The subject belongs at the low end of the size-adjusted comp range, not its "
+                            "weighted mean."),
+                "confidence": "medium", "amount_low": round(_shortfall), "amount_high": round(_shortfall),
+                "applied": _agg, "capped": False, "soft_applied": None, "captured_elsewhere": None,
+                "aggregate_inferiority": True, "validation_note": None, "original_basis_type": "comp_inferred",
+            })
+            qual_recon["aggregate_inferiority"] = {
+                "buckets": [b for b, _s in _inf_buckets], "implied_total": round(_implied_total),
+                "itemised_down": round(_itemised_down), "offset_credit": round(_offset_credit), "applied": _agg,
+            }
+            bound_hit = True  # widen the range (existing bound_hit -> range_pct += 1 path)
+            flags.append(
+                f"QUALITATIVE INFERIORITY SHORTFALL - the weighted comp set is materially superior to the subject on "
+                f"{_names} ({_nb} bucket{'s' if _nb != 1 else ''}) and the itemised adjustments only partly priced it "
+                f"in. Applied a ${_agg:,.0f} structured down adjustment for the remainder so the subject prices toward "
+                f"the low end of the size-adjusted comp range rather than its mean - the per-item caps and the +-12% "
+                f"bound are calibrated for a mixed set and under-shoot when the subject is genuinely worse than its "
+                f"comps. Confirm against the comp facts before relying on it.")
+            # this satisfies the per-bucket "materially superior ... no offsets ... export blocked" checks
+            blocking[:] = [x for x in blocking if " RECONCILIATION - the high-weight comp set is materially superior" not in x]
+            qual_recon["omissions"] = [o for o in qual_recon["omissions"]
+                                       if not (o.endswith("export blocked") and o.split(":")[0] in [b for b, _s in _inf_buckets])]
+            qual_recon["unresolved_buckets"] = [b for b in qual_recon["unresolved_buckets"]
+                                                   if b not in [name for name, _s in _inf_buckets]]
+
+    total_adj = sum(p["applied"] for p in processed)
+    # round 17: a legitimately-computed broad-inferiority discount must not be clamped back up by the
+    # mixed-set +-12% bound - widen the DOWNWARD side only when that mechanism drove it.
+    _down_bound = (_V10_ADJ_BOUND_BROAD_INF * anchor_value
+                   if qual_recon.get("aggregate_inferiority") else bound)
+    if total_adj < 0 and abs(total_adj) > _down_bound:
+        flags.append(f"Total qualitative adjustment ${total_adj:,.0f} exceeded the "
+                     f"{'broad-inferiority' if qual_recon.get('aggregate_inferiority') else 'standard'} downward "
+                     f"limit - clamped to ${-_down_bound:,.0f}.")
+        total_adj = -_down_bound
+    elif total_adj > 0 and total_adj > bound:
+        total_adj = bound
+
+    fmv_pre_exposure = anchor_value + total_adj
+    fmv = fmv_pre_exposure
+    gate = {"applied": False}
+    if exposure.get("hard_upper") and fmv > exposure["hard_upper"]:
+        _capped_from = fmv
+        flags.append(f"Market exposure ({exposure['state']}, {exposure.get('active_market_days')} active-market days): "
+                     f"FMV top capped at ${exposure['hard_upper']:,.0f} (min of list price and the comp anchor high).")
+        fmv = float(exposure["hard_upper"])
+        if _capped_from - fmv > 0.03 * anchor_value:
+            gate = {"applied": True, "action": "capped_by_exposure", "from": round(_capped_from),
+                    "to": round(fmv), "hard_upper": round(exposure["hard_upper"])}
+
+    ceiling = exposure.get("exposure_ceiling")
+    comp_backed = [p for p in processed if p["direction"] == "up" and p["basis_type"] == "paired_market_evidence" and p["confidence"] != "low"]
+    if ceiling and fmv > ceiling:
+        justified = sum(p["amount_low"] for p in comp_backed)
+        max_defensible = ceiling + justified
+        if fmv > max_defensible:
+            new_fmv = max(max_defensible, float(ceiling))
+            gate = {"applied": True, "action": "pulled_down", "from": round(fmv), "to": round(new_fmv),
+                    "ceiling": round(ceiling), "max_defensible": round(max_defensible),
+                    "paired_evidence_premium": round(justified)}
+            flags.append(f"FMV pulled from ${fmv:,.0f} to ${new_fmv:,.0f}: after {exposure.get('active_market_days')} "
+                         f"active-market days with no accepted offer, the amount above the ${ceiling:,.0f} ceiling isn't "
+                         f"covered by paired-market-evidence adjustments (${justified:,.0f}).")
+            fmv = new_fmv
+        else:
+            gate = {"applied": True, "action": "allowed_above_ceiling", "fmv": round(fmv), "ceiling": round(ceiling),
+                    "max_defensible": round(max_defensible), "paired_evidence_premium": round(justified),
+                    "justified_by": [p["factor"] for p in comp_backed]}
+            flags.append(f"FMV ${fmv:,.0f} sits ${fmv - ceiling:,.0f} above the ${ceiling:,.0f} list price after "
+                         f"{exposure.get('active_market_days')} active-market days - permitted because "
+                         f"paired-market-evidence adjustments ({', '.join(p['factor'] for p in comp_backed) or 'none'}) "
+                         "cover it. Confirm before relying on it.")
+    if exposure.get("pull_target") and exposure["state"] == "extended_exposure" and fmv > exposure["pull_target"]:
+        lift = 0.5 * sum(p["amount_low"] for p in comp_backed)
+        target = min(fmv, exposure["pull_target"] + lift)
+        if target < fmv:
+            flags.append(f"Extended exposure: FMV compressed from ${fmv:,.0f} toward the ${exposure['pull_target']:,.0f} "
+                         f"anchor/list floor (paired evidence lifts it back by half, to ${target:,.0f}).")
+            gate["extended_pull_to"] = round(target)
+            gate.setdefault("action", "extended_pull")
+            gate["applied"] = True
+            fmv = target
+
+    # Step 3: a VERIFIED accepted contract price is the strongest single evidence point - the FMV
+    # is clamped to within +-3% of it regardless of what the anchor+adjustments produced.
+    vcp = exposure.get("verified_contract_price")
+    if vcp and abs(fmv - vcp) > 0.03 * vcp:
+        _from = fmv
+        fmv = _clamp(fmv, vcp * 0.97, vcp * 1.03)
+        flags.append(f"FMV pulled from ${_from:,.0f} to ${fmv:,.0f} to sit within 3% of the verified accepted "
+                     f"contract price (${vcp:,.0f}) - that is the strongest evidence available.")
+        gate = {"applied": True, "action": "clamped_to_contract_price", "from": round(_from), "to": round(fmv), "contract_price": round(vcp)}
+
+    # ---- Step 6: range width. Floor at the anchor's own spread (never imply more precision than
+    # the comp evidence carries), allow up to _V10_RANGE_MAX_PCT (12%) when evidence is thin, and
+    # only let it go as tight as _V10_RANGE_TIGHT_PCT (2%) for an EXCELLENT closed-comp set. ----
+    # Fix 1 (round 10): when the $/sqft leg leaned on the FALLBACK below-grade HEURISTIC for one or
+    # more comps (no paired/local evidence for the below-grade rate), that leg is less reliable -
+    # widen the range floor and, if it touched most of the weighted comps, step confidence down.
+    _psf_heuristic_ct = anchor.get("psf_leg_heuristic_comp_count", 0) or 0
+    _psf_heuristic_heavy = _psf_heuristic_ct >= max(2, (anchor.get("weighted_comp_count", 0) + 1) // 2)
+    _excellent = (
+        anchor.get("mode") == "closed_only"
+        and anchor.get("weighted_comp_count", 0) >= 3
+        and anchor["sale_psf_divergence_pct"] <= 5
+        and not any(c.get("outlier") for c in anchor_comps)
+        and "sanity_clamped" not in anchor.get("size_model", "")
+        and _psf_heuristic_ct == 0
+    )
+    min_range = _V10_RANGE_TIGHT_PCT if _excellent else 4.0
+    if _psf_heuristic_ct:
+        min_range = max(min_range, 5.0)
+    if anchor.get("mode") == "mixed":
+        min_range = max(min_range, 6.0)
+    _weak_anchor = anchor.get("anchor_validity") == "weak"
+    if _weak_anchor:
+        min_range = max(min_range, 8.0)  # a weak anchor must not imply tight precision
+    range_pct = _as_float((ai_estimate or {}).get("range_pct")) or 5.0
+    range_pct = max(range_pct, float(anchor["spread_pct"]), min_range)
+    if anchor["sale_psf_divergence_pct"] > 8:
+        range_pct += 1
+    if disputed:
+        range_pct += 1
+    _pull_actions = ("pulled_down", "extended_pull", "capped_by_exposure", "clamped_to_contract_price")
+    if bound_hit or gate.get("action") in _pull_actions:
+        range_pct += 1
+    range_pct = _clamp(range_pct, _MIN_RANGE_PCT, _V10_RANGE_MAX_PCT)
+
+    conf_seed = (ai_estimate or {}).get("confidence")
+    if conf_seed not in ("low", "medium", "high"):
+        conf_seed = "medium"
+    if disputed and conf_seed == "high":
+        conf_seed = "medium"
+    if anchor.get("mode") == "mixed" and conf_seed == "high":
+        conf_seed = "medium"  # no closed-sale majority can't be High confidence
+    if _psf_heuristic_heavy and conf_seed == "high":
+        conf_seed = "medium"  # the $/sqft leg rests on a fallback heuristic for most comps
+        flags.append(
+            f"$/sqft-leg confidence reduced: the below-grade contribution for {_psf_heuristic_ct} of "
+            f"{anchor.get('weighted_comp_count', 0)} weighted comps was estimated with the fallback heuristic "
+            "(no paired/local market evidence for the below-grade rate)."
+        )
+    elif _psf_heuristic_ct and conf_seed != "low":
+        flags.append(
+            f"The below-grade contribution for {_psf_heuristic_ct} comp(s) in the $/sqft leg was estimated with "
+            "the fallback heuristic (no paired/local market evidence) - range floor widened."
+        )
+    # round 13: an uncorroborated competitive (well-over-ask, fast) sale that dominates the high
+    # side of the anchor. The sale price stays in the math; this raises a caution and knocks
+    # confidence one notch so the range reflects the thinner support for that upper level.
+    _comp_drivers = [d for d in (anchor.get("competitive_sale_drivers") or []) if not d.get("corroborated")]
+    if _comp_drivers:
+        _d = _comp_drivers[0]
+        flags.append(
+            f"HIGH-SIDE DRIVER IS A COMPETITIVE SALE - {_d['label']} sold at {_d['sale_to_list']}x list in "
+            f"{_d['dom']} day(s) and carries {round(_d['normalized_weight']*100)}% of the anchor weight, with its "
+            f"indication ~${_d['own_indication']:,.0f} well above the ${_d['other_closed_median']:,.0f} median of the "
+            f"other closed comps and no ordinary closed comp near that level. The sale price is kept, but confidence "
+            f"is reduced and the range widened - corroborate the upper end against more closed sales before leaning on it.")
+        conf_seed = {"high": "medium", "medium": "low", "low": "low"}[conf_seed]
+
+    # round 17: a broad-inferiority aggregate discount means the subject is a poor fit for its own
+    # comp set - knock confidence a notch (range is already widened via bound_hit above).
+    if qual_recon.get("aggregate_inferiority"):
+        conf_seed = {"high": "medium", "medium": "low", "low": "low"}[conf_seed]
+
+    # Step 3: a quick contract with no verified price can support confidence NEAR ASK, not above.
+    if exposure.get("state") == "quick_contract" and not vcp and conf_seed == "low" \
+       and subject_asking and abs(fmv - subject_asking) <= 0.03 * subject_asking:
+        conf_seed = "medium"
+    moved = abs(gate.get("from", fmv) - fmv) if gate.get("action") in _pull_actions else 0.0
+    if moved > 0.03 * anchor_value:
+        conf_seed = {"high": "medium", "medium": "low", "low": "low"}[conf_seed]
+    # anchor-validity escape hatch (item 8): a WEAK anchor still produces a real FMV (the math
+    # isn't thrown away), but confidence is forced Low and export is gated for agent review -
+    # it must not sit in a tight band around a shaky number.
+    if _weak_anchor:
+        conf_seed = "low"
+        flags.append(
+            f"ANCHOR VALIDITY WEAK - {anchor.get('anchor_validity_reason')}. The value stands on a thin comp "
+            "set; confidence forced Low and the range widened. Rebuild from broader defensible comps if possible."
+        )
+        blocking.append(
+            "ANCHOR VALIDITY WEAK / AGENT REVIEW REQUIRED - the deterministic anchor rests on an inadequate comp "
+            "set (no closed-sale majority, few weighted comps, wide spread). Confirm the comp selection or add "
+            "stronger closed sales before sharing this report with a client."
+        )
+
+    shift_pct = None
+    if prov_anchor and prov_anchor.get("anchor_value"):
+        shift_pct = round((anchor["anchor_value"] - prov_anchor["anchor_value"]) / prov_anchor["anchor_value"] * 100, 1)
+        if abs(shift_pct) > 5:
+            flags.append(f"The deterministic anchor moved {shift_pct}% after the AI's comp reclassification "
+                         f"(shown ${prov_anchor['anchor_value']:,.0f}, final ${anchor['anchor_value']:,.0f}); the AI's "
+                         "adjustments were reasoned against the earlier figure.")
+
+    trace = {
+        "mode": "hybrid_v10",
+        "prompt_version": PROMPT_VERSION,
+        "anchor": anchor,
+        "anchor_validity": anchor.get("anchor_validity"),
+        "anchor_validity_reason": anchor.get("anchor_validity_reason"),
+        "provisional_anchor_value": round(prov_anchor["anchor_value"]) if (prov_anchor and prov_anchor.get("anchor_value")) else None,
+        "anchor_shift_from_provisional_pct": shift_pct,
+        "exposure": exposure,
+        "adjustments": processed,
+        "adjustment_total": round(total_adj),
+        "adjustment_bound_pct": round((_V10_ADJ_BOUND_DISPUTED if disputed else _V10_ADJ_BOUND) * 100, 1),
+        # Fix 3 - weighted qualitative signals + the reconciliation against the itemised adjustments
+        "weighted_condition_signal": qsig.get("condition"),
+        "weighted_location_signal": qsig.get("location"),
+        "weighted_amenity_signal": qsig.get("amenities"),
+        "weighted_accessory_space_signal": qsig.get("accessory_space"),
+        "qualitative_reconciliation": qual_recon,
+        "anchor_dispute": disputed,
+        "anchor_dispute_reason": dispute_reason or None,
+        "fmv_pre_exposure": round(fmv_pre_exposure),
+        "above_ask_gate": gate,
+        "subject_asking": round(subject_asking) if subject_asking else None,
+        "ai_value_cross_check": round(ai_value) if ai_value else None,
+        "final_fmv": round(fmv),
+        "range_pct": round(range_pct, 1),
+        "range_floor_pct": round(min_range, 1),
+        "confidence_seed": conf_seed,
+        "insufficient_evidence": False,
+    }
+    return {"fmv": round(fmv), "range_pct": round(range_pct, 1), "confidence_seed": conf_seed,
+            "flags": flags, "blocking": blocking, "insufficient_evidence": False, "trace": trace,
+            "adjustment_values": [abs(p["applied"]) for p in processed if p["applied"]]}
+
+
+# ============================================================================================
+# FRONTIER REASONING FINAL-VALUATION AUTHORITY
+# --------------------------------------------------------------------------------------------
+# V10 still runs in full and remains the deterministic benchmark/audit trace. This separate,
+# text-only pass receives the completed evidence packet and owns the final FMV/range/confidence.
+# Deterministic checks may block bad output, but never substitute V10's number for a valid result.
+# ============================================================================================
+
+_CMA_REASONING_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "independent_preliminary_fmv": {"type": "number"},
+        "independent_preliminary_range_low": {"type": "number"},
+        "independent_preliminary_range_high": {"type": "number"},
+        "independent_preliminary_confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "final_fmv": {"type": "number"},
+        "range_low": {"type": "number"},
+        "range_high": {"type": "number"},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "anchor_assessment": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "classification": {"type": "string", "enum": ["too_low", "reasonable", "too_high"]},
+                "reason": {"type": "string"},
+            },
+            "required": ["classification", "reason"],
+        },
+        "v10_assessment": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "classification": {"type": "string", "enum": ["too_low", "reasonable", "too_high"]},
+                "reason": {"type": "string"},
+            },
+            "required": ["classification", "reason"],
+        },
+        "primary_comps": {
+            "type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "comp_id": {"type": "string"},
+                    "role": {"type": "string", "enum": ["direct"]},
+                    "reason": {"type": "string"},
+                },
+                "required": ["comp_id", "role", "reason"],
+            },
+        },
+        "floor_comps": {
+            "type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "comp_id": {"type": "string"},
+                    "role": {"type": "string", "enum": ["floor"]},
+                    "reason": {"type": "string"},
+                },
+                "required": ["comp_id", "role", "reason"],
+            },
+        },
+        "ceiling_comps": {
+            "type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "comp_id": {"type": "string"},
+                    "role": {"type": "string", "enum": ["ceiling"]},
+                    "reason": {"type": "string"},
+                },
+                "required": ["comp_id", "role", "reason"],
+            },
+        },
+        "comp_roles": {
+            "type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "comp_id": {"type": "string"},
+                    "role": {
+                        "type": "string",
+                        "enum": [
+                            "direct_analog", "floor", "ceiling", "inferior_condition",
+                            "superior_condition", "new_construction_or_renovation_premium",
+                            "bidding_war_or_unusual_demand", "location_adjusted_context",
+                            "product_type_mismatch", "misleading_price_per_sqft"
+                        ],
+                    },
+                    "reason": {"type": "string"},
+                },
+                "required": ["comp_id", "role", "reason"],
+            },
+        },
+        "major_value_drivers": {
+            "type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "factor": {"type": "string"},
+                    "direction": {"type": "string", "enum": ["up", "neutral"]},
+                    "evidence_strength": {
+                        "type": "string",
+                        "enum": [
+                            "clearly_market_supported", "directionally_supported_amount_uncertain",
+                            "subjective_or_speculative"
+                        ],
+                    },
+                    "reason": {"type": "string"},
+                },
+                "required": ["factor", "direction", "evidence_strength", "reason"],
+            },
+        },
+        "major_value_drags": {
+            "type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "factor": {"type": "string"},
+                    "direction": {"type": "string", "enum": ["down", "neutral"]},
+                    "evidence_strength": {
+                        "type": "string",
+                        "enum": [
+                            "clearly_market_supported", "directionally_supported_amount_uncertain",
+                            "subjective_or_speculative"
+                        ],
+                    },
+                    "reason": {"type": "string"},
+                },
+                "required": ["factor", "direction", "evidence_strength", "reason"],
+            },
+        },
+        "market_exposure_assessment": {"type": "string"},
+        "why_final_differs_from_anchor": {"type": "string"},
+        "why_final_differs_from_v10": {"type": "string"},
+        "final_valuation_summary": {"type": "string"},
+    },
+    "required": [
+        "independent_preliminary_fmv", "independent_preliminary_range_low",
+        "independent_preliminary_range_high", "independent_preliminary_confidence",
+        "final_fmv", "range_low", "range_high", "confidence", "anchor_assessment",
+        "v10_assessment", "primary_comps", "floor_comps", "ceiling_comps", "comp_roles",
+        "major_value_drivers", "major_value_drags", "market_exposure_assessment",
+        "why_final_differs_from_anchor", "why_final_differs_from_v10",
+        "final_valuation_summary",
+    ],
+}
+
+_CMA_REASONING_SYSTEM_PROMPT = """You are the final valuation authority for a residential CMA.
+Act like a senior luxury real-estate agent and appraiser. Independently reconcile the complete
+evidence packet as a whole.
+
+Facts only: describe the subject strictly from authoritative_property_features and the listing
+fields. Never call a feature "documented" or "established" unless it appears there, never treat a
+"future" or "potential" use as an existing feature, and never say the home lacks something or is
+unupdated unless the packet says so. Write for a client: no internal words like "packet",
+"authoritative records" or "subject-market exposure".
+
+Work in two ordered phases. In phase one, deliberately ignore every field under
+deterministic_evidence, including the deterministic anchor, V10 formula FMV, structured dollar
+adjustments, and prior AI estimate. Using only the subject facts, comparable facts and narratives,
+actual sale outcomes, comp roles, and market exposure, commit an independent preliminary FMV,
+range, and confidence in the independent_preliminary_* fields. Do not reverse-engineer those
+fields from a benchmark. In phase two, examine deterministic_evidence and reconcile it against the
+already-formed independent conclusion. The anchor, V10 result, structured adjustments, and prior
+AI estimate are evidence, not constraints and not answers. Do not reward agreement with them,
+penalize disagreement, or move the final conclusion toward them merely because they exist. Explain
+why a material difference is warranted. You may conclude above or below any benchmark when the
+complete evidence supports it. Do not mechanically sum adjustment buckets and do not apply V10
+caps, anchor-percentage clamps, inferiority-shortfall rules, above-ask gates, or the old V10 final
+value to your conclusion.
+
+Classify every supplied comparable exactly once in comp_roles by its primary role: direct analog,
+floor, ceiling, inferior-condition, superior-condition, new-construction/renovation-premium,
+bidding-war/unusual-demand, location-adjusted context, product-type mismatch, or misleading
+price-per-square-foot due to size, basement, accessory space, or amenity mix. Then populate the
+legacy primary/floor/ceiling subsets consistently. Explain each important comp's role before
+concluding value. Favor direct similarity, observable condition and renovation level, systems
+modernization, turnkey quality, pools, guest wings, garages, accessory space, location, lot
+usability, actual sale prices, sold/list behavior, market time, and credible buyer behavior.
+
+For every major positive and negative factor, set evidence_strength to clearly_market_supported,
+directionally_supported_amount_uncertain, or subjective_or_speculative. Distinctive architecture,
+pedigree, character, privacy, grounds, scarcity, and "estate feel" do not automatically earn a
+premium and acreage does not automatically offset renovation or amenity deficits. They may matter,
+but a meaningful value effect requires direct or near-direct comparable sales, paired-market
+evidence, credible buyer behavior, actual sale outcomes, clear superiority, or other observable
+support in the packet. Subjective or speculative factors may inform judgment but must not overpower
+stronger observable market evidence. Do not convert every qualitative difference into dollars;
+use it to determine each comp's role and relevance, then reconcile the market picture holistically.
+
+Use only facts in the supplied JSON. Never invent a comp, feature, price, status, date, DOM figure,
+percentage, or market fact. Refer to comps only by their exact comp_id. A factor can be directional
+only when the packet supports that direction. `authoritative_property_features` is the source of
+truth for hard feature presence, primary area, and documented system updates. Comp narratives and
+photo observations are interpretive only: they cannot establish or negate a hard feature, area, or
+system update. Unknown system ages/history mean unverified, not deferred maintenance or an
+age-related defect. Return ranges that bracket their corresponding FMVs and an honest
+low/medium/high confidence.
+
+final_valuation_summary is client-facing prose. Explain the reasoning in one concise paragraph,
+but do not put any dollar figure, percentage, internal variable name, V10 label, or debug language
+in that paragraph; the application will prepend the exact authoritative FMV and range. Do not
+mention this instruction. All other reason fields are audit-only and should be concise and factual.
+Return only the strict structured response."""
+
+
+def _first_present(data: Optional[dict], *keys):
+    data = data or {}
+    for key in keys:
+        if data.get(key) not in (None, "", [], {}):
+            return data.get(key)
+    return None
+
+
+def _build_reasoning_evidence_packet(
+    *, subject: dict, comps: list, status_timeline: dict, anchor: Optional[dict],
+    exposure: dict, v10_result: dict, subject_estimate: Optional[dict],
+    evidence_by_key: dict, outliers: dict, data_quality_flags: Optional[list] = None,
+    deterministic_confidence: Optional[str] = None,
+) -> dict:
+    """Build the bounded, JSON-only packet for the final reasoning pass."""
+    tl = status_timeline or {}
+    a = anchor or {}
+    v10_trace = v10_result.get("trace") or {}
+    address = ", ".join(str(x) for x in (
+        subject.get("street_address"), subject.get("city"), subject.get("state"), subject.get("postal_code"),
+    ) if x)
+    subject_features = _authoritative_property_features(subject)
+    subject_sqft = _exact_sqft_semantics(subject)
+    subject_packet = {
+        "address": address or None,
+        "current_list_price": _as_float(subject.get("list_price")),
+        "original_list_price": _as_float(tl.get("original_list_price")) or _as_float(subject.get("original_list_price")),
+        "price_history": exposure.get("price_history") or tl.get("history_events") or [],
+        "status": tl.get("current_status") or subject.get("status") or subject.get("mls_status"),
+        "dom": None if tl.get("not_listed") else (tl.get("active_market_days") if tl.get("active_market_days") is not None else subject.get("days_on_market")),
+        "cdom": None if tl.get("not_listed") else (tl.get("cumulative_dom") if tl.get("cumulative_dom") is not None else subject.get("cumulative_days_on_market")),
+        "market_status_note": (
+            " ".join(tl.get("summary_lines") or []) + " It has no market exposure of its own to weigh - do not "
+            "cite its time on market or 'subject-market exposure' anywhere, including as a confidence limit."
+        ) if tl.get("not_listed") else None,
+        "beds": _first_present(subject, "beds", "bedrooms", "bedrooms_total"),
+        "baths": _first_present(subject, "baths", "bathrooms", "bathrooms_total"),
+        "above_grade_sqft": subject_sqft["above_grade_sqft"],
+        "below_grade_sqft": subject_sqft["below_grade_sqft"],
+        "total_finished_sqft": subject_sqft["total_finished_sqft"],
+        "primary_sqft_type": subject_sqft["primary_sqft_type"],
+        "lot_size": _first_present(subject, "lot_size", "lot_size_sqft", "acres"),
+        "year_built": subject.get("year_built"),
+        "school_district": subject.get("school_district"),
+        "taxes": _first_present(subject, "taxes", "annual_taxes", "tax_annual_amount"),
+        "garage": _first_present(subject, "garage", "garage_spaces", "parking_features"),
+        "pool": "pool" in subject_features["amenities"],
+        "guest_house_or_accessory_space": subject_features["accessory_features"],
+        "architecture": _first_present(subject, "architecture", "architectural_style", "structure_type"),
+        "renovation_level": _first_present(subject, "renovation_level", "condition", "property_condition"),
+        "systems_condition": (
+            {"documented_updates": subject_features["documented_system_updates"]}
+            if subject_features["documented_system_updates"] else "unverified"
+        ),
+        "authoritative_property_features": subject_features,
+        "street_context": subject.get("road_context"),
+        "listing_remarks": _first_present(subject, "public_remarks", "remarks", "listing_remarks"),
+        "photo_derived_condition_finish_analysis": {
+            "feature_observations": [
+                {
+                    "type": item.get("type"),
+                    "approx_size": item.get("approx_size"),
+                    "description": item.get("description"),
+                }
+                for item in ((subject_estimate or {}).get("premium_improvements") or [])
+                if isinstance(item, dict) and item.get("description")
+            ],
+        },
+    }
+
+    trace_by_label = {str(c.get("label")): c for c in (a.get("comps") or [])}
+    comp_packets = []
+    for i, comp in enumerate(comps):
+        label = _comp_label(i, comp)
+        key = str(comp.get("listing_key") or f"comp-{i + 1}")
+        ct = trace_by_label.get(label) or {}
+        price = _as_float(comp.get("sale_price")) or _as_float(comp.get("close_price"))
+        list_price = _as_float(comp.get("list_price")) or _as_float(comp.get("original_list_price"))
+        sold_list = _as_float(ct.get("sale_to_list"))
+        if sold_list is None and price and list_price:
+            sold_list = price / list_price
+        comp_features = _authoritative_property_features(comp)
+        comp_sqft = _exact_sqft_semantics(comp)
+        comp_packets.append({
+            "comp_id": key,
+            "comp_label": label,
+            "address": ", ".join(str(x) for x in (
+                comp.get("street_address"), comp.get("city"), comp.get("state"), comp.get("postal_code"),
+            ) if x) or None,
+            "sale_price": price,
+            "list_price": list_price,
+            "sold_list_ratio": sold_list,
+            "dom": ct.get("dom") if ct.get("dom") is not None else comp.get("days_on_market"),
+            "sale_date": _first_present(comp, "sale_date", "close_date"),
+            "distance_miles": ct.get("distance_miles") if ct.get("distance_miles") is not None else comp.get("distance_miles"),
+            "beds": _first_present(comp, "beds", "bedrooms", "bedrooms_total"),
+            "baths": _first_present(comp, "baths", "bathrooms", "bathrooms_total"),
+            "above_grade_sqft": comp_sqft["above_grade_sqft"],
+            "below_grade_sqft": comp_sqft["below_grade_sqft"],
+            "total_finished_sqft": comp_sqft["total_finished_sqft"],
+            "primary_sqft_type": comp_sqft["primary_sqft_type"],
+            "lot_size": _first_present(comp, "lot_size", "lot_size_sqft", "acres"),
+            "year_built": comp.get("year_built"),
+            "school_district": comp.get("school_district"),
+            "garage": _first_present(comp, "garage", "garage_spaces", "parking_features"),
+            "pool_and_amenities": {
+                "pool": "pool" in comp_features["amenities"],
+                "amenities": comp_features["amenities"],
+            },
+            "guest_house_or_accessory_space": comp_features["accessory_features"],
+            "authoritative_property_features": comp_features,
+            "renovation_condition": _first_present(comp, "renovation_level", "condition", "property_condition"),
+            "street_context": comp.get("road_context"),
+            "similarity_score": comp.get("match_score"),
+            "normalized_weight": ct.get("normalized_weight"),
+            "comp_classification": _normalize_strength(comp.get("strength")),
+            "size_adjusted_value": ct.get("size_adjusted_price"),
+            "normalized_price_per_sqft": ct.get("adjusted_above_grade_psf") or comp.get("price_per_sqft"),
+            "better_worse_ratings": comp.get("quality") or {},
+            "comp_narrative": comp.get("ai_commentary") or comp.get("commentary") or "",
+            "evidence_score": evidence_by_key.get(comp.get("listing_key")) or {},
+            "outlier_flag": outliers.get(comp.get("listing_key")),
+        })
+
+    deterministic = {
+        "deterministic_anchor": a.get("anchor_value"),
+        "anchor_low": a.get("anchor_low"),
+        "anchor_high": a.get("anchor_high"),
+        "sale_price_indication": a.get("sale_price_indication"),
+        "price_per_sqft_indication": a.get("psf_indication"),
+        "price_per_sqft_rate": a.get("psf_indication_per_sqft"),
+        "size_model": a.get("size_model"),
+        "comp_weights": [
+            {"comp_label": c.get("label"), "normalized_weight": c.get("normalized_weight")}
+            for c in (a.get("comps") or [])
+        ],
+        "exposure_state": exposure.get("state"),
+        "exposure_ceiling": exposure.get("exposure_ceiling"),
+        "exposure_hard_upper": exposure.get("hard_upper"),
+        "comp_set_median_dom": exposure.get("comp_median_dom"),
+        "comp_sold_list_median": a.get("comp_list_to_sale_median"),
+        "outlier_flags": outliers or {},
+        "data_quality_flags": list(data_quality_flags or []),
+        "structured_qualitative_adjustments": v10_trace.get("adjustments") or [],
+        "qualitative_reconciliation": v10_trace.get("qualitative_reconciliation") or {},
+        "inferiority_superiority_signals": {
+            "condition": v10_trace.get("weighted_condition_signal"),
+            "location": v10_trace.get("weighted_location_signal"),
+            "amenities": v10_trace.get("weighted_amenity_signal"),
+            "accessory_space": v10_trace.get("weighted_accessory_space_signal"),
+        },
+        "old_v10_final_fmv": v10_result.get("fmv"),
+        "old_v10_range_pct": v10_result.get("range_pct"),
+        "old_v10_confidence": deterministic_confidence or v10_result.get("confidence_seed"),
+        "prior_ai_estimate": {
+            "value": _as_float((subject_estimate or {}).get("value")),
+            "confidence": (subject_estimate or {}).get("confidence"),
+        },
+    }
+    return {"subject": subject_packet, "comparables": comp_packets, "deterministic_evidence": deterministic}
+
+
+def _reasoning_output_text(payload: dict) -> str:
+    parts = []
+    for item in payload.get("output") or []:
+        if item.get("type") != "message":
+            continue
+        for block in item.get("content") or []:
+            if block.get("type") == "output_text" and block.get("text"):
+                parts.append(block["text"])
+    return "".join(parts)
+
+
+async def _call_cma_reasoning_model(config: dict, evidence_packet: dict) -> tuple[dict, dict]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+    model = config["cma_reasoning_model"]
+    payload = {
+        "model": model,
+        "reasoning": {"effort": config.get("cma_reasoning_effort", "high")},
+        "instructions": _CMA_REASONING_SYSTEM_PROMPT,
+        "input": json.dumps(evidence_packet, separators=(",", ":"), default=str),
+        "max_output_tokens": config.get("cma_reasoning_max_output_tokens", 6000),
+        "store": False,
+        "text": {"format": {
+            "type": "json_schema", "name": "cma_final_valuation", "strict": True,
+            "schema": _CMA_REASONING_SCHEMA,
+        }},
+    }
+    timeout = httpx.Timeout(float(config.get("cma_reasoning_request_timeout_seconds", 180)))
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            "https://api.openai.com/v1/responses",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+        )
+        response.raise_for_status()
+        body = response.json()
+    if body.get("status") != "completed":
+        reason = (body.get("incomplete_details") or {}).get("reason") or body.get("status") or "unknown"
+        raise ValueError(f"reasoning response did not complete ({reason})")
+    raw = _reasoning_output_text(body)
+    if not raw:
+        raise ValueError("reasoning response contained no structured output text")
+    result = json.loads(raw)
+    if not isinstance(result, dict):
+        raise ValueError("reasoning response was not an object")
+    return result, body.get("usage") or {}
+
+
+def _validate_reasoning_valuation(result: dict, evidence_packet: dict) -> tuple[dict, list]:
+    """Validate core shape strictly; return factual QA blockers without changing model values."""
+    if not isinstance(result, dict):
+        raise ValueError("reasoning valuation is missing")
+    normalized = copy.deepcopy(result)
+    for key in (
+        "independent_preliminary_fmv", "independent_preliminary_range_low",
+        "independent_preliminary_range_high", "final_fmv", "range_low", "range_high",
+    ):
+        if isinstance(normalized.get(key), bool):
+            raise ValueError(f"{key} must be numeric")
+        value = _as_float(normalized.get(key))
+        if value is None or value <= 0:
+            raise ValueError(f"{key} must be a positive number")
+        normalized[key] = round(value)
+    if not (normalized["range_low"] <= normalized["final_fmv"] <= normalized["range_high"]):
+        raise ValueError("reasoning range must bracket final_fmv")
+    if normalized["range_low"] >= normalized["range_high"]:
+        raise ValueError("reasoning range_low must be below range_high")
+    if not (
+        normalized["independent_preliminary_range_low"]
+        <= normalized["independent_preliminary_fmv"]
+        <= normalized["independent_preliminary_range_high"]
+    ):
+        raise ValueError("reasoning independent preliminary range must bracket its FMV")
+    if normalized["independent_preliminary_range_low"] >= normalized["independent_preliminary_range_high"]:
+        raise ValueError("reasoning independent preliminary range low must be below range high")
+    confidence = str(normalized.get("confidence") or "").lower()
+    if confidence not in ("low", "medium", "high"):
+        raise ValueError("reasoning confidence must be low, medium, or high")
+    normalized["confidence"] = confidence
+    preliminary_confidence = str(normalized.get("independent_preliminary_confidence") or "").lower()
+    if preliminary_confidence not in ("low", "medium", "high"):
+        raise ValueError("reasoning independent preliminary confidence must be low, medium, or high")
+    normalized["independent_preliminary_confidence"] = preliminary_confidence
+    if not str(normalized.get("final_valuation_summary") or "").strip():
+        raise ValueError("reasoning final_valuation_summary is required")
+
+    comp_rows = evidence_packet.get("comparables") or []
+    comp_ids = {str(c.get("comp_id")) for c in comp_rows if c.get("comp_id")}
+    blockers: list[str] = []
+    for bucket, expected_role in (("primary_comps", "direct"), ("floor_comps", "floor"), ("ceiling_comps", "ceiling")):
+        items = normalized.get(bucket)
+        if not isinstance(items, list):
+            raise ValueError(f"reasoning {bucket} must be a list")
+        for item in items:
+            if not isinstance(item, dict) or not str(item.get("reason") or "").strip():
+                raise ValueError(f"reasoning {bucket} contains a malformed item")
+            comp_id = str(item.get("comp_id") or "")
+            if item.get("role") != expected_role:
+                raise ValueError(f"reasoning {bucket} contains an invalid role")
+            if comp_id not in comp_ids:
+                blockers.append(
+                    f"Reasoning factual QA: {bucket} references unknown comp_id '{comp_id}'."
+                )
+    role_items = normalized.get("comp_roles")
+    if not isinstance(role_items, list):
+        raise ValueError("reasoning comp_roles must be a list")
+    role_ids: list[str] = []
+    valid_roles = {
+        "direct_analog", "floor", "ceiling", "inferior_condition", "superior_condition",
+        "new_construction_or_renovation_premium", "bidding_war_or_unusual_demand",
+        "location_adjusted_context", "product_type_mismatch", "misleading_price_per_sqft",
+    }
+    for item in role_items:
+        if not isinstance(item, dict) or item.get("role") not in valid_roles \
+           or not str(item.get("reason") or "").strip():
+            raise ValueError("reasoning comp_roles contains a malformed item")
+        role_ids.append(str(item.get("comp_id") or ""))
+    if len(role_ids) != len(set(role_ids)):
+        raise ValueError("reasoning comp_roles must classify each comparable exactly once")
+    if set(role_ids) != comp_ids:
+        missing = sorted(comp_ids - set(role_ids))
+        unknown = sorted(set(role_ids) - comp_ids)
+        raise ValueError(
+            "reasoning comp_roles must classify every supplied comparable exactly once "
+            f"(missing={missing}, unknown={unknown})"
+        )
+    evidence_strengths = {
+        "clearly_market_supported", "directionally_supported_amount_uncertain",
+        "subjective_or_speculative",
+    }
+    for bucket, directions in (("major_value_drivers", {"up", "neutral"}),
+                               ("major_value_drags", {"down", "neutral"})):
+        items = normalized.get(bucket)
+        if not isinstance(items, list):
+            raise ValueError(f"reasoning {bucket} must be a list")
+        for item in items:
+            if not isinstance(item, dict) or not str(item.get("factor") or "").strip() \
+               or not str(item.get("reason") or "").strip() or item.get("direction") not in directions \
+               or item.get("evidence_strength") not in evidence_strengths:
+                raise ValueError(f"reasoning {bucket} contains a malformed item")
+
+    narrative = " ".join(str(normalized.get(k) or "") for k in (
+        "market_exposure_assessment", "why_final_differs_from_anchor",
+        "why_final_differs_from_v10", "final_valuation_summary",
+    ))
+    for bucket in ("anchor_assessment", "v10_assessment"):
+        item = normalized.get(bucket)
+        if not isinstance(item, dict) or item.get("classification") not in ("too_low", "reasonable", "too_high") \
+           or not str(item.get("reason") or "").strip():
+            raise ValueError(f"reasoning {bucket} is malformed")
+        narrative += " " + str(item.get("reason") or "")
+    for bucket in (
+        "primary_comps", "floor_comps", "ceiling_comps", "comp_roles",
+        "major_value_drivers", "major_value_drags",
+    ):
+        narrative += " " + " ".join(str(x.get("reason") or "") for x in normalized.get(bucket) or [] if isinstance(x, dict))
+
+    # Client prose is deliberately number-free here; the application prepends the exact locked
+    # FMV/range after validation. This makes a stale anchor/V10/list value impossible to smuggle
+    # into the client paragraph before the existing final-string QA runs.
+    client_summary = str(normalized.get("final_valuation_summary") or "")
+    if re.search(r"\$\s*\d|\b\d+(?:\.\d+)?\s*%", client_summary):
+        blockers.append(
+            "Reasoning factual QA: final_valuation_summary contains a generated dollar or percentage; "
+            "client valuation numbers must be injected from the authoritative final object."
+        )
+
+    known_dollars = {
+        round(float(v)) for v in (
+            normalized["final_fmv"], normalized["range_low"], normalized["range_high"],
+            normalized["independent_preliminary_fmv"],
+            normalized["independent_preliminary_range_low"],
+            normalized["independent_preliminary_range_high"],
+            (evidence_packet.get("deterministic_evidence") or {}).get("deterministic_anchor"),
+            (evidence_packet.get("deterministic_evidence") or {}).get("anchor_low"),
+            (evidence_packet.get("deterministic_evidence") or {}).get("anchor_high"),
+            (evidence_packet.get("deterministic_evidence") or {}).get("old_v10_final_fmv"),
+            ((evidence_packet.get("deterministic_evidence") or {}).get("prior_ai_estimate") or {}).get("value"),
+            (evidence_packet.get("subject") or {}).get("current_list_price"),
+            (evidence_packet.get("subject") or {}).get("original_list_price"),
+        ) if _as_float(v)
+    }
+    benchmark_values = [
+        _as_float((evidence_packet.get("deterministic_evidence") or {}).get("deterministic_anchor")),
+        _as_float((evidence_packet.get("deterministic_evidence") or {}).get("old_v10_final_fmv")),
+    ]
+    known_dollars.update(
+        round(abs(normalized["final_fmv"] - benchmark))
+        for benchmark in benchmark_values if benchmark and abs(normalized["final_fmv"] - benchmark) >= 1
+    )
+    for comp in comp_rows:
+        for key in ("sale_price", "list_price", "size_adjusted_value"):
+            if _as_float(comp.get(key)):
+                known_dollars.add(round(float(comp[key])))
+    for adjustment in (evidence_packet.get("deterministic_evidence") or {}).get(
+        "structured_qualitative_adjustments"
+    ) or []:
+        for key in ("applied", "amount", "amount_low", "amount_high"):
+            if _as_float(adjustment.get(key)):
+                known_dollars.add(round(abs(float(adjustment[key]))))
+
+    # Unlike the older generic number scanner, require an actual dollar sign here. Bare numeric
+    # MLS/listing IDs are identifiers, not unsupported prices.
+    cited_dollars = []
+    for match in re.finditer(r"\$\s*([\d,]+(?:\.\d+)?)\s*([mMkK])?(?![A-Za-z])", narrative):
+        fig = float(match.group(1).replace(",", ""))
+        suffix = (match.group(2) or "").lower()
+        if suffix == "m":
+            fig *= 1_000_000
+        elif suffix == "k":
+            fig *= 1_000
+        cited_dollars.append(fig)
+    for fig in cited_dollars:
+        if fig >= 100000 and not any(abs(fig - known) <= max(2500.0, 0.005 * known) for known in known_dollars):
+            blockers.append(
+                f"Reasoning factual QA: narrative cites unsupported dollar figure ${fig:,.0f}."
+            )
+
+    known_psf = {
+        round(float(comp["normalized_price_per_sqft"]), 1) for comp in comp_rows
+        if _as_float(comp.get("normalized_price_per_sqft"))
+    }
+    for match in re.finditer(
+        r"\$\s*([\d,]+(?:\.\d+)?)\s*(?:/|per\s+)\s*(?:sq\.?\s*ft|sqft|square\s+f(?:oo|ee)t)",
+        narrative, re.IGNORECASE,
+    ):
+        cited = float(match.group(1).replace(",", ""))
+        if not any(abs(cited - known) <= max(2.0, 0.01 * known) for known in known_psf):
+            blockers.append(
+                f"Reasoning factual QA: narrative cites unsupported price per square foot ${cited:,.0f}."
+            )
+
+    known_dom = {
+        round(float(v)) for v in (
+            (evidence_packet.get("subject") or {}).get("dom"),
+            (evidence_packet.get("subject") or {}).get("cdom"),
+            (evidence_packet.get("deterministic_evidence") or {}).get("comp_set_median_dom"),
+            *(comp.get("dom") for comp in comp_rows),
+        ) if _as_float(v) is not None
+    }
+    for match in re.finditer(r"\b(\d{1,4})\s*(?:days?\s+on\s+market|days?|DOM)\b", narrative, re.IGNORECASE):
+        cited = int(match.group(1))
+        if cited not in known_dom:
+            blockers.append(
+                f"Reasoning factual QA: narrative cites unsupported DOM figure {cited} days."
+            )
+    return normalized, list(dict.fromkeys(blockers))
+
+
+_CIRCULAR_COMP_VALUE_RE = re.compile(
+    r"(?:,?\s*)(?:which\s+is\s+)?(?:well\s+|materially\s+|slightly\s+)?"
+    r"(?:above|below|in\s+line\s+with)\s+(?:what\s+)?(?:our|the)\s+"
+    r"(?:final\s+|current\s+)?(?:estimate|valuation|fmv|indicated\s+value)\s+"
+    r"(?:implies|suggests)(?:\s+for\s+(?:the\s+)?subject)?",
+    re.IGNORECASE,
+)
+_CIRCULAR_COMP_DIRECT_RE = re.compile(
+    r"(?:,?\s*)(?:which\s+is\s+)?(?:above|below)\s+(?:our|the)\s+"
+    r"(?:final\s+|current\s+)?(?:estimate|valuation|fmv|indicated\s+value)",
+    re.IGNORECASE,
+)
+_CIRCULAR_SUBJECT_IMPLIED_RE = re.compile(
+    r"(?:,?\s*)(?:well\s+|materially\s+|slightly\s+)?(?:above|below)\s+the\s+"
+    r"subject(?:'s|\u2019s)\s+implied\s+(?:per[- ]foot|price[- ]per[- ]square[- ]foot|\$/sq\.?\s*ft)\s+value",
+    re.IGNORECASE,
+)
+_CIRCULAR_COMPARATIVE_PREFIX_RE = re.compile(
+    r"\b(?:its|the\s+comp(?:'s|\u2019s))\s+(?:lower|higher)\s+\$/sqft\s+than\s+"
+    r"(?:the\s+)?subject(?:'s|\u2019s)\s+(?:estimated|indicated|final)\s+value\s+reflects\b",
+    re.IGNORECASE,
+)
+
+
+def _structured_fact_text(data: Optional[dict]) -> str:
+    """Flatten supplied property facts for narrow prose-support checks."""
+    if not isinstance(data, dict):
+        return ""
+    try:
+        return json.dumps(data, default=str).lower()
+    except Exception:
+        return " ".join(str(v).lower() for v in data.values() if v not in (None, "", [], {}))
+
+
+def _sanitize_comp_fact_prose(text: str, label: str, subject: Optional[dict] = None) -> tuple[str, list[str]]:
+    """Remove circular valuation references and unsupported age-based condition claims from a
+    comp note. This only edits prose; it never changes classifications, ratings, or pricing."""
+    if not text:
+        return text, []
+    out = text
+    flags: list[str] = []
+    out2 = _CIRCULAR_COMP_VALUE_RE.sub("", out)
+    out2 = _CIRCULAR_COMP_DIRECT_RE.sub("", out2)
+    out2 = _CIRCULAR_SUBJECT_IMPLIED_RE.sub("", out2)
+    out2 = _CIRCULAR_COMPARATIVE_PREFIX_RE.sub("The sale price reflects", out2)
+    if out2 != out:
+        out = out2
+        flags.append(f"{label}: removed circular wording that compared a comp with the final estimate.")
+    # Removing a circular middle clause can leave ", largely because ..." dangling.
+    out = re.sub(
+        r",\s*(largely|mainly|primarily)\s+because\b",
+        lambda m: f". This was {m.group(1).lower()} because",
+        out,
+        flags=re.IGNORECASE,
+    )
+
+    facts = _authoritative_property_fact_blob(subject).lower()
+    if not _documented_original_systems(subject):
+        out2 = re.sub(
+            r"(?:that|which)?\s*the\s+subject(?:'s|\u2019s)\s+(?:dated\s+)?original\s+systems?"
+            r"(?:\s+and\s+(?:finishes|interiors?))?\s+(?:cannot|can't|can\u2019t)\s+match",
+            "; the subject's systems and modernization history remain unverified",
+            out, flags=re.IGNORECASE,
+        )
+        out2 = re.sub(
+            r"the\s+subject(?:'s|\u2019s)\s+(?:dated\s+)?original\s+systems?"
+            r"(?:\s+and\s+(?:finishes|interiors?))?",
+            "the subject's unverified systems and modernization history",
+            out2, flags=re.IGNORECASE,
+        )
+        out2 = re.sub(
+            r"\b(?:its|the\s+comp(?:'s|\u2019s)?)\s+finish\s+level\s+and\s+systems?\s+are\s+"
+            r"(?:clearly\s+)?superior",
+            "its finish level is superior; the subject's systems and modernization history remain unverified",
+            out2, flags=re.IGNORECASE,
+        )
+        if out2 != out:
+            out = out2
+            flags.append(f"{label}: replaced an unsupported original-system comparison with unverified wording.")
+    if "deferred maintenance" not in facts and "deferred-maintenance" not in facts:
+        specific = re.compile(
+            r"(?:with\s+none\s+of\s+|none\s+of\s+|without\s+)(?:the\s+)?deferred[- ]maintenance\s+risk\s+"
+            r"(?:that\s+)?the\s+subject(?:'s|\u2019s)?(?:\s+\d{4})?\s+systems?\s+likely\s+carry",
+            re.IGNORECASE,
+        )
+        out2 = specific.sub(
+            "with less documented system uncertainty; the subject's system ages and condition remain unverified",
+            out,
+        )
+        out2 = re.sub(r"\bdeferred[- ]maintenance\s+risk\b", "system-condition uncertainty", out2,
+                      flags=re.IGNORECASE)
+        out2 = re.sub(r"\bage[- ]related\s+(?:wear|defects?|deterioration)\b",
+                      "condition items that remain to be verified", out2, flags=re.IGNORECASE)
+        if out2 != out:
+            out = out2
+            flags.append(f"{label}: replaced an unsupported age-based condition inference with unverified wording.")
+    out = re.sub(
+        r"with\s+while\s+the\s+subject(?:'s|\u2019s)\s+system ages and condition remain unverified",
+        "with less documented system uncertainty; the subject's system ages and condition remain unverified",
+        out, flags=re.IGNORECASE,
+    )
+    out = re.sub(r"\ba\s*\.(\d)", r"0.\1", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bon\s+(0\.\d+[- ]acre)\b", r"on a \1", out, flags=re.IGNORECASE)
+    # A bare decimal missing its leading zero anywhere else (e.g. "beautifully landscaped .84-acre
+    # grounds") - without this, the space-before-punctuation cleanup just below misreads the
+    # decimal point as stray sentence punctuation and collapses it into "landscaped.84-acre".
+    out = re.sub(r"(?<![\d.])\.(\d)", r"0.\1", out)
+    out = re.sub(r"\s+([,.;:])", r"\1", out)
+    out = re.sub(r"([.!?])\s*\.\s*", r"\1 ", out)
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    return out, flags
+
+
+_SQFT_FACT_RE = re.compile(
+    r"\b([\d,]{3,7}(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft|square\s+feet|square\s+foot)\b",
+    re.IGNORECASE,
+)
+
+
+def _documented_sqft_values(data: Optional[dict], area_kind: Optional[str] = None) -> set[int]:
+    data = data or {}
+    above = (
+        _as_float(data.get("above_grade_finished_area")),
+        _as_float(data.get("above_grade_sqft")),
+    )
+    below = (
+        _as_float(data.get("below_grade_finished_area")),
+        _as_float(data.get("below_grade_sqft")),
+    )
+    total = (_as_float(data.get("sqft")),)
+    selected = above if area_kind == "above" else below if area_kind == "below" else (*above, *below, *total)
+    values = {round(v) for v in selected if v and v > 0}
+    # Free-text areas are useful for guest houses and similar components, but must not validate an
+    # explicitly labelled above/below-grade claim against a different area definition.
+    if area_kind is None:
+        for match in _SQFT_FACT_RE.finditer(_authoritative_property_fact_blob(data)):
+            value = _as_float(match.group(1).replace(",", ""))
+            if value and value > 0:
+                values.add(round(value))
+    return values
+
+
+def _sqft_fact_owner(
+    text: str, match: re.Match, subject: Optional[dict], comp: Optional[dict], area_kind: Optional[str],
+) -> tuple[dict, str]:
+    """Bind one sqft mention to the entity it describes.
+
+    Comp narratives compare two properties, so merely seeing ``subject`` somewhere before a
+    number is not enough to make that number a subject fact. Prefer direct grammatical ownership,
+    then use a unique exact match in the two authoritative records. An unresolved mention in a
+    comp card belongs to that card's comp, which is the narrative's default entity.
+    """
+    subject = subject or {}
+    comp = comp or {}
+    before = text[max(0, match.start() - 100):match.start()].lower()
+    after = text[match.end():min(len(text), match.end() + 70)].lower()
+
+    subject_direct = bool(re.search(
+        r"\bsubject(?:\s+(?:property|home))?(?:'s|\u2019s)?[^,;:.]{0,38}"
+        r"(?:\bis\b|\bhas\b|\boffers?\b|\bcontains?\b|\btotals?\b|\bmeasures?\b|\bat\b|\bwith\b|\bof\b)?\s*$",
+        before, re.IGNORECASE,
+    )) or bool(re.match(r"\s*(?:for|of)\s+the\s+subject\b", after, re.IGNORECASE))
+    comp_direct = bool(re.search(
+        r"\b(?:this\s+)?(?:comp(?:arable)?(?:\s*#?\d+)?|property|home|it)(?:'s|\u2019s)?[^,;:.]{0,38}"
+        r"(?:\bis\b|\bhas\b|\boffers?\b|\bcontains?\b|\btotals?\b|\bmeasures?\b|\bat\b|\bwith\b|\bof\b)?\s*$",
+        before, re.IGNORECASE,
+    )) or bool(re.match(r"\s*(?:for|of)\s+(?:this\s+)?(?:comp(?:arable)?|property|home)\b", after, re.IGNORECASE))
+
+    if subject_direct and not comp_direct:
+        return subject, "subject"
+    if comp_direct and not subject_direct:
+        return comp, "comp"
+
+    value = _as_float(match.group(1).replace(",", ""))
+    tolerance = lambda known: max(2, 0.002 * known)
+    subject_match = bool(value and any(
+        abs(value - known) <= tolerance(known) for known in _documented_sqft_values(subject, area_kind)
+    ))
+    comp_match = bool(value and any(
+        abs(value - known) <= tolerance(known) for known in _documented_sqft_values(comp, area_kind)
+    ))
+    if subject_match != comp_match:
+        return (subject, "subject") if subject_match else (comp, "comp")
+    return comp, "comp"
+
+
+def _reconcile_comp_hard_facts(
+    text: str, label: str, subject: Optional[dict], comp: Optional[dict],
+) -> tuple[str, list[str]]:
+    """Reconcile a comp card with the same authoritative facts used by QA and reasoning."""
+    out, flags = _sanitize_comp_fact_prose(text, label, subject)
+    subject = subject or {}
+    comp = comp or {}
+    subject_updates = _documented_system_updates(subject)
+    if not subject_updates:
+        substitutions = (
+            (r"(?:,?\s*or\s+)?updated systems the subject offers",
+             "; the subject's system ages and history are unverified"),
+            (r"the subject(?:'s|\u2019s) updated systems",
+             "the subject's systems, whose ages and history are unverified"),
+            (r"the subject (?:has|offers) updated systems",
+             "the subject's system ages and history are unverified"),
+        )
+        for pattern, replacement in substitutions:
+            revised = re.sub(pattern, replacement, out, flags=re.IGNORECASE)
+            if revised != out:
+                out = revised
+                flags.append(f"{label}: replaced an unsupported claim that the subject's systems are updated.")
+
+    subject_blob = _authoritative_property_fact_blob(subject).lower()
+    if not re.search(r"\b(?:original|unrenovated|not\s+renovated)\b", subject_blob):
+        revised = re.sub(
+            r"the subject(?:'s|\u2019s)\s+(?:original(?:,?\s+unrenovated)?|unrenovated)\s+"
+            r"(?:condition|interiors?|systems?)",
+            "the subject's unverified renovation and systems history",
+            out, flags=re.IGNORECASE,
+        )
+        if revised != out:
+            out = revised
+            flags.append(f"{label}: replaced an undocumented subject-condition claim with unverified wording.")
+
+    # Mirrors _factual_prose_blocking's "original wiring/plumbing/systems" hard-fact check exactly
+    # (same _documented_original_systems gate on subject and comp) so that check can never fire on
+    # this text waiting on an AI rewrite that might not resolve it - this guarantees it, deterministically,
+    # with zero AI call, before the comp note is ever scanned for blocking.
+    if not _documented_original_systems(subject) and not _documented_original_systems(comp):
+        revised = re.sub(
+            r"\boriginal\s+(wiring|plumbing|systems?)\b",
+            lambda m: f"unconfirmed-age {m.group(1)}",
+            out, flags=re.IGNORECASE,
+        )
+        if revised != out:
+            out = revised
+            flags.append(f"{label}: relabeled an unsupported 'original wiring/plumbing/systems' claim to honest uncertainty wording.")
+
+    # Mirrors _factual_prose_blocking's "infers a condition problem from age" hard-fact check
+    # (same deferred-maintenance/age-related-wear gate on subject and comp) so that check can
+    # never fire on this text waiting on an AI rewrite - guaranteed, deterministically, with zero
+    # AI call, before the comp note is ever scanned for blocking.
+    if not _documented_deferred_maintenance(subject) and not _documented_deferred_maintenance(comp):
+        revised = re.sub(
+            r"deferred[- ]maintenance",
+            "unverified condition items (no confirmed deferred-maintenance finding)",
+            out, flags=re.IGNORECASE,
+        )
+        revised = re.sub(
+            r"\bage[- ]related\s+(?:wear|defects?|deterioration)\b",
+            "age alone, without a documented inspection finding",
+            revised, flags=re.IGNORECASE,
+        )
+        if revised != out:
+            out = revised
+            flags.append(f"{label}: softened an age-based condition inference to honest uncertainty wording (no documented deferred-maintenance finding).")
+
+    # A comp's distance-from-subject was being written inside the same parenthetical as its
+    # lot-size comparison - "on a smaller lot (0.85 miles out)" - which reads as if 0.85 were the
+    # lot's own size. Split the two facts explicitly, backed by the authoritative lot_size/
+    # distance_miles record, so a distance figure can never be misread as a lot-size figure.
+    _lot_distance_re = re.compile(
+        r"\b(smaller|larger|comparable|similar)\s+lot\s*\(\s*([\d.]+)\s*mi(?:les?)?\s*(?:out|away)?\s*\)",
+        re.IGNORECASE,
+    )
+    _lot_dist_match = _lot_distance_re.search(out)
+    if _lot_dist_match:
+        _comp_lot_sqft = _as_float(comp.get("lot_size"))
+        _comp_acres = _comp_lot_sqft / 43560.0 if _comp_lot_sqft else None
+        _dist = _as_float(comp.get("distance_miles"))
+        if _dist is None:
+            _dist = _as_float(_lot_dist_match.group(2))
+        _adj = _lot_dist_match.group(1).lower()
+        if _comp_acres:
+            _replacement = f"{_adj} {_comp_acres:.2f}-acre lot, {_dist:g} miles from the subject"
+        else:
+            _replacement = f"{_adj} lot, {_dist:g} miles from the subject"
+        revised = _lot_distance_re.sub(_replacement, out, count=1)
+        if revised != out:
+            out = revised
+            flags.append(
+                f"{label}: separated a distance figure that was embedded inside a lot-size "
+                "parenthetical so distance can no longer be read as lot size."
+            )
+
+    # Remove an invented exact lower-level decomposition as a whole phrase before scanning other
+    # sqft mentions. This avoids turning "a 1,500 sqft finished basement" into a grammatically
+    # broken fragment while still retaining the supported qualitative basement fact.
+    if not _documented_sqft_values(comp, "below"):
+        revised = re.sub(
+            r"\b(?:an?\s+)?[\d,]{3,7}(?:\.\d+)?\s*(?:sq\.?\s*ft|sqft|square\s+feet|square\s+foot)\s+"
+            r"(?:finished\s+)?basement\b",
+            "a finished basement (exact lower-level area is not documented)",
+            out, flags=re.IGNORECASE,
+        )
+        revised = re.sub(
+            r"\b(?:an?\s+)?[\d,]{3,7}(?:\.\d+)?\s*(?:sq\.?\s*ft|sqft|square\s+feet|square\s+foot)\s+"
+            r"(?:finished\s+)?lower[- ]level\b",
+            "a finished lower level (exact area is not documented)",
+            revised, flags=re.IGNORECASE,
+        )
+        if revised != out:
+            out = revised
+            flags.append(f"{label}: removed an unsupported exact lower-level sqft decomposition.")
+
+    comp_sqft = _exact_sqft_semantics(comp)
+    rebuilt: list[str] = []
+    pos = 0
+    for match in _SQFT_FACT_RE.finditer(out):
+        rebuilt.append(out[pos:match.start()])
+        raw_value = _as_float(match.group(1).replace(",", ""))
+        prefix = out[max(0, match.start() - 65):match.start()].lower()
+        context = out[max(0, match.start() - 45):min(len(out), match.end() + 45)].lower()
+        area_kind = (
+            "above" if re.search(r"above[- ]grade", context)
+            else "below" if re.search(r"below[- ]grade|basement|lower[- ]level", context)
+            else None
+        )
+        record, owner = _sqft_fact_owner(out, match, subject, comp, area_kind)
+        is_subject = owner == "subject"
+        allowed = _documented_sqft_values(record, area_kind)
+        replacement = match.group(0)
+        if raw_value and not any(abs(raw_value - known) <= max(2, 0.002 * known) for known in allowed):
+            replacement_value = (
+                comp_sqft["above_grade_sqft"] if area_kind == "above"
+                else None if area_kind == "below"
+                else comp_sqft["total_finished_sqft"] or comp_sqft["above_grade_sqft"]
+            )
+            if not is_subject and replacement_value and not re.search(
+                    r"basement|lower[- ]level|guest|apartment|accessory|pool\s+house", prefix[-45:], re.IGNORECASE):
+                replacement = re.sub(re.escape(match.group(1)), f"{round(replacement_value):,}", match.group(0), count=1)
+                flags.append(
+                    f"{label}: corrected an unsupported {raw_value:,.0f} sqft comp claim to the structured "
+                    f"{replacement_value:,.0f} sqft record."
+                )
+            else:
+                flags.append(
+                    f"{label}: contains an unsupported {raw_value:,.0f} sqft component-area claim; "
+                    "the size must be stated as unverified or removed before export."
+                )
+        rebuilt.append(replacement)
+        pos = match.end()
+    rebuilt.append(out[pos:])
+    out = "".join(rebuilt)
+    out = re.sub(r"\s*;\s*;", ";", out)
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    return out, list(dict.fromkeys(flags))
+
+
+def _join_and(items: list[str]) -> str:
+    """Natural 'a, b, and c' join instead of a bare comma list - keeps fallback comp narratives
+    reading like normal agent prose, never a raw data dump."""
+    items = [i for i in items if i]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+_AREA_UNIT = r"(?:sq\.?\s?ft\.?|sqft|square\s+f(?:ee|oo)t|sf)\b"
+_PSF_IN_NOTE_RE = re.compile(r"\$\s?(\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?\s*(?:/|per\s+)\s*" + _AREA_UNIT, re.IGNORECASE)
+_AREA_IN_NOTE_RE = re.compile(r"(?<![\$\d,.])(\d{1,3}(?:,\d{3})+|\d{3,5})(?:\.\d+)?\s*(?:\+\s*)?" + _AREA_UNIT, re.IGNORECASE)
+
+
+def _comp_note_number_errors(text: str, comp: dict, subject: Optional[dict] = None) -> list[str]:
+    """Every $/sqft and square-footage figure in an AI comp note must be recomputable from the MLS
+    record. Seen live 2026-10-05: "$1,250,000 on 2,282 sq ft above grade ... closer to $517/sqft"
+    ($548 is right) and "2,647 sqft of finished basement" (2,647 was ABOVE grade; 512 below)."""
+    if not text:
+        return []
+    errs: list[str] = []
+    areas_c = {k: _as_float(comp.get(k)) for k in ("sqft", "above_grade_finished_area", "below_grade_finished_area")}
+    areas_s = {k: _as_float((subject or {}).get(k)) for k in ("sqft", "above_grade_finished_area", "below_grade_finished_area")}
+    lot = _as_float(comp.get("lot_size"))
+    price = _as_float(comp.get("sale_price")) or _as_float(comp.get("close_price")) or _as_float(comp.get("list_price"))
+    # $/sqft: the comp's price over any of its own areas (or the subject's list-basis psf, which notes compare against)
+    psf_ok = [price / a for a in areas_c.values() if price and a]
+    _sp = _as_float((subject or {}).get("list_price"))
+    psf_ok += [_sp / a for a in areas_s.values() if _sp and a]
+    if _as_float(comp.get("price_per_sqft")):
+        psf_ok.append(_as_float(comp.get("price_per_sqft")))
+    if psf_ok:
+        for m in _PSF_IN_NOTE_RE.finditer(text):
+            v = float(m.group(1).replace(",", ""))
+            if v >= 50 and not any(abs(v - ok) <= max(4.0, 0.025 * ok) for ok in psf_ok):
+                errs.append(f"${v:,.0f}/sqft")
+    for m in _AREA_IN_NOTE_RE.finditer(text):
+        v = float(m.group(1).replace(",", ""))
+        if v < 200:
+            continue
+        after = text[m.end():m.end() + 45].lower()
+        before = text[max(0, m.start() - 30):m.start()].lower()
+        ctx = before + " " + after
+        if re.search(r"basement|below[- ]grade|lower[- ]level", after[:40]):
+            pool = [areas_c["below_grade_finished_area"], areas_s["below_grade_finished_area"]]
+        elif re.search(r"above[- ]grade", ctx):
+            pool = [areas_c["above_grade_finished_area"], areas_s["above_grade_finished_area"]]
+        else:
+            pool = [*areas_c.values(), *areas_s.values(), lot]
+        pool = [x for x in pool if x]
+        # differences between the two homes are fair game too ("about 476 sq ft more")
+        diffs = [abs(a - b) for a in areas_c.values() if a for b in areas_s.values() if b]
+        if pool and not any(abs(v - x) <= max(15.0, 0.02 * x) for x in pool + diffs):
+            errs.append(f"{v:,.0f} sq ft")
+    return list(dict.fromkeys(errs))
+
+
+def _regenerate_comp_narrative_from_snapshot(comp: dict, label: str) -> str:
+    """Build a corrected comp card from canonical facts plus clearly labelled model judgment.
+
+    This is a client-facing fallback - it fires whenever a comp's condition rating or amenity
+    facts had to be auto-corrected, replacing whatever the AI drafted. Every sentence must read
+    like normal agent prose; none of the internal pipeline vocabulary ("authoritative structured
+    record", "normalized model comparison", dimension keys like "finish_quality") may leak into
+    it - only the underlying facts and comparisons, in plain English.
+    """
+    address = _tidy_caps_address(comp.get("street_address")) or label
+    status_text = str(comp.get("status") or "").lower()
+    price = _as_float(comp.get("sale_price")) or _as_float(comp.get("close_price"))
+    list_price = _as_float(comp.get("list_price"))
+    sentences: list[str] = []
+    # Client-facing prose (this replaces the AI's note when that note failed QA), so it has to read
+    # like an agent wrote it - the old template said "sits in a same as subject area relative to the
+    # subject" and "is a verified closed sale at".
+    if price and comp.get("price_verified", True) and status_text in ("sold", "closed"):
+        sentences.append(f"{address} sold for ${price:,.0f}.")
+    elif status_text in ("sold", "closed") and list_price:
+        sentences.append(f"{address} sold, but its final price isn't confirmed (it was listed near ${list_price:,.0f}), so it's shown for context only.")
+    elif list_price:
+        status_label = status_text.replace("_", " ").strip() or "on the market"
+        sentences.append(f"{address} is currently {status_label} at ${list_price:,.0f}.")
+    else:
+        sentences.append(f"{address} is included for market context; its sale price isn't documented.")
+
+    sqft = _exact_sqft_semantics(comp)
+    facts: list[str] = []
+    if sqft["above_grade_sqft"]:
+        facts.append(f"has {sqft['above_grade_sqft']:,.0f} sq ft above grade")
+    elif sqft["total_finished_sqft"]:
+        facts.append(f"has {sqft['total_finished_sqft']:,.0f} sq ft of finished space")
+    if comp.get("year_built"):
+        facts.append(f"was built in {comp['year_built']}")
+    if _as_float(comp.get("lot_size")):
+        facts.append(f"sits on {_as_float(comp.get('lot_size')) / 43560:.2f} acres")
+    if facts:
+        sentences.append(f"It {_join_and(facts)}.")
+
+    q = comp.get("quality") or {}
+    dimension_labels = {
+        "finish_quality": "finishes", "interior": "interior", "exterior": "exterior",
+        "lot": "lot", "amenities": "amenities", "layout": "layout",
+        "street_context": "street setting",
+    }
+    superior = [dimension_labels[k] for k, v in q.items() if k in dimension_labels and v == "above"]
+    inferior = [dimension_labels[k] for k, v in q.items() if k in dimension_labels and v == "below"]
+    similar = [dimension_labels[k] for k, v in q.items() if k in dimension_labels and v == "similar"]
+    def _plain_list(items: list[str]) -> str:
+        return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+    parts: list[str] = []
+    if superior:
+        parts.append(f"stronger on {_plain_list(superior)}")
+    if inferior:
+        parts.append(f"weaker on {_plain_list(inferior)}")
+    if parts:
+        sentences.append("Compared with the subject, it is " + ", but ".join(parts) + ".")
+    if similar:
+        sentences.append(("Its " if parts else "Compared with the subject, its ") + _plain_list(similar)
+                         + (" are" if len(similar) > 1 or similar[0] == "amenities" else " is") + " similar.")
+    area = str(q.get("area") or "").lower()
+    if area:
+        if "same" in area or area in ("similar", "equal"):
+            sentences.append("It's in the same immediate area.")
+        elif any(w in area for w in ("better", "superior", "above", "stronger", "more")):
+            sentences.append("Its location is a step up from the subject's.")
+        elif any(w in area for w in ("worse", "inferior", "below", "weaker", "less")):
+            sentences.append("Its location is a step down from the subject's.")
+
+    remarks = str(_first_present(comp, "public_remarks", "remarks", "listing_remarks") or "")
+    if re.search(r"\b(?:renovat\w+|rebuilt|updated)\b", remarks, re.IGNORECASE):
+        sentences.append(
+            "Its listing calls it renovated or updated, though that alone doesn't confirm the major "
+            "systems were replaced."
+        )
+    return " ".join(sentences)
+
+
+def _tidy_caps_address(addr) -> str:
+    """'1522 EVERGREEN LN' -> '1522 Evergreen Ln' (MLS sends addresses in capitals)."""
+    t = str(addr or "").strip()
+    if not t or any(ch.islower() for ch in t):
+        return t
+    out = []
+    for w in t.split():
+        if re.fullmatch(r"\d+(ST|ND|RD|TH)", w):
+            out.append(w.lower())
+        elif re.fullmatch(r"[NSEW]{1,2}", w) or re.fullmatch(r"#?\d+[A-Z]?", w):
+            out.append(w)
+        else:
+            out.append(w.capitalize())
+    return " ".join(out)
+
+
+async def _targeted_comp_narrative_rewrite(
+    flagged: list[dict], *, subject: dict, model: str,
+) -> dict:
+    """ONE small, batched model call that rewrites ONLY the flagged comps' own narrative text so it
+    drops the specific claim deterministic QA found unsupported by either record (e.g. a comp note
+    asserting the subject's condition with nothing in the subject's authoritative record to back
+    it) - used so an agent never has to notice and manually trigger a full regenerate for something
+    this targeted. Keeps every other fact and the overall tone untouched. Best-effort: any failure
+    (or a response missing an entry) returns nothing for that label, and the caller falls back to
+    surfacing the original finding unchanged - this is a bounded, single retry, never a loop."""
+    if not flagged:
+        return {}
+    try:
+        client = _get_client()
+        facts = _authoritative_property_fact_blob(subject)
+        sys = (
+            "You are correcting one or more comp write-ups in an already-finished CMA. Deterministic "
+            "fact-checking found each note below makes a specific claim that is not backed by the "
+            "subject property's own authoritative record. Rewrite ONLY the flagged claim in each note - "
+            "keep the price, the comparison, and every other fact exactly as written. If the claim was "
+            "about the subject's condition and you have no supported alternative, remove that clause "
+            "rather than guess a replacement (describe the comp's own condition/finish without also "
+            "characterizing the subject). Return ONLY a JSON object "
+            "{\"notes\": [{\"label\": \"...\", \"text\": \"...\"}]} with exactly one entry per note given "
+            "to you, in the same order, using the exact same label."
+        )
+        user = (
+            f"SUBJECT'S AUTHORITATIVE RECORD (the only evidence that counts for what's true about the "
+            f"subject):\n{facts or '(no remarks on file)'}\n\nNOTES TO CORRECT:\n" + "\n\n".join(
+                f"[{f['label']}] issue(s): {'; '.join(f['reasons'])}\ncurrent text: {f['text']}"
+                for f in flagged
+            )
+        )
+        # Sized to the batch: a fixed 1400 truncated mid-JSON with 3+ flagged notes (each echoed
+        # back near-verbatim runs 150-250 tokens, plus per-entry JSON/label overhead) - a
+        # truncated response fails json.loads below and drops the WHOLE batch, so every flagged
+        # comp fell back to its original unfixed text even though the model was correcting them
+        # fine, just running out of room before closing the JSON. This model also spends a highly
+        # variable number of tokens on internal reasoning BEFORE any visible text (observed
+        # 1000-1200+ "thinking" tokens on this same 3-note batch across back-to-back calls) with
+        # no way here to turn that off, so the budget must comfortably absorb worst-case thinking
+        # AND the visible JSON, not just the JSON alone.
+        resp = await client.messages.create(
+            model=model, max_tokens=min(8000, 2500 + 700 * len(flagged)), system=sys,
+            messages=[{"role": "user", "content": user}],
+        )
+        raw = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", None) == "text")
+        mjson = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not mjson:
+            return {}
+        data = json.loads(mjson.group(0))
+        out: dict = {}
+        for item in data.get("notes") or []:
+            label = item.get("label")
+            text = _coerce_ai_text(item.get("text")).strip()
+            if label and text:
+                out[label] = text
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+async def _materialize_snapshot_with_comp_narratives(
+    snapshot: _AuthoritativeEvidenceSnapshot, drafts: list[dict],
+    *, attempt_rewrite: bool = False, model: str = "",
+) -> tuple[dict, list[dict], dict, list[str], list[str]]:
+    """Materialize the frozen evidence and reconcile/regenerate every client comp narrative.
+
+    attempt_rewrite=True (the live generate/recompute pipelines only - never the default, so a bare
+    unit-test call never makes a real model call) gives any comp note still flagged after
+    deterministic reconciliation ONE targeted, batched rewrite attempt before it's surfaced to the
+    agent as a blocking item - see _targeted_comp_narrative_rewrite."""
+    subject, comps, timeline = snapshot.materialize()
+    flags: list[str] = []
+    blocking: list[str] = []
+    per_comp_blocking: dict[int, list[str]] = {}
+    for i, comp in enumerate(comps):
+        label = _comp_label(i, comp)
+        draft = drafts[i] if i < len(drafts) else {}
+        ai_draft = str(draft.get("ai_commentary") or "").strip()
+        agent_draft = str(draft.get("commentary") or "").strip()
+        corrected = bool(comp.get("_cond_rating_fix") or comp.get("_amenities_fact_reconciled"))
+        _num_errs = [] if corrected or not ai_draft else _comp_note_number_errors(ai_draft, comp, subject)
+        if _num_errs:
+            corrected = True
+            flags.append(f"{label}: AI note had figures that don't match the MLS record ({'; '.join(_num_errs[:3])}) - rebuilt from verified facts.")
+        generated = _regenerate_comp_narrative_from_snapshot(comp, label) if corrected else ai_draft
+        if generated:
+            generated, ff = _reconcile_comp_hard_facts(generated, label, subject, comp)
+            flags.extend(ff)
+            comp["ai_commentary"] = generated
+        if not agent_draft or (ai_draft and agent_draft == ai_draft):
+            if generated:
+                comp["commentary"] = generated
+        else:
+            agent_text, ff = _reconcile_comp_hard_facts(agent_draft, label, subject, comp)
+            flags.extend(ff)
+            comp["commentary"] = agent_text
+        _comp_blocking: list[str] = []
+        for field in ("ai_commentary", "commentary"):
+            if comp.get(field):
+                _comp_blocking.extend(_factual_prose_blocking(
+                    comp[field], label, subject, comp_note=True, comp=comp,
+                ))
+        if _comp_blocking:
+            per_comp_blocking[i] = _comp_blocking
+        if corrected:
+            flags.append(f"{label}: regenerated its client narrative from the corrected authoritative evidence snapshot.")
+
+    if per_comp_blocking and attempt_rewrite:
+        flagged = [
+            {
+                "label": _comp_label(i, comps[i]),
+                "text": comps[i].get("commentary") or comps[i].get("ai_commentary") or "",
+                "reasons": reasons,
+            }
+            for i, reasons in per_comp_blocking.items()
+        ]
+        rewritten = await _targeted_comp_narrative_rewrite(flagged, subject=subject, model=model)
+        for i, reasons in per_comp_blocking.items():
+            label = _comp_label(i, comps[i])
+            new_text = rewritten.get(label)
+            if not new_text:
+                blocking.extend(reasons)
+                continue
+            re_blocking = _factual_prose_blocking(new_text, label, subject, comp_note=True, comp=comps[i])
+            if re_blocking:
+                blocking.extend(re_blocking)
+                continue
+            for field in ("ai_commentary", "commentary"):
+                if comps[i].get(field):
+                    comps[i][field] = new_text
+            flags.append(f"{label}: rewrote its client narrative to remove a claim the subject's own record didn't support.")
+    else:
+        for reasons in per_comp_blocking.values():
+            blocking.extend(reasons)
+
+    return subject, comps, timeline, list(dict.fromkeys(flags)), list(dict.fromkeys(blocking))
+
+
+def _stucco_inspection_paragraph(subject: dict) -> Optional[str]:
+    """Return era- and construction-aware stucco guidance from supplied facts only."""
+    facts = _structured_fact_text(subject)
+    if "stucco" not in facts and "eifs" not in facts:
+        return None
+    yb = _as_float(subject.get("year_built"))
+    current_year = datetime.now(timezone.utc).year
+    age = current_year - int(yb) if yb else None
+    masonry = any(x in facts for x in ("masonry", "stone", "brick", "concrete block", "cmu"))
+    wood = any(x in facts for x in ("wood frame", "wood-framed", "wood framed", "sheathing", "stick-built", "eifs"))
+    evidence = bool(re.search(
+        r"(?:stucco|eifs).{0,80}(?:damage|failure|crack|moisture|intrusion|leak|rot)|"
+        r"(?:damage|failure|crack|moisture|intrusion|leak|rot).{0,80}(?:stucco|eifs)", facts,
+        re.IGNORECASE,
+    ))
+    if evidence:
+        return ("**Stucco / EIFS:** The supplied property data identifies a specific stucco-related "
+                "condition concern. Have a qualified stucco specialist evaluate it and determine the "
+                "appropriate moisture testing, including invasive testing where warranted.")
+    if age is not None and age <= 5:
+        return ("**Stucco / EIFS:** Stucco is reported on this recently constructed home. Review the "
+                "installation records and warranty, confirm the wall assembly, and have the general "
+                "inspector assess visible condition. Do not default to invasive testing unless the "
+                "assembly or an actual finding provides a reason for it.")
+    if yb and yb < 1980 and not wood:
+        assembly = "The recorded stone/masonry construction supports that era-appropriate context. " if masonry else "The wall assembly is unverified. "
+        return ("**Stucco / EIFS:** Stucco is reported on this pre-1980 home. " + assembly +
+                "Homes of this era commonly used masonry or stone substrates, so stucco presence alone "
+                "does not call for invasive testing. Have the general inspector assess visible condition "
+                "and confirm the assembly; escalate to invasive moisture testing only if construction "
+                "details or actual findings warrant it.")
+    if masonry and not wood:
+        return ("**Stucco / EIFS:** Stucco is reported with masonry/stone construction. Have the general "
+                "inspector assess visible condition and confirm the wall assembly; invasive moisture "
+                "testing is warranted only if the construction details or actual findings indicate a risk.")
+    if wood:
+        return ("**Stucco / EIFS:** Stucco/EIFS is reported with wood framing or sheathing, where concealed "
+                "moisture is more relevant. Have a qualified stucco specialist evaluate the assembly and "
+                "use invasive moisture testing where that evaluation warrants it.")
+    return ("**Stucco / EIFS:** Stucco is reported, but the underlying wall assembly is unverified. Confirm "
+            "whether it is over masonry/stone or wood framing/sheathing before deciding on invasive testing; "
+            "a qualified inspector can escalate based on the assembly and actual findings.")
+
+
+def _reconcile_inspection_fact_prose(text: str, subject: dict) -> tuple[str, list[str]]:
+    """Reconcile inspection prose with structured facts and replace generic stucco advice with the
+    deterministic era/construction rule. This is intentionally narrow and non-valuative."""
+    if not text:
+        return text, []
+    facts = _authoritative_property_fact_blob(subject).lower()
+    flags: list[str] = []
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    kept: list[str] = []
+    removed_stucco = False
+    for paragraph in paragraphs:
+        low = paragraph.lower()
+        if ("stucco" in low or "eifs" in low) and any(
+                x in low for x in ("inspect", "test", "moisture", "probe", "wall assembly")):
+            removed_stucco = True
+            continue
+        p = paragraph
+        p = re.sub(
+            r"A full whole-house inspection is recommended given [^;]+;\s*verify\b",
+            "A full whole-house inspection is recommended. Verify",
+            p, flags=re.IGNORECASE,
+        )
+        p = re.sub(
+            r",?\s*particularly around the multiple rooflines, dormers, and implied by the architectural style",
+            "", p, flags=re.IGNORECASE,
+        )
+        p = re.sub(
+            r"including whether the original wiring and plumbing have been updated over the years",
+            "the ages and condition of the wiring and plumbing are unverified; request service and permit records",
+            p, flags=re.IGNORECASE,
+        )
+        p = re.sub(
+            r"No age is provided for ([^;]+);[^.]+\.",
+            lambda m: (f"No age or condition information is provided for {m.group(1).strip()}. "
+                       "Treat those systems as unverified and request service and permit records."),
+            p, flags=re.IGNORECASE,
+        )
+        p = re.sub(
+            r"confirm the condition and age of the service lines given the home's age",
+            "confirm the condition and age of the service lines because those details are not documented",
+            p, flags=re.IGNORECASE,
+        )
+        if "skylight" not in facts and "skylight" in low:
+            p2 = re.sub(r"(?:,\s*)?(?:and\s+)?(?:confirm|verify|inspect|check|assess)\s+"
+                        r"(?:that\s+)?(?:any\s+)?skylights?[^.;]*", "", p, flags=re.IGNORECASE)
+            p2 = re.sub(r"\bskylights?\s*,?\s*(?:and\s+)?", "", p2, flags=re.IGNORECASE)
+            if "skylight" in p2.lower():
+                p2 = ""
+            if p2 != p:
+                flags.append("Inspection concerns: removed an unsupported skylight reference.")
+                p = p2
+        if p and re.search(r"\boriginal\b", p, re.IGNORECASE):
+            p2 = re.sub(
+                r"(?:confirm|verify|determine)\s+whether\s+(.{1,100}?)\s+(?:is|are|remain)\s+original(?:\s+to\s+[^.;]+)?",
+                lambda m: f"Verify the age, condition, and service history of {m.group(1).strip()}",
+                p, flags=re.IGNORECASE,
+            )
+            if not _documented_original_elements(subject):
+                p2 = re.sub(
+                    r"\b((?:these|those|the)\s+)?original\s+(?:architectural\s+)?elements\b",
+                    lambda m: f"{m.group(1) or ''}documented architectural elements",
+                    p2, flags=re.IGNORECASE,
+                )
+            if re.search(r"\b(?:is|are|was|were|remain)\s+original\b", p2, re.IGNORECASE):
+                p2 = ""
+            if p2 != p:
+                flags.append("Inspection concerns: removed an undocumented claim that a feature or component is original.")
+                p = p2
+        if p:
+            p, f2 = _sanitize_comp_fact_prose(p, "Inspection concerns", subject)
+            flags.extend(f2)
+            if p:
+                kept.append(p)
+    stucco = _stucco_inspection_paragraph(subject)
+    if stucco:
+        kept.append(stucco)
+        if removed_stucco:
+            flags.append("Inspection concerns: replaced generic stucco testing advice with build-era and construction-aware guidance.")
+    elif removed_stucco:
+        flags.append("Inspection concerns: removed stucco testing advice because stucco is not supported by the property data.")
+    return "\n\n".join(kept), list(dict.fromkeys(flags))
+
+
+# Shared with _neutralize_unsupported_condition_adjustment below, which reuses these to fix
+# adjustment wording (not just detect it) - the single source of truth for what counts as an
+# unsupported subject-condition claim on either pole.
+_DEFICIT_POLE_WORDS_RE = (
+    r"\b(?:original|largely\s+original|unrenovated|un-renovated|dated|as-is|as\s+is|untouched|"
+    r"less[- ]updated|less\s+renovated|less\s+finished|"
+    r"inferior\s+(?:condition|finish(?:es|ing)?|kitchen|interior|finish\s+level)|"
+    r"cannot\s+claim\s+(?:the\s+)?(?:same\s+)?modern|"
+    r"cannot\s+claim\s+(?:the\s+)?(?:same\s+)?(?:updated\s+)?finish\s+level)\b"
+)
+_RENOVATED_POLE_WORDS_RE = (
+    r"\b(?:turnkey|turn-key|move-in[\s-]?ready|fully\s+renovated|fully\s+updated|"
+    r"recently\s+renovated|newly\s+renovated|more\s+finished|more\s+move-in[\s-]?ready|"
+    r"more\s+livable)\b"
+)
+
+
+def _factual_prose_blocking(
+    text: str, label: str, subject: dict, *, comp_note: bool = False, comp: Optional[dict] = None,
+) -> list[str]:
+    """Final deterministic guard for unsupported client-facing factual claims."""
+    if not text:
+        return []
+    facts = _authoritative_property_fact_blob(subject).lower()
+    # A comp's own writeup describes THAT comp, not the subject - a fact genuinely documented on
+    # the comp's own record (e.g. its own original systems) must not be flagged just because the
+    # subject's record doesn't happen to share it. These "is this documented" checks accept either
+    # record supporting the claim when scanning comp text; the "updated systems" check above is
+    # unaffected since it's already scoped to claims specifically about the subject.
+    comp_facts = _authoritative_property_fact_blob(comp).lower() if (comp_note and comp) else ""
+    low = text.lower()
+    blocking: list[str] = []
+    if comp_note and (_CIRCULAR_COMP_VALUE_RE.search(text) or _CIRCULAR_COMP_DIRECT_RE.search(text)
+                      or _CIRCULAR_SUBJECT_IMPLIED_RE.search(text)
+                      or _CIRCULAR_COMPARATIVE_PREFIX_RE.search(text)):
+        blocking.append(f"{label}: comp analysis circularly references the report's final estimate.")
+    # Ways this text can plausibly refer to the subject - not just the literal word "subject".
+    # Generated prose (adjustment "basis" text especially) is never instructed to write "the
+    # subject" and routinely uses the property's own street name instead (e.g. "Cherry").
+    _subj_ref = _subject_reference_pattern(subject)
+    if not _documented_system_updates(subject):
+        unsupported_update = (
+            re.search(
+                rf"{_subj_ref}(?:\s+(?:has|offers))?\s+updated\s+systems?",
+                text, re.IGNORECASE,
+            ) if comp_note else re.search(
+                rf"\b(?:its|the\s+{_subj_ref}|this\s+home(?:'s|\u2019s)?)?\s*"
+                r"updated\s+(?:home\s+)?systems?\b", text, re.IGNORECASE,
+            )
+        )
+        if unsupported_update:
+            blocking.append(f"{label}: describes the subject's systems as updated without documented support.")
+    # A condition characterization of the subject (either pole - "original/unrenovated/dated" or
+    # "turnkey/renovated/updated") must be backed by the subject's own authoritative record,
+    # regardless of which text surface makes the claim (methodology, an adjustment's basis, or a
+    # comp's own narrative comparing itself to the subject). The window after each subject mention
+    # stops at the next comp reference or clause boundary so a single sentence that moves on to
+    # describe something else - "...for the subject, after a full renovation that left IT turnkey"
+    # (the comp's own renovation) or "...than the subject with no pedigree, but the turnkey
+    # condition explains..." (again the comp) - can't have that later clause's condition word
+    # misattributed to the subject just because both sit in one sentence. A comma does NOT end the
+    # window when it introduces a relative clause still describing the same entity ("the subject,
+    # which is original, ...") - only "which/who/that" is treated as a continuation.
+    def _subject_condition_window(match: re.Match) -> str:
+        tail = text[match.end():]
+        boundary = re.search(r"\bcomp\s*#?\s*\d+\b|[.;]|,(?!\s*(?:which|who|that)\b)", tail, re.IGNORECASE)
+        return tail[:min(boundary.start() if boundary else len(tail), 90)]
+
+    _deficit_found = _renovated_found = False
+    for _m in re.finditer(rf"\b{_subj_ref}\b", text, re.IGNORECASE):
+        _window = _subject_condition_window(_m)
+        if re.search(_DEFICIT_POLE_WORDS_RE, _window, re.IGNORECASE) and not _documented_condition_deficit(subject):
+            _deficit_found = True
+            break
+    for _m in re.finditer(rf"\b{_subj_ref}\b", text, re.IGNORECASE):
+        _window = _subject_condition_window(_m)
+        if re.search(_RENOVATED_POLE_WORDS_RE, _window, re.IGNORECASE) and not _documented_condition_renovated(subject):
+            _renovated_found = True
+            break
+    # A trailing-comparison construction ("a move-in-ready home LIKE the subject") puts the
+    # condition word BEFORE the subject reference, outside the forward window above - catch that
+    # shape directly instead of trying to window backward from every subject mention.
+    if not _deficit_found and re.search(
+        _DEFICIT_POLE_WORDS_RE[:-2] + r"\b[^.;]{0,50}\b(?:like|similar\s+to|comparable\s+to|as)\s+"
+        rf"(?:the\s+)?{_subj_ref}\b", text, re.IGNORECASE,
+    ) and not _documented_condition_deficit(subject):
+        _deficit_found = True
+    if not _renovated_found and re.search(
+        _RENOVATED_POLE_WORDS_RE[:-2] + r"\b[^.;]{0,50}\b(?:like|similar\s+to|comparable\s+to|as)\s+"
+        rf"(?:the\s+)?{_subj_ref}\b", text, re.IGNORECASE,
+    ) and not _documented_condition_renovated(subject):
+        _renovated_found = True
+    # A comparative-degree construction ("its updated systems and finishes are well beyond the
+    # subject's unverified renovation and systems history") makes the same "subject is worse"
+    # claim as the pole-word list above without using any of those specific words - it frames the
+    # comp as categorically ahead of the subject, turning mere "unverified"/"undocumented"
+    # evidence-uncertainty into an implied confirmed deficit. Caught separately since the
+    # inferiority claim lives in "well beyond"/"far superior to" itself, not in whatever
+    # (if anything) follows "the subject's".
+    if not _deficit_found and re.search(
+        r"\b(?:well|far|considerably|significantly)\s+(?:beyond|ahead\s+of|superior\s+to)\s+"
+        rf"(?:the\s+)?{_subj_ref}\b", text, re.IGNORECASE,
+    ) and not _documented_condition_deficit(subject):
+        _deficit_found = True
+    if _deficit_found:
+        blocking.append(f"{label}: describes the subject as original/unrenovated/dated without supporting property data.")
+    if _renovated_found:
+        blocking.append(f"{label}: describes the subject as turnkey/renovated/updated without supporting property data.")
+    if "skylight" in low and "skylight" not in facts and "skylight" not in comp_facts:
+        blocking.append(f"{label}: mentions skylights, but skylights are not documented in the supplied property facts.")
+    if re.search(r"\b(?:is|are|was|were|remain)\s+original\b", text, re.IGNORECASE) \
+            and "original" not in facts and "original" not in comp_facts:
+        blocking.append(f"{label}: claims a feature is original without supporting property data.")
+    if re.search(r"\boriginal\s+(?:wiring|plumbing|systems?)\b", text, re.IGNORECASE) \
+            and not _documented_original_systems(subject) \
+            and not (comp_note and comp and _documented_original_systems(comp)):
+        blocking.append(f"{label}: describes a system as original without supporting property data.")
+    if re.search(r"\boriginal\s+(?:architectural\s+)?elements?\b", text, re.IGNORECASE) \
+            and not _documented_original_elements(subject) \
+            and not (comp_note and comp and _documented_original_elements(comp)):
+        blocking.append(f"{label}: describes architectural elements as original without supporting property data.")
+    if re.search(r"\boriginal\s+(?:terraces?|loggias?|walls?)\b", text, re.IGNORECASE) \
+            and "original" not in facts and "original" not in comp_facts:
+        blocking.append(f"{label}: describes a component as original without supporting property data.")
+    # A hedge sentence that explicitly DISCLAIMS assuming a condition problem ("...rather than
+    # assuming either deferred maintenance or...") must not trip this - only an actual assertion
+    # that the subject has the problem should. Checked per-match, not once for the whole text, so
+    # one negated mention can't shield a later, genuinely unhedged one in the same passage.
+    def _negated_condition_claim(match: "re.Match") -> bool:
+        pre = text[max(0, match.start() - 60):match.start()]
+        return bool(re.search(
+            r"\b(?:rather than|instead of|without|not|isn't|doesn't|didn't|never|no)\b(?:\s+\w+){0,4}\s*$",
+            pre, re.IGNORECASE,
+        ))
+    if not any(x in facts for x in ("deferred maintenance", "deferred-maintenance", "needs repair", "damage")) \
+            and not any(x in comp_facts for x in ("deferred maintenance", "deferred-maintenance", "needs repair", "damage")):
+        _deferred_matches = list(re.finditer(r"deferred[- ]maintenance", text, re.IGNORECASE))
+        _deferred_matches += list(re.finditer(r"\bage[- ]related\s+(?:wear|defects?|deterioration)\b", text, re.IGNORECASE))
+        if any(not _negated_condition_claim(m) for m in _deferred_matches):
+            blocking.append(f"{label}: infers a condition problem from age without supporting property data.")
+    if comp_note and comp:
+        for match in _SQFT_FACT_RE.finditer(text):
+            value = _as_float(match.group(1).replace(",", ""))
+            context = text[max(0, match.start() - 45):min(len(text), match.end() + 45)].lower()
+            area_kind = (
+                "above" if re.search(r"above[- ]grade", context)
+                else "below" if re.search(r"below[- ]grade|basement|lower[- ]level", context)
+                else None
+            )
+            record, owner = _sqft_fact_owner(text, match, subject, comp, area_kind)
+            known = _documented_sqft_values(record, area_kind)
+            if value and not any(abs(value - k) <= max(2, 0.002 * k) for k in known):
+                blocking.append(
+                    f"{label}: cites {value:,.0f} sqft for the {owner}, but that area is not in the "
+                    "authoritative structured property record."
+                )
+    return blocking
+
+
+# Families where the adjustment is specifically about condition/finish/systems - the only ones
+# _neutralize_unsupported_condition_adjustment touches. Mirrors _V10_FAMILY_BUCKET's "condition"
+# mapping above.
+_CONDITION_ADJUSTMENT_FAMILIES = ("renovation_condition", "systems_mechanical")
+
+
+_CONDITION_PHRASE_REPLACEMENT = "condition-unverified"  # starts with a consonant sound so it drops
+# into both "a ___" and "an ___" slots without an article mismatch; used as a straight adjective
+# swap for every matched pole word/phrase below.
+
+
+def _condition_claim_spans(text: str, subj_ref: str, pole_re: str) -> list[tuple[int, int]]:
+    """Character spans in `text` that assert `pole_re` ABOUT THE SUBJECT specifically - the same
+    forward-window-after-a-subject-mention and trailing-comparison-before-a-subject-mention shapes
+    _factual_prose_blocking scans for, but returning positions instead of a yes/no so the caller
+    can replace exactly those words and leave everything else (including the same claim made
+    accurately about a COMP elsewhere in the same text) untouched."""
+    spans: list[tuple[int, int]] = []
+    for m in re.finditer(rf"\b{subj_ref}\b", text, re.IGNORECASE):
+        tail = text[m.end():]
+        boundary = re.search(r"\bcomp\s*#?\s*\d+\b|[.;]|,(?!\s*(?:which|who|that)\b)", tail, re.IGNORECASE)
+        limit = m.end() + min(boundary.start() if boundary else len(tail), 90)
+        for cm in re.finditer(pole_re, text[m.end():limit], re.IGNORECASE):
+            spans.append((m.end() + cm.start(), m.end() + cm.end()))
+    for m in re.finditer(
+        pole_re[:-2] + r"\b[^.;]{0,50}\b(?:like|similar\s+to|comparable\s+to|as)\s+(?:the\s+)?" + subj_ref + r"\b",
+        text, re.IGNORECASE,
+    ):
+        sub = re.search(pole_re, m.group(0), re.IGNORECASE)
+        if sub:
+            spans.append((m.start() + sub.start(), m.start() + sub.end()))
+    # Dedupe/merge - the forward-window and trailing-comparison scans can both catch the same span.
+    spans = sorted(set(spans))
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _replace_spans(text: str, spans: list[tuple[int, int]], replacement: str) -> str:
+    for start, end in sorted(spans, reverse=True):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
+def _neutralize_unsupported_condition_adjustment(adj: dict, subject: dict) -> list[str]:
+    """Deterministic (no AI call) relabeling for a condition/renovation-family adjustment whose
+    factor/basis asserts a specific condition claim about the SUBJECT ("less-updated interior",
+    "outdated kitchen", "original/unrenovated", etc.) that the subject's own authoritative record
+    doesn't support. Mutates adj["factor"]/adj["basis"] in place to honest uncertainty wording and
+    downgrades adj["confidence"] - NEVER touches applied/amount_low/amount_high/direction/family,
+    so the dollar effect this adjustment contributes is completely unchanged. Returns qa_flags
+    describing what was relabeled (full audit visibility - nothing is silently altered).
+
+    Only replaces spans that are actually attributed to the SUBJECT (via the same windowing
+    _factual_prose_blocking uses) - an accurate, documented claim about a COMP elsewhere in the
+    same basis text (e.g. "the more original 315 Keithwood") is left untouched.
+
+    This exists because 'not documented as updated' kept getting worded as a confirmed defect
+    ('less-updated interior', 'condition-gap') rather than the uncertainty it actually is - the
+    fix is to say the pricing effect honestly reflects unresolved condition uncertainty, not to
+    remove or resize the effect itself."""
+    if adj.get("family") not in _CONDITION_ADJUSTMENT_FAMILIES:
+        return []
+    factor = _coerce_ai_text(adj.get("factor"))
+    basis = _coerce_ai_text(adj.get("basis"))
+    if not factor and not basis:
+        return []
+    direction = str(adj.get("direction") or "").lower()
+    subj_ref = _subject_reference_pattern(subject)
+    # A down adjustment asserting the deficit pole (dated/original/less-updated/...), or an up
+    # adjustment asserting the renovated pole (turnkey/move-in-ready/...), attributed specifically
+    # to the subject, with nothing on the subject's own record to back either one.
+    if direction == "down" and not _documented_condition_deficit(subject):
+        pole_re = _DEFICIT_POLE_WORDS_RE
+    elif direction == "up" and not _documented_condition_renovated(subject):
+        pole_re = _RENOVATED_POLE_WORDS_RE
+    else:
+        return []
+
+    # The factor label is a short, single-purpose summary of THIS adjustment - unlike the basis
+    # prose, it never describes a comp's own condition, so it needs no subject-mention windowing;
+    # any pole word in it is safe to sweep unconditionally (e.g. "Move-in-ready premium vs.
+    # comps" never means the comps are move-in-ready, it means the subject supposedly is).
+    factor_has_claim = bool(re.search(pole_re, factor, re.IGNORECASE))
+    basis_spans = _condition_claim_spans(basis, subj_ref, pole_re)
+    if not factor_has_claim and not basis_spans:
+        return []
+
+    new_factor = re.sub(pole_re, _CONDITION_PHRASE_REPLACEMENT, factor, flags=re.IGNORECASE)
+    new_factor = re.sub(r"\b(?:condition|renovation)(?:/(?:condition|renovation))?[- ]gap\b",
+                         "condition uncertainty", new_factor, flags=re.IGNORECASE)
+    if new_factor and factor[:1].isupper() and new_factor[:1].islower():
+        new_factor = new_factor[0].upper() + new_factor[1:]
+    new_basis = _replace_spans(basis, basis_spans, _CONDITION_PHRASE_REPLACEMENT)
+    new_basis = re.sub(r"\b(?:condition|renovation)[- ]gap\s+deduction\b", "condition-uncertainty allowance",
+                        new_basis, flags=re.IGNORECASE)
+    new_basis = re.sub(r"\bbrackets?\s+a\s+reasonable\b", "supports a conservative", new_basis, flags=re.IGNORECASE)
+    # Two adjacent replacements read as an unintentional repetition ("X and X") more often than a
+    # deliberate one - collapse to a single mention.
+    new_basis = re.sub(
+        rf"\b{_CONDITION_PHRASE_REPLACEMENT}\b(?:\s*(?:,|and|or)\s*{_CONDITION_PHRASE_REPLACEMENT}\b)+",
+        _CONDITION_PHRASE_REPLACEMENT, new_basis, flags=re.IGNORECASE,
+    )
+    changed = new_factor != factor or new_basis != basis
+    if not changed:
+        return []
+    adj["factor"] = new_factor
+    adj["basis"] = new_basis
+    # Requirement: unresolved condition should read as lower confidence, not a confirmed negative.
+    if str(adj.get("confidence") or "").lower() in ("high", "medium"):
+        adj["confidence"] = "low"
+    return [
+        f"{new_factor}: subject condition is undocumented, not a confirmed defect - relabeled "
+        f"from an asserted condition claim to an honest uncertainty allowance; the applied "
+        f"${abs(_as_float(adj.get('applied')) or 0):,.0f} was not changed."
+    ]
+
+
+def _apply_reasoning_authority(
+    v10_result: dict, reasoning: dict, *, model: str, effort: str,
+    comp_labels_by_id: Optional[dict] = None,
+) -> dict:
+    """Promote valid reasoning values without mutating or clamping them to the V10 benchmark."""
+    trace = copy.deepcopy(v10_result.get("trace") or {})
+    old_v10_fmv = _as_float(v10_result.get("fmv"))
+    old_range_pct = _as_float(v10_result.get("range_pct"))
+    anchor_value = _as_float((trace.get("anchor") or {}).get("anchor_value"))
+    fmv = round(float(reasoning["final_fmv"]))
+    low = round(float(reasoning["range_low"]))
+    high = round(float(reasoning["range_high"]))
+    range_pct = round(((high - low) / (2 * fmv)) * 100, 2)
+    reasoning_audit = copy.deepcopy(reasoning)
+    for bucket in ("primary_comps", "floor_comps", "ceiling_comps"):
+        for item in reasoning_audit.get(bucket) or []:
+            item["comp_label"] = (comp_labels_by_id or {}).get(str(item.get("comp_id")))
+    trace.update({
+        "mode": "frontier_reasoning_authority",
+        "authority": "reasoning_model",
+        "reasoning_model": reasoning_audit,
+        "reasoning_model_name": model,
+        "reasoning_effort": effort,
+        "deterministic_anchor": round(anchor_value) if anchor_value else None,
+        "v10_formula_fmv": round(old_v10_fmv) if old_v10_fmv else None,
+        "v10_formula_range_pct": old_range_pct,
+        "reasoning_model_fmv": fmv,
+        "reasoning_model_range_low": low,
+        "reasoning_model_range_high": high,
+        "reasoning_model_confidence": reasoning["confidence"],
+        "reasoning_independent_preliminary_fmv": round(reasoning["independent_preliminary_fmv"]),
+        "reasoning_independent_preliminary_range_low": round(reasoning["independent_preliminary_range_low"]),
+        "reasoning_independent_preliminary_range_high": round(reasoning["independent_preliminary_range_high"]),
+        "reasoning_independent_preliminary_confidence": reasoning["independent_preliminary_confidence"],
+        "reasoning_delta_vs_v10": round(fmv - old_v10_fmv) if old_v10_fmv else None,
+        "reasoning_delta_vs_anchor": round(fmv - anchor_value) if anchor_value else None,
+        "reasoning_delta_vs_v10_pct": round((fmv / old_v10_fmv - 1) * 100, 2) if old_v10_fmv else None,
+        "reasoning_delta_vs_anchor_pct": round((fmv / anchor_value - 1) * 100, 2) if anchor_value else None,
+        "final_fmv": fmv,
+        "range_min": low,
+        "range_max": high,
+        "range_pct": range_pct,
+        "confidence": reasoning["confidence"],
+    })
+    if isinstance(trace.get("above_ask_gate"), dict):
+        trace["above_ask_gate"]["benchmark_only"] = True
+    return {
+        "fmv": fmv, "range_low": low, "range_high": high, "range_pct": range_pct,
+        "confidence": reasoning["confidence"], "trace": trace,
+        "v10_formula_fmv": round(old_v10_fmv) if old_v10_fmv else None,
+    }
+
+
+def _reasoning_client_methodology(reasoning: dict) -> str:
+    return (
+        f"The final fair market value is ${reasoning['final_fmv']:,.0f}, with a supported valuation "
+        f"range of ${reasoning['range_low']:,.0f}-${reasoning['range_high']:,.0f}. "
+        f"{str(reasoning.get('final_valuation_summary') or '').strip()}"
+    ).strip()
+
+
+_COMP_RAW_ID_FIELDS = ("listing_key", "mls_number", "listing_id", "mls_id", "property_id", "id")
+
+
+def _replace_raw_comp_references(text: Optional[str], comps: Optional[list]) -> str:
+    """Resolve provider-facing comp IDs to the canonical human label before client display."""
+    out = str(text or "")
+    for i, comp in enumerate(comps or []):
+        label = _comp_label(i, comp)
+        for field in _COMP_RAW_ID_FIELDS:
+            raw = str(comp.get(field) or "").strip()
+            if len(raw) >= 5 and raw not in label:
+                out = re.sub(rf"(?<![\w]){re.escape(raw)}(?![\w])", label, out)
+    return out
+
+
+def _raw_comp_reference_blocking(
+    value_drivers: Optional[list], comps: Optional[list], client_texts: Optional[list[str]] = None,
+) -> list[str]:
+    text = "\n".join(client_texts or []) + "\n" + "\n".join(
+        f"{d.get('comp_label') or ''} {d.get('note') or ''}" for d in (value_drivers or []) if isinstance(d, dict)
+    )
+    unresolved = []
+    for comp in comps or []:
+        for field in _COMP_RAW_ID_FIELDS:
+            raw = str(comp.get(field) or "").strip()
+            if len(raw) >= 5 and re.search(rf"(?<![\w]){re.escape(raw)}(?![\w])", text):
+                unresolved.append(raw)
+    return (["Why this number: contains unresolved raw comp identifiers instead of canonical human-readable labels: "
+             + ", ".join(sorted(set(unresolved)))] if unresolved else [])
+
+
+def _reasoning_value_drivers(reasoning: dict, comps: Optional[list] = None) -> list:
+    rows = []
+    for bucket in ("major_value_drivers", "major_value_drags"):
+        for item in reasoning.get(bucket) or []:
+            rows.append({
+                "comp_key": "", "comp_label": _replace_raw_comp_references(item.get("factor"), comps),
+                "direction": item.get("direction"),
+                "note": _replace_raw_comp_references(item.get("reason"), comps),
+            })
+    return rows[:4]
+
+
+def _authoritative_range(value: float, range_pct: float, trace: Optional[dict] = None,
+                         final: Optional[dict] = None) -> tuple[Optional[int], Optional[int]]:
+    """Resolve the exact final range, preferring the reasoning authority's explicit endpoints."""
+    source = final or {}
+    low = _as_float(source.get("range_min"))
+    high = _as_float(source.get("range_max"))
+    if low is None or high is None:
+        t = trace or {}
+        low = _as_float(t.get("reasoning_model_range_low")) or _as_float(t.get("range_min"))
+        high = _as_float(t.get("reasoning_model_range_high")) or _as_float(t.get("range_max"))
+    if low is not None and high is not None:
+        return round(low), round(high)
+    if not value:
+        return None, None
+    return round(value * (1 - range_pct / 100)), round(value * (1 + range_pct / 100))
+
+
+async def _run_cma_reasoning_stage(
+    db: AsyncSession, owner_id: str, plan_tier: str, config: dict, evidence_packet: dict,
+    report_id: str,
+) -> tuple[dict, list, float, dict]:
+    """Meter, call, validate, and audit one final reasoning pass."""
+    reservation = await reserve_cma_reasoning(db, owner_id, config, plan_tier)
+    model = config["cma_reasoning_model"]
+    projected_input = max(1, len(json.dumps(evidence_packet, default=str)) // 4)
+    projected_output = int(config.get("cma_reasoning_max_output_tokens", 6000))
+    projected_cost = ai_config_service.estimate_cost_usd(config, model, projected_input, projected_output)
+    max_cost = float(config.get("cma_reasoning_max_cost_per_generation_usd", 1.0))
+    if projected_cost > max_cost:
+        await reconcile_budget(db, reservation, 0.0)
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"The final valuation reasoning pass would exceed its ${max_cost:.2f} per-CMA limit.",
+        )
+    cost = 0.0
+    usage: dict = {}
+    try:
+        raw, usage = await _call_cma_reasoning_model(config, evidence_packet)
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+        cost = ai_config_service.estimate_cost_usd(config, model, input_tokens, output_tokens)
+        reasoning, blockers = _validate_reasoning_valuation(raw, evidence_packet)
+        await record_usage_event(
+            db, owner_id, None, model, input_tokens, output_tokens,
+            cost, 0, False, None, event_type="cma_reasoning",
+        )
+        await reconcile_budget(db, reservation, cost)
+        return reasoning, blockers, cost, usage
+    except HTTPException:
+        await reconcile_budget(db, reservation, cost)
+        raise
+    except Exception as exc:
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+        if usage:
+            await record_usage_event(
+                db, owner_id, None, model, input_tokens, output_tokens,
+                cost, 0, False, None, event_type="cma_reasoning",
+            )
+        else:
+            # The call itself never returned (provider-side failure, e.g. an exhausted credit
+            # balance) rather than returning something that failed validation - still worth a
+            # blocked AIUsageEvent row so this shows up on the admin AI usage dashboard instead of
+            # only ever existing in this log line.
+            await record_usage_event(
+                db, owner_id, None, model, None, None, 0.0, 0, True,
+                classify_provider_error(exc), event_type="cma_reasoning",
+            )
+        await reconcile_budget(db, reservation, cost)
+        logger.warning(
+            "CMA final reasoning pass failed",
+            extra={"report_id": report_id, "model": model, "error": str(exc), "error_type": type(exc).__name__},
+        )
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "The final valuation reasoning pass did not return a valid result. No fallback value was substituted.",
+        ) from exc
+
+
+# Internal / debug vocabulary that must never reach a client-facing prose field.
+_V10_JARGON_RE = re.compile(
+    r"\b(basis_type|qualitative_adjustment|paired_market_evidence|comp_inferred|model_judgment|"
+    r"valuation_trace|anchor_dispute|exposure_ceiling|hard_upper|pull_target|redundancy_penalty|"
+    r"prompt_version|_v10|\bV10\b|v10_formula_fmv|reasoning_model_fmv|fmv_pre_exposure|range_pct|provisional_range|confidence_seed|"
+    r"active_market_days|size_model)\b",
+    re.IGNORECASE,
+)
+
+
+def _structured_currency_values(value, key: str = "") -> set[float]:
+    """Collect dollar-like values only from structured valuation fields, never prose."""
+    values: set[float] = set()
+    if isinstance(value, dict):
+        for child_key, child in value.items():
+            values.update(_structured_currency_values(child, str(child_key)))
+    elif isinstance(value, list):
+        for child in value:
+            values.update(_structured_currency_values(child, key))
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        if abs(float(value)) >= 10000 and re.search(
+            r"(?:price|value|fmv|anchor|amount|applied|dollar|range_(?:low|high|min|max)|offer|adjustment|delta)",
+            key, re.I,
+        ):
+            values.add(abs(float(value)))
+    return values
+
+
+def _v10_final_report_qa(
+    fields: dict, value: float, range_pct: float, trace: dict, *, known_dollars=None,
+) -> tuple:
+    """Step 16 - a last deterministic client-safety sweep over the three prose fields against the
+    authoritative v10 numbers. Returns (flags, blocking). Blocking entries gate PDF export until
+    the agent confirms they've reviewed them."""
+    flags: list = []
+    blocking: list = []
+    lo, hi = _authoritative_range(value, range_pct, trace)
+    adj_by_dir = {}
+    for a in (trace or {}).get("adjustments", []):
+        adj_by_dir.setdefault(a["factor"].lower(), a["direction"])
+
+    for key, (label, text) in fields.items():
+        if not text:
+            continue
+        if _V10_JARGON_RE.search(text):
+            blocking.append(f"{label}: contains internal/debug wording (e.g. a variable or evidence-class name) - reword before exporting.")
+        # every large $ figure in the prose should be the FMV, a range bound, the list price, or a
+        # real comp price - a stray big number that matches none of those is a red flag.
+        known = {round(value), lo, hi, (trace or {}).get("subject_asking") or 0}
+        known.update(_structured_currency_values(trace or {}))
+        known.update(abs(float(v)) for v in (known_dollars or []) if _as_float(v) is not None)
+        for c in ((trace or {}).get("anchor") or {}).get("comps", []):
+            known.add(c.get("raw_sale_price") or 0)
+        known.add(((trace or {}).get("anchor") or {}).get("anchor_value") or 0)
+        for v in _v10_extract_dollars(text):
+            if v >= 10000 and not any(k and abs(v - k) <= max(1000, 0.005 * k) for k in known):
+                blocking.append(
+                    f"{label}: material figure ${v:,.0f} has no matching authoritative structured value."
+                )
+    return flags, blocking
+
+
+# ============================================================================================
+# v10 FINAL PRE-EXPORT DETERMINISTIC QA  (hardening - final layer)
+# --------------------------------------------------------------------------------------------
+# One consolidating pass, run LAST (after every reconcile/polish/gate pass above), that:
+#   * cross-checks the narrative against the AUTHORITATIVE backend numbers in valuation_trace -
+#     directional wording, statistical labels, status, DOM, ask, FMV, range, comp class, comp
+#     ratings vs commentary, value-driver notes vs the adjustment trace, displayed statistics;
+#   * runs a full prose-hygiene sweep (dupes, malformed/merged sentences, placeholders,
+#     unfinished phrases, contradictions, unsupported hard system/permit claims);
+#   * separates findings into blocking_errors (real contradictions / broken output - gate the
+#     client export) and warnings (style / soft issues - never gate);
+#   * records automatic corrections it applied.
+# Returns (qa_result dict, corrected_fields dict, blocking_list). qa_result is stored alongside
+# valuation_trace and is AGENT-ONLY - it never appears in the client PDF / public report.
+# ============================================================================================
+
+_QA_PLACEHOLDER_RE = re.compile(
+    r"\b(TODO|TBD|FIXME|XXX|lorem\s+ipsum|placeholder|insert\s+(?:value|name|figure|here))\b|\{\{|\}\}|"
+    r"\[\s*(?:insert|placeholder|todo|name|address|value)\b|<(?:placeholder|insert|name)>|(?<!_)_{3,}(?!_)",
+    re.IGNORECASE,
+)
+_QA_DUP_WORD_RE = re.compile(r"\b([A-Za-z]{3,})\s+\1\b(?!\s+\1)", re.IGNORECASE)
+# A 2-4 word phrase repeated back-to-back ("under contract under contract", "the subject the subject").
+_QA_DUP_PHRASE_RE = re.compile(r"\b((?:[A-Za-z][A-Za-z'-]*\s+){1,3}[A-Za-z][A-Za-z'-]*)\s+\1\b", re.IGNORECASE)
+_QA_DANGLING_RE = re.compile(
+    r"\b(such as|including|for example|e\.g\.|i\.e\.|between|ranging from|as well as|and|or|than|because|due to)\s*[.;:]",
+    re.IGNORECASE,
+)
+_QA_REPAIRABLE_DANGLING_RE = re.compile(
+    r"\s*,?\s*\b(such as|including|for example|e\.g\.|i\.e\.|ranging from|as well as|because|due to)\s*[.;:]",
+    re.IGNORECASE,
+)
+
+
+def _repair_unambiguous_dangling_connectors(text: str) -> tuple[str, bool]:
+    """Trim only connector tails whose removal leaves the preceding factual clause intact."""
+    out = text or ""
+    changed = False
+    for _ in range(3):
+        repaired = _QA_REPAIRABLE_DANGLING_RE.sub(".", out)
+        if repaired == out:
+            break
+        out = repaired
+        changed = True
+    return out, changed
+_QA_MERGE_RE = re.compile(r"[a-z]{2}\.[A-Z][a-z]{2}")          # "value.The" with no space
+_QA_CAMEL_IN_WORD_RE = re.compile(r"\b[a-z]+[A-Z][a-z]+\b")     # "valueThe" corrupted merge inside a token
+_QA_ALLOWED_CAMEL = {"openhousepal", "mcmansion", "lasalle", "mckinley", "desoto", "lamesa", "labelle"}
+_QA_STATUS_GROUPS = {
+    "active": "on_market", "coming soon": "on_market",
+    "pending": "under_contract", "under contract": "under_contract",
+    "under agreement": "under_contract", "contingent": "under_contract", "active under contract": "under_contract",
+    "sold": "closed", "closed": "closed", "settled": "closed",
+    "withdrawn": "off_market", "expired": "off_market", "canceled": "off_market",
+    "cancelled": "off_market", "off market": "off_market", "off-market": "off_market",
+}
+_QA_STATUS_ASSERT_RE = re.compile(
+    r"\b(?:is|are|remains?|currently|now|still|property\s+is|listing\s+is|home\s+is)\s+"
+    r"(active(?:\s+under\s+contract)?|coming\s+soon|pending|under\s+(?:contract|agreement)|contingent|"
+    r"sold|closed|settled|withdrawn|expired|cancell?ed|off[-\s]market)\b",
+    re.IGNORECASE,
+)
+_QA_DOM_RE = re.compile(
+    r"\b(\d{1,4})[\s‑-]*(?:calendar[\s-]*)?(?:active[\s-]*market[\s-]*)?days?\b(?!\s+(?:ago|of\s+the\s+week|a\s+week))",
+    re.IGNORECASE,
+)
+_QA_CUMULATIVE_NEAR_RE = re.compile(r"cumulative|total\s+days|all\s+listing\s+periods|combined", re.IGNORECASE)
+_QA_ASK_RE = re.compile(
+    r"\b(?:listed|asking|list(?:ed)?\s+price|priced|offered|on\s+the\s+market)\s+(?:at|of|for|price\s+of)?\s*"
+    r"\$\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?",
+    re.IGNORECASE,
+)
+_QA_ABOVE_ASK_RE = re.compile(
+    r"\b(above|over|exceeds?|exceeding|higher\s+than|premium\s+to|more\s+than)\s+(?:the\s+)?"
+    r"(?:asking|list(?:ing)?(?:\s+price)?|ask\b)",
+    re.IGNORECASE,
+)
+_QA_BELOW_ASK_RE = re.compile(
+    r"\b(below|under|less\s+than|discount\s+to|lower\s+than|beneath|short\s+of)\s+(?:the\s+)?"
+    r"(?:asking|list(?:ing)?(?:\s+price)?|ask\b)",
+    re.IGNORECASE,
+)
+_QA_AT_ASK_RE = re.compile(
+    r"\b(?:in\s+line\s+with|at|matches?|equal\s+to|consistent\s+with|on\s+par\s+with)\s+(?:the\s+)?"
+    r"(?:asking|list(?:ing)?(?:\s+price)?|ask\b)",
+    re.IGNORECASE,
+)
+_QA_SIMPLE_AVG_RE = re.compile(
+    r"\b(simple|straight|plain|unweighted|arithmetic)\s+(average|mean)\b|"
+    r"\baverag(?:e|ed|ing)\s+(?:the\s+)?(?:\d+\s+)?(?:comp|comparable|sale)s?\b|"
+    r"\bmean\s+of\s+the\s+(?:\d+\s+)?(?:comp|comparable|sale)s?\b",
+    re.IGNORECASE,
+)
+_QA_MEDIAN_BASIS_RE = re.compile(
+    r"\bmedian\s+(?:comp\s+)?(?:sale\s+)?price\b.{0,40}\b(?:anchor|basis|indication|used|valuation|drove|derived)|"
+    r"\b(?:anchor|basis|value|indication)\b.{0,40}\bmedian\s+(?:comp\s+)?(?:sale\s+)?price\b",
+    re.IGNORECASE,
+)
+_QA_PSF_INDICATION_RE = re.compile(
+    r"\$\s*([\d,]+(?:\.\d+)?)\s*(?:/|per\s+)\s*(?:sq\.?\s*ft|sqft|square\s+f(?:oo|ee)?t)\s+indication|"
+    r"\$/sq\.?\s*ft\s+indication\s+of\s+\$?\s*([\d,]+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_QA_HARD_FACT_RE = re.compile(
+    r"\b(new|newer|brand[\s-]new|replaced|recently\s+replaced|updated|upgraded|installed|rebuilt|"
+    r"renovated|permitted)\s+"
+    r"(roof|hvac|furnace|a/?c|air\s+condition\w*|boiler|heat\s+pump|water\s+heater|"
+    r"electrical\s+(?:panel|service|system|wiring)|wiring|plumbing|septic(?:\s+system)?|well\s+pump|"
+    r"foundation|sewer\s+line)\b",
+    re.IGNORECASE,
+)
+_QA_YEAR_SYSTEM_RE = re.compile(
+    r"\b(roof|hvac|furnace|a/?c|boiler|water\s+heater|electrical|plumbing|septic|windows?|siding)\b"
+    r"[^.\n]{0,40}?\b(?:in\s+|installed\s+|replaced\s+|from\s+|dated\s+|circa\s+|,\s*)(19|20)\d{2}\b",
+    re.IGNORECASE,
+)
+_QA_VERIFY_NEARBY_RE = re.compile(r"\bverif(?:y|ied|ication)\b|\bconfirm\b|\bunconfirmed\b|\bper\s+(?:seller|public\s+record|mls)\b", re.IGNORECASE)
+_QA_TURNKEY_RE = re.compile(r"\b(turnkey|turn-key|move[\s-]in\s+ready|fully\s+renovated|fully\s+updated|extensively\s+renovated|gut\s+renovat\w+)\b", re.IGNORECASE)
+_QA_DATED_RE = re.compile(r"\b(dated|outdated|needs?\s+updating|needs?\s+work|original\s+condition|tired\s+finishes|deferred\s+maintenance|fixer)\b", re.IGNORECASE)
+
+
+def _qa_norm_sentence(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", "", s.lower())).strip()
+
+
+def _v10_pre_export_qa(
+    fields: dict, *, value: float, range_pct: float, subject_asking: Optional[float],
+    status_timeline: dict, comps: list, comp_num_by_key: dict, addr_by_key: dict,
+    valuation_trace: Optional[dict], value_drivers: Optional[list], confidence: Optional[str],
+) -> tuple:
+    """Final deterministic pre-export QA consolidator. Returns (qa_result, corrected_fields, blocking).
+    See the section header above. Never rewrites a NUMBER (that's the earlier reconcile passes'
+    job); it only fixes cosmetic prose defects and otherwise flags/blocks."""
+    trace = valuation_trace or {}
+    tl = status_timeline or {}
+    warnings: list[str] = []
+    blocking: list[str] = []
+    corrections: list[str] = []
+    checks_run = [
+        "directional_math", "statistical_labels", "status_consistency", "dom_consistency",
+        "ask_consistency", "fmv_consistency", "fmv_range_consistency", "comp_classification",
+        "comp_rating_vs_commentary", "value_driver_vs_trace", "displayed_stats_vs_authoritative",
+        "prose_hygiene", "unsupported_hard_facts",
+    ]
+    out_fields: dict = {}
+
+    anchor = trace.get("anchor") or {}
+    anchor_comps = anchor.get("comps") or []
+    trace_adjustments = trace.get("adjustments") or []
+    gate = trace.get("above_ask_gate") or {}
+    v = float(value or 0)
+    rmin, rmax = _authoritative_range(v, range_pct, trace)
+    ask = _as_float(subject_asking)
+    tol = max(2500.0, 0.005 * v) if v else 2500.0
+
+    # comp lookup by ordinal (1-based) - strength + committed quality dims + flags from the trace
+    comp_by_num: dict = {}
+    for i, c in enumerate(comps):
+        q = c.get("quality") or {}
+        comp_by_num[i + 1] = {
+            "strength": _normalize_strength(c.get("strength")),
+            "quality": {k: str(q.get(k) or "").lower() for k in _V10_ALL_DIMS},
+            "address": str(c.get("street_address") or "").lower(),
+        }
+    for tc in anchor_comps:
+        m = re.search(r"comp\s*#\s*(\d+)", str(tc.get("label") or ""), re.IGNORECASE)
+        if m and int(m.group(1)) in comp_by_num:
+            comp_by_num[int(m.group(1))].update({
+                "outlier": bool(tc.get("outlier")),
+                "redundancy_penalty": tc.get("redundancy_penalty"),
+                "normalized_weight": tc.get("normalized_weight"),
+                "in_anchor": True,
+            })
+    ctx_labels = {re.search(r"comp\s*#\s*(\d+)", str(c.get("label") or ""), re.IGNORECASE).group(1)
+                  for c in (anchor.get("context_comps") or [])
+                  if re.search(r"comp\s*#\s*(\d+)", str(c.get("label") or ""), re.IGNORECASE)}
+    reasoning_primary_labels = {
+        str(c.get("comp_label") or "") for c in ((trace.get("reasoning_model") or {}).get("primary_comps") or [])
+        if isinstance(c, dict) and c.get("comp_label")
+    }
+    reasoning_primary_nums = {
+        m.group(1) for label in reasoning_primary_labels
+        for m in [re.search(r"comp\s*#\s*(\d+)", label, re.IGNORECASE)] if m
+    }
+
+    combined = "  ".join(t for _, (_, t) in fields.items() if t)
+
+    def _negated(text: str, start: int) -> bool:
+        """A directional phrase whose SENTENCE carries a negator / contrast is not a claim the
+        value IS in that direction - "does not support a value above list", "no evidence large
+        enough to override ... above list", "rather than above ask", "constrained below the
+        anchor". Scans back to the previous sentence boundary."""
+        seg = text[:start].lower()
+        seg = re.split(r"[.!?;:]\s", seg)[-1] if re.search(r"[.!?;:]\s", seg) else seg
+        return bool(re.search(
+            r"\b(no|not|n't|never|without|rather than|instead of|isn't|aren't|wasn't|"
+            r"cannot|can't|won't|doesn't|don't|didn't|hard to|difficult to|unlikely to|"
+            r"prevent\w*|preclud\w*|constrain\w*|cap\w*|limit\w*|overrid\w*|"
+            r"enough to|insufficient|fail(?:s|ed)?\s+to|below|beneath|under|"
+            # Seen live: "This weakens support for a premium above the asking price" was BLOCKED as
+            # an above-asking claim. Words that argue AGAINST the direction count as negators too.
+            r"weaken\w*|undercut\w*|against|lessen\w*|reduc\w*|unsupported|unlikely|caution\w*|doubt\w*)\b", seg))
+
+    # ---- 1. directional math: FMV vs ask. BLOCK only on a true opposite (prose says above while
+    #      the value is genuinely below, or vice versa); a "below/above asking" phrase when the
+    #      value actually sits AT asking (within rounding) is a warning, not a contradiction. -----
+    if v and ask:
+        rel = "above" if v > ask + tol else "below" if v < ask - tol else "at"
+        _above_hits = [m for m in _QA_ABOVE_ASK_RE.finditer(combined) if not _negated(combined, m.start())]
+        _below_hits = [m for m in _QA_BELOW_ASK_RE.finditer(combined) if not _negated(combined, m.start())]
+        if _above_hits:
+            if rel == "below":
+                blocking.append(
+                    f"Directional math: the narrative says the value is ABOVE asking, but the FMV "
+                    f"(${v:,.0f}) is BELOW the ${ask:,.0f} list price.")
+            elif rel == "at":
+                warnings.append(
+                    f"Directional wording: the narrative says the value is above asking, but the FMV "
+                    f"(${v:,.0f}) sits at the ${ask:,.0f} list price.")
+        if _below_hits:
+            if rel == "above":
+                blocking.append(
+                    f"Directional math: the narrative says the value is BELOW asking, but the FMV "
+                    f"(${v:,.0f}) is ABOVE the ${ask:,.0f} list price.")
+            elif rel == "at":
+                warnings.append(
+                    f"Directional wording: the narrative says the value is below asking, but the FMV "
+                    f"(${v:,.0f}) sits at the ${ask:,.0f} list price.")
+        if _QA_AT_ASK_RE.search(combined) and rel != "at" and abs(v - ask) > 0.02 * ask:
+            warnings.append(
+                f"Directional wording: the narrative says the value is in line with asking, but the FMV "
+                f"(${v:,.0f}) is {rel} the ${ask:,.0f} list price by "
+                f"{abs(v - ask) / ask * 100:.1f}%.")
+
+    # ---- 2. statistical labels vs the real method --------------------------------------------
+    if anchor_comps:
+        nws = [c.get("normalized_weight") for c in anchor_comps if c.get("normalized_weight")]
+        unequal = bool(nws) and (max(nws) - min(nws)) > 0.10 and (max(nws) / max(min(nws), 1e-6)) > 1.5
+        if _QA_SIMPLE_AVG_RE.search(combined) and unequal:
+            blocking.append(
+                "Statistical label: the narrative describes a simple/straight average of the comps, but the "
+                "anchor is a WEIGHTED mean (comp weights are materially unequal). Reword to 'weighted average'.")
+        if _QA_MEDIAN_BASIS_RE.search(combined):
+            blocking.append(
+                "Statistical label: the narrative attributes the anchor to a MEDIAN comp price, but the v10 "
+                "anchor is a weighted mean of size-adjusted indications - correct the wording.")
+        psf_ind = anchor.get("psf_indication_per_sqft")
+        for m in _QA_PSF_INDICATION_RE.finditer(combined):
+            stated = _as_float((m.group(1) or m.group(2) or "").replace(",", ""))
+            if stated and psf_ind and abs(stated - psf_ind) > max(5.0, 0.03 * psf_ind):
+                warnings.append(
+                    f"Statistical label: prose cites a $/sq ft indication of ${stated:,.0f} but the anchor's "
+                    f"$/sq ft indication is ${psf_ind:,.0f}/sq ft - verify.")
+        if re.search(r"\b(no|without|before any)\s+size[\s-]adjust", combined, re.IGNORECASE) \
+           and anchor.get("size_model", "").startswith(("regression", "fixed")) \
+           and (anchor.get("sale_psf_divergence_pct") or 0) > 3:
+            warnings.append(
+                "Statistical label: prose says the indication is not size-adjusted, but the anchor applied a "
+                f"{anchor.get('size_model')} size correction (sale-vs-$/sq ft divergence "
+                f"{anchor.get('sale_psf_divergence_pct')}%).")
+        # any "average / median [comp] price of $X" claim must match one of the authoritative
+        # descriptive stats over the weighted comp set.
+        cs = anchor.get("comp_stats") or {}
+        if cs:
+            _known_stats = [cs.get("weighted_mean_sale"), cs.get("simple_mean_sale"), cs.get("median_sale"),
+                            cs.get("min_sale"), cs.get("max_sale")]
+            for mm in re.finditer(
+                r"\b(average|mean|median)\b[^.$]{0,40}?\$\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?", combined, re.IGNORECASE,
+            ):
+                sv = _parse_dollar(mm.group(2), mm.group(3))
+                if sv >= 200000 and not any(k and abs(sv - k) <= max(10000.0, 0.03 * k) for k in _known_stats):
+                    warnings.append(
+                        f"Statistical label: prose cites a comp {mm.group(1).lower()} of ${sv:,.0f}, which matches "
+                        f"none of the computed comp-set stats (weighted mean ${cs.get('weighted_mean_sale', 0):,.0f}, "
+                        f"simple mean ${cs.get('simple_mean_sale', 0):,.0f}, median ${cs.get('median_sale', 0):,.0f}).")
+                    break
+
+    # ---- 3. status consistency --------------------------------------------------------------
+    actual_status = str(tl.get("current_status") or "").lower()
+    actual_group = _QA_STATUS_GROUPS.get(actual_status)
+    asserted_groups: set = set()
+    for m in _QA_STATUS_ASSERT_RE.finditer(combined):
+        w = re.sub(r"\s+", " ", m.group(1).lower()).strip()
+        g = _QA_STATUS_GROUPS.get(w) or _QA_STATUS_GROUPS.get(w.replace("-", " "))
+        if g:
+            asserted_groups.add((w, g))
+    groups_seen = {g for _, g in asserted_groups}
+    if actual_group and any(g != actual_group for g in groups_seen):
+        bad = sorted({w for w, g in asserted_groups if g != actual_group})
+        blocking.append(
+            f"Status consistency: the subject's actual status is '{tl.get('current_status')}' but the narrative "
+            f"describes it as {', '.join(bad)} - reconcile before export.")
+    elif len(groups_seen) > 1:
+        blocking.append(
+            f"Status consistency: different report sections assert different listing statuses "
+            f"({', '.join(sorted(w for w, _ in asserted_groups))}) - reconcile before export.")
+
+    # ---- 4. DOM consistency  (SUBJECT days-on-market only - comps legitimately carry their own
+    #      DOM, e.g. "sold within 18-41 days", so a figure is only counted when it sits next to a
+    #      subject-listing phrase and NOT next to a comp/sale-velocity phrase). ------------------
+    amd = tl.get("active_market_days")
+    cdom = tl.get("cumulative_dom")
+    _SUBJ_DOM_CTX = re.compile(r"\b(on\s+the\s+market|active[\s-]market|days?\s+on\s+market|\bDOM\b|listed\s+for|"
+                               r"exposure|been\s+(?:on|listed|active)|marketing\s+(?:time|period))", re.IGNORECASE)
+    _COMP_DOM_CTX = re.compile(r"\b(sold|closed|comp|comparable|each\s+sell|sell\w*\s+within|went\s+under\s+contract|"
+                               r"under\s+contract\s+in|absorbed|traded)\b", re.IGNORECASE)
+    dom_mentions: list = []
+    for _key, (label, text) in fields.items():
+        for m in _QA_DOM_RE.finditer(text or ""):
+            n = int(m.group(1))
+            if n <= 1 or n > 3000:
+                continue
+            win = (text or "")[max(0, m.start() - 55):min(len(text or ""), m.end() + 20)]
+            if not _SUBJ_DOM_CTX.search(win) or _COMP_DOM_CTX.search(win):
+                continue  # not a subject-DOM claim
+            pre = (text or "")[max(0, m.start() - 30):m.start()]
+            dom_mentions.append((n, bool(_QA_CUMULATIVE_NEAR_RE.search(pre)), label))
+    non_cum = {n for n, is_cum, _ in dom_mentions if not is_cum}
+    if len(non_cum) > 1:
+        blocking.append(
+            f"DOM consistency: the narrative cites more than one subject days-on-market figure "
+            f"({', '.join(str(n) for n in sorted(non_cum))} days) - they must agree.")
+    elif non_cum and amd is not None and abs(next(iter(non_cum)) - amd) > 1:
+        n = next(iter(non_cum))
+        if cdom is None or abs(n - cdom) > 1:
+            warnings.append(
+                f"DOM consistency: prose cites {n} subject days on market; the authoritative active-market figure "
+                f"is {amd} days" + (f" (cumulative {cdom})" if cdom is not None else "") + " - verify.")
+
+    # ---- 5. asking-price consistency ---------------------------------------------------------
+    if ask:
+        for _key, (label, field_text) in fields.items():
+            ask_vals = set()
+            for m in _QA_ASK_RE.finditer(field_text or ""):
+                av = _parse_dollar(m.group(1), m.group(2))
+                if av >= 10000:
+                    ask_vals.add(av)
+            bad_ask = [a for a in ask_vals if abs(a - ask) > max(5000.0, 0.005 * ask)]
+            if bad_ask:
+                blocking.append(
+                    f"{label}: asking-price consistency states a list price of "
+                    f"{', '.join(f'${a:,.0f}' for a in bad_ask)} but the subject is listed at ${ask:,.0f}.")
+
+    # ---- 6. FMV consistency (should already be reconciled - this catches a straggler) --------
+    # NOT a competing concluded value: the labeled asking / list price ("the value is above the
+    # $1,350,000 asking price"), or an AUTHORITATIVE RANGE ENDPOINT ("a value in the $1.43M-$1.74M
+    # range" / "as low as $1,453,654") - those are the report's own numbers correctly quoted. Only a
+    # genuine rival FMV blocks.
+    _ASK_TAG_RE = re.compile(
+        r"\b(?:asking|list(?:ed|ing)?|ask)\b(?:\s+price)?|\bprice\s+(?:of|point)\b|\boriginal\s+list\b",
+        re.IGNORECASE,
+    )
+    _RANGE_TAG_RE = re.compile(
+        r"\b(?:range|band|low\s+end|high\s+end|as\s+low\s+as|as\s+high\s+as|between|lower\s+bound|"
+        r"upper\s+bound|from\s+\$|to\s+\$|[-–—]\s*\$)",
+        re.IGNORECASE,
+    )
+    _anchor_lo = _as_float((anchor or {}).get("anchor_low"))
+    _anchor_hi = _as_float((anchor or {}).get("anchor_high"))
+    # The comps' own weighted figure is quoted in plain words ("the adjusted comparable sales point
+    # to about $907,000") - it's a known number of the report, never a rival conclusion.
+    _anchor_mid = _as_float((anchor or {}).get("anchor_value"))
+    _fmv_ok = [g for g in (rmin, rmax, _anchor_lo, _anchor_hi, _anchor_mid) if g]
+    if v:
+        for _key, (label, field_text) in fields.items():
+            _blocked_fmv = False
+            for m in _FMV_TRIGGER_RE.finditer(field_text or ""):
+                seg = (field_text or "")[m.start():m.start() + 180]
+                for dm in _DOLLAR_RE.finditer(seg):
+                    parsed = _parse_dollar(dm.group(1), dm.group(2))
+                    if parsed < 100000:
+                        continue
+                    if ask and abs(parsed - ask) <= max(5000.0, 0.01 * ask):
+                        continue  # it's the list price, not another conclusion
+                    if any(abs(parsed - g) <= max(2500.0, 0.002 * v) for g in _fmv_ok):
+                        continue  # it's an authoritative range / anchor endpoint, correctly quoted
+                    _around = seg[max(0, dm.start() - 32):dm.end() + 24]
+                    if _ASK_TAG_RE.search(_around) or _RANGE_TAG_RE.search(_around) or _ANCHOR_PHRASE_RE.search(_around):
+                        continue  # explicitly tagged as the asking price, a range endpoint, or the anchor
+                    if abs(parsed - v) > max(5000.0, 0.015 * v):
+                        blocking.append(
+                            f"{label}: FMV consistency found {dm.group(0).strip()} next to a conclusion phrase, "
+                            f"but the report's one FMV is ${v:,.0f}.")
+                        _blocked_fmv = True
+                        break
+                if _blocked_fmv:
+                    break
+
+    # ---- 6b. anchor -> final-FMV DIRECTION vs. the prose (round 19). The Buyer Valuation Notes
+    #      must directionally agree with what the qualitative analysis actually did to the anchor.
+    #      If the anchor is $1.608M and the final FMV is $1.480M, the prose cannot say the value is
+    #      "close to the anchor", "in line with the comp anchor", or has a "modest upward tilt".
+    _av = _as_float(anchor.get("anchor_value"))
+    if v and _av and abs(_av - v) > max(15000.0, 0.02 * _av):
+        _rel = "below" if v < _av else "above"
+        _delta_pct = abs(_av - v) / _av * 100
+        for _key, (label, text) in fields.items():
+            if _key not in ("m", "vd") or not text:
+                continue
+            for cm in re.finditer(r"[^.!?]*\b(?:anchor|comp(?:arable[\s-]?sales?)?\s+anchor|deterministic\s+anchor)\b[^.!?]*[.!?]",
+                                  text, re.IGNORECASE):
+                sent = cm.group(0)
+                low = sent.lower()
+                # "close to / in line with / near / basically at / modest tilt" = a NEAR-ANCHOR claim
+                _near = re.search(r"\b(close to|in line with|near(?:ly)?|basically at|roughly at|about at|"
+                                  r"right at|essentially (?:at|the)|sits at|lands at|modest (?:upward|downward)?\s*(?:tilt|premium|discount)|"
+                                  r"slight (?:premium|discount)|small (?:premium|discount))\b", low)
+                _says_up = re.search(r"\b(above|over|exceeds?|premium to|higher than|tilt(?:s|ed)?\s+up|adjusted?\s+up|"
+                                     r"upward|lifts?|raises?)\b", low)
+                _says_down = re.search(r"\b(below|under|beneath|discount to|lower than|tilt(?:s|ed)?\s+down|adjusted?\s+down|"
+                                       r"downward|pulls?\s+(?:it\s+)?down|reduces?|trimmed|held below)\b", low)
+                _bad = False
+                if _rel == "below" and (_says_up or (_near and not _says_down)):
+                    _bad = True
+                elif _rel == "above" and (_says_down or (_near and not _says_up)):
+                    _bad = True
+                if _bad:
+                    blocking.append(
+                        f"{label}: describes the value as {'near / above' if _rel == 'below' else 'near / below'} "
+                        f"the comparable-sales anchor, but the final FMV (${v:,.0f}) is {_delta_pct:.0f}% "
+                        f"{_rel.upper()} the ${_av:,.0f} anchor. The Buyer Valuation Notes must state that the "
+                        f"qualitative analysis adjusted the anchor {_rel.upper()} to the final value.")
+                    break
+    if "anchor_fmv_direction" not in checks_run:
+        checks_run.append("anchor_fmv_direction")
+
+    # ---- 7. FMV range consistency ---------------------------------------------------------
+    if rmin and rmax:
+        for _key, (label, field_text) in fields.items():
+            for m in re.finditer(r"\$\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?\s*(?:to|[-–—]|and)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?", field_text or ""):
+                a = _parse_dollar(m.group(1), m.group(2))
+                b = _parse_dollar(m.group(3), m.group(4))
+                if a < 100000 or b < 100000:
+                    continue
+                pre = (field_text or "")[max(0, m.start() - 48):m.start()].lower()
+                if not any(w in pre for w in ("range", "between", "confidence", "value band", "estimated value")):
+                    continue
+                if abs(a - rmin) > max(2500.0, 0.002 * v) or abs(b - rmax) > max(2500.0, 0.002 * v):
+                    blocking.append(
+                        f"{label}: FMV range consistency found ${a:,.0f}-${b:,.0f}, which doesn't match the "
+                        f"authoritative final range ${rmin:,.0f}-${rmax:,.0f}.")
+                    break
+
+    # ---- 8. comp classification consistency ------------------------------------------------
+    # "closest" is deliberately excluded here - it's a distance claim, not a valuation-weight
+    # claim, and is checked against actual distance_miles separately by
+    # _reconcile_closest_comp_claims (which also auto-fixes it) rather than against
+    # strength/anchor-role here.
+    _SUPERLATIVE_RE = re.compile(
+        r"\b(primary|best|strongest|key|anchor|most\s+(?:comparable|similar|relevant))\s+"
+        r"(comp|comparable|sale|match)\b", re.IGNORECASE)
+    for _key, (label, text) in fields.items():
+        for chunk, _s, _e in _sentence_chunks(text or ""):
+            if not _SUPERLATIVE_RE.search(chunk):
+                continue
+            for cm in re.finditer(r"comp\s*#\s*(\d+)", chunk, re.IGNORECASE):
+                num = int(cm.group(1))
+                info = comp_by_num.get(num)
+                if not info:
+                    continue
+                if (str(num) in ctx_labels or not info.get("in_anchor")) and str(num) not in reasoning_primary_nums:
+                    blocking.append(
+                        f"{label}: calls Comp #{num} a primary/best comparable, but it carries no valuation "
+                        f"weight (context-only in the anchor).")
+                elif info.get("strength") != "strong" and str(num) not in reasoning_primary_nums:
+                    warnings.append(
+                        f"{label}: calls Comp #{num} a primary/best comparable, but it's rated "
+                        f"{info.get('strength') or 'unrated'}, not Strong.")
+                elif info.get("outlier"):
+                    warnings.append(
+                        f"{label}: calls Comp #{num} a primary/best comparable, but it carries a $/sq ft outlier flag.")
+                elif info.get("redundancy_penalty") and info["redundancy_penalty"] < 0.95:
+                    warnings.append(
+                        f"{label}: calls Comp #{num} a primary/best comparable, but it's redundancy-penalised "
+                        f"(near-duplicate of another comp).")
+
+    # ---- 9. comp quality rating vs commentary --------------------------------------------
+    _DIM_PHRASES = [
+        (re.compile(r"\b(superior|better\s+finished|more\s+updated|more\s+renovated|higher-end|nicer)\b.{0,30}\b(finish|interior|kitchen|bath|condition)\b", re.IGNORECASE), "finish_quality", "above"),
+        (re.compile(r"\b(inferior|more\s+dated|less\s+updated|weaker)\b.{0,30}\b(finish|interior|kitchen|bath|condition)\b", re.IGNORECASE), "finish_quality", "below"),
+        (re.compile(r"\b(superior|better|larger|premium)\s+(lot|parcel|grounds|acreage|land)\b", re.IGNORECASE), "lot", "above"),
+        (re.compile(r"\b(inferior|smaller|weaker)\s+(lot|parcel|grounds|acreage)\b", re.IGNORECASE), "lot", "below"),
+        (re.compile(r"\b(better|stronger|superior)\s+(curb\s+appeal|exterior|facade|façade)\b", re.IGNORECASE), "exterior", "above"),
+        (re.compile(r"\b(quieter|better|calmer|superior)\s+(street|road|setting|location\s+within)\b", re.IGNORECASE), "street_context", "above"),
+    ]
+    for _key, (label, text) in fields.items():
+        for chunk, _s, _e in _sentence_chunks(text or ""):
+            nums = [int(x) for x in re.findall(r"comp\s*#\s*(\d+)", chunk, re.IGNORECASE)]
+            if len(set(nums)) != 1:
+                continue
+            info = comp_by_num.get(nums[0])
+            if not info:
+                continue
+            for pat, dim, claimed in _DIM_PHRASES:
+                if not pat.search(chunk):
+                    continue
+                rating = info["quality"].get(dim)
+                opp = "below" if claimed == "above" else "above"
+                if rating == opp:
+                    blocking.append(
+                        f"{label}: says Comp #{nums[0]} is {claimed.replace('_', ' ')} on {dim.replace('_', ' ')}, "
+                        f"but that comp's structured rating for {dim.replace('_', ' ')} is the opposite "
+                        f"({'subject superior' if opp == 'below' else 'comp superior'}).")
+                elif rating in ("similar", "", None) and claimed in ("above", "below"):
+                    warnings.append(
+                        f"{label}: makes a {dim.replace('_', ' ')} comparison for Comp #{nums[0]} that its "
+                        f"structured rating doesn't commit to ('{rating or 'unrated'}').")
+
+    # ---- 10. value-driver notes vs the trace  (drivers describe COMP POSITIONING, not the
+    #      adjustment layer - so this is a coherence check, not a per-item equivalence). ---------
+    pulled = trace.get("authority") != "reasoning_model" and gate.get("action") in (
+        "pulled_down", "extended_pull", "capped_by_exposure", "clamped_to_contract_price"
+    )
+    _drv_dirs = [str(d.get("direction") or "").lower() for d in (value_drivers or [])]
+    _up = sum(1 for x in _drv_dirs if "up" in x or "higher" in x or "premium" in x)
+    _down = sum(1 for x in _drv_dirs if "down" in x or "lower" in x or "discount" in x)
+    if value_drivers and _up >= 2 and _down == 0 and pulled and v and ask and v <= ask:
+        warnings.append(
+            f"Value-driver coherence: every 'Why this number' driver points UP, but the value was capped down "
+            f"to ${v:,.0f} by market exposure ({gate.get('action')}). Make sure the driver notes explain that the "
+            f"comps support a higher number the market hasn't paid, so the section doesn't read as bullish.")
+    # a driver dollar figure, if any, should trace to a real adjustment (±5%)
+    _adj_amts = [abs(a.get("applied", 0)) for a in trace_adjustments if a.get("applied")]
+    for d in (value_drivers or []):
+        for fig in _v10_extract_dollars(str(d.get("note") or "")):
+            if 20000 <= fig <= 0.30 * (v or 1) and _adj_amts and not any(abs(fig - x) <= 0.05 * max(x, 1) for x in _adj_amts):
+                warnings.append(
+                    f"Value driver '{d.get('comp_label') or d.get('comp_ref') or ''}' cites ${fig:,.0f}, which doesn't "
+                    f"match any bounded adjustment in the trace - verify it isn't an unsupported dollar claim.")
+                break
+
+    # ---- 11. displayed statistics vs authoritative backend values ---------------------------
+    t_fmv = trace.get("final_fmv")
+    if t_fmv is not None and v and abs(t_fmv - v) > 1:
+        blocking.append(
+            f"Displayed stats: valuation_trace.final_fmv (${t_fmv:,.0f}) != the headline FMV (${v:,.0f}) - the "
+            f"report and the audit trail would show different numbers.")
+    t_rng = trace.get("range_pct")
+    if t_rng is not None and abs(t_rng - range_pct) > 0.15:
+        blocking.append(
+            f"Displayed stats: valuation_trace.range_pct ({t_rng}%) != the applied range ({range_pct}%).")
+    if trace.get("mode") == "insufficient_evidence":
+        if (confidence or "").lower() != "low":
+            blocking.append("Displayed stats: insufficient-evidence mode must report Low confidence.")
+        if not trace.get("requires_agent_review"):
+            warnings.append("Displayed stats: insufficient-evidence mode should set requires_agent_review.")
+    if anchor.get("anchor_value"):
+        al, ah, av = anchor.get("anchor_low"), anchor.get("anchor_high"), anchor.get("anchor_value")
+        if al and ah and not (al <= av <= ah):
+            blocking.append(
+                f"Displayed stats: anchor range ${al:,.0f}-${ah:,.0f} does not bracket the anchor value ${av:,.0f}.")
+
+    # ---- 12. prose hygiene ---------------------------------------------------------------
+    for key, (label, text) in fields.items():
+        if not text:
+            out_fields[key] = text
+            continue
+        cur = text
+        # placeholders
+        pm = _QA_PLACEHOLDER_RE.search(cur)
+        if pm:
+            blocking.append(f"{label}: contains a placeholder / unfilled token (\"{pm.group(0).strip()}\") - complete it before export.")
+        # duplicate consecutive words -> auto-fix
+        def _dedup(m: "re.Match") -> str:
+            return m.group(1)
+        deduped = _QA_DUP_WORD_RE.sub(_dedup, cur)
+        if deduped != cur:
+            corrections.append(f"{label}: removed a repeated word.")
+            cur = deduped
+        # repeated back-to-back phrase ("under contract under contract") - run to a fixed point
+        for _ in range(3):
+            dp = _QA_DUP_PHRASE_RE.sub(_dedup, cur)
+            if dp == cur:
+                break
+            corrections.append(f"{label}: removed a repeated phrase (\"{_QA_DUP_PHRASE_RE.search(cur).group(1).strip()}\").")
+            cur = dp
+        # double period / space-before-punct / triple space -> auto-fix
+        for pat, repl, why in (
+            (re.compile(r"(?<!\.)\.\.(?!\.)"), ".", "collapsed a double period"),
+            # a stray single-letter abbreviation fragment before a comma ("e. ," / "i. ,") - the
+            # remnant of a mangled "i.e.," / "e.g.," that lost its other letter somewhere upstream.
+            # No genuine sentence ever ends a clause on a bare single letter + period + comma, so
+            # it's always safe to drop the fragment rather than guess which abbreviation it was.
+            (re.compile(r"\b[a-zA-Z]\.\s+,"), ",", "removed a corrupted abbreviation fragment before a comma"),
+            (re.compile(r"\s+([,.;:])"), r"\1", "removed a space before punctuation"),
+            (re.compile(r"[ \t]{3,}"), " ", "collapsed excess spacing"),
+        ):
+            nc = pat.sub(repl, cur)
+            if nc != cur:
+                corrections.append(f"{label}: {why}.")
+                cur = nc
+        cur, repaired_dangling = _repair_unambiguous_dangling_connectors(cur)
+        if repaired_dangling:
+            corrections.append(f"{label}: removed an unfinished trailing connector without changing the factual clause.")
+        # corrupted merges
+        if _QA_MERGE_RE.search(cur):
+            warnings.append(f"{label}: two sentences look merged with no space after a period - review.")
+        camel = [w for w in _QA_CAMEL_IN_WORD_RE.findall(cur) if w.lower() not in _QA_ALLOWED_CAMEL]
+        if camel:
+            warnings.append(f"{label}: a word looks like a corrupted merge (\"{camel[0]}\") - review.")
+        # dangling connectors / unfinished phrases (skip for the synthetic joined value-driver
+        # field 'vd' - it's newline-joined notes, only scanned here for numbers/status/dupes)
+        if key != "vd" and _QA_DANGLING_RE.search(cur):
+            warnings.append(f"{label}: a sentence ends on a dangling connector (\"such as.\", \"between.\", etc.) - finish or trim it.")
+        _stripped = cur.strip()
+        if key != "vd" and _stripped and _stripped[-1] not in ".!?\"')" and len(_stripped.split()[-5:]) >= 1 and len(_stripped) > 40:
+            warnings.append(f"{label}: the text doesn't end on terminal punctuation - it may be cut off.")
+        # duplicate sentences
+        seen: dict = {}
+        for chunk, _s, _e in _sentence_chunks(cur):
+            n = _qa_norm_sentence(chunk)
+            if len(n) >= 40:
+                seen[n] = seen.get(n, 0) + 1
+        if any(c >= 2 for c in seen.values()):
+            warnings.append(f"{label}: a sentence is repeated almost verbatim - remove the duplicate.")
+        # contradiction: turnkey + dated about the subject in the same field, where the span
+        # between the two phrases doesn't name a comp (i.e. it's about the subject).
+        tk, dt = _QA_TURNKEY_RE.search(cur), _QA_DATED_RE.search(cur)
+        if tk and dt:
+            span = cur[min(tk.start(), dt.start()):max(tk.end(), dt.end())]
+            comparison_context = re.search(
+                r"\b(comp(?:arable)?s?|competition|sales?|offerings?|bracket|inventory|other\s+homes?|"
+                r"relative\s+to|compared\s+(?:with|to)|separate[sd]?\s+(?:it|the\s+subject)\s+from)\b",
+                span, re.IGNORECASE,
+            )
+            if not comparison_context:
+                warnings.append(f"{label}: describes the subject as both turnkey and dated/needing work - reconcile.")
+        out_fields[key] = cur
+
+    # ---- 13. unsupported hard system / permit claims ---------------------------------------
+    for key, (label, text) in fields.items():
+        for m in list(_QA_HARD_FACT_RE.finditer(text or "")) + list(_QA_YEAR_SYSTEM_RE.finditer(text or "")):
+            # only a verify/confirm word IMMEDIATELY BEFORE the claim (same clause) makes it a
+            # to-verify item - a "confirm" later in the sentence about something else doesn't.
+            before = (text or "")[max(0, m.start() - 40):m.start()]
+            if _QA_VERIFY_NEARBY_RE.search(before) and not re.search(r"[.;]", before):
+                continue  # phrased as an item to verify - allowed
+            blocking.append(
+                f"{label}: asserts a hard system/permit fact (\"{m.group(0).strip()}\") not backed by verified "
+                f"subject data - phrase it as 'verify ...' or remove it.")
+            break
+
+    # ---- 14. valuation reliability - the primary AI valuation call failed this run and the
+    #      pipeline fell back to the deterministic benchmark alone (see generate_ai_analysis's
+    #      subject_estimate_missing marker). Never blocking - the deterministic fallback, or a
+    #      reasoning pass run on top of it, is still a valid number - but this can never look like
+    #      an ordinary clean "Passed" run. Names which authority actually produced the final FMV so
+    #      the agent isn't left assuming a full AI read backs it.
+    checks_run.append("valuation_reliability")
+    if trace.get("subject_estimate_missing"):
+        if trace.get("authority") == "reasoning_model":
+            _authority_desc = (
+                f"{trace.get('reasoning_model_name') or 'the reasoning model'}, reasoning from the "
+                "deterministic comp benchmark alone (no independent AI value read to reconcile against)"
+            )
+        else:
+            _authority_desc = "the deterministic comparable-sales formula alone (no AI valuation call succeeded this run)"
+        warnings.append(
+            f"Valuation reliability: the AI's own value read came back unusable (malformed tool output) "
+            f"this run - the final ${v:,.0f} FMV was produced by {_authority_desc}. Confidence: "
+            f"{confidence or 'unknown'}. Re-run the analysis for an independent AI read."
+        )
+
+    passed = not blocking and not warnings
+    qa_result = {
+        "version": "v10-pre-export-1",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "checks_run": checks_run,
+        "passed": passed,
+        "warnings": warnings,
+        "blocking_errors": blocking,
+        "corrections": corrections,
+        "export_allowed": not blocking,
+    }
+    return qa_result, out_fields, blocking
+
+
+# ============================================================================================
+# ONE authoritative source for every descriptive CMA statistic (Studio · PDF · public report)
+# --------------------------------------------------------------------------------------------
+def _annotate_comp_valuation_roles(comps: list[dict], anchor: Optional[dict]) -> list[dict]:
+    """Attach the actual anchor weight/role after deterministic relevance classification."""
+    weighted = {}
+    for item in (anchor or {}).get("comps") or []:
+        weight = _as_float(item.get("normalized_weight")) or 0.0
+        if weight <= 0:
+            continue
+        if item.get("listing_key"):
+            weighted[("key", str(item["listing_key"]))] = weight
+        if item.get("label"):
+            weighted[("label", str(item["label"]))] = weight
+    out: list[dict] = []
+    for i, source in enumerate(comps or []):
+        comp = dict(source)
+        weight = weighted.get(("key", str(comp.get("listing_key"))))
+        if weight is None:
+            weight = weighted.get(("label", _comp_label(i, comp)), 0.0)
+        comp["valuation_weight"] = round(float(weight or 0.0), 6)
+        comp["valuation_role"] = "valuation_comp" if weight and weight > 0 else "context_only"
+        out.append(comp)
+    return out
+
+
+def _cma_display_comp_stats(comps: list) -> Optional[dict]:
+    """The single backend source of truth for every comp/valuation statistic shown ANYWHERE in
+    the CMA. It uses valuation comps and their actual normalized continuous-relevance weights;
+    the frontend formats these numbers and does not independently recreate them.
+
+    Returns keys: count, total_shown, enough_for_stats, sale_min/max, sale_weighted_avg,
+    sale_median, psf_min/max, psf_weighted_avg, psf_median, subject_psf_list, method. None only
+    when there are no included comps at all."""
+    included = [c for c in (comps or []) if c.get("is_included", True)]
+    if not included:
+        return None
+
+    def _eff_price(c: dict) -> Optional[float]:
+        st = str(c.get("status") or "").lower()
+        if st in ("sold", "closed"):
+            if c.get("price_verified", True) is False:
+                return None
+            return _as_float(c.get("sale_price")) or _as_float(c.get("close_price"))
+        return _as_float(c.get("list_price"))
+
+    has_anchor_roles = any("valuation_weight" in c for c in included)
+
+    def _wt(c: dict) -> float:
+        if c.get("price_verified", True) is False or _eff_price(c) is None:
+            return 0.0
+        if has_anchor_roles:
+            return max(0.0, _as_float(c.get("valuation_weight")) or 0.0)
+        return {"strong": 1.0, "supporting": 0.5, "weak": 0.0}.get(_normalize_strength(c.get("strength")) or "supporting", 0.5)
+
+    pool = [c for c in included if _wt(c) > 0]
+    price_rows = [(_eff_price(c), _wt(c)) for c in pool]
+    price_rows = [(p, w) for p, w in price_rows if p and w > 0]
+    psf_rows = []
+    for c in pool:
+        p, s = _eff_price(c), _as_float(c.get("sqft"))
+        if p and s and s > 0 and _wt(c) > 0:
+            psf_rows.append((round(p / s), _wt(c)))
+    enough = len(pool) >= 2
+
+    def _wmean(rows: list) -> Optional[float]:
+        w = sum(r[1] for r in rows)
+        return (sum(v * x for v, x in rows) / w) if w > 0 else None
+
+    prices = [r[0] for r in price_rows]
+    psf = [r[0] for r in psf_rows]
+    return {
+        "count": len(pool),
+        "total_shown": len(included),
+        "enough_for_stats": enough,
+        "sale_min": round(min(prices)) if prices else None,
+        "sale_max": round(max(prices)) if prices else None,
+        "sale_weighted_avg": round(_wmean(price_rows)) if (enough and price_rows) else None,
+        "sale_median": round(_v10_median(prices)) if (enough and prices) else None,
+        "psf_min": min(psf) if psf else None,
+        "psf_max": max(psf) if psf else None,
+        "psf_weighted_avg": round(_wmean(psf_rows)) if (enough and psf_rows) else None,
+        "psf_median": round(_v10_median(psf)) if (enough and psf) else None,
+        "method": ("actual normalized valuation-anchor weights, verified prices only" if has_anchor_roles
+                   else "weighted by classification (Strong 1.0 / Supporting 0.5), verified prices only"),
+    }
+
+
+# ============================================================================================
+# Post-exposure-gate prose reconciliation
+# --------------------------------------------------------------------------------------------
+_RANGE_IN_PROSE_RE = re.compile(
+    r"\$\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?\s*(?:to|through|[-–—]|and)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?",
+)
+
+
+def _v10_why_this_number(trace: Optional[dict], value: float, range_pct: float) -> str:
+    """Fix 4. A plain-language 'why this number' paragraph built from the FINAL authoritative
+    valuation trace: the comp anchor + the 2 comps that moved it most, size + finished-basement
+    normalization, the weighted condition/amenity read and how it was reflected or offset,
+    location/street weight effects, the itemised feature adjustments, market exposure, and any
+    gate/cap. No formulas, weights, or internal vocabulary - this is client-facing prose."""
+    t = trace or {}
+    a = t.get("anchor") or {}
+    authoritative_anchor = _as_float(t.get("deterministic_anchor")) or _as_float(a.get("anchor_value"))
+    a_val = authoritative_anchor or 0.0
+    if not value or not a_val:
+        return ""
+    a_high = _as_float(a.get("anchor_high")) or a_val
+    comps = sorted((a.get("comps") or []), key=lambda c: abs(c.get("dollar_contribution_to_anchor") or 0), reverse=True)
+    top = [c["label"] for c in comps[:2] if c.get("label")]
+    s: list = []
+    if top:
+        s.append(f"The value starts from what the comparable sales point to - about ${round(a_val, -3):,.0f}, "
+                 f"weighted toward {' and '.join(top)} as the closest recent sales.")
+    else:
+        s.append(f"The value starts from what the comparable sales point to - about ${round(a_val, -3):,.0f}.")
+    s.append("Each sale was adjusted for its size difference with the subject before being compared.")
+    if (a.get("psf_leg_normalized_comp_count") or 0) > 0:
+        s.append("Because some of those sales include large finished lower levels, their per-square-foot figures "
+                 "were brought back to an above-grade basis so the comparison is like-for-like.")
+    cond = t.get("weighted_condition_signal") or {}
+    qr = t.get("qualitative_reconciliation") or {}
+    if cond.get("direction") == "subject_inferior":
+        if qr.get("offsets_accepted"):
+            s.append("The comps are generally more updated than the subject; that downward pressure is offset by "
+                     "the subject's own advantages (such as accessory space, grounds, or architectural character), "
+                     "leaving the condition effect close to neutral.")
+        else:
+            s.append("The comps are generally more updated than the subject, which weighs on the figure.")
+    elif cond.get("direction") == "subject_superior":
+        s.append("The subject shows better than the comp set on condition and finish, which supports the figure.")
+    adj = t.get("adjustments") or []
+    ups = [p["factor"] for p in adj if (p.get("applied") or 0) > 0][:3]
+    downs = [p["factor"] for p in adj if (p.get("applied") or 0) < 0][:3]
+    if ups:
+        s.append(f"Features adding value: {', '.join(ups)}.")
+    if downs:
+        s.append(f"Features subtracting: {', '.join(downs)}.")
+    if any((c.get("location_weight_penalty") or 1.0) < 0.98 for c in comps):
+        s.append("Comps in a different school district or municipality, or on a busier street, were given less "
+                 "weight rather than a separate dollar penalty, so the location isn't counted twice.")
+    exp = t.get("exposure") or {}
+    gate = t.get("above_ask_gate") or {}
+    amd = exp.get("active_market_days")
+    ask = _as_float(t.get("subject_asking"))
+    act = gate.get("action")
+    if act in ("pulled_down", "capped_by_exposure", "extended_pull"):
+        dom = f"{int(amd)} days on the market with no accepted offer" if amd else "extended time on the market with no offer"
+        s.append(f"The comparable sales support a figure up to roughly ${a_high:,.0f}, but after {dom} the supported "
+                 f"current value is held to ${value:,.0f} - the comps set a theoretical ceiling and the market's own "
+                 f"response is the evidence of what buyers will actually pay.")
+    elif act == "clamped_to_contract_price":
+        s.append(f"A verified accepted contract price is the strongest single data point, so the supported value is "
+                 f"held at ${value:,.0f}.")
+    elif act == "allowed_above_ceiling" and ask:
+        s.append(f"The figure sits above the ${ask:,.0f} asking price; the closed sales cover the difference through "
+                 f"paired comparison - confirm before relying on it.")
+    elif ask and value > ask * 1.02:
+        s.append(f"The concluded value is above the ${ask:,.0f} asking price because the verified closed sales, "
+                 f"adjusted to the subject, support it.")
+    elif ask and value < ask * 0.98:
+        s.append(f"The concluded value is below the ${ask:,.0f} asking price because the verified closed sales, "
+                 f"adjusted to the subject, come in beneath it.")
+    return " ".join(s)
+
+
+_ANCHOR_DOWN_RE = re.compile(
+    r"\b(below|under|beneath|discount to|lower than|downward|adjusted?\s+down|"
+    r"pulls?\s+(?:it\s+)?down|reduces?|trimmed|held below)\b",
+    re.IGNORECASE,
+)
+_ANCHOR_UP_RE = re.compile(
+    r"\b(above|over|exceeds?|premium to|higher than|upward|adjusted?\s+up|"
+    r"lifts?|raises?)\b",
+    re.IGNORECASE,
+)
+
+
+def _v10_reconcile_anchor_direction_prose(methodology: str, *, final: Optional[dict],
+                                          trace: Optional[dict]) -> tuple[str, list[str]]:
+    """Ensure the client valuation notes affirmatively describe a material final-FMV move away
+    from the comparable-sales anchor. Contradictory prose is still blocked later by QA; this helper
+    only appends the missing source-of-truth direction when the notes are silent or merely neutral."""
+    if not methodology or not final:
+        return methodology, []
+    v = _as_float(final.get("value"))
+    a = _as_float(final.get("anchor_value")) or _as_float(((trace or {}).get("anchor") or {}).get("anchor_value"))
+    if not v or not a:
+        return methodology, []
+    if abs(v - a) <= max(15000.0, 0.02 * a):
+        return methodology, []
+    rel = "below" if v < a else "above"
+    pct = abs(v - a) / a * 100
+    has_anchor = bool(_ANCHOR_PHRASE_RE.search(methodology))
+    has_rel = bool((_ANCHOR_DOWN_RE if rel == "below" else _ANCHOR_UP_RE).search(methodology))
+    if (has_anchor and has_rel) or "adjusted comparable sales point to" in methodology.lower():
+        return methodology, []
+
+    # Client-facing: plain words, rounded figures - it used to read "about 3.1% above the $907,051
+    # comparable-sales anchor; after the complete comp, property, and market-exposure reconciliation".
+    if (trace or {}).get("authority") == "reasoning_model":
+        reason = "after weighing this home's own features and today's market"
+    else:
+        qr = (trace or {}).get("qualitative_reconciliation") or {}
+        gate_action = ((trace or {}).get("above_ask_gate") or {}).get("action")
+        if rel == "below":
+            reason = ("after accounting for where this home falls short of those sales" if qr.get("aggregate_inferiority")
+                      else "after adjusting for this home's specific features")
+            if gate_action in ("pulled_down", "capped_by_exposure", "extended_pull", "clamped_to_contract_price"):
+                reason = "after factoring in how long it has been on the market"
+        else:
+            reason = "after crediting the features this home offers beyond those sales"
+    sentence = (
+        f" Weighted together, the adjusted comparable sales point to about ${round(a, -3):,.0f}; {reason}, "
+        f"the final value lands about {max(1, round(pct))}% {rel} that, at ${v:,.0f}."
+    )
+    return methodology.rstrip() + sentence, [
+        f"Methodology summary: appended plain-language comps-to-final-value direction ({rel}) from the final valuation object."
+    ]
+
+
+def _reconcile_post_gate_prose(fields: dict, *, value: float, range_pct: float,
+                               anchor: Optional[dict], trace: Optional[dict], value_drivers: Optional[list]) -> tuple:
+    """Stage-4's exposure gate can MOVE the FMV after the AI has already written methodology /
+    value-driver prose. This brings that prose back into agreement with the authoritative final
+    number - deterministically, no model call. Returns (new_fields, new_value_drivers, flags).
+    new_fields keeps the {key: (label, text)} shape.
+
+    Fix 4: also ensures the methodology's 'why this number' actually reflects the FINAL trace - the
+    anchor + top comps + size / sqft-composition normalization + the weighted condition read + the
+    exposure/gate effect + why the number sits where it does relative to the asking price."""
+    flags: list = []
+    out = {k: (lbl, txt) for k, (lbl, txt) in fields.items()}
+    vd = [dict(d) for d in (value_drivers or [])]
+    if not value:
+        return out, vd, flags
+
+    gate = (trace or {}).get("above_ask_gate") or {}
+    action = gate.get("action")
+    pulled = (trace or {}).get("authority") != "reasoning_model" and bool(gate.get("applied")) and action in (
+        "pulled_down", "capped_by_exposure", "extended_pull", "clamped_to_contract_price")
+    rmin, rmax = _authoritative_range(value, range_pct, trace)
+    a = anchor or {}
+    a_val = _as_float(a.get("anchor_value"))
+    a_high = _as_float(a.get("anchor_high")) or a_val
+    exp = (trace or {}).get("exposure") or {}
+    amd = exp.get("active_market_days")
+    tol = max(5000.0, 0.02 * value)
+
+    _VAL_LANG = ("range", "between", "indicated value", "value range", "supported value", "estimated value",
+                 "concluded value", "concluded at", "fair market value", "our valuation", "value of",
+                 "roughly", "approximately", "band", "settle", "arrive at")
+    # the pre-gate / pre-engine numbers a stale "concluded value" figure might still be quoting:
+    # the gate's own "from", the anchor + anchor-high, and the AI's own pre-engine estimate (which
+    # the v10 engine never uses as the value, so it must never survive as a concluded figure).
+    _old_nums = [n for n in (_as_float((gate or {}).get("from")), a_val, a_high,
+                             _as_float((trace or {}).get("ai_value_cross_check")),
+                             _as_float((trace or {}).get("fmv_pre_exposure")),
+                             _as_float((trace or {}).get("v10_formula_fmv"))) if n]
+
+    # 1) stale "$X to $Y" ranges near value language -> the real final range (always, even if the
+    #    gate didn't fire - the AI can still have written a range that doesn't match range_pct).
+    for k, (label, text) in list(out.items()):
+        if not text:
+            continue
+        def _fix_range(m: "re.Match", _label=label, _text=text) -> str:
+            lo = _parse_dollar(m.group(1), m.group(2))
+            hi = _parse_dollar(m.group(3), m.group(4))
+            if lo < 100000 or hi < 100000 or hi <= lo:
+                return m.group(0)
+            pre = _text[max(0, m.start() - 64):m.start()].lower()
+            # An offer range and a valuation range are different entities. The old broad check
+            # treated words such as "roughly" as value language, so a valid opening offer could be
+            # overwritten with the full Astra confidence interval after the offer builder ran.
+            if any(w in pre for w in (
+                    "opening offer", "initial offer", "starting offer", "start at", "open at",
+                    "offer is", "offer of", "bid of", "come in at", "propose",
+            )) and not any(w in pre for w in (
+                    "valuation range", "value range", "confidence range", "supported range",
+                    "estimated value range", "final range",
+            )):
+                return m.group(0)
+            if not any(w in pre for w in _VAL_LANG):
+                return m.group(0)
+            if abs(lo - rmin) <= tol and abs(hi - rmax) <= tol:
+                return m.group(0)
+            flags.append(f"{_label}: a stated value range {m.group(0).strip()} was rewritten to the final ${rmin:,.0f}–${rmax:,.0f}.")
+            # Round 18: keep a space/punctuation boundary after the rewrite so we never emit
+            # "$1,671,505centered".
+            _tail = _text[m.end():m.end() + 1]
+            _sep = " " if _tail and (_tail.isalnum() or _tail in "([{") else ""
+            return f"${rmin:,.0f}–${rmax:,.0f}{_sep}"
+        new_text = _RANGE_IN_PROSE_RE.sub(_fix_range, text)
+
+        # 1b) a bare "$X" next to value-conclusion language that still equals an OLD pre-final number
+        #     (the pre-gate anchor OR the pre-Stage-3 figure the AI wrote its prose against) -> the
+        #     final value. Round 18: fires whenever the FINAL FMV diverges materially from any of
+        #     those, not only when the exposure gate pulled - Stage-3 adjustments / the qualitative-
+        #     inferiority shortfall move the number too, and the AI's methodology + offer prose were
+        #     written before that.
+        _final_diverged = any(abs(value - o) > tol for o in _old_nums)
+        if (pulled or _final_diverged) and _old_nums:
+            _tight = new_text
+            def _fix_fig(m: "re.Match", _label=label) -> str:
+                fig = _parse_dollar(m.group(1), (m.group(2) or "").strip() or None)
+                if fig < 100000 or abs(fig - value) <= tol:
+                    return m.group(0)
+                # a legitimate confidence-range endpoint is not a stale value (issue #4)
+                if abs(fig - rmin) <= tol or abs(fig - rmax) <= tol:
+                    return m.group(0)
+                if not any(abs(fig - o) <= max(8000.0, 0.015 * o) for o in _old_nums):
+                    return m.group(0)
+                # value-conclusion language on EITHER side of the figure ("indicated value of $X"
+                # OR "$X indicated value"), within the same clause - not the next sentence.
+                back = re.split(r"[.!?;]\s", _tight[max(0, m.start() - 70):m.start()].lower())[-1]
+                fwd = re.split(r"[.!?;]", _tight[m.end():m.end() + 34].lower())[0]
+                # The anchor is an intentionally different structured value. In wording such as
+                # "the final FMV is below the $X comparable-sales anchor", nearby FMV language
+                # belongs to the first figure and must not relabel the anchor as stale.
+                if _ANCHOR_PHRASE_RE.search(fwd):
+                    return m.group(0)
+                if not (any(w in back for w in _VAL_LANG) or any(w in fwd for w in _VAL_LANG)):
+                    return m.group(0)
+                flags.append(f"{_label}: a stale value of {m.group(0).strip()} (the pre-gate number) was corrected to the final ${value:,.0f}.")
+                return f"${value:,.0f}"
+            new_text = re.sub(r"\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?)(\s?[MmKk])?", _fix_fig, new_text)
+        out[k] = (label, new_text)
+
+    # 1c) Fix 4 - whether or not the gate fired: if the final value sits materially above or below
+    #     the asking price and the methodology never says WHY (from the closed-sale evidence), add
+    #     a one-line deterministic explanation grounded in the trace.
+    _ask = _as_float((trace or {}).get("subject_asking"))
+    m_label0, m_text0 = out.get("m", ("Methodology summary", ""))
+    if m_text0 and _ask and abs(value - _ask) > max(0.02 * _ask, 20000):
+        _rel = "above" if value > _ask else "below"
+        _has_why = re.search(
+            rf"{_rel}\s+(?:the\s+)?(?:\$\s*[\d,]+(?:\.\d+)?\s*)?(?:asking|list)",
+            m_text0, re.IGNORECASE,
+        ) and re.search(
+            r"(closed sale|comparable sale|sold comp|paired|because|driven by|reflect|support)", m_text0, re.IGNORECASE)
+        if not _has_why:
+            if _rel == "above":
+                _add = (f" The concluded value sits above the ${_ask:,.0f} asking price because the verified "
+                        f"closed sales - size-adjusted to the subject - support it; the list price is not the ceiling "
+                        f"the market evidence points to.")
+            else:
+                _add = (f" The concluded value sits below the ${_ask:,.0f} asking price because the verified closed "
+                        f"sales, adjusted to the subject, come in beneath it - the asking price is ahead of the "
+                        f"comparable evidence.")
+            out["m"] = (m_label0, m_text0.rstrip() + _add)
+            flags.append("Methodology summary: added a deterministic note explaining why the value sits above/below asking, from the closed-sale evidence.")
+
+    if not pulled or not a_val or a_val <= value * 1.02:
+        return out, vd, flags
+
+    # 2) methodology: state the comps-vs-exposure story explicitly if it isn't already there.
+    m_label, m_text = out.get("m", ("Methodology summary", ""))
+    _has_exposure_story = bool(m_text) and re.search(
+        r"(exposure|time on the market|days on market|without an accepted offer|market has not)",
+        m_text, re.IGNORECASE) and re.search(
+        r"(constrain|cap(?:s|ped)?|pull|held?|hold|limit|below the (?:comp|anchor|indicated))",
+        m_text, re.IGNORECASE)
+    if m_text and not _has_exposure_story:
+        # Fix 4: prefer the fuller trace-grounded "why this number" paragraph; fall back to the
+        # narrow comps-vs-exposure sentence if it can't be built.
+        _why = _v10_why_this_number(trace, value, range_pct)
+        if _why:
+            add = " " + _why
+        elif action == "clamped_to_contract_price":
+            add = (f" The comparable sales indicate roughly ${a_val:,.0f}, but the verified accepted contract price "
+                   f"is the single strongest data point, so the supported value is held at ${value:,.0f}.")
+        else:
+            dom = (f"{int(amd)} active-market days with no accepted offer" if amd
+                   else "the subject's extended time on the market with no accepted offer")
+            add = (f" The comparable sales support a value up to roughly ${a_high:,.0f}; {dom} constrains the "
+                   f"supported current value to ${value:,.0f}. The comps establish a higher theoretical range, "
+                   f"and the subject's own market exposure is the evidence of what buyers have actually been willing to pay.")
+        out["m"] = (m_label, m_text.rstrip() + add)
+        flags.append("Methodology summary: appended a deterministic 'why this number' note reconciling the comp anchor, the qualitative read, and the exposure-gated final value.")
+
+    # 3) value drivers all pointing up while the gate pulled down -> add the exposure driver so
+    #    the "Why this number" section isn't one-sidedly bullish.
+    dirs = [str(d.get("direction") or "").lower() for d in vd]
+    if vd and dirs and all(("up" in d or "higher" in d or d == "" or d == "neutral") for d in dirs) \
+       and any("up" in d or "higher" in d for d in dirs):
+        vd.append({
+            "comp_key": "",
+            "comp_label": "Market exposure",
+            "direction": "down",
+            "note": ((f"{int(amd)} active-market days with no accepted offer" if amd
+                      else "Extended market exposure with no accepted offer")
+                     + f" holds the supported value at ${value:,.0f}, below the ~${a_val:,.0f} comparable indication."),
+        })
+        flags.append("Value drivers: every comp driver pointed up while the final value was gated down - added a 'Market exposure' driver so the section reflects the constraint.")
+
+    return out, vd, flags
+
+
+async def _targeted_gate_rewrite(methodology: str, offer: str, *, value: float, range_pct: float,
+                                 anchor: Optional[dict], trace: Optional[dict], mode: str, model: str) -> tuple:
+    """ONE small model call that rewrites ONLY the methodology summary (and, buyer mode, the offer
+    strategy) so they agree with the FINAL authoritative FMV / range - used when deterministic
+    reconciliation left a real contradiction (the exposure gate moved the number, OR the Stage-3
+    qualitative analysis / shortfall moved it after this prose was drafted). Best-effort: any
+    failure returns the inputs unchanged with a note. Never re-runs comp analysis or invents
+    figures."""
+    try:
+        client = _get_client()
+        gate = (trace or {}).get("above_ask_gate") or {}
+        exp = (trace or {}).get("exposure") or {}
+        a = anchor or {}
+        _gate_fired = bool(gate.get("applied")) and gate.get("action")
+        _why_moved = (
+            f"A market-exposure rule then pulled the comp-based number DOWN to the final value above "
+            f"(gate action: {gate.get('action')})."
+            if _gate_fired else
+            "The qualitative analysis (condition / amenity / accessory-space read vs. the comps, and the "
+            "aggregate qualitative-inferiority shortfall) then adjusted the comp-based number to the final "
+            "value above, AFTER this prose was drafted."
+        )
+        ctx = (
+            "AUTHORITATIVE FINAL NUMBERS (these are fixed - do not change or contradict them):\n"
+            f"- Fair market value: ${round(value):,}\n"
+            f"- Value range: ${round(value * (1 - range_pct / 100)):,} to ${round(value * (1 + range_pct / 100)):,}\n"
+            f"- Deterministic comparable-sales anchor: ${round(_as_float(a.get('anchor_value')) or 0):,} "
+            f"(comp range ${round(_as_float(a.get('anchor_low')) or 0):,}–${round(_as_float(a.get('anchor_high')) or 0):,})\n"
+            f"- {_why_moved}\n"
+            f"- Subject active-market days with no accepted offer: {exp.get('active_market_days')}\n"
+            "- The real forces behind the final number (use these, in plain language, no formulas):\n    "
+            + (_v10_why_this_number(trace, value, range_pct) or "the comp anchor, the qualitative read, and market exposure")
+            + "\n"
+        )
+        sys = (
+            "You are fixing stale wording in one or two sections of an already-finished CMA. The final "
+            "value changed AFTER this prose was drafted, so the draft may still quote an old number, an "
+            "old range, an old recommended-offer band, or lean the wrong way. Rewrite the section(s) so "
+            "every number and every directional statement matches the AUTHORITATIVE numbers below - and "
+            "for a buyer offer, re-derive the opening offer and negotiation range from the FINAL fair "
+            "market value / range, not any earlier figure. Say plainly (methodology) that the comparable "
+            "sales establish a higher theoretical range but the subject's own condition / amenities / "
+            "market exposure constrain the supported value. Keep the same approximate length and tone and "
+            "every still-correct fact. Do NOT add new comp analysis or any dollar figure not given to "
+            "you. Return ONLY a JSON object with key \"methodology_summary\""
+            + (" and key \"offer_strategy_considerations\"." if mode == "buyer" else ".")
+        )
+        user = ctx + "\n---\nmethodology_summary:\n" + (methodology or "")
+        if mode == "buyer" and offer:
+            user += "\n---\noffer_strategy_considerations:\n" + offer
+        # Same headroom concern as _targeted_comp_narrative_rewrite: this model spends a highly
+        # variable, uncontrollable number of tokens on internal reasoning before any visible
+        # text, so the budget must absorb worst-case thinking AND both rewritten sections, not
+        # just the JSON alone.
+        resp = await client.messages.create(
+            model=model, max_tokens=4000, system=sys,
+            messages=[{"role": "user", "content": user}],
+        )
+        raw = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", None) == "text")
+        mjson = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not mjson:
+            return methodology, offer, ["Targeted gate rewrite returned no usable JSON - kept the deterministically-reconciled text."]
+        data = json.loads(mjson.group(0))
+        new_m = _coerce_ai_text(data.get("methodology_summary")).strip() or methodology
+        new_o = offer
+        if mode == "buyer":
+            new_o = _coerce_ai_text(data.get("offer_strategy_considerations")).strip() or offer
+        return new_m, new_o, ["Methodology summary rewritten (targeted, single section) to match the exposure-gated final value."]
+    except Exception as _e:  # noqa: BLE001
+        return methodology, offer, [f"Targeted gate rewrite failed ({type(_e).__name__}) - kept the deterministically-reconciled text."]
+
+
+# --- items #4/#5: the final non-semantic language polish + its numeric/directional guard --------
+_POLISH_NUM_RE = re.compile(r"\$?\s?\d[\d,]*(?:\.\d+)?\s?(?:%|[MmKk]\b|million|thousand|/\s?sq\.?\s?ft|per\s+sq\.?\s?ft|psf|sq\.?\s?ft|/sqft)?", re.IGNORECASE)
+_POLISH_DIR_RE = re.compile(
+    r"\b(above|below|over|under|higher|lower|premium|discount|superior|inferior|up|down|"
+    r"positive|negative|increase\w*|decrease\w*|add(?:ed|s|ing)?|subtract(?:ed|s|ing)?|"
+    r"more|less|exceeds?|trails?|outperform\w*|underperform\w*|stronger|weaker)\b", re.IGNORECASE)
+
+
+def _polish_num_multiset(text: str) -> list:
+    out = []
+    for m in _POLISH_NUM_RE.finditer(text or ""):
+        tok = re.sub(r"\s+", "", m.group(0).lower()).strip(" .,;:()")
+        if re.search(r"\d", tok):
+            out.append(tok)
+    return sorted(out)
+
+
+def _polish_dir_multiset(text: str) -> list:
+    return sorted(w.lower() for w in _POLISH_DIR_RE.findall(text or ""))
+
+
+def _polish_semantic_multiset(text: str) -> list:
+    """Semantic identities a grammar-only pass is never allowed to alter."""
+    patterns = (
+        r"\bcomp(?:arable)?\s*#?\s*\d+\b",
+        r"\b\d{1,6}\s+(?:[A-Za-z0-9.'-]+\s+){0,4}(?:rd|road|ln|lane|ave|avenue|st|street|dr|drive|ct|court|cir|circle|blvd|boulevard|pike|way|pl|place|ter|terrace)\b",
+        r"\b(?:coming soon|active under contract|pending|active|closed|sold|withdrawn|canceled|expired)\b",
+        r"\b(?:strong|supporting|weaker|weak|context only|valuation comp)\b",
+    )
+    found: list[str] = []
+    for pattern in patterns:
+        found.extend(" ".join(match.lower().split()) for match in re.findall(pattern, text or "", re.I))
+    return sorted(found)
+
+
+async def _v10_final_language_polish(fields: dict, *, model: str) -> dict:
+    """The LAST prose stage. One model call that may ONLY improve grammar / spelling / punctuation /
+    spacing / sentence flow / repeated wording / broken fragments / malformed replacement text /
+    AI-sounding phrasing. It may NOT change any number, valuation direction, factor, comp
+    classification, structured rating, confidence, status, offer logic, or add a fact. A
+    deterministic guard enforces this: for each field, if the numeric-token multiset OR the
+    directional-word multiset changed, the polish for that field is REJECTED and the original kept.
+    Returns {fields: {name: text}, changed: bool, flags: [str]}. Best-effort - any failure keeps
+    the inputs verbatim."""
+    src = {k: v for k, v in fields.items() if isinstance(v, str) and v.strip()}
+    if not src:
+        return {"fields": dict(fields), "changed": False, "flags": []}
+    flags: list = []
+    try:
+        client = _get_client()
+        sys = (
+            "You are a senior real-estate copy editor doing a FINAL polish on the client-facing text of a "
+            "finished CMA. The valuation is locked. You may ONLY fix: grammar, spelling, punctuation, "
+            "spacing, sentence flow, awkward or repeated wording, broken fragments, malformed auto-replaced "
+            "text (e.g. 'meaningful contributory value/sqft', '$1,671,505centered'), and obvious AI-sounding "
+            "phrasing - make it read like an experienced agent wrote it. You may NOT change any number, "
+            "dollar figure, range, percentage, $/sq ft value, date, or count; may NOT change any "
+            "up/down/above/below/higher/lower/premium/discount direction; may NOT add, remove or reword a "
+            "valuation factor, comp classification, rating, confidence level, listing status, or offer "
+            "recommendation; may NOT introduce a new fact. If a phrase is garbled around a figure, rewrite "
+            "the surrounding words naturally but keep the figure exactly. Preserve section structure and "
+            "any '**Header:**' lines. Return ONLY a JSON object mapping each given field name to its "
+            "polished text."
+        )
+        user = "Fields to polish (keep every number and direction identical):\n\n" + "\n\n".join(
+            f"### {k}\n{v}" for k, v in src.items()
+        )
+        resp = await client.messages.create(model=model, max_tokens=3000, system=sys,
+                                            messages=[{"role": "user", "content": user}])
+        raw = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", None) == "text")
+        mjson = re.search(r"\{.*\}", raw, re.DOTALL)
+        data = json.loads(mjson.group(0)) if mjson else {}
+    except Exception as _e:  # noqa: BLE001
+        return {"fields": dict(fields), "changed": False,
+                "flags": [f"Final language polish skipped ({type(_e).__name__}) - exported the pre-polish text."]}
+
+    out = dict(fields)
+    changed = False
+    for k, orig in src.items():
+        cand = _coerce_ai_text(data.get(k)).strip()
+        if not cand or cand == orig:
+            continue
+        if _polish_num_multiset(cand) != _polish_num_multiset(orig):
+            flags.append(f"{k}: final polish rejected - it altered a numeric token; kept the pre-polish wording.")
+            continue
+        if _polish_dir_multiset(cand) != _polish_dir_multiset(orig):
+            flags.append(f"{k}: final polish rejected - it altered a directional word; kept the pre-polish wording.")
+            continue
+        if _polish_semantic_multiset(cand) != _polish_semantic_multiset(orig):
+            flags.append(f"{k}: final polish rejected - it altered a status, comp reference, or classification; kept the pre-polish wording.")
+            continue
+        if not (0.55 * len(orig) <= len(cand) <= 1.8 * len(orig) + 40):
+            flags.append(f"{k}: final polish rejected - length changed too much (likely a rewrite, not a polish).")
+            continue
+        out[k] = cand
+        changed = True
+    if changed:
+        flags.append("Final non-semantic language polish applied (grammar / spacing / flow only; numbers and "
+                     "directions guard-checked unchanged); deterministic QA re-run on the polished text.")
+    return {"fields": out, "changed": changed, "flags": flags}
+
+
+# ============================================================================================
+# ONE authoritative final valuation object + a concluded-number scan against it
+# --------------------------------------------------------------------------------------------
+_STATUS_LABELS = {
+    "on_market": "Active", "under_contract": "Under Contract", "closed": "Sold", "off_market": "Off Market",
+}
+_CONCLUDED_VALUE_RE = re.compile(
+    r"(indicated\s+value|fair\s+market\s+value|\bFMV\b|concluded\s+(?:value|at)|supported\s+value|"
+    r"estimated\s+value|most\s+likely\s+value|point\s+value|value\s+of|our\s+valuation|reconciled\s+value|"
+    r"final\s+(?:value|figure)|worth\s+(?:approximately|about|roughly)?)",
+    re.IGNORECASE,
+)
+_ANCHOR_PHRASE_RE = re.compile(r"(deterministic\s+(?:comp\s+)?anchor|comp(?:arable[\s-]sales?)?\s+anchor|anchor\s+value)",
+                               re.IGNORECASE)
+_TOTAL_AREA_RE = re.compile(r"\b(total|blended|overall|entire|all[-\s]?in|gross|combined)\s+"
+                            r"(?:finished\s+)?(?:square\s+f(?:oo|ee)?tage|sq\.?\s*ft|sqft|area|footage|living\s+area)\b",
+                            re.IGNORECASE)
+_PSF_FIG_RE = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)\s*(?:/|per\s+)\s*(?:sq\.?\s*ft|sqft|square\s+f(?:oo|ee)?t)", re.IGNORECASE)
+
+
+def _v10_authoritative_valuation(*, value: float, range_pct: float, confidence: Optional[str],
+                                 valuation_trace: Optional[dict], subject_asking: Optional[float],
+                                 status_timeline: dict, comp_stats: Optional[dict],
+                                 range_min: Optional[float] = None, range_max: Optional[float] = None) -> dict:
+    """The ONE final valuation object. Built AFTER the final anchor, qualitative reconciliation,
+    exposure gate, FMV, range and confidence are locked - every client-facing number and every
+    status phrase in the report must be sourced from this. Never recomputed downstream."""
+    t = valuation_trace or {}
+    a = t.get("anchor") or {}
+    authoritative_anchor = _as_float(t.get("deterministic_anchor")) or _as_float(a.get("anchor_value"))
+    tl = status_timeline or {}
+    v = float(value or 0)
+    exact_low, exact_high = _authoritative_range(
+        v, range_pct, t, {"range_min": range_min, "range_max": range_max}
+        if range_min is not None and range_max is not None else None,
+    )
+    current_status = tl.get("current_status")
+    grp = ("closed" if tl.get("is_closed") else "under_contract" if tl.get("is_under_contract")
+           else "on_market" if tl.get("is_active") else "off_market")
+    status_label = current_status if current_status and current_status != "Unknown" else _STATUS_LABELS.get(grp, "Off Market")
+    method = (comp_stats or {}).get("method") or (a.get("comp_stats") or {}).get("method") or ""
+    return {
+        "value": round(v) if v else None,
+        "range_pct": round(range_pct, 1) if range_pct is not None else None,
+        "range_min": exact_low,
+        "range_max": exact_high,
+        "confidence": (confidence or None),
+        "authority": t.get("authority") or "deterministic_v10",
+        "reasoning_model": t.get("reasoning_model_name"),
+        "anchor_value": round(authoritative_anchor) if authoritative_anchor else None,
+        "anchor_low": a.get("anchor_low"),
+        "anchor_high": a.get("anchor_high"),
+        # round 12 issue #3: the methodology-of-record must also match the FINAL comp set, not just
+        # the FMV/range - how many comps carry anchor weight and which ones.
+        "anchor_weighted_comp_count": a.get("weighted_comp_count"),
+        "anchor_closed_comp_count": a.get("closed_comp_count"),
+        "anchor_comps": [
+            {"label": cc.get("label"),
+             "strength": cc.get("validated_class") or cc.get("strength"),
+             "normalized_weight": cc.get("normalized_weight"),
+             "dollar_contribution": cc.get("dollar_contribution_to_anchor")}
+            for cc in (a.get("comps") or [])
+            if (cc.get("normalized_weight") or 0) > 0
+        ],
+        "list_price": round(subject_asking) if subject_asking else None,
+        "exposure_state": (t.get("exposure") or {}).get("state"),
+        "gate_action": (t.get("above_ask_gate") or {}).get("action"),
+        "fmv_pre_exposure": t.get("fmv_pre_exposure"),
+        "ai_value_cross_check": t.get("ai_value_cross_check"),
+        "v10_formula_fmv": t.get("v10_formula_fmv"),
+        "insufficient_evidence": bool(t.get("insufficient_evidence")),
+        "stat_method_label": ("Weighted Average" if "weighted" in method.lower() else "Average"),
+        "stat_method": method or None,
+        "status": {
+            "current": status_label,
+            "label": status_label,
+            "group": grp,
+            "is_active": grp == "on_market",
+            "is_under_contract": grp == "under_contract",
+            "is_closed": grp == "closed",
+            "active_market_days": tl.get("active_market_days"),
+            "as_of": tl.get("as_of") or tl.get("status_as_of"),
+        },
+    }
+
+
+def _v10_scan_concluded_numbers(fields: dict, *, final: dict) -> tuple:
+    """Deterministic pre-export check (issue #2/#4). Extracts every valuation dollar figure / range
+    that appears in CONCLUDED-value prose and blocks export when it materially conflicts with the
+    authoritative final FMV / range / anchor, or when a $/sqft figure is labelled a total-area rate
+    while it's actually an above-grade figure. Rewrites the small set of unambiguously-stale forms
+    (a value range that should be the final range; a bare concluded figure that still equals a
+    known pre-gate number). Returns (corrected_fields, blocking, notes)."""
+    out = {k: (lbl, txt) for k, (lbl, txt) in fields.items()}
+    blocking: list = []
+    notes: list = []
+    v = _as_float(final.get("value"))
+    if not v:
+        return out, blocking, notes
+    rmin, rmax = _as_float(final.get("range_min")), _as_float(final.get("range_max"))
+    av = _as_float(final.get("anchor_value"))
+    ah = _as_float(final.get("anchor_high"))
+    al = _as_float(final.get("anchor_low"))
+    lp = _as_float(final.get("list_price"))
+    tol = max(7500.0, 0.02 * v)
+    range_tol = max(2500.0, 0.002 * v)
+    fmv_tol = max(2500.0, 0.002 * v)
+    # issue #4: the scan is FIELD-AWARE. These are legitimate authoritative figures - the point
+    # estimate, either confidence-range endpoint, the comp anchor value + its own band, and the
+    # list price. A number that matches one of these next to concluded-value language is that
+    # figure correctly stated, NOT a competing FMV; only a figure matching NONE of them conflicts.
+    # structural figures that are neither the point value nor a stale pre-gate number - a bare
+    # "$X" that equals one of these (a range endpoint, the anchor band low, the list price) must
+    # never be rewritten as "the final value" in (b). Matched on a TIGHT tolerance: these are
+    # stated in prose straight from the authoritative figure, so a merely-nearby stale value is
+    # still caught (issue #4 is field-aware, not a blanket loosening).
+    structural_figs = [f for f in (rmin, rmax, av, al, ah, lp) if f]
+    stale_nums = [n for n in (av, ah, _as_float(final.get("fmv_pre_exposure")),
+                              _as_float(final.get("ai_value_cross_check")),
+                              _as_float(final.get("v10_formula_fmv"))) if n and abs(n - v) > tol]
+
+    _CONCLUDE_WORDS = ("indicated value", "fair market value", "concluded", "supported value",
+                       "estimated value", "our valuation", "reconciled", "final value",
+                       "value of the subject", "most likely value", "point value")
+
+    for k, (label, text) in list(out.items()):
+        if not text:
+            continue
+        cur = text
+
+        # (a) "$X to $Y" value ranges -> the final confidence range. Done FIRST so a rewritten
+        #     bound isn't mistaken for a stale figure in (b).
+        if rmin and rmax:
+            def _fix_rng(m: "re.Match", _label=label) -> str:
+                lo = _parse_dollar(m.group(1), m.group(2))
+                hi = _parse_dollar(m.group(3), m.group(4))
+                if lo < 100000 or hi < 100000 or hi <= lo:
+                    return m.group(0)
+                pre = cur[max(0, m.start() - 60):m.start()].lower()
+                if not any(w in pre for w in ("range", "between", "value band", "confidence", "indicated value",
+                                              "estimated value", "supported value", "valuation")):
+                    return m.group(0)
+                if abs(lo - rmin) <= range_tol and abs(hi - rmax) <= range_tol:
+                    return m.group(0)
+                notes.append(f"{_label}: stale value range {m.group(0).strip()} -> final ${rmin:,.0f}-${rmax:,.0f}.")
+                return f"${rmin:,.0f}–${rmax:,.0f}"
+            cur = _RANGE_IN_PROSE_RE.sub(_fix_rng, cur)
+
+        # (b) bare stale pre-gate figures immediately after concluded-value language -> rewrite to
+        #     the final value (unambiguous auto-fix). Skips anything sitting inside a $X-$Y range.
+        if stale_nums:
+            _range_spans = [(mm.start(), mm.end()) for mm in _RANGE_IN_PROSE_RE.finditer(cur)]
+
+            def _in_range_span(pos: int) -> bool:
+                return any(s <= pos < e for s, e in _range_spans)
+
+            def _fix_fig(m: "re.Match", _label=label) -> str:
+                if _in_range_span(m.start()):
+                    return m.group(0)
+                fig = _parse_dollar(m.group(1), (m.group(2) or "").strip() or None)
+                if fig < 100000 or abs(fig - v) <= tol:
+                    return m.group(0)
+                # a legitimate range endpoint / anchor-band low / list price is not "stale" - leave it
+                if any(abs(fig - g) <= max(2500.0, 0.004 * g) for g in structural_figs):
+                    return m.group(0)
+                # must match a KNOWN pre-gate number closely (0.5%), not just "in the ballpark"
+                if not any(abs(fig - s) <= max(4000.0, 0.005 * s) for s in stale_nums):
+                    return m.group(0)
+                back = cur[max(0, m.start() - 55):m.start()].lower()
+                back = re.split(r"[.!?;]\s", back)[-1]
+                # a concluded-value word must sit in the SAME clause, and no "anchor" word (the
+                # anchor legitimately keeps its own value)
+                if _ANCHOR_PHRASE_RE.search(back):
+                    return m.group(0)
+                if not any(w in back for w in _CONCLUDE_WORDS):
+                    return m.group(0)
+                notes.append(f"{_label}: stale pre-gate figure {m.group(0).strip()} -> final ${v:,.0f}.")
+                return f"${v:,.0f}"
+            cur = re.sub(r"\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?)(\s?[MmKk])?", _fix_fig, cur)
+
+        # (c) anything STILL conflicting next to a concluded-value phrase -> BLOCK (couldn't be
+        #     safely auto-fixed).
+        _range_spans2 = [(mm.start(), mm.end()) for mm in _RANGE_IN_PROSE_RE.finditer(cur)]
+        for m in _CONCLUDED_VALUE_RE.finditer(cur):
+            seg = cur[m.start():m.start() + 170]
+            dm = _DOLLAR_RE.search(seg)
+            if not dm:
+                continue
+            fig_pos = m.start() + dm.start()
+            if any(s <= fig_pos < e for s, e in _range_spans2):
+                continue
+            fig = _parse_dollar(dm.group(1), dm.group(2))
+            if fig < 100000 or abs(fig - v) <= fmv_tol:
+                continue
+            # a range endpoint / anchor band / list price stated in prose was GENERATED from the
+            # authoritative figure, so it matches near-exactly - a tight tolerance here keeps a
+            # merely-nearby stale value (e.g. an old indicated value ~1% off the new range low)
+            # from being waved through (issue #4: field-aware, not weaker).
+            _endpoint_tol = lambda g: max(2500.0, 0.004 * g)  # noqa: E731
+            fig_end = m.start() + dm.end()
+            near = cur[max(0, fig_pos - 35):min(len(cur), fig_end + 45)]
+            comparative_to_later_dollar = re.search(
+                r"\b(?:above|below|under|over|beneath|higher\s+than|lower\s+than)\s+the\s+\$",
+                cur[fig_end:fig_end + 55],
+                re.IGNORECASE,
+            )
+            if _ANCHOR_PHRASE_RE.search(near) and not comparative_to_later_dollar:
+                # an anchor figure legitimately keeps its own value - only flag if it matches NONE
+                # of the authoritative anchor figures (value / band low / band high)
+                if av and not any(g and abs(fig - g) <= max(tol, _endpoint_tol(g)) for g in (av, al, ah)):
+                    blocking.append(f"{label}: cites a deterministic anchor of {dm.group(0).strip()} but the authoritative "
+                                    f"anchor is ${av:,.0f}.")
+                continue
+            # field-aware: a valid range endpoint / anchor value / list price next to a
+            # concluded-value phrase is that figure correctly stated, not a competing FMV.
+            if any(abs(fig - g) <= _endpoint_tol(g) for g in (rmin, rmax, av, al, ah, lp) if g):
+                continue
+            blocking.append(f"{label}: a concluded value of {dm.group(0).strip()} appears next to \"{m.group(0)}\" but the "
+                            f"report's authoritative FMV is ${v:,.0f}.")
+
+        out[k] = (label, cur)
+    return out, blocking, notes
+
+
+_NUM_WORD = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+             "eight": 8, "nine": 9, "ten": 10}
+# NOTE: distinct name from the module-level _COMP_COUNT_RE (digits-only, used by _prose_math_qa
+# which int()s the capture) - this one also matches spelled-out numbers and _v10_methodology_
+# consistency_check maps them via _NUM_WORD before comparing.
+_METHOD_COMP_COUNT_RE = re.compile(
+    r"\b(one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\s+"
+    r"(?:(?:strong|supporting|weighted|closed|verified|primary|key|comparable)[\s,./and-]*){0,3}"
+    r"(?:comp\w*|comparable\s+sales?|sales?)\b",
+    re.IGNORECASE,
+)
+
+
+def _v10_methodology_consistency_check(fields: dict, final: dict) -> tuple:
+    """Round 12 issue #3. The exposure gate + qualitative reconciliation can move the anchor value,
+    the number of weighted comps, and which comps carry weight AFTER the methodology prose is
+    drafted. _v10_scan_concluded_numbers reconciles the FMV + range; this reconciles the
+    METHODOLOGY-of-record claims: the stated comp-anchor dollar figure, the stated count of weighted
+    comps, and any comp the prose names as an anchor / value driver that actually carries no anchor
+    weight. Auto-fixes an unambiguously stale anchor figure; blocks the rest. Only touches the
+    methodology ('m') and 'why this number' ('vd') fields. Returns (corrected_fields, blocking,
+    notes)."""
+    out = {k: (lbl, txt) for k, (lbl, txt) in fields.items()}
+    blocking: list = []
+    notes: list = []
+    av = _as_float(final.get("anchor_value"))
+    wcc = final.get("anchor_weighted_comp_count")
+    acomps = final.get("anchor_comps") or []
+    stale = [n for n in (_as_float(final.get("fmv_pre_exposure")),
+                         _as_float(final.get("ai_value_cross_check"))) if n]
+    tol = max(15000.0, 0.02 * av) if av else 15000.0
+    weighted_labels = [str(c.get("label") or "").lower() for c in acomps]
+
+    for k, (label, text) in list(out.items()):
+        if not text or k not in ("m", "vd"):
+            continue
+        cur = text
+
+        # (1) an anchor dollar figure stated next to an anchor phrase
+        if av:
+            def _fix_anchor(m: "re.Match", _label=label) -> str:
+                seg = cur[max(0, m.start() - 35):m.end() + 45]
+                if not _ANCHOR_PHRASE_RE.search(seg):
+                    return m.group(0)
+                if re.search(r"\b(?:above|below|under|over|beneath|higher\s+than|lower\s+than)\s+the\s+\$",
+                             cur[m.end():m.end() + 55], re.IGNORECASE):
+                    return m.group(0)
+                fig = _parse_dollar(m.group(1), (m.group(2) or "").strip() or None)
+                if fig < 500000 or abs(fig - av) <= tol:
+                    return m.group(0)
+                if any(abs(fig - s) <= max(6000.0, 0.01 * s) for s in stale):
+                    notes.append(f"{_label}: stale comp-anchor figure {m.group(0).strip()} -> ${av:,.0f}.")
+                    return f"${av:,.0f}"
+                blocking.append(f"{_label}: states a comparable-sales anchor of {m.group(0).strip()} but the "
+                                f"authoritative final anchor is ${av:,.0f}.")
+                return m.group(0)
+            cur = re.sub(r"\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?)(\s?[MmKk])?", _fix_anchor, cur)
+
+        # (2) the stated count of weighted comps
+        if isinstance(wcc, int) and wcc > 0:
+            for m in _METHOD_COMP_COUNT_RE.finditer(cur):
+                raw = m.group(1).lower()
+                stated = int(raw) if raw.isdigit() else _NUM_WORD.get(raw)
+                if not stated or stated > 12:
+                    continue
+                pre = cur[max(0, m.start() - 70):m.start()].lower()
+                if not any(w in pre for w in ("anchor", "built", "based", "drawn", "draw", "weighted",
+                                              "rests on", "rest on", "leans on", "lean on", "from the",
+                                              "blend of", "average of")):
+                    continue
+                if stated - wcc >= 2:
+                    blocking.append(f"{label}: says the anchor draws on {m.group(0).strip()} but the authoritative "
+                                    f"anchor carries {wcc} weighted comp(s) - update the methodology to the "
+                                    f"final comp set.")
+                break
+
+        # (3) a comp named as an anchor / value driver that carries no anchor weight
+        if weighted_labels:
+            for m in re.finditer(r"comp\s*#?\s*(\d{1,2})\b", cur, re.IGNORECASE):
+                seg = cur[max(0, m.start() - 95):m.start() + 95].lower()
+                if not any(cue in seg for cue in ("anchor", "leans on", "lean on", "rests on", "rest on",
+                                                  "weighted toward", "built from", "drives the", "carries the",
+                                                  "most weight", "primary comp", "key comp")):
+                    continue
+                lbl = f"comp #{m.group(1)}"
+                if not any(lbl in wl for wl in weighted_labels):
+                    blocking.append(f"{label}: names {m.group(0).strip()} as an anchor / value driver, but it carries "
+                                    f"no weight in the authoritative anchor (weighted comps: "
+                                    f"{', '.join(c.get('label') or '?' for c in acomps) or 'none'}).")
+                    break
+
+        out[k] = (label, cur)
+    return out, blocking, notes
+
+
+_OFFSET_CLAIM_RE = re.compile(
+    r"(offset|offsets|offsetting|counterbalanc\w*|compensat\w*|balanced?\s+(?:out\s+)?(?:by|against)|"
+    r"made\s+up\s+for|cancels?\s+out|washes?\s+out|neutraliz\w*|nets?\s+(?:out|to\s+(?:about\s+)?(?:zero|neutral)))",
+    re.IGNORECASE,
+)
+_OFFSET_FEATURE_MAP = (
+    ("a guest apartment / accessory dwelling", {"accessory_dwelling", "layout_space"},
+     re.compile(r"guest\s+(?:apartment|house|cottage|suite|quarters)|carriage\s+house|pool\s+house|"
+                r"accessory\s+(?:apartment|dwelling|unit)|\bADU\b|in-?law\s+(?:suite|apartment)|"
+                r"guest[-\s]+wing", re.IGNORECASE)),
+    ("a pool / spa", {"pool_spa"}, re.compile(r"\bpool\b|\bspa\b|hot\s+tub", re.IGNORECASE)),
+    ("the grounds / lot / setting", {"views_setting", "lot_land"},
+     re.compile(r"grounds|setting|acreage|\bparcel\b|\blot\b|\bland\b|privacy|wooded|gardens?", re.IGNORECASE)),
+    ("architectural pedigree / character", {"architecture_pedigree"},
+     re.compile(r"architectur\w*|pedigree|provenance|historic\b|custom-built|bespoke", re.IGNORECASE)),
+    ("the street / cul-de-sac position", {"views_setting"},
+     re.compile(r"\bstreet\b|cul-de-sac|cul\s+de\s+sac|no-through|quiet\s+road", re.IGNORECASE)),
+)
+
+_DIRECTIONAL_ADJ_FEATURE_MAP = (
+    *_OFFSET_FEATURE_MAP,
+    ("condition / finish", {"renovation_condition"},
+     re.compile(r"condition|finish(?:es)?|renovat\w*|updated|updating|kitchen|bath", re.IGNORECASE)),
+    ("systems / mechanicals", {"systems_mechanical"},
+     re.compile(r"systems?|mechanicals?|roof|hvac|septic|well|plumbing|electrical", re.IGNORECASE)),
+    ("garage / parking", {"garage_parking"},
+     re.compile(r"garage|parking|carport", re.IGNORECASE)),
+)
+_ADJ_UP_CLAIM_RE = re.compile(
+    r"\b(?:priced|valued|adjusted|treated|carried)\s+(?:as\s+)?(?:upward|up|higher|above)\b|"
+    r"\b(?:adds?|added|adding|lifts?|raises?|credits?)\b[^.!?]{0,35}\b(?:value|premium|figure|valuation)\b|"
+    r"\b(?:positive|upward)\s+adjustment\b|\bpremium\s+(?:for|from|of|attributable to)\b",
+    re.IGNORECASE,
+)
+_ADJ_DOWN_CLAIM_RE = re.compile(
+    r"\b(?:priced|valued|adjusted|treated|carried)\s+(?:as\s+)?(?:downward|down|lower|below)\b|"
+    r"\b(?:subtracts?|subtracted|deducts?|deducted|reduces?|reduced|penaliz\w*)\b[^.!?]{0,35}\b(?:value|figure|valuation)\b|"
+    r"\b(?:negative|downward)\s+adjustment\b|\bdiscount\s+(?:for|from|of|attributable to)\b|"
+    r"\bdisadvantage\b[^.!?]{0,45}\bpriced\s+down",
+    re.IGNORECASE,
+)
+_NO_SEPARATE_ADJ_RE = re.compile(
+    r"\b(?:not|no)\s+(?:separately|individually|specifically)?\s*(?:priced|valued|adjusted|credited|deducted)|"
+    r"\b(?:not|no)\s+(?:a\s+)?separate\s+(?:line-item\s+)?adjustment\b|"
+    r"\bconsidered\s+within\s+the\s+broader\s+qualitative\s+analysis\b|"
+    r"\brather\s+than\s+(?:an?\s+)?(?:assumed|automatic|separate|unsupported)?\s*premium\b|"
+    r"\b(?:does\s+not|doesn't|is\s+not|isn't|was\s+not|wasn't)\b[^.!?]{0,35}\bpremium\b",
+    re.IGNORECASE,
+)
+
+
+def _v10_structured_adjustment_records(trace: dict) -> list[dict]:
+    """Flatten adjustment-like dicts from the whole final valuation trace."""
+    records: list[dict] = []
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            if any(k in obj for k in ("factor", "family", "basis")) and any(
+                k in obj for k in ("applied", "direction", "amount_low", "amount_high")
+            ):
+                applied = _as_float(obj.get("applied"))
+                if applied is None:
+                    vals = [_as_float(obj.get("amount_low")), _as_float(obj.get("amount_high"))]
+                    vals = [v for v in vals if v is not None]
+                    applied = sum(vals) / len(vals) if vals else 0.0
+                    if str(obj.get("direction") or "").lower().startswith("down"):
+                        applied = -abs(applied)
+                if abs(applied or 0) > 1:
+                    direction = str(obj.get("direction") or "").lower()
+                    if not direction:
+                        direction = "up" if applied > 0 else "down"
+                    records.append({
+                        "family": str(obj.get("family") or "").lower(),
+                        "direction": "down" if "down" in direction or applied < 0 else "up",
+                        "text": " ".join(str(obj.get(k) or "") for k in ("family", "factor", "basis", "reason", "note")).lower(),
+                    })
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
+
+    walk(trace or {})
+    deduped: list[dict] = []
+    seen: set[tuple] = set()
+    for r in records:
+        key = (r["family"], r["direction"], r["text"])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(r)
+    return deduped
+
+
+def _v10_directional_adjustment_backing_check(fields: dict, trace: dict) -> list:
+    """Block client prose that says a named factor added/subtracted value unless a matching
+    nonzero structured adjustment exists anywhere in the final adjustment trace."""
+    blocking: list = []
+    records = _v10_structured_adjustment_records(trace or {})
+
+    def backed(families: set[str], feat_re: re.Pattern, direction: str) -> bool:
+        for r in records:
+            if r["direction"] != direction:
+                continue
+            if r["family"] in families or feat_re.search(r["text"]):
+                return True
+        return False
+
+    for _key, (label, text) in fields.items():
+        if not text:
+            continue
+        for sent, _s, _e in _sentence_chunks(text):
+            if _NO_SEPARATE_ADJ_RE.search(sent):
+                continue
+            if not _ADJ_UP_CLAIM_RE.search(sent) and not _ADJ_DOWN_CLAIM_RE.search(sent):
+                continue
+            for feat_name, families, feat_re in _DIRECTIONAL_ADJ_FEATURE_MAP:
+                feat_match = feat_re.search(sent)
+                if not feat_match:
+                    continue
+                before = sent[:feat_match.start()]
+                after = sent[feat_match.end():]
+                starts = [m.end() for m in re.finditer(r"\b(?:while|but|whereas)\b|[,;]", before, re.IGNORECASE)]
+                ends = [feat_match.end() + m.start() for m in re.finditer(r"\b(?:while|but|whereas)\b|[,;]", after, re.IGNORECASE)]
+                clause = sent[(max(starts) if starts else 0):(min(ends) if ends else len(sent))]
+                says_up = bool(_ADJ_UP_CLAIM_RE.search(clause))
+                says_down = bool(_ADJ_DOWN_CLAIM_RE.search(clause))
+                if not says_up and not says_down:
+                    continue
+                for direction, active in (("up", says_up), ("down", says_down)):
+                    if not active or backed(families, feat_re, direction):
+                        continue
+                    blocking.append(
+                        f"{label}: says {feat_name} was priced {'upward' if direction == 'up' else 'downward'}, "
+                        "but no matching nonzero structured adjustment for that factor exists anywhere in the "
+                        "final adjustment trace. Describe it as considered within the broader qualitative analysis "
+                        "unless it has a backed line-item adjustment.")
+                    break
+    return list(dict.fromkeys(blocking))
+
+
+def _v10_structured_adjustment_fact_check(trace: dict, subject: dict) -> list[str]:
+    """Block applied system adjustments whose stated fact basis is only age or uncertainty."""
+    # Once the reasoning model is authoritative, the legacy V10 adjustments are retained only
+    # as benchmark/audit evidence. They cannot block export as though they priced the final FMV.
+    # Client-facing factual and adjustment-claim checks still run against the exact final prose.
+    if str((trace or {}).get("authority") or "").strip().lower() == "reasoning_model":
+        return []
+    facts = _authoritative_property_fact_blob(subject).lower()
+    documented_problem = bool(re.search(
+        r"\b(?:deferred maintenance|needs? repair|needs? replacement|failed|not working|"
+        r"leak(?:ing)?|damage(?:d)?|obsolete|end of (?:its )?life|unsafe)\b", facts,
+        re.IGNORECASE,
+    ))
+    documented_updates = _documented_system_updates(subject)
+    blocking: list[str] = []
+    for item in (trace or {}).get("adjustments") or []:
+        if not isinstance(item, dict):
+            continue
+        applied = _as_float(item.get("applied")) or 0.0
+        text = " ".join(str(item.get(k) or "") for k in ("family", "factor", "basis", "note"))
+        family = str(item.get("family") or "")
+        if abs(applied) <= 1 or not (family == "systems_mechanical" or _SYSTEM_NAMES_RE.search(text)):
+            continue
+        if applied < 0 and not documented_problem and re.search(
+            r"\b(?:old(?:er)?|age[- ]related|inherent age|original|unknown|unverified|not documented|"
+            r"not specified|system ages?|built\s+(?:in\s+)?(?:18|19|20)\d{2})\b", text,
+            re.IGNORECASE,
+        ):
+            blocking.append(
+                "Structured adjustment QA: a downward systems/mechanicals adjustment relies on "
+                "property age or unverified system history without a documented condition problem."
+            )
+        if applied > 0 and _SYSTEM_UPDATE_RE.search(text) and not documented_updates:
+            blocking.append(
+                "Structured adjustment QA: an upward systems/mechanicals adjustment claims an "
+                "update that is not documented in the authoritative property record."
+            )
+    return list(dict.fromkeys(blocking))
+
+
+def _v10_prose_offset_backing_check(fields: dict, trace: dict) -> list:
+    """Round 12 issue #2, DISABLED as of 2026-09-14 by explicit product decision - always returns
+    []. This used to block export whenever the narrative said a disadvantage was "offset by" some
+    named quality (architectural pedigree, grounds, a guest wing, ...) without one single itemised
+    dollar line for that exact feature. That's a legitimate holistic judgment call the reasoning
+    model is trusted to make - not a factual error - and treating it as an export-blocking finding
+    was exactly the "second-guess Astra's reasoning, make the agent deal with it" pattern the
+    product explicitly rejected. Left in place (not deleted) in case a future real CMA exposes a
+    genuine version of this problem worth re-enabling for. Do not re-enable without being asked.
+
+    Original docstring: the client narrative may only describe a valuation offset (the condition /
+    finish gap made up for by a guest apartment, pool, grounds, street, architectural pedigree) if a
+    SUPPORTED structured adjustment for that factor actually exists in the itemised trace and
+    survived the evidence / bounds / double-count checks."""
+    return []
+
+
+_OFFER_VAL_LANG = (
+    "indicated value", "fair market value", " fmv", "valuation", "estimated value", "value of",
+    "concluded", "worth", "supported value", "our estimate", "the estimate", "indicated at",
+    "value at", "value sits", "value comes", "value lands", "value of about", "value of roughly",
+)
+
+
+def _v10_offer_final_valuation_check(offer_text: str, final: Optional[dict], trace: Optional[dict]) -> list:
+    """Item #2. The Offer Suggestion must derive every valuation / recommended-offer number from the
+    AUTHORITATIVE final_valuation object. Blocks when the offer prose quotes, as an indicated /
+    estimated value, a figure that is NOT the final FMV or a final range endpoint but IS one of the
+    stale pre-final numbers (the pre-gate anchor / anchor band, the AI's pre-engine estimate, the
+    pre-Stage-3 / pre-gate figure, or a provisional centre). A recommended OFFER band that sits below
+    the FMV is legitimate and is not flagged - only a stale quoted VALUE is."""
+    if not offer_text or not final:
+        return []
+    fv = _as_float(final.get("value"))
+    if not fv:
+        return []
+    rmin = _as_float(final.get("range_min"))
+    rmax = _as_float(final.get("range_max"))
+    list_price = _as_float(final.get("list_price")) or _as_float((trace or {}).get("subject_asking"))
+    t = trace or {}
+    _a = t.get("anchor") or {}
+    stale = [n for n in (
+        _as_float(_a.get("anchor_value")), _as_float(_a.get("anchor_high")), _as_float(_a.get("anchor_low")),
+        _as_float(t.get("ai_value_cross_check")), _as_float(t.get("fmv_pre_exposure")),
+        _as_float((t.get("above_ask_gate") or {}).get("from")), _as_float(t.get("provisional_centre")),
+        _as_float(t.get("v10_formula_fmv")),
+    ) if n and abs(n - fv) > max(8000.0, 0.01 * fv)]
+    ok = [g for g in (fv, rmin, rmax) if g]
+    if not stale:
+        return []
+    for m in re.finditer(r"\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?)(\s?[MmKk])?", offer_text):
+        fig = _parse_dollar(m.group(1), (m.group(2) or "").strip() or None)
+        if fig < 100000 or any(abs(fig - g) <= max(6000.0, 0.015 * g) for g in ok):
+            continue
+        # value-conclusion language on EITHER side of the figure ("indicated value of $X" OR
+        # "$X indicated value" / "$X estimated value").
+        back = re.split(r"[.!?;]\s", offer_text[max(0, m.start() - 90):m.start()].lower())[-1]
+        fwd = offer_text[m.end():m.end() + 40].lower()
+        # Bind the actual asking price to its explicit field label before looking for nearby
+        # valuation language. In a sentence such as "the FMV sits above the $X list price",
+        # "FMV" describes the first value, not the list-price figure that follows it.
+        list_bound = bool(list_price and abs(fig - list_price) <= max(1000.0, 0.002 * list_price) and (
+            re.match(r"^\s*(?:current\s+)?(?:list(?:ing|ed)?|asking|ask)\s+price\b", fwd)
+            or re.search(r"(?:current\s+)?(?:list(?:ing|ed)?|asking|ask)\s+price\s+(?:of|at)\s*$", back)
+        ))
+        if list_bound:
+            continue
+        if not (any(w in back for w in _OFFER_VAL_LANG) or any(w.strip() in fwd for w in _OFFER_VAL_LANG)):
+            continue
+        # An offer figure, not a value claim: the nearest cue before it is offer language ("Given the
+        # $935,000 fair market value ..., a reasonable opening offer is roughly $870,000" - the FMV
+        # words describe the first figure; seen blocking a clean buyer report live 2026-10-05).
+        _last_val = max((back.rfind(w) for w in _OFFER_VAL_LANG), default=-1)
+        _last_offer = max((back.rfind(w) for w in ("offer", "settle", "paying", "pay ", " to ")), default=-1)
+        if _last_offer > _last_val and not any(w.strip() in fwd for w in _OFFER_VAL_LANG):
+            continue
+        if any(abs(fig - s) <= max(8000.0, 0.02 * s) for s in stale):
+            return [
+                f"Offer strategy: quotes ${fig:,.0f} as an indicated/estimated value, but the report's final FMV "
+                f"is ${fv:,.0f}" + (f" (range ${rmin:,.0f}-${rmax:,.0f})" if rmin and rmax else "")
+                + ". The Offer Suggestion must be rebuilt from the final valuation - opening offer and "
+                "negotiation range re-derived from the final FMV, not a pre-final figure."
+            ]
+    return []
+
+
+# --- round 19: deterministic buyer-offer rebuild + a dedicated blocking sanity check -----------
+_MALFORMED_PCT_RE = re.compile(
+    r"\d%[A-Za-z]"                                # "5%below" (glued - a real space is fine)
+    r"|%\s*%"                                     # "% %"
+    r"|[-–—]\s*%\s*\d|\d\s*%\s*[-–—]\s*%"         # "-%5" / "3%-%5"
+    r"|\b(?:about|around|roughly|approximately|nearly|some)\s+%(?!\s*\d)"   # "about %" (not "about 5%")
+    r"|%\s*(?:to|and|[-–—])\s*%"                  # "% to %"
+    r"|\$\s?[\d,]+(?:\.\d+)?\s?[MmKk]?\s*[-–—]\s*\$?\s?[\d,]+(?:\.\d+)?\s?[MmKk]?\s*%"  # "$1.2M-$1.4M%"
+    r"|\d{1,3}\s*[-–—]\s*%\s*\d|\bpercent\s+percent\b|\bof\s+%\b"          # "3-%5"
+    r"|\b\d{1,3}\s*[-–—]\s*\d{1,3}\.\s*\d{1,3}\s*%"                    # "9-5. 6%"
+)
+
+
+_V10_OFFER_AGGRESSION_TARGET = {"low": 0.30, "moderate": 0.55, "high": 0.85}   # frac of the list->FMV gap to target
+_V10_OFFER_AGGRESSION_OPEN = {"low": -0.10, "moderate": 0.10, "high": 0.45}     # opening_high as frac of that gap, rel. to list
+
+
+def _v10_offer_aggression(trace: Optional[dict], confidence: Optional[str], status_timeline: Optional[dict]) -> str:
+    """How hard the buyer should push toward the supported FMV, from the market read: subject
+    exposure state, whether comps are closing over/under list, competitive-sale signals, subject
+    days on market, any price cut, and valuation confidence. Returns low | moderate | high."""
+    exp = (trace or {}).get("exposure") or {}
+    anch = (trace or {}).get("anchor") or {}
+    state = str(exp.get("state") or "").lower()
+    lts = _as_float(anch.get("comp_list_to_sale_median"))
+    comp_competitive = bool(anch.get("competitive_sale_drivers")) or any(
+        c.get("competitive_sale") for c in (anch.get("comps") or []))
+    active_days = _as_float(exp.get("active_market_days"))
+    if active_days is None:
+        active_days = _as_float((status_timeline or {}).get("active_market_days"))
+    price_cut = _as_float(exp.get("price_cut_pct")) or 0.0
+    score = 0
+    if state in ("quick_contract", "insufficient_exposure"):
+        score += 1
+    if state in ("elevated_exposure", "extended_exposure"):
+        score -= 1
+    if lts is not None and lts >= 1.0:
+        score += 1
+    if lts is not None and lts < 0.975:
+        score -= 1
+    if comp_competitive:
+        score += 1
+    if active_days is not None and active_days <= 10:
+        score += 1
+    if active_days is not None and active_days >= 45:
+        score -= 1
+    if price_cut >= 2.0:
+        score -= 1
+    if str(confidence or "").lower() == "low":
+        score -= 1   # don't chase a shaky FMV hard
+    return "high" if score >= 2 else "low" if score <= -1 else "moderate"
+
+
+def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trace: Optional[dict] = None,
+                                confidence: Optional[str] = None, status_timeline: Optional[dict] = None,
+                                range_min: Optional[float] = None, range_max: Optional[float] = None) -> Optional[dict]:
+    """A sensible opening-offer band from the FINAL FMV and the ACTUAL list price.
+
+    Every actual number this hands the buyer to WRITE ON AN OFFER (opening_low/opening_high/
+    target-strong_offer) is capped at the list/asking price whenever one is known - recommending an
+    opening move above asking gives away negotiating leverage for no reason, even on a property
+    that's genuinely underpriced relative to FMV. That underpriced case is instead handled by a
+    separate, independent number: `comfort_ceiling` (FMV x 1.05), the "most you should feel
+    comfortable paying if it comes to it" walk-away figure - advisory guidance, not a number to
+    submit - which is deliberately NOT capped by list price, since its entire purpose is to state
+    how much negotiating room exists above list on a property priced below its real value. How
+    aggressively the opening/target band approaches its cap is set by _v10_offer_aggression
+    (exposure, list-to-sale behaviour, competition, confidence)."""
+    fmv = _as_float(fmv)
+    if not fmv or fmv <= 0:
+        return None
+    lp = _as_float(list_price)
+    # The cap for anything presented as an actual offer number: never above list price (when
+    # known), and never above FMV either (unchanged from the original design).
+    ceiling = round(min(lp, fmv)) if lp else round(fmv)
+    comfort_ceiling = round(fmv * 1.05)       # advisory-only "most you'd pay" ceiling, not offer-capped
+    aggr = _v10_offer_aggression(trace, confidence, status_timeline)
+    underpriced = bool(lp and lp > 0 and fmv > lp * 1.01)
+
+    if not underpriced and lp and comfort_ceiling > lp:
+        # Asking is already at/above value: the walk-away figure never goes past the asking price
+        # (seen live 2026-10-05: FMV $950k, ask $995k, 42 days, no offer -> "comfortable up to $1,000,000").
+        comfort_ceiling = round(lp)
+    if not underpriced:
+        # priced AT or ABOVE value (or no list): open a few % below FMV, settle at/just under FMV.
+        hi_frac = {"high": 0.985, "moderate": 0.97, "low": 0.955}[aggr]
+        opening_high = round(fmv * hi_frac)
+        opening_low = round(fmv * (hi_frac - 0.04))
+        target = round(fmv * (1.0 if aggr == "high" else 0.995))
+        basis_ref = round(lp) if lp else ceiling
+    else:
+        # UNDERPRICED: the reference span is [list, FMV]; approach FMV per the competition read. A
+        # strong read can open at or above list; a weak one opens below list. Never above FMV.
+        gap = fmv - lp
+        target = round(lp + _V10_OFFER_AGGRESSION_TARGET[aggr] * gap)
+        opening_high = round(lp + _V10_OFFER_AGGRESSION_OPEN[aggr] * gap)
+        opening_low = round(opening_high - max(0.35 * (target - opening_high), 0.02 * lp))
+        opening_low = max(opening_low, round(lp * 0.90))
+        basis_ref = round(lp)
+
+    target = min(target, ceiling)
+    opening_high = min(opening_high, ceiling, target)
+    opening_low = min(opening_low, opening_high - 1)
+    # Round what the buyer writes on an offer the way an agent would say it ($870,000, not
+    # $869,550): nearest $5k over $500k, else $1k - never past the ceiling, low stays below high.
+    _step = 5000 if fmv >= 500000 else 1000
+    _rd = lambda x: int(round(float(x) / _step) * _step)
+    target = min(_rd(target), int(ceiling // _step * _step) if ceiling else _rd(target))
+    opening_high = min(_rd(opening_high), target)
+    opening_low = min(_rd(opening_low), opening_high - _step)
+    comfort_ceiling = _rd(comfort_ceiling)
+    pct_low = ((opening_low - lp) / lp * 100) if lp else None
+    pct_high = ((opening_high - lp) / lp * 100) if lp else None
+    return {
+        "contract_version": "deterministic-offer-v1",
+        "fmv": round(fmv), "list_price": round(lp) if lp else None, "ceiling": ceiling,
+        "comfort_ceiling": comfort_ceiling,
+        "opening_low": opening_low, "opening_high": opening_high, "target": target,
+        "opening_offer_low": opening_low, "opening_offer_high": opening_high,
+        "strong_offer": target,
+        "valuation_range_low": round(range_min) if _as_float(range_min) else None,
+        "valuation_range_high": round(range_max) if _as_float(range_max) else None,
+        "opening_pct_low_vs_list": round(pct_low, 4) if pct_low is not None else None,
+        "opening_pct_high_vs_list": round(pct_high, 4) if pct_high is not None else None,
+        "opening_pct_phrase": _v10_pct_range_phrase(opening_low, opening_high, lp) if lp else None,
+        "aggression": aggr, "underpriced": underpriced, "basis_ref": basis_ref,
+        "above_ask": bool(lp and opening_high > lp),
+    }
+
+
+def _v10_pct_phrase(x: float, ref: float) -> str:
+    """'about 2% above' / 'roughly at' / 'about 3% below' - grammatically safe range wording."""
+    if not ref:
+        return ""
+    d = (x - ref) / ref * 100
+    if abs(d) < 1:
+        return "roughly at"
+    return f"about {round(abs(d))}% {'above' if d > 0 else 'below'}"
+
+
+def _v10_pct_range_phrase(low: float, high: float, ref: float) -> str:
+    """Describe both endpoints of a numeric offer band relative to one reference price."""
+    if not ref:
+        return ""
+    lo_pct = (low - ref) / ref * 100
+    hi_pct = (high - ref) / ref * 100
+    lo_rounded, hi_rounded = round(abs(lo_pct)), round(abs(hi_pct))
+    if abs(lo_pct) < 1 and abs(hi_pct) < 1:
+        return "roughly at"
+    if lo_pct >= 0 and hi_pct >= 0:
+        if lo_rounded == hi_rounded:
+            return f"about {hi_rounded}% above"
+        return f"about {lo_rounded}%-{hi_rounded}% above"
+    if lo_pct <= 0 and hi_pct <= 0:
+        if lo_rounded == hi_rounded:
+            return f"about {hi_rounded}% below"
+        return f"about {hi_rounded}%-{lo_rounded}% below"
+    return "straddling"
+
+
+def _v10_offer_position_label(low: float, high: float, ref: float) -> str:
+    """Return a deterministic qualitative label that agrees with the whole opening band."""
+    if not ref:
+        return "market-based"
+    midpoint_pct = (((low + high) / 2) - ref) / ref * 100
+    if abs(midpoint_pct) < 1.5:
+        return "near-list"
+    if midpoint_pct > 0:
+        return "modestly above-list" if midpoint_pct < 8 else "meaningfully above-list"
+    return "modestly below-list" if midpoint_pct > -8 else "meaningfully below-list"
+
+
+def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float) -> tuple:
+    """Replace the numeric opening of the Offer Suggestion with a deterministic paragraph built
+    from `band` (final FMV + actual list price), and keep the AI's non-numeric strategy sentences
+    (contingencies, negotiation approach). If the model omitted the field, this still produces the
+    complete deterministic offer paragraph. Any kept sentence that quotes an opening-offer dollar
+    range is dropped so it can't contradict the rebuilt opener. Returns (new_text, flags)."""
+    b = band
+    fmv, lp = b["fmv"], b.get("list_price")
+    # Offer amounts read the way an agent would say them - "$870,000 to $905,000", not "$869,550 to
+    # $906,950" (false precision a client notices). Nearest $5k on homes over $500k, else $1k.
+    def _r(x):
+        step = 5000 if (fmv or 0) >= 500000 else 1000
+        return int(round(float(x) / step) * step) if x else x
+    ol, oh, tgt = _r(b["opening_low"]), _r(b["opening_high"]), _r(b["target"])
+    comfort_ceiling = _r(b.get("comfort_ceiling") or round(fmv * 1.05))
+    if b.get("underpriced"):
+        rel_open = b.get("opening_pct_phrase") or _v10_pct_range_phrase(ol, oh, lp)
+        position = _v10_offer_position_label(ol, oh, lp)
+        opener = (
+            f"This home looks underpriced: the ${fmv:,} fair market value sits above the ${lp:,} list "
+            f"price. A reasonable opening offer is roughly ${ol:,} to ${oh:,} ({rel_open} the list price), "
+            f"a {position} opening with room to move toward ${tgt:,} if the property draws competition - "
+            f"never above the ${lp:,} list price at the opening stage. Even though the property is "
+            f"underpriced, you shouldn't feel comfortable paying more than ${comfort_ceiling:,} for it "
+            f"(about 5% above the ${fmv:,} fair market value) without new property-specific information."
+        )
+    else:
+        lp_txt = f" against the ${lp:,} list price" if lp else ""
+        _ref = b.get("basis_ref") or fmv
+        _ref_name = "asking price" if lp and abs(_ref - lp) <= 1 else "fair market value"
+        rel_open = _v10_pct_range_phrase(ol, oh, _ref)
+        if lp and comfort_ceiling >= _r(lp) and lp > fmv:
+            _walk = (f"Don't go above the ${lp:,} asking price, and treat anything past the ${fmv:,} fair "
+                     f"market value as needing a clear reason, such as competing offers or new "
+                     f"property-specific information.")
+        else:
+            _walk = (f"You shouldn't feel comfortable paying more than ${comfort_ceiling:,} for this property "
+                     f"(about 5% above the ${fmv:,} fair market value) without new property-specific information.")
+        opener = (
+            f"Given the ${fmv:,} fair market value{lp_txt}, a reasonable opening offer is roughly ${ol:,} "
+            f"to ${oh:,} ({rel_open} the ${_ref:,} {_ref_name}), leaving room to settle "
+            f"toward ${tgt:,}. " + _walk
+        )
+    kept: list = []
+    source_offer = _strip_under_contract_offer_frame(offer_text or "")
+    for sm in re.finditer(r"[^.!?]*[.!?]", source_offer):
+        s = sm.group(0).strip()
+        if not s:
+            continue
+        if len(re.findall(r"[A-Za-z]{2,}", s)) < 2:
+            continue
+        low = s.lower()
+        _has_open_num = re.search(r"\$\s?\d[\d,]*(?:\.\d+)?\s?[MmKk]?\s*(?:to|and|[-–—])\s*\$?\s?\d", s) and \
+            any(w in low for w in ("open", "offer", "start", "initial", "come in", "bid"))
+        _has_indicated_num = re.search(r"\$\s?\d[\d,]*", s) and any(
+            w in low for w in ("indicated value", "fair market value", "fmv", "estimated value", "list price", "asking"))
+        _repeats_opening_advice = any(
+            w in low for w in ("starting offer", "start near", "start below", "start above", "opening offer",
+                               "initial offer", "initial bid", "come in near", "come in below", "come in above")
+        )
+        _mentions_internal_anchor = bool(re.search(r"\b(?:deterministic|comparable-sales|comp)?\s*anchor\b", low))
+        # The deterministic opener owns every numeric offer recommendation. Retain only genuinely
+        # nonnumeric advice such as inspection/financing terms; this also removes malformed fragments
+        # that sentence splitting can leave behind (for example "9-5. 6% above list").
+        _has_strategy_number = bool(
+            "$" in s or "%" in s or re.search(r"\b\d{1,3}\s*[-–—]\s*\d{1,3}\s*[.)]", s)
+        )
+        if (_has_open_num or _has_indicated_num or _repeats_opening_advice
+                or _mentions_internal_anchor or _has_strategy_number):
+            continue  # its numbers are re-stated by the deterministic opener
+        kept.append(s)
+    body = " ".join(kept).strip()
+    new_text = (opener + (" " + body if body else "")).strip()
+    return new_text, ["Offer strategy: the opening-offer figures were rebuilt deterministically from the final "
+                      "FMV and the actual list price (the AI's own numeric opener was replaced)."]
+
+
+def _v10_offer_field_contract_check(band: Optional[dict], final: Optional[dict]) -> list[str]:
+    """Validate the structured fields rendered by the site/PDF before prose is considered."""
+    if not band or not final:
+        return ["Offer strategy: deterministic offer fields are missing."]
+    blocking: list[str] = []
+    expected = {
+        "fmv": _as_float(final.get("value")),
+        "valuation_range_low": _as_float(final.get("range_min")),
+        "valuation_range_high": _as_float(final.get("range_max")),
+        "list_price": _as_float(final.get("list_price")),
+    }
+    for field, value in expected.items():
+        actual = _as_float(band.get(field))
+        if value is not None and (actual is None or abs(actual - value) > 1):
+            blocking.append(
+                f"Offer strategy: structured {field} is {actual}, but its authoritative value is {value}."
+            )
+    ol = _as_float(band.get("opening_offer_low"))
+    oh = _as_float(band.get("opening_offer_high"))
+    strong = _as_float(band.get("strong_offer"))
+    fmv = expected["fmv"]
+    if not all(v is not None for v in (ol, oh, strong, fmv)) or not (ol < oh <= strong <= fmv):
+        blocking.append(
+            "Offer strategy: opening offer, strong offer, and FMV fields are missing, inverted, or substituted."
+        )
+    vr_low, vr_high = expected["valuation_range_low"], expected["valuation_range_high"]
+    if ol is not None and oh is not None and vr_low is not None and vr_high is not None \
+            and abs(ol - vr_low) <= 1 and abs(oh - vr_high) <= 1:
+        blocking.append(
+            "Offer strategy: the opening-offer range was substituted with the authoritative valuation range."
+        )
+    lp = expected["list_price"]
+    if lp and ol is not None and oh is not None:
+        expected_low = (ol - lp) / lp * 100
+        expected_high = (oh - lp) / lp * 100
+        stored_low = _as_float(band.get("opening_pct_low_vs_list"))
+        stored_high = _as_float(band.get("opening_pct_high_vs_list"))
+        if stored_low is None or stored_high is None or abs(stored_low - expected_low) > 0.01 \
+                or abs(stored_high - expected_high) > 0.01:
+            blocking.append("Offer strategy: structured opening-offer percentages do not match the offer endpoints.")
+        expected_phrase = _v10_pct_range_phrase(ol, oh, lp)
+        if band.get("opening_pct_phrase") != expected_phrase:
+            blocking.append(
+                f"Offer strategy: structured percentage phrase must be '{expected_phrase}', not "
+                f"'{band.get('opening_pct_phrase')}'."
+            )
+    return blocking
+
+
+def _v10_offer_sanity_check(offer_text: str, band: Optional[dict], range_min: Optional[float],
+                            range_max: Optional[float]) -> list:
+    """A dedicated blocking sanity check for the Offer Suggestion - runs LAST, on the exact text
+    going to the PDF. Blocks on: a wrong list price, a wrong FMV, an opening-offer range as wide as
+    the whole valuation range, any recommended figure above the walk-away ceiling, and malformed
+    percentage / range wording."""
+    if not offer_text or not band:
+        return []
+    # Accept pre-contract callers while validating them through the same explicit field shape.
+    band = dict(band)
+    band.setdefault("opening_offer_low", band.get("opening_low"))
+    band.setdefault("opening_offer_high", band.get("opening_high"))
+    band.setdefault("strong_offer", band.get("target"))
+    if band.get("valuation_range_low") is None:
+        band["valuation_range_low"] = range_min
+    if band.get("valuation_range_high") is None:
+        band["valuation_range_high"] = range_max
+    if band.get("list_price") and band.get("opening_offer_low") is not None \
+            and band.get("opening_offer_high") is not None:
+        _legacy_lp = band["list_price"]
+        band.setdefault(
+            "opening_pct_low_vs_list",
+            (band["opening_offer_low"] - _legacy_lp) / _legacy_lp * 100,
+        )
+        band.setdefault(
+            "opening_pct_high_vs_list",
+            (band["opening_offer_high"] - _legacy_lp) / _legacy_lp * 100,
+        )
+        band.setdefault(
+            "opening_pct_phrase",
+            _v10_pct_range_phrase(band["opening_offer_low"], band["opening_offer_high"], _legacy_lp),
+        )
+    blocking: list = []
+    lp = band.get("list_price")
+    fmv = band.get("fmv")
+    ceiling = band.get("ceiling")
+    comfort_ceiling = band.get("comfort_ceiling")
+    txt = offer_text
+    blocking += _v10_offer_field_contract_check(band, {
+        "value": fmv, "range_min": range_min, "range_max": range_max, "list_price": lp,
+    })
+
+    # wrong list price
+    if lp:
+        for m in re.finditer(r"(list(?:ed|ing)?\s+(?:price|at)|asking(?:\s+price)?|on\s+the\s+market\s+at)\s*(?:of|for|is|:)?\s*\$\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?",
+                             txt, re.IGNORECASE):
+            fig = _parse_dollar(m.group(2), m.group(3))
+            if fig >= 100000 and abs(fig - lp) > max(5000.0, 0.005 * lp):
+                blocking.append(f"Offer strategy: states the list price as ${fig:,.0f}, but the subject is listed at ${lp:,.0f}.")
+                break
+
+    # wrong FMV
+    if fmv:
+        for m in re.finditer(r"(fair\s+market\s+value|indicated\s+value|\bFMV\b|estimated\s+value|our\s+estimate|value\s+of)\s*(?:of|is|at|:|about|around|roughly)?\s*\$\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?",
+                             txt, re.IGNORECASE):
+            fig = _parse_dollar(m.group(2), m.group(3))
+            if fig >= 100000 and abs(fig - fmv) > max(8000.0, 0.01 * fmv):
+                blocking.append(f"Offer strategy: quotes a fair market value of ${fig:,.0f}, but the report's final FMV is ${fmv:,.0f}.")
+                break
+
+    # wrong valuation range
+    if range_min and range_max and fmv:
+        for m in re.finditer(r"\$\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?\s*(?:to|[-â€“â€”]|and)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?", txt):
+            lo = _parse_dollar(m.group(1), m.group(2))
+            hi = _parse_dollar(m.group(3), m.group(4))
+            if lo < 100000 or hi < 100000 or hi <= lo:
+                continue
+            pre = txt[max(0, m.start() - 70):m.start()].lower()
+            if not any(w in pre for w in ("valuation range", "value range", "confidence range",
+                                          "supported range", "estimated value range", "final range")):
+                continue
+            if abs(lo - range_min) > max(2500.0, 0.002 * fmv) or abs(hi - range_max) > max(2500.0, 0.002 * fmv):
+                blocking.append(
+                    f"Offer strategy: states a valuation range of ${lo:,.0f}-${hi:,.0f}, but the "
+                    f"authoritative final range is ${range_min:,.0f}-${range_max:,.0f}.")
+                break
+
+    # opening-offer range as wide as the whole valuation range / above the settle basis
+    _vr_width = (range_max - range_min) if (range_min and range_max) else None
+    for m in re.finditer(r"\$\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?\s*(?:to|[-–—]|and)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?", txt):
+        lo = _parse_dollar(m.group(1), m.group(2))
+        hi = _parse_dollar(m.group(3), m.group(4))
+        if lo < 100000 or hi < 100000 or hi <= lo:
+            continue
+        pre = txt[max(0, m.start() - 60):m.start()].lower()
+        if not any(w in pre for w in ("open", "offer", "start", "initial", "come in", "bid", "propose")):
+            continue
+        expected_low = _as_float(band.get("opening_offer_low"))
+        expected_high = _as_float(band.get("opening_offer_high"))
+        if expected_low is not None and expected_high is not None and (
+                abs(lo - expected_low) > 1 or abs(hi - expected_high) > 1):
+            blocking.append(
+                f"Offer strategy: rendered opening-offer range ${lo:,.0f}-${hi:,.0f} does not match the "
+                f"deterministic opening fields ${expected_low:,.0f}-${expected_high:,.0f}."
+            )
+        if lp:
+            pct_window = txt[m.end():min(len(txt), m.end() + 100)]
+            pct_match = re.search(
+                r"(?:about|roughly)?\s*(\d{1,3})(?:\s*%\s*(?:-|to)\s*(\d{1,3}))?\s*%\s*"
+                r"(above|below)\s+(?:the\s+)?list\s+price",
+                pct_window, re.IGNORECASE,
+            )
+            if pct_match:
+                stated = {int(pct_match.group(1))}
+                if pct_match.group(2):
+                    stated.add(int(pct_match.group(2)))
+                actual = {
+                    round(abs((lo - lp) / lp * 100)),
+                    round(abs((hi - lp) / lp * 100)),
+                }
+                actual_direction = (
+                    "above" if lo >= lp and hi >= lp
+                    else "below" if lo <= lp and hi <= lp else "straddling"
+                )
+                if stated != actual or pct_match.group(3).lower() != actual_direction:
+                    expected = _v10_pct_range_phrase(lo, hi, lp)
+                    blocking.append(
+                        f"Offer strategy: opening-range percentage does not match ${lo:,.0f}-${hi:,.0f} "
+                        f"against the ${lp:,.0f} list price; it must read '{expected} the list price'."
+                    )
+        if _vr_width and (hi - lo) >= 0.8 * _vr_width:
+            blocking.append(
+                f"Offer strategy: the opening-offer range ${lo:,.0f}-${hi:,.0f} is about as wide as the entire "
+                f"valuation range - an opening offer is a narrow band, not the confidence interval.")
+        if ceiling and hi > ceiling + max(5000.0, 0.01 * ceiling):
+                blocking.append(
+                    f"Offer strategy: the opening-offer range tops out at ${hi:,.0f}, above the ${ceiling:,.0f} "
+                    f"supported-FMV walk-away ceiling.")
+        break
+
+    # any recommended figure above the ceiling - except the comfort_ceiling itself (DELIBERATELY
+    # above list price on an underpriced subject - the "most you'd pay if it comes to it" advisory
+    # figure, never a number to actually write on an offer) and the FMV itself (always a
+    # legitimate reference figure to quote - e.g. "...paying more than $X, about 5% above the $FMV
+    # fair market value" - never itself an instruction to pay up to the FMV).
+    if ceiling:
+        for m in re.finditer(r"\$\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?", txt):
+            fig = _parse_dollar(m.group(1), m.group(2))
+            if fig < 100000 or fig <= ceiling + max(5000.0, 0.01 * ceiling):
+                continue
+            if comfort_ceiling and abs(fig - comfort_ceiling) <= 1:
+                continue
+            if fmv and abs(fig - fmv) <= 1:
+                continue
+            win = txt[max(0, m.start() - 55):m.start()].lower()
+            if any(w in win for w in ("offer", "pay", "bid", "go to", "go as high", "up to", "as high as",
+                                      "stretch to", "push to", "increase to", "raise to", "settle at", "settle toward")):
+                blocking.append(
+                    f"Offer strategy: recommends going to ${fig:,.0f}, above the ${ceiling:,.0f} walk-away ceiling "
+                    f"(no comp support for paying above the final FMV).")
+                break
+
+    strong = _as_float(band.get("strong_offer"))
+    if strong:
+        for m in re.finditer(
+                r"(?:strong\s+offer|move\s+toward|settle\s+toward|target(?:\s+an?\s+offer)?(?:\s+of|\s+at)?)"
+                r"[^$]{0,24}\$\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?", txt, re.IGNORECASE):
+            fig = _parse_dollar(m.group(1), m.group(2))
+            if abs(fig - strong) > max(2500.0, 0.002 * strong):
+                blocking.append(
+                    f"Offer strategy: rendered strong-offer/target figure ${fig:,.0f} does not match the "
+                    f"deterministic strong offer ${strong:,.0f}."
+                )
+                break
+
+    # malformed percentage / range wording
+    _mm = _MALFORMED_PCT_RE.search(txt)
+    if _mm:
+        blocking.append(f"Offer strategy: contains malformed percentage / range wording (\"{_mm.group(0).strip()}\") - rewrite it.")
+
+    return list(dict.fromkeys(blocking))
+
+
+def _v10_apply_buyer_offer_rebuild(offer_text: str, final: Optional[dict], list_price, range_pct: float,
+                                   status_timeline: dict, valuation_trace: Optional[dict],
+                                   qa_blocking: list, qa_result) -> tuple:
+    """Round 19 orchestration (buyer mode). Rebuilds the Offer Suggestion opener from the final
+    valuation + the actual list price, re-applies the status-aware wrapper, runs the dedicated
+    blocking sanity check on the exact text going to the PDF, and reconciles qa_result: any earlier
+    'Offer strategy:' block (raised against the PRE-rebuild text) is dropped and replaced by the
+    fresh checks on the rebuilt text. Returns (offer_text, qa_blocking, qa_result, flags)."""
+    flags: list = []
+    band = _v10_build_buyer_offer_band(
+        (final or {}).get("value"), list_price,
+        trace=valuation_trace, confidence=(final or {}).get("confidence"), status_timeline=status_timeline,
+        range_min=(final or {}).get("range_min"), range_max=(final or {}).get("range_max"))
+    if not band:
+        return offer_text, qa_blocking, qa_result, flags
+    offer_text, _rf = _v10_rebuild_buyer_offer_prose(offer_text, band, range_pct)
+    flags += _rf
+    offer_text, _sf = _status_aware_offer_guidance(offer_text, status_timeline or {})
+    flags += _sf
+    fresh = _v10_offer_sanity_check(offer_text, band, (final or {}).get("range_min"), (final or {}).get("range_max"))
+    fresh += _v10_offer_final_valuation_check(offer_text, final, valuation_trace)
+    fresh = list(dict.fromkeys(fresh))
+    # drop stale offer-strategy blocks (raised against the pre-rebuild text), keep everything else
+    qa_blocking = [b for b in (qa_blocking or []) if not str(b).startswith("Offer strategy:")] + fresh
+    if isinstance(qa_result, dict):
+        kept = [b for b in qa_result.get("blocking_errors", []) if not str(b).startswith("Offer strategy:")]
+        qa_result["blocking_errors"] = list(dict.fromkeys([*kept, *fresh]))
+        qa_result["export_allowed"] = not qa_result["blocking_errors"]
+        qa_result["passed"] = not qa_result["blocking_errors"] and not qa_result.get("warnings")
+        if "buyer_offer_sanity" not in qa_result.get("checks_run", []):
+            qa_result.setdefault("checks_run", []).append("buyer_offer_sanity")
+    return offer_text, qa_blocking, qa_result, flags
+
+
+
+def _v10_sync_qa_authority(qa_result: Optional[dict], qa_blocking: list) -> Optional[dict]:
+    """Keep qa_result authoritative if qa_blocking grew after _finalize_gate_reconciled_prose
+    returned (e.g. the premium-improvements pass). Idempotent."""
+    if not isinstance(qa_result, dict):
+        return qa_result
+    for key in ("warnings", "corrections", "blocking_errors", "external_blocking"):
+        if isinstance(qa_result.get(key), list):
+            qa_result[key] = list(dict.fromkeys(qa_result[key]))
+    merged = list(dict.fromkeys([*qa_result.get("blocking_errors", []), *(qa_blocking or [])]))
+    qa_result["blocking_errors"] = merged
+    qa_result["export_allowed"] = not merged
+    qa_result["passed"] = not merged and not qa_result.get("warnings")
+    return qa_result
+
+
+def _v10_psf_denominator_check(fields: dict, anchor_comps: list) -> list:
+    """Issue #4. Block prose that calls an ABOVE-GRADE $/sqft figure a TOTAL-area rate. Each anchor
+    comp carries both raw_total_finished_psf and adjusted_above_grade_psf (see _compute_comp_anchor)."""
+    blocking: list = []
+    ag_figs = []
+    total_figs = []
+    for c in anchor_comps or []:
+        for key in ("adjusted_above_grade_psf", "raw_psf", "psf_used_in_leg"):
+            f = _as_float(c.get(key))
+            if f:
+                ag_figs.append(f)
+        f = _as_float(c.get("raw_total_finished_psf"))
+        if f:
+            total_figs.append(f)
+    if not ag_figs:
+        return blocking
+    for _key, (label, text) in fields.items():
+        for m in _PSF_FIG_RE.finditer(text or ""):
+            stated = _as_float((m.group(1) or "").replace(",", ""))
+            if not stated:
+                continue
+            win = (text or "")[max(0, m.start() - 20):min(len(text or ""), m.end() + 60)]
+            if not _TOTAL_AREA_RE.search(win):
+                continue
+            near_ag = any(abs(stated - f) <= max(6.0, 0.02 * f) for f in ag_figs)
+            near_total = any(abs(stated - f) <= max(6.0, 0.02 * f) for f in total_figs)
+            if near_ag and not near_total:
+                blocking.append(
+                    f"{label}: describes ${stated:,.0f}/sq ft as a total-area rate, but that figure is an "
+                    f"ABOVE-GRADE $/sq ft (the true total-finished-area rate for that comp is "
+                    f"{'~$' + format(min(total_figs, key=lambda x: abs(x - stated)), ',.0f') + '/sq ft' if total_figs else 'lower'}). "
+                    "Label it 'above-grade $/sq ft' or use the total-area figure.")
+                break
+    return blocking
+
+
+async def _finalize_gate_reconciled_prose(
+    *, methodology: str, offer: str, inspection: str, value: float, range_pct: float,
+    subject_asking: Optional[float], confidence: Optional[str], status_timeline: dict,
+    enriched_subject: dict, comps: list, comp_num_by_key: dict, addr_by_key: dict,
+    valuation_trace: Optional[dict], value_drivers: Optional[list], qa_ctx: dict, mode: str, model: str,
+    final: Optional[dict] = None, external_blocking: Optional[list] = None,
+    run_language_polish: bool = True,
+) -> dict:
+    """The shared tail of generate_ai_analysis / recompute_valuation - the LAST pipeline stage
+    before the report payload is assembled (issue #6 ordering). In order:
+      1. deterministic post-exposure-gate prose reconciliation (stale ranges, the comps-vs-
+         exposure sentence, an exposure value-driver when all drivers lean up);
+      2. concluded-number scan against the ONE authoritative `final` valuation object + the
+         above-grade-vs-total $/sqft denominator check;
+      3. _v10_final_report_qa (jargon / stray-$ sweep);
+      4. _v10_pre_export_qa (the consolidator), on m/o/i AND the value-driver notes;
+      5. ONLY if a gate-related contradiction survived AND the exposure gate actually fired: one
+         targeted single-section model rewrite of the methodology (+ buyer offer), re-run of 1-4;
+      6. MERGE every blocking source - this stage's QA, the concluded-number scan, and the
+         caller's `external_blocking` (valuation-reconciliation / gate / range blocking) - into the
+         authoritative qa_result and recompute export_allowed. A blocking valuation-reconciliation
+         failure now ALWAYS shows in qa_result and gates client export.
+    Returns methodology / offer / inspection / value_drivers / qa_result (AUTHORITATIVE), plus
+    qa_flags and qa_blocking that are ONLY this stage's NEW additions (the caller already holds
+    external_blocking)."""
+    anchor = (valuation_trace or {}).get("anchor")
+    _final = final or {}
+    _ext_block = list(external_blocking or [])
+    flags: list = []
+    blocking: list = []
+    offer_fields: Optional[dict] = None
+
+    methodology = _replace_raw_comp_references(methodology, comps)
+    offer = _replace_raw_comp_references(offer, comps)
+    inspection = _replace_raw_comp_references(inspection, comps)
+    for driver in value_drivers or []:
+        if not isinstance(driver, dict):
+            continue
+        driver["comp_label"] = _replace_raw_comp_references(driver.get("comp_label"), comps)
+        driver["note"] = _replace_raw_comp_references(driver.get("note"), comps)
+    blocking += _raw_comp_reference_blocking(value_drivers, comps, [methodology, offer, inspection])
+
+    # Deterministic FLOOR for the methodology summary. The AI can satisfy the schema's
+    # `required: [methodology_summary]` with an empty string (same failure class as the inspection
+    # section - see _deterministic_inspection_baseline). methodology_summary feeds the client
+    # "Buyer Valuation Notes" / "Agent Pricing Analysis" section AND is what the entry points copy
+    # into pricing.offer_strategy_commentary - a blank one leaves that whole section empty. Build a
+    # plain-language explanation from the locked valuation trace instead.
+    if _is_blank(methodology):
+        methodology = _v10_why_this_number(valuation_trace, value, range_pct) or (
+            (f"The estimated fair market value is ${round(value):,}" if value else "The estimated value")
+            + (f", within roughly ±{range_pct:.0f}%" if range_pct else "")
+            + ", based on the verified comparable sales adjusted to the subject property"
+            + (f" and its {confidence} confidence read" if confidence else "") + "."
+        )
+        flags.append("Methodology summary came back empty from the AI - filled a plain-language "
+                     "explanation built from the valuation trace (anchor, key comps, adjustments, "
+                     "market exposure). Review and expand before sharing.")
+
+    inspection, _inspection_fact_flags = _reconcile_inspection_fact_prose(inspection, enriched_subject)
+    flags += _inspection_fact_flags
+
+    def _vd_text(vds: Optional[list]) -> str:
+        return "\n".join(str(d.get("note") or "") for d in (vds or []) if d.get("note"))
+
+    def _run_qa(m_txt: str, o_txt: str, i_txt: str, vds: Optional[list]):
+        f_local: list = []
+        b_local: list = []
+        _flds = {"m": ("Methodology summary", m_txt), "o": ("Offer strategy", o_txt),
+                 "i": ("Inspection concerns", i_txt), "vd": ("Why this number", _vd_text(vds))}
+        _qf, _qb = _v10_final_report_qa(_flds, value, range_pct, valuation_trace or {})
+        f_local += _qf
+        b_local += _qb
+        qa_result, corrected, block2 = _v10_pre_export_qa(
+            _flds,
+            value=value, range_pct=range_pct, subject_asking=subject_asking, status_timeline=status_timeline,
+            comps=comps, comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key,
+            valuation_trace=valuation_trace, value_drivers=vds, confidence=confidence,
+        )
+        f_local += qa_result["warnings"] + [f"auto-corrected: {c}" for c in qa_result["corrections"]]
+        b_local += block2
+        return qa_result, corrected, f_local, b_local
+
+    # ---- 1. deterministic post-gate reconciliation
+    _pg, value_drivers, _pg_flags = _reconcile_post_gate_prose(
+        {"m": ("Methodology summary", methodology), "o": ("Offer strategy", offer), "i": ("Inspection concerns", inspection)},
+        value=value, range_pct=range_pct, anchor=anchor, trace=valuation_trace, value_drivers=value_drivers,
+    )
+    methodology, offer, inspection = _pg["m"][1], _pg["o"][1], _pg["i"][1]
+    flags += _pg_flags
+    methodology, _adf = _v10_reconcile_anchor_direction_prose(methodology, final=_final, trace=valuation_trace)
+    flags += _adf
+
+    # ---- 2. concluded-number scan against the authoritative final object + $/sqft denominator
+    _scan_block: list = []
+    if _final:
+        _sf, _sb, _sn = _v10_scan_concluded_numbers(
+            {"m": ("Methodology summary", methodology), "o": ("Offer strategy", offer),
+             "i": ("Inspection concerns", inspection), "vd": ("Why this number", _vd_text(value_drivers))},
+            final=_final,
+        )
+        methodology, offer, inspection = _sf["m"][1], _sf["o"][1], _sf["i"][1]
+        _scan_block += _sb
+        flags += [f"auto-corrected: {n}" for n in _sn]
+        # issue #3: reconcile the METHODOLOGY-of-record (anchor $, weighted-comp count, named
+        # driver comps), not just the FMV/range. Rewrites a stale anchor figure; blocks the rest.
+        _mf, _mb, _mn = _v10_methodology_consistency_check(
+            {"m": ("Methodology summary", methodology), "vd": ("Why this number", _vd_text(value_drivers))},
+            _final,
+        )
+        methodology = _mf["m"][1]
+        _scan_block += _mb
+        flags += [f"auto-corrected: {n}" for n in _mn]
+    _scan_block += _v10_psf_denominator_check(
+        {"m": ("Methodology summary", methodology), "o": ("Offer strategy", offer),
+         "i": ("Inspection concerns", inspection), "vd": ("Why this number", _vd_text(value_drivers))},
+        (anchor or {}).get("comps") or [],
+    )
+    # issue #2: the client narrative may only describe offsets that exist as supported structured
+    # adjustments in the itemised trace - no narrative-only valuation logic.
+    _scan_block += _v10_prose_offset_backing_check(
+        {"m": ("Methodology summary", methodology), "o": ("Offer strategy", offer),
+         "i": ("Inspection concerns", inspection), "vd": ("Why this number", _vd_text(value_drivers))},
+        valuation_trace or {},
+    )
+    _scan_block += _v10_directional_adjustment_backing_check(
+        {"m": ("Methodology summary", methodology), "o": ("Offer strategy", offer),
+         "i": ("Inspection concerns", inspection), "vd": ("Why this number", _vd_text(value_drivers))},
+        valuation_trace or {},
+    )
+    _scan_block += _v10_structured_adjustment_fact_check(
+        valuation_trace or {}, enriched_subject,
+    )
+    for _fact_label, _fact_text in (
+        ("Methodology summary", methodology), ("Offer strategy", offer),
+        ("Inspection concerns", inspection),
+    ):
+        _scan_block += _factual_prose_blocking(_fact_text, _fact_label, enriched_subject)
+    # item #2: the Offer Suggestion must be built from the FINAL valuation, not a pre-final figure.
+    _offer_stale_block = _v10_offer_final_valuation_check(offer, _final, valuation_trace)
+    _scan_block += _offer_stale_block
+
+    # ---- 3 + 4. QA (pass 1)
+    qa_result, corrected, f1, b1 = _run_qa(methodology, offer, inspection, value_drivers)
+    methodology = corrected.get("m", methodology)
+    offer = corrected.get("o", offer)
+    inspection = corrected.get("i", inspection)
+    flags += f1
+    blocking += b1 + _scan_block
+
+    # ---- 4. targeted rewrite if a gate-related contradiction survived OR the offer still quotes a
+    #         pre-final valuation (item #2 - regenerate the strategy from the final numbers, don't
+    #         string-patch).
+    _reasoning_authority = (valuation_trace or {}).get("authority") == "reasoning_model"
+    _gate_fired = (not _reasoning_authority) and bool(
+        ((valuation_trace or {}).get("above_ask_gate") or {}).get("applied")
+    )
+    _gate_related = [b for b in b1 if any(t in b.lower() for t in
+                     ("directional math", "fmv range consistency", "fmv consistency", "value-driver"))]
+    if (_gate_fired and _gate_related) or (_offer_stale_block and not _reasoning_authority):
+        new_m, new_o, _rw_flags = await _targeted_gate_rewrite(
+            methodology, offer, value=value, range_pct=range_pct, anchor=anchor,
+            trace=valuation_trace, mode=mode, model=model,
+        )
+        flags += _rw_flags
+        if new_m != methodology or new_o != offer:
+            # re-run the deterministic prose passes on the rewrite, then reconcile + QA again
+            new_m, _x1 = _prose_math_qa(new_m, "Methodology summary", qa_ctx)
+            new_m, _x3 = _final_polish_pass(new_m, "Methodology summary")
+            new_m, _x4 = _firm_up_hedges(new_m, comps)
+            flags += _x1 + _x3 + _x4
+            _rg, _rgf, _rgb = _final_consistency_gate(
+                {"m": ("Methodology summary", new_m), "o": ("Offer strategy", new_o), "i": ("Inspection concerns", inspection)},
+                subject=enriched_subject, comps=comps, value=value, status_timeline=status_timeline,
+                comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key,
+            )
+            new_m, new_o, inspection = _rg["m"], _rg["o"], _rg["i"]
+            flags += _rgf
+            _pg2, value_drivers, _pg2f = _reconcile_post_gate_prose(
+                {"m": ("Methodology summary", new_m), "o": ("Offer strategy", new_o), "i": ("Inspection concerns", inspection)},
+                value=value, range_pct=range_pct, anchor=anchor, trace=valuation_trace, value_drivers=value_drivers,
+            )
+            new_m, new_o, inspection = _pg2["m"][1], _pg2["o"][1], _pg2["i"][1]
+            flags += _pg2f
+            new_m, _adf2 = _v10_reconcile_anchor_direction_prose(new_m, final=_final, trace=valuation_trace)
+            flags += _adf2
+            _scan_block = []
+            if _final:
+                _sf2, _sb2, _sn2 = _v10_scan_concluded_numbers(
+                    {"m": ("Methodology summary", new_m), "o": ("Offer strategy", new_o),
+                     "i": ("Inspection concerns", inspection), "vd": ("Why this number", _vd_text(value_drivers))},
+                    final=_final,
+                )
+                new_m, new_o, inspection = _sf2["m"][1], _sf2["o"][1], _sf2["i"][1]
+                _scan_block += _sb2
+                flags += [f"auto-corrected: {n}" for n in _sn2]
+                _mf2, _mb2, _mn2 = _v10_methodology_consistency_check(
+                    {"m": ("Methodology summary", new_m), "vd": ("Why this number", _vd_text(value_drivers))},
+                    _final,
+                )
+                new_m = _mf2["m"][1]
+                _scan_block += _mb2
+                flags += [f"auto-corrected: {n}" for n in _mn2]
+            _scan_block += _v10_psf_denominator_check(
+                {"m": ("Methodology summary", new_m), "o": ("Offer strategy", new_o),
+                 "i": ("Inspection concerns", inspection), "vd": ("Why this number", _vd_text(value_drivers))},
+                (anchor or {}).get("comps") or [],
+            )
+            _scan_block += _v10_prose_offset_backing_check(
+                {"m": ("Methodology summary", new_m), "o": ("Offer strategy", new_o),
+                 "i": ("Inspection concerns", inspection), "vd": ("Why this number", _vd_text(value_drivers))},
+                valuation_trace or {},
+            )
+            _scan_block += _v10_directional_adjustment_backing_check(
+                {"m": ("Methodology summary", new_m), "o": ("Offer strategy", new_o),
+                 "i": ("Inspection concerns", inspection), "vd": ("Why this number", _vd_text(value_drivers))},
+                valuation_trace or {},
+            )
+            _scan_block += _v10_structured_adjustment_fact_check(
+                valuation_trace or {}, enriched_subject,
+            )
+            for _fact_label, _fact_text in (
+                ("Methodology summary", new_m), ("Offer strategy", new_o),
+                ("Inspection concerns", inspection),
+            ):
+                _scan_block += _factual_prose_blocking(_fact_text, _fact_label, enriched_subject)
+            _scan_block += _v10_offer_final_valuation_check(new_o, _final, valuation_trace)
+            qa_result, corrected, f2, b2 = _run_qa(new_m, new_o, inspection, value_drivers)
+            methodology = corrected.get("m", new_m)
+            offer = corrected.get("o", new_o)
+            inspection = corrected.get("i", inspection)
+            # pass 2 REPLACES pass 1's QA contribution (don't double-count)
+            flags = [x for x in flags if x not in f1]
+            blocking = [x for x in blocking if x not in b1]
+            flags += _rgb + f2
+            blocking += b2 + _scan_block
+
+    # ---- 5. FINAL non-semantic language polish (items #4/#5). After ALL valuation math,
+    #      reconciliation, deterministic corrections and offer logic are locked, one prose-quality
+    #      pass over every client-facing field - grammar / spelling / punctuation / spacing / flow /
+    #      dedup / broken fragments / malformed replacement text / AI-sounding phrasing ONLY. A
+    #      deterministic guard rejects the polish for any field whose numeric or directional tokens
+    #      changed, so it can never move a number or a valuation direction. Then the FINAL
+    #      deterministic QA re-runs on the POST-polish strings that actually go into the PDF.
+    _pol = (await _v10_final_language_polish(
+        {"methodology_summary": methodology, "offer_strategy_considerations": offer,
+         "inspection_concerns": inspection},
+        model=model,
+    ) if run_language_polish else {"fields": {}, "changed": False, "flags": []})
+    methodology = _pol["fields"].get("methodology_summary", methodology)
+    offer = _pol["fields"].get("offer_strategy_considerations", offer)
+    inspection = _pol["fields"].get("inspection_concerns", inspection)
+    flags += _pol["flags"]
+    if run_language_polish and any("Final language polish skipped" in f for f in _pol["flags"]):
+        # Mutating qa_result (already built by pass-1 _run_qa above) directly rather than relying
+        # on the "changed" branch below - that branch re-runs QA on the polish's OWN output, but
+        # a failed polish sets changed=False so it's skipped entirely, and this is the only place
+        # left that still sees the failure. Never blocking (the pre-polish text is still valid,
+        # unpolished prose) but must not present as an ordinary clean "Passed" run.
+        qa_result.setdefault("warnings", []).append(
+            "Valuation reliability: the final language-polish pass failed and was skipped this run "
+            "- the exported text is the unpolished draft. Numbers and valuation direction are "
+            "unaffected (a deterministic guard would have rejected the polish otherwise)."
+        )
+        qa_result["passed"] = False
+    inspection, _post_polish_fact_flags = _reconcile_inspection_fact_prose(inspection, enriched_subject)
+    flags += _post_polish_fact_flags
+    if _pol["changed"]:
+        _post_scan_block: list = []
+        if _final:
+            _sf3, _sb3, _sn3 = _v10_scan_concluded_numbers(
+                {"m": ("Methodology summary", methodology), "o": ("Offer strategy", offer),
+                 "i": ("Inspection concerns", inspection), "vd": ("Why this number", _vd_text(value_drivers))},
+                final=_final,
+            )
+            methodology, offer, inspection = _sf3["m"][1], _sf3["o"][1], _sf3["i"][1]
+            _post_scan_block += _sb3
+            flags += [f"auto-corrected: {n}" for n in _sn3]
+            _mf3, _mb3, _mn3 = _v10_methodology_consistency_check(
+                {"m": ("Methodology summary", methodology), "vd": ("Why this number", _vd_text(value_drivers))},
+                _final,
+            )
+            methodology = _mf3["m"][1]
+            _post_scan_block += _mb3
+            flags += [f"auto-corrected: {n}" for n in _mn3]
+        _post_fields = {"m": ("Methodology summary", methodology), "o": ("Offer strategy", offer),
+                        "i": ("Inspection concerns", inspection), "vd": ("Why this number", _vd_text(value_drivers))}
+        _post_scan_block += _v10_psf_denominator_check(_post_fields, (anchor or {}).get("comps") or [])
+        _post_scan_block += _v10_prose_offset_backing_check(_post_fields, valuation_trace or {})
+        _post_scan_block += _v10_directional_adjustment_backing_check(_post_fields, valuation_trace or {})
+        _post_scan_block += _v10_structured_adjustment_fact_check(
+            valuation_trace or {}, enriched_subject,
+        )
+        for _fact_label, _fact_text in (
+            ("Methodology summary", methodology), ("Offer strategy", offer),
+            ("Inspection concerns", inspection),
+        ):
+            _post_scan_block += _factual_prose_blocking(_fact_text, _fact_label, enriched_subject)
+        _post_scan_block += _v10_offer_final_valuation_check(offer, _final, valuation_trace)
+        # re-run the final deterministic QA on the exact strings that will be exported
+        _pf, _pb = _v10_final_report_qa(
+            {"m": ("Methodology summary", methodology), "o": ("Offer strategy", offer),
+             "i": ("Inspection concerns", inspection), "vd": ("Why this number", _vd_text(value_drivers))},
+            value, range_pct, valuation_trace or {},
+        )
+        _pqa, _pcorr, _pb2 = _v10_pre_export_qa(
+            {"m": ("Methodology summary", methodology), "o": ("Offer strategy", offer),
+             "i": ("Inspection concerns", inspection), "vd": ("Why this number", _vd_text(value_drivers))},
+            value=value, range_pct=range_pct, subject_asking=subject_asking, status_timeline=status_timeline,
+            comps=comps, comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key,
+            valuation_trace=valuation_trace, value_drivers=value_drivers, confidence=confidence,
+        )
+        methodology = _pcorr.get("m", methodology)
+        offer = _pcorr.get("o", offer)
+        inspection = _pcorr.get("i", inspection)
+        _post_block = list(dict.fromkeys(_post_scan_block + _pb + _pb2))
+        blocking += _post_block
+        # the polished text is authoritative from here - replace qa_result's view with the re-run
+        qa_result = _pqa
+        flags += _pqa["warnings"] + [f"auto-corrected: {c}" for c in _pqa["corrections"]]
+        if "post_polish_final_qa" not in qa_result.get("checks_run", []):
+            qa_result.setdefault("checks_run", []).append("post_polish_final_qa")
+
+    # ---- 6. FINAL buyer-offer materialization. This intentionally runs after language polish and
+    # every generic range scrubber. The exact structured fields rendered by the site/PDF and the
+    # exact prose exported to clients are created together, then checked together.
+    if mode == "buyer" and _final:
+        offer_fields = _v10_build_buyer_offer_band(
+            _final.get("value"), subject_asking, trace=valuation_trace,
+            confidence=_final.get("confidence"), status_timeline=status_timeline,
+            range_min=_final.get("range_min"), range_max=_final.get("range_max"),
+        )
+        if offer_fields:
+            offer, _off_flags = _v10_rebuild_buyer_offer_prose(offer, offer_fields, range_pct)
+            flags += _off_flags
+            offer, _status_flags = _status_aware_offer_guidance(offer, status_timeline or {})
+            flags += _status_flags
+            fresh_offer_blocks = _v10_offer_sanity_check(
+                offer, offer_fields, _final.get("range_min"), _final.get("range_max"),
+            )
+            fresh_offer_blocks += _v10_offer_final_valuation_check(offer, _final, valuation_trace)
+            fresh_offer_blocks += _factual_prose_blocking(offer, "Offer strategy", enriched_subject)
+        else:
+            fresh_offer_blocks = ["Offer strategy: deterministic offer fields are missing."]
+        fresh_offer_blocks = list(dict.fromkeys(fresh_offer_blocks))
+        blocking = [b for b in blocking if not str(b).startswith("Offer strategy:")] + fresh_offer_blocks
+        qa_result["blocking_errors"] = [
+            b for b in qa_result.get("blocking_errors", []) if not str(b).startswith("Offer strategy:")
+        ] + fresh_offer_blocks
+        for check_name in ("buyer_offer_field_contract", "post_offer_render_qa"):
+            if check_name not in qa_result.get("checks_run", []):
+                qa_result.setdefault("checks_run", []).append(check_name)
+
+    # ---- 6a. Cross-section semantic consistency. Runs on methodology/offer/inspection/value-driver
+    # notes AND every comp's own narrative, right before the exact-artifact QA below sees them, so
+    # a contradiction this pass corrects or blocks is what the rest of 6b actually checks against -
+    # never a stale pre-correction copy.
+    methodology, offer, inspection, value_drivers, _xs_flags, _xs_blocking = _v10_cross_section_semantic_consistency_check(
+        methodology=methodology, offer=offer, inspection=inspection, value_drivers=value_drivers,
+        comps=comps, subject=enriched_subject, value=value,
+        comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key,
+    )
+    flags.extend(_xs_flags)
+    blocking.extend(_xs_blocking)
+    if "cross_section_semantic_consistency" not in qa_result.get("checks_run", []):
+        qa_result.setdefault("checks_run", []).append("cross_section_semantic_consistency")
+
+    # ---- 6b. Exact final-artifact prose QA. This runs after the deterministic offer builder and
+    # includes every client-facing comp card, so an earlier/pre-offer approval cannot be reused.
+    _exact_fields = {
+        "m": ("Methodology summary", methodology),
+        "o": ("Offer strategy", offer),
+        "i": ("Inspection concerns", inspection),
+        "vd": ("Why this number", _vd_text(value_drivers)),
+    }
+    _known_client_dollars: list[float] = []
+    if _final:
+        _known_client_dollars.extend(
+            number for number in (
+                _final.get("value"), _final.get("range_min"), _final.get("range_max"), subject_asking,
+            ) if _as_float(number) is not None
+        )
+    _known_client_dollars.extend(
+        number for number in (offer_fields or {}).values() if _as_float(number) is not None
+    )
+    _exact_comp_blocks: list[str] = []
+    for _index, _comp in enumerate(comps or []):
+        if not _comp.get("is_included", True):
+            continue
+        _label = _comp_label(_index, _comp)
+        _comp_text = _comp.get("commentary") or _comp.get("ai_commentary") or ""
+        if _comp_text:
+            _exact_fields[f"comp_{_index}"] = (_label, _comp_text)
+            _exact_comp_blocks.extend(_factual_prose_blocking(
+                _comp_text, _label, enriched_subject, comp_note=True, comp=_comp,
+            ))
+        _known_client_dollars.extend(
+            number for number in (
+                _comp.get("sale_price"), _comp.get("close_price"), _comp.get("list_price"),
+                _comp.get("original_list_price"),
+            ) if _as_float(number) is not None
+        )
+    _exact_flags, _exact_blocks = _v10_final_report_qa(
+        _exact_fields, value, range_pct, valuation_trace or {}, known_dollars=_known_client_dollars,
+    )
+    flags.extend(_exact_flags)
+    blocking.extend(_exact_blocks + _exact_comp_blocks)
+    if "exact_rendered_prose_qa" not in qa_result.get("checks_run", []):
+        qa_result.setdefault("checks_run", []).append("exact_rendered_prose_qa")
+
+    # ---- 7. authoritative QA merge: this stage's blocking + the caller's external blocking
+    #      (valuation-reconciliation / gate / range) ALL land in qa_result. export_allowed is
+    #      recomputed from the union - a blocking valuation-reconciliation failure can no longer be
+    #      "export allowed · 0 blocking" (issue #1).
+    _all_block = list(dict.fromkeys([*qa_result.get("blocking_errors", []), *blocking, *_ext_block]))
+    qa_result["blocking_errors"] = _all_block
+    qa_result["external_blocking"] = list(dict.fromkeys(_ext_block)) or []
+    qa_result["export_allowed"] = not _all_block
+    qa_result["passed"] = not _all_block and not qa_result.get("warnings")
+    for _cn in ("valuation_reconciliation_blocking", "concluded_number_scan", "psf_denominator_labels",
+                "methodology_consistency", "prose_offset_backing", "directional_adjustment_backing"):
+        if _cn not in qa_result.get("checks_run", []):
+            qa_result.setdefault("checks_run", []).append(_cn)
+
+    return {
+        "methodology": methodology, "offer": offer, "inspection": inspection,
+        "offer_fields": offer_fields,
+        "value_drivers": value_drivers, "qa_result": qa_result,
+        "qa_flags": flags, "qa_blocking": blocking,
+    }
+
+
+def _v10_provisional_inputs(
+    subject: dict, comps: list, status_timeline: dict, *, density_context: Optional[dict] = None,
+) -> tuple:
+    """Production relevance-weighted anchor + exposure shown to the analysis model."""
+    prov = [dict(c) for c in comps]
+    ev = _build_evidence_by_key(subject, prov)
+    outliers = _flag_psf_outliers(prov)
+    weighted, anchor, _ = _apply_continuous_relevance_weighting(
+        subject, prov, ev, outliers, density_context=density_context,
+    )
+    exposure = _compute_exposure(subject, status_timeline, _v10_comp_median_dom(weighted), anchor)
+    return anchor, exposure
+
+
+def _format_anchor_block(anchor: Optional[dict], exposure: dict) -> str:
+    """The DETERMINISTIC VALUATION INPUTS text block injected into the user message (pairs with
+    _V10_VALUATION_RULES in the system prompt)."""
+    L = ["DETERMINISTIC VALUATION INPUTS (already computed - do NOT recompute the anchor):"]
+    if anchor and anchor.get("mode") not in (None, "insufficient") and anchor.get("anchor_value"):
+        _basis = "verified CLOSED sales only" if anchor["mode"] == "closed_only" else "mixed comps (no closed-sale majority - lower confidence)"
+        L.append(f"  Comp anchor value: ${anchor['anchor_value']:,}  (from {_basis}; sale-price indication "
+                 f"${anchor['sale_price_indication']:,}; $/sqft indication ${anchor['psf_indication']:,} = "
+                 f"${anchor['psf_indication_per_sqft']:,}/sqft x {anchor['subject_sqft_used']:,} sqft)")
+        L.append(f"  Anchor range: ${anchor['anchor_low']:,} - ${anchor['anchor_high']:,}   (size model: {anchor['size_model']}, "
+                 f"sale-vs-$/sqft divergence {anchor['sale_psf_divergence_pct']}%)")
+        for c in anchor["comps"]:
+            line = (f"    {c['label']}: weight {c['normalized_weight']} ({c['strength']}), {c['status']} "
+                    f"${c['raw_sale_price']:,} (${c['raw_psf']:,}/sqft), size-adjusted to the subject "
+                    f"${c['size_adjusted_price']:,}, contributes ~${c['dollar_contribution_to_anchor']:,} of the anchor")
+            if c.get("sale_to_list"):
+                line += f", sold/list {c['sale_to_list']}"
+            if c.get("outlier"):
+                line += "  [statistical $/sqft outlier - half weight]"
+            if c.get("redundancy_penalty", 1.0) < 1.0:
+                line += f"  [near-duplicate of another comp - weight x{c['redundancy_penalty']}]"
+            if c.get("below_grade_frac", 0) > _V10_BELOW_GRADE_FLAG_FRAC:
+                line += f"  [~{int(c['below_grade_frac']*100)}% below-grade area - $/sqft not one-for-one comparable]"
+            if c.get("psf_leg_eligibility") and c["psf_leg_eligibility"] != "full":
+                line += (f"  [$/sqft leg: {c['psf_leg_eligibility'].replace('_', ' ')} - used ${c.get('psf_used_in_leg', 0):,}/sqft, "
+                         "not raw price / above-grade; do NOT re-adjust for basement sqft]")
+            if (c.get("location_weight_penalty") or 1.0) < 0.98:
+                _ln = c.get("location_negatives") or []
+                line += f"  [location weight x{c['location_weight_penalty']}: {', '.join(_ln) or 'market-location differences'}]"
+            if c.get("ai_class") and c.get("validated_class") and c["ai_class"] != c["validated_class"]:
+                line += f"  [{c['ai_class']} -> {c['validated_class']} on validation]"
+            L.append(line)
+        for cc in (anchor.get("context_comps") or []):
+            L.append(f"    (context only, NOT in the anchor) {cc['label']}: {cc['status']} ${cc['price']:,} (${cc['psf']:,}/sqft)")
+        if anchor.get("comp_list_to_sale_median"):
+            L.append(f"  Comp list-to-sale median: {anchor['comp_list_to_sale_median']} "
+                     f"({'comps closing over list' if anchor['comp_list_to_sale_median'] > 1.0 else 'comps closing under list'})")
+    else:
+        _ncl = (anchor or {}).get("closed_comp_count", 0)
+        L.append(f"  Comp anchor: NOT AVAILABLE - only {_ncl} verified closed sale(s) and fewer than two usable "
+                 "Strong/Supporting comps overall. Give your best appraiser estimate in `value`; the system will "
+                 "publish a PROVISIONAL WIDE RANGE at LOW confidence, marked 'Insufficient Comparable Evidence' and "
+                 "held for agent review before it can be exported. Do NOT present a precise number.")
+    L.append("MARKET EXPOSURE (the subject's own listing behaviour - real evidence about achievable price):")
+    L.append(f"  State: {exposure['state']}   |   active-market days: {exposure.get('active_market_days')}   |   {exposure['dom_basis']}")
+    if exposure.get("current_list_price"):
+        cl = f"  Current list ${exposure['current_list_price']:,}"
+        if exposure.get("original_list_price") and exposure["original_list_price"] != exposure["current_list_price"]:
+            cl += f" (original list ${exposure['original_list_price']:,}, reduced {exposure['price_cut_pct']}%)"
+        L.append(cl)
+    if exposure.get("exposure_ceiling"):
+        L.append(f"  Above-ask ceiling: ${exposure['exposure_ceiling']:,} - a final value above this needs "
+                 "paired-market-evidence adjustments to cover the gap, or the system pulls it back down.")
+    if exposure.get("hard_upper"):
+        L.append(f"  Hard upper cap for this exposure state: ${exposure['hard_upper']:,}.")
+    L.append(f"  {exposure['meaning']}")
+    if exposure.get("relisted_note"):
+        L.append(f"  {exposure['relisted_note']}")
+    L.append("HOW TO USE THIS: start from the anchor; put every material qualitative difference in "
+             "`qualitative_adjustments` (each with basis_type + written basis); set `value` = anchor + your "
+             "adjustments as a cross-check. The system bounds the adjustments and applies the exposure "
+             "constraint to produce the authoritative FMV.")
+    return "\n".join(L)
+
+
+async def _build_content(subject: dict, comps: list[dict], max_photos: int, warnings: list[str], include_map_images: bool, mode: str,
+                         anchor: Optional[dict] = None, exposure: Optional[dict] = None) -> tuple[list[dict], dict, int]:
+    """Builds the user message content blocks (text + image), the images_sent transparency
+    record, and a real projected input-token count (text chars/4 + actual per-image token
+    estimates) - the token count is what generate_ai_analysis checks against
+    cma_ai_max_cost_per_generation_usd BEFORE ever calling Claude. Text blocks first (all context
+    up front), then images grouped subject-first."""
+    content: list[dict] = []
+    projected_tokens = 0
+
+    def add_text(text: str):
+        nonlocal projected_tokens
+        content.append({"type": "text", "text": text})
+        projected_tokens += max(1, len(text) // 4)
+
+    add_text(
+        "This CMA is for a BUYER (helping them structure an offer) - fill in offer_strategy_considerations."
+        if mode == "buyer" else
+        (
+            "This CMA is for a SELLER/listing - the homeowner is deciding what to list their home for, "
+            "based on what comparable homes actually SOLD for. Value it exactly the same way (same comp "
+            "analysis, same rules), but write every narrative for the owner and their listing agent, not "
+            "a buyer: fill in listing_strategy_considerations (how to price and position the listing) and "
+            "listing_prep_concerns (what to address, document, or disclose before listing). There is no "
+            "offer to structure and no buyer inspection to plan in this report."
+        )
+    )
+    subject_for_ai = _with_age(subject)
+    subject_for_ai["authoritative_property_features"] = _authoritative_property_features(subject)
+    add_text(_format_block("SUBJECT PROPERTY:", subject_for_ai, _SUBJECT_FIELDS))
+    _timeline = subject.get("_status_timeline") if isinstance(subject, dict) else None
+    if _timeline and _timeline.get("summary_lines"):
+        add_text(_format_status_block(_timeline))
+    # v10 - the deterministic comp anchor + market-exposure constraint the AI must build its
+    # qualitative_adjustments on top of (see _V10_VALUATION_RULES in the system prompt).
+    if exposure is not None:
+        add_text(_format_anchor_block(anchor, exposure))
+    # Labeled by ordinal + street address (no city, no raw MLS listing_key) - this is the exact
+    # identifier the AI is instructed to use when referring to a comp in its prose, so the agent-
+    # facing methodology_summary reads "Comp #2 (112 Dovecote Ln)" instead of a meaningless raw
+    # listing_key number the agent has no context for.
+    for i, comp in enumerate(comps):
+        comp_for_ai = _with_age(_prep_comp_for_ai(comp))
+        comp_for_ai["authoritative_property_features"] = _authoritative_property_features(comp)
+        add_text(_format_block(f"{_comp_label(i, comp)}:", comp_for_ai, _COMP_FIELDS))
 
     images_sent: dict = {}
 
     async with httpx.AsyncClient() as http:
         async def add_images(key: str, data: dict):
+            nonlocal projected_tokens
             urls = _photo_urls(data, max_photos)
             if not urls:
                 warnings.append(f"No photos available for {key}")
                 return
-            blocks = [b for b in await asyncio.gather(*[_fetch_image_block(http, u) for u in urls]) if b]
-            if not blocks:
+            results = await asyncio.gather(*[_fetch_image_block(http, u) for u in urls])
+            # Pair by URL (not just count) so images_sent stays accurate when a failure happens
+            # mid-batch rather than at the end - a plain truncation would misreport which photos
+            # actually made it to Claude whenever one in the middle failed.
+            succeeded = [(u, r[0], r[1]) for u, r in zip(urls, results) if r]
+            if not succeeded:
                 warnings.append(f"Photos for {key} couldn't be loaded")
                 return
-            content.append({"type": "text", "text": f"Photos for {key}:"})
-            content.extend(blocks)
-            images_sent[key] = urls[:len(blocks)]
+            if len(succeeded) < len(urls):
+                warnings.append(f"{len(urls) - len(succeeded)} of {len(urls)} photos for {key} couldn't be loaded and were skipped")
+            add_text(f"Photos for {key}:")
+            content.extend(b for _, b, _ in succeeded)
+            projected_tokens += sum(t for _, _, t in succeeded)
+            images_sent[key] = [u for u, _, _ in succeeded]
 
-        await add_images("subject", subject)
-        for comp in comps:
-            await add_images(comp.get("listing_key") or comp.get("street_address") or "comp", comp)
+            if include_map_images:
+                lat, lng = data.get("latitude"), data.get("longitude")
+                map_url = _static_map_url(lat, lng) if lat is not None and lng is not None else None
+                if map_url:
+                    map_result = await _fetch_image_block(http, map_url)
+                    if map_result:
+                        map_block, map_tokens = map_result
+                        add_text(f"Location map for {key} (immediate surroundings only, not a substitute for a photo):")
+                        content.append(map_block)
+                        projected_tokens += map_tokens
+                        images_sent[key] = images_sent[key] + ["static_map"]
+                    else:
+                        warnings.append(f"Location map for {key} couldn't be loaded")
+                else:
+                    warnings.append(f"No location map available for {key} (missing coordinates or API key)")
 
-    content.append({
-        "type": "text",
-        "text": "Now analyze each comp against the subject and call submit_cma_analysis with your findings.",
-    })
-    return content, images_sent
+        await add_images("Subject", subject)
+        for i, comp in enumerate(comps):
+            await add_images(_comp_label(i, comp), comp)
+
+    add_text("Now analyze each comp against the subject and call submit_cma_analysis with your findings.")
+    return content, images_sent, projected_tokens
 
 
 async def generate_ai_analysis(
-    db: AsyncSession, owner_id: str, report_id: str,
+    db: AsyncSession, owner_id: str, report_id: str, plan_tier: str,
     max_photos_per_property: Optional[int] = None, include_map_images: bool = False,
     force_regenerate: bool = False,
 ) -> CmaReport:
@@ -197,27 +12032,77 @@ async def generate_ai_analysis(
 
     subject = report.subject or {}
     comps = [c for c in (report.comparables or []) if c.get("is_included", True)]
+    if len(comps) > MAX_COMPS:
+        comps = sorted(comps, key=lambda c: c.get("match_score") or 0, reverse=True)[:MAX_COMPS]
     if not comps:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Add at least one comparable before generating an AI analysis.")
     if subject.get("latitude") is None or subject.get("longitude") is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "The subject property needs a location before generating an AI analysis.")
 
-    fingerprint = _compute_fingerprint(subject, comps, max_photos, include_map_images)
-    existing_meta = report.ai_analysis or {}
-    if not force_regenerate and existing_meta.get("input_fingerprint") == fingerprint:
-        return report
+    # Regeneration is intentionally not offered - once a report has an analysis, this is a hard
+    # stop regardless of force_regenerate, matching the frontend which never shows the button
+    # again after the first generation. Enforced here too since the frontend guard alone isn't
+    # trustworthy against a direct API call.
+    if report.ai_analysis and _has_completed_ai_pricing(report):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This report already has an AI analysis - regenerating isn't available.")
 
-    reservation = await reserve_cma_analysis(db, owner_id, config)
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "AI analysis is not configured yet. Add ANTHROPIC_API_KEY to backend/.env and restart the backend.",
+        )
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Final valuation reasoning is not configured yet. Add OPENAI_API_KEY to backend/.env and restart the backend.",
+        )
+
+    # From here on this is the real (long, paid) run - mark it so a client that navigates away
+    # and back (or the CMA list page) can tell it's still in progress. The route handler clears
+    # this in its except/success paths regardless of how this function exits from here on.
+    await cma_service.mark_generation_started(db, owner_id, report_id)
+
+    fingerprint = _compute_fingerprint(subject, comps, max_photos, include_map_images)
+    reservation = await reserve_cma_analysis(db, owner_id, config, plan_tier)
+
+    enriched_subject, enriched_comps = await _enrich_with_property_data(db, subject, comps)
+    status_timeline = enriched_subject.get("_status_timeline") or {}
+    # Normalize the live status/DOM onto the subject before any model sees or narrates it.
+    enriched_subject = _reconciled_subject_snapshot(enriched_subject, status_timeline)
+    enriched_subject, status_timeline = _seller_not_listed(report.mode, enriched_subject, status_timeline)
+    proximity_context = await load_local_proximity_context(db, enriched_subject)
+
+    # v10 - provisional anchor + exposure (before the AI reclassifies comps), shown to the model
+    # in the prompt. The anchor is recomputed from the AI's final strengths after the call.
+    prov_anchor, prov_exposure = _v10_provisional_inputs(
+        enriched_subject, enriched_comps, status_timeline, density_context=proximity_context,
+    )
 
     warnings: list[str] = []
-    # include_map_images stays a documented no-op for now (Phase C - the app's Google key is
-    # Places-API-restricted and Static Maps/Street View likely need a separate enablement check
-    # before this can be wired in without risking every generation's images silently failing).
-    if include_map_images:
-        warnings.append("Map/street-view images are not yet available - analysis is based on listing photos and data only.")
-
-    content, images_sent = await _build_content(subject, comps, max_photos, warnings)
+    content, images_sent, projected_tokens = await _build_content(
+        enriched_subject, enriched_comps, max_photos, warnings, include_map_images, report.mode,
+        anchor=prov_anchor, exposure=prov_exposure,
+    )
     model = config["cma_ai_model"]
+
+    # Real hard cap, checked BEFORE spending anything - projected_tokens comes from actual fetched
+    # image dimensions (see _image_token_estimate) plus the exact text just built, not a guess, so
+    # this can't be exceeded by a single generation regardless of how photo/comp-count config
+    # drifts in the future. Refunds the reservation and blocks (never calls Claude) if the
+    # projected cost - using the full max_output_tokens as the output-side assumption, the true
+    # worst case - would exceed cma_ai_max_cost_per_generation_usd.
+    projected_cost = ai_config_service.estimate_cost_usd(config, model, projected_tokens, config["cma_ai_max_output_tokens"])
+    max_cost = config["cma_ai_max_cost_per_generation_usd"]
+    if projected_cost > max_cost:
+        await reconcile_budget(db, reservation, 0.0)
+        await record_usage_event(
+            db, owner_id, None, model, projected_tokens, 0, projected_cost, 0, True, "cma_cost_cap", event_type="cma_ai",
+        )
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"This generation would cost an estimated ${projected_cost:.3f}, over the ${max_cost:.2f} "
+            "per-CMA limit - reduce the photo count per property or the number of comps and try again.",
+        )
 
     try:
         client = _get_client()
@@ -225,55 +12110,1564 @@ async def generate_ai_analysis(
             model=model,
             max_tokens=config["cma_ai_max_output_tokens"],
             system=_SYSTEM_PROMPT,
-            tools=[_SUBMIT_TOOL],
+            tools=[_tool_for_mode(_SUBMIT_TOOL, report.mode)],
             tool_choice={"type": "tool", "name": "submit_cma_analysis"},
             messages=[{"role": "user", "content": content}],
         )
     except Exception as exc:
         logger.warning("CMA AI analysis call failed", extra={"report_id": report_id, "error": str(exc)})
         await reconcile_budget(db, reservation, 0.0)
+        # Otherwise a provider-side failure (e.g. an exhausted Anthropic credit balance) is
+        # invisible everywhere except this log line - never reaches AIUsageEvent, so the admin AI
+        # usage dashboard has no idea it happened. No cost, since the call never completed.
+        await record_usage_event(
+            db, owner_id, None, model, None, None, 0.0, 0, True,
+            classify_provider_error(exc), event_type="cma_ai",
+        )
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Couldn't generate the AI analysis right now. Try again in a moment.")
 
     submit_block = next((b for b in response.content if getattr(b, "type", None) == "tool_use" and b.name == "submit_cma_analysis"), None)
     result = submit_block.input if submit_block and isinstance(submit_block.input, dict) else None
+    usage_input_tokens = response.usage.input_tokens
+    usage_output_tokens = response.usage.output_tokens
 
-    cost = ai_config_service.estimate_cost_usd(config, model, response.usage.input_tokens, response.usage.output_tokens)
-    await record_usage_event(
-        db, owner_id, None, model, response.usage.input_tokens, response.usage.output_tokens,
-        cost, 0, False, None, event_type="cma_ai",
+    logger.info(
+        "CMA AI analysis returned",
+        extra={
+            "report_id": report_id,
+            "stop_reason": response.stop_reason,
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+            "result_keys": sorted(result.keys()) if isinstance(result, dict) else [],
+            "has_subject_estimate": bool(result and result.get("subject_estimate")),
+        },
     )
-    await reconcile_budget(db, reservation, cost)
 
     if not result:
         warnings.append("The AI didn't return a usable result - try regenerating.")
         result = {"comps": [], "subject_estimate": None}
 
-    notes_by_key = {c.get("listing_key"): c.get("note") for c in (result.get("comps") or []) if c.get("listing_key")}
+    # The model occasionally emits a malformed `comps` entry (a bare string instead of the
+    # object, or a truncated element) - every downstream consumer assumes a list of dicts, so
+    # drop anything that isn't one here rather than let a `.get()` blow up 60+ seconds and a
+    # paid call later (which then surfaces to the browser as an opaque "Failed to fetch").
+    _raw_comps = result.get("comps")
+    if not isinstance(_raw_comps, list):
+        result["comps"] = []
+    else:
+        _clean_comps = [c for c in _raw_comps if isinstance(c, dict)]
+        if len(_clean_comps) != len(_raw_comps):
+            logger.warning(
+                "CMA AI analysis dropped malformed comps entries",
+                extra={"report_id": report_id, "dropped": len(_raw_comps) - len(_clean_comps), "kept": len(_clean_comps)},
+            )
+            warnings.append("Part of the AI's comp analysis came back malformed and was skipped - regenerate if a comp is missing its notes.")
+        result["comps"] = _clean_comps
+
+    # The model sometimes returns `subject_estimate` as a JSON STRING or a single-element list
+    # instead of the object (seen live: "has_subject_estimate: true" but not a dict -> the whole
+    # valuation block was then skipped and the report died at "did not finish pricing"). Coerce it
+    # back to a dict before anything downstream checks `isinstance(..., dict)`.
+    _se_raw = result.get("subject_estimate")
+    if isinstance(_se_raw, str):
+        try:
+            _parsed = json.loads(_se_raw)
+            if isinstance(_parsed, dict):
+                result["subject_estimate"] = _parsed
+                logger.warning("CMA AI returned subject_estimate as a JSON string - parsed it", extra={"report_id": report_id})
+        except Exception:  # noqa: BLE001
+            pass
+    elif isinstance(_se_raw, list):
+        _first = next((x for x in _se_raw if isinstance(x, dict)), None)
+        if _first is not None:
+            result["subject_estimate"] = _first
+            logger.warning("CMA AI returned subject_estimate as a list - took the first object", extra={"report_id": report_id})
+
+    # Same defensiveness for the declared-string fields on subject_estimate + notes: the model
+    # has returned inspection_concerns / offer_strategy_considerations as a list, which then
+    # crashes _split_buyer_guidance's .strip() ~60s into the run.
+    _se = result.get("subject_estimate")
+    if isinstance(_se, dict):
+        for _k in ("methodology_summary", "offer_strategy_considerations", "inspection_concerns", "confidence"):
+            if _k in _se and not isinstance(_se[_k], (str, type(None))):
+                _se[_k] = _coerce_ai_text(_se[_k])
+        for _k in _SELLER_GUIDANCE_FIELDS:
+            if _k in _se and not isinstance(_se[_k], (str, type(None))):
+                _se[_k] = _coerce_ai_text(_se[_k])
+        for _vd in (_se.get("value_drivers") or []):
+            if isinstance(_vd, dict) and not isinstance(_vd.get("note"), (str, type(None))):
+                _vd["note"] = _coerce_ai_text(_vd["note"])
+    for _c in result.get("comps") or []:
+        if not isinstance(_c.get("note"), (str, type(None))):
+            _c["note"] = _coerce_ai_text(_c["note"])
+
+    subject_estimate_raw = result.get("subject_estimate") if isinstance(result.get("subject_estimate"), dict) else None
+    _has_value = bool(subject_estimate_raw and _as_float(subject_estimate_raw.get("value")))
+
+    def _blank(key: str) -> bool:
+        return not (subject_estimate_raw and str(subject_estimate_raw.get(key) or "").strip())
+
+    # A BUYER CMA's report also needs the inspection-concerns and offer-strategy paragraphs. The
+    # main call sometimes produces a clean value but truncates (stop_reason "max_tokens") before
+    # finishing those, or just omits one - which is why agents saw reports where the Offer
+    # Suggestion / Inspection Concerns section never filled in. Treat a missing guidance field
+    # the same as a missing estimate: run the (image-free, cheap) estimate-only pass, which has
+    # both fields promoted to required for buyer mode, then merge in only what the main call
+    # didn't already give.
+    _needs_buyer_guidance = report.mode == "buyer" and (
+        _blank("inspection_concerns") or _blank("offer_strategy_considerations")
+    )
+    # A material, one-sided qualitative signal the AI's own comp ratings commit to but that it filed
+    # NO adjustment/offset/captured_elsewhere for. Previously this only surfaced downstream as a hard
+    # reconciliation BLOCK in _apply_v10_valuation with nothing able to satisfy it (seen live when a
+    # truncated main tool call dropped qualitative_adjustments entirely and the estimate-only retry -
+    # which never asked for them - couldn't restore them). Re-request the itemised adjustment here so
+    # Python can validate + apply it, instead of shipping an un-exportable report.
+    _qual_gap_buckets = _v10_unfiled_material_qual_buckets(result.get("comps") or [], subject_estimate_raw)
+    _needs_qual_adjustments = bool(_qual_gap_buckets)
+    # Seller mirror of _needs_buyer_guidance - the same cheap estimate-only retry (it reuses the
+    # seller-only tool copy from _tool_for_mode, where both listing fields are required) when the
+    # main call truncated or skipped one. Gated on seller mode, so it can never trigger a buyer retry.
+    _needs_seller_guidance = report.mode != "buyer" and (
+        _blank("listing_strategy_considerations") or _blank("listing_prep_concerns")
+    )
+    if not _has_value or _needs_buyer_guidance or _needs_seller_guidance or _needs_qual_adjustments:
+        logger.info(
+            "CMA AI result incomplete; running estimate-only pass",
+            extra={
+                "report_id": report_id, "stop_reason": response.stop_reason,
+                "has_value": _has_value, "needs_buyer_guidance": _needs_buyer_guidance,
+                "needs_seller_guidance": _needs_seller_guidance,
+                "qual_gap_buckets": [b for b, _s, _c in _qual_gap_buckets],
+            },
+        )
+        try:
+            estimate_warnings: list[str] = []
+            estimate_content, _, _ = await _build_content(
+                enriched_subject, enriched_comps, 0, estimate_warnings, False, report.mode,
+                anchor=prov_anchor, exposure=prov_exposure,
+            )
+            if _qual_gap_buckets and isinstance(estimate_content, list):
+                estimate_content.append({"type": "text", "text": _v10_qual_gap_directive(_qual_gap_buckets)})
+            estimate_response = await client.messages.create(
+                model=model,
+                max_tokens=_ESTIMATE_ONLY_OUTPUT_TOKENS,
+                system=_estimate_only_system_prompt(report.mode),
+                tools=[_tool_for_mode(_ESTIMATE_ONLY_TOOL, report.mode)],
+                tool_choice={"type": "tool", "name": "submit_cma_estimate"},
+                messages=[{"role": "user", "content": estimate_content}],
+            )
+            usage_input_tokens += estimate_response.usage.input_tokens
+            usage_output_tokens += estimate_response.usage.output_tokens
+            estimate_block = next((b for b in estimate_response.content if getattr(b, "type", None) == "tool_use" and b.name == "submit_cma_estimate"), None)
+            estimate_result = estimate_block.input if estimate_block and isinstance(estimate_block.input, dict) else None
+            _er_se = estimate_result.get("subject_estimate") if isinstance(estimate_result, dict) else None
+            logger.info(
+                "CMA AI estimate-only pass returned",
+                extra={
+                    "report_id": report_id, "stop_reason": estimate_response.stop_reason,
+                    "output_tokens": estimate_response.usage.output_tokens,
+                    "se_keys": sorted(_er_se.keys()) if isinstance(_er_se, dict) else [],
+                },
+            )
+            if isinstance(_er_se, str):
+                try:
+                    _er_se = json.loads(_er_se)
+                except Exception:  # noqa: BLE001
+                    _er_se = None
+            elif isinstance(_er_se, list):
+                _er_se = next((x for x in _er_se if isinstance(x, dict)), None)
+            if isinstance(_er_se, dict):
+                merged = dict(subject_estimate_raw or {})
+                for key, val in _er_se.items():
+                    if val in (None, "", [], {}) or (isinstance(val, str) and not val.strip()):
+                        continue
+                    # qualitative_adjustments / premium_improvements: UNION by (factor/type, direction)
+                    # rather than gap-fill - the retry may carry an item for a bucket the (possibly
+                    # truncated) main call missed, which a plain "keep what's there" merge would drop.
+                    if key in ("qualitative_adjustments", "premium_improvements") and isinstance(val, list):
+                        _cur = merged.get(key) if isinstance(merged.get(key), list) else []
+                        _idk = "factor" if key == "qualitative_adjustments" else "type"
+                        _seen = {
+                            (str(x.get(_idk, "")).strip().lower(), str(x.get("direction", "")).lower())
+                            for x in _cur if isinstance(x, dict)
+                        }
+                        for x in val:
+                            if isinstance(x, dict) and (
+                                str(x.get(_idk, "")).strip().lower(), str(x.get("direction", "")).lower()
+                            ) not in _seen:
+                                _cur.append(x)
+                        merged[key] = _cur
+                        continue
+                    # Everything else: keep whatever the main call already produced; only fill gaps
+                    # (an empty list / dict / blank string counts as a gap).
+                    _cur = merged.get(key)
+                    _present = (_cur.strip() if isinstance(_cur, str) else _cur) not in (None, "", [], {})
+                    if _present:
+                        continue
+                    merged[key] = val
+                result["subject_estimate"] = merged
+                subject_estimate_raw = merged
+        except Exception as exc:
+            logger.warning(
+                "CMA AI estimate-only retry failed",
+                extra={"report_id": report_id, "error": str(exc), "error_type": type(exc).__name__},
+            )
+
+    # The narrative sections each report exists for - seller: pricing strategy + listing prep;
+    # buyer: inspection concerns + offer strategy. Seen live (2026-10-05, both modes): the
+    # ~160k-token main call AND the estimate-only retry skipped them despite the schema marking
+    # them required, so the client got a blank / generic section. One small, text-only call that
+    # asks for NOTHING else.
+    _guide_fields = _guidance_fields(report.mode)
+    def _guide_blank(k: str) -> bool:
+        # Blank OR too thin to be worth a client's read - seen live 2026-10-05 (buyer): one generic
+        # "**General Inspection:** get an inspection" line for a 1963 house.
+        v = (subject_estimate_raw or {}).get(k)
+        if not (isinstance(v, str) and v.strip()):
+            return True
+        return len(v.strip()) < 350 or (v.count("**") >= 2 and v.count("**") < 4)
+    if any(_guide_blank(k) for k in _guide_fields):
+        try:
+            guidance_content = _guidance_content(enriched_subject, enriched_comps, result.get("comps") or [], subject_estimate_raw or {})
+            g_resp = await client.messages.create(
+                model=model,
+                max_tokens=2500,
+                system=_guidance_system_prompt(report.mode),
+                tools=[{"name": "submit_report_guidance", "description": "Submit the narrative sections for this CMA.",
+                        "input_schema": {"type": "object", "properties": copy.deepcopy(_guide_fields), "required": list(_guide_fields)}}],
+                tool_choice={"type": "tool", "name": "submit_report_guidance"},
+                messages=[{"role": "user", "content": guidance_content}],
+            )
+            usage_input_tokens += g_resp.usage.input_tokens
+            usage_output_tokens += g_resp.usage.output_tokens
+            g_block = next((b for b in g_resp.content if getattr(b, "type", None) == "tool_use" and b.name == "submit_report_guidance"), None)
+            g_out = g_block.input if g_block and isinstance(g_block.input, dict) else {}
+            merged = dict(subject_estimate_raw or {})
+            for k in _guide_fields:
+                v = g_out.get(k)
+                _have = (subject_estimate_raw or {}).get(k)
+                _have_len = len(_have.strip()) if isinstance(_have, str) else 0
+                if _guide_blank(k) and isinstance(v, str) and len(v.strip()) > _have_len:
+                    merged[k] = v.strip()
+            subject_estimate_raw = merged
+            result["subject_estimate"] = merged
+            logger.info("CMA guidance pass returned", extra={"report_id": report_id, "mode": report.mode, "keys": sorted(k for k, v in g_out.items() if v)})
+        except Exception as exc:  # noqa: BLE001 - the deterministic fallbacks still apply
+            logger.warning("CMA guidance pass failed", extra={"report_id": report_id, "error": str(exc)})
+
+    cost = ai_config_service.estimate_cost_usd(config, model, usage_input_tokens, usage_output_tokens)
+    await record_usage_event(
+        db, owner_id, None, model, usage_input_tokens, usage_output_tokens,
+        cost, 0, False, None, event_type="cma_ai",
+    )
+    await reconcile_budget(db, reservation, cost)
+
+    # Fills strength/quality only where the agent hasn't already made a choice - same non-
+    # destructive posture as ai_commentary, just applied directly to the real fields since these
+    # are single-click selections (unlike freeform commentary, there's no meaningful "draft" state
+    # to stage for a Use-this button, and re-clicking one button to override costs nothing).
+    ai_by_key = {c.get("listing_key"): c for c in (result.get("comps") or []) if c.get("listing_key")}
+    # Fresh-from-mirror re-verification computed in _enrich_with_property_data - carry a newly
+    # found ClosePrice back onto the stored comp so the report's own valuation math uses it too.
+    enriched_by_key = {c.get("listing_key"): c for c in enriched_comps if c.get("listing_key")}
+    # "Comp #N" / address by listing_key, in the SAME order the prompt numbered them - so the
+    # methodology-consistency pass below can tell which comp a "Comp #2" / address reference in
+    # the narrative points at.
+    comp_num_by_key = {c.get("listing_key"): i + 1 for i, c in enumerate(comps) if c.get("listing_key")}
+    addr_by_key = {c.get("listing_key"): (c.get("street_address") or "") for c in comps if c.get("listing_key")}
+    # Internal reconciliation log - NOT shown on the client-facing report/PDF (only kept so the
+    # agent can see what the consistency pass changed, in the editor).
+    qa_flags: list[str] = []
+    qa_blocking: list[str] = []
+    if status_timeline.get("live_status_note"):
+        qa_flags.append(status_timeline["live_status_note"])
     new_comparables = []
     for comp in report.comparables or []:
         comp = dict(comp)
-        note = notes_by_key.get(comp.get("listing_key"))
-        if note:
-            comp["ai_commentary"] = note
+        _enr = enriched_by_key.get(comp.get("listing_key"))
+        if _enr:
+            comp = _merge_authoritative_property_facts(comp, _enr)
+            # OSM road/street classification (road_context_service) - computed during enrichment.
+            if _enr.get("road_context") and not comp.get("road_context"):
+                comp["road_context"] = _enr["road_context"]
+        if _enr and _enr.get("price_verified") and _enr.get("sale_price") and not (comp.get("price_verified") and comp.get("sale_price")):
+            for _pk in ("sale_price", "close_price", "close_date", "sale_date", "price_per_sqft"):
+                if _enr.get(_pk) is not None:
+                    comp[_pk] = _enr[_pk]
+            comp["price_verified"] = True
+            qa_flags.append(f"{_comp_label(len(new_comparables), comp)}: closing price found in the MLS mirror - marked verified.")
+        ai = ai_by_key.get(comp.get("listing_key"))
+        if ai:
+            note = ai.get("note") or ""
+            if note:
+                note, _polish_flags = _final_polish_pass(note, _comp_label(len(new_comparables), comp))
+                qa_flags.extend(_polish_flags)
+                comp["ai_commentary"] = note
+                if _is_blank(comp.get("commentary")):
+                    comp["commentary"] = note
+            if not comp.get("strength") and ai.get("strength") in _STRENGTH_VALUES:
+                comp["strength"] = _normalize_strength(ai["strength"])
+            # normalise any legacy value already stored on the comp too
+            if comp.get("strength"):
+                comp["strength"] = _normalize_strength(comp["strength"])
+            ai_quality = ai.get("quality") if isinstance(ai.get("quality"), dict) else {}
+            existing_quality = dict(comp.get("quality") or {})
+            for field, allowed in _QUALITY_FIELD_VALUES.items():
+                value = ai_quality.get(field)
+                if value in allowed and not existing_quality.get(field):
+                    existing_quality[field] = value
+            comp["quality"] = existing_quality
+
+            # Fix 2: carry the AI's machine-checkable Strong market-location override onto the comp
+            # so _v10_location_class_review can validate it against structured evidence.
+            for _ovk in ("strong_location_override", "strong_location_override_reason", "market_equivalence_evidence"):
+                if ai.get(_ovk) is not None:
+                    comp[_ovk] = ai[_ovk]
+
+            # --- deterministic classification QA (never trust the label over the prose / data) ---
+            label = _comp_label(len(new_comparables), comp)
+            from_note = classify_from_note(note)
+            if from_note == "weak" and comp.get("strength") in ("strong", "supporting", None):
+                qa_flags.append(f"{label}: note dismisses it as context-only - set to Weaker.")
+                comp["strength"] = "weak"
+            # A strong/supporting comp with no verified closing price can't carry valuation weight.
+            if comp.get("strength") in ("strong", "supporting") and str(comp.get("status") or "").lower() in ("sold", "closed") \
+               and not (comp.get("price_verified", True) and comp.get("sale_price")):
+                qa_flags.append(f"{label}: closing price unverified - set to Weaker (no valuation weight).")
+                comp["strength"] = "weak"
+        elif comp.get("strength"):
+            comp["strength"] = _normalize_strength(comp["strength"])
+
+        # Deterministic backfill for the objective comparison dimensions (area / layout / lot)
+        # when neither the agent nor the AI rated them - keeps the comparison matrix from
+        # showing blanks on data we already hold. Subjective dimensions stay blank if unrated.
+        _q = dict(comp.get("quality") or {})
+        for _f, _v in _derive_quality_from_data(enriched_subject, comp).items():
+            if not _q.get(_f):
+                _q[_f] = _v
+        if not _q.get("street_context"):
+            _street = _derive_street_context(enriched_subject, comp)
+            if _street:
+                _q["street_context"] = _street
+        _comp_lbl = _comp_label(len(new_comparables), comp)
+        _q, _amenity_flags = _reconcile_amenities_quality(
+            enriched_subject, comp, _q, _comp_lbl,
+        )
+        if _amenity_flags:
+            comp["_amenities_fact_reconciled"] = True
+        qa_flags.extend(_amenity_flags)
+        if _q:
+            comp["quality"] = _q
+
         new_comparables.append(comp)
+
+    # --- methodology / classification consistency pass (item 2: the 952 Lafayette bug) ---
+    # If the narrative leans on a comp to set the value, that comp cannot be shown as "Weaker".
+    # If the narrative explicitly dismisses a comp, it cannot be shown as Strong/Supporting.
+    methodology_raw = (subject_estimate_raw or {}).get("methodology_summary") or ""
+    # Sentence-scoped: a comp is a "driver" (or "dismissed") only if the SAME sentence carries
+    # both a reference to that comp and the cue phrase - a wide char window would catch driver
+    # language about a different comp in the neighbouring clause.
+    _m_sentences = [s.strip().lower() for s in re.split(r"(?<=[.;!?])\s+|\n+", methodology_raw) if s.strip()]
+    _DRIVER_CUES = ("rest on", "rests on", "resting on", "anchor", "leans on", "lean on", "relies on",
+                    "rely on", "drives the", "driving the", "based primarily", "based largely",
+                    "most weight", "heaviest weight", "primary comp", "key comp", "strongest comp",
+                    "best comp", "most comparable", "closest comp", "value is set", "supported primarily",
+                    "supported chiefly", "carries the")
+    _DISMISS_CUES = ("not comparable", "different market", "excluded from", "not used in", "set aside",
+                     "disregard", "context only", "context-only", "should not drive", "little weight",
+                     "minimal weight", "no weight")
+
+    def _mentions(key: str, near: tuple[str, ...]) -> bool:
+        num = comp_num_by_key.get(key)
+        addr = (addr_by_key.get(key) or "").lower()
+        tokens = [t for t in ([f"comp #{num}", f"comp {num}"] if num else []) + ([addr] if len(addr) >= 5 else []) if t]
+        for sent in _m_sentences:
+            if any(tok in sent for tok in tokens) and any(cue in sent for cue in near):
+                return True
+        return False
+
+    for _i, comp in enumerate(new_comparables):
+        if not comp.get("is_included", True):
+            continue
+        key = comp.get("listing_key")
+        label = _comp_label(_i, comp)
+        strength = comp.get("strength")
+        if strength == "weak" and key and _mentions(key, _DRIVER_CUES):
+            # the value analysis leans on it -> it is at least Supporting (verified price required)
+            if comp.get("price_verified", True) and (comp.get("sale_price") or str(comp.get("status") or "").lower() not in ("sold", "closed")):
+                comp["strength"] = "supporting"
+                qa_flags.append(f"{label}: narrative leans on it but it was rated Weaker - promoted to Supporting for consistency.")
+        elif strength in ("strong", "supporting") and key and _mentions(key, _DISMISS_CUES):
+            comp["strength"] = "weak"
+            qa_flags.append(f"{label}: narrative dismisses it - set to Weaker for consistency.")
+
+    # ---- deterministic evidence (B1) + non-circular grading challenge (B7) ----
+    # Computed against the enriched subject (has above_grade_finished_area/property_type/etc. from
+    # the raw MLS join) - runs AFTER the note-based/narrative-consistency checks above so a comp's
+    # strength is already as AI-reasoned as it's going to get, and BEFORE the all-Weaker guard/
+    # confidence model below so a B7 demotion is reflected in both.
+    evidence_by_key = _build_evidence_by_key(enriched_subject, new_comparables)
+    outliers = _flag_psf_outliers(new_comparables)
+    for _key, _note in outliers.items():
+        _oi = next((i for i, c in enumerate(new_comparables) if c.get("listing_key") == _key), None)
+        if _oi is not None:
+            qa_flags.append(f"{_comp_label(_oi, new_comparables[_oi])}: {_note}")
+    qa_flags.extend(_non_circular_grading_check(new_comparables, evidence_by_key, comp_num_by_key))
+    # Fix 2: market-location consistency (AI class vs. evidence vs. final weight) - may demote a
+    # location-mismatched Strong to Supporting and sets comp["_loc"] (weight penalty + trace) for
+    # the anchor. Runs after the note/narrative + evidence checks so strength is settled, before
+    # the anchor + confidence use it.
+    qa_flags.extend(_v10_location_class_review(enriched_subject, new_comparables, evidence_by_key))
+    # round 12 issue #1: a pure condition/renovation gap must not leave a same-market sale out of
+    # the anchor - re-promote weak -> supporting when finish is the only material difference. Runs
+    # after the location review so a real location call is never overridden here.
+    qa_flags.extend(_v10_condition_class_review(enriched_subject, new_comparables, evidence_by_key))
+    # round 15: pin finish_quality / interior / exterior to each comp's own narrative + verified
+    # facts BEFORE the weighted qualitative signals are computed - an inconsistent label set (a
+    # "fully renovated / turnkey" comp rated finish = Similar) must not be able to neutralise Stage 3.
+    qa_flags.extend(_v10_condition_rating_consistency_check(enriched_subject, new_comparables))
+
+    # Freeze the normalized evidence before any downstream valuation narrative, adjustment trace,
+    # offer section, QA payload, or PDF field is assembled. Generated commentary is deliberately
+    # outside the snapshot and is reconciled/regenerated against a fresh materialization below.
+    _narrative_drafts = [
+        {"ai_commentary": c.get("ai_commentary"), "commentary": c.get("commentary")}
+        for c in new_comparables
+    ]
+    _evidence_snapshot = _build_authoritative_evidence_snapshot(
+        enriched_subject, new_comparables, status_timeline,
+    )
+    enriched_subject, new_comparables, status_timeline, _snapshot_flags, _snapshot_blocking = (
+        await _materialize_snapshot_with_comp_narratives(
+            _evidence_snapshot, _narrative_drafts, attempt_rewrite=True, model=model,
+        )
+    )
+    qa_flags.extend(_snapshot_flags)
+    qa_blocking.extend(_snapshot_blocking)
+    # Recompute read-only evidence from the snapshot copy so later stages never reuse a mutable
+    # pre-normalization object.
+    evidence_by_key = _build_evidence_by_key(enriched_subject, new_comparables)
+    outliers = _flag_psf_outliers(new_comparables)
+
+    # All-Weaker (B6): NO force-promote. If every comp genuinely rated Weaker, the report says so
+    # honestly rather than manufacturing a usable comp - confidence is forced to Low for this case
+    # inside _compute_confidence below, and the value (still the AI's own number, never a comp-
+    # weighted average) is left to stand on whatever it can.
+    _incl_now = [c for c in new_comparables if c.get("is_included", True)]
+    if _incl_now and not any(_normalize_strength(c.get("strength")) in ("strong", "supporting") for c in _incl_now):
+        qa_flags.append("No comp met the bar for Strong or Supporting - reliable comp evidence is limited.")
+
+    # v10 - firm up hedged wording in each comp's note now that its quality ratings are settled
+    # (the note polish earlier in the loop ran before quality was merged/derived).
+    _hedge_flagged = False
+    for _note_idx, _c in enumerate(new_comparables):
+        _note_label = _comp_label(_note_idx, _c)
+        for _fld in ("ai_commentary", "commentary"):
+            _v = _c.get(_fld)
+            if isinstance(_v, str) and _v:
+                _v2, _hf = _firm_up_hedges(_v, new_comparables)
+                if _hf:
+                    _hedge_flagged = True
+                _v2, _ff = _reconcile_comp_hard_facts(
+                    _v2, _note_label, enriched_subject, _c,
+                )
+                qa_flags.extend(_ff)
+                qa_blocking.extend(_factual_prose_blocking(
+                    _v2, _note_label, enriched_subject, comp_note=True, comp=_c,
+                ))
+                _c[_fld] = _v2
+    if _hedge_flagged:
+        qa_flags.append("One or more comp notes had hedged wording firmed up where that comp's quality ratings already commit to the comparison.")
+
     report.comparables = new_comparables
 
-    subject_estimate = result.get("subject_estimate")
-    if subject_estimate:
+    # strong_ct/weight_ct - display counts only now (see _compute_confidence for the actual
+    # confidence math, B4).
+    strong_ct = sum(1 for c in new_comparables if c.get("is_included", True) and _normalize_strength(c.get("strength")) == "strong")
+    weight_ct = sum(1 for c in new_comparables if c.get("is_included", True) and _normalize_strength(c.get("strength")) in ("strong", "supporting"))
+
+    # Run V10 in full to produce the benchmark and evidence trace. The dedicated reasoning pass
+    # below promotes its own final FMV/range/confidence after this deterministic work is complete.
+    subject_asking = (
+        _as_float(status_timeline.get("current_list_price"))
+        or _as_float(enriched_subject.get("list_price"))
+    )
+    value = None
+    valuation_trace = None
+    _v10_range_pct = None
+    _v10_conf_seed = None
+    _v10_insufficient = False
+    _reasoning_output = None
+    _reasoning_cost = 0.0
+    _reasoning_usage: dict = {}
+    # Run the deterministic valuation whenever there's ANYTHING to value from - a comp set OR a
+    # list price. Previously gated on `subject_estimate_raw` being truthy, so when the model
+    # returned a malformed / non-dict subject_estimate the whole pricing step was skipped and the
+    # report died at "did not finish pricing". The v10 engine handles an empty ai_estimate fine
+    # (no AI value/adjustments -> it prices off the anchor).
+    _subject_estimate_unusable = bool((new_comparables or subject_asking) and not subject_estimate_raw)
+    if new_comparables or subject_asking:
+        if not subject_estimate_raw:
+            qa_flags.append(
+                "The AI's own value estimate came back unusable (malformed tool output) - the value "
+                "below is from the deterministic comp anchor alone. Review the methodology and re-run "
+                "the analysis if you want the AI's read too."
+            )
+        new_comparables, final_anchor, _relevance_trace = _apply_continuous_relevance_weighting(
+            enriched_subject, new_comparables, evidence_by_key, outliers,
+            source_snapshot_sha256=_evidence_snapshot.digest,
+            density_context=proximity_context,
+        )
+        report.comparables = new_comparables
+        strong_ct = sum(
+            1 for c in new_comparables
+            if c.get("valuation_role") == "valuation_comp" and _normalize_strength(c.get("strength")) == "strong"
+        )
+        weight_ct = sum(1 for c in new_comparables if c.get("valuation_role") == "valuation_comp")
+        exposure = _compute_exposure(
+            enriched_subject, status_timeline, _v10_comp_median_dom(new_comparables), final_anchor,
+        )
+        _v10 = _apply_v10_valuation(final_anchor, exposure, subject_estimate_raw or {}, subject_asking, prov_anchor=prov_anchor)
+        value = _v10["fmv"]
+        valuation_trace = _v10["trace"]
+        valuation_trace["relevance_weighting"] = _relevance_trace
+        # Downstream (QA + any later reasoning-authority promotion) needs to know the value/
+        # adjustments this trace was built from never included an actual AI read - a reasoning
+        # pass run on top of this is judging from the deterministic benchmark alone, not an
+        # independent estimate, and must never present as an ordinary clean run. Survives
+        # _apply_reasoning_authority's deepcopy since that only overwrites known keys.
+        if _subject_estimate_unusable:
+            valuation_trace["subject_estimate_missing"] = True
+        _v10_range_pct = _v10["range_pct"]
+        _v10_conf_seed = _v10["confidence_seed"]
+        _v10_insufficient = bool(_v10.get("insufficient_evidence"))
+        qa_flags.extend(_v10["flags"])
+        qa_blocking.extend(_v10.get("blocking") or [])
+        # Each adjustment's "basis" is free-form AI prose citing a factual reason for its dollar
+        # figure (e.g. subject condition) and was never scanned for unsupported claims the way
+        # methodology/offer/inspection text already is - only the dollar math was validated above.
+        # A condition/renovation-family adjustment asserting an unsupported claim gets relabeled
+        # to honest uncertainty wording FOR FREE first (deterministic, no AI call, dollar amount
+        # untouched - see _neutralize_unsupported_condition_adjustment); a flagged one gets the
+        # same one-shot targeted rewrite as a comp note (below, before this report is ever saved)
+        # rather than surfacing the raw finding to the agent.
+        _adj_flagged: list[dict] = []
+        _adj_by_label: dict[str, dict] = {}
+        for _adj in (valuation_trace.get("adjustments") or []):
+            qa_flags.extend(_neutralize_unsupported_condition_adjustment(_adj, enriched_subject))
+            _adj_label = f"Qualitative adjustment ({_adj.get('factor') or 'unlabeled'})"
+            _adj_reasons = _factual_prose_blocking(_adj.get("basis") or "", _adj_label, enriched_subject)
+            if _adj_reasons:
+                _adj_flagged.append({"label": _adj_label, "text": _adj.get("basis") or "", "reasons": _adj_reasons})
+                _adj_by_label[_adj_label] = _adj
+        if _adj_flagged:
+            _adj_rewritten = await _targeted_comp_narrative_rewrite(_adj_flagged, subject=enriched_subject, model=model)
+            for _f in _adj_flagged:
+                _new_text = _adj_rewritten.get(_f["label"])
+                _re_block = _factual_prose_blocking(_new_text, _f["label"], enriched_subject) if _new_text else _f["reasons"]
+                if _new_text and not _re_block:
+                    _adj_by_label[_f["label"]]["basis"] = _new_text
+                    qa_flags.append(f"{_f['label']}: rewrote its basis text to remove a claim the subject's own record didn't support.")
+                else:
+                    qa_blocking.extend(_f["reasons"])
+        # Absolute last resort: the deterministic engine could not land ANY number (no anchor, no
+        # list price, no comp prices to average, and the AI gave no value). Rather than a dead
+        # report and a "click again" loop, fall back to the AI's own estimate if it has one -
+        # LOUDLY flagged, forced Low, wide range, agent-review gate. Better a marked-unreliable
+        # number the agent can correct than no report at all.
+        if not (value and value > 0):
+            _ai_v = _as_float((subject_estimate_raw or {}).get("value"))
+            if _ai_v and _ai_v > 0:
+                value = _ai_v
+                _v10_range_pct = max(_v10_range_pct or 0, 15.0)
+                _v10_conf_seed = "low"
+                _v10_insufficient = True
+                _msg = ("VALUATION FELL BACK TO THE AI'S RAW ESTIMATE - the deterministic comp anchor "
+                        "could not be built (comp set too thin / unverified). This is NOT a supported "
+                        "valuation: treat the number as provisional, widen your own review, and fix the "
+                        "comp set before sharing.")
+                qa_blocking.append(_msg)
+                qa_flags.append(_msg)
+                if isinstance(valuation_trace, dict):
+                    valuation_trace["ai_raw_fallback"] = True
+                logger.warning(
+                    "CMA valuation fell back to AI raw estimate", extra={"report_id": report_id, "ai_value": _ai_v},
+                )
+    # Authoritative status + active-market DOM from the deterministic timeline (never today - list
+    # date once the listing went contingent/pending/closed). Falls back to the subject's own
+    # days_on_market field only when the timeline couldn't compute one.
+    _subject_on_market = bool(status_timeline.get("is_active", True)) and not status_timeline.get("is_under_contract") and not status_timeline.get("is_closed")
+    active_dom = status_timeline.get("active_market_days")
+    if active_dom is None and not status_timeline.get("not_listed"):
+        active_dom = _as_float(subject.get("days_on_market"))
+    # B5: NO hard clamp to list price. Extended active-market exposure is real, meaningful
+    # evidence - flagged for the agent to weigh - but list price is not an absolute ceiling the
+    # value can never cross; a comp-supported estimate above a stale asking price can be correct
+    # (the seller may simply be over/under-priced relative to the market).
+    if value and active_dom is not None and active_dom > 14 and subject_asking and value > subject_asking and _subject_on_market:
+        qa_flags.append(
+            f"Subject has been active {int(active_dom)} days without an accepted offer - the "
+            f"estimated value (${value:,.0f}) exceeds list price (${subject_asking:,.0f}); confirm "
+            "this is justified by the comp evidence, not just the AI's own read."
+        )
+    if active_dom is not None and active_dom > 14 and not _subject_on_market:
+        _stat = (status_timeline.get("current_status") or "under contract").lower()
+        qa_flags.append(
+            f"Subject's active-market window ({int(active_dom)} days) ended when it went {_stat}"
+            + (f" on {status_timeline['under_contract_date']}" if status_timeline.get("under_contract_date") else "")
+            + " - it is not evidence of weak demand, and offer guidance must not treat it as an active listing."
+        )
+    elif status_timeline.get("current_status") and status_timeline.get("current_status") != "Unknown":
+        qa_flags.append(
+            f"Subject listing status: {status_timeline['current_status']}"
+            + (f"; active-market days {int(active_dom)}" if active_dom is not None else "")
+            + (f" ({status_timeline['dom_source']})" if status_timeline.get("dom_source") else "")
+            + "."
+        )
+    if value and value > 0:
+        _se_for_fields = subject_estimate_raw or {}
+        # Build deterministic benchmark confidence for the reasoning evidence packet. It does not
+        # constrain the reasoning model's final confidence.
+        range_pct = _v10_range_pct if _v10_range_pct is not None else _clamp(
+            _as_float(_se_for_fields.get("range_pct")) or 5.0, _MIN_RANGE_PCT, _MAX_RANGE_PCT
+        )
+        confidence = _v10_conf_seed or _se_for_fields.get("confidence")
+        if confidence not in ("low", "medium", "high"):
+            confidence = "medium"
+        # B4 - full-evidence confidence composite (proximity, area match, size similarity,
+        # property type, condition-agreement, recency, verified-data quality, redundancy-adjusted
+        # independent-comp breadth), replacing the old bare "count of Strong comps" switch. And
+        # whatever this produces IS what the report shows - no separate "internal logic" that can
+        # disagree with the displayed value. Stored as low|medium|high; the UI renders "medium" as
+        # "Moderate".
+        confidence, _conf_flags = _compute_confidence(new_comparables, evidence_by_key, outliers, confidence)
+        qa_flags.extend(_conf_flags)
+
+        # The completed deterministic engine is now an evidence/benchmark layer. A separate
+        # frontier reasoning pass owns the final FMV, exact range, and confidence. Its values are
+        # promoted verbatim after structural validation; no V10 clamp or gate is re-applied.
+        _deterministic_confidence = confidence
+        _reasoning_packet = _build_reasoning_evidence_packet(
+            subject=enriched_subject, comps=new_comparables, status_timeline=status_timeline,
+            anchor=final_anchor, exposure=exposure, v10_result=_v10,
+            subject_estimate=_se_for_fields, evidence_by_key=evidence_by_key, outliers=outliers,
+            data_quality_flags=qa_flags, deterministic_confidence=_deterministic_confidence,
+        )
+        _reasoning_output, _reasoning_blocking, _reasoning_cost, _reasoning_usage = await _run_cma_reasoning_stage(
+            db, owner_id, plan_tier, config, _reasoning_packet, report_id,
+        )
+        _comp_labels = {str(c.get("comp_id")): c.get("comp_label") for c in _reasoning_packet["comparables"]}
+        _authority = _apply_reasoning_authority(
+            _v10, _reasoning_output, model=config["cma_reasoning_model"],
+            effort=config.get("cma_reasoning_effort", "high"), comp_labels_by_id=_comp_labels,
+        )
+        value = _authority["fmv"]
+        final_range_low = _authority["range_low"]
+        final_range_high = _authority["range_high"]
+        range_pct = _authority["range_pct"]
+        confidence = _authority["confidence"]
+        valuation_trace = _authority["trace"]
+        valuation_trace["authoritative_evidence_snapshot"] = _evidence_snapshot.audit_metadata()
+        qa_blocking.extend(_reasoning_blocking)
+        _formula_only_blocks = [b for b in qa_blocking if " RECONCILIATION -" in str(b)]
+        if _formula_only_blocks:
+            qa_blocking = [b for b in qa_blocking if b not in _formula_only_blocks]
+            qa_flags.extend(
+                "V10 benchmark only (not an export block under reasoning authority): " + str(b)
+                for b in _formula_only_blocks
+            )
+        qa_flags.append(
+            f"Final valuation authority: {config['cma_reasoning_model']} at "
+            f"{config.get('cma_reasoning_effort', 'high')} reasoning effort; V10 FMV "
+            f"${_authority.get('v10_formula_fmv') or 0:,.0f} retained for audit."
+        )
         new_pricing = dict(report.pricing or {})
-        new_pricing["ai_estimate"] = {**subject_estimate, "model": model, "generated_at": datetime.now(timezone.utc).isoformat()}
+        inspection_concerns, offer_strategy_considerations = _split_buyer_guidance(
+            _se_for_fields.get("inspection_concerns") or "",
+            _se_for_fields.get("offer_strategy_considerations") or "",
+        )
+        # A buyer CMA must never ship with an empty Inspection Concerns section. The AI's main call
+        # + the estimate-only "mini prompt" both got a shot; when they still return it blank (seen
+        # on an under-contract subject), fall back to a deterministic due-diligence checklist built
+        # from the subject's own water/sewer/systems/age/exterior data.
+        if report.mode == "buyer" and _is_blank(inspection_concerns):
+            inspection_concerns = _deterministic_inspection_baseline(enriched_subject, status_timeline)
+            qa_flags.append(
+                "Inspection Concerns came back empty from the AI - filled a standard due-diligence "
+                "checklist from the subject's own data (water / sewer / systems / roof / age / exterior). "
+                "Review and add anything property-specific."
+            )
+        offer_min = final_range_low
+        offer_max = value
+        # The model is asked to verify its own "X% below/above list" claims but real generations
+        # confirmed it doesn't reliably do the arithmetic (e.g. calling a value 3-5% below list
+        # when it's really 6.1% below, and separately calling an offer range 5-7% below when it's
+        # really 7-8% below, in the same generation) - substituted with the real computed number
+        # here rather than trusted from the model's prose.
+        methodology_summary = _fix_pct_below_list(
+            _reasoning_client_methodology(_reasoning_output), subject_asking, value, value,
+        )
+        offer_strategy_considerations = _fix_pct_below_list(
+            offer_strategy_considerations, subject_asking, offer_min, offer_max,
+        )
+
+        # ---- deterministic prose / math QA (item 3), invented-adjustment scrub (item 2),
+        #      speculative-defect flags (item 5), status-aware offer guidance (item 6) ----
+        _incl = [c for c in new_comparables if c.get("is_included", True)]
+        _val_comps = [c for c in _incl if _normalize_strength(c.get("strength")) in ("strong", "supporting")]
+        _comp_psf = [
+            _as_float(c.get("price_per_sqft")) for c in _val_comps
+            if c.get("price_verified", True) and _as_float(c.get("price_per_sqft"))
+        ]
+        _comp_prices = [
+            _as_float(c.get("sale_price")) for c in _incl
+            if c.get("price_verified", True) and _as_float(c.get("sale_price"))
+        ]
+        _qa_ctx = {
+            "comp_psf": _comp_psf,
+            "included_comp_count": len(_incl),
+            "valuation_comp_count": len(_val_comps),
+            "list_price": subject_asking,
+            "value": value,
+            "range_min": final_range_low,
+            "range_max": final_range_high,
+            "offer_min": offer_min,
+            "offer_max": offer_max,
+            "comp_prices": _comp_prices,
+        }
+        for _label, _getter, _setter in (
+            ("Methodology summary", lambda: methodology_summary, "m"),
+            ("Offer strategy", lambda: offer_strategy_considerations, "o"),
+            ("Inspection concerns", lambda: inspection_concerns, "i"),
+        ):
+            _txt = _getter() or ""
+            _txt, _f1 = _prose_math_qa(_txt, _label, _qa_ctx)
+            _txt, _f2 = _scrub_invented_adjustments(_txt, _qa_ctx)
+            _txt, _f3 = _final_polish_pass(_txt, _label)
+            _f4: list = []
+            if _setter == "m":
+                _txt, _f4 = _firm_up_hedges(_txt, new_comparables)
+            qa_flags.extend(_f1 + _f2 + _f3 + _f4)
+            if _setter == "m":
+                methodology_summary = _txt
+            elif _setter == "o":
+                offer_strategy_considerations = _txt
+            else:
+                inspection_concerns = _txt
+        qa_flags.extend(_flag_speculative_defects(inspection_concerns))
+        offer_strategy_considerations, _osf = _status_aware_offer_guidance(offer_strategy_considerations, status_timeline)
+        qa_flags.extend(_osf)
+
+        # ---- final consistency gate: comp-card $/sqft vs. prose, directional claims, one true
+        #      FMV, and a stale "active" status reference - run last, after every other prose pass
+        #      above, on the fully-corrected text (see cma_ai_service final-QA docs). ----
+        _gated, _gate_flags, _gate_blocking = _final_consistency_gate(
+            {
+                "m": ("Methodology summary", methodology_summary),
+                "o": ("Offer strategy", offer_strategy_considerations),
+                "i": ("Inspection concerns", inspection_concerns),
+            },
+            subject=enriched_subject, comps=new_comparables, value=value, status_timeline=status_timeline,
+            comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key,
+        )
+        methodology_summary = _gated["m"]
+        offer_strategy_considerations = _gated["o"]
+        inspection_concerns = _gated["i"]
+        qa_flags.extend(_gate_flags)
+        qa_blocking.extend(_gate_blocking)
+
+        # ---- pricing-range internal-consistency check (defense in depth - see
+        #      _check_pricing_range_consistency; never rewrites a number, only flags/blocks) ----
+        _range_flags, _range_blocking = _check_pricing_range_consistency(
+            report.mode, value, range_pct,
+            final_range_low, final_range_high,
+            offer_min=_round_to_5k(offer_min) if report.mode == "buyer" else None,
+            offer_max=_round_to_5k(offer_max) if report.mode == "buyer" else None,
+            recommended_min=_round_to_5k(final_range_low) if report.mode != "buyer" else None,
+            recommended_max=_round_to_5k(final_range_high) if report.mode != "buyer" else None,
+        )
+        qa_flags.extend(_range_flags)
+        qa_blocking.extend(_range_blocking)
+
+        # Materialize every client-facing fact-bearing field before the final prose/QA pass. The
+        # exact subject snapshot checked below is the same object later saved and rendered.
+        report.subject = _reconciled_subject_snapshot(
+            _merge_authoritative_property_facts(report.subject or {}, enriched_subject), status_timeline,
+        )
+        enriched_subject = dict(report.subject or {})
+
+        # Suggested improvements are also normalized before final QA. They remain outside the
+        # valuation math, but no client artifact field is allowed to appear after QA has run.
+        premium_improvements = _premium_improvements_from_ai(_se_for_fields)
+        for _imp in premium_improvements:
+            for _k in ("description", "estimated_value_context"):
+                _scrubbed, _sf = _scrub_invented_adjustments(_imp.get(_k) or "", _qa_ctx)
+                _scrubbed, _pf = _final_polish_pass(_scrubbed, f"Premium improvement '{_imp.get('type') or _k}'")
+                if _sf or _pf:
+                    _imp[_k] = _scrubbed
+                    qa_flags.extend(f"Premium improvement '{_imp.get('type') or _k}': {m}" for m in _sf)
+                    qa_flags.extend(_pf)
+        if premium_improvements:
+            report.improvements = [*(report.improvements or []), *premium_improvements]
+
+        # ---- B8: final valuation traceability + post-exposure-gate prose reconciliation + final QA.
+        # These are the newest, most involved passes (value-driver reconciliation, the round-4
+        # gate-reconciliation tail with its optional targeted rewrite, the 13-check consolidator).
+        # If any final-string QA step throws, preserve the reasoning valuation for diagnosis but
+        # fail the report closed for export. A valid reasoning FMV is never replaced with V10.
+        # The ONE authoritative final valuation object - built now that the final anchor, the
+        # qualitative reconciliation, the exposure gate, the FMV, the range and the confidence are
+        # ALL locked. Every client-facing number + status phrase downstream is sourced from this.
+        _final_val = _v10_authoritative_valuation(
+            value=value, range_pct=range_pct, confidence=confidence, valuation_trace=valuation_trace,
+            subject_asking=subject_asking, status_timeline=status_timeline,
+            comp_stats=_cma_display_comp_stats(new_comparables),
+            range_min=final_range_low, range_max=final_range_high,
+        )
+        # Seller-only narratives - processed here, after the subject snapshot is final and before
+        # the external-blocking snapshot below, so any blocking they raise gates export the same
+        # way the buyer narratives' does.
+        listing_strategy_considerations = ""
+        listing_prep_concerns = ""
+        if report.mode != "buyer":
+            listing_strategy_considerations, listing_prep_concerns, _sg_flags, _sg_blocking = _process_seller_guidance(
+                _se_for_fields, subject=enriched_subject, comps=new_comparables, value=value,
+                status_timeline=status_timeline, comp_num_by_key=comp_num_by_key,
+                addr_by_key=addr_by_key, qa_ctx=_qa_ctx,
+            )
+            qa_flags.extend(_sg_flags)
+            qa_blocking.extend(_sg_blocking)
+        # Everything that has ALREADY landed a blocking entry (valuation reconciliation incl. the
+        # CONDITION RECONCILIATION block, the exposure gate, the range check) - fed into the final
+        # QA so qa_result.export_allowed reflects the FULL picture (issue #1).
+        _external_blocking = list(qa_blocking)
+        _qa_result = None
+        _value_drivers = None
+        _offer_strategy_fields = None
+        try:
+            if report.mode == "buyer":
+                offer_strategy_considerations, qa_blocking, _unused_offer_qa, _ob_flags = _v10_apply_buyer_offer_rebuild(
+                    offer_strategy_considerations, _final_val, subject_asking, range_pct,
+                    status_timeline, valuation_trace, qa_blocking, None,
+                )
+                qa_flags.extend(_ob_flags)
+                _external_blocking = list(qa_blocking)
+            _value_drivers = _reasoning_value_drivers(_reasoning_output, new_comparables)
+            for _d in _value_drivers or []:
+                if isinstance(_d.get("note"), str) and _d["note"]:
+                    _d["note"], _dhf = _firm_up_hedges(_d["note"], new_comparables)
+            _value_drivers, _road_flags = _reconcile_road_exposure_claims(
+                _value_drivers, new_comparables, comp_num_by_key, addr_by_key,
+            )
+            qa_flags.extend(_road_flags)
+
+            _fin = await _finalize_gate_reconciled_prose(
+                methodology=methodology_summary, offer=offer_strategy_considerations, inspection=inspection_concerns,
+                value=value, range_pct=range_pct, subject_asking=subject_asking, confidence=confidence,
+                status_timeline=status_timeline, enriched_subject=enriched_subject, comps=new_comparables,
+                comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key, valuation_trace=valuation_trace,
+                value_drivers=_value_drivers, qa_ctx=_qa_ctx, mode=report.mode, model=model,
+                final=_final_val, external_blocking=_external_blocking,
+            )
+            methodology_summary = _fin["methodology"]
+            offer_strategy_considerations = _fin["offer"]
+            inspection_concerns = _fin["inspection"]
+            _offer_strategy_fields = _fin.get("offer_fields")
+            _value_drivers = _fin["value_drivers"]
+            _qa_result = _fin["qa_result"]
+            qa_flags.extend(_fin["qa_flags"])
+            qa_blocking.extend(_fin["qa_blocking"])
+
+        except Exception:  # noqa: BLE001
+            logger.exception("CMA post-estimate reconciliation/QA failed for report %s - export blocked", report_id)
+            if not isinstance(_value_drivers, list):
+                _value_drivers = None
+            _qa_failure = (
+                "FINAL OUTPUT QA FAILED - the authoritative reasoning valuation was preserved, but "
+                "client export is blocked until the final prose checks complete successfully."
+            )
+            qa_blocking.append(_qa_failure)
+            _qa_result = {
+                "version": "v10-final-output",
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "checks_run": ["final_qa_runtime"],
+                "passed": False,
+                "warnings": [],
+                "corrections": [],
+                "blocking_errors": list(dict.fromkeys([*_external_blocking, _qa_failure])),
+                "external_blocking": list(dict.fromkeys(_external_blocking)),
+                "export_allowed": False,
+            }
+            warnings.append(
+                "The authoritative value is saved, but final prose QA hit an error and client export "
+                "is blocked. Re-run the analysis after reviewing the server error."
+            )
+        qa_flags = list(dict.fromkeys(qa_flags))
+        qa_blocking = list(dict.fromkeys(qa_blocking))
+        _qa_result = _v10_sync_qa_authority(_qa_result, qa_blocking)
+        if valuation_trace is not None:
+            valuation_trace["qa"] = _qa_result
+
+        new_pricing["ai_estimate"] = {
+            "value": round(value),
+            "range_min": round(final_range_low),
+            "range_max": round(final_range_high),
+            "confidence": confidence,
+            # The ONE authoritative final valuation object (issue #2/#3/#6). Every client-facing
+            # number + status label in the PDF / public report must be sourced from this, never
+            # from independent/freeform generation.
+            "final_valuation": _final_val,
+            "status": _final_val.get("status"),
+            "methodology_summary": methodology_summary,
+            # Stored here (not just written into offer_suggestion_notes) so the frontend can show
+            # the same "AI Generated" marker on that field for as long as it still matches this
+            # verbatim - same verbatim-match pattern as methodology_summary above.
+            "offer_strategy_considerations": offer_strategy_considerations or None,
+            "offer_strategy_fields": _offer_strategy_fields or None,
+            "inspection_concerns": inspection_concerns or None,
+            # Seller/listing mirror of the two buyer narratives above (None on a buyer report).
+            "listing_strategy_considerations": listing_strategy_considerations or None,
+            "listing_prep_concerns": listing_prep_concerns or None,
+            # B8 - the 2-3 comps that most influenced the value, with a fact-checked direction and
+            # the AI's own qualitative note. Rendered on the report/PDF as "Why this number."
+            "value_drivers": _value_drivers or None,
+            # Deterministic QA notes (classification corrections, unverified-price downgrades,
+            # DOM caveats, insufficient-comp warning). Surfaced on the report + PDF.
+            "qa_flags": qa_flags or None,
+            # Residual hard contradictions the gate above couldn't safely auto-correct - agent-only
+            # (see cma_ai_service final-QA docs), and gates PDF export in the frontend.
+            "qa_blocking": qa_blocking or None,
+            "verified_strong_comp_count": strong_ct,
+            "weighted_comp_count": weight_ct,
+            # The ONE authoritative source for every descriptive comp statistic shown in Studio,
+            # the PDF, and the public report - the frontend formats these, never recomputes them.
+            "comp_stats": _cma_display_comp_stats(new_comparables),
+            # v10 - the full audit trail: deterministic anchor + per-comp weights, the
+            # market-exposure state/ceiling, every bounded qualitative adjustment, the above-ask
+            # gate action, and the final FMV. Agent-only ("How this value was calculated"
+            # disclosure in Studio); never on the client PDF/public report.
+            "valuation_trace": valuation_trace or None,
+            "authoritative_evidence_snapshot": _evidence_snapshot.audit_metadata(),
+            "exposure_state": (valuation_trace or {}).get("exposure", {}).get("state") if valuation_trace else None,
+            # Agent-only structured result of the final pre-export QA consolidator (checks run,
+            # warnings, blocking errors, auto-corrections, export allowed). Never in the client PDF.
+            "qa_result": _qa_result or None,
+            # True when there weren't enough verified comps for a deterministic anchor - the value
+            # is a provisional wide range only, and qa_blocking holds the "review before export" gate.
+            "insufficient_evidence": _v10_insufficient or None,
+            # OSM road/street classification for the SUBJECT (each comp carries its own on
+            # comp.road_context). {verdict, road_types, max_speed_mph, nearby_road_names, summary}.
+            "subject_road_context": enriched_subject.get("road_context") or None,
+            "model": config["cma_reasoning_model"],
+            "comp_analysis_model": model,
+            "reasoning_cost_usd": round(_reasoning_cost, 4),
+            "reasoning_usage": _reasoning_usage or None,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        # Written straight into the real pricing fields, not staged for a manual "Apply" click -
+        # still non-destructive: only fills a field the agent hasn't already entered a number/note
+        # into themselves. Mode-specific since listing and buyer expose different fields.
+        if report.mode == "buyer":
+            # These legacy editable fields mirror the structured deterministic offer contract for
+            # compatibility. They are not populated from the valuation-range endpoints.
+            _of = _offer_strategy_fields or {}
+            opening_low = _as_float(_of.get("opening_offer_low"))
+            comfort_ceiling = _as_float(_of.get("comfort_ceiling"))
+            strong_offer = _as_float(_of.get("strong_offer"))
+            if _is_blank(new_pricing.get("estimated_fair_value")):
+                new_pricing["estimated_fair_value"] = _round_to_5k(value)
+            if opening_low is not None and _is_blank(new_pricing.get("suggested_offer_min")):
+                new_pricing["suggested_offer_min"] = round(opening_low)
+            # Suggested Offer Max is the "most you should feel comfortable paying" ceiling
+            # (~5% over FMV) - not the opening offer's own top end, which is list-capped above.
+            if comfort_ceiling is not None and _is_blank(new_pricing.get("suggested_offer_max")):
+                new_pricing["suggested_offer_max"] = round(comfort_ceiling)
+            if strong_offer is not None and _is_blank(new_pricing.get("strong_offer")):
+                new_pricing["strong_offer"] = round(strong_offer)
+            if _is_blank(new_pricing.get("offer_strategy_commentary")):
+                new_pricing["offer_strategy_commentary"] = methodology_summary
+            if _is_blank(new_pricing.get("inspection_concerns")):
+                if inspection_concerns:
+                    new_pricing["inspection_concerns"] = inspection_concerns
+            # offer_suggestion_notes is otherwise agent-only (never AI-touched) - this is the one
+            # exception, since it's specifically the tactical negotiation guidance the agent asked
+            # the AI to draft; still non-destructive, only fills it if still blank.
+            if _is_blank(new_pricing.get("offer_suggestion_notes")):
+                if offer_strategy_considerations:
+                    new_pricing["offer_suggestion_notes"] = offer_strategy_considerations
+        else:
+            if _is_blank(new_pricing.get("most_likely_value")):
+                new_pricing["most_likely_value"] = _round_to_5k(value)
+            if _is_blank(new_pricing.get("recommended_min")):
+                new_pricing["recommended_min"] = _round_to_5k(final_range_low)
+            if _is_blank(new_pricing.get("recommended_max")):
+                new_pricing["recommended_max"] = _round_to_5k(final_range_high)
+            # Recommended List Price = the engine's own final value (same rounding as Most Likely
+            # Value) - no separate seller pricing math, so it can never drift from the valuation.
+            if _is_blank(new_pricing.get("recommended_list_price")):
+                new_pricing["recommended_list_price"] = _round_to_5k(value)
+            if _is_blank(new_pricing.get("pricing_commentary")):
+                new_pricing["pricing_commentary"] = methodology_summary
+            if _is_blank(new_pricing.get("listing_strategy_notes")) and listing_strategy_considerations:
+                new_pricing["listing_strategy_notes"] = listing_strategy_considerations
+            if _is_blank(new_pricing.get("listing_prep_notes")) and listing_prep_concerns:
+                new_pricing["listing_prep_notes"] = listing_prep_concerns
         report.pricing = new_pricing
+
+        # qa_flags/qa_blocking may have grown after ai_estimate was assembled above - keep in sync,
+        # and re-fold qa_blocking into the authoritative qa_result so export_allowed can't drift.
+        if isinstance(new_pricing.get("ai_estimate"), dict):
+            qa_flags = list(dict.fromkeys(qa_flags))
+            qa_blocking = list(dict.fromkeys(qa_blocking))
+            new_pricing["ai_estimate"]["qa_flags"] = qa_flags or None
+            new_pricing["ai_estimate"]["qa_blocking"] = qa_blocking or None
+            _synced = _v10_sync_qa_authority(new_pricing["ai_estimate"].get("qa_result"), qa_blocking)
+            if _synced is not None:
+                new_pricing["ai_estimate"]["qa_result"] = _synced
+                if isinstance(valuation_trace, dict):
+                    valuation_trace["qa"] = _synced
+            report.pricing = new_pricing
     else:
-        warnings.append("The AI didn't return a value estimate - try regenerating.")
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "The CMA did not produce enough valuation evidence for the final reasoning pass. No fallback value was saved.",
+        )
 
     report.ai_analysis = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "model": model,
-        "cost_usd": round(cost, 4),
+        "reasoning_model": config.get("cma_reasoning_model"),
+        "cost_usd": round(cost + _reasoning_cost, 4),
+        "comp_analysis_cost_usd": round(cost, 4),
+        "reasoning_cost_usd": round(_reasoning_cost, 4),
+        "reasoning_usage": _reasoning_usage or None,
         "input_fingerprint": fingerprint,
         "images_sent": images_sent,
         "warnings": warnings,
     }
+    report.pricing = stamp_final_artifact_qa(
+        subject=report.subject or {}, comparables=report.comparables or [], pricing=report.pricing or {},
+        market_context=report.market_context or {}, improvements=report.improvements or [],
+    )
+    await db.commit()
+    await db.refresh(report)
+    return report
+
+
+async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, plan_tier: str) -> CmaReport:
+    """Phase C - re-runs the deterministic evidence/outlier/redundancy/confidence/value_drivers
+    pipeline (B1-B9) against the report's CURRENT comps (an agent's strength reclassifications and
+    Mark Irrelevant overrides already autosaved onto them), plus one lightweight AI call to keep
+    the value/methodology/offer/inspection text consistent with that comp set. Distinct from
+    generate_ai_analysis: no photos re-sent (text-only, via the existing estimate-only tool - same
+    _ESTIMATE_ONLY_SYSTEM_PROMPT/submit_cma_estimate pattern already used there as a fallback), no
+    comp notes/quality ratings rewritten, and - unlike the one-time initial generation - callable
+    any number of times, gated by the same shared per-user monthly AI budget every other metered
+    tool draws from (reserve_cma_analysis), not a separate count limit.
+
+    Non-destructive like the initial generation: only fills a mode-specific pricing field
+    (recommended_min/max, estimated_fair_value, etc.) if the agent left it blank - a field they've
+    already set (or a prior generation already filled) is never overwritten. ai_estimate itself
+    (the read-only AI snapshot: value, range, confidence, methodology, qa_flags, value_drivers)
+    IS always refreshed - that's the whole point of a recompute."""
+    report = await cma_service._get_owned(db, owner_id, report_id)
+    if not report.ai_analysis:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Generate the initial AI analysis before recomputing.")
+
+    config = await ai_config_service.get_config(db)
+    subject = report.subject or {}
+    comps = [c for c in (report.comparables or []) if c.get("is_included", True)]
+    if not comps:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Add at least one comparable before recomputing.")
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Final valuation reasoning is not configured yet. Add OPENAI_API_KEY to backend/.env and restart the backend.",
+        )
+
+    await cma_service.mark_generation_started(db, owner_id, report_id)
+
+    reservation = await reserve_cma_analysis(db, owner_id, config, plan_tier)
+    model = config["cma_ai_model"]
+    usage_input_tokens = usage_output_tokens = 0
+    cost = 0.0
+    _analysis_budget_closed = False
+    try:
+        enriched_subject, enriched_comps = await _enrich_with_property_data(db, subject, comps)
+        status_timeline = enriched_subject.get("_status_timeline") or {}
+        enriched_subject = _reconciled_subject_snapshot(enriched_subject, status_timeline)
+        enriched_subject, status_timeline = _seller_not_listed(report.mode, enriched_subject, status_timeline)
+        proximity_context = await load_local_proximity_context(db, enriched_subject)
+        enriched_by_key = {c.get("listing_key"): c for c in enriched_comps if c.get("listing_key")}
+
+        # Same field merge as generate_ai_analysis's main loop - the stored comp dict never
+        # owns hard facts; copy only the canonical property fields from the raw-joined record and
+        # run the same factual reconciliation used by initial generation.
+        new_comparables: list[dict] = []
+        _recompute_fact_flags: list[str] = []
+        _recompute_fact_blocking: list[str] = []
+        for comp in report.comparables or []:
+            comp = dict(comp)
+            _enr = enriched_by_key.get(comp.get("listing_key"))
+            if _enr:
+                comp = _merge_authoritative_property_facts(comp, _enr)
+                if _enr.get("price_verified") and _enr.get("sale_price") and not (comp.get("price_verified") and comp.get("sale_price")):
+                    for _pk in ("sale_price", "close_price", "close_date", "sale_date", "price_per_sqft"):
+                        if _enr.get(_pk) is not None:
+                            comp[_pk] = _enr[_pk]
+                    comp["price_verified"] = True
+            if comp.get("strength"):
+                comp["strength"] = _normalize_strength(comp["strength"])
+            label = _comp_label(len(new_comparables), comp)
+            comp["quality"], _af = _reconcile_amenities_quality(
+                enriched_subject, comp, comp.get("quality"), label,
+            )
+            if _af:
+                comp["_amenities_fact_reconciled"] = True
+            _recompute_fact_flags.extend(_af)
+            for field in ("ai_commentary", "commentary"):
+                if isinstance(comp.get(field), str) and comp[field]:
+                    comp[field], _ff = _reconcile_comp_hard_facts(
+                        comp[field], label, enriched_subject, comp,
+                    )
+                    _recompute_fact_flags.extend(_ff)
+                    _recompute_fact_blocking.extend(_factual_prose_blocking(
+                        comp[field], label, enriched_subject, comp_note=True, comp=comp,
+                    ))
+            new_comparables.append(comp)
+
+        comp_num_by_key = {c.get("listing_key"): i + 1 for i, c in enumerate(comps) if c.get("listing_key")}
+        addr_by_key = {c.get("listing_key"): (c.get("street_address") or "") for c in comps if c.get("listing_key")}
+
+        qa_flags: list[str] = list(dict.fromkeys(_recompute_fact_flags))
+        qa_blocking: list[str] = list(dict.fromkeys(_recompute_fact_blocking))
+        if status_timeline.get("live_status_note"):
+            qa_flags.append(status_timeline["live_status_note"])
+
+        evidence_by_key = _build_evidence_by_key(enriched_subject, new_comparables)
+        outliers = _flag_psf_outliers(new_comparables)
+        for _key, _note in outliers.items():
+            _oi = next((i for i, c in enumerate(new_comparables) if c.get("listing_key") == _key), None)
+            if _oi is not None:
+                qa_flags.append(f"{_comp_label(_oi, new_comparables[_oi])}: {_note}")
+        qa_flags.extend(_non_circular_grading_check(new_comparables, evidence_by_key, comp_num_by_key))
+        # Fix 2: market-location consistency (recompute keeps the AI's earlier override fields on
+        # the stored comps, so a previously-validated override still stands).
+        qa_flags.extend(_v10_location_class_review(enriched_subject, new_comparables, evidence_by_key))
+        # round 12 issue #1: keep same-market evidence in the anchor when finish is the only gap.
+        qa_flags.extend(_v10_condition_class_review(enriched_subject, new_comparables, evidence_by_key))
+        # round 15: finish-rating vs. narrative/fact consistency, before the weighted signals.
+        qa_flags.extend(_v10_condition_rating_consistency_check(enriched_subject, new_comparables))
+
+        _narrative_drafts = [
+            {"ai_commentary": c.get("ai_commentary"), "commentary": c.get("commentary")}
+            for c in new_comparables
+        ]
+        _evidence_snapshot = _build_authoritative_evidence_snapshot(
+            enriched_subject, new_comparables, status_timeline,
+        )
+        enriched_subject, new_comparables, status_timeline, _snapshot_flags, _snapshot_blocking = (
+            await _materialize_snapshot_with_comp_narratives(
+                _evidence_snapshot, _narrative_drafts, attempt_rewrite=True, model=model,
+            )
+        )
+        qa_flags.extend(_snapshot_flags)
+        qa_blocking.extend(_snapshot_blocking)
+        evidence_by_key = _build_evidence_by_key(enriched_subject, new_comparables)
+        outliers = _flag_psf_outliers(new_comparables)
+
+        _incl_now = [c for c in new_comparables if c.get("is_included", True)]
+        if _incl_now and not any(_normalize_strength(c.get("strength")) in ("strong", "supporting") for c in _incl_now):
+            qa_flags.append("No comp met the bar for Strong or Supporting - reliable comp evidence is limited.")
+
+        report.comparables = new_comparables
+        strong_ct = sum(1 for c in new_comparables if c.get("is_included", True) and _normalize_strength(c.get("strength")) == "strong")
+        weight_ct = sum(1 for c in new_comparables if c.get("is_included", True) and _normalize_strength(c.get("strength")) in ("strong", "supporting"))
+
+        # v10 - strengths are already settled on a recompute, so one anchor (no provisional/final
+        # split). Shown in the estimate-only prompt and used for the authoritative FMV below.
+        new_comparables, v10_anchor, _relevance_trace = _apply_continuous_relevance_weighting(
+            enriched_subject, new_comparables, evidence_by_key, outliers,
+            source_snapshot_sha256=_evidence_snapshot.digest,
+            density_context=proximity_context,
+        )
+        report.comparables = new_comparables
+        strong_ct = sum(
+            1 for c in new_comparables
+            if c.get("valuation_role") == "valuation_comp" and _normalize_strength(c.get("strength")) == "strong"
+        )
+        weight_ct = sum(1 for c in new_comparables if c.get("valuation_role") == "valuation_comp")
+        v10_exposure = _compute_exposure(
+            enriched_subject, status_timeline, _v10_comp_median_dom(new_comparables), v10_anchor,
+        )
+
+        client = _get_client()
+        estimate_warnings: list[str] = []
+        estimate_content, _, _ = await _build_content(
+            enriched_subject, new_comparables, 0, estimate_warnings, False, report.mode,
+            anchor=v10_anchor, exposure=v10_exposure,
+        )
+        response = await client.messages.create(
+            model=model,
+            max_tokens=_ESTIMATE_ONLY_OUTPUT_TOKENS,
+            system=_estimate_only_system_prompt(report.mode),
+            tools=[_tool_for_mode(_ESTIMATE_ONLY_TOOL, report.mode)],
+            tool_choice={"type": "tool", "name": "submit_cma_estimate"},
+            messages=[{"role": "user", "content": estimate_content}],
+        )
+        usage_input_tokens += response.usage.input_tokens
+        usage_output_tokens += response.usage.output_tokens
+        block = next((b for b in response.content if getattr(b, "type", None) == "tool_use" and b.name == "submit_cma_estimate"), None)
+        result = block.input if block and isinstance(block.input, dict) else {}
+        subject_estimate_raw = result.get("subject_estimate") if isinstance(result.get("subject_estimate"), dict) else None
+        if not subject_estimate_raw:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The AI didn't return a usable value estimate - try again.")
+
+        subject_asking = (
+            _as_float(status_timeline.get("current_list_price"))
+            or _as_float(enriched_subject.get("list_price"))
+        )
+        # Run V10 unchanged as the deterministic benchmark before the final reasoning pass.
+        _v10 = _apply_v10_valuation(v10_anchor, v10_exposure, subject_estimate_raw, subject_asking)
+        value = _v10["fmv"]
+        valuation_trace = _v10["trace"]
+        valuation_trace["relevance_weighting"] = _relevance_trace
+        _v10_insufficient = bool(_v10.get("insufficient_evidence"))
+        qa_flags.extend(_v10["flags"])
+        qa_blocking.extend(_v10.get("blocking") or [])
+        # See generate_ai_analysis - each adjustment's "basis" text needs the same unsupported-claim
+        # scan as methodology/offer/inspection text, not just its dollar amount validated, the same
+        # free deterministic condition-wording relabel first, and the same one-shot targeted
+        # rewrite before this report is ever saved.
+        _adj_flagged: list[dict] = []
+        _adj_by_label: dict[str, dict] = {}
+        for _adj in (valuation_trace.get("adjustments") or []):
+            qa_flags.extend(_neutralize_unsupported_condition_adjustment(_adj, enriched_subject))
+            _adj_label = f"Qualitative adjustment ({_adj.get('factor') or 'unlabeled'})"
+            _adj_reasons = _factual_prose_blocking(_adj.get("basis") or "", _adj_label, enriched_subject)
+            if _adj_reasons:
+                _adj_flagged.append({"label": _adj_label, "text": _adj.get("basis") or "", "reasons": _adj_reasons})
+                _adj_by_label[_adj_label] = _adj
+        if _adj_flagged:
+            _adj_rewritten = await _targeted_comp_narrative_rewrite(_adj_flagged, subject=enriched_subject, model=model)
+            for _f in _adj_flagged:
+                _new_text = _adj_rewritten.get(_f["label"])
+                _re_block = _factual_prose_blocking(_new_text, _f["label"], enriched_subject) if _new_text else _f["reasons"]
+                if _new_text and not _re_block:
+                    _adj_by_label[_f["label"]]["basis"] = _new_text
+                    qa_flags.append(f"{_f['label']}: rewrote its basis text to remove a claim the subject's own record didn't support.")
+                else:
+                    qa_blocking.extend(_f["reasons"])
+
+        if not (value and value > 0):
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The AI didn't return a usable value estimate - try again.")
+
+        range_pct = _v10["range_pct"] if _v10["range_pct"] is not None else _clamp(
+            _as_float(subject_estimate_raw.get("range_pct")) or 5.0, _MIN_RANGE_PCT, _MAX_RANGE_PCT
+        )
+        confidence = _v10["confidence_seed"] or subject_estimate_raw.get("confidence")
+        if confidence not in ("low", "medium", "high"):
+            confidence = "medium"
+        confidence, _conf_flags = _compute_confidence(new_comparables, evidence_by_key, outliers, confidence)
+        qa_flags.extend(_conf_flags)
+
+        cost = ai_config_service.estimate_cost_usd(config, model, usage_input_tokens, usage_output_tokens)
+        await record_usage_event(
+            db, owner_id, None, model, usage_input_tokens, usage_output_tokens,
+            cost, 0, False, None, event_type="cma_ai_recompute",
+        )
+        await reconcile_budget(db, reservation, cost)
+        _analysis_budget_closed = True
+
+        _reasoning_packet = _build_reasoning_evidence_packet(
+            subject=enriched_subject, comps=new_comparables, status_timeline=status_timeline,
+            anchor=v10_anchor, exposure=v10_exposure, v10_result=_v10,
+            subject_estimate=subject_estimate_raw, evidence_by_key=evidence_by_key, outliers=outliers,
+            data_quality_flags=qa_flags, deterministic_confidence=confidence,
+        )
+        _reasoning_output, _reasoning_blocking, _reasoning_cost, _reasoning_usage = await _run_cma_reasoning_stage(
+            db, owner_id, plan_tier, config, _reasoning_packet, report_id,
+        )
+        _comp_labels = {str(c.get("comp_id")): c.get("comp_label") for c in _reasoning_packet["comparables"]}
+        _authority = _apply_reasoning_authority(
+            _v10, _reasoning_output, model=config["cma_reasoning_model"],
+            effort=config.get("cma_reasoning_effort", "high"), comp_labels_by_id=_comp_labels,
+        )
+        value = _authority["fmv"]
+        final_range_low = _authority["range_low"]
+        final_range_high = _authority["range_high"]
+        range_pct = _authority["range_pct"]
+        confidence = _authority["confidence"]
+        valuation_trace = _authority["trace"]
+        valuation_trace["authoritative_evidence_snapshot"] = _evidence_snapshot.audit_metadata()
+        qa_blocking.extend(_reasoning_blocking)
+        _formula_only_blocks = [b for b in qa_blocking if " RECONCILIATION -" in str(b)]
+        if _formula_only_blocks:
+            qa_blocking = [b for b in qa_blocking if b not in _formula_only_blocks]
+            qa_flags.extend(
+                "V10 benchmark only (not an export block under reasoning authority): " + str(b)
+                for b in _formula_only_blocks
+            )
+        qa_flags.append(
+            f"Final valuation authority: {config['cma_reasoning_model']} at "
+            f"{config.get('cma_reasoning_effort', 'high')} reasoning effort; V10 FMV "
+            f"${_authority.get('v10_formula_fmv') or 0:,.0f} retained for audit."
+        )
+
+        new_pricing = dict(report.pricing or {})
+        _previous_ai_estimate = (
+            copy.deepcopy(new_pricing.get("ai_estimate"))
+            if isinstance(new_pricing.get("ai_estimate"), dict) else {}
+        )
+        inspection_concerns, offer_strategy_considerations = _split_buyer_guidance(
+            subject_estimate_raw.get("inspection_concerns") or "",
+            subject_estimate_raw.get("offer_strategy_considerations") or "",
+        )
+        if report.mode == "buyer" and _is_blank(inspection_concerns):
+            inspection_concerns = _deterministic_inspection_baseline(enriched_subject, status_timeline)
+            qa_flags.append(
+                "Inspection Concerns came back empty from the AI - filled a standard due-diligence "
+                "checklist from the subject's own data (water / sewer / systems / roof / age / exterior). "
+                "Review and add anything property-specific."
+            )
+        offer_min = final_range_low
+        offer_max = value
+        methodology_summary = _fix_pct_below_list(
+            _reasoning_client_methodology(_reasoning_output), subject_asking, value, value)
+        offer_strategy_considerations = _fix_pct_below_list(offer_strategy_considerations, subject_asking, offer_min, offer_max)
+
+        _incl = [c for c in new_comparables if c.get("is_included", True)]
+        _val_comps = [c for c in _incl if _normalize_strength(c.get("strength")) in ("strong", "supporting")]
+        _qa_ctx = {
+            "comp_psf": [_as_float(c.get("price_per_sqft")) for c in _val_comps if c.get("price_verified", True) and _as_float(c.get("price_per_sqft"))],
+            "included_comp_count": len(_incl),
+            "valuation_comp_count": len(_val_comps),
+            "list_price": subject_asking,
+            "value": value,
+            "range_min": final_range_low,
+            "range_max": final_range_high,
+            "offer_min": offer_min,
+            "offer_max": offer_max,
+            "comp_prices": [_as_float(c.get("sale_price")) for c in _incl if c.get("price_verified", True) and _as_float(c.get("sale_price"))],
+        }
+        for _label, _txt_key in (("Methodology summary", "m"), ("Offer strategy", "o"), ("Inspection concerns", "i")):
+            _txt = {"m": methodology_summary, "o": offer_strategy_considerations, "i": inspection_concerns}[_txt_key]
+            _txt, _f1 = _prose_math_qa(_txt, _label, _qa_ctx)
+            _txt, _f2 = _scrub_invented_adjustments(_txt, _qa_ctx)
+            _txt, _f3 = _final_polish_pass(_txt, _label)
+            _f4: list = []
+            if _txt_key == "m":
+                _txt, _f4 = _firm_up_hedges(_txt, new_comparables)
+            qa_flags.extend(_f1 + _f2 + _f3 + _f4)
+            if _txt_key == "m":
+                methodology_summary = _txt
+            elif _txt_key == "o":
+                offer_strategy_considerations = _txt
+            else:
+                inspection_concerns = _txt
+        qa_flags.extend(_flag_speculative_defects(inspection_concerns))
+        offer_strategy_considerations, _osf = _status_aware_offer_guidance(offer_strategy_considerations, status_timeline)
+        qa_flags.extend(_osf)
+
+        _gated, _gate_flags, _gate_blocking = _final_consistency_gate(
+            {"m": ("Methodology summary", methodology_summary), "o": ("Offer strategy", offer_strategy_considerations), "i": ("Inspection concerns", inspection_concerns)},
+            subject=enriched_subject, comps=new_comparables, value=value, status_timeline=status_timeline,
+            comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key,
+        )
+        methodology_summary, offer_strategy_considerations, inspection_concerns = _gated["m"], _gated["o"], _gated["i"]
+        qa_flags.extend(_gate_flags)
+        qa_blocking.extend(_gate_blocking)
+
+        _range_flags, _range_blocking = _check_pricing_range_consistency(
+            report.mode, value, range_pct, final_range_low, final_range_high,
+            offer_min=_round_to_5k(offer_min) if report.mode == "buyer" else None,
+            offer_max=_round_to_5k(offer_max) if report.mode == "buyer" else None,
+            recommended_min=_round_to_5k(final_range_low) if report.mode != "buyer" else None,
+            recommended_max=_round_to_5k(final_range_high) if report.mode != "buyer" else None,
+        )
+        qa_flags.extend(_range_flags)
+        qa_blocking.extend(_range_blocking)
+
+        # Recompute follows the same ordering contract as initial generation: save and render the
+        # exact authoritative subject snapshot that the final prose and QA inspect.
+        report.subject = _reconciled_subject_snapshot(
+            _merge_authoritative_property_facts(report.subject or {}, enriched_subject), status_timeline,
+        )
+        enriched_subject = dict(report.subject or {})
+
+        _value_drivers = _reasoning_value_drivers(_reasoning_output, new_comparables)
+        for _d in _value_drivers or []:
+            if isinstance(_d.get("note"), str) and _d["note"]:
+                _d["note"], _dhf = _firm_up_hedges(_d["note"], new_comparables)
+        _value_drivers, _road_flags = _reconcile_road_exposure_claims(
+            _value_drivers, new_comparables, comp_num_by_key, addr_by_key,
+        )
+        qa_flags.extend(_road_flags)
+
+        _final_val = _v10_authoritative_valuation(
+            value=value, range_pct=range_pct, confidence=confidence, valuation_trace=valuation_trace,
+            subject_asking=subject_asking, status_timeline=status_timeline,
+            comp_stats=_cma_display_comp_stats(new_comparables),
+            range_min=final_range_low, range_max=final_range_high,
+        )
+        if report.mode == "buyer":
+            offer_strategy_considerations, qa_blocking, _unused_offer_qa, _ob_flags = _v10_apply_buyer_offer_rebuild(
+                offer_strategy_considerations, _final_val, subject_asking, range_pct,
+                status_timeline, valuation_trace, qa_blocking, None,
+            )
+            qa_flags.extend(_ob_flags)
+        # Seller-only narratives - same processing + placement as generate_ai_analysis.
+        listing_strategy_considerations = ""
+        listing_prep_concerns = ""
+        if report.mode != "buyer":
+            listing_strategy_considerations, listing_prep_concerns, _sg_flags, _sg_blocking = _process_seller_guidance(
+                subject_estimate_raw, subject=enriched_subject, comps=new_comparables, value=value,
+                status_timeline=status_timeline, comp_num_by_key=comp_num_by_key,
+                addr_by_key=addr_by_key, qa_ctx=_qa_ctx,
+            )
+            qa_flags.extend(_sg_flags)
+            qa_blocking.extend(_sg_blocking)
+        _external_blocking = list(qa_blocking)
+        _fin = await _finalize_gate_reconciled_prose(
+            methodology=methodology_summary, offer=offer_strategy_considerations, inspection=inspection_concerns,
+            value=value, range_pct=range_pct, subject_asking=subject_asking, confidence=confidence,
+            status_timeline=status_timeline, enriched_subject=enriched_subject, comps=new_comparables,
+            comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key, valuation_trace=valuation_trace,
+            value_drivers=_value_drivers, qa_ctx=_qa_ctx, mode=report.mode, model=model,
+            final=_final_val, external_blocking=_external_blocking,
+        )
+        methodology_summary = _fin["methodology"]
+        offer_strategy_considerations = _fin["offer"]
+        inspection_concerns = _fin["inspection"]
+        _offer_strategy_fields = _fin.get("offer_fields")
+        _value_drivers = _fin["value_drivers"]
+        _qa_result = _fin["qa_result"]
+        qa_flags.extend(_fin["qa_flags"])
+        qa_blocking.extend(_fin["qa_blocking"])
+
+        if valuation_trace is not None:
+            valuation_trace["qa"] = _qa_result
+
+        new_pricing["ai_estimate"] = {
+            "value": round(value),
+            "range_min": round(final_range_low),
+            "range_max": round(final_range_high),
+            "confidence": confidence,
+            "final_valuation": _final_val,
+            "status": _final_val.get("status"),
+            "methodology_summary": methodology_summary,
+            "offer_strategy_considerations": offer_strategy_considerations or None,
+            "offer_strategy_fields": _offer_strategy_fields or None,
+            "inspection_concerns": inspection_concerns or None,
+            # Seller/listing mirror of the two buyer narratives above (None on a buyer report).
+            "listing_strategy_considerations": listing_strategy_considerations or None,
+            "listing_prep_concerns": listing_prep_concerns or None,
+            "value_drivers": _value_drivers or None,
+            "qa_flags": qa_flags or None,
+            "qa_blocking": qa_blocking or None,
+            "verified_strong_comp_count": strong_ct,
+            "weighted_comp_count": weight_ct,
+            "comp_stats": _cma_display_comp_stats(new_comparables),
+            "valuation_trace": valuation_trace or None,
+            "authoritative_evidence_snapshot": _evidence_snapshot.audit_metadata(),
+            "exposure_state": (valuation_trace or {}).get("exposure", {}).get("state") if valuation_trace else None,
+            "qa_result": _qa_result or None,
+            "insufficient_evidence": _v10_insufficient or None,
+            "model": config["cma_reasoning_model"],
+            "comp_analysis_model": model,
+            "reasoning_cost_usd": round(_reasoning_cost, 4),
+            "reasoning_usage": _reasoning_usage or None,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        def _replace_ai_owned(field: str, value_to_set, previous_ai_value=None) -> None:
+            current = new_pricing.get(field)
+            previous = previous_ai_value
+            if isinstance(current, (int, float)) and isinstance(previous, (int, float)):
+                unchanged = round(float(current)) == round(float(previous))
+            else:
+                unchanged = current == previous and previous not in (None, "")
+            if _is_blank(current) or unchanged:
+                new_pricing[field] = value_to_set
+
+        # Refresh fields still owned by the previous AI snapshot, while preserving an agent's
+        # actual edits. This prevents a recompute from leaving old V10/reasoning values in Studio.
+        if report.mode == "buyer":
+            _old_value = _as_float(_previous_ai_estimate.get("value"))
+            _new_offer_fields = _offer_strategy_fields or {}
+            _old_offer_fields = _previous_ai_estimate.get("offer_strategy_fields") or {}
+            _new_open_low = _as_float(_new_offer_fields.get("opening_offer_low"))
+            _new_comfort_ceiling = _as_float(_new_offer_fields.get("comfort_ceiling"))
+            _new_strong = _as_float(_new_offer_fields.get("strong_offer"))
+            _old_open_low = _as_float(_old_offer_fields.get("opening_offer_low"))
+            _old_comfort_ceiling = _as_float(_old_offer_fields.get("comfort_ceiling"))
+            _old_strong = _as_float(_old_offer_fields.get("strong_offer"))
+            # Reports created before deterministic-offer-v1 used range-low/FMV as the two legacy
+            # offer fields. Recognize those exact prior AI values as AI-owned so recompute can
+            # replace them, while still preserving genuinely agent-edited figures. Reports created
+            # before the comfort_ceiling field existed fall back to the old FMV as the closest prior
+            # AI-owned value for that same "unchanged since last AI touch" comparison.
+            if _old_open_low is None:
+                _old_open_low = _as_float(_previous_ai_estimate.get("range_min"))
+            if _old_comfort_ceiling is None:
+                _old_comfort_ceiling = _old_value
+            if _old_strong is None and _old_open_low and _old_value:
+                _old_strong = _round_to_5k(_old_open_low + 0.75 * (_old_value - _old_open_low))
+            _replace_ai_owned("estimated_fair_value", _round_to_5k(value), _round_to_5k(_old_value) if _old_value else None)
+            if _new_open_low is not None:
+                _replace_ai_owned("suggested_offer_min", round(_new_open_low), round(_old_open_low) if _old_open_low else None)
+            # Suggested Offer Max is the "most you should feel comfortable paying" ceiling (~5%
+            # over FMV), independent of the opening offer's own list-capped top end.
+            if _new_comfort_ceiling is not None:
+                _replace_ai_owned("suggested_offer_max", round(_new_comfort_ceiling), round(_old_comfort_ceiling) if _old_comfort_ceiling else None)
+            if _new_strong is not None:
+                _replace_ai_owned("strong_offer", round(_new_strong), round(_old_strong) if _old_strong else None)
+            # Buyer Valuation - Agent Notes / inspection / tactical notes: recompute must backfill
+            # these the SAME non-destructive way generate_ai_analysis does (they were only being
+            # filled on the initial generation, so a recompute-only report showed them blank).
+            if methodology_summary:
+                _replace_ai_owned("offer_strategy_commentary", methodology_summary,
+                                  _previous_ai_estimate.get("methodology_summary"))
+            if inspection_concerns:
+                _replace_ai_owned("inspection_concerns", inspection_concerns,
+                                  _previous_ai_estimate.get("inspection_concerns"))
+            if offer_strategy_considerations:
+                _replace_ai_owned("offer_suggestion_notes", offer_strategy_considerations,
+                                  _previous_ai_estimate.get("offer_strategy_considerations"))
+        else:
+            _old_value = _as_float(_previous_ai_estimate.get("value"))
+            _old_low = _as_float(_previous_ai_estimate.get("range_min"))
+            _old_high = _as_float(_previous_ai_estimate.get("range_max"))
+            _replace_ai_owned("most_likely_value", _round_to_5k(value), _round_to_5k(_old_value) if _old_value else None)
+            _replace_ai_owned("recommended_min", _round_to_5k(final_range_low), _round_to_5k(_old_low) if _old_low else None)
+            _replace_ai_owned("recommended_max", _round_to_5k(final_range_high), _round_to_5k(_old_high) if _old_high else None)
+            _replace_ai_owned("recommended_list_price", _round_to_5k(value), _round_to_5k(_old_value) if _old_value else None)
+            if methodology_summary:
+                _replace_ai_owned("pricing_commentary", methodology_summary,
+                                  _previous_ai_estimate.get("methodology_summary"))
+            if listing_strategy_considerations:
+                _replace_ai_owned("listing_strategy_notes", listing_strategy_considerations,
+                                  _previous_ai_estimate.get("listing_strategy_considerations"))
+            if listing_prep_concerns:
+                _replace_ai_owned("listing_prep_notes", listing_prep_concerns,
+                                  _previous_ai_estimate.get("listing_prep_concerns"))
+        report.pricing = new_pricing
+
+    except HTTPException:
+        if not _analysis_budget_closed:
+            await reconcile_budget(db, reservation, cost)
+        raise
+    except Exception as exc:
+        logger.warning("CMA recompute failed", extra={"report_id": report_id, "error": str(exc)})
+        if not _analysis_budget_closed:
+            await reconcile_budget(db, reservation, cost)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Recompute failed - try again.") from exc
+
+    report.pricing = stamp_final_artifact_qa(
+        subject=report.subject or {}, comparables=report.comparables or [], pricing=report.pricing or {},
+        market_context=report.market_context or {}, improvements=report.improvements or [],
+    )
     await db.commit()
     await db.refresh(report)
     return report

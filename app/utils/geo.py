@@ -1,10 +1,30 @@
 import math
 from typing import Tuple, List, Any, Optional
 
+from sqlalchemy import func
+
 # Constants for geographic calculations
 # Approximate miles per degree of latitude
 MILES_PER_LAT_DEGREE = 69.1
 EARTH_RADIUS_MILES = 3959.0
+
+
+def distance_miles_sql(lat_column, lng_column, center_lat: float, center_lng: float):
+    """Great-circle distance in miles as a SQL expression (PostgreSQL trig functions), for use
+    in a WHERE / ORDER BY so the database - not Python - decides which rows fall inside a radius.
+
+    This is the sargable-after-a-bounding-box companion to `haversine_distance`: pre-filter with
+    `get_lat_long_offsets` to let the lat/lng index narrow the set, then apply this for the exact
+    circle and for nearest-first ordering. `func.greatest`/`func.least` clamp the radicand and the
+    asin argument so float rounding on two near-identical points can't push them out of domain.
+    """
+    dlat = (func.radians(lat_column) - func.radians(center_lat)) / 2
+    dlng = (func.radians(lng_column) - func.radians(center_lng)) / 2
+    haversine = (
+        func.pow(func.sin(dlat), 2)
+        + func.cos(func.radians(center_lat)) * func.cos(func.radians(lat_column)) * func.pow(func.sin(dlng), 2)
+    )
+    return 2 * EARTH_RADIUS_MILES * func.asin(func.least(func.sqrt(func.greatest(haversine, 0.0)), 1.0))
 
 def get_lat_long_offsets(lat: float, diameter_miles: float) -> Tuple[float, float]:
     """

@@ -56,13 +56,34 @@ class EmailSchedulerService:
                         # Extract agent email for Reply-To header if available
                         reply_to = email_record.template_variables.get("agent_email")
                         
-                        status_code, response_text = email_service.send_simple_message(
+                        # A guest email goes from the agent's own mailbox when they connected one -
+                        # tracked, and held back when the engagement rules say so (client_email_service).
+                        sent = None
+                        track_id = None
+                        variables = email_record.template_variables or {}
+                        if email_record.owner_id:
+                            from app.services.agent_mailbox_service import send_guest
+                            from app.services.client_email_service import before_send, strip_private
+                            gate = await before_send(email_record.owner_id, email_record.recipient_email, email_record.template_name,
+                                                     email_record.subject, variables)
+                            if gate is None:
+                                email_record.status = "CANCELLED"
+                                email_record.error_message = "Held back by the email rules (not opening these updates)"
+                                await db.commit()
+                                continue
+                            track_id, variables = gate
+                            sent = await send_guest(email_record.owner_id, email_record.recipient_email, email_record.subject,
+                                                    email_record.template_name, strip_private(variables))
+                        status_code, response_text = sent or email_service.send_simple_message(
                             to_email=email_record.recipient_email,
                             subject=email_record.subject,
                             template=email_record.template_name,
-                            template_variables=email_record.template_variables,
+                            template_variables=variables,
                             reply_to=reply_to
                         )
+                        if track_id:
+                            from app.services.client_email_service import after_send
+                            await after_send(track_id, status_code == 200, "mailbox" if sent else "openhousepal")
                         
                         if status_code == 200:
                             email_record.status = "SENT"

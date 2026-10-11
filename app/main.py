@@ -1,18 +1,25 @@
 from fastapi import FastAPI, Request  # , Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import uvicorn
 import os
+import re
 import time
 import uuid
 from dotenv import load_dotenv
 from app.database import init_db, wait_for_db
 from app.api import router
 from app.utils.clean_cache import cleanup_expired_signup_verifications
-from app.utils.property_sync_scheduler import scheduled_property_sync
+from app.utils.property_sync_scheduler import scheduled_bright_sync
+from app.utils.domain_verification_scheduler import scheduled_domain_verification
+from app.utils.studio_media_video_poll_scheduler import scheduled_studio_media_video_poll
+from app.utils.task_reminder_scheduler import scheduled_task_reminders
+from app.services.calendar_sync_service import scheduled_finish_past_tours, scheduled_reconcile_deleted_followups
+from app.utils.state_facts_scheduler import scheduled_state_facts_refresh
+from app.services.agent_hub_video_sync import scheduled_hub_video_sync
 from app.services.email_scheduler_service import EmailSchedulerService
 from app.utils.create_admin import create_admin_user
 from app.config.logging import (
@@ -41,6 +48,14 @@ async def lifespan(app: FastAPI):
     await init_db()
     await create_admin_user()
 
+    # A plan with no PayPal ID can't be bought or switched to - say so loudly at boot instead
+    # of an agent finding out at checkout.
+    from app.utils.plan_ids import CURRENT_NO_TRIAL_PLAN_ID_BY_TIER, _PLAN_ID_ENV_PAIRS_BY_TIER
+    missing = [tier for tier, pid in CURRENT_NO_TRIAL_PLAN_ID_BY_TIER.items() if not pid]
+    missing += [pairs[-1][0] for tier, pairs in _PLAN_ID_ENV_PAIRS_BY_TIER.items() if not os.getenv(pairs[-1][0])]
+    if missing:
+        logger.error(f"PayPal plan IDs missing - these plans can't be bought or switched to: {sorted(set(missing))}")
+
     logger.info("Initializing APScheduler for scheduled tasks")
 
     cache_hour = int(os.getenv("CACHE_CLEANUP_HOUR", 2))
@@ -54,13 +69,16 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
-    # This is for the property sync (every 5 minutes)
+    # The Bright sync - every 5 minutes, one cycle: changed listings + deletions, open house dates,
+    # sold prices (each asks Bright only for what changed since its own checkpoint).
     scheduler.add_job(
-        scheduled_property_sync,
-        CronTrigger(minute="*/5"),  # Every 5 minutes
+        scheduled_bright_sync,
+        CronTrigger(minute="*/5"),
         id="property_sync",
-        name="Sync properties from Bright MLS API",
+        name="Bright MLS sync: listings, open houses, sold prices",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
 
     # Schedule email processing every minute
@@ -73,12 +91,121 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
-    scheduler.start()
+    # Production Bright data pulls (3 years of sales for CMAs, a one-time refresh of every listing
+    # on the market, and each home's 2012+ price history) - a few pages every 10 minutes until each
+    # is done. Off unless BRIGHT_DATA_PULLS is set (see bright_data_pulls_service).
+    from app.services import bright_data_pulls_service as _pulls
+    if _pulls.any_enabled():
+        async def _bright_data_pulls_job():
+            from app.database import AsyncSessionLocal
+            try:
+                async with AsyncSessionLocal() as db:
+                    await _pulls.run_enabled(db)
+            except Exception:
+                logger.error("Bright data pulls job failed", exc_info=True)
+        scheduler.add_job(
+            _bright_data_pulls_job, "interval", minutes=10, id="bright_data_pulls",
+            name="Production Bright data pulls", replace_existing=True, max_instances=1,
+        )
+
+    # Website Builder custom domains: real DNS/HTTPS check on a recurring poll, so a domain an
+    # agent fixes doesn't require them to come back and click anything - see
+    # domain_verification_scheduler.py / domain_verification_service.py.
+    scheduler.add_job(
+        scheduled_domain_verification,
+        "interval",
+        minutes=5,
+        id="domain_verification",
+        name="Verify custom domain DNS/HTTPS status",
+        replace_existing=True,
+    )
+
+    # AI video renders take minutes and an agent is explicitly encouraged to navigate away while
+    # one runs - without this, a video only ever advances out of "processing" while its own
+    # project page happens to be open polling it. See studio_media_video_poll_scheduler.py.
+    scheduler.add_job(
+        scheduled_studio_media_video_poll,
+        "interval",
+        minutes=1,
+        id="studio_media_video_poll",
+        name="Advance in-flight AI video generations",
+        replace_existing=True,
+    )
+
+    # Agent task / follow-up reminders: fire an in-app Notification when a task's remind_at passes.
+    scheduler.add_job(
+        scheduled_task_reminders,
+        "interval",
+        minutes=1,
+        id="task_reminders",
+        name="Fire agent task reminders",
+        replace_existing=True,
+    )
+
+    # A follow-up the agent deleted from their Google/Outlook calendar counts as checked off.
+    scheduler.add_job(
+        scheduled_reconcile_deleted_followups,
+        "interval",
+        minutes=5,
+        id="calendar_deleted_followups",
+        name="Mark follow-ups deleted from the calendar as done",
+        replace_existing=True,
+    )
+
+    # A confirmed tour whose hour has passed gets crossed out on the calendar ("✅ DONE", grey).
+    scheduler.add_job(
+        scheduled_finish_past_tours,
+        "interval",
+        minutes=15,
+        id="calendar_finish_past_tours",
+        name="Cross out past tours on connected calendars",
+        replace_existing=True,
+    )
+
+    # Agent Hub "My Videos": a linked YouTube channel's new uploads appear on their own (each hub
+    # refreshes at most once a day - see agent_hub_video_sync.py).
+    scheduler.add_job(
+        scheduled_hub_video_sync,
+        "interval",
+        hours=6,
+        id="agent_hub_video_sync",
+        name="Refresh Agent Hub YouTube videos",
+        replace_existing=True,
+    )
+
+    # Shared state-wide facts for blog articles (transfer taxes, buyer programs, rules): once a month,
+    # re-research any Bright state whose facts have aged out. See state_facts_scheduler.py.
+    scheduler.add_job(
+        scheduled_state_facts_refresh,
+        CronTrigger(day=1, hour=3, minute=0, timezone="America/New_York"),
+        id="state_facts_refresh",
+        name="Refresh shared state facts",
+        replace_existing=True,
+    )
+
+    # Shared towns stay current and accurate on their own: school districts re-checked against
+    # Bright, Fair Housing wording, closed places removed, commute / flood / research refreshed
+    # when due. See app/services/areas/town_upkeep_scheduler.py.
+    from app.services.areas.town_upkeep_scheduler import scheduled_town_upkeep
+    scheduler.add_job(
+        scheduled_town_upkeep,
+        CronTrigger(hour=4, minute=15, timezone="America/New_York"),
+        id="town_upkeep",
+        name="Keep neighborhood data current",
+        replace_existing=True,
+    )
+
+    # DISABLE_SCHEDULER=true for a second local/test copy of the API, so it never repeats the
+    # real server's jobs (MLS sync, reminder emails, digests...).
+    if os.getenv("DISABLE_SCHEDULER", "false").lower() == "true":
+        logger.warning("Scheduler disabled (DISABLE_SCHEDULER=true) - no scheduled jobs will run in this process")
+    else:
+        scheduler.start()
     logger.info(
         "APScheduler started",
         extra={
             "cache_cleanup_schedule": f"Daily at {cache_hour:02d}:{cache_mins:02d}",
-            "property_sync_interval": "Every hour at :00",
+            "property_sync_interval": "Every 5 minutes",
             "email_processing_interval": "Every 1 minute",
         },
     )
@@ -87,14 +214,12 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down application")
-    scheduler.shutdown()
+    if scheduler.running:
+        scheduler.shutdown()
     logger.info("APScheduler stopped")
 
 
 app = FastAPI(title="Open House Pal API", lifespan=lifespan)
-
-os.makedirs(os.path.join("uploads", "agent-photos"), exist_ok=True)
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 
 @app.middleware("http")
@@ -167,11 +292,69 @@ async def logging_middleware(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[CLIENT_URL],
+    # Local dev browsers may load the app via either "localhost" or "127.0.0.1" -
+    # allow both so a CORS-origin mismatch never masks itself as a generic
+    # "Failed to fetch" error in the browser console.
+    allow_origins=[CLIENT_URL, CLIENT_URL.replace("localhost", "127.0.0.1")] if "localhost" in CLIENT_URL else [CLIENT_URL],
+    # Every agent's own <slug>.openhousepal.com website (IDX site, Spotlights) talks to this API
+    # from the browser too (signature card, "data last updated", Showcase actions) - without
+    # this those calls were blocked as soon as a site ran on its own address.
+    allow_origin_regex=rf"https://([a-z0-9-]+\.)*{re.escape(os.getenv('OHP_BASE_DOMAIN', 'openhousepal.com'))}",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+# Agents' own custom domains (theirrealty.com) can't be listed ahead of time. Visitor-facing,
+# no-login endpoints answer browsers on ANY site - safe because sign-in is a Bearer token, never a
+# cookie, so a foreign page can't act as anyone. Added after CORSMiddleware = runs first.
+_PUBLIC_CORS_PREFIXES = (
+    "/public/", "/agent-hub/public/", "/agent-hub/forms/public/", "/studio/blogs/public/",
+    "/email-signature/public/", "/api/cma/public/",
+)
+
+
+class PublicCORSMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not scope["path"].startswith(_PUBLIC_CORS_PREFIXES):
+            return await self.app(scope, receive, send)
+        origin = next((v.decode() for k, v in scope["headers"] if k == b"origin"), None)
+        if not origin:
+            return await self.app(scope, receive, send)
+        cors = [(b"access-control-allow-origin", origin.encode()), (b"vary", b"Origin")]
+        if scope["method"] == "OPTIONS":
+            req_headers = next((v for k, v in scope["headers"] if k == b"access-control-request-headers"), b"content-type")
+            await send({"type": "http.response.start", "status": 200, "headers": cors + [
+                (b"access-control-allow-methods", b"GET, POST, OPTIONS"),
+                (b"access-control-allow-headers", req_headers), (b"access-control-max-age", b"600"),
+                (b"content-length", b"0")]})
+            return await send({"type": "http.response.body", "body": b""})
+
+        async def send_with_cors(message):
+            if message["type"] == "http.response.start":
+                headers = [(k, v) for k, v in message.get("headers", []) if k.lower() not in (b"access-control-allow-origin", b"access-control-allow-credentials")]
+                message = {**message, "headers": headers + cors}
+            await send(message)
+        return await self.app(scope, receive, send_with_cors)
+
+
+app.add_middleware(PublicCORSMiddleware)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # Without this, an unhandled exception is caught by Starlette's default
+    # error handler outside the CORS middleware layer, so the resulting 500
+    # has no Access-Control-Allow-Origin header. Browsers then block the
+    # response as a CORS failure, which surfaces to fetch() callers as a
+    # generic "Failed to fetch" indistinguishable from the server being down.
+    logger.error("Unhandled exception", exc_info=True, extra={"path": request.url.path})
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
 
 # Include API routes
 app.include_router(router)

@@ -3,7 +3,9 @@ from sqlalchemy import select, func, and_
 from typing import List, Optional
 from datetime import datetime, timezone
 import os
+from urllib.parse import quote
 
+from app.services.email_avatar_service import agent_email_vars
 from app.models.database import PropertyInteraction, PropertyComment, Collection, Property, User, Notification
 from app.schemas.property_interactions import (
     PropertyInteractionUpdate,
@@ -15,7 +17,10 @@ from app.schemas.property_interactions import (
 )
 from app.services.email_service import EmailService
 from app.services.blacklist_service import BlacklistService
+from app.services.leads_service import upsert_lead
+from app.services.website.site_service import resolve_owner_public_base_url
 from app.config.logging import get_logger
+from app.services.agent_email_service import agent_public_phone
 
 logger = get_logger(__name__)
 
@@ -47,6 +52,7 @@ class PropertyInteractionsService:
         interaction = result.scalar_one_or_none()
 
         current_time = datetime.now(timezone.utc)
+        was_liked, was_disliked = (bool(interaction.liked), bool(interaction.disliked)) if interaction else (False, False)
 
         if interaction:
             # Update existing interaction
@@ -75,6 +81,16 @@ class PropertyInteractionsService:
         await db.commit()
         await db.refresh(interaction)
 
+        # The client's own like / dislike goes on their lead's activity (not the agent's own clicks,
+        # not taking one back).
+        if user_id is None and ((interaction.liked and not was_liked) or (interaction.disliked and not was_disliked)):
+            from app.services.leads_service import log_showcase_activity
+            liked = bool(interaction.liked)
+            await log_showcase_activity(db, collection_id, "showcase_like" if liked else "showcase_dislike",
+                                        "Liked {home} in their Showcase" if liked else "Passed on {home} in their Showcase",
+                                        property_id=property_id, dedupe_hours=1)
+            await db.refresh(interaction)
+
         # Send email to agent if visitor liked the property (NOT if agent themselves liked it)
         if interaction.liked:
             collection_result = await db.execute(
@@ -95,25 +111,11 @@ class PropertyInteractionsService:
                 property_obj = property_result.scalar_one_or_none()
 
                 if agent and agent.email and property_obj:
-                    frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
-                    collection_link = f"{frontend_url}/showcases?showcase={collection_id}"
-                    
-                    # Create full address string
-                    full_address = f"{property_obj.street_address}, {property_obj.city}, {property_obj.state} {property_obj.zipcode or ''}".strip()
-
-                    email_service = EmailService()
-                    email_service.send_simple_message(
-                        to_email=agent.email,
-                        subject=f"A Visitor Liked a Property - {property_obj.street_address}",
-                        template="visitor_liked_property",
-                        template_variables={
-                            "agent_name": agent.first_name,
-                            "visitor_name": collection.visitor_name or "A visitor",
-                            "property_address": full_address,
-                            "property_image": property_obj.img_src,
-                            "collection_link": collection_link
-                        }
-                    )
+                    # No email per like - it joins the agent's hourly "liked homes" roll-up
+                    # (agent_roundup_service), so a client hearting 12 homes is one email, not 12.
+                    from app.services.agent_roundup_service import queue_like
+                    queue_like(db, agent, collection, property_obj, property_obj.img_src, property_obj.price)
+                    await db.commit()
 
         # Create in-app notification for property interactions (like, dislike)
         if interaction.liked or interaction.disliked:
@@ -188,7 +190,8 @@ class PropertyInteractionsService:
         cls,
         db: AsyncSession,
         collection_id: str,
-        property_id: str
+        property_id: str,
+        user_id: Optional[str] = None
     ) -> PropertyInteractionResponse:
         """Track a property view by incrementing view_count and updating last_viewed_at"""
 
@@ -206,40 +209,99 @@ class PropertyInteractionsService:
 
         current_time = datetime.now(timezone.utc)
 
-        if interaction:
-            # Update existing interaction
-            interaction.view_count = (interaction.view_count or 0) + 1
-            interaction.last_viewed_at = current_time
-            interaction.updated_at = current_time
-        else:
-            # Create new interaction with view tracking
+        if not interaction:
             interaction = PropertyInteraction(
                 collection_id=collection_id,
                 property_id=property_id,
                 liked=False,
                 disliked=False,
-                view_count=1,
-                last_viewed_at=current_time,
+                view_count=0,
                 created_at=current_time,
-                updated_at=current_time
             )
             db.add(interaction)
 
-        # Update the collection's activity timestamp to track last VISITOR activity
-        try:
-            from sqlalchemy import update
-            await db.execute(
-                update(Collection)
-                .where(Collection.id == collection_id)
-                .values(last_visitor_activity_at=current_time)
-            )
-        except Exception as e:
-            logger.error(f"Failed to update collection visitor activity timestamp: {e}")
+        if user_id is None:
+            # Visitor view - drives the visitor-facing "unviewed" NEW badge and
+            # Collection.last_visitor_activity_at (the Showcases/Leads/Dashboard "Active" signal).
+            interaction.view_count = (interaction.view_count or 0) + 1
+            interaction.last_viewed_at = current_time
+            try:
+                from sqlalchemy import update
+                await db.execute(
+                    update(Collection)
+                    .where(Collection.id == collection_id)
+                    .values(last_visitor_activity_at=current_time)
+                )
+            except Exception as e:
+                logger.error(f"Failed to update collection visitor activity timestamp: {e}")
+        else:
+            # Agent previewing their own showcase - clears this property's own NEW tag in the
+            # agent view without inflating the visitor-facing view_count/last_viewed_at.
+            interaction.agent_viewed_at = current_time
 
+        interaction.updated_at = current_time
         await db.commit()
         await db.refresh(interaction)
 
+        if user_id is None:
+            # "Looked at 22 Birch Ln" - once per home per half-day, not once per tap.
+            from app.services.leads_service import log_showcase_activity
+            await log_showcase_activity(db, collection_id, "showcase_view", "Looked at {home} in their Showcase",
+                                        property_id=property_id, dedupe_hours=12)
+            await db.refresh(interaction)
+
         return PropertyInteractionResponse.from_orm(interaction)
+
+    @classmethod
+    async def mark_comments_read(
+        cls,
+        db: AsyncSession,
+        collection_id: str,
+        property_id: str,
+        is_agent: bool
+    ) -> None:
+        """Record that this side (agent or visitor) has just read this property's comment
+        thread - clears their own unread badge without touching the other side's."""
+        result = await db.execute(
+            select(PropertyInteraction)
+            .where(
+                and_(
+                    PropertyInteraction.collection_id == collection_id,
+                    PropertyInteraction.property_id == property_id
+                )
+            )
+        )
+        interaction = result.scalar_one_or_none()
+
+        current_time = datetime.now(timezone.utc)
+
+        if not interaction:
+            interaction = PropertyInteraction(
+                collection_id=collection_id,
+                property_id=property_id,
+                liked=False,
+                disliked=False,
+                view_count=0,
+                created_at=current_time,
+            )
+            db.add(interaction)
+
+        if is_agent:
+            interaction.agent_comments_read_at = current_time
+        else:
+            interaction.visitor_comments_read_at = current_time
+
+        interaction.updated_at = current_time
+        await db.commit()
+
+    @classmethod
+    async def _is_showcase_agent(cls, db: AsyncSession, collection_id: str, user_id: Optional[str]) -> bool:
+        """True when the signed-in commenter owns this Showcase (the agent), not just any account."""
+        if not user_id:
+            return False
+        from app.models.database import Collection
+        owner_id = (await db.execute(select(Collection.owner_id).where(Collection.id == collection_id))).scalar_one_or_none()
+        return owner_id == user_id
 
     @classmethod
     async def add_property_comment(
@@ -263,6 +325,7 @@ class PropertyInteractionsService:
             content=content,
             visitor_name=comment_data.visitor_name,
             visitor_email=comment_data.visitor_email,
+            is_agent=await cls._is_showcase_agent(db, collection_id, user_id),
             created_at=current_time,
             updated_at=current_time
         )
@@ -289,21 +352,49 @@ class PropertyInteractionsService:
             )
             property_obj = property_result.scalar_one_or_none()
 
+            # The Showcase belongs to a known person - the guest page only sends a first name, so
+            # fall back to the Showcase's own contact or the comment never reaches their lead
+            # (no activity, no "reply to their comment" follow-up).
+            lead_email = comment_data.visitor_email or collection.visitor_email
+            lead_phone = None if comment_data.visitor_email else getattr(collection, "visitor_phone", None)
+            if lead_email or lead_phone or comment_data.visitor_name:
+                comment_address = None
+                if property_obj:
+                    comment_address = f"{property_obj.street_address}, {property_obj.city}, {property_obj.state} {property_obj.zipcode or ''}".strip()
+                await upsert_lead(
+                    db,
+                    owner_id=collection.owner_id,
+                    name=collection.visitor_name or comment_data.visitor_name,
+                    email=lead_email,
+                    phone=lead_phone,
+                    source_type="property_comment",
+                    source_id=comment.id,
+                    summary=f"Commented on a property{' - ' + comment_address if comment_address else ''}",
+                    occurred_at=current_time,
+                    property_address=comment_address,
+                    collection_id=collection_id,
+                    raw_snapshot={"content": content},
+                )
+
             if agent and agent.email and property_obj:
                 frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
-                collection_link = f"{frontend_url}/showcases"
+                # Straight to that home's comment thread in the agent's Showcase view, ready to reply.
+                collection_link = f"{frontend_url.rstrip('/')}/showcases?showcase={collection.id}&property={property_obj.id}&comments=1"
                 
                 # Create full address string
                 full_address = f"{property_obj.street_address}, {property_obj.city}, {property_obj.state} {property_obj.zipcode or ''}".strip()
 
+                from app.services.notification_preferences_service import channel_enabled
                 email_service = EmailService()
-                email_service.send_simple_message(
+                if channel_enabled(agent, "PROPERTY_COMMENT", "email"):
+                  from app.services.agent_email_service import send_simple_bg
+                  send_simple_bg(
                     to_email=agent.email,
                     subject=f"New Comment on Property - {property_obj.street_address}",
                     template="property_comment",
                     template_variables={
                         "agent_name": agent.first_name,
-                        "visitor_name": comment.visitor_name or "A visitor",
+                        "visitor_name": comment.visitor_name or collection.visitor_name or "A visitor",
                         "property_address": full_address,
                         "property_image": property_obj.img_src,
                         "message": content,
@@ -328,7 +419,7 @@ class PropertyInteractionsService:
                         property_id=property_obj.id,
                         property_address=property_obj.street_address,
                         visitor_name=comment.visitor_name or "Anonymous",
-                        link=f"/showcases?showcase={collection.id}",
+                        link=f"/showcases?showcase={collection.id}&property={property_obj.id}&comments=1",
                         is_read=False,
                         created_at=datetime.now(timezone.utc)
                     )
@@ -367,33 +458,40 @@ class PropertyInteractionsService:
             property_obj = property_result.scalar_one_or_none()
 
             if agent and property_obj:
-                frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
-                # Use public share link for visitor
-                collection_link = f"{frontend_url}/showcase/{collection.share_token}"
+                # Use public share link for visitor - on the agent's own IDX domain if they have one
+                base_url = await resolve_owner_public_base_url(db, agent)
+                collection_link = f"{base_url}/showcase/{collection.share_token}"
                 
                 # Create full address string
                 full_address = f"{property_obj.street_address}, {property_obj.city}, {property_obj.state} {property_obj.zipcode or ''}".strip()
 
                 email_service = EmailService()
-                email_service.send_simple_message(
+                from app.services.agent_email_service import send_simple_bg
+                send_simple_bg(
                     to_email=collection.visitor_email,
                     subject=f"Your agent commented on a property: {property_obj.street_address}",
                     template="agent_comment_response",
                     template_variables={
                         "agent_name": f"{agent.first_name} {agent.last_name}",
-                        "recipient_name": collection.visitor_name or "Valued Visitor",
+                        "recipient_name": ((collection.visitor_name or "").strip().split(" ")[0].title() or "there"),
                         "message": content,
                         "property_image": property_obj.img_src,
                         "property_address": full_address,
-                        "property_beds": property_obj.bedrooms,
-                        "property_baths": property_obj.bathrooms,
-                        "property_sqft": property_obj.living_area,
-                        "property_price": f"${property_obj.price:,.0f}" if property_obj.price else "N/A",
+                        # "4 bd · 2.5 ba · 3,130 sq ft", not "4.0 bd · 2.5 ba · 3130.0 sq ft"
+                        "property_beds": f"{property_obj.bedrooms:g}" if property_obj.bedrooms else "",
+                        "property_baths": f"{property_obj.bathrooms:g}" if property_obj.bathrooms else "",
+                        "property_sqft": f"{property_obj.living_area:,.0f}" if property_obj.living_area else "",
+                        "property_price": f"${property_obj.price:,.0f}" if property_obj.price else "",
                         "collection_link": collection_link,
                         "agent_email": agent.email,
-                        "agent_phone": getattr(agent, 'phone', "")
+                        "agent_phone": await agent_public_phone(db, agent),
+                        "Unsub": f"{os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'https://openhousepal.com')).rstrip('/')}/unsubscribe?email={quote(collection.visitor_email or '', safe='')}",
+                        **(await agent_email_vars(db, agent)),   # face, title, brokerage
                     },
-                    reply_to=agent.email
+                    reply_to=agent.email,
+                    # from the agent (it is their reply) - and from their own mailbox if connected
+                    from_name=f"{agent.first_name or ''} {agent.last_name or ''}".strip() or "OpenHousePal",
+                    owner_id=agent.id,
                 )
                     # Don't fail the comment creation if notification creation fails
 

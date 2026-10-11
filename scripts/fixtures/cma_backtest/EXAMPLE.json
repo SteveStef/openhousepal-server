@@ -1,0 +1,34 @@
+{
+  "id": "EXAMPLE-copy-me",
+  "as_of_date": "2025-03-01",
+  "geography": "Lower Merion",
+  "actual_close_price": 3175000,
+  "_notes": "Everything under `subject` and `comps` must be exactly what was KNOWN before the subject sold. actual_close_price is hidden from the engine and used only to score. Copy this file, rename it, fill it in.",
+  "subject": {
+    "list_price": 3199000, "sqft": 6198, "above_grade_finished_area": 5900,
+    "school_district": "Lower Merion", "city": "Villanova", "state": "PA", "lot_size": 87120,
+    "property_type": "SINGLE_FAMILY",
+    "_status_timeline": {
+      "is_active": true, "is_under_contract": false, "is_closed": false,
+      "active_market_days": 22, "current_status": "Active",
+      "original_list_price": 3199000, "current_list_price": 3199000, "cumulative_dom": 22
+    }
+  },
+  "comps": [
+    {"listing_key": "C1", "is_included": true, "status": "sold", "sale_price": 3650000, "price_verified": true,
+     "sqft": 6200, "above_grade_finished_area": 6200, "distance_miles": 0.6, "days_on_market": 18,
+     "school_district": "Lower Merion", "city": "Villanova", "close_date": "2025-01-10", "sale_date": "2025-01-10",
+     "list_price": 3724000, "strength": "strong", "price_per_sqft": 588.7, "property_type": "SINGLE_FAMILY",
+     "home_type": "SINGLE_FAMILY", "lot_size": 80000, "street_address": "1 Alpha Rd", "quality": {"finish_quality": "above"}},
+    {"listing_key": "C2", "is_included": true, "status": "sold", "sale_price": 3300000, "price_verified": true,
+     "sqft": 6000, "above_grade_finished_area": 6000, "distance_miles": 0.9, "days_on_market": 24,
+     "school_district": "Lower Merion", "city": "Villanova", "close_date": "2024-11-15", "sale_date": "2024-11-15",
+     "list_price": 3366000, "strength": "supporting", "price_per_sqft": 550, "property_type": "SINGLE_FAMILY",
+     "home_type": "SINGLE_FAMILY", "lot_size": 90000, "street_address": "2 Beta Ln", "quality": {}},
+    {"listing_key": "C3", "is_included": true, "status": "sold", "sale_price": 2950000, "price_verified": true,
+     "sqft": 5600, "above_grade_finished_area": 5600, "distance_miles": 1.2, "days_on_market": 41,
+     "school_district": "Lower Merion", "city": "Bryn Mawr", "close_date": "2025-02-01", "sale_date": "2025-02-01",
+     "list_price": 3010000, "strength": "supporting", "price_per_sqft": 526.8, "property_type": "SINGLE_FAMILY",
+     "home_type": "SINGLE_FAMILY", "lot_size": 60000, "street_address": "3 Gamma St", "quality": {}}
+  ]
+}

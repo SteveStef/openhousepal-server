@@ -1,5 +1,4 @@
-import random
-import string
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,10 +20,13 @@ class VerificationService:
         self.code_expiration_minutes = 15
         self.rate_limit_window_minutes = 15
         self.max_attempts_per_window = 3
+        # Wrong guesses allowed per code before it's thrown away (a 6-digit code must not be
+        # guessable by trying them all).
+        self.max_wrong_guesses = 5
 
     def generate_code(self) -> str:
         """Generate a random 6-digit verification code"""
-        return ''.join(random.choices(string.digits, k=6))
+        return f"{secrets.randbelow(1_000_000):06d}"
 
     async def store_code(self, email: str, code: str, form_data: Dict[str, Any], db: AsyncSession) -> None:
         """
@@ -116,7 +118,15 @@ class VerificationService:
             return False, "Verification code has expired. Please request a new one."
 
         # Check if code matches
-        if entry.code != code:
+        if not secrets.compare_digest(str(entry.code), str(code).strip()):
+            wrong = int((entry.form_data or {}).get("_wrong_guesses", 0)) + 1
+            if wrong >= self.max_wrong_guesses:
+                entry.expires_at = now  # burn this code - they'll need a new one
+                entry.form_data = {**(entry.form_data or {}), "_wrong_guesses": wrong}
+                await db.commit()
+                return False, "Too many wrong codes. Please request a new code."
+            entry.form_data = {**(entry.form_data or {}), "_wrong_guesses": wrong}
+            await db.commit()
             return False, "Invalid verification code"
 
         # Mark as verified
@@ -169,6 +179,7 @@ class VerificationService:
 
         # Update entry
         entry.code = new_code
+        entry.form_data = {k: v for k, v in (entry.form_data or {}).items() if k != "_wrong_guesses"}
         entry.expires_at = now + timedelta(minutes=self.code_expiration_minutes)
         entry.verified = False
         

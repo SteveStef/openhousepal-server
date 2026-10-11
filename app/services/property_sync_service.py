@@ -3,8 +3,9 @@ from sqlalchemy import select, func, and_, or_, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import selectinload, joinedload
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 import os
+import time
 import re
 
 from app.models.database import (
@@ -13,13 +14,17 @@ from app.models.database import (
     City, Township, Brokerage
 )
 from app.services.bright_mls_service import bright_mls_service
+from app.services.mls_open_houses import merge_open_house_rows, rebuild_open_house_slots, single_columns, stored_slots
 from app.utils.mls_mapper import map_reso_to_internal, parse_dt
 from app.utils.geo import get_lat_long_offsets, is_within_distance
 from app.utils.normalization import normalize_brokerage, normalize_township, normalize_school_district
 from app.services.email_service import EmailService
 from app.services.blacklist_service import BlacklistService
+from app.services.website.site_service import resolve_owner_public_base_url
 from app.config.logging import get_logger
 from app.database import AsyncSessionLocal
+from app.services.agent_email_service import agent_public_phone
+from urllib.parse import quote
 
 logger = get_logger(__name__)
 
@@ -33,9 +38,18 @@ class PropertySyncService:
         self.email_service = EmailService()
         self.SYNC_KEY = "last_property_sync_time"
         self.OPEN_HOUSE_SYNC_KEY = "last_open_house_sync_time"
+        # Day (YYYY-MM-DD) the once-a-day open house reconciliation last ran, and its page cap
+        # (200 rows/page - well above Bright's typical count of upcoming open houses).
+        self.OPEN_HOUSE_RECONCILE_KEY = "last_open_house_reconcile_date"
+        self.OPEN_HOUSE_RECONCILE_MAX_PAGES = 150
+        self.CLOSED_SYNC_KEY = "last_closed_property_sync_time"
 
-    async def get_last_sync_time(self, db: AsyncSession, key: Optional[str] = None) -> str:
-        """Retrieves the last successful sync timestamp from SystemSettings."""
+    async def get_last_sync_time(self, db: AsyncSession, key: Optional[str] = None, fallback_hours: int = 24) -> str:
+        """Retrieves the last successful sync timestamp from SystemSettings.
+
+        fallback_hours: how far back to start when there is no stored checkpoint yet. The 5-minute
+        global sync only ever needs a short window; the closed-listings leg uses a wider one so a
+        cold start still sweeps up recently-settled sales."""
         stmt = select(SystemSettings).where(SystemSettings.key == (key or self.SYNC_KEY))
         result = await db.execute(stmt)
         setting = result.scalar_one_or_none()
@@ -43,8 +57,7 @@ class PropertySyncService:
         if setting and setting.value and "timestamp" in setting.value:
             return setting.value["timestamp"]
 
-        # Default fallback: 24 hours ago
-        fallback = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fallback = (datetime.now(timezone.utc) - timedelta(hours=fallback_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
         return fallback
 
     async def update_last_sync_time(self, db: AsyncSession, timestamp: str, key: Optional[str] = None):
@@ -166,13 +179,16 @@ class PropertySyncService:
     async def run_open_house_sync(self, max_pages: Optional[int] = None) -> Dict[str, Any]:
         """
         Incrementally syncs Bright's separately-tracked open house schedule (BrightOpenHouses)
-        into Property.mls_open_house_* - a fallback so Discovery can show a date/time badge on
-        listings nobody has hosted inside OpenHousePal itself. Deliberately its own loop with its
-        own checkpoint (not folded into run_global_sync): scheduling a new open house doesn't
-        necessarily touch the listing's own ModificationTimestamp, only the open house record's.
+        into Property.mls_open_houses (every upcoming slot) + Property.mls_open_house_* (the
+        soonest one). Deliberately its own loop with its own checkpoint (not folded into
+        run_global_sync): scheduling a new open house doesn't necessarily touch the listing's own
+        ModificationTimestamp, only the open house record's.
 
-        Past dates are never scraped out of the columns here - callers (Discovery) filter to
-        "date >= today" at read time, same as the existing in-app OpenHouseEvent handling.
+        Every row in a batch is merged (a listing can have a Saturday and a Sunday slot) and past
+        slots are dropped, so an edit to an old open house never knocks out an upcoming one. An
+        open house stays on the listing until its day passes (no cancellation handling - product
+        rule). Once a day it also runs _reconcile_open_houses: adds anything the incremental feed
+        missed and clears slots whose day has passed.
         """
         logger.info("Starting Open House Synchronization Cycle...")
         stats = {"updated": 0, "errors": 0}
@@ -199,9 +215,9 @@ class PropertySyncService:
 
                     logger.info(f"Found {len(raw_open_houses)} modified open house records in this batch (skip={skip})")
 
-                    # A batch can contain several rows for the same listing (re-scheduled/duplicate
-                    # entries) - keep only the soonest one per listing from this batch.
-                    by_listing: Dict[str, Dict[str, Any]] = {}
+                    # Group every row per listing, keeping feed (modification) order so the
+                    # latest change to a slot wins.
+                    by_listing: Dict[str, List[Dict[str, Any]]] = {}
                     for row in raw_open_houses:
                         l_key = str(row.get("OpenHouseListingKey") or "")
                         if not l_key:
@@ -211,23 +227,10 @@ class PropertySyncService:
                         if not had_failure and mod_ts and (not new_last_sync or mod_ts > new_last_sync):
                             new_last_sync = mod_ts
 
-                        existing_pick = by_listing.get(l_key)
-                        if existing_pick is None:
-                            by_listing[l_key] = row
-                        else:
-                            new_date = parse_dt(row.get("OpenHouseDate"))
-                            existing_date = parse_dt(existing_pick.get("OpenHouseDate"))
-                            if new_date and (not existing_date or new_date < existing_date):
-                                by_listing[l_key] = row
+                        by_listing.setdefault(l_key, []).append(row)
 
-                    for l_key, row in by_listing.items():
-                        try:
-                            await self._apply_open_house_row(db, l_key, row)
-                            stats["updated"] += 1
-                        except Exception as e:
-                            logger.error(f"Error syncing open house for {l_key}: {e}")
-                            stats["errors"] += 1
-                            had_failure = True
+                    if not await self._apply_open_house_rows(db, by_listing, stats):
+                        had_failure = True
 
                     pages_processed += 1
                     if len(raw_open_houses) < page_size:
@@ -243,92 +246,238 @@ class PropertySyncService:
                 await self.update_last_sync_time(db, new_last_sync, key=self.OPEN_HOUSE_SYNC_KEY)
                 logger.info(f"Open House Sync Cycle Complete. New Checkpoint: {new_last_sync}")
 
+            # Once a day: full rebuild. Same PROPERTY_SYNC_ENABLED gate as the scheduler, checked
+            # again here so a manual/admin call in a sync-disabled environment never walks Bright's
+            # whole upcoming set.
+            if os.getenv("PROPERTY_SYNC_ENABLED", "false").lower() == "true":
+                today_str = date.today().isoformat()
+                last_reconcile = await self.get_last_sync_time(db, key=self.OPEN_HOUSE_RECONCILE_KEY)
+                if not str(last_reconcile).startswith(today_str):
+                    # Marked before running so a failing reconcile can't retry every 30 minutes.
+                    await self.update_last_sync_time(db, today_str, key=self.OPEN_HOUSE_RECONCILE_KEY)
+                    stats["reconcile"] = await self._reconcile_open_houses(db)
+
         return stats
 
     async def run_open_house_backfill(self, max_pages: Optional[int] = None) -> Dict[str, Any]:
         """
-        One-time (or occasionally re-run) full pull of every currently-scheduled future open
-        house, regardless of modification time. The incremental run_open_house_sync loop only
-        catches opens *modified after* its checkpoint starts tracking, so anything already
-        scheduled before that point needs this instead. Safe to run more than once - it's a plain
-        upsert of "soonest known open house" per listing, same as the incremental path.
+        Full pull of every currently-scheduled future open house, regardless of modification
+        time - the same rebuild the daily reconciliation does (_reconcile_open_houses), run on
+        demand. Safe to run more than once.
 
         On completion, advances the incremental checkpoint to now() so the regular loop doesn't
         re-walk records this backfill already covered.
         """
         logger.info("Starting Open House Backfill...")
-        stats = {"updated": 0, "errors": 0}
+        async with AsyncSessionLocal() as db:
+            stats = await self._reconcile_open_houses(db, max_pages=max_pages)
+            now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            await self.update_last_sync_time(db, now_ts, key=self.OPEN_HOUSE_SYNC_KEY)
+            logger.info(f"Open House Backfill Complete. Checkpoint advanced to: {now_ts}")
+        return stats
+
+    async def _reconcile_open_houses(self, db: AsyncSession, max_pages: Optional[int] = None) -> Dict[str, Any]:
+        """Adds every open house in Bright's full upcoming set to its listing (catching anything
+        the incremental feed missed) and drops slots whose day has passed. Additive - it never
+        removes an upcoming slot.
+
+        Paged and capped like the other loops. Nothing is written unless the whole set was read
+        cleanly - a partial read must never wipe real open houses."""
+        stats = {"updated": 0, "cleared": 0, "errors": 0, "complete": False}
+        page_cap = max_pages if max_pages is not None else self.OPEN_HOUSE_RECONCILE_MAX_PAGES
+        page_size = 200
+        skip = 0
+        pages_processed = 0
+        rows_by_listing: Dict[str, List[Dict[str, Any]]] = {}
+
+        while True:
+            if pages_processed >= page_cap:
+                logger.warning(f"Open house reconcile hit its {page_cap}-page cap - skipping the rebuild this time.")
+                break
+            try:
+                raw_open_houses = await bright_mls_service.get_upcoming_open_houses(top=page_size, skip=skip)
+            except Exception as e:
+                logger.error(f"Error in open house reconcile batch at skip {skip}: {e}")
+                stats["errors"] += 1
+                break
+            for row in raw_open_houses or []:
+                l_key = str(row.get("OpenHouseListingKey") or "")
+                if l_key:
+                    rows_by_listing.setdefault(l_key, []).append(row)
+            pages_processed += 1
+            if not raw_open_houses or len(raw_open_houses) < page_size:
+                stats["complete"] = True
+                break
+            skip += page_size
+
+        if not stats["complete"]:
+            return stats
+
+        today = date.today()
+        plan = await self._open_house_reconcile_plan(db, rows_by_listing, today)
+        for l_key, slots in plan.items():
+            try:
+                res = await db.execute(
+                    update(Property).where(Property.listing_key == l_key)
+                    .values(mls_open_houses=slots or None, **single_columns(slots))
+                )
+                await db.commit()
+                if res.rowcount:
+                    stats["updated" if slots else "cleared"] += 1
+            except Exception as e:
+                logger.error(f"Error reconciling open houses for {l_key}: {e}")
+                stats["errors"] += 1
+                await db.rollback()
+        logger.info(f"Open house reconcile done: {stats}")
+        return stats
+
+    async def _open_house_reconcile_plan(self, db: AsyncSession, rows_by_listing: Dict[str, List[Dict[str, Any]]], today: date) -> Dict[str, List[dict]]:
+        """Which listings the reconcile needs to rewrite, and to what: each listing's stored slots
+        plus anything new in Bright's upcoming set, minus slots whose day has passed. Listings
+        already correct are skipped. Reads the DB only - no Bright calls."""
+        cols_q = (Property.listing_key, Property.mls_open_houses, Property.mls_open_house_date,
+                  Property.mls_open_house_start_time, Property.mls_open_house_end_time)
+        # Local listings currently showing something, plus (in chunks - this set can be large)
+        # every listing Bright has an upcoming open house for.
+        result = await db.execute(select(*cols_q).where(or_(Property.mls_open_house_date >= today, Property.mls_open_houses.is_not(None))))
+        local = {r.listing_key: r for r in result.all()}
+        keys = [k for k in rows_by_listing if k not in local]
+        for i in range(0, len(keys), 1000):
+            result = await db.execute(select(*cols_q).where(Property.listing_key.in_(keys[i:i + 1000])))
+            local.update({r.listing_key: r for r in result.all()})
+        plan: Dict[str, List[dict]] = {}
+        for r in local.values():
+            stored = stored_slots(r.mls_open_houses, r.mls_open_house_date, r.mls_open_house_start_time, r.mls_open_house_end_time)
+            slots = rebuild_open_house_slots(stored, rows_by_listing.get(r.listing_key, []), today)
+            cols = single_columns(slots)
+            unchanged = (
+                (r.mls_open_houses or []) == slots
+                and r.mls_open_house_date == cols["mls_open_house_date"]
+                and r.mls_open_house_start_time == cols["mls_open_house_start_time"]
+                and r.mls_open_house_end_time == cols["mls_open_house_end_time"]
+            )
+            if not unchanged:
+                plan[r.listing_key] = slots
+        return plan
+
+    async def run_closed_sync(self, max_pages: Optional[int] = None) -> Dict[str, Any]:
+        """Incremental sync of CLOSED-BRIGHT listings, on its own checkpoint.
+
+        Why this exists as a separate leg from run_global_sync:
+          - The general modified-since feed carries closed listings with a NULL sale price -
+            Bright only fills ClosePrice/CloseDate when the query scopes to closed status. The
+            CMA valuation engine needs the verified closed price, so we re-fetch closed records
+            through get_closed_properties_modified_since.
+          - run_global_sync never *inserts* a listing that wasn't ACTIVE/COMING SOON when first
+            seen, so a comp that sold before we ever tracked it would never enter the mirror.
+            Here we pass allow_inactive_insert=True so newly-discovered sold comps land too.
+
+        Catches the active->closed transition (ModificationTimestamp bumps on settlement) and
+        later corrections to an already-closed record. No collection propagation - a settled sale
+        isn't a buyer alert, and we don't want price-drop emails firing off closed comps.
+
+        First run (no checkpoint) starts 45 days back. The deep multi-year history per market is
+        the job of scripts/pull_sold_comps.py, not this loop.
+        """
+        logger.info("Starting Closed-Listings Synchronization Cycle...")
+        stats = {"updated": 0, "inserted": 0, "errors": 0}
 
         async with AsyncSessionLocal() as db:
+            last_sync = await self.get_last_sync_time(db, key=self.CLOSED_SYNC_KEY, fallback_hours=45 * 24)
+            logger.info(f"Syncing closed listings from checkpoint: {last_sync}")
+
             skip = 0
             page_size = 200
+            new_last_sync = last_sync
+            had_failure = False
             pages_processed = 0
 
             while True:
                 if max_pages is not None and pages_processed >= max_pages:
-                    logger.info(f"Reached max_pages={max_pages} for open house backfill - stopping early.")
+                    logger.info(f"Reached max_pages={max_pages} for closed sync - stopping early, checkpoint saved so far.")
                     break
                 try:
-                    raw_open_houses = await bright_mls_service.get_upcoming_open_houses(top=page_size, skip=skip)
-                    if not raw_open_houses:
+                    raw_properties = await bright_mls_service.get_closed_properties_modified_since(last_sync, top=page_size, skip=skip)
+                    if not raw_properties:
+                        logger.info("No more modified closed listings found.")
                         break
 
-                    by_listing: Dict[str, Dict[str, Any]] = {}
-                    for row in raw_open_houses:
-                        l_key = str(row.get("OpenHouseListingKey") or "")
-                        if not l_key:
-                            continue
-                        existing_pick = by_listing.get(l_key)
-                        if existing_pick is None:
-                            by_listing[l_key] = row
-                        else:
-                            new_date = parse_dt(row.get("OpenHouseDate"))
-                            existing_date = parse_dt(existing_pick.get("OpenHouseDate"))
-                            if new_date and (not existing_date or new_date < existing_date):
-                                by_listing[l_key] = row
+                    logger.info(f"Found {len(raw_properties)} modified closed listings in this batch (skip={skip})")
 
-                    for l_key, row in by_listing.items():
+                    listing_keys = [str(p["ListingKey"]) for p in raw_properties]
+                    photo_map = await bright_mls_service.get_media_for_properties(listing_keys)
+
+                    for raw_prop in raw_properties:
+                        l_key = str(raw_prop.get("ListingKey"))
+                        mod_ts = raw_prop.get("ModificationTimestamp")
                         try:
-                            await self._apply_open_house_row(db, l_key, row)
-                            stats["updated"] += 1
-                        except Exception as e:
-                            logger.error(f"Error backfilling open house for {l_key}: {e}")
+                            sync_event = await self._sync_single_property(db, raw_prop, photo_map, allow_inactive_insert=True)
+                            if sync_event:
+                                if sync_event["type"] == "NEW_GLOBAL":
+                                    stats["inserted"] += 1
+                                else:
+                                    stats["updated"] += 1
+
+                            if not had_failure and mod_ts and (not new_last_sync or mod_ts > new_last_sync):
+                                new_last_sync = mod_ts
+
+                        except Exception as prop_error:
+                            logger.error(f"Error syncing closed listing {l_key}: {prop_error}")
                             stats["errors"] += 1
+                            had_failure = True
 
                     pages_processed += 1
-                    if len(raw_open_houses) < page_size:
+                    if len(raw_properties) < page_size:
                         break
                     skip += page_size
 
                 except Exception as e:
-                    logger.error(f"Error in open house backfill batch at skip {skip}: {e}")
+                    logger.error(f"Error in closed sync batch at skip {skip}: {e}")
                     stats["errors"] += 1
                     break
 
-            now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            await self.update_last_sync_time(db, now_ts, key=self.OPEN_HOUSE_SYNC_KEY)
-            logger.info(f"Open House Backfill Complete. Checkpoint advanced to: {now_ts}")
+            if new_last_sync != last_sync:
+                await self.update_last_sync_time(db, new_last_sync, key=self.CLOSED_SYNC_KEY)
+                logger.info(
+                    f"Closed-Listings Sync Cycle Complete. inserted={stats['inserted']} "
+                    f"updated={stats['updated']} errors={stats['errors']} New Checkpoint: {new_last_sync}"
+                )
 
         return stats
 
-    async def _apply_open_house_row(self, db: AsyncSession, listing_key: str, row: Dict[str, Any]):
-        """Upserts the soonest-known open house date/time onto the matching Property row. A no-op
-        if the listing isn't in our local mirror (e.g. inactive/never synced)."""
-        oh_date = parse_dt(row.get("OpenHouseDate"))
-        start_dt = parse_dt(row.get("OpenHouseStartTime"))
-        end_dt = parse_dt(row.get("OpenHouseEndTime"))
-
-        stmt = (
-            update(Property)
-            .where(Property.listing_key == listing_key)
-            .values(
-                mls_open_house_date=oh_date.date() if oh_date else None,
-                mls_open_house_start_time=start_dt.time() if start_dt else None,
-                mls_open_house_end_time=end_dt.time() if end_dt else None,
-            )
+    async def _apply_open_house_rows(self, db: AsyncSession, rows_by_listing: Dict[str, List[Dict[str, Any]]], stats: Dict[str, Any]) -> bool:
+        """Merges a batch's BrightOpenHouses rows into each listing's stored slots (see
+        merge_open_house_rows) and refreshes the soonest-slot columns. Listings that aren't in our
+        local mirror (e.g. inactive/never synced) are skipped. Returns False if any listing failed."""
+        if not rows_by_listing:
+            return True
+        result = await db.execute(
+            select(Property.listing_key, Property.mls_open_houses, Property.mls_open_house_date,
+                   Property.mls_open_house_start_time, Property.mls_open_house_end_time)
+            .where(Property.listing_key.in_(list(rows_by_listing.keys())))
         )
-        await db.execute(stmt)
-        await db.commit()
+        local = {r.listing_key: r for r in result.all()}
+        today = date.today()
+        ok = True
+        for l_key, rows in rows_by_listing.items():
+            r = local.get(l_key)
+            if r is None:
+                continue
+            try:
+                existing = stored_slots(r.mls_open_houses, r.mls_open_house_date, r.mls_open_house_start_time, r.mls_open_house_end_time)
+                slots = merge_open_house_rows(existing, rows, today)
+                await db.execute(
+                    update(Property).where(Property.listing_key == l_key)
+                    .values(mls_open_houses=slots or None, **single_columns(slots))
+                )
+                await db.commit()
+                stats["updated"] += 1
+            except Exception as e:
+                logger.error(f"Error syncing open house for {l_key}: {e}")
+                stats["errors"] += 1
+                ok = False
+                await db.rollback()
+        return ok
 
     async def _sync_deletions(self, db: AsyncSession, last_sync: str, stats: Dict[str, Any]):
         """Helper to process hard-deleted properties from MLS."""
@@ -472,7 +621,26 @@ class PropertySyncService:
             if existing.price and mapped["price"] and mapped["price"] < existing.price:
                 event_type = "PRICE_DROP"
                 old_price = existing.price
-            
+
+            # Price history log: Bright only ever sends a listing's latest change, so every change
+            # we see is kept here (property_price_events) - never allowed to break the sync.
+            try:
+                from app.models.database import PropertyPriceEvent
+                if existing.price and mapped.get("price") and mapped["price"] != existing.price:
+                    db.add(PropertyPriceEvent(listing_key=l_key, kind="price", price=mapped["price"], previous_price=existing.price,
+                                              status=mapped.get("home_status"), previous_status=existing.home_status))
+                elif mapped.get("home_status") and existing.home_status and mapped["home_status"] != existing.home_status:
+                    db.add(PropertyPriceEvent(listing_key=l_key, kind="status", price=mapped.get("price"), previous_price=existing.price,
+                                              status=mapped["home_status"], previous_status=existing.home_status))
+            except Exception:  # noqa: BLE001
+                logger.warning("price history event not recorded", exc_info=True)
+
+            # A refresh that didn't fetch this listing's media (backfills, history pulls) only has the
+            # one primary photo - never let it shrink a full gallery we already have.
+            if (not photo_map or l_key not in photo_map) and isinstance(existing.photos, list) \
+                    and len(existing.photos) > len(mapped.get("photos") or []):
+                mapped["photos"] = existing.photos
+
             # Update all columns
             for key, value in mapped.items():
                 setattr(existing, key, value)
@@ -492,6 +660,12 @@ class PropertySyncService:
             event_type = "NEW_GLOBAL"
             existing = Property(**mapped)
             db.add(existing)
+            try:
+                from app.models.database import PropertyPriceEvent
+                if is_active:  # a historical listing pulled in by the backfill isn't "listed today"
+                    db.add(PropertyPriceEvent(listing_key=l_key, kind="listed", price=mapped.get("price"), status=mapped.get("home_status")))
+            except Exception:  # noqa: BLE001
+                logger.warning("price history event not recorded", exc_info=True)
             logger.debug(f"Added NEW property: {l_key} | {mapped['street_address']} | Status: {mapped['home_status']}")
         
         try:
@@ -520,16 +694,33 @@ class PropertySyncService:
         count = 0
 
         # 1. DISCOVERY: If this is a NEW house to our system, find ALL matching collections
+        # Showcases only keep working while their agent is on a live Showcase plan - a downgrade
+        # to Basic or an ended subscription pauses new matches + client alerts (the showcase
+        # itself is kept, so upgrading/resubscribing resumes it). Agents are warned about exactly
+        # this before downgrading/cancelling (Settings > Billing).
+        from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
+
         if event["type"] == "NEW_GLOBAL":
-            discovered_collections = await self._discover_matching_collections(db, event["data"])
+            discovered_collections = [
+                col for col in await self._discover_matching_collections(db, event["data"])
+                if owner_has_access(col.owner, SHOWCASE_ACCESS_TIERS)
+            ]
             for col in discovered_collections:
                 # Link property to collection (Mark as NEW by setting added_at)
                 await self._link_property_to_collection(db, col.id, prop_id)
-                
+
                 # Schedule 'New Property' notification
                 changes = {"new_properties": [event["data"]], "price_drops": []}
                 await self._schedule_combined_notification(db, col, changes)
                 count += 1
+
+            # My Team: if this brand-new listing belongs to an on-platform agent, let their
+            # accepted team members know there's a new opportunity to host. NEW_GLOBAL only ever
+            # fires once per listing_key for the life of that Property row (_upsert_property only
+            # takes this branch on first insert; every later resync is UPDATE/PRICE_DROP), so this
+            # can't repeat on its own - the notification-existence check below is an extra,
+            # explicit guard against ever double-notifying for the same listing.
+            await self._notify_team_of_new_listing(db, l_key, event["data"])
 
         # 2. UPDATES: Find collections that already HAVE this property (Price Drops)
         query = (
@@ -555,6 +746,8 @@ class PropertySyncService:
         existing_collections = result.scalars().all()
         
         for col in existing_collections:
+            if not owner_has_access(col.owner, SHOWCASE_ACCESS_TIERS):
+                continue
             if event["type"] == "PRICE_DROP":
                 # Include price change info in the data
                 drop_data = {
@@ -568,6 +761,73 @@ class PropertySyncService:
                 
         await db.commit()
         return count
+
+    async def _notify_team_of_new_listing(self, db: AsyncSession, listing_key: str, mapped: Dict[str, Any]) -> None:
+        """Alerts an on-platform listing agent's accepted My Team members that they've got a new
+        listing that might need a host. Only ever called from the NEW_GLOBAL (first-insert) branch
+        above, so a resync of an already-known listing can't reach this - the per-recipient
+        existence check below is an additional, explicit guard against ever sending the same
+        (listing, member) alert twice."""
+        from app.models.database import OpenHouseTeamMember, User
+
+        owner_mls_id = mapped.get("list_agent_mls_id") or mapped.get("co_list_agent_mls_id")
+        if not owner_mls_id:
+            return
+        owner_result = await db.execute(select(User).where(User.mls_id == owner_mls_id))
+        owner = owner_result.scalar_one_or_none()
+        if not owner:
+            return
+
+        members_result = await db.execute(
+            select(OpenHouseTeamMember.member_agent_id).where(
+                OpenHouseTeamMember.owner_id == owner.id, OpenHouseTeamMember.status == "accepted",
+            )
+        )
+        member_ids = [row[0] for row in members_result.all()]
+        if not member_ids:
+            return
+
+        existing_result = await db.execute(
+            select(Notification.agent_id).where(
+                Notification.type == "TEAM_NEW_LISTING",
+                Notification.reference_id == listing_key,
+                Notification.agent_id.in_(member_ids),
+            )
+        )
+        already_notified = {row[0] for row in existing_result.all()}
+
+        street_address = mapped.get("street_address") or "A new listing"
+        owner_name = f"{owner.first_name} {owner.last_name}".strip()
+        for member_id in member_ids:
+            if member_id in already_notified:
+                continue
+            try:
+                db.add(Notification(
+                    agent_id=member_id,
+                    type="TEAM_NEW_LISTING",
+                    reference_type="PROPERTY",
+                    reference_id=listing_key,
+                    title=f"{owner_name} has a new listing",
+                    message=f"{street_address} just hit the market - might be worth hosting an open house.",
+                    property_address=street_address,
+                    link="/discovery",
+                    is_read=False,
+                ))
+            except Exception:
+                pass
+        try:
+            to_notify = [m for m in member_ids if m not in already_notified]
+            if to_notify:
+                from app.models.database import User as _User
+                from app.services.agent_email_service import absolute, email_agent
+                price = mapped.get("price") or mapped.get("list_price")
+                for member in (await db.execute(select(_User).where(_User.id.in_(to_notify)))).scalars():
+                    email_agent(member, "TEAM_NEW_LISTING", "team_new_listing", f"{owner_name} listed a new property: {street_address}",
+                                {"owner_name": owner_name, "property_address": street_address,
+                                 "list_price": f"${float(price):,.0f}" if price else None,
+                                 "property_image": mapped.get("img_src"), "link": absolute("/discovery")})
+        except Exception:
+            logger.warning("team new-listing email failed", exc_info=True)
 
     async def _discover_matching_collections(self, db: AsyncSession, prop: Dict[str, Any]) -> List[Collection]:
         """
@@ -750,21 +1010,31 @@ class PropertySyncService:
             # If not exempt (Residential, Condo, etc.), must match all numeric filters
             stmt = stmt.where(and_(*numeric_conditions))
 
-        # 3. Property Type Match
+        # 3. Property Type Match - the same rule as the search itself (property_service): a Showcase
+        # with home types picked gets only those; one with none picked ("any") gets every home FOR
+        # SALE, never rentals/commercial. (Before, an "any" Showcase matched no new listing at all
+        # when the listing had a type, and an untyped listing went to every Showcase.)
         # In standard search, Lot/Land includes both LAND and FARM
+        type_flags = (CollectionPreferences.is_single_family, CollectionPreferences.is_town_house, CollectionPreferences.is_condo,
+                      CollectionPreferences.is_multi_family, CollectionPreferences.is_lot_land, CollectionPreferences.is_farm,
+                      CollectionPreferences.is_commercial, CollectionPreferences.is_apartment)
+        no_types_picked = and_(*[func.coalesce(flag, False).is_(False) for flag in type_flags])
         type_match_conditions = []
-        if h_type:
-            if h_type_upper == "SINGLE_FAMILY": type_match_conditions.append(CollectionPreferences.is_single_family == True)
-            elif h_type_upper == "TOWNHOUSE": type_match_conditions.append(CollectionPreferences.is_town_house == True)
-            elif h_type_upper == "CONDO": type_match_conditions.append(CollectionPreferences.is_condo == True)
-            elif h_type_upper == "MULTI_FAMILY": type_match_conditions.append(CollectionPreferences.is_multi_family == True)
-            elif h_type_upper == "LAND": type_match_conditions.append(CollectionPreferences.is_lot_land == True)
-            elif h_type_upper == "FARM": type_match_conditions.append(or_(CollectionPreferences.is_lot_land == True, CollectionPreferences.is_farm == True))
-            elif h_type_upper == "COMMERCIAL": type_match_conditions.append(CollectionPreferences.is_commercial == True)
-            elif h_type_upper == "RESIDENTIAL_LEASE": type_match_conditions.append(CollectionPreferences.is_apartment == True)
-
-        if type_match_conditions:
-            stmt = stmt.where(or_(*type_match_conditions))
+        if h_type_upper == "SINGLE_FAMILY": type_match_conditions.append(CollectionPreferences.is_single_family == True)
+        elif h_type_upper == "TOWNHOUSE": type_match_conditions.append(CollectionPreferences.is_town_house == True)
+        elif h_type_upper == "CONDO": type_match_conditions.append(CollectionPreferences.is_condo == True)
+        elif h_type_upper == "MULTI_FAMILY": type_match_conditions.append(CollectionPreferences.is_multi_family == True)
+        elif h_type_upper == "LAND": type_match_conditions.append(CollectionPreferences.is_lot_land == True)
+        elif h_type_upper == "FARM": type_match_conditions.append(or_(CollectionPreferences.is_lot_land == True, CollectionPreferences.is_farm == True))
+        elif h_type_upper == "COMMERCIAL": type_match_conditions.append(CollectionPreferences.is_commercial == True)
+        elif h_type_upper == "RESIDENTIAL_LEASE": type_match_conditions.append(CollectionPreferences.is_apartment == True)
+        if h_type_upper not in ("COMMERCIAL", "RESIDENTIAL_LEASE"):
+            type_match_conditions.append(no_types_picked)
+        stmt = stmt.where(or_(*type_match_conditions))
+        if price and price < 10000 and h_type_upper not in ("LAND", "FARM", "COMMERCIAL", "RESIDENTIAL_LEASE"):
+            # Same as the search: a "home" under $10k (mis-tagged rental, timeshare week) only goes
+            # to Showcases that asked for rentals/commercial.
+            stmt = stmt.where(or_(CollectionPreferences.is_apartment == True, CollectionPreferences.is_commercial == True))
 
         result = await db.execute(stmt, params)
         collections = result.scalars().all()
@@ -817,6 +1087,18 @@ class PropertySyncService:
         )
         existing = await db.execute(stmt)
         if not existing.fetchone():
+            # The same house under a second MLS number (often filed under the next town over) -
+            # the Showcase already has it.
+            from app.utils.same_home import is_same_home
+            new_prop = await db.get(Property, property_id)
+            if new_prop is not None:
+                linked = (await db.execute(
+                    select(Property).join(collection_properties, collection_properties.c.property_id == Property.id)
+                    .where(collection_properties.c.collection_id == collection_id,
+                           Property.street_address.ilike(f"{(new_prop.street_address or '').split(' ')[0]} %"))
+                )).scalars().all()
+                if any(is_same_home(new_prop, q) for q in linked):
+                    return
             await db.execute(insert(collection_properties).values(
                 collection_id=collection_id,
                 property_id=property_id,
@@ -866,7 +1148,12 @@ class PropertySyncService:
         return random.choice(subjects)
 
     async def _schedule_combined_notification(self, db: AsyncSession, collection: Collection, changes: Dict[str, Any], is_broadcast: bool = False):
-        """Schedules emails and in-app alerts for a collection."""
+        """Queues a new match / price drop for the 4:30 PM daily digest (showcase_digest_service).
+        Nothing is emailed here - one change used to mean one email to the buyer AND one to the
+        agent, which flooded both when an agent had dozens of Showcases in one area. The rows are
+        ScheduledEmails with status QUEUED (the minute-by-minute sender ignores them); _audience,
+        _collection_id, _owner_id, _listing_key, _kind and the prices are what the digest reads."""
+        from app.services.showcase_digest_service import QUEUED
         frontend_url = os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
         new_count = len(changes.get("new_properties", []))
         drop_count = len(changes.get("price_drops", []))
@@ -899,13 +1186,22 @@ class PropertySyncService:
             "today_date": datetime.now(timezone.utc).strftime("%m/%d/%Y")
         }
 
-        # 1. Visitor Email
+        digest_meta = {
+            "_collection_id": collection.id, "_owner_id": collection.owner_id,
+            "_listing_key": str(featured.get("listing_key") or ""),
+            "_kind": "new" if new_count else "drop",
+            "_old_price": featured.get("old_price_raw"), "_new_price": featured.get("new_price_raw"),
+            "_street": featured.get("street_address"), "_city": featured.get("city"), "_state": featured.get("state"),
+            "_seq": time.time_ns(),  # exact order (several changes can share one transaction timestamp)
+        }
+
+        # 1. Visitor Email (queued for the daily digest)
         if collection.visitor_email and getattr(collection, 'notify_visitor', True):
             # Check if visitor is blacklisted
             if await BlacklistService.is_blacklisted(db, collection.visitor_email):
                 logger.info(f"Skipping scheduled email for blacklisted visitor: {collection.visitor_email}")
             else:
-                template = "price_drop_alert" if (is_broadcast or (drop_count > 0 and new_count == 0)) else "new_properties_synced"
+                template = "showcase_daily_digest"  # queued for the 4:30 digest, never sent on its own
                 
                 # Calculate price drop variables if applicable
                 old_p = featured.get("old_price_raw")
@@ -914,17 +1210,20 @@ class PropertySyncService:
                 if old_p and new_p:
                     savings = old_p - new_p
 
+                # IDX agents get this client-facing link on their own domain, same as every other
+                # showcase link/QR code they hand out (see resolve_owner_public_base_url).
+                showcase_base_url = await resolve_owner_public_base_url(db, collection.owner) if collection.owner else frontend_url
                 visitor_vars = {
                     **common_vars,
-                    "collection_link": f"{frontend_url}/showcase/{collection.share_token}",
-                    "recipient_name": collection.visitor_name or "Valued Visitor",
+                    "collection_link": f"{showcase_base_url}/showcase/{collection.share_token}",
+                    "recipient_name": ((collection.visitor_name or "").strip().split(" ")[0].title() or "there"),
                     "agent_name": f"{collection.owner.first_name} {collection.owner.last_name}" if collection.owner else "Your Agent",
                     "agent_email": collection.owner.email if collection.owner else "",
-                    "agent_phone": getattr(collection.owner, 'phone', "") if collection.owner else "",
+                    "agent_phone": await agent_public_phone(db, collection.owner),
                     "old_price": f"${old_p:,.0f}" if old_p else None,
                     "new_price": f"${new_p:,.0f}" if new_p else None,
                     "savings": f"${savings:,.0f}" if savings > 0 else None,
-                    "Unsub": f"{frontend_url}/unsubscribe?email={collection.visitor_email}"
+                    "Unsub": f"{frontend_url}/unsubscribe?email={quote(collection.visitor_email, safe='')}"
                 }
                 
                 subject = self._generate_subject(featured, template)
@@ -933,8 +1232,8 @@ class PropertySyncService:
                     recipient_email=collection.visitor_email,
                     subject=subject,
                     template_name=template,
-                    template_variables=visitor_vars,
-                    status="PENDING",
+                    template_variables={**visitor_vars, **digest_meta, "_audience": "buyer"},
+                    status=QUEUED,
                     scheduled_for=datetime.now(timezone.utc)
                 ))
 
@@ -948,43 +1247,11 @@ class PropertySyncService:
             db.add(ScheduledEmail(
                 recipient_email=collection.owner.email,
                 subject=f"Showcase Updated: {collection.visitor_name or 'Visitor'} - {collection.name}",
-                template_name="new_properties_synced_agent",
-                template_variables=agent_vars,
-                status="PENDING",
+                template_name="showcase_daily_digest_agent",
+                template_variables={**agent_vars, **digest_meta, "_audience": "agent"},
+                status=QUEUED,
                 scheduled_for=datetime.now(timezone.utc)
             ))
 
-            # 3. In-App Notification
-            try:
-                if new_count > 0 and drop_count > 0:
-                    title = f"Showcase Update: {collection.visitor_name or 'Visitor'}"
-                    message = f"Found {new_count} new and {drop_count} price drop{'s' if drop_count > 1 else ''} for {collection.name}."
-                elif new_count > 0:
-                    title = f"New Property Match: {collection.visitor_name or 'Visitor'}"
-                    message = f"Found {new_count} new property match{'es' if new_count > 1 else ''} for {collection.name}."
-                else:
-                    title = f"Price Drop Alert: {collection.visitor_name or 'Visitor'}"
-                    message = f"Found {drop_count} price drop{'s' if drop_count > 1 else ''} for {collection.name}."
-
-                prop_id_query = select(Property.id).where(Property.listing_key == str(featured.get('listing_key')))
-                prop_id = (await db.execute(prop_id_query)).scalar()
-
-                db.add(Notification(
-                    agent_id=collection.owner_id,
-                    type="PROPERTY_SYNC_UPDATE",
-                    reference_type="VISITOR",
-                    reference_id=collection.id,
-                    title=title,
-                    message=message,
-                    collection_id=collection.id,
-                    collection_name=collection.name,
-                    property_id=prop_id,
-                    property_address=featured.get('street_address'),
-                    visitor_name=collection.visitor_name,
-                    link=f"/showcases?showcase={collection.id}" + (f"&property={prop_id}" if prop_id else ""),
-                    is_read=False,
-                    created_at=datetime.now(timezone.utc)
-                ))
-            except Exception as e:
-                logger.error(f"In-app notification failed: {e}")
+        # 3. In-app alert: none per change any more - the digest adds ONE bell alert per agent a day.
 

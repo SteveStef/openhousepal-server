@@ -1,7 +1,9 @@
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 from typing import Optional, List, Dict, Any, Union
-from datetime import datetime, timezone
+from datetime import datetime
+
+from app.utils.listing_dom import resolve_days_on_market
 
 class PropertySummaryResponse(BaseModel):
     """
@@ -29,6 +31,8 @@ class PropertySummaryResponse(BaseModel):
     bedrooms: Optional[float] = Field(None, alias="BedroomsTotal")
     bathrooms: Optional[float] = Field(None, alias="BathroomsTotal")
     living_area: Optional[float] = Field(None, alias="LivingArea")
+    lot_size: Optional[float] = Field(None, alias="LotSizeSquareFeet")
+    lot_size_acres: Optional[float] = Field(None, alias="LotSizeAcres")
     home_type: Optional[str] = Field(None, alias="PropertyType")
     
     # Raw MLS data
@@ -41,25 +45,26 @@ class PropertySummaryResponse(BaseModel):
     
     subdivision_name: Optional[str] = Field(None, alias="SubdivisionName")
     township: Optional[str] = Field(None, alias="MLSAreaMajor")
+    school_district_name: Optional[str] = Field(None, alias="SchoolDistrictName")
     
     img_src: Optional[str] = Field(None, alias="ListPictureURL")
     latitude: Optional[float] = Field(None, alias="Latitude")
     longitude: Optional[float] = Field(None, alias="Longitude")
+    google_rooftop_latitude: Optional[float] = None
+    google_rooftop_longitude: Optional[float] = None
+    google_geocode_location_type: Optional[str] = None
     
     days_on_market: Optional[int] = Field(None, alias="DaysOnMarket")
     year_built: Optional[int] = Field(None, alias="YearBuilt")
     mls_list_date: Optional[datetime] = Field(None, alias="MLSListDate")
     price_change_timestamp: Optional[datetime] = Field(None, alias="PriceChangeTimestamp")
+    original_list_price: Optional[float] = Field(None, alias="OriginalListPrice")
 
     @model_validator(mode='after')
     def calculate_dom(self) -> 'PropertySummaryResponse':
-        if self.mls_list_date:
-            now = datetime.now(timezone.utc)
-            list_date = self.mls_list_date
-            if list_date.tzinfo is None:
-                list_date = list_date.replace(tzinfo=timezone.utc)
-            delta = now - list_date
-            self.days_on_market = max(0, delta.days)
+        self.days_on_market = resolve_days_on_market(
+            self.days_on_market, self.home_status, self.mls_list_date,
+        )
         return self
 
 class PropertyDetailResponse(PropertySummaryResponse):
@@ -159,7 +164,6 @@ class PropertyDetailResponse(PropertySummaryResponse):
     # Detailed Features
     cooling_fuel: Optional[List[str]] = Field(None, alias="CoolingFuel")
     heating_fuel: Optional[List[str]] = Field(None, alias="HeatingFuel")
-    lot_size_acres: Optional[float] = Field(None, alias="LotSizeAcres")
     attached_garage_yn: Optional[bool] = Field(None, alias="AttachedGarageYN")
     new_construction_yn: Optional[bool] = Field(None, alias="NewConstructionYN")
     senior_community_yn: Optional[bool] = Field(None, alias="SeniorCommunityYN")
@@ -176,22 +180,40 @@ class PropertyDetailResponse(PropertySummaryResponse):
     updated_at: Optional[datetime] = None
     modification_timestamp: Optional[datetime] = Field(None, alias="ModificationTimestamp")
 
-    @model_validator(mode='after')
-    def calculate_dom(self) -> 'PropertyDetailResponse':
-        if self.mls_list_date:
-            now = datetime.now(timezone.utc)
-            list_date = self.mls_list_date
-            if list_date.tzinfo is None:
-                list_date = list_date.replace(tzinfo=timezone.utc)
-            delta = now - list_date
-            self.days_on_market = max(0, delta.days)
-        return self
-
 class NearbyPlace(BaseModel):
     name: str
     address: Optional[str] = None
     distance_miles: Optional[float] = None
     place_type: Optional[str] = None  # e.g. "Hospital", "Urgent Care", "Primary Care", "Rehabilitation", "Medical Clinic" - only set for medical_care entries
+
+class ExploreNearbyPlace(BaseModel):
+    place_id: str
+    name: str
+    category: str
+    address: Optional[str] = None
+    rating: Optional[float] = None
+    review_count: Optional[int] = None
+    distance_miles: Optional[float] = None
+    latitude: float
+    longitude: float
+
+class ExploreNearbyResponse(BaseModel):
+    available: bool = True
+    category: str
+    origin: Dict[str, float]
+    radius_miles: float
+    places: List[ExploreNearbyPlace] = []
+    cache_hit: bool = False
+    source: str = "google_places_nearby_search_new"
+    sku: str = "nearby_search_pro"
+
+class ExploreNearbyPlaceDetails(BaseModel):
+    place_id: str
+    rating: Optional[float] = None
+    review_count: Optional[int] = None
+    cache_hit: bool = False
+    source: str = "google_place_details_new"
+    sku: str = "place_details_enterprise"
 
 class NearbyAmenitiesResponse(BaseModel):
     schools: List[NearbyPlace] = []
@@ -227,3 +249,4 @@ class SimilarPropertiesRequest(BaseModel):
     max_price: Optional[int] = None
     min_beds: Optional[int] = None
     min_baths: Optional[float] = None
+    min_acres: Optional[float] = None

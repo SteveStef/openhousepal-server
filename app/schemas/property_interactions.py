@@ -32,6 +32,7 @@ class PropertyInteractionResponse(BaseModel):
     disliked: bool
     view_count: int = 0
     last_viewed_at: Optional[datetime] = None
+    agent_viewed_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
@@ -48,6 +49,7 @@ class PropertyCommentResponse(BaseModel):
     visitor_name: Optional[str] = None
     visitor_email: Optional[str] = None
     author: Optional[str] = None  # Computed field for frontend compatibility
+    is_agent: bool = False  # the agent wrote it (their photo shows beside it on the Showcase)
     created_at: datetime
     updated_at: datetime
 

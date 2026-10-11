@@ -50,7 +50,11 @@ class CollectionResponse(BaseModel):
     visitor_name: Optional[str] = None
     visitor_email: Optional[str] = None
     visitor_phone: Optional[str] = None
-    original_property: Optional[dict] = None
+    source: Optional[str] = None
+    # Camelcase to match the frontend Collection.originalProperty field directly (same reason
+    # matchedProperties below is already spelled this way) - previously spelled original_property
+    # here, which the frontend never actually read since it always looked for originalProperty.
+    originalProperty: Optional[dict] = None
     preferences: dict = {}
     property_count: int = 0
     active_property_count: int = 0
@@ -59,6 +63,9 @@ class CollectionResponse(BaseModel):
     share_token: Optional[str] = None
     created_at: str
     updated_at: str
+    refine_request_message: Optional[str] = None
+    refine_request_at: Optional[str] = None
     stats: Optional[dict] = None
+    matchedProperties: List[dict] = []
 
 # Forward reference for PropertySummary will be resolved when property schemas are imported

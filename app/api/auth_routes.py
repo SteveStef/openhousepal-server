@@ -6,15 +6,18 @@ import secrets
 from app.services.email_service import EmailService
 
 from app.database import get_db
-from app.schemas.user import UserCreate, User, UserLogin, Token, ForgotPasswordRequest, ResetPasswordRequest
+from app.schemas.user import UserCreate, User, UserLogin, Token, ForgotPasswordRequest, ResetPasswordRequest, ChangePasswordRequest
 from app.services.user_service import UserService
 from app.services.paypal_service import paypal_service
 from app.services.property_service import property_service
-from app.utils.auth import create_access_token, get_current_active_user, hash_password, require_broker_authorization
+from app.utils.auth import create_access_token, get_current_active_user, hash_password, verify_password, require_broker_authorization
+from app.utils.plan_ids import tier_for_plan_id, plan_id_has_trial
 from app.models.database import User as UserModel, DiscoveryPreferences
 from app.services.verification_service import verification_service
-from app.services.discord_notifier import notifier 
+from app.services import login_rate_limit_service
+from app.services.discord_notifier import notifier
 from app.utils.subscription_sync import sync_subscription_status
+from app.utils.request_ip import get_client_ip
 from app.config.logging import get_logger
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
@@ -43,7 +46,7 @@ async def send_verification_code(
             )
 
         is_dev_mode = os.getenv("DEV", 'false') == 'true' # we are defaulting to prod
-        if not is_dev_mode:
+        if user_data.is_bright and not is_dev_mode:
             logger.info("Skipping the mls id verification")
             valid_bright_mls_id = await property_service.bright_mls_id_exists(db, user_data.mls_id)
             if not valid_bright_mls_id:
@@ -77,12 +80,14 @@ async def send_verification_code(
             "state": user_data.state,
             "brokerage": user_data.brokerage,
             "mls_id": user_data.mls_id,
+            "license_number": user_data.license_number,
+            "is_bright": user_data.is_bright,
             "password": user_data.password  # Will be hashed by verification_service
         }
         await verification_service.store_code(user_data.email, code, form_data, db)
 
         # Log code in development mode (emails are auto-masked by logging filter)
-        if os.getenv("MAILGUN_DEV", "yes") == "yes":
+        if EmailService().is_dev:
             logger.info(
                 "DEV MODE: Verification code generated",
                 extra={
@@ -126,7 +131,7 @@ async def verify_code(
     """
     Verify the 6-digit code and automatically create the user account.
     """
-    email = request.get("email")
+    email = (request.get("email") or "").strip().lower()
     code = request.get("code")
 
     if not email or not code:
@@ -145,6 +150,10 @@ async def verify_code(
     if not form_data:
         raise HTTPException(status_code=400, detail="Registration data expired. Please start over.")
 
+    # Someone may have finished signing up with this email in another tab meanwhile.
+    if await UserService.get_user_by_email(db, email):
+        raise HTTPException(status_code=400, detail="Email already registered. Please log in instead.")
+
     # 3. Create the User (restricted status)
     try:
         new_user = UserModel(
@@ -154,9 +163,12 @@ async def verify_code(
             last_name=form_data["last_name"],
             state=form_data["state"],
             brokerage=form_data["brokerage"],
-            mls_id=form_data["mls_id"],
+            mls_id=form_data.get("mls_id") or None,
+            license_number=form_data.get("license_number") or None,
             subscription_status="PENDING_PAYMENT",
-            broker_authorized=False,
+            # Bright agents wait for Bright to approve OpenHousePal's data feed (an admin then
+            # authorizes them). Agents outside Bright have no feed to approve - straight to checkout.
+            broker_authorized=form_data.get("is_bright", True) is False,
             plan_tier=None
         )
         db.add(new_user)
@@ -174,6 +186,17 @@ async def verify_code(
         # 5. Clear verification data
         await verification_service.clear_verification(email, db)
         await db.commit()
+
+        # Tell the team someone is waiting - they can't pay until an admin authorizes them.
+        try:
+            if new_user.mls_id:
+                notifier.send(f"New agent signed up: {new_user.first_name} {new_user.last_name} ({new_user.brokerage}, MLS ID {new_user.mls_id}). "
+                              f"Authorize them in Admin once Bright approves their feed.")
+            else:
+                notifier.send(f"New agent outside Bright MLS signed up: {new_user.first_name} {new_user.last_name} ({new_user.brokerage}, {new_user.state}, "
+                              f"license {new_user.license_number}). No approval needed - they can pick a No-MLS plan now.")
+        except Exception:
+            pass
 
         # 5. Return access token
         access_token = create_access_token(data={"sub": new_user.id})
@@ -204,7 +227,7 @@ async def resend_verification_code(
     """
     Resend a new verification code to the user's email.
     """
-    email = request.get("email")
+    email = (request.get("email") or "").strip().lower()
 
     if not email:
         raise HTTPException(
@@ -232,7 +255,7 @@ async def resend_verification_code(
     first_name = form_data.get('first_name', 'User') if form_data else 'User'
 
     # Print code to console in development mode
-    if os.getenv("MAILGUN_DEV", "yes") == "yes":
+    if EmailService().is_dev:
         logger.info("Verification code generated", extra={"user_email": email, "code": new_code})
 
     # Send email with new code
@@ -256,40 +279,102 @@ async def resend_verification_code(
 @router.post("/verify-bundle-code")
 async def verify_bundle_code(
     request: dict,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: UserModel = Depends(require_broker_authorization),
 ):
-    """
-    Verify a bundle/promo code and return the special plan ID if valid.
-    """
-    code_str = request.get("code")
+    """Check a checkout code. Admin-made codes (admin "Codes") come first; the old single-use
+    bundle codes still work after that."""
+    code_str = (request.get("code") or "").strip()
     if not code_str:
-        raise HTTPException(status_code=400, detail="Code is required")
+        raise HTTPException(status_code=400, detail="Enter a code first.")
 
-    from app.models.database import BundleCode
     from sqlalchemy import select
+    from app.models.database import BundleCode, PromoCode
+    from app.services.promo_code_service import clean_code, find_usable
+    from app.utils.plan_ids import tier_allowed_for, NOT_IN_BRIGHT_MESSAGE, display_name_for_tier
 
-    result = await db.execute(
-        select(BundleCode).where(BundleCode.code == code_str)
-    )
-    bundle_code = result.scalar_one_or_none()
+    if (await db.execute(select(PromoCode.id).where(PromoCode.code == clean_code(code_str)))).first():
+        promo, why = await find_usable(db, code_str)
+        if promo is None:
+            raise HTTPException(status_code=400, detail=why)
+        if not tier_allowed_for(current_user, promo.plan_tier):
+            raise HTTPException(status_code=400, detail=NOT_IN_BRIGHT_MESSAGE)
+        billed_by_us = promo.kind == "billed_by_us"
+        return {
+            "valid": True, "code": promo.code, "kind": promo.kind, "plan_tier": promo.plan_tier,
+            "plan_name": display_name_for_tier(promo.plan_tier), "label": promo.label,
+            "plan_id": None if billed_by_us else promo.paypal_plan_id,
+            "custom_price": promo.custom_price if billed_by_us else None,
+            "billing_cycle": (promo.billing_cycle or "monthly") if billed_by_us else None,
+            "message": "Code applied!",
+        }
 
+    bundle_code = (await db.execute(select(BundleCode).where(BundleCode.code == code_str))).scalar_one_or_none()
     if not bundle_code:
-        raise HTTPException(status_code=404, detail="Invalid promo code")
-
+        raise HTTPException(status_code=404, detail="That code isn't valid. Check the spelling and try again.")
     if bundle_code.is_used:
         raise HTTPException(status_code=400, detail="This code has already been used")
-
-    # Return the special bundle plan ID from environment
     bundle_plan_id = os.getenv("PAYPAL_BUNDLE_PLAN_ID")
     if not bundle_plan_id:
         logger.error("PAYPAL_BUNDLE_PLAN_ID not set in environment")
         raise HTTPException(status_code=500, detail="Special plan configuration missing")
+    if not tier_allowed_for(current_user, "PREMIUM"):
+        raise HTTPException(status_code=400, detail=NOT_IN_BRIGHT_MESSAGE)
+    return {"valid": True, "code": code_str, "kind": "bundle", "plan_tier": "PREMIUM", "plan_name": "Premium",
+            "plan_id": bundle_plan_id, "message": "Promo code applied successfully!"}
 
-    return {
-        "valid": True,
-        "plan_id": bundle_plan_id,
-        "message": "Promo code applied successfully!"
-    }
+
+@router.post("/redeem-code")
+async def redeem_billed_by_us_code(
+    request: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserModel = Depends(require_broker_authorization),
+):
+    """A 'billed by us' code: switch the account on with no PayPal - OpenHousePal bills the agent
+    directly (the same kind of plan as the admin's manual plan switch)."""
+    from app.services.promo_code_service import claim, find_usable
+    from app.utils.plan_ids import tier_allowed_for, NOT_IN_BRIGHT_MESSAGE, display_name_for_tier
+
+    if current_user.subscription_id or (current_user.subscription_status not in (None, "PENDING_PAYMENT")):
+        raise HTTPException(status_code=400, detail="You already have a plan on this account. Manage it in Settings > Billing.")
+    promo, why = await find_usable(db, request.get("code") or "")
+    if promo is None:
+        raise HTTPException(status_code=400, detail=why)
+    if promo.kind != "billed_by_us":
+        raise HTTPException(status_code=400, detail="This code is used with PayPal checkout.")
+    if not tier_allowed_for(current_user, promo.plan_tier):
+        raise HTTPException(status_code=400, detail=NOT_IN_BRIGHT_MESSAGE)
+    if not await claim(db, promo.id):
+        await db.rollback()
+        raise HTTPException(status_code=400, detail="That code was just used up. Please contact us.")
+
+    from app.services.website.site_service import reset_idx_site_question_on_upgrade
+    reset_idx_site_question_on_upgrade(current_user, current_user.plan_tier, promo.plan_tier)
+    now = datetime.now(timezone.utc)
+    current_user.plan_tier = promo.plan_tier
+    current_user.subscription_status = "ACTIVE"
+    current_user.subscription_id = None
+    current_user.plan_id = None
+    current_user.trial_ends_at = None
+    current_user.next_billing_date = None
+    current_user.subscription_started_at = now
+    current_user.promo_code_id = promo.id
+    if promo.plan_tier == "IDX":
+        current_user.idx_setup_settled_at = now
+    if promo.billing_group_id:
+        current_user.billing_group_id = promo.billing_group_id
+    await db.commit()
+    await db.refresh(current_user)
+
+    cycle = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}.get(promo.billing_cycle or "monthly", "month")
+    price = f"${promo.custom_price:,.2f}/{cycle}" if promo.custom_price is not None else "no price set"
+    notifier.send(f"Agent {current_user.first_name} {current_user.last_name} ({current_user.email}) switched on "
+                  f"{display_name_for_tier(promo.plan_tier)} with code {promo.code} - billed by us, {price}. Send them their first invoice.")
+    from app.services.agent_email_service import absolute, email_agent, plan_name
+    email_agent(current_user, None, "agent_welcome", f"Welcome to OpenHousePal, {current_user.first_name or 'friend'}",
+                {"plan_name": plan_name(promo.plan_tier), "plan_tier": plan_name(promo.plan_tier), "trial_end_date": "",
+                 "link": absolute("/dash")}, always=True)
+    return {"success": True, "subscription_status": current_user.subscription_status, "plan_tier": current_user.plan_tier}
 
 
 @router.post("/link-subscription")
@@ -305,6 +390,16 @@ async def link_subscription(
     Reuses the exact PayPal validation logic from the previous flow.
     """
     try:
+        # A retry of the same link (the first answer got lost on a bad connection) is a no-op.
+        if current_user.subscription_id and current_user.subscription_id == subscription_id:
+            return {"success": True, "subscription_status": current_user.subscription_status, "plan_tier": current_user.plan_tier}
+
+        # This endpoint is the first-time checkout only. Anyone who already had a subscription
+        # (suspended, cancelled, expired - or still active) goes through Settings > Billing, so
+        # they can't pick up a second free trial or end up paying for two subscriptions.
+        if current_user.subscription_id or (current_user.subscription_status not in (None, "PENDING_PAYMENT")):
+            raise HTTPException(status_code=400, detail="You already have a subscription on this account. Manage it in Settings > Billing.")
+
         # Step 1: Validate subscription with PayPal API
         try:
             subscription_details = await paypal_service.get_subscription(subscription_id)
@@ -315,22 +410,40 @@ async def link_subscription(
         if subscription_details.get('plan_id') != plan_id:
             raise HTTPException(status_code=400, detail="Plan ID mismatch")
 
-        # Step 3: Check subscription status
-        if subscription_details.get('status') not in ['ACTIVE', 'APPROVAL_PENDING', 'APPROVED']:
-            raise HTTPException(status_code=400, detail="Invalid subscription status")
+        # Step 3: Check subscription status - it must actually be approved on PayPal
+        # (APPROVAL_PENDING means the buyer never finished approving it).
+        if subscription_details.get('status') not in ['ACTIVE', 'APPROVED']:
+            raise HTTPException(status_code=400, detail="PayPal hasn't confirmed this subscription yet. Please finish approving it on PayPal.")
 
-        # Step 4: Determine plan tier
+        # Step 4: Determine plan tier - any of the 4 tiers, legacy or current plan ID
         BUNDLE_PLAN_ID = os.getenv("PAYPAL_BUNDLE_PLAN_ID")
-        if plan_id == BASIC_PLAN_ID:
-            plan_tier = "BASIC"
-        elif plan_id == PREMIUM_PLAN_ID:
-            plan_tier = "PREMIUM"
+        resolved_tier = tier_for_plan_id(plan_id)
+        promo = None
+        if bundle_code and not (BUNDLE_PLAN_ID and plan_id == BUNDLE_PLAN_ID):
+            # An admin-made code with its own PayPal plan (e.g. IDX with no setup fee).
+            from app.services.promo_code_service import find_usable
+            promo, why = await find_usable(db, bundle_code)
+            if promo is None:
+                raise HTTPException(status_code=400, detail=why)
+            if promo.kind != "paypal_plan" or promo.paypal_plan_id != plan_id:
+                raise HTTPException(status_code=400, detail="This code doesn't go with that plan.")
+            resolved_tier = promo.plan_tier
+        if resolved_tier is not None and promo is None:
+            from app.utils.plan_ids import SIGNUP_PLAN_IDS
+            if plan_id not in SIGNUP_PLAN_IDS:
+                # A plan-change / no-fee plan picked without the code that unlocks it.
+                raise HTTPException(status_code=400, detail="That plan needs a code. Go back and pick your plan again.")
+        if resolved_tier is not None:
+            plan_tier = resolved_tier
         elif BUNDLE_PLAN_ID and plan_id == BUNDLE_PLAN_ID:
             if not bundle_code:
                 raise HTTPException(status_code=400, detail="Promo code required for this plan")
             plan_tier = "PREMIUM"
         else:
             raise HTTPException(status_code=400, detail="Invalid plan configuration")
+        from app.utils.plan_ids import tier_allowed_for, NOT_IN_BRIGHT_MESSAGE
+        if not tier_allowed_for(current_user, plan_tier):
+            raise HTTPException(status_code=400, detail=NOT_IN_BRIGHT_MESSAGE)
 
         # Step 5: Check if subscription already linked
         from sqlalchemy import select
@@ -339,18 +452,27 @@ async def link_subscription(
         if existing.scalar_one_or_none():
             raise HTTPException(status_code=400, detail="Subscription already linked to another account")
 
-        # Handle Bundle Code marking
-        if bundle_code:
+        # Handle Bundle Code marking - only for the promo plan, and claimed atomically so two
+        # people can't both redeem the same single-use code at the same moment.
+        is_bundle_plan = bool(BUNDLE_PLAN_ID and plan_id == BUNDLE_PLAN_ID)
+        if bundle_code and is_bundle_plan:
             from app.models.database import BundleCode
-            code_res = await db.execute(select(BundleCode).where(BundleCode.code == bundle_code))
-            db_code = code_res.scalar_one_or_none()
-            if not db_code:
-                raise HTTPException(status_code=400, detail="Invalid promo code")
-            if db_code.is_used:
-                raise HTTPException(status_code=400, detail="Promo code already used")
-            
-            db_code.is_used = True
-            db_code.used_at = datetime.now(timezone.utc)
+            from sqlalchemy import update
+            claimed = await db.execute(
+                update(BundleCode)
+                .where(BundleCode.code == bundle_code, BundleCode.is_used.is_(False))
+                .values(is_used=True, used_at=datetime.now(timezone.utc))
+                .returning(BundleCode.code)
+            )
+            if claimed.first() is None:
+                raise HTTPException(status_code=400, detail="This promo code is invalid or has already been used")
+        if promo is not None:
+            from app.services.promo_code_service import claim
+            if not await claim(db, promo.id):
+                raise HTTPException(status_code=400, detail="That code was just used up. Please contact us.")
+            current_user.promo_code_id = promo.id
+            if promo.billing_group_id:
+                current_user.billing_group_id = promo.billing_group_id
 
         # Step 6: Update User Record
         now = datetime.now(timezone.utc)
@@ -364,11 +486,17 @@ async def link_subscription(
 
         current_user.subscription_id = subscription_id
         current_user.plan_id = plan_id
+        from app.services.website.site_service import reset_idx_site_question_on_upgrade
+        reset_idx_site_question_on_upgrade(current_user, current_user.plan_tier, plan_tier)
         current_user.plan_tier = plan_tier
-        current_user.subscription_status = "TRIAL"
+        # Trial only when the PayPal plan really has one (the promo plan's free period counts).
+        has_trial = plan_id_has_trial(plan_id) or is_bundle_plan or bool(promo and promo.trial_days)
+        current_user.subscription_status = "TRIAL" if has_trial else "ACTIVE"
         current_user.subscription_started_at = now
-        current_user.trial_ends_at = trial_end
+        current_user.trial_ends_at = trial_end if has_trial else None
         current_user.next_billing_date = trial_end
+        if plan_tier == "IDX":
+            current_user.idx_setup_settled_at = now  # paid with the sign-up plan, or waived by a code
         current_user.last_paypal_sync = now
 
         await db.commit()
@@ -376,6 +504,10 @@ async def link_subscription(
 
         # Welcome notification
         notifier.send(f"Agent {current_user.first_name} {current_user.last_name} has successfully linked a {plan_tier} subscription.")
+        from app.services.agent_email_service import absolute, email_agent, nice_date, plan_name
+        email_agent(current_user, None, "agent_welcome", f"Welcome to OpenHousePal, {current_user.first_name or 'friend'}",
+                    {"plan_name": plan_name(plan_tier), "plan_tier": plan_name(plan_tier), "trial_end_date": nice_date(trial_end),
+                     "link": absolute("/dash")}, always=True)
 
         return {
             "success": True,
@@ -392,44 +524,42 @@ async def link_subscription(
 
 
 
-@router.get("/users/{user_id}", response_model=User)
-async def get_user(
-    user_id: str,
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Get user by ID (for testing)
-    """
-    user = await UserService.get_user_by_id(db, user_id)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
-    return user
-
 @router.post("/login", response_model=Token)
 async def login(
     user_credentials: UserLogin,
+    request: Request,
     db: AsyncSession = Depends(get_db)
 ):
     """
     Authenticate user and return access token
     """
     try:
+        email = user_credentials.email.strip().lower()
+        client_ip = get_client_ip(request)
+
+        allowed, block_message = await login_rate_limit_service.check_login_allowed(db, email, client_ip)
+        if not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=block_message,
+            )
+
         # Authenticate user
         user = await UserService.authenticate_user(
-            db, 
-            user_credentials.email, 
+            db,
+            user_credentials.email,
             user_credentials.password
         )
-        
+
         if not user:
+            await login_rate_limit_service.record_attempt(db, email, client_ip, success=False)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect email or password",
             )
-        
+
+        await login_rate_limit_service.record_attempt(db, email, client_ip, success=True)
+
         # This is for just incase the webhook for this user misses
         if user.subscription_id:
             try:
@@ -490,31 +620,53 @@ async def get_current_user_profile(
         current_user.trial_ends_at < now
     )
 
-    # Strictly only sync if they have an ID and we are in the trial-expired edge case
+    # Trial just ran out: check PayPal now (they've probably just been charged) so they aren't
+    # locked out for even one page load.
     if current_user.subscription_id and is_trial_expired:
         try:
             # This updates the DB and the current_user object in-place
             await sync_subscription_status(current_user, db)
         except Exception as e:
             logger.error(f"Background sync failed for user {current_user.id}: {e}")
+    elif current_user.subscription_id and (
+        not current_user.last_paypal_sync or now - current_user.last_paypal_sync > timedelta(hours=6)
+    ):
+        # Safety net for a PayPal webhook that never arrived - re-check in the background at
+        # most every few hours, never slowing this page load down.
+        _schedule_background_sync(current_user.id)
 
     return current_user
 
-@router.get("/debug")
-async def debug_auth(request: Request):
-    """
-    Debug endpoint to check authentication headers
-    """
-    headers = dict(request.headers)
-    
-    auth_header = headers.get('authorization', 'No Authorization header')
-    
-    return {
-        "message": "Debug endpoint reached",
-        "authorization_header": auth_header,
-        "all_headers": headers,
-        "jwt_secret_key_env": os.getenv("JWT_SECRET_KEY", "NOT_SET")[:10] + "..." if os.getenv("JWT_SECRET_KEY") else "NOT_SET"
-    }
+
+_sync_in_flight: dict[str, datetime] = {}
+_bg_tasks: set = set()  # strong refs so a running check isn't garbage-collected mid-flight
+
+
+def _schedule_background_sync(user_id: str) -> None:
+    import asyncio
+    now = datetime.now(timezone.utc)
+    started = _sync_in_flight.get(user_id)
+    if started and now - started < timedelta(minutes=15):
+        return  # already checking (or PayPal was down a moment ago) - don't pile up
+    _sync_in_flight[user_id] = now
+
+    async def run():
+        from app.database import AsyncSessionLocal
+        from sqlalchemy import select as _select
+        try:
+            async with AsyncSessionLocal() as s:
+                u = (await s.execute(_select(UserModel).where(UserModel.id == user_id))).scalar_one_or_none()
+                if u and u.subscription_id:
+                    await sync_subscription_status(u, s)
+        except Exception:
+            logger.warning("background PayPal sync failed", exc_info=True, extra={"user_id": user_id})
+
+    try:
+        task = asyncio.get_running_loop().create_task(run())
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+    except RuntimeError:
+        pass
 
 @router.post("/forgot-password")
 async def forgot_password(
@@ -530,14 +682,22 @@ async def forgot_password(
         from sqlalchemy import select
         from app.models.database import PasswordResetToken
 
-        result = await db.execute(
-            select(UserModel).where(UserModel.email == email)
-        )
-        user = result.scalar_one_or_none()
+        user = await UserService.get_user_by_email(db, email)
 
         success_response = {"message": "If an account exists with this email, you will receive a password reset link shortly."}
 
         if not user:
+            return success_response
+
+        # At most 3 reset emails an hour per account, so nobody can flood someone's inbox.
+        from sqlalchemy import func as _f
+        recent = (await db.execute(
+            select(_f.count(PasswordResetToken.id)).where(
+                PasswordResetToken.user_id == user.id,
+                PasswordResetToken.expires_at > datetime.now(timezone.utc),  # issued within the last hour
+            )
+        )).scalar() or 0
+        if recent >= 3:
             return success_response
 
         # Generate secure token
@@ -627,8 +787,11 @@ async def reset_password(
         # Update password
         user.hashed_password = hash_password(request.new_password)
 
-        # Mark token as used
+        # Mark token as used - and every other outstanding link for this account
         reset_token.used = True
+        from sqlalchemy import update as _update
+        await db.execute(_update(PasswordResetToken).where(
+            PasswordResetToken.user_id == user.id, PasswordResetToken.used.is_(False)).values(used=True))
 
         # Commit changes
         await db.commit()
@@ -644,4 +807,28 @@ async def reset_password(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to reset password"
         )
+
+
+@router.post("/change-password", status_code=status.HTTP_200_OK)
+async def change_password(
+    request: ChangePasswordRequest,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Change your password while logged in. Proves it's you by re-checking the current password
+    (there is no emailed code / 2FA in the system). The emailed forgot-password link flow is the
+    path for someone who can't sign in."""
+    if not verify_password(request.current_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect.",
+        )
+    if verify_password(request.new_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be different from the current one.",
+        )
+    current_user.hashed_password = hash_password(request.new_password)
+    await db.commit()
+    return {"message": "Password changed."}
 

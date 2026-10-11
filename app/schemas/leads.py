@@ -8,9 +8,59 @@ LeadRepresented = Literal['yes', 'no', 'unknown']
 LeadSourceType = Literal[
     'open_house_visitor', 'form_submission', 'property_tour', 'property_comment', 'collection_visitor',
     'open_house_second_visit', 'open_house_disclosure',
+    'property_website_inquiry', 'property_website_tour_request',
+    'portal_lead', 'form_partial',
+    'property_page_inquiry', 'property_page_tour_request',
+    'blog_inquiry',
+    # Done inside their Showcase / elsewhere - logged by leads_service.log_activity.
+    'showcase_like', 'showcase_dislike', 'showcase_view', 'showcase_refine', 'showcase_search_changed',
+    'showcase_emails_off', 'showcase_emails_on', 'email_unsubscribed', 'review_left',
+    # Email tracking + engagement rules - client_email_service.
+    'email_opened', 'email_clicked', 'email_weekly', 'email_paused', 'email_resumed',
 ]
 LeadSourceFilter = Literal['all', 'open_house', 'form', 'showcase', 'website', 'tour']
-LeadSort = Literal['unrepresented_first', 'newest', 'oldest', 'name']
+# 'activity' = needs-you first, then most recent activity (the default). 'unrepresented_first' is
+# the old default, still accepted.
+LeadSort = Literal['activity', 'unrepresented_first', 'newest', 'oldest', 'name', 'warmth']
+# Where the person first came in (their first touch point) - the Leads page's "Came in from" filter.
+LeadOriginGroup = Literal['open_house', 'showcase', 'forms', 'listings', 'website', 'portal', 'review', 'other']
+
+
+class LeadMomentOut(BaseModel):
+    """One moment on a lead - how they came in, or the latest thing they did."""
+    type: str
+    label: str
+    at: datetime
+    group: Optional[str] = None
+    # Where they were before reaching out ("Scanned the QR under 22 Birch Ln at your open house...").
+    came_from: Optional[str] = None
+
+
+class LeadTodoOut(BaseModel):
+    """Something waiting on the agent for this lead: an open follow-up, or a request they haven't
+    handled (disclosure, showing, comment, search change...)."""
+    kind: str  # followup | disclosure | second_visit | showing | comment | refine | likes
+    label: str
+    href: Optional[str] = None
+    due_at: Optional[datetime] = None
+    all_day: bool = False
+    bucket: Optional[str] = None  # follow-ups: overdue | today | upcoming | someday
+    task_id: Optional[str] = None
+    # False = worth a look, not a must-do (they liked homes).
+    urgent: bool = True
+
+
+class LeadShowcaseOut(BaseModel):
+    id: str
+    name: Optional[str] = None
+    share_token: Optional[str] = None
+    home_count: int = 0
+    liked: int = 0
+    disliked: int = 0
+    new_matches: int = 0
+    last_active_at: Optional[datetime] = None
+    emails_on: bool = True
+    refine_message: Optional[str] = None
 
 
 class LeadEventOut(BaseModel):
@@ -23,6 +73,12 @@ class LeadEventOut(BaseModel):
     form_id: Optional[str] = None
     raw_snapshot: Optional[Dict[str, Any]] = None
     occurred_at: datetime
+    # The record it came from (form request / submission / visitor / tour / comment id).
+    source_id: Optional[str] = None
+    # Where this touch point is handled - {href, label, external?} (lead_routes._event_link).
+    link: Optional[Dict[str, Any]] = None
+    # Where they came from before reaching out (a Similar Homes QR at an open house, the Agent Hub...).
+    came_from: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -83,6 +139,9 @@ class LeadOut(BaseModel):
     showcase_new_matches: int = 0
     has_second_visit_request: bool = False
     has_disclosure_request: bool = False
+    # The newest still-open disclosure / second-visit request - deep links to exactly that one
+    # on the Open Houses page (/open-houses?request=<id>).
+    pending_request_id: Optional[str] = None
     has_tour_request: bool = False
     has_commented: bool = False
     has_liked_property: bool = False
@@ -95,6 +154,24 @@ class LeadOut(BaseModel):
     created_at: datetime
     last_contacted_at: Optional[datetime] = None
     hidden_at: Optional[datetime] = None
+    # How they first came in, and the latest thing they did (any kind).
+    origin: Optional[LeadMomentOut] = None
+    origin_group: LeadOriginGroup = 'other'
+    latest: Optional[LeadMomentOut] = None
+    # What's waiting on the agent (open follow-ups first, then unhandled requests).
+    todos: List[LeadTodoOut] = []
+    needs_you: bool = False
+    # They unsubscribed from all emails (Showcase updates no longer reach them).
+    unsubscribed: bool = False
+    # Emails we sent them + whether automatic ones go daily / weekly / not at all, and why
+    # (client_email_service.people). None = never emailed.
+    email_engagement: Optional[Dict[str, Any]] = None
+    # How active they are right now (lead_warmth.warmth): 0-100, recent activity counts most.
+    warmth: int = 0
+    warmth_level: str = 'cold'
+    # Much busier than their usual week (lead_warmth) - the moment to reach out.
+    heating_up: bool = False
+    warmth_reason: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -102,6 +179,12 @@ class LeadOut(BaseModel):
 
 class LeadDetailOut(LeadOut):
     events: List[LeadEventOut] = []
+    showcases: List[LeadShowcaseOut] = []
+
+
+class LeadHandleRequest(BaseModel):
+    """Mark one kind of waiting request handled (see LeadTodoOut.kind)."""
+    kind: str
 
 
 class LeadUpdate(BaseModel):

@@ -160,6 +160,15 @@ class CollectionPreferencesService:
             
         full_address = ", ".join(filter(None, address_parts))
 
+        # An open house saved without map coordinates (typed in by hand, say) would leave this
+        # search with no distance limit at all - look the home up in our listings instead.
+        oh_lat, oh_lng = original_open_house.latitude, original_open_house.longitude
+        if oh_lat is None or oh_lng is None:
+            coords = await coordinates_for(db, full_address or original_open_house.address, getattr(original_open_house, "listing_key", None))
+            if coords:
+                oh_lat, oh_lng = coords
+                original_open_house.latitude, original_open_house.longitude = coords
+
         preferences_data_dict = {
             "collection_id": collection_id,
             "min_beds": max(0, (original_open_house.bedrooms or 0) - 1) if original_open_house.bedrooms else 0,
@@ -168,8 +177,8 @@ class CollectionPreferencesService:
             "max_baths": 0,
             "min_price": int((original_open_house.price or 0) * 0.8) if original_open_house.price else 0,  # 20% less
             "max_price": int((original_open_house.price or 1000000) * 1.2) if original_open_house.price else 0,  # 20% more
-            "lat": original_open_house.latitude,
-            "long": original_open_house.longitude,
+            "lat": oh_lat,
+            "long": oh_lng,
             "address": full_address or original_open_house.address,
             "diameter": 6,
             "special_features": "",
@@ -271,3 +280,39 @@ class CollectionPreferencesService:
                 'preferences_updated': False,
                 'properties_refreshed': False
             }
+
+
+async def coordinates_for(db: AsyncSession, address: Optional[str], listing_key: Optional[str] = None):
+    """(lat, lng) for a home, from our own synced listings - by its MLS listing key, else by house
+    number + street + ZIP in the address. None when we can't place it. (No Google call: the
+    Geocoding API isn't reliable with the current key.)"""
+    from app.models.database import Property
+    try:
+        if listing_key:
+            p = (await db.execute(select(Property).where(Property.listing_key == listing_key))).scalars().first()
+            if p is not None and p.latitude is not None and p.longitude is not None:
+                return (p.google_rooftop_latitude or p.latitude, p.google_rooftop_longitude or p.longitude)
+        if address:
+            from app.api.lead_routes import _batch_match_properties
+            p = (await _batch_match_properties(db, [address])).get(address)
+            if p is not None and p.latitude is not None and p.longitude is not None:
+                return (p.google_rooftop_latitude or p.latitude, p.google_rooftop_longitude or p.longitude)
+    except Exception as e:
+        logger.warning(f"coordinates lookup failed for {address!r}: {e}")
+    return None
+
+
+async def fill_missing_coordinates(db: AsyncSession, preferences) -> bool:
+    """A search "within N miles of an address" with no coordinates silently searched EVERYWHERE
+    (the distance limit needs lat/long). Fill them in from our listings when we can. Caller commits."""
+    if preferences is None or not getattr(preferences, "address", None):
+        return False
+    if preferences.lat is not None and preferences.long is not None:
+        return False
+    coords = await coordinates_for(db, preferences.address)
+    if not coords:
+        return False
+    preferences.lat, preferences.long = coords
+    if not preferences.diameter:
+        preferences.diameter = 6
+    return True

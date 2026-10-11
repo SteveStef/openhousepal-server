@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, Text, ForeignKey, Table, Index, DateTime, Date, Time, UniqueConstraint
 from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
+from sqlalchemy.sql import func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from app.database import Base
 from typing import Optional
@@ -18,6 +18,21 @@ class HomeType(str, enum.Enum):
     RESIDENTIAL_LEASE = "RESIDENTIAL_LEASE"
     COMMERCIAL = "COMMERCIAL"
     OTHER = "OTHER"
+
+
+class PlanTier(str, enum.Enum):
+    """Five subscription tiers across two tracks. The Bright ladder is BASIC -> PREMIUM -> IDX
+    (see PLAN_TIER_RANK in app.utils.auth). NO_MLS and PRO_NO_MLS are a parallel track for
+    agents without Bright MLS coverage (manual data entry throughout) - neither has a ladder
+    rank and neither gets Bright MLS data. PRO_NO_MLS is NO_MLS plus Design Studio, Blogs and
+    the Studio AI Media tool. Feature access is checked by explicit capability set, not a
+    single rank comparison - see MLS_ACCESS_TIERS / STUDIO_DESIGN_ACCESS_TIERS /
+    STUDIO_MEDIA_ACCESS_TIERS in app.utils.auth."""
+    NO_MLS = "NO_MLS"
+    PRO_NO_MLS = "PRO_NO_MLS"
+    BASIC = "BASIC"
+    PREMIUM = "PREMIUM"
+    IDX = "IDX"
 
 # Association table for many-to-many relationship between collections and properties
 collection_properties = Table(
@@ -38,11 +53,28 @@ class User(Base):
     last_name = Column(String, nullable=False)
     state = Column(String, nullable=False)  # Agent's state
     brokerage = Column(String, nullable=False)  # Agent's brokerage
-    mls_id = Column(String, unique=True, index=True, nullable=False)  # Agent's MLS ID
+    mls_id = Column(String, unique=True, index=True, nullable=True)  # Agent's Bright MLS ID - NULL for agents outside Bright MLS
+    license_number = Column(String, nullable=True)  # Real-estate license # - how agents outside Bright MLS identify themselves
     broker_authorized = Column(Boolean, default=False, nullable=False)
+    # When True, only accepted OpenHouseTeamMembers may Request to Host this agent's listings.
+    # Default False = same-brokerage OpenHousePal agents (plus any accepted team member,
+    # regardless of brokerage) may request - see open_house_manager_service._is_eligible_requester.
+    restrict_host_requests_to_team = Column(Boolean, default=False, nullable=False, server_default='false')
     photo_url = Column(String, nullable=True)  # Uploaded headshot, served from /uploads
     professional_title = Column(String, nullable=True)  # e.g. "Real Estate Agent" - shown on Agent Hub + public forms
     market = Column(String, nullable=True)  # e.g. "Philly Main Line & Suburbs" - shown on Agent Hub + public forms
+    # Per-category notification opt-outs, shape {category: {"email": bool, "push": bool}}. NULL or a
+    # missing key = the default (everything on). The in-app bell is never suppressed by this - it
+    # only gates the email/push channels. See services/notification_preferences_service.py.
+    notification_prefs = Column(JSONB, nullable=True)
+    # Which automatic follow-up rules are switched OFF: {"<rule key>": false}. Missing key = the
+    # rule's default (on). See tasks_service.AUTO_FOLLOWUP_RULES.
+    followup_rules = Column(JSONB, nullable=True)
+    # Google colorId ('1'-'11') for follow-up events on the agent's calendar (None = '5', gold).
+    followup_color = Column(String, nullable=True)
+    # The one-time setup flow's own bookkeeping: {"last_step", "skipped": [...], "confirmed": [...]}.
+    # The answers themselves live where every feature reads them - see setup_flow_service.
+    setup_state = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     @property
@@ -53,20 +85,68 @@ class User(Base):
     subscription_id = Column(String, nullable=True, unique=True, index=True)  # PayPal subscription ID (unique to prevent hijacking)
     subscription_status = Column(String, default="TRIAL")  # TRIAL, ACTIVE, SUSPENDED, CANCELLED, EXPIRED
     plan_id = Column(String, nullable=True)  # PayPal plan ID (P-50796747... or P-4KN61644...)
-    plan_tier = Column(String, nullable=True)  # BASIC or PREMIUM
+    plan_tier = Column(String, nullable=True)  # NO_MLS, BASIC, PREMIUM, or IDX - see PlanTier enum above
     trial_ends_at = Column(DateTime(timezone=True), nullable=True)
+    # Last signed-in request (admin activity tracker; stamped at most every few minutes).
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)
+    # Paid for by their brokerage on a custom deal (admin "Brokerage groups"). The plan itself is
+    # still plan_tier/subscription_status (set by the admin, no PayPal subscription on the agent).
+    billing_group_id = Column(String, ForeignKey('billing_groups.id', ondelete='SET NULL'), nullable=True, index=True)
+    # The admin-made sign-up code this agent used at checkout (admin "Codes"), if any.
+    promo_code_id = Column(String, ForeignKey('promo_codes.id', ondelete='SET NULL'), nullable=True, index=True)
+    # When the one-time $500 IDX setup fee was paid or waived (a code, an admin plan). Set once -
+    # going onto IDX again later never charges it twice.
+    idx_setup_settled_at = Column(DateTime(timezone=True), nullable=True)
     subscription_started_at = Column(DateTime(timezone=True), nullable=True)
     last_billing_date = Column(DateTime(timezone=True), nullable=True)
     next_billing_date = Column(DateTime(timezone=True), nullable=True)  # For grace period after cancellation
     last_paypal_sync = Column(DateTime(timezone=True), nullable=True)  # Track when last synced with PayPal
+    # Set the moment an IDX agent agrees to the "everything moves to your IDX link" prompt (see
+    # /idx-domain-migration/agree). Gates that one-time modal - null means still needs to see it.
+    # Never cleared by a plan downgrade, so a re-upgrade to IDX doesn't re-show it.
+    idx_domain_migration_agreed_at = Column(DateTime(timezone=True), nullable=True)
+    # IDX: new QR codes and copied links use the agent's own domain (on) or openhousepal.com (off).
+    # Both addresses always work - this only picks which one we hand out. Settings -> IDX Domain.
+    links_use_own_domain = Column(Boolean, nullable=False, default=True, server_default='true')
+
+    # Opaque secret in the agent's private iCalendar (.ics) feed URL
+    # (/calendar/{calendar_feed_token}.ics). Lets Google / Outlook / Apple Calendar subscribe to
+    # this agent's OpenHousePal tasks and open houses read-only, with no OAuth. Rotatable from
+    # Settings (regenerating invalidates the old URL). NULL until the agent first opens the feed.
+    calendar_feed_token = Column(String, nullable=True, unique=True, index=True)
+
+    # --- CRM push (send leads OUT to the agent's real CRM) ------------------------------------
+    # OpenHousePal isn't meant to replace FollowUpBoss / Lofty / kvCORE - when on, every new lead
+    # is forwarded to whichever of these the agent set: a webhook URL (JSON POST) and/or that
+    # CRM's lead-parsing inbox (a formatted plain-text email those systems already know how to
+    # read). crm_last_push_* is just the "did the last one work" status shown in Settings.
+    crm_push_enabled = Column(Boolean, nullable=False, server_default='false', default=False)
+    crm_webhook_url = Column(String, nullable=True)
+    crm_parse_email = Column(String, nullable=True)
+    # Native Follow Up Boss push (their API key -> POST /v1/events). Server-side only.
+    crm_fub_api_key = Column(String, nullable=True)
+    # A human-readable heads-up computed from FUB's /v1/identity when the key is saved - e.g.
+    # "this is a team account, new leads route to the owner first". NULL = solo / owner / unknown.
+    crm_fub_account_note = Column(String, nullable=True)
+    crm_last_push_at = Column(DateTime(timezone=True), nullable=True)
+    crm_last_push_status = Column(String, nullable=True)
+
+    # --- Portal lead ingestion (pull leads IN from Zillow / Realtor.com / etc.) ---------------
+    # Opaque secret in the agent's unique inbound address (leads-<token>@<inbound domain>). The
+    # agent points each portal's lead-forwarding at that address; an inbound-email webhook parses
+    # the forwarded message into a real Lead. NULL until the agent first opens the Integrations
+    # section. Rotatable (regenerating invalidates the old address).
+    inbound_lead_token = Column(String, nullable=True, unique=True, index=True)
 
     # Relationships
     collections = relationship("Collection", back_populates="owner")
     notifications = relationship("Notification", back_populates="agent")
     discovery_preferences = relationship("DiscoveryPreferences", back_populates="user", uselist=False, cascade="all, delete-orphan")
     agent_hub = relationship("AgentHub", back_populates="owner", uselist=False, cascade="all, delete-orphan")
+    email_signature = relationship("EmailSignature", back_populates="owner", uselist=False, cascade="all, delete-orphan")
     agent_forms = relationship("AgentForm", back_populates="owner", cascade="all, delete-orphan")
     site = relationship("Site", back_populates="owner", uselist=False, cascade="all, delete-orphan")
+    tasks = relationship("AgentTask", back_populates="owner", cascade="all, delete-orphan")
 
 class AgentHub(Base):
     __tablename__ = "agent_hubs"
@@ -85,6 +165,28 @@ class AgentHub(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     owner = relationship("User", back_populates="agent_hub")
+
+class EmailSignature(Base):
+    """A condensed, email-safe "mini Agent Hub" the agent installs in Gmail/Outlook/Apple Mail.
+    Same page-builder-payload-as-JSONB shape as AgentHub.config (block order, field toggles,
+    template, banner settings) - a separate table rather than another AgentHub.config key because
+    it has its own install/HTML-generation lifecycle and its own public banner image endpoint,
+    unrelated to the Agent Hub's public slug page."""
+    __tablename__ = "email_signatures"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), unique=True, nullable=False)
+    config = Column(JSONB, nullable=False, server_default='{}')
+    # Opaque id embedded in the banner <img> src of an installed signature (public, unauthenticated
+    # endpoint - the whole point is it loads in recipients' inboxes). Not the owner's real user id,
+    # same "rotatable opaque token" idiom as calendar_feed_token/inbound_lead_token. NULL until the
+    # agent first opens Email Signature settings.
+    public_token = Column(String, nullable=True, unique=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    owner = relationship("User", back_populates="email_signature")
+
 
 class AgentForm(Base):
     __tablename__ = "agent_forms"
@@ -122,6 +224,34 @@ class AgentForm(Base):
     owner = relationship("User", back_populates="agent_forms")
     submissions = relationship("FormSubmission", back_populates="form", cascade="all, delete-orphan")
 
+
+class FormCampaign(Base):
+    """A separately-tracked link+QR for a premade form - never a copy of the form itself. "General"
+    (the form's default/original link) is NOT a row here; it's represented by campaign_id IS NULL
+    on FormViewSession/FormSubmission below, so every existing form's link stays byte-identical
+    with zero backfill. Soft-delete only (deleted_at) - a deleted campaign's token stops attributing
+    new traffic (falls back to General) but its historical sessions/submissions keep pointing at
+    this row forever, so past stats/leads stay visible under its real name."""
+    __tablename__ = "form_campaigns"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    form_id = Column(String, ForeignKey('agent_forms.id', ondelete='CASCADE'), nullable=False, index=True)
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    token = Column(String, nullable=False)  # opaque, appended as ?c={token} on the form's existing URL
+    # Where this campaign's visitors land after submitting. NULL = the form's own "Redirect to Agent
+    # Hub" switch; else 'agent_hub' | 'sales' (Sales & Listings page) | 'none' (stay on the
+    # thank-you screen) | 'custom' (redirect_url). See forms_service.normalize_campaign_redirect.
+    redirect_mode = Column(String(20), nullable=True)
+    redirect_url = Column(String(500), nullable=True)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('form_id', 'token', name='uq_form_campaigns_form_token'),
+    )
+
+
 class FormSubmission(Base):
     __tablename__ = "form_submissions"
 
@@ -135,6 +265,13 @@ class FormSubmission(Base):
     contact_phone = Column(String, nullable=True)
     property_address = Column(String, nullable=True)
     is_reviewed = Column(Boolean, default=False, nullable=False)
+    # NULL = General. Inherited from the visitor's FormViewSession at submit time (never
+    # re-resolved from a token passed fresh on submit) - see forms_routes.py submit_form.
+    campaign_id = Column(String, ForeignKey('form_campaigns.id', ondelete='SET NULL'), nullable=True, index=True)
+    # Schedule a Showing only: {listing_key, preferred: [{date, time}], note, confirmed_date,
+    # confirmed_time}. The visitor's form link reads it back (by submission id) to show the
+    # request as Pending until the agent confirms a time, then Confirmed.
+    showing = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     form = relationship("AgentForm", back_populates="submissions")
@@ -154,8 +291,29 @@ class FormViewSession(Base):
     furthest_question_id = Column(String, nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
     submission_id = Column(String, ForeignKey('form_submissions.id', ondelete='SET NULL'), nullable=True)
+    # NULL = General. Set once, only when this session row is first created (from the campaign
+    # token on that first progress ping) - never touched again for the life of the session. This
+    # is the single source of truth a submission's own campaign_id is inherited from.
+    campaign_id = Column(String, ForeignKey('form_campaigns.id', ondelete='SET NULL'), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    # ---- Insights (migration e7f4a0c3b2d6) - see forms_service.record_form_progress ----
+    # What they've answered so far, {question_id: value} - kept even if they never submit, so the
+    # agent can see unfinished responses. Cleared after UNFINISHED_RETENTION_DAYS.
+    partial_answers = Column(JSONB(none_as_null=True), nullable=True)
+    # Every question they landed on, in order: [{"q": question_id, "s": step, "t": iso}] (capped).
+    # Drives per-question drop-off on branching forms and time spent per question.
+    path = Column(JSONB(none_as_null=True), nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)        # first real question
+    last_activity_at = Column(DateTime(timezone=True), nullable=True)  # when they dropped off, if they did
+    source = Column(String, nullable=True)     # qr | link | website - first touch only
+    device = Column(String, nullable=True)     # mobile | tablet | desktop
+    referrer = Column(String, nullable=True)   # host only, e.g. instagram.com
+    contact_name = Column(String, nullable=True)
+    contact_email = Column(String, nullable=True)
+    contact_phone = Column(String, nullable=True)
+    dismissed_at = Column(DateTime(timezone=True), nullable=True)  # agent hid it from Unfinished
 
     __table_args__ = (
         UniqueConstraint('form_id', 'session_key', name='uq_form_view_sessions_form_session'),
@@ -220,9 +378,13 @@ class LeadEvent(Base):
     summary = Column(String, nullable=False)  # human-readable, e.g. "Signed in at Open House - 123 Main St"
 
     property_address = Column(String, nullable=True)
-    open_house_event_id = Column(String, ForeignKey('open_house_events.id'), nullable=True)
+    # All three source FKs are ON DELETE SET NULL: deleting the open house event, showcase, or
+    # form a lead came through nulls the pointer here (the lead + its history survive) rather
+    # than blocking the delete with an FK violation. See migrations a1c4e8b2d9f3 (collection_id)
+    # and f1a4c7e9b2d5 (open_house_event_id, form_id).
+    open_house_event_id = Column(String, ForeignKey('open_house_events.id', ondelete='SET NULL'), nullable=True)
     collection_id = Column(String, ForeignKey('collections.id', ondelete='SET NULL'), nullable=True)
-    form_id = Column(String, ForeignKey('agent_forms.id'), nullable=True)
+    form_id = Column(String, ForeignKey('agent_forms.id', ondelete='SET NULL'), nullable=True)
     raw_snapshot = Column(JSONB, nullable=True)  # form answers / message text, for detail view
 
     occurred_at = Column(DateTime(timezone=True), nullable=False)
@@ -259,6 +421,270 @@ class LeadNote(Base):
     open_house_event = relationship("OpenHouseEvent")
 
 
+class BillingGroup(Base):
+    """A brokerage paying for a group of its agents on a custom deal (invoiced via PayPal) - admin only."""
+    __tablename__ = "billing_groups"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, nullable=False)
+    brokerage = Column(String, nullable=True)
+    contact_name = Column(String, nullable=True)
+    contact_email = Column(String, nullable=True)
+    contact_phone = Column(String, nullable=True)
+    paypal_reference = Column(String, nullable=True)   # their PayPal invoice / recurring-invoice id
+    amount = Column(Float, nullable=True)              # what the brokerage pays per billing_cycle
+    billing_cycle = Column(String, nullable=False, server_default='monthly', default='monthly')  # monthly | quarterly | yearly
+    seats = Column(Integer, nullable=True)             # agents the deal covers (None = no set number)
+    plan_tier = Column(String, nullable=True)          # the plan its agents get
+    status = Column(String, nullable=False, server_default='active', default='active')  # active | paused | ended
+    started_on = Column(Date, nullable=True)
+    next_invoice_on = Column(Date, nullable=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class PromoCode(Base):
+    """An admin-made sign-up code, reusable until it's switched off, runs out of uses or expires.
+    'paypal_plan': checkout swaps in a special PayPal plan (e.g. IDX with no setup fee).
+    'billed_by_us': the account switches on with no PayPal at all - OpenHousePal bills them directly
+    at custom_price (kept for the admin's records)."""
+    __tablename__ = "promo_codes"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    code = Column(String, nullable=False, unique=True, index=True)  # stored upper-case
+    label = Column(String, nullable=True)                           # e.g. "Smith Team - no setup fee"
+    kind = Column(String, nullable=False)                           # paypal_plan | billed_by_us
+    plan_tier = Column(String, nullable=False)
+    paypal_plan_id = Column(String, nullable=True, index=True)
+    trial_days = Column(Integer, nullable=False, server_default='0', default=0)  # read from PayPal when saved
+    custom_price = Column(Float, nullable=True)
+    billing_cycle = Column(String, nullable=True)                   # monthly | quarterly | yearly
+    billing_group_id = Column(String, ForeignKey('billing_groups.id', ondelete='SET NULL'), nullable=True)
+    max_uses = Column(Integer, nullable=True)                       # None = unlimited
+    uses = Column(Integer, nullable=False, server_default='0', default=0)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    is_active = Column(Boolean, nullable=False, server_default='true', default=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class AgentActiveDay(Base):
+    """One row per agent per day they used the app (admin activity tracker)."""
+    __tablename__ = "agent_active_days"
+
+    user_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), primary_key=True)
+    day = Column(Date, primary_key=True)
+
+
+class AgentTask(Base):
+    """A to-do / follow-up reminder an agent works from the Leads page and the dashboard widget.
+    Optionally tied to a lead (so it shows on that lead's profile and can carry a suggested
+    outreach message). Some are created automatically - e.g. a next-day "follow up" task the
+    moment an open house sign-in creates or updates a lead (auto_source = 'open_house_signin').
+    Included in the agent's private .ics calendar feed."""
+    __tablename__ = "agent_tasks"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    # Optional link to the lead this follow-up is about. SET NULL so deleting a lead keeps the
+    # task (it just loses the shortcut back to a now-gone profile).
+    lead_id = Column(String, ForeignKey('leads.id', ondelete='SET NULL'), nullable=True, index=True)
+
+    title = Column(String, nullable=False)
+    notes = Column(Text, nullable=True)
+    # 'call' | 'text' | 'email' | 'showing' | 'general' - drives the icon and the .ics category.
+    kind = Column(String, nullable=False, default='general')
+    priority = Column(String, nullable=False, default='normal')   # 'low' | 'normal' | 'high'
+
+    due_at = Column(DateTime(timezone=True), nullable=True, index=True)  # NULL = someday / no date
+    # A whole-day task (no specific time) - the .ics feed emits it as an all-day VEVENT.
+    all_day = Column(Boolean, nullable=False, default=False)
+    remind_at = Column(DateTime(timezone=True), nullable=True, index=True)  # when to fire the in-app/notification reminder
+    reminder_sent_at = Column(DateTime(timezone=True), nullable=True)       # set once that reminder has fired, so it fires once
+
+    completed_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
+    # For auto-created tasks: what made it, so we never make a second one for the same trigger.
+    # e.g. 'open_house_signin'. NULL for tasks the agent added by hand.
+    auto_source = Column(String, nullable=True)
+    auto_source_id = Column(String, nullable=True, index=True)  # e.g. the open_house_event_id
+
+    # A ready-to-send draft outreach message (SMS/email body) the agent can copy. For open-house
+    # follow-ups this is templated now; a later pass swaps in an AI-written version.
+    suggested_message = Column(Text, nullable=True)
+    # One short line saying WHY this follow-up exists ("Signed in at your open house - 12 Oak St"),
+    # shown on the task card so the agent knows what the touch point was without opening notes.
+    context = Column(String, nullable=True)
+    # Short secret behind the one-tap "Mark as done" link in the calendar event (/d/<code>).
+    done_code = Column(String, nullable=True, unique=True, index=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (
+        # One auto task per (owner, source, source id) - the guard behind "don't make a second
+        # follow-up if the same guest signs in again at the same open house".
+        UniqueConstraint('owner_id', 'auto_source', 'auto_source_id', name='uq_agent_tasks_auto_dedup'),
+        Index('ix_agent_tasks_owner_open', 'owner_id', 'completed_at'),
+    )
+
+    owner = relationship("User", back_populates="tasks")
+    lead = relationship("Lead")
+
+
+class MailConnection(Base):
+    """An agent's own mailbox (Gmail or Outlook) that their GUEST emails are sent from - Showcase
+    invites, tour confirmations, Spotlight alerts... - so they arrive from the agent's real address
+    instead of OpenHousePal's. One per agent. Agent-only alerts never use it. If sending through it
+    fails for any reason the email goes out through OpenHousePal instead (agent_mailbox_service)."""
+    __tablename__ = "mail_connections"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, unique=True, index=True)
+    provider = Column(String, nullable=False)  # google | microsoft
+    account_email = Column(String, nullable=True)
+    access_token = Column(Text, nullable=True)
+    refresh_token = Column(Text, nullable=True)
+    token_expiry = Column(DateTime(timezone=True), nullable=True)
+    scopes = Column(String, nullable=True)
+    # The agent's switch: guest emails go from this mailbox (on) or from OpenHousePal (off).
+    enabled = Column(Boolean, nullable=False, default=True, server_default='true')
+    # ok | needs_reconnect (the provider refused our token - sending paused, OpenHousePal sends)
+    status = Column(String, nullable=False, default='ok', server_default='ok')
+    last_error = Column(Text, nullable=True)
+    last_sent_at = Column(DateTime(timezone=True), nullable=True)
+    # Per-day count, so we stay well under Gmail/Outlook sending limits (then OpenHousePal sends).
+    sent_day = Column(String, nullable=True)
+    sent_count = Column(Integer, nullable=False, default=0, server_default='0')
+    total_sent = Column(Integer, nullable=False, default=0, server_default='0')
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class ClientEmail(Base):
+    """One email an agent's client was sent (Showcase invite / digest, tour confirmation, Spotlight
+    alert...) - whether it went from the agent's own mailbox or OpenHousePal - with its open and
+    click tracking. The id is also the tracking token in the pixel / link addresses
+    (client_email_service). Agents see these on the Emails page and in each lead's history."""
+    __tablename__ = "client_emails"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    recipient_email = Column(String, nullable=False)   # normalized (lowercased/trimmed)
+    template = Column(String, nullable=False)
+    subject = Column(String, nullable=False, default='')
+    # auto = a recurring automatic update (daily / weekly digest, Spotlight listing alert) - the kind
+    # the engagement rules slow down or stop; personal = a reply to something they did or the agent did.
+    kind = Column(String, nullable=False, default='personal')
+    via = Column(String, nullable=True)                # mailbox | openhousepal
+    status = Column(String, nullable=False, default='sending')  # sending | sent | failed
+    links = Column(JSONB, nullable=True)               # {"collection_link": "https://..."} - where tracked links go
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    opened_at = Column(DateTime(timezone=True), nullable=True)
+    open_count = Column(Integer, nullable=False, default=0, server_default='0')
+    clicked_at = Column(DateTime(timezone=True), nullable=True)
+    click_count = Column(Integer, nullable=False, default=0, server_default='0')
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (Index('ix_client_emails_owner_recipient_sent', 'owner_id', 'recipient_email', 'sent_at'),)
+
+
+class ClientEmailPref(Base):
+    """Per agent + client: whether automatic emails go out daily, weekly or not at all, and why.
+    `mode` is the last state the rules worked out (kept so a change can be announced once);
+    `manual` is the agent's own choice ("off" stays off; "on" restarts the count)."""
+    __tablename__ = "client_email_prefs"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    email = Column(String, nullable=False)
+    mode = Column(String, nullable=False, default='daily', server_default='daily')  # daily | weekly | off
+    reason = Column(Text, nullable=True)
+    manual = Column(String, nullable=True)             # None | off
+    reset_at = Column(DateTime(timezone=True), nullable=True)   # count unopened emails only after this
+    changed_at = Column(DateTime(timezone=True), nullable=True)
+    last_weekly_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (UniqueConstraint('owner_id', 'email', name='uq_client_email_prefs_owner_email'),)
+
+
+class CalendarConnection(Base):
+    """One agent's connection to an external calendar (Google now; `provider` leaves room for
+    Microsoft). We hold the OAuth tokens and the id of a dedicated "OpenHousePal" secondary
+    calendar we create in their account - the calendar.app.created scope only lets us manage
+    events on a calendar we made, never their existing ones."""
+    __tablename__ = "calendar_connections"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    provider = Column(String, nullable=False, server_default='google', default='google')
+    access_token = Column(Text, nullable=True)
+    refresh_token = Column(Text, nullable=True)
+    token_expiry = Column(DateTime(timezone=True), nullable=True)
+    calendar_id = Column(String, nullable=True)      # the OHP secondary calendar in their account
+    account_email = Column(String, nullable=True)    # which Google account connected
+    scopes = Column(String, nullable=True)
+    last_sync_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('owner_id', 'provider', name='uq_calendar_connections_owner_provider'),
+    )
+
+    owner = relationship("User")
+    event_links = relationship("CalendarEventLink", back_populates="connection", cascade="all, delete-orphan")
+
+
+class CalendarEventLink(Base):
+    """Maps one OHP task / scheduled open house to the event we created for it in the connected
+    calendar, so an edit or delete updates the right event instead of making duplicates."""
+    __tablename__ = "calendar_event_links"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    connection_id = Column(String, ForeignKey('calendar_connections.id', ondelete='CASCADE'), nullable=False, index=True)
+    kind = Column(String, nullable=False)            # 'task' | 'open_house'
+    source_id = Column(String, nullable=False)
+    external_event_id = Column(String, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('connection_id', 'kind', 'source_id', name='uq_calendar_event_links_src'),
+    )
+
+    connection = relationship("CalendarConnection", back_populates="event_links")
+
+
+class AgentReview(Base):
+    """A client review collected through the agent's public review link. Shown on the Agent Hub.
+    When the rating is high the public flow also nudges the reviewer to re-post it on Google /
+    Zillow (deep link + their text on the clipboard) - those destinations are configured in
+    Settings and stored on AgentHub.config.reviews, not here."""
+    __tablename__ = "agent_reviews"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+
+    reviewer_name = Column(String, nullable=False)
+    reviewer_email = Column(String, nullable=True)   # optional - lets the agent follow up / thank them
+    rating = Column(Integer, nullable=False)         # 1-5
+    body = Column(Text, nullable=False)
+
+    source = Column(String, nullable=False, default='direct')      # 'direct' (our form) - room for imports later
+    status = Column(String, nullable=False, default='published')   # 'published' | 'hidden'
+    # Set once the reviewer confirmed they also posted it on that external site (best-effort, from
+    # the public flow's "I posted it" button) - purely informational for the agent.
+    posted_google_at = Column(DateTime(timezone=True), nullable=True)
+    posted_zillow_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    owner = relationship("User")
+
+
 class DigestDismissal(Base):
     """An agent manually dismissing one Daily Digest "needs attention" item (see
     ai_insights_service.get_daily_digest) without leaving the Dashboard. item_id is the same
@@ -285,11 +711,11 @@ class Collection(Base):
     share_token = Column(String, unique=True, nullable=True)
     is_public = Column(Boolean, default=True)
     status = Column(String, default="ACTIVE", nullable=False)  # ACTIVE, INACTIVE
-    
+
     # Notification Settings
     notify_visitor = Column(Boolean, default=True, nullable=False)
     notify_agent = Column(Boolean, default=True, nullable=False)
-    
+
     # Anonymous visitor info (for open house collections)
     visitor_email = Column(String, nullable=True)
     visitor_name = Column(String, nullable=True)
@@ -322,20 +748,47 @@ class Collection(Base):
     property_comments = relationship("PropertyComment", back_populates="collection", cascade="all, delete-orphan")
     property_tours = relationship("PropertyTour", back_populates="collection", cascade="all, delete-orphan")
 
+class PriceHistoryParcel(Base):
+    """A parcel whose 2012+ Bright listings the history backfill has pulled (and when)."""
+    __tablename__ = "price_history_parcels"
+
+    tax_id = Column(String, primary_key=True)
+    checked_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    listings_found = Column(Integer, nullable=True)
+
+
+class PropertyPriceEvent(Base):
+    """One price or status change the MLS sync saw on a listing (see property_sync_service
+    _upsert_property). Bright only sends a listing's latest change, so this log is what lets the
+    price history show every cut - from the day it was added on."""
+    __tablename__ = "property_price_events"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    listing_key = Column(String, nullable=False)
+    observed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    kind = Column(String, nullable=False)  # 'listed' | 'price' | 'status'
+    price = Column(Float, nullable=True)
+    previous_price = Column(Float, nullable=True)
+    status = Column(String, nullable=True)
+    previous_status = Column(String, nullable=True)
+
+    __table_args__ = (Index('ix_property_price_events_listing_key', 'listing_key', 'observed_at'),)
+
+
 class Property(Base):
     __tablename__ = "properties"
-    
+
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     listing_key = Column(String, unique=True, index=True, nullable=False)
     listing_id = Column(String, nullable=True) # MLS Number
-    
+
     # Basic property info
     street_address = Column(String, nullable=False)
     unparsed_address = Column(String, nullable=True)
     city = Column(String, index=True, nullable=False)
     state = Column(String, index=True, nullable=False)
     zipcode = Column(String, index=True, nullable=True)
-    
+
     # Property details
     price = Column(Float, index=True, nullable=True)
     bedrooms = Column(Float, index=True, nullable=True)
@@ -343,10 +796,10 @@ class Property(Base):
     living_area = Column(Float, index=True, nullable=True)
     lot_size = Column(Float, nullable=True)
     home_status = Column(String, index=True, nullable=False)
-    
+
     # Standardized type for application logic
     home_type = Column(String, index=True, nullable=True)
-    
+
     # Raw MLS data for precise filtering and reference
     mls_property_type = Column(String, index=True, nullable=True) # e.g., 'Residential'
     mls_structure_design_type = Column(String, index=True, nullable=True) # e.g., 'Interior Row/Townhouse'
@@ -369,13 +822,13 @@ class Property(Base):
     google_rooftop_longitude = Column(Float, nullable=True)
     google_geocode_location_type = Column(String, nullable=True)
     google_geocoded_at = Column(DateTime(timezone=True), nullable=True)
-    
+
     img_src = Column(String, nullable=True)
 
     # Narrative & Media
     description = Column(Text, nullable=True)
     photos = Column(JSONB, nullable=True)  # List of URL strings
-    
+
     # Listing Agent & Office
     list_agent_full_name = Column(String, nullable=True)
     list_agent_email = Column(String, nullable=True)
@@ -392,7 +845,7 @@ class Property(Base):
     foundation_details = Column(JSONB, nullable=True)
     structure_type = Column(JSONB, nullable=True)
     levels = Column(JSONB, nullable=True)
-    
+
     # Interior & Features
     interior_features = Column(JSONB, nullable=True)
     exterior_features = Column(JSONB, nullable=True)
@@ -402,61 +855,61 @@ class Property(Base):
     fireplace_features = Column(JSONB, nullable=True)
     door_features = Column(JSONB, nullable=True)
     window_features = Column(JSONB, nullable=True)
-    
+
     # Utilities & Systems
     cooling = Column(JSONB, nullable=True)
     heating = Column(JSONB, nullable=True)
     water_source = Column(JSONB, nullable=True)
     sewer = Column(JSONB, nullable=True)
     utilities = Column(JSONB, nullable=True)
-    
+
     # Parking
     garage_spaces = Column(Float, nullable=True)
     parking_features = Column(JSONB, nullable=True)
     has_garage = Column(Boolean, nullable=True)
-    
+
     # Community & HOA
     association_fee = Column(Float, nullable=True)
     association_fee_frequency = Column(String, nullable=True)
     association_amenities = Column(JSONB, nullable=True)
     association_fee_includes = Column(JSONB, nullable=True)
     has_association = Column(Boolean, nullable=True)
-    
+
     # Lot & Location
     lot_features = Column(JSONB, nullable=True)
     view = Column(JSONB, nullable=True)
     waterfront_features = Column(JSONB, nullable=True)
     has_waterfront_view = Column(Boolean, nullable=True)
     has_view = Column(Boolean, nullable=True)
-    
+
     # Tax & Financial
     tax_annual_amount = Column(Float, nullable=True)
     tax_year = Column(Integer, nullable=True)
-    
+
     # Dates
     year_built = Column(Integer, index=True, nullable=True)
     mls_list_date = Column(DateTime(timezone=True), nullable=True)
     price_change_timestamp = Column(DateTime(timezone=True), nullable=True)
-    
+
     # Education
     elementary_school = Column(String, nullable=True)
     middle_or_junior_school = Column(String, nullable=True)
     high_school = Column(String, nullable=True)
     school_district_name = Column(String, index=True, nullable=True)
-    
+
     # Neighborhood & Location
     county = Column(String, index=True, nullable=True)
     township = Column(String, index=True, nullable=True)
     subdivision_name = Column(String, index=True, nullable=True)
     directions = Column(Text, nullable=True)
     zoning = Column(String, nullable=True)
-    
+
     # Financials (More detail)
     tax_assessment_amount = Column(Float, nullable=True)
     assessment_year = Column(Integer, nullable=True)
     possession = Column(JSONB, nullable=True)
     listing_tax_id = Column(String, nullable=True)
-    
+
     # Detailed Features
     cooling_fuel = Column(JSONB, nullable=True)
     heating_fuel = Column(JSONB, nullable=True)
@@ -464,30 +917,30 @@ class Property(Base):
     below_grade_finished_area = Column(Float, nullable=True)
     basement = Column(JSONB, nullable=True)
     accessibility_features = Column(JSONB, nullable=True)
-    
+
     # Booleans
     has_basement = Column(Boolean, nullable=True)
     has_central_air = Column(Boolean, nullable=True)
     has_fireplace = Column(Boolean, nullable=True)
-    
+
     # More Financials
     association_fee_2 = Column(Float, nullable=True)
     association_fee_2_frequency = Column(String, nullable=True)
-    
+
     # More Agent Info
     list_agent_preferred_phone = Column(String, nullable=True)
-    
+
     lot_size_acres = Column(Float, nullable=True)
     attached_garage_yn = Column(Boolean, nullable=True)
     new_construction_yn = Column(Boolean, nullable=True)
     senior_community_yn = Column(Boolean, nullable=True)
     pets_allowed = Column(JSONB, nullable=True)
-    
+
     # Listing Intelligence
     original_list_price = Column(Float, nullable=True)
     days_on_market = Column(Integer, index=True, nullable=True)
     cumulative_days_on_market = Column(Integer, nullable=True)
-    
+
     # Structure
     stories = Column(Float, nullable=True)
 
@@ -502,14 +955,24 @@ class Property(Base):
     mls_open_house_date = Column(Date, nullable=True)
     mls_open_house_start_time = Column(Time, nullable=True)
     mls_open_house_end_time = Column(Time, nullable=True)
+    # Every upcoming Bright open house slot (a listing can have several - Sat + Sun, next
+    # weekend). The three columns above stay as the soonest one. Shape + merge rules live in
+    # app/services/mls_open_houses.py.
+    mls_open_houses = Column(JSONB(none_as_null=True), nullable=True)
 
     # Relationships
     collections = relationship("Collection", secondary=collection_properties, back_populates="properties")
 
     __table_args__ = (
         Index('ix_properties_city_state', 'city', 'state'),
+        Index('ix_properties_listing_tax_id', 'listing_tax_id'),
         Index('ix_properties_lat_long', 'latitude', 'longitude'),
         Index('ix_properties_status_price', 'home_status', 'price'),
+        # Agent sale matching (content_adapters._agent_sale_identifier_filters) - migration f6a9d2c4b8e1
+        Index('ix_properties_raw_buyer_agent_mls_id', text("(raw_mls_data ->> 'BuyerAgentMlsId')")),
+        Index('ix_properties_raw_co_buyer_agent_mls_id', text("(raw_mls_data ->> 'CoBuyerAgentMlsId')")),
+        Index('ix_properties_raw_list_agent_mls_id', text("(raw_mls_data ->> 'ListAgentMlsId')")),
+        Index('ix_properties_raw_co_list_agent_mls_id', text("(raw_mls_data ->> 'CoListAgentMlsId')")),
     )
 
 
@@ -527,7 +990,7 @@ class OpenHouseEvent(Base):
     cover_image_position = Column(JSONB, nullable=True)  # {x, y} crop offset (%) for the Sign In sheet cover photo
     cheat_sheet_photos = Column(JSONB, nullable=True)  # Agent-selected photos for the Open House Cheat Sheet PDF
     cheat_sheet_snapshot = Column(JSONB, nullable=True)  # Frozen Cheat Sheet PDF payload created with the kit.
-    
+
     # Property metadata (replaces property_id relationship)
     address = Column(String, nullable=True)
     abbreviated_address = Column(String, nullable=True)
@@ -563,6 +1026,25 @@ class OpenHouseEvent(Base):
     # Default theme for the on-screen Sign-In Sheet/Kiosk guests see when they scan this open
     # house's QR code (or the agent leaves a tablet running it) - does not affect the printed flyer.
     qr_dark_mode = Column(Boolean, default=True, nullable=False)
+    # Hosting-agent-controlled, per kit. Off by default: the listing agent (when different from the
+    # host) always sees basic anonymous performance (see get_listing_detail), but never actual guest
+    # name/email/phone unless the host explicitly turns this on for this specific open house.
+    share_guests_with_listing_agent = Column(Boolean, default=False, nullable=False, server_default='false')
+    # Build a Showcase (and its invite email) for each guest who signs in without an agent. On by
+    # default; a listing agent sitting their own listing can turn it off so guests aren't sent off
+    # to other homes. A guest who scans the Similar Homes sheet's "see more like these" QR asked
+    # for other homes, so they still get one.
+    auto_showcase = Column(Boolean, default=True, nullable=False, server_default='true')
+    # Bright MLS plans: after signing in, the guest's phone opens their Guest Pass for this open
+    # house (the home, its Similar Homes + Cheat Sheet as web pages, one-tap disclosure / second
+    # tour requests, their Showcase) - app/api/guest_pass_routes.py. On by default.
+    guest_pass = Column(Boolean, default=True, nullable=False, server_default='true')
+    # Guest Pass footer: the host's Email Signature card (site version) in place of the plain agent
+    # card - on by default; only shows when the plan has signatures and one is saved.
+    pass_signature = Column(Boolean, default=True, nullable=False, server_default='true')
+    # No-MLS Pro plan (no Guest Pass - it has no Similar Homes / Cheat Sheet / Showcases): "hub"
+    # sends the guest to the agent's Agent Hub after signing in; NULL / "none" = nothing.
+    after_signin = Column(String, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -888,6 +1370,105 @@ class Notification(Base):
     agent = relationship("User", back_populates="notifications")
     collection = relationship("Collection")
 
+class SupportTicket(Base):
+    __tablename__ = "support_tickets"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    agent_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+
+    subject = Column(String, nullable=False)
+    status = Column(String, nullable=False, default='open', index=True)  # 'open' | 'closed'
+    # What the agent picked before writing: 'support' (a question), 'bug' (something broke) or
+    # 'feature' (an idea). Tickets from before the picker existed read as 'support'.
+    category = Column(String, nullable=False, default='support', server_default='support', index=True)
+    # Context captured quietly at submission (page they came from, browser/device/screen, urgency) -
+    # shown to the admin beside the thread. See support_routes._clean_details for the allowed keys.
+    details = Column(JSONB, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    # Per-viewer read tracking - a ticket is "unread" for a viewer when updated_at is newer than
+    # their own last-read stamp and the newest message wasn't sent by that same viewer.
+    agent_last_read_at = Column(DateTime(timezone=True), nullable=True)
+    admin_last_read_at = Column(DateTime(timezone=True), nullable=True)
+
+    agent = relationship("User")
+    messages = relationship("SupportTicketMessage", backref="ticket", cascade="all, delete-orphan", order_by="SupportTicketMessage.created_at")
+
+
+class SupportTicketMessage(Base):
+    __tablename__ = "support_ticket_messages"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    ticket_id = Column(String, ForeignKey('support_tickets.id', ondelete='CASCADE'), nullable=False, index=True)
+
+    sender_type = Column(String, nullable=False)  # 'agent' | 'admin'
+    body = Column(Text, nullable=False)
+    attachments = Column(JSONB, nullable=True)  # screenshot URLs (support-screenshots/ in S3), up to 3
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PublicQuestion(Base):
+    """A one-off question from a signed-out homepage visitor ("Ask Us a Question") - just an
+    email + message, no account and no threaded conversation (there's no user to notify back, so
+    unlike SupportTicket this is a one-way inbox the admin reads and marks handled, not a two-way
+    thread). Kept in its own admin tab, separate from agents' own SupportTicket inbox."""
+    __tablename__ = "public_questions"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    email = Column(String, nullable=False)
+    message = Column(Text, nullable=False)
+    is_read = Column(Boolean, nullable=False, default=False)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class SavedManualProperty(Base):
+    """An agent's personal library of properties they've typed in by hand (e.g. via the Forms
+    'Enter it manually' picker) so they can re-attach the same property elsewhere without
+    retyping it. This is intentionally decoupled from Property/is_manual (Open House Manager's
+    'My Listings') and Agent Hub's recentSales config array - saving here never creates a real
+    listing or sale; the agent still has to add it there deliberately for it to show up as one."""
+    __tablename__ = "saved_manual_properties"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    agent_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+
+    address = Column(String, nullable=False)
+    city = Column(String, nullable=True)
+    state = Column(String, nullable=True)
+    zipcode = Column(String, nullable=True)
+    price = Column(Float, nullable=True)
+    beds = Column(Float, nullable=True)
+    baths = Column(Float, nullable=True)
+    sqft = Column(Float, nullable=True)
+    image_url = Column(String, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class LoginRateLimit(Base):
+    """Sliding-window failed-login counters for /auth/login, keyed by either the attempted
+    email or the client IP - see login_rate_limit_service.py for the two very different
+    thresholds each scope uses and why. One row per (scope, identifier); attempts/window_started_at
+    reset together once the window ages out, same pattern as SignupVerification's rate limit."""
+    __tablename__ = "login_rate_limits"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    scope = Column(String, nullable=False)  # 'email' | 'ip'
+    identifier = Column(String, nullable=False)  # lowercased email, or client IP string
+
+    attempts = Column(Integer, nullable=False, default=0)
+    window_started_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('scope', 'identifier', name='uq_login_rate_limit_scope_identifier'),
+    )
+
+
 class ScheduledEmail(Base):
     __tablename__ = "scheduled_emails"
 
@@ -896,17 +1477,20 @@ class ScheduledEmail(Base):
     subject = Column(String, nullable=False)
     template_name = Column(String, nullable=False)
     template_variables = Column(JSONB, nullable=False)
-    
+    # The agent whose guest this is - lets a guest email go out from the agent's own mailbox
+    # (MailConnection) when they've connected one. NULL = not a guest email / sent by OpenHousePal.
+    owner_id = Column(String, ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+
     # Status tracking
     status = Column(String, default="PENDING", index=True)  # PENDING, SENT, FAILED
-    
+
     # Scheduling
     scheduled_for = Column(DateTime(timezone=True), nullable=False, index=True)
     sent_at = Column(DateTime(timezone=True), nullable=True)
-    
+
     # Error tracking
     error_message = Column(Text, nullable=True)
-    
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -1017,7 +1601,7 @@ class DiscoveryPreferences(Base):
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, unique=True)
-    
+
     landmark_address = Column(String, nullable=True)
     miles = Column(Float, nullable=True)
     latitude = Column(Float, index=True, nullable=True)
@@ -1054,6 +1638,12 @@ class OpenHouseHostRequest(Base):
     listing_owner_agent_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     requesting_agent_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
 
+    # Client-generated id shared across multiple slots offered in one "Request to Host" submission
+    # (e.g. "Offer a Second Open") - null for a plain single-slot request. Lets notifications/badge
+    # counts treat those slots as one ask while each row here still stays independently
+    # approvable/declinable - see open_house_manager_service.create_host_request/get_action_counts.
+    group_id = Column(String, nullable=True, index=True)
+
     requested_date = Column(Date, nullable=False)
     requested_start_time = Column(Time, nullable=False)
     requested_end_time = Column(Time, nullable=False)
@@ -1086,13 +1676,43 @@ class OpenHouseHostRequest(Base):
     open_house_event = relationship("OpenHouseEvent")
 
 
+class OpenHouseHostRequestEvent(Base):
+    """Append-only audit trail for one OpenHouseHostRequest - one row per action taken on it
+    (requested, countered, counter-accepted/declined, approved, declined, a plain note). Powers
+    the request's visible history/thread. The parent row's own fields (status, counter_*,
+    requested_*) remain the fast-path "current state" used everywhere else - this table only
+    exists so the full back-and-forth is never lost."""
+    __tablename__ = "open_house_host_request_events"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    request_id = Column(String, ForeignKey('open_house_host_requests.id', ondelete='CASCADE'), nullable=False, index=True)
+    actor_id = Column(String, ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+
+    # requested | countered | counter_accepted | counter_declined | approved | declined | note
+    action = Column(String, nullable=False)
+    proposed_date = Column(Date, nullable=True)
+    proposed_start_time = Column(Time, nullable=True)
+    proposed_end_time = Column(Time, nullable=True)
+    note = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    request = relationship("OpenHouseHostRequest")
+    actor = relationship("User", foreign_keys=[actor_id])
+
+
 class OpenHouseTeamMember(Base):
     __tablename__ = "open_house_team_members"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     member_agent_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    # pending -> accepted|declined. New invites start pending and need the invited agent's
+    # acceptance; existing rows created before this column existed are grandfathered in as
+    # 'accepted' via the column's server_default, so already-established teams keep working.
+    status = Column(String, default="accepted", nullable=False, server_default="accepted", index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    responded_at = Column(DateTime(timezone=True), nullable=True)
 
     owner = relationship("User", foreign_keys=[owner_id])
     member_agent = relationship("User", foreign_keys=[member_agent_id])
@@ -1110,15 +1730,26 @@ class OpenHouseTeamBroadcast(Base):
     owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
 
     requested_date = Column(Date, nullable=False)
-    requested_start_time = Column(Time, nullable=False)
-    requested_end_time = Column(Time, nullable=False)
+    # Null when is_anytime is set - the owner doesn't care what time, so nothing to store until
+    # whoever accepts picks one (see respond_to_broadcast).
+    requested_start_time = Column(Time, nullable=True)
+    requested_end_time = Column(Time, nullable=True)
     message = Column(Text, nullable=True)
+    is_anytime = Column(Boolean, default=False, nullable=False)
 
     status = Column(String, default="open", nullable=False, index=True)  # open, filled, cancelled
+
+    # When set, this is a direct 1:1 ask to one specific OpenHousePal agent (Manager > Manage Hosts
+    # "Direct Request") rather than a fan-out to the whole My Team - reuses the exact same
+    # open/filled/cancelled + atomic-claim-or-counter machinery as a team broadcast (see
+    # respond_to_broadcast) instead of a separate flow, and doesn't require the target to be a
+    # team member. Null = a normal team-wide broadcast.
+    target_agent_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=True, index=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     owner = relationship("User", foreign_keys=[owner_id])
+    target_agent = relationship("User", foreign_keys=[target_agent_id])
 
 
 class OpenHouseListingNote(Base):
@@ -1172,7 +1803,10 @@ class DesignProject(Base):
     owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
 
     design_type = Column(String, nullable=False)  # e.g. 'just_listed_flyer', 'instagram_post'
-    template_id = Column(String, nullable=False)
+    style_id = Column(String, nullable=False)  # visual style, e.g. 'modern_luxury' - renamed from template_id
+    template_id = Column(String, nullable=True)  # layout/template variant chosen at creation (Situation+Format+Template)
+    situation = Column(String, nullable=True, index=True)  # e.g. 'just_listed', 'open_house' - set once at creation
+    color_mode = Column(String, nullable=True)  # 'light' | 'dark' | 'brand' - independent of style_id
     name = Column(String, nullable=False)
     status = Column(String, default="DRAFT", nullable=False)  # DRAFT, READY, EXPORTED, PUBLISHED, ARCHIVED
 
@@ -1180,12 +1814,88 @@ class DesignProject(Base):
     blocks = Column(JSONB, nullable=False, default=list)  # ordered list of structured content blocks
     branding_mode = Column(String, default="personal", nullable=False)  # personal | team | brokerage | none
 
-    campaign_id = Column(String, nullable=True, index=True)  # groups co-generated campaign assets
+    campaign_id = Column(String, ForeignKey('form_campaigns.id', ondelete='SET NULL'), nullable=True, index=True)  # the real Form Campaign this design's QR/link tracks, if any
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     owner = relationship("User")
+
+
+class ListingBlurb(Base):
+    """The short "about this home" lines a Studio design prints (door hanger, flyer, postcard...),
+    one per agent per listing. Written once by AI from the MLS remarks (cheap model, ~0.1 cent),
+    then every later design for that home reuses it - and an agent's own edit replaces it, so the
+    next design brings their wording over. `key` = the MLS listing key, else the normalized address."""
+    __tablename__ = "listing_blurbs"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    key = Column(String, nullable=False)
+    text = Column(Text, nullable=False)
+    source = Column(String, nullable=False, default="ai")  # ai | agent (edited by the agent)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (UniqueConstraint('owner_id', 'key', name='uq_listing_blurbs_owner_key'),)
+
+
+class StudioMediaAsset(Base):
+    """One AI Property Media generation (or regeneration) - Studio's AutoReel-style tool. The
+    source photo is only ever referenced by URL and never mutated; each run is a new row. All
+    versions produced from the same (source photo + action) share `group_id`, which drives the
+    history rail; `parent_asset_id` records the exact version a regenerate came from.
+
+    Image actions (twilight/lights_on/virtual_staging/enhance) resolve synchronously via OpenAI
+    gpt-image-2 and land as status="succeeded". `animate` is async: the row is created
+    status="processing" with a Runway `provider_job_id`, then flipped by poll_asset() once
+    Runway finishes. See app/services/studio_media_service.py."""
+    __tablename__ = "studio_media_assets"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+
+    group_id = Column(String, nullable=False, index=True)  # all versions from one (source photo + action)
+    parent_asset_id = Column(String, ForeignKey('studio_media_assets.id', ondelete='SET NULL'), nullable=True)
+
+    kind = Column(String, nullable=False)  # 'image' | 'video'
+    action = Column(String, nullable=False)  # 'twilight' | 'lights_on' | 'virtual_staging' | 'enhance' | 'animate'
+    status = Column(String, default="processing", nullable=False)  # 'processing' | 'succeeded' | 'failed'
+
+    source_photo_url = Column(String, nullable=False)  # untouched original (MLS URL or uploaded studio-media/...)
+    source_kind = Column(String, nullable=False)  # 'listing' | 'upload'
+    linked_property = Column(JSONB, nullable=True)  # snapshot, same shape as DesignProject.linked_property; null for non-MLS tiers
+    options = Column(JSONB, nullable=True)  # {room_type, style} / {enhancements: [...]} / {motion}
+
+    provider = Column(String, nullable=True)  # 'openai' | 'runway'
+    provider_model = Column(String, nullable=True)  # 'gpt-image-2' | 'gen4.5'
+    provider_job_id = Column(String, nullable=True)  # Runway task id (video only)
+
+    result_url = Column(String, nullable=True)  # S3 URL of the generated image/video
+    error_message = Column(String, nullable=True)
+    prompt = Column(Text, nullable=True)  # exact prompt sent (audit/debug, mirrors cma_ai_service)
+    prompt_version = Column(String, nullable=True)
+    cost_usd = Column(Float, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    owner = relationship("User")
+
+
+class StorageItem(Base):
+    """One row per media file an agent uploads or generates across the whole app - AI Media,
+    Design Studio, Blogs, brand logos, manual listing photos, agent/sale photos. The single
+    source of truth for an agent's total stored bytes (see storage_ledger_service). Keyed by
+    S3 URL so a delete anywhere can release it by URL."""
+    __tablename__ = "storage_items"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    category = Column(String, nullable=False)  # ai_media_image | ai_media_video | ai_media_upload | design | blog | brand_logo | listing_photo | agent_photo | agent_sale_photo
+    s3_url = Column(String, nullable=False, unique=True, index=True)
+    size_bytes = Column(BigInteger, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class Blog(Base):
@@ -1202,6 +1912,7 @@ class Blog(Base):
     cover_image_url = Column(String, nullable=True)
     category = Column(String, nullable=True)
     tags = Column(JSONB, nullable=False, default=list)
+    theme = Column(String, nullable=True)  # the article's look: luxe (default when null), editorial, modern, midnight, luxe_plus (Luxe - IDX only)
 
     blocks = Column(JSONB, nullable=False, default=list)  # ordered list of structured content blocks
     linked_properties = Column(JSONB, nullable=False, default=list)  # list of property snapshots
@@ -1216,6 +1927,11 @@ class Blog(Base):
 
     agent_hub_visible = Column(Boolean, default=True, nullable=False)
     agent_hub_featured = Column(Boolean, default=False, nullable=False)
+    idx_visible = Column(Boolean, default=True, nullable=False, server_default='true')  # shows on the agent's IDX website
+    luxe_metal = Column(String, nullable=True)  # Luxe theme finish: gold (default) / silver / bronze
+    linked_areas = Column(JSONB, nullable=False, default=list, server_default='[]')  # IDX neighborhood pages the article links (area slugs) - see services/blog_neighborhoods.py
+    use_signature_card = Column(Boolean, default=True, nullable=False, server_default='true')  # end the article with the agent's Email Signature card (when their plan has it) instead of the small contact card
+    ai_review = Column(JSONB, nullable=True)  # AI pipeline's Verified report (ai_blog_pipeline_service) - private to the agent
 
     scheduled_at = Column(DateTime(timezone=True), nullable=True)
     published_at = Column(DateTime(timezone=True), nullable=True)
@@ -1259,6 +1975,11 @@ class Site(Base):
     # real DNS name, unlike e.g. Blog.slug which only needs to be unique per owner.
     subdomain_slug = Column(String, unique=True, index=True, nullable=False)
     status = Column(String, nullable=False, default="DRAFT")  # DRAFT | PUBLISHED - has this site ever gone live, not content freshness
+    # The agent's own on/off switch (Settings -> IDX Website; asked right after an IDX purchase).
+    # Off = the public IDX site isn't served at all and every generated link falls back to
+    # openhousepal.com - for agents who already have a website of their own. Independent of
+    # `status` so turning it back on restores the exact published site.
+    is_enabled = Column(Boolean, nullable=False, default=True, server_default='true')
 
     # draft_data and published_snapshot share one shape ({"pages": [...], "theme": {...}}) so
     # publishing is a cheap copy, not a transform. The public renderer only ever reads
@@ -1304,6 +2025,82 @@ class SiteDomain(Base):
 
     site = relationship("Site", back_populates="domains")
     redirect_target = relationship("SiteDomain", remote_side=[id])
+
+
+# ---------------------------------------------------------------------------
+# Single Property Websites: one standalone cinematic marketing site per listing,
+# many per owner (unlike Site above, which is one whole-agent website). Publishes at its own
+# <slug>.OHP_BASE_DOMAIN subdomain - see domain_resolution_service.resolve_property_hostname -
+# and, once an owner has a verified custom domain on their Site, under a /listings/<slug> path
+# there too. Deliberately reuses Site's draft/published-snapshot split (site_service.publish_site)
+# rather than inventing a different publish model.
+# ---------------------------------------------------------------------------
+
+class PropertyWebsite(Base):
+    __tablename__ = "property_websites"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+
+    # The real listing this was generated from, when it came from Bright MLS / My Listings - null
+    # for a manually-entered property (mirrors AgentForm.linked_property's own manual-entry case).
+    # Never re-joined against Property at render time: property_snapshot below is the single
+    # source of truth a published site reads, so it keeps working even after the listing sells,
+    # expires, or is removed from sync.
+    listing_key = Column(String, nullable=True, index=True)
+
+    template_id = Column(String, nullable=False, default="cinematic_luxury")
+
+    # The <slug> in <slug>.OHP_BASE_DOMAIN - a global namespace shared with Site.subdomain_slug
+    # (see property_website_service._unique_property_slug, which checks both tables), since both
+    # are real DNS names under the same base domain and must never collide.
+    slug = Column(String, unique=True, index=True, nullable=False)
+    status = Column(String, nullable=False, default="DRAFT")  # DRAFT | PUBLISHED
+
+    # Wide snapshot of the source property at creation time - address/price/beds/baths/features/
+    # photos/agent info/etc, far wider than the slim LinkedProperty shape used elsewhere, since the
+    # cinematic template shows categorized features, school district, county, etc. Frozen at
+    # creation; an agent can refresh it manually later if the underlying listing changed.
+    property_snapshot = Column(JSONB, nullable=False, default=dict)
+
+    # draft_data / published_snapshot share one shape (hero image, photo order, description
+    # override, featured amenities, video asset id, floor plans, documents, agents, open house
+    # overrides, colors, section visibility) - same cheap-copy-to-publish split as Site above.
+    draft_data = Column(JSONB, nullable=False, default=dict)
+    published_snapshot = Column(JSONB, nullable=False, default=dict)
+
+    published_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    owner = relationship("User")
+
+    __table_args__ = (
+        Index('ix_property_websites_owner_id_status', 'owner_id', 'status'),
+    )
+
+
+class PropertyWebsiteView(Base):
+    """One row per public visit to a published Spotlight site - backs the visitor stats shown
+    on the Listing Spotlight Pages list (unique visitors + total visits, per site and overall).
+
+    visitor_id is the soft per-browser `ohp_vid` cookie (see public_nearby_shared.visitor_device_id),
+    so "unique visitors" counts distinct browsers, not raw page loads. The agent viewing their own
+    published site is kept out entirely - the frontend beacon never fires when the page was opened
+    from Studio (an owner_ref marker persisted in that browser), so no owner row is ever written.
+    Rows are deduped to roughly one per (site, visitor) per 30 min in property_website_service.record_view,
+    so total_views reads as visits, not refreshes.
+    """
+    __tablename__ = "property_website_views"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    property_website_id = Column(String, ForeignKey('property_websites.id', ondelete='CASCADE'), nullable=False, index=True)
+    visitor_id = Column(String, nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    __table_args__ = (
+        Index('ix_property_website_views_site_visitor', 'property_website_id', 'visitor_id'),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1388,6 +2185,32 @@ class MarketArea(Base):
     agents = relationship("AgentMarketArea", back_populates="area", cascade="all, delete-orphan")
 
 
+class SpotlightAlertSubscription(Base):
+    """A guest who asked a Listing Spotlight page to "tell me about price changes and open
+    houses". One row per (site, email). The daily check (spotlight_alerts_service) compares the
+    live price / upcoming open houses with what this guest was last told and emails only real
+    changes. `token` is the one-click unsubscribe key; unsubscribed rows are kept (never re-added
+    by a repeat sign-up without the guest asking again)."""
+    __tablename__ = "spotlight_alert_subscriptions"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    property_website_id = Column(String, ForeignKey('property_websites.id', ondelete='CASCADE'), nullable=False, index=True)
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    lead_id = Column(String, nullable=True)
+    email = Column(String, nullable=False)
+    name = Column(String, nullable=True)
+    token = Column(String, nullable=False, unique=True, default=lambda: uuid.uuid4().hex)
+    last_price = Column(Float, nullable=True)
+    last_state = Column(JSONB, nullable=True)  # {"status", "open_houses": [ids]} as last told to this guest
+    last_notified_at = Column(DateTime(timezone=True), nullable=True)
+    unsubscribed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index('ux_spotlight_alert_site_email', 'property_website_id', 'email', unique=True),
+    )
+
+
 class AgentMarketArea(Base):
     """One agent's claim that they serve a given MarketArea - drives which community pages
     (/villanova-pa) exist on that agent's site. Never owns or duplicates the area's data."""
@@ -1436,10 +2259,21 @@ class CmaReport(Base):
     # column is metadata only, not a duplicate copy of the content.
     ai_analysis = Column(JSONB, nullable=True)
 
+    # In-flight "Create AI Analysis" / recompute tracking - lets a GET (list or detail) tell the
+    # difference between "no analysis yet" and "an analysis is running right now in another
+    # request", so a client that navigated away mid-generation and comes back (or never left, on
+    # the list page) can show the generating state again instead of looking idle. Set at the start
+    # of the request, cleared at the end - see cma_service.mark_generation_started/_finished.
+    generation_status = Column(String, nullable=True, index=True)  # None | 'generating' | 'complete' | 'failed'
+    generation_started_at = Column(DateTime(timezone=True), nullable=True)
+
     # Public share link - opaque slug, distinct from the DB id so a shared link can't be used to
     # probe/enumerate reports. Nullable until the agent first shares. The agent keeps editing the
     # same report after sharing (no snapshot/freeze), so the link always reflects the latest state.
     share_slug = Column(String, unique=True, index=True, nullable=True)
+    # Web version of the shared report ends with the agent's Email Signature card (plans with
+    # signatures, when one is saved) - the PDF keeps its own footer. On by default.
+    use_signature_card = Column(Boolean, default=True, nullable=False, server_default='true')
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -1605,6 +2439,20 @@ class ExploreNearbyCache(Base):
     cache_key = Column(String, nullable=False, unique=True, index=True)
     payload = Column(JSONB, nullable=False)
     fetched_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class SharedKnowledge(Base):
+    """Researched, sourced facts that aren't about one town - e.g. scope "state:PA" holds
+    Pennsylvania-wide facts (realty transfer tax, PHFA programs, disclosure rules, the latest
+    Freddie Mac rate). Researched once, reused by every agent's articles (and any other product)
+    for free until each item's topic shelf life runs out - see town_knowledge_service. Town-level
+    facts live on MarketArea.facts["evidence_bank"] instead."""
+    __tablename__ = "shared_knowledge"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    scope = Column(String, nullable=False, unique=True, index=True)
+    items = Column(JSONB, nullable=False, default=list)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
 class AIRealtimeSession(Base):

@@ -50,12 +50,16 @@ class PropertyUpdate(BaseModel):
 class PropertySummary(PropertyBase):
     id: str
     price: Optional[float] = Field(None, alias="ListPrice")
+    original_list_price: Optional[float] = Field(None, alias="OriginalListPrice")
+    price_change_timestamp: Optional[datetime] = Field(None, alias="PriceChangeTimestamp")
     bedrooms: Optional[float] = Field(None, alias="BedroomsTotal")
     bathrooms: Optional[float] = Field(None, alias="BathroomsTotal")
     living_area: Optional[float] = Field(None, alias="LivingArea")
+    lot_size: Optional[float] = Field(None, alias="LotSizeSquareFeet")
     home_type: Optional[str] = Field(None, alias="PropertyType")
     home_status: Optional[str] = Field(None, alias="MlsStatus")
     img_src: Optional[str] = Field(None, alias="ListPictureURL")
+    school_district_name: Optional[str] = Field(None, alias="SchoolDistrictName")
 
 class Property(PropertyBase):
     id: str

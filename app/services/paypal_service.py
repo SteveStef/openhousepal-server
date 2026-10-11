@@ -75,6 +75,19 @@ class PayPalService:
 
             return response.json()
 
+    async def get_plan(self, plan_id: str) -> dict:
+        """Raw PayPal billing plan (billing cycles, setup fee) - what PayPal will really charge."""
+        token = await self.get_token()
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self._base_url}/v1/billing/plans/{plan_id}",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                timeout=30.0,
+            )
+            if response.status_code != 200:
+                raise Exception(f"Failed to get plan: {response.status_code} - {response.text}")
+            return response.json()
+
     async def create_subscription(self, plan_id: str) -> dict:
         """
         Create a PayPal subscription.
@@ -123,7 +136,7 @@ class PayPalService:
 
             return response.json()
 
-    async def create_subscription_with_urls(self, plan_id: str, return_url: str, cancel_url: str) -> dict:
+    async def create_subscription_with_urls(self, plan_id: str, return_url: str, cancel_url: str, start_time: str = None) -> dict:
         """
         Create a PayPal subscription with custom return URLs.
 
@@ -157,6 +170,9 @@ class PayPalService:
                 "cancel_url": cancel_url
             }
         }
+        if start_time:
+            # First monthly charge on this date (a one-time setup fee is still charged right away).
+            data["start_time"] = start_time
 
         async with httpx.AsyncClient() as client:
             response = await client.post(
