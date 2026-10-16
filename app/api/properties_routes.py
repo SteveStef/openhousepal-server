@@ -460,9 +460,10 @@ async def search_properties_by_address(
             )
         )
         if active_only:
-            # Literally "active" - not Coming Soon (not yet showable, so an open house can't be
-            # hosted for it anyway), Pending/Under Contract, or Closed/Off Market.
-            stmt = stmt.where(clean_status == "ACTIVE")
+            # For-sale homes: Active and Coming Soon (an agent preps the kit for a Coming Soon
+            # listing's first open house - user, 10/16). Never Pending/Under Contract, Closed or
+            # Off Market.
+            stmt = stmt.where(clean_status.in_(["ACTIVE", "COMING SOON"]))
         if exclude_rentals:
             stmt = stmt.where(Property.mls_property_type.notilike("%Lease%"))
         # The address they typed comes first - "252 Highland Ave" must find 252 HIGHLAND AVE, WAYNE
