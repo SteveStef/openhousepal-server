@@ -292,14 +292,16 @@ async def rotate_inbound_address(
 
 def _frontend_settings_url(status: str, back: str = "settings") -> str:
     base = (os.getenv("CLIENT_URL") or "http://localhost:3000").rstrip("/")
+    # Setup opens the sign-in in its own tab (setup is never interrupted) - that tab lands on a small
+    # "connected" page that tells setup and closes itself.
     if back == "mail-setup":
-        return f"{base}/setup?step=mailbox&mailbox={status}"
+        return f"{base}/settings/connected?what=email&status={status}"
     if back == "mail-settings":
         return f"{base}/studio/integrations?mailbox={status}#send-as"
     if back == "mail-emails":
         return f"{base}/leads/emails?tab=sender&mailbox={status}"
     if back == "setup":
-        return f"{base}/setup?step=calendar&calendar={status}"
+        return f"{base}/settings/connected?what=calendar&status={status}"
     return f"{base}/settings?calendar={status}#calendar"
 
 

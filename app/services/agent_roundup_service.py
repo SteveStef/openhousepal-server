@@ -11,6 +11,7 @@ with a single UPDATE ... WHERE status = <queued>, so a restart or a second worke
 Same approach as the Showcase daily digest (showcase_digest_service)."""
 from __future__ import annotations
 
+import re
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
@@ -40,9 +41,14 @@ def _cap_words(name: Optional[str]) -> str:
     return " ".join(w[:1].upper() + w[1:] for w in (name or "").split())
 
 
-def nice_street(v: Optional[str]) -> str:
-    """MLS streets arrive in capitals ("20-30 W ALLENS LN #105") - "20-30 W Allens Ln #105"."""
-    v = (v or "").strip()
+def nice_street(v: Optional[str], city: Optional[str] = None) -> str:
+    """MLS streets arrive in capitals ("20-30 W ALLENS LN #105") - "20-30 W Allens Ln #105". Some also
+    carry the town, state and ZIP on the end ("846-850  Mt. Pleasant BRYN MAWR PA 19010") - that
+    tail and doubled spaces go, so an email subject reads "846-850 Mt. Pleasant"."""
+    v = re.sub(r"\s+", " ", (v or "").strip())
+    v = re.sub(r"[\s,]+[A-Za-z]{2}[\s,]+\d{5}(?:-\d{4})?$", "", v)       # " PA 19010" / ", PA, 19010"
+    if city and v.lower().endswith(" " + city.strip().lower()):
+        v = v[: -len(city.strip())].rstrip(" ,")                         # " BRYN MAWR"
     return v.title() if v and v == v.upper() else v
 
 
@@ -90,7 +96,7 @@ def queue_like(db: AsyncSession, agent: User, collection, prop, image: Optional[
         return
     _queue(db, LIKES_QUEUED, agent.email, f"likes:{agent.id}", agent.id, LIKES_TEMPLATE, {
         "_collection_id": collection.id, "_client": _cap_words(collection.visitor_name) or "A client",
-        "_listing": str(prop.id), "street_address": nice_street(prop.street_address), "city": (prop.city or "").title(),
+        "_listing": str(prop.id), "street_address": nice_street(prop.street_address, prop.city), "city": (prop.city or "").title(),
         "state": prop.state or "", "image": image or "", "price": f"${price:,.0f}" if price else "",
     })
 

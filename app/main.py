@@ -345,6 +345,31 @@ class PublicCORSMiddleware:
 app.add_middleware(PublicCORSMiddleware)
 
 
+from fastapi import HTTPException as _HTTPException
+from fastapi.exception_handlers import http_exception_handler as _default_http_handler
+
+
+@app.exception_handler(_HTTPException)
+async def provider_failure_handler(request: Request, exc: _HTTPException):
+    """502 / 503 = something only OpenHousePal can fix (an AI provider out of credit or down, a key or
+    setting missing). Agents never see why (user, 10/15) - they get one calm message, and the real
+    reason goes to the admin's bell + Discord (admin_alerts). Every other status passes through."""
+    if exc.status_code in (502, 503):
+        from app.services.admin_alerts import AGENT_MESSAGE, alert_admin
+        owner_id = None
+        try:
+            from app.utils.auth import verify_token
+            auth = request.headers.get("authorization") or ""
+            owner_id = verify_token(auth.split(" ", 1)[1]) if auth.lower().startswith("bearer ") else None
+        except Exception:  # noqa: BLE001
+            owner_id = None
+        area = (request.url.path.strip("/").split("/") + [""])[0] or "api"
+        await alert_admin(area, str(exc.detail)[:160], f"{request.method} {request.url.path} returned {exc.status_code}: {exc.detail}",
+                          owner_id=owner_id, path=request.url.path)
+        return JSONResponse(status_code=exc.status_code, content={"detail": AGENT_MESSAGE}, headers=getattr(exc, "headers", None))
+    return await _default_http_handler(request, exc)
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     # Without this, an unhandled exception is caught by Starlette's default

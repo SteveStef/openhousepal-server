@@ -378,11 +378,13 @@ DEFAULT_SIGNATURE_CONFIG: dict[str, Any] = {
         "tiktok": {"include": False},
     },
     "ctaButtons": [],
-    "blockVisibility": {"banner": False},
+    # Listings & sales and stats both start on (user, 10/15) - mirrors DEFAULT_SIGNATURE_CONFIG in
+    # frontend/lib/signatureConfig.ts. Each only shows once there's something behind it.
+    "blockVisibility": {"banner": True},
     "banner": {
         "showFeaturedListing": True,
         "showRecentSales": True,
-        "showStats": False,
+        "showStats": True,
     },
     "accentColor": DEFAULT_ACCENT,
     "fontFamily": "system",
@@ -690,6 +692,9 @@ def pick_featured_items(agent_hub_config: dict, show_listing: bool, show_sales: 
     if pool and pool[0] == "listing":
         listings = pool[1]
         return ("listing", [listings[_epoch_day_index() % len(listings)]])
+    # 1-2 sales: the featured-listing strip (one still, or two flipping) - see render_sale_feature.
+    if pool and pool[0] == "sale" and len(pool[1]) < _SALE_MINI_COUNT:
+        return ("sale_feature", pool[1])
     return pool
 
 
@@ -1608,6 +1613,52 @@ async def render_listing_bar_gif(item: dict, accent_hex: str = DEFAULT_ACCENT, d
     return _frames_to_gif(frames, duration_ms=90, hold_ms=2200, colors=220, dither=False)
 
 
+_SALE_FLIP_HOLD_MS = 4000
+_SALE_FLIP_FADE_FRAMES = 3
+_SALE_FLIP_FADE_MS = 70
+
+
+async def render_sale_feature(items: list[dict], accent_hex: str = DEFAULT_ACCENT, dark: bool = False, luxe: bool = False) -> tuple[bytes, str]:
+    """An agent with only 1 or 2 recent sales (no listing) - the 3-slot mini strip left one or two
+    slots empty, so these get the featured-listing strip instead (user, 10/15): one sale is that
+    strip as a still JPEG; two flip between each other (a looping GIF - a soft fade, then each
+    held a few seconds). Same size and URL as the featured-listing strip, so the installed HTML
+    never changes between a listing, one sale and two. Clients that don't animate GIFs (classic
+    desktop Outlook) show the first frame - the newest sale, a complete strip on its own.
+    Returns (bytes, media type)."""
+    from PIL import Image
+    if len(items) < 2:
+        return await render_listing_bar_jpeg(items[0], accent_hex, dark=dark, luxe=luxe), "image/jpeg"
+    # 1.25x, not the JPEG's 2x: an animated photo GIF has no inter-frame compression - this keeps
+    # both homes sharp on a phone at a weight an email signature can carry.
+    w, h = round(_LISTING_BAR_DISPLAY_W * 1.25), round(_LISTING_BAR_DISPLAY_H * 1.25)
+    stills = []
+    for item in items[:2]:
+        photo = None
+        if item.get("image"):
+            raw = await _fetch_image(item["image"])
+            if raw is not None:
+                photo = _cover_crop(raw, round(_LISTING_PHOTO_DISPLAY_W * 1.25 * 1.03), h)
+        stills.append(_compose_listing_bar_frame(photo, accent_hex, item, pan_t=0.0, w=w, h=h, dark=dark, luxe=luxe).convert("RGB"))
+    a, b = stills
+    # A slide, not a fade - a fade ghosts two addresses and prices over each other mid-way.
+    frames, durations = [a], [_SALE_FLIP_HOLD_MS]
+    for src, dst in ((a, b), (b, a)):
+        for i in range(1, _SALE_FLIP_FADE_FRAMES + 1):
+            t = i / (_SALE_FLIP_FADE_FRAMES + 1)
+            off = round(w * (1 - (1 - t) ** 3))  # ease-out
+            f = Image.new("RGB", (w, h))
+            f.paste(src, (-off, 0))
+            f.paste(dst, (w - off, 0))
+            frames.append(f)
+            durations.append(_SALE_FLIP_FADE_MS)
+        frames.append(dst)
+        durations.append(_SALE_FLIP_HOLD_MS)
+    frames.pop()  # the loop comes back to `a` by itself
+    durations.pop()
+    return _frames_to_looping_gif(frames, durations, colors=236, dither=False), "image/gif"
+
+
 def _mini_card_geometry(w: int, h: int) -> tuple[int, int, int, int, int, float, int]:
     scale = h / _LISTING_BAR_DISPLAY_H
     pad = round(_SALE_MINI_PAD_DISPLAY * scale)
@@ -2352,7 +2403,8 @@ def wants_stats(cfg: dict) -> bool:
     """Not module-private (no leading underscore) - the stats.png route needs this same check
     before rendering the live stats image, not just _build_gallery deciding whether to reserve the
     column for it."""
-    return bool(cfg["blockVisibility"].get("banner") and cfg["banner"].get("showStats"))
+    # Its own switch - stats show even with the listings & sales strip off (user, 10/15).
+    return bool(cfg["banner"].get("showStats"))
 
 
 def side_column_content_height(cfg: dict, hub: dict, owner: User) -> int:
@@ -2372,7 +2424,9 @@ def side_column_content_height(cfg: dict, hub: dict, owner: User) -> int:
     featured = _featured(cfg, hub)
     if featured:
         featured_mode, _ = featured
-        h += _LISTING_MARGIN_TOP + (_SALE_MINI_BAR_DISPLAY_H if featured_mode != "listing" else _LISTING_BAR_DISPLAY_H)
+        h += _LISTING_MARGIN_TOP + (_SALE_MINI_BAR_DISPLAY_H if featured_mode == "sale" else _LISTING_BAR_DISPLAY_H)
+    elif stats_as_strip(cfg, hub):
+        h += _LISTING_MARGIN_TOP + _STATS_STRIP_DISPLAY_H
     return h
 
 
@@ -2637,6 +2691,101 @@ async def render_stats_webp(stats: dict, accent_hex: str, dark_theme: bool = Fal
     return buffer.getvalue()
 
 
+# The main column beside the icon rail, minus its padding (no stats column in this mode).
+_STATS_STRIP_DISPLAY_W, _STATS_STRIP_DISPLAY_H = 610, 58
+
+
+async def _compose_stats_strip(stats: dict, accent_hex: str, dark_theme: bool = False):
+    """Stats with the listings & sales strip switched off (user, 10/15: stats must work on their
+    own): the right-hand stats column is taller than a card with no strip, so the same numbers
+    sit in a slim strip where the listing would be - "MY STATS" then Volume / Closed / Avg pills
+    side by side, white on the stats column's own accent gradient (left to right here)."""
+    from PIL import Image, ImageDraw
+
+    true_scale, scale = _STATS_IMG_SCALE, _STATS_IMG_SCALE * _STATS_SUPERSAMPLE
+    w, h = round(_STATS_STRIP_DISPLAY_W * scale), round(_STATS_STRIP_DISPLAY_H * scale)
+    light, deep = _stats_gradient_stops(accent_hex)
+    a, b = _hex_to_rgb(light), _hex_to_rgb(deep)
+    grad = Image.new("RGB", (w, 1))
+    for x in range(w):
+        t = x / max(1, w - 1)
+        grad.putpixel((x, 0), tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3)))
+    canvas = grad.resize((w, h)).convert("RGBA")
+    draw = ImageDraw.Draw(canvas)
+    white = (255, 255, 255, 255)
+    border = (*_hex_to_rgb(_mix_hex(accent_hex, "#FFFFFF", 0.35)), 255)
+    pill_bg = (*_hex_to_rgb(_mix_hex(accent_hex, "#FFFFFF", 0.16)), 255)
+    from PIL import ImageFilter
+    # Soft shadows on their own layer (the stats column's embossed look), crisp text on top.
+    shade = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    shade_draw = ImageDraw.Draw(shade)
+    texts: list = []
+
+    def text(xy, s, font, fill=white):
+        shade_draw.text((xy[0], xy[1] + round(1.5 * scale)), s, font=font, fill=(0, 0, 0, 120))
+        texts.append((xy, s, font, fill))
+
+    head_font, value_font, label_font = _inter_font(11 * scale, 800), _inter_font(17 * scale, 900), _inter_font(8.5 * scale, 800)
+    pad = round(12 * scale)
+    # "MY STATS" with the short underline mark the column's header uses
+    hb = draw.textbbox((0, 0), "MY STATS", font=head_font)
+    mark_w, mark_h = round(14 * scale), max(1, round(2 * scale))
+    head_h = (hb[3] - hb[1]) + round(6 * scale) + mark_h
+    hy = (h - head_h) / 2
+    text((pad - hb[0], hy - hb[1]), "MY STATS", head_font)
+    my = hy + (hb[3] - hb[1]) + round(6 * scale)
+    draw.rounded_rectangle((pad, my, pad + mark_w, my + mark_h), radius=mark_h / 2, fill=white)
+
+    cells = [("VOLUME", _fmt_compact_money(stats["totalVolume"])), ("CLOSED", str(stats["totalSold"])), ("AVG PRICE", _fmt_compact_money(stats["avgPrice"]))]
+    cells = [(lbl, v) for lbl, v in cells if v]
+    left = pad + (hb[2] - hb[0]) + round(18 * scale)
+    gap = round(8 * scale)
+    pill_w = (w - pad - left - gap * (len(cells) - 1)) / max(1, len(cells))
+    py0, py1 = round(8 * scale), h - round(8 * scale)
+    for i, (lbl, v) in enumerate(cells):
+        x0 = left + i * (pill_w + gap)
+        draw.rounded_rectangle((x0, py0, x0 + pill_w, py1), radius=round(9 * scale), outline=border, fill=pill_bg, width=max(1, round(scale / 2)))
+        vb = draw.textbbox((0, 0), v, font=value_font)
+        lb = draw.textbbox((0, 0), lbl, font=label_font)
+        block = (vb[3] - vb[1]) + round(4 * scale) + (lb[3] - lb[1])
+        top = py0 + ((py1 - py0) - block) / 2
+        text((x0 + (pill_w - (vb[2] - vb[0])) / 2 - vb[0], top - vb[1]), v, value_font)
+        text((x0 + (pill_w - (lb[2] - lb[0])) / 2 - lb[0], top + (vb[3] - vb[1]) + round(4 * scale) - lb[1]), lbl, label_font)
+    canvas = Image.alpha_composite(canvas, shade.filter(ImageFilter.GaussianBlur(round(2 * scale))))
+    draw = ImageDraw.Draw(canvas)
+    for xy, s, font, fill in texts:
+        draw.text(xy, s, font=font, fill=fill)
+    draw.rounded_rectangle((pad, my, pad + mark_w, my + mark_h), radius=mark_h / 2, fill=white)
+    return canvas.resize((round(_STATS_STRIP_DISPLAY_W * true_scale), round(_STATS_STRIP_DISPLAY_H * true_scale)), Image.LANCZOS).convert("RGB")
+
+
+async def render_stats_strip_png(stats: dict, accent_hex: str, dark_theme: bool = False) -> bytes:
+    canvas = await _compose_stats_strip(stats, accent_hex, dark_theme=dark_theme)
+    buffer = BytesIO()
+    canvas.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
+def _stats_strip_html(accent: str, asset_base: str, href: str = "") -> str:
+    """The stats strip's chrome - same rounded, accent-edged frame as the listing strip around one
+    live image (stats-strip.png), so new sales show without a re-paste."""
+    w, h = _STATS_STRIP_DISPLAY_W, _STATS_STRIP_DISPLAY_H
+    light, _ = _stats_gradient_stops(accent)
+    img = (f'<img src="{asset_base}/stats-strip.png" width="{w}" height="{h}" alt="My sales stats" '
+           f'style="display:block;width:100%;max-width:{w}px;height:auto;border:0;" />')
+    cell = f'<a href="{_esc(href)}" style="display:block;line-height:0;">{img}</a>' if href else img
+    return (
+        f'<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="{w}" bgcolor="{light}" '
+        f'style="width:100%;max-width:{w}px;background-color:{light};border:1px solid {accent};border-radius:10px;overflow:hidden;">'
+        f'<tr><td style="padding:0;line-height:0;">{cell}</td></tr></table>'
+    )
+
+
+def stats_as_strip(cfg: dict, hub: dict) -> bool:
+    """Stats on, nothing in the listings & sales strip -> the stats strip takes its place."""
+    return wants_stats(cfg) and _featured(cfg, hub) is None and compute_sales_stats(hub) is not None
+
+
 def _stats_gradient_stops(accent: str) -> tuple[str, str]:
     """Light-to-dark accent stops (top to bottom) for the stats column - shared by the column's
     <td> background AND its <img>, computed once so both layers stay pixel-identical with no seam
@@ -2845,7 +2994,7 @@ def _build_gallery(cfg: dict, hub: dict, owner: User, redirect_base_url: str, as
     featured = _featured(cfg, hub)
     if featured:
         featured_mode, _ = featured
-        if featured_mode == "listing":
+        if featured_mode in ("listing", "sale_feature"):
             # The "smart QR" link, resolved by the caller (email_signature_routes.py) via
             # property_website_service.resolve_listing_link before this HTML is built: the
             # agent's own published Listing Spotlight for this exact property when they have
@@ -2869,18 +3018,22 @@ def _build_gallery(cfg: dict, hub: dict, owner: User, redirect_base_url: str, as
         # at the old destination until the agent re-pasted. `listing_link_override` is no longer
         # needed here (kept in the signature for callers).
         banner_href = f"{redirect_base_url}/featured" if redirect_base_url else ""
-        banner_html = _listing_bar_html(accent, banner_border, asset_base, banner_href, card_bg=card_bg, dark=bool(cfg.get("darkMode")), sales_header=featured_mode != "listing")
+        banner_html = _listing_bar_html(accent, banner_border, asset_base, banner_href, card_bg=card_bg, dark=bool(cfg.get("darkMode")), sales_header=featured_mode == "sale")
         below_parts.append(f'<div style="margin-top:{_LISTING_MARGIN_TOP}px;">{banner_html}</div>')
+    strip = (not featured) and stats_as_strip(cfg, hub)
+    if strip:
+        strip_href = f"{redirect_base_url}/sales" if redirect_base_url else ""
+        below_parts.append(f'<div style="margin-top:{_LISTING_MARGIN_TOP}px;">{_stats_strip_html(accent, asset_base, strip_href)}</div>')
 
     body_html = "".join(below_parts)
 
     # Knowable ahead of time from just the photo/listing presence - see side_column_content_height
     # (the /stats.png route uses the same formula independently, since it can't see these locals).
-    listing_bar_h = _SALE_MINI_BAR_DISPLAY_H if (featured and featured_mode != "listing") else _LISTING_BAR_DISPLAY_H
-    content_h = (_PHOTO_CANVAS_H if photo_html else 0) + (_LISTING_MARGIN_TOP + listing_bar_h if featured else 0)
+    listing_bar_h = _SALE_MINI_BAR_DISPLAY_H if (featured and featured_mode == "sale") else _LISTING_BAR_DISPLAY_H
+    content_h = (_PHOTO_CANVAS_H if photo_html else 0) + (_LISTING_MARGIN_TOP + listing_bar_h if featured else 0) + (_LISTING_MARGIN_TOP + _STATS_STRIP_DISPLAY_H if strip else 0)
     # The strip's own 1px top/bottom border isn't part of listing_bar_h - counted here so every
     # column's height is computed against the row's REAL height, not a couple of pixels short.
-    bar_border = 2 if featured else 0
+    bar_border = 2 if (featured or strip) else 0
     # The row's one true height. The rail pill, the stats column and the main cell are all sized to
     # exactly this - before, the rail's spacer math ignored its own padding/border and came out ~8px
     # taller than everything else, which (being the tallest cell) stretched the whole card and left
@@ -2891,7 +3044,9 @@ def _build_gallery(cfg: dict, hub: dict, owner: User, redirect_base_url: str, as
     rail_icons_h = rail_pill_h - 4 - rail_pad_top - rail_pad_bottom  # minus the pill's 2px border, top+bottom
 
     rail_html = _rail_icons_html(links, asset_base, card_bg, rail_icons_h)
-    stats = compute_sales_stats(hub) if wants_stats(cfg) else None
+    # The right-hand stats column only sits beside a listing/sales strip; without one the stats
+    # are the strip itself (above).
+    stats = compute_sales_stats(hub) if (wants_stats(cfg) and featured) else None
     # Explicit width, not left to the table's own auto-layout - with none of main_cell's own rows
     # (name/contact/buttons) forcing a width, the browser was sizing this column down to whatever
     # its widest row actually needed, so the Recent Sales/Listing strip's own width:100% filled

@@ -281,16 +281,7 @@ class OpenHouseService:
                 if addr:
                     live_addr.setdefault(addr, s)
 
-        keys = {oh.listing_key for oh in open_houses if oh.listing_key}
-        owned_keys: set = set()
-        if keys:
-            from app.utils.plan_ids import listing_owner_key
-            owner_key = listing_owner_key(agent)
-            rows = (await db.execute(
-                select(Property.listing_key, Property.list_agent_mls_id, Property.co_list_agent_mls_id)
-                .where(Property.listing_key.in_(keys))
-            )).all()
-            owned_keys = {r.listing_key for r in rows if owner_key in {r.list_agent_mls_id, r.co_list_agent_mls_id}}
+        owned_keys = await OpenHouseService.owned_listing_keys(db, agent, {oh.listing_key for oh in open_houses if oh.listing_key})
 
         out: Dict[str, dict] = {}
         urls: Dict[str, str] = {}
@@ -311,6 +302,34 @@ class OpenHouseService:
                 urls[site.id] = await pws.public_url(db, site)
             out[oh.id] = {"url": urls[site.id] if site else None, "draft_id": draft.id if (draft and not site) else None}
         return out
+
+    @staticmethod
+    async def owned_listing_keys(db: AsyncSession, agent: User, keys: set) -> set:
+        """The listing keys (of `keys`) the MLS lists this agent on as listing or co-listing agent."""
+        from app.models.database import Property
+        from app.utils.plan_ids import listing_owner_key
+        keys = {k for k in keys if k}
+        if not agent or not keys:
+            return set()
+        owner_key = listing_owner_key(agent)
+        rows = (await db.execute(
+            select(Property.listing_key, Property.list_agent_mls_id, Property.co_list_agent_mls_id)
+            .where(Property.listing_key.in_(keys))
+        )).all()
+        return {r.listing_key for r in rows if owner_key in {r.list_agent_mls_id, r.co_list_agent_mls_id}}
+
+    @staticmethod
+    async def is_own_listing(db: AsyncSession, agent: User, listing_key: Optional[str]) -> bool:
+        """The agent is this home's listing (or co-listing) agent."""
+        return bool(listing_key) and listing_key in await OpenHouseService.owned_listing_keys(db, agent, {listing_key})
+
+    @staticmethod
+    async def guest_defaults(db: AsyncSession, agent: User, listing_key: Optional[str]) -> Dict[str, Any]:
+        """What a new kit starts with. Sitting your OWN listing you want guests focused on it, not
+        shopping other homes - so no Showcases and no Similar Homes (sheet or Guest Pass). Hosting
+        someone else's listing (or a home with no MLS record) both start on."""
+        own = await OpenHouseService.is_own_listing(db, agent, listing_key)
+        return {"own_listing": own, "auto_showcase": not own, "similar_homes": not own}
 
     @staticmethod
     async def own_listing_spotlights(db: AsyncSession, agent: User, open_houses: list) -> Dict[str, str]:

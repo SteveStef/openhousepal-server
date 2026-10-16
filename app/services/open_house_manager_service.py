@@ -114,6 +114,19 @@ def _send_email_safely(recipient, subject: str, template: str, variables: dict, 
         pass
 
 
+def _send_update_email(recipient, subject: str, headline: str, badge: str, address: str, before: str, after: str,
+                       button_label: str, button_path: str, notification_type: str) -> None:
+    """The hosting emails that had no template (request not approved, date taken, suggested time
+    turned down) - one Mailgun template (host_request_update) with the words passed in."""
+    if recipient is None:
+        return
+    _send_email_safely(recipient, subject, "host_request_update", {
+        "agent_name": recipient.first_name, "headline": headline, "preheader": subject, "badge": badge,
+        "property_address": address, "message_before": before, "message_after": after,
+        "button_label": button_label, "button_path": button_path,
+    }, notification_type=notification_type)
+
+
 def _format_date(d: date) -> str:
     # %-d (no leading zero) is a glibc-only strftime extension - not supported on Windows.
     return f"{d.strftime('%a, %b')} {d.day}"
@@ -192,6 +205,18 @@ async def _log_request_event(
     ))
 
 
+async def _suggestions_used(db: AsyncSession, req: OpenHouseHostRequest) -> tuple:
+    """(listing agent already suggested another time, host already suggested another time).
+    Each side gets ONE "Other time" per request - after that it's yes or no, so a request can't
+    ping-pong forever. A host answering a team/direct ask with a different time has used theirs
+    (that's how a pending request with a broadcast_id is born)."""
+    rows = (await db.execute(select(OpenHouseHostRequestEvent.actor_id).where(
+        OpenHouseHostRequestEvent.request_id == req.id, OpenHouseHostRequestEvent.action == "countered"))).scalars().all()
+    la_used = req.listing_owner_agent_id in rows
+    host_used = req.requesting_agent_id in rows or (req.broadcast_id is not None and req.status in ("pending", "countered"))
+    return la_used, host_used
+
+
 async def _is_accepted_team_member(db: AsyncSession, owner_id: str, member_agent_id: str) -> bool:
     result = await db.execute(
         select(OpenHouseTeamMember.id).where(
@@ -231,6 +256,57 @@ def _find_scheduled_event(events: List[OpenHouseEvent]) -> Optional[OpenHouseEve
         if event.is_active and event.scheduled_date is None:
             return event
     return None
+
+
+EASTERN_TZ = ZoneInfo("America/New_York")
+
+
+# Under contract, or pulled from the market for now - nobody can hold an open house there.
+NO_HOSTING_STATUSES = {"PENDING-BRIGHT": "pending", "ACTIVE UNDER CONTRACT-BRIGHT": "pending", "TEMP OFF MARKET-BRIGHT": "off_market"}
+COMING_SOON_STATUS = "COMING SOON-BRIGHT"
+
+
+def hosting_window(home_status: Optional[str], raw_mls_data: Optional[dict]) -> tuple:
+    """When a listing may have an open house, as (blocked_reason, hosts_from):
+    ("pending", None) / ("off_market", None) - under contract / temporarily off the market: no
+        open houses at all.
+    ("coming_soon", None) - Coming Soon with no go-live date yet: Bright allows no showings, so no
+        open house until we know the day it goes active.
+    (None, <date>) - Coming Soon: open houses only on or after Bright's ExpectedOnMarketDate.
+    (None, None) - open any day."""
+    if home_status in NO_HOSTING_STATUSES:
+        return NO_HOSTING_STATUSES[home_status], None
+    if home_status == COMING_SOON_STATUS:
+        raw = (raw_mls_data or {}).get("ExpectedOnMarketDate")
+        try:
+            return None, date.fromisoformat(str(raw)[:10])
+        except (TypeError, ValueError):
+            return "coming_soon", None
+    return None, None
+
+
+def hosting_date_problem(home_status: Optional[str], raw_mls_data: Optional[dict], day: Optional[date]) -> Optional[str]:
+    """A plain-English reason this listing can't have an open house on `day` (None = fine)."""
+    if day and day < datetime.now(EASTERN_TZ).date():
+        return "That day has already passed - pick an upcoming day."
+    blocked, hosts_from = hosting_window(home_status, raw_mls_data)
+    if blocked == "pending":
+        return "This home is under contract, so it can't have an open house."
+    if blocked == "off_market":
+        return "This home is temporarily off the market, so it can't have an open house."
+    if blocked == "coming_soon":
+        return "This home is Coming Soon and Bright doesn't allow showings until it goes active."
+    if hosts_from and day and day < hosts_from:
+        return f"This home is Coming Soon - open houses can start {hosts_from:%a, %b} {hosts_from.day}, when it goes active."
+    return None
+
+
+async def _ensure_hostable(db: AsyncSession, listing_key: str, day: Optional[date]) -> None:
+    """Refuse an open house on a day the listing can't be shown (checked again at every step -
+    the home can go under contract between the ask and the yes)."""
+    prop = (await db.execute(select(Property.home_status, Property.raw_mls_data).where(Property.listing_key == listing_key))).first()
+    if prop and (problem := hosting_date_problem(prop.home_status, prop.raw_mls_data, day)):
+        raise ValueError(problem)
 
 
 def _compute_open_house_status(events: List[OpenHouseEvent]) -> str:
@@ -274,6 +350,23 @@ def _signin_day(visitor: OpenHouseVisitor) -> Optional[date]:
     return ts.astimezone(_EASTERN).date()
 
 
+_WINDOW_SLACK = timedelta(hours=1)
+
+
+def _signed_in_during(visitor: OpenHouseVisitor, day: date, start=None, end=None) -> bool:
+    """A sign-in belongs to a hosted open only if it came on that day - and, when the open's hours
+    are known, from an hour before it started to an hour after it ended. Anything else at the same
+    kit (the host trying their QR code at home, a sign-in on some other day) isn't part of the open
+    the listing agent approved, so they never see it."""
+    if _signin_day(visitor) != day:
+        return False
+    if start is None or end is None:
+        return True
+    ts = visitor.created_at if visitor.created_at.tzinfo else visitor.created_at.replace(tzinfo=timezone.utc)
+    at = ts.astimezone(_EASTERN).replace(tzinfo=None)
+    return datetime.combine(day, start) - _WINDOW_SLACK <= at <= datetime.combine(day, end) + _WINDOW_SLACK
+
+
 def _window_over(d: date, end_time, now_et: datetime) -> bool:
     """An approved open has happened once its day is past - or it's today and its end time passed."""
     return d < now_et.date() or (d == now_et.date() and end_time is not None and now_et.time() >= end_time)
@@ -295,27 +388,30 @@ def _hosted_windows(owner_id: str, listing_events: List[OpenHouseEvent], approve
     for e in listing_events:
         kits_by_agent.setdefault(e.agent_id, []).append(e)
 
-    def that_day(agent_id: str, day: date):
+    def that_day(agent_id: str, day: date, start=None, end=None):
         kit, out = None, []
         for e in kits_by_agent.get(agent_id, []):
-            vs = [v for v in visitors_by_event.get(e.id, []) if _signin_day(v) == day]
+            vs = [v for v in visitors_by_event.get(e.id, []) if _signed_in_during(v, day, start, end)]
             if vs and kit is None:
                 kit = e
             out += vs
         return kit or next(iter(kits_by_agent.get(agent_id, [])), None), out
 
     rows: List[dict] = []
-    seen = set()
-    for r in sorted(approved_requests, key=lambda r: (r.requested_date, r.requested_start_time or datetime.min.time())):
+    # One row per host per day; if they were approved for two slots that day, the window spans both.
+    by_day: Dict[tuple, List[OpenHouseHostRequest]] = {}
+    for r in approved_requests:
         if r.requesting_agent_id == owner_id or not _window_over(r.requested_date, r.requested_end_time, now_et):
             continue
-        key = (r.requesting_agent_id, r.requested_date)
-        if key in seen:
-            continue
-        seen.add(key)
-        kit, vs = that_day(*key)
-        rows.append({"kit": kit, "request": r, "agent_id": r.requesting_agent_id, "date": r.requested_date,
-                     "start": r.requested_start_time, "end": r.requested_end_time, "visitors": vs})
+        by_day.setdefault((r.requesting_agent_id, r.requested_date), []).append(r)
+    for (agent_id, day), reqs in by_day.items():
+        reqs.sort(key=lambda r: r.requested_start_time or datetime.min.time())
+        starts, ends = [r.requested_start_time for r in reqs], [r.requested_end_time for r in reqs]
+        start = None if None in starts else min(starts)
+        end = None if None in ends else max(ends)
+        kit, vs = that_day(agent_id, day, start, end)
+        rows.append({"kit": kit, "request": reqs[0], "agent_id": agent_id, "date": day,
+                     "start": start, "end": end, "visitors": vs})
     own_days = sorted({d for e in kits_by_agent.get(owner_id, []) for v in visitors_by_event.get(e.id, []) if (d := _signin_day(v))})
     for day in own_days:
         kit, vs = that_day(owner_id, day)
@@ -689,12 +785,23 @@ async def get_my_listings(db: AsyncSession, current_user: User) -> MyListingsRes
         scheduled_opens = scheduled_opens + covered_by_existing_kit
         scheduled_opens = scheduled_opens + _bright_mls_synthetic_opens(prop, scheduled_opens + confirmed_pending_kit)
         scheduled_opens = sorted(scheduled_opens, key=lambda p: (p.scheduled_date or date.max, p.scheduled_start_time or datetime.min.time()))
+        # An open house the listing agent posted in Bright already has someone covering it - the
+        # listing reads "Host booked", not "Hosts needed" (same as Discovery shows it).
+        if open_house_status == "needs_host" and any(o.hosting_agent_id == BRIGHT_MLS_AGENT_ID for o in scheduled_opens):
+            open_house_status = "scheduled"
         note = notes_by_listing.get(prop.listing_key)
         manual_priority = bool(note and note.is_priority_override)
         # High priority = this listing has proven it draws guests (a past open had at least one
         # guest sign in) and still needs a host lined up - worth prioritizing over an unproven listing.
-        computed_priority = open_house_status == "needs_host" and listing_guest_count > 0
-        needs_host_this_weekend = not _has_weekend_host(scheduled_opens + confirmed_pending_kit, weekend_friday, weekend_sunday)
+        hosting_blocked, hosts_from = hosting_window(prop.home_status, prop.raw_mls_data)
+        computed_priority = open_house_status == "needs_host" and listing_guest_count > 0 and not hosting_blocked
+        # Nothing to find a host for while it can't be shown (under contract / Coming Soon before
+        # its go-live weekend).
+        needs_host_this_weekend = (
+            not hosting_blocked
+            and not (hosts_from and hosts_from > weekend_sunday)
+            and not _has_weekend_host(scheduled_opens + confirmed_pending_kit, weekend_friday, weekend_sunday)
+        )
 
         listings.append(MyListingItem(
             listing_key=prop.listing_key,
@@ -721,6 +828,8 @@ async def get_my_listings(db: AsyncSession, current_user: User) -> MyListingsRes
             is_high_priority=manual_priority or computed_priority,
             pending_request_count=pending_counts.get(prop.listing_key, 0),
             is_manual=prop.is_manual,
+            hosting_blocked=hosting_blocked,
+            hosts_from=hosts_from,
         ))
 
     summary = MyListingSummary(
@@ -815,7 +924,12 @@ async def _hydrate_host_request(
     # a pending, countered, or declined request must never carry them, even though the frontend
     # also chooses not to render this field pre-approval.
     note = (note_by_listing_key or {}).get(req.listing_key) if req.status == "approved" else None
+    # The host's own cards are about the listing agent they're dealing with, not themselves.
+    owner = await db.get(User, req.listing_owner_agent_id) if req.listing_owner_agent_id else None
+    la_suggested, host_suggested = await _suggestions_used(db, req) if req.status in ("pending", "countered") else (True, True)
     return HostRequestResponse(
+        listing_agent_suggested_time=la_suggested,
+        host_suggested_time=host_suggested,
         id=req.id,
         listing_key=req.listing_key,
         property_address=prop.street_address if prop else None,
@@ -825,6 +939,8 @@ async def _hydrate_host_request(
         requesting_agent_name=_agent_name(requester) if requester else "Unknown agent",
         requesting_agent_brokerage=requester.brokerage if requester else None,
         requesting_agent_email=requester.email if requester else None,
+        listing_agent_name=_agent_name(owner) if owner else None,
+        listing_agent_brokerage=owner.brokerage if owner else None,
         requested_date=req.requested_date,
         requested_start_time=req.requested_start_time,
         requested_end_time=req.requested_end_time,
@@ -981,6 +1097,11 @@ async def _date_already_booked(db: AsyncSession, listing_key: str, target_date: 
     if result.scalar_one_or_none() is not None:
         return True
 
+    # An open house the listing agent already posted in Bright for that day - someone's hosting it.
+    bright_prop = (await db.execute(select(Property).where(Property.listing_key == listing_key))).scalar_one_or_none()
+    if bright_prop is not None and any(slot["date"] == target_date for slot in upcoming_mls_open_houses(bright_prop)):
+        return True
+
     event_result = await db.execute(
         select(OpenHouseEvent.agent_id).where(
             OpenHouseEvent.listing_key == listing_key,
@@ -1069,6 +1190,12 @@ async def _decline_same_date_conflicts(db: AsyncSession, request: OpenHouseHostR
             ))
         except Exception:
             pass
+        other = await db.get(User, conflict.requesting_agent_id)
+        prop = (await db.execute(select(Property.street_address).where(Property.listing_key == conflict.listing_key))).scalar()
+        _send_update_email(other, f"{_format_date(conflict.requested_date)} at {prop or 'that home'} was booked", "That day was booked", "Day booked",
+                           prop or "the listing", "another agent was confirmed to host",
+                           f" on {_format_date(conflict.requested_date)} first, so your request for that day is closed. Other days and homes may still need a host.",
+                           "Find another home", "/discovery", "HOST_REQUEST_DECLINED")
 
 
 async def create_host_request(db: AsyncSession, current_user: User, payload: CreateHostRequestRequest) -> CreateHostRequestResult:
@@ -1076,6 +1203,12 @@ async def create_host_request(db: AsyncSession, current_user: User, payload: Cre
     prop = prop_result.scalar_one_or_none()
     if not prop:
         raise ValueError("This listing could not be found.")
+    if problem := hosting_date_problem(prop.home_status, prop.raw_mls_data, payload.requested_date):
+        raise ValueError(problem)
+    # Before the on-platform check: a day that's already covered (an approved host, or an open house
+    # posted in Bright) is taken whoever the listing agent is.
+    if await _date_already_booked(db, payload.listing_key, payload.requested_date):
+        raise ValueError(f"{prop.street_address} already has an open house on {_format_date(payload.requested_date)}. Pick a different date.")
 
     owner_mls_id = prop.list_agent_mls_id or prop.co_list_agent_mls_id
     listing_owner = None
@@ -1218,6 +1351,7 @@ async def approve_host_request(db: AsyncSession, current_user: User, request_id:
     request = result.scalar_one_or_none()
     if not request or request.listing_owner_agent_id != current_user.id:
         raise ValueError("Host request not found.")
+    await _ensure_hostable(db, request.listing_key, request.requested_date)
 
     if await _date_already_booked(db, request.listing_key, request.requested_date, exclude_request_id=request_id):
         raise ValueError("This listing already has a confirmed host for that date.")
@@ -1321,6 +1455,11 @@ async def decline_host_request(db: AsyncSession, current_user: User, request_id:
     await db.refresh(request)
     requester_result = await db.execute(select(User).where(User.id == request.requesting_agent_id))
     requester = requester_result.scalar_one_or_none()
+    address = prop.street_address if prop else "the listing"
+    _send_update_email(requester, f"Your request to host {address} wasn't approved", "Your request wasn’t approved", "Not approved", address,
+                       "the listing agent didn’t approve your request to host",
+                       f" on {_format_slot(request.requested_date, request.requested_start_time, request.requested_end_time)}. Other homes near you may still need a host.",
+                       "Find another home", "/discovery", "HOST_REQUEST_DECLINED")
     return await _hydrate_host_request(db, request, {request.listing_key: prop} if prop else {}, {requester.id: requester} if requester else {})
 
 
@@ -1414,12 +1553,64 @@ async def cancel_approved_open(db: AsyncSession, current_user: User, listing_key
     await db.commit()
 
 
+async def withdraw_host_request(db: AsyncSession, current_user: User, request_id: str) -> HostRequestResponse:
+    """The HOST takes back a request (pending / new time proposed) or backs out of an open they were
+    confirmed for. Frees the day, takes it off their calendar, and tells the listing agent at once."""
+    request = (await db.execute(select(OpenHouseHostRequest).where(OpenHouseHostRequest.id == request_id))).scalar_one_or_none()
+    if not request or request.requesting_agent_id != current_user.id:
+        raise ValueError("Host request not found.")
+    was_approved = request.status == "approved"
+    claimed = await _atomic_status_update(
+        db, request_id, (OpenHouseHostRequest.requesting_agent_id == current_user.id,), ("pending", "countered", "approved"),
+        {"status": "declined", "responded_at": datetime.now(timezone.utc)},
+    )
+    if not claimed:
+        raise ValueError("This request has already been closed.")
+    await db.refresh(request)
+    await _log_request_event(db, request.id, current_user.id, "withdrawn",
+                             note="The host can't host after all." if was_approved else "The host withdrew the request.")
+    if was_approved:
+        _calendar_host_open(request.requesting_agent_id, request.id, remove=True)
+        if request.broadcast_id:
+            await db.execute(update(OpenHouseTeamBroadcast).where(OpenHouseTeamBroadcast.id == request.broadcast_id,
+                                                                  OpenHouseTeamBroadcast.status == "filled").values(status="cancelled"))
+    prop = (await db.execute(select(Property).where(Property.listing_key == request.listing_key))).scalar_one_or_none()
+    address = prop.street_address if prop else "your listing"
+    slot = _format_slot(request.requested_date, request.requested_start_time, request.requested_end_time)
+    who = _agent_name(current_user)
+    title = f"{who} can't host anymore" if was_approved else f"{who} withdrew their request"
+    try:
+        db.add(Notification(
+            agent_id=request.listing_owner_agent_id, type="HOST_REQUEST_WITHDRAWN", reference_type="HOST_REQUEST", reference_id=request.id,
+            title=title, message=(f"{address} on {slot} needs a host again." if was_approved else f"Their request to host {address} on {slot} is closed."),
+            property_id=prop.id if prop else None, property_address=address, link=f"/open-houses/my-listings?listingKey={request.listing_key}", is_read=False,
+        ))
+    except Exception:
+        pass
+    await db.commit()
+    await db.refresh(request)
+    owner = await db.get(User, request.listing_owner_agent_id)
+    if was_approved:
+        _send_update_email(owner, f"{who} can't host {address} anymore", "Your host can’t make it", "Needs a host", address,
+                           f"{who} can’t host", f" on {slot} anymore. That day is open again - ask your team or another agent.",
+                           "Find a host", f"/open-houses/my-listings?listingKey={request.listing_key}", "HOST_REQUEST_WITHDRAWN")
+    else:
+        _send_update_email(owner, f"{who} withdrew their request for {address}", "Request withdrawn", "Withdrawn", address,
+                           f"{who} withdrew their request to host", f" on {slot}. Nothing else is needed from you.",
+                           "Open your listings", f"/open-houses/my-listings?listingKey={request.listing_key}", "HOST_REQUEST_WITHDRAWN")
+    return await _hydrate_host_request(db, request, {request.listing_key: prop} if prop else {}, {current_user.id: current_user},
+                                       await _fetch_notes_by_listing_key(db, [request.listing_key]))
+
+
 async def counter_host_request(db: AsyncSession, current_user: User, request_id: str, payload: CounterHostRequestRequest) -> HostRequestResponse:
     """Listing agent proposes a different date/time instead of approving or declining outright."""
     result = await db.execute(select(OpenHouseHostRequest).where(OpenHouseHostRequest.id == request_id))
     request = result.scalar_one_or_none()
     if not request or request.listing_owner_agent_id != current_user.id:
         raise ValueError("Host request not found.")
+    if (await _suggestions_used(db, request))[0]:
+        raise ValueError("You already suggested another time once - approve or decline this one.")
+    await _ensure_hostable(db, request.listing_key, payload.counter_date)
 
     claimed = await _atomic_status_update(
         db, request_id, (OpenHouseHostRequest.listing_owner_agent_id == current_user.id,), ("pending",),
@@ -1479,6 +1670,9 @@ async def counter_back_host_request(db: AsyncSession, current_user: User, reques
     request = result.scalar_one_or_none()
     if not request or request.requesting_agent_id != current_user.id:
         raise ValueError("Host request not found.")
+    if (await _suggestions_used(db, request))[1]:
+        raise ValueError("You already suggested another time once - accept or decline this one.")
+    await _ensure_hostable(db, request.listing_key, payload.proposed_date)
 
     claimed = await _atomic_status_update(
         db, request_id, (OpenHouseHostRequest.requesting_agent_id == current_user.id,), ("countered",),
@@ -1596,6 +1790,13 @@ async def respond_to_counter(db: AsyncSession, current_user: User, request_id: s
         ))
     except Exception:
         pass
+    if not accept:
+        owner = await db.get(User, request.listing_owner_agent_id)
+        address = prop.street_address if prop else "your listing"
+        _send_update_email(owner, f"{_agent_name(current_user)} can't do the time you suggested", "Suggested time turned down", "Not this time", address,
+                           f"{_agent_name(current_user)} can’t make the time you suggested for",
+                           ", so that request is closed. The day is still open for another host.",
+                           "Open your listings", f"/open-houses/my-listings?listingKey={request.listing_key}", "HOST_REQUEST_COUNTER_RESPONSE")
     if accept:
         # Their open house now has a confirmed host - same email as a claimed team broadcast.
         _calendar_host_open(request.requesting_agent_id, request.id)
@@ -1859,6 +2060,8 @@ async def create_broadcast(db: AsyncSession, current_user: User, payload: Create
     same OpenHouseTeamBroadcast row either way, same open/filled/cancelled lifecycle and the same
     atomic-claim-or-counter response path (respond_to_broadcast), just a different recipient set."""
     prop = await _get_owned_property(db, current_user, payload.listing_key)
+    if problem := hosting_date_problem(prop.home_status, prop.raw_mls_data, payload.requested_date):
+        raise ValueError(problem)
 
     if not payload.is_anytime and (not payload.requested_start_time or not payload.requested_end_time):
         raise ValueError("Please choose a start and end time, or mark this as Anytime.")
@@ -2074,6 +2277,35 @@ async def list_incoming_broadcasts(db: AsyncSession, current_user: User) -> List
     return result
 
 
+async def decline_direct_ask(db: AsyncSession, current_user: User, broadcast_id: str) -> None:
+    """An agent asked DIRECTLY to host says they can't - the ask closes and the listing agent is told
+    right away (a team-wide ask just stays open for the others, so there's nothing to decline)."""
+    b = (await db.execute(select(OpenHouseTeamBroadcast).where(OpenHouseTeamBroadcast.id == broadcast_id))).scalar_one_or_none()
+    if not b or b.target_agent_id != current_user.id:
+        raise ValueError("This open house request is no longer available.")
+    if b.status != "open":
+        raise ValueError("This open house request is no longer open.")
+    b.status = "cancelled"
+    prop = (await db.execute(select(Property).where(Property.listing_key == b.listing_key))).scalar_one_or_none()
+    address = prop.street_address if prop else "your listing"
+    slot = _format_slot(b.requested_date, b.requested_start_time, b.requested_end_time) if not b.is_anytime else _format_date(b.requested_date)
+    who = _agent_name(current_user)
+    try:
+        db.add(Notification(
+            agent_id=b.owner_id, type="TEAM_BROADCAST_RESPONSE", reference_type="TEAM_BROADCAST", reference_id=b.id,
+            title=f"{who} can't host", message=f"{who} can't host {address} on {slot}.",
+            property_id=prop.id if prop else None, property_address=address,
+            link=f"/open-houses/my-listings?listingKey={b.listing_key}", is_read=False,
+        ))
+    except Exception:
+        pass
+    await db.commit()
+    owner = await db.get(User, b.owner_id)
+    _send_update_email(owner, f"{who} can't host {address}", "They can’t host", "Can’t host", address,
+                       f"{who} can’t host", f" on {slot}. Ask someone else, or your whole team.",
+                       "Find a host", f"/open-houses/my-listings?listingKey={b.listing_key}", "TEAM_BROADCAST_RESPONSE")
+
+
 async def respond_to_broadcast(db: AsyncSession, current_user: User, broadcast_id: str, payload: RespondToBroadcastRequest) -> HostRequestResponse:
     """Team member responds to a team-wide broadcast. Omitting proposed_* means 'I'll host exactly
     as requested' - claimed atomically (see below) so the first member to do so gets the open
@@ -2089,6 +2321,7 @@ async def respond_to_broadcast(db: AsyncSession, current_user: User, broadcast_i
     is_direct_target = broadcast.target_agent_id == current_user.id
     if broadcast.target_agent_id and not is_direct_target:
         raise ValueError("This open house was offered to another agent.")
+    await _ensure_hostable(db, broadcast.listing_key, payload.proposed_date or broadcast.requested_date)
     if not is_direct_target and not await _is_accepted_team_member(db, broadcast.owner_id, current_user.id):
         raise ValueError("You're not on this agent's Open House Team.")
 
@@ -2415,16 +2648,22 @@ async def get_shared_guests(db: AsyncSession, current_user: User, event_id: str,
     if not prop or not _owns_listing(current_user, prop) or not event.share_guests_with_listing_agent:
         raise ValueError("Guest details aren't available for this open house.")
 
-    # One evergreen kit covers every date this host holds here - so a history row asks for its own
-    # day only (window_date), across all of this host's kits for the home.
-    kit_ids = [event_id]
-    if window_date is not None:
-        kit_ids = (await db.execute(select(OpenHouseEvent.id).where(
-            OpenHouseEvent.listing_key == event.listing_key, OpenHouseEvent.agent_id == event.agent_id))).scalars().all()
-    visitors_result = await db.execute(
-        select(OpenHouseVisitor).where(OpenHouseVisitor.open_house_event_id.in_(kit_ids)).order_by(OpenHouseVisitor.created_at.asc())
-    )
-    visitors = [v for v in visitors_result.scalars().all() if window_date is None or _signin_day(v) == window_date]
+    # One evergreen kit covers every date this host holds here, so names come only from the opens
+    # the listing agent approved and that have happened (same windows as the history rows) - a host
+    # testing their kit, or using it on some other day, never shows up here. window_date narrows
+    # it to one history row's day.
+    host_kits = (await db.execute(select(OpenHouseEvent).where(
+        OpenHouseEvent.listing_key == event.listing_key, OpenHouseEvent.agent_id == event.agent_id))).scalars().all()
+    approved = (await db.execute(select(OpenHouseHostRequest).where(
+        OpenHouseHostRequest.listing_key == event.listing_key, OpenHouseHostRequest.status == "approved",
+        OpenHouseHostRequest.requesting_agent_id == event.agent_id))).scalars().all()
+    visitors_by_event: Dict[str, List[OpenHouseVisitor]] = {}
+    for v in (await db.execute(select(OpenHouseVisitor).where(
+            OpenHouseVisitor.open_house_event_id.in_([k.id for k in host_kits])))).scalars().all():
+        visitors_by_event.setdefault(v.open_house_event_id, []).append(v)
+    windows = _hosted_windows(current_user.id, host_kits, approved, visitors_by_event)
+    visitors = sorted((v for w in windows if w["agent_id"] == event.agent_id and (window_date is None or w["date"] == window_date)
+                       for v in w["visitors"]), key=lambda v: v.created_at)
     return [
         VisitorResponse(
             id=v.id, full_name=v.full_name, email=v.email, phone=v.phone, has_agent=v.has_agent,

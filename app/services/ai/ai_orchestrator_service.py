@@ -157,6 +157,10 @@ async def run_turn(
             response = await _call_model()
             usage_state["input_tokens"] += response.usage.input_tokens
             usage_state["output_tokens"] += response.usage.output_tokens
+            # The cached system prompt is billed too (write 1.25x, read 0.1x/0.05x) but isn't in
+            # input_tokens - counted separately so the meter matches Anthropic's bill.
+            usage_state["cache_write_tokens"] = usage_state.get("cache_write_tokens", 0) + (getattr(response.usage, "cache_creation_input_tokens", 0) or 0)
+            usage_state["cache_read_tokens"] = usage_state.get("cache_read_tokens", 0) + (getattr(response.usage, "cache_read_input_tokens", 0) or 0)
 
             if response.stop_reason != "tool_use":
                 text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
@@ -213,6 +217,7 @@ async def run_turn(
         ) from e
 
     usage_state["estimated_cost_usd"] = ai_config_service.estimate_cost_usd(
-        config, usage_state["model"], usage_state["input_tokens"], usage_state["output_tokens"]
+        config, usage_state["model"], usage_state["input_tokens"], usage_state["output_tokens"],
+        usage_state.get("cache_write_tokens", 0), usage_state.get("cache_read_tokens", 0),
     )
     return text, all_refs, usage_state

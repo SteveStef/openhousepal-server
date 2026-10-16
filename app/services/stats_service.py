@@ -1,6 +1,7 @@
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Literal
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +15,13 @@ METRICS: List[Metric] = ["agent_hub_visits", "agent_hub_interactions", "qr_scans
 # Tallied as unique anonymous visitors (by browser-local visitor_id) rather than raw event counts,
 # so a visitor reloading the page or clicking several buttons doesn't inflate the number.
 UNIQUE_VISITOR_METRICS = {"agent_hub_visits", "agent_hub_interactions"}
+# Daily charts count by the agent's own calendar day (Eastern, like the rest of the app) - a
+# timestamp's UTC date put an evening sign-in on the next day.
+EASTERN = ZoneInfo("America/New_York")
+
+
+def local_day(ts: datetime) -> date:
+    return (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).astimezone(EASTERN).date()
 # A visitor "interacted" when they clicked anything on the hub OR saved the contact card (the vCard
 # download is logged server-side, so it still counts if the click ping was cut off by the download).
 _EVENT_TYPES_BY_UNIQUE_METRIC = {"agent_hub_visits": ("visit",), "agent_hub_interactions": ("interaction", "save_contact")}
@@ -107,7 +115,7 @@ async def get_daily_counts(db: AsyncSession, owner_id: str, metric: Metric, sinc
         rows = await _visitor_rows_for_metric(db, owner_id, metric, since, until)
         seen_by_day: Dict[date, set] = defaultdict(set)
         for created_at, visitor_id in rows:
-            day = created_at.date()
+            day = local_day(created_at)
             # No visitor_id (older client, or one that didn't send it) - still count the visit
             # itself rather than silently dropping it, just can't be deduped against others.
             seen_by_day[day].add(visitor_id or created_at.isoformat())
@@ -117,7 +125,7 @@ async def get_daily_counts(db: AsyncSession, owner_id: str, metric: Metric, sinc
 
     timestamps = await _timestamps_for_metric(db, owner_id, metric, since, until)
     for ts in timestamps:
-        counts[ts.date()] += 1
+        counts[local_day(ts)] += 1
     return counts
 
 

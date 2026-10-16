@@ -338,17 +338,26 @@ class BrightMlsService:
         Fetches hard-deleted ListingKeys from the Deletion route.
         Table 'CWA_BRIGHT_ALL' contains the property deletions.
         """
-        params = {
-            "$filter": f"DeletionTimestamp gt {since_timestamp} and TableName eq 'CWA_BRIGHT_ALL'",
-            "$select": "DeleteKey,DeletionTimestamp",
-            "$orderby": "DeletionTimestamp asc"
-        }
+        # Paged (Bright audit, 10/15): one unpaged request only ever returned the first page, so a
+        # busy day's extra deletions were never seen and those homes stayed "for sale" here.
+        out: List[Dict[str, str]] = []
+        skip, page = 0, 200
         try:
-            data = await self._make_request("Deletion", params=params)
-            return [{"key": str(d["DeleteKey"]), "timestamp": d["DeletionTimestamp"]} for d in data.get("value", [])]
+            for _ in range(50):
+                data = await self._make_request("Deletion", params={
+                    "$filter": f"DeletionTimestamp gt {since_timestamp} and TableName eq 'CWA_BRIGHT_ALL'",
+                    "$select": "DeleteKey,DeletionTimestamp",
+                    "$orderby": "DeletionTimestamp asc",
+                    "$top": page, "$skip": skip,
+                })
+                rows = data.get("value", [])
+                out += [{"key": str(d["DeleteKey"]), "timestamp": d["DeletionTimestamp"]} for d in rows]
+                if len(rows) < page:
+                    break
+                skip += page
         except Exception as e:
             logger.error(f"Failed to fetch deletions: {e}")
-            return []
+        return out
 
     async def get_media_for_properties(self, listing_keys: List[str]) -> Dict[str, List[str]]:
         """Batch fetch photos for multiple properties.
@@ -450,6 +459,21 @@ class BrightMlsService:
         (Bright fills ClosePrice/CloseDate only on closed-scoped queries) - the 3-year sold pull."""
         data = await self._make_request("BrightProperties", params={
             "$filter": self._closed_window_filter(date_from, date_to),
+            "$top": top, "$skip": skip, "$select": self._get_full_field_list(), "$orderby": "ListingKey",
+        })
+        return data.get("value", [])
+
+    _AGENT_FIELDS = ("ListAgentMlsId", "CoListAgentMlsId", "BuyerAgentMlsId", "CoBuyerAgentMlsId")
+
+    async def get_agent_closed_sales(self, field: str, mls_id: str, top: int = 200, skip: int = 0) -> List[Dict[str, Any]]:
+        """One page of one agent's sales (no leases) on one side of the deal, any year, full fields -
+        closed-scoped, so ClosePrice/CloseDate come back filled. The agent_sales pull."""
+        if field not in self._AGENT_FIELDS:
+            raise ValueError(f"not an agent id field: {field}")
+        safe = mls_id.replace("'", "''")
+        data = await self._make_request("BrightProperties", params={
+            "$filter": (f"{field} eq '{safe}' and MlsStatus eq 'CLOSED-BRIGHT' "
+                        "and PropertyType ne 'Residential Lease' and PropertyType ne 'CommercialLease'"),
             "$top": top, "$skip": skip, "$select": self._get_full_field_list(), "$orderby": "ListingKey",
         })
         return data.get("value", [])

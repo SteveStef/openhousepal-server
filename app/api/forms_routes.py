@@ -33,7 +33,7 @@ from app.schemas.forms import (
     SlugUpdate,
     SubmissionReviewedUpdate,
 )
-from app.utils.auth import get_current_active_user, require_active_plan
+from app.utils.auth import get_current_active_user, get_current_user_optional, require_active_plan
 from app.services.forms_service import record_form_progress, normalize_campaign_redirect, campaign_after_submit, active_campaign_for_token
 from app.services.leads_service import upsert_lead
 from app.services.agent_email_service import agent_public_phone
@@ -1682,7 +1682,7 @@ async def _showing_home(db: AsyncSession, submission: FormSubmission) -> dict:
     photos = prop.photos if isinstance(prop.photos, list) else []
     return {
         "address": submission.property_address or prop.street_address or "",
-        "street": nice_street(prop.street_address) or (submission.property_address or "").split(",")[0],
+        "street": nice_street(prop.street_address, prop.city) or (submission.property_address or "").split(",")[0],
         "city": (prop.city or "").title(), "state": prop.state or "", "zipcode": prop.zipcode or "",
         "photo": prop.img_src or (photos[0] if photos else None),
         "price": prop.price, "beds": prop.bedrooms, "baths": prop.bathrooms, "sqft": prop.living_area,
@@ -1926,6 +1926,7 @@ async def track_form_progress(
     form_slug: str,
     payload: FormProgressUpdate,
     db: AsyncSession = Depends(get_db),
+    viewer: Optional[User] = Depends(get_current_user_optional),
 ):
     """Best-effort per-question progress ping (view / step-advance / completion) that powers the
     Stats drop-off funnel - never raises, since a tracking failure must never surface to the
@@ -1944,6 +1945,10 @@ async def track_form_progress(
         )
         form = form_result.scalar_one_or_none()
         if not form:
+            return {"success": True}
+        # The agent trying out their own form isn't a visitor - same rule as Agent Hub visits and
+        # blog reads, so "Forms Viewed" on Dash only counts real guests.
+        if viewer and viewer.id == form.owner_id:
             return {"success": True}
 
         await record_form_progress(db, form, payload)

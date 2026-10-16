@@ -17,6 +17,8 @@ can never send a second digest for the same changes."""
 from __future__ import annotations
 
 from collections import OrderedDict
+import json
+import re
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
@@ -27,6 +29,7 @@ from sqlalchemy.orm import selectinload
 from app.config.logging import get_logger
 from app.models.database import Collection, Notification, ScheduledEmail, User
 from app.services.tasks_service import EASTERN
+from app.services.agent_roundup_service import nice_street
 from app.services.agent_email_service import agent_public_phone
 from app.services.email_avatar_service import agent_email_vars
 from urllib.parse import quote
@@ -44,6 +47,8 @@ BUYER_TEMPLATE = "showcase_daily_digest"
 # The one-time "your Showcase is ready" email (queue_showcase_ready) - its own template.
 READY_TEMPLATE = "showcase_ready"
 READY_HOMES = 3
+# Same idea, when the agent builds it by hand and sends it ("Email it to them").
+SHARED_TEMPLATE = "showcase_shared"
 AGENT_TEMPLATE = "showcase_daily_digest_agent"
 # Emails stay short - a few items, then "+ N more" and a button to see everything (user, 10/06).
 MAX_HOMES = 4               # homes in one buyer email (big photos on phones); the rest are in their Showcase
@@ -101,6 +106,25 @@ def _place(v: dict) -> tuple[str, str, str]:
     return (parts[0] if parts else ""), (parts[1] if len(parts) > 1 else ""), state
 
 
+def _total_label(n) -> str:
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return ""
+    return "1 home" if n == 1 else f"All {n} homes" if n > 1 else ""
+
+
+async def _spotlight_told_today(db: AsyncSession, email: str, now: datetime) -> set:
+    """Listing keys this guest got a Spotlight alert email about today (Eastern)."""
+    from app.models.database import PropertyWebsite, SpotlightAlertSubscription
+    day_start = datetime.combine(now.astimezone(EASTERN).date(), datetime.min.time(), EASTERN).astimezone(timezone.utc)
+    rows = (await db.execute(
+        select(PropertyWebsite.listing_key).join(SpotlightAlertSubscription, SpotlightAlertSubscription.property_website_id == PropertyWebsite.id)
+        .where(func.lower(SpotlightAlertSubscription.email) == email.lower(), SpotlightAlertSubscription.last_notified_at >= day_start)
+    )).scalars().all()
+    return {str(k) for k in rows if k}
+
+
 def _homes(rows: list[dict]) -> list[dict]:
     """One entry per home (in the order they came in), shaped the way the Mailgun templates read it.
     A home that was new AND dropped its price the same day shows once, as new, at its latest price;
@@ -113,7 +137,7 @@ def _homes(rows: list[dict]) -> list[dict]:
         if h is None:
             street, city, state = _place(v)
             from app.services.agent_roundup_service import nice_street
-            h = homes[key] = {"street_address": nice_street(street), "city": city.title() if city.isupper() else city, "state": state,
+            h = homes[key] = {"street_address": nice_street(street, city), "city": city.title() if city.isupper() else city, "state": state,
                               "image": v.get("property_image") or "", "beds": _num(v.get("property_beds")),
                               "baths": _num(v.get("property_baths")), "sqft": _num(v.get("property_sqft")),
                               "is_price_drop": False, "_new": False}
@@ -214,8 +238,16 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
         col = cols.get(cid)
         if not live(col) or not getattr(col, "notify_visitor", True) or not col.visitor_email:
             continue
+        # Already told today by that home's Spotlight alert (10 AM) - don't send the same price drop
+        # again at 4:30. A new match is still news (the Spotlight alert never says "new for you").
+        # The agent changed their search today (queue_search_changed) - its own block, not a home.
+        search_rows = [v for v in rows if v.get("_kind") == "search"]
+        rows = [v for v in rows if v.get("_kind") != "search"]
+        told = await _spotlight_told_today(db, email, now or datetime.now(timezone.utc))
+        if told:
+            rows = [v for v in rows if not (v.get("_kind") == "drop" and str(v.get("_listing_key") or "") in told)]
         homes = _homes(rows)
-        if not homes:
+        if not homes and not search_rows:
             continue
         # The engagement rules (client_email_service): people who stopped opening these get one
         # email a week - or none - instead of one a day.
@@ -236,11 +268,15 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
                 continue
         new, drops, new_label, drop_label = _labels(homes, "new match", "new matches")
         both = " and ".join(x for x in (new_label, drop_label) if x)
-        last = rows[-1]
+        last = (rows or search_rows)[-1]
+        agent_first = (str(last.get("agent_name") or "").split(" ")[0]) or "Your agent"
+        search = search_change_vars(search_rows, agent_first)
         vars_ = {
             "recipient_name": _cap((col.visitor_name or "").strip().split(" ")[0]) or "there",   # "Hi Casey," - first name
-            "collection_name": col.name, "collection_link": last.get("collection_link") or "",
+            "collection_name": nice_street(col.name), "collection_link": last.get("collection_link") or "",
             "total_count": last.get("total_count") or len(homes), "today_date": today,
+            # The button's small line, ready-made so it never reads "All 1 homes".
+            "total_label": _total_label(last.get("total_count") or len(homes)),
             "agent_name": last.get("agent_name") or "", "agent_email": last.get("agent_email") or "",
             "agent_phone": last.get("agent_phone") or "", "Unsub": last.get("Unsub") or "",
             "new_label": new_label, "drop_label": drop_label, "properties": homes[:MAX_HOMES],
@@ -254,7 +290,14 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
             vars_["headline"] = (f"This week: {_one_home_line(homes[0])}" if len(homes) == 1 else f"This week: {both} in your Showcase")
             subject = (f"Your week: {_one_home_line(homes[0])}" if len(homes) == 1 else f"Your week: {both} in your Showcase")
         else:
-            subject = (_one_home_line(homes[0]) if len(homes) == 1 else f"{both[0].upper() + both[1:]} in your Showcase today")
+            subject = (_one_home_line(homes[0]) if len(homes) == 1 else f"{both[0].upper() + both[1:]} in your Showcase today") if homes else ""
+        if search:
+            added = search.pop("_added")
+            vars_.update(search)
+            fits = f" - {_plural(added, 'new home', 'new homes')} for you" if added else ""
+            # Leads with the search change; the homes (if any) follow under it.
+            vars_["headline"] = f"{agent_first} updated your search" + (f", plus {both}" if both else "")
+            subject = f"{agent_first} updated your Showcase search{fits}" if not homes else f"Your search was updated + {both}"
         n = per_owner.get(col.owner_id, 0)
         per_owner[col.owner_id] = n + 1
         db.add(ScheduledEmail(
@@ -284,7 +327,7 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
             if homes:
                 new, drops, new_label, drop_label = _labels(homes, "new", "new")
                 showcases.append({"visitor_name": " ".join(_cap(w) for w in (col.visitor_name or "").split()),
-                                  "collection_name": col.name, "collection_link": absolute(f"/showcases?showcase={col.id}"),
+                                  "collection_name": nice_street(col.name), "collection_link": absolute(f"/showcases?showcase={col.id}"),
                                   "new_label": new_label, "drop_label": drop_label,
                                   "properties": _sample(homes, MAX_HOMES_PER_SHOWCASE), "_new": new, "_drops": drops})
         if showcases:
@@ -313,14 +356,19 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
                 brief = {"followups": [], "actions": [], "client_activity": [], "followups_label": "", "followup_count": 0}
             if not sc and not brief["followups"] and not brief["actions"] and not brief["client_activity"]:
                 continue  # nothing to say today - no email
+            keys = brief.pop("_keys", [])
+            seen_row = (await db.execute(text("SELECT value FROM system_settings WHERE key = :k"), {"k": f"briefing_seen:{user.id}"})).scalar()
+            if not sc and not (set(keys) - set(seen_row or [])):
+                continue  # only things they were already told about yesterday - no email
             v = {"recipient_name": user.first_name or "there", "today_date": today,
                  "dashboard_link": absolute("/dash"), **brief}
             if sc:
                 new_part = _plural(sc["new"], "new match", "new matches") if sc["new"] else ""
                 drop_part = _plural(sc["drops"], "price drop", "price drops") if sc["drops"] else ""
-                clients = _plural(len(sc["showcases"]), "client showcase", "client showcases")
-                headline = f"{new_part or drop_part} across {clients}"
+                clients = _plural(len(sc["showcases"]), "client Showcase", "client Showcases")
                 both = " and ".join(p for p in (new_part, drop_part) if p)
+                # names the price drops too ("3 new matches and 1 price drop across 2 client Showcases")
+                headline = f"{both} across {clients}"
                 bell = (f"{both} across {len(sc['showcases'])} clients' Showcases" if len(sc["showcases"]) > 1
                         else f"{both} in {sc['showcases'][0]['visitor_name'] or 'a client'}'s Showcase")
                 db.add(Notification(
@@ -333,13 +381,18 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
                           "collections": sc["showcases"][:MAX_SHOWCASES], "has_showcases": True,
                           "collections_more": _more(len(sc["showcases"]) - MAX_SHOWCASES, "more Showcase updated", "more Showcases updated", "")})
             elif brief["followup_count"]:
-                headline = _plural(brief["followup_count"], "follow-up for today", "follow-ups for today")
+                # "for today" only when none are overdue - otherwise it says they're waiting.
+                headline = (_plural(brief["followup_count"], "follow-up waiting on you", "follow-ups waiting on you") if brief.get("followup_overdue")
+                            else _plural(brief["followup_count"], "follow-up for today", "follow-ups for today"))
             else:
                 n = len(brief["actions"]) + len(brief["client_activity"])
                 headline = _plural(n, "thing waiting on you", "things waiting on you")
             v["headline"] = headline
             v["has_showcase_section"] = bool(sc or brief["client_activity"])
             agent_emails.append((user, f"Your daily briefing: {headline}", v))
+            await db.execute(text(
+                "INSERT INTO system_settings (key, value) VALUES (:k, CAST(:v AS jsonb)) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"), {"k": f"briefing_seen:{user.id}", "v": json.dumps(keys)})
             agents += 1
 
     await db.commit()
@@ -371,21 +424,40 @@ async def _briefing(db: AsyncSession, user: User, now: datetime, showcase_access
     from app.services.tasks_service import compute_bucket, task_day
     from app.utils.auth import tier_has_mls
 
-    # Follow-ups: today's + overdue (overdue = the same 7-day window the calendar carries forward).
+    # Follow-ups: today's + EVERY overdue one (same as Dash and the Follow-ups page - the user wants
+    # nothing old to quietly drop off). Order matches Dash: overdue this week, then today, then the
+    # older backlog last, so a backlog never pushes today's off the 5 shown.
     from app.services.tasks_service import followups_enabled
     tasks = (await db.execute(select(AgentTask).where(
         AgentTask.owner_id == user.id, AgentTask.completed_at.is_(None), AgentTask.due_at.isnot(None),
-        AgentTask.due_at >= now - timedelta(days=8), AgentTask.due_at <= now + timedelta(days=1),
+        AgentTask.due_at <= now + timedelta(days=1),
     ))).scalars().all() if followups_enabled(user) else []
     due = [(t, compute_bucket(t, now)) for t in tasks]
     overdue = [t for t, b in due if b == "overdue"]
     today_ = [t for t, b in due if b == "today"]
+    week_ago = now - timedelta(days=7)
+    recent_over = sorted((t for t in overdue if t.due_at >= week_ago), key=lambda t: t.due_at)
+    older_over = sorted((t for t in overdue if t.due_at < week_ago), key=lambda t: t.due_at, reverse=True)
     followups = []
-    for t in sorted(overdue, key=lambda t: t.due_at) + sorted(today_, key=lambda t: t.due_at):
+    for t in recent_over + sorted(today_, key=lambda t: t.due_at) + older_over:
         is_over = t in overdue
         d = task_day(t)
         when = f"Overdue · was due {d.strftime('%a, %b')} {d.day}" if is_over and d else "Today"
-        followups.append({"title": t.title, "when": when, "overdue": is_over})
+        followups.append({"title": t.title, "when": when, "overdue": is_over, "_key": f"task:{t.id}"})
+    # Two open follow-ups with the same title (one person, two different reasons - each card in the
+    # app shows its own reason) read as a duplicate in an email that only shows titles: one line each.
+    merged: "OrderedDict[str, dict]" = OrderedDict()
+    for f in followups:
+        m = merged.get(f["title"])
+        if m is None:
+            merged[f["title"]] = {**f, "_n": 1, "_keys": [f["_key"]]}
+        else:
+            m["_n"] += 1
+            m["_keys"].append(f["_key"])
+    followups = []
+    for m in merged.values():
+        n, keys = m.pop("_n"), m.pop("_keys")
+        followups.append({**m, "title": f"{m['title']} ({n})" if n > 1 else m["title"], "_key": keys[0], "_all_keys": keys})
     label = " · ".join(x for x in (f"{len(today_)} due today" if today_ else "", f"{len(overdue)} overdue" if overdue else "") if x)
 
     actions, activity = [], []
@@ -406,9 +478,15 @@ async def _briefing(db: AsyncSession, user: User, now: datetime, showcase_access
     # Leads that need a response (the Dashboard's "needs attention" list).
     try:
         from app.services.ai.ai_insights_service import get_daily_digest
+        # A person who already has a follow-up in this email isn't listed again here ("Follow up
+        # with Sam" + "Sam has new activity" is the same thing twice).
+        followup_leads = {t.lead_id for t in overdue + today_ if t.lead_id}
         for item in (await get_daily_digest(db, user))["needs_attention"]:
             kind = item.get("kind")
             if kind in _SKIP_KINDS:
+                continue
+            m = re.match(r"lead-([0-9a-f-]{36})-", str(item.get("id") or ""))
+            if m and m.group(1) in followup_leads:
                 continue
             row = {"badge": "!", "title": item["title"], "detail": item.get("detail") or "", "link": absolute(item.get("link") or "/leads")}
             if kind in _SHOWCASE_KINDS:
@@ -467,24 +545,33 @@ async def _briefing(db: AsyncSession, user: User, now: datetime, showcase_access
     return {
         "followups": followups[:MAX_FOLLOWUPS],
         "followups_more": f"+ {len(followups) - MAX_FOLLOWUPS} more" if len(followups) > MAX_FOLLOWUPS else "",
-        "followups_label": label, "followup_count": len(followups), "followups_link": absolute("/leads/tasks"),
+        "followups_label": label, "followup_count": len(overdue) + len(today_), "followup_overdue": len(overdue), "followups_link": absolute("/leads/tasks"),
         "actions": actions[:MAX_ACTIONS], "actions_more": f"+ {more} more on your Dashboard" if more > 0 else "",
         "client_activity": activity[:MAX_ACTIONS],
+        # Everything this briefing is about - compared with the last one sent, so a day with
+        # nothing new (the same old overdue follow-ups, the same unopened forms) sends no email.
+        "_keys": sorted({k for f in followups for k in f.get("_all_keys", [f["_key"]])}
+                        | {f"action:{a['title']}|{a.get('detail', '')}" for a in actions}
+                        | {f"activity:{a['title']}|{a.get('detail', '')}" for a in activity}),
     }
 
 
-async def queue_showcase_ready(db: AsyncSession, collection_id: str) -> bool:
+async def queue_showcase_ready(db: AsyncSession, collection_id: str, from_agent: bool = False) -> bool:
     """The buyer's own Showcase link, emailed the moment their Showcase is first built (a form, the
     IDX "Create my free Showcase", the Guest Pass) - so closing the thank-you page doesn't lose it
     until the next 4:30 digest. Its own Mailgun template (showcase_ready): their link, what they can
-    do on any home, and the first three homes it picked. Never raises."""
+    do on any home, and the first three homes it picked. Never raises.
+
+    from_agent: the agent built it for them by hand ("Email it to them" on) - its own template
+    (showcase_shared): "{Agent} picked homes for you", what the search looks for and how to change it."""
     import os
     from app.models.database import Property, collection_properties
     from app.services.blacklist_service import BlacklistService
     from app.services.website.site_service import resolve_owner_public_base_url
     from app.services.agent_roundup_service import nice_street
     try:
-        col = await db.get(Collection, collection_id)
+        col = (await db.execute(select(Collection).options(selectinload(Collection.preferences), selectinload(Collection.original_open_house_event))
+                                .where(Collection.id == collection_id))).scalar_one_or_none()
         if col is None or col.status != "ACTIVE" or not col.visitor_email or not getattr(col, "notify_visitor", True):
             return False
         if await BlacklistService.is_blacklisted(db, col.visitor_email):
@@ -495,10 +582,13 @@ async def queue_showcase_ready(db: AsyncSession, collection_id: str) -> bool:
         )).scalar() or 0
         props = (await db.execute(
             select(Property).join(collection_properties, collection_properties.c.property_id == Property.id)
-            .where(collection_properties.c.collection_id == col.id).limit(READY_HOMES)
+            .where(collection_properties.c.collection_id == col.id)
+            # homes with a photo first - an email card with an empty photo box looks broken
+            .order_by(Property.img_src.is_(None), Property.img_src == "", Property.mls_list_date.desc().nullslast())
+            .limit(READY_HOMES)
         )).scalars().all()
         homes = [{
-            "street_address": nice_street(p.street_address or ""), "city": (p.city or "").title(), "state": p.state or "",
+            "street_address": nice_street(p.street_address or "", p.city), "city": (p.city or "").title(), "state": p.state or "",
             "image": p.img_src or "", "beds": _num(p.bedrooms), "baths": _num(p.bathrooms), "sqft": _num(p.living_area),
             "price": f"${p.price:,.0f}" if p.price else "",
         } for p in props]
@@ -515,9 +605,27 @@ async def queue_showcase_ready(db: AsyncSession, collection_id: str) -> bool:
             "Unsub": f"{frontend_url}/unsubscribe?email={quote(col.visitor_email or '', safe='')}",
             **(await agent_email_vars(db, owner)),   # face, title, brokerage, email, phone
         }
+        template = READY_TEMPLATE
+        subject = f"{first + ', your' if first else 'Your'} Showcase is ready" + (f" - {total} home{'s' if total != 1 else ''} picked for you" if total else "")
+        if from_agent:
+            from app.services.collections_service import _resolve_original_property_data
+            agent_first = (owner.first_name or "").strip() if owner else ""
+            agent_first = agent_first or vars_["agent_name"].split(" ")[0]
+            built = None
+            if col.preferences and col.preferences.show_match_score is not False:
+                built = ((await _resolve_original_property_data(db, col)) or {}).get("address")
+            vars_.update({
+                "agent_first": agent_first,
+                "homes_label": _plural(total, "home", "homes"),
+                "search_summary": search_summary(col.preferences, built) if col.preferences else "",
+                "search_link": f"{vars_['collection_link']}?search=1",
+            })
+            template = SHARED_TEMPLATE
+            subject = (f"{agent_first} picked {_plural(total, 'home', 'homes')} for you" if total
+                       else f"{agent_first} set up your home search")
         db.add(ScheduledEmail(
-            recipient_email=col.visitor_email, template_name=READY_TEMPLATE, template_variables=vars_,
-            subject=f"{first + ', your' if first else 'Your'} Showcase is ready" + (f" - {total} home{'s' if total != 1 else ''} picked for you" if total else ""),
+            recipient_email=col.visitor_email, template_name=template, template_variables=vars_,
+            subject=subject,
             status="PENDING", scheduled_for=datetime.now(timezone.utc), owner_id=col.owner_id,
         ))
         await db.commit()
@@ -526,3 +634,108 @@ async def queue_showcase_ready(db: AsyncSession, collection_id: str) -> bool:
         logger.warning("showcase ready email failed", exc_info=True)
         await db.rollback()
         return False
+
+
+def _k(v) -> str:
+    """400000 -> "$400k", 1250000 -> "$1.25M"."""
+    v = float(v)
+    return f"${v / 1_000_000:.2f}".rstrip("0").rstrip(".") + "M" if v >= 1_000_000 else f"${round(v / 1000):,}k"
+
+
+def search_summary(prefs, built_around: str | None = None) -> str:
+    """What a Showcase search is now, in one plain line for the buyer's email:
+    "Built around 12 Oak St · Within 6 mi · $400k-$600k · 3+ beds"."""
+    parts: list[str] = []
+    if built_around:
+        parts.append(f"Built around {nice_street(built_around)}")
+    if getattr(prefs, "search_polygon", None):
+        parts.append("The area your agent drew on the map")
+    elif prefs.address and prefs.diameter:
+        parts.append(f"Within {prefs.diameter:g} mi" + ("" if built_around else f" of {nice_street(prefs.address)}"))
+    towns = [t for t in list(prefs.cities or []) + list(prefs.townships or []) if t]
+    if towns:
+        parts.append(", ".join(towns[:3]) + (f" +{len(towns) - 3} more" if len(towns) > 3 else ""))
+    if prefs.school_districts:
+        parts.append(", ".join(prefs.school_districts[:2]) + (" school district" if len(prefs.school_districts) == 1 else " school districts"))
+    if prefs.min_price and prefs.max_price:
+        parts.append(f"{_k(prefs.min_price)}-{_k(prefs.max_price)}")
+    elif prefs.max_price:
+        parts.append(f"Up to {_k(prefs.max_price)}")
+    elif prefs.min_price:
+        parts.append(f"{_k(prefs.min_price)}+")
+    if prefs.min_beds:
+        parts.append(f"{prefs.min_beds:g}+ beds")
+    if prefs.min_baths:
+        parts.append(f"{prefs.min_baths:g}+ baths")
+    return " · ".join(parts)
+
+
+async def showcase_home_ids(db: AsyncSession, collection_id: str) -> set:
+    from app.models.database import collection_properties
+    return set((await db.execute(select(collection_properties.c.property_id)
+                                 .where(collection_properties.c.collection_id == collection_id))).scalars().all())
+
+
+async def queue_search_changed(db: AsyncSession, collection_id: str, before_ids: set) -> bool:
+    """The agent changed a client's Showcase search: queue it for that client's 4:30 email - what
+    the search is now, how many homes it adds / drops, and a button to change it themselves.
+    Several changes in one day fold into one note (first "before" vs last "after"). The client's
+    own edits aren't queued - they just made them. Never raises."""
+    import os
+    from app.services.blacklist_service import BlacklistService
+    from app.services.collections_service import _resolve_original_property_data
+    from app.services.website.site_service import resolve_owner_public_base_url
+    try:
+        col = (await db.execute(select(Collection).options(selectinload(Collection.preferences), selectinload(Collection.owner),
+                                                           selectinload(Collection.original_open_house_event))
+                                .where(Collection.id == collection_id))).scalar_one_or_none()
+        if col is None or col.status != "ACTIVE" or not col.visitor_email or not getattr(col, "notify_visitor", True) or not col.preferences:
+            return False
+        if await BlacklistService.is_blacklisted(db, col.visitor_email):
+            return False
+        after = await showcase_home_ids(db, col.id)
+        built = None
+        if col.preferences.show_match_score is not False:
+            built = ((await _resolve_original_property_data(db, col)) or {}).get("address")
+        owner = col.owner
+        frontend_url = os.getenv("FRONTEND_URL", os.getenv("CLIENT_URL", "http://localhost:3000")).rstrip("/")
+        base = (await resolve_owner_public_base_url(db, owner)) if owner else frontend_url
+        db.add(ScheduledEmail(
+            recipient_email=col.visitor_email, template_name=BUYER_TEMPLATE, subject="Your search was updated", status=QUEUED,
+            scheduled_for=datetime.now(timezone.utc), owner_id=col.owner_id,
+            template_variables={
+                "collection_link": f"{base}/showcase/{col.share_token}", "total_count": len(after),
+                "agent_name": (f"{owner.first_name or ''} {owner.last_name or ''}".strip() if owner else "") or "Your agent",
+                "agent_email": owner.email if owner else "", "agent_phone": await agent_public_phone(db, owner),
+                "Unsub": f"{frontend_url}/unsubscribe?email={quote(col.visitor_email, safe='')}",
+                "_audience": "buyer", "_collection_id": col.id, "_owner_id": col.owner_id, "_kind": "search", "_seq": __import__("time").time_ns(),
+                "_before_ids": sorted(before_ids), "_after_ids": sorted(after),
+                "_summary": search_summary(col.preferences, built),
+            }))
+        await db.commit()
+        return True
+    except Exception:  # noqa: BLE001 - the search itself is already saved
+        logger.warning("queueing the search-changed note failed", exc_info=True)
+        await db.rollback()
+        return False
+
+
+def search_change_vars(search_rows: list[dict], agent_first: str) -> dict:
+    """Template variables for the "Your search was updated" block of the buyer's email."""
+    if not search_rows:
+        return {}
+    before, after = set(search_rows[0].get("_before_ids") or []), set(search_rows[-1].get("_after_ids") or [])
+    added, removed = len(after - before), len(before - after)
+    counts = [
+        f"{_plural(added, 'new home fits', 'new homes fit')} it now" if added else "",
+        f"{removed} no longer {'fits' if removed == 1 else 'fit'}" if removed else "",
+        f"{_plural(len(after), 'home', 'homes')} in all",
+    ]
+    link = str(search_rows[-1].get("collection_link") or "")
+    return {
+        "search_changed": True,
+        "search_summary": search_rows[-1].get("_summary") or "",
+        "search_counts": " · ".join(c for c in counts if c),
+        "search_link": f"{link}{'&' if '?' in link else '?'}search=1" if link else "",
+        "_added": added,
+    }

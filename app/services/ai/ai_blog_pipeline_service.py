@@ -242,7 +242,8 @@ def _cost(config: dict, model: str, u: dict) -> float:
     return round(
         (u["input_tokens"] * inp
          + u["cache_creation_input_tokens"] * inp * config.get("blog_pipeline_cache_write_multiplier", 1.25)
-         + u["cache_read_input_tokens"] * inp * config.get("blog_pipeline_cache_read_multiplier", 0.1)
+         # Cache reads are 0.1x input on most models, 0.05x on Opus 5.5 / Sonnet 5.5 (model_pricing).
+         + u["cache_read_input_tokens"] * inp * p.get("cache_read_multiplier", config.get("blog_pipeline_cache_read_multiplier", 0.1))
          + u["output_tokens"] * out) / 1_000_000
         + u["web_search_requests"] * config.get("blog_pipeline_web_search_cost_usd", 0.01),
         6,

@@ -35,6 +35,9 @@ def _to_out(task: AgentTask) -> TaskOut:
             if line.startswith("Open house: "):
                 data.context = f"Signed in at your open house - {line[len('Open house: '):]}"
                 break
+    # Older follow-ups were saved with the MLS's capitals ("26 OLD GULPH RD") - tidy on the way out.
+    if data.context:
+        data.context = tasks_service._tidy_context(data.context)
     return data
 
 
@@ -249,7 +252,7 @@ def _public_view(task: AgentTask, others: Optional[list] = None) -> dict:
     lead = task.lead
     out = {
         "title": task.title,
-        "context": task.context,
+        "context": tasks_service._tidy_context(task.context) if task.context else task.context,
         "lead_name": lead.name if lead else None,
         # Their contact info stays on the page (done or not) - with the one-tap "save to contacts".
         "contact": {"name": lead.name, "phone": lead.phone, "email": lead.email} if lead else None,

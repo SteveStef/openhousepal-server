@@ -422,11 +422,17 @@ async def get_signature_listing_jpeg(token: str, request: Request, db: AsyncSess
     accent = resolved["accentColor"]
     luxe = bool(resolved.get("luxe"))
 
+    # 2 sales = the featured strip flipping between them: a GIF on this same URL (the installed
+    # HTML stays identical for a listing, one sale or two - see render_sale_feature).
+    media_type = "image/gif" if (mode == "sale_feature" and len(items) > 1) else "image/jpeg"
+
     async def render():
         if mode == "listing":
             return await email_signature_service.render_listing_bar_jpeg(items[0], accent, dark=dark, luxe=luxe)
+        if mode == "sale_feature":
+            return (await email_signature_service.render_sale_feature(items, accent, dark=dark, luxe=luxe))[0]
         return await email_signature_service.render_recent_sales_carousel_jpeg(items, accent, dark=dark)
-    return await _live_image(request, _fingerprint("listing.jpg", mode, items, accent, dark, luxe, "v3"), "image/jpeg", render)
+    return await _live_image(request, _fingerprint("listing.jpg", mode, items, accent, dark, luxe, "v4"), media_type, render)
 
 
 @router.get("/public/{token}/listing.webp")
@@ -443,7 +449,7 @@ async def get_signature_listing_webp(token: str, db: AsyncSession = Depends(get_
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No featured listing yet.")
     mode, items = featured
     dark = bool(resolved.get("darkMode"))
-    if mode == "listing":
+    if mode in ("listing", "sale_feature"):
         webp_bytes = await email_signature_service.render_listing_bar_webp(items[0], resolved["accentColor"], dark=dark, luxe=bool(resolved.get("luxe")))
     else:
         webp_bytes = await email_signature_service.render_recent_sales_carousel_webp(items, resolved["accentColor"], dark=dark)
@@ -472,6 +478,22 @@ async def get_signature_stats_png(token: str, request: Request, db: AsyncSession
     return await _live_image(request, _fingerprint("stats.png", stats, accent, dark, target_h), "image/png", render)
 
 
+@router.get("/public/{token}/stats-strip.png")
+async def get_signature_stats_strip_png(token: str, request: Request, db: AsyncSession = Depends(get_db)):
+    """The stats as a slim strip - shown instead of the stats column when the listings & sales
+    strip is off (see email_signature_service.stats_as_strip). Live, like every other image here."""
+    signature, owner, hub_config = await _load_public_signature(db, token)
+    resolved = email_signature_service.resolve_signature_config(signature.config)
+    stats = email_signature_service.compute_sales_stats(hub_config) if email_signature_service.wants_stats(resolved) else None
+    if not stats:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No stats yet.")
+    accent, dark = resolved["accentColor"], bool(resolved.get("darkMode"))
+
+    async def render():
+        return await email_signature_service.render_stats_strip_png(stats, accent, dark_theme=dark)
+    return await _live_image(request, _fingerprint("stats-strip.png", stats, accent, dark), "image/png", render)
+
+
 @router.get("/public/{token}/stats.webp")
 async def get_signature_stats_webp(token: str, db: AsyncSession = Depends(get_db)):
     """Lossless WebP sibling of stats.png - see the <picture> wrapper in _stats_img_html."""
@@ -494,7 +516,7 @@ async def get_signature_sales_header_png(token: str, request: Request, db: Async
     resolved = email_signature_service.resolve_signature_config(signature.config)
     banner_cfg = resolved["banner"]
     featured = email_signature_service.pick_featured_items(hub_config, banner_cfg.get("showFeaturedListing", True), banner_cfg.get("showRecentSales", True))
-    if not featured or featured[0] == "listing":
+    if not featured or featured[0] != "sale":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
     dark, accent = bool(resolved.get("darkMode")), resolved["accentColor"]
 
@@ -510,7 +532,7 @@ async def get_signature_sales_header_webp(token: str, db: AsyncSession = Depends
     resolved = email_signature_service.resolve_signature_config(signature.config)
     banner_cfg = resolved["banner"]
     featured = email_signature_service.pick_featured_items(hub_config, banner_cfg.get("showFeaturedListing", True), banner_cfg.get("showRecentSales", True))
-    if not featured or featured[0] == "listing":
+    if not featured or featured[0] != "sale":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
     dark = bool(resolved.get("darkMode"))
     webp_bytes = email_signature_service.render_recent_sales_header_webp(resolved["accentColor"], dark=dark)
@@ -527,7 +549,9 @@ async def get_signature_listing_gif(token: str, db: AsyncSession = Depends(get_d
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No featured listing yet.")
     mode, items = featured
     dark = bool(resolved.get("darkMode"))
-    if mode == "listing":
+    if mode == "sale_feature" and len(items) > 1:
+        gif_bytes = (await email_signature_service.render_sale_feature(items, resolved["accentColor"], dark=dark, luxe=bool(resolved.get("luxe"))))[0]
+    elif mode in ("listing", "sale_feature"):
         gif_bytes = await email_signature_service.render_listing_bar_gif(items[0], resolved["accentColor"], dark=dark, luxe=bool(resolved.get("luxe")))
     else:
         gif_bytes = await email_signature_service.render_recent_sales_carousel_gif(items, resolved["accentColor"], dark=dark)

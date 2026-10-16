@@ -97,6 +97,13 @@ async def create_open_house(
         # (open_house_manager_service._hosted_windows), so nothing is stamped onto the kit.
         scheduled_date = scheduled_start_time = scheduled_end_time = None
 
+        defaults = await OpenHouseService.guest_defaults(db, current_user, listing_key_value or None)
+        guest_choices = {
+            "auto_showcase": defaults["auto_showcase"] if request.auto_showcase is None else request.auto_showcase,
+            "similar_homes": defaults["similar_homes"] if request.similar_homes is None else request.similar_homes,
+            **({"guest_pass": request.guest_pass} if request.guest_pass is not None else {}),
+        }
+
         open_house = OpenHouseEvent(
             id=open_house_id,
             agent_id=current_user.id,
@@ -129,6 +136,7 @@ async def create_open_house(
             scheduled_date=scheduled_date,
             scheduled_start_time=scheduled_start_time,
             scheduled_end_time=scheduled_end_time,
+            **guest_choices,
         )
 
         db.add(open_house)
@@ -166,6 +174,9 @@ async def create_open_house(
             cheat_sheet_snapshot=open_house.cheat_sheet_snapshot,
             qr_dark_mode=open_house.qr_dark_mode,
             share_guests_with_listing_agent=open_house.share_guests_with_listing_agent,
+            auto_showcase=open_house.auto_showcase,
+            similar_homes=open_house.similar_homes,
+            guest_pass=open_house.guest_pass,
             visitor_count=0,
             created_at=open_house.created_at
         )
@@ -272,6 +283,7 @@ async def get_open_houses(
                 qr_dark_mode=oh.qr_dark_mode,
                 share_guests_with_listing_agent=oh.share_guests_with_listing_agent,
                 auto_showcase=oh.auto_showcase,
+                similar_homes=oh.similar_homes,
                 after_signin=oh.after_signin,
                 guest_pass=oh.guest_pass,
                 pass_signature=oh.pass_signature,
@@ -294,6 +306,18 @@ async def get_open_houses(
     except Exception as e:
         logger.error("fetching open houses failed", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail="Failed to fetch open houses")
+
+
+@router.get("/api/open-houses/guest-defaults")
+async def get_guest_defaults(
+    listing_key: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
+):
+    """What the kit wizard starts Showcases + Similar Homes at for this home: both off when the
+    agent is its listing (or co-listing) agent, both on otherwise. Same rule the create route uses
+    when the wizard doesn't say."""
+    return await OpenHouseService.guest_defaults(db, current_user, listing_key)
 
 
 @router.get("/api/open-houses/missed-showcases")
@@ -428,6 +452,12 @@ async def complete_open_house_form_request(
 
         await db.commit()
         await db.refresh(req)
+        # ...and its follow-up ("Send the disclosure to Jane" / "Tour 12 Oak St") is done too - checked
+        # off and off the calendar, as if the agent ticked it (user, 10/15).
+        from app.services.tasks_service import complete_request_followups
+        await complete_request_followups(db, current_user.id, source_ids=(req.id,),
+                                         rules={"disclosure_request", "second_visit_request"})
+        await db.refresh(req)
 
         return OpenHouseFormRequestResponse(
             id=req.id,
@@ -501,6 +531,7 @@ async def get_open_house(
         qr_dark_mode=oh.qr_dark_mode,
         share_guests_with_listing_agent=oh.share_guests_with_listing_agent,
         auto_showcase=oh.auto_showcase,
+        similar_homes=oh.similar_homes,
         after_signin=oh.after_signin,
         guest_pass=oh.guest_pass,
         pass_signature=oh.pass_signature,
@@ -828,6 +859,7 @@ async def get_property_by_qr(
         open_house_event = oh_result.scalar_one_or_none()
         if open_house_event:
             qr_dark_mode = bool(open_house_event.qr_dark_mode)
+            property_data["similarHomes"] = open_house_event.similar_homes is not False
             # Where the guest's phone goes once they sign in (the host's Spotlight for this home,
             # their Agent Hub, or nowhere) - the sign-in page sends them there.
             target = await OpenHouseService.after_signin_target(db, open_house_event, await db.get(User, open_house_event.agent_id))
@@ -1218,8 +1250,9 @@ async def update_guest_settings(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_active_plan)
 ):
-    """Per open house: auto-build Showcases for guests without an agent, and send guests to the
-    host's own Spotlight after they sign in. Either field may be sent alone."""
+    """Per open house: auto-build Showcases for guests without an agent, the Similar Homes sheet +
+    Guest Pass similar homes, the Guest Pass itself and its footer, and (No-MLS Pro) where the
+    guest's phone goes after signing in. Any field may be sent alone."""
     open_house = (await db.execute(
         select(OpenHouseEvent).where(and_(OpenHouseEvent.id == open_house_id, OpenHouseEvent.agent_id == current_user.id))
     )).scalar_one_or_none()
@@ -1227,6 +1260,8 @@ async def update_guest_settings(
         raise HTTPException(status_code=404, detail="Open house not found")
     if payload.auto_showcase is not None:
         open_house.auto_showcase = payload.auto_showcase
+    if payload.similar_homes is not None:
+        open_house.similar_homes = payload.similar_homes
     if payload.after_signin is not None:
         open_house.after_signin = payload.after_signin
     if payload.guest_pass is not None:
@@ -1234,8 +1269,8 @@ async def update_guest_settings(
     if payload.pass_signature is not None:
         open_house.pass_signature = payload.pass_signature
     await db.commit()
-    return {"success": True, "auto_showcase": open_house.auto_showcase, "after_signin": open_house.after_signin,
-            "guest_pass": open_house.guest_pass, "pass_signature": open_house.pass_signature}
+    return {"success": True, "auto_showcase": open_house.auto_showcase, "similar_homes": open_house.similar_homes,
+            "after_signin": open_house.after_signin, "guest_pass": open_house.guest_pass, "pass_signature": open_house.pass_signature}
 
 
 @router.put("/api/visitors/{visitor_id}/note")

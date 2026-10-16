@@ -502,7 +502,7 @@ async def release(owner_id: str):
 
 
 _DEFAULT_EXTERNAL_PRICES = {
-    "places_nearby": 0.032, "places_text": 0.032, "places_details": 0.017,
+    "places_nearby": 0.032, "places_text": 0.032, "places_details": 0.017, "places_details_reviews": 0.025,
     "geocoding": 0.005, "routes_matrix_element": 0.005, "static_map": 0.002, "census": 0.0,
 }
 

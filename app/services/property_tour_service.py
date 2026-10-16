@@ -384,6 +384,11 @@ class PropertyTourService:
         # (only matters when it was confirmed - _sync_tour no-ops otherwise).
         if tour.confirmed_date and tour.confirmed_time:
             calendar_sync_service.sync_tour_bg(user_id, tour_id)
+        # Done = handled: its "Tour 12 Oak St" follow-up is checked off and off the calendar too.
+        if completion_update.is_completed:
+            from app.services.tasks_service import complete_request_followups
+            await complete_request_followups(db, user_id, source_ids=(tour_id,), rules={"showing_request"})
+            await db.refresh(tour)
 
         return PropertyTourResponse.from_orm(tour)
 
@@ -471,7 +476,7 @@ class PropertyTourService:
             base = await resolve_owner_public_base_url(db, agent)
             first = (tour.visitor_name or collection.visitor_name or "").strip().split(" ")[0]
             from app.services.agent_roundup_service import nice_street
-            street = nice_street(prop.street_address)
+            street = nice_street(prop.street_address, prop.city)
             email_person(to, "tour_confirmed", f"Your tour of {street} is confirmed - {date_label} at {time_label}", {
                 "recipient_name": first[:1].upper() + first[1:] if first else "there",
                 "street_address": street, "city": (prop.city or "").title(), "state": prop.state or "",

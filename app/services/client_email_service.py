@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 AUTO_TEMPLATES = {"showcase_daily_digest", "showcase_weekly_digest", "spotlight_listing_update"}
 TRACKED_TEMPLATES = AUTO_TEMPLATES | {
-    "visitor_confirmation", "showcase_ready", "agent_comment_response", "tour_confirmed", "spotlight_alert_confirm",
+    "visitor_confirmation", "showcase_ready", "showcase_shared", "agent_comment_response", "tour_confirmed", "spotlight_alert_confirm",
 }
 # Template variables that are the email's real links (checked against every client template's
 # href="{{ ... }}"; unsubscribe, mailto: and tel: links are never wrapped).
@@ -327,7 +327,7 @@ async def record_click(db, track_id: str, key: str) -> Optional[str]:
 
 _TEMPLATE_LABEL = {
     "showcase_daily_digest": "daily Showcase update", WEEKLY_TEMPLATE: "weekly Showcase update",
-    "showcase_ready": "Showcase invite", "visitor_confirmation": "open house thank-you", "tour_confirmed": "tour confirmation",
+    "showcase_ready": "Showcase invite", "showcase_shared": "Showcase from you", "visitor_confirmation": "open house thank-you", "tour_confirmed": "tour confirmation",
     "agent_comment_response": "reply to their comment", "spotlight_alert_confirm": "Spotlight sign-up email",
     "spotlight_listing_update": "Spotlight listing alert",
 }

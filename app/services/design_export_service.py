@@ -104,9 +104,13 @@ async def render_design_pdf(design_type: str, export_token: str, design_id: str)
                 )
                 await page.goto(print_url, wait_until="domcontentloaded", timeout=60000)
                 await _wait_until_painted(page)
+                # Chromium turns a wider-than-tall paper size (a 6x4 postcard) into an upright page
+                # with the design in its top half - only a CSS @page size keeps it landscape.
+                await page.add_style_tag(content=f"@page {{ size: {width_in}in {height_in}in; margin: 0 }}")
                 return await page.pdf(
                     width=f"{width_in}in",
                     height=f"{height_in}in",
+                    prefer_css_page_size=True,
                     print_background=True,
                     margin={"top": "0in", "bottom": "0in", "left": "0in", "right": "0in"},
                 )

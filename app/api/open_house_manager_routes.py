@@ -600,3 +600,35 @@ async def _refresh_listings_and_open_houses():
     Both capped at 5 pages (1,000 records) per click, same reasoning as above."""
     await run_global_property_sync(max_pages=5)
     await run_open_house_sync(max_pages=5)
+
+
+@router.post("/host-requests/{request_id}/withdraw", response_model=HostRequestResponse)
+async def withdraw_request(
+    request_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.BASIC)),
+):
+    """The host takes back a request, or backs out of an open they were confirmed for."""
+    try:
+        return await service.withdraw_host_request(db, current_user, request_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to withdraw host request: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Unable to withdraw this request right now.")
+
+
+@router.post("/team/broadcasts/{broadcast_id}/decline", status_code=status.HTTP_204_NO_CONTENT)
+async def decline_direct_ask(
+    broadcast_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.BASIC)),
+):
+    """An agent asked directly to host says they can't."""
+    try:
+        await service.decline_direct_ask(db, current_user, broadcast_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to decline direct ask: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Unable to answer this request right now.")

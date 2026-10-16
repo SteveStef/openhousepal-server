@@ -122,6 +122,8 @@ class ShowcaseSelfServePreferencesUpdate(BaseModel):
     # to (the showcase was only ever comparing to its open-house default) turns comparison off
     # entirely, rather than being a no-op that silently keeps showing the same default.
     show_match_score: Optional[bool] = None
+    # "Don't build it around a home" - just their filters from now on (no match %).
+    remove_home: Optional[bool] = None
 
 class CollectionPreferences(CollectionPreferencesBase):
     id: str

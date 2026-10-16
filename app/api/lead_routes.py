@@ -4,6 +4,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
+from pydantic import BaseModel
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -209,7 +210,17 @@ async def _fetch_owner_collections(db: AsyncSession, owner_id: str) -> List[Coll
         .options(selectinload(Collection.properties), selectinload(Collection.property_interactions))
         .where(Collection.owner_id == owner_id, or_(Collection.visitor_email.isnot(None), Collection.visitor_phone.isnot(None)))
     )
-    return list(result.scalars().unique().all())
+    cols = list(result.scalars().unique().all())
+    # When each home came in - the NEW count (CollectionsService.count_new_properties) needs it.
+    if cols:
+        from app.models.database import collection_properties
+        added: dict = {}
+        for r in (await db.execute(select(collection_properties.c.collection_id, collection_properties.c.property_id, collection_properties.c.added_at)
+                                   .where(collection_properties.c.collection_id.in_([c.id for c in cols])))).all():
+            added.setdefault(r.collection_id, {})[r.property_id] = r.added_at
+        for c in cols:
+            c._added_at = added.get(c.id, {})
+    return cols
 
 
 def _match_collections(lead: Lead, collections: List[Collection]) -> List[Collection]:
@@ -231,7 +242,11 @@ _ENGAGEMENT_EVENT_TYPES = {'property_comment', 'property_tour', 'property_websit
                            'property_page_inquiry', 'property_page_tour_request',
                            # inside their Showcase (leads_service.log_activity)
                            'showcase_like', 'showcase_dislike', 'showcase_view', 'showcase_refine', 'showcase_search_changed',
-                           'review_left'}
+                           'review_left',
+                           # a question or request they sent, like the Spotlight inquiry above
+                           'blog_inquiry', 'open_house_second_visit', 'open_house_disclosure',
+                           # clicked a link in your email (an open alone isn't reliable proof)
+                           'email_clicked'}
 
 
 def _last_activity_at(lead: Lead, events: List[LeadEvent], matched_collections: List[Collection]) -> Optional[datetime]:
@@ -361,9 +376,13 @@ def _to_lead_out(lead: Lead, collections: Optional[List[Collection]] = None) -> 
         created_at=lead.created_at,
         last_contacted_at=lead.last_contacted_at,
         hidden_at=lead.hidden_at,
-        origin=LeadMomentOut(type=first.source_type, label=_nice_summary(first), at=first.occurred_at, group=_origin_group(first)) if first else None,
+        # No activity on record (added by hand, or its history was removed): say when it was added
+        # rather than leaving the "came in" / "latest" lines blank.
+        origin=LeadMomentOut(type=first.source_type, label=_nice_summary(first), at=first.occurred_at, group=_origin_group(first)) if first
+        else LeadMomentOut(type='added', label='Added to your leads', at=lead.created_at, group='other'),
         origin_group=_origin_group(first) if first else 'other',
-        latest=LeadMomentOut(type=last_event.source_type, label=_nice_summary(last_event), at=last_event.occurred_at) if last_event else None,
+        latest=LeadMomentOut(type=last_event.source_type, label=_nice_summary(last_event), at=last_event.occurred_at) if last_event
+        else LeadMomentOut(type='added', label='No activity yet', at=lead.created_at),
         unsubscribed=any(e.source_type == 'email_unsubscribed' for e in events),
     )
 
@@ -410,9 +429,11 @@ async def _enrich(db: AsyncSession, owner_id: str, leads: List[Lead], lead_outs:
                   collections: Optional[List[Collection]], with_came_from: bool = True) -> None:
     """The parts that need the database: what's waiting on the agent (open follow-ups + unhandled
     requests), and where they were before they first reached out."""
-    from app.services.tasks_service import compute_bucket
+    from app.services.tasks_service import compute_bucket, followups_enabled
     from app.services.visit_source import describe_came_from
-    tasks = await _open_tasks_by_lead(db, owner_id, [l.id for l in leads])
+    # Follow-ups switched off: no follow-up chips on the rows (and requests show as "waiting on you"
+    # again, since no follow-up covers them) - the switch promises it's hidden from Leads.
+    tasks = await _open_tasks_by_lead(db, owner_id, [l.id for l in leads]) if followups_enabled(await db.get(User, owner_id)) else {}
     try:
         from app.services.client_email_service import people as email_people
         engagement = await email_people(db, owner_id)
@@ -648,14 +669,45 @@ async def export_leads_csv(
     if open_house_event_id:
         lead_outs = [l for l in lead_outs if any(oh.id == open_house_event_id for oh in l.open_houses)]
     lead_outs = _sort_leads(lead_outs, sort)
+    return _leads_csv(lead_outs)
 
+
+# Same words as the Leads page's "Came in from" filter (lib/leadActivity.ts ORIGIN_META).
+_ORIGIN_LABELS = {'open_house': 'Open houses', 'showcase': 'Showcases', 'forms': 'Forms', 'listings': 'Spotlights & listings',
+                  'website': 'Website & blog', 'portal': 'Zillow & portals', 'review': 'Reviews', 'other': 'Other'}
+
+
+class LeadExportRequest(BaseModel):
+    # The leads on screen, in the order shown (the page filters and sorts itself).
+    ids: List[str]
+    hidden: bool = False
+
+
+@router.post("/export.csv")
+async def export_these_leads_csv(
+    body: LeadExportRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """"Export" on the Leads page downloads exactly what's on screen (tab, search, filters, sort)."""
+    leads = await _fetch_leads(db, current_user, None, None, None, False)
+    if body.hidden:
+        leads += await _fetch_leads(db, current_user, None, None, None, True)
+    collections = await _fetch_owner_collections(db, current_user.id)
+    lead_outs = [_to_lead_out(l, collections) for l in leads]
+    await _enrich(db, current_user.id, leads, lead_outs, collections)
+    by_id = {l.id: l for l in lead_outs}
+    return _leads_csv([by_id[i] for i in body.ids if i in by_id])
+
+
+def _leads_csv(lead_outs) -> StreamingResponse:
     buffer = io.StringIO()
     writer = _SafeCsv(csv.writer(buffer))
-    writer.writerow(['Name', 'Email', 'Phone', 'Source', 'Came In', 'Status', 'Represented', 'Property', 'Tags', 'Created At',
+    writer.writerow(['Name', 'Email', 'Phone', 'Came In From', 'Came In', 'Status', 'Represented', 'Property', 'Tags', 'Created At',
                      'Last Contacted', 'Latest Activity', 'Latest Activity At', 'Needs'])
     for lead in lead_outs:
         writer.writerow([
-            lead.name or '', lead.email or '', lead.phone or '', lead.primary_source, lead.origin.label if lead.origin else '',
+            lead.name or '', lead.email or '', lead.phone or '', _ORIGIN_LABELS.get(lead.origin_group or 'other', 'Other'), lead.origin.label if lead.origin else '',
             lead.status, lead.represented, lead.property_address or '', ', '.join(lead.tags), lead.created_at.isoformat(),
             lead.last_contacted_at.isoformat() if lead.last_contacted_at else '',
             lead.latest.label if lead.latest else '', lead.latest.at.isoformat() if lead.latest else '',
@@ -765,6 +817,10 @@ async def _event_link(db: AsyncSession, owner_id: str, e: LeadEvent) -> Optional
             # A manual (non-MLS) listing has no property details page - the agent's own editor
             # for that Spotlight is the one screen about this home.
             return {"href": f"/studio/property-sites/{site.id}", "label": "Open Spotlight"}
+    if st == 'review_left' and sid:
+        return {"href": f"/studio/reviews?review={sid}", "label": "View Review"}
+    if st == 'blog_inquiry' and sid:
+        return {"href": f"/studio/blogs/{sid}", "label": "View Post"}
     if st in ('property_page_inquiry', 'property_page_tour_request'):
         listing_key = (e.raw_snapshot or {}).get("listing_key") or sid
         if listing_key:
@@ -786,6 +842,7 @@ async def _events_out(db: AsyncSession, owner_id: str, events: List[LeadEvent]) 
     for e in events:
         item = LeadEventOut.model_validate(e)
         item.summary = _nice_summary(e)
+        item.handled = e.agent_viewed_at is not None
         try:
             item.link = await _event_link(db, owner_id, e)
         except Exception:
@@ -804,18 +861,33 @@ async def _events_out(db: AsyncSession, owner_id: str, events: List[LeadEvent]) 
     return out
 
 
+async def _clear_open_followups(db: AsyncSession, lead_id: str, owner_id: str) -> List[str]:
+    """A lead you're done with (hidden or deleted) shouldn't keep reminding you: its still-open
+    follow-ups go, and come off the calendar (after commit - see _unsync). Done ones stay as history."""
+    open_tasks = (await db.execute(select(AgentTask.id).where(
+        AgentTask.owner_id == owner_id, AgentTask.lead_id == lead_id, AgentTask.completed_at.is_(None)))).scalars().all()
+    for tid in open_tasks:
+        await db.delete(await db.get(AgentTask, tid))
+    return list(open_tasks)
+
+
+def _unsync(owner_id: str, task_ids: List[str]) -> None:
+    from app.services import calendar_sync_service
+    for tid in task_ids:
+        calendar_sync_service.unsync_task_bg(owner_id, tid)
+
+
 async def _hide_owned_lead(db: AsyncSession, lead_id: str, owner_id: str) -> LeadDetailOut:
     lead = await _load_owned_lead(db, lead_id, owner_id)
-    lead.hidden_at = datetime.now(timezone.utc)
-    db.add(lead)
-    await db.commit()
-    return await _detail_out(db, await _load_owned_lead(db, lead_id, owner_id), owner_id)
+    return await _hide_lead_record(db, lead, owner_id)
 
 
 async def _hide_lead_record(db: AsyncSession, lead: Lead, owner_id: str) -> LeadDetailOut:
     lead.hidden_at = datetime.now(timezone.utc)
     db.add(lead)
+    cleared = await _clear_open_followups(db, lead.id, owner_id)
     await db.commit()
+    _unsync(owner_id, cleared)
     return await _detail_out(db, await _load_owned_lead(db, lead.id, owner_id), owner_id)
 
 
@@ -876,15 +948,10 @@ async def delete_lead(
     lead = await _load_owned_lead(db, lead_id, current_user.id)
     # Their still-open follow-ups would otherwise linger as "Follow up with ..." with no person
     # behind them (and stay on the agent's calendar). Done ones are just history - kept, unlinked.
-    open_tasks = (await db.execute(select(AgentTask.id).where(
-        AgentTask.owner_id == current_user.id, AgentTask.lead_id == lead_id, AgentTask.completed_at.is_(None)))).scalars().all()
-    for tid in open_tasks:
-        await db.delete(await db.get(AgentTask, tid))
+    open_tasks = await _clear_open_followups(db, lead_id, current_user.id)
     await db.delete(lead)
     await db.commit()
-    from app.services import calendar_sync_service
-    for tid in open_tasks:
-        calendar_sync_service.unsync_task_bg(current_user.id, tid)
+    _unsync(current_user.id, open_tasks)
     return {"success": True}
 
 

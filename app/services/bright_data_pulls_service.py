@@ -12,6 +12,11 @@ remembering where it stopped (system_settings), until done:
                    gallery, without waiting for each listing to change.
   price_history    every earlier listing of each home on the market (back to 2012) - see
                    price_history_service.backfill_batch.
+  agent_sales      part of sold_3y (on whenever it is): every sale (any year, listing side or buyer
+                   side, no leases) of every agent who has an OpenHousePal account - their Agent Hub / website / signature sales go
+                   further back than the 3-year pool. Never "done": a new agent's MLS id is picked
+                   up on the next tick (Bright audit, 10/15). New sales after that arrive through
+                   the 5-minute sync's closed-listings step.
 
 Switched on by BRIGHT_DATA_PULLS (comma list, or "all"); PRICE_HISTORY_BACKFILL=true also turns on
 price_history. Nothing here sends alerts or touches Showcases - it only fills the mirror.
@@ -28,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
-PULLS = ("sold_3y", "refresh_current", "price_history")
+PULLS = ("sold_3y", "refresh_current", "price_history", "agent_sales")
 _CURRENT = ("ACTIVE-BRIGHT", "COMING SOON-BRIGHT", "PENDING-BRIGHT", "ACTIVE UNDER CONTRACT-BRIGHT")
 PAGE = 200
 
@@ -36,6 +41,9 @@ PAGE = 200
 def enabled(name: str) -> bool:
     raw = {p.strip() for p in os.getenv("BRIGHT_DATA_PULLS", "").lower().split(",") if p.strip()}
     if name == "price_history" and os.getenv("PRICE_HISTORY_BACKFILL", "").lower() == "true":
+        return True
+    # Agents' sales are part of the sales backfill - one switch (user, 10/15).
+    if name == "agent_sales" and "sold_3y" in raw:
         return True
     return "all" in raw or name in raw
 
@@ -85,7 +93,7 @@ async def pull_sold_3y(db: AsyncSession, max_pages: int = 10, pause: float = 1.0
             for raw in rows:
                 try:
                     ev = await syncer._sync_single_property(db, raw, photos, allow_inactive_insert=True)
-                    added += 1 if ev and ev.get("type") == "NEW_GLOBAL" else 0
+                    added += 1 if ev and ev.get("type") in ("NEW_GLOBAL", "NEW_QUIET") else 0
                 except Exception:  # noqa: BLE001 - one bad record never stops the pull
                     await db.rollback()
                     logger.warning("sold_3y: listing failed", exc_info=True)
@@ -136,6 +144,51 @@ async def refresh_current(db: AsyncSession, max_pages: int = 10, pause: float = 
     return {"done": False, "status": _CURRENT[idx] if idx < len(_CURRENT) else None, "skip": skip}
 
 
+async def pull_agent_sales(db: AsyncSession, max_agents: int = 5, pause: float = 1.0) -> dict:
+    """Each OpenHousePal agent's full sales history from Bright, a few agents per tick. Remembers
+    which MLS ids are finished (system_settings data_pull_agent_sales), so a new sign-up is the
+    only work on later ticks."""
+    from app.services.bright_mls_service import bright_mls_service
+    from app.services.property_sync_service import PropertySyncService
+    key = "data_pull_agent_sales"
+    st = await _get(db, key)
+    done = set(st.get("done_ids") or [])
+    ids = [r for r in (await db.execute(text(
+        "SELECT DISTINCT trim(mls_id) FROM users WHERE mls_id IS NOT NULL AND trim(mls_id) <> ''"))).scalars()]
+    todo = [i for i in ids if i not in done][:max_agents]
+    syncer = PropertySyncService()
+    added = 0
+    for mid in todo:
+        ok = True
+        for field in bright_mls_service._AGENT_FIELDS:
+            skip = 0
+            for _ in range(25):  # 5,000 sales per side is far beyond any one agent
+                try:
+                    rows = await bright_mls_service.get_agent_closed_sales(field, mid, top=PAGE, skip=skip)
+                except Exception:  # noqa: BLE001 - retried next tick
+                    logger.warning("agent_sales: Bright lookup failed", extra={"field": field}, exc_info=True)
+                    ok = False
+                    break
+                if rows:
+                    photos = await bright_mls_service.get_media_for_properties([str(r["ListingKey"]) for r in rows])
+                    for raw in rows:
+                        try:
+                            ev = await syncer._sync_single_property(db, raw, photos, allow_inactive_insert=True)
+                            added += 1 if ev and ev.get("type") in ("NEW_GLOBAL", "NEW_QUIET") else 0
+                        except Exception:  # noqa: BLE001
+                            await db.rollback()
+                            logger.warning("agent_sales: listing failed", exc_info=True)
+                if len(rows) < PAGE:
+                    break
+                skip += PAGE
+                await asyncio.sleep(pause)
+        if ok:
+            done.add(mid)
+    st = {"done_ids": sorted(done), "added_total": int(st.get("added_total") or 0) + added, "last_tick": date.today().isoformat()}
+    await _set(db, key, st)
+    return {"agents_done": len(done), "agents_waiting": max(0, len(ids) - len(done)), "added": added}
+
+
 async def run_enabled(db: AsyncSession) -> dict:
     """One tick of every switched-on pull (called every 10 minutes)."""
     out = {}
@@ -146,6 +199,8 @@ async def run_enabled(db: AsyncSession) -> dict:
     if enabled("price_history"):
         from app.services.price_history_service import backfill_batch
         out["price_history"] = await backfill_batch(db, max_parcels=300)
+    if enabled("agent_sales"):
+        out["agent_sales"] = await pull_agent_sales(db)
     if out:
         logger.info("Bright data pulls tick", extra={"event": "bright_data_pulls", "result": out})
     return out
@@ -158,4 +213,5 @@ async def status(db: AsyncSession) -> dict:
         "sold_3y": await _get(db, "data_pull_sold_3y"),
         "refresh_current": await _get(db, "data_pull_refresh_current"),
         "price_history": {"parcels_done": parcels_done},
+        "agent_sales": {k: v for k, v in (await _get(db, "data_pull_agent_sales")).items() if k != "done_ids"},
     }

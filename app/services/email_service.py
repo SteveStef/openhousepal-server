@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 # must NOT: it put an Unsubscribe button on password resets, and an agent who tapped it got their
 # own address blacklisted (which then silently dropped lead emails queued for them).
 SHOWCASE_UNSUBSCRIBE_TEMPLATES = {
-    "showcase_daily_digest", "showcase_weekly_digest", "showcase_ready", "visitor_confirmation", "agent_comment_response",
+    "showcase_daily_digest", "showcase_weekly_digest", "showcase_ready", "showcase_shared", "visitor_confirmation", "agent_comment_response",
 }
 # Spotlight alert emails have their own per-subscription unsubscribe link (unsubscribe_url).
 OWN_UNSUBSCRIBE_TEMPLATES = {"spotlight_alert_confirm", "spotlight_listing_update"}
@@ -27,10 +27,10 @@ OWN_UNSUBSCRIBE_TEMPLATES = {"spotlight_alert_confirm", "spotlight_listing_updat
 REDESIGNED_TEMPLATES = {
     "account_approved", "agent_comment_response", "agent_welcome", "calendar_disconnected", "crm_push_failing",
     "direct_host_request", "domain_verification_failed", "domain_verified", "form_submission_received",
-    "host_request_approved", "host_request_countered", "host_request_declined", "host_request_received",
+    "host_request_approved", "host_request_countered", "host_request_declined", "host_request_received", "host_request_update",
     "liked_homes_roundup", "new_lead_captured", "new_review_received", "open_house_form_request",
     "open_house_recap", "password_reset", "payment_failed", "property_comment", "refine_search_request",
-    "showcase_daily_digest", "showcase_daily_digest_agent", "showcase_ready", "showcase_weekly_digest", "similar_property_visitor_message",
+    "showcase_daily_digest", "showcase_daily_digest_agent", "showcase_ready", "showcase_shared", "showcase_weekly_digest", "similar_property_visitor_message",
     "similar_property_visitor_tour_request", "spotlight_alert_confirm", "spotlight_listing_update",
     "spotlight_weekly_report", "studio_media_failed", "studio_media_ready", "subscription_cancelled",
     "subscription_plan_changed", "subscription_suspended", "support_ticket_reply", "team_broadcast_claimed",

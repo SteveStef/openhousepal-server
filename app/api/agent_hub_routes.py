@@ -26,7 +26,7 @@ from app.services.bright_mls_service import bright_mls_service
 from app.services import property_website_service, s3_service, vcard_service
 from app.services.website.site_service import owner_links, resolve_owner_public_base_url
 from app.utils.auth import luxe_theme_allowed, AGENT_HUB_ACCESS_TIERS, REVIEWS_ACCESS_TIERS, get_current_active_user, get_current_user_optional, require_active_plan, require_agent_hub_access, require_reviews_access, owner_has_access, tier_has_mls
-from app.utils.image_validation import assert_valid_jpeg
+from app.utils.image_validation import assert_valid_jpeg, photo_to_jpeg
 
 router = APIRouter(prefix="/agent-hub", tags=["agent-hub"])
 logger = logging.getLogger(__name__)
@@ -41,6 +41,9 @@ PHOTO_CONTENT_TYPES = {
     "image/jpeg": ".jpg",
 }
 PHOTO_MAX_BYTES = 5 * 1024 * 1024
+# The agent's own headshot also takes PNG/WebP (what phones and photo apps often save) - it's
+# converted to a real JPEG before it's stored, so everything downstream still only ever sees JPG.
+HEADSHOT_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
 
 class AgentHubSlugUpdate(BaseModel):
@@ -229,6 +232,9 @@ async def fetch_bright_agent_sales(identifier: str, identifier_type: str, limit:
     async def fetch_field(field: str, mode: str = "eq", value: str | None = None) -> list[dict]:
         lookup_value = (value or safe_identifier).replace("'", "''")
         filter_expr = f"{field} eq '{lookup_value}'" if mode == "eq" else f"contains({field}, '{lookup_value}')"
+        # Closed-scoped (Bright audit, 10/15): Bright only fills ClosePrice/CloseDate when the
+        # query asks for closed listings, and unscoped the `limit` went to active listings too.
+        filter_expr = f"{filter_expr} and MlsStatus eq 'CLOSED-BRIGHT'"
         try:
             data = await bright_mls_service._make_request(
                 "BrightProperties",
@@ -236,7 +242,7 @@ async def fetch_bright_agent_sales(identifier: str, identifier_type: str, limit:
                     "$filter": filter_expr,
                     "$top": limit,
                     "$select": select_fields,
-                    "$orderby": "ModificationTimestamp desc",
+                    "$orderby": "CloseDate desc",
                 },
             )
         except Exception as exc:
@@ -1273,11 +1279,10 @@ async def upload_my_photo(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_active_plan),
 ):
-    extension = PHOTO_CONTENT_TYPES.get(file.content_type)
-    if not extension:
+    if file.content_type not in HEADSHOT_CONTENT_TYPES:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Please upload a JPG image.",
+            detail="Please upload a JPG, PNG or WebP photo.",
         )
 
     contents = await file.read()
@@ -1287,12 +1292,12 @@ async def upload_my_photo(
             detail="Photo must be 5MB or smaller.",
         )
     try:
-        assert_valid_jpeg(contents)
+        contents = photo_to_jpeg(contents)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
 
     old_photo_url = current_user.photo_url
-    photo_url = s3_service.upload_bytes(contents, "agent-photos", extension, file.content_type)
+    photo_url = s3_service.upload_bytes(contents, "agent-photos", ".jpg", "image/jpeg")
     current_user.photo_url = photo_url
     hub = (await db.execute(select(AgentHub).where(AgentHub.owner_id == current_user.id))).scalar_one_or_none()
     if hub:
@@ -1663,6 +1668,11 @@ async def import_google_reviews(
         data = await google_reviews_service.fetch_reviews(place_id)
     except google_reviews_service.GoogleReviewsError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+    # One Place Details call with reviews (Google's Enterprise + Atmosphere SKU) - the agent's
+    # own click, so it goes on their AI usage like every other paid lookup they trigger.
+    from app.services.ai.ai_rate_limit_service import record_external_api_cost
+    from app.services.ai.ai_config_service import ai_config_service
+    await record_external_api_cost(db, current_user.id, kind="places_details_reviews", config=await ai_config_service.get_config(db))
 
     existing = (await db.execute(
         select(AgentReview).where(AgentReview.owner_id == current_user.id, AgentReview.source == "google")

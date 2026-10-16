@@ -177,16 +177,25 @@ async def send_ai_message(
         try:
             text, refs, usage = await run_turn(db, current_user, history, message_text, voice_mode=payload.voice_mode)
         except AIOrchestratorError as e:
+            # What the partial turn really cost (the orchestrator only prices a finished turn).
+            # Logged as blocked, so it never counts on the agent's meter - they got no answer -
+            # but the platform counters and admin view see the real spend.
+            spent = e.usage.get("estimated_cost_usd")
+            if spent is None:
+                spent = ai_config_service.estimate_cost_usd(
+                    config, e.usage.get("model", config.get("model")), e.usage.get("input_tokens") or 0, e.usage.get("output_tokens") or 0,
+                    e.usage.get("cache_write_tokens") or 0, e.usage.get("cache_read_tokens") or 0,
+                )
             await record_usage_event(
                 db, current_user.id, conversation.id, e.usage.get("model", config.get("model")),
-                e.usage.get("input_tokens"), e.usage.get("output_tokens"), e.usage.get("estimated_cost_usd"),
+                e.usage.get("input_tokens"), e.usage.get("output_tokens"), spent,
                 e.usage.get("tool_call_count", 0), True, e.reason,
                 tool_names=e.usage.get("tool_names"),
             )
             # A failed/aborted turn may still have made real (partial) model calls before
             # erroring out - true up the reservation with whatever it actually cost, never a
             # blind full refund, so the global/emergency counters stay accurate either way.
-            await reconcile_budget(db, reservation, e.usage.get("estimated_cost_usd") or 0.0)
+            await reconcile_budget(db, reservation, spent or 0.0)
             raise HTTPException(status_code=503, detail=e.user_message)
 
         assistant_msg = AIMessage(conversation_id=conversation.id, role="assistant", content=text, tool_calls=refs or None)

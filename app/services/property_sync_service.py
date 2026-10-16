@@ -28,6 +28,11 @@ from urllib.parse import quote
 
 logger = get_logger(__name__)
 
+# Raw MLS keys Bright only fills on closed-scoped queries (see bright_mls_service
+# get_closed_properties_modified_since) - kept when a later read comes back without them.
+_STICKY_SOLD_KEYS = ("ClosePrice", "CloseDate", "BuyerAgentMlsId", "CoBuyerAgentMlsId", "BuyerAgentFullName",
+                     "CoBuyerAgentFullName", "BuyerOfficeName", "BuyerOfficeMlsId", "PurchaseContractDate")
+
 class PropertySyncService:
     """
     Global Synchronization Service.
@@ -413,7 +418,7 @@ class PropertySyncService:
                         try:
                             sync_event = await self._sync_single_property(db, raw_prop, photo_map, allow_inactive_insert=True)
                             if sync_event:
-                                if sync_event["type"] == "NEW_GLOBAL":
+                                if sync_event["type"] in ("NEW_GLOBAL", "NEW_QUIET"):
                                     stats["inserted"] += 1
                                 else:
                                     stats["updated"] += 1
@@ -615,8 +620,19 @@ class PropertySyncService:
         
         event_type = "UPDATE"
         old_price = None
+        rematch = False
 
         if existing:
+            # A home that just became something a buyer could want - Coming Soon -> Active, back on
+            # the market (Pending -> Active), or a new price while for sale (it may have dropped into
+            # someone's range) - is matched against every Showcase again, like a new listing
+            # (user, 10/15). Showcases that already have it only get the price-drop update.
+            new_status = str(mapped.get("home_status") or "")
+            old_status = str(existing.home_status or "")
+            for_sale = new_status.startswith("ACTIVE-BRIGHT") or new_status.startswith("COMING SOON")
+            became_active = new_status.startswith("ACTIVE-BRIGHT") and not old_status.startswith("ACTIVE-BRIGHT")
+            price_moved = bool(existing.price and mapped.get("price") and mapped["price"] != existing.price)
+            rematch = for_sale and (became_active or price_moved)
             # Check for Price Drop
             if existing.price and mapped["price"] and mapped["price"] < existing.price:
                 event_type = "PRICE_DROP"
@@ -641,6 +657,17 @@ class PropertySyncService:
                     and len(existing.photos) > len(mapped.get("photos") or []):
                 mapped["photos"] = existing.photos
 
+            # raw_mls_data is replaced whole - but Bright only fills ClosePrice / CloseDate (and some
+            # buyer-side fields) when the query itself asks for closed listings. A later read that
+            # wasn't closed-scoped (the price-history pull, a tax-id lookup, a refresh) must never
+            # wipe them off a sale we already have (Bright audit, 10/15).
+            old_raw = existing.raw_mls_data if isinstance(existing.raw_mls_data, dict) else {}
+            new_raw = mapped.get("raw_mls_data")
+            if old_raw and isinstance(new_raw, dict):
+                for k in _STICKY_SOLD_KEYS:
+                    if new_raw.get(k) in (None, "") and old_raw.get(k) not in (None, ""):
+                        new_raw[k] = old_raw[k]
+
             # Update all columns
             for key, value in mapped.items():
                 setattr(existing, key, value)
@@ -651,13 +678,19 @@ class PropertySyncService:
             # This prevents our DB from filling up with old CLOSED listings we never tracked
             status = raw_data.get("MlsStatus", "")
             is_active = status.startswith("ACTIVE-BRIGHT") or status.startswith("COMING SOON")
+            # Pending / Active Under Contract homes are still on the market (My Listings, CMA pending
+            # comps, IDX) - they used to be skipped when first seen that way, so a home that went
+            # under contract before we mirrored it never showed up (Bright audit, 10/15). Mirrored
+            # quietly: no "new home" alerts for a home that's already under contract.
+            under_contract = status.startswith("PENDING") or status.startswith("ACTIVE UNDER CONTRACT")
 
-            if not is_active and not allow_inactive_insert:
+            if not is_active and not under_contract and not allow_inactive_insert:
                 logger.debug(f"Skipping discovery for NEW inactive property: {l_key} | Status: {status}")
                 return None
 
-            # New property to our system (Global Mirror)
-            event_type = "NEW_GLOBAL"
+            # New property to our system (Global Mirror). Only a newly-for-sale home is "new" to
+            # Showcases / team alerts; anything else is just filled into the mirror.
+            event_type = "NEW_GLOBAL" if is_active else "NEW_QUIET"
             existing = Property(**mapped)
             db.add(existing)
             try:
@@ -677,7 +710,8 @@ class PropertySyncService:
                 "type": event_type,
                 "old_price": old_price,
                 "new_price": mapped["price"],
-                "data": mapped
+                "data": mapped,
+                "rematch": rematch,
             }
         except Exception as e:
             logger.error(f"Failed to upsert property {l_key}: {e}")
@@ -700,14 +734,16 @@ class PropertySyncService:
         # this before downgrading/cancelling (Settings > Billing).
         from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
 
-        if event["type"] == "NEW_GLOBAL":
+        if event["type"] == "NEW_GLOBAL" or event.get("rematch"):
             discovered_collections = [
                 col for col in await self._discover_matching_collections(db, event["data"])
                 if owner_has_access(col.owner, SHOWCASE_ACCESS_TIERS)
             ]
             for col in discovered_collections:
-                # Link property to collection (Mark as NEW by setting added_at)
-                await self._link_property_to_collection(db, col.id, prop_id)
+                # Link property to collection (Mark as NEW by setting added_at) - a Showcase that
+                # already has this home (or the same house under another MLS number) is skipped.
+                if not await self._link_property_to_collection(db, col.id, prop_id):
+                    continue
 
                 # Schedule 'New Property' notification
                 changes = {"new_properties": [event["data"]], "price_drops": []}
@@ -720,7 +756,8 @@ class PropertySyncService:
             # takes this branch on first insert; every later resync is UPDATE/PRICE_DROP), so this
             # can't repeat on its own - the notification-existence check below is an extra,
             # explicit guard against ever double-notifying for the same listing.
-            await self._notify_team_of_new_listing(db, l_key, event["data"])
+            if event["type"] == "NEW_GLOBAL":  # not on a re-match - the team already heard about it
+                await self._notify_team_of_new_listing(db, l_key, event["data"])
 
         # 2. UPDATES: Find collections that already HAVE this property (Price Drops)
         query = (
@@ -1077,8 +1114,8 @@ class PropertySyncService:
 
         return collections
 
-    async def _link_property_to_collection(self, db: AsyncSession, collection_id: str, property_id: str):
-        """Silently links a property to a collection if not already linked."""
+    async def _link_property_to_collection(self, db: AsyncSession, collection_id: str, property_id: str) -> bool:
+        """Silently links a property to a collection if not already linked. True = it was added now."""
         stmt = select(collection_properties).where(
             and_(
                 collection_properties.c.collection_id == collection_id,
@@ -1098,12 +1135,14 @@ class PropertySyncService:
                            Property.street_address.ilike(f"{(new_prop.street_address or '').split(' ')[0]} %"))
                 )).scalars().all()
                 if any(is_same_home(new_prop, q) for q in linked):
-                    return
+                    return False
             await db.execute(insert(collection_properties).values(
                 collection_id=collection_id,
                 property_id=property_id,
                 added_at=datetime.now(timezone.utc) # Mark as NEW
             ))
+            return True
+        return False
 
     def _format_price_compact(self, price: float) -> str:
         """Formats price into a compact string like $750K or $2.1M"""

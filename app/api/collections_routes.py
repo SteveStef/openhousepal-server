@@ -86,6 +86,8 @@ class CreateCollectionWithPreferencesRequest(BaseModel):
     special_features: Optional[str] = None
     compare_property_listing_key: Optional[str] = None
     show_match_score: bool = True
+    # "Email it to them" in the agent's create flow: their link + a few homes, right away.
+    email_client: bool = False
 
 
 class UpdateStatusRequest(BaseModel):
@@ -473,6 +475,10 @@ async def create_collection_with_preferences(
                     "Showcase %s population raised - collection kept but may be empty: %s",
                     collection.id, e, exc_info=True,
                 )
+
+            if request.email_client:
+                from app.services.showcase_digest_service import queue_showcase_ready
+                await queue_showcase_ready(db, collection.id, from_agent=True)
 
             collections = await CollectionsService.get_user_collections(db, current_user.id)
             
@@ -1002,6 +1008,32 @@ async def _notify_search_changed(db: AsyncSession, collection_obj: Collection, c
         await db.rollback()
 
 
+def _self_serve_payload(payload: dict) -> dict:
+    """The rules for a Showcase visitor's own search change (save and live preview alike):
+    - building it around a home makes that home the one the match % is measured against;
+    - remove_home: no home at all any more - just their filters, no match %;
+    - they can't draw, so a new address or new towns replace an area their agent drew on the map
+      (a school district narrows it instead - districts narrow every area)."""
+    payload = dict(payload)
+    remove_home = payload.pop('remove_home', None)
+    if not payload.get('compare_property_listing_key'):
+        payload.pop('compare_property_listing_key', None)
+    payload.pop('show_match_score', None)
+    if payload.get('compare_property_listing_key'):
+        payload['show_match_score'] = True
+    elif remove_home:
+        payload['show_match_score'] = False
+        payload['compare_property_listing_key'] = None
+    if payload.get('address') or payload.get('cities'):
+        payload['search_polygon'] = None
+    # Areas add up (a circle OR a township OR a county), so a buyer who picks "within N miles"
+    # would otherwise still get every home in a township / county their agent had set - far
+    # outside the circle they see. Their distance search replaces those.
+    if payload.get('address'):
+        payload.update(townships=[], counties=[], county=None)
+    return payload
+
+
 def _describe_search_change(payload: dict) -> list:
     """A client's own Showcase search edit -> [{"label", "value"}] rows for their lead's activity."""
     def money(v):
@@ -1018,6 +1050,8 @@ def _describe_search_change(payload: dict) -> list:
     rows = []
     if payload.get("compare_property_listing_key"):
         rows.append({"label": "Built around", "value": str(payload.get("address") or "A different home")})
+    elif payload.get("show_match_score") is False:
+        rows.append({"label": "Built around", "value": "No home - just their filters"})
     if "min_price" in payload or "max_price" in payload:
         rows.append({"label": "Price", "value": span(money(payload.get("min_price")), money(payload.get("max_price")))})
     if "min_beds" in payload or "max_beds" in payload:
@@ -1079,23 +1113,15 @@ async def update_shared_collection_preferences(
         # (EditPreferencesModal.validateLocationPreferences): a radius is only required
         # alongside an address that's actually present, and SOME location method (address
         # or area filters) must exist - never let an edit leave the showcase with neither.
-        payload = preferences_update.dict(exclude_unset=True)
-        # A visitor can build their search around a different home (2026-10-04: one step - it
-        # becomes the home the match % is measured against too), but never turn comparison off.
-        if not payload.get('compare_property_listing_key'):
-            payload.pop('compare_property_listing_key', None)
-        payload.pop('show_match_score', None)
-        # A search built around a home always shows the match % against it - even if comparison
-        # had been switched off.
-        if payload.get('compare_property_listing_key'):
-            payload['show_match_score'] = True
+        payload = _self_serve_payload(preferences_update.dict(exclude_unset=True))
         effective_diameter = payload.get('diameter', collection_obj.preferences.diameter)
         effective_address = payload.get('address', collection_obj.preferences.address)
         # The resulting areas (what they're sending, else what's saved) - switching from "near the
-        # home" to towns / school districts sends the new areas with an empty address.
+        # home" to towns / school districts sends the new areas with an empty address. An area the
+        # agent drew on the map counts too (the visitor can't draw, but can keep it).
         has_area_filters = any(
             payload.get(k, getattr(collection_obj.preferences, k, None))
-            for k in ('cities', 'townships', 'school_districts', 'counties')
+            for k in ('cities', 'townships', 'school_districts', 'counties', 'search_polygon')
         )
         if effective_address and (not effective_diameter or effective_diameter <= 0):
             raise HTTPException(
@@ -1162,7 +1188,7 @@ async def preview_shared_collection_matches(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found or not available")
     try:
         saved = CollectionPreferencesBase.model_validate(collection_obj.preferences, from_attributes=True).model_dump()
-        merged = CollectionPreferencesBase(**{**saved, **preferences_update.model_dump(exclude_unset=True)})
+        merged = CollectionPreferencesBase(**{**saved, **_self_serve_payload(preferences_update.model_dump(exclude_unset=True))})
         properties = await property_service.get_properties_by_preferences(db, merged, max_properties=200)
         count = await property_service.get_properties_count_by_preferences(db, merged)
         return {
@@ -1264,12 +1290,21 @@ async def update_preferences_and_refresh(
                 detail="Collection not found or access denied"
             )
 
+        from app.services.showcase_digest_service import queue_search_changed, showcase_home_ids
+        before_ids = await showcase_home_ids(db, collection_id)
+
         # Perform atomic update of preferences and properties
         result = await CollectionPreferencesService.update_preferences_and_refresh_properties(
             db, collection_id, preferences_update
         )
 
         if result['success']:
+            # Their client hears about it in the 4:30 email: what the search is now, homes added / gone.
+            await queue_search_changed(db, collection_id, before_ids)
+            # They just saw what their own change brought in - no NEW for it on their Showcases page.
+            from sqlalchemy import update as _update
+            await db.execute(_update(Collection).where(Collection.id == collection_id).values(last_agent_dismissed_at=datetime.now(timezone.utc)))
+            await db.commit()
             return {
                 "success": True,
                 "message": result['message'],

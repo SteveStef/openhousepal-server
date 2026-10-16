@@ -58,6 +58,27 @@ def _polygon_bbox(geometry: dict[str, Any]) -> Optional[dict[str, float]]:
 # Configure logging
 logger = logging.getLogger(__name__)
 
+async def _place_address_center(db, preferences):
+    """A search near an address needs that address's map point - without it the distance limit
+    can't apply and the search used to match the WHOLE MLS (an address typed without picking a
+    suggestion). Fill it in from our own listings; None = can't place it, so no homes rather
+    than every home. Towns / districts / counties / a drawn area still filter on their own."""
+    if not getattr(preferences, 'address', None) or (preferences.lat is not None and preferences.long is not None):
+        return preferences
+    if (getattr(preferences, 'search_polygon', None) or preferences.cities or preferences.townships
+            or preferences.school_districts or pref_counties(preferences)):
+        return preferences
+    from app.services.collection_preferences_service import coordinates_for
+    coords = await coordinates_for(db, preferences.address)
+    if not coords:
+        return None
+    try:
+        return preferences.model_copy(update={'lat': coords[0], 'long': coords[1]})
+    except AttributeError:   # a saved row (the caller commits)
+        preferences.lat, preferences.long = coords
+        return preferences
+
+
 class PropertyService:
     """
     Local Search Engine that queries our mirrored 'properties' table.
@@ -235,6 +256,9 @@ class PropertyService:
         Performs a local SQLAlchemy search against the mirrored 'properties' table.
         Implements radius filtering (Bounding Box), price, beds/baths, and location filters.
         """
+        preferences = await _place_address_center(db, preferences)
+        if preferences is None:
+            return []
         query = select(Property)
         filters = []
         
@@ -242,9 +266,8 @@ class PropertyService:
         exempt_types = ['LAND', 'FARM', 'COMMERCIAL', 'OTHER']
 
         # 1. Location Filtering
-        # Town/township, school district, and county are a geographic hierarchy (a county contains
-        # school districts contain towns) - so picking values in more than one of these narrows
-        # down through that hierarchy (AND) rather than adding a second unrelated area (OR).
+        # Town/township and county are a geographic hierarchy - picking both narrows (AND) rather
+        # than adding a second unrelated area (OR). A school district narrows everything (below).
         # Picking two towns, or two districts, or two counties still unions within that one field
         # (OR) - "Villanova or Gladwyne" is still one broadening choice about which towns count.
         place_filters = []
@@ -310,13 +333,12 @@ class PropertyService:
 
         # AND the non-empty hierarchy dimensions together (each already OR'd within itself above).
         location_filters = []
-        hierarchy_groups = [g for g in (place_filters, school_district_filters, county_filters) if g]
+        hierarchy_groups = [g for g in (place_filters, county_filters) if g]
         if hierarchy_groups:
             location_filters.append(and_(*[or_(*group) for group in hierarchy_groups]))
 
-        # Geography criteria stack: an agent can combine the town/district/county hierarchy above
-        # with a radius and drawn shapes all at once - those are independent, additive areas (OR),
-        # unlike the hierarchy fields (AND) above.
+        # Geography areas add up: the town/county hierarchy above, a radius and drawn shapes are
+        # independent areas (OR). School districts then narrow the result (AND) - see below.
         geo_filters = list(location_filters)
 
         if preferences.lat is not None and preferences.long is not None and preferences.diameter:
@@ -346,6 +368,12 @@ class PropertyService:
 
         if geo_filters:
             filters.append(or_(*geo_filters))
+
+        # A school district narrows whatever area was picked (like Zillow/Redfin): within 3 mi AND
+        # in Radnor schools, a drawn shape AND the district, towns AND the district. On its own it's
+        # the whole district.
+        if school_district_filters:
+            filters.append(or_(*school_district_filters))
 
         # 2. Status Filtering
         # Match exact BRIGHT statuses
@@ -444,9 +472,9 @@ class PropertyService:
         result = await db.execute(query)
         properties = result.scalars().all()
 
-        # 5. Circular Post-Filtering (Trim the Corners) - only safe when radius is the *only*
-        # active geo criterion; trimming to an exact circle after combining with other criteria
-        # would wrongly discard rows that only matched via a town/school-district/county/polygon.
+        # 5. Circular Post-Filtering (Trim the Corners) - only safe when radius is the only area
+        # (a school district is fine - it narrows inside the circle); with towns/counties/a shape
+        # it would wrongly drop rows that matched through those.
         if not location_filters and not getattr(preferences, 'search_polygon', None) and preferences.lat is not None and preferences.long is not None and preferences.diameter:
             properties = filter_properties_by_radius(
                 properties,
@@ -463,12 +491,14 @@ class PropertyService:
     @staticmethod
     async def get_properties_count_by_preferences(db: AsyncSession, preferences: CollectionPreferencesSchema) -> int:
         """Fetch only the count of matching properties without downloading records."""
+        preferences = await _place_address_center(db, preferences)
+        if preferences is None:
+            return 0
         # Use precise circular filtering if searching by radius (no explicit locations)
         # to ensure count matches actual discovery logic.
         use_circular_filter = (
             not preferences.cities and
             not preferences.townships and
-            not preferences.school_districts and
             not pref_counties(preferences) and
             not getattr(preferences, 'search_polygon', None) and
             preferences.lat is not None and
@@ -546,7 +576,7 @@ class PropertyService:
                     county_filters.append(Property.county.ilike(raw_name))
 
         location_filters = []
-        hierarchy_groups = [g for g in (place_filters, school_district_filters, county_filters) if g]
+        hierarchy_groups = [g for g in (place_filters, county_filters) if g]
         if hierarchy_groups:
             location_filters.append(and_(*[or_(*group) for group in hierarchy_groups]))
 
@@ -577,6 +607,10 @@ class PropertyService:
 
         if geo_filters:
             filters.append(or_(*geo_filters))
+
+        # School districts narrow the area - same as get_properties_by_preferences above.
+        if school_district_filters:
+            filters.append(or_(*school_district_filters))
 
         # 2. Status Filtering
         filters.append(or_(

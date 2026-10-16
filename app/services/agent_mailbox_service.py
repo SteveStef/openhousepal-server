@@ -241,6 +241,42 @@ async def _flag_reconnect(db, conn: MailConnection, reason: str) -> None:
     await db.commit()
 
 
+# Why a provider refused a send, from its own error text. Only a lost permission is fixed by
+# reconnecting; the other two used to say "please reconnect" too, which sent agents round in circles.
+#   'unavailable' - sending isn't switched on for OUR Google/Microsoft app (e.g. the Gmail API is off
+#                   in the Cloud project). Nothing the agent can do; we fix it on our side.
+#   'blocked'     - their mailbox / company doesn't let outside apps send for them (a Google Workspace
+#                   or Microsoft 365 admin setting, or mail turned off for the account).
+#   'reconnect'   - the permission was removed / the password changed.
+_UNAVAILABLE_HINTS = ("accessnotconfigured", "service_disabled", "has not been used in project", "api has not been used", "is disabled")
+_BLOCKED_HINTS = ("mail service not enabled", "failedprecondition", "admin_policy", "delegation denied", "domain policy",
+                  "access blocked", "mailboxnotenabled", "errorsendasdenied", "sendasdenied")
+REFUSAL_TEXT = {
+    "unavailable": "Sending from your email isn't switched on on our side yet - guest emails go out from OpenHousePal until it is. Nothing for you to do.",
+    "blocked": "Your email account doesn't let apps send for you - usually a setting your office (Google Workspace / Microsoft 365) controls. Ask your IT team to allow OpenHousePal, or connect a personal email instead.",
+    "reconnect": "Your email account refused to send - please reconnect it.",
+}
+
+
+def refusal_kind(status_code: int, body: str) -> str:
+    b = (body or "").lower()
+    if any(h in b for h in _UNAVAILABLE_HINTS):
+        return "unavailable"
+    if any(h in b for h in _BLOCKED_HINTS):
+        return "blocked"
+    return "reconnect" if status_code in (401, 403) else ""
+
+
+async def _note_refusal(db, conn: MailConnection, kind: str, detail: str) -> None:
+    """Record a refusal that reconnecting won't fix: sending pauses (guest emails go out from
+    OpenHousePal) and the agent sees why; a later successful test switches it back on."""
+    conn.status = kind
+    conn.last_error = detail[:500]
+    if kind == "unavailable":
+        logger.error("mailbox sending unavailable on our side (check the Gmail API / Graph app): %s", detail[:300])
+    await db.commit()
+
+
 def _dev_suppressed() -> bool:
     from app.services.email_service import EmailService
     return EmailService().is_dev and os.getenv("MAILBOX_SEND_IN_DEV", "no") != "yes"
@@ -280,8 +316,12 @@ async def send_guest(owner_id: Optional[str], to_email: str, subject: str, templ
             except MailboxAuthError as e:
                 await _flag_reconnect(db, conn, f"token refused: {e}")
                 return None
-            if resp.status_code in (401, 403):
+            kind = refusal_kind(resp.status_code, resp.text) if resp.status_code >= 300 else ""
+            if kind == "reconnect":
                 await _flag_reconnect(db, conn, f"{resp.status_code} {resp.text[:200]}")
+                return None
+            if kind in ("unavailable", "blocked"):
+                await _note_refusal(db, conn, kind, f"{resp.status_code} {resp.text[:300]}")
                 return None
             if resp.status_code >= 300:
                 conn.last_error = f"{resp.status_code} {resp.text[:300]}"
@@ -317,11 +357,19 @@ async def send_test(db, conn: MailConnection, to_email: str, agent_name: str) ->
         return False, "Your email account refused the connection - please reconnect it."
     except Exception:  # noqa: BLE001
         return False, "We couldn't reach your email account - please try again in a minute."
-    if resp.status_code in (401, 403):
+    kind = refusal_kind(resp.status_code, resp.text) if resp.status_code >= 300 else ""
+    if kind == "reconnect":
         await _flag_reconnect(db, conn, f"{resp.status_code} {resp.text[:200]}")
-        return False, "Your email account refused to send - please reconnect it."
+        return False, REFUSAL_TEXT["reconnect"]
+    if kind in ("unavailable", "blocked"):
+        await _note_refusal(db, conn, kind, f"{resp.status_code} {resp.text[:300]}")
+        return False, REFUSAL_TEXT[kind]
     if resp.status_code >= 300:
         return False, "Your email account didn't accept the message - please try again in a minute."
+    # it works (again): a mailbox paused by an earlier refusal goes back to sending
+    if conn.status != "ok" or conn.last_error:
+        conn.status, conn.last_error = "ok", None
+        await db.commit()
     return True, f"Sent - check {to_email}. It came from {conn.account_email}."
 
 

@@ -203,10 +203,13 @@ async def _showcase_url(db: AsyncSession, host: User, col: Collection) -> Option
     return f"{await resolve_owner_public_base_url(db, host)}/showcase/{col.share_token}"
 
 
-def showcases_offered(host: User, visitor: OpenHouseVisitor) -> bool:
-    """The Showcase button: only for a guest without an agent, on a plan with Showcases."""
+def showcases_offered(host: User, visitor: OpenHouseVisitor, oh: Optional[OpenHouseEvent] = None) -> bool:
+    """The Showcase button: only for a guest without an agent, on a plan with Showcases, at an open
+    house whose Showcases switch is on (a listing agent sitting their own listing turns it off so
+    guests aren't sent shopping other homes)."""
     from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
-    return visitor.has_agent != "YES" and owner_has_access(host, SHOWCASE_ACCESS_TIERS)
+    return (visitor.has_agent != "YES" and owner_has_access(host, SHOWCASE_ACCESS_TIERS)
+            and (oh is None or oh.auto_showcase is not False))
 
 
 async def payload(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEvent, host: User) -> dict:
@@ -228,8 +231,9 @@ async def payload(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEven
         theme = {**theme, **(hub.config or {})["openHouseRequestTheme"]}
     theme["darkMode"] = bool(oh.qr_dark_mode)
 
+    # Similar Homes switch off -> no similar homes on the pass (the saved picks stay for later).
     similar = await _live_similar(db, [{k: v for k, v in (item or {}).items() if k not in _HEAVY_KEYS}
-                                       for item in (oh.similar_properties_snapshot or []) if isinstance(item, dict)])
+                                       for item in (oh.similar_properties_snapshot or []) if isinstance(item, dict)]) if oh.similar_homes is not False else []
 
     cheat = None
     snap = oh.cheat_sheet_snapshot or {}
@@ -241,7 +245,7 @@ async def payload(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEven
         spotlight = f"{with_src(spotlight, 'pass')}&oh={oh.id}"
 
     showcase = None
-    if showcases_offered(host, visitor):
+    if showcases_offered(host, visitor, oh):
         col = await _showcase(db, host, visitor)
         showcase = {"url": await _showcase_url(db, host, col)} if col else {"url": None}
 
@@ -365,11 +369,11 @@ async def _note_on_open_followup(db: AsyncSession, host: User, visitor: OpenHous
 
 async def open_showcase(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEvent, host: User) -> dict:
     """Their Showcase link - building it now, the same way the sign-in would have (homes like this
-    one + the "your homes are ready" email an hour out), when it wasn't made at sign-in (the
-    open house's Showcases switch was off, or the build didn't go through)."""
+    one + the "your homes are ready" email an hour out), when it wasn't made at sign-in (the build
+    didn't go through). Never while the open house's Showcases switch is off."""
     from app.schemas.open_house import HasAgent, OpenHouseFormSubmission
     from app.services.open_house_service import OpenHouseService
-    if not showcases_offered(host, visitor):
+    if not showcases_offered(host, visitor, oh):
         raise HTTPException(status_code=404, detail="Showcases aren't available here.")
     col = await _showcase(db, host, visitor)
     if not col:

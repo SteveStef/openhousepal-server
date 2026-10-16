@@ -50,6 +50,11 @@ class OpenHouseCreateRequest(BaseModel):
     cheat_sheet_snapshot: Optional[Dict[str, Any]] = None
     # Sign-in screen theme picked in the wizard's Review step (None = keep the model default).
     qr_dark_mode: Optional[bool] = None
+    # Guest settings picked in the wizard. None = the default for this home: off for Showcases and
+    # Similar Homes when the agent is the listing agent of their own listing, on otherwise.
+    auto_showcase: Optional[bool] = None
+    similar_homes: Optional[bool] = None
+    guest_pass: Optional[bool] = None
 
     @field_validator("address", "cover_image_url", "open_house_event_id", "qr_code_url", mode="before")
     @classmethod
@@ -91,6 +96,7 @@ class OpenHouseResponse(BaseModel):
     qr_dark_mode: bool = True
     share_guests_with_listing_agent: bool = False
     auto_showcase: bool = True
+    similar_homes: bool = True
     after_signin: Optional[str] = None
     guest_pass: bool = True
     pass_signature: bool = True
@@ -144,6 +150,7 @@ class ShareGuestsUpdate(BaseModel):
 
 class GuestSettingsUpdate(BaseModel):
     auto_showcase: Optional[bool] = None
+    similar_homes: Optional[bool] = None
     guest_pass: Optional[bool] = None
     pass_signature: Optional[bool] = None
     after_signin: Optional[Literal["hub", "none"]] = None

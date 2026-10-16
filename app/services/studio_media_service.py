@@ -1846,7 +1846,7 @@ async def _notify_video_done(db: AsyncSession, asset: StudioMediaAsset) -> None:
                 (asset.error_message or "The AI video couldn't be finished. Try again.")
             ),
             property_address=address,
-            link="/studio/media",
+            link=f"/studio/media/{asset.id}",
             is_read=False,
         ))
         await db.commit()
@@ -1854,11 +1854,11 @@ async def _notify_video_done(db: AsyncSession, asset: StudioMediaAsset) -> None:
         owner = await db.get(User, asset.owner_id)
         if succeeded:
             email_agent(owner, "STUDIO_MEDIA_VIDEO_READY", "studio_media_ready", "Your AI property video is ready",
-                        {"media_type": "AI property video", "property_address": address, "link": absolute("/studio/media")})
+                        {"media_type": "AI property video", "property_address": address, "link": absolute(f"/studio/media/{asset.id}")})
         else:
             email_agent(owner, "STUDIO_MEDIA_VIDEO_FAILED", "studio_media_failed", "Your AI property video couldn't be finished",
                         {"media_type": "AI property video", "property_address": address, "reason": asset.error_message,
-                         "link": absolute("/studio/media")})
+                         "link": absolute(f"/studio/media/{asset.id}")})
     except Exception as exc:  # noqa: BLE001 - never let a notification failure sink the poll
         logger.warning("studio media video notification failed", extra={"asset_id": asset.id, "error": _exc_text(exc)})
         await db.rollback()
@@ -1914,6 +1914,10 @@ async def _poll_asset_body(db: AsyncSession, user: User, asset: StudioMediaAsset
     if any(c["status"] == "failed" for c in clips):
         asset.status = "failed"
         asset.error_message = "One of the video clips failed. Try again with different photos."
+        # The agent sees the line above; the provider's real reason (credit, policy, outage) goes to the admin.
+        from app.services.admin_alerts import alert_admin
+        await alert_admin("ai_video", "AI video clip failed", "; ".join(str(c.get("error") or "") for c in clips if c["status"] == "failed")[:600],
+                          owner_id=asset.owner_id)
         # _settle_video(..., 0.0, ...) already refunds this generation's platform-wide reservation
         # and records a $0 usage event - cost_usd must match that (was left at the pre-flight
         # estimate set at creation time otherwise), or the agent sees a non-zero price tag on a
@@ -2121,6 +2125,8 @@ async def _finish_video_runway_legacy(db, asset, opts: dict, clips: list[dict], 
         logger.warning("studio media video assemble failed", extra={"asset_id": asset.id, "error": _exc_text(exc)})
         asset.status = "failed"
         asset.error_message = "The finished video couldn't be assembled. Try again."
+        from app.services.admin_alerts import alert_admin
+        await alert_admin("ai_video", "AI video couldn't be assembled", _exc_text(exc)[:600], owner_id=asset.owner_id)
         asset.cost_usd = 0.0  # match the $0 refund/usage-event settled below, not the stale pre-flight estimate
         await _settle_video(db, asset, 0.0, est_cost, block_reason="studio_media_store_failed")
         await db.commit()
@@ -2267,6 +2273,8 @@ async def _finish_video_per_clip(db, asset, opts: dict, clips: list[dict], confi
         logger.warning("studio media video assemble failed", extra={"asset_id": asset.id, "error": _exc_text(exc)})
         asset.status = "failed"
         asset.error_message = "The finished video couldn't be assembled. Try again."
+        from app.services.admin_alerts import alert_admin
+        await alert_admin("ai_video", "AI video couldn't be assembled", _exc_text(exc)[:600], owner_id=asset.owner_id)
         asset.cost_usd = 0.0
         await _settle_video(db, asset, 0.0, est_cost, block_reason="studio_media_store_failed")
         await db.commit()
@@ -2394,6 +2402,8 @@ async def _finish_video_from_base(db, asset, opts: dict, config: dict, est_cost:
             return asset
         asset.status = "failed"
         asset.error_message = "The finished video couldn't be assembled. Try again."
+        from app.services.admin_alerts import alert_admin
+        await alert_admin("ai_video", "AI video couldn't be assembled", _exc_text(exc)[:600], owner_id=asset.owner_id)
         asset.cost_usd = 0.0  # match the $0 refund/usage-event settled below, not the stale pre-flight estimate
         await _settle_video(db, asset, 0.0, est_cost, block_reason="studio_media_store_failed")
         await db.commit()

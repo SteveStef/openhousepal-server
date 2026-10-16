@@ -1035,6 +1035,10 @@ class OpenHouseEvent(Base):
     # to other homes. A guest who scans the Similar Homes sheet's "see more like these" QR asked
     # for other homes, so they still get one.
     auto_showcase = Column(Boolean, default=True, nullable=False, server_default='true')
+    # The Similar Homes sheet in the kit + the similar homes on the Guest Pass. Off = neither shows
+    # (similar_properties_snapshot is kept, so switching back on restores the picked homes). A
+    # listing agent hosting their own listing starts with this and auto_showcase off.
+    similar_homes = Column(Boolean, default=True, nullable=False, server_default='true')
     # Bright MLS plans: after signing in, the guest's phone opens their Guest Pass for this open
     # house (the home, its Similar Homes + Cheat Sheet as web pages, one-tap disclosure / second
     # tour requests, their Showcase) - app/api/guest_pass_routes.py. On by default.

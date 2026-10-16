@@ -66,4 +66,4 @@ async def get_stats_history(
         counts = await stats_service.get_daily_counts(db, current_user.id, metric, since, until)
         daily = [DailyPoint(date=d.isoformat(), count=n) for d, n in sorted(counts.items())]
 
-    return MetricHistory(metric=metric, joined_at=since.date().isoformat(), daily=daily)
+    return MetricHistory(metric=metric, joined_at=stats_service.local_day(since).isoformat(), daily=daily)

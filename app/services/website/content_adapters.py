@@ -613,6 +613,27 @@ def _agent_sale_identifier_filters(mls_id: str) -> list:
     return filters
 
 
+def _not_a_lease():
+    """A rental isn't a sale - leases closed by an agent never fill their Recent Sales."""
+    t = Property.raw_mls_data["PropertyType"].astext
+    return or_(t.is_(None), ~t.ilike("%lease%"))
+
+
+def _sold_price(p) -> Optional[float]:
+    """What it sold for (ClosePrice), the list price only when Bright never sent one."""
+    raw = p.raw_mls_data if isinstance(p.raw_mls_data, dict) else {}
+    try:
+        close = float(raw.get("ClosePrice") or 0)
+    except (TypeError, ValueError):
+        close = 0
+    return close or p.price
+
+
+def _sold_date(p) -> Optional[str]:
+    raw = p.raw_mls_data if isinstance(p.raw_mls_data, dict) else {}
+    return str(raw.get("CloseDate") or "")[:10] or None
+
+
 async def get_recent_sales(
     db: AsyncSession, user: User, limit: int = 12, zip_codes: Optional[list[str]] = None,
     area_scope: Optional[dict] = None,
@@ -623,13 +644,22 @@ async def get_recent_sales(
     if not user.mls_id:
         return []
     mls_id = user.mls_id.strip()
-    query = select(Property).where(or_(*_agent_sale_identifier_filters(mls_id)))
+    # Closed sales only, newest CLOSING first (Bright audit, 10/15): it used to take the agent's 3x
+    # most recently MODIFIED rows of any status, so a busy agent's listings crowded their real
+    # sales out, and it showed the list price + the last-edited date instead of what it sold for
+    # and when.
+    query = select(Property).where(
+        or_(*_agent_sale_identifier_filters(mls_id)),
+        or_(Property.home_status.ilike("%closed%"), Property.home_status.ilike("%sold%")),
+        _not_a_lease(),
+    )
     location_filter = geography.location_filter(Property, area_scope or (geography.zip_scope(zip_codes) if zip_codes else None))
     if location_filter is not None:
         query = query.where(location_filter)
     result = await db.execute(
-        query.order_by(Property.modification_timestamp.desc().nullslast(), Property.mls_list_date.desc().nullslast())
-        .limit(limit * 3)  # over-fetch before the sold-status/price filter below, still bounded
+        query.order_by(Property.raw_mls_data["CloseDate"].astext.desc().nullslast(),
+                       Property.modification_timestamp.desc().nullslast())
+        .limit(limit * 3)  # over-fetch before the price floor below, still bounded
     )
     sales = []
     for p in result.scalars().all():
@@ -639,13 +669,13 @@ async def get_recent_sales(
             "address": tidy_caps(p.full_address or p.street_address),
             "city": tidy_caps(p.city),
             "state": p.state,
-            "price": p.price,
+            "price": _sold_price(p),
             "bedrooms": p.bedrooms,
             "bathrooms": p.bathrooms,
             "living_area": p.living_area,
             "status": p.home_status,
             "photo": _property_photo(p),
-            "sold_date": (p.modification_timestamp or p.mls_list_date),
+            "sold_date": _sold_date(p) or p.modification_timestamp or p.mls_list_date,
         }
         if is_eligible_recent_sale(sale):
             sales.append(apply_recent_sale_defaults(sale))
@@ -682,14 +712,16 @@ async def get_agent_stats(db: AsyncSession, user: User) -> dict:
         return {"active_listings": active_count, "sold_count": len(hub_sales), "sold_volume": round(sum(s.get("price") or 0 for s in hub_sales))}
 
     result = await db.execute(
-        select(Property.price, Property.home_status, Property.modification_timestamp, Property.mls_list_date)
-        .where(or_(*_agent_sale_identifier_filters(mls_id)))
+        select(Property)
+        .where(or_(*_agent_sale_identifier_filters(mls_id)),
+               or_(Property.home_status.ilike("%closed%"), Property.home_status.ilike("%sold%")), _not_a_lease())
         .limit(1000)
     )
     sold_count = 0
     sold_volume = 0
-    for price, status, mod_ts, list_date in result.all():
-        if is_eligible_recent_sale({"status": status, "price": price}):
+    for p in result.scalars().all():
+        price = _sold_price(p)
+        if is_eligible_recent_sale({"status": p.home_status, "price": price}):
             sold_count += 1
             sold_volume += price or 0
 

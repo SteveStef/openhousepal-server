@@ -445,11 +445,19 @@ def _clean_header(raw) -> Optional[dict]:
         except (TypeError, ValueError):
             return default
 
+    # x / y = the computer's spot; px / py = the phone's own spot (a tall phone header often needs
+    # a different one - user, 10/15), the computer's when never set. desk_set / phone_set = the
+    # agent confirmed each one (the editor asks for both).
     clean_frame = {
         "x": _num(frame.get("x"), 0, 100, 50),
         "y": _num(frame.get("y"), 0, 100, 50),
         "zoom": _num(frame.get("zoom"), 1.0, 1.3, 1.12),
     } if frame else None
+    if clean_frame is not None:
+        clean_frame["px"] = _num(frame.get("px"), 0, 100, clean_frame["x"])
+        clean_frame["py"] = _num(frame.get("py"), 0, 100, clean_frame["y"])
+        clean_frame["desk_set"] = bool(frame.get("desk_set"))
+        clean_frame["phone_set"] = bool(frame.get("phone_set"))
     return {
         "mode": mode,
         "motion": raw.get("motion") if raw.get("motion") in ("in", "out", "both", "none") else "out",

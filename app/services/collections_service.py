@@ -109,29 +109,46 @@ async def _resolve_original_property_data(db: AsyncSession, collection: Collecti
     return None
 
 
+# NEW tags - one set of rules everywhere:
+#  - the agent's Showcases page card: a home matched in since the agent last opened that Showcase
+#    (opening it sets last_agent_dismissed_at, same as the card's "N NEW x");
+#  - inside the Showcase (agent): matched in within NEW_PROPERTY_DAYS and the agent hasn't opened it;
+#  - the buyer's page: within NEW_PROPERTY_DAYS and the buyer hasn't opened it.
+# Homes from the first fill (in within 10 minutes of making the Showcase) aren't "new matches" for
+# the agent - they picked them; for the buyer everything is new in the Showcase's first week.
+FIRST_FILL = timedelta(minutes=10)
+
+
+def _utc(d: Optional[datetime]) -> Optional[datetime]:
+    return d.replace(tzinfo=timezone.utc) if d is not None and d.tzinfo is None else d
+
+
+def new_window() -> timedelta:
+    return timedelta(days=int(os.getenv("NEW_PROPERTY_DAYS", "7")))
+
+
+def matched_in_at(collection: Collection, added_at: Optional[datetime]) -> Optional[datetime]:
+    """When this home came in as a NEW match - None for the Showcase's first fill."""
+    a, c = _utc(added_at), _utc(collection.created_at)
+    if a is None or (c is not None and a <= c + FIRST_FILL):
+        return None
+    return a
+
+
+def card_new_since(collection: Collection) -> datetime:
+    return _utc(collection.last_agent_dismissed_at or collection.created_at)
+
+
 class CollectionsService:
 
     @staticmethod
     def count_new_properties(collection: Collection) -> int:
-        """
-        Same "new since last dismissed" rule used on the Showcases dashboard (mls_list_date
-        newer than last_agent_dismissed_at, falling back to the collection's created_at) -
-        pulled out so Leads can surface the identical NEW count without duplicating the logic.
-        Requires collection.properties to already be loaded.
-        """
-        dismiss_reference = collection.last_agent_dismissed_at or collection.created_at
-        if dismiss_reference.tzinfo is None:
-            dismiss_reference = dismiss_reference.replace(tzinfo=timezone.utc)
-
-        count = 0
-        for p in (collection.properties or []):
-            if p.mls_list_date:
-                mls_date = p.mls_list_date
-                if mls_date.tzinfo is None:
-                    mls_date = mls_date.replace(tzinfo=timezone.utc)
-                if mls_date > dismiss_reference:
-                    count += 1
-        return count
+        """The card's NEW count (matched in since the agent last opened the Showcase) for Leads/AI.
+        Needs collection._added_at ({property_id: added_at}) - lead_routes._fetch_owner_collections sets it."""
+        added = getattr(collection, '_added_at', None) or {}
+        since = card_new_since(collection)
+        return sum(1 for p in (collection.properties or [])
+                   if (m := matched_in_at(collection, added.get(p.id))) is not None and m > since)
 
     @staticmethod
     def _calculate_dom(
@@ -264,10 +281,8 @@ class CollectionsService:
                 active_count = 0
                 new_listings_count = 0
 
-                # A property is "new" if mls_list_date > last_agent_dismissed_at (fallback to created_at)
-                dismiss_reference = collection.last_agent_dismissed_at or collection.created_at
-                if dismiss_reference.tzinfo is None:
-                    dismiss_reference = dismiss_reference.replace(tzinfo=timezone.utc)
+                # NEW on the card = matched in since the agent last opened this Showcase (see FIRST_FILL notes).
+                dismiss_reference = card_new_since(collection)
 
                 # Properties the agent has individually opened - clears that one property's NEW
                 # tag (and the count) even if the collection-wide dismiss hasn't been clicked.
@@ -284,13 +299,9 @@ class CollectionsService:
                         if p.id not in disliked_property_ids and _is_property_available(p.home_status):
                             active_count += 1
 
-                        if p.mls_list_date and p.id not in agent_viewed_ids:
-                            mls_date = p.mls_list_date
-                            if mls_date.tzinfo is None:
-                                mls_date = mls_date.replace(tzinfo=timezone.utc)
-
-                            if mls_date > dismiss_reference:
-                                new_listings_count += 1
+                        m_in = matched_in_at(collection, added_at_lookup.get((collection.id, p.id)))
+                        if m_in is not None and m_in > dismiss_reference and p.id not in agent_viewed_ids:
+                            new_listings_count += 1
 
                 try:
                     original_property_data = await _resolve_original_property_data(db, collection)
@@ -320,6 +331,17 @@ class CollectionsService:
                         "has_agent": collection.preferences.has_agent,
                         "compare_property_listing_key": collection.preferences.compare_property_listing_key,
                         "show_match_score": collection.preferences.show_match_score,
+                    # The editor reopens with everything the agent set - leaving these out made
+                    # the drawn area, counties, size and lot settings look empty, and the next Save
+                    # quietly erased them.
+                    "search_polygon": collection.preferences.search_polygon,
+                    "counties": collection.preferences.counties,
+                    "county": collection.preferences.county,
+                    "state": collection.preferences.state,
+                    "min_sqft": collection.preferences.min_sqft,
+                    "max_sqft": collection.preferences.max_sqft,
+                    "min_acres": collection.preferences.min_acres,
+                    "max_acres": collection.preferences.max_acres,
 
                         "is_town_house": collection.preferences.is_town_house,
                         "is_condo": collection.preferences.is_condo,
@@ -368,10 +390,10 @@ class CollectionsService:
                         'ModificationTimestamp': prop.modification_timestamp.isoformat() if prop.modification_timestamp else (prop.updated_at.isoformat() if prop.updated_at else None),
                         'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,
                         'MlsStatus': prop.home_status,
-                        # Same "new since last dismissed" rule as stats.newProperties - lets card
-                        # previews show exactly which properties make up that count.
+                        # Same rule as stats.newProperties - lets the card photos show exactly
+                        # which homes make up that count.
                         'MLSListDate': mls_date.isoformat() if mls_date else None,
-                        'is_new': bool(mls_date and mls_date > dismiss_reference and prop.id not in agent_viewed_ids),
+                        'is_new': bool((m_in := matched_in_at(collection, added_at)) and m_in > dismiss_reference and prop.id not in agent_viewed_ids),
                         # When this property was matched into the showcase (NULL for the
                         # properties the collection started with) - drives "most recently
                         # added" ordering on the dashboard card preview.
@@ -475,16 +497,36 @@ class CollectionsService:
         "agent_viewed_at" signal each of those tags already individually respects, rather than
         requiring the agent to click through every single property card to dismiss each one."""
         try:
-            owns = await db.execute(select(Collection.id).where(Collection.id == collection_id, Collection.owner_id == user_id))
-            if not owns.scalar_one_or_none():
+            owns = await db.execute(select(Collection.created_at, Collection.last_agent_dismissed_at).where(Collection.id == collection_id, Collection.owner_id == user_id))
+            coll = owns.first()
+            if not coll:
                 return {"success": False, "error": "Collection not found"}
 
             now = datetime.now(timezone.utc)
+            # agent_viewed_at is also what clears a home's NEW tag, and NEW clears only when the agent
+            # opens THAT home - so homes that are still new are left alone here (a new home the buyer
+            # already viewed or liked used to lose NEW the moment the agent opened the Showcase).
+            # Still new inside the Showcase = matched in within the NEW window, not the first fill.
+            created = _utc(coll.created_at)
+            still_new = (
+                select(collection_properties.c.property_id)
+                .where(
+                    collection_properties.c.collection_id == collection_id,
+                    collection_properties.c.added_at >= now - new_window(),
+                    collection_properties.c.added_at > created + FIRST_FILL,
+                )
+            )
             await db.execute(
                 update(PropertyInteraction)
-                .where(PropertyInteraction.collection_id == collection_id, PropertyInteraction.agent_viewed_at.is_(None))
+                .where(
+                    PropertyInteraction.collection_id == collection_id,
+                    PropertyInteraction.agent_viewed_at.is_(None),
+                    PropertyInteraction.property_id.notin_(still_new),
+                )
                 .values(agent_viewed_at=now)
             )
+            # The Showcases page card's NEW = "since you last opened it" - opening it is seeing them.
+            await db.execute(update(Collection).where(Collection.id == collection_id).values(last_agent_dismissed_at=now))
             await db.execute(
                 update(LeadEvent)
                 .where(
@@ -696,6 +738,10 @@ class CollectionsService:
             collection.refine_request_message = None
             collection.refine_request_at = None
             await db.commit()
+            # Dismissed = handled: its "Update Jane's Showcase search" follow-up is checked off too.
+            from app.services.tasks_service import complete_request_followups
+            await complete_request_followups(db, user_id, collection_id=collection_id, source_types=("showcase_refine",),
+                                             rules={"showcase_search_request"})
 
             return {"success": True}
 
@@ -742,10 +788,11 @@ class CollectionsService:
             active_count = 0
             new_listings_count = 0
 
-            # A property is "new" if mls_list_date > last_agent_dismissed_at (fallback to created_at)
-            dismiss_reference = collection.last_agent_dismissed_at or collection.created_at
-            if dismiss_reference.tzinfo is None:
-                dismiss_reference = dismiss_reference.replace(tzinfo=timezone.utc)
+            # Same card rule as get_user_collections.
+            dismiss_reference = card_new_since(collection)
+            one_added = {r.property_id: r.added_at for r in (await db.execute(
+                select(collection_properties.c.property_id, collection_properties.c.added_at)
+                .where(collection_properties.c.collection_id == collection.id))).all()}
 
             for prop in collection.properties:
                 # "Active" here means still a real, purchasable match: not disliked and not
@@ -753,13 +800,9 @@ class CollectionsService:
                 if prop.id not in disliked_property_ids and _is_property_available(prop.home_status):
                     active_count += 1
 
-                if prop.mls_list_date:
-                    mls_date = prop.mls_list_date
-                    if mls_date.tzinfo is None:
-                        mls_date = mls_date.replace(tzinfo=timezone.utc)
-                    
-                    if mls_date > dismiss_reference:
-                        new_listings_count += 1
+                m_in = matched_in_at(collection, one_added.get(prop.id))
+                if m_in is not None and m_in > dismiss_reference:
+                    new_listings_count += 1
 
                 property_dict = {
                     'id': prop.id,
@@ -815,6 +858,17 @@ class CollectionsService:
                     "has_agent": collection.preferences.has_agent,
                     "compare_property_listing_key": collection.preferences.compare_property_listing_key,
                     "show_match_score": collection.preferences.show_match_score,
+                    # The editor reopens with everything the agent set - leaving these out made
+                    # the drawn area, counties, size and lot settings look empty, and the next Save
+                    # quietly erased them.
+                    "search_polygon": collection.preferences.search_polygon,
+                    "counties": collection.preferences.counties,
+                    "county": collection.preferences.county,
+                    "state": collection.preferences.state,
+                    "min_sqft": collection.preferences.min_sqft,
+                    "max_sqft": collection.preferences.max_sqft,
+                    "min_acres": collection.preferences.min_acres,
+                    "max_acres": collection.preferences.max_acres,
 
                     "is_town_house": collection.preferences.is_town_house,
                     "is_condo": collection.preferences.is_condo,
@@ -1536,6 +1590,9 @@ class CollectionsService:
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
                     'viewCount': interactions_lookup[prop.id].view_count if prop.id in interactions_lookup else 0,
+                    # NEW for the buyer: in their Showcase less than NEW_PROPERTY_DAYS (the first fill
+                    # counts from when it was made); the page also hides it once they've opened it.
+                    'is_new': bool(_utc(added_at_lookup.get(prop.id) or collection.created_at) >= new_threshold),
                     'lastViewedAt': interactions_lookup[prop.id].last_viewed_at.isoformat() if prop.id in interactions_lookup and interactions_lookup[prop.id].last_viewed_at else None,
                     'comments': comments_lookup.get(prop.id, []),
                     'unreadCommentCount': unread_comment_lookup.get(prop.id, 0),
@@ -1615,6 +1672,8 @@ class CollectionsService:
                     'has_agent': collection.preferences.has_agent,
                     'compare_property_listing_key': collection.preferences.compare_property_listing_key,
                     'show_match_score': collection.preferences.show_match_score,
+                    # The visitor's window shows "the area your agent drew" (they can't draw it).
+                    'has_drawn_area': bool(collection.preferences.search_polygon),
 
                     'is_town_house': collection.preferences.is_town_house,
                     'is_condo': collection.preferences.is_condo,
@@ -2012,13 +2071,10 @@ class CollectionsService:
 
             properties_data = []
             for prop in collection.properties:
-                added_at = added_at_lookup.get(prop.id)
-                is_new = False
-                if added_at:
-                    # Make added_at timezone-aware if it isn't already
-                    if added_at.tzinfo is None:
-                        added_at = added_at.replace(tzinfo=timezone.utc)
-                    is_new = added_at >= new_threshold
+                added_at = _utc(added_at_lookup.get(prop.id))
+                # Matched in within the NEW window (not the first fill - see FIRST_FILL notes).
+                m_in = matched_in_at(collection, added_at)
+                is_new = bool(m_in and m_in >= new_threshold)
 
                 # Once the agent has actually opened this property from their own showcase
                 # management view, its NEW tag clears there - independent of the collection-wide

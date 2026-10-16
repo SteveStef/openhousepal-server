@@ -702,8 +702,11 @@ async def _sync_task(db: AsyncSession, conn: CalendarConnection, task_id: str) -
     if not task or task.owner_id != conn.owner_id:
         return
     # A task with no date can't sit on the calendar. A completed one stays, crossed out
-    # (_task_event_body); deleting a task in the app is what takes its event off.
-    if task.due_at is None:
+    # (_task_event_body); deleting a task in the app is what takes its event off. Except a done
+    # request follow-up (send the disclosure, book the showing...): once it's handled there's
+    # nothing left to see, so it comes off the calendar (user, 10/15).
+    from app.services.tasks_service import ACTION_REQUEST_RULES
+    if task.due_at is None or (task.completed_at is not None and task.auto_source in ACTION_REQUEST_RULES):
         await _remove_event(db, conn, "task", task_id)
         return
     await _upsert_event(db, conn, "task", task_id, await task_body_for(db, task))

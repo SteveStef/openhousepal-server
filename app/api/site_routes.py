@@ -435,9 +435,12 @@ async def _enrich_area_background(area_id: str, triggering_user_id: str):
 
 @router.get("/me/areas", response_model=List[AgentMarketAreaResponse])
 async def get_my_served_areas(
+    lite: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
 ):
+    """lite=1: names + research status only (the setup town picker polls this every few seconds
+    while a town is researched - each town's full facts/boundary is ~50 KB it doesn't need)."""
     result = await db.execute(
         select(AgentMarketArea)
         .where(AgentMarketArea.owner_id == current_user.id)
@@ -446,7 +449,14 @@ async def get_my_served_areas(
     links = result.scalars().all()
     for link in links:
         await db.refresh(link, attribute_names=["area"])
-    return links
+    if not lite:
+        return links
+    out = []
+    for link in links:
+        a = AgentMarketAreaResponse.model_validate(link)
+        a.area.facts, a.area.geography, a.area.narrative = {}, {}, None
+        out.append(a)
+    return out
 
 
 @router.post("/me/areas", response_model=AgentMarketAreaResponse, status_code=status.HTTP_201_CREATED)

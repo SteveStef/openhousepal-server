@@ -79,6 +79,11 @@ class MyListingItem(BaseModel):
     is_high_priority: bool
     pending_request_count: int
     is_manual: bool = False
+    # When it may have an open house (open_house_manager_service.hosting_window): "pending" = under
+    # contract / off market, none at all; "coming_soon" = Coming Soon, go-live date unknown, none
+    # yet; hosts_from = Coming Soon, only on or after this day.
+    hosting_blocked: Optional[str] = None
+    hosts_from: Optional[date] = None
 
 
 class MyListingsResponse(BaseModel):
@@ -112,6 +117,11 @@ class HostRequestResponse(BaseModel):
     requesting_agent_name: str
     requesting_agent_brokerage: Optional[str] = None
     requesting_agent_email: Optional[str] = None
+    listing_agent_name: Optional[str] = None
+    listing_agent_brokerage: Optional[str] = None
+    # One "Other time" each way: once used, that side can only say yes or no.
+    listing_agent_suggested_time: bool = False
+    host_suggested_time: bool = False
     requested_date: date
     requested_start_time: time
     requested_end_time: time

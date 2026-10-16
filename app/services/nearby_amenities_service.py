@@ -1842,9 +1842,14 @@ async def get_nearby_amenities(db, property: Property, force_refresh: bool = Fal
                 logger.info(f"[CHEAT SHEET COST] listing_key={property.listing_key} CACHE HIT - live Google cost=$0.000 (served from cache)")
                 return cached
 
+    # Only a home's FIRST lookup counts toward the agent's AI usage. A re-lookup because we changed
+    # the cheat sheet's data format (AMENITIES_SCHEMA_VERSION - every release that bumps it would
+    # otherwise re-charge every agent ~$0.30 per home), the 180-day refresh, or a forced refresh is
+    # our doing, not theirs - it stays on the platform budget like any sync call.
+    charge_to = owner_id if not property.nearby_amenities and not force_refresh else None
     try:
         async with httpx.AsyncClient() as client:
-            result = await _fetch_live(client, api_key, lookup_lat, lookup_lng, property, db, owner_id=owner_id)
+            result = await _fetch_live(client, api_key, lookup_lat, lookup_lng, property, db, owner_id=charge_to)
     except Exception as e:
         logger.warning(f"Nearby amenities lookup failed for listing {property.listing_key}: {e}")
         cached = _cached_response(property)

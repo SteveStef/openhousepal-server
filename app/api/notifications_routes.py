@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, func
+from sqlalchemy import select, and_, or_, func
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 
@@ -14,6 +14,7 @@ from app.schemas.notification import (
     NotificationPreferencesUpdate,
 )
 from app.services import notification_preferences_service
+from app.services.notification_links import exact_links
 from app.config.logging import get_logger
 
 logger = get_logger(__name__)
@@ -38,8 +39,10 @@ async def get_notifications(
             query = query.where(Notification.is_read == False)
 
         if max_age_days:
+            # Recent ones, plus anything still unread however old - so the bell, Dash and the
+            # Activity page always count the same unread items.
             cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
-            query = query.where(Notification.created_at >= cutoff)
+            query = query.where(or_(Notification.created_at >= cutoff, Notification.is_read == False))
 
         # Order by created_at descending (most recent first). The bell is now a history mailbox
         # (read notifications stay visible instead of disappearing), so cap the page size - without
@@ -50,8 +53,25 @@ async def get_notifications(
 
         result = await db.execute(query)
         notifications = result.scalars().all()
+        if max_age_days and not unread_only and not offset:
+            # Every unread one is in the bell / Dash list even past the newest 100 - so their unread
+            # count always matches the Activity page.
+            have = {n.id for n in notifications}
+            more = (await db.execute(
+                select(Notification).where(Notification.agent_id == current_user.id, Notification.is_read == False)
+                .order_by(Notification.created_at.desc()).limit(100)
+            )).scalars().all()
+            extra = [n for n in more if n.id not in have]
+            if extra:
+                notifications = sorted([*notifications, *extra], key=lambda n: n.created_at, reverse=True)
 
-        return notifications
+        # Each one opens the exact thing it talks about (see notification_links) - computed here,
+        # never written back, so the stored link stays the fallback.
+        links = await exact_links(db, current_user.id, notifications)
+        return [
+            NotificationResponse.model_validate(n).model_copy(update={"link": links[n.id]}) if n.id in links else n
+            for n in notifications
+        ]
 
     except Exception as e:
         logger.error("fetching notifications failed", extra={"error": str(e)})

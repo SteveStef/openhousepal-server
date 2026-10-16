@@ -10,6 +10,7 @@ from app.config.logging import get_logger
 from app.utils.auth import get_current_active_user, require_mls_access, require_broker_authorization
 from app.utils.geo import get_lat_long_offsets, is_within_distance, haversine_distance, filter_properties_by_radius, distance_miles_sql
 from app.utils.listing_dom import resolve_days_on_market
+from app.services.open_house_manager_service import hosting_window
 import os
 
 logger = get_logger(__name__)
@@ -51,6 +52,10 @@ class DiscoveryPropertyResponse(BaseModel):
     # can match a listing against whichever of the viewer's (possibly several) Open House Teams
     # they've selected, without a second lookup per listing.
     OnPlatformAgentId: Optional[str] = None
+    # Coming Soon: "coming_soon" = no go-live date yet (no open houses until it goes active);
+    # HostsFrom = the first day an open house is allowed (open_house_manager_service.hosting_window).
+    HostingBlocked: Optional[str] = None
+    HostsFrom: Optional[str] = None
 
 class DiscoveryPreferencesResponse(BaseModel):
     landmark_address: Optional[str] = None
@@ -219,7 +224,11 @@ async def get_discovery(
         # circle - so widening the radius genuinely pulls in the next ring of listings once the
         # nearer ones are exhausted, instead of the cap staying full of rows inside the old radius.
         if is_radius_search and radius_distance_expr is not None:
-            prop_stmt = prop_stmt.order_by(radius_distance_expr.asc())
+            prop_stmt = prop_stmt.order_by(radius_distance_expr.asc(), Property.listing_key)
+        else:
+            # Without a radius the cap used to take ANY 50 rows (no order) - a different set on every
+            # load, and the newest listings could be missing. Newest first, same as the page sorts.
+            prop_stmt = prop_stmt.order_by(Property.mls_list_date.desc().nullslast(), Property.listing_key)
 
         # Limit results (a touch higher for a radius search - a few rows can still be trimmed by the
         # float-parity safety net below).
@@ -303,6 +312,7 @@ async def get_discovery(
                 dist = haversine_distance(prefs.latitude, prefs.longitude, p.latitude, p.longitude)
 
             on_platform_owner = owner_by_mls_id.get(p.list_agent_mls_id) or owner_by_mls_id.get(p.co_list_agent_mls_id)
+            hosting_blocked, hosts_from = hosting_window(p.home_status, p.raw_mls_data)
 
             response_data.append(DiscoveryPropertyResponse(
                 ListingKey=str(p.listing_key),
@@ -331,6 +341,8 @@ async def get_discovery(
                 HostRequestEligible=_host_request_eligible(on_platform_owner),
                 ListAgentPhotoUrl=on_platform_owner.photo_url if on_platform_owner else None,
                 OnPlatformAgentId=on_platform_owner.id if on_platform_owner else None,
+                HostingBlocked=hosting_blocked,
+                HostsFrom=hosts_from.isoformat() if hosts_from else None,
             ))
 
         # Sort by distance if applicable

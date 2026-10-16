@@ -79,6 +79,8 @@ class LeadEventOut(BaseModel):
     link: Optional[Dict[str, Any]] = None
     # Where they came from before reaching out (a Similar Homes QR at an open house, the Agent Hub...).
     came_from: Optional[str] = None
+    # The agent already dealt with it (opened / marked done) - "Waiting on you" points at one that isn't.
+    handled: bool = False
 
     class Config:
         from_attributes = True

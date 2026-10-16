@@ -1456,6 +1456,48 @@ async def carry_forward_overdue(db: AsyncSession) -> int:
     return len(rows)
 
 
+async def complete_request_followups(db: AsyncSession, owner_id: str, *, source_ids: tuple = (), collection_id: Optional[str] = None,
+                                     source_types: tuple = (), rules: Optional[set] = None) -> int:
+    """The request behind these follow-ups was handled in the app - a disclosure marked Sent, a second
+    visit marked Scheduled, a tour marked Done, a Showcase search request dismissed (user, 10/15). Its
+    open follow-ups are checked off as if the agent ticked them, and they leave the calendar (see
+    calendar_sync_service._sync_task). Matched through the LeadEvent the follow-up was made from:
+    by the request's own id (source_ids) or by the Showcase it came from (collection_id + source_types).
+    Never raises - a follow-up left open is better than a failed "Mark sent"."""
+    from sqlalchemy import or_
+    from app.models.database import LeadEvent
+    try:
+        conds = []
+        if source_ids:
+            conds.append(LeadEvent.source_id.in_([str(s) for s in source_ids]))
+        if collection_id and source_types:
+            conds.append((LeadEvent.collection_id == collection_id) & LeadEvent.source_type.in_(source_types))
+        if not conds:
+            return 0
+        event_ids = list((await db.execute(select(LeadEvent.id).where(or_(*conds)))).scalars())
+        if not event_ids:
+            return 0
+        tasks = list((await db.execute(select(AgentTask).where(
+            AgentTask.owner_id == owner_id, AgentTask.completed_at.is_(None),
+            AgentTask.auto_source.in_(rules or ACTION_REQUEST_RULES),
+            AgentTask.auto_source_id.in_(event_ids),
+        ))).scalars())
+        if not tasks:
+            return 0
+        now = datetime.now(timezone.utc)
+        for t in tasks:
+            t.completed_at = now
+        await db.commit()
+        from app.services.calendar_sync_service import unsync_task_bg
+        for t in tasks:
+            unsync_task_bg(owner_id, t.id)
+        return len(tasks)
+    except Exception:  # noqa: BLE001
+        logger.warning("request follow-ups not completed", exc_info=True)
+        await db.rollback()
+        return 0
+
+
 async def purge_old_completed(db: AsyncSession) -> int:
     from sqlalchemy import delete
     cutoff = datetime.now(timezone.utc) - timedelta(days=COMPLETED_RETENTION_DAYS)
@@ -2059,6 +2101,11 @@ async def _open_house_short(db: AsyncSession, visitor_id: Optional[str], fallbac
     return display_address(fallback)[1] or fallback
 
 
+def _tidy_context(s: str) -> str:
+    from app.services.email_service import _tidy_subject
+    return _tidy_subject(s)
+
+
 async def create_open_house_followup(
     db: AsyncSession,
     *,
@@ -2093,6 +2140,30 @@ async def create_open_house_followup(
         if existing.scalar_one_or_none():
             return None
 
+        # One open follow-up per person (what the Follow-ups page promises): signing in at another
+        # open house while their last "Reach out" is still open moves that card to the newest open
+        # house instead of adding a second; any other open follow-up already covers reaching out.
+        # (Once it's done, a later sign-in gets a fresh one.) The visit is still on their lead.
+        open_task = (await db.execute(select(AgentTask).where(
+            AgentTask.owner_id == owner_id, AgentTask.lead_id == lead.id, AgentTask.auto_source.is_not(None),
+            AgentTask.completed_at.is_(None)).order_by(AgentTask.created_at.desc()).limit(1))).scalar_one_or_none()
+        if open_task is not None:
+            if open_task.auto_source in ("open_house_signin", "similar_homes_qr") and property_address:
+                from app.services.email_service import _tidy_subject
+                open_task.context = _tidy_subject(f"Signed in at your open house - {property_address}")[:240]
+                if property_address not in (open_task.notes or ""):
+                    open_task.notes = ((open_task.notes or "") + f"\nAlso signed in at: {property_address}").strip()
+                if commit:
+                    await db.commit()
+                else:
+                    await db.flush()
+                try:
+                    from app.services import calendar_sync_service
+                    calendar_sync_service.sync_task_bg(owner_id, open_task.id)
+                except Exception:
+                    pass
+            return None
+
         # When + how is the agent's setting for this rule (default: next day, timed free slot).
         due, remind, all_day = await plan_followup(db, owner, rule, occurred_at)
         contact_bits = "  |  ".join(b for b in [lead.email, lead.phone] if b)
@@ -2119,9 +2190,10 @@ async def create_open_house_followup(
             suggested_message=render_rule_message(owner, rule, name=lead.name, address=await _open_house_short(db, signin_id, property_address)),
             # The sheet's bottom "Want to see more homes like these?" QR (-> sign-in -> Showcase), not
             # one of the per-home QRs (those open that home's listing page - tracked separately).
-            context=(f"Scanned \"Want to see more homes like these?\" on your Similar Homes sheet and signed in{' - ' + property_address if property_address else ''}"
-                     if rule == "similar_homes_qr" else
-                     f"Signed in at your open house{' - ' + property_address if property_address else ''}")[:240],
+            # MLS capitals tidied like every other follow-up ("26 OLD GULPH RD" read as shouting).
+            context=_tidy_context(f"Scanned \"Want to see more homes like these?\" on your Similar Homes sheet and signed in{' - ' + property_address if property_address else ''}"
+                                  if rule == "similar_homes_qr" else
+                                  f"Signed in at your open house{' - ' + property_address if property_address else ''}")[:240],
         )
         db.add(task)
         if commit:
@@ -2608,7 +2680,13 @@ async def fire_due_reminders(db: AsyncSession) -> int:
         ).limit(200)
     )
     tasks = rows.scalars().all()
+    # Follow-ups switched off = hidden everywhere, the bell included. Stamp them anyway so turning it
+    # back on doesn't dump every old reminder at once.
+    owners = {u.id: u for u in (await db.execute(select(User).where(User.id.in_({t.owner_id for t in tasks})))).scalars().all()} if tasks else {}
     for t in tasks:
+        if not followups_enabled(owners.get(t.owner_id)):
+            t.reminder_sent_at = now
+            continue
         db.add(Notification(
             agent_id=t.owner_id,
             type="TASK_REMINDER",

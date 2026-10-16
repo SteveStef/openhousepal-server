@@ -122,8 +122,8 @@ DEFAULT_CONFIG = {
         "claude-haiku-4-5": {"input_per_mtok": 1.0, "output_per_mtok": 5.0},
         "claude-sonnet-5": {"input_per_mtok": 2.0, "output_per_mtok": 10.0},
         "claude-opus-5": {"input_per_mtok": 5.0, "output_per_mtok": 25.0},
-        "claude-opus-5-5": {"input_per_mtok": 4.0, "output_per_mtok": 20.0},
-        "claude-sonnet-5-5": {"input_per_mtok": 2.0, "output_per_mtok": 10.0},
+        "claude-opus-5-5": {"input_per_mtok": 4.0, "output_per_mtok": 20.0, "cache_read_multiplier": 0.05},
+        "claude-sonnet-5-5": {"input_per_mtok": 2.0, "output_per_mtok": 10.0, "cache_read_multiplier": 0.05},
         "gpt-6-astra": {"input_per_mtok": 10.0, "output_per_mtok": 50.0},
     },
 
@@ -710,6 +710,7 @@ DEFAULT_CONFIG = {
         "places_nearby": 0.032,
         "places_text": 0.032,
         "places_details": 0.017,
+        "places_details_reviews": 0.025,  # Place Details with reviews = Enterprise + Atmosphere SKU
         "geocoding": 0.005,
         "routes_matrix_element": 0.005,
         "static_map": 0.002,
@@ -784,12 +785,20 @@ class AIConfigService:
         return merged
 
     @staticmethod
-    def estimate_cost_usd(config: dict, model: str, input_tokens: int, output_tokens: int) -> float:
+    def estimate_cost_usd(config: dict, model: str, input_tokens: int, output_tokens: int,
+                          cache_write_tokens: int = 0, cache_read_tokens: int = 0) -> float:
+        """Anthropic's real bill for one call. `input_tokens` from the API EXCLUDES prompt-cache
+        tokens, so callers that use cache_control pass those separately: a 5-minute cache write is
+        1.25x the input price, a cache read 0.1x (0.05x on Opus 5.5 / Sonnet 5.5 - see
+        cache_read_multiplier in model_pricing)."""
         pricing = config.get("model_pricing", {}).get(model)
         if not pricing:
             return 0.0
+        inp = pricing["input_per_mtok"]
         return (
-            (input_tokens / 1_000_000) * pricing["input_per_mtok"]
+            (input_tokens / 1_000_000) * inp
+            + (cache_write_tokens / 1_000_000) * inp * 1.25
+            + (cache_read_tokens / 1_000_000) * inp * pricing.get("cache_read_multiplier", 0.1)
             + (output_tokens / 1_000_000) * pricing["output_per_mtok"]
         )
 
