@@ -254,10 +254,12 @@ async def generate(
     except HTTPException:
         await reconcile_budget(db, reservation, 0.0)
         raise
-    except Exception:
+    except Exception as e:
         logger.exception("copywrite generate failed")
         await reconcile_budget(db, reservation, 0.0)
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The AI writer didn't respond - try again in a moment.")
+        # The real reason (bad model name, no credit, provider down...) rides along for the admin
+        # warning - agents only ever see the generic message (main.provider_failure_handler).
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"The AI writer didn't respond ({purpose}, model {model}): {type(e).__name__}: {str(e)[:300]}")
 
 
 async def compliance_check(db, owner_id: str, plan_tier: str, *, text: str) -> dict:
