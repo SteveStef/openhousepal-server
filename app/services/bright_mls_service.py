@@ -444,9 +444,11 @@ class BrightMlsService:
 
     @staticmethod
     def _closed_window_filter(date_from: str, date_to: str) -> str:
-        # sales only - leases (about a third of "closed" records) aren't comps for a CMA
+        # sales only - leases (about a third of "closed" records) aren't comps for a CMA.
+        # Bright returns this type as 'CommercialLease' but its $filter picklist only accepts
+        # 'Commercial Lease' (with the space) - the unspaced form 400s the whole query.
         return (f"MlsStatus eq 'CLOSED-BRIGHT' and CloseDate ge {date_from} and CloseDate lt {date_to} "
-                "and PropertyType ne 'Residential Lease' and PropertyType ne 'CommercialLease'")
+                "and PropertyType ne 'Residential Lease' and PropertyType ne 'Commercial Lease'")
 
     async def count_closed_window(self, date_from: str, date_to: str) -> int:
         """How many sales closed in [date_from, date_to) across all of Bright - no rows transferred."""
@@ -473,7 +475,7 @@ class BrightMlsService:
         safe = mls_id.replace("'", "''")
         data = await self._make_request("BrightProperties", params={
             "$filter": (f"{field} eq '{safe}' and MlsStatus eq 'CLOSED-BRIGHT' "
-                        "and PropertyType ne 'Residential Lease' and PropertyType ne 'CommercialLease'"),
+                        "and PropertyType ne 'Residential Lease' and PropertyType ne 'Commercial Lease'"),
             "$top": top, "$skip": skip, "$select": self._get_full_field_list(), "$orderby": "ListingKey",
         })
         return data.get("value", [])

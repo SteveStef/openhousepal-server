@@ -190,17 +190,25 @@ async def pull_agent_sales(db: AsyncSession, max_agents: int = 5, pause: float =
 
 
 async def run_enabled(db: AsyncSession) -> dict:
-    """One tick of every switched-on pull (called every 10 minutes)."""
+    """One tick of every switched-on pull (called every 10 minutes). Each pull is isolated - one
+    failing (e.g. Bright rejecting its query) is logged and never stops the others from running."""
+    from app.services.price_history_service import backfill_batch
     out = {}
-    if enabled("refresh_current"):
-        out["refresh_current"] = await refresh_current(db)
-    if enabled("sold_3y"):
-        out["sold_3y"] = await pull_sold_3y(db)
-    if enabled("price_history"):
-        from app.services.price_history_service import backfill_batch
-        out["price_history"] = await backfill_batch(db, max_parcels=300)
-    if enabled("agent_sales"):
-        out["agent_sales"] = await pull_agent_sales(db)
+    for name, run in (("refresh_current", lambda: refresh_current(db)),
+                      ("sold_3y", lambda: pull_sold_3y(db)),
+                      ("price_history", lambda: backfill_batch(db, max_parcels=300)),
+                      ("agent_sales", lambda: pull_agent_sales(db))):
+        if not enabled(name):
+            continue
+        try:
+            out[name] = await run()
+        except Exception as e:  # noqa: BLE001
+            await db.rollback()
+            logger.error(f"Bright data pull failed: {name}", exc_info=True)
+            out[name] = {"error": str(getattr(e, "detail", e))[:300]}
+            # A pull that keeps failing used to go unnoticed for days - tell the admin (throttled).
+            from app.services.admin_alerts import alert_admin
+            await alert_admin("bright_data_pulls", f"Bright data pull failing: {name}", out[name]["error"])
     if out:
         logger.info("Bright data pulls tick", extra={"event": "bright_data_pulls", "result": out})
     return out

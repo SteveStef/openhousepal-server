@@ -157,7 +157,7 @@ def bright_property_to_sale(item: dict) -> dict:
         "image": item.get("ListPictureURL") or item.get("ListPicture2URL") or item.get("ListPicture3URL"),
         "sold_date": item.get("CloseDate") or item.get("ModificationTimestamp"),
         "beds": item.get("BedroomsTotal"),
-        "baths": item.get("BathroomsTotalInteger") or item.get("BathroomsTotalDecimal"),
+        "baths": item.get("BathroomsTotalInteger"),
         "acres": item.get("LotSizeAcres"),
         "sqft": item.get("LivingArea"),
     }
@@ -186,7 +186,6 @@ async def fetch_bright_agent_sales(identifier: str, identifier_type: str, limit:
         "ListPicture3URL",
         "BedroomsTotal",
         "BathroomsTotalInteger",
-        "BathroomsTotalDecimal",
         "LotSizeAcres",
         "LivingArea",
         "ListAgentFullName",
