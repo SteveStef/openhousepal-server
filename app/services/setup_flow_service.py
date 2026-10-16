@@ -24,6 +24,7 @@ from typing import Any, Optional
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.hub_phones import brokerage_phone, office_phone, upgrade as hub_phones_upgrade
 from app.models.database import (
     AgentHub, AgentMarketArea, CalendarConnection, EmailSignature, MailConnection, Site, StudioBrandKit, User,
 )
@@ -96,7 +97,10 @@ def effective_info(user: User, cfg: dict) -> dict:
         "call": _s(contact.get("call")),
         "text": _s(contact.get("text")),
         "email": _s(contact.get("email")) or _s(user.email),
-        "officePhone": _s((card.get("officePhone") or {}).get("value")),
+        # Two numbers kept apart (hub_phones): the brokerage's main line (compliance) and the
+        # agent's own office line (Save Contact).
+        "brokeragePhone": brokerage_phone(cfg),
+        "officePhone": office_phone(cfg),
         "officeAddress": _s((card.get("officeAddress") or {}).get("value")),
         "linkedin": _s((card.get("linkedin") or {}).get("value")),
         "photoUrl": photo or _s(user.photo_url),
@@ -154,11 +158,11 @@ def mirror_user_from_profile(user: User, profile: dict) -> None:
 
 async def apply_info(db: AsyncSession, user: User, hub: AgentHub, patch: dict) -> None:
     """Merge a partial answer into the hub config (+ User mirror). License locks once set."""
-    cfg = dict(hub.config or {})
+    cfg = hub_phones_upgrade(dict(hub.config or {}))
     current = effective_info(user, cfg)
     if isinstance(patch.get("profile"), dict):
         profile = dict(cfg.get("profile") or {})
-        incoming = {k: v for k, v in patch["profile"].items() if k in {"name", "title", "brokerage", "team", "market", "about", "licenseNumber"} and isinstance(v, str)}
+        incoming = {k: v for k, v in patch["profile"].items() if k in {"name", "title", "brokerage", "team", "market", "about", "licenseNumber", "brokeragePhone"} and isinstance(v, str)}
         if current["licenseNumber"]:
             incoming.pop("licenseNumber", None)  # locked once saved
         for k, v in incoming.items():
@@ -231,7 +235,7 @@ async def compute(db: AsyncSession, user: User, hub: AgentHub) -> dict:
         if step == "about":
             done[step] = all(info[k] for k in ("name", "title", "brokerage", "market"))
         elif step == "contact":
-            done[step] = all(info[k] for k in ("call", "text", "email", "officePhone"))
+            done[step] = all(info[k] for k in ("call", "text", "email", "brokeragePhone"))
         elif step == "license":
             done[step] = bool(info["licenseNumber"])
         elif step == "photo":

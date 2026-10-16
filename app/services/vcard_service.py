@@ -161,8 +161,11 @@ def build_vcard_text(
             # A separate texting number - labelled "Text" on iPhone (other phones show it as a 2nd mobile).
             lines.append(f"item9.TEL;TYPE=CELL:{_escape(text)}")
             lines.append("item9.X-ABLabel:Text")
-    if fields["officePhone"]["include"] and fields["officePhone"]["value"]:
-        lines.append(f"TEL;TYPE=WORK:{_escape(fields['officePhone']['value'])}")
+    # The agent's OWN office line only - never the brokerage's main number (see hub_phones).
+    from app.services.hub_phones import office_phone
+    office = office_phone(config)
+    if fields["officePhone"]["include"] and office:
+        lines.append(f"TEL;TYPE=WORK:{_escape(office)}")
 
     if fields["email"]["include"] and (contact.get("email") or "").strip():
         lines.append(f"EMAIL;TYPE=INTERNET:{_escape(contact['email'].strip())}")

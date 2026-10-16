@@ -288,9 +288,10 @@ async def _agent_identity(db: AsyncSession, user: User) -> tuple[set[str], set[s
     for k in ("call", "text"):
         if isinstance(contact.get(k), str) and contact[k].strip():
             phones.add(contact[k])
-    office = (((cfg.get("contactCard") or {}).get("fields") or {}).get("officePhone") or {}).get("value")
-    if isinstance(office, str) and office.strip():
-        phones.add(office)
+    from app.services.hub_phones import brokerage_phone, office_phone
+    for num in (office_phone(cfg), brokerage_phone(cfg)):
+        if num:
+            phones.add(num)
     return emails, phones
 
 
