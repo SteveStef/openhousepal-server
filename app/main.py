@@ -290,6 +290,46 @@ async def logging_middleware(request: Request, call_next):
         clear_request_id()
 
 
+class CrashToJsonMiddleware:
+    """Turns an unexpected crash into a normal 500 reply INSIDE the CORS layer (added just before it,
+    so it sits inside it). Starlette runs @app.exception_handler(Exception) outside every middleware,
+    so a crash used to reach the browser with no Access-Control-Allow-Origin - fetch() then reported
+    "Network error" and the real reason was lost (Spotlight's AI steps all showed "Skipped", 10/16).
+    The exact error also goes to the admin's bell + Discord (throttled)."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        started = False
+
+        async def send_wrapper(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception as exc:  # noqa: BLE001
+            path = scope.get("path", "")
+            logger.error("Unhandled exception", exc_info=True, extra={"path": path})
+            try:
+                from app.services.admin_alerts import alert_admin
+                area = (path.strip("/").split("/") + [""])[0] or "api"
+                await alert_admin(area, f"Server error on {path}: {type(exc).__name__}"[:160],
+                                  f"{scope.get('method')} {path} crashed: {type(exc).__name__}: {str(exc)[:500]}", path=path)
+            except Exception:  # noqa: BLE001
+                pass
+            if started:
+                raise
+            await JSONResponse(status_code=500, content={"detail": "Something went wrong on our side - please try again."})(scope, receive, send)
+
+
+app.add_middleware(CrashToJsonMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     # Local dev browsers may load the app via either "localhost" or "127.0.0.1" -
