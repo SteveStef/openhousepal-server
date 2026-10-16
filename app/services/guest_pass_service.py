@@ -356,7 +356,11 @@ async def _note_on_open_followup(db: AsyncSession, host: User, visitor: OpenHous
             AgentTask.owner_id == host.id, AgentTask.lead_id == lead.id,
             AgentTask.auto_source.is_not(None), AgentTask.completed_at.is_(None),
         ).order_by(AgentTask.created_at.desc()))).scalars().first()
-        if task is None or text in (task.notes or ""):
+        # The question's own follow-up (a listing inquiry) already shows it - copying it in again
+        # printed it twice on the card (user, 10/16). Only a different follow-up (e.g. their
+        # open-house sign-in one) gets the note.
+        squash = lambda v: " ".join(str(v or "").lower().split())
+        if task is None or task.auto_source == "listing_inquiry" or squash(text) in squash(task.notes):
             return
         line = f'Asked on their Guest Pass: "{text}"'
         task.notes = f"{task.notes}\n{line}" if task.notes else line
