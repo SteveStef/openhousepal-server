@@ -126,7 +126,9 @@ async def create_open_house(
             zipcode=zipcode,
             bedrooms=safe_num(property_data.get('BedroomsTotal') or property_data.get('bedrooms')),
             bathrooms=safe_num(property_data.get('BathroomsTotal') or property_data.get('bathrooms')),
-            living_area=safe_num(property_data.get('LivingArea') or property_data.get('livingArea') or property_data.get('living_area')),
+            # No MLS total -> above + below grade finished area (some listings only have those).
+            living_area=safe_num(property_data.get('LivingArea') or property_data.get('livingArea') or property_data.get('living_area'))
+            or (((safe_num(property_data.get('AboveGradeFinishedArea')) or 0) + (safe_num(property_data.get('BelowGradeFinishedArea')) or 0)) or None),
             price=safe_num(property_data.get('ListPrice') or property_data.get('price')),
             home_status=property_data.get('MlsStatus') or property_data.get('homeStatus'),
             listing_key=listing_key_value,
