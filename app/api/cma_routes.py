@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import List
 
@@ -21,6 +22,9 @@ from app.utils.auth import require_mls_access, require_broker_authorization
 # the unauthenticated public share-link route below - each protected route declares its own
 # require_basic_plan + require_broker_authorization instead.
 router = APIRouter(prefix="/api/cma", tags=["cma"])
+
+# Background AI runs in this process (kept referenced so they're never garbage-collected mid-run).
+_BACKGROUND: set = set()
 
 
 @router.get("", response_model=List[CmaReportListItem])
@@ -63,6 +67,35 @@ async def get_public_cma_report(
     """Unauthenticated - this is the client-facing share link, no login required."""
     response.headers["Cache-Control"] = "no-store"
     return await service.get_public_report(db, slug)
+
+
+@router.get("/ai-estimate")
+async def cma_ai_estimate(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_mls_access),
+):
+    """What one "Create AI Analysis" usually costs, as a share of this agent's monthly AI allowance -
+    shown by the button before they spend it (user, 10/17). Typical = the average real cost of recent
+    runs across the platform (photo review + reasoning); "up to" = the per-run cap."""
+    from sqlalchemy import func, select
+    from app.models.database import AIUsageEvent
+    from app.services.ai.ai_config_service import ai_config_service
+    config = await ai_config_service.get_config(db)
+    limit = (config.get("agent_monthly_ai_budget_usd_by_tier") or {}).get(current_user.plan_tier)
+    cap = float(config.get("cma_ai_max_cost_per_generation_usd") or 0.75)
+
+    async def avg(kind: str) -> float:
+        sub = (select(AIUsageEvent.estimated_cost_usd).where(AIUsageEvent.event_type == kind, AIUsageEvent.blocked.is_(False),
+                                                             AIUsageEvent.estimated_cost_usd > 0)
+               .order_by(AIUsageEvent.created_at.desc()).limit(40)).subquery()
+        return float((await db.execute(select(func.avg(sub.c.estimated_cost_usd)))).scalar() or 0)
+
+    typical = (await avg("cma_ai")) + (await avg("cma_reasoning"))
+    if typical <= 0:
+        typical = cap * 0.6
+    typical = min(typical, cap)
+    pct = (lambda usd: round(usd / float(limit) * 100, 1) if limit else None)
+    return {"usd": round(typical, 3), "percent": pct(typical), "max_percent": pct(cap)}
 
 
 @router.get("/{report_id}", response_model=CmaReportResponse)
@@ -118,6 +151,44 @@ async def generate_cma_ai_analysis(
     """Writes a short AI-drafted note per comp (ai_commentary) and a proposed value estimate
     (pricing.ai_estimate) - never overwrites the agent's own commentary/pricing, see
     cma_ai_service.py."""
+    if payload.background:
+        # Runs on its own session, untied to this request: the answer comes back at once
+        # ('generating') and the page polls GET /{id} until it's 'complete' or 'failed' (with
+        # generation_error saying why). Nothing the network does can break it any more.
+        await service.get_report(db, current_user.id, report_id)   # 404 for someone else's report
+        await service.mark_generation_started(db, current_user.id, report_id)
+        owner_id, tier = current_user.id, current_user.plan_tier
+        opts = dict(max_photos_per_property=payload.max_photos_per_property, include_map_images=payload.include_map_images,
+                    force_regenerate=payload.force_regenerate)
+
+        async def run():
+            ok, err = False, None
+            from app.database import AsyncSessionLocal
+            try:
+                async with AsyncSessionLocal() as s:
+                    await service.drop_subject_from_comps(s, owner_id, report_id)
+                    await cma_ai_service.generate_ai_analysis(s, owner_id, report_id, plan_tier=tier, **opts)
+                ok = True
+            except AIRateLimitExceeded as e:
+                err = e.user_message
+            except HTTPException as e:
+                err = str(e.detail)
+            except Exception:
+                logger.exception("CMA AI analysis failed unexpectedly (background)", extra={"report_id": report_id})
+                err = "The AI analysis hit an unexpected error partway through - please try again."
+                try:
+                    from app.services.admin_alerts import alert_admin
+                    await alert_admin("cma", "CMA AI analysis crashed", f"report {report_id}", owner_id=owner_id)
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                await service.mark_generation_finished(owner_id, report_id, "complete" if ok else "failed", error=err)
+
+        task = asyncio.create_task(run())
+        _BACKGROUND.add(task)
+        task.add_done_callback(_BACKGROUND.discard)
+        return await service.get_report(db, current_user.id, report_id)
+
     success = False
     try:
         await service.drop_subject_from_comps(db, current_user.id, report_id)

@@ -8,7 +8,7 @@ anywhere in this codebase yet (confirmed during Phase 3 planning research).
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import Numeric, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import Property
@@ -57,6 +57,23 @@ async def get_area_market_stats(db: AsyncSession, zip_codes: list[str] | dict, c
         ).where(location_filter, for_sale, Property.home_status.in_(_SOLD_STATUSES))
     )).first()
 
+    # The town's price range (user, 10/17 - Radnor read "$140K - $10M"): what homes actually SOLD
+    # for in the last two years, the middle 90% of them, leaving out units under 800 sq ft (studio
+    # condos, parking spaces) - not the min/max of whatever happens to be listed today.
+    from datetime import date, timedelta
+    close_price = cast(func.nullif(Property.raw_mls_data["ClosePrice"].astext, ""), Numeric)
+    range_row = (await db.execute(
+        select(
+            func.count(close_price),
+            func.percentile_cont(0.05).within_group(close_price.asc()),
+            func.percentile_cont(0.95).within_group(close_price.asc()),
+        ).where(
+            location_filter, for_sale, Property.home_status.in_(_SOLD_STATUSES),
+            Property.raw_mls_data["CloseDate"].astext >= (date.today() - timedelta(days=730)).isoformat(),
+            or_(Property.living_area.is_(None), Property.living_area >= 800),
+        )
+    )).first()
+
     # Real MLS field per listing (School District Name), not the NCES attendance-boundary lookup
     # baked into MarketArea.facts.schools - reuses data already ingested for every property, so
     # it's as reliable/fresh as anything else on this page rather than depending on a separate
@@ -81,10 +98,11 @@ async def get_area_market_stats(db: AsyncSession, zip_codes: list[str] | dict, c
             stats["median_dom"] = round(float(active_row[2]))
         if active_row[3] is not None:
             stats["avg_price_per_sqft"] = round(float(active_row[3]))
-        if active_row[4] is not None:
-            stats["min_price"] = round(float(active_row[4]))
-        if active_row[5] is not None:
-            stats["max_price"] = round(float(active_row[5]))
+    if range_row and (range_row[0] or 0) >= 5 and range_row[1] is not None and range_row[2] is not None:
+        stats["min_price"] = round(float(range_row[1]))
+        stats["max_price"] = round(float(range_row[2]))
+        stats["price_range_basis"] = "sold_2y"
+        stats["price_range_sales"] = int(range_row[0])
     if sold_count:
         stats["recently_sold_count"] = sold_count
         if sold_row[1] is not None:

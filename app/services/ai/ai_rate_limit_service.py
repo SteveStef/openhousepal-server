@@ -157,6 +157,18 @@ async def studio_media_monthly_cost(db: AsyncSession, owner_id: str) -> float:
     return await _cost_since_types(db, owner_id, _start_of_month(), _STUDIO_MEDIA_EVENT_TYPES)
 
 
+_USAGE_LABELS = {
+    "blog_writer": "Blog articles",
+    "cma_ai": "CMA reports", "cma_reasoning": "CMA reports", "cma_ai_recompute": "CMA reports",
+    "copywrite": "Copywriter & wording checks",
+    "studio_media_image": "AI Media pictures", "studio_media_video": "AI Media videos",
+    "chat": "AI assistant", "tts": "AI assistant", "realtime": "AI assistant",
+    "external_api": "Maps & place lookups",
+    "school_lookup": "Cheat sheet schools",
+    "area_research": "Researching your towns", "area_narrative": "Researching your towns", "area_fair_housing": "Researching your towns",
+}
+
+
 async def monthly_ai_budget_snapshot(db: AsyncSession, owner_id: str, config: dict, plan_tier: str) -> dict:
     """Powers GET /ai/usage/monthly. `percent` is None for a tier with no configured budget
     (the frontend renders no meter in that case). `used_usd` is returned for the temporary
@@ -172,7 +184,23 @@ async def monthly_ai_budget_snapshot(db: AsyncSession, owner_id: str, config: di
     recent_percent = None if not limit else min(percent or 0, int(round(recent / limit * 100)))
     if recent_percent == 0 and recent > 0.0005 and limit:
         recent_percent = 1 if (percent or 0) >= 1 else 0
+    # What used it (user, 10/17 - "what's Peter's 12%?"): this month's spend by feature, as a share
+    # of the allowance. Refunded / blocked events are left out, same as the total.
+    rows = (await db.execute(
+        select(AIUsageEvent.event_type, func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0.0))
+        .where(AIUsageEvent.owner_id == owner_id, AIUsageEvent.blocked.is_(False), AIUsageEvent.created_at >= _start_of_month())
+        .group_by(AIUsageEvent.event_type)
+    )).all()
+    groups: dict[str, float] = {}
+    for event_type, cost in rows:
+        label = _USAGE_LABELS.get(event_type or "", "Other AI tools")
+        groups[label] = groups.get(label, 0.0) + float(cost or 0.0)
+    breakdown = sorted(
+        [{"label": k, "usd": round(v, 4), "percent": round(v / limit * 100, 1) if limit else None} for k, v in groups.items() if v > 0.0005],
+        key=lambda r: -r["usd"],
+    )
     return {
+        "breakdown": breakdown,
         "tier": plan_tier,
         "used_usd": round(used, 4),
         "recent_used_usd": round(recent, 4),
@@ -597,3 +625,4 @@ async def record_usage_event(
     )
     db.add(event)
     await db.commit()
+    return event

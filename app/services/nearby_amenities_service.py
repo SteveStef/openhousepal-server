@@ -1788,6 +1788,10 @@ async def _persist_amenities_cache(db, property: Property, result: NearbyAmeniti
     try:
         data = result.model_dump(mode="json", exclude={"available", "cached_at"})
         data["_schema_version"] = AMENITIES_SCHEMA_VERSION
+        # Keep the saved web school lookup (ai_school_lookup_service) - it's paid for once per home.
+        prev = property.nearby_amenities if isinstance(property.nearby_amenities, dict) else {}
+        if prev.get("ai_schools"):
+            data["ai_schools"] = prev["ai_schools"]
         if google_failed:
             data["_google_lookup_failed_at"] = datetime.now(timezone.utc).isoformat()
         property.nearby_amenities = data
@@ -1799,6 +1803,20 @@ async def _persist_amenities_cache(db, property: Property, result: NearbyAmeniti
 
 
 async def get_nearby_amenities(db, property: Property, force_refresh: bool = False, owner_id: Optional[str] = None) -> NearbyAmenitiesResponse:
+    """The Cheat Sheet's nearby data. Schools still missing after Bright MLS + NCES get a last-resort
+    web lookup (ai_school_lookup_service - saved on the listing, so once per home)."""
+    result = await _get_nearby_amenities_base(db, property, force_refresh=force_refresh, owner_id=owner_id)
+    try:
+        from app.services.ai.ai_school_lookup_service import fill_missing_schools
+        result.schools = await fill_missing_schools(db, property, list(result.schools or []), owner_id=owner_id)
+        if result.schools:
+            result.available = True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"school fallback skipped for listing {property.listing_key}: {e}")
+    return result
+
+
+async def _get_nearby_amenities_base(db, property: Property, force_refresh: bool = False, owner_id: Optional[str] = None) -> NearbyAmenitiesResponse:
     """Never raises - on any failure (missing key, network error, bad response), falls back to a
     stale cache if one exists, else returns available=False so the PDF just omits the section."""
     global _warned_missing_key

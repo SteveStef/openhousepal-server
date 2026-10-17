@@ -225,9 +225,18 @@ async def before_send(owner_id: Optional[str], to: Optional[str], template: str,
     try:
         async with AsyncSessionLocal() as db:
             email = _norm(to)
+            # The agent's own Studio -> Email settings can only hold emails back, never add any.
+            from app.models.database import User
+            from app.services.email_settings_service import client_rule
+            rule = client_rule(await db.get(User, owner_id), template)
+            if rule is not None and not rule["on"]:
+                logger.info("client email held (agent turned it off)", extra={"template": template, "owner_id": owner_id})
+                return None
             kind = "auto" if template in AUTO_TEMPLATES else "personal"
             if kind == "auto":
                 st = await refresh_status(db, owner_id, email)
+                if rule is not None and rule.get("mode") == "weekly" and st["mode"] == "daily":
+                    st = {**st, "mode": "weekly"}
                 if st["mode"] == "off":
                     logger.info("client email held (off)", extra={"template": template, "owner_id": owner_id, "code": st.get("code")})
                     return None
@@ -253,9 +262,15 @@ async def before_send(owner_id: Optional[str], to: Optional[str], template: str,
             await db.commit()
             base = api_base()
             out = dict(variables)
-            for k in links:
-                out[k] = f"{base}/e/c/{rec.id}/{k}"
-            out["track_open"] = f"{base}/e/o/{rec.id}.gif"
+            from app.services.personal_email_service import PERSONAL_TEMPLATES, with_marker
+            if template in PERSONAL_TEMPLATES:
+                # Plain personal note: the real link (+ a marker the page reports), no pixel.
+                for k in links:
+                    out[k] = with_marker(links[k], rec.id)
+            else:
+                for k in links:
+                    out[k] = f"{base}/e/c/{rec.id}/{k}"
+                out["track_open"] = f"{base}/e/o/{rec.id}.gif"
             out["_track_id"] = rec.id
             return rec.id, out
     except Exception:  # noqa: BLE001 - tracking must never stop an email
@@ -263,7 +278,20 @@ async def before_send(owner_id: Optional[str], to: Optional[str], template: str,
         return None, variables
 
 
-async def after_send(track_id: Optional[str], ok: bool, via: str) -> None:
+def failure_reason(code: Optional[int], body: Optional[str]) -> str:
+    """A plain reason the agent can act on, from the provider's answer."""
+    t = (body or "").lower()
+    if any(x in t for x in ("not a valid address", "invalid to", "invalid address", "invalid recipient", "recipient address rejected",
+                             "no such user", "does not exist", "mailbox unavailable", "invalid email")):
+        return "That email address doesn't exist - check it on their lead."
+    if "suppress" in t or "unsubscribed" in t or "bounce" in t:
+        return "This address bounced before, so it's blocked to protect your sending."
+    if code == 429 or "limit" in t or "quota" in t:
+        return "Sending limit reached - it will be retried."
+    return f"The email service refused it ({code or 'no answer'})."
+
+
+async def after_send(track_id: Optional[str], ok: bool, via: str, *, code: Optional[int] = None, detail: Optional[str] = None) -> None:
     if not track_id:
         return
     from app.database import AsyncSessionLocal
@@ -274,6 +302,9 @@ async def after_send(track_id: Optional[str], ok: bool, via: str) -> None:
                 return
             rec.status, rec.via = ("sent" if ok else "failed"), via
             rec.sent_at = _now() if ok else None
+            rec.error = None if ok else failure_reason(code, detail)[:300]
+            if not ok:
+                logger.warning("client email failed", extra={"template": rec.template, "via": via, "code": code, "detail": (detail or "")[:300]})
             if ok and rec.template == WEEKLY_TEMPLATE:
                 pref = await _pref(db, rec.owner_id, rec.recipient_email)
                 pref.last_weekly_at = rec.sent_at
@@ -323,6 +354,16 @@ async def record_click(db, track_id: str, key: str) -> Optional[str]:
     if first:
         await _engaged(db, rec, "clicked")
     return url
+
+
+async def record_visit(db, track_id: str) -> None:
+    """The Showcase page opened from a personal email's link (?ce=<id>) - a click (and an open)."""
+    rec = await db.get(ClientEmail, track_id)
+    if rec is None or rec.status != "sent":
+        return
+    key = next(iter(rec.links or {}), None)
+    if key:
+        await record_click(db, track_id, key)
 
 
 _TEMPLATE_LABEL = {
@@ -460,6 +501,6 @@ async def people(db, owner_id: str) -> dict[str, dict]:
 
 def email_out(r: ClientEmail) -> dict:
     return {"id": r.id, "to": r.recipient_email, "subject": r.subject, "template": r.template, "label": template_label(r.template),
-            "kind": r.kind, "via": r.via, "status": r.status,
+            "kind": r.kind, "via": r.via, "status": r.status, "error": r.error, "created_at": r.created_at.isoformat() if r.created_at else None,
             "sent_at": r.sent_at.isoformat() if r.sent_at else None, "opened_at": r.opened_at.isoformat() if r.opened_at else None,
             "open_count": r.open_count or 0, "clicked_at": r.clicked_at.isoformat() if r.clicked_at else None, "click_count": r.click_count or 0}

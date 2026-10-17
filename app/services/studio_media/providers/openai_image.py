@@ -15,6 +15,7 @@ from .base import ImageEditProvider, ImageEditRequest, ImageEditResult, Provider
 logger = get_logger(__name__)
 
 _EDITS_URL = "https://api.openai.com/v1/images/edits"
+_GENERATIONS_URL = "https://api.openai.com/v1/images/generations"
 _TIMEOUT = httpx.Timeout(180.0, connect=15.0)
 
 
@@ -83,3 +84,34 @@ class OpenAIImageProvider(ImageEditProvider):
             provider_cost_usd=None,
             usage=usage,
         )
+
+    async def generate(self, prompt: str, size: str = "1536x1024", quality: str = "high") -> ImageEditResult:
+        """A brand-new image from a prompt (blog cover photos) - /v1/images/generations."""
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise ProviderError("OPENAI_API_KEY is not configured", not_configured=True)
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                resp = await client.post(
+                    _GENERATIONS_URL,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json={"model": self.model, "prompt": prompt, "n": 1, "size": size, "quality": quality},
+                )
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"OpenAI image request failed: {exc}") from exc
+        if resp.status_code >= 400:
+            logger.warning("openai image generation non-2xx", extra={"status": resp.status_code, "body": resp.text[:500]})
+            raise ProviderError(f"OpenAI image generation returned {resp.status_code}")
+        payload = resp.json()
+        try:
+            b64 = payload["data"][0]["b64_json"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ProviderError("OpenAI image generation response had no image") from exc
+        u = payload.get("usage") or {}
+        details = u.get("input_tokens_details") or {}
+        usage = {
+            "text_input": details.get("text_tokens", u.get("input_tokens", 0)),
+            "image_input": details.get("image_tokens", 0),
+            "image_output": u.get("output_tokens", 0),
+        }
+        return ImageEditResult(image_bytes=base64.b64decode(b64), content_type="image/png", provider_cost_usd=None, usage=usage)

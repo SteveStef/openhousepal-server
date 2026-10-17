@@ -47,6 +47,16 @@ async def track_click(track_id: str, key: str, db: AsyncSession = Depends(get_db
     return RedirectResponse(url, status_code=302, headers=_NO_CACHE)
 
 
+@router.post("/e/v/{track_id}")
+async def track_visit(track_id: str, db: AsyncSession = Depends(get_db)):
+    """The Showcase page was opened from a personal email's own link (?ce=<id>) - no redirect hop."""
+    try:
+        await ce.record_visit(db, track_id[:64])
+    except Exception:  # noqa: BLE001
+        logger.warning("visit tracking failed", exc_info=True)
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------- Mailgun bounces / complaints
 
 @router.post("/webhooks/mailgun-events")

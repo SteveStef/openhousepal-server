@@ -200,7 +200,9 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
     cutoff = digest_cutoff(now)
     claimed = (await db.execute(
         update(ScheduledEmail)
-        .where(ScheduledEmail.status == QUEUED, ScheduledEmail.created_at < cutoff)
+        .where(ScheduledEmail.status == QUEUED, ScheduledEmail.created_at < cutoff,
+               # the agent's own rows wait for THEIR briefing time (send_agent_briefings)
+               func.coalesce(ScheduledEmail.template_variables["_audience"].astext, "buyer") != "agent")
         .values(status=ROLLED_UP, sent_at=datetime.now(timezone.utc))
         .returning(ScheduledEmail.recipient_email, ScheduledEmail.template_variables, ScheduledEmail.id)
     )).all()
@@ -256,6 +258,14 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
         except Exception:  # noqa: BLE001 - the rules failing must not stop the digest
             logger.warning("email rules check failed", exc_info=True)
             st = {"mode": "daily"}
+        # The agent's own Studio -> Email setting can only slow these down or stop them.
+        from app.services.email_settings_service import client_rule
+        rule = client_rule(col.owner, BUYER_TEMPLATE)
+        if rule is not None and not rule["on"]:
+            held_off += 1
+            continue
+        if rule is not None and rule.get("mode") == "weekly" and st["mode"] == "daily":
+            st = {**st, "mode": "weekly"}
         if st["mode"] == "off":
             held_off += 1
             continue
@@ -309,99 +319,141 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
     if hold_ids:
         await db.execute(update(ScheduledEmail).where(ScheduledEmail.id.in_(hold_ids)).values(status=QUEUED, sent_at=None))
 
-    # ---- the agent's daily briefing: follow-ups, what's waiting on them, their clients' Showcases.
-    # Sent once a day to every agent with a live plan, skipped when all three are empty. The
-    # system_settings claim below makes it once a day even across restarts / several workers (the
-    # Showcase part has its own per-row claim above).
-    showcase_by_owner: dict[str, dict] = {}
-    for owner_id, rows in agent_rows.items():
-        per_col: "OrderedDict[str, list[dict]]" = OrderedDict()
-        for v in rows:
-            per_col.setdefault(str(v.get("_collection_id")), []).append(v)
-        showcases = []
-        for cid, crow in per_col.items():
-            col = cols.get(cid)
-            if not live(col) or not getattr(col, "notify_agent", True):
-                continue
-            homes = _homes(crow)
-            if homes:
-                new, drops, new_label, drop_label = _labels(homes, "new", "new")
-                showcases.append({"visitor_name": " ".join(_cap(w) for w in (col.visitor_name or "").split()),
-                                  "collection_name": nice_street(col.name), "collection_link": absolute(f"/showcases?showcase={col.id}"),
-                                  "new_label": new_label, "drop_label": drop_label,
-                                  "properties": _sample(homes, MAX_HOMES_PER_SHOWCASE), "_new": new, "_drops": drops})
-        if showcases:
-            showcases.sort(key=lambda s: -(s["_new"] + s["_drops"]))
-            total_new = sum(s.pop("_new") for s in showcases)
-            total_drops = sum(s.pop("_drops") for s in showcases)
-            showcase_by_owner[owner_id] = {"showcases": showcases, "new": total_new, "drops": total_drops}
+    await db.commit()
+    await send_agent_briefings(db, now)
+    logger.info("Showcase digests", extra={"event": "showcase_digest", "buyers": buyers, "changes": len(claimed),
+                                           "weekly": weekly_sent, "held_weekly": held_weekly, "held_off": held_off})
+    return {"buyers": buyers, "changes": len(claimed), "weekly": weekly_sent, "held_weekly": held_weekly, "held_off": held_off}
+
+
+_BRIEFED: set[tuple[str, str]] = set()   # (user id, day) this process already handled - skips the DB claim
+
+
+async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) -> dict:
+    """Each agent's daily briefing, at the time THEY picked in Studio -> Email (4:30 PM by default):
+    follow-ups, what's waiting on them, and their clients' Showcase news since their last briefing.
+    Safe to call every minute - a per-agent per-day claim in system_settings means one a day, even
+    across restarts / several workers, and the Showcase rows are claimed per agent."""
+    from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
+    from app.services.agent_email_service import absolute, email_agent
+    from app.services.email_settings_service import briefing_hm
+    now = now or datetime.now(timezone.utc)
+    local = now.astimezone(EASTERN)
+    local_day = local.date().isoformat()
+    today = local.strftime("%m/%d/%Y")
+
+    def live(col: Collection | None) -> bool:
+        return bool(col and col.status == "ACTIVE" and col.owner and owner_has_access(col.owner, SHOWCASE_ACCESS_TIERS))
 
     agent_emails: list[tuple[User, str, dict]] = []
     agents = 0
-    local_day = (now or datetime.now(timezone.utc)).astimezone(EASTERN).date().isoformat()
-    first_run_today = is_digest_time(now) and (await db.execute(text(
-        "INSERT INTO system_settings (key, value) VALUES ('daily_briefing_last_sent', to_jsonb(CAST(:d AS text))) "
-        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value WHERE system_settings.value <> EXCLUDED.value "
-        "RETURNING key"), {"d": local_day})).first() is not None
-    if first_run_today:
-        people = (await db.execute(select(User).where(User.email.isnot(None)))).scalars().all()
-        for user in people:
-            if not owner_has_access(user):
-                continue
-            sc = showcase_by_owner.get(user.id)
-            try:
-                brief = await _briefing(db, user, now or datetime.now(timezone.utc), showcase_access=owner_has_access(user, SHOWCASE_ACCESS_TIERS))
-            except Exception:  # noqa: BLE001 - one agent's bad data must not stop everyone's email
-                logger.warning("daily briefing sections failed", exc_info=True, extra={"user_id": user.id})
-                brief = {"followups": [], "actions": [], "client_activity": [], "followups_label": "", "followup_count": 0}
-            if not sc and not brief["followups"] and not brief["actions"] and not brief["client_activity"]:
-                continue  # nothing to say today - no email
-            keys = brief.pop("_keys", [])
-            seen_row = (await db.execute(text("SELECT value FROM system_settings WHERE key = :k"), {"k": f"briefing_seen:{user.id}"})).scalar()
-            if not sc and not (set(keys) - set(seen_row or [])):
-                continue  # only things they were already told about yesterday - no email
-            v = {"recipient_name": user.first_name or "there", "today_date": today,
-                 "dashboard_link": absolute("/dash"), **brief}
-            if sc:
-                new_part = _plural(sc["new"], "new match", "new matches") if sc["new"] else ""
-                drop_part = _plural(sc["drops"], "price drop", "price drops") if sc["drops"] else ""
-                clients = _plural(len(sc["showcases"]), "client Showcase", "client Showcases")
-                both = " and ".join(p for p in (new_part, drop_part) if p)
-                # names the price drops too ("3 new matches and 1 price drop across 2 client Showcases")
-                headline = f"{both} across {clients}"
-                bell = (f"{both} across {len(sc['showcases'])} clients' Showcases" if len(sc["showcases"]) > 1
-                        else f"{both} in {sc['showcases'][0]['visitor_name'] or 'a client'}'s Showcase")
-                db.add(Notification(
-                    agent_id=user.id, type="SHOWCASE_DIGEST", reference_type="SHOWCASE_DIGEST",
-                    reference_id=f"digest-{local_day}", title="Today's Showcase update",
-                    message=bell[0].upper() + bell[1:] + ".", link="/showcases", is_read=False,
-                    created_at=datetime.now(timezone.utc),
-                ))
-                v.update({"collection_label": clients, "total_new_label": new_part, "total_drop_label": drop_part,
-                          "collections": sc["showcases"][:MAX_SHOWCASES], "has_showcases": True,
-                          "collections_more": _more(len(sc["showcases"]) - MAX_SHOWCASES, "more Showcase updated", "more Showcases updated", "")})
-            elif brief["followup_count"]:
-                # "for today" only when none are overdue - otherwise it says they're waiting.
-                headline = (_plural(brief["followup_count"], "follow-up waiting on you", "follow-ups waiting on you") if brief.get("followup_overdue")
-                            else _plural(brief["followup_count"], "follow-up for today", "follow-ups for today"))
-            else:
-                n = len(brief["actions"]) + len(brief["client_activity"])
-                headline = _plural(n, "thing waiting on you", "things waiting on you")
-            v["headline"] = headline
-            v["has_showcase_section"] = bool(sc or brief["client_activity"])
-            agent_emails.append((user, f"Your daily briefing: {headline}", v))
-            await db.execute(text(
-                "INSERT INTO system_settings (key, value) VALUES (:k, CAST(:v AS jsonb)) "
-                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"), {"k": f"briefing_seen:{user.id}", "v": json.dumps(keys)})
-            agents += 1
+    # Deploy day: the old one-for-everyone 4:30 run may already have gone out today.
+    legacy = (await db.execute(text("SELECT value FROM system_settings WHERE key = 'daily_briefing_last_sent'"))).scalar()
+    legacy_sent_today = legacy == local_day
+    people = (await db.execute(select(User).where(User.email.isnot(None)))).scalars().all()
+    for user in people:
+        if (user.id, local_day) in _BRIEFED:
+            continue
+        h, m = briefing_hm(user)
+        if (local.hour, local.minute) < (h, m) or not owner_has_access(user):
+            continue
+        _BRIEFED.add((user.id, local_day))
+        claimed_day = (await db.execute(text(
+            "INSERT INTO system_settings (key, value) VALUES (:k, to_jsonb(CAST(:d AS text))) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value WHERE system_settings.value <> EXCLUDED.value "
+            "RETURNING key"), {"k": f"briefing_day:{user.id}", "d": local_day})).first() is not None
+        if not claimed_day:
+            continue
+        if legacy_sent_today:
+            await db.commit()
+            continue
+        rows_claimed = (await db.execute(
+            update(ScheduledEmail)
+            .where(ScheduledEmail.status == QUEUED, ScheduledEmail.created_at < now,
+                   ScheduledEmail.template_variables["_audience"].astext == "agent",
+                   ScheduledEmail.template_variables["_owner_id"].astext == user.id)
+            .values(status=ROLLED_UP, sent_at=datetime.now(timezone.utc))
+            .returning(ScheduledEmail.template_variables)
+        )).scalars().all()
+        rows = sorted((dict(v or {}) for v in rows_claimed), key=lambda v: v.get("_seq") or 0)
+        sc = None
+        if rows:
+            per_col: "OrderedDict[str, list[dict]]" = OrderedDict()
+            for v in rows:
+                per_col.setdefault(str(v.get("_collection_id")), []).append(v)
+            cols = {c.id: c for c in (await db.execute(
+                select(Collection).options(selectinload(Collection.owner)).where(Collection.id.in_(list(per_col)))
+            )).scalars().all()}
+            showcases = []
+            for cid, crow in per_col.items():
+                col = cols.get(cid)
+                if not live(col) or not getattr(col, "notify_agent", True):
+                    continue
+                homes = _homes(crow)
+                if homes:
+                    new, drops, new_label, drop_label = _labels(homes, "new", "new")
+                    showcases.append({"visitor_name": " ".join(_cap(w) for w in (col.visitor_name or "").split()),
+                                      "collection_name": nice_street(col.name), "collection_link": absolute(f"/showcases?showcase={col.id}"),
+                                      "new_label": new_label, "drop_label": drop_label,
+                                      "properties": _sample(homes, MAX_HOMES_PER_SHOWCASE), "_new": new, "_drops": drops})
+            if showcases:
+                showcases.sort(key=lambda x: -(x["_new"] + x["_drops"]))
+                sc = {"showcases": showcases, "new": sum(x.pop("_new") for x in showcases), "drops": sum(x.pop("_drops") for x in showcases)}
+        try:
+            brief = await _briefing(db, user, now, showcase_access=owner_has_access(user, SHOWCASE_ACCESS_TIERS))
+        except Exception:  # noqa: BLE001 - one agent's bad data must not stop everyone's email
+            logger.warning("daily briefing sections failed", exc_info=True, extra={"user_id": user.id})
+            brief = {"followups": [], "actions": [], "client_activity": [], "followups_label": "", "followup_count": 0}
+        if not sc and not brief["followups"] and not brief["actions"] and not brief["client_activity"]:
+            await db.commit()
+            continue  # nothing to say today - no email
+        keys = brief.pop("_keys", [])
+        seen_row = (await db.execute(text("SELECT value FROM system_settings WHERE key = :k"), {"k": f"briefing_seen:{user.id}"})).scalar()
+        if not sc and not (set(keys) - set(seen_row or [])):
+            await db.commit()
+            continue  # only things they were already told about yesterday - no email
+        v = {"recipient_name": user.first_name or "there", "today_date": today,
+             "dashboard_link": absolute("/dash"), **brief}
+        if sc:
+            new_part = _plural(sc["new"], "new match", "new matches") if sc["new"] else ""
+            drop_part = _plural(sc["drops"], "price drop", "price drops") if sc["drops"] else ""
+            clients = _plural(len(sc["showcases"]), "client Showcase", "client Showcases")
+            both = " and ".join(p for p in (new_part, drop_part) if p)
+            # names the price drops too ("3 new matches and 1 price drop across 2 client Showcases")
+            headline = f"{both} across {clients}"
+            bell = (f"{both} across {len(sc['showcases'])} clients' Showcases" if len(sc["showcases"]) > 1
+                    else f"{both} in {sc['showcases'][0]['visitor_name'] or 'a client'}'s Showcase")
+            db.add(Notification(
+                agent_id=user.id, type="SHOWCASE_DIGEST", reference_type="SHOWCASE_DIGEST",
+                reference_id=f"digest-{local_day}", title="Today's Showcase update",
+                message=bell[0].upper() + bell[1:] + ".", link="/showcases", is_read=False,
+                created_at=datetime.now(timezone.utc),
+            ))
+            v.update({"collection_label": clients, "total_new_label": new_part, "total_drop_label": drop_part,
+                      "collections": sc["showcases"][:MAX_SHOWCASES], "has_showcases": True,
+                      "collections_more": _more(len(sc["showcases"]) - MAX_SHOWCASES, "more Showcase updated", "more Showcases updated", "")})
+        elif brief["followup_count"]:
+            # "for today" only when none are overdue - otherwise it says they're waiting.
+            headline = (_plural(brief["followup_count"], "follow-up waiting on you", "follow-ups waiting on you") if brief.get("followup_overdue")
+                        else _plural(brief["followup_count"], "follow-up for today", "follow-ups for today"))
+        else:
+            n = len(brief["actions"]) + len(brief["client_activity"])
+            headline = _plural(n, "thing waiting on you", "things waiting on you")
+        v["headline"] = headline
+        v["has_showcase_section"] = bool(sc or brief["client_activity"])
+        agent_emails.append((user, f"Your daily briefing: {headline}", v))
+        await db.execute(text(
+            "INSERT INTO system_settings (key, value) VALUES (:k, CAST(:v AS jsonb)) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"), {"k": f"briefing_seen:{user.id}", "v": json.dumps(keys)})
+        agents += 1
+        await db.commit()
 
-    await db.commit()
     # Only after the claims are saved - a failed save must not leave emails out that a retry repeats.
     for user, subject, variables in agent_emails:
         email_agent(user, "SHOWCASE_DIGEST", AGENT_TEMPLATE, subject, variables)
-    logger.info("Showcase digests", extra={"event": "showcase_digest", "buyers": buyers, "agents": agents, "changes": len(claimed),
-                                           "weekly": weekly_sent, "held_weekly": held_weekly, "held_off": held_off})
-    return {"buyers": buyers, "agents": agents, "changes": len(claimed), "weekly": weekly_sent, "held_weekly": held_weekly, "held_off": held_off}
+    if agents:
+        logger.info("Daily briefings", extra={"event": "daily_briefing", "agents": agents})
+    return {"agents": agents}
 
 
 _SHOWCASE_KINDS = {"tour_request", "comment"}           # -> the Showcase section's "waiting on you"
@@ -621,8 +673,7 @@ async def queue_showcase_ready(db: AsyncSession, collection_id: str, from_agent:
                 "search_link": f"{vars_['collection_link']}?search=1",
             })
             template = SHARED_TEMPLATE
-            subject = (f"{agent_first} picked {_plural(total, 'home', 'homes')} for you" if total
-                       else f"{agent_first} set up your home search")
+            subject = "Some homes I picked out for you" if total else "Your home search is set up"
         db.add(ScheduledEmail(
             recipient_email=col.visitor_email, template_name=template, template_variables=vars_,
             subject=subject,

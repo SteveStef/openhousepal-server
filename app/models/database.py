@@ -67,6 +67,10 @@ class User(Base):
     # missing key = the default (everything on). The in-app bell is never suppressed by this - it
     # only gates the email/push channels. See services/notification_preferences_service.py.
     notification_prefs = Column(JSONB, nullable=True)
+    # Client-email + briefing settings (services/email_settings_service.py). NULL = defaults.
+    email_settings = Column(JSONB, nullable=True)
+    # Center of every QR code: None/'ohp' = OpenHousePal house, 'logo' = Brand Kit logo, 'initials' (IDX only)
+    qr_logo = Column(String, nullable=True)
     # Which automatic follow-up rules are switched OFF: {"<rule key>": false}. Missing key = the
     # rule's default (on). See tasks_service.AUTO_FOLLOWUP_RULES.
     followup_rules = Column(JSONB, nullable=True)
@@ -581,6 +585,7 @@ class ClientEmail(Base):
     via = Column(String, nullable=True)                # mailbox | openhousepal
     status = Column(String, nullable=False, default='sending')  # sending | sent | failed
     links = Column(JSONB, nullable=True)               # {"collection_link": "https://..."} - where tracked links go
+    error = Column(String, nullable=True)              # why it didn't go through (provider's answer, trimmed)
     sent_at = Column(DateTime(timezone=True), nullable=True)
     opened_at = Column(DateTime(timezone=True), nullable=True)
     open_count = Column(Integer, nullable=False, default=0, server_default='0')
@@ -649,6 +654,8 @@ class CalendarEventLink(Base):
     kind = Column(String, nullable=False)            # 'task' | 'open_house'
     source_id = Column(String, nullable=False)
     external_event_id = Column(String, nullable=False)
+    # What we last sent - a sync that would send the same event again skips the call.
+    body_hash = Column(String, nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
@@ -1039,6 +1046,8 @@ class OpenHouseEvent(Base):
     # (similar_properties_snapshot is kept, so switching back on restores the picked homes). A
     # listing agent hosting their own listing starts with this and auto_showcase off.
     similar_homes = Column(Boolean, default=True, nullable=False, server_default='true')
+    # 'on' | 'no_calendar' (follow-ups made but kept off the agent's calendar) | 'off' (no follow-ups)
+    followups_mode = Column(String, default='on', nullable=False, server_default='on')
     # Bright MLS plans: after signing in, the guest's phone opens their Guest Pass for this open
     # house (the home, its Similar Homes + Cheat Sheet as web pages, one-tap disclosure / second
     # tour requests, their Showcase) - app/api/guest_pass_routes.py. On by default.
@@ -2270,6 +2279,8 @@ class CmaReport(Base):
     # of the request, cleared at the end - see cma_service.mark_generation_started/_finished.
     generation_status = Column(String, nullable=True, index=True)  # None | 'generating' | 'complete' | 'failed'
     generation_started_at = Column(DateTime(timezone=True), nullable=True)
+    # Why the last AI run didn't finish, in plain words (a usage limit, an error) - shown on the page.
+    generation_error = Column(String, nullable=True)
 
     # Public share link - opaque slug, distinct from the DB id so a shared link can't be used to
     # probe/enumerate reports. Nullable until the agent first shares. The agent keeps editing the

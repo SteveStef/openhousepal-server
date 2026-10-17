@@ -129,6 +129,8 @@ class BlogListItem(BaseModel):
     updated_at: Optional[datetime] = None
     created_at: datetime
     view_count: int = 0
+    # Unfinished AI article: 'interview' (answers saved, never written), 'running', 'failed'.
+    ai_state: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -172,6 +174,7 @@ class PublicBlogDetail(BaseModel):
     agentName: str
     agentBrokerage: str
     agentPhotoUrl: Optional[str] = None
+    agentId: Optional[str] = None
     agentTitle: Optional[str] = None
     agentMarket: Optional[str] = None
     theme: Optional[str] = None

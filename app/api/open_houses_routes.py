@@ -102,6 +102,7 @@ async def create_open_house(
             "auto_showcase": defaults["auto_showcase"] if request.auto_showcase is None else request.auto_showcase,
             "similar_homes": defaults["similar_homes"] if request.similar_homes is None else request.similar_homes,
             **({"guest_pass": request.guest_pass} if request.guest_pass is not None else {}),
+            **({"followups_mode": request.followups_mode} if request.followups_mode else {}),
         }
 
         open_house = OpenHouseEvent(
@@ -126,7 +127,9 @@ async def create_open_house(
             zipcode=zipcode,
             bedrooms=safe_num(property_data.get('BedroomsTotal') or property_data.get('bedrooms')),
             bathrooms=safe_num(property_data.get('BathroomsTotal') or property_data.get('bathrooms')),
-            living_area=safe_num(property_data.get('LivingArea') or property_data.get('livingArea') or property_data.get('living_area')),
+            # No MLS total -> above + below grade finished area (some listings only have those).
+            living_area=safe_num(property_data.get('LivingArea') or property_data.get('livingArea') or property_data.get('living_area'))
+            or (((safe_num(property_data.get('AboveGradeFinishedArea')) or 0) + (safe_num(property_data.get('BelowGradeFinishedArea')) or 0)) or None),
             price=safe_num(property_data.get('ListPrice') or property_data.get('price')),
             home_status=property_data.get('MlsStatus') or property_data.get('homeStatus'),
             listing_key=listing_key_value,
@@ -176,6 +179,7 @@ async def create_open_house(
             share_guests_with_listing_agent=open_house.share_guests_with_listing_agent,
             auto_showcase=open_house.auto_showcase,
             similar_homes=open_house.similar_homes,
+            followups_mode=getattr(open_house, 'followups_mode', None) or 'on',
             guest_pass=open_house.guest_pass,
             visitor_count=0,
             created_at=open_house.created_at
@@ -284,6 +288,7 @@ async def get_open_houses(
                 share_guests_with_listing_agent=oh.share_guests_with_listing_agent,
                 auto_showcase=oh.auto_showcase,
                 similar_homes=oh.similar_homes,
+                followups_mode=getattr(oh, 'followups_mode', None) or 'on',
                 after_signin=oh.after_signin,
                 guest_pass=oh.guest_pass,
                 pass_signature=oh.pass_signature,
@@ -532,6 +537,7 @@ async def get_open_house(
         share_guests_with_listing_agent=oh.share_guests_with_listing_agent,
         auto_showcase=oh.auto_showcase,
         similar_homes=oh.similar_homes,
+        followups_mode=getattr(oh, 'followups_mode', None) or 'on',
         after_signin=oh.after_signin,
         guest_pass=oh.guest_pass,
         pass_signature=oh.pass_signature,
@@ -859,7 +865,8 @@ async def get_property_by_qr(
         open_house_event = oh_result.scalar_one_or_none()
         if open_house_event:
             qr_dark_mode = bool(open_house_event.qr_dark_mode)
-            property_data["similarHomes"] = open_house_event.similar_homes is not False
+            property_data["similarHomes"] = (open_house_event.similar_homes is not False and open_house_event.auto_showcase is not False
+                                             and bool(open_house_event.similar_properties_snapshot))
             # Where the guest's phone goes once they sign in (the host's Spotlight for this home,
             # their Agent Hub, or nowhere) - the sign-in page sends them there.
             target = await OpenHouseService.after_signin_target(db, open_house_event, await db.get(User, open_house_event.agent_id))
@@ -879,6 +886,7 @@ async def get_property_by_qr(
                 property_data["agentName"] = f"{agent.first_name or ''} {agent.last_name or ''}".strip()
                 property_data["agentBrokerage"] = agent.brokerage or ""
                 property_data["agentPhotoUrl"] = agent.photo_url or None
+                property_data["agentId"] = agent.id   # whose QR look (qr_brand_routes) the page draws
 
         return {
             "success": True,
@@ -1268,9 +1276,17 @@ async def update_guest_settings(
         open_house.guest_pass = payload.guest_pass
     if payload.pass_signature is not None:
         open_house.pass_signature = payload.pass_signature
+    mode_changed = payload.followups_mode is not None and payload.followups_mode != open_house.followups_mode
+    if payload.followups_mode is not None:
+        open_house.followups_mode = payload.followups_mode
     await db.commit()
+    if mode_changed:
+        # Put this open house's existing follow-ups on / off the calendar to match.
+        from app.services.tasks_service import resync_open_house_followups
+        await resync_open_house_followups(db, current_user.id, open_house.id)
     return {"success": True, "auto_showcase": open_house.auto_showcase, "similar_homes": open_house.similar_homes,
-            "after_signin": open_house.after_signin, "guest_pass": open_house.guest_pass, "pass_signature": open_house.pass_signature}
+            "after_signin": open_house.after_signin, "guest_pass": open_house.guest_pass, "pass_signature": open_house.pass_signature,
+            "followups_mode": open_house.followups_mode}
 
 
 @router.put("/api/visitors/{visitor_id}/note")

@@ -257,6 +257,7 @@ class CmaReportResponse(BaseModel):
     use_signature_card: bool = True
     generation_status: Optional[Literal["generating", "complete", "failed"]] = None
     generation_started_at: Optional[datetime] = None
+    generation_error: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
 
@@ -311,6 +312,10 @@ class CmaGenerateAiAnalysisRequest(BaseModel):
     max_photos_per_property: Optional[int] = None
     include_map_images: bool = False
     force_regenerate: bool = False
+    # True = start it on the server and answer right away ('generating'); the page polls. A run
+    # takes minutes - a phone or a proxy dropping one long request showed "Network error" while
+    # the report was in fact being finished.
+    background: bool = False
 
 
 class CmaCompSearchRequest(BaseModel):

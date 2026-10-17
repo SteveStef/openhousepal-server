@@ -231,9 +231,11 @@ async def payload(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEven
         theme = {**theme, **(hub.config or {})["openHouseRequestTheme"]}
     theme["darkMode"] = bool(oh.qr_dark_mode)
 
-    # Similar Homes switch off -> no similar homes on the pass (the saved picks stay for later).
+    # Similar Homes switch off, or Showcases off for this open house (user, 10/17) -> no similar
+    # homes on the pass (the saved picks stay for later).
     similar = await _live_similar(db, [{k: v for k, v in (item or {}).items() if k not in _HEAVY_KEYS}
-                                       for item in (oh.similar_properties_snapshot or []) if isinstance(item, dict)]) if oh.similar_homes is not False else []
+                                       for item in (oh.similar_properties_snapshot or []) if isinstance(item, dict)]) \
+        if oh.similar_homes is not False and oh.auto_showcase is not False else []
 
     cheat = None
     snap = oh.cheat_sheet_snapshot or {}
@@ -244,8 +246,9 @@ async def payload(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEven
     if spotlight:
         spotlight = f"{with_src(spotlight, 'pass')}&oh={oh.id}"
 
+    # The Showcase button rides with the Similar Homes sheet: none made (or Showcases off) -> no pitch.
     showcase = None
-    if showcases_offered(host, visitor, oh):
+    if similar and showcases_offered(host, visitor, oh):
         col = await _showcase(db, host, visitor)
         showcase = {"url": await _showcase_url(db, host, col)} if col else {"url": None}
 

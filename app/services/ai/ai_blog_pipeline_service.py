@@ -290,7 +290,7 @@ async def _run_tool_call(*, model: str, system: str, user_msg: str, tools: list[
             break
         nudged = True
         messages.append({"role": "user", "content": f"Now call {tool_name} with your result."})
-    raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The AI didn't return a result - please try again. You were only charged for what ran.")
+    raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The AI didn't return a result - please try again. Nothing was charged for this try.")
 
 
 class _Meter:
@@ -300,6 +300,7 @@ class _Meter:
         self.db, self.user, self.config = db, user, config
         self.stages: list[dict] = []
         self.total = 0.0
+        self.events: list = []
 
     async def record(self, stage: str, model: str, usage: dict, started: float, *, failed: Optional[str] = None) -> None:
         cost = _cost(self.config, model, usage)
@@ -307,10 +308,49 @@ class _Meter:
         self.stages.append({"stage": stage, "model": model, "cost_usd": round(cost, 4), "seconds": round(time.monotonic() - started, 1),
                             "input_tokens": usage["input_tokens"] + usage["cache_read_input_tokens"] + usage["cache_creation_input_tokens"],
                             "output_tokens": usage["output_tokens"], "web_searches": usage["web_search_requests"]})
-        await record_usage_event(
+        self.events.append(await record_usage_event(
             self.db, self.user.id, None, model, usage["input_tokens"] + usage["cache_read_input_tokens"] + usage["cache_creation_input_tokens"],
             usage["output_tokens"], cost, 1, bool(failed), failed, tool_names=[f"blog_pipeline_{stage}"], event_type=EVENT_TYPE,
-        )
+        ))
+
+    async def refund(self) -> None:
+        """A run that ends without an article costs the agent nothing (user, 10/17 - Peter's usage
+        went up for blog runs that failed): every stage it charged stays in the log, marked
+        "refunded_failed_run", and drops out of the monthly allowance (which only counts
+        un-blocked events)."""
+        from sqlalchemy import update
+        from app.models.database import AIUsageEvent
+        ids = [e.id for e in self.events if e is not None and not e.blocked]
+        if not ids:
+            return
+        try:
+            await self.db.rollback()
+            await self.db.execute(update(AIUsageEvent).where(AIUsageEvent.id.in_(ids)).values(blocked=True, block_reason="refunded_failed_run"))
+            await self.db.commit()
+            self.total = 0.0
+        except Exception:
+            logger.warning("blog pipeline: refund of a failed run failed", exc_info=True)
+
+
+async def refund_since(db: AsyncSession, owner_id: str, since_iso) -> None:
+    """Refund a run that died without finishing (its job went stale): the article-pipeline stages
+    this agent was charged for since that run started."""
+    from datetime import datetime
+    from sqlalchemy import update
+    from app.models.database import AIUsageEvent
+    try:
+        since = datetime.fromisoformat(str(since_iso))
+    except (TypeError, ValueError):
+        return
+    try:
+        await db.execute(update(AIUsageEvent).where(
+            AIUsageEvent.owner_id == owner_id, AIUsageEvent.event_type == EVENT_TYPE,
+            AIUsageEvent.blocked.is_(False), AIUsageEvent.created_at >= since,
+        ).values(blocked=True, block_reason="refunded_failed_run"))
+        await db.commit()
+    except Exception:
+        logger.warning("blog pipeline: stale-run refund failed", exc_info=True)
+        await db.rollback()
 
 
 async def _gate(db: AsyncSession, user: User, config: dict, engine: str) -> None:
@@ -473,6 +513,7 @@ async def run_pipeline(db: AsyncSession, user: User, brief: dict, *, engine: Opt
     try:
         result = await _run(db, user, brief, engine, spec, config, meter, persist_research, on_stage)
     except Exception:
+        await meter.refund()
         await reconcile_budget(db, reservation, meter.total)
         raise
     await reconcile_budget(db, reservation, meter.total)
@@ -638,8 +679,7 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
     spotlight: list[dict] = []
     if brief.get("area_slugs"):
         try:
-            cards = {c["slug"]: c for c in await writer.area_spotlight_cards(db, user)}
-            spotlight = [cards[s] for s in list(brief["area_slugs"])[:3] if s in cards]
+            spotlight = await writer.spotlight_for_brief(db, user, list(brief["area_slugs"]))
         except Exception:
             logger.warning("blog pipeline: spotlight cards failed", exc_info=True)
     brief_msg, _ = writer._brief_text(brief, profile, [], [], None)

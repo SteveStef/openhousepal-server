@@ -227,12 +227,12 @@ async def mark_generation_started(db: AsyncSession, owner_id: str, report_id: st
     await db.execute(
         update(CmaReport)
         .where(CmaReport.id == report_id, CmaReport.owner_id == owner_id)
-        .values(generation_status="generating", generation_started_at=datetime.now(timezone.utc))
+        .values(generation_status="generating", generation_started_at=datetime.now(timezone.utc), generation_error=None)
     )
     await db.commit()
 
 
-async def mark_generation_finished(owner_id: str, report_id: str, outcome: str) -> None:
+async def mark_generation_finished(owner_id: str, report_id: str, outcome: str, error: Optional[str] = None) -> None:
     """Called from the route handler's except/success paths to clear an in-flight marker. Uses
     its own short-lived session rather than the request's `db` - by the time this runs from an
     exception handler, that session may need a rollback before it can be used again, and this
@@ -242,7 +242,7 @@ async def mark_generation_finished(owner_id: str, report_id: str, outcome: str) 
         await session.execute(
             update(CmaReport)
             .where(CmaReport.id == report_id, CmaReport.owner_id == owner_id, CmaReport.generation_status == "generating")
-            .values(generation_status=outcome)
+            .values(generation_status=outcome, generation_error=(error or None) if outcome != "complete" else None)
         )
         await session.commit()
 

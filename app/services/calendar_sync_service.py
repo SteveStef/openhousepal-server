@@ -160,6 +160,15 @@ CALENDAR_TZ = "America/New_York"
 _DIVIDER = "\u2501" * 16
 
 
+def _strike(text: str) -> str:
+    return "".join(ch + "̶" if ch.isalnum() else ch for ch in text or "")
+
+
+def _tidy_subject(s: str) -> str:
+    from app.services.email_service import _tidy_subject as tidy
+    return tidy(s)
+
+
 def _local(dt: datetime) -> dict:
     return {"dateTime": _to_utc(dt).astimezone(EASTERN).isoformat(), "timeZone": CALENDAR_TZ}
 
@@ -186,10 +195,10 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
     first = (lead_name or "").strip() or "them"
     parts = []
     if done:
-        # Checked off: the event stays as a record, grey and silent, marked DONE in plain text.
-        # (A per-letter combining strike-through was tried; some iPhones render it with the
-        # letters spread far apart, so the title stays normal text.)
-        summary = "✅ DONE · " + summary
+        # Checked off: the event stays as a record, grey and silent, "✅ DONE ·" then the title
+        # crossed out (user, 10/17). Only letters and digits get the combining stroke - a stroke on
+        # spaces / punctuation / emoji is what made some iPhones spread the letters apart before.
+        summary = "✅ DONE · " + _strike(summary)
         when = task.completed_at.astimezone(EASTERN)
         stamp = f"{when:%a} {when:%b} {when.day} at {when.hour % 12 or 12}:{when:%M} {'AM' if when.hour < 12 else 'PM'}"
         parts.append(f"✅ DONE - checked off {stamp}" + (f"\n↩️ Checked it off by mistake? Tap to undo:\n{done_link}" if done_link else ""))
@@ -208,14 +217,21 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
         who.append(_DIVIDER)
         parts.append("\n".join(who))
     why = []
-    if task.context:
-        why.append(f"\U0001F4CC {task.context}")
+    context = _tidy_subject(task.context or "")
+    if context:
+        why.append(f"\U0001F4CC {context}")
     if prop and prop.get("came_from"):
         why.append(f"\U0001F9ED {prop['came_from']}")
     if prop and prop.get("address"):
-        why.append(f"\U0001F3E0 {prop['address']}")
+        addr = _tidy_subject(prop["address"])
+        # The address once: no home line when the "why" line already names it.
+        street = addr.split(",")[0].strip().lower()
+        if not (street and street in context.lower()):
+            why.append(f"\U0001F3E0 {addr}")
         if prop.get("url"):
-            label = f"Open it in {first}'s Showcase" if prop.get("where") == "showcase" else "See the listing"
+            # Their own Showcase link - safe to forward. Opened while signed in, the page knows it's
+            # the agent: their clicks don't count as the client's, and it offers the agent view.
+            label = f"Open {first}'s Showcase" if prop.get("where") == "showcase" else "See the listing"
             why.append(f"\U0001F449 {label}:\n{prop['url']}")
     if why:
         parts.append("\n".join(why))
@@ -479,16 +495,33 @@ async def _upsert_event_locked(db: AsyncSession, conn: CalendarConnection, kind:
     # Plain values up front: a rollback below expires `conn`, and touching its attributes after
     # that raised inside the cleanup's try/except - so the duplicate event was never deleted.
     conn_id, calendar_id = conn.id, conn.calendar_id
+    digest = _body_hash(body)
     link = await _link(db, conn_id, kind, source_id)
     if link:
-        await client.patch_event(token, calendar_id, link.external_event_id, body)
+        if link.body_hash == digest:
+            return  # already exactly this on their calendar - "Sync now" doesn't touch it again
+        try:
+            await client.patch_event(token, calendar_id, link.external_event_id, body)
+        except Exception as e:  # noqa: BLE001
+            gone = any(c in str(e) for c in ("404", "410"))
+            if not (gone and kind == "task"):
+                raise
+            # The agent deleted this follow-up's event themselves = done (same as
+            # reconcile_deleted_followups) - never put it back.
+            task = await db.get(AgentTask, source_id)
+            if task is not None and task.completed_at is None:
+                task.completed_at = datetime.now(timezone.utc)
+            await db.delete(link)
+            await db.commit()
+            return
         link.updated_at = datetime.now(timezone.utc)
+        link.body_hash = digest
         db.add(link)
         await db.commit()
         return
 
     event_id = await client.insert_event(token, calendar_id, body)
-    db.add(CalendarEventLink(connection_id=conn_id, kind=kind, source_id=source_id, external_event_id=event_id))
+    db.add(CalendarEventLink(connection_id=conn_id, kind=kind, source_id=source_id, external_event_id=event_id, body_hash=digest))
     try:
         await db.commit()
     except IntegrityError:
@@ -505,6 +538,12 @@ async def _upsert_event_locked(db: AsyncSession, conn: CalendarConnection, kind:
             existing.updated_at = datetime.now(timezone.utc)
             db.add(existing)
             await db.commit()
+
+
+def _body_hash(body: dict) -> str:
+    import hashlib
+    import json as _json
+    return hashlib.sha1(_json.dumps(body, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
 async def _remove_event(db: AsyncSession, conn: CalendarConnection, kind: str, source_id: str) -> None:
@@ -705,8 +744,13 @@ async def _sync_task(db: AsyncSession, conn: CalendarConnection, task_id: str) -
     # (_task_event_body); deleting a task in the app is what takes its event off. Except a done
     # request follow-up (send the disclosure, book the showing...): once it's handled there's
     # nothing left to see, so it comes off the calendar (user, 10/15).
-    from app.services.tasks_service import ACTION_REQUEST_RULES
+    from app.services.tasks_service import ACTION_REQUEST_RULES, SIGNIN_FOLLOWUP_SOURCES, open_house_followups_mode
     if task.due_at is None or (task.completed_at is not None and task.auto_source in ACTION_REQUEST_RULES):
+        await _remove_event(db, conn, "task", task_id)
+        return
+    # The open house these came from has "keep follow-ups off my calendar" on: they stay on the
+    # Follow-ups page only.
+    if task.auto_source in SIGNIN_FOLLOWUP_SOURCES and await open_house_followups_mode(db, task.auto_source_id) != "on":
         await _remove_event(db, conn, "task", task_id)
         return
     await _upsert_event(db, conn, "task", task_id, await task_body_for(db, task))
@@ -814,6 +858,12 @@ async def _backfill_bg(owner_id: str, provider: str = "google") -> None:
 
 async def _backfill(db: AsyncSession, conn: CalendarConnection) -> None:
     await _client_for(conn).set_calendar_timezone(await _valid_access_token(db, conn), conn.calendar_id, CALENDAR_TZ)
+    # Follow-ups the agent deleted off the calendar count as done FIRST, so this sync can't put
+    # them back; then only events that actually changed are sent (_upsert_event's body hash).
+    try:
+        await reconcile_deleted_followups(db, conn.owner_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("calendar delete check before sync failed", exc_info=True)
     now = datetime.now(timezone.utc)
     horizon_past = now - timedelta(days=30)
 
@@ -826,7 +876,11 @@ async def _backfill(db: AsyncSession, conn: CalendarConnection) -> None:
         ).limit(500)
     )).scalars().all()
     for t in tasks:
-        await _upsert_event(db, conn, "task", t.id, await task_body_for(db, t))
+        try:
+            await _sync_task(db, conn, t.id)
+        except Exception:  # noqa: BLE001 - one bad event must not stop the rest of the sync
+            logger.warning("calendar sync of one item failed", exc_info=True)
+            await db.rollback()
 
     opens = (await db.execute(
         select(OpenHouseEvent).where(
@@ -837,7 +891,11 @@ async def _backfill(db: AsyncSession, conn: CalendarConnection) -> None:
         ).limit(300)
     )).scalars().all()
     for oh in opens:
-        await _upsert_event(db, conn, "open_house", oh.id, _oh_event_body(oh))
+        try:
+            await _upsert_event(db, conn, "open_house", oh.id, _oh_event_body(oh))
+        except Exception:  # noqa: BLE001 - one bad event must not stop the rest of the sync
+            logger.warning("calendar sync of one item failed", exc_info=True)
+            await db.rollback()
 
     hosting = (await db.execute(
         select(OpenHouseHostRequest).where(
@@ -847,7 +905,11 @@ async def _backfill(db: AsyncSession, conn: CalendarConnection) -> None:
         ).limit(200)
     )).scalars().all()
     for req in hosting:
-        await _upsert_event(db, conn, "host_open", req.id, await host_open_body_for(db, req))
+        try:
+            await _upsert_event(db, conn, "host_open", req.id, await host_open_body_for(db, req))
+        except Exception:  # noqa: BLE001 - one bad event must not stop the rest of the sync
+            logger.warning("calendar sync of one item failed", exc_info=True)
+            await db.rollback()
 
 
 async def trigger_backfill(owner_id: str, provider: str = "google") -> None:

@@ -149,6 +149,10 @@ class LeadOut(BaseModel):
     has_liked_property: bool = False
     has_disliked_property: bool = False
     needs_attention: bool = False
+    # The agent wrote a note on them (lead profile or the open house visitor list). A guest who has
+    # an agent only needs a look when there's a note - and lives in the "No agent / noted" tab then.
+    has_note: bool = False
+    note_at: Optional[datetime] = None
     # The showcase (Collection) this lead's pending attention item lives in, if any - lets the
     # frontend deep-link straight to /showcases?showcase={id} instead of a generic lead page.
     # Picks the first matched collection since most leads have exactly one showcase.

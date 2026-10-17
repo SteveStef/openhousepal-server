@@ -1593,6 +1593,8 @@ class CollectionsService:
                     # NEW for the buyer: in their Showcase less than NEW_PROPERTY_DAYS (the first fill
                     # counts from when it was made); the page also hides it once they've opened it.
                     'is_new': bool(_utc(added_at_lookup.get(prop.id) or collection.created_at) >= new_threshold),
+                    # when it joined their Showcase - the share preview shows the newest three
+                    'AddedAt': (_utc(added_at_lookup.get(prop.id)) or _utc(collection.created_at)).isoformat() if (added_at_lookup.get(prop.id) or collection.created_at) else None,
                     'lastViewedAt': interactions_lookup[prop.id].last_viewed_at.isoformat() if prop.id in interactions_lookup and interactions_lookup[prop.id].last_viewed_at else None,
                     'comments': comments_lookup.get(prop.id, []),
                     'unreadCommentCount': unread_comment_lookup.get(prop.id, 0),
@@ -1632,6 +1634,8 @@ class CollectionsService:
             collection_data = {
                 'id': collection.id,
                 'name': collection.name,
+                # lets the page notice its own agent opening it (their clicks aren't the client's)
+                'ownerId': collection.owner_id,
                 'agentName': agent.first_name if agent else None,
                 'agentFullName': agent_profile.get('name') if agent_profile else None,
                 'agentEmail': agent_profile.get('email') if agent_profile else None,

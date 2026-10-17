@@ -235,8 +235,8 @@ async def _flag_reconnect(db, conn: MailConnection, reason: str) -> None:
         db.add(Notification(
             agent_id=conn.owner_id, type="MAILBOX_DISCONNECTED", reference_type="INTEGRATION", reference_id=conn.id,
             title="Reconnect your email",
-            message=f"We can't send from {conn.account_email or 'your mailbox'} right now, so guest emails are going out from OpenHousePal. Reconnect it in Integrations.",
-            link="/studio/integrations#send-as", is_read=False, created_at=datetime.now(timezone.utc),
+            message=f"We can't send from {conn.account_email or 'your mailbox'} right now, so guest emails are going out from OpenHousePal. Reconnect it in Tools → Email.",
+            link="/studio/email", is_read=False, created_at=datetime.now(timezone.utc),
         ))
     await db.commit()
 
@@ -295,6 +295,12 @@ async def send_guest(owner_id: Optional[str], to_email: str, subject: str, templ
             conn = (await db.execute(select(MailConnection).where(MailConnection.owner_id == owner_id))).scalar_one_or_none()
             if not conn or not conn.enabled or conn.status != "ok" or not conn.account_email:
                 return None
+            # Studio -> Email: the agent picked OpenHousePal's address for this kind of email.
+            from app.models.database import User
+            from app.services.email_settings_service import client_rule
+            rule = client_rule(await db.get(User, owner_id), template)
+            if rule is not None and rule.get("via") == "openhousepal":
+                return None
             today = _today()
             if conn.sent_day != today:
                 conn.sent_day, conn.sent_count = today, 0
@@ -305,8 +311,16 @@ async def send_guest(owner_id: Optional[str], to_email: str, subject: str, templ
             if _dev_suppressed():
                 logger.info("DEV MODE: mailbox email suppressed", extra={"to": to_email, "template": template, "via": conn.provider, "from": conn.account_email})
                 return 200, "Mailbox email suppressed in dev mode"
-            html, text = await render(template, variables)
-            headers = unsubscribe_headers(template, to_email, variables)
+            from app.services.personal_email_service import PERSONAL_TEMPLATES, render as render_personal
+            if template in PERSONAL_TEMPLATES:
+                # A typed-style note from one person: no bulk-mail header (the visible unsubscribe
+                # line in the body stays) - see personal_email_service.
+                link = variables.get("showcase_link") or variables.get("collection_link") or ""
+                subject, html, text = render_personal(template, subject, variables, link=link)
+                headers = {}
+            else:
+                html, text = await render(template, variables)
+                headers = unsubscribe_headers(template, to_email, variables)
             try:
                 token = await _access_token(db, conn)
                 resp = await _deliver(conn, token, to=to_email, subject=subject, html=html, text=text, from_name=name, headers=headers)

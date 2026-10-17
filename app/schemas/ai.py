@@ -247,6 +247,8 @@ class MonthlyAIUsageResponse(BaseModel):
     exhausted: bool = False
     studio_media_used_usd: float = 0.0
     studio_media_cap_usd: Optional[float] = None
+    # This month's spend by feature: [{label, usd, percent}] - the meter's "What used it".
+    breakdown: list = []
 
 
 class CopywriteRequest(BaseModel):

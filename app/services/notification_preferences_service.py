@@ -43,7 +43,7 @@ CATEGORIES: Dict[str, dict] = {
         ],
     },
     "showcase_digest": {
-        "label": "Daily briefing (4:30 PM)",
+        "label": "Daily briefing",
         "help": "One email a day: your follow-ups, anything waiting on you, and new matches & price drops in your clients' Showcases. Skipped on days with nothing to report.",
         "types": ["SHOWCASE_DIGEST"],
     },

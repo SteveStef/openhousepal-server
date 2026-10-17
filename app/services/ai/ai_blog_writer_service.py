@@ -293,7 +293,196 @@ def _hub_videos(config: dict) -> list[dict]:
     return out[:40]
 
 
-async def area_spotlight_cards(db: AsyncSession, user: User) -> list[dict]:
+MAX_SPOTLIGHT_TOWNS = 5
+
+
+async def town_card_for_area(db: AsyncSession, area: MarketArea) -> dict:
+    """A Town Spotlight card for ANY researched town - not just the agent's IDX served areas
+    (user, 10/17: a non-IDX agent can spotlight a town too). The research is shared: once one
+    agent's article researched Villanova, every later article gets it from the database for free."""
+    from app.services.website.content_adapters import (
+        _area_hover_facts, _public_school_districts, get_area_live_market_stats, reconcile_public_schools, resolve_photo_urls,
+    )
+    from app.services.areas import geography
+    scope = geography.scope_for_market_area(area)
+    facts = area.facts or {}
+    stats = await get_area_live_market_stats(db, scope, facts.get("market_stats"))
+    checked = await reconcile_public_schools(db, area, scope) if facts.get("public_schools") else None
+    items = ((resolve_photo_urls(facts.get("photos")) or {}).get("items") or [])
+    photos = [{"url": it["url"], "credit": it.get("attribution") or it.get("author") or "Google Maps"} for it in items[:4] if it.get("url")]
+    return {
+        "slug": area.slug, "name": area.name, "state": area.state, "county": area.county,
+        "photo": photos[0]["url"] if photos else None, "photos": photos,
+        "summary": _objective_summary((area.narrative or {}).get("summary")),
+        "median_price": stats.get("median_price"), "active_count": stats.get("active_count"),
+        "min_price": stats.get("min_price"), "max_price": stats.get("max_price"), "price_range_basis": stats.get("price_range_basis"),
+        "school_districts": _public_school_districts({"public_schools": checked} if checked else facts, stats.get("school_districts") or []),
+        "nearby": _area_hover_facts(facts, stats),
+        "as_of": datetime.now(timezone.utc).strftime("%B %Y"),
+    }
+
+
+async def _landmark_photos(area: MarketArea) -> dict:
+    """A real photo of something that matters in the town (its landmarks, main street, park) when
+    the town search itself came back without photos - Google Places, stored as photo NAMES (the
+    key never reaches a page; public_site_routes proxies them)."""
+    import os
+    import httpx
+    from app.services.areas.area_enrichment_service import PLACES_TEXT_URL
+    key = os.getenv("GOOGLE_PLACES_API_KEY")
+    if not key:
+        return {}
+    # "historic sites and landmarks" finds the places a town is known for (gardens, historic
+    # houses, parks); "attractions"/"famous places" mostly returned restaurants and malls.
+    body: dict = {"textQuery": f"historic sites and landmarks in {area.name}, {area.state}", "maxResultCount": 12}
+    if area.centroid_lat is not None and area.centroid_lng is not None:
+        # Inside the town (about 4 km each way) - a bias alone let Valley Forge in as "Radnor".
+        lat, lng = area.centroid_lat, area.centroid_lng
+        body["locationRestriction"] = {"rectangle": {"low": {"latitude": lat - 0.036, "longitude": lng - 0.047},
+                                                     "high": {"latitude": lat + 0.036, "longitude": lng + 0.047}}}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(PLACES_TEXT_URL, json=body, headers={
+                "Content-Type": "application/json", "X-Goog-Api-Key": key, "X-Goog-FieldMask": "places.displayName,places.photos,places.userRatingCount,places.primaryType",
+            })
+            r.raise_for_status()
+            places = r.json().get("places") or []
+    except Exception as exc:  # noqa: BLE001
+        logger.info("landmark photo lookup failed", extra={"area": area.slug, "error": str(exc) or repr(exc)})
+        return {}
+    # The places people actually know (most Google reviews) first, and a wide photo of each.
+    skip = ("restaurant", "cafe", "bar", "store", "shopping", "mall", "playground", "gym", "bank", "gas_station", "diner", "pizza", "bakery")
+    places = [p for p in places if not any(k in (p.get("primaryType") or "") for k in skip)]
+    places.sort(key=lambda p: -(p.get("userRatingCount") or 0))
+    items = []
+    for place in places:
+        shots = [ph for ph in (place.get("photos") or []) if ph.get("name")]
+        wide = [ph for ph in shots if (ph.get("widthPx") or 0) >= (ph.get("heightPx") or 0) * 1.2]
+        for ph in (wide or shots)[:1]:
+            if ph.get("name"):
+                items.append({"photo_name": ph["name"], "source": "google_places_landmark",
+                              "attribution": ", ".join(a.get("displayName", "") for a in (ph.get("authorAttributions") or []) if a.get("displayName")) or "Google",
+                              "caption": (place.get("displayName") or {}).get("text")})
+        if len(items) >= 4:
+            break
+    return {"items": items, "source": "google_places_landmark", "fetched_at": datetime.now(timezone.utc).isoformat()} if items else {}
+
+
+async def _ai_town_photo(db: AsyncSession, user: User, area: MarketArea) -> dict:
+    """Last resort only (no town photo, no landmark photo): one AI picture of the kind of street
+    the town is known for, saved on the shared town record so it's made once, ever. Recorded
+    against the agent whose article needed it (a few cents); any failure just means no photo."""
+    from app.services import s3_service
+    from app.services.ai.ai_rate_limit_service import record_usage_event
+    from app.services.studio_media.providers.registry import image_provider
+    from app.services.studio_media_service import _image_cost
+    from app.services.blog_cover_service import _wide
+    config = await ai_config_service.get_config(db)
+    try:
+        provider = image_provider(config["studio_media_image_provider"], config["studio_media_image_model"])
+        result = await provider.generate(
+            f"Photorealistic photograph of a typical residential street in {area.name}, {area.state}, USA - the homes, "
+            "trees and setting characteristic of the area, in soft daylight. No text, no signs with words, no logos, no people.",
+            size="1536x1024", quality="medium",
+        )
+        url = s3_service.upload_bytes(_wide(result.image_bytes), "town-photos", ".jpg", "image/jpeg")
+        await record_usage_event(db, user.id, None, provider.model, None, None, _image_cost(result, config, 0.04), 0, False, None, event_type="studio_media_image")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ai town photo failed", extra={"area": area.slug, "error": str(exc) or repr(exc)})
+        return {}
+    return {"items": [{"url": url, "attribution": "Illustration", "source": "ai_generated"}], "source": "ai_generated",
+            "fetched_at": datetime.now(timezone.utc).isoformat()}
+
+
+async def ensure_spotlight_photos(db: AsyncSession, user: User, cards: list[dict], allow_ai: bool = True) -> None:
+    """Every town in a Town Spotlight shows a picture (user, 10/17 - one came out blank): the town's
+    own photos, else a real landmark photo, else (last) one AI picture - saved on the shared town
+    record either way, so the next article anywhere gets it instantly."""
+    from app.services.website.content_adapters import resolve_photo_urls
+    for card in cards:
+        if card.get("photos") or card.get("photo"):
+            continue
+        area = (await db.execute(select(MarketArea).where(MarketArea.slug == card.get("slug")))).scalar_one_or_none()
+        if area is None:
+            continue
+        found = await _landmark_photos(area) or (await _ai_town_photo(db, user, area) if allow_ai else {})
+        if not found:
+            continue
+        area.facts = {**(area.facts or {}), "photos": found}
+        await db.commit()
+        items = ((resolve_photo_urls(found) or {}).get("items") or [])
+        card["photos"] = [{"url": it["url"], "credit": it.get("attribution") or "Google Maps"} for it in items[:4] if it.get("url")]
+        card["photo"] = card["photos"][0]["url"] if card["photos"] else None
+
+
+_PHOTO_LOOKUPS: set[str] = set()
+
+
+async def _landmark_backfill(slug: str) -> None:
+    """Background: a real landmark photo for a town with none (no AI here - this runs from a
+    public page view). Saved on the shared town record; the next view of the article shows it."""
+    from app.database import AsyncSessionLocal
+    try:
+        async with AsyncSessionLocal() as db:
+            area = (await db.execute(select(MarketArea).where(MarketArea.slug == slug))).scalar_one_or_none()
+            if area is None or ((area.facts or {}).get("photos") or {}).get("items"):
+                return
+            found = await _landmark_photos(area)
+            if found:
+                area.facts = {**(area.facts or {}), "photos": found}
+                await db.commit()
+    except Exception:
+        logger.warning("landmark backfill failed", exc_info=True)
+
+
+async def fill_spotlight_photos(db: AsyncSession, blocks: list) -> list:
+    """Published articles whose Town Spotlight was saved without a picture (user, 10/17 - Radnor)
+    show the town's shared photos once there are some. Never calls out while the page waits:
+    a town with no photos at all gets a landmark lookup in the background, once."""
+    import asyncio
+    from app.services.website.content_adapters import resolve_photo_urls
+    missing = [b for b in (blocks or []) if isinstance(b, dict) and b.get("type") == "area_spotlight"
+               and isinstance((b.get("data") or {}).get("area"), dict)
+               and not (b["data"]["area"].get("photos") or b["data"]["area"].get("photo"))]
+    if not missing:
+        return blocks
+    slugs = {b["data"]["area"].get("slug") for b in missing if b["data"]["area"].get("slug")}
+    areas = {a.slug: a for a in (await db.execute(select(MarketArea).where(MarketArea.slug.in_(slugs)))).scalars().all()} if slugs else {}
+    out = []
+    for b in blocks:
+        if b in missing:
+            area = areas.get(b["data"]["area"].get("slug"))
+            items = ((resolve_photo_urls((area.facts or {}).get("photos")) or {}).get("items") or []) if area is not None else []
+            photos = [{"url": it["url"], "credit": it.get("attribution") or "Google Maps"} for it in items[:4] if it.get("url")]
+            if photos:
+                b = {**b, "data": {**b["data"], "area": {**b["data"]["area"], "photos": photos, "photo": photos[0]["url"]}}}
+            elif area is not None and area.slug not in _PHOTO_LOOKUPS:
+                _PHOTO_LOOKUPS.add(area.slug)
+                task = asyncio.create_task(_landmark_backfill(area.slug))
+                _BACKGROUND.add(task)
+                task.add_done_callback(_BACKGROUND.discard)
+        out.append(b)
+    return out
+
+
+_BACKGROUND: set = set()
+
+
+async def spotlight_for_brief(db: AsyncSession, user: User, slugs: list) -> list[dict]:
+    """The Town Spotlight cards an article asked for (up to MAX_SPOTLIGHT_TOWNS), each with a photo."""
+    wanted = [s for s in (slugs or []) if isinstance(s, str)][:MAX_SPOTLIGHT_TOWNS]
+    if not wanted:
+        return []
+    cards = {c["slug"]: c for c in await area_spotlight_cards(db, user, extra_slugs=wanted)}
+    out = [cards[s] for s in wanted if s in cards]
+    try:
+        await ensure_spotlight_photos(db, user, out)
+    except Exception:
+        logger.warning("spotlight photo fallback failed", exc_info=True)
+    return out
+
+
+async def area_spotlight_cards(db: AsyncSession, user: User, extra_slugs: Optional[list] = None) -> list[dict]:
     """Every town the agent serves, as a Town Spotlight snapshot: photo(s), summary, live median
     price / homes for sale / days on market, school districts and what's nearby - the same verified
     Areas research + Bright MLS stats the IDX community pages use, dated so the article can say
@@ -326,7 +515,15 @@ async def area_spotlight_cards(db: AsyncSession, user: User) -> list[dict]:
             "school_districts": c.get("school_districts") or [],
             "nearby": c.get("hover_facts") or {},
             "as_of": as_of,
+            "price_range_basis": c.get("price_range_basis"),
         })
+    # Towns outside the agent's served areas that the article asked for - researched, shared rows.
+    have = {c["slug"] for c in out}
+    extra = [x for x in (extra_slugs or []) if x and x not in have]
+    if extra:
+        rows = (await db.execute(select(MarketArea).where(MarketArea.slug.in_(extra), MarketArea.enrichment_status == "ENRICHED"))).scalars().all()
+        for area in rows:
+            out.append(await town_card_for_area(db, area))
     return out
 
 
@@ -374,6 +571,19 @@ async def build_context(db: AsyncSession, user: User) -> dict:
     serve (Website Builder areas), their recent sales and their active listings - all real data
     they can choose to reference - plus whether their AI allowance can cover a generation."""
     config = await _hub_config(db, user.id)
+    try:
+        from app.services import agent_hub_video_sync
+        hub = (await db.execute(select(AgentHub).where(AgentHub.owner_id == user.id))).scalars().first() if agent_hub_video_sync.wants_sync(config) else None
+        if hub is not None:
+            if not (config.get("videoLinks") or []):
+                import asyncio
+                await asyncio.wait_for(agent_hub_video_sync.sync_hub_videos(db, hub), timeout=8)
+                config = hub.config or {}
+            else:
+                agent_hub_video_sync.refresh_in_background(hub.id)
+    except Exception:  # YouTube slow/unreachable: carry on without suggestions (session left clean)
+        logger.info("blog context: channel video sync skipped", exc_info=True)
+        await db.rollback()
     areas_result = await db.execute(
         select(MarketArea.name).join(AgentMarketArea, AgentMarketArea.area_id == MarketArea.id)
         .where(AgentMarketArea.owner_id == user.id).order_by(AgentMarketArea.created_at)
@@ -785,10 +995,8 @@ async def generate_article(db: AsyncSession, user: User, brief: dict) -> dict:
     listings = [p for p in (brief.get("listings") or []) if isinstance(p, dict)][:6]
     spotlight: list[dict] = []
     if brief.get("area_slugs"):
-        wanted_areas = list(brief.get("area_slugs") or [])[:3]
         try:
-            cards = {c["slug"]: c for c in await area_spotlight_cards(db, user)}
-            spotlight = [cards[s] for s in wanted_areas if s in cards]
+            spotlight = await spotlight_for_brief(db, user, list(brief.get("area_slugs") or []))
         except Exception:
             logger.warning("blog writer: area spotlight lookup failed", exc_info=True)
 

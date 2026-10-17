@@ -63,7 +63,7 @@ def nice_date(d: Optional[datetime]) -> str:
     return f"{d.strftime('%A, %B')} {d.day}"
 
 
-def _send(to: str, subject: str, template: str, variables: dict, reply_to: Optional[str], from_name: str) -> int:
+def _send_full(to: str, subject: str, template: str, variables: dict, reply_to: Optional[str], from_name: str) -> tuple[int, str]:
     try:
         from app.services.email_service import EmailService
         code, body = EmailService().send_simple_message(
@@ -72,10 +72,14 @@ def _send(to: str, subject: str, template: str, variables: dict, reply_to: Optio
         )
         if code >= 300:
             logger.warning("notification email not accepted", extra={"template": template, "status": code, "body": str(body)[:300]})
-        return code
-    except Exception:  # noqa: BLE001 - an email must never break anything
+        return code, str(body or "")
+    except Exception as e:  # noqa: BLE001 - an email must never break anything
         logger.warning("notification email failed", exc_info=True, extra={"template": template})
-        return 500
+        return 500, str(e)
+
+
+def _send(to: str, subject: str, template: str, variables: dict, reply_to: Optional[str], from_name: str) -> int:
+    return _send_full(to, subject, template, variables, reply_to, from_name)[0]
 
 
 async def _send_via_owner(owner_id: str, to: str, subject: str, template: str, variables: dict,
@@ -92,10 +96,10 @@ async def _send_via_owner(owner_id: str, to: str, subject: str, template: str, v
     sent = await send_guest(owner_id, to, subject, template, strip_private(variables),
                             from_name=None if from_name == "OpenHousePal" else from_name)
     if sent is None:
-        code = await asyncio.get_running_loop().run_in_executor(None, _send, to, subject, template, variables, reply_to, from_name)
-        await after_send(track_id, code < 300, "openhousepal")
+        code, body = await asyncio.get_running_loop().run_in_executor(None, _send_full, to, subject, template, variables, reply_to, from_name)
+        await after_send(track_id, code < 300, "openhousepal", code=code, detail=body)
     else:
-        await after_send(track_id, sent[0] < 300, "mailbox")
+        await after_send(track_id, sent[0] < 300, "mailbox", code=sent[0], detail=sent[1])
 
 
 def send(to: Optional[str], template: str, subject: str, variables: dict[str, Any], *,

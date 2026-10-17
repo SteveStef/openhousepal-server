@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models.database import AgentHub, Blog, BlogEvent, User
+from app.models.database import AgentHub, Blog, BlogEvent, Notification, User
 from app.services import s3_service, storage_ledger_service
 from app.schemas.blogs import (
     BlogLeadCreate,
@@ -129,6 +129,11 @@ async def get_my_blogs(
         item = BlogListItem.model_validate(blog)
         item.view_count = view_counts.get(blog.id, 0)
         item.preview_image_url = blog_preview_image(blog)
+        review = blog.ai_review or {}
+        if review.get("status") == "running":
+            item.ai_state = "failed" if _job_is_stale(review) else "running"
+        elif review.get("status") in ("interview", "failed") and review.get("new"):
+            item.ai_state = review["status"]
         items.append(item)
     return items
 
@@ -208,6 +213,71 @@ async def estimate_blog_ai(
     usd = typical * {"short": 0.8, "standard": 1.0, "long": 1.3}.get(length, 1.0)
     limit = config.get("agent_monthly_ai_budget_usd_by_tier", {}).get(current_user.plan_tier)
     return {"usd": round(usd, 5), "percent": round(usd / float(limit) * 100, 2) if limit else None}
+
+
+@router.post("/ai/town-card")
+async def blog_town_card(
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_design_access),
+):
+    """Town Spotlight for a town outside the agent's served areas (any plan - user, 10/17). Uses
+    the shared town database: a town someone already researched comes back instantly and free;
+    a new one is researched once (in the background) and then serves everyone. Poll until
+    status == "ready"."""
+    from sqlalchemy import update
+    from app.models.database import MarketArea
+    from app.services.areas import area_enrichment_service
+    from app.services.ai import ai_blog_writer_service
+    name = str(payload.get("name") or "").split(",")[0].strip()[:80]
+    state = str(payload.get("state") or "").strip().upper()
+    if not state:
+        tail = str(payload.get("name") or "").split(",")[1:]
+        state = (tail[0].strip().upper()[:2] if tail else "") or (current_user.state or "PA").strip().upper()[:2]
+    if len(name) < 2 or len(state) != 2:
+        raise HTTPException(status_code=422, detail="Type the town's name.")
+    area = await area_enrichment_service.get_or_create_market_area(db, name, state)
+    if area.enrichment_status == "ENRICHED":
+        card = await ai_blog_writer_service.town_card_for_area(db, area)
+        if not card.get("photo"):  # a real landmark photo for the preview (the AI picture waits for the article)
+            await ai_blog_writer_service.ensure_spotlight_photos(db, current_user, [card], allow_ai=False)
+        return {"status": "ready", "card": card}
+    claim = await db.execute(
+        update(MarketArea).where(MarketArea.id == area.id, MarketArea.enrichment_status.in_(["PENDING", "FAILED"]))
+        .values(enrichment_status="RESEARCHING")
+    )
+    await db.commit()
+    if claim.rowcount:
+        import asyncio
+        from app.api.site_routes import _enrich_area_background
+        task = asyncio.create_task(_enrich_area_background(area.id, current_user.id))
+        _AI_JOBS.add(task)
+        task.add_done_callback(_AI_JOBS.discard)
+    return {"status": "researching", "slug": area.slug, "name": area.name}
+
+
+@router.get("/ai/cover-estimate")
+async def estimate_blog_cover(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_design_access),
+):
+    """What one AI cover picture (or one change to it) costs, as a share of the monthly AI."""
+    from app.services import blog_cover_service
+    return await blog_cover_service.estimate(db, current_user)
+
+
+@router.post("/{blog_id}/ai-cover")
+async def make_blog_cover(
+    blog_id: str,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_design_access),
+):
+    """Make the article's cover picture with AI ({"idea": ...}), or change the last one
+    ({"comment": ...}, up to 2 times). Returns the picture; "Use as cover" saves it."""
+    from app.services import blog_cover_service
+    blog = await get_owned_blog(db, blog_id, current_user.id)
+    return await blog_cover_service.make_cover(db, current_user, blog, payload.get("idea"), payload.get("comment"))
 
 
 @router.get("/ai/context")
@@ -326,7 +396,7 @@ async def _run_blog_ai_job(blog_id: str, user_id: str, brief: dict, engine: str)
             error = str(exc.detail)
         except Exception:
             logger.exception("AI blog job failed", extra={"blog_id": blog_id})
-            error = "The AI writer hit a problem - please try again. You were only charged for what ran."
+            error = "The AI writer hit a problem - please try again. Nothing was charged for this try."
         blog = await db.get(Blog, blog_id)
         if not blog:
             return
@@ -338,7 +408,72 @@ async def _run_blog_ai_job(blog_id: str, user_id: str, brief: dict, engine: str)
                 blog.slug = await next_available_slug(db, blog.owner_id, slugify(result["title"]), exclude_id=blog.id)
             _apply_ai_result(blog, result)
             logger.info("AI blog draft generated", extra={"blog_id": blog.id, "owner_id": user_id, "engine": engine, "cost_usd": result["usage"]["cost_usd"]})
+        # The agent may have left the page (user, 10/17: "work in the background and alert the agent
+        # when it's done") - a bell alert either way. It clears itself once seen (the progress poll
+        # marks it read - see _mark_ai_alert_seen).
+        title = (blog.title or "your article")[:120]
+        db.add(Notification(
+            agent_id=user_id, type="BLOG_AI_FAILED" if error else "BLOG_AI_READY", reference_type="BLOG", reference_id=blog.id,
+            title=(f"Couldn't finish \u201c{title}\u201d" if error else f"Your article is ready: \u201c{title}\u201d")[:200],
+            message=(f"{error} Your answers are saved - open it to try again." if error else "Open it to pick its look and publish when you're happy.")[:500],
+            link=f"/studio/blogs/{blog.id}", is_read=False, created_at=datetime.now(timezone.utc),
+        ))
         await db.commit()
+
+
+async def _mark_ai_alert_seen(db: AsyncSession, blog_id: str, owner_id: str) -> None:
+    from sqlalchemy import update
+    await db.execute(update(Notification).where(
+        Notification.agent_id == owner_id, Notification.reference_id == blog_id,
+        Notification.type.in_(("BLOG_AI_READY", "BLOG_AI_FAILED")), Notification.is_read.is_(False),
+    ).values(is_read=True, read_at=datetime.now(timezone.utc)))
+
+
+def _brief_store(brief: dict) -> dict:
+    """The interview answers kept on the article so a draft can be finished later - capped so a
+    runaway paste can't bloat the row."""
+    import json
+    out = {k: v for k, v in (brief or {}).items() if k not in ("engine", "blog_id")}
+    return out if len(json.dumps(out, default=str)) <= 40_000 else {k: out.get(k) for k in ("topic", "goal", "audiences", "areas", "tone", "length", "cta")}
+
+
+@router.put("/ai/brief-draft")
+async def save_blog_ai_brief(
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_design_access),
+):
+    """Autosave of the AI writer's interview (user, 10/17: "save every single step ... you can exit
+    out and it saves everything you put into the flow as a draft to finish later"). The first save
+    creates a DRAFT article (titled with the topic); later saves update it. Opening that draft from
+    Blogs puts the agent back in the writer, on the step they left."""
+    brief = payload.get("brief") if isinstance(payload.get("brief"), dict) else {}
+    topic = str(brief.get("topic") or "").strip()
+    try:
+        step = max(0, min(3, int(payload.get("step") or 0)))
+    except (TypeError, ValueError):
+        step = 0
+    blog = await get_owned_blog(db, payload["blog_id"], current_user.id) if payload.get("blog_id") else None
+    if blog is not None:
+        current = blog.ai_review or {}
+        if current.get("status") not in ("interview", "failed") or not current.get("new"):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This article is no longer an unfinished AI draft.")
+    if not topic:
+        if blog is None:
+            return {"blog_id": None}
+        topic = blog.title
+    now = datetime.now(timezone.utc).isoformat()
+    if blog is None:
+        blog = Blog(owner_id=current_user.id, slug=await next_available_slug(db, current_user.id, slugify(topic)), title=topic[:200], status="DRAFT")
+        if payload.get("category_hint"):
+            blog.category = str(payload["category_hint"])[:80]
+        db.add(blog)
+    else:
+        blog.title = topic[:200]
+    blog.ai_review = {"status": "interview", "new": True, "brief": _brief_store(brief), "step": step, "saved_at": now}
+    await db.commit()
+    await db.refresh(blog)
+    return {"blog_id": blog.id, "saved_at": now}
 
 
 @router.post("/ai/generate-job")
@@ -357,12 +492,17 @@ async def start_blog_ai_job(
     engine = await ai_blog_pipeline_service.precheck(db, current_user, payload.engine)
     existing = await get_owned_blog(db, payload.blog_id, current_user.id) if payload.blog_id else None
     now = datetime.now(timezone.utc).isoformat()
+    is_new = existing is None
     if existing:
         current = existing.ai_review or {}
         if current.get("status") == "running" and not _job_is_stale(current):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="The AI is already writing this article.")
         blog = existing
         previous = current if current.get("status") == "done" else None
+        # An autosaved interview (or a run that failed) - still a brand-new article, never written.
+        is_new = bool(current.get("new")) and current.get("status") in ("interview", "failed", "running")
+        if is_new:
+            blog.title = payload.topic.strip()[:200]
     else:
         topic = payload.topic.strip()
         blog = Blog(owner_id=current_user.id, slug=await next_available_slug(db, current_user.id, slugify(topic)), title=topic[:200], status="DRAFT")
@@ -371,7 +511,7 @@ async def start_blog_ai_job(
         db.add(blog)
         previous = None
     blog.ai_review = {"status": "running", "stage": "gathering", "engine": engine, "started_at": now, "stage_at": now,
-                      "new": existing is None, "previous": previous}
+                      "new": is_new, "previous": previous, "brief": _brief_store(payload.model_dump(mode="json"))}
     await db.commit()
     await db.refresh(blog)
 
@@ -393,18 +533,29 @@ async def get_blog_ai_job(
     review = blog.ai_review or {}
     state = review.get("status") or "done"
     if state == "running" and _job_is_stale(review):
-        state, review = "failed", {**review, "error": "The AI writer took too long - please try again. You were only charged for what ran."}
+        state, review = "failed", {**review, "error": "The AI writer took too long - please try again. Nothing was charged for this try."}
+        # The run died part-way (e.g. a restart) - give back what its finished steps charged.
+        from app.services.ai import ai_blog_pipeline_service
+        await ai_blog_pipeline_service.refund_since(db, current_user.id, review.get("started_at"))
+    if state == "interview":
+        return {"status": "interview", "brief": review.get("brief"), "step": review.get("step")}
     if state == "running":
         return {"status": "running", "stage": review.get("stage"), "engine": review.get("engine"), "started_at": review.get("started_at")}
     if state == "failed":
         error = review.get("error") or "The AI writer could not finish this draft."
-        # A brand-new article that never got written is removed; a rewrite keeps its old content and report.
+        # A brand-new article stays a DRAFT holding the agent's answers (open it to try again - user,
+        # 10/17); a rewrite keeps its old content and report.
         if review.get("new"):
-            await db.delete(blog)
+            blog.ai_review = {"status": "failed", "new": True, "error": error, "brief": review.get("brief") or {},
+                              "step": 3, "saved_at": review.get("stage_at")}
         else:
             blog.ai_review = review.get("previous")
+        await _mark_ai_alert_seen(db, blog.id, current_user.id)
         await db.commit()
-        return {"status": "failed", "error": error}
+        return {"status": "failed", "error": error, "brief": review.get("brief")}
+    await _mark_ai_alert_seen(db, blog.id, current_user.id)
+    await db.commit()
+    await db.refresh(blog)
     return {"status": "done", "result": BlogAiGenerateResponse(
         blog=BlogResponse.model_validate(blog),
         facts_used=review.get("facts_used") or [],
@@ -678,6 +829,15 @@ async def list_public_blogs(
     ]
 
 
+async def _public_blocks(db: AsyncSession, blocks) -> list:
+    from app.services.ai import ai_blog_writer_service
+    try:
+        return await ai_blog_writer_service.fill_spotlight_photos(db, blocks or [])
+    except Exception:
+        logger.warning("spotlight photo fill failed", exc_info=True)
+        return blocks or []
+
+
 @router.get("/public/{agent_slug}/{blog_slug}", response_model=PublicBlogDetail)
 async def get_public_blog(
     agent_slug: str,
@@ -722,7 +882,7 @@ async def get_public_blog(
         coverImageUrl=blog.cover_image_url,
         category=blog.category,
         tags=blog.tags or [],
-        blocks=blog.blocks or [],
+        blocks=await _public_blocks(db, blog.blocks),
         linkedProperties=blog.linked_properties or [],
         seoTitle=blog.seo_title,
         metaDescription=blog.meta_description,
@@ -735,6 +895,7 @@ async def get_public_blog(
         agentName=f"{agent.first_name} {agent.last_name}".strip(),
         agentBrokerage=agent.brokerage,
         agentPhotoUrl=agent.photo_url,
+        agentId=agent.id,
         agentTitle=agent.professional_title,
         agentMarket=agent.market,
         # A Luxe article whose author left IDX shows in the default look (the choice is kept).

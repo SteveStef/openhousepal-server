@@ -939,8 +939,8 @@ def resolve_photo_urls(photos_fact: Optional[dict]) -> Optional[dict]:
         return photos_fact
     resolved = dict(photos_fact)
     resolved["items"] = [
-        {**item, "url": f"/public/sites/photo/{item['photo_name']}"}
-        for item in photos_fact["items"] if item.get("photo_name")
+        {**item, "url": f"/public/sites/photo/{item['photo_name']}" if item.get("photo_name") else item["url"]}
+        for item in photos_fact["items"] if item.get("photo_name") or item.get("url")
     ]
     return resolved
 
@@ -1183,20 +1183,52 @@ _served_areas_cache: dict[tuple, tuple[float, list[dict]]] = {}
 _market_cache: dict[str, tuple[float, object]] = {}
 
 
-async def cached_market(key: str, make):
-    """Live market numbers (town stats, trends, related towns) kept 5 minutes - the Bright sync's
-    rhythm, so they're never more than one sync behind - so a town page doesn't recompute them for
-    every visitor. `make` is a no-argument coroutine function."""
+_MARKET_STALE_OK_S = 6 * 3600
+_market_refreshing: set[str] = set()
+
+
+def _market_store(key: str, value) -> None:
+    _market_cache[key] = (time.monotonic(), value)
+    if len(_market_cache) > 2000:
+        for k in sorted(_market_cache, key=lambda k: _market_cache[k][0])[:500]:
+            _market_cache.pop(k, None)
+
+
+async def cached_market(key: str, make, db: Optional[AsyncSession] = None):
+    """Live market numbers (town stats, trends, related towns) for town pages, refreshed every 5
+    minutes - the Bright sync's rhythm. `make(db)` computes them with the session it's given.
+
+    Stale-while-revalidate (user, 10/17: neighborhood pages "taking forever"; one took 27 s on the
+    live site): after 5 minutes the last numbers are still served instantly and recomputed in the
+    background on their own session, so no visitor waits on the math. Only a town nobody has
+    opened for 6 hours (or since a restart - see warm_area_caches) is computed while waiting."""
     hit = _market_cache.get(key)
     now = time.monotonic()
     if hit and now - hit[0] < _SERVED_AREAS_TTL_S:
         return copy.deepcopy(hit[1])
-    value = await make()
-    _market_cache[key] = (now, value)
-    if len(_market_cache) > 2000:
-        for k in sorted(_market_cache, key=lambda k: _market_cache[k][0])[:500]:
-            _market_cache.pop(k, None)
+    if hit and now - hit[0] < _MARKET_STALE_OK_S:
+        if key not in _market_refreshing:
+            _market_refreshing.add(key)
+
+            async def refresh():
+                from app.database import AsyncSessionLocal
+                try:
+                    async with AsyncSessionLocal() as fresh:
+                        _market_store(key, await make(fresh))
+                except Exception:
+                    logger.warning("market cache refresh failed", extra={"key": key}, exc_info=True)
+                finally:
+                    _market_refreshing.discard(key)
+            task = asyncio.create_task(refresh())
+            _market_tasks.add(task)
+            task.add_done_callback(_market_tasks.discard)
+        return copy.deepcopy(hit[1])
+    value = await make(db)
+    _market_store(key, value)
     return copy.deepcopy(value)
+
+
+_market_tasks: set = set()
 
 
 async def served_area_names(db: AsyncSession, user: User, limit: int = 50) -> list[str]:
@@ -1280,6 +1312,7 @@ async def _build_served_areas_summary(db: AsyncSession, user: User, limit: int =
             card["active_count"] = stats.get("active_count")
             card["min_price"] = stats.get("min_price")
             card["max_price"] = stats.get("max_price")
+            card["price_range_basis"] = stats.get("price_range_basis")
             checked = await reconcile_public_schools(db, a, area_scope) if (a.facts or {}).get("public_schools") else None
             card["school_districts"] = _public_school_districts({"public_schools": checked} if checked else a.facts, stats.get("school_districts") or [])
             card["hover_facts"] = _area_hover_facts(a.facts, stats)

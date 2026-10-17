@@ -1345,7 +1345,30 @@ def full_message(task: AgentTask, showcase: Optional[dict], owner: Optional[User
         out = f"{msg}\n\n{pitch}" if pitch else msg
     # Signed off with the agent's name | brokerage (auto follow-ups only - a hand-added task has
     # no message of its own).
-    return (with_footer(out, owner) if task.auto_source and owner is not None else out) or None
+    out = with_footer(out, owner) if task.auto_source and owner is not None else out
+    return link_last(out, (showcase or {}).get("url")) or None
+
+
+_LINK_LEAD_IN = re.compile(r"(?:here'?s|here is) (?:your|the) link\s*:?\s*$|take a look here\s*:?\s*$|here it is\s*:?\s*$", re.I)
+
+
+def link_last(message: Optional[str], url: Optional[str]) -> Optional[str]:
+    """The Showcase link on its own line at the very END of the text, after a blank line (user,
+    10/17): it no longer runs into the paragraph, and iMessage only draws the rich link preview
+    (the three best homes) when the link is the last thing in the message. "Here's your link:"
+    becomes "Your link is at the bottom of this text." so the sentence still reads right."""
+    if not message or not url or url not in message:
+        return message
+    head, _, tail = message.partition(url)
+    head = head.rstrip()
+    m = _LINK_LEAD_IN.search(head)
+    if m:
+        head = head[:m.start()].rstrip() + (" " if head[:m.start()].strip() else "") + "Your link is at the bottom of this text."
+    elif head.endswith(":"):
+        head = head[:-1].rstrip() + " (link below)."
+    tail = tail.lstrip(" .")
+    body = _tidy(f"{head} {tail}" if tail and not tail.startswith("\n") else f"{head}{tail}")
+    return f"{body}\n\n{url}"
 
 
 def resync_lead_followups(owner_id: str, lead_id: str, delay: float = 0) -> None:
@@ -2101,6 +2124,33 @@ async def _open_house_short(db: AsyncSession, visitor_id: Optional[str], fallbac
     return display_address(fallback)[1] or fallback
 
 
+async def open_house_followups_mode(db: AsyncSession, signin_id: Optional[str]) -> str:
+    """The open house's own follow-ups switch for this sign-in: 'on' | 'no_calendar' | 'off'."""
+    from app.models.database import OpenHouseVisitor
+    try:
+        visitor = await db.get(OpenHouseVisitor, signin_id) if signin_id else None
+        oh = await db.get(OpenHouseEvent, visitor.open_house_event_id) if visitor and visitor.open_house_event_id else None
+        return (getattr(oh, "followups_mode", None) or "on") if oh is not None else "on"
+    except Exception:  # noqa: BLE001 - never block a follow-up on this lookup
+        return "on"
+
+
+SIGNIN_FOLLOWUP_SOURCES = ("open_house_signin", "similar_homes_qr", "open_house_noted")
+
+
+async def resync_open_house_followups(db: AsyncSession, owner_id: str, open_house_id: str) -> int:
+    """Re-push (or take off) the calendar events of every open follow-up from this open house's
+    sign-ins, after its follow-ups switch changed. Returns how many were touched."""
+    from app.models.database import OpenHouseVisitor
+    from app.services import calendar_sync_service
+    ids = (await db.execute(select(AgentTask.id).join(OpenHouseVisitor, OpenHouseVisitor.id == AgentTask.auto_source_id).where(
+        AgentTask.owner_id == owner_id, AgentTask.auto_source.in_(SIGNIN_FOLLOWUP_SOURCES),
+        OpenHouseVisitor.open_house_event_id == open_house_id))).scalars().all()
+    for tid in ids:
+        calendar_sync_service.sync_task_bg(owner_id, tid)
+    return len(ids)
+
+
 def _tidy_context(s: str) -> str:
     from app.services.email_service import _tidy_subject
     return _tidy_subject(s)
@@ -2128,6 +2178,9 @@ async def create_open_house_followup(
     try:
         owner = await db.get(User, owner_id)
         if owner is None or not rule_enabled(owner, rule) or lead.represented == "yes":
+            return None
+        # The agent switched follow-ups off for this one open house (kit setting) - none at all.
+        if await open_house_followups_mode(db, signin_id) == "off":
             return None
         dedup_key = signin_id or f"lead:{lead.id}:{int(occurred_at.timestamp())}"
         existing = await db.execute(

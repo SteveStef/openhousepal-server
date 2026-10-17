@@ -441,6 +441,17 @@ async def _enrich(db: AsyncSession, owner_id: str, leads: List[Lead], lead_outs:
         logger.warning("email engagement lookup failed", exc_info=True)
         engagement = {}
     from app.services.lead_warmth import warmth as lead_warmth
+    # Newest note per lead. A guest with an agent never waits on the agent to open them (user,
+    # 10/17) - unless the agent left a note on them, which means "look at this one again".
+    note_rows = (await db.execute(
+        select(LeadNote.lead_id, func.max(LeadNote.created_at)).where(LeadNote.lead_id.in_([l.id for l in leads])).group_by(LeadNote.lead_id)
+    )).all() if leads else []
+    note_at = {lid: at for lid, at in note_rows}
+    for lead, lo in zip(leads, lead_outs):
+        lo.note_at = note_at.get(lead.id)
+        lo.has_note = lo.note_at is not None
+        if lead.represented == 'yes':
+            lo.needs_attention = bool(lo.note_at) and (lead.viewed_at is None or lead.viewed_at < lo.note_at)
     for lead, lo in zip(leads, lead_outs):
         lo.email_engagement = engagement.get((lead.email or '').lower()) if lead.email else None
         try:
@@ -669,7 +680,7 @@ async def export_leads_csv(
     if open_house_event_id:
         lead_outs = [l for l in lead_outs if any(oh.id == open_house_event_id for oh in l.open_houses)]
     lead_outs = _sort_leads(lead_outs, sort)
-    return _leads_csv(lead_outs)
+    return _leads_csv(lead_outs, await _notes_for(db, [l.id for l in lead_outs]))
 
 
 # Same words as the Leads page's "Came in from" filter (lib/leadActivity.ts ORIGIN_META).
@@ -681,6 +692,21 @@ class LeadExportRequest(BaseModel):
     # The leads on screen, in the order shown (the page filters and sorts itself).
     ids: List[str]
     hidden: bool = False
+
+
+@router.post("/mark-all-seen")
+async def mark_all_leads_seen(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """"Mark all seen" on the Leads page (user, 10/17): every lead's red "new since you last looked"
+    dot clears at once, as if each had been opened. Follow-ups and unhandled requests are NOT
+    touched - those stay until they're actually done."""
+    from sqlalchemy import update as _update
+    now = datetime.now(timezone.utc)
+    res = await db.execute(_update(Lead).where(Lead.owner_id == current_user.id).values(viewed_at=now))
+    await db.commit()
+    return {"success": True, "count": res.rowcount or 0}
 
 
 @router.post("/export.csv")
@@ -697,28 +723,82 @@ async def export_these_leads_csv(
     lead_outs = [_to_lead_out(l, collections) for l in leads]
     await _enrich(db, current_user.id, leads, lead_outs, collections)
     by_id = {l.id: l for l in lead_outs}
-    return _leads_csv([by_id[i] for i in body.ids if i in by_id])
+    picked = [by_id[i] for i in body.ids if i in by_id]
+    return _leads_csv(picked, await _notes_for(db, [l.id for l in picked]))
 
 
-def _leads_csv(lead_outs) -> StreamingResponse:
+_STATUS_WORDS = {'new': 'New', 'contacted': 'Contacted', 'in_talks': 'In talks', 'signed': 'Signed', 'hidden': 'Hidden', 'archived': 'Hidden'}
+
+
+def _csv_when(d) -> str:
+    """Eastern time, the way a spreadsheet / CRM import reads it: 2026-10-17 14:05."""
+    if not d:
+        return ''
+    from app.services.tasks_service import EASTERN
+    return d.astimezone(EASTERN).strftime('%Y-%m-%d %H:%M')
+
+
+def _csv_phone(p: Optional[str]) -> str:
+    digits = ''.join(ch for ch in (p or '') if ch.isdigit())
+    if len(digits) == 11 and digits.startswith('1'):
+        digits = digits[1:]
+    return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}" if len(digits) == 10 else (p or '')
+
+
+def _leads_csv(lead_outs, notes: Optional[Dict[str, List[str]]] = None) -> StreamingResponse:
+    """Columns in the order real-estate CRMs (Follow Up Boss, kvCORE, Lofty, Sierra...) expect on
+    import - First Name, Last Name, Email, Phone first, then source, status, the home and notes.
+    UTF-8 with a BOM so Excel shows accented names correctly."""
     buffer = io.StringIO()
+    buffer.write('\ufeff')
     writer = _SafeCsv(csv.writer(buffer))
-    writer.writerow(['Name', 'Email', 'Phone', 'Came In From', 'Came In', 'Status', 'Represented', 'Property', 'Tags', 'Created At',
-                     'Last Contacted', 'Latest Activity', 'Latest Activity At', 'Needs'])
+    writer.writerow(['First Name', 'Last Name', 'Email', 'Phone', 'Lead Source', 'Source Detail', 'Status', 'Has Agent',
+                     'Property Address', 'Open Houses Attended', 'Tags', 'Notes', 'Date Added', 'Last Contacted',
+                     'Latest Activity', 'Latest Activity Date', 'Warmth (0-100)', 'Emails', 'Needs Attention'])
     for lead in lead_outs:
+        parts = (lead.name or '').strip().split()
+        first, last = (parts[0], ' '.join(parts[1:])) if parts else ('', '')
+        email_state = ('Unsubscribed' if lead.unsubscribed else
+                       {'weekly': 'Weekly only', 'off': 'Paused'}.get(((lead.email_engagement or {}).get('mode') or ''), 'Receiving'))
         writer.writerow([
-            lead.name or '', lead.email or '', lead.phone or '', _ORIGIN_LABELS.get(lead.origin_group or 'other', 'Other'), lead.origin.label if lead.origin else '',
-            lead.status, lead.represented, lead.property_address or '', ', '.join(lead.tags), lead.created_at.isoformat(),
-            lead.last_contacted_at.isoformat() if lead.last_contacted_at else '',
-            lead.latest.label if lead.latest else '', lead.latest.at.isoformat() if lead.latest else '',
+            first.title() if first.islower() else first, last.title() if last.islower() else last,
+            lead.email or '', _csv_phone(lead.phone),
+            'OpenHousePal - ' + _ORIGIN_LABELS.get(lead.origin_group or 'other', 'Other'),
+            lead.origin.label if lead.origin else '',
+            _STATUS_WORDS.get(lead.status, (lead.status or '').title()),
+            {'yes': 'Yes', 'no': 'No'}.get(lead.represented, 'Unknown'),
+            lead.property_address or '',
+            '; '.join(f"{oh.address or 'Open house'} ({oh.created_at.astimezone().strftime('%Y-%m-%d')})" for oh in (lead.open_houses or [])),
+            ', '.join(lead.tags or []),
+            ' | '.join((notes or {}).get(lead.id, []) or ([lead.notes] if lead.notes else [])),
+            _csv_when(lead.created_at), _csv_when(lead.last_contacted_at),
+            lead.latest.label if lead.latest else '', _csv_when(lead.latest.at) if lead.latest else '',
+            lead.warmth if lead.warmth is not None else '',
+            email_state,
             '; '.join(t.label for t in lead.todos if t.urgent),
         ])
     buffer.seek(0)
+    from app.services.tasks_service import EASTERN
+    stamp = datetime.now(EASTERN).strftime('%Y-%m-%d')
     return StreamingResponse(
         iter([buffer.getvalue()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=leads.csv"},
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename=openhousepal-leads-{stamp}.csv"},
     )
+
+
+async def _notes_for(db: AsyncSession, lead_ids: List[str]) -> Dict[str, List[str]]:
+    """Every note on these leads, newest first (what the agent wrote on their profile / visitor list)."""
+    if not lead_ids:
+        return {}
+    rows = (await db.execute(
+        select(LeadNote.lead_id, LeadNote.text).where(LeadNote.lead_id.in_(lead_ids)).order_by(LeadNote.created_at.desc())
+    )).all()
+    out: Dict[str, List[str]] = {}
+    for lid, text in rows:
+        if (text or '').strip():
+            out.setdefault(lid, []).append(' '.join(text.split()))
+    return out
 
 
 @router.get("/open-houses/history", response_model=List[LeadOpenHouseOut])

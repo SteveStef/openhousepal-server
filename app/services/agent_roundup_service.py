@@ -49,6 +49,7 @@ def nice_street(v: Optional[str], city: Optional[str] = None) -> str:
     v = re.sub(r"[\s,]+[A-Za-z]{2}[\s,]+\d{5}(?:-\d{4})?$", "", v)       # " PA 19010" / ", PA, 19010"
     if city and v.lower().endswith(" " + city.strip().lower()):
         v = v[: -len(city.strip())].rstrip(" ,")                         # " BRYN MAWR"
+    v = re.sub(r"\s*(?:#|apt\.?|unit|ste\.?|suite)\s*$", "", v, flags=re.I)  # an empty unit: "1330 N Avignon Dr #"
     return v.title() if v and v == v.upper() else v
 
 

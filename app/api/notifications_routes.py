@@ -248,3 +248,54 @@ async def update_notification_preferences(
         logger.error("saving notification preferences failed", extra={"error": str(e)})
         await db.rollback()
         raise HTTPException(status_code=500, detail="Failed to save notification preferences")
+
+
+# ---------------------------------------------------------------- Studio -> Email (one agent's own settings)
+
+async def _email_settings_payload(db: AsyncSession, user: User) -> dict:
+    from app.models.database import MailConnection
+    from app.services import email_settings_service as es
+    conn = (await db.execute(select(MailConnection).where(MailConnection.owner_id == user.id))).scalar_one_or_none()
+    connected = bool(conn and conn.enabled and conn.account_email and conn.status == "ok")
+    s = es.resolve(user.email_settings)
+    prefs = notification_preferences_service.resolve_prefs(user.notification_prefs)
+    cats = {c["id"]: c for c in notification_preferences_service.categories_payload()}
+    return {
+        "client": [{k: v for k, v in {**c, **s["client"][c["key"]]}.items() if k != "templates"} for c in es.CLIENT_EMAILS],
+        "invite_delay": s["invite_delay"], "invite_delays": list(es.INVITE_DELAYS),
+        "briefing_time": s["briefing_time"], "briefing_times": list(es.BRIEFING_TIMES),
+        "mailbox": {"connected": connected, "account_email": conn.account_email if conn else None,
+                    "provider": conn.provider if conn else None, "status": conn.status if conn else None},
+        "receive": [{**t, "categories": [{**cats[c], "email": prefs[c]["email"]} for c in t["categories"] if c in cats]} for t in es.RECEIVE_TIERS],
+        "always_on": es.ALWAYS_ON,
+    }
+
+
+@router.get("/api/v1/email-settings")
+async def get_email_settings(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    """Everything on Studio -> Email for the signed-in agent only."""
+    return await _email_settings_payload(db, current_user)
+
+
+@router.put("/api/v1/email-settings")
+async def update_email_settings(payload: dict, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    """Partial update: {client: {key: {on, via, mode}}, invite_delay, briefing_time, receive: {category: bool}}.
+    Saved on this agent's own account; nothing here can add emails beyond the defaults."""
+    from app.services import email_settings_service as es
+    try:
+        user = await db.get(User, current_user.id)
+        user.email_settings = es.sanitize(payload, user.email_settings)
+        receive = payload.get("receive") if isinstance(payload, dict) else None
+        if isinstance(receive, dict) and receive:
+            current = notification_preferences_service.resolve_prefs(user.notification_prefs)
+            for cat_id, on in receive.items():
+                if cat_id in current and isinstance(on, bool):
+                    current[cat_id]["email"] = on
+            user.notification_prefs = notification_preferences_service.sanitize_incoming(current)
+        await db.commit()
+        await db.refresh(user)
+        return await _email_settings_payload(db, user)
+    except Exception as e:
+        logger.error("saving email settings failed", extra={"error": str(e)})
+        await db.rollback()
+        raise HTTPException(status_code=500, detail="Couldn't save your email settings - please try again.")

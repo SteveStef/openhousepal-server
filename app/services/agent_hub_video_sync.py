@@ -26,9 +26,25 @@ SYNC_EVERY = timedelta(hours=24)
 _in_flight: set[str] = set()
 
 
+def channel_url(config: Optional[dict]) -> str:
+    """The agent's YouTube channel: the link in Agent Hub -> Videos, else the YouTube link they gave
+    in setup / Social Links (user, 10/17: "we ask for the channel in sign-up - pull it from there")
+    when it's a channel address (youtube.com/@name, /channel/..., /c/..., /user/...)."""
+    cfg = config or {}
+    url = str(cfg.get("videoChannelUrl") or "").strip()
+    if url:
+        return url
+    for link in cfg.get("socialLinks") or []:
+        if isinstance(link, dict) and link.get("id") == "youtube":
+            u = str(link.get("url") or "").strip()
+            if "youtube.com/" in u and any(k in u for k in ("/@", "/channel/", "/c/", "/user/")):
+                return u if u.startswith("http") else f"https://{u.lstrip('/')}"
+    return ""
+
+
 def wants_sync(config: Optional[dict], force: bool = False) -> bool:
     cfg = config or {}
-    if cfg.get("videoAutoSync") is False or not str(cfg.get("videoChannelUrl") or "").strip():
+    if cfg.get("videoAutoSync") is False or not channel_url(cfg):
         return False
     if force:
         return True
@@ -75,7 +91,7 @@ async def sync_hub_videos(db, hub: AgentHub, force: bool = False) -> Optional[in
     if not wants_sync(cfg, force):
         return None
     try:
-        fetched = await fetch_channel_videos(str(cfg["videoChannelUrl"]).strip())
+        fetched = await fetch_channel_videos(channel_url(cfg))
     except Exception as exc:  # noqa: BLE001 - YouTube being unreachable must never break a hub
         logger.warning("agent hub video sync failed", extra={"hub_id": hub.id, "error": str(exc)})
         return None

@@ -83,7 +83,7 @@ class EmailSchedulerService:
                         )
                         if track_id:
                             from app.services.client_email_service import after_send
-                            await after_send(track_id, status_code == 200, "mailbox" if sent else "openhousepal")
+                            await after_send(track_id, status_code == 200, "mailbox" if sent else "openhousepal", code=status_code, detail=response_text)
                         
                         if status_code == 200:
                             email_record.status = "SENT"

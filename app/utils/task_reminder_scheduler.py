@@ -16,7 +16,8 @@ Every minute it also sends any roll-ups that are due (agent_roundup_service): th
 email and each open house's wrap-up (2 hours after its last sign-in).
 
 And once each afternoon (4:30 PM Eastern) it sends the Showcase daily digest - every new match and
-price drop of the day in one email per buyer and one per agent (showcase_digest_service).
+price drop of the day in one email per buyer (showcase_digest_service); each agent's daily briefing goes
+out at the time they picked in Studio -> Email (4:30 PM by default).
 """
 from datetime import date, datetime
 
@@ -70,13 +71,17 @@ async def scheduled_task_reminders():
                 await send_weekly_reports(db)  # agents: the Monday Spotlight report (8 AM)
             except Exception:
                 logger.error("spotlight alerts / weekly report failed", exc_info=True)
-            if _last_digest != local.date():
-                from app.services.showcase_digest_service import is_digest_time, send_showcase_digests
-                if is_digest_time():
-                    _last_digest = local.date()
-                    try:
-                        await send_showcase_digests(db)
-                    except Exception:
-                        logger.error("showcase daily digest failed", exc_info=True)
+            from app.services.showcase_digest_service import is_digest_time, send_agent_briefings, send_showcase_digests
+            if _last_digest != local.date() and is_digest_time():
+                _last_digest = local.date()
+                try:
+                    await send_showcase_digests(db)   # buyers' 4:30 emails (+ any briefings due)
+                except Exception:
+                    logger.error("showcase daily digest failed", exc_info=True)
+            else:
+                try:
+                    await send_agent_briefings(db)    # each agent at the time they picked
+                except Exception:
+                    logger.error("daily briefings failed", exc_info=True)
     except Exception as e:
         logger.error("Scheduled task reminders failed", exc_info=True, extra={"error": str(e)})

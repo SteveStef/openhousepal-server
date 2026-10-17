@@ -2,6 +2,7 @@ import os
 import re
 import httpx
 import json
+from email.utils import formataddr
 from typing import Tuple, Optional, Dict, Any
 from dotenv import load_dotenv
 from app.config.logging import get_logger
@@ -122,7 +123,9 @@ def _tidy_subject(subject: str) -> str:
     # with the town/state after it ("..., WAYNE, PA 19087") and numbered streets ("N 5TH ST")
     word = r"(?:\d+(?:ST|ND|RD|TH)\b|[A-Z][A-Z0-9'.#-]*|#?\d+[A-Z]?)"
     pattern = rf"\b\d+[A-Z]{{0,2}}(?:\s+{word})+(?:,\s*[A-Z][A-Z'.-]*(?:\s+[A-Z][A-Z'.-]*)*)*(?:\s+\d{{5}})?"
-    return re.sub(pattern, lambda m: tidy_caps(m.group(0)), subject or "")
+    out = re.sub(pattern, lambda m: tidy_caps(m.group(0)), subject or "")
+    # an empty unit number from the MLS: "1330 N Avignon Dr #, Gladwyne" -> "1330 N Avignon Dr, Gladwyne"
+    return re.sub(r"\s+#(?=\s*(?:,|$|\s-\s|\)))", "", out)
 
 
 def _secure_urls(value):
@@ -156,6 +159,21 @@ def unsubscribe_headers(template: str, to_email: str, template_variables: Dict[s
     if template in OWN_UNSUBSCRIBE_TEMPLATES and template_variables.get("unsubscribe_url"):
         return {"List-Unsubscribe": f"<{template_variables['unsubscribe_url']}>"}
     return {}
+
+
+def sender_address(configured: Optional[str]) -> str:
+    """MAILGUN_FROM may be a bare address or "OpenHousePal <noreply@mg...>" - always the bare address,
+    so "{name} <{MAILGUN_FROM}>" can never become the invalid "Name <OpenHousePal <noreply@...>>"."""
+    from email.utils import parseaddr
+    return parseaddr(configured or "")[1] or (configured or "").strip()
+
+
+def agent_sender_address(agent_name: str, fallback: str) -> str:
+    """"Peter Stefanatos" + "noreply@mg.openhousepal.com" -> "peter.stefanatos@mg.openhousepal.com"."""
+    import re as _re
+    domain = fallback.split("@")[-1] if "@" in fallback else ""
+    local = _re.sub(r"[^a-z0-9]+", ".", (agent_name or "").lower()).strip(".")[:48]
+    return f"{local}@{domain}" if local and domain else fallback
 
 
 class EmailService:
@@ -207,19 +225,31 @@ class EmailService:
             agent_name = template_variables.get("agent_name")
             from_name = from_name or (f"{agent_name}" if agent_name else "OpenHousePal")
             
+            from_addr = sender_address(self.mailgun_from)
+            from app.services.personal_email_service import PERSONAL_TEMPLATES
+            if template in PERSONAL_TEMPLATES and template_variables.get("agent_name"):
+                # A personal note reads as one: "Peter Stefanatos <peter.stefanatos@mg...>", not "noreply@".
+                from_addr = agent_sender_address(template_variables["agent_name"], from_addr)
             data = {
-                "from": f"{from_name} <{self.mailgun_from}>",
+                "from": formataddr((from_name, from_addr)),
                 "to": to_email,
                 "subject": subject,
-                "template": mailgun_template_name(template),
-                # Plain-text part rendered from the same template by Mailgun. It used to be one
-                # generic "You have a new update regarding your showcase" text for EVERY email -
-                # including sign-up codes (no code in it) and password resets.
-                "t:text": "yes",
-                "t:variables": json.dumps(template_variables),
                 "o:tag": template,
                 "o:tracking": "no",
             }
+            if template in PERSONAL_TEMPLATES:
+                from app.services.personal_email_service import render as render_personal
+                link = template_variables.get("showcase_link") or template_variables.get("collection_link") or ""
+                data["subject"], data["html"], data["text"] = render_personal(template, subject, template_variables, link=link)
+            else:
+                data.update({
+                    "template": mailgun_template_name(template),
+                    # Plain-text part rendered from the same template by Mailgun. It used to be one
+                    # generic "You have a new update regarding your showcase" text for EVERY email -
+                    # including sign-up codes (no code in it) and password resets.
+                    "t:text": "yes",
+                    "t:variables": json.dumps(template_variables),
+                })
             if track_id:
                 data["v:ce"] = track_id   # comes back on Mailgun's bounce / complaint webhooks
             from urllib.parse import quote
@@ -274,7 +304,7 @@ class EmailService:
 
         try:
             data = {
-                "from": f"{from_name} <{self.mailgun_from}>" if from_name else f"OpenHousePal <{self.mailgun_from}>",
+                "from": formataddr((from_name or "OpenHousePal", sender_address(self.mailgun_from))),
                 "to": to_email,
                 "subject": subject,
                 "text": text,

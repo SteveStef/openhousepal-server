@@ -297,9 +297,9 @@ def _frontend_settings_url(status: str, back: str = "settings") -> str:
     if back == "mail-setup":
         return f"{base}/settings/connected?what=email&status={status}"
     if back == "mail-settings":
-        return f"{base}/studio/integrations?mailbox={status}#send-as"
+        return f"{base}/studio/email?mailbox={status}"
     if back == "mail-emails":
-        return f"{base}/leads/emails?tab=sender&mailbox={status}"
+        return f"{base}/studio/email?mailbox={status}"
     if back == "setup":
         return f"{base}/settings/connected?what=calendar&status={status}"
     return f"{base}/settings?calendar={status}#calendar"

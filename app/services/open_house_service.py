@@ -211,6 +211,15 @@ class OpenHouseService:
                 hosting_agent = (await db.execute(select(User).where(User.id == oh_event.agent_id))).scalar_one_or_none()
             agent_name = f"{hosting_agent.first_name or ''} {hosting_agent.last_name or ''}".strip() if hosting_agent else ""
             agent_email = (hosting_agent.email or "") if hosting_agent else ""
+            # The agent's Studio -> Email settings: invite off = the Showcase is still built, no email;
+            # "sooner" = 0 / 15 / 30 min instead of the 1-hour default (only for the live sign-in -
+            # a backfill's few minutes stay as they are).
+            from app.services.email_settings_service import DEFAULT_INVITE_DELAY, client_rule, invite_delay_minutes
+            rule = client_rule(hosting_agent, "visitor_confirmation")
+            if rule is not None and not rule["on"]:
+                return collection_result
+            if hosting_agent is not None and send_after == timedelta(minutes=DEFAULT_INVITE_DELAY):
+                send_after = timedelta(minutes=invite_delay_minutes(hosting_agent))
 
             # IDX hosts get the showcase link on their own domain, same as the sign-in QR code.
             base_url = await resolve_owner_public_base_url(db, hosting_agent) if hosting_agent else os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
@@ -218,7 +227,9 @@ class OpenHouseService:
 
             count = collection_result.get('properties_added', 0)
             prop_addr = property_data.get('address', 'the open house')
-            subject = f"{agent_name} shared {count} homes you might like near {prop_addr}" if agent_name else f"Your collection: {count} homes near {prop_addr}"
+            # Reads like a person's follow-up, not a campaign (personal_email_service).
+            street = " ".join(str(prop_addr or "").split(",")[0].split())
+            subject = f"Following up from the open house at {street}" if street else "Following up from the open house"
 
             db.add(ScheduledEmail(
                 recipient_email=visitor.email,

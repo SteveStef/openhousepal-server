@@ -26,6 +26,9 @@ from app.services import email_signature_service
 from app.services import blog_neighborhoods
 from app.services.website import content_adapters, domain_resolution_service
 from app.utils.request_ip import get_client_ip as _client_ip
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/public/sites", tags=["website-builder-public"])
 
@@ -349,6 +352,14 @@ async def list_site_blog_posts(site_id: str, limit: int = Query(20, ge=1, le=50)
     }
 
 
+async def _site_blog_blocks(db: AsyncSession, blocks) -> list:
+    from app.services.ai import ai_blog_writer_service
+    try:
+        return await ai_blog_writer_service.fill_spotlight_photos(db, blocks or [])
+    except Exception:
+        return blocks or []
+
+
 @router.get("/{site_id}/blog/{slug}")
 async def get_site_blog_post(site_id: str, slug: str, db: AsyncSession = Depends(get_db)):
     owner = await _published_site_owner(db, site_id)
@@ -366,7 +377,7 @@ async def get_site_blog_post(site_id: str, slug: str, db: AsyncSession = Depends
         "cover_image_url": post.cover_image_url,
         "category": post.category,
         "theme": post.theme,
-        "blocks": post.blocks,
+        "blocks": await _site_blog_blocks(db, post.blocks),
         "seo_title": post.seo_title,
         "meta_description": post.meta_description,
         "published_at": post.published_at.isoformat() if post.published_at else None,
@@ -598,6 +609,52 @@ async def compare_site_areas(
     return {"areas": compared}
 
 
+async def _related_for(db: AsyncSession, owner_id: str, area_id: str):
+    user = await db.get(User, owner_id)
+    return await content_adapters.get_area_related(db, user, area_id, limit=3) if user else []
+
+
+async def warm_area_caches() -> None:
+    """After a restart: compute every published site's town-page numbers once, quietly in the
+    background, so the first visitor to each town page isn't the one who waits (see
+    content_adapters.cached_market)."""
+    import asyncio as _asyncio
+    from app.database import AsyncSessionLocal
+    try:
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(
+                select(Site.owner_id, MarketArea)
+                .join(AgentMarketArea, AgentMarketArea.owner_id == Site.owner_id)
+                .join(MarketArea, MarketArea.id == AgentMarketArea.area_id)
+                .where(Site.status == "PUBLISHED", Site.is_enabled.isnot(False))
+            )).all()
+        done = set()
+        for owner_id, area in rows:
+            if area.id in done:
+                continue
+            done.add(area.id)
+            scope = geography.scope_for_market_area(area)
+            facts = dict(area.facts or {})
+            districts = [d.get("name") for d in (facts.get("public_schools") or {}).get("districts") or [] if isinstance(d, dict)]
+            for key, make in (
+                (f"stats:{area.id}", lambda d: content_adapters.get_area_live_market_stats(d, scope, facts.get("market_stats"))),
+                (f"trends:{area.id}", lambda d: market_stats_service.get_area_market_trends(d, scope)),
+                (f"msales:{area.id}", lambda d: content_adapters.get_area_recent_market_sales(d, scope, 6)),
+                (f"insights:{area.id}", lambda d: market_insights_service.get_area_insights(d, scope, districts)),
+                (f"munis:{area.id}", lambda d: market_insights_service.get_area_municipalities(d, scope)),
+                (f"related:{owner_id}:{area.id}", lambda d: _related_for(d, owner_id, area.id)),
+            ):
+                try:
+                    async with AsyncSessionLocal() as d:
+                        content_adapters._market_store(key, await make(d))
+                except Exception:
+                    logger.warning("area cache warm failed", extra={"key": key}, exc_info=True)
+                await _asyncio.sleep(0.2)  # gentle on the database
+        logger.info("area caches warmed", extra={"areas": len(done)})
+    except Exception:
+        logger.warning("area cache warm-up failed", exc_info=True)
+
+
 @router.get("/{site_id}/areas/{slug}")
 async def get_site_area(site_id: str, slug: str, db: AsyncSession = Depends(get_db)):
     """A community page (/villanova-pa) - real shared Area facts/narrative, the broader current
@@ -617,7 +674,7 @@ async def get_site_area(site_id: str, slug: str, db: AsyncSession = Depends(get_
     if "photos" in facts:
         facts["photos"] = content_adapters.resolve_photo_urls(facts["photos"])
     stats_seed = facts.get("market_stats")
-    facts["market_stats"] = await content_adapters.cached_market(f"stats:{area.id}", lambda: content_adapters.get_area_live_market_stats(db, area_scope, stats_seed))
+    facts["market_stats"] = await content_adapters.cached_market(f"stats:{area.id}", lambda d: content_adapters.get_area_live_market_stats(d, area_scope, stats_seed), db)
     # Districts checked against what Bright says about this town's homes (see reconcile_public_schools).
     if facts.get("public_schools"):
         facts["public_schools"] = await content_adapters.reconcile_public_schools(db, area, area_scope)
@@ -640,18 +697,18 @@ async def get_site_area(site_id: str, slug: str, db: AsyncSession = Depends(get_
         "my_listings": await content_adapters.get_active_listings(db, user, 6, area_scope=area_scope),
         "sales": await content_adapters.get_recent_sales(db, user, 6, area_scope=area_scope),
         "open_houses": await content_adapters.get_open_houses(db, user, 4, area_scope=area_scope),
-        "related_areas": await content_adapters.cached_market(f"related:{user.id}:{area.id}", lambda: content_adapters.get_area_related(db, user, area.id, limit=3)),
+        "related_areas": await content_adapters.cached_market(f"related:{user.id}:{area.id}", lambda d: content_adapters.get_area_related(d, user, area.id, limit=3), db),
         # Live market trends (12 months of closed sales, what's for sale now) and the latest
         # closed sales across the whole MLS - see market_stats_service.get_area_market_trends.
-        "market_trends": await content_adapters.cached_market(f"trends:{area.id}", lambda: market_stats_service.get_area_market_trends(db, area_scope)),
-        "market_sales": await content_adapters.cached_market(f"msales:{area.id}", lambda: content_adapters.get_area_recent_market_sales(db, area_scope, 6)),
+        "market_trends": await content_adapters.cached_market(f"trends:{area.id}", lambda d: market_stats_service.get_area_market_trends(d, area_scope), db),
+        "market_sales": await content_adapters.cached_market(f"msales:{area.id}", lambda d: content_adapters.get_area_recent_market_sales(d, area_scope, 6), db),
         # What your money buys / buyer's-or-seller's market / taxes per sq ft (market_insights_service).
-        "insights": await content_adapters.cached_market(f"insights:{area.id}", lambda: market_insights_service.get_area_insights(
-            db, area_scope, [d.get("name") for d in (facts.get("public_schools") or {}).get("districts") or [] if isinstance(d, dict)])),
+        "insights": await content_adapters.cached_market(f"insights:{area.id}", lambda d: market_insights_service.get_area_insights(
+            d, area_scope, [x.get("name") for x in (facts.get("public_schools") or {}).get("districts") or [] if isinstance(x, dict)]), db),
         # Which townships this mailing-address town actually spans (Haverford: Lower Merion 67%, Haverford 33%).
         # Real Census borders when the town map has been built (town_map_service), else the MLS field.
         "municipalities": [{"name": m["name"], "share": m["share"]} for m in ((facts.get("boundaries") or {}).get("municipalities") or [])]
-        or await content_adapters.cached_market(f"munis:{area.id}", lambda: market_insights_service.get_area_municipalities(db, area_scope)),
+        or await content_adapters.cached_market(f"munis:{area.id}", lambda d: market_insights_service.get_area_municipalities(d, area_scope), db),
     }
 
 

@@ -195,6 +195,24 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
+    # Claude health check: a tiny real request a minute after every start (= every deploy) and every
+    # 30 minutes - if the AI library or key breaks, the admin hears about it before an agent does.
+    from datetime import datetime as _dt, timedelta as _td
+    from apscheduler.triggers.interval import IntervalTrigger as _Interval
+    from app.services.ai.ai_health_check import scheduled_ai_health_check
+    scheduler.add_job(
+        scheduled_ai_health_check,
+        _Interval(minutes=30, start_date=_dt.now() + _td(minutes=1)),
+        id="ai_health_check",
+        name="Claude AI health check",
+        replace_existing=True,
+    )
+    # Town pages: compute every published site's market numbers once, 90 s after start, so the first
+    # visitor after a deploy doesn't wait on them (public_site_routes.warm_area_caches).
+    from apscheduler.triggers.date import DateTrigger as _Once
+    from app.api.public_site_routes import warm_area_caches
+    scheduler.add_job(warm_area_caches, _Once(run_date=_dt.now() + _td(seconds=90)), id="warm_area_caches", name="Warm town-page caches", replace_existing=True)
+
     # DISABLE_SCHEDULER=true for a second local/test copy of the API, so it never repeats the
     # real server's jobs (MLS sync, reminder emails, digests...).
     if os.getenv("DISABLE_SCHEDULER", "false").lower() == "true":

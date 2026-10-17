@@ -55,6 +55,8 @@ class OpenHouseCreateRequest(BaseModel):
     auto_showcase: Optional[bool] = None
     similar_homes: Optional[bool] = None
     guest_pass: Optional[bool] = None
+    # 'on' | 'no_calendar' (follow-ups kept off the calendar) | 'off' (no follow-ups for this open house)
+    followups_mode: Optional[Literal["on", "no_calendar", "off"]] = None
 
     @field_validator("address", "cover_image_url", "open_house_event_id", "qr_code_url", mode="before")
     @classmethod
@@ -97,6 +99,7 @@ class OpenHouseResponse(BaseModel):
     share_guests_with_listing_agent: bool = False
     auto_showcase: bool = True
     similar_homes: bool = True
+    followups_mode: str = 'on'
     after_signin: Optional[str] = None
     guest_pass: bool = True
     pass_signature: bool = True
@@ -154,6 +157,7 @@ class GuestSettingsUpdate(BaseModel):
     guest_pass: Optional[bool] = None
     pass_signature: Optional[bool] = None
     after_signin: Optional[Literal["hub", "none"]] = None
+    followups_mode: Optional[Literal["on", "no_calendar", "off"]] = None
 
 class OpenHouseSnapshotUpdate(BaseModel):
     similar_properties_snapshot: List[Dict[str, Any]]
