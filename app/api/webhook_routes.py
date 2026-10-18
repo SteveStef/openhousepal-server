@@ -25,6 +25,15 @@ PAYPAL_WEBHOOK_ID = os.getenv("PAYPAL_WEBHOOK_ID")
 _INBOUND_RECIPIENT_RE = re.compile(r"leads-([A-Za-z0-9]+)@", re.I)
 
 
+def inbound_route_key() -> str:
+    """The secret on the Mailgun route's forward URL (?k=...) - derived from the Mailgun API key the
+    server already has, so no extra setting is needed. Mailgun signs route forwards with its
+    separate "HTTP webhook signing key", which this server may not have; the route secret lets the
+    lead in either way."""
+    api_key = os.getenv("MAILGUN_API_KEY") or ""
+    return hmac.new(api_key.encode(), b"ohp-inbound-route", hashlib.sha256).hexdigest()[:40] if api_key else ""
+
+
 def _verify_mailgun_inbound(form: dict) -> bool:
     """Mailgun signs inbound POSTs: hex HMAC-SHA256 of (timestamp + token). Newer Mailgun accounts
     sign with the separate "HTTP webhook signing key", older ones with the API key - accept a
@@ -501,7 +510,9 @@ async def handle_inbound_email(request: Request, db: AsyncSession = Depends(get_
         logger.warning("inbound-email: could not read form body")
         return {"status": "bad_request"}
 
-    if not _verify_mailgun_inbound(form):
+    route_key = inbound_route_key()
+    from_our_route = bool(route_key) and hmac.compare_digest(request.query_params.get("k", ""), route_key)
+    if not from_our_route and not _verify_mailgun_inbound(form):
         logger.warning("inbound-email: signature verification failed")
         return {"status": "unauthorized"}
 

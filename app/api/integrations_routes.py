@@ -32,7 +32,9 @@ from app.utils.auth import get_current_active_user
 
 router = APIRouter(prefix="/integrations", tags=["integrations"])
 
-INBOUND_LEAD_DOMAIN = os.getenv("INBOUND_LEAD_DOMAIN", "parse.openhousepal.com")
+# mg.openhousepal.com already receives mail (Mailgun MX); a Mailgun route sends leads-*@ to
+# /webhooks/inbound-email (10/18 - parse.openhousepal.com never had mail DNS, so every lead bounced).
+INBOUND_LEAD_DOMAIN = os.getenv("INBOUND_LEAD_DOMAIN", "mg.openhousepal.com")
 _STATE_TTL = 600  # seconds an OAuth `state` value stays valid
 
 
