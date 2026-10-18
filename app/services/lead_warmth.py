@@ -27,7 +27,7 @@ from typing import Iterable, Optional
 WEIGHTS: dict[str, float] = {
     'property_tour': 6, 'property_website_tour_request': 6, 'property_page_tour_request': 6,
     'open_house_second_visit': 6, 'open_house_disclosure': 5,
-    'property_website_inquiry': 5, 'property_page_inquiry': 5, 'blog_inquiry': 4, 'portal_lead': 4,
+    'property_website_inquiry': 5, 'property_page_inquiry': 5, 'blog_inquiry': 4, 'portal_lead': 4, 'website_google_signin': 2,
     'form_submission': 4, 'open_house_visitor': 4, 'property_comment': 3,
     'showcase_like': 2, 'showcase_refine': 2, 'showcase_search_changed': 2, 'email_clicked': 2,
     'showcase_view': 1, 'collection_visitor': 1, 'showcase_dislike': 1, 'email_opened': 1, 'form_partial': 1,
@@ -69,7 +69,7 @@ _NOUN: dict[str, tuple[str, str]] = {
     'property_page_tour_request': ('showing request', 'showing requests'), 'open_house_second_visit': ('second-visit request', 'second-visit requests'),
     'open_house_visitor': ('open house sign-in', 'open house sign-ins'), 'open_house_disclosure': ('disclosure request', 'disclosure requests'),
     'property_website_inquiry': ('listing question', 'listing questions'), 'property_page_inquiry': ('listing question', 'listing questions'),
-    'blog_inquiry': ('blog question', 'blog questions'), 'portal_lead': ('portal inquiry', 'portal inquiries'),
+    'blog_inquiry': ('blog question', 'blog questions'), 'website_google_signin': ('website sign-in', 'website sign-ins'), 'portal_lead': ('portal inquiry', 'portal inquiries'),
     'showcase_refine': ('search change', 'search changes'), 'showcase_search_changed': ('search change', 'search changes'),
     'showcase_dislike': ('home passed on', 'homes passed on'), 'form_partial': ('form started', 'forms started'),
     'review_left': ('review', 'reviews'),

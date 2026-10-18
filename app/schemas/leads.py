@@ -12,6 +12,8 @@ LeadSourceType = Literal[
     'portal_lead', 'form_partial',
     'property_page_inquiry', 'property_page_tour_request',
     'blog_inquiry',
+    # Google One Tap on the agent's IDX website (google_visitor_service).
+    'website_google_signin',
     # Done inside their Showcase / elsewhere - logged by leads_service.log_activity.
     'showcase_like', 'showcase_dislike', 'showcase_view', 'showcase_refine', 'showcase_search_changed',
     'showcase_emails_off', 'showcase_emails_on', 'email_unsubscribed', 'review_left',

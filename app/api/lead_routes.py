@@ -41,7 +41,7 @@ def _categorize_source(source_type: str, raw_snapshot: Optional[dict]) -> LeadSo
         return 'form'
     if source_type in ('open_house_second_visit', 'property_tour', 'property_website_tour_request', 'property_page_tour_request'):
         return 'tour'
-    if source_type in ('property_website_inquiry', 'portal_lead', 'property_page_inquiry', 'blog_inquiry'):
+    if source_type in ('property_website_inquiry', 'portal_lead', 'property_page_inquiry', 'blog_inquiry', 'website_google_signin'):
         return 'website'
     # property_comment, collection_visitor - actual engagement with an existing showcase
     return 'showcase'
@@ -61,7 +61,7 @@ def _origin_group(e: LeadEvent) -> str:
         return 'listings'
     if st in ('property_page_inquiry', 'property_page_tour_request'):
         return 'website' if came.get('src') == 'site' else 'listings'
-    if st == 'blog_inquiry':
+    if st in ('blog_inquiry', 'website_google_signin'):
         return 'website'
     if st == 'portal_lead':
         return 'portal'

@@ -944,6 +944,90 @@ class SiteAskRequest(BaseModel):
     came_from: Optional[dict] = None
 
 
+class GoogleVisitorRequest(BaseModel):
+    credential: str
+    page_url: Optional[str] = None
+    listing_key: Optional[str] = None
+    address: Optional[str] = None
+
+
+@router.get("/{site_id}/google-visitor")
+async def google_visitor_config(site_id: str, db: AsyncSession = Depends(get_db)):
+    """What the One Tap frame needs: the Google client id (null = One Tap off for this site)."""
+    from app.services import google_visitor_service as gv
+    if not await _published_site_owner(db, site_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Site not found.")
+    return {"client_id": gv.client_id()}
+
+
+@router.post("/{site_id}/google-visitor")
+async def google_visitor_signin(site_id: str, payload: GoogleVisitorRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    """A visitor tapped "Continue as ..." in Google One Tap on this agent's website (user, 10/18).
+    Google's token is checked with Google; the person becomes (or is added to) the agent's lead,
+    and the agent hears about a NEW person once (a repeat sign-in only adds a line, at most every
+    12 hours). Returns just the name + email the site uses to fill in its forms."""
+    from datetime import timedelta
+    from app.services.public_rate_limit import check_public_submit
+    from app.services import google_visitor_service as gv, leads_service
+    from app.services.agent_email_service import absolute, email_agent
+    from app.models.database import Lead, LeadEvent, Notification
+    check_public_submit(request)
+    owner = await _published_site_owner(db, site_id)
+    if not owner:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Site not found.")
+    _site, user = owner
+    person = await gv.verify_credential(payload.credential)
+    if not person:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Google couldn't confirm that sign-in.")
+    email = person["email"]
+    name = person["name"] or " ".join(x for x in (person["given_name"], person["family_name"]) if x) or email.split("@")[0]
+    first = person["given_name"] or name.split(" ")[0]
+    address = (payload.address or "").strip()[:200] or None
+    if not address and payload.listing_key:
+        # The home they were looking at when they signed in.
+        row = (await db.execute(select(Property.street_address, Property.city).where(Property.listing_key == payload.listing_key[:80]))).first()
+        if row and row[0]:
+            from app.services.agent_roundup_service import nice_street
+            address = nice_street(row[0], row[1])
+    now = datetime.now(timezone.utc)
+
+    existing = (await db.execute(select(Lead).where(Lead.owner_id == user.id, Lead.email == email))).scalars().first()
+    recent = None
+    if existing is not None:
+        recent = (await db.execute(
+            select(LeadEvent.id).where(LeadEvent.lead_id == existing.id, LeadEvent.source_type == gv.SOURCE_TYPE,
+                                       LeadEvent.occurred_at >= now - gv.REPEAT_WINDOW).limit(1)
+        )).first()
+    if recent is None:
+        lead = await leads_service.upsert_lead(
+            db, owner_id=user.id, name=name, email=email, phone=None,
+            source_type=gv.SOURCE_TYPE, source_id=site_id,
+            summary=("Signed in with Google on your website" + (f" while viewing {address}" if address else ""))[:250],
+            occurred_at=now, property_address=address,
+            raw_snapshot={"page_url": (payload.page_url or "")[:500] or None, "listing_key": (payload.listing_key or "")[:80] or None,
+                          "address": address, "picture": person.get("picture"), "verified_by": "google"},
+        )
+        if existing is None and lead is not None:
+            try:
+                link = f"/leads/{lead.id}"
+                where = f" while looking at {address}" if address else ""
+                db.add(Notification(
+                    agent_id=user.id, type="LEAD", reference_type="LEAD", reference_id=lead.id,
+                    title=f"New website lead: {name}"[:200],
+                    message=f"{name} signed in with Google on your website{where}."[:500],
+                    visitor_name=name, link=link, is_read=False, created_at=now,
+                ))
+                await db.commit()
+                email_agent(user, "LEAD", "new_lead_captured", f"New website lead: {name}", {
+                    "lead_name": name, "lead_source": "Your website (signed in with Google)", "lead_email": email,
+                    "lead_phone": None, "lead_message": None, "property_address": address or "", "link": absolute(link),
+                })
+            except Exception as e:  # the lead itself is already saved
+                logger.warning("google visitor side effects failed", extra={"error": str(e)})
+                await db.rollback()
+    return {"name": name, "first_name": first, "email": email}
+
+
 @router.post("/{site_id}/properties/{listing_key}/ask")
 async def ask_about_site_property(site_id: str, listing_key: str, payload: SiteAskRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """The quick "Ask a question" box on an IDX property page. The published site names the agent

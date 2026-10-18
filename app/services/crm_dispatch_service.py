@@ -50,6 +50,7 @@ _SOURCE_LABELS = {
     "property_page_tour_request": "Listing page tour request",
     "form_partial": "Website form (unfinished)",
     "blog_inquiry": "Blog article question",
+    "website_google_signin": "Website (signed in with Google)",
 }
 
 
@@ -72,6 +73,7 @@ _FUB_TYPES = {
     "collection_visitor": "Property Search",
     "portal_lead": "Inquiry",
     "blog_inquiry": "General Inquiry",
+    "website_google_signin": "Registration",
 }
 _SELLER_FORMS = {"selling", "home_value", "seller_onboarding", "make_me_sell"}
 
