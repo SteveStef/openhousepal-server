@@ -1942,6 +1942,7 @@ class Blog(Base):
     agent_hub_featured = Column(Boolean, default=False, nullable=False)
     idx_visible = Column(Boolean, default=True, nullable=False, server_default='true')  # shows on the agent's IDX website
     luxe_metal = Column(String, nullable=True)  # Luxe theme finish: gold (default) / silver / bronze
+    accent_color = Column(String, nullable=True)  # Classic theme accent: the Agent Hub's Classic choices (null = Original gold)
     linked_areas = Column(JSONB, nullable=False, default=list, server_default='[]')  # IDX neighborhood pages the article links (area slugs) - see services/blog_neighborhoods.py
     use_signature_card = Column(Boolean, default=True, nullable=False, server_default='true')  # end the article with the agent's Email Signature card (when their plan has it) instead of the small contact card
     ai_review = Column(JSONB, nullable=True)  # AI pipeline's Verified report (ai_blog_pipeline_service) - private to the agent

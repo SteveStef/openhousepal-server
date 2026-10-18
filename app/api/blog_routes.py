@@ -906,6 +906,7 @@ async def get_public_blog(
         areaTowns=_article_towns(blog),
         neighborhoodLinks=await blog_neighborhoods.neighborhood_links(db, agent, blog.linked_areas),
         luxeMetal=blog.luxe_metal,
+        accentColor=blog.accent_color,
         forms=await _public_forms(db, blog.owner_id),
     )
 

@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Literal, Any, Dict
 from datetime import datetime
 
@@ -47,6 +47,7 @@ class BlogResponse(BaseModel):
     use_signature_card: bool = True
     linked_areas: List[str] = []
     luxe_metal: Optional[str] = None
+    accent_color: Optional[str] = None
     ai_review: Optional[dict] = None
     scheduled_at: Optional[datetime] = None
     published_at: Optional[datetime] = None
@@ -84,6 +85,8 @@ class BlogUpdate(BaseModel):
     social_image_url: Optional[str] = None
     is_indexed: Optional[bool] = None
     luxe_metal: Optional[Literal['gold', 'silver', 'bronze']] = None
+    # Classic look's accent - a #rrggbb from the Agent Hub's Classic choices.
+    accent_color: Optional[str] = Field(default=None, pattern=r'^#[0-9a-fA-F]{6}$')
 
 
 class BlogStatusUpdate(BaseModel):
@@ -186,6 +189,7 @@ class PublicBlogDetail(BaseModel):
     # Linked IDX neighborhood pages: {slug, name, url, photo, median_price, active_count}.
     neighborhoodLinks: List[dict] = []
     luxeMetal: Optional[str] = None
+    accentColor: Optional[str] = None
     # The agent's live forms ({formType, slug, title}) - the closing section's buttons open them in a
     # window over the article.
     forms: List[dict] = []
