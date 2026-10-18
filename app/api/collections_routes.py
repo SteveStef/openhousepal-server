@@ -731,6 +731,40 @@ async def update_property_interaction(
         )
 
 
+class RecommendUpdate(BaseModel):
+    recommended: bool
+
+
+@router.put("/{collection_id}/properties/{property_id}/recommend")
+async def recommend_property(
+    collection_id: str,
+    property_id: str,
+    body: RecommendUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """The agent's "I recommend this home for you" on one home in a client's Showcase (or taking it
+    back). The home shows a Recommended tag on both sides and sorts to the top."""
+    from app.models.database import PropertyInteraction
+    coll = (await db.execute(select(Collection).where(Collection.id == collection_id))).scalar_one_or_none()
+    if not coll or coll.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    row = (await db.execute(select(PropertyInteraction).where(
+        and_(PropertyInteraction.collection_id == collection_id, PropertyInteraction.property_id == property_id)))).scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    if row is None:
+        if not body.recommended:
+            return {"success": True, "recommended": False}
+        row = PropertyInteraction(collection_id=collection_id, property_id=property_id, liked=False, disliked=False, created_at=now, updated_at=now)
+        db.add(row)
+    # Recommending a home the client passed on puts it back in their Matches.
+    if body.recommended and row.disliked:
+        row.disliked = False
+    row.agent_recommended_at = now if body.recommended else None
+    await db.commit()
+    return {"success": True, "recommended": body.recommended}
+
+
 @router.post("/{collection_id}/properties/{property_id}/view")
 async def track_property_view(
     collection_id: str,

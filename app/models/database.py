@@ -1170,6 +1170,10 @@ class PropertyInteraction(Base):
     # visitor-facing view_count/last_viewed_at or Collection.last_visitor_activity_at.
     agent_viewed_at = Column(DateTime(timezone=True), nullable=True)
 
+    # The agent's "I recommend this home for you" - set from their Showcase view; the home wears a
+    # Recommended tag on both sides and sorts first. Cleared when the client passes on it.
+    agent_recommended_at = Column(DateTime(timezone=True), nullable=True)
+
     # Last time each side actually read this property's comment thread - drives the
     # per-property unread message badge independently for the agent and the visitor.
     agent_comments_read_at = Column(DateTime(timezone=True), nullable=True)

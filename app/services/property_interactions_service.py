@@ -77,6 +77,9 @@ class PropertyInteractionsService:
                 interaction.disliked = False
             else:
                 interaction.liked = False
+        # Passed on: the agent's "I recommend this" comes off (user, 10/18).
+        if interaction.disliked and getattr(interaction, "agent_recommended_at", None):
+            interaction.agent_recommended_at = None
 
         await db.commit()
         await db.refresh(interaction)

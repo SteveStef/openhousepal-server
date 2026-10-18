@@ -1588,6 +1588,7 @@ class CollectionsService:
                     'MlsStatus': prop.home_status,                    # Real interaction data from database
                     'liked': interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
+                    'agentRecommended': bool(prop.id in interactions_lookup and interactions_lookup[prop.id].agent_recommended_at),
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
                     'viewCount': interactions_lookup[prop.id].view_count if prop.id in interactions_lookup else 0,
                     # NEW for the buyer: in their Showcase less than NEW_PROPERTY_DAYS (the first fill
@@ -2116,6 +2117,7 @@ class CollectionsService:
                     'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,
                     'MlsStatus': prop.home_status,                    'liked': interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
+                    'agentRecommended': bool(prop.id in interactions_lookup and interactions_lookup[prop.id].agent_recommended_at),
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
                     'viewCount': interactions_lookup[prop.id].view_count if prop.id in interactions_lookup else 0,
                     'lastViewedAt': interactions_lookup[prop.id].last_viewed_at.isoformat() if prop.id in interactions_lookup and interactions_lookup[prop.id].last_viewed_at else None,
