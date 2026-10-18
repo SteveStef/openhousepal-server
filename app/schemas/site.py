@@ -64,7 +64,7 @@ class SiteTheme(BaseModel):
     # The agent's Email Signature card as the footer's agent block on every page (the one place
     # the signature lives on the website). Only shows when the plan has signatures and one is
     # saved - see content_adapters.signature_hub_slug_for.
-    footer_signature: bool = True
+    footer_signature: bool = False  # off unless the agent turns it on (user, 10/18)
     # Luxe's metal finish - the same gold / silver / bronze as the Email Signature and Agent Hub
     # (frontend lib/luxeMetals). Classic uses secondary_color (any non-metal accent) instead.
     luxe_metal: Optional[Literal['gold', 'silver', 'bronze']] = None
