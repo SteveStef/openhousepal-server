@@ -61,6 +61,7 @@ class CollectionResponse(BaseModel):
     is_anonymous: bool = False
     is_public: bool = False
     share_token: Optional[str] = None
+    short_code: Optional[str] = None   # short personal link /s/<code>
     created_at: str
     updated_at: str
     refine_request_message: Optional[str] = None

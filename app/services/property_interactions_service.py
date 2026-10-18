@@ -463,7 +463,8 @@ class PropertyInteractionsService:
             if agent and property_obj:
                 # Use public share link for visitor - on the agent's own IDX domain if they have one
                 base_url = await resolve_owner_public_base_url(db, agent)
-                collection_link = f"{base_url}/showcase/{collection.share_token}"
+                from app.services.showcase_links import showcase_path
+                collection_link = f"{base_url}{await showcase_path(collection)}"
                 
                 # Create full address string
                 full_address = f"{property_obj.street_address}, {property_obj.city}, {property_obj.state} {property_obj.zipcode or ''}".strip()

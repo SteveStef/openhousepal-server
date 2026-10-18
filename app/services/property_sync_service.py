@@ -1252,9 +1252,10 @@ class PropertySyncService:
                 # IDX agents get this client-facing link on their own domain, same as every other
                 # showcase link/QR code they hand out (see resolve_owner_public_base_url).
                 showcase_base_url = await resolve_owner_public_base_url(db, collection.owner) if collection.owner else frontend_url
+                from app.services.showcase_links import showcase_path
                 visitor_vars = {
                     **common_vars,
-                    "collection_link": f"{showcase_base_url}/showcase/{collection.share_token}",
+                    "collection_link": f"{showcase_base_url}{await showcase_path(collection)}",
                     "recipient_name": ((collection.visitor_name or "").strip().split(" ")[0].title() or "there"),
                     "agent_name": f"{collection.owner.first_name} {collection.owner.last_name}" if collection.owner else "Your Agent",
                     "agent_email": collection.owner.email if collection.owner else "",

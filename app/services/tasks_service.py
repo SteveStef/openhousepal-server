@@ -1315,7 +1315,8 @@ async def lead_showcase_info(db: AsyncSession, owner: User, leads: list) -> dict
                 payload = {}
             cache[token] = _pick_standout(payload)
         count, best, _match, days = cache[token]
-        url = f"{base}/showcase/{token}"
+        from app.services.showcase_links import showcase_path
+        url = f"{base}{await showcase_path(share_token=token, db=db) or f'/showcase/{token}'}"
         out[lead_id] = {"url": url, "count": count, "parts": _pitch_parts(count, best, days, url),
                         "first_name": _first(by_id[lead_id].name)}
     return out
@@ -2567,7 +2568,8 @@ async def followup_property(db: AsyncSession, task: AgentTask, owner: Optional[U
             if row:
                 from app.services.website.site_service import resolve_owner_public_base_url
                 base = (await resolve_owner_public_base_url(db, owner)).rstrip("/")
-                out.update(url=f"{base}/showcase/{row[0]}?property={row[1]}", where="showcase")
+                from app.services.showcase_links import showcase_path
+                out.update(url=f"{base}{await showcase_path(share_token=row[0], db=db) or f'/showcase/{row[0]}'}?property={row[1]}", where="showcase")
                 return out
         # 2) the property details page
         from app.services import property_website_service as pws

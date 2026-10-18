@@ -426,6 +426,7 @@ class CollectionsService:
                     "is_anonymous": collection.owner_id is None,
                     "is_public": bool(collection.is_public) if collection.is_public is not None else False,
                     "share_token": collection.share_token,
+                    "short_code": collection.short_code,
                     "created_at": collection.created_at.isoformat(),
                     "updated_at": collection.updated_at.isoformat() if collection.updated_at else collection.created_at.isoformat(),
                     "refine_request_message": collection.refine_request_message,
@@ -904,6 +905,7 @@ class CollectionsService:
                 "is_anonymous": collection.owner_id is None,
                 "is_public": collection.is_public or False,
                 "share_token": collection.share_token,
+                "short_code": collection.short_code,
                 "status": collection.status,
                 "notify_visitor": collection.notify_visitor if hasattr(collection, 'notify_visitor') else True,
                 "notify_agent": collection.notify_agent if hasattr(collection, 'notify_agent') else True,
@@ -979,6 +981,7 @@ class CollectionsService:
                 "is_anonymous": False,
                 "is_public": collection.is_public,
                 "share_token": collection.share_token,
+                "short_code": collection.short_code,
                 "status": collection.status,
                 "notify_visitor": collection.notify_visitor if hasattr(collection, 'notify_visitor') else True,
                 "notify_agent": collection.notify_agent if hasattr(collection, 'notify_agent') else True,
@@ -1372,7 +1375,8 @@ class CollectionsService:
                             break
 
                 collection.is_public = True
-                share_url = f"/showcase/{collection.share_token}"
+                from app.services.showcase_links import showcase_path
+                share_url = await showcase_path(collection)
                 message = "Collection is now public and shareable"
             else:
                 # Make private but keep the share token for potential future use
@@ -1696,6 +1700,7 @@ class CollectionsService:
                     'lastActivity': collection.last_visitor_activity_at.isoformat() if collection.last_visitor_activity_at else None
                 },
                 'shareToken': collection.share_token,
+                'shortCode': collection.short_code,
                 'isPublic': collection.is_public
             }
 

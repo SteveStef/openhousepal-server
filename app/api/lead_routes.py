@@ -518,7 +518,8 @@ async def _showcases_out(lead: Lead, collections: List[Collection]) -> List[Lead
         in_it = {p.id for p in (c.properties or [])}
         pis = [pi for pi in (c.property_interactions or []) if pi.property_id in in_it]
         out.append(LeadShowcaseOut(
-            id=c.id, name=c.name, share_token=c.share_token if c.is_public else None, home_count=len(in_it),
+            id=c.id, name=c.name, share_token=c.share_token if c.is_public else None,
+            short_code=c.short_code if c.is_public else None, home_count=len(in_it),
             liked=sum(1 for pi in pis if pi.liked), disliked=sum(1 for pi in pis if pi.disliked),
             new_matches=CollectionsService.count_new_properties(c), last_active_at=c.last_visitor_activity_at,
             emails_on=bool(c.notify_visitor), refine_message=c.refine_request_message,

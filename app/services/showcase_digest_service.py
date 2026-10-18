@@ -114,6 +114,12 @@ def _total_label(n) -> str:
     return "1 home" if n == 1 else f"All {n} homes" if n > 1 else ""
 
 
+
+async def _sc_path(col) -> str:
+    """The short /s/<code> link for a Showcase (services/showcase_links.py)."""
+    from app.services.showcase_links import showcase_path
+    return await showcase_path(col) or f"/showcase/{col.share_token}"
+
 async def _spotlight_told_today(db: AsyncSession, email: str, now: datetime) -> set:
     """Listing keys this guest got a Spotlight alert email about today (Eastern)."""
     from app.models.database import PropertyWebsite, SpotlightAlertSubscription
@@ -649,7 +655,7 @@ async def queue_showcase_ready(db: AsyncSession, collection_id: str, from_agent:
         first = (col.visitor_name or "").split(" ")[0].strip().title()
         vars_ = {
             "first_name": _cap((col.visitor_name or "").split(" ")[0].strip()) or "there",
-            "collection_link": f"{base}/showcase/{col.share_token}",
+            "collection_link": f"{base}{await _sc_path(col)}",
             "total_count": total, "has_homes": bool(total), "homes": homes,
             "today_date": datetime.now(EASTERN).strftime("%m/%d/%Y"),
             "agent_name": (f"{owner.first_name or ''} {owner.last_name or ''}".strip() if owner else "") or "Your agent",
@@ -755,7 +761,7 @@ async def queue_search_changed(db: AsyncSession, collection_id: str, before_ids:
             recipient_email=col.visitor_email, template_name=BUYER_TEMPLATE, subject="Your search was updated", status=QUEUED,
             scheduled_for=datetime.now(timezone.utc), owner_id=col.owner_id,
             template_variables={
-                "collection_link": f"{base}/showcase/{col.share_token}", "total_count": len(after),
+                "collection_link": f"{base}{await _sc_path(col)}", "total_count": len(after),
                 "agent_name": (f"{owner.first_name or ''} {owner.last_name or ''}".strip() if owner else "") or "Your agent",
                 "agent_email": owner.email if owner else "", "agent_phone": await agent_public_phone(db, owner),
                 "Unsub": f"{frontend_url}/unsubscribe?email={quote(col.visitor_email, safe='')}",

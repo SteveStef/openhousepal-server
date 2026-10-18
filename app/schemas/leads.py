@@ -54,6 +54,7 @@ class LeadShowcaseOut(BaseModel):
     id: str
     name: Optional[str] = None
     share_token: Optional[str] = None
+    short_code: Optional[str] = None
     home_count: int = 0
     liked: int = 0
     disliked: int = 0

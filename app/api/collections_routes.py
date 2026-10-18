@@ -218,6 +218,15 @@ async def preview_matches(
         )
 
 
+@router.get("/short/{code}")
+async def resolve_short_link(code: str, db: AsyncSession = Depends(get_db)):
+    """/s/<code> -> the Showcase it stands for (public: the short link IS the share link)."""
+    row = (await db.execute(select(Collection.share_token).where(Collection.short_code == code.lower()))).first()
+    if not row or not row[0]:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="That link isn't active.")
+    return {"share_token": row[0]}
+
+
 @router.get("/refine-requests/count")
 async def get_pending_refine_requests_count(
     db: AsyncSession = Depends(get_db),

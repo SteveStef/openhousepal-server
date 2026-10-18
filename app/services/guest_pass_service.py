@@ -200,7 +200,8 @@ async def _showcase_url(db: AsyncSession, host: User, col: Collection) -> Option
     if not col or not col.share_token:
         return None
     from app.services.website.site_service import resolve_owner_public_base_url
-    return f"{await resolve_owner_public_base_url(db, host)}/showcase/{col.share_token}"
+    from app.services.showcase_links import showcase_path
+    return f"{await resolve_owner_public_base_url(db, host)}{await showcase_path(col)}"
 
 
 def showcases_offered(host: User, visitor: OpenHouseVisitor, oh: Optional[OpenHouseEvent] = None) -> bool:

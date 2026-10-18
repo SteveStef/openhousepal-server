@@ -716,6 +716,7 @@ class Collection(Base):
     description = Column(Text, nullable=True)
     owner_id = Column(String, ForeignKey('users.id'), nullable=False)  # Required - agent who owns the collection
     share_token = Column(String, unique=True, nullable=True)
+    short_code = Column(String, unique=True, nullable=True, index=True)  # short personal link /s/<code> (services/showcase_links.py)
     is_public = Column(Boolean, default=True)
     status = Column(String, default="ACTIVE", nullable=False)  # ACTIVE, INACTIVE
 

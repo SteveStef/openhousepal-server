@@ -223,7 +223,8 @@ class OpenHouseService:
 
             # IDX hosts get the showcase link on their own domain, same as the sign-in QR code.
             base_url = await resolve_owner_public_base_url(db, hosting_agent) if hosting_agent else os.getenv('FRONTEND_URL', os.getenv('CLIENT_URL', 'http://localhost:3000'))
-            showcase_link = f"{base_url}/showcase/{collection_result['share_token']}"
+            from app.services.showcase_links import showcase_path
+            showcase_link = f"{base_url}{await showcase_path(collection_id=collection_result.get('collection_id') or collection_result.get('id'), share_token=collection_result['share_token'], db=db)}"
 
             count = collection_result.get('properties_added', 0)
             prop_addr = property_data.get('address', 'the open house')
