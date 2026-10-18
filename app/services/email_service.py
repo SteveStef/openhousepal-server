@@ -197,6 +197,7 @@ class EmailService:
         # Inject today's date for all templates
         template_variables = dict(template_variables or {})
         track_id = template_variables.pop("_track_id", None)   # client_email_service tracking id
+        ics = template_variables.pop("_ics", None)              # calendar_invite_service - attached, not a template var
         template_variables = _tidy_values(_secure_urls(template_variables))
         subject = _tidy_subject(subject)
         if "today_date" not in template_variables:
@@ -265,10 +266,12 @@ class EmailService:
             if reply_to:
                 data["h:Reply-To"] = reply_to
 
+            files = [("attachment", ("invite.ics", ics.encode("utf-8"), "text/calendar; method=REQUEST; charset=UTF-8"))] if ics else None
             response = httpx.post(
                 self.mailgun_url,
                 auth=("api", self.mailgun_api_key),
                 data=data,
+                files=files,
                 timeout=10.0
             )
             return response.status_code, response.text

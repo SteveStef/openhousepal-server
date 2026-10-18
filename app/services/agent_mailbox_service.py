@@ -195,7 +195,7 @@ async def render(template: str, variables: dict) -> tuple[str, str]:
 
 # ----------------------------------------------------------------------------- sending
 
-def _mime(from_name: str, from_addr: str, to: str, subject: str, html: str, text: str, headers: dict) -> str:
+def _mime(from_name: str, from_addr: str, to: str, subject: str, html: str, text: str, headers: dict, ics: str | None = None) -> str:
     msg = EmailMessage()
     msg["From"] = formataddr((from_name, from_addr)) if from_name else from_addr
     msg["To"] = to
@@ -204,20 +204,29 @@ def _mime(from_name: str, from_addr: str, to: str, subject: str, html: str, text
         msg[k] = v
     msg.set_content(text or " ")
     msg.add_alternative(html, subtype="html")
+    if ics:
+        # Gmail / Apple Mail draw the event card from the text/calendar part; the .ics attachment
+        # is there for everything else.
+        msg.add_alternative(ics, subtype="calendar", params={"method": "REQUEST"})
+        msg.add_attachment(ics.encode("utf-8"), maintype="text", subtype="calendar", filename="invite.ics")
     return base64.urlsafe_b64encode(msg.as_bytes()).decode()
 
 
 async def _deliver(conn: MailConnection, token: str, *, to: str, subject: str, html: str, text: str,
-                   from_name: str, headers: dict) -> httpx.Response:
+                   from_name: str, headers: dict, ics: str | None = None) -> httpx.Response:
     async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
         if conn.provider == "google":
-            raw = _mime(from_name, conn.account_email or "", to, subject, html, text, headers)
+            raw = _mime(from_name, conn.account_email or "", to, subject, html, text, headers, ics)
             return await c.post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
                                 headers={"Authorization": f"Bearer {token}"}, json={"raw": raw})
         # Microsoft Graph only accepts custom headers named X-...; the unsubscribe link is in the body.
+        message = {"subject": subject, "body": {"contentType": "HTML", "content": html},
+                   "toRecipients": [{"emailAddress": {"address": to}}]}
+        if ics:
+            message["attachments"] = [{"@odata.type": "#microsoft.graph.fileAttachment", "name": "invite.ics",
+                                       "contentType": "text/calendar", "contentBytes": base64.b64encode(ics.encode("utf-8")).decode()}]
         return await c.post("https://graph.microsoft.com/v1.0/me/sendMail", headers={"Authorization": f"Bearer {token}"}, json={
-            "message": {"subject": subject, "body": {"contentType": "HTML", "content": html},
-                        "toRecipients": [{"emailAddress": {"address": to}}]},
+            "message": message,
             "saveToSentItems": True,
         })
 
@@ -306,6 +315,8 @@ async def send_guest(owner_id: Optional[str], to_email: str, subject: str, templ
                 conn.sent_day, conn.sent_count = today, 0
             if conn.sent_count >= DAILY_CAP.get(conn.provider, 250) or _hour_full(owner_id, conn.provider):
                 return None
+            variables = dict(variables)
+            ics = variables.pop("_ics", None)   # a client calendar invite (calendar_invite_service)
             subject, variables = prepare_template_email(subject, variables)
             name = from_name or variables.get("agent_name") or ""
             if _dev_suppressed():
@@ -323,10 +334,10 @@ async def send_guest(owner_id: Optional[str], to_email: str, subject: str, templ
                 headers = unsubscribe_headers(template, to_email, variables)
             try:
                 token = await _access_token(db, conn)
-                resp = await _deliver(conn, token, to=to_email, subject=subject, html=html, text=text, from_name=name, headers=headers)
+                resp = await _deliver(conn, token, to=to_email, subject=subject, html=html, text=text, from_name=name, headers=headers, ics=ics)
                 if resp.status_code == 401:
                     token = await _access_token(db, conn, force=True)
-                    resp = await _deliver(conn, token, to=to_email, subject=subject, html=html, text=text, from_name=name, headers=headers)
+                    resp = await _deliver(conn, token, to=to_email, subject=subject, html=html, text=text, from_name=name, headers=headers, ics=ics)
             except MailboxAuthError as e:
                 await _flag_reconnect(db, conn, f"token refused: {e}")
                 return None

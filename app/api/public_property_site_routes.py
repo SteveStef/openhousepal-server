@@ -265,6 +265,18 @@ async def unsubscribe_property_site_alerts(token: str = Query(..., min_length=8,
     return {"success": True, "address": address}
 
 
+@router.get("/{site_id}/agent-busy")
+async def property_site_agent_busy(site_id: str, days: int = 14, db: AsyncSession = Depends(get_db)):
+    """The agent's busy blocks (start/end only) so the client's time picker only offers times the
+    agent is actually free (user, 10/18). [] when no calendar is connected."""
+    from app.services import calendar_sync_service
+    owner = await _published_owner(db, site_id)
+    if not owner:
+        return {"busy": []}
+    site, _user = owner
+    return {"busy": await calendar_sync_service.public_busy(db, site.owner_id, days)}
+
+
 @router.post("/{site_id}/tour-request")
 async def submit_property_site_tour_request(site_id: str, payload: PropertyWebsiteTourRequestCreate, request: Request, db: AsyncSession = Depends(get_db)):
     from app.services.public_rate_limit import check_public_submit

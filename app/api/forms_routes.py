@@ -1711,7 +1711,14 @@ async def _email_showing_confirmed(db: AsyncSession, submission: FormSubmission,
         link = (await owner_links(db, agent, hub.slug)).form(form.slug) if hub and hub.slug else await resolve_owner_public_base_url(db, agent)
         agent_name = f"{agent.first_name or ''} {agent.last_name or ''}".strip()
         first = (submission.contact_name or "").strip().split(" ")[0]
+        from app.services.calendar_invite_service import build_invite, eastern_start
+        start = eastern_start(info.get("confirmed_date"), info.get("confirmed_time"))
+        full = ", ".join(x for x in (home.get("address") or home["street"], home.get("city"), " ".join(y for y in (home.get("state"), home.get("zipcode")) if y)) if x)
+        ics = build_invite(uid=f"showing-{submission.id}", start=start, street=home["street"], address=full, agent_name=agent_name,
+                           agent_email=agent.email, agent_phone=await agent_public_phone(db, agent), client_name=submission.contact_name,
+                           client_email=to, link=link) if start else None
         email_person(to, "tour_confirmed", f"Your tour of {home['street']} is confirmed - {date_label} at {time_label}", {
+            "_ics": ics,
             "recipient_name": first[:1].upper() + first[1:] if first else "there",
             "street_address": home["street"], "city": home.get("city", ""), "state": home.get("state", ""),
             "image": home.get("photo") or "", "price": f"${home['price']:,.0f}" if home.get("price") else "",
@@ -1756,6 +1763,10 @@ async def confirm_showing_submission(
         form = await db.get(AgentForm, submission.form_id)
         if form is not None:
             await _email_showing_confirmed(db, submission, form, current_user)
+    # The confirmed showing on the agent's own calendar (off it again when cleared) - Showcase
+    # tours already did this; Agent Hub showings didn't.
+    from app.services import calendar_sync_service
+    calendar_sync_service.sync_showing_bg(current_user.id, submission.id)
     return submission
 
 
@@ -1816,6 +1827,17 @@ def _agent_hub_is_live(agent: User, hub: AgentHub) -> bool:
     from app.utils.auth import owner_has_access, AGENT_HUB_ACCESS_TIERS
     from app.api.agent_hub_routes import _hub_has_minimum_content
     return owner_has_access(agent, AGENT_HUB_ACCESS_TIERS) and _hub_has_minimum_content(hub.config or {})
+
+
+@router.get("/public/{agent_slug}/agent-busy")
+async def public_agent_busy(agent_slug: str, days: int = 8, db: AsyncSession = Depends(get_db)):
+    """The agent's busy blocks (start/end only) so the client's time picker only offers times the
+    agent is actually free (user, 10/18). [] when no calendar is connected."""
+    from app.services import calendar_sync_service
+    hub = (await db.execute(select(AgentHub).where(AgentHub.slug == normalize_form_slug(agent_slug)))).scalar_one_or_none()
+    if not hub:
+        return {"busy": []}
+    return {"busy": await calendar_sync_service.public_busy(db, hub.owner_id, days)}
 
 
 @router.get("/public/{agent_slug}", response_model=List[PublicFormSummary])

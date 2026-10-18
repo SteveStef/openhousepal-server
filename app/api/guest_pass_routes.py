@@ -28,6 +28,15 @@ async def get_guest_pass(token: str, db: AsyncSession = Depends(get_db)):
     return await gp.payload(db, visitor, oh, host)
 
 
+@router.get("/guest-pass/{token}/agent-busy")
+async def guest_pass_agent_busy(token: str, db: AsyncSession = Depends(get_db)):
+    """The agent's busy blocks (start/end only) so the client's time picker only offers times the
+    agent is actually free (user, 10/18). [] when no calendar is connected."""
+    from app.services import calendar_sync_service
+    _visitor, oh, _host = await gp.resolve(db, token)
+    return {"busy": await calendar_sync_service.public_busy(db, oh.agent_id, 11)}
+
+
 @router.post("/guest-pass/{token}/request")
 async def guest_pass_request(token: str, body: GuestPassRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """One-tap "request the seller disclosure" / "request a second tour" with their sign-in info."""

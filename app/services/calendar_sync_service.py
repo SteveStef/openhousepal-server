@@ -409,6 +409,68 @@ def _tour_event_body(tour: PropertyTour, prop: Optional[Property]) -> dict:
     }
 
 
+async def _showing_event_body(db: AsyncSession, sub) -> Optional[dict]:
+    """An Agent Hub "Schedule a Showing" the agent confirmed - same look as a Showcase tour."""
+    info = sub.showing or {}
+    if not info.get("confirmed_date") or not info.get("confirmed_time"):
+        return None
+    try:
+        y, mo, d = (int(x) for x in str(info["confirmed_date"]).split("-"))
+        hh, mm = (int(x) for x in str(info["confirmed_time"]).split(":"))
+    except ValueError:
+        return None
+    start = datetime(y, mo, d, hh, mm, tzinfo=EASTERN).astimezone(timezone.utc)
+    end = start + timedelta(hours=1)
+    done = end <= datetime.now(timezone.utc)
+    from app.services.tasks_service import short_person
+    prop = None
+    key = info.get("listing_key")
+    if key:
+        prop = (await db.execute(select(Property).where(Property.listing_key == key).limit(1))).scalars().first()
+    addr = (prop.full_address if prop else None) or sub.property_address or None
+    raw_street = (prop.street_address if prop else None) or (addr or "").split(",")[0]
+    street = (raw_street or "").strip()
+    street = street.title() if street.isupper() else street
+    desc = [f"Showing requested by {sub.contact_name or 'a visitor'}"]
+    if sub.contact_email:
+        desc.append(sub.contact_email)
+    if sub.contact_phone:
+        desc.append(sub.contact_phone)
+    if info.get("note"):
+        desc.append(f"\nVisitor note: {info['note']}")
+    title = f"[Showing] {street or 'Property'} - {short_person(sub.contact_name) or 'Visitor'}"
+    return {
+        "summary": f"✅ DONE · {title}" if done else title,
+        **({"colorId": "8"} if done else {}),
+        "location": addr,
+        "description": "\n".join(desc),
+        "start": _local(start),
+        "end": _local(end),
+        "source": {"title": "OpenHousePal", "url": "https://openhousepal.com/leads"},
+        "extendedProperties": {"private": {"ohp_kind": "showing", "ohp_id": sub.id}},
+        "reminders": {"useDefault": False, "overrides": [] if done else [{"method": "popup", "minutes": 60}]},
+    }
+
+
+async def _sync_showing(db: AsyncSession, conn: CalendarConnection, submission_id: str) -> None:
+    from app.models.database import FormSubmission
+    sub = (await db.execute(select(FormSubmission).where(FormSubmission.id == submission_id))).scalar_one_or_none()
+    if not sub or sub.owner_id != conn.owner_id:
+        return
+    body = await _showing_event_body(db, sub)
+    if body is None:
+        await _remove_event(db, conn, "showing", submission_id)
+        return
+    await _upsert_event(db, conn, "showing", submission_id, body)
+
+
+def sync_showing_bg(owner_id: str, submission_id: str) -> None:
+    async def run():
+        for provider in PROVIDERS:
+            await _with_conn(owner_id, provider, lambda db, conn: _sync_showing(db, conn, submission_id))
+    _spawn(run())
+
+
 def _host_open_event_body(req: OpenHouseHostRequest, prop: Optional[Property], listing_agent: Optional[User],
                           listing_notes: Optional[str], open_note: Optional[str]) -> dict:
     """An open house another agent's listing approved you to host: the home's real address as the
@@ -1072,7 +1134,9 @@ _public_busy_cache: dict[str, tuple[datetime, list[dict]]] = {}
 
 async def public_busy(db: AsyncSession, owner_id: str, days: int = 8) -> list[dict]:
     now = datetime.now(timezone.utc)
-    hit = _public_busy_cache.get(owner_id)
+    days = max(1, min(int(days or 8), 14))
+    key = owner_id if days == 8 else f"{owner_id}:{days}"
+    hit = _public_busy_cache.get(key)
     if hit and (now - hit[0]).total_seconds() < 60:
         return hit[1]
     start = now.replace(minute=0, second=0, microsecond=0)
@@ -1089,7 +1153,7 @@ async def public_busy(db: AsyncSession, owner_id: str, days: int = 8) -> list[di
     # All-day items (birthdays, reminders, "out of office" banners) would cross out a whole day -
     # only timed events count as a conflict.
     out = [{"start": b.get("start"), "end": b.get("end")} for b in blocks if b.get("start") and b.get("end") and _hours(b) < 23]
-    _public_busy_cache[owner_id] = (now, out)
+    _public_busy_cache[key] = (now, out)
     return out
 
 
