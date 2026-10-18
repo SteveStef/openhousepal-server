@@ -520,9 +520,12 @@ async def get_signature_sales_header_png(token: str, request: Request, db: Async
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
     dark, accent = bool(resolved.get("darkMode")), resolved["accentColor"]
 
+    from app.services.sales_wording import sales_are_recent
+    recent = sales_are_recent((email_signature_service.compute_sales_stats(hub_config) or {}).get("totalVolume"))
+
     async def render():
-        return email_signature_service.render_recent_sales_header_png(accent, dark=dark)
-    return await _live_image(request, _fingerprint("sales-header.png", accent, dark), "image/png", render)
+        return email_signature_service.render_recent_sales_header_png(accent, dark=dark, recent=recent)
+    return await _live_image(request, _fingerprint("sales-header.png", accent, dark, recent), "image/png", render)
 
 
 @router.get("/public/{token}/sales-header.webp")
@@ -535,7 +538,9 @@ async def get_signature_sales_header_webp(token: str, db: AsyncSession = Depends
     if not featured or featured[0] != "sale":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
     dark = bool(resolved.get("darkMode"))
-    webp_bytes = email_signature_service.render_recent_sales_header_webp(resolved["accentColor"], dark=dark)
+    from app.services.sales_wording import sales_are_recent
+    recent = sales_are_recent((email_signature_service.compute_sales_stats(hub_config) or {}).get("totalVolume"))
+    webp_bytes = email_signature_service.render_recent_sales_header_webp(resolved["accentColor"], dark=dark, recent=recent)
     return Response(content=webp_bytes, media_type="image/webp", headers=_CACHE_HEADERS)
 
 

@@ -1905,7 +1905,13 @@ async def hydrate_page_blocks(db: AsyncSession, user: User, page: dict, featured
     if "spotlights" in types_present:
         fetched["spotlights"] = await get_published_spotlights(db, user, _SELECTED_MODE_FETCH_CAP)
     profile = await get_agent_profile(db, user) if ("about_agent" in types_present or "hero" in types_present or "contact_cta" in types_present) else None
-    agent_stats = await get_agent_stats(db, user) if "about_agent" in types_present else None
+    # "Recent" sales wording only under $50M in volume (services/sales_wording): the Sold page's
+    # heading and a Recent Sales block's headline follow it.
+    sales_wording_needed = "recent_sales" in types_present or any(
+        b.get("type") == "heading_text" and (b.get("data") or {}).get("text") in ("Recently Sold", "Recent Sales") for b in blocks)
+    agent_stats = await get_agent_stats(db, user) if ("about_agent" in types_present or sales_wording_needed) else None
+    from app.services.sales_wording import sales_are_recent, sales_words
+    sales_recent = sales_are_recent((agent_stats or {}).get("sold_volume"))
     showcases_by_id: dict[str, dict] = {}
     if "showcase" in types_present:
         wanted_ids = {b.get("data", {}).get("collection_id") for b in blocks if b.get("type") == "showcase"}
@@ -1954,6 +1960,10 @@ async def hydrate_page_blocks(db: AsyncSession, user: User, page: dict, featured
             else:
                 items = all_items[:limit]
             data["resolved"] = items
+            if block_type == "recent_sales":
+                data["headline"] = sales_words(data.get("headline") or "Recently Sold", sales_recent)
+        elif block_type == "heading_text" and data.get("text"):
+            data["text"] = sales_words(data["text"], sales_recent)
         elif block_type == "about_agent" and profile:
             # Source + override: real profile data first, then the agent's website-only field
             # overrides (see SiteBlockType docstring) layered on top, never mutating AgentHub.

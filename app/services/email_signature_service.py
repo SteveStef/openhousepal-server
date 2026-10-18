@@ -711,6 +711,11 @@ def featured_pool(agent_hub_config: dict, show_listing: bool, show_sales: bool) 
     pool = _sales_rotation_pool(hub.get("recentSales") or [], min_price) if show_sales else []
     if not pool:
         return None
+    # "Recently sold" stamps only under $50M in volume (services/sales_wording) - carried on each
+    # card so every renderer (and the image fingerprints, which hash the items) follows it.
+    from app.services.sales_wording import sales_are_recent
+    recent = sales_are_recent((compute_sales_stats(hub) or {}).get("totalVolume"))
+    pool = [{**s, "_recent": recent} for s in pool]
     # Full pool (not sliced) - render_recent_sales_carousel_gif/jpeg windows through it itself
     # (always showing 3 at a time, scrolling one card every few seconds), so the whole qualifying
     # set gets seen over time instead of only ever the first 2-3.
@@ -1478,7 +1483,8 @@ def _compose_listing_bar_frame(photo, accent_hex: str, item: dict, pan_t: float,
         _inter_font(7 * scale, 800), pad_x=round(7 * scale), pad_y=round(3.5 * scale), radius=round(8 * scale),
     )
 
-    kicker = "RECENT SALE" if is_sold else ("COMING SOON" if status == "Coming Soon" else "FEATURED LISTING")
+    from app.services.sales_wording import sales_words
+    kicker = sales_words("RECENT SALE", item.get("_recent", True)) if is_sold else ("COMING SOON" if status == "Coming Soon" else "FEATURED LISTING")
     street = str(item.get("address") or "").strip().split(",")[0].strip()
     city_state = ", ".join(x for x in [item.get("city"), item.get("state")] if x)
     price = _fmt_money(item.get("price"))
@@ -1696,7 +1702,7 @@ def _mini_card_geometry(w: int, h: int) -> tuple[int, int, int, int, int, float,
     return pad, header_h, gap, card_w, card_h, scale, card_y
 
 
-def _compose_recent_sales_header(accent_hex: str, w: int, header_h: int, scale: float, dark: bool = False, bg=None):
+def _compose_recent_sales_header(accent_hex: str, w: int, header_h: int, scale: float, dark: bool = False, bg=None, recent: bool = True):
     """`bg`, when given, is a pre-built background (see _diagonal_wash_image) this paints straight
     onto instead of a flat fill - lets the static JPEG carousel's header share one continuous
     accent wash with the mini-cards below it rather than each independently flat-filling its own
@@ -1741,7 +1747,8 @@ def _compose_recent_sales_header(accent_hex: str, w: int, header_h: int, scale: 
     # mixed-case text too (see signaturePreview.ts's .mini-header), just CSS-uppercased for
     # display; a solid block of same-height raster caps has less silhouette variation than mixed
     # case, so it reads muddier once the shadow/blur pass is applied at this small a size).
-    label = "Recent Sales"
+    from app.services.sales_wording import sales_words
+    label = sales_words("Recent Sales", recent)
     bbox = probe.textbbox((0, 0), label, font=big_font)
     # Back to left-pinned at `pad` (briefly centered last round - explicit ask to revert: "make
     # recent sales text back in left side").
@@ -1766,7 +1773,7 @@ _SALES_HEADER_SCALE = 2  # retina - this is a standalone lossless PNG now (see b
 # palette to protect any more, same reasoning as _STATS_IMG_SCALE.
 
 
-def render_recent_sales_header_png(accent_hex: str = DEFAULT_ACCENT, dark: bool = False) -> bytes:
+def render_recent_sales_header_png(accent_hex: str = DEFAULT_ACCENT, dark: bool = False, recent: bool = True) -> bytes:
     """The "RECENT SALES" label, split out into its own small lossless PNG stacked in its own <tr>
     directly above the listing.gif/jpg cards image (see _listing_bar_html's sales_header row),
     instead of baked into the very top of that shared image the way it used to be. A GIF's limited
@@ -1786,13 +1793,13 @@ def render_recent_sales_header_png(accent_hex: str = DEFAULT_ACCENT, dark: bool 
     header_h = round(_LEGACY_SALES_HEADER_H_DISPLAY * scale)
     full_wash = _wash_with_glow_image(w, h, accent_hex, dark=dark)
     bg = full_wash.crop((0, 0, w, header_h))
-    canvas = _compose_recent_sales_header(accent_hex, w, header_h, scale, dark=dark, bg=bg)
+    canvas = _compose_recent_sales_header(accent_hex, w, header_h, scale, dark=dark, bg=bg, recent=recent)
     buffer = BytesIO()
     canvas.save(buffer, format="PNG", optimize=True)
     return buffer.getvalue()
 
 
-def render_recent_sales_header_webp(accent_hex: str = DEFAULT_ACCENT, dark: bool = False) -> bytes:
+def render_recent_sales_header_webp(accent_hex: str = DEFAULT_ACCENT, dark: bool = False, recent: bool = True) -> bytes:
     """Lossless WebP sibling of render_recent_sales_header_png, same composition - see that
     function's own docstring for why this text specifically has to stay lossless (it's the exact
     text that used to visibly band under GIF's limited palette)."""
@@ -1801,7 +1808,7 @@ def render_recent_sales_header_webp(accent_hex: str = DEFAULT_ACCENT, dark: bool
     header_h = round(_LEGACY_SALES_HEADER_H_DISPLAY * scale)
     full_wash = _wash_with_glow_image(w, h, accent_hex, dark=dark)
     bg = full_wash.crop((0, 0, w, header_h))
-    canvas = _compose_recent_sales_header(accent_hex, w, header_h, scale, dark=dark, bg=bg)
+    canvas = _compose_recent_sales_header(accent_hex, w, header_h, scale, dark=dark, bg=bg, recent=recent)
     buffer = BytesIO()
     canvas.save(buffer, format="WEBP", lossless=True, method=6)
     return buffer.getvalue()
@@ -1906,7 +1913,8 @@ def _draw_mini_sale_card(canvas, draw, x: int, y: int, cw: int, ch: int, photo, 
         # layer (so its rounded corners and letters come out smooth once it's shrunk down) - the
         # mini-card twin of the Live Preview's .mini-tag.
         stamp_font = _inter_font(6.4 * text_scale * text_ss, 800)
-        stamp = "RECENTLY SOLD"
+        from app.services.sales_wording import sales_words
+        stamp = sales_words("RECENTLY SOLD", item.get("_recent", True))
         sb = probe.textbbox((0, 0), stamp, font=stamp_font)
         pad_x, pad_y = round(5 * scale * text_ss), round(2.6 * scale * text_ss)
         sx, sy = round(6 * scale * text_ss), round(6 * scale * text_ss)

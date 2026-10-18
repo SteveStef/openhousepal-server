@@ -824,6 +824,7 @@ async def get_site_profile(site_id: str, db: AsyncSession = Depends(get_db)):
     if not owner:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Site not found.")
     _, user = owner
+    from app.services.sales_wording import sales_are_recent
     profile = await content_adapters.get_agent_profile(db, user)
     hub = (await db.execute(select(AgentHub).where(AgentHub.owner_id == user.id))).scalar_one_or_none()
     forms = await content_adapters.get_forms_list(db, user)
@@ -844,6 +845,8 @@ async def get_site_profile(site_id: str, db: AsyncSession = Depends(get_db)):
         "social_links": profile.get("social_links") or [],
         # Footer signature card (theme.footer_signature decides whether the page uses it).
         "signature_hub_slug": await content_adapters.signature_hub_slug_for(db, user),
+        # "Recently Sold" (footer link) only under $50M in volume - services/sales_wording.
+        "sales_recent": sales_are_recent((await content_adapters.get_agent_stats(db, user)).get("sold_volume")),
         # Every page's form buttons (Home value, Buying, Selling, a showing...) open one of these in
         # a window over the page - see components/website-public/SiteFormLauncher.
         "agent_hub_slug": hub.slug if hub else None,
