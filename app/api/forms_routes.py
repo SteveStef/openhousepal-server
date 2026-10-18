@@ -628,6 +628,33 @@ BUY_BATHROOMS_ONLY = {
 }
 
 
+# Schedule a Showing forms made before the day-and-time picker: one "Schedule a Showing" group (or
+# loose questions) asking for the address, name, phone, email and a typed "when are you available".
+# Those can't cross out the agent's busy times, so they move onto today's questions (user, 10/18) -
+# the picker flow then runs (ShowingRequestFlow). Only forms made of these standard questions; one
+# with any question the agent added stays as it is. Past requests keep their own answer snapshots.
+_LEGACY_SHOWING_IDS = {"showing_details", "property_of_interest", "full_name", "phone", "email", "availability",
+                       "preferred_times", "contact_info", "message", "showing_note"}
+
+
+def upgrade_legacy_showing(form_type: str, questions: List[dict]) -> Optional[List[dict]]:
+    """Today's Schedule a Showing questions for an old standard showing form, else None."""
+    if form_type != "showing":
+        return None
+    asked = [q for q in (questions or []) if q.get("type") != "statement"]
+    ids = {q.get("id") for q in asked}
+    flow_ids = {"property_of_interest", "preferred_times", "contact_info"}
+    if "property_of_interest" in ids and ids <= flow_ids:
+        return None   # already today's shape
+    every = set(ids)
+    for q in asked:
+        every |= {f.get("id") for f in (q.get("fields") or [])}
+    allowed = _LEGACY_SHOWING_IDS | {f"preferred_{k}_{n}" for k in ("date", "time") for n in (1, 2, 3)}
+    if not asked or "property_of_interest" not in every or not every <= allowed:
+        return None
+    return [dict(q) for q in DEFAULT_FORMS["showing"]["questions"]]
+
+
 def add_showcase_criteria(form_type: str, questions: List[dict]) -> Optional[List[dict]]:
     """I'm Buying and How Can We Help build the buyer a Showcase too, so they carry Setup My Own
     Showcase's home-search questions (slotted in after the buyer's "working with an agent?"
@@ -809,6 +836,13 @@ async def get_or_create_forms(db: AsyncSession, owner_id: str) -> List[AgentForm
             if getattr(form, attr) != default_value:
                 setattr(form, attr, default_value)
                 needs_resync = True
+
+    # Old standard Schedule a Showing forms move onto the day-and-time picker.
+    for form in all_forms:
+        upgraded = upgrade_legacy_showing(form.form_type, form.questions or [])
+        if upgraded is not None:
+            form.questions = upgraded
+            needs_resync = True
 
     # Forms made before I'm Buying / How Can We Help built Showcases get the home-search block.
     for form in all_forms:
