@@ -664,6 +664,37 @@ async def get_area_shapes(
     return {"shapes": shapes}
 
 
+@router.get("/area-shapes/public", dependencies=[])
+async def get_area_shapes_public(
+    cities: List[str] = Query(default=[]),
+    school_districts: List[str] = Query(default=[]),
+    counties: List[str] = Query(default=[]),
+    db: AsyncSession = Depends(get_db),
+):
+    """The same lines for a CLIENT editing their own search (EditShowcaseCriteriaModal) - public
+    Census data, cached per place; capped lower than the agent's."""
+    return await get_area_shapes(cities=cities[:6], school_districts=school_districts[:6], counties=counties[:4], db=db)
+
+
+@router.get("/home-areas/public", dependencies=[])
+async def get_home_areas_public(
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+    db: AsyncSession = Depends(get_db),
+):
+    """One home's surroundings for a property map: its township / borough / city, the ones around
+    it, and its school district (areas/boundary_service.home_areas - free Census lines, saved once
+    and shared). Empty lists when the Census can't be reached - the map still shows the home."""
+    import httpx
+    from app.services.areas import boundary_service
+    try:
+        async with httpx.AsyncClient(headers={"User-Agent": "OpenHousePal/1.0"}) as client:
+            return await boundary_service.home_areas(db, client, round(lat, 5), round(lng, 5))
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        logger.info(f"Home areas lookup failed for {lat},{lng}: {exc}")
+        return {"municipality": None, "neighbors": [], "school_districts": []}
+
+
 @router.get("/address/public", dependencies=[])
 async def search_properties_by_address_public(
     query: str = Query(..., min_length=2, max_length=200),

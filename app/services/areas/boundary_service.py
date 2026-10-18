@@ -9,6 +9,11 @@
 
 Lines for a named place (a Showcase's "Bryn Mawr, PA" / "LOWER MERION, PA" / "Montgomery, PA")
 are cached in system_settings under "geo:..." for 180 days - one Census call per place, ever.
+
+home_areas (user, 10/18): for ONE home's spot on a map - the township / borough / city it sits in, the
+ones around it, and its school district - for every property map (Showcase, IDX, Guest Pass, CMA,
+Spotlight). Each shape is saved once by its Census id and shared by every home and agent; the spot
+-> ids lookup is saved per ~100 m.
 """
 import logging
 import re
@@ -375,3 +380,79 @@ async def town_shape(db: AsyncSession, client: httpx.AsyncClient, value: str) ->
                      "rings": [ring for f in feats for ring in f["geometry"]["rings"]]}
     await _cache_put(db, ck, {"shape": shape})
     return shape
+
+
+
+# ---------------------------------------------------------------- one home's surroundings
+# States whose townships are real local governments (taxes, zoning, trash) - elsewhere the Census
+# "county subdivisions" are just statistical, and an incorporated city / town is the government.
+_MCD_STATES = {"09", "23", "25", "26", "27", "33", "34", "36", "42", "44", "50", "55"}  # CT ME MA MI MN NH NJ NY PA RI VT WI
+
+
+def _point(lat: float, lng: float) -> dict:
+    return {"geometry": f"{lng},{lat}", "geometryType": "esriGeometryPoint", "spatialRel": "esriSpatialRelIntersects"}
+
+
+async def _shape_by_geoid(db: AsyncSession, client: httpx.AsyncClient, layer: int, geoid: str, offset: float) -> Optional[dict]:
+    ck = f"geo:shape:{layer}:{geoid}"
+    hit = await _cache_get(db, ck)
+    if hit:
+        return hit.get("shape")
+    safe = re.sub(r"[^0-9A-Za-z]", "", geoid)
+    feats = await tiger(client, layer, offset=offset, where=f"GEOID='{safe}'")
+    shape = None
+    if feats:
+        a = feats[0]["attributes"]
+        shape = {"name": nice_place(a.get("NAME") or ""), "geoid": safe, "rings": feats[0]["geometry"]["rings"]}
+    await _cache_put(db, ck, {"shape": shape})
+    return shape
+
+
+async def home_areas(db: AsyncSession, client: httpx.AsyncClient, lat: float, lng: float) -> dict:
+    """{'municipality': shape|None, 'neighbors': [shape], 'school_districts': [shape]} for a home's
+    spot. A shape is {name, geoid, rings ([lng, lat] rings)}."""
+    ck = f"geo:pt:{lat:.3f},{lng:.3f}"
+    ids = (await _cache_get(db, ck) or {}).get("ids")
+    if ids is None:
+        pt = _point(lat, lng)
+        muni = None
+        cs = await tiger(client, COUSUB, with_geometry=False, **pt)
+        state = cs[0]["attributes"].get("STATE") if cs else None
+        if cs and state in _MCD_STATES and cs[0]["attributes"].get("FUNCSTAT") == "A":
+            muni = [COUSUB, cs[0]["attributes"]["GEOID"]]
+        else:
+            places = [f for f in await tiger(client, PLACE, with_geometry=False, **pt) if f["attributes"].get("LSADC") != "57"]  # 57 = CDP
+            if places:
+                muni = [PLACE, places[0]["attributes"]["GEOID"]]
+        neighbors: list = []
+        if muni:
+            own = await _shape_by_geoid(db, client, muni[0], muni[1], 0.0002)
+            if own and own.get("rings"):
+                x0, y0, x1, y1 = bbox(own["rings"])
+                pad = 0.002
+                around = await tiger(client, muni[0], with_geometry=False, **envelope(x0 - pad, y0 - pad, x1 + pad, y1 + pad))
+                for f in around:
+                    a = f["attributes"]
+                    if a.get("GEOID") == muni[1] or (muni[0] == PLACE and a.get("LSADC") == "57"):
+                        continue
+                    if muni[0] == COUSUB and a.get("FUNCSTAT") != "A":
+                        continue
+                    neighbors.append([muni[0], a["GEOID"]])
+                neighbors = neighbors[:10]
+        districts: list = []
+        unified = await tiger(client, UNSD, with_geometry=False, **pt)
+        if unified:
+            districts = [[UNSD, unified[0]["attributes"]["GEOID"]]]
+        else:
+            for layer in (ELSD, SCSD):
+                hit = await tiger(client, layer, with_geometry=False, **pt)
+                if hit:
+                    districts.append([layer, hit[0]["attributes"]["GEOID"]])
+        ids = {"muni": muni, "neighbors": neighbors, "districts": districts}
+        await _cache_put(db, ck, {"ids": ids})
+
+    municipality = await _shape_by_geoid(db, client, ids["muni"][0], ids["muni"][1], 0.0002) if ids.get("muni") else None
+    near = [await _shape_by_geoid(db, client, layer, g, 0.0004) for layer, g in ids.get("neighbors") or []]
+    sds = [await _shape_by_geoid(db, client, layer, g, 0.0003) for layer, g in ids.get("districts") or []]
+    return {"municipality": municipality, "neighbors": [n for n in near if n and n.get("rings")],
+            "school_districts": [d for d in sds if d and d.get("rings")]}
