@@ -411,7 +411,7 @@ async def _shape_by_geoid(db: AsyncSession, client: httpx.AsyncClient, layer: in
 async def home_areas(db: AsyncSession, client: httpx.AsyncClient, lat: float, lng: float) -> dict:
     """{'municipality': shape|None, 'neighbors': [shape], 'school_districts': [shape]} for a home's
     spot. A shape is {name, geoid, rings ([lng, lat] rings)}."""
-    ck = f"geo:pt:{lat:.3f},{lng:.3f}"
+    ck = f"geo:pt2:{lat:.3f},{lng:.3f}"
     ids = (await _cache_get(db, ck) or {}).get("ids")
     if ids is None:
         pt = _point(lat, lng)
@@ -424,21 +424,13 @@ async def home_areas(db: AsyncSession, client: httpx.AsyncClient, lat: float, ln
             places = [f for f in await tiger(client, PLACE, with_geometry=False, **pt) if f["attributes"].get("LSADC") != "57"]  # 57 = CDP
             if places:
                 muni = [PLACE, places[0]["attributes"]["GEOID"]]
+        if not muni:
+            # Unincorporated (Bethesda MD, Arlington VA, Hockessin DE): the county is the local government.
+            county = await tiger(client, COUNTY, with_geometry=False, **pt)
+            if county:
+                muni = [COUNTY, county[0]["attributes"]["GEOID"]]
+        # (Neighbouring towns are no longer drawn - user 10/18: the grey lines made maps messy.)
         neighbors: list = []
-        if muni:
-            own = await _shape_by_geoid(db, client, muni[0], muni[1], 0.0002)
-            if own and own.get("rings"):
-                x0, y0, x1, y1 = bbox(own["rings"])
-                pad = 0.002
-                around = await tiger(client, muni[0], with_geometry=False, **envelope(x0 - pad, y0 - pad, x1 + pad, y1 + pad))
-                for f in around:
-                    a = f["attributes"]
-                    if a.get("GEOID") == muni[1] or (muni[0] == PLACE and a.get("LSADC") == "57"):
-                        continue
-                    if muni[0] == COUSUB and a.get("FUNCSTAT") != "A":
-                        continue
-                    neighbors.append([muni[0], a["GEOID"]])
-                neighbors = neighbors[:10]
         districts: list = []
         unified = await tiger(client, UNSD, with_geometry=False, **pt)
         if unified:
@@ -451,7 +443,8 @@ async def home_areas(db: AsyncSession, client: httpx.AsyncClient, lat: float, ln
         ids = {"muni": muni, "neighbors": neighbors, "districts": districts}
         await _cache_put(db, ck, {"ids": ids})
 
-    municipality = await _shape_by_geoid(db, client, ids["muni"][0], ids["muni"][1], 0.0002) if ids.get("muni") else None
+    m = ids.get("muni")
+    municipality = await _shape_by_geoid(db, client, m[0], m[1], 0.0006 if m[0] == COUNTY else 0.0002) if m else None
     near = [await _shape_by_geoid(db, client, layer, g, 0.0004) for layer, g in ids.get("neighbors") or []]
     sds = [await _shape_by_geoid(db, client, layer, g, 0.0003) for layer, g in ids.get("districts") or []]
     return {"municipality": municipality, "neighbors": [n for n in near if n and n.get("rings")],
