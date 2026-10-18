@@ -477,7 +477,7 @@ class PropertyTourService:
             first = (tour.visitor_name or collection.visitor_name or "").strip().split(" ")[0]
             from app.services.agent_roundup_service import nice_street
             street = nice_street(prop.street_address, prop.city)
-            from app.services.showcase_links import showcase_path
+            from app.services.showcase_links import showcase_path, home_suffix
             # A real calendar invite for the client (calendar_invite_service).
             from app.services.calendar_invite_service import build_invite, eastern_start
             phone = await agent_public_phone(db, agent)
@@ -485,7 +485,7 @@ class PropertyTourService:
             address = prop.full_address or ", ".join(p for p in (prop.street_address, prop.city, prop.state) if p)
             ics = build_invite(uid=f"tour-{tour.id}", start=start, street=street, address=address, agent_name=agent_name,
                                agent_email=agent.email, agent_phone=phone, client_name=tour.visitor_name or collection.visitor_name,
-                               client_email=to, link=f"{base}{await showcase_path(collection)}") if start else None
+                               client_email=to, link=f"{base}{await showcase_path(collection)}{home_suffix(prop.street_address)}") if start else None
             email_person(to, "tour_confirmed", f"Your tour of {street} is confirmed - {date_label} at {time_label}", {
                 "_ics": ics,
                 "recipient_name": first[:1].upper() + first[1:] if first else "there",

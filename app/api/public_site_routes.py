@@ -7,6 +7,7 @@ import httpx
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import or_, select
+from app.services.showcase_links import share_match
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -238,7 +239,7 @@ async def _assert_site_showcase(db: AsyncSession, site_id: str, share_token: str
     _site, user = owner
     result = await db.execute(
         select(Collection.id).where(
-            Collection.share_token == share_token,
+            share_match(share_token),
             Collection.owner_id == user.id,
             Collection.is_public.is_(True),
             Collection.status == "ACTIVE",

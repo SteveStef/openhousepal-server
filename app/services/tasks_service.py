@@ -819,7 +819,7 @@ PITCH_TOKENS: dict[str, dict] = {
     "home_count": {"label": "Number of homes", "kind": "property", "sample": "14 homes"},
     "best_home": {"label": "Newest best match (only if listed in the last 3 weeks)", "kind": "property", "sample": "12 Oak St in Ardmore (4 bd / 2.5 ba, $650,000)"},
     "why_now": {"label": "How new it is", "kind": "property", "sample": "It just hit the market 2 days ago."},
-    "showcase_link": {"label": "Showcase link", "kind": "link", "sample": "https://openhousepal.com/showcase/a1b2c3"},
+    "showcase_link": {"label": "Showcase link", "kind": "link", "sample": "https://openhousepal.com/showcase/dana-k7q2"},
     "first_name": {"label": "First name", "kind": "person", "sample": "Jane"},
     "my_name": {"label": "Your name", "kind": "you", "sample": ""},
 }
@@ -2557,7 +2557,7 @@ async def followup_property(db: AsyncSession, task: AgentTask, owner: Optional[U
         # 1) that exact home inside their own Showcase
         if listing_key and task.lead_id and owner is not None and owner_has_showcases(owner):
             row = (await db.execute(
-                select(Collection.share_token, Property.id)
+                select(Collection.share_token, Property.street_address)
                 .join(LeadEvent, LeadEvent.collection_id == Collection.id)
                 .join(collection_properties, collection_properties.c.collection_id == Collection.id)
                 .join(Property, Property.id == collection_properties.c.property_id)
@@ -2568,8 +2568,8 @@ async def followup_property(db: AsyncSession, task: AgentTask, owner: Optional[U
             if row:
                 from app.services.website.site_service import resolve_owner_public_base_url
                 base = (await resolve_owner_public_base_url(db, owner)).rstrip("/")
-                from app.services.showcase_links import showcase_path
-                out.update(url=f"{base}{await showcase_path(share_token=row[0], db=db) or f'/showcase/{row[0]}'}?property={row[1]}", where="showcase")
+                from app.services.showcase_links import showcase_path, home_suffix
+                out.update(url=f"{base}{await showcase_path(share_token=row[0], db=db) or f'/showcase/{row[0]}'}{home_suffix(row[1])}", where="showcase")
                 return out
         # 2) the property details page
         from app.services import property_website_service as pws
@@ -2590,10 +2590,10 @@ async def followup_property(db: AsyncSession, task: AgentTask, owner: Optional[U
 def _sample_cases() -> dict:
     import os
     base = os.getenv("FRONTEND_URL", os.getenv("CLIENT_URL", "http://localhost:3000")).rstrip("/")
-    in_showcase = {"address": "12 Oak St, Ardmore, PA", "short": "12 Oak St, Ardmore", "url": f"{base}/showcase/sample?property=12-oak", "where": "showcase", "mls": "PAMC2012345",
+    in_showcase = {"address": "12 Oak St, Ardmore, PA", "short": "12 Oak St, Ardmore", "url": f"{base}/showcase/sample/12-oak-st", "where": "showcase", "mls": "PAMC2012345",
                    "list_agent": {"name": "Alex Lister", "phone": "(610) 555-0199", "email": "alex@example.com", "office": "Main Line Realty"}}
     listing = {"address": "12 Oak St, Ardmore, PA", "short": "12 Oak St, Ardmore", "url": f"{base}/property/sample", "where": "listing"}
-    birch = {"address": "22 Birch Ln, Wayne, PA", "short": "22 Birch Ln, Wayne", "url": f"{base}/showcase/sample?property=22-birch", "where": "showcase", "mls": "PADE2054321",
+    birch = {"address": "22 Birch Ln, Wayne, PA", "short": "22 Birch Ln, Wayne", "url": f"{base}/showcase/sample/22-birch-ln", "where": "showcase", "mls": "PADE2054321",
              "list_agent": {"name": "Alex Lister", "phone": "(610) 555-0199", "email": "alex@example.com", "office": "Main Line Realty"}}
     return {
         "open_house_signin": ("Follow up with Jane Buyer", "Signed in at your open house - 12 Oak St, Ardmore", [], in_showcase),

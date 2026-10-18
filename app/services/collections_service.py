@@ -1,5 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, insert, delete, text, func, update
+from app.services.showcase_links import share_match
 from sqlalchemy.orm import selectinload, joinedload, load_only
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
@@ -1303,9 +1304,7 @@ class CollectionsService:
     ) -> bool:
         """Update collection notification settings via share token (for visitors)"""
         try:
-            query = select(Collection).where(
-                Collection.share_token == share_token
-            )
+            query = select(Collection).where(share_match(share_token))
 
             result = await db.execute(query)
             collection = result.scalar_one_or_none()
@@ -1417,7 +1416,7 @@ class CollectionsService:
                 )
                 .where(
                     and_(
-                        Collection.share_token == share_token,
+                        share_match(share_token),
                         Collection.is_public == True,
                         Collection.status == "ACTIVE",
                     )
@@ -1429,7 +1428,7 @@ class CollectionsService:
 
             if not collection:
                 # Let's also check if collection exists but is not public
-                debug_query = select(Collection).where(Collection.share_token == share_token)
+                debug_query = select(Collection).where(share_match(share_token))
                 debug_result = await db.execute(debug_query)
                 debug_collection = debug_result.scalar_one_or_none()
                 if debug_collection:

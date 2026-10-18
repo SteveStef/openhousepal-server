@@ -28,6 +28,7 @@ from app.services.leads_service import upsert_lead
 from app.utils.auth import get_current_active_user, get_current_user_optional, require_premium_plan, require_broker_authorization
 from app.models.database import User, Collection, Notification
 from sqlalchemy import select, update, and_
+from app.services.showcase_links import share_match
 from sqlalchemy.orm import joinedload
 from app.config.logging import get_logger
 
@@ -984,7 +985,7 @@ async def _assert_showcase_owner_active(db: AsyncSession, share_token: str) -> N
     comes straight back if the agent upgrades/resubscribes."""
     from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
     owner = (await db.execute(
-        select(User).join(Collection, Collection.owner_id == User.id).where(Collection.share_token == share_token)
+        select(User).join(Collection, Collection.owner_id == User.id).where(share_match(share_token))
     )).scalar_one_or_none()
     if owner is not None and not owner_has_access(owner, SHOWCASE_ACCESS_TIERS):
         raise HTTPException(status_code=status.HTTP_410_GONE, detail=SHOWCASE_PAUSED_DETAIL)
@@ -1129,7 +1130,7 @@ async def update_shared_collection_preferences(
         result = await db.execute(
             select(Collection).options(joinedload(Collection.preferences)).where(
                 and_(
-                    Collection.share_token == share_token,
+                    share_match(share_token),
                     Collection.is_public == True,
                     Collection.status == "ACTIVE",
                 )
@@ -1223,7 +1224,7 @@ async def preview_shared_collection_matches(
     real update runs, on their saved criteria with these changes laid over them."""
     result = await db.execute(
         select(Collection).options(joinedload(Collection.preferences)).where(
-            and_(Collection.share_token == share_token, Collection.is_public == True, Collection.status == "ACTIVE")
+            and_(share_match(share_token), Collection.is_public == True, Collection.status == "ACTIVE")
         )
     )
     collection_obj = result.unique().scalar_one_or_none()
