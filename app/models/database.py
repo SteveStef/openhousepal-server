@@ -2300,11 +2300,54 @@ class CmaReport(Base):
     # Web version of the shared report ends with the agent's Email Signature card (plans with
     # signatures, when one is saved) - the PDF keeps its own footer. On by default.
     use_signature_card = Column(Boolean, default=True, nullable=False, server_default='true')
+    # Made by the admin CMA accuracy test (cma_backtest_service), never by an agent: excluded from
+    # every report list, never shareable, removed in bulk from the admin page.
+    is_backtest = Column(Boolean, default=False, nullable=False, server_default='false', index=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     owner = relationship("User")
+
+
+class CmaBacktestBatch(Base):
+    """One admin CMA accuracy test: real past sales re-run through the normal CMA flow as of the day
+    before each went under contract (see cma_backtest_service / cma_time_machine). `items` holds one
+    entry per home - its hidden truth, the as-of facts used, the generated report id and the
+    scoreboard numbers - updated in place as the queue works through them."""
+    __tablename__ = "cma_backtest_batches"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    status = Column(String, nullable=False, default="queued")  # queued | running | done | stopped
+    settings = Column(JSONB, nullable=False, default=dict)
+    items = Column(JSONB, nullable=False, default=list)
+    estimated_cost_usd = Column(Float, nullable=True)
+    actual_cost_usd = Column(Float, nullable=True)
+    error = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class CmaBacktestArm(Base):
+    """'The next CMA this test agent builds for this sold listing is an accuracy-test run as of
+    facts["as_of"].' Created only by the admin test runner; the server's address search, listing
+    lookup, comp search and AI generation honour it for that one owner + listing (see
+    cma_backtest_arms). `facts` holds the as-of view AND the hidden truth (for the leak scan only)."""
+    __tablename__ = "cma_backtest_arms"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    batch_id = Column(String, ForeignKey('cma_backtest_batches.id', ondelete='CASCADE'), nullable=True)
+    item_index = Column(Integer, nullable=True)
+    listing_key = Column(String, nullable=False)
+    address_key = Column(String, nullable=True)
+    facts = Column(JSONB, nullable=False, default=dict)
+    dry_run = Column(Boolean, nullable=False, default=False, server_default='false')
+    report_id = Column(String, nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class SellerNetSheet(Base):

@@ -144,7 +144,7 @@ def _record_is_recent_market_evidence(record: dict, *, max_days: int, as_of: dat
     if _is_current_market_status(record.get("status") or record.get("home_status")):
         return True
     closed = _parse_market_date(record.get("close_date") or record.get("sale_date"))
-    return bool(closed and closed >= as_of - timedelta(days=max_days))
+    return bool(closed and as_of - timedelta(days=max_days) <= closed <= as_of)
 
 
 def build_adaptive_proximity_context(subject: dict, references: list[dict]) -> dict:
@@ -219,7 +219,8 @@ def build_adaptive_proximity_context(subject: dict, references: list[dict]) -> d
     recency_window_days = None
     suitable = physically_suitable
     if lifecycle_known:
-        as_of = date.today()
+        from app.services import cma_time_machine
+        as_of = cma_time_machine.today()
         for max_days in DENSITY_RECENCY_WINDOWS_DAYS:
             recent = [
                 item for item in physically_suitable

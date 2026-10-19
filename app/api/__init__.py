@@ -22,6 +22,7 @@ from .design_routes import router as design_router
 from .lead_routes import router as lead_router
 from .stats_routes import router as stats_router
 from .cma_routes import router as cma_router
+from .cma_backtest_routes import router as cma_backtest_router
 from .seller_net_sheet_routes import router as seller_net_sheet_router
 from .buyer_cash_needed_routes import router as buyer_cash_needed_router
 from .ai_routes import router as ai_router
@@ -71,6 +72,7 @@ router.include_router(design_router)
 router.include_router(lead_router)
 router.include_router(stats_router)
 router.include_router(cma_router)
+router.include_router(cma_backtest_router)
 router.include_router(seller_net_sheet_router)
 router.include_router(buyer_cash_needed_router)
 router.include_router(ai_router)

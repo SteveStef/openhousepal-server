@@ -34,6 +34,34 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.database import CmaReport, Property
 from app.services import cma_service
 from app.services import road_context_service
+# Admin accuracy-test only: "as of an earlier date" runs (see the module docstring). Inert unless
+# the backtest runner switches it on around a single generation.
+from app.services import cma_time_machine as _tmach
+from app.utils.listing_dom import resolve_days_on_market
+import contextvars as _contextvars
+
+# Tokens spent by the follow-up model calls of the CMA run in progress (comp-note rewrite, gate
+# rewrite, language polish). generate_ai_analysis books them once at the end.
+_EXTRA_USAGE: "_contextvars.ContextVar[Optional[list]]" = _contextvars.ContextVar("cma_extra_usage", default=None)
+
+
+def _note_extra_usage(resp, model: str, label: str) -> None:
+    acc = _EXTRA_USAGE.get()
+    usage = getattr(resp, "usage", None)
+    if acc is None or usage is None:
+        return
+    acc.append({"label": label, "model": model,
+                "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
+                "output_tokens": int(getattr(usage, "output_tokens", 0) or 0)})
+
+
+def _get_client():
+    """The Anthropic client - or, inside an accuracy-test DRY RUN only, the time machine's stub
+    (zero cost; every request it receives is kept for the leak scan)."""
+    tm = _tmach.current()
+    if tm is not None and getattr(tm, "fake_client", None) is not None:
+        return tm.fake_client
+    return _provider_client()
 from app.services.cma_similarity_service import (
     MATCH_DISPLAY_CALIBRATION_VERSION,
     build_adaptive_proximity_context,
@@ -43,7 +71,7 @@ from app.services.cma_similarity_service import (
 from app.services.cma_artifact_service import stamp_final_artifact_qa
 from app.services.bright_mls_service import bright_mls_service
 from app.services.ai.ai_config_service import ai_config_service
-from app.services.ai.ai_orchestrator_service import _get_client
+from app.services.ai.ai_orchestrator_service import _get_client as _provider_client
 from app.services.ai.ai_rate_limit_service import (
     AIRateLimitExceeded, classify_provider_error, reconcile_budget, record_usage_event, reserve_cma_analysis,
     reserve_cma_reasoning,
@@ -1903,7 +1931,7 @@ def _comp_recency_weight(comp: dict) -> Optional[float]:
     sale_date = _parse_iso_date(comp.get("close_date") or comp.get("sale_date"))
     if not sale_date:
         return None
-    age_days = max(0, (datetime.now(timezone.utc).date() - sale_date).days)
+    age_days = max(0, (_tmach.today() - sale_date).days)
     return round(max(0.15, _half_life_decay(age_days, _V10_RECENCY_HALF_LIFE_DAYS)), 3)
 
 
@@ -2505,6 +2533,9 @@ async def _enrich_with_property_data(db: AsyncSession, subject: dict, comps: lis
         return subject, comps
     result = await db.execute(select(Property).where(Property.listing_key.in_(keys)))
     by_key = {p.listing_key: p for p in result.scalars().all()}
+    _tm = _tmach.current()
+    if _tm and _tm.listing_key in by_key:
+        by_key[_tm.listing_key] = _tmach.masked_property(by_key[_tm.listing_key], _tm)
 
     def _merged(data: dict) -> dict:
         prop = by_key.get(data.get("listing_key"))
@@ -2567,7 +2598,8 @@ async def _enrich_with_property_data(db: AsyncSession, subject: dict, comps: lis
     listing_key = subject.get("listing_key")
     live_overlay: Optional[dict] = None
     live_status_note: Optional[str] = None
-    if listing_key:
+    # Time-machine (accuracy test) runs never re-pull live status - it would reveal the sale.
+    if listing_key and not _tmach.current():
         try:
             live = await bright_mls_service.get_property_by_listing_key(listing_key)
         except Exception as exc:
@@ -2632,7 +2664,7 @@ def _with_age(data: dict) -> dict:
     if not year_built:
         return data
     try:
-        age = datetime.now(timezone.utc).year - int(year_built)
+        age = _tmach.this_year() - int(year_built)
     except (TypeError, ValueError):
         return data
     return {**data, "property_age_years": age}
@@ -2794,7 +2826,7 @@ def _subject_status_timeline(
     is_under_contract = low in _UNDER_CONTRACT_STATUSES
     is_active = low in ("active", "coming soon")
 
-    today = datetime.now(timezone.utc).date()
+    today = _tmach.today()
     list_date = (
         _parse_iso_date(raw.get("ListingContractDate"))
         or _parse_iso_date(raw.get("OnMarketDate"))
@@ -2816,6 +2848,14 @@ def _subject_status_timeline(
     off_market_date = _parse_iso_date(raw.get("OffMarketDate"))
 
     mls_dom = _as_float(raw.get("DaysOnMarket"))
+    if mls_dom is not None and prop is not None and not (live_overlay or {}).get("DaysOnMarket"):
+        # No live re-pull: the stored count is from the day we last read the listing - while it is
+        # Active it kept counting since (same rule as everywhere else, listing_dom). In a
+        # time-machine run 'today' is the as-of date, before that read, so nothing is added.
+        _fresh = resolve_days_on_market(mls_dom, raw.get("MlsStatus") or getattr(prop, "home_status", None),
+                                        None, as_of=today, fetched_at=getattr(prop, "updated_at", None))
+        if _fresh is not None:
+            mls_dom = float(_fresh)
     if mls_dom is None and prop is not None:
         mls_dom = _as_float(getattr(prop, "days_on_market", None))
     if mls_dom is None:
@@ -7667,6 +7707,9 @@ def _reasoning_output_text(payload: dict) -> str:
 
 
 async def _call_cma_reasoning_model(config: dict, evidence_packet: dict) -> tuple[dict, dict]:
+    _tm = _tmach.current()
+    if _tm is not None and getattr(_tm, "fake_reasoning", None) is not None:
+        return _tm.fake_reasoning(evidence_packet), {}   # accuracy-test dry run: no provider call
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not configured")
@@ -8475,6 +8518,7 @@ async def _targeted_comp_narrative_rewrite(
             model=model, max_tokens=min(8000, 2500 + 700 * len(flagged)), system=sys,
             messages=[{"role": "user", "content": user}],
         )
+        _note_extra_usage(resp, model, "comp_narrative_rewrite")
         raw = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", None) == "text")
         mjson = re.search(r"\{.*\}", raw, re.DOTALL)
         if not mjson:
@@ -8575,7 +8619,7 @@ def _stucco_inspection_paragraph(subject: dict) -> Optional[str]:
     if "stucco" not in facts and "eifs" not in facts:
         return None
     yb = _as_float(subject.get("year_built"))
-    current_year = datetime.now(timezone.utc).year
+    current_year = _tmach.this_year()
     age = current_year - int(yb) if yb else None
     masonry = any(x in facts for x in ("masonry", "stone", "brick", "concrete block", "cmu"))
     wood = any(x in facts for x in ("wood frame", "wood-framed", "wood framed", "sheathing", "stick-built", "eifs"))
@@ -10399,6 +10443,7 @@ async def _targeted_gate_rewrite(methodology: str, offer: str, *, value: float, 
             model=model, max_tokens=4000, system=sys,
             messages=[{"role": "user", "content": user}],
         )
+        _note_extra_usage(resp, model, "gate_rewrite")
         raw = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", None) == "text")
         mjson = re.search(r"\{.*\}", raw, re.DOTALL)
         if not mjson:
@@ -10482,6 +10527,7 @@ async def _v10_final_language_polish(fields: dict, *, model: str) -> dict:
         )
         resp = await client.messages.create(model=model, max_tokens=3000, system=sys,
                                             messages=[{"role": "user", "content": user}])
+        _note_extra_usage(resp, model, "language_polish")
         raw = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", None) == "text")
         mjson = re.search(r"\{.*\}", raw, re.DOTALL)
         data = json.loads(mjson.group(0)) if mjson else {}
@@ -12274,6 +12320,8 @@ async def generate_ai_analysis(
 ) -> CmaReport:
     report = await cma_service._get_owned(db, owner_id, report_id)
     config = await ai_config_service.get_config(db)
+    _extra_usage: list = []
+    _EXTRA_USAGE.set(_extra_usage)
 
     max_photos = min(
         max_photos_per_property or config["cma_ai_default_max_photos_per_property"],
@@ -12321,6 +12369,7 @@ async def generate_ai_analysis(
     enriched_subject = _reconciled_subject_snapshot(enriched_subject, status_timeline)
     enriched_subject, status_timeline = _seller_not_listed(report.mode, enriched_subject, status_timeline)
     proximity_context = await load_local_proximity_context(db, enriched_subject)
+    _tm_comp_prices = [p for c in enriched_comps for p in (_as_float(c.get("sale_price")), _as_float(c.get("list_price"))) if p]
 
     # v10 - provisional anchor + exposure (before the AI reclassifies comps), shown to the model
     # in the prompt. The anchor is recomputed from the AI's final strengths after the call.
@@ -12334,6 +12383,12 @@ async def generate_ai_analysis(
         anchor=prov_anchor, exposure=prov_exposure,
     )
     model = config["cma_ai_model"]
+    try:
+        _tmach.check_structured(enriched_subject, status_timeline, enriched_comps, "subject snapshot / comp set")
+        _tmach.check_payload(content, "comp-analysis prompt", comp_prices=_tm_comp_prices)
+    except _tmach.TimeMachineLeak:
+        await reconcile_budget(db, reservation, 0.0)   # nothing was spent - give the reservation back
+        raise
 
     # Real hard cap, checked BEFORE spending anything - projected_tokens comes from actual fetched
     # image dimensions (see _image_token_estimate) plus the exact text just built, not a guess, so
@@ -12499,6 +12554,7 @@ async def generate_ai_analysis(
             )
             if _qual_gap_buckets and isinstance(estimate_content, list):
                 estimate_content.append({"type": "text", "text": _v10_qual_gap_directive(_qual_gap_buckets)})
+            _tmach.check_payload(estimate_content, "estimate-only retry prompt", comp_prices=_tm_comp_prices, raise_now=False)
             estimate_response = await client.messages.create(
                 model=model,
                 max_tokens=_ESTIMATE_ONLY_OUTPUT_TOKENS,
@@ -12558,6 +12614,8 @@ async def generate_ai_analysis(
                     merged[key] = val
                 result["subject_estimate"] = merged
                 subject_estimate_raw = merged
+        except _tmach.TimeMachineLeak:
+            raise
         except Exception as exc:
             logger.warning(
                 "CMA AI estimate-only retry failed",
@@ -12580,6 +12638,7 @@ async def generate_ai_analysis(
     if any(_guide_blank(k) for k in _guide_fields):
         try:
             guidance_content = _guidance_content(enriched_subject, enriched_comps, result.get("comps") or [], subject_estimate_raw or {})
+            _tmach.check_payload(guidance_content, "guidance prompt", comp_prices=_tm_comp_prices, raise_now=False)
             g_resp = await client.messages.create(
                 model=model,
                 max_tokens=2500,
@@ -12603,6 +12662,8 @@ async def generate_ai_analysis(
             subject_estimate_raw = merged
             result["subject_estimate"] = merged
             logger.info("CMA guidance pass returned", extra={"report_id": report_id, "mode": report.mode, "keys": sorted(k for k, v in g_out.items() if v)})
+        except _tmach.TimeMachineLeak:
+            raise
         except Exception as exc:  # noqa: BLE001 - the deterministic fallbacks still apply
             logger.warning("CMA guidance pass failed", extra={"report_id": report_id, "error": str(exc)})
 
@@ -12612,6 +12673,7 @@ async def generate_ai_analysis(
         cost, 0, False, None, event_type="cma_ai",
     )
     await reconcile_budget(db, reservation, cost)
+    _tmach.raise_if_leaked("comp-analysis retry / guidance prompts")   # accuracy-test runs only
 
     # Fills strength/quality only where the agent hasn't already made a choice - same non-
     # destructive posture as ai_commentary, just applied directly to the real fields since these
@@ -13005,6 +13067,7 @@ async def generate_ai_analysis(
             subject_estimate=_se_for_fields, evidence_by_key=evidence_by_key, outliers=outliers,
             data_quality_flags=qa_flags, deterministic_confidence=_deterministic_confidence,
         )
+        _tmach.check_payload(_reasoning_packet, "final-valuation evidence packet", comp_prices=_tm_comp_prices)
         _reasoning_output, _reasoning_blocking, _reasoning_cost, _reasoning_usage = await _run_cma_reasoning_stage(
             db, owner_id, plan_tier, config, _reasoning_packet, report_id,
         )
@@ -13395,11 +13458,23 @@ async def generate_ai_analysis(
             "The CMA did not produce enough valuation evidence for the final reasoning pass. No fallback value was saved.",
         )
 
+    # Follow-up calls (comp-note / gate rewrites, language polish) - book them like the main calls.
+    _extra_cost = 0.0
+    if _extra_usage:
+        _ex_in = sum(u["input_tokens"] for u in _extra_usage)
+        _ex_out = sum(u["output_tokens"] for u in _extra_usage)
+        _extra_cost = ai_config_service.estimate_cost_usd(config, model, _ex_in, _ex_out)
+        await record_usage_event(
+            db, owner_id, None, model, _ex_in, _ex_out, _extra_cost, 0, False, None, event_type="cma_ai",
+        )
+        cost += _extra_cost
     report.ai_analysis = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "model": model,
         "reasoning_model": config.get("cma_reasoning_model"),
         "cost_usd": round(cost + _reasoning_cost, 4),
+        "followup_calls": [u["label"] for u in _extra_usage] or None,
+        "followup_cost_usd": round(_extra_cost, 4),
         "comp_analysis_cost_usd": round(cost, 4),
         "reasoning_cost_usd": round(_reasoning_cost, 4),
         "reasoning_usage": _reasoning_usage or None,

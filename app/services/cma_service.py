@@ -92,6 +92,10 @@ async def _canonical_subject_snapshot(db: AsyncSession, subject: Dict[str, Any])
     if snapshot.get("source", "mls") != "mls" or not listing_key:
         return snapshot
     prop = (await db.execute(select(Property).where(Property.listing_key == str(listing_key)))).scalar_one_or_none()
+    from app.services import cma_time_machine
+    _tm = cma_time_machine.current()
+    if prop is not None and _tm and _tm.listing_key == str(listing_key):
+        prop = cma_time_machine.masked_property(prop, _tm)
     return _merge_authoritative_subject_facts(snapshot, prop) if prop else snapshot
 
 
@@ -250,7 +254,8 @@ async def mark_generation_finished(owner_id: str, report_id: str, outcome: str, 
 async def list_reports(db: AsyncSession, owner_id: str) -> List[CmaReportListItem]:
     result = await db.execute(
         select(CmaReport)
-        .where(CmaReport.owner_id == owner_id)
+        # Admin accuracy-test reports never appear in a report list (open them from the admin page).
+        .where(CmaReport.owner_id == owner_id, CmaReport.is_backtest.is_(False))
         .order_by(CmaReport.updated_at.desc().nullslast(), CmaReport.created_at.desc())
     )
     reports = result.scalars().all()
@@ -372,7 +377,14 @@ async def update_report(db: AsyncSession, owner_id: str, report_id: str, payload
     report = await _get_owned(db, owner_id, report_id)
     data = payload.model_dump(exclude_unset=True)
     if "subject" in data:
-        data["subject"] = await _canonical_subject_snapshot(db, data["subject"] or {})
+        # CMA accuracy test only: a live arm for this agent + listing makes this an as-of test report.
+        from app.services import cma_backtest_arms as _arms
+        _arm = await _arms.find_arm(db, owner_id, listing_key=(data["subject"] or {}).get("listing_key"))
+        with _arms.activated(_arm):
+            data["subject"] = await _canonical_subject_snapshot(db, data["subject"] or {})
+        if _arm:
+            report.is_backtest = True
+            _arm.report_id = report.id
     # Every export-readiness fix runs automatically inside the generation pipeline itself, before a
     # report is ever saved - there is no user-facing "this changed since final QA, go regenerate"
     # gate anymore (agents were hitting it on routine post-generation saves like filling in
@@ -435,6 +447,8 @@ async def share_report(db: AsyncSession, owner_id: str, report_id: str) -> CmaSh
 async def get_public_report(db: AsyncSession, slug: str) -> CmaPublicResponse:
     result = await db.execute(select(CmaReport).where(CmaReport.share_slug == slug))
     report = result.scalar_one_or_none()
+    # (Accuracy-test reports can be shared like any other so the test can open the client page the
+    # way an agent would; they live on the test agent's account and are never listed.)
     if not report or report.status != 'SHARED':
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This CMA link isn't active.")
 
@@ -702,6 +716,10 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest) -> Lis
         sale_date = None
         if category == 'sold':
             parsed = _parse_date(close_date_raw) or (p.updated_at.date() if p.updated_at else None)
+            # A closing date in the future is a data error (seen: 2026-12-31 in the live sold set) -
+            # never offer it as a comparable sale.
+            if _parse_date(close_date_raw) and _parse_date(close_date_raw) > date.today():
+                continue
             if date_from and (not parsed or parsed < date_from):
                 continue
             if date_to and (not parsed or parsed > date_to):
@@ -736,6 +754,8 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest) -> Lis
                 dom_raw if dom_raw not in (None, "") else p.days_on_market,
                 p.home_status,
                 p.mls_list_date,
+                # Bright's DOM is the count on the day we read it - still-active comps keep counting.
+                fetched_at=p.updated_at,
             )
         except (TypeError, ValueError):
             dom_val = None

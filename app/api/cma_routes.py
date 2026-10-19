@@ -14,7 +14,7 @@ from app.schemas.cma import (
     CmaCompSearchRequest, CmaCompCandidate, CmaShareResponse, CmaPublicResponse,
     CmaGenerateAiAnalysisRequest, CmaThemeUpdate,
 )
-from app.services import cma_ai_service, cma_service as service
+from app.services import cma_ai_service, cma_service as service, cma_time_machine
 from app.services.ai.ai_rate_limit_service import AIRateLimitExceeded
 from app.utils.auth import require_mls_access, require_broker_authorization
 
@@ -55,7 +55,12 @@ async def search_cma_comparables(
 ):
     """Suggests candidate comparables from the local MLS mirror around a location - the agent
     decides what actually gets added to the CMA, this just narrows the search."""
-    return await service.search_comparables(db, payload)
+    from app.services import cma_backtest_arms as _arms
+    arm = await _arms.find_arm(db, current_user.id, listing_key=payload.listing_key)
+    if arm:   # CMA accuracy test only: the search window ends on the as-of date
+        payload = _arms.shift_search_window(payload, arm)
+    with _arms.activated(arm):
+        return await service.search_comparables(db, payload)
 
 
 @router.get("/public/{slug}", response_model=CmaPublicResponse)
@@ -140,6 +145,32 @@ async def delete_cma_report(
     await service.delete_report(db, current_user.id, report_id)
 
 
+async def _generate_maybe_as_of(db, owner_id: str, report_id: str, tier, opts: dict):
+    """The normal generation. Only for an accuracy-test report with a live arm (see
+    cma_backtest_arms) it runs inside the time machine - in a dry run with zero-cost AI stand-ins."""
+    from app.services import cma_backtest_arms as _arms
+    arm = await _arms.find_arm(db, owner_id, report_id=report_id)
+    if not arm:
+        return await cma_ai_service.generate_ai_analysis(db, owner_id, report_id, plan_tier=tier, **opts)
+    with _arms.activated(arm) as tm:
+        if arm.dry_run:
+            from app.services.cma_backtest_stubs import StubAnthropic, stub_reasoning
+            rep = await service.get_report(db, owner_id, report_id)
+            tm.fake_client = StubAnthropic({"list_price": (arm.facts or {}).get("list_price"), "comps": [
+                {"listing_key": c.get("listing_key"), "address": c.get("street_address"), "price": c.get("sale_price") or c.get("list_price")}
+                for c in (rep.comparables or []) if c.get("is_included", True)]})
+            tm.fake_reasoning = stub_reasoning
+            opts = {**opts, "include_map_images": False}   # the one paid Google call - off in a dry run
+        try:
+            return await cma_ai_service.generate_ai_analysis(db, owner_id, report_id, plan_tier=tier, **opts)
+        finally:
+            for i, cap in enumerate(tm.captured):
+                cma_time_machine.check_payload(cap, f"captured model request {i + 1} ({cap.get('provider')})", raise_now=False)
+            arm.facts = {**(arm.facts or {}), "leak_checks": tm.checks, "leak_log": tm.leak_log,
+                         "captured_requests": len(tm.captured), "ai_input_excerpt": tm.prompt_excerpt}
+            await db.commit()
+
+
 @router.post("/{report_id}/generate-ai-analysis", response_model=CmaReportResponse)
 async def generate_cma_ai_analysis(
     report_id: str,
@@ -167,7 +198,7 @@ async def generate_cma_ai_analysis(
             try:
                 async with AsyncSessionLocal() as s:
                     await service.drop_subject_from_comps(s, owner_id, report_id)
-                    await cma_ai_service.generate_ai_analysis(s, owner_id, report_id, plan_tier=tier, **opts)
+                    await _generate_maybe_as_of(s, owner_id, report_id, tier, opts)
                 ok = True
             except AIRateLimitExceeded as e:
                 err = e.user_message
@@ -192,13 +223,11 @@ async def generate_cma_ai_analysis(
     success = False
     try:
         await service.drop_subject_from_comps(db, current_user.id, report_id)
-        result = await cma_ai_service.generate_ai_analysis(
-            db, current_user.id, report_id,
-            plan_tier=current_user.plan_tier,
+        result = await _generate_maybe_as_of(db, current_user.id, report_id, current_user.plan_tier, dict(
             max_photos_per_property=payload.max_photos_per_property,
             include_map_images=payload.include_map_images,
             force_regenerate=payload.force_regenerate,
-        )
+        ))
         success = True
         return result
     except AIRateLimitExceeded as e:

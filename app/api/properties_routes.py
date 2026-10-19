@@ -421,7 +421,8 @@ async def search_properties_by_address(
     query: str = Query(..., min_length=2),
     active_only: bool = Query(False),
     exclude_rentals: bool = Query(False),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_broker_authorization),
 ):
     """Internal address search using Trigram similarity for typo-tolerant autocomplete.
     active_only/exclude_rentals are opt-in (default off) - this endpoint is shared by several
@@ -491,7 +492,7 @@ async def search_properties_by_address(
             },
         )
 
-        return {
+        payload = {
             "success": True,
             "results": [
                 {
@@ -519,6 +520,14 @@ async def search_properties_by_address(
                 )]
             ]
         }
+        # CMA accuracy test only: a live arm for this agent shows its sold test home as it read on
+        # the as-of date (Active, its asking price then). No arm -> unchanged.
+        from app.services import cma_backtest_arms as _arms
+        for _arm in await _arms.live_arms(db, current_user.id):
+            _street = _arm.address_key.split("|")[0] if _arm.address_key else None
+            payload["results"] = [_arms.mask_suggestion(x, _arm) if _street and _arms._street_of(x.get("address")) == _street else x
+                                  for x in payload["results"]]
+        return payload
     except Exception as e:
         logger.error(f"Address search failed: {e}")
         raise HTTPException(status_code=500, detail="Search failed")
@@ -1023,11 +1032,20 @@ async def get_property(
 @router.post("/lookup", response_model=PropertyDetailResponse, dependencies=[Depends(require_broker_authorization), Depends(require_mls_access)])
 async def get_property_details(
     request: PropertyLookupRequest,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_broker_authorization),
 ):
     """Fetch property details from the local mirror using PropertyService"""
     if not request.listing_key and not request.address:
         raise HTTPException(status_code=400, detail="Either listing_key or address must be provided")
+
+    # CMA accuracy test only (see cma_backtest_arms): the armed sold home, as it read on the as-of date.
+    from app.services import cma_backtest_arms as _arms
+    _arm = await _arms.find_arm(db, current_user.id, listing_key=request.listing_key, address=request.address)
+    if _arm:
+        _detail = await property_service.get_property_by_listing_key(db, _arm.listing_key)
+        if _detail:
+            return _arms.mask_lookup(_detail, _arm)
 
     try:
         if request.listing_key:
