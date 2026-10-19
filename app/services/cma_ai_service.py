@@ -8772,7 +8772,7 @@ def _factual_prose_blocking(
         if comp_note:
             # A comp's own note talks about the comp as "it/its" - "the subject's anchor $/sqft, which
             # is consistent with its dated kitchen" describes the COMP's kitchen.
-            switch = re.search(r"\b(?:its|it|this\s+(?:comp|home|sale|house|property))\b", window, re.IGNORECASE)
+            switch = re.search(r"\b(?:its|it|this\s+(?:comp|home|sale|house|property))\b|\s[-\u2013\u2014]\s|\u2014", window, re.IGNORECASE)
             if switch:
                 window = window[:switch.start()]
         return window
@@ -8817,6 +8817,10 @@ def _factual_prose_blocking(
         blocking.append(f"{label}: describes the subject as original/unrenovated/dated without supporting property data.")
     if _renovated_found:
         blocking.append(f"{label}: describes the subject as turnkey/renovated/updated without supporting property data.")
+    _as_is_doc = re.compile(r"\bas[- ]is\b|\bin\s+its\s+current\s+condition\b|\bestate\s+sale\b", re.IGNORECASE)
+    if re.search(r"\b(?:sold|selling|offered|marketed|listed|sale)\b[^.;]{0,25}\bas[- ]is\b", text, re.IGNORECASE) \
+            and not _as_is_doc.search(facts) and not _as_is_doc.search(comp_facts):
+        blocking.append(f"{label}: says a home sold/was offered as-is, but no record documents an as-is sale.")
     if "skylight" in low and "skylight" not in facts and "skylight" not in comp_facts:
         blocking.append(f"{label}: mentions skylights, but skylights are not documented in the supplied property facts.")
     if re.search(r"\b(?:is|are|was|were|remain)\s+original\b", text, re.IGNORECASE) \
