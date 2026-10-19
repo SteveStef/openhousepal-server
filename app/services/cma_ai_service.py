@@ -1385,7 +1385,9 @@ _AMENITY_PATTERNS: list[tuple[str, "re.Pattern"]] = [
         r"(?<!car\s)(?<!whirl)\b(?:in[-\s]?ground pool|swimming pool|heated pool|gunite pool|"
         r"salt[-\s]?water pool|infinity pool|lap pool|pool\s*(?:house|/\s*spa|and spa|&\s*spa)|\bpool\b)(?!\s*table)",
         re.IGNORECASE)),
-    ("spa_sauna", re.compile(r"\b(?:sauna|steam\s?room|hot\s?tub|(?<!salt)\bspa\b(?!ce)|jacuzzi)\b", re.IGNORECASE)),
+    # "spa-like bath" / "spa-inspired shower" describe a bathroom, not a spa amenity (a $550K twin
+    # was credited a "documented spa or sauna feature" from "spa-like upstairs bath", 10/19).
+    ("spa_sauna", re.compile(r"\b(?:sauna|steam\s?room|hot\s?tub|(?<!salt)\bspa\b(?!ce)(?![\s-]*(?:like|style|inspired|quality|feel|worthy|caliber|bath|shower|tub|retreat|experience))|jacuzzi)\b", re.IGNORECASE)),
     ("accessory_dwelling", re.compile(
         r"\b(?:guest\s(?:house|apartment|apt|suite|quarters|cottage)|carriage house|coach house|guest[-\s]+wing|pool\s+house|"
         r"in[-\s]?law\s(?:suite|apartment|apt|quarters)|accessory dwelling(?:\s*unit)?|\badu\b|casita|"
@@ -1617,7 +1619,8 @@ def _documented_condition_renovated(data: Optional[dict]) -> bool:
         r"\b(?:turnkey|turn-key|move[\s-]?in[\s-]?ready|fully\s+renovat\w+|fully\s+updated|"
         r"newly\s+built|extensively\s+renovat\w+|gut[\s-]?renovat\w+|completely\s+renovat\w+|"
         r"total(?:ly)?\s+renovat\w+|newly\s+renovat\w+|recently\s+renovat\w+|"
-        r"renovated\s+(?:kitchen|bath)|new\s+(?:kitchen|bath\w*|roof|windows?|hvac|systems?))\b",
+        r"renovated\s+(?:kitchen|bath)|new\s+(?:kitchen|bath\w*|roof|windows?|hvac|systems?)|"
+        r"recently\s+updated|shows\s+like\s+(?:a\s+)?(?:brand[\s-]+)?new)\b",
         blob, re.IGNORECASE,
     ))
 
@@ -1857,13 +1860,17 @@ def _reconcile_amenities_quality(
 # already-known fields.
 # --------------------------------------------------------------------------------------------
 
+# 2-4 unit income property (Bright home_type MULTI_FAMILY): a different product from a single-family
+# home or a twin - it trades on rents. It used to classify as None (no family), so a duplex scored
+# as an 81% "strong" comp for a Wynnewood single-family house (review run, 10/19).
+_TYPE_FAMILY_MULTI = {"multi family", "multifamily", "multi unit", "duplex", "triplex", "quadruplex", "fourplex"}
 _TYPE_FAMILY_CONDO = {"condo", "unit", "flat", "apartment", "penthouse"}
 _TYPE_FAMILY_ATTACHED = {"townhouse", "townhome", "row", "twin", "attached"}
 _TYPE_FAMILY_DETACHED = {"single family", "detached", "farm"}
 
 
 def _type_family(raw) -> Optional[str]:
-    """'condo' | 'attached' | 'detached' | None - same narrow classifier as the Match Score
+    """'multi' | 'condo' | 'attached' | 'detached' | None - same narrow classifier as the Match Score
     rewrite's typeFamily (frontend/lib/matchScore.ts), kept as an independent Python
     implementation since this runs server-side against Property/CmaComparable's own
     home_type/property_type field. Deliberately does NOT also encode acreage or construction-era
@@ -1872,6 +1879,8 @@ def _type_family(raw) -> Optional[str]:
     t = _norm_token(raw).replace("_", " ").replace("-", " ")
     if not t:
         return None
+    if any(k in t for k in _TYPE_FAMILY_MULTI):
+        return "multi"
     if any(k in t for k in _TYPE_FAMILY_CONDO):
         return "condo"
     if any(k in t for k in _TYPE_FAMILY_ATTACHED):
@@ -3596,6 +3605,143 @@ def _process_seller_guidance(
                 "it's drafted. Check it matches the final numbers shown above it."
             )
     return gated.get("s") or "", gated.get("p") or "", flags, blocking
+
+
+# ---- Seller Pricing Position, rebuilt from the FINAL valuation (10/19 review) -------------------
+# The AI writes listing_strategy_considerations inside the comp-analysis call, BEFORE the final value
+# exists, so its "where should the list price sit" paragraph contradicted the report's own numbers
+# ("the recommended value sits at the current list price" with the value 2.4% below it; "list at or
+# just above the supported value range"). The Pricing Position section is now written here from the
+# authoritative numbers; the AI's other sections (competition, risk, launch) are kept.
+
+def _seller_comp_market_read(comps: list) -> dict:
+    ratios, doms = [], []
+    for c in comps or []:
+        if not c.get("is_included", True) or str(c.get("status") or "").lower() not in ("sold", "closed"):
+            continue
+        sp = _as_float(c.get("sale_price")) if c.get("price_verified", True) else None
+        lp = _as_float(c.get("list_price"))
+        if sp and lp:
+            ratios.append(sp / lp)
+        d = _as_float(c.get("days_on_market"))
+        if d is not None:
+            doms.append(d)
+    return {"sale_to_list": _v10_median(ratios) if ratios else None, "dom": _v10_median(doms) if doms else None,
+            "n": len(ratios)}
+
+
+def _search_bracket_note(price: float) -> Optional[str]:
+    """Agents price to buyers' search filters: a home a few % over a round search mark is invisible
+    to everyone who caps their search there. Returns a one-sentence note, or None."""
+    p = _as_float(price)
+    if not p:
+        return None
+    step = 100_000 if p < 1_000_000 else 250_000 if p < 3_000_000 else 500_000
+    mark = int(p // step) * step
+    if mark <= 0 or p <= mark or (p - mark) / mark >= 0.03:
+        return None
+    alt = mark - (1_000 if mark >= 1_000_000 else 100)
+    return (f"${p:,.0f} sits just above the ${mark:,.0f} mark many buyers use as a search limit; listing at "
+            f"${alt:,.0f} instead would put the home in front of those buyers too, and a well-priced home often "
+            f"draws offers back up toward its value.")
+
+
+def _seller_pricing_position(*, value: float, range_min: Optional[float], range_max: Optional[float],
+                             subject_asking: Optional[float], status_timeline: Optional[dict], comps: list) -> str:
+    tl = status_timeline or {}
+    v = float(value)
+    rlp = _round_to_5k(v)
+    rng = (f" (supported range ${_round_to_5k(range_min):,.0f} to ${_round_to_5k(range_max):,.0f})"
+           if _as_float(range_min) and _as_float(range_max) else "")
+    read = _seller_comp_market_read(comps)
+    stl, cdom = read["sale_to_list"], read["dom"]
+    market = ""
+    if stl and read["n"] >= 2:
+        pct = round(abs(stl - 1) * 100)
+        dom_txt = f" after a median of {int(round(cdom))} days on market" if cdom is not None else ""
+        if stl >= 1.01:
+            market = (f" The comparable sales closed at a median of about {pct}% above their asking prices{dom_txt} - "
+                      "buyers here compete for well-priced homes, and listing at value (not above it) is what creates that competition.")
+        elif stl <= 0.99:
+            market = (f" The comparable sales closed at a median of about {pct}% below their asking prices{dom_txt} - "
+                      "buyers here negotiate, so a price set above value is likely to sit and then be cut.")
+        else:
+            market = (f" The comparable sales closed right around their asking prices{dom_txt}, so buyers here pay "
+                      "full price for a home that is priced to its value.")
+    ask = _as_float(subject_asking)
+    listed = bool(ask) and not tl.get("not_listed") and not tl.get("is_closed")
+    days = _as_float(tl.get("active_market_days"))
+    if tl.get("is_under_contract"):
+        text = (f"The home is under contract. This analysis documents its supported market value of about ${v:,.0f}"
+                f"{rng}, which is useful for the buyer's appraisal and for any renegotiation after inspection.")
+    elif listed and ask > v * 1.02:
+        gap = round((ask - v) / ask * 100)
+        stale = (f" After {int(days)} days on the market without an accepted offer, buyers have answered that price."
+                 if days is not None and days >= 30 else "")
+        text = (f"The current ${ask:,.0f} asking price is about {gap}% above the supported value of ${v:,.0f}{rng}.{stale} "
+                f"We recommend repositioning to about ${rlp:,.0f}, where the home competes directly with the sales "
+                f"buyers are comparing it to.")
+    elif listed and ask < v * 0.98:
+        gap = round((v - ask) / ask * 100)
+        text = (f"The current ${ask:,.0f} asking price sits about {gap}% below the supported value of ${v:,.0f}{rng}. "
+                f"There is no reason to reduce it; expect strong early interest, and weigh any offers against that value.")
+    elif listed:
+        stale = (f" Since {int(days)} days have passed without an accepted offer at a supported price, look at "
+                 "presentation, photos and showing feedback before cutting the price."
+                 if days is not None and days >= 45 else "")
+        text = (f"The current ${ask:,.0f} asking price is in line with the supported value of ${v:,.0f}{rng}, so the "
+                f"price itself is defensible.{stale}")
+    else:
+        text = (f"We recommend listing at about ${rlp:,.0f}, the home's supported market value{rng}.")
+    note = _search_bracket_note(rlp) if not tl.get("is_under_contract") else None
+    return "**Pricing Position:** " + text + market + (" " + note if note else "")
+
+
+def _rebuild_seller_pricing_section(strategy: str, position: str) -> tuple[str, list[str]]:
+    paras = [p.strip() for p in re.split(r"\n\s*\n", strategy or "") if p.strip()]
+    out, replaced = [], False
+    for p in paras:
+        head = re.match(r"\*\*([^*]{2,60}?):?\*\*", p)
+        if head and re.search(r"pric", head.group(1), re.IGNORECASE) and not replaced:
+            out.append(position)
+            replaced = True
+        else:
+            out.append(p)
+    if not replaced:
+        out.insert(0, position)
+    return "\n\n".join(out), [
+        "Pricing strategy: the Pricing Position section was rebuilt from the final value, range, list price and "
+        "days on market (the AI's draft was written before the final value existed)."
+    ]
+
+
+async def _finish_seller_strategy(strategy: str, *, subject: dict, comps: list, value: float,
+                                  range_min, range_max, subject_asking, status_timeline: dict,
+                                  model: str) -> tuple[str, list[str], list[str]]:
+    """Rebuild Pricing Position, then fact-check the whole strategy against the subject's record;
+    one targeted rewrite if a claim isn't supported, else it blocks export like any other section."""
+    flags: list[str] = []
+    position = _seller_pricing_position(value=value, range_min=range_min, range_max=range_max,
+                                        subject_asking=subject_asking, status_timeline=status_timeline, comps=comps)
+    strategy, f = _rebuild_seller_pricing_section(strategy, position)
+    flags.extend(f)
+    reasons = _factual_prose_blocking(strategy, "Pricing strategy", subject)
+    if not reasons:
+        return strategy, flags, []
+    # Only the AI-written sections go to the rewrite; the rebuilt Pricing Position is factual by construction.
+    others = "\n\n".join(p for p in re.split(r"\n\s*\n", strategy) if p.strip() and p.strip() != position)
+    try:
+        rewritten = (await _targeted_comp_narrative_rewrite(
+            [{"label": "Pricing strategy", "text": others, "reasons": reasons}], subject=subject, model=model,
+        )).get("Pricing strategy")
+    except Exception:  # noqa: BLE001
+        rewritten = None
+    if rewritten:
+        candidate = position + "\n\n" + rewritten.strip()
+        if not _factual_prose_blocking(candidate, "Pricing strategy", subject):
+            flags.append("Pricing strategy: rewrote a claim about the home that its own record didn't support.")
+            return candidate, flags, []
+    return strategy, flags, reasons
 
 
 def _strip_under_contract_offer_frame(text: str) -> str:
@@ -5481,6 +5627,11 @@ def _continuous_relevance(
         comp_sqft = _v10_sqft(comp)
         if subject_sqft and comp_sqft:
             components["size"] = _half_life_decay(comp_sqft - subject_sqft, max(subject_sqft * 0.22, 400))
+        elif subject_sqft:
+            # The comp's record has no finished area (seen: a $4.0M "single family" sale with 0 sqft and
+            # year built 0 scored 75% for a 4,234 sqft Bryn Mawr home). Missing size is not a neutral
+            # unknown here - size is the biggest physical driver - so it scores as no size match.
+            components["size"] = 0.0
         comp_type = _type_family(comp.get("property_type") or comp.get("home_type"))
         if subject_type and comp_type:
             components["property_type"] = 1.0 if subject_type == comp_type else 0.0
@@ -7287,6 +7438,14 @@ concluding value. Favor direct similarity, observable condition and renovation l
 modernization, turnkey quality, pools, guest wings, garages, accessory space, location, lot
 usability, actual sale prices, sold/list behavior, market time, and credible buyer behavior.
 
+Read market_tempo before judging any over-list sale. When most verified sales closed at or over
+their list price within a few weeks, competitive over-list closings ARE this market: a comparable
+that sold over list is direct evidence of what buyers here pay, not unusual demand to discount, and
+the subject should be valued as a home that will meet the same buyer competition. Reserve
+bidding_war_or_unusual_demand for a sale clearly out of line with the rest of the set (for example
+far further over list, or far faster, than the others). Likewise, when most sales closed below
+list after long market times, do not treat the one quick over-list sale as the norm.
+
 For every major positive and negative factor, set evidence_strength to clearly_market_supported,
 directionally_supported_amount_uncertain, or subjective_or_speculative. Distinctive architecture,
 pedigree, character, privacy, grounds, scarcity, and "estate feel" do not automatically earn a
@@ -7472,7 +7631,28 @@ def _build_reasoning_evidence_packet(
             "confidence": (subject_estimate or {}).get("confidence"),
         },
     }
-    return {"subject": subject_packet, "comparables": comp_packets, "deterministic_evidence": deterministic}
+    return {"subject": subject_packet, "comparables": comp_packets, "market_tempo": _reasoning_market_tempo(comp_packets),
+            "deterministic_evidence": deterministic}
+
+
+def _reasoning_market_tempo(comp_packets: list) -> dict:
+    """Plain facts about how the verified sales in this packet actually transacted - how many closed
+    at/over their list price and how fast. Lets the valuation pass tell a hot market (over-list
+    closings are the norm) from one exceptional bidding war."""
+    rows = [(float(c["sold_list_ratio"]), _as_float(c.get("dom")))
+            for c in comp_packets if _as_float(c.get("sale_price")) and _as_float(c.get("sold_list_ratio"))]
+    if not rows:
+        return {"verified_sales": 0}
+    ratios = sorted(r for r, _ in rows)
+    doms = sorted(d for _, d in rows if d is not None)
+    at_or_over = sum(1 for r in ratios if r >= 0.995)
+    return {
+        "verified_sales": len(rows),
+        "closed_at_or_over_list": at_or_over,
+        "closed_over_list_by_3pct_or_more": sum(1 for r in ratios if r >= 1.03),
+        "median_sold_to_list_ratio": round(_v10_median(ratios), 3),
+        "median_days_on_market": _v10_median(doms) if doms else None,
+    }
 
 
 def _reasoning_output_text(payload: dict) -> str:
@@ -7713,6 +7893,7 @@ def _validate_reasoning_valuation(result: dict, evidence_packet: dict) -> tuple[
             (evidence_packet.get("subject") or {}).get("dom"),
             (evidence_packet.get("subject") or {}).get("cdom"),
             (evidence_packet.get("deterministic_evidence") or {}).get("comp_set_median_dom"),
+            (evidence_packet.get("market_tempo") or {}).get("median_days_on_market"),
             *(comp.get("dom") for comp in comp_rows),
         ) if _as_float(v) is not None
     }
@@ -7842,6 +8023,32 @@ _SQFT_FACT_RE = re.compile(
     r"\b([\d,]{3,7}(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft|square\s+feet|square\s+foot)\b",
     re.IGNORECASE,
 )
+_SQFT_ABOVE_RE = re.compile(r"above[- ]grade|above[- ]ground", re.IGNORECASE)
+_SQFT_BELOW_RE = re.compile(r"below[- ]grade|basement|lower[- ]level", re.IGNORECASE)
+
+
+def _sqft_area_kind(text: str, match: "re.Match") -> Optional[str]:
+    """'above' | 'below' | None for a '<N> sqft' figure - decided by the qualifier NEAREST the number
+    ('7,059 sqft of finished lower level - on an above-grade basis' is a below-grade claim), falling
+    back to the old +/-45-char window only when nothing sits right next to it."""
+    tail = text[match.end():match.end() + 40]
+    head = text[max(0, match.start() - 30):match.start()]
+    best = None
+    for kind, rx in (("above", _SQFT_ABOVE_RE), ("below", _SQFT_BELOW_RE)):
+        m = rx.search(tail)
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), kind)
+    if best:
+        return best[1]
+    best = None
+    for kind, rx in (("above", _SQFT_ABOVE_RE), ("below", _SQFT_BELOW_RE)):
+        hits = list(rx.finditer(head))
+        if hits and (best is None or len(head) - hits[-1].end() < best[0]):
+            best = (len(head) - hits[-1].end(), kind)
+    if best:
+        return best[1]
+    context = text[max(0, match.start() - 45):min(len(text), match.end() + 45)]
+    return "above" if _SQFT_ABOVE_RE.search(context) else "below" if _SQFT_BELOW_RE.search(context) else None
 
 
 def _documented_sqft_values(data: Optional[dict], area_kind: Optional[str] = None) -> set[int]:
@@ -8034,12 +8241,7 @@ def _reconcile_comp_hard_facts(
         rebuilt.append(out[pos:match.start()])
         raw_value = _as_float(match.group(1).replace(",", ""))
         prefix = out[max(0, match.start() - 65):match.start()].lower()
-        context = out[max(0, match.start() - 45):min(len(out), match.end() + 45)].lower()
-        area_kind = (
-            "above" if re.search(r"above[- ]grade", context)
-            else "below" if re.search(r"below[- ]grade|basement|lower[- ]level", context)
-            else None
-        )
+        area_kind = _sqft_area_kind(out, match)
         record, owner = _sqft_fact_owner(out, match, subject, comp, area_kind)
         is_subject = owner == "subject"
         allowed = _documented_sqft_values(record, area_kind)
@@ -8392,12 +8594,15 @@ def _stucco_inspection_paragraph(subject: dict) -> Optional[str]:
                 "inspector assess visible condition. Do not default to invasive testing unless the "
                 "assembly or an actual finding provides a reason for it.")
     if yb and yb < 1980 and not wood:
-        assembly = "The recorded stone/masonry construction supports that era-appropriate context. " if masonry else "The wall assembly is unverified. "
-        return ("**Stucco / EIFS:** Stucco is reported on this pre-1980 home. " + assembly +
-                "Homes of this era commonly used masonry or stone substrates, so stucco presence alone "
-                "does not call for invasive testing. Have the general inspector assess visible condition "
-                "and confirm the assembly; escalate to invasive moisture testing only if construction "
-                "details or actual findings warrant it.")
+        # Plain words for a homeowner (the old 'supports that era-appropriate context' read as filler).
+        assembly = ("The record also lists stone/masonry construction, and stucco over masonry - typical of "
+                    "homes this age - is far less prone to hidden moisture damage than modern stucco over wood "
+                    "framing. ") if masonry else ("Homes this age usually have stucco over masonry, which is far "
+                                                  "less prone to hidden moisture damage than modern stucco over wood "
+                                                  "framing, but the wall construction isn't recorded here. ")
+        return ("**Stucco / EIFS:** The listing reports stucco on this pre-1980 home. " + assembly +
+                "Have the general inspector check its visible condition and confirm what it sits on; invasive "
+                "moisture testing is only worth doing if the construction or an actual finding calls for it.")
     if masonry and not wood:
         return ("**Stucco / EIFS:** Stucco is reported with masonry/stone construction. Have the general "
                 "inspector assess visible condition and confirm the wall assembly; invasive moisture "
@@ -8506,7 +8711,10 @@ _DEFICIT_POLE_WORDS_RE = (
 )
 _RENOVATED_POLE_WORDS_RE = (
     r"\b(?:turnkey|turn-key|move-in[\s-]?ready|fully\s+renovated|fully\s+updated|"
-    r"recently\s+renovated|newly\s+renovated|more\s+finished|more\s+move-in[\s-]?ready|"
+    r"recently\s+renovated|newly\s+renovated|"
+    # "more finished square footage / lower level" is about AREA, not finish quality
+    r"more\s+finished(?!\s+(?:square|sq|sqft|space|area|living|lower|basement|below|above|rooms?|levels?|attic))|"
+    r"more\s+move-in[\s-]?ready|"
     r"more\s+livable)\b"
 )
 
@@ -8560,7 +8768,14 @@ def _factual_prose_blocking(
     def _subject_condition_window(match: re.Match) -> str:
         tail = text[match.end():]
         boundary = re.search(r"\bcomp\s*#?\s*\d+\b|[.;]|,(?!\s*(?:which|who|that)\b)", tail, re.IGNORECASE)
-        return tail[:min(boundary.start() if boundary else len(tail), 90)]
+        window = tail[:min(boundary.start() if boundary else len(tail), 90)]
+        if comp_note:
+            # A comp's own note talks about the comp as "it/its" - "the subject's anchor $/sqft, which
+            # is consistent with its dated kitchen" describes the COMP's kitchen.
+            switch = re.search(r"\b(?:its|it|this\s+(?:comp|home|sale|house|property))\b", window, re.IGNORECASE)
+            if switch:
+                window = window[:switch.start()]
+        return window
 
     _deficit_found = _renovated_found = False
     for _m in re.finditer(rf"\b{_subj_ref}\b", text, re.IGNORECASE):
@@ -8637,12 +8852,7 @@ def _factual_prose_blocking(
     if comp_note and comp:
         for match in _SQFT_FACT_RE.finditer(text):
             value = _as_float(match.group(1).replace(",", ""))
-            context = text[max(0, match.start() - 45):min(len(text), match.end() + 45)].lower()
-            area_kind = (
-                "above" if re.search(r"above[- ]grade", context)
-                else "below" if re.search(r"below[- ]grade|basement|lower[- ]level", context)
-                else None
-            )
+            area_kind = _sqft_area_kind(text, match)
             record, owner = _sqft_fact_owner(text, match, subject, comp, area_kind)
             known = _documented_sqft_values(record, area_kind)
             if value and not any(abs(value - k) <= max(2, 0.002 * k) for k in known):
@@ -9136,6 +9346,15 @@ _QA_YEAR_SYSTEM_RE = re.compile(
     r"[^.\n]{0,40}?\b(?:in\s+|installed\s+|replaced\s+|from\s+|dated\s+|circa\s+|,\s*)(19|20)\d{2}\b",
     re.IGNORECASE,
 )
+# "The listing states/identifies/notes ...", "per the seller", "the remarks describe ..." - the claim is
+# reported as what the listing says, not asserted as a verified fact.
+_QA_LISTING_ATTRIBUTION_RE = re.compile(
+    r"\b(?:the\s+)?(?:listing|remarks|mls\s+(?:record|remarks)|seller|marketing)(?:'s)?\s+"
+    r"(?:\w+\s+){0,2}(?:states?|identifies|identified|notes?|noted|reports?|reported|says|said|mentions?|"
+    r"describes?|described|cites?|lists?|advertises?|calls?|claims?|references?|highlights?)\b|"
+    r"\b(?:according\s+to|per)\s+the\s+(?:listing|remarks|seller)\b",
+    re.IGNORECASE,
+)
 _QA_VERIFY_NEARBY_RE = re.compile(r"\bverif(?:y|ied|ication)\b|\bconfirm\b|\bunconfirmed\b|\bper\s+(?:seller|public\s+record|mls)\b", re.IGNORECASE)
 _QA_TURNKEY_RE = re.compile(r"\b(turnkey|turn-key|move[\s-]in\s+ready|fully\s+renovated|fully\s+updated|extensively\s+renovated|gut\s+renovat\w+)\b", re.IGNORECASE)
 _QA_DATED_RE = re.compile(r"\b(dated|outdated|needs?\s+updating|needs?\s+work|original\s+condition|tired\s+finishes|deferred\s+maintenance|fixer)\b", re.IGNORECASE)
@@ -9228,8 +9447,21 @@ def _v10_pre_export_qa(
     #      value actually sits AT asking (within rounding) is a warning, not a contradiction. -----
     if v and ask:
         rel = "above" if v > ask + tol else "below" if v < ask - tol else "at"
-        _above_hits = [m for m in _QA_ABOVE_ASK_RE.finditer(combined) if not _negated(combined, m.start())]
-        _below_hits = [m for m in _QA_BELOW_ASK_RE.finditer(combined) if not _negated(combined, m.start())]
+
+        def _about_comp_sales(text: str, start: int) -> bool:
+            """The phrase describes how COMPARABLE sales closed ("Comp #3 and Comp #5 sold above
+            list after five and six days", "homes here are closing over asking") - market evidence,
+            not a statement about where the subject's value sits versus its own asking price."""
+            seg = text[:start]
+            seg = re.split(r"[.!?;]\s", seg)[-1] if re.search(r"[.!?;]\s", seg) else seg
+            return bool(re.search(
+                r"\b(?:sold|closed|closing|sell|selling|went|traded|sales?|comps?|comparables?|"
+                r"homes|listings|properties|bidding|offers)\b[^.!?;]{0,40}$", seg, re.IGNORECASE))
+
+        _above_hits = [m for m in _QA_ABOVE_ASK_RE.finditer(combined)
+                       if not _negated(combined, m.start()) and not _about_comp_sales(combined, m.start())]
+        _below_hits = [m for m in _QA_BELOW_ASK_RE.finditer(combined)
+                       if not _negated(combined, m.start()) and not _about_comp_sales(combined, m.start())]
         if _above_hits:
             if rel == "below":
                 blocking.append(
@@ -9657,6 +9889,10 @@ def _v10_pre_export_qa(
             before = (text or "")[max(0, m.start() - 40):m.start()]
             if _QA_VERIFY_NEARBY_RE.search(before) and not re.search(r"[.;]", before):
                 continue  # phrased as an item to verify - allowed
+            _sent_start = (text or "")[:m.start()]
+            _sent_start = re.split(r"[.!?;]\s", _sent_start)[-1] if re.search(r"[.!?;]\s", _sent_start) else _sent_start
+            if _QA_LISTING_ATTRIBUTION_RE.search(_sent_start):
+                continue  # attributed to the listing/seller ("the listing identifies a new roof") - allowed
             blocking.append(
                 f"{label}: asserts a hard system/permit fact (\"{m.group(0).strip()}\") not backed by verified "
                 f"subject data - phrase it as 'verify ...' or remove it.")
@@ -9899,6 +10135,11 @@ def _v10_reconcile_anchor_direction_prose(methodology: str, *, final: Optional[d
     # Client-facing: plain words, rounded figures - it used to read "about 3.1% above the $907,051
     # comparable-sales anchor; after the complete comp, property, and market-exposure reconciliation".
     if (trace or {}).get("authority") == "reasoning_model":
+        if pct > 8:
+            # The reasoning model's value is the authority and its own paragraph explains it; quoting
+            # a mechanical figure 15-20% away ("comps point to $1,125,000 ... lands 17% below") made
+            # the report read as contradicting itself (10/19 review, 2 of 4 buyer reports).
+            return methodology, []
         reason = "after weighing this home's own features and today's market"
     else:
         qr = (trace or {}).get("qualitative_reconciliation") or {}
@@ -10635,7 +10876,9 @@ _NO_SEPARATE_ADJ_RE = re.compile(
     r"\b(?:not|no)\s+(?:a\s+)?separate\s+(?:line-item\s+)?adjustment\b|"
     r"\bconsidered\s+within\s+the\s+broader\s+qualitative\s+analysis\b|"
     r"\brather\s+than\s+(?:an?\s+)?(?:assumed|automatic|separate|unsupported)?\s*premium\b|"
-    r"\b(?:does\s+not|doesn't|is\s+not|isn't|was\s+not|wasn't)\b[^.!?]{0,35}\bpremium\b",
+    r"\b(?:does\s+not|doesn't|is\s+not|isn't|was\s+not|wasn't)\b[^.!?]{0,35}\bpremium\b|"
+    r"\b(?:no|not|never|nor|cannot|can't|without)\b[^.!?]{0,45}\b(?:isolates?|supports?|justif(?:y|ies)|"
+    r"quantif(?:y|ies)|measures?|establish(?:es)?|warrants?)\b[^.!?]{0,25}\bpremium\b",
     re.IGNORECASE,
 )
 
@@ -10917,7 +11160,7 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
     target-strong_offer) is capped at the list/asking price whenever one is known - recommending an
     opening move above asking gives away negotiating leverage for no reason, even on a property
     that's genuinely underpriced relative to FMV. That underpriced case is instead handled by a
-    separate, independent number: `comfort_ceiling` (FMV x 1.05), the "most you should feel
+    separate, independent number: `comfort_ceiling` (FMV x 1.05 when underpriced; the FMV itself otherwise), the "most you should feel
     comfortable paying if it comes to it" walk-away figure - advisory guidance, not a number to
     submit - which is deliberately NOT capped by list price, since its entire purpose is to state
     how much negotiating room exists above list on a property priced below its real value. How
@@ -10934,10 +11177,14 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
     aggr = _v10_offer_aggression(trace, confidence, status_timeline)
     underpriced = bool(lp and lp > 0 and fmv > lp * 1.01)
 
-    if not underpriced and lp and comfort_ceiling > lp:
-        # Asking is already at/above value: the walk-away figure never goes past the asking price
-        # (seen live 2026-10-05: FMV $950k, ask $995k, 42 days, no offer -> "comfortable up to $1,000,000").
-        comfort_ceiling = round(lp)
+    if not underpriced:
+        # Priced at or above value: the walk-away is the supported value itself. Paying 5% over a
+        # supported value on a listing that is already asking more than it (seen 10/19: $3.1M ask,
+        # $2.9M FMV, 103 days, "comfortable up to $3,045,000") is not advice a buyer's agent gives.
+        # Only a genuinely hot read (competing offers likely) allows a small stretch, never past ask.
+        comfort_ceiling = round(fmv * (1.02 if aggr == "high" else 1.0))
+        if lp:
+            comfort_ceiling = min(comfort_ceiling, round(lp))
     if not underpriced:
         # priced AT or ABOVE value (or no list): open a few % below FMV, settle at/just under FMV.
         hi_frac = {"high": 0.985, "moderate": 0.97, "low": 0.955}[aggr]
@@ -11058,13 +11305,12 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
         _ref = b.get("basis_ref") or fmv
         _ref_name = "asking price" if lp and abs(_ref - lp) <= 1 else "fair market value"
         rel_open = _v10_pct_range_phrase(ol, oh, _ref)
-        if lp and comfort_ceiling >= _r(lp) and lp > fmv:
-            _walk = (f"Don't go above the ${lp:,} asking price, and treat anything past the ${fmv:,} fair "
-                     f"market value as needing a clear reason, such as competing offers or new "
-                     f"property-specific information.")
+        if comfort_ceiling > fmv:
+            _walk = (f"If competing offers appear you could stretch to about ${comfort_ceiling:,}, but not past "
+                     f"that without new property-specific information" + (f" - and never above the ${lp:,} asking price." if lp else "."))
         else:
-            _walk = (f"You shouldn't feel comfortable paying more than ${comfort_ceiling:,} for this property "
-                     f"(about 5% above the ${fmv:,} fair market value) without new property-specific information.")
+            _walk = (f"Treat the ${fmv:,} fair market value as your walk-away price; going past it needs a clear "
+                     f"reason, such as competing offers or new property-specific information.")
         opener = (
             f"Given the ${fmv:,} fair market value{lp_txt}, a reasonable opening offer is roughly ${ol:,} "
             f"to ${oh:,} ({rel_open} the ${_ref:,} {_ref_name}), leaving room to settle "
@@ -12939,6 +13185,13 @@ async def generate_ai_analysis(
             )
             qa_flags.extend(_sg_flags)
             qa_blocking.extend(_sg_blocking)
+            listing_strategy_considerations, _ss_flags, _ss_blocking = await _finish_seller_strategy(
+                listing_strategy_considerations, subject=enriched_subject, comps=new_comparables, value=value,
+                range_min=final_range_low, range_max=final_range_high, subject_asking=subject_asking,
+                status_timeline=status_timeline, model=model,
+            )
+            qa_flags.extend(_ss_flags)
+            qa_blocking.extend(_ss_blocking)
         # Everything that has ALREADY landed a blocking entry (valuation reconciliation incl. the
         # CONDITION RECONCILIATION block, the exposure gate, the range check) - fed into the final
         # QA so qa_result.export_allowed reflects the FULL picture (issue #1).
@@ -13074,7 +13327,7 @@ async def generate_ai_analysis(
             # compatibility. They are not populated from the valuation-range endpoints.
             _of = _offer_strategy_fields or {}
             opening_low = _as_float(_of.get("opening_offer_low"))
-            comfort_ceiling = _as_float(_of.get("comfort_ceiling"))
+            opening_high = _as_float(_of.get("opening_offer_high"))
             strong_offer = _as_float(_of.get("strong_offer"))
             if _is_blank(new_pricing.get("estimated_fair_value")):
                 new_pricing["estimated_fair_value"] = _round_to_5k(value)
@@ -13082,8 +13335,11 @@ async def generate_ai_analysis(
                 new_pricing["suggested_offer_min"] = round(opening_low)
             # Suggested Offer Max is the "most you should feel comfortable paying" ceiling
             # (~5% over FMV) - not the opening offer's own top end, which is list-capped above.
-            if comfort_ceiling is not None and _is_blank(new_pricing.get("suggested_offer_max")):
-                new_pricing["suggested_offer_max"] = round(comfort_ceiling)
+            # Suggested Offer Max = the top of the opening-offer band, the same figure the client's
+            # PDF/web page show (it used to hold the walk-away ceiling, so Studio said $514K while
+            # the client saw $483K for the same report).
+            if opening_high is not None and _is_blank(new_pricing.get("suggested_offer_max")):
+                new_pricing["suggested_offer_max"] = round(opening_high)
             if strong_offer is not None and _is_blank(new_pricing.get("strong_offer")):
                 new_pricing["strong_offer"] = round(strong_offer)
             if _is_blank(new_pricing.get("offer_strategy_commentary")):
@@ -13529,6 +13785,13 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             )
             qa_flags.extend(_sg_flags)
             qa_blocking.extend(_sg_blocking)
+            listing_strategy_considerations, _ss_flags, _ss_blocking = await _finish_seller_strategy(
+                listing_strategy_considerations, subject=enriched_subject, comps=new_comparables, value=value,
+                range_min=final_range_low, range_max=final_range_high, subject_asking=subject_asking,
+                status_timeline=status_timeline, model=model,
+            )
+            qa_flags.extend(_ss_flags)
+            qa_blocking.extend(_ss_blocking)
         _external_blocking = list(qa_blocking)
         _fin = await _finalize_gate_reconciled_prose(
             methodology=methodology_summary, offer=offer_strategy_considerations, inspection=inspection_concerns,
@@ -13598,7 +13861,8 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             _new_offer_fields = _offer_strategy_fields or {}
             _old_offer_fields = _previous_ai_estimate.get("offer_strategy_fields") or {}
             _new_open_low = _as_float(_new_offer_fields.get("opening_offer_low"))
-            _new_comfort_ceiling = _as_float(_new_offer_fields.get("comfort_ceiling"))
+            _new_open_high = _as_float(_new_offer_fields.get("opening_offer_high"))
+            _old_open_high = _as_float(_old_offer_fields.get("opening_offer_high"))
             _new_strong = _as_float(_new_offer_fields.get("strong_offer"))
             _old_open_low = _as_float(_old_offer_fields.get("opening_offer_low"))
             _old_comfort_ceiling = _as_float(_old_offer_fields.get("comfort_ceiling"))
@@ -13617,10 +13881,11 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             _replace_ai_owned("estimated_fair_value", _round_to_5k(value), _round_to_5k(_old_value) if _old_value else None)
             if _new_open_low is not None:
                 _replace_ai_owned("suggested_offer_min", round(_new_open_low), round(_old_open_low) if _old_open_low else None)
-            # Suggested Offer Max is the "most you should feel comfortable paying" ceiling (~5%
-            # over FMV), independent of the opening offer's own list-capped top end.
-            if _new_comfort_ceiling is not None:
-                _replace_ai_owned("suggested_offer_max", round(_new_comfort_ceiling), round(_old_comfort_ceiling) if _old_comfort_ceiling else None)
+            # Suggested Offer Max = top of the opening band (what the client sees). Older reports
+            # stored the walk-away ceiling there - both prior AI values count as AI-owned.
+            if _new_open_high is not None:
+                for _prev in (_old_comfort_ceiling, _old_open_high):
+                    _replace_ai_owned("suggested_offer_max", round(_new_open_high), round(_prev) if _prev else None)
             if _new_strong is not None:
                 _replace_ai_owned("strong_offer", round(_new_strong), round(_old_strong) if _old_strong else None)
             # Buyer Valuation - Agent Notes / inspection / tactical notes: recompute must backfill

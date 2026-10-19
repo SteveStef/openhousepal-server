@@ -1932,7 +1932,7 @@ def test_y_factual_prose_and_qa_cleanup():
           "skylight" not in clean_inspection.lower() and "original" not in clean_inspection.lower(),
           clean_inspection)
     check("4: pre-1980 stone/stucco does not automatically recommend invasive testing",
-          "presence alone does not call for invasive testing" in clean_inspection.lower()
+          "invasive moisture testing is only worth doing if the construction or an actual finding calls for it" in clean_inspection.lower()
           and bool(inspection_flags), clean_inspection)
     check("5: cleaned inspection prose passes deterministic factual QA",
           not _factual_prose_blocking(clean_inspection, "Inspection concerns", old_subject),
@@ -2465,13 +2465,15 @@ def test_ad_entity_binding_and_offer_field_contract():
     frontend_root = Path(__file__).resolve().parents[2] / "frontend"
     pdf_source = (frontend_root / "lib" / "pdfs.tsx").read_text(encoding="utf-8")
     share_source = (frontend_root / "app" / "cma" / "[slug]" / "page.tsx").read_text(encoding="utf-8")
+    # Both client renderers go through lib/cma.ts buyerOfferFigures(), which reads the deterministic
+    # contract first (and shows no offer figures once the subject has sold).
+    cma_lib_source = (frontend_root / "lib" / "cma.ts").read_text(encoding="utf-8")
     check("7: PDF and share-page offer facts render the deterministic contract before legacy fields",
-          "offerFields?.opening_offer_low" in pdf_source
-          and "offerFields?.opening_offer_high" in pdf_source
-          and "offerFields?.strong_offer" in pdf_source
-          and "offerFields?.opening_offer_low" in share_source
-          and "offerFields?.opening_offer_high" in share_source
-          and "offerFields?.strong_offer" in share_source,
+          "f?.opening_offer_low ?? pricing.suggested_offer_min" in cma_lib_source
+          and "f?.opening_offer_high ?? pricing.suggested_offer_max" in cma_lib_source
+          and "f?.strong_offer ?? pricing.strong_offer" in cma_lib_source
+          and pdf_source.count("buyerOfferFigures(report.pricing)") >= 2
+          and "buyerOfferFigures(pricing)" in share_source,
           "one or more client renderers still bypasses offer_strategy_fields")
 
 
