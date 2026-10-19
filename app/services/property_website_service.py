@@ -918,7 +918,8 @@ async def live_property_snapshot(db: AsyncSession, site: PropertyWebsite) -> dic
         snap["original_list_price"] = prop.original_list_price
     if prop.home_status:
         snap["status"] = prop.home_status
-    snap["days_on_market"] = prop.days_on_market
+    from app.utils.listing_dom import property_days_on_market
+    snap["days_on_market"] = property_days_on_market(prop)  # today's count, not the one stored
     snap["price_changed_at"] = prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None
     snap["listed_at"] = prop.mls_list_date.isoformat() if prop.mls_list_date else None
     backfill = {

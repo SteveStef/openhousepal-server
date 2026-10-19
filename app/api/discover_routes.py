@@ -301,7 +301,7 @@ async def get_discovery(
         for p in properties:
             # Check if it's "new" (e.g., listed within last 3 days)
             resolved_dom = resolve_days_on_market(
-                p.days_on_market, p.home_status, p.mls_list_date,
+                p.days_on_market, p.home_status, p.mls_list_date, fetched_at=p.updated_at,
             )
             days_on_market = resolved_dom if resolved_dom is not None else 0
             is_new = resolved_dom is not None and resolved_dom < 3

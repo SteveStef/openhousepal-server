@@ -8,7 +8,7 @@ anywhere in this codebase yet (confirmed during Phase 3 planning research).
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Numeric, cast, func, or_, select
+from sqlalchemy import Numeric, case, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import Property
@@ -43,7 +43,11 @@ async def get_area_market_stats(db: AsyncSession, zip_codes: list[str] | dict, c
         select(
             func.count(Property.id),
             func.percentile_cont(0.5).within_group(Property.price.asc()),
-            func.percentile_cont(0.5).within_group(Property.days_on_market.asc()),
+            # today's DOM for Active homes (the stored count is as of when we last read the listing)
+            func.percentile_cont(0.5).within_group(case(
+                (Property.home_status == "ACTIVE-BRIGHT", Property.days_on_market + func.greatest(0,
+                    func.current_date() - func.date(func.timezone("America/New_York", Property.updated_at)))),
+                else_=Property.days_on_market).asc()),
             func.avg(Property.price_per_square_feet),
             func.min(Property.price),
             func.max(Property.price),

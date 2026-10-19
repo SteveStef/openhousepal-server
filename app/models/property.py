@@ -59,11 +59,13 @@ class PropertySummaryResponse(BaseModel):
     mls_list_date: Optional[datetime] = Field(None, alias="MLSListDate")
     price_change_timestamp: Optional[datetime] = Field(None, alias="PriceChangeTimestamp")
     original_list_price: Optional[float] = Field(None, alias="OriginalListPrice")
+    # when Bright's DaysOnMarket was read (the sync's write time) - not sent to the browser
+    dom_read_at: Optional[datetime] = Field(None, exclude=True, validation_alias="updated_at")
 
     @model_validator(mode='after')
     def calculate_dom(self) -> 'PropertySummaryResponse':
         self.days_on_market = resolve_days_on_market(
-            self.days_on_market, self.home_status, self.mls_list_date,
+            self.days_on_market, self.home_status, self.mls_list_date, fetched_at=self.dom_read_at,
         )
         return self
 

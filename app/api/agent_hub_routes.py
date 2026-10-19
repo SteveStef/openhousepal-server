@@ -567,8 +567,9 @@ async def get_marketing_moments(
 
     def card(p: Property) -> dict:
         item = _listing_item(p)
-        listed = p.mls_list_date.date() if p.mls_list_date else None
-        days = (date.today() - listed).days if listed else p.days_on_market
+        # Bright's count, kept current (a relisted home's DOM isn't "days since first listed")
+        from app.utils.listing_dom import property_days_on_market
+        days = property_days_on_market(p)
         return {**item, "listing_key": p.listing_key, "listed_at": p.mls_list_date.isoformat() if p.mls_list_date else None,
                 "days_on_market": days, "is_new": days is not None and days <= 21, "has_spotlight": p.listing_key in keys_with_site}
 

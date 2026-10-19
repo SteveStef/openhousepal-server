@@ -156,8 +156,9 @@ class CollectionsService:
         mls_list_date: Optional[datetime],
         mls_days_on_market: Optional[int] = None,
         status: Optional[str] = None,
+        fetched_at: Optional[datetime] = None,
     ) -> Optional[int]:
-        return resolve_days_on_market(mls_days_on_market, status, mls_list_date)
+        return resolve_days_on_market(mls_days_on_market, status, mls_list_date, fetched_at=fetched_at)
 
     @staticmethod
     async def count_active_collections(db: AsyncSession, user_id: str) -> int:
@@ -383,7 +384,7 @@ class CollectionsService:
                         'PropertyType': prop.home_type,
                         'YearBuilt': prop.year_built,
                         'DaysOnMarket': CollectionsService._calculate_dom(
-                            prop.mls_list_date, prop.days_on_market, prop.home_status,
+                            prop.mls_list_date, prop.days_on_market, prop.home_status, prop.updated_at,
                         ),
                         'AssociationYN': prop.has_association,
                         'ListPictureURL': prop.img_src,
@@ -826,7 +827,7 @@ class CollectionsService:
                     'PropertyType': prop.home_type,
                     'YearBuilt': prop.year_built,
                     'DaysOnMarket': CollectionsService._calculate_dom(
-                        prop.mls_list_date, prop.days_on_market, prop.home_status,
+                        prop.mls_list_date, prop.days_on_market, prop.home_status, prop.updated_at,
                     ),
                     'AssociationYN': prop.has_association,
                     'ListPictureURL': prop.img_src,
@@ -1595,7 +1596,7 @@ class CollectionsService:
                     'PropertyType': prop.home_type,
                     'YearBuilt': prop.year_built,
                     'DaysOnMarket': CollectionsService._calculate_dom(
-                        prop.mls_list_date, prop.days_on_market, prop.home_status,
+                        prop.mls_list_date, prop.days_on_market, prop.home_status, prop.updated_at,
                     ),
                     'AssociationYN': prop.has_association,
                     'ListPictureURL': prop.img_src,
@@ -2129,7 +2130,7 @@ class CollectionsService:
                     'PropertyType': prop.home_type,
                     'YearBuilt': prop.year_built,
                     'DaysOnMarket': CollectionsService._calculate_dom(
-                        prop.mls_list_date, prop.days_on_market, prop.home_status,
+                        prop.mls_list_date, prop.days_on_market, prop.home_status, prop.updated_at,
                     ),
                     'AssociationYN': prop.has_association,
                     'ListPictureURL': prop.img_src,
