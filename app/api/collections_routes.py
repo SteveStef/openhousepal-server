@@ -228,6 +228,94 @@ async def resolve_short_link(code: str, db: AsyncSession = Depends(get_db)):
     return {"share_token": row[0]}
 
 
+async def _home_ids(db: AsyncSession, property_id: Optional[str], listing_key: Optional[str]) -> List[str]:
+    """The Property rows a home page stands for (its id, and/or every row with its MLS number)."""
+    from app.models.database import Property
+    ids: set = set()
+    if property_id:
+        if (await db.execute(select(Property.id).where(Property.id == property_id))).first():
+            ids.add(property_id)
+    if listing_key:
+        ids |= {r[0] for r in (await db.execute(select(Property.id).where(Property.listing_key == listing_key))).all()}
+    return list(ids)
+
+
+@router.get("/membership", dependencies=[Depends(require_broker_authorization)])
+async def showcase_membership(
+    property_id: Optional[str] = Query(None),
+    listing_key: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """A home's page, agent side (user, 10/18): which of the agent's Showcases already have this
+    home, and the rest - so the bar under the photos can list them and "Add to a Showcase" can
+    offer the others (the ones that have it shown greyed out)."""
+    from sqlalchemy import func
+    from app.models.database import PropertyInteraction, collection_properties
+    ids = await _home_ids(db, property_id, listing_key)
+    cols = (await db.execute(select(Collection).where(Collection.owner_id == current_user.id)
+                             .order_by(Collection.updated_at.desc().nullslast(), Collection.created_at.desc()))).scalars().all()
+    if not cols:
+        return {"home_ids": ids, "showcases": []}
+    col_ids = [c.id for c in cols]
+    counts = dict((await db.execute(select(collection_properties.c.collection_id, func.count())
+                                   .where(collection_properties.c.collection_id.in_(col_ids))
+                                   .group_by(collection_properties.c.collection_id))).all())
+    having = {r[0] for r in (await db.execute(select(collection_properties.c.collection_id).where(
+        collection_properties.c.collection_id.in_(col_ids), collection_properties.c.property_id.in_(ids)))).all()} if ids else set()
+    picked = {r[0] for r in (await db.execute(select(PropertyInteraction.collection_id).where(
+        PropertyInteraction.collection_id.in_(col_ids), PropertyInteraction.property_id.in_(ids),
+        PropertyInteraction.agent_recommended_at.is_not(None)))).all()} if ids else set()
+    return {
+        "home_ids": ids,
+        "showcases": [{
+            "id": c.id, "name": c.name, "client": c.visitor_name, "status": c.status,
+            "homes": int(counts.get(c.id, 0)), "contains": c.id in having, "recommended": c.id in picked,
+        } for c in cols],
+    }
+
+
+class AddHomeBody(BaseModel):
+    property_id: Optional[str] = None
+    listing_key: Optional[str] = None
+
+
+@router.post("/{collection_id}/add-home", dependencies=[Depends(require_broker_authorization)])
+async def add_home_to_showcase(
+    collection_id: str,
+    body: AddHomeBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """The agent puts one home into one of their client's Showcases from that home's page. It's
+    marked as the agent's pick (Recommended) - which also keeps it there when the Showcase refreshes
+    from its search, even if the home doesn't match it - and counts as new for the client."""
+    from sqlalchemy import insert
+    from app.models.database import PropertyInteraction, collection_properties
+    coll = (await db.execute(select(Collection).where(Collection.id == collection_id))).scalar_one_or_none()
+    if not coll or coll.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    ids = await _home_ids(db, body.property_id, body.listing_key)
+    if not ids:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This home isn't in the listings yet.")
+    already = {r[0] for r in (await db.execute(select(collection_properties.c.property_id).where(
+        collection_properties.c.collection_id == collection_id, collection_properties.c.property_id.in_(ids)))).all()}
+    home_id = next(iter(already)) if already else (body.property_id if body.property_id in ids else ids[0])
+    now = datetime.now(timezone.utc)
+    if not already:
+        await db.execute(insert(collection_properties).values(collection_id=collection_id, property_id=home_id, added_at=now))
+    row = (await db.execute(select(PropertyInteraction).where(
+        and_(PropertyInteraction.collection_id == collection_id, PropertyInteraction.property_id == home_id)))).scalar_one_or_none()
+    if row is None:
+        row = PropertyInteraction(collection_id=collection_id, property_id=home_id, liked=False, disliked=False, created_at=now, updated_at=now)
+        db.add(row)
+    row.disliked = False
+    row.agent_recommended_at = row.agent_recommended_at or now
+    coll.updated_at = now
+    await db.commit()
+    return {"success": True, "added": not already, "property_id": home_id}
+
+
 @router.get("/refine-requests/count")
 async def get_pending_refine_requests_count(
     db: AsyncSession = Depends(get_db),

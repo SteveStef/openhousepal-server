@@ -1768,7 +1768,10 @@ class CollectionsService:
                         )
                     ),
                     collection_properties.c.property_id.in_(select(PropertyComment.property_id).where(PropertyComment.collection_id == collection_id)),
-                    collection_properties.c.property_id.in_(select(PropertyTour.property_id).where(PropertyTour.collection_id == collection_id))
+                    collection_properties.c.property_id.in_(select(PropertyTour.property_id).where(PropertyTour.collection_id == collection_id)),
+                    # The agent's own picks (recommended / added by hand from a home's page) stay too.
+                    collection_properties.c.property_id.in_(select(PropertyInteraction.property_id).where(
+                        and_(PropertyInteraction.collection_id == collection_id, PropertyInteraction.agent_recommended_at.is_not(None))))
                 )
             )
             keep_ids_res = await db.execute(keep_query)
