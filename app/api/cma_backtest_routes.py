@@ -25,6 +25,9 @@ class BacktestSettings(BaseModel):
     count: int = Field(10, ge=1, le=svc.MAX_HOMES_PER_BATCH)
     mode: str = "buyer"
     dry_run: bool = False
+    # 'ui' = scored the way an agent builds it: the real Studio wizard in a browser, driven by
+    # scripts/cma_backtest_ui_runner.py as the test agent. 'api' = the same flow called directly.
+    runner: str = Field("ui", pattern="^(ui|api)$")
     cost_cap_usd: float = Field(svc.DEFAULT_COST_CAP_USD, gt=0, le=500)
 
 
@@ -108,7 +111,8 @@ async def start(req: StartRequest, db: AsyncSession = Depends(get_db), admin: Us
     db.add(batch)
     await db.commit()
     await db.refresh(batch)
-    svc.ensure_worker()
+    if req.runner == "api":
+        svc.ensure_worker()
     return _batch_out(batch)
 
 
@@ -157,7 +161,8 @@ async def resume(batch_id: str, db: AsyncSession = Depends(get_db), admin: User 
         b.status = "queued"
         b.error = None
         await db.commit()
-        svc.ensure_worker()
+        if (b.settings or {}).get("runner", "api") == "api":
+            svc.ensure_worker()
     return _batch_out(b)
 
 

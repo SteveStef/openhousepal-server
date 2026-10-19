@@ -487,8 +487,11 @@ _WORKER: Optional[asyncio.Task] = None
 async def _worker() -> None:
     while True:
         async with AsyncSessionLocal() as db:
-            batch = (await db.execute(select(CmaBacktestBatch).where(CmaBacktestBatch.status.in_(["queued", "running"]))
-                                      .order_by(CmaBacktestBatch.created_at))).scalars().first()
+            # Browser-run ("ui") batches belong to scripts/cma_backtest_ui_runner.py, never this worker.
+            batch = (await db.execute(select(CmaBacktestBatch).where(
+                CmaBacktestBatch.status.in_(["queued", "running"]),
+                func.coalesce(CmaBacktestBatch.settings["runner"].astext, "api") != "ui",
+            ).order_by(CmaBacktestBatch.created_at))).scalars().first()
             if not batch:
                 return
             batch.status = "running"

@@ -93,10 +93,13 @@ _POST_DATE_KEY_PARTS = (
 _KEEP_KEYS = {"ListingContractDate"}   # the listing agreement date - known on day one
 
 _REMARK_LEAK_RE = re.compile(
-    r"[^.!?\n]*\b(?:under\s+(?:contract|agreement|deposit)|pending|sold|settled|closed|"
+    # Only what an agent writes once THIS deal happened. Not "being sold as-is" (a pre-sale term of
+    # sale) and not "back on market" (a fallen-through EARLIER deal - known on the as-of date).
+    r"[^.!?\n]*\b(?:under\s+(?:contract|agreement|deposit)|pending|(?:has|was|have\s+been|been|just)\s+sold|"
+    r"sold\s*!|settled|closed\s+(?:on|at|for)|"
     r"accepted\s+(?:an\s+)?offer|multiple\s+offers|highest\s+and\s+best|offer\s+deadline|"
-    r"back\s+on\s+(?:the\s+)?market|kick[- ]?out|cancel+ed|no\s+more\s+showings|"
-    r"showings?\s+(?:have\s+)?(?:stopped|paused|suspended))\b[^.!?\n]*[.!?]?",
+    r"kick[- ]?out|cancel+ed|no\s+more\s+showings|"
+    r"showings?\s+(?:have\s+)?(?:stopped|paused|suspended))(?:\b|(?<=!))[^.!?\n]*[.!?]?",
     re.IGNORECASE,
 )
 
@@ -109,6 +112,7 @@ def scrub_remarks(text: Optional[str]) -> tuple[Optional[str], list[str]]:
     removed = [m.group(0).strip() for m in _REMARK_LEAK_RE.finditer(text) if m.group(0).strip()]
     cleaned = _REMARK_LEAK_RE.sub(" ", text)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    cleaned = re.sub(r"^[\s!.,;:|\-]+", "", cleaned)   # leftovers like the 2nd '!' of '...CANCELLED!!'
     return cleaned, removed
 
 
