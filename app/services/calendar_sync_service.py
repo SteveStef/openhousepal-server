@@ -169,6 +169,10 @@ def _local(dt: datetime) -> dict:
     return {"dateTime": _to_utc(dt).astimezone(EASTERN).isoformat(), "timeZone": CALENDAR_TZ}
 
 
+# Done events' title prefix - plain text, so it renders the same size as everything else.
+DONE_PREFIX = "DONE · "
+
+
 def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: str = "5",
                      done_link: Optional[str] = None, owner=None, contact_link: Optional[str] = None,
                      your_notes: Optional[list] = None, lead_name: Optional[str] = None,
@@ -191,11 +195,11 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
     first = (lead_name or "").strip() or "them"
     parts = []
     if done:
-        # Checked off: the event stays as a record, grey and silent, "✅ DONE ·" then the title.
-        # No cross-out: a title is plain text, so a strike is a combining stroke after every letter,
-        # and the iPhone Calendar app spreads those letters far apart even with letters-only strokes
-        # (user, 10/19 - "extremely weird and super spaced out").
-        summary = "✅ DONE · " + summary
+        # Checked off: the event stays as a record, grey and silent, "DONE ·" then the title.
+        # Plain letters only: a cross-out (a combining stroke after every letter) and the ✅ emoji
+        # both make the iPhone Calendar draw the title in a bigger fallback font - a done follow-up
+        # stood out MORE than the ones still to do (user, 10/19).
+        summary = DONE_PREFIX + summary
         when = task.completed_at.astimezone(EASTERN)
         stamp = f"{when:%a} {when:%b} {when.day} at {when.hour % 12 or 12}:{when:%M} {'AM' if when.hour < 12 else 'PM'}"
         parts.append(f"✅ DONE - checked off {stamp}" + (f"\n↩️ Checked it off by mistake? Tap to undo:\n{done_link}" if done_link else ""))
@@ -394,7 +398,7 @@ def _tour_event_body(tour: PropertyTour, prop: Optional[Property]) -> dict:
     title = f"[Tour] {street or 'Property'} - {short_person(tour.visitor_name) or 'Visitor'}"
     return {
         # Short title - "[Tour] 732 Buck Ln - Jane B."; the location + notes carry the rest.
-        "summary": f"✅ DONE · {title}" if done else title,
+        "summary": f"{DONE_PREFIX}{title}" if done else title,
         **({"colorId": "8"} if done else {}),
         "location": addr or None,
         "description": "\n".join(desc),
@@ -437,7 +441,7 @@ async def _showing_event_body(db: AsyncSession, sub) -> Optional[dict]:
         desc.append(f"\nVisitor note: {info['note']}")
     title = f"[Showing] {street or 'Property'} - {short_person(sub.contact_name) or 'Visitor'}"
     return {
-        "summary": f"✅ DONE · {title}" if done else title,
+        "summary": f"{DONE_PREFIX}{title}" if done else title,
         **({"colorId": "8"} if done else {}),
         "location": addr,
         "description": "\n".join(desc),
@@ -1074,6 +1078,45 @@ async def scheduled_reconcile_deleted_followups() -> None:
             _last_reconcile[owner_id] = datetime.now(timezone.utc)
         except Exception:  # noqa: BLE001
             logger.warning("calendar delete check failed for %s", owner_id, exc_info=True)
+
+
+# Events re-titled before this moment may still carry the old "✅ DONE ·" / crossed-out title.
+_RETITLE_BEFORE = datetime(2026, 10, 23, tzinfo=timezone.utc)
+
+
+async def retitle_done_events() -> None:
+    """Once, shortly after a deploy: follow-ups and tours checked off in the last 3 weeks get their
+    calendar title re-written to the plain "DONE ·" one (the old emoji / cross-out title showed
+    bigger than the open ones on the iPhone). One event at a time; each is touched once."""
+    from app.database import AsyncSessionLocal
+    now = datetime.now(timezone.utc)
+    if now >= _RETITLE_BEFORE + timedelta(days=7):
+        return
+    async with AsyncSessionLocal() as db:
+        tasks = (await db.execute(
+            select(CalendarConnection.owner_id, CalendarConnection.provider, AgentTask.id)
+            .join(CalendarEventLink, and_(CalendarEventLink.kind == "task", CalendarEventLink.source_id == AgentTask.id))
+            .join(CalendarConnection, CalendarConnection.id == CalendarEventLink.connection_id)
+            .where(AgentTask.completed_at >= now - timedelta(days=21), CalendarEventLink.updated_at < _RETITLE_BEFORE)
+        )).all()
+        tours = (await db.execute(
+            select(CalendarConnection.owner_id, CalendarConnection.provider, PropertyTour.id)
+            .join(CalendarEventLink, and_(CalendarEventLink.kind == "tour", CalendarEventLink.source_id == PropertyTour.id))
+            .join(CalendarConnection, CalendarConnection.id == CalendarEventLink.connection_id)
+            .where(PropertyTour.confirmed_date.is_not(None), PropertyTour.confirmed_date >= (now - timedelta(days=21)).date().isoformat(),
+                   CalendarEventLink.updated_at < _RETITLE_BEFORE)
+        )).all()
+    for owner_id, provider, tid in tasks:
+        try:
+            await _with_conn(owner_id, provider, lambda db, conn, t=tid: _sync_task(db, conn, t))
+        except Exception:  # noqa: BLE001
+            logger.warning("re-titling done follow-up %s failed", tid, exc_info=True)
+    for owner_id, provider, tid in tours:
+        try:
+            await _with_conn(owner_id, provider, lambda db, conn, t=tid: _sync_tour(db, conn, t))
+        except Exception:  # noqa: BLE001
+            logger.warning("re-titling tour %s failed", tid, exc_info=True)
+    logger.info("re-titled %d done follow-up and %d tour events", len(tasks), len(tours))
 
 
 async def scheduled_finish_past_tours() -> None:

@@ -17,7 +17,7 @@ from app.utils.property_sync_scheduler import scheduled_bright_sync
 from app.utils.domain_verification_scheduler import scheduled_domain_verification
 from app.utils.studio_media_video_poll_scheduler import scheduled_studio_media_video_poll
 from app.utils.task_reminder_scheduler import scheduled_task_reminders
-from app.services.calendar_sync_service import scheduled_finish_past_tours, scheduled_reconcile_deleted_followups
+from app.services.calendar_sync_service import retitle_done_events, scheduled_finish_past_tours, scheduled_reconcile_deleted_followups
 from app.utils.state_facts_scheduler import scheduled_state_facts_refresh
 from app.services.agent_hub_video_sync import scheduled_hub_video_sync
 from app.services.email_scheduler_service import EmailSchedulerService
@@ -161,6 +161,20 @@ async def lifespan(app: FastAPI):
         name="Cross out past tours on connected calendars",
         replace_existing=True,
     )
+
+    # Once, a few minutes after boot (live only - not the local dev server): done follow-ups and
+    # tours from the last 3 weeks get the plain "DONE ·" calendar title (10/19 - the old emoji /
+    # cross-out title showed bigger than the open ones on the iPhone).
+    if "localhost" not in os.getenv("FRONTEND_URL", "http://localhost:3000"):
+        from datetime import datetime as _dt, timedelta as _td
+        scheduler.add_job(
+            retitle_done_events,
+            "date",
+            run_date=_dt.now() + _td(minutes=3),
+            id="calendar_retitle_done",
+            name="Plain DONE titles on checked-off calendar events",
+            replace_existing=True,
+        )
 
     # Agent Hub "My Videos": a linked YouTube channel's new uploads appear on their own (each hub
     # refreshes at most once a day - see agent_hub_video_sync.py).
