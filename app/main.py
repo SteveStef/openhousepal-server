@@ -14,7 +14,7 @@ from app.database import init_db, wait_for_db
 from app.api import router
 from app.utils.clean_cache import cleanup_expired_signup_verifications
 from app.utils.property_sync_scheduler import scheduled_bright_sync
-from app.utils.domain_verification_scheduler import scheduled_domain_verification
+from app.utils.domain_verification_scheduler import scheduled_domain_health, scheduled_domain_verification
 from app.utils.studio_media_video_poll_scheduler import scheduled_studio_media_video_poll
 from app.utils.task_reminder_scheduler import scheduled_task_reminders
 from app.services.calendar_sync_service import retitle_done_events, scheduled_finish_past_tours, scheduled_reconcile_deleted_followups
@@ -117,6 +117,16 @@ async def lifespan(app: FastAPI):
         minutes=5,
         id="domain_verification",
         name="Verify custom domain DNS/HTTPS status",
+        replace_existing=True,
+    )
+    # ...and once connected, is it actually opening? Every 2 hours (new domains each time - the
+    # first 4 days - older ones once a day). Problems show on the agent's Dash + to the admin.
+    scheduler.add_job(
+        scheduled_domain_health,
+        "interval",
+        hours=2,
+        id="domain_health",
+        name="Check connected custom domains open",
         replace_existing=True,
     )
 

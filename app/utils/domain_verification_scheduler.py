@@ -12,6 +12,18 @@ from app.services.website import domain_verification_service
 logger = get_logger(__name__)
 
 
+async def scheduled_domain_health():
+    """Connected domains opened like a visitor would (every 2h while new, then daily)."""
+    try:
+        from app.services.website.domain_health_service import run_health_checks
+        async with AsyncSessionLocal() as db:
+            n = await run_health_checks(db)
+        if n:
+            logger.info("Domain health check completed", extra={"event": "domain_health", "checked": n})
+    except Exception as e:
+        logger.error("Scheduled domain health check failed", exc_info=True, extra={"error": str(e)})
+
+
 async def scheduled_domain_verification():
     try:
         async with AsyncSessionLocal() as db:

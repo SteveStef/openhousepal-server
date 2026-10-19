@@ -15,6 +15,16 @@ from app.config.logging import get_logger
 router = APIRouter(prefix="/admin", tags=["admin"])
 logger = get_logger(__name__)
 
+@router.get("/domain-issues")
+async def list_domain_issues(
+    db: AsyncSession = Depends(get_db),
+    admin: UserModel = Depends(require_admin_user),
+):
+    """Agents whose own domain isn't working right now - so the admin can reach out."""
+    from app.services.website.domain_health_service import all_domain_issues
+    return {"issues": await all_domain_issues(db)}
+
+
 @router.get("/users", response_model=List[UserSchema])
 async def list_users(
     db: AsyncSession = Depends(get_db),

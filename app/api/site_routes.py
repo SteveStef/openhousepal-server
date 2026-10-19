@@ -309,6 +309,17 @@ async def publish_my_site(
     return await site_service.publish_site(db, site)
 
 
+@router.get("/me/domains/health")
+async def get_my_domain_health(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """What's wrong with the agent's own domain right now, with the fix (Dash banner + Domain
+    screen). Any plan - [] when there's nothing to say (see domain_health_service)."""
+    from app.services.website.domain_health_service import domain_issues
+    return {"issues": await domain_issues(db, current_user.id)}
+
+
 @router.get("/me/domains", response_model=List[SiteDomainResponse])
 async def get_my_site_domains(
     db: AsyncSession = Depends(get_db),
