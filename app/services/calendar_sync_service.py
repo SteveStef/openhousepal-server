@@ -160,10 +160,6 @@ CALENDAR_TZ = "America/New_York"
 _DIVIDER = "\u2501" * 16
 
 
-def _strike(text: str) -> str:
-    return "".join(ch + "̶" if ch.isalnum() else ch for ch in text or "")
-
-
 def _tidy_subject(s: str) -> str:
     from app.services.email_service import _tidy_subject as tidy
     return tidy(s)
@@ -195,10 +191,11 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
     first = (lead_name or "").strip() or "them"
     parts = []
     if done:
-        # Checked off: the event stays as a record, grey and silent, "✅ DONE ·" then the title
-        # crossed out (user, 10/17). Only letters and digits get the combining stroke - a stroke on
-        # spaces / punctuation / emoji is what made some iPhones spread the letters apart before.
-        summary = "✅ DONE · " + _strike(summary)
+        # Checked off: the event stays as a record, grey and silent, "✅ DONE ·" then the title.
+        # No cross-out: a title is plain text, so a strike is a combining stroke after every letter,
+        # and the iPhone Calendar app spreads those letters far apart even with letters-only strokes
+        # (user, 10/19 - "extremely weird and super spaced out").
+        summary = "✅ DONE · " + summary
         when = task.completed_at.astimezone(EASTERN)
         stamp = f"{when:%a} {when:%b} {when.day} at {when.hour % 12 or 12}:{when:%M} {'AM' if when.hour < 12 else 'PM'}"
         parts.append(f"✅ DONE - checked off {stamp}" + (f"\n↩️ Checked it off by mistake? Tap to undo:\n{done_link}" if done_link else ""))

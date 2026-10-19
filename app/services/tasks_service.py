@@ -2168,6 +2168,36 @@ def _tidy_context(s: str) -> str:
     return _tidy_subject(s)
 
 
+def _ordinal(n: int) -> str:
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
+async def _repeat_visit(db: AsyncSession, lead_id: str, property_address: Optional[str]) -> Optional[dict]:
+    """This person has signed in at this agent's open houses before: {label, context, message}
+    for the follow-up ("2nd open house" / "came back"), else None. Counts their sign-ins
+    (this one included - the caller links the visitor to the lead first)."""
+    from app.models.database import OpenHouseVisitor
+    rows = (await db.execute(select(OpenHouseVisitor.open_house_event_id).where(OpenHouseVisitor.lead_id == lead_id)
+                             .order_by(OpenHouseVisitor.created_at))).scalars().all()
+    if len(rows) < 2:
+        return None
+    houses = len({r for r in rows if r})
+    street = (property_address or "").split(",")[0].strip()
+    from app.services.email_service import _tidy_subject
+    place = _tidy_subject(street) if street else "the open house"
+    if houses >= 2:
+        label = f"{_ordinal(houses)} open house"
+        context = f"Signed in at {houses} of your open houses - latest {place}"
+        message = ("Hi {first_name}, great to see you again" + (f" at {place}" if street else "") + "! That's "
+                   f"{houses} of my open houses now, so I'd love to help you find the right one. How's the search going?{SHOWCASE_MARKER}")
+    else:
+        label = "came back"
+        context = f"Came back to your open house - {place} ({_ordinal(len(rows))} visit)"
+        message = ("Hi {first_name}, great to see you back" + (f" at {place}" if street else "") + "! A second look is a good sign - "
+                   f"want me to set up a private showing, or answer anything about it?{SHOWCASE_MARKER}")
+    return {"label": label, "context": context, "message": message}
+
+
 async def create_open_house_followup(
     db: AsyncSession,
     *,
@@ -2205,6 +2235,12 @@ async def create_open_house_followup(
         if existing.scalar_one_or_none():
             return None
 
+        # Signed in before (user, 10/19): the follow-up says so - "2nd open house" / "came back" -
+        # with its own message (check in, and their Showcase), instead of a card identical to the
+        # first one that read as a duplicate. Not an agent setting: rare, and always worth saying.
+        repeat = await _repeat_visit(db, lead.id, property_address)
+        repeat_name = (lead.name or "this guest").strip()
+
         # One open follow-up per person (what the Follow-ups page promises): signing in at another
         # open house while their last "Reach out" is still open moves that card to the newest open
         # house instead of adding a second; any other open follow-up already covers reaching out.
@@ -2215,9 +2251,14 @@ async def create_open_house_followup(
         if open_task is not None:
             if open_task.auto_source in ("open_house_signin", "similar_homes_qr") and property_address:
                 from app.services.email_service import _tidy_subject
-                open_task.context = _tidy_subject(f"Signed in at your open house - {property_address}")[:240]
+                open_task.context = _tidy_subject(repeat["context"] if repeat else f"Signed in at your open house - {property_address}")[:240]
+                if repeat:
+                    open_task.title = f"Follow up with {repeat_name} - {repeat['label']}"
+                    open_task.suggested_message = repeat["message"].replace("{first_name}", _first(lead.name))
                 if property_address not in (open_task.notes or ""):
                     open_task.notes = ((open_task.notes or "") + f"\nAlso signed in at: {property_address}").strip()
+                elif repeat:
+                    open_task.notes = ((open_task.notes or "") + f"\nSigned in again: {property_address}").strip()
                 if commit:
                     await db.commit()
                 else:
@@ -2232,8 +2273,8 @@ async def create_open_house_followup(
         # When + how is the agent's setting for this rule (default: next day, timed free slot).
         due, remind, all_day = await plan_followup(db, owner, rule, occurred_at)
         contact_bits = "  |  ".join(b for b in [lead.email, lead.phone] if b)
-        title = f"Follow up with {lead.name or 'open house guest'}"
-        notes = "Auto-created from an open house sign-in."
+        title = f"Follow up with {lead.name or 'open house guest'}" + (f" - {repeat['label']}" if repeat else "")
+        notes = "Auto-created from an open house sign-in." + (f"\n{repeat['context']}." if repeat else "")
         if property_address:
             notes += f"\nOpen house: {property_address}"
         if contact_bits:
@@ -2252,11 +2293,13 @@ async def create_open_house_followup(
             done_code=new_done_code(),
             auto_source=rule,
             auto_source_id=dedup_key,
-            suggested_message=render_rule_message(owner, rule, name=lead.name, address=await _open_house_short(db, signin_id, property_address)),
+            suggested_message=(repeat["message"].replace("{first_name}", _first(lead.name)) if repeat else
+                               render_rule_message(owner, rule, name=lead.name, address=await _open_house_short(db, signin_id, property_address))),
             # The sheet's bottom "Want to see more homes like these?" QR (-> sign-in -> Showcase), not
             # one of the per-home QRs (those open that home's listing page - tracked separately).
             # MLS capitals tidied like every other follow-up ("26 OLD GULPH RD" read as shouting).
-            context=_tidy_context(f"Scanned \"Want to see more homes like these?\" on your Similar Homes sheet and signed in{' - ' + property_address if property_address else ''}"
+            context=_tidy_context(repeat["context"] if repeat else
+                                  f"Scanned \"Want to see more homes like these?\" on your Similar Homes sheet and signed in{' - ' + property_address if property_address else ''}"
                                   if rule == "similar_homes_qr" else
                                   f"Signed in at your open house{' - ' + property_address if property_address else ''}")[:240],
         )
