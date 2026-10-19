@@ -852,14 +852,9 @@ async def get_property_by_qr(
         photos: list = []
         if property_data.get("listingKey"):
             photo_result = await db.execute(
-                select(Property.photos, Property.list_office_name).where(Property.listing_key == str(property_data["listingKey"]))
+                select(Property.photos).where(Property.listing_key == str(property_data["listingKey"]))
             )
-            row = photo_result.first()
-            photos = (row[0] if row else None) or []
-            # Whose listing it is - a host showing another brokerage's home credits them (the link
-            # preview's "Listing courtesy of" line).
-            if row and row[1]:
-                property_data["listOfficeName"] = row[1]
+            photos = photo_result.scalar_one_or_none() or []
         if not photos and property_data.get("imageSrc"):
             photos = [property_data["imageSrc"]]
         property_data["photos"] = photos
