@@ -96,6 +96,8 @@ SELLER_SOURCE = "how_can_we_help_seller"
 FILL_IN_TIME = "[ADD DATE & TIME]"
 # Left in a message where the agent answers the question the person asked (Spotlight / listing inquiries).
 FILL_IN_ANSWER = "[ANSWER THEIR QUESTION]"
+# Left in the check-in text for a guest who has an agent: what to say is the agent's call.
+FILL_IN_MESSAGE = "[ADD YOUR MESSAGE HERE]"
 _RULE_KEYS = {r["key"] for r in AUTO_FOLLOWUP_RULES}
 
 # The Follow-ups page lists the situations under these headings, in this order.
@@ -2344,6 +2346,39 @@ async def _visitor_notes(db: AsyncSession, visitor) -> list[str]:
     return [n.text.strip() for n in (here or rows) if (n.text or "").strip()]
 
 
+def noted_guest_message(owner: Optional[User], lead_name: Optional[str], address: Optional[str]) -> str:
+    """The check-in text for a guest who has an agent but got a note (user, 10/19): who you are,
+    thanks for coming, then a spot for your own words - the "Thanks, name | brokerage" sign-off is
+    added under it like every follow-up message."""
+    name = _my_name(owner) if owner is not None else ""
+    brokerage = (getattr(owner, "brokerage", None) or "").strip() if owner is not None else ""
+    me = f"it's {name}" + (f" with {brokerage}" if brokerage else "") if name else ""
+    street = (address or "").split(",")[0].strip()
+    from app.services.email_service import _tidy_subject
+    where = f" at {_tidy_subject(street)}" if street else ""
+    first = _first(lead_name)
+    first = first.capitalize() if first.isupper() else first  # "JOHN" typed in capitals
+    hello = f"Hi {first or 'there'}" + (f", {me}" if me else "") + "."
+    return f"{hello} Thanks for stopping by the open house{where}!\n\n{FILL_IN_MESSAGE}"
+
+
+async def backfill_noted_message(db: AsyncSession, owner: User, tasks: list) -> None:
+    """Give older check-in follow-ups (made with no message) their text, then redo their calendar events."""
+    from app.models.database import OpenHouseEvent as _OHE, OpenHouseVisitor
+    try:
+        for t in tasks:
+            visitor = await db.get(OpenHouseVisitor, t.auto_source_id) if t.auto_source_id else None
+            oh = await db.get(_OHE, visitor.open_house_event_id) if visitor is not None and visitor.open_house_event_id else None
+            lead = t.lead if getattr(t, "lead", None) is not None else (await db.get(Lead, t.lead_id) if t.lead_id else None)
+            t.suggested_message = noted_guest_message(owner, getattr(lead, "name", None) or getattr(visitor, "full_name", None), getattr(oh, "address", None))
+        await db.commit()
+        from app.services import calendar_sync_service
+        for t in tasks:
+            calendar_sync_service.sync_task_bg(owner.id, t.id)
+    except Exception:
+        logger.warning("check-in follow-up messages not filled in", exc_info=True)
+
+
 def _noted_guest_notes(lead: Lead, visitor, address: Optional[str], notes: list[str]) -> str:
     first = _first(lead.name or visitor.full_name) or "This guest"
     lines = [NOTED_GUEST_ALERT.format(first=first)]
@@ -2394,6 +2429,8 @@ async def on_visitor_note(db: AsyncSession, owner_id: str, visitor) -> None:
         if existing is not None:
             if existing.completed_at is None and notes:
                 existing.notes = _noted_guest_notes(lead, visitor, address, notes)
+                if not existing.suggested_message:
+                    existing.suggested_message = noted_guest_message(await db.get(User, owner_id), lead.name or visitor.full_name, address)
                 await db.commit()
                 resync_lead_followups(owner_id, lead.id)
             return
@@ -2420,7 +2457,7 @@ async def on_visitor_note(db: AsyncSession, owner_id: str, visitor) -> None:
             done_code=new_done_code(),
             auto_source=NOTED_GUEST_SOURCE,
             auto_source_id=visitor.id,
-            suggested_message=None,
+            suggested_message=noted_guest_message(owner, name, address),
         )
         db.add(task)
         await db.commit()

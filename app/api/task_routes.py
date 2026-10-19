@@ -74,6 +74,11 @@ async def list_tasks(
     )
     rows = await db.execute(open_stmt)
     tasks = list(rows.scalars().all())
+    # Open "check in (has an agent)" follow-ups made before they had a text (user, 10/19) get it
+    # now - and their calendar event is redone with it.
+    from app.services.tasks_service import NOTED_GUEST_SOURCE, backfill_noted_message
+    if any(t.auto_source == NOTED_GUEST_SOURCE and not t.suggested_message for t in tasks):
+        await backfill_noted_message(db, current_user, [t for t in tasks if t.auto_source == NOTED_GUEST_SOURCE and not t.suggested_message])
 
     if include_done:
         # Only recently completed ones - older history isn't useful on a to-do list and is
