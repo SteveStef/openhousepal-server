@@ -62,6 +62,8 @@ AUTO_FOLLOWUP_RULES: list[dict] = [
      "description": "A client messages you from their Showcase asking you to change their search. You get an alert with exactly what they asked for and a link to their Showcase - update it, then let them know.", "tiers": "showcase"},
     {"key": "listing_inquiry", "label": "Listing inquiry", "timing": "Right away",
      "description": "Someone asks about one of your listings - through a Spotlight listing site, or a Zillow, Realtor.com or other portal lead sent to your OpenHousePal leads address.", "tiers": None},
+    {"key": "website_signin", "label": "Website sign-in", "timing": "Next day",
+     "description": "Someone taps \"Continue with Google\" on your IDX website - you get their name, email and the home they were looking at. Once per person.", "tiers": "idx"},
     {"key": "private_feedback", "label": "Unhappy review (1-3 stars)", "timing": "Right away",
      "description": "A client leaves private 1-3 star feedback through your review link.", "tiers": "reviews"},
 ]
@@ -106,7 +108,7 @@ RULE_GROUPS: list[dict] = [
      "rules": ["showcase_setup", "buyer_form", "how_can_we_help", "form_submission"]},
     {"key": "other", "label": "Showcases, listings & reviews",
      "description": "Activity on your Showcases, listing sites, portals and review link.",
-     "rules": ["showing_request", "showcase_comment", "showcase_search_request", "listing_inquiry", "private_feedback"]},
+     "rules": ["showing_request", "showcase_comment", "showcase_search_request", "listing_inquiry", "website_signin", "private_feedback"]},
 ]
 _RULE_GROUP = {k: g["key"] for g in RULE_GROUPS for k in g["rules"]}
 
@@ -126,6 +128,8 @@ _SOURCE_RULES: dict[str, tuple[str, int]] = {
     "property_page_tour_request": ("showing_request", 0),
     # A reader's question from a blog article's contact form.
     "blog_inquiry": ("form_submission", 0),
+    # Google One Tap on the agent's IDX website (first sign-in only - see schedule_followup_for_lead_event).
+    "website_google_signin": ("website_signin", 1),
 }
 
 # form_submission events from these premade forms get their own situation (own switch, message
@@ -704,6 +708,7 @@ DEFAULT_TEMPLATES: dict[str, str] = {
     "form_submission": "Hi {first_name}, thanks for filling out my {form_name} form - I've got everything you sent over. When's a good time for a quick call to go through it together?",
     "showing_request": "Hi {first_name}, thanks for asking to see {address}! You're all set for {requested_time} - I'll send you the details beforehand. If anything changes, feel free to text here.",
     "listing_inquiry": "Hi {first_name}, thanks for your message about {address}! {answer} Would you like to see it in person? Just reply with a day and time that works for you.",
+    "website_signin": "Hi {first_name}, thanks for visiting my website! If a home caught your eye, I'd be happy to send you more like it or set up a showing - just text me here.",
     # Sent once the agent has emailed it (the card says so).
     "disclosure_request": "Hi {first_name}, I just emailed you the seller's disclosure for {address}. Let me know if you need anything else!",
 }
@@ -1551,6 +1556,12 @@ def schedule_followup_for_lead_event(owner_id: str, lead_id: str, event_id: str,
                 return
             if says_has_agent(event.raw_snapshot):
                 return  # this time they told us they have an agent - nothing to follow up on
+            if source_type == "website_google_signin":
+                # One follow-up per person: a returning visitor signing in again isn't new.
+                earlier = (await db.execute(select(LeadEvent.id).where(
+                    LeadEvent.lead_id == lead.id, LeadEvent.source_type == source_type, LeadEvent.id != event.id).limit(1))).first()
+                if earlier:
+                    return
             form_title = None
             context = event.summary
             seller = False
