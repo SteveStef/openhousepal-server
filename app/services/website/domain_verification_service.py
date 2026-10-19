@@ -118,18 +118,24 @@ async def check_dns(hostname: str) -> DnsCheckResult:
         return DnsCheckResult(matched=False, error="lookup_failed")
 
 
-async def check_forwarding(apex: str) -> bool:
-    """The bare domain forwards to its www address (the agent's domain-company forwarding)."""
+async def check_forwarding(apex: str) -> str:
+    """Does the bare domain forward to its www address (the agent's domain-company forwarding)?
+    'ok' = it lands on the working https site; 'http' = it forwards to http://www... instead (GoDaddy's
+    forwarding defaults to http:// - those visitors got a 404, user 10/19); 'none' = no forward yet."""
     target = f"www.{apex}"
+    saw_http = False
     for scheme in ("https", "http"):
         try:
             async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
                 resp = await client.get(f"{scheme}://{apex}/")
-                if (resp.url.host or "").lower() == target:
-                    return True
+                hops = [*resp.history, resp]
+                if any((h.url.host or "").lower() == target and h.url.scheme == "http" for h in hops):
+                    saw_http = True
+                if (resp.url.host or "").lower() == target and resp.url.scheme == "https" and resp.status_code < 400:
+                    return "ok"
         except httpx.HTTPError:
             continue
-    return False
+    return "http" if saw_http else "none"
 
 
 async def check_https_reachable(hostname: str) -> bool:
@@ -161,13 +167,26 @@ async def verify_domain(db: AsyncSession, domain: SiteDomain) -> SiteDomain:
     domain.last_checked_at = datetime.now(timezone.utc)
     prev_status = domain.status
 
-    # The bare domain of a www pair: connected once it forwards to the www address (or, on a
-    # company that offers ALIAS at the root, once its DNS points at us like the www record).
-    if domain.redirect_target_domain_id and not is_www(domain.hostname) and domain.status != "ACTIVE":
-        if await check_forwarding(domain.hostname):
-            domain.status = "ACTIVE"
-            domain.verified_at = domain.verified_at or datetime.now(timezone.utc)
-            domain.last_error = None
+    # The bare domain of a www pair: connected once it forwards to the working https www address
+    # (or, on a company that offers ALIAS at the root, once its DNS points at us like the www
+    # record). Re-checked while connected too: a forward to http:// isn't connected - it goes back
+    # to waiting with "forward_http", so the panel says exactly what to change.
+    if domain.redirect_target_domain_id and not is_www(domain.hostname):
+        fwd = await check_forwarding(domain.hostname)
+        if fwd == "ok" or (fwd == "none" and domain.status == "ACTIVE"):
+            # (one failed look at an already-working forward isn't enough to undo it)
+            if fwd == "ok":
+                domain.status = "ACTIVE"
+                domain.verified_at = domain.verified_at or datetime.now(timezone.utc)
+                domain.last_error = None
+            db.add(domain)
+            await db.commit()
+            await db.refresh(domain)
+            domain_resolution_service.invalidate_site(domain.site_id)
+            return domain
+        if fwd == "http":
+            domain.status = "PENDING"
+            domain.last_error = "forward_http"
             db.add(domain)
             await db.commit()
             await db.refresh(domain)

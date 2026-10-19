@@ -2,7 +2,7 @@
 status-PATCH stand-in with an actual recurring DNS/HTTPS check. Same shape as
 property_sync_scheduler.py: a thin async entry function, its own DB session (background jobs
 have no request-scoped session), registered in app/main.py's lifespan()."""
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from app.config.logging import get_logger
 from app.database import AsyncSessionLocal
@@ -16,7 +16,11 @@ async def scheduled_domain_verification():
     try:
         async with AsyncSessionLocal() as db:
             result = await db.execute(
-                select(SiteDomain).where(SiteDomain.status.in_(["PENDING", "VERIFIED", "FAILED"]))
+                # connected bare-domain forwards are re-checked too (a forward to http:// broke them)
+                select(SiteDomain).where(or_(
+                    SiteDomain.status.in_(["PENDING", "VERIFIED", "FAILED"]),
+                    and_(SiteDomain.status == "ACTIVE", SiteDomain.redirect_target_domain_id.isnot(None), ~SiteDomain.hostname.startswith("www.")),
+                ))
             )
             domains = result.scalars().all()
 
