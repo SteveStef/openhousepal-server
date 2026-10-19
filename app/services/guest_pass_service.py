@@ -109,15 +109,11 @@ async def pass_url(db: AsyncSession, host: User, visitor: OpenHouseVisitor) -> s
 
 
 async def _website_url(db: AsyncSession, host: User) -> Optional[str]:
-    """The host's live IDX website, when they have one (IDX plan, published)."""
-    if host.plan_tier != "IDX":
-        return None
-    from app.models.database import Site
-    from app.services.website.site_service import resolve_owner_public_base_url
-    site = (await db.execute(select(Site).where(Site.owner_id == host.id))).scalar_one_or_none()
-    if not site or site.status != "PUBLISHED":
-        return None
-    return await resolve_owner_public_base_url(db, host)
+    """The host's live IDX website, when they have one (IDX plan, published) - their own domain
+    once connected, else <slug>.openhousepal.com (was the openhousepal.com home page without one)."""
+    from app.services.website_link_service import auto_website
+    auto = await auto_website(db, host)
+    return auto["url"] if auto and auto["kind"] != "hub" else None
 
 
 async def resolve(db: AsyncSession, token: str) -> tuple[OpenHouseVisitor, OpenHouseEvent, User]:

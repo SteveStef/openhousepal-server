@@ -148,5 +148,7 @@ async def live_hub_config(db: AsyncSession, owner: Optional[User], config: Optio
         cfg["recentSales"] = await _merged_sales(db, owner, cfg.get("recentSales") or [])
     except Exception:
         logger.warning("live Agent Hub merge failed - serving saved lists", exc_info=True)
-        return dict(config or {})
-    return cfg
+        cfg = dict(config or {})
+    # The Website link fills itself in: IDX site / own domain, else the hub (website_link_service).
+    from app.services.website_link_service import apply_auto_website
+    return await apply_auto_website(db, owner, cfg)

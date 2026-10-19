@@ -211,6 +211,9 @@ async def get_agent_profile(db: AsyncSession, user: User) -> dict:
     don't need null-guards everywhere."""
     hub = (await db.execute(select(AgentHub).where(AgentHub.owner_id == user.id))).scalar_one_or_none()
     config = (hub.config or {}) if hub else {}
+    if hub is not None:  # the Website link filled in (their IDX site / own domain)
+        from app.services.website_link_service import apply_auto_website
+        config = await apply_auto_website(db, user, config, hub.slug)
     profile = config.get("profile") or {}
     contact = config.get("contact") or {}
     social_links = [

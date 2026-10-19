@@ -120,8 +120,10 @@ def build_vcard_text(
     owner: User,
     agent_hub_url: str,
     photo_base64: Optional[str] = None,
+    config: Optional[dict] = None,
 ) -> str:
-    config = hub.config or {}
+    # `config`: the hub config as read live (the Website link filled in) - the saved one if not given.
+    config = config if config is not None else (hub.config or {})
     profile = config.get("profile") or {}
     contact = config.get("contact") or {}
     social_links = config.get("socialLinks") or []

@@ -434,7 +434,9 @@ async def get_public_agent_hub_vcard(
     if fields["agentHubUrl"]["include"]:
         agent_hub_url = (await owner_links(db, owner, hub.slug)).hub()
 
-    vcard_text = vcard_service.build_vcard_text(hub, owner, agent_hub_url, photo_base64)
+    from app.services.website_link_service import apply_auto_website
+    vcard_text = vcard_service.build_vcard_text(hub, owner, agent_hub_url, photo_base64,
+                                                config=await apply_auto_website(db, owner, hub.config or {}, hub.slug))
 
     # Same anonymous-only rule as every other Agent Hub event - a logged-in viewer (the owner
     # previewing their own card) shouldn't inflate the count.

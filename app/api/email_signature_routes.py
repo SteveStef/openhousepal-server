@@ -322,7 +322,9 @@ async def stable_social_redirect(owner_id: str, network: str, db: AsyncSession =
     owner = await db.get(User, owner_id) if hub else None
     if not hub or not owner or not owner_has_access(owner, EMAIL_SIGNATURE_ACCESS_TIERS):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
-    url = email_signature_service._social_url((hub.config or {}).get("socialLinks") or [], network)
+    from app.services.website_link_service import apply_auto_website
+    config = await apply_auto_website(db, owner, hub.config or {}, hub.slug)  # Website: IDX site / own domain / hub
+    url = email_signature_service._social_url(config.get("socialLinks") or [], network)
     if not url:
         url = (await owner_links(db, owner, hub.slug)).hub()
     return RedirectResponse(url)
