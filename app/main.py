@@ -373,12 +373,18 @@ _PUBLIC_CORS_PREFIXES = (
 )
 
 
+def _is_public_path(path: str) -> bool:
+    # + the no-login property lookups visitors' pages use on any site (home map lines, town /
+    # school district / address pickers): /api/properties/<thing>/public.
+    return path.startswith(_PUBLIC_CORS_PREFIXES) or (path.startswith("/api/properties/") and path.rstrip("/").endswith("/public"))
+
+
 class PublicCORSMiddleware:
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not scope["path"].startswith(_PUBLIC_CORS_PREFIXES):
+        if scope["type"] != "http" or not _is_public_path(scope["path"]):
             return await self.app(scope, receive, send)
         origin = next((v.decode() for k, v in scope["headers"] if k == b"origin"), None)
         if not origin:

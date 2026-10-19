@@ -869,6 +869,8 @@ async def search_listing_addresses_public(
                 "street": display_address(p.street_address or p.unparsed_address)[0].split(",")[0],
                 "city": (p.city or "").title() or None, "state": p.state, "zipcode": p.zipcode,
                 "beds": p.bedrooms, "baths": p.bathrooms, "sqft": p.living_area,
+                # where it is - the IDX Showcase builder draws its "around this home" circle from it
+                "lat": float(p.latitude) if p.latitude is not None else None, "lng": float(p.longitude) if p.longitude is not None else None,
             })
             if len(out) >= 8:
                 break

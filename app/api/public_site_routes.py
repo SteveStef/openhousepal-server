@@ -1025,7 +1025,69 @@ async def google_visitor_signin(site_id: str, payload: GoogleVisitorRequest, req
             except Exception as e:  # the lead itself is already saved
                 logger.warning("google visitor side effects failed", extra={"error": str(e)})
                 await db.rollback()
-    return {"name": name, "first_name": first, "email": email}
+    # Already has a Showcase with this agent (an open house sign-in, a form...): the site shows it as
+    # "{first}'s Showcase" right away. Only for a Google-verified email, so nobody can look one up.
+    return {"name": name, "first_name": first, "email": email, "showcase": await _visitor_showcase_code(db, user.id, email)}
+
+
+async def _visitor_showcase_code(db: AsyncSession, owner_id: str, email: str) -> Optional[str]:
+    from sqlalchemy import func
+    from app.services.showcase_links import ensure_short_code
+    try:
+        col = (await db.execute(
+            select(Collection).where(
+                Collection.owner_id == owner_id, func.lower(Collection.visitor_email) == email.strip().lower(),
+                Collection.is_public.is_(True), Collection.status == "ACTIVE",
+            ).order_by(Collection.updated_at.desc().nullslast(), Collection.created_at.desc()).limit(1)
+        )).scalars().first()
+        if not col:
+            return None
+        return col.short_code or await ensure_short_code(col.id) or col.share_token
+    except Exception as e:
+        logger.warning("visitor showcase lookup failed", extra={"error": str(e)})
+        await db.rollback()
+        return None
+
+
+@router.get("/{site_id}/my-showcase/{share_token}")
+async def get_site_my_showcase(site_id: str, share_token: str, db: AsyncSession = Depends(get_db)):
+    """The header of a visitor's "{first}'s Showcase" tab on the agent's IDX site: whose it is, how
+    many homes are in it (and how many are new), and what it's searching for - so the site can
+    show it and the Showcase builder can start an edit from it. The Showcase page itself does the rest."""
+    from datetime import timedelta
+    from sqlalchemy import func
+    from app.models.database import CollectionPreferences, collection_properties
+    await _assert_site_showcase(db, site_id, share_token)
+    col = (await db.execute(select(Collection).where(share_match(share_token)))).scalars().first()
+    if not col:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found.")
+    homes = (await db.execute(select(func.count()).select_from(collection_properties).where(collection_properties.c.collection_id == col.id))).scalar() or 0
+    new = (await db.execute(select(func.count()).select_from(collection_properties).where(
+        collection_properties.c.collection_id == col.id, collection_properties.c.added_at.is_not(None),
+        collection_properties.c.added_at >= datetime.now(timezone.utc) - timedelta(days=7)))).scalar() or 0
+    pref = (await db.execute(select(CollectionPreferences).where(CollectionPreferences.collection_id == col.id))).scalars().first()
+    types = [t for t, on in (("single_family", getattr(pref, "is_single_family", False)), ("town_house", getattr(pref, "is_town_house", False)),
+                             ("condo", getattr(pref, "is_condo", False)), ("multi_family", getattr(pref, "is_multi_family", False))) if on] if pref else []
+    name = (col.visitor_name or "").strip()
+    return {
+        "code": col.short_code or col.share_token,
+        "name": name or None,
+        "first_name": name.split(" ")[0] if name else None,
+        "homes": int(homes),
+        "new_this_week": int(new),
+        "criteria": {
+            "cities": list(pref.cities or []) if pref else [],
+            "school_districts": list(pref.school_districts or []) if pref else [],
+            "min_price": pref.min_price if pref else None, "max_price": pref.max_price if pref else None,
+            "min_beds": pref.min_beds if pref else None, "min_baths": pref.min_baths if pref else None,
+            "min_sqft": pref.min_sqft if pref else None,
+            "center_address": pref.address if pref and pref.lat is not None and pref.diameter else None,
+            "center_lat": pref.lat if pref and pref.diameter else None, "center_lng": pref.long if pref and pref.diameter else None,
+            "radius_miles": pref.diameter if pref else None,
+            "drawn_area": bool(pref and pref.search_polygon),
+            "types": types,
+        },
+    }
 
 
 @router.post("/{site_id}/properties/{listing_key}/ask")

@@ -1074,6 +1074,19 @@ class CollectionsService:
         def sane(v, lo, hi):
             return v if v is not None and lo <= v <= hi else None
 
+        # "Around a home I love" from the IDX Showcase builder (user, 10/18): that home's spot + how
+        # far to look, stored as the Showcase's own distance search (lat/long/diameter = radius in
+        # miles), so the agent's and the client's radius tools work on it like any other Showcase.
+        center: Dict[str, Any] = {}
+        c_lat, c_lng, c_rad = to_number(answers_by_id.get("center_lat")), to_number(answers_by_id.get("center_lng")), to_number(answers_by_id.get("radius_miles"))
+        if c_lat is not None and c_lng is not None and -90 <= c_lat <= 90 and -180 <= c_lng <= 180 and sane(c_rad, 0.1, 50):
+            center = {"address": str(answers_by_id.get("center_address") or "").strip()[:300] or None,
+                      "lat": float(c_lat), "long": float(c_lng), "diameter": float(c_rad), "search_polygon": None}
+        elif str(answers_by_id.get("search_mode") or "") in ("towns", "district"):
+            # The builder switched this Showcase to towns / a school district: its old circle or
+            # drawn area goes, or both would apply at once (a district inside the old circle).
+            center = {"address": None, "lat": None, "long": None, "diameter": None, "search_polygon": None}
+
         this_year = datetime.now().year
         min_price, max_price = sane(to_int(answers_by_id.get("budget_min")), 1, 500_000_000), sane(to_int(answers_by_id.get("budget_max")), 1, 500_000_000)
         if min_price and max_price and min_price > max_price:
@@ -1100,6 +1113,7 @@ class CollectionsService:
             # An area the visitor drew on the IDX map ("Save this search") - their alerts follow
             # that exact shape. Only set when present, so a refresh never wipes an agent-drawn one.
             **({"search_polygon": polygon} if (polygon := geography.polygon_from_param(answers_by_id.get("search_area"))) else {}),
+            **center,
         }
 
     @staticmethod
@@ -1123,7 +1137,7 @@ class CollectionsService:
 
             pref_fields = CollectionsService._preferences_from_showcase_form_answers(answers_by_id)
             if require_criteria and not any(pref_fields.get(k) for k in (
-                    "cities", "school_districts", "county", "counties", "state", "min_price", "max_price", "min_beds", "search_polygon")):
+                    "cities", "school_districts", "county", "counties", "state", "min_price", "max_price", "min_beds", "search_polygon", "lat")):
                 return None
 
             # Match on the same contact, so a returning visitor refines their existing Showcase
