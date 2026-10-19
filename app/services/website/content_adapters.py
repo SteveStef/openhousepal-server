@@ -317,6 +317,18 @@ async def _spotlight_url_map(db: AsyncSession, user: User, listing_keys: list[st
     keys = [k for k in listing_keys if k]
     if not keys:
         return {}
+    # Never for a home the MLS lists under ANOTHER agent (user, 10/19): a Spotlight the agent made
+    # for someone else's listing isn't what their share link, website or property page opens.
+    # Their own listings (listing / co-listing agent) and homes with no listing agent on record
+    # (manual / off-MLS) keep theirs.
+    from app.utils.plan_ids import listing_owner_key
+    me = listing_owner_key(user)
+    others = {r.listing_key for r in (await db.execute(
+        select(Property.listing_key, Property.list_agent_mls_id, Property.co_list_agent_mls_id).where(Property.listing_key.in_(keys))
+    )).all() if (r.list_agent_mls_id or r.co_list_agent_mls_id) and me not in {r.list_agent_mls_id, r.co_list_agent_mls_id}}
+    keys = [k for k in keys if k not in others]
+    if not keys:
+        return {}
     from app.models.database import PropertyWebsite
     from app.services import property_website_service
     hub_config = (await db.execute(select(AgentHub.config).where(AgentHub.owner_id == user.id))).scalar_one_or_none() or {}
