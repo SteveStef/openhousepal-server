@@ -318,6 +318,20 @@ async def mls_data_updated(db: AsyncSession = Depends(get_db)):
     return {"updated_at": value}
 
 
+@router.get("/warm-hosts")
+async def list_warm_hosts(db: AsyncSession = Depends(get_db)):
+    """Every live IDX site's address - the website server opens each one itself right after it
+    starts (frontend instrumentation.ts), so no real visitor is ever the first, slow one after a
+    deploy. Public on purpose: these are the agents' public website addresses."""
+    from app.services.website.site_service import default_hostname
+    rows = (await db.execute(
+        select(Site).join(User, User.id == Site.owner_id)
+        .where(Site.status == "PUBLISHED", Site.is_enabled.isnot(False), User.plan_tier == "IDX")
+    )).scalars().all()
+    hosts = [default_hostname(s) for s in rows if s.subdomain_slug]
+    return {"hosts": hosts[:500]}
+
+
 @router.get("/resolve")
 async def resolve_site(
     host: str = Query(..., min_length=1),

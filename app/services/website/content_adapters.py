@@ -1222,6 +1222,8 @@ _market_refreshing: set[str] = set()
 
 def _market_store(key: str, value) -> None:
     _market_cache[key] = (time.monotonic(), value)
+    from app.services import app_cache
+    app_cache.save_bg(f"mkt:{key}", value)  # survives a restart (preload_persistent_caches)
     if len(_market_cache) > 2000:
         for k in sorted(_market_cache, key=lambda k: _market_cache[k][0])[:500]:
             _market_cache.pop(k, None)
@@ -1288,8 +1290,30 @@ async def get_served_areas_summary(db: AsyncSession, user: User, limit: int = 15
             asyncio.create_task(_refresh_served_areas(key, str(user.id), limit, with_stats))
         return copy.deepcopy(hit[1])
     out = await _build_served_areas_summary(db, user, limit, with_stats)
-    _served_areas_cache[key] = (now, out)
+    _served_store(key, out)
     return copy.deepcopy(out)
+
+
+def _served_store(key: tuple, value: list[dict]) -> None:
+    _served_areas_cache[key] = (time.monotonic(), value)
+    from app.services import app_cache
+    app_cache.save_bg(f"served:{key[0]}:{key[1]}:{int(bool(key[2]))}", value)
+
+
+async def preload_persistent_caches() -> int:
+    """At startup, before the first request: the last saved market numbers and served-areas cards
+    go back into memory, marked due for a refresh - so the first visitor after a deploy gets them
+    instantly (refreshed in the background) instead of waiting while they're rebuilt."""
+    from app.services import app_cache
+    saved = await app_cache.load_all(("mkt:", "served:"))
+    now = time.monotonic()
+    for k, v in saved.items():
+        if k.startswith("mkt:"):
+            _market_cache.setdefault(k[4:], (now - _SERVED_AREAS_TTL_S - 1, v))
+        else:
+            _, uid, limit, stats = k.split(":", 3)
+            _served_areas_cache.setdefault((uid, int(limit), stats == "1"), (now - _SERVED_AREAS_TTL_S - 1, v))
+    return len(saved)
 
 
 _served_areas_refreshing: set[tuple] = set()
@@ -1301,7 +1325,7 @@ async def _refresh_served_areas(key: tuple, user_id: str, limit: int, with_stats
         async with AsyncSessionLocal() as db:
             user = await db.get(User, user_id)
             if user:
-                _served_areas_cache[key] = (time.monotonic(), await _build_served_areas_summary(db, user, limit, with_stats))
+                _served_store(key, await _build_served_areas_summary(db, user, limit, with_stats))
     except Exception:
         logger.exception("served areas refresh failed")
     finally:
