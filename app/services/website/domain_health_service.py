@@ -4,8 +4,10 @@ every link 404'd - nothing told him.
 
 Two parts:
   * `run_health_checks` (scheduled): opens each connected www address like a visitor would -
-    every 2 hours for the first 4 days after it's added, then once a day for good. Two failed
-    looks in a row = "site_down" (one blip isn't enough).
+    every 2 hours for the first 4 days after it's added, then once a month (user, 10/19 - daily
+    was overkill); a failing one is re-checked every 2 hours until it works. Two failed looks in a
+    row = "site_down" (one blip isn't enough). Agents whose IDX plan ended (or who switched their
+    site off) aren't opened at all - their domain can't show the site, and they're told why.
   * `domain_issues`: what's wrong right now, in plain words with the fix - read from the domain
     rows the verification poll and this check keep current. Shown as a banner on the Dash, on the
     domain screen, and to the admin (who can reach out).
@@ -26,7 +28,8 @@ from app.services.website.domain_verification_service import is_www
 
 logger = logging.getLogger(__name__)
 
-NEW_DAYS = 4                       # checked often while new
+NEW_DAYS = 4                       # checked every 2 hours while new
+LATER_DAYS = 30                    # then once a month
 GRACE = timedelta(hours=24)        # time to finish setting up before "still not working" shows
 
 
@@ -42,15 +45,19 @@ async def site_opens(hostname: str) -> bool:
 
 async def run_health_checks(db: AsyncSession) -> int:
     now = datetime.now(timezone.utc)
-    rows = (await db.execute(select(SiteDomain).where(
+    from app.models.database import Site, User
+    rows = (await db.execute(select(SiteDomain, User.plan_tier, Site.is_enabled, Site.status).join(User, User.id == SiteDomain.owner_id)
+                             .join(Site, Site.id == SiteDomain.site_id).where(
         SiteDomain.status == "ACTIVE", SiteDomain.redirect_target_domain_id.is_(None),
-    ))).scalars().all()
+    ))).all()
     checked = 0
-    for d in rows:
+    for d, tier, enabled, site_status in rows:
+        if not _site_on(tier, enabled, site_status):
+            continue  # nothing to show there anyway - domain_issues says why
         created = d.created_at if d.created_at.tzinfo else d.created_at.replace(tzinfo=timezone.utc)
         last = d.last_checked_at and (d.last_checked_at if d.last_checked_at.tzinfo else d.last_checked_at.replace(tzinfo=timezone.utc))
         new = created > now - timedelta(days=NEW_DAYS)
-        due = new or d.last_error or not last or last < now - timedelta(hours=20)
+        due = new or d.last_error or not last or last < now - timedelta(days=LATER_DAYS)
         if not due:
             continue
         ok = await site_opens(d.hostname)
@@ -75,10 +82,31 @@ def _aware(dt: Optional[datetime]) -> Optional[datetime]:
     return dt if dt is None or dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def issues_for(rows: list[SiteDomain]) -> list[dict]:
+def _site_on(tier: Optional[str], enabled: Optional[bool], site_status: Optional[str]) -> bool:
+    return tier == "IDX" and enabled is not False and site_status == "PUBLISHED"
+
+
+def issues_for(rows: list[SiteDomain], tier: Optional[str] = "IDX", enabled: Optional[bool] = True,
+               site_status: Optional[str] = "PUBLISHED") -> list[dict]:
     """[{hostname, code, title, fix, since}] for one agent's domain rows."""
     now = datetime.now(timezone.utc)
     out = []
+    if not _site_on(tier, enabled, site_status):
+        # Their domain can't show the site right now - say why once (on the www/main address),
+        # instead of a list of connection problems they can't fix at the domain company.
+        main = next((d for d in rows if d.status == "ACTIVE" and not d.redirect_target_domain_id), None)
+        if main is None:
+            return []
+        if tier != "IDX":
+            issue = ("plan_ended", f"{main.hostname} no longer shows your website",
+                     "Your IDX plan has ended, so your own domain has nothing to show. Renew the IDX plan "
+                     "(Settings > Billing) and it comes straight back - nothing to change at your domain company.")
+        else:
+            issue = ("site_off", f"{main.hostname} isn't showing anything",
+                     "Your IDX website is switched off (Settings > IDX Website). Turn it back on, or remove the "
+                     "domain if you're not using it.")
+        return [{"hostname": main.hostname, "code": issue[0], "title": issue[1], "fix": issue[2],
+                 "since": (_aware(main.updated_at) or _aware(main.created_at)).isoformat()}]
     for d in rows:
         old = _aware(d.created_at) < now - GRACE
         apex = _apex(d.hostname)
@@ -116,20 +144,26 @@ def issues_for(rows: list[SiteDomain]) -> list[dict]:
 
 
 async def domain_issues(db: AsyncSession, owner_id: str) -> list[dict]:
+    from app.models.database import Site, User
     rows = (await db.execute(select(SiteDomain).where(SiteDomain.owner_id == owner_id))).scalars().all()
-    return issues_for(list(rows))
+    if not rows:
+        return []
+    owner = await db.get(User, owner_id)
+    site = await db.get(Site, rows[0].site_id)
+    return issues_for(list(rows), getattr(owner, "plan_tier", None), getattr(site, "is_enabled", None), getattr(site, "status", None))
 
 
 async def all_domain_issues(db: AsyncSession) -> list[dict]:
     """Every agent with a domain problem right now (admin) - newest first."""
-    from app.models.database import User
-    rows = (await db.execute(select(SiteDomain, User).join(User, User.id == SiteDomain.owner_id))).all()
+    from app.models.database import Site, User
+    rows = (await db.execute(select(SiteDomain, User, Site).join(User, User.id == SiteDomain.owner_id)
+                             .join(Site, Site.id == SiteDomain.site_id))).all()
     by_owner: dict[str, tuple] = {}
-    for d, u in rows:
-        by_owner.setdefault(u.id, (u, []))[1].append(d)
+    for d, u, s in rows:
+        by_owner.setdefault(u.id, (u, s, []))[2].append(d)
     out = []
-    for u, ds in by_owner.values():
-        for i in issues_for(ds):
+    for u, s, ds in by_owner.values():
+        for i in issues_for(ds, u.plan_tier, s.is_enabled, s.status):
             out.append({**i, "agent_id": u.id, "agent_name": f"{u.first_name or ''} {u.last_name or ''}".strip() or u.email,
                         "agent_email": u.email, "brokerage": u.brokerage})
     return sorted(out, key=lambda x: x["since"], reverse=True)

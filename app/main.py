@@ -120,7 +120,7 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
     # ...and once connected, is it actually opening? Every 2 hours (new domains each time - the
-    # first 4 days - older ones once a day). Problems show on the agent's Dash + to the admin.
+    # first 4 days - after that once a month). Problems show on the agent's Dash + to the admin.
     scheduler.add_job(
         scheduled_domain_health,
         "interval",
