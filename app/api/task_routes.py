@@ -360,6 +360,53 @@ async def public_followup_text(code: str, request: Request, db: AsyncSession = D
     }
 
 
+@public_router.get("/{code}/card")
+async def public_followup_card(code: str, request: Request, db: AsyncSession = Depends(get_db)):
+    """One follow-up in full, opened from the "Did you also do these?" list on the check-off page
+    (user, 10/19 - "click that follow-up and it takes me exactly to where it has the pre-made
+    message and situation"): why, the details, the ready message, who to reach - and where its
+    event is on the agent's calendar (Google's exact event; the time, for the iPhone Calendar).
+    Read-only like GET /{code}, so not on the shared submit limit - opening a few in a row from
+    the check-off page ran into "Too many submissions"."""
+    task = await _task_by_code(db, code)
+    owner = await db.get(User, task.owner_id)
+    lead = task.lead
+    sc = None
+    if lead is not None and owner is not None:
+        try:
+            sc = (await tasks_service.lead_showcase_info(db, owner, [lead])).get(lead.id)
+        except Exception:
+            logger.warning("showcase lookup failed for follow-up card %s", task.id, exc_info=True)
+    message = (tasks_service.full_message(task, sc, owner) or "") if task.completed_at is None else ""
+    situation = await _situation(db, task)
+    google_url = None
+    try:
+        import base64
+        row = (await db.execute(
+            select(CalendarEventLink.external_event_id, CalendarConnection.calendar_id)
+            .join(CalendarConnection, CalendarConnection.id == CalendarEventLink.connection_id)
+            .where(CalendarConnection.owner_id == task.owner_id, CalendarConnection.provider == "google",
+                   CalendarEventLink.kind == "task", CalendarEventLink.source_id == task.id)
+        )).first()
+        if row and row[0] and row[1]:
+            eid = base64.urlsafe_b64encode(f"{row[0]} {row[1]}".encode()).decode().rstrip("=")
+            google_url = f"https://www.google.com/calendar/event?eid={eid}"
+    except Exception:
+        logger.warning("calendar link lookup failed for follow-up card %s", task.id, exc_info=True)
+    bucket = tasks_service.compute_bucket(task)
+    return {
+        **_public_view(task),
+        "code": code,
+        "due_at": task.due_at.isoformat() if task.due_at else None,
+        "all_day": task.all_day,
+        "overdue": bucket == "overdue",
+        "details": situation[1:] if situation else [],
+        "message": message,
+        "fill_ins": [f for f in (tasks_service.FILL_IN_TIME, tasks_service.FILL_IN_ANSWER, tasks_service.FILL_IN_MESSAGE) if f in message],
+        "google_event_url": google_url,
+    }
+
+
 @public_router.post("/{code}/done")
 async def public_followup_done(code: str, request: Request, db: AsyncSession = Depends(get_db)):
     from app.services.public_rate_limit import check_public_submit
