@@ -57,6 +57,40 @@ async def get_area_photo(photo_name: str):
     return Response(content=resp.content, media_type=resp.headers.get("content-type", "image/jpeg"), headers={"Cache-Control": "public, max-age=604800"})
 
 
+_BLOG_COVER_CACHE: dict[str, tuple[str, bytes]] = {}
+
+
+@router.get("/blog-cover/{blog_id}")
+async def get_blog_cover(blog_id: str, db: AsyncSession = Depends(get_db)):
+    """A published article's photo that was saved inline (base64 data: URL) - decoded and shrunk to
+    a normal JPEG so public pages can reference it by address (content_adapters.public_image_url)
+    instead of carrying half a megabyte of text in every page that lists the article."""
+    from app.models.database import Blog
+    blog = (await db.execute(select(Blog).where(Blog.id == blog_id, Blog.status == "PUBLISHED"))).scalar_one_or_none()
+    raw = content_adapters.blog_photo_raw(blog) if blog else None
+    if not raw or not raw.startswith("data:") or "," not in raw:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Photo unavailable.")
+    key = f"{blog_id}:{len(raw)}:{raw[-32:]}"
+    hit = _BLOG_COVER_CACHE.get(blog_id)
+    if not hit or hit[0] != key:
+        import base64, io
+        try:
+            data = base64.b64decode(raw.split(",", 1)[1])
+            from PIL import Image
+            img = Image.open(io.BytesIO(data))
+            img = img.convert("RGB")
+            img.thumbnail((1280, 1280))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=74, optimize=True, progressive=True)
+            body = buf.getvalue()
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Photo unavailable.")
+        if len(_BLOG_COVER_CACHE) > 200:
+            _BLOG_COVER_CACHE.clear()
+        _BLOG_COVER_CACHE[blog_id] = hit = (key, body)
+    return Response(content=hit[1], media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+
+
 def _find_page(pages: list, path: str) -> dict | None:
     """Mirrors the frontend's findPage() in [host]/[[...path]]/page.tsx exactly, so the page the
     backend hydrates is always the same one the frontend is about to render."""
@@ -375,7 +409,7 @@ async def get_site_blog_post(site_id: str, slug: str, db: AsyncSession = Depends
         "slug": post.slug,
         "title": post.title,
         "subtitle": post.subtitle,
-        "cover_image_url": post.cover_image_url,
+        "cover_image_url": content_adapters.public_image_url(post.cover_image_url, post.id),
         "category": post.category,
         "theme": post.theme,
         "blocks": await _site_blog_blocks(db, post.blocks),

@@ -780,8 +780,26 @@ async def get_open_houses(
     ]
 
 
+# Some covers are stored inline as base64 data: URLs (500 KB+ each). Sent as-is, one of them made
+# the IDX Blog page 1.2 MB of HTML (it lands in the markup AND the page data). Public payloads get
+# this small address instead - public_site_routes.get_blog_cover serves the picture, shrunk.
+BLOG_COVER_ROUTE = "/public/sites/blog-cover/{id}"
+
+
+def public_image_url(url: Optional[str], blog_id: str) -> Optional[str]:
+    """A blog photo as public pages should reference it: inline data: images become the cover route."""
+    if url and url.startswith("data:"):
+        return BLOG_COVER_ROUTE.format(id=blog_id)
+    return url
+
+
 def _blog_photo(b: Blog) -> Optional[str]:
     """The article's cover, else the first photo inside it - cards always get a picture if one exists."""
+    return public_image_url(blog_photo_raw(b), b.id)
+
+
+def blog_photo_raw(b: Blog) -> Optional[str]:
+    """_blog_photo before the data: swap (the cover route decodes this one)."""
     if b.cover_image_url:
         return b.cover_image_url
     for blk in (b.blocks if isinstance(b.blocks, list) else []):
