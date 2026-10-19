@@ -200,11 +200,12 @@ def normalize_manual_snapshot(manual: dict) -> dict:
     return snap
 
 
+_OFF_MARKET = re.compile(r"closed|sold|expired|withdrawn|cancel", re.I)
+
+
 async def _find_property_by_key(db: AsyncSession, listing_key: str) -> Optional[Property]:
-    """Any active-mirror MLS listing, not just one this agent is the listing agent on - matches
-    Studio Media's "Search Any Address" tab (/api/properties/lookup, properties_routes.py), which
-    has never been ownership-gated. The Single Property Websites picker reuses that exact same
-    component/tab, so building a site from a searched (not-owned) listing_key has to work too."""
+    """The MLS listing for a key (ownership is checked by the caller - a Spotlight is only for the
+    agent's own current listings since 10/19)."""
     result = await db.execute(select(Property).where(Property.listing_key == listing_key))
     return result.scalar_one_or_none()
 
@@ -290,15 +291,20 @@ async def create_property_website(
     if template_id not in TEMPLATE_IDS:
         template_id = DEFAULT_TEMPLATE_ID
 
-    if listing_key:
-        prop = await _find_property_by_key(db, listing_key)
-        if not prop:
-            raise ValueError("That listing could not be found.")
-        snapshot = _build_property_snapshot(prop)
-    elif manual_property:
-        snapshot = normalize_manual_snapshot(manual_property)
-    else:
-        raise ValueError("A listing or manual property is required.")
+    # A Spotlight is the listing agent's own page for their own listing (user, 10/19): only the
+    # agent's current listings (listing or co-listing agent; hand-entered ones count) - never
+    # another agent's home, a sold one, or a typed-in address.
+    if not listing_key:
+        raise ValueError("Pick one of your current listings - a Spotlight is for your own listings.")
+    prop = await _find_property_by_key(db, listing_key)
+    if not prop:
+        raise ValueError("That listing could not be found.")
+    from app.utils.plan_ids import listing_owner_key
+    if listing_owner_key(owner) not in {prop.list_agent_mls_id, prop.co_list_agent_mls_id}:
+        raise ValueError("A Spotlight can only be made for your own listing.")
+    if _OFF_MARKET.search(prop.home_status or ""):
+        raise ValueError("That listing is no longer on the market - a Spotlight is for your current listings.")
+    snapshot = _build_property_snapshot(prop)
 
     slug_base = snapshot.get("address") or "property"
     slug = await _unique_property_slug(db, slug_base)
