@@ -2877,13 +2877,30 @@ def _ics_escape(text: str) -> str:
 
 
 def _fold(line: str) -> str:
-    """RFC 5545: no content line over 75 octets. Simple char-based fold is fine for our ASCII-ish text."""
-    out = []
-    while len(line) > 73:
-        out.append(line[:73])
-        line = " " + line[73:]
-    out.append(line)
+    """RFC 5545: no content line over 75 octets - counted in UTF-8 bytes (bold titles are 4 bytes a
+    letter), never splitting a character."""
+    out, cur, size = [], "", 0
+    for ch in line:
+        n = len(ch.encode("utf-8"))
+        if size + n > 73:
+            out.append(cur)
+            cur, size = " ", 1
+        cur += ch
+        size += n
+    out.append(cur)
     return "\r\n".join(out)
+
+
+_BOLD = {**{chr(ord("A") + i): chr(0x1D5D4 + i) for i in range(26)},
+         **{chr(ord("a") + i): chr(0x1D5EE + i) for i in range(26)},
+         **{chr(ord("0") + i): chr(0x1D7EC + i) for i in range(10)}}
+
+
+def calendar_bold(text: str) -> str:
+    """A calendar title can't be formatted, so a follow-up still to do is written in bold letters
+    (Unicode sans-serif bold) - it stands out bold and bigger on the iPhone / Google calendar, and a
+    done one ("DONE · ...", plain) sits back small (user, 10/19 - "the opposite" of before)."""
+    return "".join(_BOLD.get(c, c) for c in text or "")
 
 
 def _dt_utc(dt: datetime) -> str:
@@ -2963,7 +2980,7 @@ async def render_ics(db: AsyncSession, user: User) -> str:
         else:
             lines.append(f"DTSTART:{_dt_utc(due)}")
             lines.append(f"DTEND:{_dt_utc(due + timedelta(minutes=30))}")
-        lines.append(_fold(f"SUMMARY:[{task_prefix(t)}] {_ics_escape(t.title)}"))
+        lines.append(_fold("SUMMARY:" + calendar_bold(f"[{task_prefix(t)}] {_ics_escape(t.title)}")))
         sc = showcases.get(t.lead_id)
         code = await ensure_done_code(db, t)
         desc_parts = ["Mark as done: " + done_url(code)]

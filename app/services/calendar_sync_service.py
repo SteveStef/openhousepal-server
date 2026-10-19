@@ -29,7 +29,7 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -169,8 +169,14 @@ def _local(dt: datetime) -> dict:
     return {"dateTime": _to_utc(dt).astimezone(EASTERN).isoformat(), "timeZone": CALENDAR_TZ}
 
 
-# Done events' title prefix - plain text, so it renders the same size as everything else.
+# Done events' title prefix - plain letters, small beside the bold to-dos.
 DONE_PREFIX = "DONE · "
+
+
+def _bold(text: str) -> str:
+    """To-dos (follow-ups, tours, showings not done yet) get bold letters - see calendar_bold."""
+    from app.services.tasks_service import calendar_bold
+    return calendar_bold(text)
 
 
 def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: str = "5",
@@ -192,6 +198,8 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
     due = _to_utc(task.due_at)
     done = task.completed_at is not None
     summary = f"[{task_prefix(task)}] {task.title}"
+    if not done:
+        summary = _bold(summary)  # still to do: bold, so it stands out over the small done ones
     first = (lead_name or "").strip() or "them"
     parts = []
     if done:
@@ -398,7 +406,7 @@ def _tour_event_body(tour: PropertyTour, prop: Optional[Property]) -> dict:
     title = f"[Tour] {street or 'Property'} - {short_person(tour.visitor_name) or 'Visitor'}"
     return {
         # Short title - "[Tour] 732 Buck Ln - Jane B."; the location + notes carry the rest.
-        "summary": f"{DONE_PREFIX}{title}" if done else title,
+        "summary": f"{DONE_PREFIX}{title}" if done else _bold(title),
         **({"colorId": "8"} if done else {}),
         "location": addr or None,
         "description": "\n".join(desc),
@@ -441,7 +449,7 @@ async def _showing_event_body(db: AsyncSession, sub) -> Optional[dict]:
         desc.append(f"\nVisitor note: {info['note']}")
     title = f"[Showing] {street or 'Property'} - {short_person(sub.contact_name) or 'Visitor'}"
     return {
-        "summary": f"{DONE_PREFIX}{title}" if done else title,
+        "summary": f"{DONE_PREFIX}{title}" if done else _bold(title),
         **({"colorId": "8"} if done else {}),
         "location": addr,
         "description": "\n".join(desc),
@@ -1085,8 +1093,8 @@ _RETITLE_BEFORE = datetime(2026, 10, 23, tzinfo=timezone.utc)
 
 
 async def retitle_done_events() -> None:
-    """Once, shortly after a deploy: follow-ups and tours checked off in the last 3 weeks get their
-    calendar title re-written to the plain "DONE ·" one (the old emoji / cross-out title showed
+    """Once, shortly after a deploy: follow-ups still to do get their bold title, and follow-ups and
+    tours checked off in the last 3 weeks get their calendar title re-written to the plain "DONE ·" one (the old emoji / cross-out title showed
     bigger than the open ones on the iPhone). One event at a time; each is touched once."""
     from app.database import AsyncSessionLocal
     now = datetime.now(timezone.utc)
@@ -1097,7 +1105,9 @@ async def retitle_done_events() -> None:
             select(CalendarConnection.owner_id, CalendarConnection.provider, AgentTask.id)
             .join(CalendarEventLink, and_(CalendarEventLink.kind == "task", CalendarEventLink.source_id == AgentTask.id))
             .join(CalendarConnection, CalendarConnection.id == CalendarEventLink.connection_id)
-            .where(AgentTask.completed_at >= now - timedelta(days=21), CalendarEventLink.updated_at < _RETITLE_BEFORE)
+            .where(or_(AgentTask.completed_at >= now - timedelta(days=21),
+                       and_(AgentTask.completed_at.is_(None), AgentTask.due_at >= now - timedelta(days=14))),
+                   CalendarEventLink.updated_at < _RETITLE_BEFORE)
         )).all()
         tours = (await db.execute(
             select(CalendarConnection.owner_id, CalendarConnection.provider, PropertyTour.id)
