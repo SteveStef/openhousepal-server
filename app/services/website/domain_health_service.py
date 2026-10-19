@@ -87,8 +87,9 @@ def _site_on(tier: Optional[str], enabled: Optional[bool], site_status: Optional
 
 
 def issues_for(rows: list[SiteDomain], tier: Optional[str] = "IDX", enabled: Optional[bool] = True,
-               site_status: Optional[str] = "PUBLISHED") -> list[dict]:
-    """[{hostname, code, title, fix, since}] for one agent's domain rows."""
+               site_status: Optional[str] = "PUBLISHED", no_forward: Optional[set] = None) -> list[dict]:
+    """`no_forward`: bare hostnames whose company can't forward (Wix, Shopify, Route 53) - not an
+    issue the agent can fix, so it isn't raised (the setup guide says to share the www address)."""
     now = datetime.now(timezone.utc)
     out = []
     if not _site_on(tier, enabled, site_status):
@@ -117,11 +118,10 @@ def issues_for(rows: list[SiteDomain], tier: Optional[str] = "IDX", enabled: Opt
                 issue = ("forward_http", f"{apex} forwards to http:// - visitors who type it get \"page not found\"",
                          f"At your domain company, open the forwarding for {apex} and switch http:// to https:// "
                          f"(on GoDaddy it's the small dropdown on the left of the address box). Forward to https://www.{apex}.")
-            elif d.status != "ACTIVE" and old:
+            elif d.status != "ACTIVE" and old and d.hostname not in (no_forward or set()):
                 issue = ("forward_none", f"{apex} (without the www) doesn't open your website yet",
                          f"Add a forward from {apex} to https://www.{apex} at your domain company - the exact steps "
-                         f"for your company are on the IDX Website > Domain screen. (Wix can't forward to outside "
-                         f"websites - there, people need to type the www.)")
+                         f"for your company are on the IDX Domain screen.")
         elif d.status == "ACTIVE" and d.last_error == "site_down":
             issue = ("site_down", f"{d.hostname} isn't opening your website right now",
                      f"Check the www record at your domain company still points to the address on the Domain screen. "
@@ -150,7 +150,18 @@ async def domain_issues(db: AsyncSession, owner_id: str) -> list[dict]:
         return []
     owner = await db.get(User, owner_id)
     site = await db.get(Site, rows[0].site_id)
-    return issues_for(list(rows), getattr(owner, "plan_tier", None), getattr(site, "is_enabled", None), getattr(site, "status", None))
+    return issues_for(list(rows), getattr(owner, "plan_tier", None), getattr(site, "is_enabled", None), getattr(site, "status", None),
+                      await _no_forward_hosts(rows))
+
+
+async def _no_forward_hosts(rows) -> set:
+    from app.services.website.domain_provider_service import NO_FORWARDING, detect_provider
+    out = set()
+    for d in rows:
+        if d.redirect_target_domain_id and not is_www(d.hostname) and d.status != "ACTIVE":
+            if await detect_provider(d.hostname) in NO_FORWARDING:
+                out.add(d.hostname)
+    return out
 
 
 async def all_domain_issues(db: AsyncSession) -> list[dict]:
@@ -163,7 +174,7 @@ async def all_domain_issues(db: AsyncSession) -> list[dict]:
         by_owner.setdefault(u.id, (u, s, []))[2].append(d)
     out = []
     for u, s, ds in by_owner.values():
-        for i in issues_for(ds, u.plan_tier, s.is_enabled, s.status):
+        for i in issues_for(ds, u.plan_tier, s.is_enabled, s.status, await _no_forward_hosts(ds)):
             out.append({**i, "agent_id": u.id, "agent_name": f"{u.first_name or ''} {u.last_name or ''}".strip() or u.email,
                         "agent_email": u.email, "brokerage": u.brokerage})
     return sorted(out, key=lambda x: x["since"], reverse=True)

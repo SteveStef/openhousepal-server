@@ -320,6 +320,13 @@ async def get_my_domain_health(
     return {"issues": await domain_issues(db, current_user.id)}
 
 
+@router.get("/me/domains/provider")
+async def get_domain_provider(hostname: str, current_user: User = Depends(get_current_active_user)):
+    """Which company runs this domain (from its nameservers) - the setup guide opens on its steps."""
+    from app.services.website.domain_provider_service import detect_provider
+    return {"provider": await detect_provider((hostname or "").strip().lower()[:253])}
+
+
 @router.get("/me/domains", response_model=List[SiteDomainResponse])
 async def get_my_site_domains(
     db: AsyncSession = Depends(get_db),
