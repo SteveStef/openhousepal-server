@@ -210,6 +210,11 @@ class AgentForm(Base):
     accent_color = Column(String, nullable=True)
     show_branding = Column(Boolean, default=True, nullable=False)  # Show agent photo/name/brokerage on the intro screen
     dark_mode = Column(Boolean, default=False, nullable=False)  # Force dark theme for visitors on this form's public page
+    # The form's look: 'hub' = whatever the Agent Hub wears (theme, colour/finish, light/dark);
+    # 'custom' = its own - look_theme 'classic' (accent_color) or 'luxe' (luxe_metal), dark_mode.
+    look_mode = Column(String, default='hub', server_default='hub', nullable=False)
+    look_theme = Column(String, nullable=True)
+    luxe_metal = Column(String, nullable=True)
     redirect_to_agent_hub = Column(Boolean, default=True, nullable=False)  # After submitting, auto-redirect the visitor to the agent's public Agent Hub
     property_photo_carousel = Column(Boolean, default=False, nullable=False)  # Welcome screen cycles through the linked property's listing photos
     background_effects = Column(Boolean, default=True, nullable=False)  # Subtle animated background graphics across the visitor form flow

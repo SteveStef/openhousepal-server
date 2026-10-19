@@ -17,6 +17,7 @@ from app.models.database import AgentForm, AgentHub, AgentHubEvent, FormCampaign
 from app.schemas.forms import (
     AgentFormCreate,
     AgentFormLayoutUpdate,
+    FormLookUpdate,
     AgentFormResponse,
     AgentFormUpdate,
     CampaignLookupResponse,
@@ -1408,6 +1409,9 @@ async def duplicate_form(
         accent_color=original.accent_color,
         show_branding=original.show_branding,
         dark_mode=original.dark_mode,
+        look_mode=original.look_mode,
+        look_theme=original.look_theme,
+        luxe_metal=original.luxe_metal,
         redirect_to_agent_hub=original.redirect_to_agent_hub,
         property_photo_carousel=original.property_photo_carousel,
         background_effects=original.background_effects,
@@ -1531,6 +1535,9 @@ async def reset_form_to_default(
     form.accent_color = defaults["accent_color"]
     form.show_branding = True
     form.dark_mode = False
+    form.look_mode = 'hub'
+    form.look_theme = None
+    form.luxe_metal = None
     form.redirect_to_agent_hub = True
     form.property_photo_carousel = False
     form.background_effects = True
@@ -1804,6 +1811,66 @@ async def confirm_showing_submission(
     return submission
 
 
+_HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _apply_look(form: AgentForm, payload) -> None:
+    """Look fields from an update (one form, or every form at once) - unknown values ignored."""
+    if payload.look_mode in ("hub", "custom"):
+        form.look_mode = payload.look_mode
+    if payload.look_theme in ("classic", "luxe"):
+        form.look_theme = payload.look_theme
+    if payload.luxe_metal in ("gold", "silver", "bronze"):
+        form.luxe_metal = payload.luxe_metal
+
+
+def resolve_form_look(form: AgentForm, hub_config: dict, owner) -> dict:
+    """What a visitor sees: the Agent Hub's look when the form matches it, else the form's own.
+    Luxe is IDX only (same rule as the hub) - otherwise it shows as Classic."""
+    from app.utils.auth import luxe_theme_allowed
+    cfg = hub_config or {}
+    if (form.look_mode or "hub") == "hub":
+        theme = cfg.get("hubTheme") or "classic"
+        accent = cfg.get("hubAccent")
+        metal = cfg.get("hubLuxeMetal")
+        dark = cfg.get("visitorDarkMode") is True
+    else:
+        theme = form.look_theme or "classic"
+        accent = form.accent_color
+        metal = form.luxe_metal
+        dark = bool(form.dark_mode)
+    if theme == "luxe" and not luxe_theme_allowed(owner):
+        theme = "classic"
+    return {
+        "theme": "luxe" if theme == "luxe" else "classic",
+        "accent": accent if isinstance(accent, str) and _HEX.match(accent) else "#C9A24D",
+        "metal": metal if metal in ("gold", "silver", "bronze") else "gold",
+        "dark": dark,
+    }
+
+
+@router.patch("/look", response_model=List[AgentFormResponse])
+async def update_all_forms_look(
+    payload: FormLookUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
+):
+    """One look on every form (the setup flow, or "Use on all my forms" in a form's Settings)."""
+    result = await db.execute(select(AgentForm).where(AgentForm.owner_id == current_user.id).order_by(AgentForm.order_index))
+    forms = result.scalars().all()
+    for form in forms:
+        _apply_look(form, payload)
+        if payload.look_mode == "custom":
+            if payload.accent_color and _HEX.match(payload.accent_color):
+                form.accent_color = payload.accent_color
+            if payload.dark_mode is not None:
+                form.dark_mode = payload.dark_mode
+    await db.commit()
+    for form in forms:
+        await db.refresh(form)
+    return forms
+
+
 @router.put("/{form_id}", response_model=AgentFormResponse)
 async def update_form(
     form_id: str,
@@ -1839,6 +1906,7 @@ async def update_form(
         form.show_branding = payload.show_branding
     if payload.dark_mode is not None:
         form.dark_mode = payload.dark_mode
+    _apply_look(form, payload)
     if payload.redirect_to_agent_hub is not None and not aesthetics_only:
         form.redirect_to_agent_hub = payload.redirect_to_agent_hub
     if payload.property_photo_carousel is not None:
@@ -1902,6 +1970,7 @@ async def get_public_form(
     agent_slug: str,
     form_slug: str,
     c: Optional[str] = Query(None, description="Campaign token from the link (?c=) - its after-submit choice overrides the form's."),
+    preview: bool = Query(False, description="An editor's live preview (setup flow / form Settings) - not a visit."),
     db: AsyncSession = Depends(get_db),
 ):
     hub_result = await db.execute(select(AgentHub).where(AgentHub.slug == normalize_form_slug(agent_slug)))
@@ -1930,17 +1999,19 @@ async def get_public_form(
     # Submissions count regardless of whether the visitor is logged in, so views need to match -
     # excluding logged-in viewers here (but not on submit) made Completion Rate nonsensical
     # whenever an agent tested their own form while signed in: fills went up, views stayed at 0.
-    try:
-        db.add(AgentHubEvent(owner_id=form.owner_id, event_type="form_view"))
-        await db.commit()
-    except Exception as e:
-        logger.warning("recording form view failed", extra={"error": str(e)})
+    if not preview:
+        try:
+            db.add(AgentHubEvent(owner_id=form.owner_id, event_type="form_view"))
+            await db.commit()
+        except Exception as e:
+            logger.warning("recording form view failed", extra={"error": str(e)})
 
     example_properties = None
     if form.form_type == "showcase_request":
         example_properties = _get_example_properties_for_showcase(hub.config or {})
 
     hub_live = _agent_hub_is_live(agent, hub)
+    look = resolve_form_look(form, hub.config or {}, agent)
     campaign_redirect, after_submit_mode, after_submit_url = campaign_after_submit(await active_campaign_for_token(db, form.id, c), hub_live)
 
     return PublicAgentFormResponse(
@@ -1955,7 +2026,8 @@ async def get_public_form(
         success_message=form.success_message,
         accent_color=form.accent_color,
         show_branding=form.show_branding,
-        dark_mode=form.dark_mode,
+        dark_mode=look["dark"],
+        look=look,
         # Only redirect to the Agent Hub when that page actually loads - on plans without Agent
         # Hub (Basic, No-MLS Basic) or before the agent has set it up, it would 404 right after the
         # guest submits. Same rule as agent_hub_routes._resolve_public_hub.

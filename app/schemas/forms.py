@@ -84,6 +84,9 @@ class AgentFormResponse(BaseModel):
     accent_color: Optional[str] = None
     show_branding: bool = True
     dark_mode: bool = False
+    look_mode: str = 'hub'
+    look_theme: Optional[str] = None
+    luxe_metal: Optional[str] = None
     redirect_to_agent_hub: bool = True
     property_photo_carousel: bool = False
     background_effects: bool = True
@@ -163,6 +166,9 @@ class AgentFormUpdate(BaseModel):
     accent_color: Optional[str] = None
     show_branding: Optional[bool] = None
     dark_mode: Optional[bool] = None
+    look_mode: Optional[str] = None
+    look_theme: Optional[str] = None
+    luxe_metal: Optional[str] = None
     redirect_to_agent_hub: Optional[bool] = None
     property_photo_carousel: Optional[bool] = None
     background_effects: Optional[bool] = None
@@ -175,6 +181,15 @@ class FormLayoutItem(BaseModel):
     id: str
     order_index: int
     is_enabled: bool
+
+
+class FormLookUpdate(BaseModel):
+    """One look for every form at once (setup flow / "Use on all my forms")."""
+    look_mode: str = 'hub'
+    look_theme: Optional[str] = None
+    accent_color: Optional[str] = None
+    luxe_metal: Optional[str] = None
+    dark_mode: Optional[bool] = None
 
 
 class AgentFormLayoutUpdate(BaseModel):
@@ -248,6 +263,9 @@ class PublicAgentFormResponse(BaseModel):
     accent_color: Optional[str] = None
     show_branding: bool = True
     dark_mode: bool = False
+    # What the visitor sees, already resolved (the Agent Hub's look when the form matches it):
+    # {theme: 'classic'|'luxe', accent: '#hex', metal: 'gold'|'silver'|'bronze', dark: bool}.
+    look: Optional[dict] = None
     redirect_to_agent_hub: bool = True
     # Set only when the link's campaign overrides the form: 'agent_hub' | 'sales' | 'none' | 'custom'
     # (after_submit_url holds the custom link). The page builds the hub/sales path for its own host.

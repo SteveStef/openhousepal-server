@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.hub_phones import brokerage_phone, office_phone, upgrade as hub_phones_upgrade
 from app.models.database import (
-    AgentHub, AgentMarketArea, CalendarConnection, EmailSignature, MailConnection, Site, StudioBrandKit, User,
+    AgentForm, AgentHub, AgentMarketArea, CalendarConnection, EmailSignature, MailConnection, Site, StudioBrandKit, User,
 )
 from app.utils.auth import (
     AGENT_HUB_ACCESS_TIERS, EMAIL_SIGNATURE_ACCESS_TIERS, REVIEWS_ACCESS_TIERS, tier_has_mls,
@@ -35,12 +35,12 @@ from app.utils.auth import (
 # Every step the flow knows, in the order it asks. Required steps can't be skipped.
 STEP_ORDER = [
     "about", "contact", "license", "photo", "story", "socials", "sales", "reviews",
-    "brand", "hub", "signature", "alerts", "calendar", "mailbox", "crm", "areas", "homes", "website",
+    "brand", "hub", "forms", "signature", "alerts", "calendar", "mailbox", "crm", "areas", "homes", "website",
 ]
 REQUIRED = {"about", "contact", "license"}
 # Steps whose answer is a choice with a working default - done once the agent confirms it here
 # (or it was set inside the feature itself).
-CONFIRM_STEPS = {"sales", "brand", "hub", "signature", "alerts", "homes", "website"}
+CONFIRM_STEPS = {"sales", "brand", "hub", "forms", "signature", "alerts", "homes", "website"}
 
 # Before a plan is chosen (waiting for broker approval, or not checked out yet) the flow offers
 # the head start every plan shares.
@@ -55,7 +55,7 @@ def steps_for_plan(plan_tier: Optional[str], approved: bool) -> list[str]:
         return list(CORE_STEPS)
     steps = {"about", "contact", "license", "photo", "brand", "alerts", "calendar", "mailbox", "crm"}
     if plan_tier in AGENT_HUB_ACCESS_TIERS:
-        steps |= {"story", "socials", "sales", "hub"}
+        steps |= {"story", "socials", "sales", "hub", "forms"}
     if plan_tier in REVIEWS_ACCESS_TIERS:
         steps.add("reviews")
     if plan_tier in EMAIL_SIGNATURE_ACCESS_TIERS:
@@ -254,6 +254,11 @@ async def compute(db: AsyncSession, user: User, hub: AgentHub) -> dict:
             done[step] = "brand" in confirmed or bool(kit and (kit.personal_logo_url or kit.team_logo_url or kit.brokerage_logo_url))
         elif step == "hub":
             done[step] = "hub" in confirmed or "hubTheme" in cfg
+        elif step == "forms":
+            # Forms match the hub out of the box - done once confirmed, or a form got its own look.
+            done[step] = "forms" in confirmed or await _exists(
+                select(AgentForm.id).where(AgentForm.owner_id == user.id, AgentForm.look_mode == "custom").limit(1)
+            )
         elif step == "signature":
             sig = (await db.execute(select(EmailSignature).where(EmailSignature.owner_id == user.id))).scalar_one_or_none()
             done[step] = "signature" in confirmed or bool(sig and (sig.config or {}).get("installedHtmlHash"))
