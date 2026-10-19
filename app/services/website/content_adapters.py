@@ -1326,7 +1326,9 @@ async def _build_served_areas_summary(db: AsyncSession, user: User, limit: int =
     out = []
     for a in areas:
         area_scope = geography.scope_for_market_area(a)
-        photo = await _area_top_listing_photo(db, area_scope)
+        # Photo + stats go through the town pages' shared market cache (same keys warm_area_caches
+        # fills): built cold they took ~20 s for 8 towns - the first home-page visit after a restart.
+        photo = await cached_market(f"photo:{a.id}", lambda d, sc=area_scope: _area_top_listing_photo(d, sc), db)
         if not photo:
             resolved_photos = resolve_photo_urls(a.facts.get("photos"))
             items = (resolved_photos or {}).get("items") or []
@@ -1340,7 +1342,7 @@ async def _build_served_areas_summary(db: AsyncSession, user: User, limit: int =
             "summary": (a.narrative or {}).get("summary"),
         }
         if with_stats:
-            stats = await get_area_live_market_stats(db, area_scope, a.facts.get("market_stats"))
+            stats = await cached_market(f"stats:{a.id}", lambda d, sc=area_scope, ms=a.facts.get("market_stats"): get_area_live_market_stats(d, sc, ms), db)
             card["median_price"] = stats.get("median_price")
             card["active_count"] = stats.get("active_count")
             card["min_price"] = stats.get("min_price")
@@ -1493,11 +1495,30 @@ def _format_price_band(price: Optional[float]) -> str:
     return f"${int(ceiling / 1000)}K"
 
 
+# Per agent, 30 min: the hero's example searches are placeholder text, and building them runs one
+# un-indexable city ILIKE scan of the whole MLS table per city (~0.5 s of the home page's 0.55 s
+# server time, 10/19 sweep).
+_SUGGESTIONS_CACHE: dict[tuple, tuple[float, list[str]]] = {}
+_SUGGESTIONS_TTL = 30 * 60
+
+
 async def get_search_suggestions(db: AsyncSession, user: User, limit: int = 3) -> list[str]:
     """Rotating example queries shown under the hero search box - grounded in cities this agent
     has actually sold in (falls back to served areas, then a generic default) and a real nearby
     listing's price/bed/lot size, so every example describes real local inventory an agent could
     plausibly be asked about, never a fabricated city or number."""
+    key = (user.id, limit)
+    hit = _SUGGESTIONS_CACHE.get(key)
+    if hit and time.monotonic() - hit[0] < _SUGGESTIONS_TTL:
+        return list(hit[1])
+    result = await _build_search_suggestions(db, user, limit)
+    if len(_SUGGESTIONS_CACHE) > 500:
+        _SUGGESTIONS_CACHE.clear()
+    _SUGGESTIONS_CACHE[key] = (time.monotonic(), result)
+    return list(result)
+
+
+async def _build_search_suggestions(db: AsyncSession, user: User, limit: int) -> list[str]:
     cities = await _sold_cities(db, user, limit * 2)
     if not cities:
         cities = await served_area_names(db, user, limit * 2)

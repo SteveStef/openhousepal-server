@@ -685,6 +685,22 @@ async def warm_area_caches() -> None:
                 except Exception:
                     logger.warning("area cache warm failed", extra={"key": key}, exc_info=True)
                 await _asyncio.sleep(0.2)  # gentle on the database
+            try:
+                async with AsyncSessionLocal() as d:
+                    content_adapters._market_store(f"photo:{area.id}", await content_adapters._area_top_listing_photo(d, scope))
+            except Exception:
+                logger.warning("area photo warm failed", extra={"area": area.id}, exc_info=True)
+        # Each published site's home page (hero + Neighborhoods row) and town list - built from the
+        # numbers warmed above, so the first visitor after a deploy gets them at once.
+        for owner_id in {o for o, _ in rows}:
+            try:
+                async with AsyncSessionLocal() as d:
+                    owner = await d.get(User, owner_id)
+                    if owner:
+                        for limit, stats in ((content_adapters._SELECTED_MODE_FETCH_CAP, True), (content_adapters._SELECTED_MODE_FETCH_CAP, False), (15, True)):
+                            await content_adapters.get_served_areas_summary(d, owner, limit, with_stats=stats)
+            except Exception:
+                logger.warning("served areas warm failed", extra={"owner": owner_id}, exc_info=True)
         logger.info("area caches warmed", extra={"areas": len(done)})
     except Exception:
         logger.warning("area cache warm-up failed", exc_info=True)
