@@ -78,6 +78,8 @@ def property_type_family(value) -> Optional[str]:
     text = _norm(value)
     if not text:
         return None
+    if any(token in text for token in ("multi family", "multifamily", "multi_family", "multi unit", "duplex", "triplex", "quadruplex", "fourplex")):
+        return "multi"
     if any(token in text for token in ("condo", "unit", "flat", "apartment", "penthouse")):
         return "condo"
     if any(token in text for token in ("townhouse", "townhome", "row", "twin", "attached")):

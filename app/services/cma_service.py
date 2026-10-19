@@ -554,6 +554,10 @@ def _score_comparable_candidates(
             # cannot become a Strong/primary comp; see _continuous_relevance's role gate.
             "proposed_role": row.get("proposed_role"),
             "property_type_incompatible": row.get("structurally_incompatible_property_type", False),
+            # Can this record carry ANY valuation weight (verified closing price for a sale, and a
+            # finished area on record)? The wizard never auto-picks one that can't - it would only
+            # take one of the five slots from a usable sale.
+            "valuation_eligible": bool(row.get("mechanically_eligible")),
         }
         scored_candidates.append(candidate.model_copy(update={
             "match_score": match_score,
@@ -581,6 +585,9 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest) -> Lis
         # rows with no home_type at all) so this can only ever exclude a row we're confident is
         # actually a lease, never silently drop an unmapped sold comp.
         or_(Property.home_type.is_(None), Property.home_type != HomeType.RESIDENTIAL_LEASE.value),
+        # Vacant land and commercial records are never a comparable sale for a home (a land/lot
+        # sale has no living area; a commercial sale prices a business). NULL-safe like the lease rule.
+        or_(Property.home_type.is_(None), Property.home_type.notin_([HomeType.LAND.value, HomeType.COMMERCIAL.value])),
     )
     if req.listing_key:
         query = query.where(Property.listing_key != req.listing_key)
@@ -636,11 +643,36 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest) -> Lis
     # drops rows on status / sale-date / lease before the final trim.
     distance_expr = distance_miles_sql(Property.latitude, Property.longitude, req.latitude, req.longitude)
     query = query.where(distance_expr <= req.radius_miles)
-    result = await db.execute(query.order_by(distance_expr.asc()).limit(400))
-    rows = result.scalars().all()
 
     date_from = _parse_date(req.sale_date_from)
     date_to = _parse_date(req.sale_date_to)
+    # Status + sale-date windows in SQL too, BEFORE the nearest-first LIMIT (the Python loop below
+    # still makes the exact call). Otherwise the 400 nearest rows are mostly old sales / actives /
+    # other statuses and a wider radius never reaches the in-window sales it was widened for.
+    status_u = func.upper(func.coalesce(Property.home_status, ""))
+    is_closed = or_(status_u.like("CLOSED%"), status_u.like("SOLD%"))
+    status_terms = []
+    if "sold" in req.statuses:
+        status_terms.append(is_closed)
+    if "active" in req.statuses or "active_under_contract" in req.statuses:
+        status_terms += [status_u.like("ACTIVE%"), status_u.like("COMING SOON%")]
+    if "pending" in req.statuses:
+        status_terms += [status_u.like("PENDING%"), status_u.like("%CONTRACT%")]
+    if status_terms:
+        query = query.where(or_(*status_terms))
+    if date_from or date_to:
+        sale_day = func.coalesce(
+            Property.raw_mls_data["CloseDate"].astext,
+            func.to_char(Property.updated_at, "YYYY-MM-DD"),
+        )
+        date_terms = []
+        if date_from:
+            date_terms.append(sale_day >= date_from.isoformat())
+        if date_to:
+            date_terms.append(func.substr(sale_day, 1, 10) <= date_to.isoformat())
+        query = query.where(or_(~is_closed, and_(*date_terms)))
+    result = await db.execute(query.order_by(distance_expr.asc()).limit(400))
+    rows = result.scalars().all()
 
     candidates: List[CmaCompCandidate] = []
     for p in rows:
@@ -822,6 +854,12 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest) -> Lis
         "subject_snapshot": _subject_scoring_snapshot(canonical_subject),
         "subject_snapshot_sha256": _subject_scoring_fingerprint(canonical_subject),
     }
+    # Same housing product first (a twin's comps are twins), nearest-first within each group - the
+    # grid only shows 60, and in a dense area 60 nearest-of-anything can hold almost no twins.
+    from app.services.cma_ai_service import _type_family
+    _subject_family = _type_family(req.property_type or (req.subject.property_type if req.subject else None))
+    if _subject_family:
+        candidates.sort(key=lambda c: _type_family(c.property_type) not in (None, _subject_family))
     visible_candidates = [
         candidate.model_copy(update={"similarity_context": similarity_context})
         for candidate in candidates[:60]
