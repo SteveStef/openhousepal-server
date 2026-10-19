@@ -4501,7 +4501,7 @@ def _reconcile_age_condition_inference(text: str, field_label: str, subject: dic
         return text, []
     revised = re.sub(
         r"deferred[- ]maintenance",
-        "unverified condition items (no confirmed deferred-maintenance finding)",
+        "possible repair items to verify",
         text, flags=re.IGNORECASE,
     )
     revised = re.sub(
@@ -4770,6 +4770,8 @@ _V10_DOM_SHORT_MULT = 0.4           # quick-contract / still-insufficient-exposu
 _V10_DOM_NORMAL_MULT = 1.5          # normal -> elevated exposure cutoff = this x comp-median DOM
 _V10_DOM_EXTENDED_MULT = 2.5        # elevated -> extended exposure cutoff = this x comp-median DOM
 _V10_DOM_FALLBACK = (14.0, 45.0, 75.0)   # absolute short / normal / extended day cutoffs when no comp DOM data
+_V10_DOM_NORMAL_FLOOR = 21.0         # never "elevated" exposure before 3 weeks on market
+_V10_DOM_EXTENDED_FLOOR = 45.0       # never "extended" exposure before 45 days on market
 # anchor-validity escape hatch: a mixed-mode anchor this thin is too weak to bound a value against
 _V10_WEAK_ANCHOR_MAX_WEIGHTED = 3     # <= this many weighted comps in mixed mode is a candidate for "weak"
 _V10_WEAK_ANCHOR_SPREAD_PCT = 10.0    # ...combined with a spread/divergence at least this wide
@@ -6244,8 +6246,10 @@ def _compute_exposure(subject: dict, status_timeline: dict, comp_median_dom: Opt
 
     if comp_median_dom:
         short_cut = max(10.0, _V10_DOM_SHORT_MULT * comp_median_dom)
-        normal_cut = _V10_DOM_NORMAL_MULT * comp_median_dom
-        extended_cut = _V10_DOM_EXTENDED_MULT * comp_median_dom
+        # Floors (accuracy test 10/19): comps that sold in 4 days put "extended" at 10 days, so a
+        # home 11 days in (an offer-deadline listing that sold 7% over asking) read as stale.
+        normal_cut = max(_V10_DOM_NORMAL_FLOOR, _V10_DOM_NORMAL_MULT * comp_median_dom)
+        extended_cut = max(_V10_DOM_EXTENDED_FLOOR, _V10_DOM_EXTENDED_MULT * comp_median_dom)
         dom_basis = f"comp-set median DOM {int(comp_median_dom)}d (thresholds scale to this comp set)"
     else:
         short_cut, normal_cut, extended_cut = _V10_DOM_FALLBACK
@@ -7486,6 +7490,15 @@ bidding_war_or_unusual_demand for a sale clearly out of line with the rest of th
 far further over list, or far faster, than the others). Likewise, when most sales closed below
 list after long market times, do not treat the one quick over-list sale as the norm.
 
+When the packet has asking_price_check, the subject is for sale and its own asking price is market
+evidence. The listing agent priced it from these same sales and has seen inside the home. Homes
+here sell at about comp_median_sold_to_list_ratio of their asking price, so the most likely sale
+price is near expected_sale_price. A comparable-sales value far above it almost always means the
+subject is worse than its comps in ways the data understates (condition, finishes, location
+pocket, few photos, "as-is" or "sweat equity" wording), not that the seller is leaving a large
+sum on the table. Explain the gap in those terms and keep final_fmv between allowed_low and
+allowed_high; the application enforces that band.
+
 For every major positive and negative factor, set evidence_strength to clearly_market_supported,
 directionally_supported_amount_uncertain, or subjective_or_speculative. Distinctive architecture,
 pedigree, character, privacy, grounds, scarcity, and "estate feel" do not automatically earn a
@@ -7671,8 +7684,87 @@ def _build_reasoning_evidence_packet(
             "confidence": (subject_estimate or {}).get("confidence"),
         },
     }
-    return {"subject": subject_packet, "comparables": comp_packets, "market_tempo": _reasoning_market_tempo(comp_packets),
-            "deterministic_evidence": deterministic}
+    packet = {"subject": subject_packet, "comparables": comp_packets, "market_tempo": _reasoning_market_tempo(comp_packets),
+              "deterministic_evidence": deterministic}
+    check = _asking_price_market_check(subject_packet, tl, exposure, comp_packets)
+    if check:
+        packet["asking_price_check"] = check
+    return packet
+
+
+# The asking-price check (accuracy test round 1, 10/19): on a home that's FOR SALE, an agent's first
+# sanity check is "homes here sell at about X% of asking, so this one most likely sells near its
+# asking price times that". The listing agent priced it from the same comps and has seen inside;
+# a comp-only value far above that (5818 Gloucester Ave: comps said $610k, asking $474k, sold
+# $505.8k = asking x the comps' 1.068 median) almost always means the home is worse than its comps
+# in ways the data understates. Earlier real tests: asking price alone missed by 6.5% median, our
+# value by 12.7%, nearly always high.
+_ASKING_CHECK_RATIO_BOUNDS = (0.90, 1.12)   # the comps' median sold/list ratio is clamped to this
+_ASKING_CHECK_BAND = (0.90, 1.05)           # final FMV allowed within this x the expected sale price
+_ASKING_CHECK_BAND_STALE_LOW = 0.85         # a stale listing can be worth well under its asking price
+
+
+def _asking_price_market_check(subject_packet: dict, status_timeline: dict, exposure: dict,
+                               comp_packets: list) -> Optional[dict]:
+    """Expected sale price of a listed subject = asking x the comps' median sold/list ratio (no
+    premium once it has sat longer than its comps), and the band the final value must stay in.
+    None when the subject isn't listed, has already closed, or fewer than 2 comps have a ratio."""
+    tl = status_timeline or {}
+    state = str((exposure or {}).get("state") or "")
+    if tl.get("not_listed") or state in ("not_listed", "closed"):
+        return None
+    lp = _as_float(subject_packet.get("current_list_price"))
+    ratios = [float(c["sold_list_ratio"]) for c in comp_packets
+              if _as_float(c.get("sale_price")) and _as_float(c.get("sold_list_ratio"))
+              and 0.75 <= float(c["sold_list_ratio"]) <= 1.5]
+    if not lp or len(ratios) < 2:
+        return None
+    median = _v10_median(sorted(ratios))
+    ratio = _clamp(median, *_ASKING_CHECK_RATIO_BOUNDS)
+    stale = state in ("elevated_exposure", "extended_exposure")
+    if state == "elevated_exposure" and ratio > 1.0:
+        ratio = 1.0 + (ratio - 1.0) / 2   # sat longer than its comps: a bidding war is less likely
+    elif state == "extended_exposure":
+        ratio = min(ratio, 1.0)
+    expected = lp * ratio
+    low_mult = _ASKING_CHECK_BAND_STALE_LOW if stale else _ASKING_CHECK_BAND[0]
+    return {
+        "asking_price": round(lp),
+        "comp_median_sold_to_list_ratio": round(median, 3),
+        "ratio_used": round(ratio, 3),
+        "expected_sale_price": round(expected),
+        "allowed_low": round(expected * low_mult),
+        "allowed_high": round(expected * _ASKING_CHECK_BAND[1]),
+        "comp_ratios_counted": len(ratios),
+        "exposure_state": state or None,
+    }
+
+
+def _apply_asking_price_check(reasoning: dict, evidence_packet: dict) -> tuple[dict, list]:
+    """Keep the final FMV inside the asking-price band (see _asking_price_market_check). The range
+    keeps its shape around the moved value. Returns (reasoning, qa_flags)."""
+    check = (evidence_packet or {}).get("asking_price_check")
+    if not check:
+        return reasoning, []
+    fmv = float(reasoning["final_fmv"])
+    lo, hi = float(check["allowed_low"]), float(check["allowed_high"])
+    if lo <= fmv <= hi:
+        return reasoning, []
+    new = hi if fmv > hi else lo
+    out = copy.deepcopy(reasoning)
+    scale = new / fmv
+    out["final_fmv"] = round(new)
+    out["range_low"] = min(round(float(reasoning["range_low"]) * scale), round(new) - 1)
+    out["range_high"] = max(round(float(reasoning["range_high"]) * scale), round(new) + 1)
+    if abs(scale - 1) > 0.08:
+        out["confidence"] = "low"
+    out["asking_price_check_applied"] = {**check, "from": round(fmv), "to": round(new)}
+    return out, [
+        f"Asking-price check: the comps' value (${fmv:,.0f}) was {'above' if fmv > hi else 'below'} what homes "
+        f"here sell for relative to asking (${check['asking_price']:,.0f} x {check['ratio_used']:.3f} = "
+        f"${check['expected_sale_price']:,.0f}), so the final value was moved to ${new:,.0f}, the edge of the "
+        f"allowed band (${lo:,.0f}-${hi:,.0f})."
+    ]
 
 
 def _reasoning_market_tempo(comp_packets: list) -> dict:
@@ -8161,11 +8253,31 @@ def _sqft_fact_owner(
     return comp, "comp"
 
 
+# Asides that name our own data sources ("(confirmed by the road context data)") read as software
+# talking, not an agent - accuracy test 10/19.
+_INTERNAL_DATA_REF_RE = re.compile(
+    r"\s*\((?:as\s+)?(?:confirmed|shown|noted|indicated|per|according to|based on)\b[^()]{0,40}?"
+    r"\b(?:road[- ]context|evidence|authoritative|structured)\b[^()]{0,25}?\b(?:data|record|records|snapshot|packet)\)",
+    re.IGNORECASE,
+)
+
+
+def _strip_internal_data_refs(text: str) -> str:
+    if not text:
+        return text
+    out = _INTERNAL_DATA_REF_RE.sub("", text)
+    return re.sub(r"\broad[- ]context data\b", "street setting", out, flags=re.IGNORECASE)
+
+
 def _reconcile_comp_hard_facts(
     text: str, label: str, subject: Optional[dict], comp: Optional[dict],
 ) -> tuple[str, list[str]]:
     """Reconcile a comp card with the same authoritative facts used by QA and reasoning."""
     out, flags = _sanitize_comp_fact_prose(text, label, subject)
+    _plain = _strip_internal_data_refs(out)
+    if _plain != out:
+        out = _plain
+        flags.append(f"{label}: removed an internal data reference from the client note.")
     subject = subject or {}
     comp = comp or {}
     subject_updates = _documented_system_updates(subject)
@@ -8217,7 +8329,7 @@ def _reconcile_comp_hard_facts(
     if not _documented_deferred_maintenance(subject) and not _documented_deferred_maintenance(comp):
         revised = re.sub(
             r"deferred[- ]maintenance",
-            "unverified condition items (no confirmed deferred-maintenance finding)",
+            "possible repair items to verify",
             out, flags=re.IGNORECASE,
         )
         revised = re.sub(
@@ -8441,7 +8553,13 @@ def _regenerate_comp_narrative_from_snapshot(comp: dict, label: str) -> str:
     area = str(q.get("area") or "").lower()
     if area:
         if "same" in area or area in ("similar", "equal"):
-            sentences.append("It's in the same immediate area.")
+            # "same immediate area" only when it really is close by - a comparable area 1.5 miles
+            # off in another neighborhood is "a comparable location", not the same area.
+            _dist = _as_float(comp.get("distance_miles"))
+            if _dist is None or _dist <= 0.5:
+                sentences.append("It's in the same immediate area.")
+            else:
+                sentences.append(f"Its location is comparable to the subject's, about {_dist:.1f} miles away.")
         elif any(w in area for w in ("better", "superior", "above", "stronger", "more")):
             sentences.append("Its location is a step up from the subject's.")
         elif any(w in area for w in ("worse", "inferior", "below", "weaker", "less")):
@@ -9179,6 +9297,8 @@ async def _run_cma_reasoning_stage(
         output_tokens = int(usage.get("output_tokens") or 0)
         cost = ai_config_service.estimate_cost_usd(config, model, input_tokens, output_tokens)
         reasoning, blockers = _validate_reasoning_valuation(raw, evidence_packet)
+        reasoning, guard_flags = _apply_asking_price_check(reasoning, evidence_packet)
+        reasoning["_guard_flags"] = guard_flags   # the callers move these into qa_flags
         await record_usage_event(
             db, owner_id, None, model, input_tokens, output_tokens,
             cost, 0, False, None, event_type="cma_reasoning",
@@ -11221,8 +11341,18 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
         return None
     lp = _as_float(list_price)
     # The cap for anything presented as an actual offer number: never above list price (when
-    # known), and never above FMV either (unchanged from the original design).
-    ceiling = round(min(lp, fmv)) if lp else round(fmv)
+    # known), and never above FMV either (unchanged from the original design) - EXCEPT in a market
+    # where homes like this sell over asking (comps' median sold/list >= 1.02) and the subject
+    # hasn't sat longer than its comps: there an at-list offer loses the house (accuracy test 10/19:
+    # every comp sold over asking, often after an offer deadline, and the report said "never above
+    # list"). Then offers may go up to asking x that ratio, still never above FMV.
+    _exp_state = str(((trace or {}).get("exposure") or {}).get("state") or "")
+    _lts = _as_float(((trace or {}).get("anchor") or {}).get("comp_list_to_sale_median"))
+    hot = bool(lp and _lts and _lts >= 1.02 and _exp_state not in ("elevated_exposure", "extended_exposure"))
+    if hot:
+        ceiling = round(min(lp * min(_lts, _ASKING_CHECK_RATIO_BOUNDS[1]), fmv))
+    else:
+        ceiling = round(min(lp, fmv)) if lp else round(fmv)
     comfort_ceiling = round(fmv * 1.05)       # advisory-only "most you'd pay" ceiling, not offer-capped
     aggr = _v10_offer_aggression(trace, confidence, status_timeline)
     underpriced = bool(lp and lp > 0 and fmv > lp * 1.01)
@@ -11250,6 +11380,9 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
         opening_high = round(lp + _V10_OFFER_AGGRESSION_OPEN[aggr] * gap)
         opening_low = round(opening_high - max(0.35 * (target - opening_high), 0.02 * lp))
         opening_low = max(opening_low, round(lp * 0.90))
+        if hot:   # competing offers are the norm here - an under-asking opener isn't a real offer
+            opening_high = max(opening_high, round(lp * 1.01))
+            opening_low = max(opening_low, round(lp))
         basis_ref = round(lp)
 
     target = min(target, ceiling)
@@ -11279,6 +11412,7 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
         "opening_pct_phrase": _v10_pct_range_phrase(opening_low, opening_high, lp) if lp else None,
         "aggression": aggr, "underpriced": underpriced, "basis_ref": basis_ref,
         "above_ask": bool(lp and opening_high > lp),
+        "hot_market": hot, "market_over_ask_pct": round((_lts - 1) * 100, 1) if hot else None,
     }
 
 
@@ -11339,7 +11473,17 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
         return int(round(float(x) / step) * step) if x else x
     ol, oh, tgt = _r(b["opening_low"]), _r(b["opening_high"]), _r(b["target"])
     comfort_ceiling = _r(b.get("comfort_ceiling") or round(fmv * 1.05))
-    if b.get("underpriced"):
+    if b.get("underpriced") and b.get("hot_market"):
+        rel_open = b.get("opening_pct_phrase") or _v10_pct_range_phrase(ol, oh, lp)
+        opener = (
+            f"This home looks underpriced: the ${fmv:,} fair market value sits above the ${lp:,} list "
+            f"price, and similar homes here have been selling about {round(b['market_over_ask_pct'])}% over "
+            f"asking, so expect competing offers. A competitive offer is roughly ${ol:,} to ${oh:,} "
+            f"({rel_open} the list price), with room to go to ${tgt:,} if it comes down to the best offer. "
+            f"You shouldn't feel comfortable paying more than ${comfort_ceiling:,} for it without new "
+            f"property-specific information."
+        )
+    elif b.get("underpriced"):
         rel_open = b.get("opening_pct_phrase") or _v10_pct_range_phrase(ol, oh, lp)
         position = _v10_offer_position_label(ol, oh, lp)
         opener = (
@@ -11390,8 +11534,13 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
         _has_strategy_number = bool(
             "$" in s or "%" in s or re.search(r"\b\d{1,3}\s*[-–—]\s*\d{1,3}\s*[.)]", s)
         )
+        # In a hot market the opener says to compete; an AI sentence advising an at/under-asking
+        # opener or holding back from a premium bid would contradict it.
+        _contradicts_hot = bool(b.get("hot_market") and re.search(
+            r"\b(?:open|offer|bid|start|come in)\w*\b.{0,60}\b(?:below|under|at)\b.{0,25}\b(?:list|ask)"
+            r"|\bpremium bid\b|\bnegotiate up only\b", low))
         if (_has_open_num or _has_indicated_num or _repeats_opening_advice
-                or _mentions_internal_anchor or _has_strategy_number):
+                or _mentions_internal_anchor or _has_strategy_number or _contradicts_hot):
             continue  # its numbers are re-stated by the deterministic opener
         kept.append(s)
     body = " ".join(kept).strip()
@@ -13072,6 +13221,7 @@ async def generate_ai_analysis(
             db, owner_id, plan_tier, config, _reasoning_packet, report_id,
         )
         _comp_labels = {str(c.get("comp_id")): c.get("comp_label") for c in _reasoning_packet["comparables"]}
+        qa_flags.extend(_reasoning_output.pop("_guard_flags", None) or [])
         _authority = _apply_reasoning_authority(
             _v10, _reasoning_output, model=config["cma_reasoning_model"],
             effort=config.get("cma_reasoning_effort", "high"), comp_labels_by_id=_comp_labels,
@@ -13726,6 +13876,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             db, owner_id, plan_tier, config, _reasoning_packet, report_id,
         )
         _comp_labels = {str(c.get("comp_id")): c.get("comp_label") for c in _reasoning_packet["comparables"]}
+        qa_flags.extend(_reasoning_output.pop("_guard_flags", None) or [])
         _authority = _apply_reasoning_authority(
             _v10, _reasoning_output, model=config["cma_reasoning_model"],
             effort=config.get("cma_reasoning_effort", "high"), comp_labels_by_id=_comp_labels,

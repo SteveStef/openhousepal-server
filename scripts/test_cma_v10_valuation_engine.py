@@ -1407,12 +1407,13 @@ def test_v_offer_and_direction_qa():
                              "comps": [{"competitive_sale": True}, {"competitive_sale": True}]}}
     band_up = _v10_build_buyer_offer_band(1_520_000, 1_350_000, trace=comp_trace, confidence="medium",
                                           status_timeline={"active_market_days": 2})
-    check("2b: underpriced -> ceiling is capped at the list price, never above asking",
-          band_up["ceiling"] == 1_350_000 and band_up["underpriced"] is True, str(band_up))
-    check("2b: a competitive read is allowed to open AT the asking price (never above it)",
-          band_up["aggression"] == "high" and band_up["opening_high"] == 1_350_000, str(band_up))
-    check("2b: the whole band still stays at or below the list price - never recommend an offer above asking",
-          band_up["opening_low"] <= band_up["opening_high"] <= band_up["target"] <= band_up["ceiling"] == 1_350_000,
+    # (accuracy test 10/19, and the user's round-19b call: asking is a reference, not a hard max)
+    check("2b: underpriced in a market selling 8% over asking -> ceiling is asking x 1.08, never above FMV",
+          band_up["ceiling"] == 1_458_000 and band_up["underpriced"] is True and band_up["hot_market"] is True, str(band_up))
+    check("2b: a competitive read opens ABOVE the asking price",
+          band_up["aggression"] == "high" and band_up["opening_low"] >= 1_350_000, str(band_up))
+    check("2b: the whole band stays at or below that ceiling and the FMV",
+          band_up["opening_low"] <= band_up["opening_high"] <= band_up["target"] <= band_up["ceiling"] <= band_up["fmv"],
           str(band_up))
     check("2b: the opening band is narrow, not the whole valuation range",
           (band_up["opening_high"] - band_up["opening_low"]) < 0.10 * band_up["fmv"], str(band_up))
@@ -1460,8 +1461,8 @@ def test_v_offer_and_direction_qa():
     check("4d: a recommendation ABOVE the supported FMV ($1,520,000) is blocked",
           any("ceiling" in b.lower() for b in _v10_offer_sanity_check(
               "Be prepared to go as high as $1,600,000 to win the deal.", band, rmin, rmax)))
-    check("4d: an above-ASK recommendation is blocked even when it stays below FMV - never recommend above asking",
-          any("ceiling" in b.lower() for b in _v10_offer_sanity_check(
+    check("4d: in a market selling over asking, an above-ASK stretch below the comfort ceiling is NOT blocked",
+          not any("ceiling" in b.lower() for b in _v10_offer_sanity_check(
               "Be prepared to stretch to $1,470,000 - still under the supported value.", band, rmin, rmax)),
           str(_v10_offer_sanity_check("Be prepared to stretch to $1,470,000.", band, rmin, rmax)))
     check("4e: malformed percentage wording is blocked",
@@ -1833,9 +1834,9 @@ def test_x_frontier_reasoning_authority():
         "Because the anchor exceeds list, there is room to offer above asking. "
         "9-5. 6% above list) is competitive, with room toward the mid-$1,500,000s. g.",
         competitive_band, 8.06)
-    check("15: opening offer is capped at list price (never above asking) and stale near-list advice is removed",
-          "roughly at the list price" in competitive_offer
-          and "near-list" in competitive_offer
+    check("15: a market selling 8% over asking gets a competitive above-asking offer and stale near-list advice is removed",
+          "expect competing offers" in competitive_offer
+          and "above the list price" in competitive_offer
           and "starting offer near list" not in competitive_offer.lower()
           and "anchor" not in competitive_offer.lower()
           and "9-5" not in competitive_offer and "mid-$" not in competitive_offer and " g." not in competitive_offer,
@@ -3518,6 +3519,45 @@ def test_ak_cross_section_semantic_consistency():
           f"note={fixed_drivers5[0]['note']!r} flags={flags5} blocking={blocking5}")
 
 
+def test_al_asking_price_check_and_round1_fixes():
+    print("\nAL. accuracy test round 1 (10/19): asking-price check, exposure floors, plain comp wording")
+    m = _cma_mod
+    comps = [{"sale_price": 605_000, "sold_list_ratio": 1.344}, {"sale_price": 575_000, "sold_list_ratio": 1.0},
+             {"sale_price": 640_000, "sold_list_ratio": 1.068}]
+    chk = m._asking_price_market_check({"current_list_price": 474_000}, {}, {"state": "normal_exposure"}, comps)
+    check("1: expected sale = asking x the comps' median sold/list ratio",
+          chk and chk["expected_sale_price"] == round(474_000 * 1.068) and chk["allowed_high"] == round(474_000 * 1.068 * 1.05),
+          str(chk))
+    reasoning = {"final_fmv": 610_000, "range_low": 550_000, "range_high": 640_000, "confidence": "low"}
+    out, flags = m._apply_asking_price_check(reasoning, {"asking_price_check": chk})
+    check("1b: a comp value far above it is moved to the top of the band, range kept around it",
+          out["final_fmv"] == chk["allowed_high"] and out["range_low"] < out["final_fmv"] < out["range_high"]
+          and flags and reasoning["final_fmv"] == 610_000, f"{out} {flags}")
+    inside, f2 = m._apply_asking_price_check({**reasoning, "final_fmv": 500_000, "range_low": 480_000, "range_high": 520_000},
+                                             {"asking_price_check": chk})
+    check("1c: a value inside the band is left exactly as the valuation pass returned it",
+          inside["final_fmv"] == 500_000 and not f2, str(inside))
+    check("1d: no check for a home that isn't listed, has closed, or has fewer than 2 comp ratios",
+          m._asking_price_market_check({"current_list_price": 474_000}, {"not_listed": True}, {"state": "not_listed"}, comps) is None
+          and m._asking_price_market_check({"current_list_price": 474_000}, {}, {"state": "closed"}, comps) is None
+          and m._asking_price_market_check({"current_list_price": 474_000}, {}, {"state": "normal_exposure"}, comps[:1]) is None)
+    stale = m._asking_price_market_check({"current_list_price": 600_000}, {}, {"state": "extended_exposure"}, comps)
+    check("1e: a stale listing gets no over-asking premium and a wider downside",
+          stale["ratio_used"] <= 1.0 and stale["allowed_low"] == round(600_000 * stale["ratio_used"] * 0.85), str(stale))
+    check("1f: the final-valuation instructions describe the asking-price check",
+          "asking_price_check" in m._CMA_REASONING_SYSTEM_PROMPT)
+
+    # 2. exposure floors: comps that sold in 4 days must not make an 11-day listing "extended"
+    check("2: exposure floors - never elevated before 21 days or extended before 45",
+          m._V10_DOM_NORMAL_FLOOR == 21.0 and m._V10_DOM_EXTENDED_FLOOR == 45.0)
+
+    # 3. internal data references are stripped from client comp notes
+    txt = "Its quiet residential street (confirmed by the road context data) is a comparable setting."
+    check("3: '(confirmed by the road context data)' is removed",
+          m._strip_internal_data_refs(txt) == "Its quiet residential street is a comparable setting.",
+          m._strip_internal_data_refs(txt))
+
+
 def main() -> int:
     for fn in (test_a_finished_basement_not_inflating_psf, test_b_location_class_and_weight,
                test_c_condition_reconciliation, test_d_mixed_set_stability,
@@ -3543,7 +3583,8 @@ def main() -> int:
                test_ai_valuation_reliability_warnings,
                test_ah_subject_condition_evidence_everywhere,
                test_aj_client_facing_road_and_fallback_prose,
-               test_ak_cross_section_semantic_consistency):
+               test_ak_cross_section_semantic_consistency,
+               test_al_asking_price_check_and_round1_fixes):
         try:
             fn()
         except Exception as exc:  # noqa: BLE001

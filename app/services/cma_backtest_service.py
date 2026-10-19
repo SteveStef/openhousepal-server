@@ -20,7 +20,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import Float, func, select, text
+from sqlalchemy import Float, and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -162,7 +162,13 @@ async def sample_homes(db: AsyncSession, *, towns: list[str], random_spread: boo
     if price_max:
         q = q.where(close_price <= price_max)
     if towns and not random_spread:
-        q = q.where(func.upper(Property.city).in_([t.strip().upper() for t in towns if t.strip()]))
+        # "Town, ST" matches that state only; a bare "Town" still matches it in any state.
+        conds = []
+        for t in (t.strip() for t in towns if t and t.strip()):
+            town, _, st = t.rpartition(",") if "," in t else (t, "", "")
+            c = func.upper(Property.city) == town.strip().upper()
+            conds.append(and_(c, func.upper(Property.state) == st.strip().upper()) if st.strip() else c)
+        q = q.where(or_(*conds))
     rows = (await db.execute(q.order_by(func.random()).limit(max(60, count * 12)))).scalars().all()
     lag = await _median_contract_to_close_days(db)
     events = await price_events(db, [p.listing_key for p in rows])
@@ -200,11 +206,13 @@ async def sample_homes(db: AsyncSession, *, towns: list[str], random_spread: boo
 async def town_options(db: AsyncSession) -> list[dict]:
     since = (date.today() - timedelta(days=SALES_WINDOW_DAYS)).isoformat()
     r = await db.execute(text(
-        "select initcap(lower(city)) c, count(*) n from properties where home_status ilike 'closed%' "
+        "select initcap(lower(city)) c, upper(state) st, count(*) n from properties where home_status ilike 'closed%' "
         "and raw_mls_data->>'CloseDate' >= :since and nullif(raw_mls_data->>'ClosePrice','')::float > 0 "
         "and living_area > 0 and latitude is not null and is_manual is false "
-        "group by 1 having count(*) >= 5 order by 2 desc limit 120"), {"since": since})
-    return [{"town": c, "closed_sales": n} for c, n in r.all() if c]
+        "group by 1, 2 having count(*) >= 5 order by 3 desc limit 400"), {"since": since})
+    # "Springfield, PA" - Bright covers several states and town names repeat (accuracy test 10/19
+    # picked Springfield, VA for a Delaware County test).
+    return [{"town": f"{c}, {st}" if st else c, "closed_sales": n} for c, st, n in r.all() if c]
 
 
 async def cost_per_home_estimate(db: AsyncSession) -> dict:
