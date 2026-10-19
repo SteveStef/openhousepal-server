@@ -665,6 +665,12 @@ def _first(name: Optional[str]) -> str:
     return (name or "").strip().split(" ")[0] if name else ""
 
 
+def _guest_first(name: Optional[str]) -> str:
+    """First name for a text to the guest - "JOHN" typed in capitals reads as John."""
+    first = _first(name)
+    return first.capitalize() if first.isupper() else first
+
+
 # ---------------------------------------------------------------- editable message templates
 # Each situation's suggested message is a template the agent can edit on the Follow-ups page.
 # {tokens} are filled per lead when the follow-up is made; {showcase} stays as a marker until the
@@ -2174,10 +2180,19 @@ def _ordinal(n: int) -> str:
     return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
 
-async def _repeat_visit(db: AsyncSession, lead_id: str, property_address: Optional[str]) -> Optional[dict]:
+def _intro(owner: Optional[User]) -> str:
+    """ "it's Peter with COMPASS RE" - first name only (the footer under the text carries the full
+    name | brokerage, user 10/19)."""
+    first = (getattr(owner, "first_name", None) or "").strip() if owner is not None else ""
+    brokerage = (getattr(owner, "brokerage", None) or "").strip() if owner is not None else ""
+    return f"it's {first}" + (f" with {brokerage}" if brokerage else "") if first else ""
+
+
+async def _repeat_visit(db: AsyncSession, lead_id: str, property_address: Optional[str],
+                        owner: Optional[User] = None) -> Optional[dict]:
     """This person has signed in at this agent's open houses before: {label, context, message}
-    for the follow-up ("2nd open house" / "came back"), else None. Counts their sign-ins
-    (this one included - the caller links the visitor to the lead first)."""
+    for the follow-up ("2nd open house" / "2nd visit", "3rd visit"...), else None. Counts their
+    sign-ins (this one included - the caller links the visitor to the lead first)."""
     from app.models.database import OpenHouseVisitor
     rows = (await db.execute(select(OpenHouseVisitor.open_house_event_id).where(OpenHouseVisitor.lead_id == lead_id)
                              .order_by(OpenHouseVisitor.created_at))).scalars().all()
@@ -2193,10 +2208,14 @@ async def _repeat_visit(db: AsyncSession, lead_id: str, property_address: Option
         message = ("Hi {first_name}, great to see you again" + (f" at {place}" if street else "") + "! That's "
                    f"{houses} of my open houses now, so I'd love to help you find the right one. How's the search going?{SHOWCASE_MARKER}")
     else:
-        label = "came back"
+        # Back at the same house - 2nd, 3rd, 4th time (user, 10/19): never "want a second look?"
+        # again; just questions, or a private tour this week. Same words every repeat.
+        label = f"{_ordinal(len(rows))} visit"
         context = f"Came back to your open house - {place} ({_ordinal(len(rows))} visit)"
-        message = ("Hi {first_name}, great to see you back" + (f" at {place}" if street else "") + "! A second look is a good sign - "
-                   f"want me to set up a private showing, or answer anything about it?{SHOWCASE_MARKER}")
+        me = _intro(owner)
+        message = ("Hi {first_name}" + (f", {me}" if me else "") + ". Thanks for coming back to see "
+                   + (place if street else "the home") + " again! I wanted to reach out to see if you had any questions "
+                   f"or interest in a private tour of the property this week.{SHOWCASE_MARKER}")
     return {"label": label, "context": context, "message": message}
 
 
@@ -2240,7 +2259,7 @@ async def create_open_house_followup(
         # Signed in before (user, 10/19): the follow-up says so - "2nd open house" / "came back" -
         # with its own message (check in, and their Showcase), instead of a card identical to the
         # first one that read as a duplicate. Not an agent setting: rare, and always worth saying.
-        repeat = await _repeat_visit(db, lead.id, property_address)
+        repeat = await _repeat_visit(db, lead.id, property_address, owner)
         repeat_name = (lead.name or "this guest").strip()
 
         # One open follow-up per person (what the Follow-ups page promises): signing in at another
@@ -2256,11 +2275,16 @@ async def create_open_house_followup(
                 open_task.context = _tidy_subject(repeat["context"] if repeat else f"Signed in at your open house - {property_address}")[:240]
                 if repeat:
                     open_task.title = f"Follow up with {repeat_name} - {repeat['label']}"
-                    open_task.suggested_message = repeat["message"].replace("{first_name}", _first(lead.name))
+                    open_task.suggested_message = repeat["message"].replace("{first_name}", _guest_first(lead.name))
                 if property_address not in (open_task.notes or ""):
                     open_task.notes = ((open_task.notes or "") + f"\nAlso signed in at: {property_address}").strip()
                 elif repeat:
                     open_task.notes = ((open_task.notes or "") + f"\nSigned in again: {property_address}").strip()
+            elif repeat:
+                # Some other follow-up is still open for them - it covers reaching out, but it
+                # should say they came back (so the repeat visit still shows on the calendar).
+                open_task.notes = ((open_task.notes or "") + f"\n{repeat['context']}.").strip()
+            if (open_task.auto_source in ("open_house_signin", "similar_homes_qr") and property_address) or repeat:
                 if commit:
                     await db.commit()
                 else:
@@ -2295,7 +2319,7 @@ async def create_open_house_followup(
             done_code=new_done_code(),
             auto_source=rule,
             auto_source_id=dedup_key,
-            suggested_message=(repeat["message"].replace("{first_name}", _first(lead.name)) if repeat else
+            suggested_message=(repeat["message"].replace("{first_name}", _guest_first(lead.name)) if repeat else
                                render_rule_message(owner, rule, name=lead.name, address=await _open_house_short(db, signin_id, property_address))),
             # The sheet's bottom "Want to see more homes like these?" QR (-> sign-in -> Showcase), not
             # one of the per-home QRs (those open that home's listing page - tracked separately).
@@ -2350,14 +2374,11 @@ def noted_guest_message(owner: Optional[User], lead_name: Optional[str], address
     """The check-in text for a guest who has an agent but got a note (user, 10/19): who you are,
     thanks for coming, then a spot for your own words - the "Thanks, name | brokerage" sign-off is
     added under it like every follow-up message."""
-    name = _my_name(owner) if owner is not None else ""
-    brokerage = (getattr(owner, "brokerage", None) or "").strip() if owner is not None else ""
-    me = f"it's {name}" + (f" with {brokerage}" if brokerage else "") if name else ""
+    me = _intro(owner)
     street = (address or "").split(",")[0].strip()
     from app.services.email_service import _tidy_subject
     where = f" at {_tidy_subject(street)}" if street else ""
-    first = _first(lead_name)
-    first = first.capitalize() if first.isupper() else first  # "JOHN" typed in capitals
+    first = _guest_first(lead_name)
     hello = f"Hi {first or 'there'}" + (f", {me}" if me else "") + "."
     return f"{hello} Thanks for stopping by the open house{where}!\n\n{FILL_IN_MESSAGE}"
 
