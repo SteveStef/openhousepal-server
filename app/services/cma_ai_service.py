@@ -14182,9 +14182,9 @@ async def _generate_ai_analysis_impl(
             tools=[_tool_for_mode(_SUBMIT_TOOL, report.mode)],
             tool_choice={"type": "tool", "name": "submit_cma_analysis"},
             messages=[{"role": "user", "content": content}],
-            # Most repeatable setting (10/20): the same home + comps should read the same way on a
-            # re-run; this pass fills one forced structured form, so nothing creative is lost.
-            temperature=0,
+            # No `temperature` here: the current Claude models reject it ("deprecated for this model")
+            # and the whole generation failed (10/20). Repeatability comes from reusing the final
+            # reasoning answer for an identical evidence packet instead.
         )
     except Exception as exc:
         logger.warning("CMA AI analysis call failed", extra={"report_id": report_id, "error": str(exc)})

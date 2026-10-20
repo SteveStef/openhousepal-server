@@ -129,6 +129,13 @@ async def subject_from_listing(db: AsyncSession, listing_key: str) -> Optional[D
         subject["photos"] = [u for u in prop.photos if isinstance(u, str)]
     for k in ("water_source", "sewer", "heating", "cooling", "basement"):
         subject[k] = _join_mls_list(subject.get(k))
+    # Heating fuel is its own Bright field (HeatingFuel, e.g. "Propane - Owned") - add it in the
+    # form's own words so the Heating Fuel box isn't blank (10/20).
+    fuel_text = (_join_mls_list(raw.get("HeatingFuel")) or "").lower()
+    fuel = next((name for name, words in (("Natural Gas", ("natural gas", "gas")), ("Propane", ("propane",)),
+                                          ("Oil", ("oil",)), ("Electric", ("electric",))) if any(w in fuel_text for w in words)), None)
+    if fuel and fuel not in (subject.get("heating") or ""):
+        subject["heating"] = ", ".join(x for x in (subject.get("heating"), fuel) if x)
     if isinstance(subject.get("garage"), str):
         subject["garage"] = re.sub(r"(\d+)\.0\b", r"\1", subject["garage"])
     if str(subject.get("subdivision_name") or "").strip().upper() in ("NONE AVAILABLE", "NONE", "N/A"):
