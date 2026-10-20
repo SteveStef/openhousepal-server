@@ -5262,7 +5262,12 @@ def _v10_feature_adjustments(subject: dict, comp: dict, price: float, comp_above
         c_bg = min(s_bg, 0.5 * c_ag) * (0.5 if partial else 1.0)
         estimated = "partially finished" if partial else "finished"
     if s_bg is not None and c_bg is not None and abs(s_bg - c_bg) >= 100 and comp_above_psf > 0:
-        rate = float(bg_rate_evidence) if bg_rate_evidence else comp_above_psf * _V10_FEATURE_BG_FRAC
+        # Always a fraction of the comp's own above-grade rate. A rate "paired" from the comp set can
+        # come out near the above-grade rate itself ($244/sqft in a Bryn Mawr backtest, 10/20) and
+        # then a 1,200 sqft basement looked worth almost as much as 1,200 sqft upstairs.
+        rate = comp_above_psf * _V10_FEATURE_BG_FRAC
+        if bg_rate_evidence:
+            rate = min(rate, float(bg_rate_evidence))
         out["below_grade"] = (s_bg - c_bg) * rate
         out["below_grade_rate_psf"] = round(rate, 2)
         out["notes"].append(
