@@ -1240,6 +1240,10 @@ _SUBJECT_FIELDS = [
     "lot_size", "year_built", "property_age_years", "property_type", "garage", "basement",
     "days_on_market", "mls_status", "last_sale_date", "last_sale_price", "school_district",
     "annual_taxes", "water_source", "sewer", "public_remarks",
+    # The manual-entry facts (a home not on the MLS yet) - an MLS subject has none of them, so its
+    # prompt is unchanged. Township/county stay out on purpose (see _RELEVANCE_ENRICHMENT_FIELDS).
+    "full_baths", "half_baths", "garage_spaces", "stories", "heating", "cooling", "condition",
+    "recent_updates",
     # OSM road/street classification summary (road_context_service) - so the model's street_context
     # rating is grounded in actual nearby road types + speed, not just the address + a map guess.
     "road_context_note", *_PROPERTY_ENRICHMENT_FIELDS, *_RAW_PROPERTY_ENRICHMENT_KEYS,
@@ -2816,8 +2820,13 @@ def _seller_not_listed(mode: str, subject: dict, timeline: dict) -> tuple[dict, 
     if tl.get("is_closed") and (close_date or last_price):
         lines.append("Last sold" + (f" {close_date}" if close_date else "") + (f" for ${last_price:,.0f}" if last_price else "") +
                      " (its most recent recorded sale). That is history, not a current asking price.")
-    lines.append("The listing remarks and photos are from that past listing - describe features as documented there, and never "
-                 "claim the home's CURRENT condition goes beyond (or falls short of) what they and the MLS fields say.")
+    if subj.get("source") == "manual" and not subj.get("listing_key"):
+        # Entered by hand in the CMA builder (the home has no MLS record) - there is no past listing.
+        lines.append("This home has no MLS record - its facts, description and photo were entered by the agent. Treat them as the "
+                     "agent's account of the home today, and never claim its condition goes beyond (or falls short of) what they say.")
+    else:
+        lines.append("The listing remarks and photos are from that past listing - describe features as documented there, and never "
+                     "claim the home's CURRENT condition goes beyond (or falls short of) what they and the MLS fields say.")
     lines.append("There is NO current list price and no current days on market. Write every narrative in the present and future "
                  "tense about listing it now - never about that past sale.")
     new_tl = {

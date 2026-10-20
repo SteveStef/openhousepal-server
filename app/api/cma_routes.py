@@ -2,7 +2,10 @@ import asyncio
 import logging
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from typing import Literal, Optional
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -101,6 +104,87 @@ async def cma_ai_estimate(
     typical = min(typical, cap)
     pct = (lambda usd: round(usd / float(limit) * 100, 1) if limit else None)
     return {"usd": round(typical, 3), "percent": pct(typical), "max_percent": pct(cap)}
+
+
+# ---- Manual subject (a home not on the MLS yet) - see cma_manual_subject_service ----
+
+@router.get("/subject-area")
+async def cma_subject_area(
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_mls_access),
+    _broker: User = Depends(require_broker_authorization),
+):
+    """School district / township / water / sewer most nearby MLS homes share, in the MLS's own
+    spelling - pre-fills a manually entered subject so it matches comps the way an MLS one does."""
+    from app.services import cma_manual_subject_service
+    return await cma_manual_subject_service.area_suggestions(db, lat, lng)
+
+
+@router.get("/locate")
+async def cma_locate_address(
+    address: str = Query(..., min_length=5, max_length=300),
+    current_user: User = Depends(require_mls_access),
+    _broker: User = Depends(require_broker_authorization),
+):
+    """Typed address -> location, for when Google's suggestions don't load in the browser."""
+    from app.services import cma_manual_subject_service
+    found = await cma_manual_subject_service.geocode_address(address)
+    if not found:
+        raise HTTPException(status_code=404, detail="Couldn't find that address on the map - check the spelling and ZIP.")
+    return found
+
+
+@router.post("/{report_id}/subject-photo")
+async def upload_cma_subject_photo(
+    report_id: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_mls_access),
+    _broker: User = Depends(require_broker_authorization),
+):
+    """A photo of a manually entered subject (JPG, PNG or WebP - stored as JPG, which the PDF needs)."""
+    from app.services import cma_manual_subject_service as manual
+    from app.utils.image_validation import photo_to_jpeg
+    await service._get_owned(db, current_user.id, report_id)
+    contents = await file.read()
+    if len(contents) > manual.SUBJECT_PHOTO_MAX_BYTES:
+        raise HTTPException(status_code=422, detail="Photo must be 10MB or smaller.")
+    try:
+        jpeg = photo_to_jpeg(contents)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Please upload a JPG, PNG or WebP photo.")
+    return {"photo_url": await manual.save_subject_photo(db, current_user, jpeg)}
+
+
+class CmaGooglePhotoRequest(BaseModel):
+    kind: Literal["street_view", "aerial"] = "street_view"
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+
+@router.post("/{report_id}/subject-photo/google")
+async def google_cma_subject_photo(
+    report_id: str,
+    payload: CmaGooglePhotoRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_mls_access),
+    _broker: User = Depends(require_broker_authorization),
+):
+    """Street View photo (or an aerial view) of the subject's location, saved as its photo."""
+    from app.services import cma_manual_subject_service as manual
+    report = await service._get_owned(db, current_user.id, report_id)
+    subject = report.subject or {}
+    lat = payload.latitude if payload.latitude is not None else subject.get("latitude")
+    lng = payload.longitude if payload.longitude is not None else subject.get("longitude")
+    if lat is None or lng is None:
+        raise HTTPException(status_code=422, detail="Pick the address first - the photo is taken at its location.")
+    try:
+        jpeg = await manual.google_photo(float(lat), float(lng), payload.kind)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"photo_url": await manual.save_subject_photo(db, current_user, jpeg), "kind": payload.kind}
 
 
 @router.get("/{report_id}", response_model=CmaReportResponse)

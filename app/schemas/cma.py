@@ -59,6 +59,21 @@ class CmaSubjectProperty(BaseModel):
     # The agent's framing of the subject itself, shown before any comps in the client-facing
     # presentation - distinct from the pricing conclusion, which comes at the very end.
     agent_notes: Optional[str] = None
+    # Typed in by the agent on the manual-entry path (a home that isn't on the MLS yet) - an MLS
+    # subject usually leaves these empty. `baths` stays the total the engine reads (full + 0.5 per
+    # half, the same way Bright's BathroomsTotal counts them); garage_spaces and stories are read
+    # by the engine ahead of the garage text / style (_v10_garage_spaces, _relevance_level_class).
+    full_baths: Optional[int] = None
+    half_baths: Optional[int] = None
+    garage_spaces: Optional[float] = None
+    stories: Optional[float] = None
+    county: Optional[str] = None
+    heating: Optional[str] = None
+    cooling: Optional[str] = None
+    condition: Optional[str] = None
+    recent_updates: Optional[str] = None
+    # Where photo_url came from on a manual subject: 'upload' | 'street_view' | 'aerial'.
+    photo_source: Optional[str] = None
 
 
 class CmaQualityAssessment(BaseModel):
