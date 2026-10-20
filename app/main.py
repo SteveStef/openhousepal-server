@@ -101,19 +101,26 @@ async def lifespan(app: FastAPI):
 
     # Production Bright data pulls (3 years of sales for CMAs, a one-time refresh of every listing
     # on the market, and each home's 2012+ price history) - a few pages every 10 minutes until each
-    # is done. Off unless BRIGHT_DATA_PULLS is set (see bright_data_pulls_service).
+    # is done. Off unless BRIGHT_DATA_PULLS is set (see bright_data_pulls_service). Price history
+    # is its own job so its slow batches never hold up the sales pull.
     from app.services import bright_data_pulls_service as _pulls
     if _pulls.any_enabled():
-        async def _bright_data_pulls_job():
-            from app.database import AsyncSessionLocal
-            try:
-                async with AsyncSessionLocal() as db:
-                    await _pulls.run_enabled(db)
-            except Exception:
-                logger.error("Bright data pulls job failed", exc_info=True)
+        def _pulls_job(names: tuple, label: str):
+            async def _job():
+                from app.database import AsyncSessionLocal
+                try:
+                    async with AsyncSessionLocal() as db:
+                        await _pulls.run_enabled(db, names)
+                except Exception:
+                    logger.error(f"{label} job failed", exc_info=True)
+            return _job
         scheduler.add_job(
-            _bright_data_pulls_job, "interval", minutes=10, id="bright_data_pulls",
+            _pulls_job(_pulls.SALES_PULLS, "Bright data pulls"), "interval", minutes=10, id="bright_data_pulls",
             name="Production Bright data pulls", replace_existing=True, max_instances=1,
+        )
+        scheduler.add_job(
+            _pulls_job(_pulls.HISTORY_PULLS, "Price history backfill"), "interval", minutes=10, id="bright_price_history",
+            name="Production Bright price history backfill", replace_existing=True, max_instances=1,
         )
 
     # Website Builder custom domains: real DNS/HTTPS check on a recurring poll, so a domain an
