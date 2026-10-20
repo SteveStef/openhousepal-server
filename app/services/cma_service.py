@@ -201,9 +201,11 @@ async def _published_idx_site_url(db: AsyncSession, owner_id: str) -> Optional[s
     return f"https://{hostname}"
 
 
-_GENERATION_STALE_AFTER_SECONDS = 480  # generous vs. real generation time (~30-90s) - a request
-# that's still marked "generating" past this almost certainly crashed/restarted mid-run rather
-# than genuinely still being in flight, so stop showing the client a spinner for it.
+_GENERATION_STALE_AFTER_SECONDS = 1800  # a request still marked "generating" past this almost
+# certainly crashed/restarted mid-run rather than genuinely still being in flight, so stop showing
+# the client a spinner for it. Was 480s - shorter than a worst-case real run (main photo call +
+# estimate-only retry + guidance pass + comp rewrites + the reasoning pass with up to 3 attempts at
+# a 180s timeout each + the language polish), so a slow but healthy run could read as "failed".
 
 
 def _reconcile_stale_generation(report: CmaReport) -> None:
@@ -241,11 +243,17 @@ async def mark_generation_finished(owner_id: str, report_id: str, outcome: str, 
     its own short-lived session rather than the request's `db` - by the time this runs from an
     exception handler, that session may need a rollback before it can be used again, and this
     write must not depend on that. Only touches rows still marked 'generating' so it's a no-op
-    for requests that never got that far (e.g. failed validation before any AI call)."""
+    for requests that never got that far (e.g. failed validation before any AI call).
+
+    A run that COMPLETES may also overwrite 'failed': the only way this run's row reads 'failed'
+    while the run itself just finished is the stale-timer guess (_reconcile_stale_generation)
+    having been persisted by some unrelated commit mid-run - the finished report must not stay
+    marked failed."""
+    allowed = ("generating", "failed") if outcome == "complete" else ("generating",)
     async with AsyncSessionLocal() as session:
         await session.execute(
             update(CmaReport)
-            .where(CmaReport.id == report_id, CmaReport.owner_id == owner_id, CmaReport.generation_status == "generating")
+            .where(CmaReport.id == report_id, CmaReport.owner_id == owner_id, CmaReport.generation_status.in_(allowed))
             .values(generation_status=outcome, generation_error=(error or None) if outcome != "complete" else None)
         )
         await session.commit()

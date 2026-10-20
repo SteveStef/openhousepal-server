@@ -302,10 +302,15 @@ DEFAULT_CONFIG = {
     # output passes deterministic factual QA.
     "cma_reasoning_model": "gpt-6-astra",
     "cma_reasoning_effort": "medium",
-    "cma_reasoning_max_output_tokens": 6000,
+    # 12000 (was 6000): high-effort reasoning plus the full JSON was being cut off at 6000. A cut-off
+    # response is retried once at 1.75x this budget (cma_ai_service._REASONING_RETRY_TOKEN_MULT).
+    "cma_reasoning_max_output_tokens": 12000,
     "cma_reasoning_request_timeout_seconds": 180,
     "cma_reasoning_reservation_estimate_usd": 0.75,
-    "cma_reasoning_max_cost_per_generation_usd": 1.0,
+    # Worst single call: 21,000 output tokens (12000 x 1.75) x $50/Mtok = $1.05, plus input
+    # (a ~200k-char evidence packet is ~50k tokens x $10/Mtok = $0.50) -> $1.55. Was 1.0, which
+    # the doubled output budget alone would have failed. Over this, the CMA uses the V10 benchmark.
+    "cma_reasoning_max_cost_per_generation_usd": 1.6,
     # Was 2000 - with 5 comps (MAX_COMPS) each needing a note + strength + full quality rating
     # object, that consistently left no room left for the final subject_estimate field, so every
     # generation truncated (stop_reason "max_tokens") with comps written but no value estimate at
