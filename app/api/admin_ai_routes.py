@@ -449,3 +449,17 @@ async def get_agent_ai_usage_detail(
     except Exception as e:
         logger.error(f"Failed to load AI usage detail for {owner_id}: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to load agent AI usage detail")
+
+
+@router.get("/failures")
+async def get_recent_failures(
+    days: int = 14,
+    include_limits: bool = False,
+    db: AsyncSession = Depends(get_db),
+    admin: UserModel = Depends(require_admin_user),
+):
+    """Every feature failure we already record, newest first - who, which feature, when, and the
+    error (see admin_failures_service). `include_limits` also lists requests our own spending /
+    abuse limits stopped (not errors)."""
+    from app.services.admin_failures_service import recent_failures
+    return await recent_failures(db, days=max(1, min(int(days), 90)), include_limits=include_limits)
