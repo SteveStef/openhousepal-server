@@ -450,6 +450,32 @@ class PayPalService:
             return await client.post(f"{self._base_url}{path}", json=data, timeout=30.0,
                                      headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
 
+    async def create_domain_plan(self) -> str:
+        """The one shared yearly "Domain name" plan (product + plan) - its $20 prices are
+        placeholders; every domain's subscription overrides them. Returns the plan id."""
+        prod = await self._post("/v1/catalogs/products", {
+            "name": "OpenHousePal domain name", "type": "SERVICE", "category": "SOFTWARE",
+            "description": "A website domain registered for an agent's OpenHousePal IDX website, renewed yearly.",
+        })
+        if prod.status_code not in (200, 201):
+            raise Exception(f"Failed to create domain product: {prod.status_code} - {prod.text}")
+        plan = await self._post("/v1/billing/plans", {
+            "product_id": prod.json()["id"], "name": "Domain name (yearly)", "status": "ACTIVE",
+            "description": "Yearly domain renewal - first year charged at sign-up",
+            "billing_cycles": [{
+                "frequency": {"interval_unit": "YEAR", "interval_count": 1}, "tenure_type": "REGULAR",
+                "sequence": 1, "total_cycles": 0,
+                "pricing_scheme": {"fixed_price": {"value": "20.00", "currency_code": "USD"}},
+            }],
+            "payment_preferences": {
+                "auto_bill_outstanding": True, "setup_fee_failure_action": "CANCEL", "payment_failure_threshold": 2,
+                "setup_fee": {"value": "20.00", "currency_code": "USD"},
+            },
+        })
+        if plan.status_code not in (200, 201):
+            raise Exception(f"Failed to create domain plan: {plan.status_code} - {plan.text}")
+        return plan.json()["id"]
+
     async def create_domain_subscription(self, plan_id: str, first_year: float, renewal: float, start_time: str,
                                          custom_id: str, description: str, return_url: str, cancel_url: str) -> dict:
         """One yearly subscription per domain on the shared "Domain name" plan, priced for this

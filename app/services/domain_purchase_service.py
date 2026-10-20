@@ -51,13 +51,40 @@ def tlds() -> list[str]:
     return [t.strip().lstrip(".").lower() for t in raw.split(",") if t.strip()] if raw else list(DEFAULT_TLDS)
 
 
-def plan_id() -> Optional[str]:
-    return os.getenv("PAYPAL_DOMAIN_PLAN_ID") or None
+_plan_ids: dict[str, str] = {}
+
+
+def _paypal_ready() -> bool:
+    return bool(os.getenv("PAYPAL_DOMAIN_PLAN_ID") or (os.getenv("PAYPAL_CLIENT_ID") and os.getenv("PAYPAL_SECRET_ID")))
+
+
+async def plan_id(db: AsyncSession) -> str:
+    """The shared yearly "Domain name" PayPal plan. PAYPAL_DOMAIN_PLAN_ID if set; otherwise made
+    automatically the first time anyone buys and remembered in app_cache (one per PayPal mode),
+    so nobody has to run anything by hand."""
+    env = os.getenv("PAYPAL_DOMAIN_PLAN_ID")
+    if env:
+        return env
+    from sqlalchemy import text
+    from app.services import app_cache
+    from app.services.paypal_service import paypal_service
+    key = f"paypal_domain_plan_id:{os.getenv('PAYPAL_MODE', 'sandbox')}"
+    if key in _plan_ids:
+        return _plan_ids[key]
+    row = (await db.execute(text("SELECT value FROM app_cache WHERE key = :k"), {"k": key})).scalar_one_or_none()
+    if isinstance(row, str) and row:
+        _plan_ids[key] = row
+        return row
+    pid = await paypal_service.create_domain_plan()
+    await app_cache.save(key, pid)
+    _plan_ids[key] = pid
+    _ping(f":credit_card: Made the PayPal 'Domain name' plan automatically ({os.getenv('PAYPAL_MODE', 'sandbox')}): {pid}")
+    return pid
 
 
 def available() -> dict:
     """Can agents buy right now? (the screen says "opens soon" otherwise)"""
-    return {"buy": namecom_service.configured() and bool(plan_id()), "test_mode": namecom_service.is_test()}
+    return {"buy": namecom_service.configured() and _paypal_ready(), "test_mode": namecom_service.is_test()}
 
 
 def our_price(cost: float) -> float:
@@ -203,7 +230,7 @@ async def start(db: AsyncSession, user: User, domain: str, contact_in: dict, bac
     first_renewal = datetime.now(timezone.utc) + timedelta(days=365 - RENEW_LEAD_DAYS)
     try:
         sub = await paypal_service.create_domain_subscription(
-            plan_id(), price, renewal, first_renewal.strftime("%Y-%m-%dT%H:%M:%SZ"), purchase.id,
+            await plan_id(db), price, renewal, first_renewal.strftime("%Y-%m-%dT%H:%M:%SZ"), purchase.id,
             f"{domain} (yearly)", ret, f"{ret}&cancelled=1",
         )
     except Exception:

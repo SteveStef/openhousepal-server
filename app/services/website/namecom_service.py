@@ -36,6 +36,12 @@ def is_test() -> bool:
     return "api.dev.name.com" in _base() or "localhost" in _base() or "127.0.0.1" in _base()
 
 
+def _username() -> str:
+    """Name.com's test server signs in as "<username>-test" - added here so the same username works for both."""
+    u = (os.getenv("NAMECOM_USERNAME") or "").strip()
+    return f"{u}-test" if is_test() and u and not u.endswith("-test") and "127.0.0.1" not in _base() else u
+
+
 def _base() -> str:
     return (os.getenv("NAMECOM_API_URL") or "https://api.dev.name.com").rstrip("/")
 
@@ -45,7 +51,7 @@ async def _call(method: str, path: str, json: Optional[dict] = None, params: Opt
     if not configured():
         raise NamecomError("not_configured", "Name.com isn't set up")
     try:
-        async with httpx.AsyncClient(timeout=timeout, auth=(os.getenv("NAMECOM_USERNAME"), os.getenv("NAMECOM_API_TOKEN"))) as client:
+        async with httpx.AsyncClient(timeout=timeout, auth=(_username(), os.getenv("NAMECOM_API_TOKEN"))) as client:
             resp = await client.request(method, f"{_base()}{path}", json=json, params=params,
                                         headers={"Content-Type": "application/json", **(headers or {})})
     except httpx.HTTPError as e:
