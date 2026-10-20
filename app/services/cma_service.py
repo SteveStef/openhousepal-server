@@ -101,6 +101,42 @@ def _property_display_facts(prop: Property) -> Dict[str, Any]:
     }
 
 
+async def subject_from_listing(db: AsyncSession, listing_key: str) -> Optional[Dict[str, Any]]:
+    """Full CMA subject for one MLS listing from our mirror (see the /subject-from-listing route)."""
+    prop = (await db.execute(select(Property).where(Property.listing_key == str(listing_key)))).scalar_one_or_none()
+    if prop is None:
+        return None
+    from app.services.cma_backtest_service import map_property_to_subject
+    from app.services.property_service import PropertyService
+    found = await PropertyService.get_property_by_listing_key(db, str(listing_key))
+    subject = map_property_to_subject(found.model_dump(by_alias=True)) if found else {"listing_key": str(listing_key), "source": "mls"}
+    subject = _merge_authoritative_subject_facts(subject, prop)
+    raw = getattr(prop, "raw_mls_data", None) or {}
+    extra = {
+        "street_address": prop.street_address, "city": prop.city, "state": prop.state, "zipcode": prop.zipcode,
+        "latitude": prop.latitude, "longitude": prop.longitude, "list_price": prop.price,
+        "county": (raw.get("County") or "").replace("-PA", "").replace("-", " ").title() or None,
+        "heating": _join_mls_list(raw.get("Heating")), "cooling": _join_mls_list(raw.get("Cooling")),
+        "garage_spaces": getattr(prop, "garage_spaces", None), "stories": getattr(prop, "stories", None),
+        "full_baths": raw.get("BathroomsFull"), "half_baths": raw.get("BathroomsHalf"),
+        "photos": [u for u in (prop.photos or []) if isinstance(u, str)] or subject.get("photos") or [],
+        "photo_url": getattr(prop, "img_src", None) or subject.get("photo_url"),
+    }
+    for k, v in extra.items():
+        if _missing_subject_fact(subject.get(k)) and not _missing_subject_fact(v):
+            subject[k] = v
+    if prop.photos and len(prop.photos) > len(subject.get("photos") or []):
+        subject["photos"] = [u for u in prop.photos if isinstance(u, str)]
+    for k in ("water_source", "sewer", "heating", "cooling", "basement"):
+        subject[k] = _join_mls_list(subject.get(k))
+    if isinstance(subject.get("garage"), str):
+        subject["garage"] = re.sub(r"(\d+)\.0\b", r"\1", subject["garage"])
+    if str(subject.get("subdivision_name") or "").strip().upper() in ("NONE AVAILABLE", "NONE", "N/A"):
+        subject["subdivision_name"] = None
+    from app.schemas.cma import CmaSubjectProperty
+    return CmaSubjectProperty(**{k: v for k, v in subject.items() if k in CmaSubjectProperty.model_fields}).model_dump()
+
+
 def _merge_authoritative_subject_facts(subject: Dict[str, Any], prop: Property) -> Dict[str, Any]:
     """Fill absent MLS facts without overwriting an agent's explicit subject correction."""
     merged = dict(subject or {})

@@ -122,6 +122,24 @@ async def cma_subject_area(
     return await cma_manual_subject_service.area_suggestions(db, lat, lng)
 
 
+@router.get("/subject-from-listing/{listing_key}")
+async def cma_subject_from_listing(
+    listing_key: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_mls_access),
+    _broker: User = Depends(require_broker_authorization),
+):
+    """The full CMA subject for an MLS listing, straight from our Bright record - location, school
+    district, township, county, lot, basement, garage, water/sewer, taxes, style, levels, the
+    listing description and every photo. Used when an agent picks one of their own listings or a
+    searched address (10/20: picking "My listing" filled only address, price, beds/baths/sqft and a
+    photo, so the home "wasn't on the map" and most facts were blank)."""
+    subject = await service.subject_from_listing(db, listing_key)
+    if not subject:
+        raise HTTPException(status_code=404, detail="That listing isn't in our MLS data yet.")
+    return subject
+
+
 @router.get("/locate")
 async def cma_locate_address(
     address: str = Query(..., min_length=5, max_length=300),
