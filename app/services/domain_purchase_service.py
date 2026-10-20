@@ -123,7 +123,8 @@ async def search(raw: str) -> dict:
     # Most wanted first: the exact name, .com ideas ("janesmithhomes.com"), then other endings.
     names = [exact, f"{sld}.com"] if "com" in endings else [exact]
     if "com" in endings:
-        names += [f"{sld}{s}.com" for s in SUFFIXES[1:] if len(sld + s) <= 63]
+        # no "mainlinehomeshomes.com" - skip a word the name already ends with
+        names += [f"{sld}{s}.com" for s in SUFFIXES[1:] if len(sld + s) <= 63 and not sld.endswith(s) and not (s == "home" and sld.endswith("homes"))]
     names += [f"{sld}.{t}" for t in endings]
     names = list(dict.fromkeys(names))[:50]
     results = await namecom_service.check_availability(names)
