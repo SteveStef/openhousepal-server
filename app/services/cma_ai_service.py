@@ -1231,6 +1231,10 @@ _RAW_PROPERTY_ENRICHMENT_FIELDS = {
     "area_total": "AreaTotal",
     "tax_total_finished_sqft": "TaxTotalFinishedSqFt",
     "rooms_total": "RoomsTotal",
+    # Which bedrooms/baths are below grade - 417 Dogwood Ln's 4th bedroom is in the lower level,
+    # and without this the model credited it with "more bedrooms on the main level" (10/20).
+    "lower_level_bedrooms": "LowerLevelsTotalBedrooms",
+    "lower_level_baths": "LowerLevelsTotalBaths",
 }
 _RAW_PROPERTY_ENRICHMENT_KEYS = tuple(_RAW_PROPERTY_ENRICHMENT_FIELDS)
 
@@ -1500,7 +1504,7 @@ def _authoritative_property_fact_blob(d: Optional[dict]) -> str:
     return " ".join(str(data.get(f) or "") for f in _AUTHORITATIVE_PROPERTY_TEXT_FIELDS)
 
 
-def _positive_fact_matches(blob: str, rx: "re.Pattern") -> bool:
+def _positive_fact_matches(blob: str, rx: "re.Pattern", *, suggested_use_sentence: bool = True) -> bool:
     """Match a documented feature while rejecting simple local negations such as 'no pool'."""
     for match in rx.finditer(blob or ""):
         prefix = blob[max(0, match.start() - 70):match.start()].lower()
@@ -1528,6 +1532,18 @@ def _positive_fact_matches(blob: str, rx: "re.Pattern") -> bool:
                      r"(?:great|perfect|ideal|nice|wonderful)?\s*$", prefix):
             continue
         if re.search(r"\b(?:ideal|perfect|great|room|space|potential|use)\s+(?:for|as)\s+(?:an?\s+|the\s+)?$", prefix):
+            continue
+        # A suggested use earlier in the same sentence, often a list: "endless possibilities - think
+        # home gym, media room", "flexibility for a home office, playroom, exercise room", "Create
+        # the family room, home gym, office..." (417 Dogwood Ln, 10/20: three comps were rated
+        # superior on amenities from an unfinished basement's "home gym" suggestion).
+        sentence = re.split(r"[.!?;\n]", prefix)[-1]
+        if suggested_use_sentence and re.search(
+            r"\b(?:think|imagine|envision|picture|possibilit(?:y|ies)|potential|flexib(?:le|ility)|"
+            r"could|would|might|create|blank\s+canvas|turn\s+(?:it\s+)?into|convert|"
+            r"whatever\s+you|you(?:'ve)?\s+always\s+wanted|make\s+it\s+your)\b",
+            sentence,
+        ):
             continue
         return True
     return False
@@ -1611,7 +1627,8 @@ def _documented_finish_updates(data: Optional[dict]) -> list[str]:
     blob = _authoritative_property_fact_blob(data)
     found: list[str] = []
     for pattern, label in _FINISH_UPDATE_TERMS:
-        if _positive_fact_matches(blob, re.compile(rf"\b(?:{pattern})\b", re.IGNORECASE)):
+        # finish updates skip the suggested-use check: "buyers would love the updated kitchen" is real
+        if _positive_fact_matches(blob, re.compile(rf"\b(?:{pattern})\b", re.IGNORECASE), suggested_use_sentence=False):
             found.append(label)
     return list(dict.fromkeys(found))
 
@@ -5258,7 +5275,26 @@ _V10_GRID_GROSS_WEIGHT_SLOPE = 1.5  # weight x (1 - 1.5 x gross adjustment %), f
 _V10_GRID_HEAVY_GROSS = 0.25      # a comp adjusted more than this (gross) ...
 _V10_GRID_HEAVY_CAP = 0.10        # ... carries at most this share of the value
 _V10_GRID_MAX_SHARE = 0.35        # no single comp carries more than this share
-_V10_STRONG_SHARE = 0.15          # a comp carrying at least this share of the value is labelled Strong
+_V10_STRONG_SHARE = 0.15          # a comp carrying at least this share of the value is labelled Strong...
+_V10_STRONG_MAX_GROSS = 0.15      # ...unless it needed more than this gross adjustment, has a material
+                                  # issue (cesspool / listing red flag) or 2+ location negatives
+
+
+def _v10_role_from_anchor_row(row: Optional[dict], comp: Optional[dict] = None) -> str:
+    """Strong / Supporting from the anchor's own numbers. Share alone made every comp Strong in an
+    even 5-comp set (417 Dogwood Ln v5, 10/20: a 1946 cesspool sale 2 mi out on a highway was
+    'Strong'), so a Strong comp also needs a light adjustment, no material issue and no
+    location demotion."""
+    row = row or {}
+    if (row.get("normalized_weight") or 0.0) < _V10_STRONG_SHARE:
+        return "supporting"
+    if (row.get("gross_adjustment_pct") or 0.0) > _V10_STRONG_MAX_GROSS * 100:
+        return "supporting"
+    if len(row.get("location_negatives") or []) >= _V10_LOC_NEG_DEMOTE and not row.get("location_override"):
+        return "supporting"
+    if comp is not None and _material_system_issues(comp):
+        return "supporting"
+    return "strong"
 
 
 def _v10_finished_below_grade_sqft(d: dict) -> Optional[float]:
@@ -6262,8 +6298,7 @@ def _apply_continuous_relevance_weighting(
     # One score for weight AND label (10/20): a comp's Strong/Supporting label follows the share of
     # the value it actually carries (Match % x how little it had to be adjusted, with caps), not a
     # separate rule - 1212 Blackhorse Hill was labelled Supporting yet carried 30% of the value.
-    _share = {str(c.get("listing_key")): c.get("normalized_weight") or 0.0
-              for c in ((result.get("anchor") or {}).get("comps") or [])}
+    _anchor_rows = {str(c.get("listing_key")): c for c in ((result.get("anchor") or {}).get("comps") or [])}
     updated: list[dict] = []
     for i, source in enumerate(comps):
         comp = copy.deepcopy(source)
@@ -6271,8 +6306,8 @@ def _apply_continuous_relevance_weighting(
         row = rows_by_key[key]
         comp["ai_strength"] = comp.get("ai_strength") or row.get("current_model_role")
         comp["strength"] = row["proposed_role"]
-        if row["proposed_role"] != "weak" and key in _share:
-            comp["strength"] = "strong" if _share[key] >= _V10_STRONG_SHARE else "supporting"
+        if row["proposed_role"] != "weak" and key in _anchor_rows:
+            comp["strength"] = _v10_role_from_anchor_row(_anchor_rows[key], comp)
         raw_relevance = row["adjusted_relevance_score"]
         comp["match_score"] = calibrate_match_percentage(raw_relevance)
         comp["similarity_details"] = {
@@ -9286,7 +9321,8 @@ def _regenerate_comp_narrative_from_snapshot(comp: dict, label: str, subject: Op
             diffs.append("no finished lower level on record")
         s_g, c_g = _v10_garage_spaces(subject), _v10_garage_spaces(comp)
         if s_g is not None and c_g is not None and s_g != c_g:
-            diffs.append(f"a {c_g:g}-car garage to the subject's {s_g:g}")
+            diffs.append(f"no garage to the subject's {s_g:g}-car" if c_g == 0 and s_g
+                         else f"a {c_g:g}-car garage to the subject's {s_g:g}")
         if diffs:
             sentences.append(f"It has {_join_and(diffs)}.")
     _issues = _material_system_issues(comp)
@@ -12589,8 +12625,19 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
             r"\b(?:open|offer|bid|start|come in)\w*\b.{0,60}\b(?:below|under|at)\b.{0,25}\b(?:list|ask)"
             r"|\bpremium bid\b|\bnegotiate up only\b"
             r"|\b(?:don'?t|do not|no need to)\s+(?:assume\s+|feel\s+)?(?:urgency|rush|hurry)", low))
+        # The value sits below asking and the opener says to offer under it; a sentence saying the
+        # seller has little room to come down contradicts that (417 Dogwood Ln v5, 10/20: "Given the
+        # gap between the indicated value and list price, there may be limited room for the seller
+        # to negotiate down significantly").
+        _contradicts_below_ask = bool(
+            lp and fmv and fmv < lp * 0.99 and not b.get("hot_market") and not b.get("underpriced")
+            and re.search(
+                r"\b(?:limited|little|no|not much|less)\s+room\b.{0,50}\b(?:negotiat|come down|move|budge)"
+                r"|\bseller\b.{0,40}\b(?:won'?t|unlikely to|not likely to|may not)\b.{0,30}\b(?:negotiat|come down|budge)",
+                low))
         if (_has_open_num or _has_indicated_num or _repeats_opening_advice
-                or _mentions_internal_anchor or _has_strategy_number or _contradicts_hot):
+                or _mentions_internal_anchor or _has_strategy_number or _contradicts_hot
+                or _contradicts_below_ask):
             continue  # its numbers are re-stated by the deterministic opener
         # This rebuild runs again on its own output during repair rounds - a sentence the opener
         # already says (or one kept twice) must not pile up (10/20: "It has been on the market
@@ -14167,10 +14214,11 @@ async def _generate_ai_analysis_impl(
         prov_anchor, prov_exposure = _v10_provisional_inputs(
             enriched_subject, enriched_comps, status_timeline, density_context=proximity_context,
         )
+        _prov_rows = {c.get("listing_key"): c for c in ((prov_anchor or {}).get("comps") or [])}
         for _ec in enriched_comps:
             _s = _share.get(_ec.get("listing_key"))
             if _s:
-                _ec["assigned_role"] = "strong" if _s >= _V10_STRONG_SHARE else "supporting"
+                _ec["assigned_role"] = _v10_role_from_anchor_row(_prov_rows.get(_ec.get("listing_key")) or {"normalized_weight": _s}, _ec)
                 _ec["share_of_value_pct"] = round(_s * 100)
 
     warnings: list[str] = []

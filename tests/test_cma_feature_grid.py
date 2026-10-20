@@ -218,3 +218,39 @@ def test_offer_prose_rebuild_is_idempotent():
     thrice, _ = ai._v10_rebuild_buyer_offer_prose(twice, band, 6)
     assert thrice == once
     assert thrice.count("bidding war is unlikely") <= 1
+
+
+# ---- 417 Dogwood Ln v5 (10/20) ------------------------------------------------------------------
+
+def test_suggested_room_uses_are_not_amenities():
+    for remarks in (
+        "The clean and versatile basement offers endless possibilities - think home gym, media room, or storage.",
+        "A bonus space above the garage offers flexibility for a home office, playroom, exercise room, or hobby area.",
+        "The expansive unfinished basement is a blank canvas. Create the family room, home gym, office or workshop you've always wanted.",
+    ):
+        assert ai._amenity_signals({"public_remarks": remarks}) == set(), remarks
+    assert ai._amenity_signals({"public_remarks": "The finished lower level has a home theater and a wine cellar."}) == {
+        "home_theater", "wine_cellar"}
+    # finish updates keep the plain reading
+    assert "updated kitchen" in ai._documented_finish_updates({"public_remarks": "Buyers would love the updated kitchen."})
+
+
+def test_strong_label_needs_light_adjustment_and_no_issues():
+    row = {"normalized_weight": 0.21, "gross_adjustment_pct": 12.0, "location_negatives": []}
+    assert ai._v10_role_from_anchor_row(row, {}) == "strong"
+    assert ai._v10_role_from_anchor_row({**row, "normalized_weight": 0.12}, {}) == "supporting"
+    assert ai._v10_role_from_anchor_row({**row, "gross_adjustment_pct": 16.7}, {}) == "supporting"
+    assert ai._v10_role_from_anchor_row({**row, "location_negatives": ["a", "b"]}, {}) == "supporting"
+    assert ai._v10_role_from_anchor_row({**row, "location_negatives": ["a", "b"], "location_override": True}, {}) == "strong"
+    assert ai._v10_role_from_anchor_row(row, {"sewer": "Cess Pool"}) == "supporting"
+
+
+def test_offer_prose_drops_little_room_sentence_when_value_is_below_asking():
+    band = {"fmv": 490000, "list_price": 500000, "opening_low": 456000, "opening_high": 475000,
+            "target": 488000, "comfort_ceiling": 490000}
+    text = ("Structure the offer with a standard inspection contingency. Given the gap between the indicated "
+            "value and list price, there may be limited room for the seller to negotiate down significantly, "
+            "so be prepared to move toward the top of this range.")
+    out, _ = ai._v10_rebuild_buyer_offer_prose(text, band, 0.04)
+    assert "inspection contingency" in out
+    assert "limited room" not in out
