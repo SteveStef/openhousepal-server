@@ -1770,16 +1770,28 @@ def test_x_frontier_reasoning_authority():
           promoted["fmv"] == above["final_fmv"] and not blockers and not below_blockers,
           f"{promoted['fmv']} / {blockers} / {below_blockers}")
 
+    # Reliability (10/20): a range that doesn't contain the FMV is now REPAIRED (re-centred on the
+    # model's own FMV, same width, flagged) instead of failing the whole CMA. Output with no usable
+    # FMV at all still fails closed here - the stage then falls back to V10 (see test_ao).
+    repaired, _rep_blk = _validate_reasoning_valuation(
+        {**_reasoning_fixture(), "range_low": 3_400_000, "range_high": 3_500_000},
+        _reasoning_packet_fixture(),
+    )
+    check("11: a non-bracketing reasoning range is repaired around the model's own FMV (not V10)",
+          repaired["final_fmv"] == 3_250_000
+          and repaired["range_low"] == 3_200_000 and repaired["range_high"] == 3_300_000
+          and any("re-centred" in f for f in repaired.get("_repair_flags") or []), str(repaired))
     malformed_failed_closed = False
     try:
         _validate_reasoning_valuation(
-            {**_reasoning_fixture(), "range_low": 3_400_000, "range_high": 3_500_000},
+            {**_reasoning_fixture(), "final_fmv": None, "range_low": None, "range_high": None,
+             "independent_preliminary_fmv": "n/a"},
             _reasoning_packet_fixture(),
         )
     except ValueError:
         malformed_failed_closed = True
-    check("11: malformed reasoning output fails closed instead of using V10",
-          malformed_failed_closed, "malformed output was accepted")
+    check("11b: reasoning output with no usable FMV at all still fails closed",
+          malformed_failed_closed, "an FMV-less output was accepted")
 
     check("12: authority promotion does not mutate V10 comp selection/normalization trace",
           json.dumps(v10, sort_keys=True) == v10_snapshot
@@ -3629,6 +3641,232 @@ def test_an_round3_soften_claims_and_passed_over():
     check("6: the asking-price check's expected price is a known figure", not _b, _b)
 
 
+def test_ao_reliability_never_fail_and_auto_repair():
+    print("\nAO. reliability (10/20): reasoning retries/repairs/V10 fallback, final auto-repair, crash guards")
+    import os
+    import httpx
+    m = _cma_mod
+
+    # ---- 1. reasoning call retries: 429 -> cut off at max_output_tokens -> completed ----
+    calls: list = []
+    good = json.dumps(_reasoning_fixture())
+
+    async def fake_post(payload, api_key, timeout_s):
+        calls.append(payload["max_output_tokens"])
+        if len(calls) == 1:
+            req = httpx.Request("POST", "https://example.invalid/v1/responses")
+            raise httpx.HTTPStatusError("rate limited", request=req, response=httpx.Response(429, request=req))
+        if len(calls) == 2:
+            return {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
+                    "usage": {"input_tokens": 100, "output_tokens": 12000}}
+        return {"status": "completed", "usage": {"input_tokens": 100, "output_tokens": 900},
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": good}]}]}
+
+    saved = (m._reasoning_http_post, m._REASONING_RETRY_BACKOFF_S, os.environ.get("OPENAI_API_KEY"))
+    m._reasoning_http_post, m._REASONING_RETRY_BACKOFF_S = fake_post, (0.0, 0.0)
+    os.environ["OPENAI_API_KEY"] = saved[2] or "test-not-a-real-key"
+    try:
+        raw, usage = asyncio.run(m._call_cma_reasoning_model(
+            {"cma_reasoning_model": "gpt-6-astra", "cma_reasoning_max_output_tokens": 12000}, {"x": 1}))
+        check("1: a 429 then a max_output_tokens cut-off are retried and the third attempt is used",
+              raw.get("final_fmv") == 3_250_000 and len(calls) == 3, f"{calls} {raw}")
+        check("1b: the cut-off retry raises the output budget once (12000 -> 21000)",
+              calls == [12000, 12000, 21000], str(calls))
+        check("1c: usage is summed across the attempts that returned a body",
+              usage == {"input_tokens": 200, "output_tokens": 12900}, str(usage))
+
+        # ---- 2. the stage falls back to the V10 benchmark when every attempt fails ----
+        async def always_500(payload, api_key, timeout_s):
+            req = httpx.Request("POST", "https://example.invalid/v1/responses")
+            raise httpx.HTTPStatusError("boom", request=req, response=httpx.Response(503, request=req))
+
+        async def _noop(*a, **k):
+            return None
+
+        saved_stage = (m.reserve_cma_reasoning, m.reconcile_budget, m.record_usage_event)
+        m._reasoning_http_post = always_500
+        m.reserve_cma_reasoning, m.reconcile_budget, m.record_usage_event = _noop, _noop, _noop
+        try:
+            cfg = dict(m.ai_config_service.DEFAULT_CONFIG) if hasattr(m.ai_config_service, "DEFAULT_CONFIG") else {}
+            cfg.update({"cma_reasoning_model": "gpt-6-astra", "cma_reasoning_max_output_tokens": 12000,
+                        "cma_reasoning_max_cost_per_generation_usd": 1.6,
+                        "model_pricing": {"gpt-6-astra": {"input_per_mtok": 10.0, "output_per_mtok": 50.0}}})
+            out, blk, cost, _u = asyncio.run(m._run_cma_reasoning_stage(
+                None, "owner", "PREMIUM", cfg, _reasoning_packet_fixture(), "rep-1",
+                fallback={"fmv": 3_050_000, "range_pct": 6.0}))
+            check("2: a reasoning pass that fails every retry falls back to the V10 FMV, confidence Low",
+                  out["final_fmv"] == 3_050_000 and out["confidence"] == "low" and out.get("fallback_to_v10")
+                  and out["range_low"] < 3_050_000 < out["range_high"], str(out))
+            check("2b: the fallback is announced to the agent as auto-corrected",
+                  any("auto-corrected" in f and "benchmark" in f for f in out.get("_guard_flags") or []),
+                  str(out.get("_guard_flags")))
+            fb_auth = _apply_reasoning_authority(
+                {"fmv": 3_050_000, "range_pct": 6.0, "trace": {}}, out, model="gpt-6-astra", effort="high")
+            check("2c: the fallback result flows through reasoning authority unchanged",
+                  fb_auth["fmv"] == 3_050_000 and fb_auth["confidence"] == "low", str(fb_auth))
+            no_fb_failed = False
+            try:
+                asyncio.run(m._run_cma_reasoning_stage(None, "owner", "PREMIUM", cfg, _reasoning_packet_fixture(), "rep-2"))
+            except Exception:  # noqa: BLE001
+                no_fb_failed = True
+            check("2d: without a fallback value the stage still refuses (nothing to show)", no_fb_failed)
+            proj, cap = m._reasoning_projected_cost(cfg, _reasoning_packet_fixture())
+            check("2e: worst-case single-call cost (21k output tokens) passes the raised $1.60 limit",
+                  proj <= cap and cap == 1.6, f"{proj} vs {cap}")
+        finally:
+            m.reserve_cma_reasoning, m.reconcile_budget, m.record_usage_event = saved_stage
+    finally:
+        m._reasoning_http_post, m._REASONING_RETRY_BACKOFF_S = saved[0], saved[1]
+        if saved[2] is None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        else:
+            os.environ["OPENAI_API_KEY"] = saved[2]
+    from app.services.ai.ai_config_service import DEFAULT_CONFIG as _DC  # noqa: F401
+    check("2f: config defaults raised (12000 output tokens, $1.60 reasoning limit)",
+          _DC.get("cma_reasoning_max_output_tokens") == 12000
+          and _DC.get("cma_reasoning_max_cost_per_generation_usd") == 1.6, "")
+
+    # ---- 3. deterministic validation repairs ----
+    messy = _reasoning_fixture()
+    messy["comp_roles"] = [
+        {"comp_id": "A", "role": "direct_analog", "reason": "Best match."},
+        {"comp_id": "A", "role": "floor", "reason": "Duplicate."},
+        {"comp_id": "ZZ", "role": "floor", "reason": "Unknown comp."},
+    ]
+    messy["primary_comps"] = ["not a dict", {"comp_id": "A", "role": "wrong", "reason": ""}]
+    messy["major_value_drivers"] = [{"factor": "", "reason": "x"}, {"factor": "lot", "reason": "Bigger lot.",
+                                                                    "direction": "sideways", "evidence_strength": "?"}]
+    messy["range_low"], messy["range_high"] = 3_375_000, 3_100_000
+    messy["final_valuation_summary"] = "It is worth $3,250,000, about 8% over list."
+    messy["confidence"] = "very sure"
+    del messy["v10_assessment"]
+    fixed, _fx_blk = _validate_reasoning_valuation(messy, _reasoning_packet_fixture())
+    roles = {r["comp_id"]: r["role"] for r in fixed["comp_roles"]}
+    check("3a: comp_roles de-duplicated, unknown dropped, missing comp added as market context",
+          roles == {"A": "direct_analog", "B": "location_adjusted_context"}, str(fixed["comp_roles"]))
+    check("3b: an inverted range is swapped (FMV unchanged)",
+          (fixed["range_low"], fixed["range_high"], fixed["final_fmv"]) == (3_100_000, 3_375_000, 3_250_000), str(fixed))
+    check("3c: malformed bucket items dropped / repaired, invalid enums normalized",
+          fixed["primary_comps"] == [{"comp_id": "A", "role": "direct", "reason": "One of the closest matches to the subject."}]
+          and fixed["major_value_drivers"][0]["direction"] == "up" and len(fixed["major_value_drivers"]) == 1,
+          f"{fixed['primary_comps']} {fixed['major_value_drivers']}")
+    check("3d: a $/% client summary is replaced with number-free text; bad confidence -> Low; missing assessment rebuilt",
+          "$" not in fixed["final_valuation_summary"] and "%" not in fixed["final_valuation_summary"]
+          and fixed["final_valuation_summary"] and fixed["confidence"] == "low"
+          and fixed["v10_assessment"]["classification"] == "too_low", str(fixed))
+    check("3e: every repair is listed as auto-corrected", len(fixed["_repair_flags"]) >= 5
+          and all(f.startswith("auto-corrected") for f in fixed["_repair_flags"]), str(fixed["_repair_flags"]))
+
+    # ---- 4. the over-broad 'updated systems' pattern + its deterministic soften ----
+    subj = _subject(public_remarks="Classic colonial on a quiet street.")
+    check("4a: 'request records for any updated systems' is not a claim",
+          not _factual_prose_blocking("Request records for any updated systems.", "Inspection concerns", subj))
+    check("4b: 'the comps have updated systems' is about the comps",
+          not _factual_prose_blocking("Comp #2 and Comp #3 both have updated systems.", "Methodology summary", subj))
+    check("4c: 'the subject has updated systems' still blocks",
+          any("systems as updated" in b for b in _factual_prose_blocking(
+              "The subject has updated systems throughout.", "Methodology summary", subj)))
+    soft, soft_notes = m._soften_unsupported_system_claims("The subject has updated systems throughout.", subj)
+    check("4d: the soften pass rewrites it so the check passes",
+          not _factual_prose_blocking(soft, "Methodology summary", subj) and soft_notes, soft)
+
+    # ---- 5. crash guards ----
+    check("5a: _parse_dollar on a bare '$,' capture reads as 0 instead of crashing",
+          m._parse_dollar(",", None) == 0.0 and m._parse_dollar("1,250", "K") == 1_250_000)
+    imps = m._premium_improvements_from_ai({"premium_improvements": [
+        {"description": ["Heated pool", "new cabana"], "type": {"a": "Pool"}, "estimated_value_context": None,
+         "approx_size": 400}]})
+    check("5b: list/dict premium-improvement fields are coerced, not crashed on",
+          len(imps) == 1 and "Heated pool" in imps[0]["description"], str(imps))
+    try:
+        txt, _f, _b = _final_consistency_gate({"m": ("Methodology summary", "The fair market value is $, which is fine.")},
+                                          subject=subj, comps=[], value=1_000_000, status_timeline={},
+                                          comp_num_by_key={}, addr_by_key={})
+        ok5 = True
+    except Exception as exc:  # noqa: BLE001
+        ok5, txt = False, repr(exc)
+    check("5c: '$,' in prose no longer crashes the final consistency gate (outside the QA guard)", ok5, str(txt))
+    known = m._client_known_dollars({"value": 1_000_000}, 990_000, None,
+                                    [_comp("K1", 900_000, 2800, list_price=925_000)])
+    check("5d: every final $ sweep knows the comps' own list/sale prices", 925_000 in known and 900_000 in known, str(known))
+
+    # ---- 6. final auto-repair: text findings fixed + re-checked; data findings stay ----
+    subject = _subject(list_price=1_000_000, public_remarks="Lovely colonial.")
+    comps = [_comp("R1", 1_050_000, 3000), _comp("R2", 980_000, 2900)]
+    bad_note = "R1 Comp Ln sold for $1,050,000. Unlike the subject's dated kitchen, its kitchen is new."
+    comps[0]["commentary"] = comps[0]["ai_commentary"] = bad_note
+    tl = {"current_status": "Active", "is_active": True, "active_market_days": 10}
+    trace = {"authority": "reasoning_model", "final_fmv": 1_000_000, "range_pct": 5.0, "subject_asking": 1_000_000,
+             "anchor": {"anchor_value": 1_000_000, "anchor_low": 950_000, "anchor_high": 1_050_000, "comps": []},
+             "adjustments": [], "above_ask_gate": {}}
+    final = _v10_authoritative_valuation(value=1_000_000, range_pct=5.0, confidence="medium", valuation_trace=trace,
+                                         subject_asking=1_000_000, status_timeline=tl, comp_stats=None,
+                                         range_min=950_000, range_max=1_050_000)
+    common = dict(value=1_000_000, range_pct=5.0, subject_asking=1_000_000, confidence="medium",
+                  status_timeline=tl, enriched_subject=subject, comps=comps,
+                  comp_num_by_key={"R1": 1, "R2": 2}, addr_by_key={"R1": "R1 Comp Ln", "R2": "R2 Comp Ln"},
+                  valuation_trace=trace, qa_ctx={}, mode="buyer", model="claude-sonnet-5", final=final)
+    insp = ("**Driveway:** Budget $15,000 for driveway resurfacing.\n\n"
+            "**Roof & Exterior:** Have the roof's age and remaining service life assessed.")
+    meth = ("The final fair market value is $1,000,000, with a supported valuation range of $950,000-$1,050,000. "
+            "The closest sales support this value.")
+    fin = asyncio.run(_finalize_gate_reconciled_prose(
+        methodology=meth, offer="", inspection=insp, value_drivers=[], external_blocking=[],
+        run_language_polish=False, **common))
+    pre = list(fin["qa_result"]["blocking_errors"])
+    check("6a: the fixture really is export-blocked before the repair (material $ + comp condition claim)",
+          any("material figure $15,000" in b for b in pre) and any("Comp #1" in b and "dated" in b for b in pre), str(pre))
+    data_block = "INSUFFICIENT COMPARABLE EVIDENCE - only 1 verified closed sale(s)."
+    rep = asyncio.run(m._auto_repair_export_blocks(
+        methodology=fin["methodology"], offer=fin["offer"], inspection=fin["inspection"],
+        value_drivers=fin["value_drivers"], offer_fields=fin["offer_fields"], listing_strategy="", listing_prep="",
+        qa_blocking=pre + [data_block], qa_result=fin["qa_result"], **common))
+    check("6b: text findings are repaired and pass the re-run final QA",
+          "$15,000" not in rep["inspection"] and "Roof & Exterior" in rep["inspection"]
+          and "dated" not in (comps[0]["commentary"] or "") and not any("material figure" in b or "dated" in b
+                                                                       for b in rep["qa_blocking"]),
+          f"{rep['inspection']!r} / {comps[0]['commentary']!r} / {rep['qa_blocking']}")
+    check("6c: a valuation-data finding is not a text problem and still gates export",
+          rep["qa_blocking"] == [data_block] and rep["qa_result"]["export_allowed"] is False
+          and rep["qa_result"]["blocking_errors"] == [data_block], str(rep["qa_result"]["blocking_errors"]))
+    check("6d: every repair is agent-visible as auto-corrected",
+          sum(1 for f in rep["qa_flags"] if f.startswith("auto-corrected")) >= 2, str(rep["qa_flags"]))
+    comps[0]["commentary"] = comps[0]["ai_commentary"] = bad_note
+    rep2 = asyncio.run(m._auto_repair_export_blocks(
+        methodology=fin["methodology"], offer=fin["offer"], inspection=fin["inspection"],
+        value_drivers=fin["value_drivers"], offer_fields=fin["offer_fields"], listing_strategy="", listing_prep="",
+        qa_blocking=pre, qa_result=fin["qa_result"], **common))
+    check("6e: with only text findings the repaired report is export-allowed with no remaining blocks",
+          rep2["qa_result"]["export_allowed"] is True and not rep2["qa_blocking"]
+          and not rep2["qa_result"]["blocking_errors"], str(rep2["qa_result"]["blocking_errors"]))
+    crash = asyncio.run(m._auto_repair_export_blocks(
+        methodology=rep2["methodology"], offer=rep2["offer"], inspection=rep2["inspection"],
+        value_drivers=rep2["value_drivers"], offer_fields=rep2["offer_fields"], listing_strategy="", listing_prep="",
+        qa_blocking=[m._FINAL_QA_CRASH_BLOCK], qa_result={"blocking_errors": [m._FINAL_QA_CRASH_BLOCK]}, **common))
+    check("6f: a FINAL OUTPUT QA FAILED marker clears only because the re-run of the final checks completed",
+          crash["qa_result"]["export_allowed"] is True and crash["qa_result"]["auto_repair"]["rerun_completed"],
+          str(crash["qa_result"].get("auto_repair")))
+
+    # ---- 7. seller texts: an unsupported subject-condition sentence is dropped, the position kept ----
+    s_common = {**common, "mode": "seller"}
+    position = "**Pricing Position:** We recommend listing at about $1,000,000, the home's supported market value."
+    ls = position + "\n\n**Competition:** The subject is dated compared with the competition. Buyers here move fast."
+    srep = asyncio.run(m._auto_repair_export_blocks(
+        methodology=meth, offer="", inspection="", value_drivers=[], offer_fields=None, listing_strategy=ls,
+        listing_prep="", qa_blocking=["Pricing strategy: describes the subject as original/unrenovated/dated without "
+                                      "supporting property data."], qa_result={}, seller_position=position, **s_common))
+    check("7: seller pricing strategy is repaired (claim dropped, deterministic position kept, export allowed)",
+          "dated" not in srep["listing_strategy"] and srep["listing_strategy"].startswith("**Pricing Position:**")
+          and "Buyers here move fast" in srep["listing_strategy"] and srep["qa_result"]["export_allowed"] is True,
+          f"{srep['listing_strategy']!r} {srep['qa_blocking']}")
+
+    # ---- 8. a run that completes is never left marked failed by the stale timer ----
+    src = (Path(__file__).resolve().parents[1] / "app" / "services" / "cma_service.py").read_text(encoding="utf-8")
+    from app.services import cma_service as _cs
+    check("8: stale timer covers a worst-case run and a completed run may overwrite a stale 'failed'",
+          _cs._GENERATION_STALE_AFTER_SECONDS >= 1800 and '("generating", "failed") if outcome == "complete"' in src)
+
+
 def main() -> int:
     for fn in (test_a_finished_basement_not_inflating_psf, test_b_location_class_and_weight,
                test_c_condition_reconciliation, test_d_mixed_set_stability,
@@ -3656,7 +3894,8 @@ def main() -> int:
                test_aj_client_facing_road_and_fallback_prose,
                test_ak_cross_section_semantic_consistency,
                test_al_asking_price_check_and_round1_fixes,
-               test_am_round2_false_blocks_and_text, test_an_round3_soften_claims_and_passed_over):
+               test_am_round2_false_blocks_and_text, test_an_round3_soften_claims_and_passed_over,
+               test_ao_reliability_never_fail_and_auto_repair):
         try:
             fn()
         except Exception as exc:  # noqa: BLE001

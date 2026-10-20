@@ -2272,7 +2272,9 @@ _DOLLAR_RE = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?(?![A-Za-z])")
 
 
 def _parse_dollar(num_str: str, suffix: Optional[str]) -> float:
-    val = float(num_str.replace(",", ""))
+    # The capture patterns are `[\d,]+`, so a stray "$," hands this a bare comma - float("") used to
+    # crash the run (reliability 10/20). An unparseable figure reads as 0, which every caller skips.
+    val = _as_float(str(num_str or "").replace(",", "")) or 0.0
     if suffix and suffix.upper() == "M":
         val *= 1_000_000
     elif suffix and suffix.upper() == "K":
@@ -2381,7 +2383,7 @@ def _is_outdoor_improvement(type_label: str, description: str) -> bool:
 def _improvement_size(type_label: str, description: str, explicit_size: str | None = None) -> Optional[str]:
     if _is_outdoor_improvement(type_label, description):
         return None
-    return (explicit_size or "").strip() or _extract_size(description)
+    return _coerce_ai_text(explicit_size).strip() or _extract_size(description)
 
 
 def _split_premium_justification(text: str) -> list[dict]:
@@ -2427,10 +2429,12 @@ def _premium_improvements_from_ai(subject_estimate: dict) -> list[dict]:
     for index, item in enumerate(subject_estimate.get("premium_improvements") or []):
         if not isinstance(item, dict):
             continue
-        description = (item.get("description") or "").strip()
+        # _coerce_ai_text: the model sometimes returns these declared strings as a list/dict, and a
+        # bare .strip() on one crashed the whole run outside any guard (reliability 10/20).
+        description = _coerce_ai_text(item.get("description")).strip()
         if not description:
             continue
-        type_label = (item.get("type") or "").strip()
+        type_label = _coerce_ai_text(item.get("type")).strip()
         if not type_label or type_label.lower() == "ai-identified premium":
             type_label = _infer_improvement_type(description, index)
         rows.append({
@@ -2438,13 +2442,13 @@ def _premium_improvements_from_ai(subject_estimate: dict) -> list[dict]:
             "type": type_label,
             "approx_size": _improvement_size(type_label, description, item.get("approx_size")),
             "description": description,
-            "estimated_value_context": (item.get("estimated_value_context") or "").strip() or "Supports the AI value estimate.",
+            "estimated_value_context": _coerce_ai_text(item.get("estimated_value_context")).strip() or "Supports the AI value estimate.",
             "agent_notes": None,
             "ai_generated": True,
         })
     if rows:
         return rows
-    return _split_premium_justification((subject_estimate.get("premium_justification") or "").strip())
+    return _split_premium_justification(_coerce_ai_text(subject_estimate.get("premium_justification")).strip())
 
 
 def _guidance_sections(text: str) -> list[tuple[str, str]]:
@@ -7822,6 +7826,50 @@ def _reasoning_output_text(payload: dict) -> str:
     return "".join(parts)
 
 
+# Reliability (10/20): the reasoning call is retried instead of failing the whole CMA on one bad
+# response. Up to _REASONING_MAX_RETRIES extra attempts on a rate limit / 5xx / timeout / transport
+# error / an incomplete or unparseable response; a response cut off by max_output_tokens is retried
+# ONCE with a larger budget (x _REASONING_RETRY_TOKEN_MULT - the cost pre-check prices that larger
+# budget, see _run_cma_reasoning_stage). Backoff seconds are module-level so tests can zero them.
+_REASONING_MAX_RETRIES = 2
+_REASONING_RETRY_BACKOFF_S = (2.0, 6.0)
+_REASONING_RETRY_TOKEN_MULT = 1.75
+
+
+class _ReasoningCallError(Exception):
+    """Raised after every reasoning attempt failed; carries the usage summed over the attempts that
+    did return a body, so the caller can still book what was spent."""
+
+    def __init__(self, message: str, usage: Optional[dict] = None):
+        super().__init__(message)
+        self.usage = usage or {}
+
+
+def _reasoning_retryable_status(code: int) -> bool:
+    return code == 429 or code == 408 or 500 <= code < 600
+
+
+async def _reasoning_http_post(payload: dict, api_key: str, timeout_s: float) -> dict:
+    """The one network call of the reasoning stage (tests monkeypatch this - never a real call)."""
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s)) as client:
+        response = await client.post(
+            "https://api.openai.com/v1/responses",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+def _add_usage(total: dict, usage: Optional[dict]) -> dict:
+    for k in ("input_tokens", "output_tokens"):
+        try:
+            total[k] = int(total.get(k) or 0) + int((usage or {}).get(k) or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
 async def _call_cma_reasoning_model(config: dict, evidence_packet: dict) -> tuple[dict, dict]:
     _tm = _tmach.current()
     if _tm is not None and getattr(_tm, "fake_reasoning", None) is not None:
@@ -7830,76 +7878,152 @@ async def _call_cma_reasoning_model(config: dict, evidence_packet: dict) -> tupl
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not configured")
     model = config["cma_reasoning_model"]
+    base_tokens = int(_as_float(config.get("cma_reasoning_max_output_tokens")) or 12000)
+    max_tokens = base_tokens
     payload = {
         "model": model,
         "reasoning": {"effort": config.get("cma_reasoning_effort", "high")},
         "instructions": _CMA_REASONING_SYSTEM_PROMPT,
         "input": json.dumps(evidence_packet, separators=(",", ":"), default=str),
-        "max_output_tokens": config.get("cma_reasoning_max_output_tokens", 6000),
+        "max_output_tokens": max_tokens,
         "store": False,
         "text": {"format": {
             "type": "json_schema", "name": "cma_final_valuation", "strict": True,
             "schema": _CMA_REASONING_SCHEMA,
         }},
     }
-    timeout = httpx.Timeout(float(config.get("cma_reasoning_request_timeout_seconds", 180)))
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            "https://api.openai.com/v1/responses",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=payload,
-        )
-        response.raise_for_status()
-        body = response.json()
-    if body.get("status") != "completed":
-        reason = (body.get("incomplete_details") or {}).get("reason") or body.get("status") or "unknown"
-        raise ValueError(f"reasoning response did not complete ({reason})")
-    raw = _reasoning_output_text(body)
-    if not raw:
-        raise ValueError("reasoning response contained no structured output text")
-    result = json.loads(raw)
-    if not isinstance(result, dict):
-        raise ValueError("reasoning response was not an object")
-    return result, body.get("usage") or {}
+    timeout_s = float(_as_float(config.get("cma_reasoning_request_timeout_seconds")) or 180)
+    usage_total: dict = {}
+    last_error = "unknown"
+    for attempt in range(_REASONING_MAX_RETRIES + 1):
+        if attempt:
+            delay = _REASONING_RETRY_BACKOFF_S[min(attempt - 1, len(_REASONING_RETRY_BACKOFF_S) - 1)]
+            if delay > 0:
+                await asyncio.sleep(delay)
+        payload["max_output_tokens"] = max_tokens
+        try:
+            body = await _reasoning_http_post(payload, api_key, timeout_s)
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code if exc.response is not None else 0
+            last_error = f"HTTP {code}"
+            if _reasoning_retryable_status(code):
+                logger.warning("CMA reasoning call retryable error", extra={"status": code, "attempt": attempt + 1})
+                continue
+            raise _ReasoningCallError(f"reasoning request failed ({last_error})", usage_total) from exc
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_error = type(exc).__name__
+            logger.warning("CMA reasoning call transport error", extra={"error": last_error, "attempt": attempt + 1})
+            continue
+        if not isinstance(body, dict):
+            last_error = "non-object response body"
+            continue
+        _add_usage(usage_total, body.get("usage"))
+        if body.get("status") != "completed":
+            reason = (body.get("incomplete_details") or {}).get("reason") or body.get("status") or "unknown"
+            last_error = f"response did not complete ({reason})"
+            if reason == "max_output_tokens":
+                max_tokens = int(base_tokens * _REASONING_RETRY_TOKEN_MULT)   # raised once, never compounding
+            continue
+        raw = _reasoning_output_text(body)
+        try:
+            result = json.loads(raw) if raw else None
+        except (TypeError, ValueError):
+            result = None
+        if not isinstance(result, dict):
+            last_error = "no parseable structured output"
+            continue
+        return result, usage_total
+    raise _ReasoningCallError(
+        f"reasoning call failed after {_REASONING_MAX_RETRIES + 1} attempts ({last_error})", usage_total,
+    )
+
+
+_REASONING_VALID_ROLES = {
+    "direct_analog", "floor", "ceiling", "inferior_condition", "superior_condition",
+    "new_construction_or_renovation_premium", "bidding_war_or_unusual_demand",
+    "location_adjusted_context", "product_type_mismatch", "misleading_price_per_sqft",
+}
+_REASONING_EVIDENCE_STRENGTHS = {
+    "clearly_market_supported", "directionally_supported_amount_uncertain", "subjective_or_speculative",
+}
+_REASONING_NEUTRAL_SUMMARY = (
+    "This value reflects the closest verified comparable sales, adjusted for this home's own size, "
+    "features and condition, and weighed against how homes like it are selling right now."
+)
+
+
+def _strip_number_sentences(text: str) -> str:
+    """Drop every sentence that carries a dollar figure or a percentage (client summary is number-free)."""
+    kept = [c for c, _s, _e in _sentence_chunks(text or "")
+            if c.strip() and not re.search(r"\$\s*\d|\b\d+(?:\.\d+)?\s*%", c)]
+    return "".join(kept).strip()
 
 
 def _validate_reasoning_valuation(result: dict, evidence_packet: dict) -> tuple[dict, list]:
-    """Validate core shape strictly; return factual QA blockers without changing model values."""
+    """Validate the reasoning output and deterministically REPAIR whatever can be repaired (10/20
+    reliability): a missing preliminary figure copies the final one, a range that is inverted or
+    doesn't bracket the FMV is re-centred on the FMV with its own width, confidence defaults to Low,
+    comp_roles are de-duplicated and completed, malformed / unknown-comp bucket items are dropped,
+    a missing summary or reason is synthesized from the structured fields. Every repair is listed in
+    normalized["_repair_flags"] ("auto-corrected: ..."). Only an output with no usable FMV at all
+    raises ValueError. Returns (normalized, factual QA blockers) - the model's FMV is never moved."""
     if not isinstance(result, dict):
         raise ValueError("reasoning valuation is missing")
     normalized = copy.deepcopy(result)
-    for key in (
-        "independent_preliminary_fmv", "independent_preliminary_range_low",
-        "independent_preliminary_range_high", "final_fmv", "range_low", "range_high",
-    ):
-        if isinstance(normalized.get(key), bool):
-            raise ValueError(f"{key} must be numeric")
-        value = _as_float(normalized.get(key))
-        if value is None or value <= 0:
-            raise ValueError(f"{key} must be a positive number")
-        normalized[key] = round(value)
-    if not (normalized["range_low"] <= normalized["final_fmv"] <= normalized["range_high"]):
-        raise ValueError("reasoning range must bracket final_fmv")
-    if normalized["range_low"] >= normalized["range_high"]:
-        raise ValueError("reasoning range_low must be below range_high")
-    if not (
-        normalized["independent_preliminary_range_low"]
-        <= normalized["independent_preliminary_fmv"]
-        <= normalized["independent_preliminary_range_high"]
-    ):
-        raise ValueError("reasoning independent preliminary range must bracket its FMV")
-    if normalized["independent_preliminary_range_low"] >= normalized["independent_preliminary_range_high"]:
-        raise ValueError("reasoning independent preliminary range low must be below range high")
+    repairs: list[str] = []
+
+    def _num(key):
+        v = normalized.get(key)
+        if isinstance(v, bool):
+            return None
+        v = _as_float(v)
+        return v if (v is not None and v > 0) else None
+
+    fmv = _num("final_fmv")
+    lo, hi = _num("range_low"), _num("range_high")
+    if fmv is None and lo and hi:
+        fmv = (lo + hi) / 2
+        repairs.append("auto-corrected: the valuation pass gave no final value - used the midpoint of its own range.")
+    if fmv is None:
+        fmv = _num("independent_preliminary_fmv")
+        if fmv is not None:
+            repairs.append("auto-corrected: the valuation pass gave no final value - used its own independent preliminary value.")
+    if fmv is None:
+        raise ValueError("final_fmv must be a positive number")
+
+    def _fix_range(center, low, high, label):
+        if low and high and low > high:
+            low, high = high, low
+            repairs.append(f"auto-corrected: the {label} range was inverted - swapped its ends.")
+        if not (low and high) or high - low < 1:
+            low, high = center * 0.95, center * 1.05
+            repairs.append(f"auto-corrected: the {label} range was missing or empty - set to +/-5% around the value.")
+        elif not (low <= center <= high):
+            half = (high - low) / 2
+            low, high = center - half, center + half
+            repairs.append(f"auto-corrected: the {label} range did not contain its value - re-centred on the value, same width.")
+        return round(low), round(high)
+
+    normalized["final_fmv"] = round(fmv)
+    normalized["range_low"], normalized["range_high"] = _fix_range(fmv, lo, hi, "final valuation")
+    pfmv = _num("independent_preliminary_fmv")
+    if pfmv is None:
+        pfmv = fmv
+        repairs.append("auto-corrected: the independent preliminary value was missing - copied the final value for the audit record.")
+    normalized["independent_preliminary_fmv"] = round(pfmv)
+    normalized["independent_preliminary_range_low"], normalized["independent_preliminary_range_high"] = _fix_range(
+        pfmv, _num("independent_preliminary_range_low"), _num("independent_preliminary_range_high"),
+        "independent preliminary",
+    )
     confidence = str(normalized.get("confidence") or "").lower()
     if confidence not in ("low", "medium", "high"):
-        raise ValueError("reasoning confidence must be low, medium, or high")
+        confidence = "low"
+        repairs.append("auto-corrected: the valuation pass gave no valid confidence - shown as Low.")
     normalized["confidence"] = confidence
     preliminary_confidence = str(normalized.get("independent_preliminary_confidence") or "").lower()
     if preliminary_confidence not in ("low", "medium", "high"):
-        raise ValueError("reasoning independent preliminary confidence must be low, medium, or high")
+        preliminary_confidence = confidence
     normalized["independent_preliminary_confidence"] = preliminary_confidence
-    if not str(normalized.get("final_valuation_summary") or "").strip():
-        raise ValueError("reasoning final_valuation_summary is required")
 
     comp_rows = evidence_packet.get("comparables") or []
     comp_ids = {str(c.get("comp_id")) for c in comp_rows if c.get("comp_id")}
@@ -7907,83 +8031,124 @@ def _validate_reasoning_valuation(result: dict, evidence_packet: dict) -> tuple[
     for bucket, expected_role in (("primary_comps", "direct"), ("floor_comps", "floor"), ("ceiling_comps", "ceiling")):
         items = normalized.get(bucket)
         if not isinstance(items, list):
-            raise ValueError(f"reasoning {bucket} must be a list")
+            items = []
+        kept_items = []
         for item in items:
-            if not isinstance(item, dict) or not str(item.get("reason") or "").strip():
-                raise ValueError(f"reasoning {bucket} contains a malformed item")
+            if not isinstance(item, dict) or not str(item.get("comp_id") or "").strip():
+                repairs.append(f"auto-corrected: dropped a malformed {bucket} entry from the valuation pass.")
+                continue
             comp_id = str(item.get("comp_id") or "")
-            if item.get("role") != expected_role:
-                raise ValueError(f"reasoning {bucket} contains an invalid role")
             if comp_id not in comp_ids:
                 blockers.append(
-                    f"Reasoning factual QA: {bucket} references unknown comp_id '{comp_id}'."
+                    f"Reasoning factual QA: {bucket} references unknown comp_id '{comp_id}' (dropped)."
                 )
+                continue
+            item = dict(item)
+            if item.get("role") != expected_role:
+                item["role"] = expected_role
+            if not str(item.get("reason") or "").strip():
+                item["reason"] = {"direct": "One of the closest matches to the subject.",
+                                  "floor": "Sets a reasonable lower bound for the value.",
+                                  "ceiling": "Sets a reasonable upper bound for the value."}[expected_role]
+            kept_items.append(item)
+        normalized[bucket] = kept_items
+
     role_items = normalized.get("comp_roles")
     if not isinstance(role_items, list):
-        raise ValueError("reasoning comp_roles must be a list")
-    role_ids: list[str] = []
-    valid_roles = {
-        "direct_analog", "floor", "ceiling", "inferior_condition", "superior_condition",
-        "new_construction_or_renovation_premium", "bidding_war_or_unusual_demand",
-        "location_adjusted_context", "product_type_mismatch", "misleading_price_per_sqft",
-    }
+        role_items = []
+    roles_out: list[dict] = []
+    seen_roles: set[str] = set()
     for item in role_items:
-        if not isinstance(item, dict) or item.get("role") not in valid_roles \
-           or not str(item.get("reason") or "").strip():
-            raise ValueError("reasoning comp_roles contains a malformed item")
-        role_ids.append(str(item.get("comp_id") or ""))
-    if len(role_ids) != len(set(role_ids)):
-        raise ValueError("reasoning comp_roles must classify each comparable exactly once")
-    if set(role_ids) != comp_ids:
-        missing = sorted(comp_ids - set(role_ids))
-        unknown = sorted(set(role_ids) - comp_ids)
-        raise ValueError(
-            "reasoning comp_roles must classify every supplied comparable exactly once "
-            f"(missing={missing}, unknown={unknown})"
-        )
-    evidence_strengths = {
-        "clearly_market_supported", "directionally_supported_amount_uncertain",
-        "subjective_or_speculative",
-    }
-    for bucket, directions in (("major_value_drivers", {"up", "neutral"}),
-                               ("major_value_drags", {"down", "neutral"})):
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("comp_id") or "")
+        if cid not in comp_ids:
+            if cid:
+                repairs.append(f"auto-corrected: dropped a comp role for an unknown comparable ('{cid}').")
+            continue
+        if cid in seen_roles:
+            repairs.append(f"auto-corrected: a comparable was classified twice by the valuation pass - kept the first ('{cid}').")
+            continue
+        item = dict(item)
+        if item.get("role") not in _REASONING_VALID_ROLES:
+            item["role"] = "location_adjusted_context"
+        if not str(item.get("reason") or "").strip():
+            item["reason"] = "Used as market context."
+        seen_roles.add(cid)
+        roles_out.append(item)
+    for cid in sorted(comp_ids - seen_roles):
+        roles_out.append({"comp_id": cid, "role": "location_adjusted_context",
+                          "reason": "Not individually classified by the valuation pass; treated as market context."})
+        repairs.append(f"auto-corrected: comparable '{cid}' was not classified by the valuation pass - recorded as market context.")
+    normalized["comp_roles"] = roles_out
+
+    for bucket, directions, default_dir in (("major_value_drivers", {"up", "neutral"}, "up"),
+                                            ("major_value_drags", {"down", "neutral"}, "down")):
         items = normalized.get(bucket)
         if not isinstance(items, list):
-            raise ValueError(f"reasoning {bucket} must be a list")
+            items = []
+        kept_items = []
         for item in items:
             if not isinstance(item, dict) or not str(item.get("factor") or "").strip() \
-               or not str(item.get("reason") or "").strip() or item.get("direction") not in directions \
-               or item.get("evidence_strength") not in evidence_strengths:
-                raise ValueError(f"reasoning {bucket} contains a malformed item")
+               or not str(item.get("reason") or "").strip():
+                repairs.append(f"auto-corrected: dropped a malformed {bucket} entry from the valuation pass.")
+                continue
+            item = dict(item)
+            if item.get("direction") not in directions:
+                item["direction"] = default_dir
+            if item.get("evidence_strength") not in _REASONING_EVIDENCE_STRENGTHS:
+                item["evidence_strength"] = "directionally_supported_amount_uncertain"
+            kept_items.append(item)
+        normalized[bucket] = kept_items
+
+    _benchmarks = {
+        "anchor_assessment": _as_float((evidence_packet.get("deterministic_evidence") or {}).get("deterministic_anchor")),
+        "v10_assessment": _as_float((evidence_packet.get("deterministic_evidence") or {}).get("old_v10_final_fmv")),
+    }
+    for bucket, bench in _benchmarks.items():
+        item = normalized.get(bucket)
+        if not isinstance(item, dict) or item.get("classification") not in ("too_low", "reasonable", "too_high") \
+           or not str(item.get("reason") or "").strip():
+            cls = ("too_low" if bench and bench < fmv * 0.97 else "too_high" if bench and bench > fmv * 1.03
+                   else "reasonable")
+            normalized[bucket] = {"classification": cls,
+                                  "reason": "Classified from the final value versus this benchmark (not provided by the valuation pass)."}
+            repairs.append(f"auto-corrected: the valuation pass's {bucket.replace('_', ' ')} was malformed - rebuilt from the numbers.")
+
+    # Client prose is deliberately number-free here; the application prepends the exact locked
+    # FMV/range after validation. This makes a stale anchor/V10/list value impossible to smuggle
+    # into the client paragraph before the existing final-string QA runs. A generated $/% sentence
+    # is dropped; an empty summary is rebuilt from the structured reasoning (still number-free).
+    client_summary = _coerce_ai_text(normalized.get("final_valuation_summary")).strip()
+    if re.search(r"\$\s*\d|\b\d+(?:\.\d+)?\s*%", client_summary):
+        client_summary = _strip_number_sentences(client_summary)
+        repairs.append("auto-corrected: removed a dollar/percentage sentence from the valuation summary "
+                       "(the report's own final numbers are stated instead).")
+    if not client_summary:
+        for src in ("why_final_differs_from_anchor", "market_exposure_assessment"):
+            client_summary = _strip_number_sentences(_coerce_ai_text(normalized.get(src)))
+            if client_summary:
+                break
+        if not client_summary:
+            client_summary = _REASONING_NEUTRAL_SUMMARY
+        repairs.append("auto-corrected: the valuation summary was missing - rebuilt from the valuation pass's own reasoning.")
+    normalized["final_valuation_summary"] = client_summary
 
     narrative = " ".join(str(normalized.get(k) or "") for k in (
         "market_exposure_assessment", "why_final_differs_from_anchor",
         "why_final_differs_from_v10", "final_valuation_summary",
     ))
     for bucket in ("anchor_assessment", "v10_assessment"):
-        item = normalized.get(bucket)
-        if not isinstance(item, dict) or item.get("classification") not in ("too_low", "reasonable", "too_high") \
-           or not str(item.get("reason") or "").strip():
-            raise ValueError(f"reasoning {bucket} is malformed")
-        narrative += " " + str(item.get("reason") or "")
+        narrative += " " + str((normalized.get(bucket) or {}).get("reason") or "")
     for bucket in (
         "primary_comps", "floor_comps", "ceiling_comps", "comp_roles",
         "major_value_drivers", "major_value_drags",
     ):
         narrative += " " + " ".join(str(x.get("reason") or "") for x in normalized.get(bucket) or [] if isinstance(x, dict))
-
-    # Client prose is deliberately number-free here; the application prepends the exact locked
-    # FMV/range after validation. This makes a stale anchor/V10/list value impossible to smuggle
-    # into the client paragraph before the existing final-string QA runs.
-    client_summary = str(normalized.get("final_valuation_summary") or "")
-    if re.search(r"\$\s*\d|\b\d+(?:\.\d+)?\s*%", client_summary):
-        blockers.append(
-            "Reasoning factual QA: final_valuation_summary contains a generated dollar or percentage; "
-            "client valuation numbers must be injected from the authoritative final object."
-        )
+    normalized["_repair_flags"] = list(dict.fromkeys(repairs))
 
     known_dollars = {
-        round(float(v)) for v in (
+        round(_as_float(v)) for v in (
             normalized["final_fmv"], normalized["range_low"], normalized["range_high"],
             normalized["independent_preliminary_fmv"],
             normalized["independent_preliminary_range_low"],
@@ -8008,23 +8173,25 @@ def _validate_reasoning_valuation(result: dict, evidence_packet: dict) -> tuple[
     for comp in comp_rows:
         for key in ("sale_price", "list_price", "size_adjusted_value"):
             if _as_float(comp.get(key)):
-                known_dollars.add(round(float(comp[key])))
+                known_dollars.add(round(_as_float(comp[key])))
     # the asking-price check is in the packet, so the valuation pass may cite its figures
     for key in ("asking_price", "expected_sale_price", "allowed_low", "allowed_high"):
         if _as_float((evidence_packet.get("asking_price_check") or {}).get(key)):
-            known_dollars.add(round(float(evidence_packet["asking_price_check"][key])))
+            known_dollars.add(round(_as_float(evidence_packet["asking_price_check"][key])))
     for adjustment in (evidence_packet.get("deterministic_evidence") or {}).get(
         "structured_qualitative_adjustments"
     ) or []:
         for key in ("applied", "amount", "amount_low", "amount_high"):
             if _as_float(adjustment.get(key)):
-                known_dollars.add(round(abs(float(adjustment[key]))))
+                known_dollars.add(round(abs(_as_float(adjustment[key]))))
 
     # Unlike the older generic number scanner, require an actual dollar sign here. Bare numeric
     # MLS/listing IDs are identifiers, not unsupported prices.
     cited_dollars = []
     for match in re.finditer(r"\$\s*([\d,]+(?:\.\d+)?)\s*([mMkK])?(?![A-Za-z])", narrative):
-        fig = float(match.group(1).replace(",", ""))
+        fig = _as_float(match.group(1))   # "$," would crash a bare float()
+        if fig is None:
+            continue
         suffix = (match.group(2) or "").lower()
         if suffix == "m":
             fig *= 1_000_000
@@ -8038,7 +8205,7 @@ def _validate_reasoning_valuation(result: dict, evidence_packet: dict) -> tuple[
             )
 
     known_psf = {
-        round(float(comp["normalized_price_per_sqft"]), 1) for comp in comp_rows
+        round(_as_float(comp["normalized_price_per_sqft"]), 1) for comp in comp_rows
         if _as_float(comp.get("normalized_price_per_sqft"))
     }
     for match in re.finditer(
@@ -8052,7 +8219,7 @@ def _validate_reasoning_valuation(result: dict, evidence_packet: dict) -> tuple[
             )
 
     known_dom = {
-        round(float(v)) for v in (
+        round(_as_float(v)) for v in (
             (evidence_packet.get("subject") or {}).get("dom"),
             (evidence_packet.get("subject") or {}).get("cdom"),
             (evidence_packet.get("deterministic_evidence") or {}).get("comp_set_median_dom"),
@@ -8908,6 +9075,53 @@ _RENOVATED_POLE_WORDS_RE = (
     r"more\s+livable)\b"
 )
 
+_UPDATED_SYSTEMS_RE = re.compile(r"\bupdated\s+(?:home\s+)?systems?\b", re.IGNORECASE)
+_UPDATED_SYSTEMS_HEDGE_RE = re.compile(
+    r"\b(?:verif\w*|confirm\w*|whether|if|any|ask\w*|request\w*|records?|unverified|undocumented|"
+    r"not\s+documented|no\s+documentation|unknown|unconfirmed)\b", re.IGNORECASE,
+)
+_COMP_MENTION_RE = re.compile(r"\bcomp(?:arable)?s?\b(?:\s*#?\s*\d+)?|\bcomparables?\b", re.IGNORECASE)
+
+
+def _subject_updated_systems_claim(text: str, subj_ref: str) -> bool:
+    """Reliability fix (10/20, was over-broad): non-comp prose ASSERTS the subject has updated systems.
+    The old pattern's subject prefix was optional, so any 'updated systems' anywhere blocked - even
+    'request records for any updated systems' or 'the comps have updated systems'. Now: a phrase
+    hedged in its own sentence (verify / confirm / whether / any / records ...) never counts; one in a
+    sentence about comps counts only with an explicit subject reference right before it."""
+    for m in _UPDATED_SYSTEMS_RE.finditer(text or ""):
+        sent_start = max(text.rfind(".", 0, m.start()), text.rfind(";", 0, m.start()),
+                         text.rfind("\n", 0, m.start())) + 1
+        sent_end_m = re.search(r"[.;\n]", text[m.end():])
+        sentence = text[sent_start:m.end() + (sent_end_m.start() if sent_end_m else len(text) - m.end())]
+        before = text[sent_start:m.start()]
+        if _UPDATED_SYSTEMS_HEDGE_RE.search(before):
+            continue
+        explicit = re.search(
+            rf"(?:\bthe\s+{subj_ref}|\b{subj_ref}|\bthis\s+home(?:'s|’s)?)(?:\s+(?:has|offers|features|with))?\s*$",
+            before, re.IGNORECASE,
+        )
+        if explicit:
+            return True
+        if _COMP_MENTION_RE.search(sentence):
+            continue
+        return True
+    return False
+
+
+def _soften_updated_systems_claims(text: Optional[str], subject: Optional[dict]) -> tuple[Optional[str], list[str]]:
+    """Deterministic repair for the claim _subject_updated_systems_claim detects: the undocumented
+    'updated systems' becomes 'systems (update history to be verified)'. Leaves the text untouched when
+    the subject's record does document a system update."""
+    if not text or _documented_system_updates(subject or {}):
+        return text, []
+    subj_ref = _subject_reference_pattern(subject)
+    if not _subject_updated_systems_claim(text, subj_ref):
+        return text, []
+    new = _UPDATED_SYSTEMS_RE.sub("systems (update history to be verified)", text)
+    return new, ["auto-corrected: an undocumented 'updated systems' claim about the subject was "
+                 "rewritten as 'systems (update history to be verified)'."]
+
 
 def _factual_prose_blocking(
     text: str, label: str, subject: dict, *, comp_note: bool = False, comp: Optional[dict] = None,
@@ -8937,10 +9151,7 @@ def _factual_prose_blocking(
             re.search(
                 rf"{_subj_ref}(?:\s+(?:has|offers))?\s+updated\s+systems?",
                 text, re.IGNORECASE,
-            ) if comp_note else re.search(
-                rf"\b(?:its|the\s+{_subj_ref}|this\s+home(?:'s|\u2019s)?)?\s*"
-                r"updated\s+(?:home\s+)?systems?\b", text, re.IGNORECASE,
-            )
+            ) if comp_note else _subject_updated_systems_claim(text, _subj_ref)
         )
         if unsupported_update:
             blocking.append(f"{label}: describes the subject's systems as updated without documented support.")
@@ -9300,19 +9511,70 @@ def _authoritative_range(value: float, range_pct: float, trace: Optional[dict] =
     return round(value * (1 - range_pct / 100)), round(value * (1 + range_pct / 100))
 
 
-async def _run_cma_reasoning_stage(
-    db: AsyncSession, owner_id: str, plan_tier: str, config: dict, evidence_packet: dict,
-    report_id: str,
-) -> tuple[dict, list, float, dict]:
-    """Meter, call, validate, and audit one final reasoning pass."""
-    reservation = await reserve_cma_reasoning(db, owner_id, config, plan_tier)
+def _v10_fallback_reasoning(fallback: dict, evidence_packet: dict, why: str) -> dict:
+    """Last-resort reasoning output when the valuation pass can't produce a usable result after its
+    retries: the deterministic V10 benchmark FMV/range, confidence Low, shaped exactly like a
+    validated reasoning result so every downstream stage runs unchanged. The agent sees why in
+    qa_flags; the client summary stays plain and number-free."""
+    fmv = round(float(fallback["fmv"]))
+    pct = _as_float(fallback.get("range_pct")) or 8.0
+    pct = max(pct, 5.0)
+    low, high = round(fmv * (1 - pct / 100)), round(fmv * (1 + pct / 100))
+    comp_ids = [str(c.get("comp_id")) for c in (evidence_packet.get("comparables") or []) if c.get("comp_id")]
+    return {
+        "independent_preliminary_fmv": fmv, "independent_preliminary_range_low": low,
+        "independent_preliminary_range_high": high, "independent_preliminary_confidence": "low",
+        "final_fmv": fmv, "range_low": low, "range_high": high, "confidence": "low",
+        "anchor_assessment": {"classification": "reasonable", "reason": "Deterministic benchmark used as the final value."},
+        "v10_assessment": {"classification": "reasonable", "reason": "Deterministic benchmark used as the final value."},
+        "primary_comps": [], "floor_comps": [], "ceiling_comps": [],
+        "comp_roles": [{"comp_id": cid, "role": "location_adjusted_context",
+                        "reason": "Weighted by the deterministic comparable-sales benchmark."} for cid in dict.fromkeys(comp_ids)],
+        "major_value_drivers": [], "major_value_drags": [],
+        "market_exposure_assessment": "", "why_final_differs_from_anchor": "", "why_final_differs_from_v10": "",
+        "final_valuation_summary": _REASONING_NEUTRAL_SUMMARY,
+        "fallback_to_v10": True,
+        "_repair_flags": [
+            f"auto-corrected: the final valuation pass could not produce a usable result ({why}) - the value "
+            "shown is the deterministic comparable-sales benchmark, confidence set to Low. Review it, or "
+            "re-run the analysis later for the full valuation read."
+        ],
+    }
+
+
+def _reasoning_projected_cost(config: dict, evidence_packet: dict) -> tuple[float, float]:
+    """Worst single-call cost of the reasoning pass (its output budget after the one allowed raise)
+    vs. the configured per-generation limit."""
     model = config["cma_reasoning_model"]
     projected_input = max(1, len(json.dumps(evidence_packet, default=str)) // 4)
-    projected_output = int(config.get("cma_reasoning_max_output_tokens", 6000))
+    base_out = int(_as_float(config.get("cma_reasoning_max_output_tokens")) or 12000)
+    projected_output = int(base_out * _REASONING_RETRY_TOKEN_MULT)
     projected_cost = ai_config_service.estimate_cost_usd(config, model, projected_input, projected_output)
-    max_cost = float(config.get("cma_reasoning_max_cost_per_generation_usd", 1.0))
+    max_cost = float(_as_float(config.get("cma_reasoning_max_cost_per_generation_usd")) or 1.6)
+    return projected_cost, max_cost
+
+
+async def _run_cma_reasoning_stage(
+    db: AsyncSession, owner_id: str, plan_tier: str, config: dict, evidence_packet: dict,
+    report_id: str, *, fallback: Optional[dict] = None, reservation=None,
+) -> tuple[dict, list, float, dict]:
+    """Meter, call (with retries), validate/repair, and audit one final reasoning pass.
+
+    `reservation` is the reasoning budget reserved up front by the caller (before any paid call);
+    reserved here only if absent. `fallback` ({fmv, range_pct}, the V10 benchmark): when given, a
+    reasoning pass that still fails after its retries - or can't run within its cost limit - returns
+    a Low-confidence benchmark result (see _v10_fallback_reasoning) instead of failing the CMA."""
+    if reservation is None:
+        reservation = await reserve_cma_reasoning(db, owner_id, config, plan_tier)
+    model = config["cma_reasoning_model"]
+    _fallback_ok = bool(fallback and (_as_float(fallback.get("fmv")) or 0) > 0)
+    projected_cost, max_cost = _reasoning_projected_cost(config, evidence_packet)
     if projected_cost > max_cost:
         await reconcile_budget(db, reservation, 0.0)
+        if _fallback_ok:
+            logger.warning("CMA reasoning pass over its cost limit - V10 fallback",
+                           extra={"report_id": report_id, "projected_cost": projected_cost, "max_cost": max_cost})
+            return _v10_fallback_reasoning(fallback, evidence_packet, f"over its ${max_cost:.2f} cost limit"), [], 0.0, {}
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             f"The final valuation reasoning pass would exceed its ${max_cost:.2f} per-CMA limit.",
@@ -9321,12 +9583,13 @@ async def _run_cma_reasoning_stage(
     usage: dict = {}
     try:
         raw, usage = await _call_cma_reasoning_model(config, evidence_packet)
-        input_tokens = int(usage.get("input_tokens") or 0)
-        output_tokens = int(usage.get("output_tokens") or 0)
+        input_tokens = int(_as_float(usage.get("input_tokens")) or 0)
+        output_tokens = int(_as_float(usage.get("output_tokens")) or 0)
         cost = ai_config_service.estimate_cost_usd(config, model, input_tokens, output_tokens)
         reasoning, blockers = _validate_reasoning_valuation(raw, evidence_packet)
         reasoning, guard_flags = _apply_asking_price_check(reasoning, evidence_packet)
-        reasoning["_guard_flags"] = guard_flags   # the callers move these into qa_flags
+        # the callers move these into qa_flags; the validator's own repairs go first
+        reasoning["_guard_flags"] = list(reasoning.pop("_repair_flags", None) or []) + list(guard_flags)
         await record_usage_event(
             db, owner_id, None, model, input_tokens, output_tokens,
             cost, 0, False, None, event_type="cma_reasoning",
@@ -9337,9 +9600,11 @@ async def _run_cma_reasoning_stage(
         await reconcile_budget(db, reservation, cost)
         raise
     except Exception as exc:
-        input_tokens = int(usage.get("input_tokens") or 0)
-        output_tokens = int(usage.get("output_tokens") or 0)
+        usage = getattr(exc, "usage", None) or usage or {}
+        input_tokens = int(_as_float(usage.get("input_tokens")) or 0)
+        output_tokens = int(_as_float(usage.get("output_tokens")) or 0)
         if usage:
+            cost = ai_config_service.estimate_cost_usd(config, model, input_tokens, output_tokens)
             await record_usage_event(
                 db, owner_id, None, model, input_tokens, output_tokens,
                 cost, 0, False, None, event_type="cma_reasoning",
@@ -9358,9 +9623,14 @@ async def _run_cma_reasoning_stage(
             "CMA final reasoning pass failed",
             extra={"report_id": report_id, "model": model, "error": str(exc), "error_type": type(exc).__name__},
         )
+        if _fallback_ok:
+            reasoning = _v10_fallback_reasoning(fallback, evidence_packet, f"{type(exc).__name__}: {str(exc)[:160]}")
+            reasoning, guard_flags = _apply_asking_price_check(reasoning, evidence_packet)
+            reasoning["_guard_flags"] = list(reasoning.pop("_repair_flags", None) or []) + list(guard_flags)
+            return reasoning, [], cost, usage
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
-            "The final valuation reasoning pass did not return a valid result. No fallback value was substituted.",
+            "The final valuation reasoning pass did not return a valid result.",
         ) from exc
 
 
@@ -9634,7 +9904,8 @@ def _soften_unsupported_system_claims(text: Optional[str], subject: Optional[dic
         cur = re.sub(r"[ \t]{2,}", " ", cur)
         notes.append(f"auto-corrected: \"{hit.group(0).strip()}\" isn't documented in the listing - "
                      f"rewritten as a to-verify item.")
-    return cur, notes
+    cur, more = _soften_updated_systems_claims(cur, subject)
+    return cur, notes + more
 
 
 def _v10_pre_export_qa(
@@ -11972,13 +12243,36 @@ def _v10_psf_denominator_check(fields: dict, anchor_comps: list) -> list:
     return blocking
 
 
+def _client_known_dollars(final: Optional[dict], subject_asking, offer_fields: Optional[dict],
+                          comps: Optional[list]) -> list[float]:
+    """Every dollar figure the client artifact may legitimately quote: the final FMV/range, the list
+    price, the deterministic offer fields, and each included comp's own sale/close/list prices. Fed to
+    EVERY _v10_final_report_qa pass (reliability 10/20 - two of the three passes used to run without
+    it, so a correct comp price could still block export through the earlier pass)."""
+    out: list[float] = []
+    for number in ((final or {}).get("value"), (final or {}).get("range_min"),
+                   (final or {}).get("range_max"), subject_asking):
+        if _as_float(number) is not None:
+            out.append(_as_float(number))
+    for number in (offer_fields or {}).values():
+        if not isinstance(number, bool) and isinstance(number, (int, float)):
+            out.append(float(number))
+    for comp in comps or []:
+        if not isinstance(comp, dict) or not comp.get("is_included", True):
+            continue
+        for key in ("sale_price", "close_price", "list_price", "original_list_price"):
+            if _as_float(comp.get(key)) is not None:
+                out.append(_as_float(comp.get(key)))
+    return out
+
+
 async def _finalize_gate_reconciled_prose(
     *, methodology: str, offer: str, inspection: str, value: float, range_pct: float,
     subject_asking: Optional[float], confidence: Optional[str], status_timeline: dict,
     enriched_subject: dict, comps: list, comp_num_by_key: dict, addr_by_key: dict,
     valuation_trace: Optional[dict], value_drivers: Optional[list], qa_ctx: dict, mode: str, model: str,
     final: Optional[dict] = None, external_blocking: Optional[list] = None,
-    run_language_polish: bool = True,
+    run_language_polish: bool = True, allow_ai_rewrite: bool = True,
 ) -> dict:
     """The shared tail of generate_ai_analysis / recompute_valuation - the LAST pipeline stage
     before the report payload is assembled (issue #6 ordering). In order:
@@ -12042,7 +12336,10 @@ async def _finalize_gate_reconciled_prose(
         b_local: list = []
         _flds = {"m": ("Methodology summary", m_txt), "o": ("Offer strategy", o_txt),
                  "i": ("Inspection concerns", i_txt), "vd": ("Why this number", _vd_text(vds))}
-        _qf, _qb = _v10_final_report_qa(_flds, value, range_pct, valuation_trace or {})
+        _qf, _qb = _v10_final_report_qa(
+            _flds, value, range_pct, valuation_trace or {},
+            known_dollars=_client_known_dollars(_final, subject_asking, None, comps),
+        )
         f_local += _qf
         b_local += _qb
         qa_result, corrected, block2 = _v10_pre_export_qa(
@@ -12161,7 +12458,7 @@ async def _finalize_gate_reconciled_prose(
     )
     _gate_related = [b for b in b1 if any(t in b.lower() for t in
                      ("directional math", "fmv range consistency", "fmv consistency", "value-driver"))]
-    if (_gate_fired and _gate_related) or (_offer_stale_block and not _reasoning_authority):
+    if allow_ai_rewrite and ((_gate_fired and _gate_related) or (_offer_stale_block and not _reasoning_authority)):
         new_m, new_o, _rw_flags = await _targeted_gate_rewrite(
             methodology, offer, value=value, range_pct=range_pct, anchor=anchor,
             trace=valuation_trace, mode=mode, model=model,
@@ -12308,6 +12605,7 @@ async def _finalize_gate_reconciled_prose(
             {"m": ("Methodology summary", methodology), "o": ("Offer strategy", offer),
              "i": ("Inspection concerns", inspection), "vd": ("Why this number", _vd_text(value_drivers))},
             value, range_pct, valuation_trace or {},
+            known_dollars=_client_known_dollars(_final, subject_asking, None, comps),
         )
         _pqa, _pcorr, _pb2 = _v10_pre_export_qa(
             {"m": ("Methodology summary", methodology), "o": ("Offer strategy", offer),
@@ -12435,6 +12733,466 @@ async def _finalize_gate_reconciled_prose(
         "value_drivers": value_drivers, "qa_result": qa_result,
         "qa_flags": flags, "qa_blocking": blocking,
     }
+
+
+
+
+# ============================================================================================
+# FINAL AUTO-REPAIR (reliability 10/20). Every remaining blocking finding about client TEXT is
+# repaired - fix the words, drop the offending sentence, or rebuild the section from a deterministic
+# builder - and a finding only stops blocking once the deterministic final QA, re-run on the repaired
+# text, no longer reports it. Every repair is listed in qa_flags as "auto-corrected: ...". Findings
+# about the valuation DATA (below) are not text problems and are carried through unchanged.
+# Runs once at the choke point after _v10_sync_qa_authority (generate + recompute), loops at most
+# _AUTO_REPAIR_MAX_ROUNDS times, and re-runs the deterministic final QA (_finalize_gate_reconciled_
+# prose with run_language_polish=False / allow_ai_rewrite=False - no model call) after each round.
+# ============================================================================================
+_AUTO_REPAIR_MAX_ROUNDS = 3
+
+# Findings about the valuation DATA (thin comp set, benchmark-only checks, the reasoning pass's own
+# audit narrative, structural range checks, agent-only adjustment text) - no client sentence to
+# repair, so the text repair leaves them as they are. FINAL OUTPUT QA FAILED is cleared only when a
+# re-run of the final checks actually completes.
+_DEMOTE_BLOCK_RE = re.compile(
+    r"INSUFFICIENT COMPARABLE EVIDENCE|ANCHOR VALIDITY WEAK|VALUATION FELL BACK|RECONCILIATION -|"
+    r"FINAL OUTPUT QA FAILED|^Reasoning factual QA:|^Confidence range|^Recommended range|"
+    r"^Suggested offer range|^Displayed stats:|^Qualitative adjustment \(|^Structured adjustment QA:|"
+    r"^Offer strategy: (?:deterministic offer fields|structured|opening offer, strong offer)",
+    re.IGNORECASE,
+)
+_FIELD_PREFIXES = (
+    ("Methodology summary", "m"), ("Offer strategy", "o"), ("Inspection concerns", "i"),
+    ("Why this number", "vd"), ("Pricing strategy", "ls"), ("Listing prep", "lp"),
+)
+_FIELD_LABELS = {k: lbl for lbl, k in _FIELD_PREFIXES}
+
+
+def _drop_sentences(text: str, should_drop) -> tuple[str, list[str]]:
+    """Remove every sentence chunk `should_drop(chunk)` flags, keeping paragraph breaks and dropping a
+    '**Header:**' left with no body. Returns (new_text, dropped_sentences)."""
+    if not text:
+        return text, []
+    out, dropped = [], []
+    for chunk, _s, _e in _sentence_chunks(text):
+        body = chunk.strip()
+        if body and should_drop(body):
+            dropped.append(body)
+            trail = re.search(r"\s*$", chunk).group(0)
+            if "\n" in trail:
+                out.append("\n\n")
+            continue
+        out.append(chunk)
+    new = "".join(out)
+    new = re.sub(r"(?m)^\s*\*\*[^*\n]{1,60}:?\*\*\s*$", "", new)      # orphaned "**Header:**"
+    new = re.sub(r"\n{3,}", "\n\n", new).strip()
+    return new, dropped
+
+
+def _fix_subject_condition_words(text: str, subject: dict) -> str:
+    """Deterministic word-level fix for an undocumented subject-condition claim (either pole): the
+    exact spans _factual_prose_blocking attributes to the subject become 'condition-unverified'."""
+    if not text:
+        return text
+    subj_ref = _subject_reference_pattern(subject)
+    out = text
+    if not _documented_condition_deficit(subject):
+        out = _replace_spans(out, _condition_claim_spans(out, subj_ref, _DEFICIT_POLE_WORDS_RE), _CONDITION_PHRASE_REPLACEMENT)
+    if not _documented_condition_renovated(subject):
+        out = _replace_spans(out, _condition_claim_spans(out, subj_ref, _RENOVATED_POLE_WORDS_RE), _CONDITION_PHRASE_REPLACEMENT)
+    return out
+
+
+def _deterministic_text_fixes(text: str, label: str, subject: dict) -> str:
+    """The word-level repairs every QA family already has a deterministic version of."""
+    if not text:
+        return text
+    t, _ = _soften_unsupported_system_claims(text, subject)
+    t, _ = _reconcile_original_systems_claim(t, label, subject)
+    t, _ = _reconcile_age_condition_inference(t, label, subject)
+    return _fix_subject_condition_words(t, subject)
+
+
+def _block_field(msg: str, comp_labels: dict) -> str:
+    """Which client field a blocking message is about: m/o/i/vd/ls/lp, 'comp:<idx>', 'xsec', or 'any'."""
+    s = str(msg)
+    for prefix, key in _FIELD_PREFIXES:
+        if s.startswith(prefix):
+            return key
+    for idx, lbl in comp_labels.items():
+        if s.startswith(lbl):
+            return f"comp:{idx}"
+    if s.startswith("Cross-section consistency:"):
+        return "xsec"
+    return "any"
+
+
+async def _auto_repair_export_blocks(
+    *, methodology: str, offer: str, inspection: str, value_drivers: Optional[list],
+    offer_fields: Optional[dict], listing_strategy: str, listing_prep: str,
+    qa_blocking: list, qa_result: Optional[dict], value: float, range_pct: float,
+    subject_asking: Optional[float], confidence: Optional[str], status_timeline: dict,
+    enriched_subject: dict, comps: list, comp_num_by_key: dict, addr_by_key: dict,
+    valuation_trace: Optional[dict], qa_ctx: dict, mode: str, model: str, final: Optional[dict],
+    seller_position: Optional[str] = None, evidence_by_key: Optional[dict] = None,
+    max_rounds: int = _AUTO_REPAIR_MAX_ROUNDS,
+) -> dict:
+    subject = enriched_subject or {}
+    tl = status_timeline or {}
+    trace = valuation_trace or {}
+    texts = {"m": methodology or "", "o": offer or "", "i": inspection or "",
+             "ls": listing_strategy or "", "lp": listing_prep or ""}
+    vds = [dict(d) for d in (value_drivers or []) if isinstance(d, dict)]
+    flags: list[str] = []
+    demoted: list[str] = []
+    qa_result = dict(qa_result or {})
+    lead = (f"The final fair market value is ${value:,.0f}, with a supported valuation range of "
+            f"${_as_float((final or {}).get('range_min')) or value * (1 - range_pct / 100):,.0f}-"
+            f"${_as_float((final or {}).get('range_max')) or value * (1 + range_pct / 100):,.0f}.") if value else ""
+
+    def comp_labels() -> dict:
+        return {i: _comp_label(i, c) for i, c in enumerate(comps or []) if c.get("is_included", True)}
+
+    def known() -> list:
+        return _client_known_dollars(final, subject_asking, offer_fields, comps)
+
+    def field_blocks(key: str, text: str) -> list[str]:
+        """Every client-text check, run on one field (or one sentence of it)."""
+        if not text or not text.strip():
+            return []
+        label = _FIELD_LABELS.get(key, "Text")
+        flds = {key: (label, text)}
+        out: list[str] = []
+        if key in ("ls", "lp"):
+            _g, _gf, gb = _final_consistency_gate(flds, subject=subject, comps=comps, value=value,
+                                                  status_timeline=tl, comp_num_by_key=comp_num_by_key,
+                                                  addr_by_key=addr_by_key)
+            out += gb
+            if key == "ls":
+                out += _factual_prose_blocking(text, label, subject)
+            return out
+        if key != "vd":
+            _g, _gf, gb = _final_consistency_gate(flds, subject=subject, comps=comps, value=value,
+                                                  status_timeline=tl, comp_num_by_key=comp_num_by_key,
+                                                  addr_by_key=addr_by_key)
+            out += gb
+            out += _factual_prose_blocking(text, label, subject)
+        out += _v10_final_report_qa(flds, value, range_pct, trace, known_dollars=known())[1]
+        out += _v10_pre_export_qa(
+            flds, value=value, range_pct=range_pct, subject_asking=subject_asking, status_timeline=tl,
+            comps=comps, comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key,
+            valuation_trace=trace, value_drivers=[], confidence=confidence, subject=subject,
+        )[2]
+        if final:
+            out += _v10_scan_concluded_numbers(flds, final=final)[1]
+            if key in ("m", "vd"):
+                out += _v10_methodology_consistency_check(flds, final)[1]
+        out += _v10_psf_denominator_check(flds, (trace.get("anchor") or {}).get("comps") or [])
+        out += _v10_directional_adjustment_backing_check(flds, trace)
+        if key == "o":
+            out += _v10_offer_final_valuation_check(text, final, trace)
+        return out
+
+    def comp_blocks(idx: int, text: str) -> list[str]:
+        if not text or not text.strip():
+            return []
+        comp = comps[idx]
+        label = _comp_label(idx, comp)
+        out = _factual_prose_blocking(text, label, subject, comp_note=True, comp=comp)
+        out += _v10_final_report_qa({"c": (label, text)}, value, range_pct, trace, known_dollars=known())[1]
+        return out
+
+    def recheck_external() -> list[str]:
+        """Blocks the finalize re-run doesn't own: seller texts, both comp-note fields, and the
+        directional/status gate on m/o/i."""
+        out: list[str] = []
+        for key in ("ls", "lp"):
+            out += field_blocks(key, texts[key])
+        for idx in comp_labels():
+            for fld in ("ai_commentary", "commentary"):
+                out += comp_blocks(idx, comps[idx].get(fld) or "")
+        _g, _gf, gb = _final_consistency_gate(
+            {k: (_FIELD_LABELS[k], texts[k]) for k in ("m", "o", "i")}, subject=subject, comps=comps,
+            value=value, status_timeline=tl, comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key)
+        return out + gb
+
+    def repair_field(key: str, rnd: int) -> None:
+        label = _FIELD_LABELS[key]
+        before = texts[key]
+        t = _deterministic_text_fixes(before, label, subject)
+        reworded = t != before
+        dropped: list = []
+        if field_blocks(key, t):
+            protect = (lambda s: s.startswith("**Pricing Position:**")) if key == "ls" else (lambda s: False)
+            t, dropped = _drop_sentences(t, lambda s: not protect(s) and bool(field_blocks(key, s)))
+        if (not t.strip() or (rnd >= 1 and field_blocks(key, t))):
+            if key == "m":
+                t = lead
+            elif key == "o":
+                t = ""      # the finalize re-run rebuilds the deterministic offer opener from the final value
+            elif key == "i":
+                t = _deterministic_inspection_baseline(subject, tl) if mode == "buyer" else ""
+            elif key == "ls":
+                t = seller_position or ""
+            elif key == "lp":
+                t = _deterministic_listing_prep_baseline(subject)
+            flags.append(f"auto-corrected: {label} - rebuilt from the report's own verified data "
+                         "(the drafted text couldn't pass the final checks).")
+        elif dropped:
+            flags.append(f"auto-corrected: {label} - removed {len(dropped)} sentence(s) the final checks "
+                         f"couldn't verify (e.g. \"{dropped[0][:90]}\").")
+        elif reworded:
+            flags.append(f"auto-corrected: {label} - reworded a claim the property record doesn't support.")
+        texts[key] = t
+
+    def repair_vd() -> None:
+        nonlocal vds
+        kept = []
+        for d in vds:
+            note = _deterministic_text_fixes(str(d.get("note") or ""), "Why this number", subject)
+            if field_blocks("vd", note):
+                note, dropped = _drop_sentences(note, lambda s: bool(field_blocks("vd", s)))
+                if dropped:
+                    flags.append(f"auto-corrected: Why this number - removed a statement the final checks couldn't "
+                                 f"verify (\"{dropped[0][:90]}\").")
+            if note.strip():
+                kept.append({**d, "note": note})
+            else:
+                flags.append(f"auto-corrected: Why this number - dropped the '{d.get('comp_label') or 'driver'}' "
+                             "entry (nothing verifiable left in it).")
+        if not kept and vds and evidence_by_key is not None:
+            try:
+                kept, _vf = _reconcile_value_drivers(
+                    None, comps, comp_num_by_key, addr_by_key, evidence_by_key, value,
+                    _as_float(subject.get("above_grade_finished_area")) or _as_float(subject.get("sqft")),
+                )
+                flags.append("auto-corrected: Why this number - rebuilt from the weighted comps' own $/sq ft.")
+            except Exception:  # noqa: BLE001
+                kept = []
+        vds = kept
+
+    def repair_comp(idx: int, rnd: int) -> None:
+        comp = comps[idx]
+        label = _comp_label(idx, comp)
+        for fld in ("ai_commentary", "commentary"):
+            txt = comp.get(fld) or ""
+            if not comp_blocks(idx, txt):
+                continue
+            t = _fix_subject_condition_words(txt, subject)
+            t, _ff = _reconcile_comp_hard_facts(t, label, subject, comp)
+            if comp_blocks(idx, t):
+                t, dropped = _drop_sentences(t, lambda s: bool(comp_blocks(idx, s)))
+            if not t.strip() or comp_blocks(idx, t):
+                t = _regenerate_comp_narrative_from_snapshot(comp, label)
+                t, _ff = _reconcile_comp_hard_facts(t, label, subject, comp)
+                flags.append(f"auto-corrected: {label} - comp write-up rebuilt from its verified MLS facts "
+                             "(the drafted note made a claim the records don't support).")
+            else:
+                flags.append(f"auto-corrected: {label} - removed/reworded an unsupported claim in the comp write-up.")
+            comp[fld] = t
+
+    def repair_xsec(msg: str) -> None:
+        m = re.match(r"Cross-section consistency: (Comp #\d+)'s (.+?) is described inconsistently", msg)
+        if not m:
+            return
+        num = m.group(1)
+        fam = next((f for f, lbl in _CROSS_CLAIM_LABELS.items() if lbl == m.group(2)), None)
+        if not fam:
+            return
+        pos_re, neg_re = _CROSS_CLAIM_PATTERNS[fam]
+        num_re = re.compile(rf"\b{re.escape(num)}\b", re.IGNORECASE)
+        bad = lambda s: bool(num_re.search(s) and (pos_re.search(s) or neg_re.search(s)))  # noqa: E731
+        for key in ("m", "o", "i"):
+            texts[key], dropped = _drop_sentences(texts[key], bad)
+            if dropped:
+                flags.append(f"auto-corrected: {_FIELD_LABELS[key]} - removed a {m.group(2)} statement about {num} "
+                             "that other sections contradicted.")
+        for d in vds:
+            d["note"], _ = _drop_sentences(str(d.get("note") or ""), bad)
+        idx = next((i for i, lbl in comp_labels().items() if lbl.startswith(num + " ")), None)
+        if idx is not None:
+            comp = comps[idx]
+            for fld in ("ai_commentary", "commentary"):
+                if comp.get(fld) and bad(comp[fld]):
+                    comp[fld], _ = _reconcile_comp_hard_facts(
+                        _regenerate_comp_narrative_from_snapshot(comp, _comp_label(idx, comp)),
+                        _comp_label(idx, comp), subject, comp)
+            flags.append(f"auto-corrected: {num}'s {m.group(2)} was described inconsistently - the comp write-up "
+                         "was rebuilt from its record and the contradicting sentence removed.")
+
+    # Findings about the valuation DATA have no client sentence to repair - they are carried through
+    # unchanged (they still gate export). A crash marker is cleared only by a re-run that completes.
+    blocking = list(dict.fromkeys([*(qa_blocking or []), *(qa_result.get("blocking_errors") or [])]))
+    persistent = [b for b in blocking if _DEMOTE_BLOCK_RE.search(str(b)) and "FINAL OUTPUT QA FAILED" not in str(b)]
+    crash_marker = [b for b in blocking if "FINAL OUTPUT QA FAILED" in str(b)]
+    rerun_completed = False
+    rounds_run = 0
+    for rnd in range(max_rounds):
+        actionable = [str(b) for b in blocking if b and b not in persistent and b not in crash_marker]
+        if not actionable and (rerun_completed or not crash_marker):
+            break
+        rounds_run += 1
+        labels = comp_labels()
+        targets: set = set()
+        for b in actionable:
+            where = _block_field(b, labels)
+            if where == "xsec":
+                repair_xsec(b)
+            else:
+                targets.add(where)
+        if "any" in targets:
+            targets.update(("m", "o", "i", "vd") if mode == "buyer" else ("m", "vd", "ls", "lp"))
+        for key in ("m", "o", "i", "ls", "lp"):
+            if key in targets:
+                repair_field(key, rnd)
+        if "vd" in targets:
+            repair_vd()
+        for t in sorted(x for x in targets if x.startswith("comp:")):
+            repair_comp(int(t.split(":", 1)[1]), rnd)
+        # ---- re-run the deterministic final QA on the repaired texts (no model call)
+        try:
+            fin = await _finalize_gate_reconciled_prose(
+                methodology=texts["m"] or lead, offer=texts["o"], inspection=texts["i"], value=value,
+                range_pct=range_pct, subject_asking=subject_asking, confidence=confidence,
+                status_timeline=tl, enriched_subject=subject, comps=comps, comp_num_by_key=comp_num_by_key,
+                addr_by_key=addr_by_key, valuation_trace=valuation_trace, value_drivers=vds, qa_ctx=qa_ctx,
+                mode=mode, model=model, final=final, external_blocking=[],
+                run_language_polish=False, allow_ai_rewrite=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - never let the repair itself fail the report
+            logger.warning("CMA auto-repair QA re-run failed", extra={"error": f"{type(exc).__name__}: {exc}"})
+            flags.append(f"Auto-repair: the final checks errored while re-checking repaired text "
+                         f"({type(exc).__name__}) - the remaining findings still need review.")
+            break
+        rerun_completed = True
+        texts["m"], texts["o"], texts["i"] = fin["methodology"], fin["offer"], fin["inspection"]
+        vds = [dict(d) for d in (fin.get("value_drivers") or []) if isinstance(d, dict)]
+        offer_fields = fin.get("offer_fields") or offer_fields
+        qa_result = dict(fin.get("qa_result") or qa_result)
+        flags.extend(f for f in (fin.get("qa_flags") or []) if str(f).startswith("auto-corrected"))
+        blocking = list(dict.fromkeys([
+            *(b for b in (qa_result.get("blocking_errors") or []) if b not in persistent),
+            *recheck_external(),
+        ]))
+
+    remaining = [b for b in blocking if b and b not in persistent and not (rerun_completed and b in crash_marker)]
+    final_blocking = list(dict.fromkeys([*persistent, *remaining]))
+    original = list(dict.fromkeys([*(qa_blocking or [])]))
+    fixed = [b for b in original if b not in final_blocking]
+    for b in fixed:
+        flags.append(f"auto-corrected: resolved and re-checked - {b}")
+    qa_result["auto_repair"] = {
+        "rounds": rounds_run, "fixed": fixed, "remaining": final_blocking,
+        "rerun_completed": rerun_completed,
+    }
+    qa_result["blocking_errors"] = final_blocking
+    qa_result["export_allowed"] = not final_blocking
+    qa_result["passed"] = not final_blocking and not qa_result.get("warnings") and not rounds_run
+    qa_result.setdefault("checks_run", [])
+    if "final_auto_repair" not in qa_result["checks_run"]:
+        qa_result["checks_run"].append("final_auto_repair")
+    return {
+        "methodology": texts["m"], "offer": texts["o"], "inspection": texts["i"],
+        "value_drivers": vds, "offer_fields": offer_fields,
+        "listing_strategy": texts["ls"], "listing_prep": texts["lp"],
+        "qa_result": qa_result, "qa_blocking": final_blocking, "qa_flags": list(dict.fromkeys(flags)),
+    }
+
+
+_FINAL_QA_CRASH_BLOCK = (
+    "FINAL OUTPUT QA FAILED - the authoritative reasoning valuation was preserved, but "
+    "client export is blocked until the final prose checks complete successfully."
+)
+
+
+def _seller_position_text(mode: str, value, range_min, range_max, subject_asking, status_timeline, comps) -> Optional[str]:
+    """The deterministic seller 'Pricing Position' paragraph - the auto-repair rebuild for a pricing
+    strategy whose AI paragraphs can't pass the final checks. None on a buyer report."""
+    if mode == "buyer" or not value:
+        return None
+    try:
+        return _seller_pricing_position(value=value, range_min=range_min, range_max=range_max,
+                                        subject_asking=subject_asking, status_timeline=status_timeline, comps=comps)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _final_tail_crash_recovery(
+    *, methodology: str, offer: str, inspection: str, reasoning_output: Optional[dict], value: float,
+    range_pct: float, subject_asking, confidence, status_timeline: dict, enriched_subject: dict,
+    comps: list, comp_num_by_key: dict, addr_by_key: dict, valuation_trace: Optional[dict], qa_ctx: dict,
+    mode: str, model: str, final: Optional[dict], external_blocking: list, runtime_error: str,
+    traceback_text: str,
+) -> tuple[dict, dict]:
+    """The final prose/QA tail crashed. Retry it ONCE with no language polish and no AI rewrite. If that
+    also fails, rebuild methodology / offer / inspection from the deterministic builders and keep the
+    FINAL OUTPUT QA FAILED block - the auto-repair step clears it only if its own re-run of the final
+    checks completes on those sections. Returns (fin-shaped dict, qa_result)."""
+    try:
+        vds = _reasoning_value_drivers(reasoning_output or {}, comps)
+        vds, _rf = _reconcile_road_exposure_claims(vds, comps, comp_num_by_key, addr_by_key)
+        fin = await _finalize_gate_reconciled_prose(
+            methodology=methodology, offer=offer, inspection=inspection, value=value, range_pct=range_pct,
+            subject_asking=subject_asking, confidence=confidence, status_timeline=status_timeline,
+            enriched_subject=enriched_subject, comps=comps, comp_num_by_key=comp_num_by_key,
+            addr_by_key=addr_by_key, valuation_trace=valuation_trace, value_drivers=vds, qa_ctx=qa_ctx,
+            mode=mode, model=model, final=final, external_blocking=external_blocking,
+            run_language_polish=False, allow_ai_rewrite=False,
+        )
+        qa = dict(fin["qa_result"] or {})
+        qa["first_attempt_runtime_error"] = runtime_error
+        qa["first_attempt_traceback"] = traceback_text
+        fin = dict(fin)
+        fin["qa_flags"] = list(fin.get("qa_flags") or []) + [
+            f"auto-corrected: the final prose checks hit an error ({runtime_error}) and were re-run once "
+            "without the language polish - the re-run completed."
+        ]
+        return fin, qa
+    except Exception as exc2:  # noqa: BLE001
+        logger.exception("CMA final QA retry failed too - deterministic section fallbacks")
+        second_error = f"{type(exc2).__name__}: {str(exc2)[:300]}"
+    try:
+        m = _reasoning_client_methodology(reasoning_output or {}) if reasoning_output else ""
+    except Exception:  # noqa: BLE001
+        m = ""
+    if not m:
+        lo, hi = (final or {}).get("range_min"), (final or {}).get("range_max")
+        m = (f"The final fair market value is ${value:,.0f}"
+             + (f", with a supported valuation range of ${lo:,.0f}-${hi:,.0f}." if lo and hi else "."))
+    o, offer_fields = offer or "", None
+    if mode == "buyer" and final:
+        try:
+            band = _v10_build_buyer_offer_band(
+                final.get("value"), subject_asking, trace=valuation_trace, confidence=final.get("confidence"),
+                status_timeline=status_timeline, range_min=final.get("range_min"), range_max=final.get("range_max"))
+            if band:
+                o, _f = _v10_rebuild_buyer_offer_prose("", band, range_pct)
+                o, _s = _status_aware_offer_guidance(o, status_timeline or {})
+                offer_fields = band
+        except Exception:  # noqa: BLE001
+            o = ""
+    i = (_deterministic_inspection_baseline(enriched_subject or {}, status_timeline or {})
+         if mode == "buyer" else (inspection or ""))
+    blocking = list(dict.fromkeys([*(external_blocking or []), _FINAL_QA_CRASH_BLOCK]))
+    qa = {
+        "version": "v10-final-output",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "checks_run": ["final_qa_runtime", "deterministic_section_fallback"],
+        "passed": False,
+        "runtime_error": runtime_error, "runtime_traceback": traceback_text, "retry_runtime_error": second_error,
+        "warnings": [], "corrections": [],
+        "blocking_errors": blocking,
+        "external_blocking": list(dict.fromkeys(external_blocking or [])),
+        "export_allowed": False,
+    }
+    return {
+        "methodology": m, "offer": o, "inspection": i, "offer_fields": offer_fields, "value_drivers": [],
+        "qa_flags": [
+            f"auto-corrected: the final prose checks errored twice ({runtime_error}; then {second_error}) - "
+            "the methodology, offer and inspection sections were rebuilt from the report's verified numbers "
+            "and property data."
+        ],
+        "qa_blocking": [_FINAL_QA_CRASH_BLOCK],
+    }, qa
 
 
 def _v10_provisional_inputs(
@@ -12615,6 +13373,32 @@ async def generate_ai_analysis(
     max_photos_per_property: Optional[int] = None, include_map_images: bool = False,
     force_regenerate: bool = False,
 ) -> CmaReport:
+    """Thin wrapper: the reasoning-stage budget is reserved up front inside the run (before the paid
+    Claude call, so a budget cap can't fail a run halfway); whatever exit the run takes, a
+    reservation it never handed to the reasoning stage is refunded here."""
+    holder: dict = {}
+    try:
+        return await _generate_ai_analysis_impl(
+            db, owner_id, report_id, plan_tier, max_photos_per_property=max_photos_per_property,
+            include_map_images=include_map_images, force_regenerate=force_regenerate,
+            _reasoning_holder=holder,
+        )
+    finally:
+        leftover = holder.pop("reservation", None)
+        if leftover is not None:
+            try:
+                await reconcile_budget(db, leftover, 0.0)
+            except Exception:  # noqa: BLE001 - a refund failure must not mask the real outcome
+                logger.warning("CMA reasoning reservation refund failed", extra={"report_id": report_id})
+
+
+async def _generate_ai_analysis_impl(
+    db: AsyncSession, owner_id: str, report_id: str, plan_tier: str,
+    max_photos_per_property: Optional[int] = None, include_map_images: bool = False,
+    force_regenerate: bool = False, *, _reasoning_holder: Optional[dict] = None,
+) -> CmaReport:
+    if _reasoning_holder is None:
+        _reasoning_holder = {}
     report = await cma_service._get_owned(db, owner_id, report_id)
     config = await ai_config_service.get_config(db)
     _extra_usage: list = []
@@ -12802,6 +13586,19 @@ async def generate_ai_analysis(
     for _c in result.get("comps") or []:
         if not isinstance(_c.get("note"), (str, type(None))):
             _c["note"] = _coerce_ai_text(_c["note"])
+        # Reliability (10/20): a list/dict where a string enum belongs made `x in {set}` raise
+        # TypeError (unhashable) and failed the whole run - keep only plain string values.
+        if not isinstance(_c.get("strength"), (str, type(None))):
+            _c["strength"] = None
+        _cq = _c.get("quality")
+        if _cq is not None and not isinstance(_cq, dict):
+            _c["quality"] = {}
+        elif isinstance(_cq, dict):
+            _c["quality"] = {k: v for k, v in _cq.items() if isinstance(v, str)}
+    if isinstance(_se, dict):
+        for _ak in ("qualitative_adjustments", "premium_improvements", "value_drivers"):
+            if _ak in _se and not isinstance(_se[_ak], list):
+                _se[_ak] = []
 
     subject_estimate_raw = result.get("subject_estimate") if isinstance(result.get("subject_estimate"), dict) else None
     _has_value = bool(subject_estimate_raw and _as_float(subject_estimate_raw.get("value")))
@@ -13367,6 +14164,8 @@ async def generate_ai_analysis(
         _tmach.check_payload(_reasoning_packet, "final-valuation evidence packet", comp_prices=_tm_comp_prices)
         _reasoning_output, _reasoning_blocking, _reasoning_cost, _reasoning_usage = await _run_cma_reasoning_stage(
             db, owner_id, plan_tier, config, _reasoning_packet, report_id,
+            fallback={"fmv": value, "range_pct": _v10_range_pct},
+            reservation=_reasoning_holder.pop("reservation", None),
         )
         _comp_labels = {str(c.get("comp_id")): c.get("comp_label") for c in _reasoning_packet["comparables"]}
         qa_flags.extend(_reasoning_output.pop("_guard_flags", None) or [])
@@ -13613,33 +14412,56 @@ async def generate_ai_analysis(
             # Kept on the report so a failed run can be diagnosed from the saved data (round 3: the
             # cause of 445 General Washington Rd's failure was only in a console log).
             _qa_tb = traceback.format_exc(limit=6)[-1500:]
-            if not isinstance(_value_drivers, list):
-                _value_drivers = None
-            _qa_failure = (
-                "FINAL OUTPUT QA FAILED - the authoritative reasoning valuation was preserved, but "
-                "client export is blocked until the final prose checks complete successfully."
+            _qa_runtime_error = f"{type(_qa_exc).__name__}: {str(_qa_exc)[:300]}"
+            # Reliability (10/20): retry the tail ONCE without the language polish / AI rewrite, then
+            # fall back to the deterministic sections - never leave the report blocked on a crash.
+            _fin, _qa_result = await _final_tail_crash_recovery(
+                methodology=methodology_summary, offer=offer_strategy_considerations,
+                inspection=inspection_concerns, reasoning_output=_reasoning_output, value=value,
+                range_pct=range_pct, subject_asking=subject_asking, confidence=confidence,
+                status_timeline=status_timeline, enriched_subject=enriched_subject, comps=new_comparables,
+                comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key, valuation_trace=valuation_trace,
+                qa_ctx=_qa_ctx, mode=report.mode, model=model, final=_final_val,
+                external_blocking=_external_blocking, runtime_error=_qa_runtime_error, traceback_text=_qa_tb,
             )
-            qa_blocking.append(_qa_failure)
-            _qa_result = {
-                "version": "v10-final-output",
-                "checked_at": datetime.now(timezone.utc).isoformat(),
-                "checks_run": ["final_qa_runtime"],
-                "passed": False,
-                "runtime_error": f"{type(_qa_exc).__name__}: {str(_qa_exc)[:300]}",
-                "runtime_traceback": _qa_tb,
-                "warnings": [],
-                "corrections": [],
-                "blocking_errors": list(dict.fromkeys([*_external_blocking, _qa_failure])),
-                "external_blocking": list(dict.fromkeys(_external_blocking)),
-                "export_allowed": False,
-            }
-            warnings.append(
-                "The authoritative value is saved, but final prose QA hit an error and client export "
-                "is blocked. Re-run the analysis after reviewing the server error."
-            )
+            methodology_summary = _fin["methodology"]
+            offer_strategy_considerations = _fin["offer"]
+            inspection_concerns = _fin["inspection"]
+            _offer_strategy_fields = _fin.get("offer_fields")
+            _value_drivers = _fin["value_drivers"]
+            qa_flags.extend(_fin["qa_flags"])
+            qa_blocking.extend(_fin["qa_blocking"])
         qa_flags = list(dict.fromkeys(qa_flags))
         qa_blocking = list(dict.fromkeys(qa_blocking))
         _qa_result = _v10_sync_qa_authority(_qa_result, qa_blocking)
+        # Reliability (10/20) choke point: repair every remaining text finding (fix / drop / rebuild)
+        # and re-run the deterministic final QA; only findings that survive the re-check still block.
+        try:
+            _rep = await _auto_repair_export_blocks(
+                methodology=methodology_summary, offer=offer_strategy_considerations,
+                inspection=inspection_concerns, value_drivers=_value_drivers,
+                offer_fields=_offer_strategy_fields, listing_strategy=listing_strategy_considerations,
+                listing_prep=listing_prep_concerns, qa_blocking=qa_blocking, qa_result=_qa_result,
+                value=value, range_pct=range_pct, subject_asking=subject_asking, confidence=confidence,
+                status_timeline=status_timeline, enriched_subject=enriched_subject, comps=new_comparables,
+                comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key, valuation_trace=valuation_trace,
+                qa_ctx=_qa_ctx, mode=report.mode, model=model, final=_final_val,
+                seller_position=_seller_position_text(report.mode, value, final_range_low, final_range_high,
+                                                      subject_asking, status_timeline, new_comparables),
+                evidence_by_key=evidence_by_key,
+            )
+            methodology_summary = _rep["methodology"]
+            offer_strategy_considerations = _rep["offer"]
+            inspection_concerns = _rep["inspection"]
+            _value_drivers = _rep["value_drivers"]
+            _offer_strategy_fields = _rep["offer_fields"]
+            listing_strategy_considerations = _rep["listing_strategy"]
+            listing_prep_concerns = _rep["listing_prep"]
+            _qa_result = _rep["qa_result"]
+            qa_flags = list(dict.fromkeys([*qa_flags, *_rep["qa_flags"]]))
+            qa_blocking = list(_rep["qa_blocking"])   # only findings the repair + re-check could not clear
+        except Exception:  # noqa: BLE001 - the repair must never be the thing that fails a report
+            logger.exception("CMA final auto-repair failed for report %s - findings left unchanged", report_id)
         if valuation_trace is not None:
             valuation_trace["qa"] = _qa_result
 
@@ -14037,6 +14859,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
         )
         _reasoning_output, _reasoning_blocking, _reasoning_cost, _reasoning_usage = await _run_cma_reasoning_stage(
             db, owner_id, plan_tier, config, _reasoning_packet, report_id,
+            fallback={"fmv": value, "range_pct": _v10["range_pct"]},
         )
         _comp_labels = {str(c.get("comp_id")): c.get("comp_label") for c in _reasoning_packet["comparables"]}
         qa_flags.extend(_reasoning_output.pop("_guard_flags", None) or [])
@@ -14196,22 +15019,65 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             qa_flags.extend(_ss_flags)
             qa_blocking.extend(_ss_blocking)
         _external_blocking = list(qa_blocking)
-        _fin = await _finalize_gate_reconciled_prose(
-            methodology=methodology_summary, offer=offer_strategy_considerations, inspection=inspection_concerns,
-            value=value, range_pct=range_pct, subject_asking=subject_asking, confidence=confidence,
-            status_timeline=status_timeline, enriched_subject=enriched_subject, comps=new_comparables,
-            comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key, valuation_trace=valuation_trace,
-            value_drivers=_value_drivers, qa_ctx=_qa_ctx, mode=report.mode, model=model,
-            final=_final_val, external_blocking=_external_blocking,
-        )
+        try:
+            _fin = await _finalize_gate_reconciled_prose(
+                methodology=methodology_summary, offer=offer_strategy_considerations, inspection=inspection_concerns,
+                value=value, range_pct=range_pct, subject_asking=subject_asking, confidence=confidence,
+                status_timeline=status_timeline, enriched_subject=enriched_subject, comps=new_comparables,
+                comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key, valuation_trace=valuation_trace,
+                value_drivers=_value_drivers, qa_ctx=_qa_ctx, mode=report.mode, model=model,
+                final=_final_val, external_blocking=_external_blocking,
+            )
+            _qa_result = _fin["qa_result"]
+        except Exception as _qa_exc:  # noqa: BLE001 - reliability 10/20: a QA crash no longer fails the recompute
+            logger.exception("CMA recompute final QA failed for report %s - retrying", report_id)
+            _fin, _qa_result = await _final_tail_crash_recovery(
+                methodology=methodology_summary, offer=offer_strategy_considerations,
+                inspection=inspection_concerns, reasoning_output=_reasoning_output, value=value,
+                range_pct=range_pct, subject_asking=subject_asking, confidence=confidence,
+                status_timeline=status_timeline, enriched_subject=enriched_subject, comps=new_comparables,
+                comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key, valuation_trace=valuation_trace,
+                qa_ctx=_qa_ctx, mode=report.mode, model=model, final=_final_val,
+                external_blocking=_external_blocking,
+                runtime_error=f"{type(_qa_exc).__name__}: {str(_qa_exc)[:300]}",
+                traceback_text=traceback.format_exc(limit=6)[-1500:],
+            )
         methodology_summary = _fin["methodology"]
         offer_strategy_considerations = _fin["offer"]
         inspection_concerns = _fin["inspection"]
         _offer_strategy_fields = _fin.get("offer_fields")
         _value_drivers = _fin["value_drivers"]
-        _qa_result = _fin["qa_result"]
         qa_flags.extend(_fin["qa_flags"])
         qa_blocking.extend(_fin["qa_blocking"])
+        qa_blocking = list(dict.fromkeys(qa_blocking))
+        _qa_result = _v10_sync_qa_authority(_qa_result, qa_blocking)
+        # Reliability (10/20) choke point - same final auto-repair as generate_ai_analysis.
+        try:
+            _rep = await _auto_repair_export_blocks(
+                methodology=methodology_summary, offer=offer_strategy_considerations,
+                inspection=inspection_concerns, value_drivers=_value_drivers,
+                offer_fields=_offer_strategy_fields, listing_strategy=listing_strategy_considerations,
+                listing_prep=listing_prep_concerns, qa_blocking=qa_blocking, qa_result=_qa_result,
+                value=value, range_pct=range_pct, subject_asking=subject_asking, confidence=confidence,
+                status_timeline=status_timeline, enriched_subject=enriched_subject, comps=new_comparables,
+                comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key, valuation_trace=valuation_trace,
+                qa_ctx=_qa_ctx, mode=report.mode, model=model, final=_final_val,
+                seller_position=_seller_position_text(report.mode, value, final_range_low, final_range_high,
+                                                      subject_asking, status_timeline, new_comparables),
+                evidence_by_key=evidence_by_key,
+            )
+            methodology_summary = _rep["methodology"]
+            offer_strategy_considerations = _rep["offer"]
+            inspection_concerns = _rep["inspection"]
+            _value_drivers = _rep["value_drivers"]
+            _offer_strategy_fields = _rep["offer_fields"]
+            listing_strategy_considerations = _rep["listing_strategy"]
+            listing_prep_concerns = _rep["listing_prep"]
+            _qa_result = _rep["qa_result"]
+            qa_flags = list(dict.fromkeys([*qa_flags, *_rep["qa_flags"]]))
+            qa_blocking = list(_rep["qa_blocking"])   # only findings the repair + re-check could not clear
+        except Exception:  # noqa: BLE001
+            logger.exception("CMA recompute auto-repair failed for report %s - findings left unchanged", report_id)
 
         if valuation_trace is not None:
             valuation_trace["qa"] = _qa_result
