@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -7501,7 +7502,10 @@ price is near expected_sale_price. A comparable-sales value far above it almost 
 subject is worse than its comps in ways the data understates (condition, finishes, location
 pocket, few photos, "as-is" or "sweat equity" wording), not that the seller is leaving a large
 sum on the table. Explain the gap in those terms and keep final_fmv between allowed_low and
-allowed_high; the application enforces that band.
+allowed_high; the application enforces that band. When asking_price_check.passed_over is true, the
+home has sat on the market well past the days its comps took to sell: buyers have already passed on
+it at this price, so it most likely sells at or a little under asking - do not describe competing
+offers or a premium over asking.
 
 For every major positive and negative factor, set evidence_strength to clearly_market_supported,
 directionally_supported_amount_uncertain, or subjective_or_speculative. Distinctive architecture,
@@ -7706,6 +7710,8 @@ def _build_reasoning_evidence_packet(
 _ASKING_CHECK_RATIO_BOUNDS = (0.90, 1.12)   # the comps' median sold/list ratio is clamped to this
 _ASKING_CHECK_BAND = (0.90, 1.05)           # final FMV allowed within this x the expected sale price
 _ASKING_CHECK_BAND_STALE_LOW = 0.85         # a stale listing can be worth well under its asking price
+_ASKING_CHECK_PASSED_OVER_DAYS = 14         # on the market this long, and 2x its comps' median days...
+_ASKING_CHECK_PASSED_OVER_RATIO = 0.98      # ...expect at most 98% of asking, and never above asking
 
 
 def _asking_price_market_check(subject_packet: dict, status_timeline: dict, exposure: dict,
@@ -7730,6 +7736,19 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
         ratio = 1.0 + (ratio - 1.0) / 2   # sat longer than its comps: a bidding war is less likely
     elif state == "extended_exposure":
         ratio = min(ratio, 1.0)
+    # Passed over: on the market 2+ weeks while its comps sold in half that. In round 3 all 5 such
+    # listings (17-57 days) closed 3-7% UNDER asking, whatever the comps' ratio (two were valued
+    # above asking). It sells at or a little under its asking price - never at a bidding-war premium.
+    dom = _as_float(subject_packet.get("dom"))
+    if dom is None:
+        dom = _as_float(subject_packet.get("cdom"))
+    comp_dom = _as_float((exposure or {}).get("comp_median_dom"))
+    passed_over = dom is not None and dom >= _ASKING_CHECK_PASSED_OVER_DAYS and (not comp_dom or dom >= 2 * comp_dom)
+    high_mult = _ASKING_CHECK_BAND[1]
+    if passed_over:
+        ratio = min(ratio, _ASKING_CHECK_PASSED_OVER_RATIO)
+        high_mult = 1.0
+        stale = True
     expected = lp * ratio
     low_mult = _ASKING_CHECK_BAND_STALE_LOW if stale else _ASKING_CHECK_BAND[0]
     return {
@@ -7738,9 +7757,10 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
         "ratio_used": round(ratio, 3),
         "expected_sale_price": round(expected),
         "allowed_low": round(expected * low_mult),
-        "allowed_high": round(expected * _ASKING_CHECK_BAND[1]),
+        "allowed_high": round(expected * high_mult),
         "comp_ratios_counted": len(ratios),
         "exposure_state": state or None,
+        "passed_over": passed_over,
     }
 
 
@@ -9394,7 +9414,9 @@ def _v10_final_report_qa(
         # real comp price - a stray big number that matches none of those is a red flag.
         known = {round(value), lo, hi, (trace or {}).get("subject_asking") or 0}
         known.update(_structured_currency_values(trace or {}))
-        known.update(abs(float(v)) for v in (known_dollars or []) if _as_float(v) is not None)
+        # _as_float, not float(): a known-figure list can carry offer text ("about 1% below") - a
+        # plain float() crashed the whole final QA and blocked export (round 3, 445 General Washington Rd)
+        known.update(abs(_as_float(v)) for v in (known_dollars or []) if _as_float(v) is not None)
         for c in ((trace or {}).get("anchor") or {}).get("comps", []):
             known.add(c.get("raw_sale_price") or 0)
         known.add(((trace or {}).get("anchor") or {}).get("anchor_value") or 0)
@@ -9547,21 +9569,72 @@ def _listing_documents_system_claim(subject: Optional[dict], claim: str) -> bool
     "boiler installed in 2023"."""
     if not subject or not claim:
         return False
-    sysm = re.search(r"roof|hvac|furnace|a/?c|air\s+condition|boiler|heat\s+pump|water\s+heater|electrical|"
-                     r"wiring|plumbing|septic|well\s+pump|windows?|siding", claim, re.IGNORECASE)
-    if not sysm:
+    # Every system named in the claim counts - "Electrical: The water heater was replaced in 2018"
+    # is backed by a listing that says "hot water heater replaced in 2018" (round 3, 940 Turner Ave).
+    systems = list(re.finditer(r"roof|hvac|furnace|a/?c|air\s+condition|boiler|heat\s+pump|water\s+heater|electrical|"
+                               r"wiring|plumbing|septic|well\s+pump|windows?|siding", claim, re.IGNORECASE))
+    if not systems:
         return False
-    system = sysm.group(0).lower().replace("air condition", "air conditioning")
     documented = _documented_system_updates(subject)
-    if any(system in d or d in system for d in documented):
-        return True
     year = re.search(r"(?:19|20)\d{2}", claim)
-    if year:
-        blob = _authoritative_property_fact_blob(subject)
-        for m in re.finditer(re.escape(sysm.group(0)), blob, re.IGNORECASE):
-            if year.group(0) in blob[max(0, m.start() - 80):m.end() + 80]:
-                return True
+    blob = _authoritative_property_fact_blob(subject) if year else ""
+    for sysm in systems:
+        system = sysm.group(0).lower().replace("air condition", "air conditioning")
+        if not year and any(system in d or d in system for d in documented):
+            return True
+        if year:
+            for m in re.finditer(re.escape(sysm.group(0)), blob, re.IGNORECASE):
+                # the year must belong to THIS system: "replacement windows in 2023, a gas water
+                # heater installed in 2019" doesn't back "windows, 2019"
+                after = re.split(r"[.;,]|\b(?:roof|hvac|furnace|boiler|heat\s+pump|water\s+heater|electrical|"
+                                 r"wiring|plumbing|septic|windows?|siding|garage|doors?|floors?|kitchen)\b",
+                                 blob[m.end():m.end() + 60], maxsplit=1, flags=re.IGNORECASE)[0]
+                before = blob[max(0, m.start() - 25):m.start()]
+                before = re.split(r"[.;,]", before)[-1]
+                if year.group(0) in after or year.group(0) in before:
+                    return True
     return False
+
+
+def _soften_unsupported_system_claims(text: Optional[str], subject: Optional[dict]) -> tuple[Optional[str], list[str]]:
+    """A sentence asserting a system update the listing never documents ("newer HVAC", "windows,
+    2019" when the listing says 2023) becomes a to-verify item instead of blocking the whole
+    report's export (round 3: 6 of 20 reports blocked this way). Same exemptions as the QA check
+    (step 13 of _v10_pre_export_qa), so whatever this leaves is what QA allows."""
+    if not text:
+        return text, []
+    notes: list[str] = []
+    cur = text
+    for _ in range(12):
+        hit = None
+        for m in sorted(list(_QA_HARD_FACT_RE.finditer(cur)) + list(_QA_YEAR_SYSTEM_RE.finditer(cur)), key=lambda x: x.start()):
+            before = cur[max(0, m.start() - 40):m.start()]
+            if _QA_VERIFY_NEARBY_RE.search(before) and not re.search(r"[.;]", before):
+                continue
+            sent_start = cur[:m.start()]
+            sent_start = re.split(r"[.!?;]\s", sent_start)[-1] if re.search(r"[.!?;]\s", sent_start) else sent_start
+            if _QA_LISTING_ATTRIBUTION_RE.search(sent_start) or _listing_documents_system_claim(subject, m.group(0)):
+                continue
+            hit = m
+            break
+        if not hit:
+            break
+        chunk = next(((c, s, e) for c, s, e in _sentence_chunks(cur) if s <= hit.start() < e), None)
+        if not chunk:
+            break
+        c, s, e = chunk
+        system = re.search(r"roof|hvac|furnace|a/?c|air\s+condition\w*|boiler|heat\s+pump|water\s+heater|electrical|"
+                           r"wiring|plumbing|septic|well\s+pump|windows?|siding|foundation|sewer\s+line",
+                           hit.group(0), re.IGNORECASE)
+        name = (system.group(0) if system else "major systems").lower().replace("hvac", "HVAC")
+        verify = f"Verify the age and condition of the {name} with the seller and the home inspection."
+        repl = "" if verify in cur else verify
+        trail = re.search(r"\s*$", c).group(0)
+        cur = (cur[:s] + repl + (trail if repl else "") + cur[e:]).strip()
+        cur = re.sub(r"[ \t]{2,}", " ", cur)
+        notes.append(f"auto-corrected: \"{hit.group(0).strip()}\" isn't documented in the listing - "
+                     f"rewritten as a to-verify item.")
+    return cur, notes
 
 
 def _v10_pre_export_qa(
@@ -9655,9 +9728,13 @@ def _v10_pre_export_qa(
             not a statement about where the subject's value sits versus its own asking price."""
             seg = text[:start]
             seg = re.split(r"[.!?;]\s", seg)[-1] if re.search(r"[.!?;]\s", seg) else seg
-            return bool(re.search(
+            if re.search(
                 r"\b(?:sold|closed|closing|sell|selling|went|traded|sales?|comps?|comparables?|"
-                r"homes|listings|properties|bidding|offers)\b[^.!?;]{0,40}$", seg, re.IGNORECASE))
+                r"homes|listings|properties|bidding|offers)\b[^.!?;]{0,40}$", seg, re.IGNORECASE):
+                return True
+            # Offer guidance is about the BID, not the value ("a reasonable opening offer is roughly
+            # $770,000 to $785,000 (about 0%-2% below the list price)" - blocked 2 of 20 in round 3).
+            return bool(re.search(r"\b(?:offer|opening|open|bid|negotiat\w*|settle)\b", seg, re.IGNORECASE))
 
         _above_hits = [m for m in _QA_ABOVE_ASK_RE.finditer(combined)
                        if not _negated(combined, m.start()) and not _about_comp_sales(combined, m.start())]
@@ -11383,7 +11460,9 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
     # list"). Then offers may go up to asking x that ratio, still never above FMV.
     _exp_state = str(((trace or {}).get("exposure") or {}).get("state") or "")
     _lts = _as_float(((trace or {}).get("anchor") or {}).get("comp_list_to_sale_median"))
-    hot = bool(lp and _lts and _lts >= 1.02 and _exp_state not in ("elevated_exposure", "extended_exposure"))
+    _passed_over = bool(((trace or {}).get("asking_price_check") or {}).get("passed_over"))
+    hot = bool(lp and _lts and _lts >= 1.02 and not _passed_over
+               and _exp_state not in ("elevated_exposure", "extended_exposure"))
     if hot:
         ceiling = round(min(lp * min(_lts, _ASKING_CHECK_RATIO_BOUNDS[1]), fmv))
     else:
@@ -11987,6 +12066,22 @@ async def _finalize_gate_reconciled_prose(
     methodology, _adf = _v10_reconcile_anchor_direction_prose(methodology, final=_final, trace=valuation_trace)
     flags += _adf
 
+    def _soften_all(m_txt, o_txt, i_txt, vds):
+        out_flags: list = []
+        res = []
+        for t in (m_txt, o_txt, i_txt):
+            t2, n = _soften_unsupported_system_claims(t, enriched_subject)
+            res.append(t2)
+            out_flags += n
+        for d in vds or []:
+            if isinstance(d, dict) and d.get("note"):
+                d["note"], n = _soften_unsupported_system_claims(d["note"], enriched_subject)
+                out_flags += n
+        return res[0], res[1], res[2], out_flags
+
+    methodology, offer, inspection, _soft_flags = _soften_all(methodology, offer, inspection, value_drivers)
+    flags += _soft_flags
+
     # ---- 2. concluded-number scan against the authoritative final object + $/sqft denominator
     _scan_block: list = []
     if _final:
@@ -12035,6 +12130,19 @@ async def _finalize_gate_reconciled_prose(
     # item #2: the Offer Suggestion must be built from the FINAL valuation, not a pre-final figure.
     _offer_stale_block = _v10_offer_final_valuation_check(offer, _final, valuation_trace)
     _scan_block += _offer_stale_block
+
+    def _soften_all(m_txt, o_txt, i_txt, vds):
+        out_flags: list = []
+        res = []
+        for t in (m_txt, o_txt, i_txt):
+            t2, n = _soften_unsupported_system_claims(t, enriched_subject)
+            res.append(t2)
+            out_flags += n
+        for d in vds or []:
+            if isinstance(d, dict) and d.get("note"):
+                d["note"], n = _soften_unsupported_system_claims(d["note"], enriched_subject)
+                out_flags += n
+        return res[0], res[1], res[2], out_flags
 
     # ---- 3 + 4. QA (pass 1)
     qa_result, corrected, f1, b1 = _run_qa(methodology, offer, inspection, value_drivers)
@@ -12162,6 +12270,8 @@ async def _finalize_gate_reconciled_prose(
     inspection, _post_polish_fact_flags = _reconcile_inspection_fact_prose(inspection, enriched_subject)
     flags += _post_polish_fact_flags
     if _pol["changed"]:
+        methodology, offer, inspection, _soft_flags2 = _soften_all(methodology, offer, inspection, value_drivers)
+        flags += _soft_flags2
         _post_scan_block: list = []
         if _final:
             _sf3, _sb3, _sn3 = _v10_scan_concluded_numbers(
@@ -13270,6 +13380,16 @@ async def generate_ai_analysis(
         range_pct = _authority["range_pct"]
         confidence = _authority["confidence"]
         valuation_trace = _authority["trace"]
+        # the asking-price check's figures are real numbers the narrative may quote ("asking x the
+        # comps' median ratio indicates about $639,348") - make them known to the final $ sweep.
+        if _reasoning_packet.get("asking_price_check"):
+            _apc = _reasoning_packet["asking_price_check"]
+            valuation_trace["asking_price_check"] = {
+                "expected_sale_price": _apc.get("expected_sale_price"),
+                "allowed_low_price": _apc.get("allowed_low"), "allowed_high_price": _apc.get("allowed_high"),
+                "asking_price": _apc.get("asking_price"), "ratio_used": _apc.get("ratio_used"),
+                "passed_over": bool(_apc.get("passed_over")),
+            }
         valuation_trace["authoritative_evidence_snapshot"] = _evidence_snapshot.audit_metadata()
         qa_blocking.extend(_reasoning_blocking)
         _formula_only_blocks = [b for b in qa_blocking if " RECONCILIATION -" in str(b)]
@@ -13488,8 +13608,11 @@ async def generate_ai_analysis(
             qa_flags.extend(_fin["qa_flags"])
             qa_blocking.extend(_fin["qa_blocking"])
 
-        except Exception:  # noqa: BLE001
+        except Exception as _qa_exc:  # noqa: BLE001
             logger.exception("CMA post-estimate reconciliation/QA failed for report %s - export blocked", report_id)
+            # Kept on the report so a failed run can be diagnosed from the saved data (round 3: the
+            # cause of 445 General Washington Rd's failure was only in a console log).
+            _qa_tb = traceback.format_exc(limit=6)[-1500:]
             if not isinstance(_value_drivers, list):
                 _value_drivers = None
             _qa_failure = (
@@ -13502,6 +13625,8 @@ async def generate_ai_analysis(
                 "checked_at": datetime.now(timezone.utc).isoformat(),
                 "checks_run": ["final_qa_runtime"],
                 "passed": False,
+                "runtime_error": f"{type(_qa_exc).__name__}: {str(_qa_exc)[:300]}",
+                "runtime_traceback": _qa_tb,
                 "warnings": [],
                 "corrections": [],
                 "blocking_errors": list(dict.fromkeys([*_external_blocking, _qa_failure])),
@@ -13925,6 +14050,16 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
         range_pct = _authority["range_pct"]
         confidence = _authority["confidence"]
         valuation_trace = _authority["trace"]
+        # the asking-price check's figures are real numbers the narrative may quote ("asking x the
+        # comps' median ratio indicates about $639,348") - make them known to the final $ sweep.
+        if _reasoning_packet.get("asking_price_check"):
+            _apc = _reasoning_packet["asking_price_check"]
+            valuation_trace["asking_price_check"] = {
+                "expected_sale_price": _apc.get("expected_sale_price"),
+                "allowed_low_price": _apc.get("allowed_low"), "allowed_high_price": _apc.get("allowed_high"),
+                "asking_price": _apc.get("asking_price"), "ratio_used": _apc.get("ratio_used"),
+                "passed_over": bool(_apc.get("passed_over")),
+            }
         valuation_trace["authoritative_evidence_snapshot"] = _evidence_snapshot.audit_metadata()
         qa_blocking.extend(_reasoning_blocking)
         _formula_only_blocks = [b for b in qa_blocking if " RECONCILIATION -" in str(b)]

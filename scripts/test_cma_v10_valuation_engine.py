@@ -3581,6 +3581,54 @@ def test_am_round2_false_blocks_and_text():
           "urgency" not in txt and "inspection contingency" in txt and "expect competing offers" in txt, txt)
 
 
+def test_an_round3_soften_claims_and_passed_over():
+    print("\nAN. accuracy test round 3 (10/20): undocumented system claims softened, offer wording, passed-over listings")
+    m = _cma_mod
+    subj = {"public_remarks": "With central air and room to personalize over time. A new roof in 2022, replacement "
+                              "windows in 2023, a gas water heater installed in 2019, hot water heater replaced in 2018."}
+    txt, notes = m._soften_unsupported_system_claims(
+        "The home has newer HVAC and good bones. Budget for cosmetic updates.", subj)
+    check("1: an undocumented 'newer HVAC' sentence becomes a to-verify item",
+          "newer HVAC" not in txt and "Verify the age and condition of the HVAC" in txt and "cosmetic updates" in txt and notes, txt)
+    txt2, notes2 = m._soften_unsupported_system_claims("The listing notes a new roof. Windows, 2019 per the seller.", subj)
+    check("1b: attributed claims are left alone", "new roof" in txt2, txt2)
+    check("1c: a wrong year is not backed ('windows, 2019' when the listing says 2023)",
+          not m._listing_documents_system_claim(subj, "windows, 2019")
+          and m._listing_documents_system_claim(subj, "windows in 2023"))
+    check("1d: any system in the claim counts ('Electrical: The water heater was replaced in 2018')",
+          m._listing_documents_system_claim(subj, "Electrical:** The water heater was replaced in 2018"))
+    qa, _, blocking = m._v10_pre_export_qa(
+        {"o": ("Offer strategy", "A reasonable opening offer is roughly $770,000 to $785,000 (about 0%-2% below the list price).")},
+        value=805_000, range_pct=5.0, subject_asking=785_000, status_timeline={}, comps=[], comp_num_by_key={},
+        addr_by_key={}, valuation_trace={}, value_drivers=[], confidence="medium", subject=subj)
+    check("2: an offer 'below the list price' line is not read as the VALUE being below asking",
+          not any("Directional math" in b for b in blocking), blocking)
+    comps = [{"sale_price": 1, "sold_list_ratio": r} for r in (1.07, 1.08, 1.06)]
+    chk = m._asking_price_market_check({"current_list_price": 1_195_000, "dom": 17}, {},
+                                       {"state": "normal_exposure", "comp_median_dom": 6}, comps)
+    check("3: 17 days on market while comps sold in 6 -> passed over, at most 98% of asking, never above it",
+          chk["passed_over"] and chk["expected_sale_price"] == round(1_195_000 * 0.98) and chk["allowed_high"] <= 1_195_000, chk)
+    fresh = m._asking_price_market_check({"current_list_price": 815_000, "dom": 6}, {},
+                                         {"state": "insufficient_exposure", "comp_median_dom": 6}, comps)
+    check("3b: a fresh listing in the same market keeps its over-asking expectation",
+          not fresh["passed_over"] and fresh["expected_sale_price"] > 815_000, fresh)
+    band = m._v10_build_buyer_offer_band(1_171_000, 1_195_000, trace={
+        "exposure": {"state": "normal_exposure"}, "anchor": {"comp_list_to_sale_median": 1.07},
+        "asking_price_check": {"passed_over": True}}, confidence="medium", status_timeline={"active_market_days": 17})
+    check("4: a passed-over listing never gets the 'expect competing offers' hot-market offer",
+          not band.get("hot_market"), band)
+    try:
+        _f, _b = m._v10_final_report_qa({"o": ("Offer strategy", "Open near $775,000.")}, 790_000, 5.0, {},
+                                        known_dollars=[775_000, "about 1% below"])
+        ok = not _b
+    except Exception as exc:  # noqa: BLE001
+        ok, _b = False, repr(exc)
+    check("5: offer text in the known-figure list doesn't crash the final $ sweep", ok, _b)
+    _f, _b = m._v10_final_report_qa({"m": ("Methodology summary", "Asking x the comps' ratio indicates about $639,348.")},
+                                    635_000, 5.0, {"asking_price_check": {"expected_sale_price": 639_348}})
+    check("6: the asking-price check's expected price is a known figure", not _b, _b)
+
+
 def main() -> int:
     for fn in (test_a_finished_basement_not_inflating_psf, test_b_location_class_and_weight,
                test_c_condition_reconciliation, test_d_mixed_set_stability,
@@ -3608,7 +3656,7 @@ def main() -> int:
                test_aj_client_facing_road_and_fallback_prose,
                test_ak_cross_section_semantic_consistency,
                test_al_asking_price_check_and_round1_fixes,
-               test_am_round2_false_blocks_and_text):
+               test_am_round2_false_blocks_and_text, test_an_round3_soften_claims_and_passed_over):
         try:
             fn()
         except Exception as exc:  # noqa: BLE001

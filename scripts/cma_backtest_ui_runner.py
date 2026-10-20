@@ -134,8 +134,10 @@ async def run_home(page, item: dict, mode: str, shots: str | None) -> str:
             st = rep.generation_status if rep else None
         if st in ("complete", "failed"):
             break
-    await page.reload(wait_until="networkidle")
-    await page.wait_for_timeout(4000)
+    # "load", not "networkidle": the analysis page keeps polling, so under 2-4 parallel runners the
+    # dev server never went idle within 30s and the run was marked failed after the report finished.
+    await page.reload(wait_until="load", timeout=120000)
+    await page.wait_for_timeout(6000)
     await _clear_overlays(page)
     await _shot(page, shots, "07_analysis_done.png")
     # Pricing -> Review through the step bar (an agent can move freely between steps).
