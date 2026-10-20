@@ -57,3 +57,11 @@ async def scheduled_domain_verification():
                 )
     except Exception as e:
         logger.error("Scheduled domain verification failed", exc_info=True, extra={"error": str(e)})
+    # Domains bought in OpenHousePal: finish paid checkouts, retry DNS, make them the main
+    # address once live, expiry reminders (domain_purchase_service.sweep).
+    try:
+        from app.services import domain_purchase_service
+        async with AsyncSessionLocal() as db:
+            await domain_purchase_service.sweep(db)
+    except Exception as e:
+        logger.error("Domain purchase sweep failed", exc_info=True, extra={"error": str(e)})

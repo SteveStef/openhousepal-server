@@ -26,7 +26,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.hub_phones import brokerage_phone, office_phone, upgrade as hub_phones_upgrade
 from app.models.database import (
-    AgentForm, AgentHub, AgentMarketArea, CalendarConnection, EmailSignature, MailConnection, Site, StudioBrandKit, User,
+    AgentForm, AgentHub, AgentMarketArea, CalendarConnection, EmailSignature, MailConnection, PurchasedDomain, Site, SiteDomain,
+    StudioBrandKit, User,
 )
 from app.utils.auth import (
     AGENT_HUB_ACCESS_TIERS, EMAIL_SIGNATURE_ACCESS_TIERS, REVIEWS_ACCESS_TIERS, tier_has_mls,
@@ -35,12 +36,12 @@ from app.utils.auth import (
 # Every step the flow knows, in the order it asks. Required steps can't be skipped.
 STEP_ORDER = [
     "about", "contact", "license", "photo", "story", "socials", "sales", "reviews",
-    "brand", "hub", "forms", "signature", "alerts", "calendar", "mailbox", "crm", "areas", "homes", "website",
+    "brand", "hub", "forms", "signature", "alerts", "calendar", "mailbox", "crm", "areas", "homes", "website", "domain",
 ]
 REQUIRED = {"about", "contact", "license"}
 # Steps whose answer is a choice with a working default - done once the agent confirms it here
 # (or it was set inside the feature itself).
-CONFIRM_STEPS = {"sales", "brand", "hub", "forms", "signature", "alerts", "homes", "website"}
+CONFIRM_STEPS = {"sales", "brand", "hub", "forms", "signature", "alerts", "homes", "website", "domain"}
 
 # Before a plan is chosen (waiting for broker approval, or not checked out yet) the flow offers
 # the head start every plan shares.
@@ -61,7 +62,7 @@ def steps_for_plan(plan_tier: Optional[str], approved: bool) -> list[str]:
     if plan_tier in EMAIL_SIGNATURE_ACCESS_TIERS:
         steps.add("signature")
     if plan_tier == "IDX":
-        steps |= {"areas", "homes", "website"}
+        steps |= {"areas", "homes", "website", "domain"}
     return [s for s in STEP_ORDER if s in steps]
 
 
@@ -279,6 +280,13 @@ async def compute(db: AsyncSession, user: User, hub: AgentHub) -> dict:
         elif step == "website":
             site = (await db.execute(select(Site).where(Site.owner_id == user.id))).scalar_one_or_none()
             done[step] = "website" in confirmed or bool(site and (site.status == "PUBLISHED" or site.is_enabled is False))
+        elif step == "domain":
+            # The web address: keeping the free one (confirmed), connecting their own, or buying one.
+            done[step] = "domain" in confirmed or await _exists(
+                select(SiteDomain.id).where(SiteDomain.owner_id == user.id).limit(1)
+            ) or await _exists(
+                select(PurchasedDomain.id).where(PurchasedDomain.owner_id == user.id, PurchasedDomain.status.in_(["REGISTERING", "ACTIVE"])).limit(1)
+            )
 
     skipped = set(st["skipped"])
     items = []

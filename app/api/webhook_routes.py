@@ -180,6 +180,18 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
             )
             return {"received": True, "warning": "No subscription_id"}
 
+        # A domain bought in OpenHousePal has its own yearly subscription - not the agent's plan.
+        from app.models.database import PurchasedDomain
+        purchase = (await db.execute(
+            select(PurchasedDomain).where(PurchasedDomain.paypal_subscription_id == subscription_id)
+        )).scalar_one_or_none()
+        if purchase:
+            from app.services import domain_purchase_service
+            db.add(WebhookEvent(id=event_id, event_type=event_type))
+            await db.commit()
+            await domain_purchase_service.on_paypal_event(db, purchase, event_type, resource)
+            return {"received": True, "event_type": event_type, "domain": purchase.domain_name}
+
         # Find user by subscription_id
         result = await db.execute(
             select(User).where(User.subscription_id == subscription_id)

@@ -434,6 +434,232 @@ async def delete_my_site_domain(
         await site_service.regenerate_owner_idx_links(db, current_user)
 
 
+# ---------- One-click connect (Domain Connect) - domain_connect_service ----------
+
+def _app_url() -> str:
+    from app.services.agent_email_service import app_url
+    return app_url().rstrip("/")
+
+
+@router.get("/me/domains/{domain_id}/one-click")
+async def get_one_click_connect(
+    domain_id: str,
+    back: str = "website",
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """Can this domain's company add our records for the agent? {supported, company, url}. The url
+    opens the company's own approve screen; it comes back to /domains/connected."""
+    from app.services.website import domain_connect_service as dc
+    from app.services.website.domain_verification_service import apex_of, is_www
+    domain = await _load_owned_domain(db, domain_id, current_user.id)
+    if domain.redirect_target_domain_id or not dc.configured():
+        return {"supported": False, "company": None, "url": None}
+    if is_www(domain.hostname):
+        host, apex = "www", apex_of(domain.hostname)
+    else:
+        # a subdomain they chose (homes.janesmith.com): its parent is the zone
+        host, _, apex = domain.hostname.partition(".")
+    settings = await dc.discover(apex)
+    if not settings or not await dc.supports(settings, dc.SERVICE_SITE):
+        return {"supported": False, "company": dc.company_name(settings), "url": None}
+    back = back if back in ("setup", "settings", "website") else "website"
+    redirect_uri = f"{_app_url()}/studio/domains/connected?d={domain.id}&back={back}"
+    return {"supported": True, "company": dc.company_name(settings),
+            "url": dc.apply_url(settings, apex, host, dc.SERVICE_SITE, redirect_uri, "site")}
+
+
+class OneClickReturn(BaseModel):
+    state: str = "site"
+    error: str | None = None
+    back: str = "website"
+
+
+@router.post("/me/domains/{domain_id}/one-click/return")
+async def one_click_return(
+    domain_id: str,
+    body: OneClickReturn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """Back from the company. After the www record, the bare-domain forward is offered the same
+    way when the company has that template too ({next_url}); then we check the connection."""
+    from app.services.website import domain_connect_service as dc
+    from app.services.website.domain_verification_service import apex_of, is_www
+    domain = await _load_owned_domain(db, domain_id, current_user.id)
+    if body.error:
+        cancelled = body.error.startswith("access_denied") or "cancel" in body.error
+        return {"done": False, "error": "cancelled" if cancelled else "failed", "next_url": None}
+    partner = (await db.execute(select(SiteDomain).where(SiteDomain.redirect_target_domain_id == domain.id))).scalar_one_or_none()
+    if body.state == "site" and partner and is_www(domain.hostname):
+        apex = apex_of(domain.hostname)
+        settings = await dc.discover(apex)
+        if settings and await dc.supports(settings, dc.SERVICE_REDIRECT):
+            back = body.back if body.back in ("setup", "settings", "website") else "website"
+            redirect_uri = f"{_app_url()}/studio/domains/connected?d={domain.id}&back={back}"
+            return {"done": False, "error": None, "next_url": dc.apply_url(settings, apex, "", dc.SERVICE_REDIRECT, redirect_uri, "redirect")}
+    domain = await domain_verification_service.verify_domain(db, domain)
+    if partner:
+        await domain_verification_service.verify_domain(db, partner)
+    return {"done": True, "error": None, "next_url": None, "status": domain.status}
+
+
+# ---------- Buy a domain (Name.com) - domain_purchase_service ----------
+
+class DomainBuyBody(BaseModel):
+    domain: str
+    contact: dict
+    back: str = "website"
+
+
+def _purchase_error(e: Exception) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+async def _load_owned_purchase(db: AsyncSession, purchase_id: str, owner_id: str):
+    from app.models.database import PurchasedDomain
+    p = (await db.execute(select(PurchasedDomain).where(PurchasedDomain.id == purchase_id, PurchasedDomain.owner_id == owner_id))).scalar_one_or_none()
+    if not p:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Domain not found")
+    return p
+
+
+@router.get("/me/domain-shop")
+async def get_domain_shop(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """Can they buy, their bought domains, and their details to pre-fill the checkout."""
+    from app.models.database import AgentHub, PurchasedDomain
+    from app.services import domain_purchase_service as shop
+    from app.services.setup_flow_service import effective_info
+    rows = (await db.execute(select(PurchasedDomain).where(
+        PurchasedDomain.owner_id == current_user.id,
+        PurchasedDomain.status.in_(["CHECKOUT", "REGISTERING", "ACTIVE", "FAILED", "EXPIRED", "TRANSFERRED"]),
+    ).order_by(PurchasedDomain.created_at.desc()))).scalars().all()
+    hub = (await db.execute(select(AgentHub).where(AgentHub.owner_id == current_user.id))).scalar_one_or_none()
+    info = effective_info(current_user, (hub.config if hub else None) or {})
+    name = (info.get("name") or "").split(None, 1)
+    return {
+        **shop.available(),
+        "endings": shop.tlds(),
+        "purchases": [shop.as_dict(p) for p in rows if not (p.status == "CHECKOUT" and not p.paypal_subscription_id)],
+        "contact": {
+            "firstName": current_user.first_name or (name[0] if name else ""),
+            "lastName": current_user.last_name or (name[1] if len(name) > 1 else ""),
+            "email": current_user.email or info.get("email") or "",
+            "phone": info.get("call") or info.get("text") or "",
+            "address1": info.get("officeAddress") or "",
+        },
+    }
+
+
+@router.get("/me/domain-shop/search")
+async def search_domains(q: str, current_user: User = Depends(require_plan_tier(PlanTier.IDX))):
+    from app.services import domain_purchase_service as shop
+    from app.services.website.namecom_service import NamecomError
+    if not shop.available()["buy"]:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Buying a domain opens soon.")
+    try:
+        return await shop.search(q[:80])
+    except NamecomError:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="The domain search didn't answer - try again in a moment.")
+
+
+@router.post("/me/domain-shop/buy")
+async def buy_domain(
+    body: DomainBuyBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    from app.services import domain_purchase_service as shop
+    from app.services.website.namecom_service import NamecomError
+    try:
+        return await shop.start(db, current_user, body.domain, body.contact, body.back)
+    except shop.PurchaseError as e:
+        raise _purchase_error(e)
+    except NamecomError:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="The domain company didn't answer - try again in a moment.")
+
+
+@router.get("/me/domain-shop/purchases/{purchase_id}")
+async def get_domain_purchase(
+    purchase_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """The return page polls this - it also finishes the purchase as soon as PayPal says paid."""
+    from app.services import domain_purchase_service as shop
+    p = await _load_owned_purchase(db, purchase_id, current_user.id)
+    if p.status == "CHECKOUT":
+        p = await shop.complete(db, p)
+    out = shop.as_dict(p)
+    if p.status == "ACTIVE":
+        out["email_confirmed"] = await shop.email_confirmed(p)
+        main = (await db.execute(select(SiteDomain).where(SiteDomain.hostname == f"www.{p.domain_name}"))).scalar_one_or_none()
+        out["site_status"] = main.status if main else None
+    return out
+
+
+@router.post("/me/domain-shop/purchases/{purchase_id}/cancel-checkout")
+async def cancel_domain_checkout(
+    purchase_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """They backed out at PayPal - nothing was charged."""
+    p = await _load_owned_purchase(db, purchase_id, current_user.id)
+    if p.status == "CHECKOUT":
+        from app.services import domain_purchase_service as shop
+        p = await shop.complete(db, p)  # paid after all? then it carries on
+        if p.status == "CHECKOUT":
+            p.status = "ABANDONED"
+            await db.commit()
+    return {"status": p.status}
+
+
+@router.post("/me/domain-shop/purchases/{purchase_id}/stop-renewing")
+async def stop_domain_renewal(
+    purchase_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    from app.services import domain_purchase_service as shop
+    p = await _load_owned_purchase(db, purchase_id, current_user.id)
+    try:
+        await shop.stop_renewing(db, p)
+    except shop.PurchaseError as e:
+        raise _purchase_error(e)
+    return shop.as_dict(p)
+
+
+@router.post("/me/domain-shop/purchases/{purchase_id}/transfer-code")
+async def get_domain_transfer_code(
+    purchase_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    from app.services import domain_purchase_service as shop
+    p = await _load_owned_purchase(db, purchase_id, current_user.id)
+    if p.status != "ACTIVE":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This domain can't be moved right now.")
+    try:
+        return {"code": await shop.transfer_code(db, p)}
+    except shop.PurchaseError as e:
+        raise _purchase_error(e)
+
+
+@router.post("/me/domain-shop/purchases/{purchase_id}/resend-email")
+async def resend_domain_email(
+    purchase_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    from app.services import domain_purchase_service as shop
+    p = await _load_owned_purchase(db, purchase_id, current_user.id)
+    return {"sent": await shop.resend_email(p)}
+
+
 async def _enrich_area_background(area_id: str, triggering_user_id: str):
     """Runs after the response is already sent (see POST /me/areas) - opens its own DB session
     since the request-scoped one is gone by the time BackgroundTasks fires, same standalone-

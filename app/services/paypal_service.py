@@ -442,6 +442,58 @@ class PayPalService:
 
             return verification_status == "SUCCESS"
 
+    # ---- Domains bought in OpenHousePal (domain_purchase_service) ----
+
+    async def _post(self, path: str, data: dict) -> httpx.Response:
+        token = await self.get_token()
+        async with httpx.AsyncClient() as client:
+            return await client.post(f"{self._base_url}{path}", json=data, timeout=30.0,
+                                     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+
+    async def create_domain_subscription(self, plan_id: str, first_year: float, renewal: float, start_time: str,
+                                         custom_id: str, description: str, return_url: str, cancel_url: str) -> dict:
+        """One yearly subscription per domain on the shared "Domain name" plan, priced for this
+        domain: year one is the setup fee (charged at approval - CANCEL if it fails, so ACTIVE means
+        paid), the yearly cycle starts at `start_time` (just before it would expire)."""
+        resp = await self._post("/v1/billing/subscriptions", {
+            "plan_id": plan_id,
+            "start_time": start_time,
+            "custom_id": custom_id,
+            "plan": {
+                "billing_cycles": [{"sequence": 1, "total_cycles": 0,
+                                    "pricing_scheme": {"fixed_price": {"value": f"{renewal:.2f}", "currency_code": "USD"}}}],
+                "payment_preferences": {"auto_bill_outstanding": True, "setup_fee_failure_action": "CANCEL",
+                                        "payment_failure_threshold": 2,
+                                        "setup_fee": {"value": f"{first_year:.2f}", "currency_code": "USD"}},
+            },
+            "application_context": {
+                "brand_name": "OpenHousePal", "shipping_preference": "NO_SHIPPING", "user_action": "SUBSCRIBE_NOW",
+                "return_url": return_url, "cancel_url": cancel_url,
+            },
+        })
+        if resp.status_code not in (200, 201):
+            raise Exception(f"Failed to create domain subscription: {resp.status_code} - {resp.text}")
+        return resp.json()
+
+    async def list_subscription_transactions(self, subscription_id: str, days: int = 400) -> list:
+        token = await self.get_token()
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=days)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{self._base_url}/v1/billing/subscriptions/{subscription_id}/transactions",
+                params={"start_time": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "end_time": end.strftime("%Y-%m-%dT%H:%M:%SZ")},
+                headers={"Authorization": f"Bearer {token}"}, timeout=30.0,
+            )
+        if resp.status_code != 200:
+            raise Exception(f"Failed to list transactions: {resp.status_code} - {resp.text}")
+        return resp.json().get("transactions") or []
+
+    async def refund_sale(self, sale_id: str) -> bool:
+        """Full refund of one subscription payment (a domain we couldn't register)."""
+        resp = await self._post(f"/v1/payments/sale/{sale_id}/refund", {})
+        return resp.status_code in (200, 201)
+
 
 paypal_service = PayPalService()
 

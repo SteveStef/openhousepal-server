@@ -2051,6 +2051,35 @@ class SiteDomain(Base):
     redirect_target = relationship("SiteDomain", remote_side=[id])
 
 
+class PurchasedDomain(Base):
+    """A domain an agent bought inside OpenHousePal (domain_purchase_service). Registered at
+    Name.com under our reseller account, in the agent's name; paid with a yearly PayPal
+    subscription (first year = the setup fee, renewals = the yearly cycle). Its website hookup is
+    ordinary site_domains rows, so everything after the purchase is the normal custom-domain path."""
+    __tablename__ = "purchased_domains"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    domain_name = Column(String, nullable=False, index=True)  # bare, lowercase: janesmithhomes.com
+    # CHECKOUT (waiting on PayPal) -> REGISTERING -> ACTIVE; FAILED (refunded) / ABANDONED
+    # (never paid); ACTIVE ones that stop renewing keep status ACTIVE with auto_renew False
+    # until expires_at, then EXPIRED. TRANSFERRED = moved to another company.
+    status = Column(String, nullable=False, default="CHECKOUT", index=True)
+    price_usd = Column(Float, nullable=False)          # what the agent paid for year one
+    renewal_price_usd = Column(Float, nullable=False)  # what the agent pays each later year
+    cost_usd = Column(Float, nullable=True)            # what Name.com charged us
+    paypal_subscription_id = Column(String, nullable=True, unique=True, index=True)
+    namecom_order_id = Column(String, nullable=True)
+    auto_renew = Column(Boolean, nullable=False, default=True)
+    registered_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    last_renewed_at = Column(DateTime(timezone=True), nullable=True)
+    registrant = Column(JSONB, nullable=True)  # the contact we registered it with (agent's own)
+    last_error = Column(String, nullable=True)  # short, agent-safe
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
 # ---------------------------------------------------------------------------
 # Single Property Websites: one standalone cinematic marketing site per listing,
 # many per owner (unlike Site above, which is one whole-agent website). Publishes at its own
