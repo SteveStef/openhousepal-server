@@ -318,7 +318,10 @@ _SYSTEM_PROMPT = (
     "recency, data quality), and the adjustment layer carries the condition difference. Only "
     "classify a close-in sale weak for condition when the PRODUCT itself is radically different "
     "(a full luxury rebuild vs. an original-condition tear-down, say) so that no bounded "
-    "adjustment can bridge it. Your classification MUST agree with your own note AND with how you use "
+    "adjustment can bridge it. A comp's assigned_role (with share_of_value_pct) comes from the valuation "
+    "engine's weighting - use it as that comp's classification unless the comp is unusable (unverified "
+    "price, different product), and write its note so it reads consistently with that role. "
+    "Your classification MUST agree with your own note AND with how you use "
     "the comp in methodology_summary: a comp your methodology leans on to set the value must be "
     "strong or supporting, never weak; a comp your note calls 'context only' / 'a different "
     "market' / 'should not drive value' must be weak, and your methodology must not lean on it. "
@@ -1252,7 +1255,7 @@ _SUBJECT_FIELDS = [
 _COMP_FIELDS = [
     "street_address", "city", "state", "zipcode", "distance_miles", "status",
     "verified_close_price", "original_list_price", "list_price", "close_date", "sale_date",
-    "days_on_market", "cdom", "data_note",
+    "days_on_market", "cdom", "data_note", "assigned_role", "share_of_value_pct",
     "sqft", "lot_size", "beds", "baths", "year_built",
     "property_age_years", "garage", "basement", "price_per_sqft", "annual_taxes", "school_district", "water_source", "sewer", "match_score", "road_context_note",
     # Computed by _comp_evidence_score (see below), not raw MLS data - grounds the AI's own
@@ -4924,7 +4927,10 @@ _V10_COMPETITIVE_CORROB_FRAC = 0.035  # a non-competitive closed comp within thi
 # closed at/under list after normal exposure - it stays in the anchor (never discarded) but at a
 # reduced weight so a single hot sale can't dominate the number. NOT applied when the whole set is
 # competitive (then it's simply the market and re-weighting is meaningless).
-_V10_COMPETITIVE_WEIGHT_MULT = 0.70
+# Was 0.70: a fast over-asking sale lost 30% of its weight. Removed 10/20 - in a market where
+# homes sell over asking that IS the evidence (it pushed 1212 Blackhorse Hill, the lowest-relevance
+# comp, to the largest weight on 417 Dogwood Ln). The flag is still traced.
+_V10_COMPETITIVE_WEIGHT_MULT = 1.0
 
 # round 16: qualitative items whose basis CANNOT isolate a feature's contributory value (anything
 # not surviving as paired_market_evidence) are inherently imprecise. They are applied at the
@@ -5027,6 +5033,16 @@ def _v10_fit_psf_size_slope(points: list) -> Optional[float]:
     return slope
 
 
+def _miles_between(a: Optional[dict], b: Optional[dict]) -> Optional[float]:
+    try:
+        lat1, lng1, lat2, lng2 = (float((a or {})["latitude"]), float((a or {})["longitude"]),
+                                  float((b or {})["latitude"]), float((b or {})["longitude"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    from app.utils.geo import haversine_distance
+    return haversine_distance(lat1, lng1, lat2, lng2)
+
+
 def _v10_redundancy_penalties(rows: list) -> dict:
     """Per-comp multiplier in (0, 1]. Comps that overlap heavily on micro-location (same street),
     sale period (<= ~45 days apart), size (<= ~10%), AND $/sqft (<= ~6%) are near-duplicate
@@ -5047,7 +5063,12 @@ def _v10_redundancy_penalties(rows: list) -> dict:
             rep = cl[0]
             psf_tight = rep["psf"] > 0 and abs(r["psf"] - rep["psf"]) <= 0.03 * rep["psf"]
             size_tight = rep["sqft"] > 0 and abs(r["sqft"] - rep["sqft"]) <= 0.06 * rep["sqft"]
-            same_street = bool(_street(r.get("address")) and _street(r.get("address")) == _street(rep.get("address")))
+            # Same street name alone no longer counts (10/20): three sales along E Kings Hwy, a mile
+            # or more apart, were each cut to 58% weight as "duplicates". Same street only counts when
+            # the two homes are also within a quarter mile of each other.
+            _apart = _miles_between(r.get("_c"), rep.get("_c"))
+            same_street = bool(_street(r.get("address")) and _street(r.get("address")) == _street(rep.get("address"))
+                               and _apart is not None and _apart <= 0.25)
             d1, d2 = _parse_iso_date(r.get("sale_date")), _parse_iso_date(rep.get("sale_date"))
             period_close = bool(d1 and d2 and abs((d1 - d2).days) <= 30)
             if same_street or (psf_tight and size_tight and period_close):
@@ -5223,18 +5244,21 @@ def _v10_psf_leg_treatment(c: dict, price: float, raw_basis_sqft: float, subj_be
     return out
 
 
-# --- Feature adjustments (10/20) -------------------------------------------------------------
-# The anchor used to size-adjust on above-grade area only, so a subject's finished lower level,
-# extra baths and extra garage bays were worth $0 in the comp math (417 Dogwood Ln: 1,300 sqft
-# finished 2023 lower-level suite, 3.5 baths vs 2 / 1.5, 2-car vs 1-car -> anchor $424K, then the
-# asking-price band alone carried the value to $500K). Each verified comp is now adjusted toward
-# the subject on these three, appraisal-grid style, at rates scaled to that comp's own price level.
-_V10_FEATURE_BG_FRAC = 0.25       # finished below-grade sqft at this x the comp's above-grade $/sqft
+# --- Adjustment grid (10/20) -------------------------------------------------------------------
+# Appraisal-style grid against ONE market rate (the weighted median of the comps' clean $/sqft on
+# an effective-area basis). Rates were picked on the free backtest; see _cma_engine_lab.
+_V10_GRID_SIZE_FRAC = float(os.getenv("CMA_GRID_SIZE_FRAC", "0.35"))  # each above-grade sqft of difference at this x the market rate
+_V10_GRID_BG_FRAC = float(os.getenv("CMA_GRID_BG_FRAC", "0.12"))      # each finished lower-level sqft at this x the market rate
 _V10_FEATURE_BATH_PCT = 0.02      # per full-bath difference (a half bath = 0.5) x the comp's price
 _V10_FEATURE_GARAGE_PCT = 0.015   # per garage-space difference x the comp's price
 _V10_FEATURE_CESSPOOL_PCT = 0.04  # cesspool vs not: 4% of the comp's price...
 _V10_FEATURE_CESSPOOL_MAX = 30000  # ...up to $30K (replacement / public-sewer connection)
-_V10_FEATURE_MAX_PCT = 0.18       # all of them together capped at +-18% of the comp's sale price
+_V10_FEATURE_MAX_PCT = 0.30       # net adjustment capped at +-30% of the comp's sale price
+_V10_GRID_GROSS_WEIGHT_SLOPE = 1.5  # weight x (1 - 1.5 x gross adjustment %), floor 0.15
+_V10_GRID_HEAVY_GROSS = 0.25      # a comp adjusted more than this (gross) ...
+_V10_GRID_HEAVY_CAP = 0.10        # ... carries at most this share of the value
+_V10_GRID_MAX_SHARE = 0.35        # no single comp carries more than this share
+_V10_STRONG_SHARE = 0.15          # a comp carrying at least this share of the value is labelled Strong
 
 
 def _v10_finished_below_grade_sqft(d: dict) -> Optional[float]:
@@ -5311,67 +5335,109 @@ def _v10_garage_spaces(d: dict) -> Optional[float]:
     return None
 
 
-def _v10_feature_adjustments(subject: dict, comp: dict, price: float, comp_above_psf: float,
-                             bg_rate_evidence: Optional[float] = None) -> dict:
-    """Dollar adjustments that move a comp's sale price toward the subject for finished
-    below-grade area, bathroom count and garage spaces. Positive = subject has more."""
-    out = {"below_grade": 0.0, "baths": 0.0, "garage": 0.0, "notes": []}
-    s_bg, c_bg = _v10_finished_below_grade_sqft(subject), _v10_finished_below_grade_sqft(comp)
-    estimated = None
-    # A COMP that says finished/partially finished but records no area: estimate it (half its
-    # above-grade footprint, halved again for "partially"), never more than the subject's own -
-    # treating it as unknown dropped the whole lower-level difference (2702 E Kings Hwy, 10/20).
-    if s_bg is not None and c_bg is None:
-        c_ag = _v10_sqft(comp) or 0.0
-        partial = "partial" in _style_text(comp.get("basement")) or _remarks_finished_basement(comp) == "partial"
-        c_bg = min(s_bg, 0.5 * c_ag) * (0.5 if partial else 1.0)
-        estimated = "partially finished" if partial else "finished"
-    if s_bg is not None and c_bg is not None and abs(s_bg - c_bg) >= 100 and comp_above_psf > 0:
-        # Always a fraction of the comp's own above-grade rate. A rate "paired" from the comp set can
-        # come out near the above-grade rate itself ($244/sqft in a Bryn Mawr backtest, 10/20) and
-        # then a 1,200 sqft basement looked worth almost as much as 1,200 sqft upstairs.
-        rate = comp_above_psf * _V10_FEATURE_BG_FRAC
-        if bg_rate_evidence:
-            rate = min(rate, float(bg_rate_evidence))
-        out["below_grade"] = (s_bg - c_bg) * rate
-        out["below_grade_rate_psf"] = round(rate, 2)
+def _v10_bg_for_grid(d: dict, above_grade: float) -> tuple:
+    """(finished lower-level sqft, estimated?) for the grid. When the MLS says the lower level is
+    finished but records no area, estimate half the above-grade footprint (a quarter for
+    "partially finished") instead of treating it as zero or skipping it - and say so."""
+    known = _v10_finished_below_grade_sqft(d)
+    if known is not None:
+        return float(known), False
+    partial = "partial" in _style_text((d or {}).get("basement")) or _remarks_finished_basement(d) == "partial"
+    return round((0.25 if partial else 0.5) * (above_grade or 0.0)), True
+
+
+def _v10_weighted_median(pairs: list) -> Optional[float]:
+    pts = sorted((v, w) for v, w in pairs if v and w and w > 0)
+    if not pts:
+        return None
+    half, acc = sum(w for _, w in pts) / 2.0, 0.0
+    for v, w in pts:
+        acc += w
+        if acc >= half:
+            return v
+    return pts[-1][0]
+
+
+def _v10_capped_weights(items: list) -> list:
+    """Normalize (raw weight, gross adjustment %) pairs to shares summing to 1, with a comp adjusted
+    more than _V10_GRID_HEAVY_GROSS held to _V10_GRID_HEAVY_CAP and no comp above _V10_GRID_MAX_SHARE
+    (1/n when there are too few comps for that cap). Excess is shared out to the uncapped comps."""
+    n = len(items)
+    if not n:
+        return []
+    caps = [(_V10_GRID_HEAVY_CAP if g > _V10_GRID_HEAVY_GROSS else max(_V10_GRID_MAX_SHARE, 1.0 / n)) for _, g in items]
+    if sum(caps) < 1.0:   # too few light comps to honour every cap - scale the caps up together
+        caps = [c / sum(caps) for c in caps]
+    raw = [max(0.0, w) for w, _ in items]
+    if sum(raw) <= 0:
+        raw = [1.0] * n
+    shares = [w / sum(raw) for w in raw]
+    for _ in range(20):
+        over = [i for i in range(n) if shares[i] > caps[i] + 1e-9]
+        if not over:
+            break
+        excess = sum(shares[i] - caps[i] for i in over)
+        for i in over:
+            shares[i] = caps[i]
+        free = [i for i in range(n) if shares[i] < caps[i] - 1e-9]
+        base = sum(shares[i] for i in free)
+        if not free or base <= 0:
+            break
+        for i in free:
+            shares[i] += excess * shares[i] / base
+    total = sum(shares)
+    return [s / total for s in shares]
+
+
+def _v10_grid_adjustments(subject: dict, r: dict, s_ag: float, s_bg: float, s_bg_est: bool,
+                          market_psf: float) -> dict:
+    """Dollar adjustments moving one comp's sale price toward the subject: size (above grade),
+    finished lower level, baths, garage, cesspool - all at one market rate. Positive = the subject
+    has more. Size ALWAYS follows the size gap (a smaller comp is adjusted up)."""
+    comp, price = r["_c"], r["price"]
+    out = {"size": 0.0, "below_grade": 0.0, "baths": 0.0, "garage": 0.0, "sewer": 0.0, "notes": [],
+           "market_psf": round(market_psf, 2),
+           "size_rate_psf": round(market_psf * _V10_GRID_SIZE_FRAC, 2),
+           "below_grade_rate_psf": round(market_psf * _V10_GRID_BG_FRAC, 2),
+           "comp_below_grade_sqft": round(r["bg"]), "comp_below_grade_estimated": r["bg_estimated"]}
+    if s_ag and r["ag"] and abs(s_ag - r["ag"]) >= 25:
+        out["size"] = (s_ag - r["ag"]) * market_psf * _V10_GRID_SIZE_FRAC
+        out["notes"].append(f"above grade {round(s_ag):,} vs {round(r['ag']):,} sqft at ${round(out['size_rate_psf'])}/sqft")
+    if abs(s_bg - r["bg"]) >= 50:
+        out["below_grade"] = (s_bg - r["bg"]) * market_psf * _V10_GRID_BG_FRAC
+        est = [w for w, e in (("comp", r["bg_estimated"]), ("subject", s_bg_est)) if e]
         out["notes"].append(
-            f"finished lower level {round(s_bg):,} vs {round(c_bg):,} sqft at ${round(rate)}/sqft"
-            + (f" (comp's {estimated} area not on record - estimated)" if estimated else ""))
-    elif s_bg is None and (c_bg or 0) > 0:
-        out["notes"].append("subject's finished lower-level area not on record - not adjusted")
+            f"finished lower level {round(s_bg):,} vs {round(r['bg']):,} sqft at ${round(out['below_grade_rate_psf'])}/sqft"
+            + (f" ({' and '.join(est)} area estimated - finished but no area on record)" if est else ""))
     s_b = _as_float(_first_present(subject, "baths", "bathrooms", "bathrooms_total"))
     c_b = _as_float(_first_present(comp, "baths", "bathrooms", "bathrooms_total"))
     if s_b and c_b and s_b != c_b:
-        diff = _clamp(s_b - c_b, -2.0, 2.0)
-        out["baths"] = diff * price * _V10_FEATURE_BATH_PCT
+        out["baths"] = _clamp(s_b - c_b, -2.0, 2.0) * price * _V10_FEATURE_BATH_PCT
         out["notes"].append(f"baths {s_b:g} vs {c_b:g}")
     s_g, c_g = _v10_garage_spaces(subject), _v10_garage_spaces(comp)
     if s_g is not None and c_g is not None and s_g != c_g:
-        diff = _clamp(s_g - c_g, -3.0, 3.0)
-        out["garage"] = diff * price * _V10_FEATURE_GARAGE_PCT
+        out["garage"] = _clamp(s_g - c_g, -3.0, 3.0) * price * _V10_FEATURE_GARAGE_PCT
         out["notes"].append(f"garage {s_g:g} vs {c_g:g} spaces")
-    # A cesspool comp sold at a discount for it (replacement / connection cost, lender limits).
     s_cess, c_cess = _has_cesspool(subject), _has_cesspool(comp)
-    out["sewer"] = 0.0
-    if s_cess != c_cess and (subject.get("sewer") and comp.get("sewer")):
+    if s_cess != c_cess and subject.get("sewer") and comp.get("sewer"):
         amount = min(_V10_FEATURE_CESSPOOL_PCT * price, _V10_FEATURE_CESSPOOL_MAX)
         out["sewer"] = amount if c_cess else -amount
         out["notes"].append("comp has a cesspool" if c_cess else "subject has a cesspool")
-    total = out["below_grade"] + out["baths"] + out["garage"] + out["sewer"]
+    keys = ("size", "below_grade", "baths", "garage", "sewer")
+    gross = sum(abs(out[k]) for k in keys)
+    net = sum(out[k] for k in keys)
     cap = _V10_FEATURE_MAX_PCT * price
-    if abs(total) > cap:
-        scale = cap / abs(total)
-        for k in ("below_grade", "baths", "garage", "sewer"):
+    if abs(net) > cap:
+        scale = cap / abs(net)
+        for k in keys:
             out[k] *= scale
-        out["notes"].append(f"capped at {int(_V10_FEATURE_MAX_PCT * 100)}% of the sale price")
-        total = cap if total > 0 else -cap
-    for k in ("below_grade", "baths", "garage", "sewer"):
+        out["notes"].append(f"net adjustment capped at {int(_V10_FEATURE_MAX_PCT * 100)}% of the sale price")
+        net, gross = net * scale, gross * scale
+    for k in keys:
         out[k] = round(out[k])
-    out["total"] = round(total)
+    out["total"] = round(net)
+    out["gross"] = round(gross)
     return out
-
-
 def _anchor_main_uncertainties(subject: dict, rows: list, closed_count: int) -> list:
     """Plain-language statements of what the comp set can't pin down, worked out from the numbers -
     the report must say these out loud (10/20 grade: "no comp has the subject's 2023 lower-level
@@ -5386,14 +5452,49 @@ def _anchor_main_uncertainties(subject: dict, rows: list, closed_count: int) -> 
                 f"None of the verified sales has a finished lower level like this home's {round(s_bg):,} sq ft, so how "
                 f"buyers value that space is the main uncertainty in this value"
                 + (f" (the grid credits it at about ${round(rate)}/sq ft)." if rate else "."))
-    heavy = [r for r in rows if r["price"] and (abs(r.get("size_only_adj_price", r["price"]) - r["price"])
-             + sum(abs(r.get("feat", {}).get(k) or 0) for k in ("below_grade", "baths", "garage", "sewer"))) / r["price"] > 0.20]
+    est = [r for r in rows if r.get("bg_estimated") and (r.get("feat") or {}).get("below_grade")]
+    if s_bg and s_bg >= 300 and est:
+        out.append(f"Finished lower-level sizes for {len(est)} of the {len(rows)} sales aren't on record and were estimated, "
+                   "so their lower-level adjustments are approximate.")
+    heavy = [r for r in rows if r["price"] and (r.get("feat") or {}).get("gross", 0) / r["price"] > 0.20]
     if rows and len(heavy) * 2 > len(rows):
         out.append(f"Adjustments exceed 20% of the sale price on {len(heavy)} of {len(rows)} verified sales - "
                    "the closest available sales still differ a lot from this home.")
     if closed_count <= 2:
         out.append(f"Only {closed_count} verified sale{'s' if closed_count != 1 else ''} carr{'y' if closed_count != 1 else 'ies'} the value, so a single sale moves it a lot.")
     return out
+
+
+def _anchor_integrity_errors(anchor: Optional[dict], subject: Optional[dict] = None) -> list:
+    """Invariants of the adjustment grid that must hold on EVERY report (10/20 review). Any failure
+    is an engine bug, surfaced loudly on the report's review list and in the logs."""
+    a = anchor or {}
+    rows = [c for c in (a.get("comps") or []) if c.get("price_basis") != "list_context"]
+    if not rows or not a.get("anchor_value"):
+        return []
+    errs = []
+    adjusted = [c.get("size_adjusted_price") for c in rows if c.get("size_adjusted_price")]
+    if adjusted and not (min(adjusted) - 1 <= a["anchor_value"] <= max(adjusted) + 1):
+        errs.append(f"value ${a['anchor_value']:,} is outside the adjusted comps (${min(adjusted):,}-${max(adjusted):,})")
+    total = sum(c.get("normalized_weight") or 0 for c in rows)
+    if abs(total - 1.0) > 0.02:
+        errs.append(f"comp weights sum to {round(total * 100)}%, not 100%")
+    for c in rows:
+        w = c.get("normalized_weight") or 0
+        heavy = (c.get("gross_adjustment_pct") or 0) > _V10_GRID_HEAVY_GROSS * 100
+        if heavy and w > _V10_GRID_HEAVY_CAP + 0.005 and len(rows) * _V10_GRID_HEAVY_CAP >= 1:
+            errs.append(f"{c.get('label')}: adjusted {c.get('gross_adjustment_pct')}% but carries {round(w * 100)}% of the value")
+        if w > max(_V10_GRID_MAX_SHARE, 1.0 / len(rows)) + 0.005:
+            errs.append(f"{c.get('label')}: carries {round(w * 100)}% of the value (cap {round(_V10_GRID_MAX_SHARE * 100)}%)")
+        s_ag = _as_float((subject or {}).get("above_grade_finished_area")) or _as_float(a.get("subject_sqft_used"))
+        c_ag = _as_float(c.get("above_grade_sqft")) or _as_float(c.get("sqft"))
+        size = _as_float(c.get("size_adjustment")) or 0
+        if s_ag and c_ag and abs(s_ag - c_ag) >= 25 and size and (size > 0) != (s_ag > c_ag):
+            errs.append(f"{c.get('label')}: size adjustment {'+' if size > 0 else '-'}${abs(size):,.0f} goes against the size difference")
+    weights = [c.get("normalized_weight") or 0 for c in rows]
+    if any(weights[i] + 0.03 < weights[i + 1] for i in range(len(weights) - 1)):
+        errs.append("comps are not listed strongest-first")
+    return errs
 
 
 def _anchor_priced_features(anchor: Optional[dict]) -> set:
@@ -5466,7 +5567,10 @@ def _compute_comp_anchor(
             "cond_trace": (c.get("_cond") or {}),
             "dom": _as_float(c.get("days_on_market")),
             "raw_weight_override": base_w if raw_weight_overrides is not None else None,
-            "sale_to_list": (price / _as_float(c.get("list_price"))) if (price_basis == "closed_verified" and _as_float(c.get("list_price"))) else None,
+            # Against the ORIGINAL asking price when known (10/20): 2702 E Kings Hwy sold "6.5% over" a
+            # reduced $385K ask but only 2.5% over its original $399,900 - the market read was too hot.
+            "sale_to_list": (price / (_as_float(c.get("original_list_price")) or _as_float(c.get("list_price"))))
+                            if (price_basis == "closed_verified" and (_as_float(c.get("original_list_price")) or _as_float(c.get("list_price")))) else None,
         }
         # round 13: a verified closed sale that went well over asking, fast = a "competitive sale".
         _lts = row["sale_to_list"]
@@ -5537,87 +5641,65 @@ def _compute_comp_anchor(
             "note": "Comps collapsed to fewer than two independent data points after redundancy adjustment.",
         }
 
-    slope = _v10_fit_psf_size_slope([(r["sqft"], r["psf"]) for r in rows])
-    size_model = "regression" if slope is not None else "fixed_elasticity"
+    # ---- Comp math rebuild (10/20, from the graded 417 Dogwood Ln report) ----------------------
+    # The old math blended a fitted $/sqft-vs-size line (it came out NEGATIVE on a set with small
+    # high-$/sqft homes, so smaller comps were adjusted DOWN toward a bigger subject) with a naive
+    # $/sqft x subject-sqft "check" that over-shot every comp ($521K "average" above the highest
+    # adjusted comp). Now: every comp is put on one EFFECTIVE-AREA basis (above-grade + a fraction
+    # of finished lower level), one market rate comes from those clean per-foot figures, and every
+    # adjustment uses that one rate - so size always moves in the direction of the size gap, the
+    # lower level is priced at one rate for every comp, and the value is a true weighted average
+    # of the adjusted sale prices.
+    size_model = "effective_area_grid"
     if anchor_mode == "mixed":
         size_model += "+no_closed_majority"
-    total_w = sum(r["weight"] for r in rows)
+    slope = None
 
-    # Two genuinely distinct indications for a cross-check:
-    #  - psf_indication:  naive weighted-mean comp $/sqft x subject sqft (NO size correction) -
-    #    the "what agents do" number.
-    #  - sale_indication: weighted-mean comp SALE PRICE, size-corrected toward the subject (via
-    #    the fitted slope, else the fixed elasticity), with each comp's correction hard-capped at
-    #    +-22% of its real sale price so a bad slope or an extreme size gap can't run away.
-    # They diverge exactly when the subject's size differs materially from the comps AND
-    # diminishing marginal $/sqft matters - which is the divergence worth flagging.
-    raw_psf_mean = sum(r["psf"] * r["weight"] for r in rows) / total_w
-
-    # ---- Fix 1: the $/sqft LEG is built from each comp's sqft-composition-NORMALIZED per-foot
-    # figure (finished-basement / auxiliary space stripped to a bounded above-grade basis, or
-    # blended + down-weighted when the split is unknown), NOT its raw price / above-grade-sqft.
-    # A materially-mixed comp whose composition can't be resolved is dropped from this leg entirely
-    # when >= 2 clean comps remain. The sale-price leg below is untouched (it size-adjusts real
-    # sale prices and hard-clamps each move to +-22%).
-    # Re-run the per-comp $/sqft-leg treatment now that the row set is settled, passing a
-    # below-grade $/sqft PAIRED from the comps themselves when the set supports one - that
-    # overrides the fallback heuristic and earns a lighter leg down-weight.
+    # Composition trace kept for audit / older consumers - no longer blended into the value.
     _bg_psf_ev, _bg_psf_src = _v10_paired_below_grade_psf(rows)
     for r in rows:
         r["psfleg"] = _v10_psf_leg_treatment(
             r["_c"], r["price"], r["sqft"], subj_below_frac,
             bg_psf_evidence=_bg_psf_ev, bg_psf_evidence_src=_bg_psf_src,
         )
-
-    _full_leg = [r for r in rows if r["psfleg"]["psf_leg_eligibility"] == "full"]
-    for r in rows:
         r["_psf_leg_mult"] = float(r["psfleg"]["psf_leg_weight_mult"])
-        if r["psfleg"]["psf_leg_eligibility"] == "blended_downweighted" and len(_full_leg) >= 2:
-            r["_psf_leg_mult"] = 0.0
-            r["psfleg"]["psf_leg_eligibility"] = "excluded_from_psf_leg"
-            r["psfleg"]["psf_leg_exclusion_reason"] = (
-                (r["psfleg"].get("psf_leg_exclusion_reason") or "") + "; excluded - enough clean-composition comps remain"
-            ).lstrip("; ")
-    # Feature adjustments per comp (finished lower level, baths, garage). On the $/sqft leg a comp
-    # whose own basement was already stripped out of its per-foot figure counts as having none.
-    for r in rows:
-        r["feat"] = _v10_feature_adjustments(subject, r["_c"], r["price"], r["psf"], _bg_psf_ev)
-        if r["psfleg"].get("adjusted_above_grade_psf_used"):
-            _stripped = {**r["_c"], "below_grade_finished_area": 0, "basement": "none"}
-            _f = _v10_feature_adjustments(subject, _stripped, r["price"], r["psf"], _bg_psf_ev)
-            r["feat_psf_total"] = _f["total"]
-        else:
-            r["feat_psf_total"] = r["feat"]["total"]
-
-    _psf_leg_den = sum(r["weight"] * r["_psf_leg_mult"] for r in rows)
-    if _psf_leg_den > 0:
-        psf_leg_mean = sum(r["psfleg"]["psf_for_leg"] * r["weight"] * r["_psf_leg_mult"] for r in rows) / _psf_leg_den
-        psf_feat_mean = sum(r["feat_psf_total"] * r["weight"] * r["_psf_leg_mult"] for r in rows) / _psf_leg_den
-    else:  # everything got excluded (pathological) - fall back to the raw weighted mean
-        psf_leg_mean = raw_psf_mean
-        psf_feat_mean = sum(r["feat_psf_total"] * r["weight"] for r in rows) / total_w
-    psf_indication = psf_leg_mean * subj_sqft + psf_feat_mean
-    psf_indication_unnormalized = raw_psf_mean * subj_sqft
     _psf_leg_norm_ct = sum(1 for r in rows if r["psfleg"]["psf_leg_eligibility"] not in ("full",))
-    _psf_leg_ct = sum(1 for r in rows if r["_psf_leg_mult"] > 0)
+    _psf_leg_ct = len(rows)
     _psf_leg_heuristic_ct = sum(1 for r in rows if r["psfleg"].get("psf_leg_heuristic_used"))
-    _bg_rate_sources = sorted({r["psfleg"]["below_grade_rate_source"] for r in rows if r["psfleg"].get("below_grade_rate_source")})
+    _bg_rate_sources = None
 
-    sale_num = 0.0
+    s_ag = _as_float(subject.get("above_grade_finished_area")) or subj_sqft
+    s_bg, s_bg_est = _v10_bg_for_grid(subject, s_ag)
     for r in rows:
-        if slope is not None:
-            psf_at_subj = max(1.0, r["psf"] + slope * (subj_sqft - r["sqft"]))
-            price_adj = psf_at_subj * subj_sqft
-        else:
-            price_adj = r["price"] * (1 + _V10_BETA * (subj_sqft - r["sqft"]) / r["sqft"])
-        price_adj = _clamp(price_adj, r["price"] * 0.78, r["price"] * 1.22)
-        r["size_only_adj_price"] = price_adj
-        price_adj += r["feat"]["total"]
-        r["price_adj_to_subject"] = price_adj
-        sale_num += price_adj * r["weight"]
+        c_ag = _as_float(r["_c"].get("above_grade_finished_area")) or r["sqft"]
+        c_bg, c_bg_est = _v10_bg_for_grid(r["_c"], c_ag)
+        r["ag"], r["bg"], r["bg_estimated"] = c_ag, c_bg, c_bg_est
+        r["eff_sqft"] = c_ag + _V10_GRID_BG_FRAC * c_bg
+        r["clean_psf"] = r["price"] / r["eff_sqft"] if r["eff_sqft"] else r["psf"]
+    market_psf = _v10_weighted_median([(r["clean_psf"], r["weight"]) for r in rows]) or (
+        sum(r["clean_psf"] for r in rows) / len(rows))
+    for r in rows:
+        r["feat"] = _v10_grid_adjustments(subject, r, s_ag, s_bg, s_bg_est, market_psf)
+        r["size_only_adj_price"] = r["price"] + r["feat"]["size"]
+        r["price_adj_to_subject"] = r["price"] + r["feat"]["total"]
+        r["gross_adj_pct"] = r["feat"]["gross"] / r["price"] if r["price"] else 0.0
+        # Fewer/smaller adjustments = better evidence (appraisal practice): weight falls with the
+        # gross adjustment, on top of the Match-% relevance weight.
+        r["gross_adj_mult"] = max(0.15, 1.0 - _V10_GRID_GROSS_WEIGHT_SLOPE * r["gross_adj_pct"])
+        r["weight"] *= r["gross_adj_mult"]
+    _norm = _v10_capped_weights([(r["weight"], r["gross_adj_pct"]) for r in rows])
+    for r, w in zip(rows, _norm):
+        r["weight"] = w
+    total_w = 1.0
 
-    sale_indication = sale_num / total_w
-    anchor_value = _V10_ANCHOR_BLEND * sale_indication + (1.0 - _V10_ANCHOR_BLEND) * psf_indication
+    raw_psf_mean = sum(r["psf"] * r["weight"] for r in rows)
+    psf_leg_mean = market_psf
+    psf_indication_unnormalized = raw_psf_mean * subj_sqft
+    # Diagnostic cross-check only (market rate x the subject's effective area + its other grid items).
+    psf_indication = market_psf * (s_ag + _V10_GRID_BG_FRAC * s_bg) + sum(
+        r["weight"] * (r["feat"]["baths"] + r["feat"]["garage"] + r["feat"]["sewer"]) for r in rows)
+    sale_indication = sum(r["price_adj_to_subject"] * r["weight"] for r in rows)
+    anchor_value = sale_indication
 
     raw_price_mean = sum(r["price"] * r["weight"] for r in rows) / total_w
     if raw_price_mean > 0 and not (0.6 * raw_price_mean <= anchor_value <= 1.8 * raw_price_mean):
@@ -5635,7 +5717,8 @@ def _compute_comp_anchor(
     dispersion = (_var ** 0.5) / anchor_value if anchor_value else _V10_ANCHOR_MIN_SPREAD
     divergence = abs(sale_indication - psf_indication) / anchor_value
     _min_spread = _V10_ANCHOR_MIN_SPREAD + (0.02 if anchor_mode == "mixed" else 0.0)
-    spread = min(_V10_ANCHOR_MAX_SPREAD, max(_min_spread, dispersion, divergence if divergence > 0.08 else 0.0))
+    # The $/sqft figure is a diagnostic now (no size curve) - it no longer widens the range (10/20).
+    spread = min(_V10_ANCHOR_MAX_SPREAD, max(_min_spread, dispersion))
 
     # per-comp dollar contribution to the blended anchor (normalized weight x its blended own
     # indication), for a fully traceable "why did this comp move it $X" read.
@@ -5644,8 +5727,7 @@ def _compute_comp_anchor(
     for r in rows:
         nw = r["weight"] / total_w
         _leg = r["psfleg"]
-        own_indication = (_V10_ANCHOR_BLEND * r["price_adj_to_subject"]
-                          + (1.0 - _V10_ANCHOR_BLEND) * (_leg["psf_for_leg"] * subj_sqft + r["feat_psf_total"]))
+        own_indication = r["price_adj_to_subject"]   # the anchor is a weighted average of these (10/20)
         _lc = r.get("loc_trace") or {}
         _cnd = r.get("cond_trace") or {}
         _cq = _quality_by_key.get(r["key"]) or {}
@@ -5659,6 +5741,9 @@ def _compute_comp_anchor(
             # Adjustment-grid trace: sale price -> size -> lower level / baths / garage -> adjusted.
             "size_adjustment": round(r["size_only_adj_price"] - r["price"]),
             "feature_adjustments": r["feat"],
+            "gross_adjustment_pct": round(r.get("gross_adj_pct", 0.0) * 100, 1),
+            "gross_adjustment_weight_mult": round(r.get("gross_adj_mult", 1.0), 3),
+            "clean_psf": round(r.get("clean_psf") or 0, 2),
             "sqft": round(r["sqft"]), "below_grade_frac": r["below_grade_frac"],
             # Fix 1 - sqft-composition normalization for the $/sqft leg, fully traced.
             # raw_total_finished_psf = price / TOTAL finished area (never call an above-grade rate
@@ -5747,8 +5832,7 @@ def _compute_comp_anchor(
     # 'weak' -> a real FMV still computes but confidence is forced Low, the range widened, and a
     # blocking "agent review required" note is raised.
     n_weighted = len(rows)
-    _wide = (spread * 100 >= _V10_WEAK_ANCHOR_SPREAD_PCT) or (divergence * 100 >= _V10_WEAK_ANCHOR_DIVERGENCE_PCT) \
-        or ("sanity_clamped" in size_model)
+    _wide = (spread * 100 >= _V10_WEAK_ANCHOR_SPREAD_PCT) or ("sanity_clamped" in size_model)
     anchor_validity = "ok"
     validity_reason = None
     if anchor_mode == "mixed" and n_weighted <= _V10_WEAK_ANCHOR_MAX_WEIGHTED and _wide:
@@ -5796,11 +5880,14 @@ def _compute_comp_anchor(
         "psf_indication_per_sqft": round(psf_indication / subj_sqft, 2),
         "psf_leg_rate_per_sqft": round(psf_leg_mean, 2),
         "feature_adjustment_weighted": round(sum(r["feat"]["total"] * r["weight"] for r in rows) / total_w),
-        "feature_adjustment_rates": {"below_grade_frac_of_above_grade_psf": _V10_FEATURE_BG_FRAC,
+        "market_psf": round(market_psf, 2),
+        "subject_effective_sqft": round(s_ag + _V10_GRID_BG_FRAC * s_bg),
+        "subject_below_grade_sqft_used": round(s_bg), "subject_below_grade_estimated": s_bg_est,
+        "feature_adjustment_rates": {"size_frac_of_market_psf": _V10_GRID_SIZE_FRAC, "below_grade_frac_of_market_psf": _V10_GRID_BG_FRAC,
                                      "bath_pct_of_price": _V10_FEATURE_BATH_PCT, "garage_space_pct_of_price": _V10_FEATURE_GARAGE_PCT,
-                                     "max_pct_of_price": _V10_FEATURE_MAX_PCT},
-        # Fix 1 - the $/sqft leg is sqft-composition-normalized; keep the un-normalized figure for QA/audit
-        "psf_indication_basis": "above-grade $/sqft, finished-below-grade normalized",
+                                     "max_net_pct_of_price": _V10_FEATURE_MAX_PCT, "heavy_gross_pct": _V10_GRID_HEAVY_GROSS,
+                                     "heavy_cap_share": _V10_GRID_HEAVY_CAP, "max_share": _V10_GRID_MAX_SHARE},
+        "psf_indication_basis": "diagnostic only: market $/sqft x subject effective area (not blended into the value)",
         "psf_indication_unnormalized": round(psf_indication_unnormalized),
         "psf_leg_comp_count": _psf_leg_ct,
         "psf_leg_normalized_comp_count": _psf_leg_norm_ct,
@@ -6172,6 +6259,11 @@ def _apply_continuous_relevance_weighting(
         density_context=density_context,
     )
     rows_by_key = {row["listing_key"]: row for row in result["comps"]}
+    # One score for weight AND label (10/20): a comp's Strong/Supporting label follows the share of
+    # the value it actually carries (Match % x how little it had to be adjusted, with caps), not a
+    # separate rule - 1212 Blackhorse Hill was labelled Supporting yet carried 30% of the value.
+    _share = {str(c.get("listing_key")): c.get("normalized_weight") or 0.0
+              for c in ((result.get("anchor") or {}).get("comps") or [])}
     updated: list[dict] = []
     for i, source in enumerate(comps):
         comp = copy.deepcopy(source)
@@ -6179,6 +6271,8 @@ def _apply_continuous_relevance_weighting(
         row = rows_by_key[key]
         comp["ai_strength"] = comp.get("ai_strength") or row.get("current_model_role")
         comp["strength"] = row["proposed_role"]
+        if row["proposed_role"] != "weak" and key in _share:
+            comp["strength"] = "strong" if _share[key] >= _V10_STRONG_SHARE else "supporting"
         raw_relevance = row["adjusted_relevance_score"]
         comp["match_score"] = calibrate_match_percentage(raw_relevance)
         comp["similarity_details"] = {
@@ -9037,7 +9131,45 @@ def _comp_note_number_errors(text: str, comp: dict, subject: Optional[dict] = No
         diffs = [abs(a - b) for a in areas_c.values() if a for b in areas_s.values() if b]
         if pool and not any(abs(v - x) <= max(15.0, 0.02 * x) for x in pool + diffs):
             errs.append(f"{v:,.0f} sq ft")
+    errs += _size_ratio_claim_errors(text, areas_c, areas_s)
     return list(dict.fromkeys(errs))
+
+
+_RATIO_CLAIMS = (
+    # (phrase, lowest true ratio, highest true ratio) comp size / subject size it may describe
+    (r"\b(?:under|less than|below)\s+half\b", 0.0, 0.52),
+    (r"\b(?:about|roughly|nearly|almost|around|just over|over)?\s*half\b", 0.38, 0.62),
+    (r"\b(?:a|one)[\s-]third\b", 0.25, 0.42),
+    (r"\b(?:twice|double)\b", 1.7, 2.4),
+)
+_SIZE_WORDS_RE = re.compile(r"size|area|square|sq\.?\s?f|sqft|footprint|living space|above[- ]grade|smaller|larger|bigger", re.IGNORECASE)
+
+
+def _size_ratio_claim_errors(text: str, areas_c: dict, areas_s: dict) -> list:
+    """A note may only call a comp 'under half' / 'twice' / 'a third' of the subject's size when the
+    records agree (10/20: 1219 Scott Dr's note said its above-grade area was 'under half the
+    subject's' - it is 80%: 1,472 vs 1,830)."""
+    def _ratio(k):
+        c, s = areas_c.get(k), areas_s.get(k)
+        return c / s if c and s else None
+    above, total = _ratio("above_grade_finished_area"), _ratio("sqft")
+    if above is None and total is None:
+        return []
+    out, used = [], []
+    for pattern, lo, hi in _RATIO_CLAIMS:
+        for m in re.finditer(pattern, text or "", re.IGNORECASE):
+            if any(a <= m.end() - 1 and m.start() < b for a, b in used):
+                continue   # "under half" already judged by the stricter pattern
+            used.append((m.start(), m.end()))
+            window = text[max(0, m.start() - 60):m.end() + 60]
+            if not _SIZE_WORDS_RE.search(window):
+                continue
+            # "above-grade area is under half" is judged on above-grade area only
+            ratios = [r for r in ([above] if (above is not None and re.search(r"above[- ]grade", window, re.I)) else [above, total]) if r is not None]
+            if ratios and not any(lo <= r <= hi for r in ratios):
+                out.append(f"'{m.group(0).strip()}' (its size is {round(ratios[0] * 100)}% of the subject's)")
+            break
+    return out
 
 
 def _regenerate_comp_narrative_from_snapshot(comp: dict, label: str, subject: Optional[dict] = None) -> str:
@@ -9065,6 +9197,10 @@ def _regenerate_comp_narrative_from_snapshot(comp: dict, label: str, subject: Op
         if list_price:
             pct = round((price / list_price - 1) * 100, 1)
             line += (f", {abs(pct):g}% {'over' if pct > 0 else 'under'} its ${list_price:,.0f} asking price" if pct else ", at its asking price")
+            _orig = _as_float(comp.get("original_list_price"))
+            if _orig and abs(_orig - list_price) / list_price > 0.005:
+                _op = round((price / _orig - 1) * 100, 1)
+                line += f" ({abs(_op):g}% {'over' if _op > 0 else 'under'} its original ${_orig:,.0f})" if _op else f" (at its original ${_orig:,.0f})"
         dom = _as_float(comp.get("days_on_market"))
         if dom is not None:
             line += f", after {int(dom)} day{'s' if int(dom) != 1 else ''} on the market"
@@ -9961,6 +10097,46 @@ def _reasoning_projected_cost(config: dict, evidence_packet: dict) -> tuple[floa
     return projected_cost, max_cost
 
 
+_REASONING_CACHE_DAYS = 14
+
+
+def _reasoning_cache_key(evidence_packet: dict, model: str) -> str:
+    payload = json.dumps({"p": evidence_packet, "m": model, "v": PROMPT_VERSION}, sort_keys=True, default=str)
+    return "cma_reasoning_cache:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:48]
+
+
+async def _reasoning_cache_get(db: AsyncSession, key: str):
+    # Own session: a read/rollback here must never touch the report being generated on `db`.
+    try:
+        from sqlalchemy import text as _text
+        from app.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as cdb:
+            row = (await cdb.execute(_text("SELECT value, updated_at FROM system_settings WHERE key = :k"), {"k": key})).first()
+        if not row or not isinstance(row[0], dict):
+            return None
+        at = row[1]
+        if at and (datetime.now(timezone.utc) - (at if at.tzinfo else at.replace(tzinfo=timezone.utc))).days > _REASONING_CACHE_DAYS:
+            return None
+        return row[0].get("raw")
+    except Exception:  # noqa: BLE001 - a cache miss is never an error
+        return None
+
+
+async def _reasoning_cache_put(db: AsyncSession, key: str, raw) -> None:
+    # Own session/commit, so the half-built report on the caller's session is never committed early.
+    try:
+        from sqlalchemy import text as _text
+        from app.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as cdb:
+            await cdb.execute(_text(
+                "INSERT INTO system_settings (key, value) VALUES (:k, CAST(:v AS jsonb)) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()"),
+                {"k": key, "v": json.dumps({"raw": raw}, default=str)})
+            await cdb.commit()
+    except Exception:  # noqa: BLE001
+        logger.warning("CMA reasoning cache write failed", exc_info=True)
+
+
 async def _run_cma_reasoning_stage(
     db: AsyncSession, owner_id: str, plan_tier: str, config: dict, evidence_packet: dict,
     report_id: str, *, fallback: Optional[dict] = None, reservation=None,
@@ -9989,18 +10165,31 @@ async def _run_cma_reasoning_stage(
     cost = 0.0
     usage: dict = {}
     try:
-        raw, usage = await _call_cma_reasoning_model(config, evidence_packet)
+        # Same evidence -> same answer (10/20): the reasoning model can't be pinned to a fixed
+        # setting, so the same home with the same comps and data gave $500K / $480K / $510K-style
+        # swings. Its answer for an identical evidence packet is reused (no charge) for 14 days.
+        _cache_key = _reasoning_cache_key(evidence_packet, model)
+        cached = await _reasoning_cache_get(db, _cache_key)
+        if cached is not None:
+            raw, usage = cached, {"cached": True}
+        else:
+            raw, usage = await _call_cma_reasoning_model(config, evidence_packet)
         input_tokens = int(_as_float(usage.get("input_tokens")) or 0)
         output_tokens = int(_as_float(usage.get("output_tokens")) or 0)
-        cost = ai_config_service.estimate_cost_usd(config, model, input_tokens, output_tokens)
+        cost = ai_config_service.estimate_cost_usd(config, model, input_tokens, output_tokens) if cached is None else 0.0
         reasoning, blockers = _validate_reasoning_valuation(raw, evidence_packet)
+        if cached is None and not blockers:
+            await _reasoning_cache_put(db, _cache_key, raw)
         reasoning, guard_flags = _apply_asking_price_check(reasoning, evidence_packet)
         # the callers move these into qa_flags; the validator's own repairs go first
         reasoning["_guard_flags"] = list(reasoning.pop("_repair_flags", None) or []) + list(guard_flags)
-        await record_usage_event(
-            db, owner_id, None, model, input_tokens, output_tokens,
-            cost, 0, False, None, event_type="cma_reasoning",
-        )
+        if cached is not None:
+            reasoning["_guard_flags"].append("Final valuation reused from an identical earlier run (same evidence) - no new charge.")
+        else:
+            await record_usage_event(
+                db, owner_id, None, model, input_tokens, output_tokens,
+                cost, 0, False, None, event_type="cma_reasoning",
+            )
         await reconcile_budget(db, reservation, cost)
         return reasoning, blockers, cost, usage
     except HTTPException:
@@ -10951,7 +11140,10 @@ def _cma_display_comp_stats(comps: list) -> Optional[dict]:
     price_rows = [(p, w) for p, w in price_rows if p and w > 0]
     psf_rows = []
     for c in pool:
-        p, s = _eff_price(c), _as_float(c.get("sqft"))
+        # Same above-grade basis as the report's $/sqft chart and table (10/20: "typical $/sqft" said
+        # $246 while the chart's median was $295 - 1212 Blackhorse Hill was divided by its total area
+        # incl. basement here and by above-grade area there).
+        p, s = _eff_price(c), (_as_float(c.get("above_grade_finished_area")) or _as_float(c.get("sqft")))
         if p and s and s > 0 and _wt(c) > 0:
             psf_rows.append((round(p / s), _wt(c)))
     enough = len(pool) >= 2
@@ -12141,11 +12333,25 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
     _passed_over = bool(((trace or {}).get("asking_price_check") or {}).get("passed_over"))
     hot = bool(lp and _lts and _lts >= 1.02 and not _passed_over
                and _exp_state not in ("elevated_exposure", "extended_exposure"))
+    # The over-asking sales went under contract fast; a subject still on the market well past that
+    # isn't drawing a bidding war (10/20: 417 Dogwood Ln at 14 days vs comps pending in 6 was told to
+    # "expect competing offers").
+    _over_doms = sorted(_as_float(c.get("dom")) for c in (((trace or {}).get("anchor") or {}).get("comps") or [])
+                        if (_as_float(c.get("sale_to_list")) or 0) >= 1.02 and _as_float(c.get("dom")) is not None)
+    _subj_days = _as_float(((trace or {}).get("exposure") or {}).get("active_market_days"))
+    if _subj_days is None:
+        _subj_days = _as_float((status_timeline or {}).get("active_market_days"))
+    outpaced = bool(hot and _over_doms and _subj_days is not None
+                    and _subj_days > max(7.0, 1.5 * _over_doms[len(_over_doms) // 2]))
+    if outpaced:
+        hot = False
     if hot:
         ceiling = round(min(lp * min(_lts, _ASKING_CHECK_RATIO_BOUNDS[1]), fmv))
     else:
         ceiling = round(min(lp, fmv)) if lp else round(fmv)
-    comfort_ceiling = round(fmv * 1.05)       # advisory-only "most you'd pay" ceiling, not offer-capped
+    # The walk-away sits at the supported value (10/20: it was FMV x 1.05 = $535K over a $510K
+    # value); only real competition earns a small stretch.
+    comfort_ceiling = round(fmv * (1.02 if hot else 1.0))
     aggr = _v10_offer_aggression(trace, confidence, status_timeline)
     underpriced = bool(lp and lp > 0 and fmv > lp * 1.01)
 
@@ -12214,6 +12420,7 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
         "aggression": aggr, "underpriced": underpriced, "basis_ref": basis_ref,
         "above_ask": bool(lp and opening_high > lp),
         "hot_market": hot, "market_over_ask_pct": round((_lts - 1) * 100, 1) if hot else None,
+        "outpaced_by_comps": outpaced, "over_ask_comp_median_dom": _over_doms[len(_over_doms) // 2] if _over_doms else None,
     }
 
 
@@ -12239,6 +12446,8 @@ def _v10_pct_range_phrase(low: float, high: float, ref: float) -> str:
     if lo_pct >= 0 and hi_pct >= 0:
         if lo_rounded == hi_rounded:
             return f"about {hi_rounded}% above"
+        if lo_rounded == 0:
+            return f"at to about {hi_rounded}% above"   # not "about 0%-1% above"
         return f"about {lo_rounded}%-{hi_rounded}% above"
     if lo_pct <= 0 and hi_pct <= 0:
         if lo_rounded == hi_rounded:
@@ -12294,8 +12503,10 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
             f"price. A reasonable opening offer is roughly ${ol:,} to ${oh:,} ({rel_open} the list price), "
             f"a {position} opening with room to move toward ${tgt:,} if the property draws competition - "
             f"never above the ${lp:,} list price at the opening stage. Even though the property is "
-            f"underpriced, you shouldn't feel comfortable paying more than ${comfort_ceiling:,} for it "
-            f"(about 5% above the ${fmv:,} fair market value) without new property-specific information."
+            f"underpriced, treat the ${comfort_ceiling:,} fair market value as your walk-away price unless new "
+            f"property-specific information supports more." + (
+                f" It has been on the market longer than the nearby sales that went over asking, so a "
+                f"bidding war is unlikely." if b.get("outpaced_by_comps") else "")
         )
     elif b.get("hot_market") and lp:
         rel_open = _v10_pct_range_phrase(ol, oh, lp)
@@ -13665,9 +13876,9 @@ def _format_anchor_block(anchor: Optional[dict], exposure: dict) -> str:
     L = ["DETERMINISTIC VALUATION INPUTS (already computed - do NOT recompute the anchor):"]
     if anchor and anchor.get("mode") not in (None, "insufficient") and anchor.get("anchor_value"):
         _basis = "verified CLOSED sales only" if anchor["mode"] == "closed_only" else "mixed comps (no closed-sale majority - lower confidence)"
-        L.append(f"  Comp anchor value: ${anchor['anchor_value']:,}  (from {_basis}; sale-price indication "
-                 f"${anchor['sale_price_indication']:,}; $/sqft indication ${anchor['psf_indication']:,} = "
-                 f"${anchor['psf_indication_per_sqft']:,}/sqft x {anchor['subject_sqft_used']:,} sqft)")
+        L.append(f"  Comp anchor value: ${anchor['anchor_value']:,}  (from {_basis}; the weighted average of each "
+                 f"comp's sale price adjusted to the subject for size, finished lower level, baths, garage and "
+                 f"sewer at one market rate of ${anchor.get('market_psf') or anchor['psf_indication_per_sqft']:,}/sqft)")
         L.append(f"  Anchor range: ${anchor['anchor_low']:,} - ${anchor['anchor_high']:,}   (size model: {anchor['size_model']}, "
                  f"sale-vs-$/sqft divergence {anchor['sale_psf_divergence_pct']}%)")
         for c in anchor["comps"]:
@@ -13910,6 +14121,25 @@ async def _generate_ai_analysis_impl(
     prov_anchor, prov_exposure = _v10_provisional_inputs(
         enriched_subject, enriched_comps, status_timeline, density_context=proximity_context,
     )
+    # One order for the whole report (10/20): Comp #1 is the comp carrying the most of the value,
+    # decided BEFORE any model writes about "Comp #N", so labels, weights and narratives agree. The
+    # agent's pick order used to stand (417 Dogwood Ln's #5 carried the most weight).
+    _share = {c.get("listing_key"): c.get("normalized_weight") or 0.0 for c in ((prov_anchor or {}).get("comps") or [])}
+    if _share:
+        def _by_share(c):
+            return -_share.get(c.get("listing_key"), -1.0)
+        _paired = sorted(zip(comps, enriched_comps), key=lambda p: _by_share(p[0]))
+        comps, enriched_comps = [p[0] for p in _paired], [p[1] for p in _paired]
+        _reordered = sorted(report.comparables or [], key=lambda c: (not c.get("is_included", True), _by_share(c)))
+        report.comparables = [{**c, "order_index": i} for i, c in enumerate(_reordered)]
+        prov_anchor, prov_exposure = _v10_provisional_inputs(
+            enriched_subject, enriched_comps, status_timeline, density_context=proximity_context,
+        )
+        for _ec in enriched_comps:
+            _s = _share.get(_ec.get("listing_key"))
+            if _s:
+                _ec["assigned_role"] = "strong" if _s >= _V10_STRONG_SHARE else "supporting"
+                _ec["share_of_value_pct"] = round(_s * 100)
 
     warnings: list[str] = []
     content, images_sent, projected_tokens = await _build_content(
@@ -13952,6 +14182,9 @@ async def _generate_ai_analysis_impl(
             tools=[_tool_for_mode(_SUBMIT_TOOL, report.mode)],
             tool_choice={"type": "tool", "name": "submit_cma_analysis"},
             messages=[{"role": "user", "content": content}],
+            # Most repeatable setting (10/20): the same home + comps should read the same way on a
+            # re-run; this pass fills one forced structured form, so nothing creative is lost.
+            temperature=0,
         )
     except Exception as exc:
         logger.warning("CMA AI analysis call failed", extra={"report_id": report_id, "error": str(exc)})
@@ -14497,6 +14730,11 @@ async def _generate_ai_analysis_impl(
         value = _v10["fmv"]
         valuation_trace = _v10["trace"]
         valuation_trace["relevance_weighting"] = _relevance_trace
+        _engine_errs = _anchor_integrity_errors(final_anchor, enriched_subject)
+        if _engine_errs:
+            logger.error("CMA engine self-check failed", extra={"report_id": report_id, "errors": _engine_errs})
+            qa_flags.extend(f"ENGINE CHECK FAILED - {e}" for e in _engine_errs)
+        valuation_trace["engine_checks"] = {"passed": not _engine_errs, "errors": _engine_errs}
         # Downstream (QA + any later reasoning-authority promotion) needs to know the value/
         # adjustments this trace was built from never included an actual AI read - a reasoning
         # pass run on top of this is judging from the deterministic benchmark alone, not an

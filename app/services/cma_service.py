@@ -51,7 +51,7 @@ def _missing_subject_fact(value: Any) -> bool:
 
 def _property_subject_facts(prop: Property) -> Dict[str, Any]:
     """One MLS-backed source for hard subject facts used by every match calculation."""
-    raw = prop.raw_mls_data or {}
+    raw = getattr(prop, "raw_mls_data", None) or {}
     return {
         "above_grade_finished_area": prop.above_grade_finished_area,
         "below_grade_finished_area": prop.below_grade_finished_area,
@@ -70,10 +70,41 @@ def _property_subject_facts(prop: Property) -> Dict[str, Any]:
     }
 
 
+def _join_mls_list(value: Any) -> Any:
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value if v) or None
+    return value
+
+
+def _property_display_facts(prop: Property) -> Dict[str, Any]:
+    """Subject facts the report shows and the engine adjusts on, but that aren't part of the Match %
+    fingerprint. Filled from the MLS row when the saved subject lacks them: a 10/20 report for 417
+    Dogwood Ln came in with no water, sewer, taxes or garage (the address lookup didn't return
+    them), so the inspection page said the sewer type was unknown and the garage went unadjusted."""
+    raw = getattr(prop, "raw_mls_data", None) or {}
+    garage = None
+    if getattr(prop, "has_garage", None) and getattr(prop, "garage_spaces", None):
+        garage = f"{int(prop.garage_spaces)} Car"
+    elif getattr(prop, "has_garage", None):
+        garage = "Yes"
+    elif getattr(prop, "has_garage", None) is False:
+        garage = "None"
+    basement = _join_mls_list(raw.get("Basement"))
+    return {
+        "water_source": _join_mls_list(raw.get("WaterSource") or getattr(prop, "water_source", None)),
+        "sewer": _join_mls_list(raw.get("Sewer") or getattr(prop, "sewer", None)),
+        "annual_taxes": raw.get("TaxAnnualAmount") or getattr(prop, "tax_annual_amount", None),
+        "garage": garage,
+        "basement": basement,
+        "beds": getattr(prop, "bedrooms", None),
+        "baths": getattr(prop, "bathrooms", None),
+    }
+
+
 def _merge_authoritative_subject_facts(subject: Dict[str, Any], prop: Property) -> Dict[str, Any]:
     """Fill absent MLS facts without overwriting an agent's explicit subject correction."""
     merged = dict(subject or {})
-    for field, value in _property_subject_facts(prop).items():
+    for field, value in {**_property_display_facts(prop), **_property_subject_facts(prop)}.items():
         if _missing_subject_fact(merged.get(field)) and not _missing_subject_fact(value):
             merged[field] = value
     return merged

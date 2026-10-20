@@ -58,29 +58,71 @@ SUBJECT = {"below_grade_finished_area": 1300, "basement": "Full, Fully Finished"
            "garage": "2 Car", "sewer": "Public Sewer"}
 
 
-def test_subject_lower_level_baths_and_garage_are_priced():
+def _row(comp, price, ag):
+    bg, est = ai._v10_bg_for_grid(comp, ag)
+    return {"_c": comp, "price": price, "ag": ag, "bg": bg, "bg_estimated": est}
+
+
+def test_grid_prices_size_lower_level_baths_and_garage_at_one_rate():
     comp = {"below_grade_finished_area": None, "basement": "Full", "baths": 2, "garage": "1 Car", "sewer": "On Site Septic"}
-    fa = ai._v10_feature_adjustments(SUBJECT, comp, 420000, 245.6)
-    assert fa["below_grade"] > 0 and fa["baths"] > 0 and fa["garage"] > 0
+    fa = ai._v10_grid_adjustments({**SUBJECT, "above_grade_finished_area": 1830}, _row(comp, 420000, 1710), 1830, 1300, False, 290.0)
+    assert fa["size"] > 0 and fa["below_grade"] > 0 and fa["baths"] > 0 and fa["garage"] > 0
+    assert fa["below_grade_rate_psf"] == round(290.0 * ai._V10_GRID_BG_FRAC, 2)
     assert fa["sewer"] == 0
-    assert abs(fa["total"]) <= ai._V10_FEATURE_MAX_PCT * 420000 + 1
+    assert fa["total"] == fa["size"] + fa["below_grade"] + fa["baths"] + fa["garage"]
+
+
+def test_smaller_comp_is_always_adjusted_up_and_larger_down():
+    small = ai._v10_grid_adjustments(SUBJECT, _row({"basement": "None"}, 450000, 1472), 1830, 1300, False, 290.0)
+    big = ai._v10_grid_adjustments(SUBJECT, _row({"basement": "None"}, 450000, 2400), 1830, 1300, False, 290.0)
+    assert small["size"] > 0 and big["size"] < 0
 
 
 def test_unreported_partial_basement_is_estimated_not_ignored():
-    comp = {"below_grade_finished_area": 0, "basement": "Partially Finished", "above_grade_finished_area": 1819,
-            "sqft": 1819, "baths": 3.5, "garage": "2 Car", "sewer": "Public Sewer"}
-    fa = ai._v10_feature_adjustments(SUBJECT, comp, 410000, 225.4)
-    assert fa["below_grade"] > 0
-    assert any("estimated" in n for n in fa["notes"])
+    comp = {"below_grade_finished_area": 0, "basement": "Partially Finished", "baths": 3.5, "garage": "2 Car", "sewer": "Public Sewer"}
+    assert ai._v10_bg_for_grid(comp, 1819) == (455, True)
+    fa = ai._v10_grid_adjustments(SUBJECT, _row(comp, 410000, 1819), 1830, 1300, False, 290.0)
+    assert fa["below_grade"] > 0 and any("estimated" in n for n in fa["notes"])
 
 
 def test_cesspool_comp_is_adjusted_up_toward_a_sewer_subject():
     comp = {"basement": "None", "baths": 3.5, "garage": "2 Car", "sewer": "Cess Pool"}
-    fa = ai._v10_feature_adjustments({**SUBJECT, "below_grade_finished_area": 0, "basement": "None"}, comp, 410000, 225.0)
+    fa = ai._v10_grid_adjustments({**SUBJECT, "below_grade_finished_area": 0, "basement": "None"}, _row(comp, 410000, 1830), 1830, 0, False, 290.0)
     assert fa["sewer"] == round(min(ai._V10_FEATURE_CESSPOOL_PCT * 410000, ai._V10_FEATURE_CESSPOOL_MAX))
     assert ai._material_system_issues(comp) == ["cesspool (sewer)"]
 
 
+def test_weights_cap_heavy_and_dominant_comps():
+    shares = ai._v10_capped_weights([(0.8, 0.10), (0.7, 0.12), (0.2, 0.36), (0.75, 0.14), (0.78, 0.11)])
+    assert abs(sum(shares) - 1) < 1e-9
+    assert shares[2] <= ai._V10_GRID_HEAVY_CAP + 1e-9
+    assert max(shares) <= ai._V10_GRID_MAX_SHARE + 1e-9
+
+
+def test_dogwood_style_set_value_is_a_true_weighted_average():
+    subject = {**SUBJECT, "above_grade_finished_area": 1830, "sqft": 3130, "property_type": "SINGLE_FAMILY",
+               "architectural_style": ["Ranch/Rambler"], "latitude": 39.98, "longitude": -75.79}
+    comps = []
+    for i, (price, ag, bg, basement, baths, garage, sewer, dist) in enumerate([
+        (420000, 1710, None, "Full", 2, "1 Car", "On Site Septic", 1.48),
+        (452000, 1472, 0, "Fully Finished, Outside Entrance", 3, "2 Car", "On Site Septic", 0.27),
+        (443000, 1504, 0, "Full, Outside Entrance", 3, "2 Car", "On Site Septic", 1.14),
+        (410000, 1819, 0, "Partially Finished", 1.5, "2 Car", "Cess Pool", 1.96),
+        (340000, 884, 884, "Full, Fully Finished", 2, "None", "Public Sewer", 0.11),
+    ]):
+        comps.append({"listing_key": f"k{i}", "street_address": f"{i} TEST RD", "status": "sold", "sale_price": price,
+                      "close_price": price, "price_verified": True, "list_price": price, "sqft": ag + (bg or 0),
+                      "above_grade_finished_area": ag, "below_grade_finished_area": bg, "basement": basement,
+                      "baths": baths, "garage": garage, "sewer": sewer, "distance_miles": dist, "property_type": "SINGLE_FAMILY",
+                      "architectural_style": ["Ranch/Rambler"], "close_date": "2026-09-01", "strength": "strong"})
+    _, a, _ = ai._apply_continuous_relevance_weighting(subject, comps, {}, {})
+    adjusted = [c["size_adjusted_price"] for c in a["comps"]]
+    assert min(adjusted) <= a["anchor_value"] <= max(adjusted)
+    assert abs(sum(c["normalized_weight"] for c in a["comps"]) - 1) < 0.01
+    for c in a["comps"]:
+        sa = c["above_grade_sqft"] or c["sqft"]
+        if sa < 1830 - 25:
+            assert c["size_adjustment"] > 0, c["label"]
 def test_same_market_needs_the_same_township():
     subject = {"school_district": "Coatesville Area", "city": "COATESVILLE", "township": "CALN"}
     same = {"school_district": "Coatesville Area", "city": "COATESVILLE", "township": "CALN"}
@@ -122,3 +164,34 @@ def test_unmatched_lower_level_is_stated_as_the_main_uncertainty():
     out = ai._anchor_main_uncertainties(SUBJECT, rows, 1)
     assert any("lower level" in u for u in out)
     assert any("Only 1 verified sale" in u for u in out)
+
+
+def test_size_ratio_claims_must_match_the_records():
+    comp = {"above_grade_finished_area": 1472, "sqft": 1472}
+    subject = {"above_grade_finished_area": 1830, "sqft": 3130}
+    bad = "Its above-grade area is under half the subject's, so its $/sqft runs high."
+    assert ai._size_ratio_claim_errors(bad, comp, subject)
+    small = {"above_grade_finished_area": 800, "sqft": 800}
+    assert not ai._size_ratio_claim_errors(bad, small, subject)
+    assert not ai._size_ratio_claim_errors("It sits on half an acre.", comp, subject)
+
+
+def test_subject_outpaced_by_fast_over_ask_sales_is_not_a_bidding_war():
+    trace = {"anchor": {"comp_list_to_sale_median": 1.065, "comps": [
+                {"sale_to_list": 1.16, "dom": 6}, {"sale_to_list": 1.14, "dom": 6}, {"sale_to_list": 0.96, "dom": 28}]},
+             "exposure": {"state": "normal_exposure", "active_market_days": 14},
+             "asking_price_check": {"passed_over": False}}
+    band = ai._v10_build_buyer_offer_band(510000, 500000, trace=trace, confidence="medium")
+    assert band["outpaced_by_comps"] is True and band["hot_market"] is False
+    assert band["comfort_ceiling"] <= 510000
+
+
+def test_engine_self_checks_pass_on_a_dogwood_style_set_and_catch_a_wrong_way_size():
+    good = {"anchor_value": 490000, "comps": [
+        {"label": "Comp #1", "size_adjusted_price": 512000, "normalized_weight": 0.5, "gross_adjustment_pct": 13, "above_grade_sqft": 1472, "size_adjustment": 36000},
+        {"label": "Comp #2", "size_adjusted_price": 470000, "normalized_weight": 0.5, "gross_adjustment_pct": 15, "above_grade_sqft": 1710, "size_adjustment": 12000}]}
+    assert ai._anchor_integrity_errors(good, {"above_grade_finished_area": 1830}) == []
+    bad = {**good, "comps": [{**good["comps"][0], "size_adjustment": -806}, good["comps"][1]]}
+    assert any("against the size difference" in e for e in ai._anchor_integrity_errors(bad, {"above_grade_finished_area": 1830}))
+    outside = {**good, "anchor_value": 521173}
+    assert any("outside the adjusted comps" in e for e in ai._anchor_integrity_errors(outside, {"above_grade_finished_area": 1830}))
