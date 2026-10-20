@@ -189,16 +189,22 @@ async def pull_agent_sales(db: AsyncSession, max_agents: int = 5, pause: float =
     return {"agents_done": len(done), "agents_waiting": max(0, len(ids) - len(done)), "added": added}
 
 
-async def run_enabled(db: AsyncSession) -> dict:
-    """One tick of every switched-on pull (called every 10 minutes). Each pull is isolated - one
-    failing (e.g. Bright rejecting its query) is logged and never stops the others from running."""
+# price_history runs as its own scheduler job: one batch of 300 parcels takes ~2 hours, and while it
+# shared the tick, sold_3y only got its 10 pages every ~2 hours instead of every 10 minutes (10/20).
+SALES_PULLS = ("refresh_current", "sold_3y", "agent_sales")
+HISTORY_PULLS = ("price_history",)
+
+
+async def run_enabled(db: AsyncSession, names: tuple = PULLS) -> dict:
+    """One tick of every switched-on pull in `names` (called every 10 minutes). Each pull is isolated
+    - one failing (e.g. Bright rejecting its query) is logged and never stops the others from running."""
     from app.services.price_history_service import backfill_batch
     out = {}
     for name, run in (("refresh_current", lambda: refresh_current(db)),
                       ("sold_3y", lambda: pull_sold_3y(db)),
                       ("price_history", lambda: backfill_batch(db, max_parcels=300)),
                       ("agent_sales", lambda: pull_agent_sales(db))):
-        if not enabled(name):
+        if name not in names or not enabled(name):
             continue
         try:
             out[name] = await run()
