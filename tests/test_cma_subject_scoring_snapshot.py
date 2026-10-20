@@ -286,7 +286,7 @@ def test_continuous_relevance_rows_carry_no_product_modifier_fields():
 # never fire for two property types that are just different labels for the same general housing
 # product (e.g. "SINGLE_FAMILY" vs "DETACHED").
 
-_PROPERTY_TYPE_WEIGHT = 12.0 / 100.0  # matches _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["property_type"]
+_PROPERTY_TYPE_WEIGHT = 11.0 / 100.0  # matches _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["property_type"] (v2, 10/20)
 
 
 def test_property_type_eligibility_guard_does_not_change_match_percentage():

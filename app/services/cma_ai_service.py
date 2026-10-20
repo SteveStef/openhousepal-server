@@ -80,7 +80,7 @@ from app.services.ai.ai_rate_limit_service import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "v10"
+PROMPT_VERSION = "v11"  # v11 (10/20): feature grid in the anchor, asking-price honesty
 # v10 (hybrid) - see the "v10 HYBRID VALUATION ENGINE" section lower in this file for the full
 # pipeline. Short version: v5 dropped the old computed comp-anchor + bounded +-15% adjustment
 # model and let the AI return a fair-value dollar figure verbatim with no ceiling. That made the
@@ -223,9 +223,12 @@ _V10_VALUATION_RULES = (
     "comps are superior, an 'up' when they are inferior); (B) itemise the specific supported "
     "subject advantages in OTHER buckets that genuinely offset it, each an 'up'/'down' item with a "
     "real written basis; or (C) set captured_elsewhere on a filed item to one of "
-    "size_normalization / below_grade_normalization / location_weighting / comp_classification / "
+    "size_normalization / below_grade_normalization / feature_grid / location_weighting / comp_classification / "
     "outlier_weighting / exposure when a deterministic mechanism already accounts for that "
-    "difference (do not also charge a dollar amount for it). A near-zero net with NONE of A/B/C is "
+    "difference (do not also charge a dollar amount for it). The deterministic anchor ALREADY adjusts "
+    "every verified comp for finished lower-level (basement) area, bathroom count and garage spaces "
+    "(feature_grid) - never file a dollar adjustment for those three; mark such an item "
+    "captured_elsewhere=feature_grid. A near-zero net with NONE of A/B/C is "
     "rejected; offsets held up only by model_judgment are scaled back and the net is allowed to "
     "move in the signalled direction. If a comp's note says the subject should trade below (or "
     "above) that comp because it is more renovated, has amenities the subject lacks, has superior "
@@ -359,7 +362,7 @@ _SYSTEM_PROMPT = (
     "stucco, or the comp you're rating it against is built entirely of stone; state whichever fact "
     "actually drove your rating rather than just asserting it. "
     "Rate area as different_from_subject, similar_to_subject, or same_as_subject based ONLY on "
-    "school_district and city - same_as_subject only when both match the subject exactly, "
+    "school_district, city and township/municipality - same_as_subject only when all known ones match the subject exactly, "
     "similar_to_subject when one matches or the two are evidently close/adjacent, "
     "different_from_subject otherwise. This is a factual comparison only, never a value judgment - "
     "do not use 'better' or 'worse' language for area, and do not let it influence your estimate on "
@@ -787,7 +790,7 @@ _SUBMIT_TOOL = {
                                 "confidence": {"type": "string", "enum": ["low", "medium", "high"], "description": "Your confidence in the DOLLAR AMOUNT (not that the factor matters). model_judgment should rarely be 'high'."},
                                 "captured_elsewhere": {
                                     "type": "string",
-                                    "enum": ["size_normalization", "below_grade_normalization", "location_weighting", "comp_classification", "outlier_weighting", "exposure"],
+                                    "enum": ["size_normalization", "below_grade_normalization", "feature_grid", "location_weighting", "comp_classification", "outlier_weighting", "exposure"],
                                     "description": (
                                         "Optional. Set this (with amount_low/high = 0) when a real, material one-sided "
                                         "difference on this factor exists but a deterministic mechanism already accounts "
@@ -1184,7 +1187,7 @@ def _guidance_content(subject: dict, comps: list, ai_comps: list, se: dict) -> s
 # guess alone. Not present for manually-added comps/subjects (no listing_key to join on) - _format_
 # block already skips any field whose value is None/empty, so those just render without them.
 _PROPERTY_ENRICHMENT_FIELDS = [
-    "architectural_style", "construction_materials", "roof_type", "foundation_details", "exterior_features",
+    "architectural_style", "levels", "construction_materials", "roof_type", "foundation_details", "exterior_features",
     # Above/below-grade split + new-construction flag - previously joined in but only used
     # internally (a basement-composition data_note); now first-class AI-visible fields too, so the
     # model can compare above-grade living area directly instead of only ever seeing one blended
@@ -1306,7 +1309,9 @@ def _derive_quality_from_data(subject: dict, comp: dict) -> dict:
     """Coarse comp-vs-subject ratings for the OBJECTIVE dimensions only, straight from structured
     fields we already have - used to fill a matrix cell the agent AND the AI both left blank so
     the comparison table isn't empty on data we hold. Deliberately limited to:
-      - area: school_district + city exact match (schema defines it as exactly this)
+      - area: school_district + city + township/municipality exact match. Township was added 10/20:
+        150 Modena Rd (South Coatesville Borough) was labelled "Same Market" for a Caln Township
+        subject because both share a mailing city and school district.
       - lot:  lot_size delta
     layout is NEVER derived here (a sqft ratio is not the same thing as usable-space layout - a
     photo/description-based judgment call belongs to the AI alone). finish_quality / interior /
@@ -1317,9 +1322,12 @@ def _derive_quality_from_data(subject: dict, comp: dict) -> dict:
 
     s_school, c_school = _norm_token(subject.get("school_district")), _norm_token(comp.get("school_district"))
     s_city, c_city = _norm_token(subject.get("city")), _norm_token(comp.get("city"))
+    s_twp = _norm_token(_first_present(subject, "township", "municipality"))
+    c_twp = _norm_token(_first_present(comp, "township", "municipality"))
     matches = [m for m in (
         (s_school == c_school) if (s_school and c_school) else None,
         (s_city == c_city) if (s_city and c_city) else None,
+        (s_twp == c_twp) if (s_twp and c_twp) else None,
     ) if m is not None]
     if matches:
         if all(matches):
@@ -4580,6 +4588,10 @@ def _prep_comp_for_ai(comp: dict) -> dict:
             f"do not compare $/sqft one-to-one with an all-above-grade property; weight the "
             f"composition difference"
         )
+    # Deal-breaker systems the narrative must name, not just list in a table (10/20: 2702 E Kings
+    # Hwy's cesspool was never mentioned while the comp was called Strong).
+    for issue in _material_system_issues(c):
+        notes.append(f"MATERIAL ISSUE: {issue} - say so in this comp's note; it depresses value and can limit financing")
     if c.get("data_note"):
         notes.insert(0, str(c["data_note"]))
     if notes:
@@ -5172,6 +5184,133 @@ def _v10_psf_leg_treatment(c: dict, price: float, raw_basis_sqft: float, subj_be
     return out
 
 
+# --- Feature adjustments (10/20) -------------------------------------------------------------
+# The anchor used to size-adjust on above-grade area only, so a subject's finished lower level,
+# extra baths and extra garage bays were worth $0 in the comp math (417 Dogwood Ln: 1,300 sqft
+# finished 2023 lower-level suite, 3.5 baths vs 2 / 1.5, 2-car vs 1-car -> anchor $424K, then the
+# asking-price band alone carried the value to $500K). Each verified comp is now adjusted toward
+# the subject on these three, appraisal-grid style, at rates scaled to that comp's own price level.
+_V10_FEATURE_BG_FRAC = 0.25       # finished below-grade sqft at this x the comp's above-grade $/sqft
+_V10_FEATURE_BATH_PCT = 0.02      # per full-bath difference (a half bath = 0.5) x the comp's price
+_V10_FEATURE_GARAGE_PCT = 0.015   # per garage-space difference x the comp's price
+_V10_FEATURE_CESSPOOL_PCT = 0.04  # cesspool vs not: 4% of the comp's price...
+_V10_FEATURE_CESSPOOL_MAX = 30000  # ...up to $30K (replacement / public-sewer connection)
+_V10_FEATURE_MAX_PCT = 0.18       # all of them together capped at +-18% of the comp's sale price
+
+
+def _v10_finished_below_grade_sqft(d: dict) -> Optional[float]:
+    """Finished below-grade sqft; 0 for none/unfinished; None when the MLS says the basement is
+    finished but records no area (1219 Scott Dr: "Fully Finished", 0 sqft) - unknown, not zero."""
+    bg = _as_float((d or {}).get("below_grade_finished_area"))
+    if bg and bg > 0:
+        return bg
+    basement = _style_text((d or {}).get("basement"))
+    if "finished" in basement.replace("unfinished", ""):
+        return None
+    # Bright's Basement field often says only "Full"; the listing text may say it's finished
+    # (2407 E Kings Hwy: "Full" in the record, "partially finished basement" in the remarks).
+    if _remarks_finished_basement(d):
+        return None
+    return 0.0
+
+
+def _remarks_finished_basement(d: dict) -> Optional[str]:
+    """'partial' / 'finished' when the listing remarks describe a finished lower level, else None."""
+    text = str(_first_present(d or {}, "public_remarks", "remarks", "listing_remarks") or "").lower()
+    if re.search(r"partially[\s-]+finished\s+(?:lower[\s-]+level|basement)|basement\s+(?:is\s+)?partially\s+finished", text):
+        return "partial"
+    if re.search(r"(?<!un)finished\s+(?:lower[\s-]+level|basement|walk[\s-]?out)|basement\s+(?:is\s+)?(?:fully\s+)?finished", text):
+        return "finished"
+    return None
+
+
+def _material_system_issues(d: dict) -> list:
+    """Recorded systems buyers and lenders treat as material problems (structured MLS fields only)."""
+    out = []
+    sewer = _style_text((d or {}).get("sewer"))
+    if "cess" in sewer:
+        out.append("cesspool (sewer)")
+    return out
+
+
+def _v10_garage_spaces(d: dict) -> Optional[float]:
+    n = _as_float((d or {}).get("garage_spaces"))
+    if n is not None and n >= 0:
+        return n
+    text = _style_text((d or {}).get("garage"))
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:car|space|bay|stall)", text)
+    if m:
+        return float(m.group(1))
+    if text in ("none", "no", "0"):
+        return 0.0
+    return None
+
+
+def _v10_feature_adjustments(subject: dict, comp: dict, price: float, comp_above_psf: float,
+                             bg_rate_evidence: Optional[float] = None) -> dict:
+    """Dollar adjustments that move a comp's sale price toward the subject for finished
+    below-grade area, bathroom count and garage spaces. Positive = subject has more."""
+    out = {"below_grade": 0.0, "baths": 0.0, "garage": 0.0, "notes": []}
+    s_bg, c_bg = _v10_finished_below_grade_sqft(subject), _v10_finished_below_grade_sqft(comp)
+    estimated = None
+    # A COMP that says finished/partially finished but records no area: estimate it (half its
+    # above-grade footprint, halved again for "partially"), never more than the subject's own -
+    # treating it as unknown dropped the whole lower-level difference (2702 E Kings Hwy, 10/20).
+    if s_bg is not None and c_bg is None:
+        c_ag = _v10_sqft(comp) or 0.0
+        partial = "partial" in _style_text(comp.get("basement")) or _remarks_finished_basement(comp) == "partial"
+        c_bg = min(s_bg, 0.5 * c_ag) * (0.5 if partial else 1.0)
+        estimated = "partially finished" if partial else "finished"
+    if s_bg is not None and c_bg is not None and abs(s_bg - c_bg) >= 100 and comp_above_psf > 0:
+        rate = float(bg_rate_evidence) if bg_rate_evidence else comp_above_psf * _V10_FEATURE_BG_FRAC
+        out["below_grade"] = (s_bg - c_bg) * rate
+        out["below_grade_rate_psf"] = round(rate, 2)
+        out["notes"].append(
+            f"finished lower level {round(s_bg):,} vs {round(c_bg):,} sqft at ${round(rate)}/sqft"
+            + (f" (comp's {estimated} area not on record - estimated)" if estimated else ""))
+    elif s_bg is None and (c_bg or 0) > 0:
+        out["notes"].append("subject's finished lower-level area not on record - not adjusted")
+    s_b = _as_float(_first_present(subject, "baths", "bathrooms", "bathrooms_total"))
+    c_b = _as_float(_first_present(comp, "baths", "bathrooms", "bathrooms_total"))
+    if s_b and c_b and s_b != c_b:
+        diff = _clamp(s_b - c_b, -2.0, 2.0)
+        out["baths"] = diff * price * _V10_FEATURE_BATH_PCT
+        out["notes"].append(f"baths {s_b:g} vs {c_b:g}")
+    s_g, c_g = _v10_garage_spaces(subject), _v10_garage_spaces(comp)
+    if s_g is not None and c_g is not None and s_g != c_g:
+        diff = _clamp(s_g - c_g, -3.0, 3.0)
+        out["garage"] = diff * price * _V10_FEATURE_GARAGE_PCT
+        out["notes"].append(f"garage {s_g:g} vs {c_g:g} spaces")
+    # A cesspool comp sold at a discount for it (replacement / connection cost, lender limits).
+    s_cess, c_cess = bool(_material_system_issues(subject)), bool(_material_system_issues(comp))
+    out["sewer"] = 0.0
+    if s_cess != c_cess and (subject.get("sewer") and comp.get("sewer")):
+        amount = min(_V10_FEATURE_CESSPOOL_PCT * price, _V10_FEATURE_CESSPOOL_MAX)
+        out["sewer"] = amount if c_cess else -amount
+        out["notes"].append("comp has a cesspool" if c_cess else "subject has a cesspool")
+    total = out["below_grade"] + out["baths"] + out["garage"] + out["sewer"]
+    cap = _V10_FEATURE_MAX_PCT * price
+    if abs(total) > cap:
+        scale = cap / abs(total)
+        for k in ("below_grade", "baths", "garage", "sewer"):
+            out[k] *= scale
+        out["notes"].append(f"capped at {int(_V10_FEATURE_MAX_PCT * 100)}% of the sale price")
+        total = cap if total > 0 else -cap
+    for k in ("below_grade", "baths", "garage", "sewer"):
+        out[k] = round(out[k])
+    out["total"] = round(total)
+    return out
+
+
+def _anchor_priced_features(anchor: Optional[dict]) -> set:
+    """Which grid features ("below_grade", "baths", "garage") the anchor adjusted on any comp."""
+    out = set()
+    for c in (anchor or {}).get("comps") or []:
+        fa = c.get("feature_adjustments") or {}
+        out |= {k for k in ("below_grade", "baths", "garage", "sewer") if fa.get(k)}
+    return out
+
+
 def _compute_comp_anchor(
     subject: dict, comps: list, evidence_by_key: dict, outliers: dict, *,
     raw_weight_overrides: Optional[dict[str, float]] = None,
@@ -5345,12 +5484,25 @@ def _compute_comp_anchor(
             r["psfleg"]["psf_leg_exclusion_reason"] = (
                 (r["psfleg"].get("psf_leg_exclusion_reason") or "") + "; excluded - enough clean-composition comps remain"
             ).lstrip("; ")
+    # Feature adjustments per comp (finished lower level, baths, garage). On the $/sqft leg a comp
+    # whose own basement was already stripped out of its per-foot figure counts as having none.
+    for r in rows:
+        r["feat"] = _v10_feature_adjustments(subject, r["_c"], r["price"], r["psf"], _bg_psf_ev)
+        if r["psfleg"].get("adjusted_above_grade_psf_used"):
+            _stripped = {**r["_c"], "below_grade_finished_area": 0, "basement": "none"}
+            _f = _v10_feature_adjustments(subject, _stripped, r["price"], r["psf"], _bg_psf_ev)
+            r["feat_psf_total"] = _f["total"]
+        else:
+            r["feat_psf_total"] = r["feat"]["total"]
+
     _psf_leg_den = sum(r["weight"] * r["_psf_leg_mult"] for r in rows)
     if _psf_leg_den > 0:
         psf_leg_mean = sum(r["psfleg"]["psf_for_leg"] * r["weight"] * r["_psf_leg_mult"] for r in rows) / _psf_leg_den
+        psf_feat_mean = sum(r["feat_psf_total"] * r["weight"] * r["_psf_leg_mult"] for r in rows) / _psf_leg_den
     else:  # everything got excluded (pathological) - fall back to the raw weighted mean
         psf_leg_mean = raw_psf_mean
-    psf_indication = psf_leg_mean * subj_sqft
+        psf_feat_mean = sum(r["feat_psf_total"] * r["weight"] for r in rows) / total_w
+    psf_indication = psf_leg_mean * subj_sqft + psf_feat_mean
     psf_indication_unnormalized = raw_psf_mean * subj_sqft
     _psf_leg_norm_ct = sum(1 for r in rows if r["psfleg"]["psf_leg_eligibility"] not in ("full",))
     _psf_leg_ct = sum(1 for r in rows if r["_psf_leg_mult"] > 0)
@@ -5365,6 +5517,8 @@ def _compute_comp_anchor(
         else:
             price_adj = r["price"] * (1 + _V10_BETA * (subj_sqft - r["sqft"]) / r["sqft"])
         price_adj = _clamp(price_adj, r["price"] * 0.78, r["price"] * 1.22)
+        r["size_only_adj_price"] = price_adj
+        price_adj += r["feat"]["total"]
         r["price_adj_to_subject"] = price_adj
         sale_num += price_adj * r["weight"]
 
@@ -5396,7 +5550,8 @@ def _compute_comp_anchor(
     for r in rows:
         nw = r["weight"] / total_w
         _leg = r["psfleg"]
-        own_indication = _V10_ANCHOR_BLEND * r["price_adj_to_subject"] + (1.0 - _V10_ANCHOR_BLEND) * (_leg["psf_for_leg"] * subj_sqft)
+        own_indication = (_V10_ANCHOR_BLEND * r["price_adj_to_subject"]
+                          + (1.0 - _V10_ANCHOR_BLEND) * (_leg["psf_for_leg"] * subj_sqft + r["feat_psf_total"]))
         _lc = r.get("loc_trace") or {}
         _cnd = r.get("cond_trace") or {}
         _cq = _quality_by_key.get(r["key"]) or {}
@@ -5407,6 +5562,9 @@ def _compute_comp_anchor(
             "status": r["status"], "distance_miles": r["distance_miles"],
             "raw_sale_price": round(r["price"]), "raw_psf": round(r["psf"]),
             "size_adjusted_price": round(r["price_adj_to_subject"]),
+            # Adjustment-grid trace: sale price -> size -> lower level / baths / garage -> adjusted.
+            "size_adjustment": round(r["size_only_adj_price"] - r["price"]),
+            "feature_adjustments": r["feat"],
             "sqft": round(r["sqft"]), "below_grade_frac": r["below_grade_frac"],
             # Fix 1 - sqft-composition normalization for the $/sqft leg, fully traced.
             # raw_total_finished_psf = price / TOTAL finished area (never call an above-grade rate
@@ -5541,6 +5699,11 @@ def _compute_comp_anchor(
         "sale_price_indication": round(sale_indication),
         "psf_indication": round(psf_indication),
         "psf_indication_per_sqft": round(psf_indication / subj_sqft, 2),
+        "psf_leg_rate_per_sqft": round(psf_leg_mean, 2),
+        "feature_adjustment_weighted": round(sum(r["feat"]["total"] * r["weight"] for r in rows) / total_w),
+        "feature_adjustment_rates": {"below_grade_frac_of_above_grade_psf": _V10_FEATURE_BG_FRAC,
+                                     "bath_pct_of_price": _V10_FEATURE_BATH_PCT, "garage_space_pct_of_price": _V10_FEATURE_GARAGE_PCT,
+                                     "max_pct_of_price": _V10_FEATURE_MAX_PCT},
         # Fix 1 - the $/sqft leg is sqft-composition-normalized; keep the un-normalized figure for QA/audit
         "psf_indication_basis": "above-grade $/sqft, finished-below-grade normalized",
         "psf_indication_unnormalized": round(psf_indication_unnormalized),
@@ -5568,17 +5731,82 @@ def _compute_comp_anchor(
     }
 
 
-_CONTINUOUS_RELEVANCE_VERSION = "continuous-relevance-v1"
+_CONTINUOUS_RELEVANCE_VERSION = "continuous-relevance-v2"
+# v2 (10/20): home style / single-level vs multi-level became its own 10-point component. In v1 it
+# was 35% of a 10-point "age_style" bucket with a 0.55 floor, so a ranch vs a two-story moved the
+# Match % ~1.5 points - and split-levels counted as ranches. A ranch buyer's comps are ranches.
 _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS = {
-    "proximity": 22.0,
+    "proximity": 21.0,
     "market_area": 16.0,
-    "size": 20.0,
-    "property_type": 12.0,
-    "lot": 9.0,
-    "age_style": 10.0,
-    "recency": 7.0,
-    "data_reliability": 4.0,
+    "size": 19.0,
+    "property_type": 11.0,
+    "lot": 8.0,
+    "age": 6.0,
+    "style": 10.0,
+    "recency": 6.0,
+    "data_reliability": 3.0,
 }
+
+# How alike two homes' level layouts are for a buyer (symmetric). Single-level living is its own
+# market (downsizers, accessibility); a split-level or a cape is a partial substitute; a two-story
+# barely is.
+_LEVEL_CLASS_SIMILARITY = {
+    frozenset(("single",)): 1.0,
+    frozenset(("single", "one_half")): 0.55,
+    frozenset(("single", "split")): 0.45,
+    frozenset(("single", "multi")): 0.15,
+    frozenset(("one_half",)): 1.0,
+    frozenset(("one_half", "split")): 0.45,
+    frozenset(("one_half", "multi")): 0.6,
+    frozenset(("split",)): 1.0,
+    frozenset(("split", "multi")): 0.5,
+    frozenset(("multi",)): 1.0,
+}
+
+
+def _style_text(value) -> str:
+    if isinstance(value, (list, tuple)):
+        value = " ".join(str(v) for v in value if v)
+    return _norm_token(value).replace("-", " ").replace("/", " ")
+
+
+def _relevance_level_class(data: dict) -> Optional[str]:
+    """single / one_half / split / multi from the MLS style first, then the Levels count. Bright's
+    Levels often counts a finished basement (18k ranches are listed as 2 levels), so a named style
+    wins over the number."""
+    text = _style_text(data.get("architectural_style") or data.get("structure_type"))
+    if any(t in text for t in ("split level", "split foyer", "bi level", "tri level", "raised ranch", "multi level")):
+        return "split"
+    if any(t in text for t in ("ranch", "rambler", "bungalow", "one story", "1 story", "single story")):
+        return "single"
+    if "cape" in text:
+        return "one_half"
+    levels = data.get("levels")
+    if isinstance(levels, (list, tuple)):
+        levels = levels[0] if levels else None
+    lv = _as_float(str(levels).replace("+", "")) if levels not in (None, "") else None
+    if lv is None:
+        lv = _as_float(data.get("stories"))
+    if lv:
+        return "single" if lv < 1.25 else "one_half" if lv < 1.75 else "multi"
+    if any(t in text for t in ("colonial", "georgian", "federal", "victorian", "tudor", "farmhouse", "manor", "traditional")):
+        return "multi"
+    return None
+
+
+def _relevance_style_score(subject: dict, comp: dict) -> Optional[float]:
+    """0-1 likeness of layout (levels) and architecture. None when either side is unknown."""
+    s_class, c_class = _relevance_level_class(subject), _relevance_level_class(comp)
+    s_family = _relevance_style_family(_style_text(subject.get("architectural_style") or subject.get("structure_type")))
+    c_family = _relevance_style_family(_style_text(comp.get("architectural_style") or comp.get("structure_type")))
+    if s_class and c_class:
+        score = _LEVEL_CLASS_SIMILARITY[frozenset((s_class, c_class))]
+        if s_class == c_class and s_family and c_family and s_family != c_family:
+            score *= 0.85   # same layout, different look (colonial vs contemporary two-story)
+        return score
+    if s_family and c_family:
+        return 1.0 if s_family == c_family else 0.6
+    return None
 
 
 def _relevance_lot_sqft(data: Optional[dict]) -> Optional[float]:
@@ -5591,14 +5819,16 @@ def _relevance_lot_sqft(data: Optional[dict]) -> Optional[float]:
 
 
 def _relevance_style_family(value) -> Optional[str]:
-    text = _norm_token(value).replace("-", " ")
-    if not text:
+    text = _style_text(value)
+    if not text or text in ("other", "none", "unknown"):
         return None
     families = (
         ("colonial_traditional", ("colonial", "traditional", "georgian", "federal")),
         ("modern", ("modern", "contemporary", "mid century")),
         ("tudor", ("tudor",)),
-        ("ranch", ("ranch", "split level", "bi level")),
+        # Split-levels are their own product, not ranches (150 Modena Rd scored as a ranch, 10/20).
+        ("split", ("split level", "split foyer", "bi level", "tri level", "raised ranch")),
+        ("ranch", ("ranch", "rambler")),
         ("cape", ("cape cod", "cape")),
         ("victorian", ("victorian", "queen anne")),
         ("craftsman", ("craftsman", "arts and crafts")),
@@ -5661,7 +5891,6 @@ def _continuous_relevance(
     subject_sqft = _v10_sqft(subject)
     subject_lot = _relevance_lot_sqft(subject)
     subject_year = _as_float(subject.get("year_built"))
-    subject_style = _relevance_style_family(subject.get("architectural_style") or subject.get("structure_type"))
     subject_type = _type_family(subject.get("property_type") or subject.get("home_type"))
     rows = []
     for i, comp in enumerate(comps):
@@ -5695,18 +5924,12 @@ def _continuous_relevance(
         comp_lot = _relevance_lot_sqft(comp)
         if subject_lot and comp_lot:
             components["lot"] = _half_life_decay(comp_lot - subject_lot, max(subject_lot * 0.4, 10890))
-        age_style_parts = []
         comp_year = _as_float(comp.get("year_built"))
         if subject_year and comp_year:
-            age_style_parts.append((_half_life_decay(comp_year - subject_year, 22.0), 0.65))
-        comp_style = _relevance_style_family(comp.get("architectural_style") or comp.get("structure_type"))
-        if subject_style and comp_style:
-            age_style_parts.append((1.0 if subject_style == comp_style else 0.55, 0.35))
-        if age_style_parts:
-            components["age_style"] = (
-                sum(value * weight for value, weight in age_style_parts)
-                / sum(weight for _, weight in age_style_parts)
-            )
+            components["age"] = _half_life_decay(comp_year - subject_year, 22.0)
+        style_score = _relevance_style_score(subject, comp)
+        if style_score is not None:
+            components["style"] = style_score
         recency = _comp_recency_weight(comp)
         if recency is not None:
             components["recency"] = recency
@@ -6781,6 +7004,20 @@ def _apply_v10_valuation(anchor: Optional[dict], exposure: dict, ai_estimate: Op
                 mid = min(mid, 0.02 * anchor_value)
                 lo, hi = min(lo, mid), min(hi, mid)
 
+        # The anchor's feature grid already priced the finished lower level, bath count and garage
+        # spaces against every verified comp (_v10_feature_adjustments) - a qualitative item for
+        # the same difference would count it twice.
+        _txt = f"{factor} {basis}".lower()
+        _priced = _anchor_priced_features(anchor)
+        _dup = (
+            ("below_grade" in _priced and any(k in _txt for k in ("lower level", "lower-level", "basement", "below-grade", "below grade")))
+            or ("garage" in _priced and fam == "garage_parking")
+            or ("baths" in _priced and any(k in _txt for k in ("more bath", "extra bath", "additional bath", "bath count", "bathroom count", "half bath", "full bath")))
+            or ("sewer" in _priced and any(k in _txt for k in ("cesspool", "cess pool")))
+        )
+        if _dup and mid:
+            flags.append(f"Adjustment '{factor}': already priced in the comp adjustment grid (finished lower level / baths / garage) - not added again.")
+            mid, lo, hi = 0.0, 0.0, 0.0
         cap = _V10_ITEM_CAP[btype] * anchor_value
         capped = mid > cap
         if capped:
@@ -6792,7 +7029,7 @@ def _apply_v10_valuation(anchor: Optional[dict], exposure: dict, ai_estimate: Op
         # deterministic mechanism (so no $ is charged for it) - the reconciliation honours this
         # instead of demanding a fresh adjustment. Only a known mechanism string is kept.
         _cap_elsewhere = str(it.get("captured_elsewhere") or "").strip().lower()
-        if _cap_elsewhere not in ("size_normalization", "below_grade_normalization", "location_weighting",
+        if _cap_elsewhere not in ("size_normalization", "below_grade_normalization", "feature_grid", "location_weighting",
                                   "comp_classification", "outlier_weighting", "exposure"):
             _cap_elsewhere = None
         if _soft:
@@ -7511,6 +7748,15 @@ home has sat on the market well past the days its comps took to sell: buyers hav
 it at this price, so it most likely sells at or a little under asking - do not describe competing
 offers or a premium over asking.
 
+deterministic_evidence.comp_adjustment_grid is an appraisal-style grid already inside the
+deterministic anchor: every verified comp was moved toward the subject for size, finished
+lower-level area, bathroom count and garage spaces. Do not add value for those three again. If
+final_fmv lands well above or below what the adjusted comps support because the asking_price_check
+band holds it there, say so plainly in final_valuation_summary - for example that the adjusted
+sales point lower but homes here are selling above their asking prices. Never present the asking
+price as confirming a comp-based conclusion it actually set ("the asking price is consistent with
+this value" when the value is the asking price is circular).
+
 For every major positive and negative factor, set evidence_strength to clearly_market_supported,
 directionally_supported_amount_uncertain, or subjective_or_speculative. Distinctive architecture,
 pedigree, character, privacy, grounds, scarcity, and "estate feel" do not automatically earn a
@@ -7671,6 +7917,17 @@ def _build_reasoning_evidence_packet(
         "size_model": a.get("size_model"),
         "comp_weights": [
             {"comp_label": c.get("label"), "normalized_weight": c.get("normalized_weight")}
+            for c in (a.get("comps") or [])
+        ],
+        # Appraisal-style grid already inside deterministic_anchor: each verified comp moved toward the
+        # subject for size, finished lower level, baths and garage. Do not price those again.
+        "comp_adjustment_grid": [
+            {"comp_label": c.get("label"), "sale_price": c.get("raw_sale_price"), "size_adjustment": c.get("size_adjustment"),
+             "lower_level": (c.get("feature_adjustments") or {}).get("below_grade"),
+             "baths": (c.get("feature_adjustments") or {}).get("baths"),
+             "garage": (c.get("feature_adjustments") or {}).get("garage"),
+             "cesspool": (c.get("feature_adjustments") or {}).get("sewer"),
+             "adjusted_price": c.get("size_adjusted_price"), "normalized_weight": c.get("normalized_weight")}
             for c in (a.get("comps") or [])
         ],
         "exposure_state": exposure.get("state"),
@@ -8684,7 +8941,7 @@ def _comp_note_number_errors(text: str, comp: dict, subject: Optional[dict] = No
     return list(dict.fromkeys(errs))
 
 
-def _regenerate_comp_narrative_from_snapshot(comp: dict, label: str) -> str:
+def _regenerate_comp_narrative_from_snapshot(comp: dict, label: str, subject: Optional[dict] = None) -> str:
     """Build a corrected comp card from canonical facts plus clearly labelled model judgment.
 
     This is a client-facing fallback - it fires whenever a comp's condition rating or amenity
@@ -8702,7 +8959,17 @@ def _regenerate_comp_narrative_from_snapshot(comp: dict, label: str) -> str:
     # like an agent wrote it - the old template said "sits in a same as subject area relative to the
     # subject" and "is a verified closed sale at".
     if price and comp.get("price_verified", True) and status_text in ("sold", "closed"):
-        sentences.append(f"{address} sold for ${price:,.0f}.")
+        # Date, sold-vs-asking and market time make each card its own (10/20: comps #3 and #4 read
+        # as the same boilerplate, and a 14%-over-asking sale in 6 days was never mentioned).
+        when = _parse_iso_date(comp.get("close_date") or comp.get("sale_date"))
+        line = f"{address} sold for ${price:,.0f}" + (f" on {when.strftime('%b')} {when.day}, {when.year}" if when else "")
+        if list_price:
+            pct = round((price / list_price - 1) * 100, 1)
+            line += (f", {abs(pct):g}% {'over' if pct > 0 else 'under'} its ${list_price:,.0f} asking price" if pct else ", at its asking price")
+        dom = _as_float(comp.get("days_on_market"))
+        if dom is not None:
+            line += f", after {int(dom)} day{'s' if int(dom) != 1 else ''} on the market"
+        sentences.append(line + ".")
     elif status_text in ("sold", "closed") and list_price:
         sentences.append(f"{address} sold, but its final price isn't confirmed (it was listed near ${list_price:,.0f}), so it's shown for context only.")
     elif list_price:
@@ -8760,13 +9027,51 @@ def _regenerate_comp_narrative_from_snapshot(comp: dict, label: str) -> str:
         elif any(w in area for w in ("worse", "inferior", "below", "weaker", "less")):
             sentences.append("Its location is a step down from the subject's.")
 
+    if subject:
+        diffs = []
+        s_b, c_b = _as_float(_first_present(subject, "baths", "bathrooms")), _as_float(_first_present(comp, "baths", "bathrooms"))
+        if s_b and c_b and s_b != c_b:
+            diffs.append(f"{c_b:g} baths to the subject's {s_b:g}")
+        s_bg, c_bg = _v10_finished_below_grade_sqft(subject), _v10_finished_below_grade_sqft(comp)
+        if s_bg and c_bg == 0:
+            diffs.append("no finished lower level on record")
+        s_g, c_g = _v10_garage_spaces(subject), _v10_garage_spaces(comp)
+        if s_g is not None and c_g is not None and s_g != c_g:
+            diffs.append(f"a {c_g:g}-car garage to the subject's {s_g:g}")
+        if diffs:
+            sentences.append(f"It has {_join_and(diffs)}.")
+    for issue in _material_system_issues(comp):
+        if "cesspool" in issue:
+            sentences.append("It is served by a cesspool, which typically lowers value and can limit financing.")
+
     remarks = str(_first_present(comp, "public_remarks", "remarks", "listing_remarks") or "")
-    if re.search(r"\b(?:renovat\w+|rebuilt|updated)\b", remarks, re.IGNORECASE):
-        sentences.append(
-            "Its listing calls it renovated or updated, though that alone doesn't confirm the major "
-            "systems were replaced."
-        )
+    updates = _listing_named_updates(remarks)
+    if updates:
+        sentences.append(f"Its listing mentions {_join_and(updates)}, though " + ("those claims aren't" if len(updates) > 1 else "that isn't") + " independently verified.")
+    elif re.search(r"\b(?:renovat\w+|rebuilt|updated)\b", remarks, re.IGNORECASE):
+        sentences.append("Its listing describes it as updated, without naming specific systems.")
     return " ".join(sentences)
+
+
+_NAMED_UPDATE_PATTERNS = (
+    ("a new roof", r"\b(?:new|newer|replaced)\s+roof\b|\broof\s+(?:replaced|new)\b"),
+    ("new siding", r"\b(?:new|newer)\s+siding\b|\bsiding\s+replaced\b"),
+    ("a new water heater", r"\b(?:new|newer)\s+(?:hot\s+)?water\s+heater\b"),
+    ("new HVAC", r"\b(?:new|newer)\s+(?:hvac|furnace|heat\s+pump|central\s+air|a/?c)\b"),
+    ("mini-split heating and cooling", r"\bmini[\s-]?splits?\b"),
+    ("new windows", r"\b(?:new|newer|replacement)\s+windows\b"),
+    ("200-amp electric service", r"\b200[\s-]?amp\b"),
+    ("a renovated kitchen", r"\b(?:new|renovated|remodeled|updated)\s+kitchen\b"),
+)
+
+
+def _listing_named_updates(remarks: str) -> list:
+    """Specific improvements a listing names (roof, siding, HVAC...), in plain words."""
+    found = []
+    for label, pattern in _NAMED_UPDATE_PATTERNS:
+        if re.search(pattern, remarks or "", re.IGNORECASE):
+            found.append(label)
+    return found[:4]
 
 
 def _tidy_caps_address(addr) -> str:
@@ -8872,7 +9177,7 @@ async def _materialize_snapshot_with_comp_narratives(
         if _num_errs:
             corrected = True
             flags.append(f"{label}: AI note had figures that don't match the MLS record ({'; '.join(_num_errs[:3])}) - rebuilt from verified facts.")
-        generated = _regenerate_comp_narrative_from_snapshot(comp, label) if corrected else ai_draft
+        generated = _regenerate_comp_narrative_from_snapshot(comp, label, subject) if corrected else ai_draft
         if generated:
             generated, ff = _reconcile_comp_hard_facts(generated, label, subject, comp)
             flags.extend(ff)
@@ -12996,7 +13301,7 @@ async def _auto_repair_export_blocks(
             if comp_blocks(idx, t):
                 t, dropped = _drop_sentences(t, lambda s: bool(comp_blocks(idx, s)))
             if not t.strip() or comp_blocks(idx, t):
-                t = _regenerate_comp_narrative_from_snapshot(comp, label)
+                t = _regenerate_comp_narrative_from_snapshot(comp, label, subject)
                 t, _ff = _reconcile_comp_hard_facts(t, label, subject, comp)
                 flags.append(f"auto-corrected: {label} - comp write-up rebuilt from its verified MLS facts "
                              "(the drafted note made a claim the records don't support).")
@@ -13028,7 +13333,7 @@ async def _auto_repair_export_blocks(
             for fld in ("ai_commentary", "commentary"):
                 if comp.get(fld) and bad(comp[fld]):
                     comp[fld], _ = _reconcile_comp_hard_facts(
-                        _regenerate_comp_narrative_from_snapshot(comp, _comp_label(idx, comp)),
+                        _regenerate_comp_narrative_from_snapshot(comp, _comp_label(idx, comp), subject),
                         _comp_label(idx, comp), subject, comp)
             flags.append(f"auto-corrected: {num}'s {m.group(2)} was described inconsistently - the comp write-up "
                          "was rebuilt from its record and the contradicting sentence removed.")
@@ -13873,7 +14178,9 @@ async def _generate_ai_analysis_impl(
         # showing blanks on data we already hold. Subjective dimensions stay blank if unrated.
         _q = dict(comp.get("quality") or {})
         for _f, _v in _derive_quality_from_data(enriched_subject, comp).items():
-            if not _q.get(_f):
+            # Area is a pure records comparison (school district / city / township) - the data wins
+            # over a model's rating; other derived dimensions only fill blanks.
+            if _f == "area" or not _q.get(_f):
                 _q[_f] = _v
         if not _q.get("street_context"):
             _street = _derive_street_context(enriched_subject, comp)

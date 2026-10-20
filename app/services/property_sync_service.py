@@ -516,6 +516,31 @@ class PropertySyncService:
             logger.info("All deletions were older than our local modifications. No updates needed.")
             return
 
+        # Bright's Deletion feed (CWA_BRIGHT_ALL) also reports listings that are still live in
+        # BrightProperties - 4 of 8 sampled "deleted" active/pending homes and recent sales with a
+        # ClosePrice were still there (10/20), and marking them off-market hid them from Showcases,
+        # IDX and CMA comps. So a listing only goes off-market once Bright no longer returns it; one
+        # it still has is re-read instead. If Bright can't be asked, nothing is marked this cycle.
+        try:
+            still_listed = await bright_mls_service.get_listings_by_keys(valid_deletion_keys)
+        except Exception as e:
+            logger.error(f"Could not confirm {len(valid_deletion_keys)} deletions with Bright - none applied this cycle: {e}")
+            stats["errors"] += 1
+            return
+        live_keys = {str(r.get("ListingKey")) for r in still_listed}
+        for raw in still_listed:
+            try:
+                await self._sync_single_property(db, raw, {}, allow_inactive_insert=False)
+            except Exception as e:  # noqa: BLE001 - one bad record never stops the deletion step
+                await db.rollback()
+                logger.warning(f"Re-read of still-listed {raw.get('ListingKey')} failed: {e}")
+        if live_keys:
+            logger.info(f"Bright still lists {len(live_keys)} of the reported deletions - kept and re-read, not marked off-market.")
+        valid_deletion_keys = [k for k in valid_deletion_keys if k not in live_keys]
+        stats["false_deletions_kept"] = len(live_keys)
+        if not valid_deletion_keys:
+            return
+
         logger.warning(f"Applying {len(valid_deletion_keys)} verified hard deletions. Marking as off-market.")
 
         # Batch update in database

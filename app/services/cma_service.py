@@ -31,6 +31,7 @@ _AUTHORITATIVE_SUBJECT_FACT_FIELDS = (
     "above_grade_finished_area",
     "below_grade_finished_area",
     "architectural_style",
+    "levels",
     "township",
     "subdivision_name",
     "latitude",
@@ -55,6 +56,7 @@ def _property_subject_facts(prop: Property) -> Dict[str, Any]:
         "above_grade_finished_area": prop.above_grade_finished_area,
         "below_grade_finished_area": prop.below_grade_finished_area,
         "architectural_style": prop.architectural_style,
+        "levels": getattr(prop, "levels", None),
         "township": prop.township,
         "subdivision_name": prop.subdivision_name,
         "latitude": prop.latitude,
@@ -832,6 +834,7 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest) -> Lis
             baths=p.bathrooms,
             year_built=p.year_built,
             architectural_style=p.architectural_style,
+            levels=p.levels,
             township=p.township,
             subdivision_name=p.subdivision_name,
             garage=garage,
@@ -882,18 +885,23 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest) -> Lis
         "subject_snapshot": _subject_scoring_snapshot(canonical_subject),
         "subject_snapshot_sha256": _subject_scoring_fingerprint(canonical_subject),
     }
-    # Same housing product first (a twin's comps are twins), nearest-first within each group - the
-    # grid only shows 60, and in a dense area 60 nearest-of-anything can hold almost no twins.
+    # Score EVERY in-circle candidate, then keep the best 60 for the grid: same housing product
+    # first (a twin's comps are twins), then usable sales (a verified price the value math can use),
+    # then Match %. It used to keep the 60 NEAREST before scoring, so in a dense area widening the
+    # radius changed nothing and a strong verified sale 2 miles out never appeared (417 Dogwood Ln:
+    # 2702 E Kings Hwy, verified, 80%, cut by 60 nearer rows - 10/20).
     from app.services.cma_ai_service import _type_family
     _subject_family = _type_family(req.property_type or (req.subject.property_type if req.subject else None))
-    if _subject_family:
-        candidates.sort(key=lambda c: _type_family(c.property_type) not in (None, _subject_family))
-    visible_candidates = [
-        candidate.model_copy(update={"similarity_context": similarity_context})
-        for candidate in candidates[:60]
-    ]
+    scored = _score_comparable_candidates(canonical_subject, [
+        candidate.model_copy(update={"similarity_context": similarity_context}) for candidate in candidates
+    ], similarity_context)
 
-    return _score_comparable_candidates(canonical_subject, visible_candidates, similarity_context)
+    def _grid_rank(c: CmaCompCandidate):
+        d = c.similarity_details or {}
+        other_product = bool(_subject_family) and _type_family(c.property_type) not in (None, _subject_family)
+        return (other_product, d.get("valuation_eligible") is False, -(c.match_score or 0), c.distance_miles or 0)
+
+    return sorted(scored, key=_grid_rank)[:60]
 
 
 async def drop_subject_from_comps(db: AsyncSession, owner_id: str, report_id: str) -> int:

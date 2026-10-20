@@ -122,6 +122,10 @@ async def lifespan(app: FastAPI):
             _pulls_job(_pulls.HISTORY_PULLS, "Price history backfill"), "interval", minutes=10, id="bright_price_history",
             name="Production Bright price history backfill", replace_existing=True, max_instances=1,
         )
+        scheduler.add_job(
+            _pulls_job(_pulls.REPAIR_PULLS, "Off-market recheck"), "interval", minutes=10, id="bright_recheck_off_market",
+            name="Production Bright off-market recheck", replace_existing=True, max_instances=1,
+        )
 
     # Website Builder custom domains: real DNS/HTTPS check on a recurring poll, so a domain an
     # agent fixes doesn't require them to come back and click anything - see

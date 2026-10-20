@@ -241,16 +241,45 @@ class BrightMlsService:
         rows = data.get("value", [])
         return rows[0] if rows else None
 
+    async def get_listings_by_keys(self, listing_keys: List[str], chunk: int = 100) -> List[Dict[str, Any]]:
+        """Bright's CURRENT full record for each of these ListingKeys, 100 per request (`in (...)` -
+        Bright rejects the same lookup written as an `or` chain). A key Bright no longer has is
+        simply absent from the result. Filtering by key returns ClosePrice/CloseDate too, unlike the
+        general modified-since feed. Raises on a failed read - a caller must never treat "couldn't
+        ask Bright" as "Bright deleted it"."""
+        keys = [k for k in dict.fromkeys(str(k).strip() for k in listing_keys) if k.isdigit()]
+        out: List[Dict[str, Any]] = []
+        for i in range(0, len(keys), chunk):
+            part = keys[i:i + chunk]
+            data = await self._make_request("BrightProperties", params={
+                "$filter": f"ListingKey in ({','.join(part)})",
+                "$top": len(part),
+                "$select": self._get_full_field_list(),
+            })
+            out += data.get("value", [])
+        return out
+
     async def get_listings_for_tax_id(self, tax_id: str) -> List[Dict[str, Any]]:
         """Every listing Bright has for one parcel (any status, back to 2012) - the price history
         backfill. One parcel per query: Bright rejects OR-ing several parcels ("Query Too Complex")."""
-        safe = (tax_id or "").replace("'", "''")
-        data = await self._make_request("BrightProperties", params={
-            "$filter": f"ListingTaxID eq '{safe}'",
-            "$top": 50,
-            "$select": self._get_full_field_list(),
-        })
-        return data.get("value", [])
+        # A merged parcel is stored as several ids joined with "&" ("04-00-00661-218 & 04-00-00661-381").
+        # Bright decodes the "&" as a query-string separator and rejects the whole request ("The URI
+        # is malformed"), so each id is looked up on its own (10/20).
+        parts = [p.strip() for p in re.split(r"[&,;]", tax_id or "") if p.strip()] or [tax_id or ""]
+        out: List[Dict[str, Any]] = []
+        seen: set = set()
+        for part in parts:
+            safe = part.replace("'", "''")
+            data = await self._make_request("BrightProperties", params={
+                "$filter": f"ListingTaxID eq '{safe}'",
+                "$top": 50,
+                "$select": self._get_full_field_list(),
+            })
+            for row in data.get("value", []):
+                if row.get("ListingKey") not in seen:
+                    seen.add(row.get("ListingKey"))
+                    out.append(row)
+        return out
 
     def _get_full_field_list(self) -> str:
         """Centralized list of all 90+ fields from mls_mapper."""

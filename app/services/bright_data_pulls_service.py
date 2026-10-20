@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
-PULLS = ("sold_3y", "refresh_current", "price_history", "agent_sales")
+PULLS = ("sold_3y", "refresh_current", "price_history", "agent_sales", "recheck_off_market")
 _CURRENT = ("ACTIVE-BRIGHT", "COMING SOON-BRIGHT", "PENDING-BRIGHT", "ACTIVE UNDER CONTRACT-BRIGHT")
 PAGE = 200
 
@@ -44,6 +44,10 @@ def enabled(name: str) -> bool:
         return True
     # Agents' sales are part of the sales backfill - one switch (user, 10/15).
     if name == "agent_sales" and "sold_3y" in raw:
+        return True
+    # The off-market repair rides the same switch: wherever sales are pulled, falsely deleted
+    # listings get re-checked once (10/20) - no new production setting needed.
+    if name == "recheck_off_market" and "sold_3y" in raw:
         return True
     return "all" in raw or name in raw
 
@@ -189,10 +193,52 @@ async def pull_agent_sales(db: AsyncSession, max_agents: int = 5, pause: float =
     return {"agents_done": len(done), "agents_waiting": max(0, len(ids) - len(done)), "added": added}
 
 
+async def recheck_off_market(db: AsyncSession, max_keys: int = 3000, pause: float = 0.5) -> dict:
+    """One pass over every listing we hold as OFF_MARKET-BRIGHT, in listing-key order, remembering
+    where it stopped. Any listing Bright still returns is re-read, so its real status comes back
+    (for sale, pending, or sold with its ClosePrice); the rest stay off-market.
+
+    Repairs the false deletions applied before _sync_deletions started confirming with Bright
+    (10/20): Bright's Deletion feed also reports listings that are still live, and those homes had
+    vanished from Showcases, IDX and CMA comps. No alerts are sent - it only fixes the mirror."""
+    from app.services.bright_mls_service import bright_mls_service
+    from app.services.property_sync_service import PropertySyncService
+    key = "data_pull_recheck_off_market"
+    st = await _get(db, key)
+    if st.get("done"):
+        return {"done": True}
+    keys = list((await db.execute(text(
+        "SELECT listing_key FROM properties WHERE home_status = 'OFF_MARKET-BRIGHT' AND listing_key > :after "
+        "ORDER BY listing_key LIMIT :n"), {"after": st.get("after_key") or "", "n": max_keys})).scalars())
+    if not keys:
+        st = {**st, "done": True, "finished": date.today().isoformat()}
+        await _set(db, key, st)
+        return st
+    syncer = PropertySyncService()
+    for i in range(0, len(keys), 100):
+        part = keys[i:i + 100]
+        found = await bright_mls_service.get_listings_by_keys(part)
+        # Photos only for homes back on the market (buyers see them); a sale keeps its stored gallery.
+        on_market = [str(r["ListingKey"]) for r in found if not str(r.get("MlsStatus") or "").startswith("CLOSED")]
+        photos = await bright_mls_service.get_media_for_properties(on_market) if on_market else {}
+        for raw in found:
+            try:
+                await syncer._sync_single_property(db, raw, photos, allow_inactive_insert=False)
+            except Exception:  # noqa: BLE001 - one bad record never stops the pass
+                await db.rollback()
+                logger.warning("recheck_off_market: listing failed", exc_info=True)
+        st = {"after_key": part[-1], "checked": int(st.get("checked") or 0) + len(part),
+              "restored": int(st.get("restored") or 0) + len(found)}
+        await _set(db, key, st)
+        await asyncio.sleep(pause)
+    return {"done": False, **st}
+
+
 # price_history runs as its own scheduler job: one batch of 300 parcels takes ~2 hours, and while it
 # shared the tick, sold_3y only got its 10 pages every ~2 hours instead of every 10 minutes (10/20).
 SALES_PULLS = ("refresh_current", "sold_3y", "agent_sales")
 HISTORY_PULLS = ("price_history",)
+REPAIR_PULLS = ("recheck_off_market",)
 
 
 async def run_enabled(db: AsyncSession, names: tuple = PULLS) -> dict:
@@ -203,7 +249,8 @@ async def run_enabled(db: AsyncSession, names: tuple = PULLS) -> dict:
     for name, run in (("refresh_current", lambda: refresh_current(db)),
                       ("sold_3y", lambda: pull_sold_3y(db)),
                       ("price_history", lambda: backfill_batch(db, max_parcels=300)),
-                      ("agent_sales", lambda: pull_agent_sales(db))):
+                      ("agent_sales", lambda: pull_agent_sales(db)),
+                      ("recheck_off_market", lambda: recheck_off_market(db))):
         if name not in names or not enabled(name):
             continue
         try:
@@ -228,4 +275,5 @@ async def status(db: AsyncSession) -> dict:
         "refresh_current": await _get(db, "data_pull_refresh_current"),
         "price_history": {"parcels_done": parcels_done},
         "agent_sales": {k: v for k, v in (await _get(db, "data_pull_agent_sales")).items() if k != "done_ids"},
+        "recheck_off_market": await _get(db, "data_pull_recheck_off_market"),
     }

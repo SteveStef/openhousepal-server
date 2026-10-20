@@ -179,9 +179,15 @@ async def backfill_batch(db: AsyncSession, max_parcels: int = 300, pause_seconds
     for tax_id in rows:
         try:
             listings = await bright_mls_service.get_listings_for_tax_id(tax_id)
-        except Exception:  # noqa: BLE001 - one parcel failing (Bright blip) never stops the batch
+        except Exception as e:  # noqa: BLE001 - one parcel failing (Bright blip) never stops the batch
             failed += 1
             logger.warning("price history backfill: parcel lookup failed", extra={"tax_id": tax_id})
+            # Bright refusing the query itself (a 400) will refuse it every time - record the parcel
+            # as checked so it isn't retried at the front of every batch forever. A blip (5xx,
+            # timeout) is left for the next batch.
+            if "400" in str(getattr(e, "detail", e)):
+                db.add(PriceHistoryParcel(tax_id=tax_id, listings_found=None, checked_at=datetime.now(timezone.utc)))
+                await db.commit()
             await asyncio.sleep(pause_seconds * 4)
             continue
         if len(listings) <= _MAX_LISTINGS_PER_PARCEL:

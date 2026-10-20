@@ -304,7 +304,7 @@ async def wizard_comps(db: AsyncSession, subject: dict, as_of: date) -> tuple[li
     max_price = -(-int(lp * 1.35) // 10000) * 10000 if lp else None
     beds = subject.get("beds") or 0
     min_beds = max(0, beds - (2 if beds >= 8 else 1)) if beds else None
-    ri, si, auto_r, auto_s = 0, 1, True, True
+    ri, si, auto_r, auto_s, extra_step = 0, 1, True, True, False
     steps = []
     res: list = []
     for _ in range(30):
@@ -324,7 +324,12 @@ async def wizard_comps(db: AsyncSession, subject: dict, as_of: date) -> tuple[li
             si += 1
             widen = True
         if auto_r:
-            if strong < _MIN_STRONG_MATCHES and ri < len(_RADIUS_STEPS) - 1:
+            # Same as the wizard (10/20): one step past "enough", since every in-circle sale is
+            # scored and a wider circle only adds candidates.
+            enough = strong >= _MIN_STRONG_MATCHES
+            if ri < len(_RADIUS_STEPS) - 1 and (not enough or not extra_step):
+                if enough:
+                    extra_step = True
                 ri += 1
                 widen = True
             else:

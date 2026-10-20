@@ -40,6 +40,7 @@ class CmaSubjectProperty(BaseModel):
     year_built: Optional[int] = None
     property_type: Optional[str] = None
     architectural_style: Optional[Union[List[str], str]] = None
+    levels: Optional[Union[List[str], str]] = None
     township: Optional[str] = None
     subdivision_name: Optional[str] = None
     garage: Optional[str] = None
@@ -114,6 +115,7 @@ class CmaComparable(BaseModel):
     baths: Optional[float] = None
     year_built: Optional[int] = None
     architectural_style: Optional[Union[List[str], str]] = None
+    levels: Optional[Union[List[str], str]] = None
     township: Optional[str] = None
     subdivision_name: Optional[str] = None
     garage: Optional[str] = None
@@ -374,6 +376,7 @@ class CmaCompCandidate(BaseModel):
     baths: Optional[float] = None
     year_built: Optional[int] = None
     architectural_style: Optional[Union[List[str], str]] = None
+    levels: Optional[Union[List[str], str]] = None
     township: Optional[str] = None
     subdivision_name: Optional[str] = None
     garage: Optional[str] = None
