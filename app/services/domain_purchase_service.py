@@ -486,10 +486,20 @@ async def transfer_code(db: AsyncSession, purchase: PurchasedDomain) -> str:
     if reg and datetime.now(timezone.utc) - reg < timedelta(days=60):
         ok = reg + timedelta(days=60)
         raise PurchaseError(f"A new domain can be moved 60 days after it's bought - from {ok:%B} {ok.day}, {ok.year}.")
+    def _locked_until(when: Optional[datetime]) -> PurchaseError:
+        return PurchaseError(f"This domain can be moved to another company from {when:%B} {when.day}, {when.year} "
+                             "(every new domain has to wait 60 days).")
     try:
+        # Name.com knows the exact end of the registry's 60-day lock - ours is only an estimate
+        lock = _parse((await namecom_service.get_domain(purchase.domain_name)).get("transferLockExpiresAt"))
+        if lock and lock > datetime.now(timezone.utc):
+            raise _locked_until(lock)
         await namecom_service.unlock(purchase.domain_name)
         return await namecom_service.get_auth_code(purchase.domain_name)
-    except NamecomError:
+    except NamecomError as e:
+        m = re.search(r"until (\d{4}-\d{2}-\d{2}T[\d:]+Z)", e.message or "")
+        if m and _parse(m.group(1)):
+            raise _locked_until(_parse(m.group(1)))
         raise PurchaseError("We couldn't get the code just now - try again, or contact support.")
 
 
