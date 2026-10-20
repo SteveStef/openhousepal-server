@@ -12192,6 +12192,20 @@ def _v10_apply_buyer_offer_rebuild(offer_text: str, final: Optional[dict], list_
 
 
 
+def _review_instead_of_block(qa_result: Optional[dict], qa_blocking: list, qa_flags: list) -> tuple:
+    """The owner's never-block rule (10/20) for the path where the auto-repair step itself failed:
+    every finding becomes a "Review before sending" warning and export stays allowed."""
+    review = list(dict.fromkeys([*(qa_blocking or []), *((qa_result or {}).get("blocking_errors") or [])]))
+    flags = list(dict.fromkeys([*(qa_flags or []), *(f"Review before sending: {b}" for b in review)]))
+    if isinstance(qa_result, dict):
+        qa_result["review_required"] = list(dict.fromkeys([*(qa_result.get("review_required") or []), *review]))
+        qa_result["warnings"] = list(dict.fromkeys([*(qa_result.get("warnings") or []), *review]))
+        qa_result["blocking_errors"] = []
+        qa_result["export_allowed"] = True
+        qa_result["passed"] = False if review else qa_result.get("passed", False)
+    return qa_result, flags
+
+
 def _v10_sync_qa_authority(qa_result: Optional[dict], qa_blocking: list) -> Optional[dict]:
     """Keep qa_result authoritative if qa_blocking grew after _finalize_gate_reconciled_prose
     returned (e.g. the premium-improvements pass). Idempotent."""
@@ -13080,13 +13094,22 @@ async def _auto_repair_export_blocks(
     fixed = [b for b in original if b not in final_blocking]
     for b in fixed:
         flags.append(f"auto-corrected: resolved and re-checked - {b}")
+    # Owner's rule (10/20, approved by the owner): a CMA is never left export-blocked. What the
+    # repairs can't fix (thin comp evidence, a weak anchor, a reasoning-pass finding) goes to the
+    # agent as a "Review before sending" warning instead - the agent decides, the report isn't stuck.
+    review = list(final_blocking)
+    for b in review:
+        flags.append(f"Review before sending: {b}")
     qa_result["auto_repair"] = {
-        "rounds": rounds_run, "fixed": fixed, "remaining": final_blocking,
+        "rounds": rounds_run, "fixed": fixed, "remaining": [], "review_required": review,
         "rerun_completed": rerun_completed,
     }
-    qa_result["blocking_errors"] = final_blocking
-    qa_result["export_allowed"] = not final_blocking
-    qa_result["passed"] = not final_blocking and not qa_result.get("warnings") and not rounds_run
+    qa_result["review_required"] = review
+    qa_result["warnings"] = list(dict.fromkeys([*(qa_result.get("warnings") or []), *review]))
+    qa_result["blocking_errors"] = []
+    qa_result["export_allowed"] = True
+    qa_result["passed"] = not review and not qa_result.get("warnings") and not rounds_run
+    final_blocking = []
     qa_result.setdefault("checks_run", [])
     if "final_auto_repair" not in qa_result["checks_run"]:
         qa_result["checks_run"].append("final_auto_repair")
@@ -14462,6 +14485,8 @@ async def _generate_ai_analysis_impl(
             qa_blocking = list(_rep["qa_blocking"])   # only findings the repair + re-check could not clear
         except Exception:  # noqa: BLE001 - the repair must never be the thing that fails a report
             logger.exception("CMA final auto-repair failed for report %s - findings left unchanged", report_id)
+            _qa_result, qa_flags = _review_instead_of_block(_qa_result, qa_blocking, qa_flags)
+            qa_blocking = []
         if valuation_trace is not None:
             valuation_trace["qa"] = _qa_result
 
@@ -15078,6 +15103,8 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             qa_blocking = list(_rep["qa_blocking"])   # only findings the repair + re-check could not clear
         except Exception:  # noqa: BLE001
             logger.exception("CMA recompute auto-repair failed for report %s - findings left unchanged", report_id)
+            _qa_result, qa_flags = _review_instead_of_block(_qa_result, qa_blocking, qa_flags)
+            qa_blocking = []
 
         if valuation_trace is not None:
             valuation_trace["qa"] = _qa_result

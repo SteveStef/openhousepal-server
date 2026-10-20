@@ -3826,9 +3826,16 @@ def test_ao_reliability_never_fail_and_auto_repair():
           and "dated" not in (comps[0]["commentary"] or "") and not any("material figure" in b or "dated" in b
                                                                        for b in rep["qa_blocking"]),
           f"{rep['inspection']!r} / {comps[0]['commentary']!r} / {rep['qa_blocking']}")
-    check("6c: a valuation-data finding is not a text problem and still gates export",
-          rep["qa_blocking"] == [data_block] and rep["qa_result"]["export_allowed"] is False
-          and rep["qa_result"]["blocking_errors"] == [data_block], str(rep["qa_result"]["blocking_errors"]))
+    check("6c: a valuation-data finding can't be repaired as text - it becomes a 'Review before sending' warning, "
+          "export stays allowed (owner's never-block rule, 10/20)",
+          rep["qa_blocking"] == [] and rep["qa_result"]["export_allowed"] is True
+          and rep["qa_result"]["blocking_errors"] == [] and rep["qa_result"]["review_required"] == [data_block]
+          and data_block in rep["qa_result"]["warnings"]
+          and any(f == f"Review before sending: {data_block}" for f in rep["qa_flags"]), str(rep["qa_result"]))
+    qa2, flags2 = m._review_instead_of_block({"blocking_errors": ["X"], "warnings": []}, ["Y"], ["a"])
+    check("6c2: if the repair step itself fails, findings still become warnings and export stays allowed",
+          qa2["export_allowed"] is True and qa2["blocking_errors"] == [] and set(qa2["review_required"]) == {"X", "Y"}
+          and "Review before sending: Y" in flags2, str(qa2))
     check("6d: every repair is agent-visible as auto-corrected",
           sum(1 for f in rep["qa_flags"] if f.startswith("auto-corrected")) >= 2, str(rep["qa_flags"]))
     comps[0]["commentary"] = comps[0]["ai_commentary"] = bad_note
