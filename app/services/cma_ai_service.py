@@ -442,6 +442,7 @@ _SYSTEM_PROMPT = (
     "feature adjustments, and value justification. End it with one clear indicated value/range, "
     "stated once. Nothing about inspection/condition or offer strategy belongs here. "
     "(2) inspection_concerns identifies only property-specific items the buyer should investigate "
+    "(every item in the subject's material_issues must appear as its own concern) "
     "- due diligence, condition, utilities, systems, roof/exterior, septic/well. Do not assume a "
     "defect exists: phrase these as what to verify, not as a diagnosis. An unknown roof, septic, or "
     "system condition is due-diligence uncertainty, not deferred maintenance or a defect - do not "
@@ -1242,7 +1243,7 @@ _SUBJECT_FIELDS = [
     # OSM road/street classification summary (road_context_service) - so the model's street_context
     # rating is grounded in actual nearby road types + speed, not just the address + a map guess.
     "road_context_note", *_PROPERTY_ENRICHMENT_FIELDS, *_RAW_PROPERTY_ENRICHMENT_KEYS,
-    "authoritative_property_features",
+    "authoritative_property_features", "material_issues",
 ]
 _COMP_FIELDS = [
     "street_address", "city", "state", "zipcode", "distance_miles", "status",
@@ -1391,9 +1392,35 @@ def _street_tier(d: dict) -> Optional[str]:
     falls back to the address street-type suffix when there's no OSM result."""
     rc = d.get("road_context") or {}
     v = rc.get("verdict")
-    if v in ("quiet", "neutral", "through"):
-        return v
-    return _street_suffix_tier(d.get("street_address"))
+    if v not in ("quiet", "neutral", "through"):
+        v = _street_suffix_tier(d.get("street_address"))
+    # A house its listing says is set back from the road isn't "on" the busy road its address names.
+    if v == "through" and _listing_says_set_back(d):
+        return "neutral"
+    return v
+
+
+_SETBACK_RE = re.compile(
+    r"\b(?:set\s+(?:well\s+|far\s+)?back(?:\s+from)?|tucked\s+(?:back|away)|long\s+(?:private\s+)?(?:driveway|drive|lane)|"
+    r"private\s+(?:lane|drive)|off\s+the\s+(?:main\s+)?road|away\s+from\s+the\s+road|flag\s+lot)\b", re.IGNORECASE)
+
+
+def _listing_says_set_back(d: dict) -> bool:
+    return bool(_SETBACK_RE.search(str(_first_present(d or {}, "public_remarks", "remarks", "listing_remarks") or "")))
+
+
+def _setback_adjusted_road_context(d: dict, ctx: dict) -> dict:
+    """The road verdict comes from the nearest mapped roads, so a house tucked back on a long
+    drive off a highway reads as "fronting" it (2702 E Kings Hwy was rated an inferior street
+    though its listing says it's tucked back from the road, 10/20). When the listing says the
+    house is set back, a 'through' verdict is softened to 'neutral' and the note says why."""
+    if not ctx or ctx.get("verdict") != "through" or not _listing_says_set_back(d):
+        return ctx
+    out = dict(ctx)
+    out["verdict"] = "neutral"
+    out["setback_from_listing"] = True
+    out["summary"] = (ctx.get("summary") or "near a busier road") + "; the listing says the house is set back from the road"
+    return out
 
 
 def _derive_street_context(subject: dict, comp: dict) -> Optional[str]:
@@ -2657,12 +2684,12 @@ async def _enrich_with_property_data(db: AsyncSession, subject: dict, comps: lis
             return " (".join([bits[0], "; ".join(bits[1:]) + ")"]) if len(bits) > 1 else bits[0]
 
         if _rc and _rc[0]:
-            subject_out["road_context"] = _rc[0]
-            subject_out["road_context_note"] = _rc_note(_rc[0])
+            subject_out["road_context"] = _setback_adjusted_road_context(subject_out, _rc[0])
+            subject_out["road_context_note"] = _rc_note(subject_out["road_context"])
         for _c, _ctx in zip(comps_out, _rc[1:] if _rc else []):
             if _ctx:
-                _c["road_context"] = _ctx
-                _c["road_context_note"] = _rc_note(_ctx)
+                _c["road_context"] = _setback_adjusted_road_context(_c, _ctx)
+                _c["road_context_note"] = _rc_note(_c["road_context"])
     except Exception:  # noqa: BLE001
         logger.debug("CMA road-context enrichment failed", exc_info=True)
 
@@ -4592,6 +4619,9 @@ def _prep_comp_for_ai(comp: dict) -> dict:
     # Hwy's cesspool was never mentioned while the comp was called Strong).
     for issue in _material_system_issues(c):
         notes.append(f"MATERIAL ISSUE: {issue} - say so in this comp's note; it depresses value and can limit financing")
+    if _listing_says_set_back(c):
+        notes.append("listing says the house is set back from the road - rate street_context on where the house "
+                     "actually sits, not only on the road named in its address")
     if c.get("data_note"):
         notes.insert(0, str(c["data_note"]))
     if notes:
@@ -5224,13 +5254,39 @@ def _remarks_finished_basement(d: dict) -> Optional[str]:
     return None
 
 
+# Listing-text red flags buyers, appraisers and lenders treat as material (10/20: the grade asked for
+# deal-breakers to be flagged, not just listed in a table). A phrase negated just before it ("not in a
+# flood zone", "no water damage") doesn't count.
+_RED_FLAG_PATTERNS = (
+    ("sold as-is", r"\bas[\s-]is\b"),
+    ("cash buyers only", r"\bcash\s+(?:only|buyers?\s+only|offers?\s+only)\b"),
+    ("foundation / structural issue", r"\b(?:foundation|structural)\s+(?:issues?|problems?|repairs?|damage|cracks?|concerns?)\b"),
+    ("mold, water or fire damage", r"\b(?:mold|mould|water\s+damage|fire\s+damage)\b"),
+    ("flood zone", r"\b(?:flood\s+(?:zone|plain|insurance)|floodplain)\b"),
+    ("needs major work", r"\b(?:handyman\s+special|fixer[\s-]?upper|investor\s+special|contractor\s+special|tear[\s-]?down|"
+                         r"needs\s+(?:a\s+)?(?:lot\s+of\s+|major\s+)?(?:work|tlc|rehab|renovation|gut))\b"),
+    ("buried oil tank", r"\b(?:underground|buried)\s+(?:oil\s+|fuel\s+)?(?:storage\s+)?tank\b"),
+)
+_NEGATION_RE = re.compile(r"\b(?:no|not|never|without|non)\b[\w\s-]{0,14}$", re.IGNORECASE)
+
+
 def _material_system_issues(d: dict) -> list:
-    """Recorded systems buyers and lenders treat as material problems (structured MLS fields only)."""
+    """Material problems on record: a cesspool (structured sewer field) plus listing-text red flags."""
     out = []
     sewer = _style_text((d or {}).get("sewer"))
     if "cess" in sewer:
         out.append("cesspool (sewer)")
+    remarks = str(_first_present(d or {}, "public_remarks", "remarks", "listing_remarks") or "")
+    for label, pattern in _RED_FLAG_PATTERNS:
+        for m in re.finditer(pattern, remarks, re.IGNORECASE):
+            if not _NEGATION_RE.search(remarks[max(0, m.start() - 20):m.start()]):
+                out.append(f"listing says: {label}")
+                break
     return out
+
+
+def _has_cesspool(d: dict) -> bool:
+    return "cess" in _style_text((d or {}).get("sewer"))
 
 
 def _v10_garage_spaces(d: dict) -> Optional[float]:
@@ -5287,7 +5343,7 @@ def _v10_feature_adjustments(subject: dict, comp: dict, price: float, comp_above
         out["garage"] = diff * price * _V10_FEATURE_GARAGE_PCT
         out["notes"].append(f"garage {s_g:g} vs {c_g:g} spaces")
     # A cesspool comp sold at a discount for it (replacement / connection cost, lender limits).
-    s_cess, c_cess = bool(_material_system_issues(subject)), bool(_material_system_issues(comp))
+    s_cess, c_cess = _has_cesspool(subject), _has_cesspool(comp)
     out["sewer"] = 0.0
     if s_cess != c_cess and (subject.get("sewer") and comp.get("sewer")):
         amount = min(_V10_FEATURE_CESSPOOL_PCT * price, _V10_FEATURE_CESSPOOL_MAX)
@@ -5304,6 +5360,30 @@ def _v10_feature_adjustments(subject: dict, comp: dict, price: float, comp_above
     for k in ("below_grade", "baths", "garage", "sewer"):
         out[k] = round(out[k])
     out["total"] = round(total)
+    return out
+
+
+def _anchor_main_uncertainties(subject: dict, rows: list, closed_count: int) -> list:
+    """Plain-language statements of what the comp set can't pin down, worked out from the numbers -
+    the report must say these out loud (10/20 grade: "no comp has the subject's 2023 lower-level
+    suite; the real uncertainty is how buyers value that space, and the report should say so")."""
+    out = []
+    s_bg = _v10_finished_below_grade_sqft(subject)
+    if s_bg and s_bg >= 300:
+        similar = [r for r in rows if (_v10_finished_below_grade_sqft(r["_c"]) or 0) >= 0.6 * s_bg]
+        if not similar:
+            rate = _v10_median([r["feat"].get("below_grade_rate_psf") for r in rows if r.get("feat", {}).get("below_grade_rate_psf")])
+            out.append(
+                f"None of the verified sales has a finished lower level like this home's {round(s_bg):,} sq ft, so how "
+                f"buyers value that space is the main uncertainty in this value"
+                + (f" (the grid credits it at about ${round(rate)}/sq ft)." if rate else "."))
+    heavy = [r for r in rows if r["price"] and (abs(r.get("size_only_adj_price", r["price"]) - r["price"])
+             + sum(abs(r.get("feat", {}).get(k) or 0) for k in ("below_grade", "baths", "garage", "sewer"))) / r["price"] > 0.20]
+    if rows and len(heavy) * 2 > len(rows):
+        out.append(f"Adjustments exceed 20% of the sale price on {len(heavy)} of {len(rows)} verified sales - "
+                   "the closest available sales still differ a lot from this home.")
+    if closed_count <= 2:
+        out.append(f"Only {closed_count} verified sale{'s' if closed_count != 1 else ''} carr{'y' if closed_count != 1 else 'ies'} the value, so a single sale moves it a lot.")
     return out
 
 
@@ -5697,6 +5777,7 @@ def _compute_comp_anchor(
         "mode": anchor_mode,
         "anchor_validity": anchor_validity,
         "anchor_validity_reason": validity_reason,
+        "main_uncertainties": _anchor_main_uncertainties(subject, rows, len(closed_rows)),
         "comp_stats": comp_stats,
         "anchor_value": round(anchor_value),
         "anchor_low": round(anchor_value * (1 - spread)),
@@ -7760,7 +7841,10 @@ final_fmv lands well above or below what the adjusted comps support because the 
 band holds it there, say so plainly in final_valuation_summary - for example that the adjusted
 sales point lower but homes here are selling above their asking prices. Never present the asking
 price as confirming a comp-based conclusion it actually set ("the asking price is consistent with
-this value" when the value is the asking price is circular).
+this value" when the value is the asking price is circular). When
+deterministic_evidence.main_uncertainties is not empty, say its first item plainly in
+final_valuation_summary in client words (no dollar figures - that paragraph allows none) and let
+it set the confidence you state.
 
 For every major positive and negative factor, set evidence_strength to clearly_market_supported,
 directionally_supported_amount_uncertain, or subjective_or_speculative. Distinctive architecture,
@@ -7926,6 +8010,7 @@ def _build_reasoning_evidence_packet(
         ],
         # Appraisal-style grid already inside deterministic_anchor: each verified comp moved toward the
         # subject for size, finished lower level, baths and garage. Do not price those again.
+        "main_uncertainties": a.get("main_uncertainties") or [],
         "comp_adjustment_grid": [
             {"comp_label": c.get("label"), "sale_price": c.get("raw_sale_price"), "size_adjustment": c.get("size_adjustment"),
              "lower_level": (c.get("feature_adjustments") or {}).get("below_grade"),
@@ -9045,9 +9130,12 @@ def _regenerate_comp_narrative_from_snapshot(comp: dict, label: str, subject: Op
             diffs.append(f"a {c_g:g}-car garage to the subject's {s_g:g}")
         if diffs:
             sentences.append(f"It has {_join_and(diffs)}.")
-    for issue in _material_system_issues(comp):
-        if "cesspool" in issue:
-            sentences.append("It is served by a cesspool, which typically lowers value and can limit financing.")
+    _issues = _material_system_issues(comp)
+    if any("cesspool" in i for i in _issues):
+        sentences.append("It is served by a cesspool, which typically lowers value and can limit financing.")
+    _flags = [i.split(": ", 1)[1] for i in _issues if i.startswith("listing says: ")]
+    if _flags:
+        sentences.append(f"Its listing notes {_join_and(_flags)}, which can weigh on its price.")
 
     remarks = str(_first_present(comp, "public_remarks", "remarks", "listing_remarks") or "")
     updates = _listing_named_updates(remarks)
@@ -12066,6 +12154,15 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
         opening_high = round(fmv * hi_frac)
         opening_low = round(fmv * (hi_frac - 0.04))
         target = round(fmv * (1.0 if aggr == "high" else 0.995))
+        if hot:
+            # Homes like this are selling over asking and this one hasn't sat longer than they did:
+            # a 3-7% under opener isn't a competitive offer (417 Dogwood Ln: $465K-$485K opening on a
+            # $500K value while nearby ranches closed 6-14% over ask in days - 10/20 grade). Open at
+            # or just under the lower of asking and value.
+            _ref = min(lp, fmv) if lp else fmv
+            opening_high = max(opening_high, round(_ref * 0.995))
+            opening_low = max(opening_low, round(_ref * 0.97))
+            target = max(target, round(_ref))
         basis_ref = round(lp) if lp else ceiling
     else:
         # UNDERPRICED: the reference span is [list, FMV]; approach FMV per the competition read. A
@@ -12137,6 +12234,8 @@ def _v10_pct_range_phrase(low: float, high: float, ref: float) -> str:
     if lo_pct <= 0 and hi_pct <= 0:
         if lo_rounded == hi_rounded:
             return f"about {hi_rounded}% below"
+        if hi_rounded == 0:
+            return f"at to about {lo_rounded}% below"   # not "about 0%-3% below"
         return f"about {hi_rounded}%-{lo_rounded}% below"
     return "straddling"
 
@@ -12188,6 +12287,15 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
             f"never above the ${lp:,} list price at the opening stage. Even though the property is "
             f"underpriced, you shouldn't feel comfortable paying more than ${comfort_ceiling:,} for it "
             f"(about 5% above the ${fmv:,} fair market value) without new property-specific information."
+        )
+    elif b.get("hot_market") and lp:
+        rel_open = _v10_pct_range_phrase(ol, oh, lp)
+        opener = (
+            f"Given the ${fmv:,} fair market value against the ${lp:,} list price, and similar homes here "
+            f"selling about {round(b['market_over_ask_pct'])}% over asking, a competitive opening offer is "
+            f"roughly ${ol:,} to ${oh:,} ({rel_open} the asking price) - there is little room to negotiate "
+            f"down here. Treat the ${fmv:,} fair market value as your walk-away price; going past it needs a "
+            f"clear reason, such as competing offers or new property-specific information."
         )
     else:
         lp_txt = f" against the ${lp:,} list price" if lp else ""
@@ -13636,6 +13744,9 @@ async def _build_content(subject: dict, comps: list[dict], max_photos: int, warn
     )
     subject_for_ai = _with_age(subject)
     subject_for_ai["authoritative_property_features"] = _authoritative_property_features(subject)
+    # Red flags on the subject's own record (cesspool, "as-is", flood zone...) - each must become a
+    # due-diligence item for a buyer, or a disclosure item for a seller (10/20).
+    subject_for_ai["material_issues"] = "; ".join(_material_system_issues(subject)) or None
     add_text(_format_block("SUBJECT PROPERTY:", subject_for_ai, _SUBJECT_FIELDS))
     _timeline = subject.get("_status_timeline") if isinstance(subject, dict) else None
     if _timeline and _timeline.get("summary_lines"):
@@ -14178,6 +14289,9 @@ async def _generate_ai_analysis_impl(
         elif comp.get("strength"):
             comp["strength"] = _normalize_strength(comp["strength"])
 
+        # Deal-breakers on record (cesspool, "as-is", foundation, flood zone...) travel with the comp
+        # so the report can show them next to the price (10/20).
+        comp["material_issues"] = _material_system_issues(comp) or None
         # Deterministic backfill for the objective comparison dimensions (area / layout / lot)
         # when neither the agent nor the AI rated them - keeps the comparison matrix from
         # showing blanks on data we already hold. Subjective dimensions stay blank if unrated.

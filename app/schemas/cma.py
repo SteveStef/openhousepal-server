@@ -116,6 +116,7 @@ class CmaComparable(BaseModel):
     year_built: Optional[int] = None
     architectural_style: Optional[Union[List[str], str]] = None
     levels: Optional[Union[List[str], str]] = None
+    material_issues: Optional[List[str]] = None  # deal-breakers on record (cesspool, "as-is", flood zone...)
     township: Optional[str] = None
     subdivision_name: Optional[str] = None
     garage: Optional[str] = None

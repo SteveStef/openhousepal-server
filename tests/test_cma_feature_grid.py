@@ -87,3 +87,38 @@ def test_same_market_needs_the_same_township():
     borough = {"school_district": "Coatesville Area", "city": "COATESVILLE", "township": "SOUTH COATESVILLE"}
     assert ai._derive_quality_from_data(subject, same)["area"] == "same_as_subject"
     assert ai._derive_quality_from_data(subject, borough)["area"] == "similar_to_subject"
+
+
+def test_set_back_house_is_not_rated_as_fronting_the_highway():
+    comp = {"street_address": "2702 E KINGS HWY", "public_remarks": "Tucked back from the road on a private drive."}
+    assert ai._listing_says_set_back(comp)
+    assert ai._street_tier(comp) == "neutral"
+    ctx = ai._setback_adjusted_road_context(comp, {"verdict": "through", "summary": "fronts an arterial"})
+    assert ctx["verdict"] == "neutral" and ctx["setback_from_listing"]
+    assert ai._street_tier({"street_address": "2702 E KINGS HWY"}) == "through"
+
+
+def test_listing_red_flags_ignore_negations():
+    issues = ai._material_system_issues({"sewer": "Cess Pool", "public_remarks": "Sold as-is. Not in a flood zone. No water damage."})
+    assert "cesspool (sewer)" in issues
+    assert "listing says: sold as-is" in issues
+    assert not any("flood" in i or "damage" in i for i in issues)
+    assert ai._material_system_issues({"public_remarks": "Handyman special in a flood zone"}) == [
+        "listing says: flood zone", "listing says: needs major work"]
+
+
+def test_hot_market_opening_offer_is_near_asking():
+    trace = {"anchor": {"comp_list_to_sale_median": 1.10}, "exposure": {"state": "normal_exposure", "active_market_days": 14},
+             "asking_price_check": {"passed_over": False}}
+    band = ai._v10_build_buyer_offer_band(500000, 500000, trace=trace, confidence="low")
+    assert band["hot_market"] is True
+    assert band["opening_low"] >= 485000 and band["opening_high"] >= 495000
+    assert band["opening_pct_phrase"] == "at to about 3% below"
+
+
+def test_unmatched_lower_level_is_stated_as_the_main_uncertainty():
+    rows = [{"_c": {"below_grade_finished_area": 0, "basement": "None"}, "price": 420000, "size_only_adj_price": 436000,
+             "feat": {"below_grade": 60000, "baths": 9000, "garage": 4000, "sewer": 0, "below_grade_rate_psf": 61.0}}]
+    out = ai._anchor_main_uncertainties(SUBJECT, rows, 1)
+    assert any("lower level" in u for u in out)
+    assert any("Only 1 verified sale" in u for u in out)
