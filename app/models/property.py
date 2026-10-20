@@ -61,12 +61,27 @@ class PropertySummaryResponse(BaseModel):
     original_list_price: Optional[float] = Field(None, alias="OriginalListPrice")
     # when Bright's DaysOnMarket was read (the sync's write time) - not sent to the browser
     dom_read_at: Optional[datetime] = Field(None, exclude=True, validation_alias="updated_at")
+    # What a sold home actually sold for. `price` stays the list price; a sold page showed that as
+    # "Sold for" (10/19: 345 Holt Ln "Sold for $520,000" - it sold for $601,000). None when Bright
+    # never sent a closing price, so the page can say it's the last asking price instead.
+    close_price: Optional[float] = Field(None, alias="ClosePrice")
+    close_date: Optional[str] = Field(None, alias="CloseDate")
+    mls_raw: Optional[dict] = Field(None, exclude=True, validation_alias="raw_mls_data")
 
     @model_validator(mode='after')
     def calculate_dom(self) -> 'PropertySummaryResponse':
         self.days_on_market = resolve_days_on_market(
             self.days_on_market, self.home_status, self.mls_list_date, fetched_at=self.dom_read_at,
         )
+        raw = self.mls_raw or {}
+        if self.close_price is None and raw.get("ClosePrice"):
+            try:
+                self.close_price = float(raw["ClosePrice"]) or None
+            except (TypeError, ValueError):
+                self.close_price = None
+        if self.close_date is None and raw.get("CloseDate"):
+            self.close_date = str(raw["CloseDate"])[:10]
+        self.mls_raw = None
         return self
 
 class PropertyDetailResponse(PropertySummaryResponse):

@@ -3558,6 +3558,29 @@ def test_al_asking_price_check_and_round1_fixes():
           m._strip_internal_data_refs(txt))
 
 
+def test_am_round2_false_blocks_and_text():
+    print("\nAM. accuracy test round 2 (10/19): false QA blocks, subject/comp road mix-up, hot-market offer text")
+    m = _cma_mod
+    subj = {"public_remarks": "The finished lower level, back paver patio, upgraded Hvac systems, newer garage door. "
+                              "The oil boiler with heat-pump backup was installed in 2023."}
+    check("1: a system update the listing documents backs the claim",
+          m._listing_documents_system_claim(subj, "updated HVAC")
+          and m._listing_documents_system_claim(subj, "boiler with heat-pump backup installed in 2023"))
+    check("1b: an update the listing never mentions is still unbacked",
+          not m._listing_documents_system_claim(subj, "new roof")
+          and not m._listing_documents_system_claim({"public_remarks": "Lovely home."}, "updated HVAC"))
+    check("2: 'the listing documents ...' counts as attribution",
+          bool(m._QA_LISTING_ATTRIBUTION_RE.search("The listing documents an oil boiler")))
+    band = m._v10_build_buyer_offer_band(2_000_000, 1_875_000, trace={
+        "exposure": {"state": "insufficient_exposure", "active_market_days": 1},
+        "anchor": {"comp_list_to_sale_median": 1.13, "comps": [{"competitive_sale": True}]}},
+        confidence="medium", status_timeline={"active_market_days": 1})
+    txt, _ = m._v10_rebuild_buyer_offer_prose(
+        "With one active day you have limited signal - don't assume urgency is required. Keep an inspection contingency.", band, 6.0)
+    check("3: in a hot market an AI 'don't assume urgency' sentence is dropped",
+          "urgency" not in txt and "inspection contingency" in txt and "expect competing offers" in txt, txt)
+
+
 def main() -> int:
     for fn in (test_a_finished_basement_not_inflating_psf, test_b_location_class_and_weight,
                test_c_condition_reconciliation, test_d_mixed_set_stability,
@@ -3584,7 +3607,8 @@ def main() -> int:
                test_ah_subject_condition_evidence_everywhere,
                test_aj_client_facing_road_and_fallback_prose,
                test_ak_cross_section_semantic_consistency,
-               test_al_asking_price_check_and_round1_fixes):
+               test_al_asking_price_check_and_round1_fixes,
+               test_am_round2_false_blocks_and_text):
         try:
             fn()
         except Exception as exc:  # noqa: BLE001

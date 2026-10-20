@@ -4202,6 +4202,10 @@ def _v10_cross_section_semantic_consistency_check(
         hit_re, claim_is_positive = (pos_re, True) if pos_re.search(chunk) else (neg_re, False)
         if claim_is_positive == bool(gt):
             return None  # claim already agrees with ground truth
+        _pre = chunk[:hit_re.search(chunk).start()]
+        if re.search(r"\b(?:the\s+subject|subject(?:'s|\u2019s)|the\s+listing|this\s+home)\b", _pre, re.IGNORECASE) \
+                and not re.search(r"\bcomp(?:arable)?\s*#?\s*\d+\b", _pre, re.IGNORECASE):
+            return None  # the phrase describes the subject, not this comp
         replacement = {
             "pool": "its documented pool features" if gt else "the absence of a documented pool",
             "road": "its quiet, low-traffic street position" if gt else "its documented road/traffic exposure",
@@ -4209,7 +4213,7 @@ def _v10_cross_section_semantic_consistency_check(
         }.get(family)
         if not replacement:
             return None
-        return hit_re.sub(replacement, chunk, count=1)
+        return re.sub(r"\b(?:a|an|the)\s+(its\b|the absence\b)", r"\1", hit_re.sub(replacement, chunk, count=1))
 
     label_of = {key: (f"Comp #{comp_num_by_key.get(key)}" if comp_num_by_key.get(key) else (addr_by_key.get(key) or "a comp"))
                 for key in by_key}
@@ -7985,6 +7989,10 @@ def _validate_reasoning_valuation(result: dict, evidence_packet: dict) -> tuple[
         for key in ("sale_price", "list_price", "size_adjusted_value"):
             if _as_float(comp.get(key)):
                 known_dollars.add(round(float(comp[key])))
+    # the asking-price check is in the packet, so the valuation pass may cite its figures
+    for key in ("asking_price", "expected_sale_price", "allowed_low", "allowed_high"):
+        if _as_float((evidence_packet.get("asking_price_check") or {}).get(key)):
+            known_dollars.add(round(float(evidence_packet["asking_price_check"][key])))
     for adjustment in (evidence_packet.get("deterministic_evidence") or {}).get(
         "structured_qualitative_adjustments"
     ) or []:
@@ -9519,7 +9527,8 @@ _QA_YEAR_SYSTEM_RE = re.compile(
 _QA_LISTING_ATTRIBUTION_RE = re.compile(
     r"\b(?:the\s+)?(?:listing|remarks|mls\s+(?:record|remarks)|seller|marketing)(?:'s)?\s+"
     r"(?:\w+\s+){0,2}(?:states?|identifies|identified|notes?|noted|reports?|reported|says|said|mentions?|"
-    r"describes?|described|cites?|lists?|advertises?|calls?|claims?|references?|highlights?)\b|"
+    r"describes?|described|cites?|lists?|advertises?|calls?|claims?|references?|highlights?|"
+    r"documents?|documented|shows?|confirms?|indicates?|specifies)\b|"
     r"\b(?:according\s+to|per)\s+the\s+(?:listing|remarks|seller)\b",
     re.IGNORECASE,
 )
@@ -9532,10 +9541,34 @@ def _qa_norm_sentence(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", "", s.lower())).strip()
 
 
+def _listing_documents_system_claim(subject: Optional[dict], claim: str) -> bool:
+    """True when the subject's own listing documents the system update a prose claim states - an
+    "upgraded Hvac systems" remark backs "updated HVAC"; "oil boiler ... installed 2023" backs
+    "boiler installed in 2023"."""
+    if not subject or not claim:
+        return False
+    sysm = re.search(r"roof|hvac|furnace|a/?c|air\s+condition|boiler|heat\s+pump|water\s+heater|electrical|"
+                     r"wiring|plumbing|septic|well\s+pump|windows?|siding", claim, re.IGNORECASE)
+    if not sysm:
+        return False
+    system = sysm.group(0).lower().replace("air condition", "air conditioning")
+    documented = _documented_system_updates(subject)
+    if any(system in d or d in system for d in documented):
+        return True
+    year = re.search(r"(?:19|20)\d{2}", claim)
+    if year:
+        blob = _authoritative_property_fact_blob(subject)
+        for m in re.finditer(re.escape(sysm.group(0)), blob, re.IGNORECASE):
+            if year.group(0) in blob[max(0, m.start() - 80):m.end() + 80]:
+                return True
+    return False
+
+
 def _v10_pre_export_qa(
     fields: dict, *, value: float, range_pct: float, subject_asking: Optional[float],
     status_timeline: dict, comps: list, comp_num_by_key: dict, addr_by_key: dict,
     valuation_trace: Optional[dict], value_drivers: Optional[list], confidence: Optional[str],
+    subject: Optional[dict] = None,
 ) -> tuple:
     """Final deterministic pre-export QA consolidator. Returns (qa_result, corrected_fields, blocking).
     See the section header above. Never rewrites a NUMBER (that's the earlier reconcile passes'
@@ -10061,6 +10094,8 @@ def _v10_pre_export_qa(
             _sent_start = re.split(r"[.!?;]\s", _sent_start)[-1] if re.search(r"[.!?;]\s", _sent_start) else _sent_start
             if _QA_LISTING_ATTRIBUTION_RE.search(_sent_start):
                 continue  # attributed to the listing/seller ("the listing identifies a new roof") - allowed
+            if _listing_documents_system_claim(subject, m.group(0)):
+                continue  # the listing itself documents this update ("upgraded Hvac systems") - allowed
             blocking.append(
                 f"{label}: asserts a hard system/permit fact (\"{m.group(0).strip()}\") not backed by verified "
                 f"subject data - phrase it as 'verify ...' or remove it.")
@@ -11538,7 +11573,8 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
         # opener or holding back from a premium bid would contradict it.
         _contradicts_hot = bool(b.get("hot_market") and re.search(
             r"\b(?:open|offer|bid|start|come in)\w*\b.{0,60}\b(?:below|under|at)\b.{0,25}\b(?:list|ask)"
-            r"|\bpremium bid\b|\bnegotiate up only\b", low))
+            r"|\bpremium bid\b|\bnegotiate up only\b"
+            r"|\b(?:don'?t|do not|no need to)\s+(?:assume\s+|feel\s+)?(?:urgency|rush|hurry)", low))
         if (_has_open_num or _has_indicated_num or _repeats_opening_advice
                 or _mentions_internal_anchor or _has_strategy_number or _contradicts_hot):
             continue  # its numbers are re-stated by the deterministic opener
@@ -11935,6 +11971,7 @@ async def _finalize_gate_reconciled_prose(
             value=value, range_pct=range_pct, subject_asking=subject_asking, status_timeline=status_timeline,
             comps=comps, comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key,
             valuation_trace=valuation_trace, value_drivers=vds, confidence=confidence,
+            subject=enriched_subject,
         )
         f_local += qa_result["warnings"] + [f"auto-corrected: {c}" for c in qa_result["corrections"]]
         b_local += block2
@@ -12168,6 +12205,7 @@ async def _finalize_gate_reconciled_prose(
             value=value, range_pct=range_pct, subject_asking=subject_asking, status_timeline=status_timeline,
             comps=comps, comp_num_by_key=comp_num_by_key, addr_by_key=addr_by_key,
             valuation_trace=valuation_trace, value_drivers=value_drivers, confidence=confidence,
+            subject=enriched_subject,
         )
         methodology = _pcorr.get("m", methodology)
         offer = _pcorr.get("o", offer)
