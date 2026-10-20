@@ -7932,7 +7932,10 @@ price is near expected_sale_price. A comparable-sales value far above it almost 
 subject is worse than its comps in ways the data understates (condition, finishes, location
 pocket, few photos, "as-is" or "sweat equity" wording), not that the seller is leaving a large
 sum on the table. Explain the gap in those terms and keep final_fmv between allowed_low and
-allowed_high; the application enforces that band. When asking_price_check.passed_over is true, the
+allowed_high; the application enforces that band. When
+asking_price_check.outpaced_by_over_ask_sales is true, the comparables that sold over asking went under
+contract much faster than this home has been on the market - do not assume it will draw the same
+over-asking competition, and do not value it above the adjusted sales on that basis. When asking_price_check.passed_over is true, the
 home has sat on the market well past the days its comps took to sell: buyers have already passed on
 it at this price, so it most likely sells at or a little under asking - do not describe competing
 offers or a premium over asking.
@@ -8199,6 +8202,16 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
     comp_dom = _as_float((exposure or {}).get("comp_median_dom"))
     passed_over = dom is not None and dom >= _ASKING_CHECK_PASSED_OVER_DAYS and (not comp_dom or dom >= 2 * comp_dom)
     high_mult = _ASKING_CHECK_BAND[1]
+    # Outpaced: the over-asking sales went under contract fast and this home is still on the market
+    # well past that - don't assume it will sell over asking too (10/20: 417 Dogwood Ln at 14 days vs
+    # over-ask comps pending in 6 was valued at asking x 1.065 = $532.5K "expected", the final pass
+    # followed it to $525K while the adjusted sales said $488K). Same rule as the offer band.
+    _over_doms = sorted(_as_float(c.get("dom")) for c in comp_packets
+                        if (_as_float(c.get("sold_list_ratio")) or 0) >= 1.02 and _as_float(c.get("dom")) is not None)
+    outpaced = bool(_over_doms and dom is not None and dom > max(7.0, 1.5 * _over_doms[len(_over_doms) // 2]))
+    if outpaced and ratio > 1.0:
+        ratio = 1.0
+        high_mult = min(high_mult, 1.02)
     if passed_over:
         ratio = min(ratio, _ASKING_CHECK_PASSED_OVER_RATIO)
         high_mult = 1.0
@@ -8215,6 +8228,7 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
         "comp_ratios_counted": len(ratios),
         "exposure_state": state or None,
         "passed_over": passed_over,
+        "outpaced_by_over_ask_sales": outpaced,
     }
 
 
@@ -11430,14 +11444,26 @@ def _reconcile_post_gate_prose(fields: dict, *, value: float, range_pct: float,
         ) and re.search(
             r"(closed sale|comparable sale|sold comp|paired|because|driven by|reflect|support)", m_text0, re.IGNORECASE)
         if not _has_why:
-            if _rel == "above":
+            # Say WHY honestly: only credit the adjusted sales when they actually sit on the same side
+            # of asking as the value (10/20: "the verified closed sales support it" was printed for a
+            # $525K value while the adjusted sales pointed to $492K, under the $500K ask).
+            _comp_val = _as_float((trace or {}).get("fmv_pre_exposure")) or _as_float(((trace or {}).get("anchor") or {}).get("anchor_value"))
+            _comps_agree = bool(_comp_val and ((_comp_val > _ask) == (_rel == "above")))
+            if _rel == "above" and _comps_agree:
                 _add = (f" The concluded value sits above the ${_ask:,.0f} asking price because the verified "
-                        f"closed sales - size-adjusted to the subject - support it; the list price is not the ceiling "
+                        f"closed sales - adjusted to the subject - support it; the list price is not the ceiling "
                         f"the market evidence points to.")
-            else:
+            elif _rel == "above":
+                _add = (f" The adjusted closed sales alone point to about ${_comp_val:,.0f}, below the ${_ask:,.0f} "
+                        f"asking price; the higher concluded value reflects how homes here have been selling "
+                        f"relative to their asking prices, which is less certain than the sales themselves.")
+            elif _comps_agree:
                 _add = (f" The concluded value sits below the ${_ask:,.0f} asking price because the verified closed "
                         f"sales, adjusted to the subject, come in beneath it - the asking price is ahead of the "
                         f"comparable evidence.")
+            else:
+                _add = (f" The adjusted closed sales point to about ${_comp_val:,.0f}; the lower concluded value "
+                        f"reflects how long this home has been on the market against how its comparables sold.")
             out["m"] = (m_label0, m_text0.rstrip() + _add)
             flags.append("Methodology summary: added a deterministic note explaining why the value sits above/below asking, from the closed-sale evidence.")
 
@@ -12566,6 +12592,12 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
         if (_has_open_num or _has_indicated_num or _repeats_opening_advice
                 or _mentions_internal_anchor or _has_strategy_number or _contradicts_hot):
             continue  # its numbers are re-stated by the deterministic opener
+        # This rebuild runs again on its own output during repair rounds - a sentence the opener
+        # already says (or one kept twice) must not pile up (10/20: "It has been on the market
+        # longer than the nearby sales..." printed five times).
+        _norm = " ".join(low.split())
+        if _norm in " ".join(opener.lower().split()) or any(" ".join(k.lower().split()) == _norm for k in kept):
+            continue
         kept.append(s)
     body = " ".join(kept).strip()
     new_text = (opener + (" " + body if body else "")).strip()

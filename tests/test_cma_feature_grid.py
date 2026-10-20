@@ -195,3 +195,26 @@ def test_engine_self_checks_pass_on_a_dogwood_style_set_and_catch_a_wrong_way_si
     assert any("against the size difference" in e for e in ai._anchor_integrity_errors(bad, {"above_grade_finished_area": 1830}))
     outside = {**good, "anchor_value": 521173}
     assert any("outside the adjusted comps" in e for e in ai._anchor_integrity_errors(outside, {"above_grade_finished_area": 1830}))
+
+
+def test_outpaced_subject_is_not_valued_at_an_over_asking_premium():
+    packets = [{"sale_price": 420000, "sold_list_ratio": 1.138, "dom": 6}, {"sale_price": 452000, "sold_list_ratio": 1.159, "dom": 6},
+               {"sale_price": 410000, "sold_list_ratio": 1.065, "dom": 42}, {"sale_price": 443000, "sold_list_ratio": 0.963, "dom": 28},
+               {"sale_price": 340000, "sold_list_ratio": 0.983, "dom": 40}]
+    chk = ai._asking_price_market_check({"current_list_price": 500000, "dom": 14}, {}, {"state": "normal_exposure", "comp_median_dom": 28}, packets)
+    assert chk["outpaced_by_over_ask_sales"] is True
+    assert chk["expected_sale_price"] == 500000
+    fresh = ai._asking_price_market_check({"current_list_price": 500000, "dom": 4}, {}, {"state": "normal_exposure", "comp_median_dom": 28}, packets)
+    assert fresh["outpaced_by_over_ask_sales"] is False and fresh["expected_sale_price"] > 500000
+
+
+def test_offer_prose_rebuild_is_idempotent():
+    trace = {"anchor": {"comp_list_to_sale_median": 1.065, "comps": [
+                {"sale_to_list": 1.16, "dom": 6}, {"sale_to_list": 1.14, "dom": 6}]},
+             "exposure": {"state": "normal_exposure", "active_market_days": 14}, "asking_price_check": {"passed_over": False}}
+    band = ai._v10_build_buyer_offer_band(525000, 500000, trace=trace, confidence="medium")
+    once, _ = ai._v10_rebuild_buyer_offer_prose("Use a standard inspection contingency.", band, 6)
+    twice, _ = ai._v10_rebuild_buyer_offer_prose(once, band, 6)
+    thrice, _ = ai._v10_rebuild_buyer_offer_prose(twice, band, 6)
+    assert thrice == once
+    assert thrice.count("bidding war is unlikely") <= 1
