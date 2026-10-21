@@ -343,8 +343,10 @@ def test_vague_adjusted_sales_line_gets_the_number():
     trace = {"authority": "reasoning_model", "asking_price_check": {"passed_over": True}}
     out, _ = ai._v10_reconcile_anchor_direction_prose(notes, final={"value": 490000, "anchor_value": 497340}, trace=trace)
     assert "$497,000" in out and "$490,000" in out and "small trim" in out
+    # a small gap with no time-on-market trim and no vague wording needs no sentence
     plain = "The comparable sales support this value."
-    assert ai._v10_reconcile_anchor_direction_prose(plain, final={"value": 490000, "anchor_value": 497340}, trace=trace)[0] == plain
+    calm = {"authority": "reasoning_model", "asking_price_check": {"passed_over": False}}
+    assert ai._v10_reconcile_anchor_direction_prose(plain, final={"value": 490000, "anchor_value": 497340}, trace=calm)[0] == plain
 
 
 def test_street_weight_comes_from_road_data_not_the_ai_rating():
@@ -366,3 +368,32 @@ def test_passed_over_drops_too_short_a_window_line():
             "about seller flexibility. Key contingencies should include a standard home inspection.")
     out, _ = ai._v10_rebuild_buyer_offer_prose(text, band, 0.04)
     assert "too short a window" not in out and "home inspection" in out
+
+
+# ---- 417 Dogwood Ln v10 (10/21) -----------------------------------------------------------------
+
+def test_listing_garage_size_is_not_corrected_to_the_house_size():
+    comp = {"sqft": 1504, "above_grade_finished_area": 1504, "below_grade_finished_area": 0,
+            "public_remarks": "The impressive 900-square-foot, two-car garage provides abundant room."}
+    out, _ = ai._reconcile_comp_hard_facts("It has a large 900 sqft garage.", "Comp #5 (2011 E KINGS HWY)", DOGWOOD_SUBJECT, comp)
+    assert "900 sqft garage" in out and "1,504 sqft garage" not in out
+
+
+def test_engine_words_become_plain_english():
+    text = ("This home sold at $307/sqft, well above the anchor rate. It fronts the highway, which depressed its "
+            "location weight in the anchor, and has no finished-basement decomposition.")
+    out = ai._strip_internal_data_refs(text)
+    assert "anchor" not in out.lower() and "decomposition" not in out
+    assert "the typical price per square foot of these sales" in out
+
+
+def test_fallback_range_is_rounded():
+    r = ai._v10_fallback_reasoning({"fmv": 490000, "range_pct": 5}, {"comparables": []}, "HTTP 429")
+    assert r["range_low"] % 5000 == 0 and r["range_high"] % 5000 == 0
+
+
+def test_passed_over_trim_is_explained_with_numbers():
+    trace = {"authority": "v10", "asking_price_check": {"passed_over": True}}
+    out, _ = ai._v10_reconcile_anchor_direction_prose(
+        "This value reflects the closest verified comparable sales.", final={"value": 490000, "anchor_value": 497491}, trace=trace)
+    assert "$497,000" in out and "small trim" in out

@@ -291,7 +291,9 @@ _SYSTEM_PROMPT = (
     "subject.' / 'The renovation quality is superior.' / 'The home has a more suburban custom-"
     "home feel.' / 'The property presents as a higher-end turnkey product.' Never mention that "
     "you (the AI) saw a photo or inferred something, and never reference this system's own "
-    "internal field names, flags, or QA/verification terminology in your prose - if a fact needs "
+    "internal field names, flags, or QA/verification terminology in your prose (no 'anchor', "
+    "'anchor rate', comp 'weight' or 'share of value' - say 'the valuation' or 'the typical "
+    "price per square foot of these sales' instead) - if a fact needs "
     "a caveat (e.g. an unverified closing price), phrase it the way an agent would talk to a "
     "client, not the way a data pipeline would log it. "
     "For each comp: write 2-4 sentences explaining why it likely sold for more or less than the "
@@ -8386,8 +8388,11 @@ def _reasoning_output_text(payload: dict) -> str:
 # error / an incomplete or unparseable response; a response cut off by max_output_tokens is retried
 # ONCE with a larger budget (x _REASONING_RETRY_TOKEN_MULT - the cost pre-check prices that larger
 # budget, see _run_cma_reasoning_stage). Backoff seconds are module-level so tests can zero them.
-_REASONING_MAX_RETRIES = 2
-_REASONING_RETRY_BACKOFF_S = (2.0, 6.0)
+_REASONING_MAX_RETRIES = 3
+# A 429 rate limit clears within a minute; the old 2 s / 6 s waits gave up after ~10 s (417 Dogwood
+# Ln, 10/21: three 429s and the report went out without its final valuation pass).
+_REASONING_RETRY_BACKOFF_S = (5.0, 15.0, 30.0)
+_REASONING_MAX_WAIT_S = 60.0
 _REASONING_RETRY_TOKEN_MULT = 1.75
 
 
@@ -8450,19 +8455,43 @@ async def _call_cma_reasoning_model(config: dict, evidence_packet: dict) -> tupl
     timeout_s = float(_as_float(config.get("cma_reasoning_request_timeout_seconds")) or 180)
     usage_total: dict = {}
     last_error = "unknown"
+    hinted_delay = None
     for attempt in range(_REASONING_MAX_RETRIES + 1):
         if attempt:
             delay = _REASONING_RETRY_BACKOFF_S[min(attempt - 1, len(_REASONING_RETRY_BACKOFF_S) - 1)]
+            if hinted_delay is not None:
+                delay = max(delay, min(hinted_delay, _REASONING_MAX_WAIT_S))
             if delay > 0:
                 await asyncio.sleep(delay)
+        hinted_delay = None
         payload["max_output_tokens"] = max_tokens
         try:
             body = await _reasoning_http_post(payload, api_key, timeout_s)
         except httpx.HTTPStatusError as exc:
             code = exc.response.status_code if exc.response is not None else 0
             last_error = f"HTTP {code}"
+            err_code, err_msg = "", ""
+            try:
+                _err = (exc.response.json() or {}).get("error") or {}
+                err_code, err_msg = str(_err.get("code") or _err.get("type") or ""), str(_err.get("message") or "")[:300]
+            except Exception:  # noqa: BLE001
+                pass
+            if err_code:
+                last_error = f"HTTP {code} {err_code}"
+            # Out of credit / billing: waiting won't help - say so plainly and stop.
+            if code == 429 and err_code in ("insufficient_quota", "billing_hard_limit_reached"):
+                logger.error("CMA reasoning call refused - OpenAI account out of credit",
+                             extra={"status": code, "error_code": err_code, "error_message": err_msg})
+                raise _ReasoningCallError(f"reasoning request failed ({last_error})", usage_total) from exc
             if _reasoning_retryable_status(code):
-                logger.warning("CMA reasoning call retryable error", extra={"status": code, "attempt": attempt + 1})
+                try:  # OpenAI's own "try again in" hint
+                    _ra = exc.response.headers.get("retry-after") if exc.response is not None else None
+                    hinted_delay = float(_ra) if _ra else None
+                except (TypeError, ValueError):
+                    hinted_delay = None
+                logger.warning("CMA reasoning call retryable error", extra={
+                    "status": code, "attempt": attempt + 1, "error_code": err_code, "error_message": err_msg,
+                    "retry_after": hinted_delay})
                 continue
             raise _ReasoningCallError(f"reasoning request failed ({last_error})", usage_total) from exc
         except (httpx.TimeoutException, httpx.TransportError) as exc:
@@ -8956,6 +8985,9 @@ def _documented_sqft_values(data: Optional[dict], area_kind: Optional[str] = Non
             value = _as_float(match.group(1).replace(",", ""))
             if value and value > 0:
                 values.add(round(value))
+        # ...including hyphenated ones ("The impressive 900-square-foot, two-car garage" was
+        # "corrected" to the house's 1,504 sqft - 417 Dogwood Ln v10, 10/21)
+        values.update(round(v) for v in _listing_stated_sizes(data) if v > 0)
     return values
 
 
@@ -9012,10 +9044,30 @@ _INTERNAL_DATA_REF_RE = re.compile(
 )
 
 
+# The engine's own words for its math, said in plain English for a client (417 Dogwood Ln v10,
+# 10/21: "sold at $307/sqft, well above the anchor rate", "its location weight was reduced in the
+# anchor", "no finished-basement decomposition").
+_PLAIN_WORDS = (
+    (r"\b(?:its|the) location weight (?:was |is )?(?:reduced|trimmed|cut|lowered)(?: in the (?:comp(?:arable)?[- ]sales )?anchor)?",
+     "it counts for less in the valuation"),
+    (r"\b(?:depressed|reduced|trimmed|cut|lowered) its (?:location |valuation )?weight in the (?:comp(?:arable)?[- ]sales )?anchor",
+     "makes it count for less in the valuation"),
+    (r"\bits weight was (?:trimmed|reduced|cut|lowered) in the (?:comp(?:arable)?[- ]sales )?(?:anchor|valuation)",
+     "it counts for a little less in the valuation"),
+    (r"\bthe (?:comp(?:arable)?[- ]sales )?anchor(?:'s)? (?:rate|\$/sq ?ft|price per square foot|psf)\b",
+     "the typical price per square foot of these sales"),
+    (r"\b(in|from|to|of|into) the (?:comp(?:arable)?[- ]sales )?anchor\b", r"\1 the valuation"),
+    (r"\bthe (?:comp(?:arable)?[- ]sales )?anchor\b", "the comparable-sales value"),
+    (r"\bdecomposition\b", "breakdown"),
+)
+
+
 def _strip_internal_data_refs(text: str) -> str:
     if not text:
         return text
     out = _INTERNAL_DATA_REF_RE.sub("", text)
+    for pattern, plain in _PLAIN_WORDS:
+        out = re.sub(pattern, plain, out, flags=re.IGNORECASE)
     return re.sub(r"\broad[- ]context data\b", "street setting", out, flags=re.IGNORECASE)
 
 
@@ -10196,7 +10248,10 @@ def _v10_fallback_reasoning(fallback: dict, evidence_packet: dict, why: str) -> 
     fmv = round(float(fallback["fmv"]))
     pct = _as_float(fallback.get("range_pct")) or 8.0
     pct = max(pct, 5.0)
-    low, high = round(fmv * (1 - pct / 100)), round(fmv * (1 + pct / 100))
+    # whole-number range ($465,000-$515,000, not $465,500-$514,500 - 417 Dogwood Ln v10, 10/21)
+    _step = 5000 if fmv >= 300000 else 1000
+    low = int(round(fmv * (1 - pct / 100) / _step) * _step)
+    high = int(round(fmv * (1 + pct / 100) / _step) * _step)
     comp_ids = [str(c.get("comp_id")) for c in (evidence_packet.get("comparables") or []) if c.get("comp_id")]
     return {
         "independent_preliminary_fmv": fmv, "independent_preliminary_range_low": low,
@@ -11416,7 +11471,10 @@ def _v10_reconcile_anchor_direction_prose(methodology: str, *, final: Optional[d
     # sales point somewhat higher": by how much? 417 Dogwood Ln v7 review, 10/20).
     _vague_gap = re.search(r"\b(?:point|suggest|indicate|sit|land)\w*\s+(?:to\s+)?(?:a\s+)?(?:somewhat|slightly|a bit|modestly|a little)\s+"
                            r"(?:higher|lower|above|below)", methodology, re.IGNORECASE)
-    if abs(v - a) < 3000 or (abs(v - a) <= max(15000.0, 0.02 * a) and not _vague_gap):
+    _passed_over_trim = bool(v < a and ((trace or {}).get("asking_price_check") or {}).get("passed_over"))
+    # ...or when the value was trimmed for time on market: say how much, and why (v10, 10/21: the
+    # notes said only that the value "reflects the closest verified comparable sales").
+    if abs(v - a) < 3000 or (abs(v - a) <= max(15000.0, 0.02 * a) and not _vague_gap and not _passed_over_trim):
         return methodology, []
     rel = "below" if v < a else "above"
     pct = abs(v - a) / a * 100
@@ -11446,6 +11504,8 @@ def _v10_reconcile_anchor_direction_prose(methodology: str, *, final: Optional[d
                 reason = "after factoring in how long it has been on the market"
         else:
             reason = "after crediting the features this home offers beyond those sales"
+    if _passed_over_trim:
+        reason = "after a small trim because it has sat on the market longer than those homes did"
     sentence = (
         f" Weighted together, the adjusted comparable sales point to about ${round(a, -3):,.0f}; {reason}, "
         f"the final value lands about {max(1, round(pct))}% {rel} that, at ${v:,.0f}."
