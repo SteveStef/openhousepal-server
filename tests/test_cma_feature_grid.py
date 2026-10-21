@@ -671,3 +671,20 @@ def test_loose_fit_estate_is_flagged_and_sales_dont_win():
     trace = {"asking_price_check": {"asking_price": 1500000}, "anchor": {"loose_fit": True}}
     text, _ = ai._v10_asking_gap_sentence("Notes.", final={"anchor_value": 1100000}, trace=trace)
     assert text.endswith("(about $1,100,000), but none of those sales is a close match for this home, so treat that as a rough guide.")
+
+
+def test_v15_offer_prose_drops_leverage_and_above_list_sentences():
+    band = {"fmv": 490000, "list_price": 500000, "opening_low": 463000, "opening_high": 483000,
+            "target": 490000, "comfort_ceiling": 490000, "passed_over": True}
+    text = ("With only 15 active-market days and no price reductions, there is limited leverage to pursue a "
+            "below-list offer, so buyers should be prepared to move decisively if comparable demand exists. "
+            "Standard contingencies (financing and a general home inspection) are appropriate, with particular "
+            "attention to verifying permits for the 2023 lower-level addition and well water quality. If multiple "
+            "offers emerge, escalating modestly above list within the indicated value range is supportable given "
+            "the documented updates and larger lot.")
+    out, _ = ai._v10_rebuild_buyer_offer_prose(text, band, 0.04)
+    assert "Standard contingencies" in out
+    assert "limited leverage" not in out and "move decisively" not in out and "above list" not in out
+    hot = {**band, "hot_market": True, "passed_over": False, "market_over_ask_pct": 6.5, "comfort_ceiling": 499800}
+    kept, _ = ai._v10_rebuild_buyer_offer_prose("If multiple offers emerge, escalating modestly above list is reasonable.", hot, 0.04)
+    assert "escalating modestly above list" in kept   # a hot market may say it

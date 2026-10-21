@@ -13204,21 +13204,35 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
             lp and fmv and fmv < lp * 0.99 and not b.get("hot_market") and not b.get("underpriced")
             and re.search(
                 r"\b(?:limited|little|no|not much|less)\s+room\b.{0,50}\b(?:negotiat|come down|move|budge)"
-                r"|\bseller\b.{0,40}\b(?:won'?t|unlikely to|not likely to|may not)\b.{0,30}\b(?:negotiat|come down|budge)",
+                r"|\bseller\b.{0,40}\b(?:won'?t|unlikely to|not likely to|may not)\b.{0,30}\b(?:negotiat|come down|budge)"
+                # v15: "there is limited leverage to pursue a below-list offer, so buyers should be
+                # prepared to move decisively"
+                r"|\b(?:limited|little|no|not much|less)\s+(?:negotiating\s+)?leverage\b"
+                r"|\bprepared to (?:move|act) (?:decisively|quickly|fast)\b",
                 low))
+        # The walk-away is at or under the asking price (not a hot market, not underpriced): a sentence
+        # inviting offers above list contradicts it (v15: "If multiple offers emerge, escalating
+        # modestly above list within the indicated value range is supportable" - range topped at list).
+        _contradicts_ceiling = bool(
+            lp and not b.get("hot_market") and not b.get("underpriced")
+            and (b.get("comfort_ceiling") or fmv or 0) <= lp
+            and re.search(r"\b(?:escalat\w*|bid\w*|offer\w*|go(?:ing)?|pay\w*|stretch\w*)\b.{0,40}\b(?:above|over)\s+"
+                          r"(?:the\s+)?(?:list|ask)", low))
         # A home its buyers have passed over isn't "early in its market exposure" (v7, 10/20).
         _contradicts_passed_over = bool(b.get("passed_over") and re.search(
             r"\bearly in (?:its|the) (?:market|listing)|\b(?:still|fairly|relatively) (?:new|fresh) (?:to|on) the market"
             r"|\bjust (?:hit|came on|listed)"
             # v9: "has only been actively listed for 14 days, which is too short a window to draw conclusions"
             r"|\bonly (?:been )?(?:actively )?(?:listed|on the market|active)\b.{0,20}\b\d+\s+days"
+            # v15: "With only 15 active-market days and no price reductions"
+            r"|\bonly \d+\s+(?:active[- ]market\s+|market\s+)?days"
             r"|\btoo (?:short|early|soon)\b.{0,30}\b(?:window|conclusions?|tell|judge|read)"
             # v12: "Given the short market exposure so far, there's no strong signal yet of pricing pressure"
             r"|\b(?:short|limited|brief|little)\s+(?:market\s+)?(?:exposure|time on (?:the )?market|listing period)"
             r"|\bno (?:strong |clear |real )?signal (?:yet )?of\b", low))
         if (_has_open_num or _has_indicated_num or _repeats_opening_advice
                 or _mentions_internal_anchor or _has_strategy_number or _contradicts_hot
-                or _contradicts_below_ask or _contradicts_passed_over):
+                or _contradicts_below_ask or _contradicts_passed_over or _contradicts_ceiling):
             continue  # its numbers are re-stated by the deterministic opener
         # This rebuild runs again on its own output during repair rounds - a sentence the opener
         # already says (or one kept twice) must not pile up (10/20: "It has been on the market
