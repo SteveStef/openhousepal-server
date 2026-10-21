@@ -885,6 +885,12 @@ async def get_property_by_qr(
             # by" line a printed flyer would carry.
             agent_result = await db.execute(select(User).where(User.id == open_house_event.agent_id))
             agent = agent_result.scalar_one_or_none()
+            # The home sold since, and not by this host (services/sold_branding): the page shows
+            # it without their name / photo / brokerage, and its QR in the OpenHousePal look (no
+            # agentId -> no logo / initials).
+            from app.services import sold_branding
+            if agent and not await sold_branding.branding_allowed_for_listing(db, agent, open_house_event.listing_key):
+                agent = None
             if agent:
                 property_data["agentName"] = f"{agent.first_name or ''} {agent.last_name or ''}".strip()
                 property_data["agentBrokerage"] = agent.brokerage or ""

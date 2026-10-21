@@ -1261,6 +1261,9 @@ class PropertyAgentResponse(BaseModel):
     expected_on_market_date: Optional[str] = None
     # Every listing this home has had + logged price changes, newest first (price_history_service).
     price_history: List[dict] = []
+    # False = a sold home this agent didn't take part in (services/sold_branding): the agent fields
+    # above come back empty and the page / share card show the home without them.
+    branding_allowed: bool = True
 
 async def _price_history(db: AsyncSession, listing_key: str) -> list:
     try:
@@ -1326,19 +1329,26 @@ async def get_property_for_agent(
             if getattr(property_data, "home_status", None) in _IDX_NOT_SHOWN_STATUSES or opted_out == "false":
                 raise HTTPException(status_code=404, detail="This home is no longer on the market.")
 
+            # A sold home this agent didn't list or sell: no name / photo / brokerage / Spotlight -
+            # the link's page and its share card show the home neutral (services/sold_branding).
+            from app.services import sold_branding
+            branded = await sold_branding.branding_allowed_for_listing(db, agent, listing_key)
+
             spotlight_url = None
-            try:
-                from app.services.website import content_adapters
-                spotlight_url = (await content_adapters.attach_spotlight_urls(db, agent, [{"listing_key": listing_key}]))[0].get("spotlight_url")
-            except Exception:  # noqa: BLE001 - the page still works without it
-                logger.warning("listing page spotlight lookup failed", exc_info=True)
+            if branded:
+                try:
+                    from app.services.website import content_adapters
+                    spotlight_url = (await content_adapters.attach_spotlight_urls(db, agent, [{"listing_key": listing_key}]))[0].get("spotlight_url")
+                except Exception:  # noqa: BLE001 - the page still works without it
+                    logger.warning("listing page spotlight lookup failed", exc_info=True)
             return PropertyAgentResponse(
-                property=property_data, agent_name=agent_name,
-                agent_photo_url=agent.photo_url or None,
-                agent_brokerage=agent.brokerage or None,
+                property=property_data, agent_name=agent_name if branded else "",
+                agent_photo_url=(agent.photo_url or None) if branded else None,
+                agent_brokerage=(agent.brokerage or None) if branded else None,
                 spotlight_url=spotlight_url,
                 expected_on_market_date=expected_on,
                 price_history=await _price_history(db, listing_key),
+                branding_allowed=branded,
             )
         except HTTPException:
             raise

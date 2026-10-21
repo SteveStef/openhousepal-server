@@ -22,6 +22,7 @@ from app.config.logging import get_logger
 
 from app.services.collection_preferences_service import CollectionPreferencesService
 from app.services.blacklist_service import BlacklistService
+from app.services import sold_branding
 from app.services.leads_service import upsert_lead
 from app.services.website.content_adapters import get_agent_profile
 from app.utils.listing_dom import dom_fetched_at, resolve_days_on_market
@@ -1626,6 +1627,9 @@ class CollectionsService:
                     # every showcase load/refresh.
                     'Latitude': prop.latitude,
                     'Longitude': prop.longitude,
+                    # False = it sold and this Showcase's agent wasn't on the sale - the home's
+                    # window shows it without their name / photo (services/sold_branding).
+                    'brandingAllowed': sold_branding.sold_branding_allowed(agent, prop),
                 }
                 properties_data.append(property_dict)
 
