@@ -9177,6 +9177,15 @@ _PSF_IN_NOTE_RE = re.compile(r"\$\s?(\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?\s*(?:/|pe
 _AREA_IN_NOTE_RE = re.compile(r"(?<![\$\d,.])(\d{1,3}(?:,\d{3})+|\d{3,5})(?:\.\d+)?\s*(?:\+\s*)?" + _AREA_UNIT, re.IGNORECASE)
 
 
+_LISTING_SIZE_RE = re.compile(r"(?<![\d,.])(\d{1,3}(?:,\d{3})+|\d{3,5})[\s-]*(?:sq\.?\s?ft\.?|sqft|square[\s-]+f(?:ee|oo)t)", re.IGNORECASE)
+
+
+def _listing_stated_sizes(data: Optional[dict]) -> list[float]:
+    """Every square-footage figure the property's own listing text states (garage, rooms, lot...)."""
+    blob = _authoritative_property_fact_blob(data or {})
+    return [float(m.group(1).replace(",", "")) for m in _LISTING_SIZE_RE.finditer(blob)]
+
+
 def _comp_note_number_errors(text: str, comp: dict, subject: Optional[dict] = None) -> list[str]:
     """Every $/sqft and square-footage figure in an AI comp note must be recomputable from the MLS
     record. Seen live 2026-10-05: "$1,250,000 on 2,282 sq ft above grade ... closer to $517/sqft"
@@ -9214,7 +9223,9 @@ def _comp_note_number_errors(text: str, comp: dict, subject: Optional[dict] = No
         elif re.search(r"above[- ]grade", ctx):
             pool = [areas_c["above_grade_finished_area"], areas_s["above_grade_finished_area"]]
         else:
-            pool = [*areas_c.values(), *areas_s.values(), lot]
+            # ...plus any size either home's own listing states ("The impressive 900-square-foot,
+            # two-car garage" - quoted right, rejected, note thrown out: 417 Dogwood Ln v7, 10/20)
+            pool = [*areas_c.values(), *areas_s.values(), lot, *_listing_stated_sizes(comp), *_listing_stated_sizes(subject)]
         pool = [x for x in pool if x]
         # differences between the two homes are fair game too ("about 476 sq ft more")
         diffs = [abs(a - b) for a in areas_c.values() if a for b in areas_s.values() if b]
@@ -9255,7 +9266,9 @@ def _size_ratio_claim_errors(text: str, areas_c: dict, areas_s: dict) -> list:
                 continue
             # "above-grade area is under half" is judged on above-grade area only
             ratios = [r for r in ([above] if (above is not None and re.search(r"above[- ]grade", window, re.I)) else [above, total]) if r is not None]
-            if ratios and not any(lo <= r <= hi for r in ratios):
+            # Either way round: "the subject has about double the finished space" (3,130 vs 1,472)
+            # is as true as "the comp is about half its size" (417 Dogwood Ln v7, 10/20).
+            if ratios and not any(lo <= r <= hi or (r > 0 and lo <= 1 / r <= hi) for r in ratios):
                 out.append(f"'{m.group(0).strip()}' (its size is {round(ratios[0] * 100)}% of the subject's)")
             break
     return out
@@ -10585,6 +10598,11 @@ def _soften_unsupported_system_claims(text: Optional[str], subject: Optional[dic
         name = (system.group(0) if system else "major systems").lower().replace("hvac", "HVAC")
         verify = f"Verify the age and condition of the {name} with the seller and the home inspection."
         repl = "" if verify in cur else verify
+        # Keep the item's bold heading when the rewritten sentence is the first one under it
+        # ("**Water Heater and Electrical:** ..." lost its heading: 417 Dogwood Ln v7, 10/20).
+        _head = re.match(r"\s*(\*\*[^*\n]{1,80}\*\*:?\s*)", c)
+        if _head and _head.group(1).strip() not in cur[:s]:
+            repl = _head.group(1) + (repl or "Verify with the seller and the home inspection.")
         trail = re.search(r"\s*$", c).group(0)
         cur = (cur[:s] + repl + (trail if repl else "") + cur[e:]).strip()
         cur = re.sub(r"[ \t]{2,}", " ", cur)
@@ -12462,7 +12480,9 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
         # supported value on a listing that is already asking more than it (seen 10/19: $3.1M ask,
         # $2.9M FMV, 103 days, "comfortable up to $3,045,000") is not advice a buyer's agent gives.
         # Only a genuinely hot read (competing offers likely) allows a small stretch, never past ask.
-        comfort_ceiling = round(fmv * (1.02 if aggr == "high" else 1.0))
+        # ...and not for a home buyers have already passed over (417 Dogwood Ln v7, 10/20: "stretch
+        # to about $500,000" in the same report that says it sat longer than its comps).
+        comfort_ceiling = round(fmv * (1.02 if aggr == "high" and not _passed_over and not outpaced else 1.0))
         if lp:
             comfort_ceiling = min(comfort_ceiling, round(lp))
     if not underpriced:
@@ -12519,7 +12539,7 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
         "opening_pct_low_vs_list": round(pct_low, 4) if pct_low is not None else None,
         "opening_pct_high_vs_list": round(pct_high, 4) if pct_high is not None else None,
         "opening_pct_phrase": _v10_pct_range_phrase(opening_low, opening_high, lp) if lp else None,
-        "aggression": aggr, "underpriced": underpriced, "basis_ref": basis_ref,
+        "aggression": aggr, "underpriced": underpriced, "basis_ref": basis_ref, "passed_over": _passed_over,
         "above_ask": bool(lp and opening_high > lp),
         "hot_market": hot, "market_over_ask_pct": round((_lts - 1) * 100, 1) if hot else None,
         "outpaced_by_comps": outpaced, "over_ask_comp_median_dom": _over_doms[len(_over_doms) // 2] if _over_doms else None,
@@ -12675,9 +12695,13 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
                 r"\b(?:limited|little|no|not much|less)\s+room\b.{0,50}\b(?:negotiat|come down|move|budge)"
                 r"|\bseller\b.{0,40}\b(?:won'?t|unlikely to|not likely to|may not)\b.{0,30}\b(?:negotiat|come down|budge)",
                 low))
+        # A home its buyers have passed over isn't "early in its market exposure" (v7, 10/20).
+        _contradicts_passed_over = bool(b.get("passed_over") and re.search(
+            r"\bearly in (?:its|the) (?:market|listing)|\b(?:still|fairly|relatively) (?:new|fresh) (?:to|on) the market"
+            r"|\bjust (?:hit|came on|listed)", low))
         if (_has_open_num or _has_indicated_num or _repeats_opening_advice
                 or _mentions_internal_anchor or _has_strategy_number or _contradicts_hot
-                or _contradicts_below_ask):
+                or _contradicts_below_ask or _contradicts_passed_over):
             continue  # its numbers are re-stated by the deterministic opener
         # This rebuild runs again on its own output during repair rounds - a sentence the opener
         # already says (or one kept twice) must not pile up (10/20: "It has been on the market

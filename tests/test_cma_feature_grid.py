@@ -289,3 +289,38 @@ def test_dated_installs_count_as_system_updates():
                                            "treatment system installed in 2023, EV charging added in 2024."})
     assert "water softener" in found and "ev charging" in found
     assert ai._documented_system_updates({"public_remarks": "Roof and new windows."}) == ["windows"]
+
+
+# ---- 417 Dogwood Ln v7 (10/20) ------------------------------------------------------------------
+
+def test_size_quoted_from_the_comps_own_listing_is_fine():
+    comp = {"sqft": 1504, "above_grade_finished_area": 1504, "below_grade_finished_area": 0,
+            "public_remarks": "The impressive 900-square-foot, two-car garage provides abundant room."}
+    assert ai._comp_note_number_errors("It has an oversized 900 sq ft two-car garage.", comp, DOGWOOD_SUBJECT) == []
+    assert ai._comp_note_number_errors("It has an oversized 950 sq ft two-car garage.", comp, DOGWOOD_SUBJECT)
+
+
+def test_double_claim_may_describe_the_subject():
+    comp = {"sqft": 1472, "above_grade_finished_area": 1472, "below_grade_finished_area": 0}
+    ok = "The subject offers roughly double the total finished living space of this smaller home."
+    assert ai._comp_note_number_errors(ok, comp, DOGWOOD_SUBJECT) == []
+    bad = "Its above-grade area is under half the subject's."
+    assert ai._comp_note_number_errors(bad, comp, DOGWOOD_SUBJECT)
+
+
+def test_inspection_rewrite_keeps_the_item_heading():
+    text = ("**Roof Age:** Ask the seller for the roof's age.\n\n"
+            "**Water Heater and Electrical:** The water heater, since the home was built in 1972, may be original. "
+            "Ask the inspector to note the age and remaining service life of each.")
+    out, notes = ai._soften_unsupported_system_claims(text, {"public_remarks": "Updated kitchen."})
+    assert notes, "the undocumented claim should still be rewritten"
+    assert "**Water Heater and Electrical:**" in out
+
+
+def test_passed_over_home_gets_no_stretch_and_no_early_exposure_line():
+    band = {"fmv": 490000, "list_price": 500000, "opening_low": 463000, "opening_high": 483000,
+            "target": 490000, "comfort_ceiling": 490000, "passed_over": True}
+    text = ("Make the offer contingent on a standard home inspection. Since the home is still early in its market "
+            "exposure (14 days), there's no strong signal of urgency from the seller.")
+    out, _ = ai._v10_rebuild_buyer_offer_prose(text, band, 0.04)
+    assert "home inspection" in out and "early in its market" not in out
