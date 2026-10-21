@@ -5564,8 +5564,13 @@ def _anchor_integrity_errors(anchor: Optional[dict], subject: Optional[dict] = N
         size = _as_float(c.get("size_adjustment")) or 0
         if s_ag and c_ag and abs(s_ag - c_ag) >= 25 and size and (size > 0) != (s_ag > c_ag):
             errs.append(f"{c.get('label')}: size adjustment {'+' if size > 0 else '-'}${abs(size):,.0f} goes against the size difference")
+    # Strong comps first, then by weight (v10 review, 10/21: a Strong comp listed #4 behind two
+    # Supporting ones read as a mistake).
+    _rank = {"strong": 0, "supporting": 1}
+    roles = [_rank.get(c.get("display_role"), 1) for c in rows]
     weights = [c.get("normalized_weight") or 0 for c in rows]
-    if any(weights[i] + 0.03 < weights[i + 1] for i in range(len(weights) - 1)):
+    if any(roles[i] > roles[i + 1] or (roles[i] == roles[i + 1] and weights[i] + 0.03 < weights[i + 1])
+           for i in range(len(weights) - 1)):
         errs.append("comps are not listed strongest-first")
     return errs
 
@@ -6361,6 +6366,10 @@ def _apply_continuous_relevance_weighting(
         comp["strength"] = row["proposed_role"]
         if row["proposed_role"] != "weak" and key in _anchor_rows:
             comp["strength"] = _v10_role_from_anchor_row(_anchor_rows[key], comp)
+        if key in _anchor_rows:
+            # the label the report shows, kept on the anchor row so the report order (Strong first,
+            # then by weight) and its self-check use the same thing
+            _anchor_rows[key]["display_role"] = _normalize_strength(comp.get("strength")) or "supporting"
         raw_relevance = row["adjusted_relevance_score"]
         comp["match_score"] = calibrate_match_percentage(raw_relevance)
         comp["similarity_details"] = {
@@ -8536,6 +8545,26 @@ _REASONING_NEUTRAL_SUMMARY = (
 )
 
 
+def _fallback_methodology_details(anchor: Optional[dict]) -> str:
+    """Two plain sentences from the deterministic anchor: the strongest sale (Strong first, then
+    weight) and the main uncertainty, without the grid's internal rates."""
+    rows = [r for r in ((anchor or {}).get("comps") or []) if (r.get("normalized_weight") or 0) > 0]
+    if not rows:
+        return ""
+    top = sorted(rows, key=lambda r: (r.get("display_role") != "strong", -(r.get("normalized_weight") or 0)))[0]
+    m = re.search(r"\(([^)]+)\)\s*$", str(top.get("label") or ""))
+    addr = (m.group(1) if m else str(top.get("address") or "")).title()
+    dist = _as_float(top.get("distance_miles"))
+    out = []
+    if addr:
+        out.append(f"The strongest comparison is {addr}" + (f", {dist:.1f} miles away." if dist is not None else "."))
+    unc = [u for u in ((anchor or {}).get("main_uncertainties") or []) if isinstance(u, str) and u.strip()]
+    if unc:
+        first = re.sub(r"\s*\([^)]*\)", "", unc[0]).strip()
+        out.append(first if first.endswith(".") else first + ".")
+    return " ".join(out)
+
+
 def _strip_number_sentences(text: str) -> str:
     """Drop every sentence that carries a dollar figure or a percentage (client summary is number-free)."""
     kept = [c for c, _s, _e in _sentence_chunks(text or "")
@@ -9048,12 +9077,16 @@ _INTERNAL_DATA_REF_RE = re.compile(
 # 10/21: "sold at $307/sqft, well above the anchor rate", "its location weight was reduced in the
 # anchor", "no finished-basement decomposition").
 _PLAIN_WORDS = (
+    # How the engine treated a comp is not something a buyer reads about - drop the clause
+    # (v10 review: "which is why its weight was trimmed in the valuation", "and anchors the
+    # valuation most heavily"); the comparison itself stays.
+    (r",?\s*(?:which is why|which|and|so)\s+(?:its|the)\s+(?:location\s+|valuation\s+)?weight\s+(?:was|is)\s+"
+     r"(?:reduced|trimmed|cut|lowered|depressed)(?:\s+in\s+the\s+(?:comp(?:arable)?[- ]sales\s+)?(?:anchor|valuation))?", ""),
+    (r",?\s*(?:which|that)\s+(?:depressed|reduced|trimmed|cut|lowered)\s+its\s+(?:location\s+|valuation\s+)?weight"
+     r"(?:\s+in\s+the\s+(?:comp(?:arable)?[- ]sales\s+)?(?:anchor|valuation))?[^,.;]*", ""),
+    (r",?\s*(?:and\s+|which\s+)?(?:anchors|drives|carries)\s+the\s+(?:valuation|value)(?:\s+(?:most heavily|the most))?", ""),
     (r"\b(?:its|the) location weight (?:was |is )?(?:reduced|trimmed|cut|lowered)(?: in the (?:comp(?:arable)?[- ]sales )?anchor)?",
-     "it counts for less in the valuation"),
-    (r"\b(?:depressed|reduced|trimmed|cut|lowered) its (?:location |valuation )?weight in the (?:comp(?:arable)?[- ]sales )?anchor",
-     "makes it count for less in the valuation"),
-    (r"\bits weight was (?:trimmed|reduced|cut|lowered) in the (?:comp(?:arable)?[- ]sales )?(?:anchor|valuation)",
-     "it counts for a little less in the valuation"),
+     "it is a weaker match"),
     (r"\bthe (?:comp(?:arable)?[- ]sales )?anchor(?:'s)? (?:rate|\$/sq ?ft|price per square foot|psf)\b",
      "the typical price per square foot of these sales"),
     (r"\b(in|from|to|of|into) the (?:comp(?:arable)?[- ]sales )?anchor\b", r"\1 the valuation"),
@@ -9536,7 +9569,12 @@ async def _targeted_comp_narrative_rewrite(
             "keep the price, the comparison, and every other fact exactly as written. If the claim was "
             "about the subject's condition and you have no supported alternative, remove that clause "
             "rather than guess a replacement (describe the comp's own condition/finish without also "
-            "characterizing the subject). Return ONLY a JSON object "
+            "characterizing the subject). The issue descriptions are internal notes for you - never "
+            "copy their wording (words like 'decomposition', 'component-area', 'structured record', "
+            "'anchor', 'weight') into the client text, and make sure the rewritten note doesn't "
+            "contradict itself (v10, 10/21: 'no finished-basement decomposition comparable' two "
+            "sentences before calling the same basement the closest feature match). Plain words a "
+            "home buyer uses. Return ONLY a JSON object "
             "{\"notes\": [{\"label\": \"...\", \"text\": \"...\"}]} with exactly one entry per note given "
             "to you, in the same order, using the exact same label."
         )
@@ -10695,6 +10733,15 @@ def _soften_unsupported_system_claims(text: Optional[str], subject: Optional[dic
         notes.append(f"auto-corrected: \"{hit.group(0).strip()}\" isn't documented in the listing - "
                      f"rewritten as a to-verify item.")
     cur, more = _soften_updated_systems_claims(cur, subject)
+    # The inspection page stands on its own - it shouldn't send the reader to "the valuation notes"
+    # (v10 review, 10/21: it cited them for the 2023 suite after the notes no longer mentioned it).
+    _ref = re.sub(r"\bthe valuation(?: notes?| summary| section)?(?= (?:notes|mentions|says|describes|lists|references)\b)",
+                  "the listing", cur, flags=re.IGNORECASE)
+    _ref = re.sub(r"\b(?:as )?(?:noted|mentioned|described) in the valuation(?: notes| summary| section)?\b",
+                  "per the listing", _ref, flags=re.IGNORECASE)
+    if _ref != cur:
+        cur = _ref
+        more = list(more) + ["Inspection concerns: pointed a reference to the valuation notes at the listing instead."]
     return cur, notes + more
 
 
@@ -12810,6 +12857,11 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
         if _norm in " ".join(opener.lower().split()) or any(" ".join(k.lower().split()) == _norm for k in kept):
             continue
         kept.append(s)
+    # Always tell the buyer to keep an inspection contingency (v10 review, 10/21: when the AI's own
+    # strategy sentences fell away, the offer page lost it).
+    if not any(re.search(r"\binspection\b", k, re.IGNORECASE) for k in kept):
+        kept.append("Include a standard home inspection contingency so the items on the inspection page can be "
+                    "checked before you're committed.")
     body = " ".join(kept).strip()
     new_text = (opener + (" " + body if body else "")).strip()
     return new_text, ["Offer strategy: the opening-offer figures were rebuilt deterministically from the final "
@@ -13255,6 +13307,13 @@ async def _finalize_gate_reconciled_prose(
     )
     methodology, offer, inspection = _pg["m"][1], _pg["o"][1], _pg["i"][1]
     flags += _pg_flags
+    # When the final valuation pass couldn't run, its stand-in summary says almost nothing (v10
+    # review, 10/21: "went from contradictory to empty"). Add what the engine itself knows: the
+    # strongest sale and the main thing the sales can't pin down. The number sentence follows below.
+    if methodology and _REASONING_NEUTRAL_SUMMARY in methodology:
+        _extra = _fallback_methodology_details(anchor)
+        if _extra:
+            methodology = methodology.replace(_REASONING_NEUTRAL_SUMMARY, _REASONING_NEUTRAL_SUMMARY + " " + _extra)
     methodology, _adf = _v10_reconcile_anchor_direction_prose(methodology, final=_final, trace=valuation_trace)
     flags += _adf
 
@@ -14382,9 +14441,11 @@ async def _generate_ai_analysis_impl(
     # decided BEFORE any model writes about "Comp #N", so labels, weights and narratives agree. The
     # agent's pick order used to stand (417 Dogwood Ln's #5 carried the most weight).
     _share = {c.get("listing_key"): c.get("normalized_weight") or 0.0 for c in ((prov_anchor or {}).get("comps") or [])}
+    _strong_keys = {c.get("listing_key") for c in ((prov_anchor or {}).get("comps") or []) if c.get("display_role") == "strong"}
     if _share:
         def _by_share(c):
-            return -_share.get(c.get("listing_key"), -1.0)
+            # Strong comps first, then by share of the value
+            return (c.get("listing_key") not in _strong_keys, -_share.get(c.get("listing_key"), -1.0))
         _paired = sorted(zip(comps, enriched_comps), key=lambda p: _by_share(p[0]))
         comps, enriched_comps = [p[0] for p in _paired], [p[1] for p in _paired]
         _reordered = sorted(report.comparables or [], key=lambda c: (not c.get("is_included", True), _by_share(c)))

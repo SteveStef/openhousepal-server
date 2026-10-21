@@ -397,3 +397,43 @@ def test_passed_over_trim_is_explained_with_numbers():
     out, _ = ai._v10_reconcile_anchor_direction_prose(
         "This value reflects the closest verified comparable sales.", final={"value": 490000, "anchor_value": 497491}, trace=trace)
     assert "$497,000" in out and "small trim" in out
+
+
+# ---- independent review of v10 (10/21) ---------------------------------------------------------
+
+def test_how_the_engine_treated_a_comp_is_dropped():
+    t = ("It fronts the highway, a clear drawback versus the subject's quiet street, which is why its location weight "
+         "was reduced in the anchor. This is the closest sale and anchors the valuation most heavily.")
+    out = ai._strip_internal_data_refs(t)
+    assert "weight" not in out and "anchor" not in out and "quiet street." in out
+
+
+def test_strong_comps_listed_first_then_by_weight():
+    rows = [{"label": "Comp #1 (A)", "normalized_weight": 0.22, "display_role": "strong"},
+            {"label": "Comp #2 (B)", "normalized_weight": 0.19, "display_role": "strong"},
+            {"label": "Comp #3 (C)", "normalized_weight": 0.21, "display_role": "supporting"}]
+    a = {"anchor_value": 1, "comps": rows}
+    assert "comps are not listed strongest-first" not in ai._anchor_integrity_errors(a, {})
+    a2 = {"anchor_value": 1, "comps": [rows[2], rows[0], rows[1]]}
+    assert "comps are not listed strongest-first" in ai._anchor_integrity_errors(a2, {})
+
+
+def test_fallback_notes_name_the_strongest_sale_and_the_uncertainty():
+    anchor = {"comps": [{"label": "Comp #1 (1219 SCOTT DR)", "normalized_weight": 0.22, "display_role": "strong", "distance_miles": 0.27}],
+              "main_uncertainties": ["None of the verified sales has a finished lower level like this home's 1,300 sq ft, so how "
+                                     "buyers value that space is the main uncertainty in this value (the grid credits it at about $31/sq ft)."]}
+    out = ai._fallback_methodology_details(anchor)
+    assert "1219 Scott Dr, 0.3 miles away" in out and "grid" not in out and "main uncertainty" in out
+
+
+def test_offer_always_keeps_an_inspection_line():
+    band = {"fmv": 490000, "list_price": 500000, "opening_low": 456000, "opening_high": 475000,
+            "target": 488000, "comfort_ceiling": 490000, "passed_over": True}
+    out, _ = ai._v10_rebuild_buyer_offer_prose("", band, 0.04)
+    assert "inspection contingency" in out
+
+
+def test_inspection_page_doesnt_point_at_the_valuation_notes():
+    out, _ = ai._soften_unsupported_system_claims(
+        "**Lower level:** The valuation notes a 2023 lower-level suite. Check the egress window.", {"public_remarks": "x"})
+    assert "valuation" not in out.lower() and "the listing notes a 2023" in out.lower()
