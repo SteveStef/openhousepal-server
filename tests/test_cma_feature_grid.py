@@ -324,3 +324,24 @@ def test_passed_over_home_gets_no_stretch_and_no_early_exposure_line():
             "exposure (14 days), there's no strong signal of urgency from the seller.")
     out, _ = ai._v10_rebuild_buyer_offer_prose(text, band, 0.04)
     assert "home inspection" in out and "early in its market" not in out
+
+
+# ---- independent review of v7 (10/20) ----------------------------------------------------------
+
+def test_mailing_town_is_not_the_municipality():
+    subj = {"city": "COATESVILLE", "township": "CALN", "school_district": "COATESVILLE AREA"}
+    summit = {"city": "DOWNINGTOWN", "township": "CALN", "school_district": "COATESVILLE AREA"}
+    assert ai._same_municipality(subj, summit) is True
+    assert ai._derive_quality_from_data(subj, summit).get("area") == "same_as_subject"
+    borough = {"city": "COATESVILLE", "township": "SOUTH COATESVILLE", "school_district": "COATESVILLE AREA"}
+    assert ai._same_municipality(subj, borough) is False
+    assert ai._same_municipality({"city": "A"}, {"city": "A"}) is True   # no township: mailing town fallback
+
+
+def test_vague_adjusted_sales_line_gets_the_number():
+    notes = "The adjusted sales point somewhat higher, but this home has sat longer than its comparables."
+    trace = {"authority": "reasoning_model", "asking_price_check": {"passed_over": True}}
+    out, _ = ai._v10_reconcile_anchor_direction_prose(notes, final={"value": 490000, "anchor_value": 497340}, trace=trace)
+    assert "$497,000" in out and "$490,000" in out and "small trim" in out
+    plain = "The comparable sales support this value."
+    assert ai._v10_reconcile_anchor_direction_prose(plain, final={"value": 490000, "anchor_value": 497340}, trace=trace)[0] == plain

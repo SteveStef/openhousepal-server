@@ -1333,13 +1333,9 @@ def _derive_quality_from_data(subject: dict, comp: dict) -> dict:
     out: dict = {}
 
     s_school, c_school = _norm_token(subject.get("school_district")), _norm_token(comp.get("school_district"))
-    s_city, c_city = _norm_token(subject.get("city")), _norm_token(comp.get("city"))
-    s_twp = _norm_token(_first_present(subject, "township", "municipality"))
-    c_twp = _norm_token(_first_present(comp, "township", "municipality"))
     matches = [m for m in (
         (s_school == c_school) if (s_school and c_school) else None,
-        (s_city == c_city) if (s_city and c_city) else None,
-        (s_twp == c_twp) if (s_twp and c_twp) else None,
+        _same_municipality(subject, comp),
     ) if m is not None]
     if matches:
         if all(matches):
@@ -2022,10 +2018,9 @@ def _comp_evidence_score(subject: dict, comp: dict) -> dict:
             notes.append(f"{dist:.1f} mi away")
 
     s_school, c_school = _norm_token(subject.get("school_district")), _norm_token(comp.get("school_district"))
-    s_city, c_city = _norm_token(subject.get("city")), _norm_token(comp.get("city"))
     area_matches = [m for m in (
         (s_school == c_school) if (s_school and c_school) else None,
-        (s_city == c_city) if (s_city and c_city) else None,
+        _same_municipality(subject, comp),
     ) if m is not None]
     if area_matches:
         components["area"] = 1.0 if all(area_matches) else (0.5 if any(area_matches) else 0.0)
@@ -6092,6 +6087,18 @@ def _relevance_density_context(subject: dict, references: list[dict]) -> dict:
     return build_adaptive_proximity_context(subject, references)
 
 
+def _same_municipality(a: Optional[dict], b: Optional[dict]) -> Optional[bool]:
+    """Same township/borough. The mailing city is only a fallback when either side has no
+    township: 3306 E Summit Ave has a Downingtown mailing address but sits in Caln Township, like
+    the subject, and was called "different municipality" (417 Dogwood Ln v7, 10/20)."""
+    ta = _norm_token(_first_present(a or {}, "township", "municipality"))
+    tb = _norm_token(_first_present(b or {}, "township", "municipality"))
+    if ta and tb:
+        return ta == tb
+    ca, cb = _norm_token((a or {}).get("city")), _norm_token((b or {}).get("city"))
+    return (ca == cb) if (ca and cb) else None
+
+
 def _relevance_market_area_score(subject: dict, comp: dict) -> tuple[Optional[float], dict]:
     fields = (
         ("school_district", ("school_district", "school_district_name"), 0.35),
@@ -6370,7 +6377,6 @@ def _v10_location_class_review(subject: dict, comps: list, evidence_by_key: dict
     rule - a single negative only trims weight; it takes >= _V10_LOC_NEG_DEMOTE to force a demote."""
     flags: list = []
     subj_school = _norm_token(subject.get("school_district"))
-    subj_city = _norm_token(subject.get("city"))
     subj_street_tier = _street_tier(subject)
 
     incl = [(i, c) for i, c in enumerate(comps)
@@ -6396,9 +6402,8 @@ def _v10_location_class_review(subject: dict, comps: list, evidence_by_key: dict
             street_score = {"quiet": 0.9, "neutral": 0.6, "through": 0.3}.get(rc_verdict)
 
         c_school = _norm_token(c.get("school_district"))
-        c_city = _norm_token(c.get("city"))
         school_match = (c_school == subj_school) if (c_school and subj_school) else None
-        city_match = (c_city == subj_city) if (c_city and subj_city) else None
+        city_match = _same_municipality(subject, c)
         school_township = ("same" if (school_match and city_match) else
                            "partial" if (school_match or city_match) else
                            "different" if (school_match is not None or city_match is not None) else "unknown")
@@ -6481,7 +6486,6 @@ def _v10_condition_class_review(subject: dict, comps: list, evidence_by_key: dic
     for the trace and returns qa_flags. Runs AFTER _v10_location_class_review."""
     flags: list = []
     subj_school = _norm_token(subject.get("school_district"))
-    subj_city = _norm_token(subject.get("city"))
     for i, c in enumerate(comps):
         if not c.get("is_included", True):
             continue
@@ -6506,10 +6510,9 @@ def _v10_condition_class_review(subject: dict, comps: list, evidence_by_key: dic
         ev_ok = score is None or score >= _V10_COND_PROMOTE_MIN_EV
 
         c_school = _norm_token(c.get("school_district"))
-        c_city = _norm_token(c.get("city"))
         loc_bad = bool(
             (c_school and subj_school and c_school != subj_school)
-            or (c_city and subj_city and c_city != subj_city)
+            or _same_municipality(subject, c) is False
             or q.get("area") == "different_from_subject"
             or q.get("street_context") == "below"
             or (c.get("_loc") or {}).get("negatives")
@@ -8001,7 +8004,8 @@ contract much faster than this home has been on the market - do not assume it wi
 over-asking competition, and do not value it above the adjusted sales on that basis. When asking_price_check.passed_over is true, the
 home has sat on the market well past the days its comps took to sell: buyers have already passed on
 it at this price, so it most likely sells at or a little under asking - do not describe competing
-offers or a premium over asking.
+offers or a premium over asking. Present that as a modest trim to what the adjusted sales say, not
+as the factor that governs the value.
 
 deterministic_evidence.comp_adjustment_grid is an appraisal-style grid already inside the
 deterministic anchor: every verified comp was moved toward the subject for size, finished
@@ -9372,6 +9376,9 @@ def _regenerate_comp_narrative_from_snapshot(comp: dict, label: str, subject: Op
         s_bg, c_bg = _v10_finished_below_grade_sqft(subject), _v10_finished_below_grade_sqft(comp)
         if s_bg and c_bg == 0:
             diffs.append("no finished lower level on record")
+        elif s_bg and c_bg is None:
+            # finished per the MLS, but no area recorded - say so rather than skip it (1219 Scott Dr)
+            diffs.append("a finished lower level whose size isn't on record")
         s_g, c_g = _v10_garage_spaces(subject), _v10_garage_spaces(comp)
         if s_g is not None and c_g is not None and s_g != c_g:
             diffs.append(f"no garage to the subject's {s_g:g}-car" if c_g == 0 and s_g
@@ -11381,7 +11388,11 @@ def _v10_reconcile_anchor_direction_prose(methodology: str, *, final: Optional[d
     a = _as_float(final.get("anchor_value")) or _as_float(((trace or {}).get("anchor") or {}).get("anchor_value"))
     if not v or not a:
         return methodology, []
-    if abs(v - a) <= max(15000.0, 0.02 * a):
+    # A small gap needs no sentence - unless the notes mention it without the number ("the adjusted
+    # sales point somewhat higher": by how much? 417 Dogwood Ln v7 review, 10/20).
+    _vague_gap = re.search(r"\b(?:point|suggest|indicate|sit|land)\w*\s+(?:to\s+)?(?:a\s+)?(?:somewhat|slightly|a bit|modestly|a little)\s+"
+                           r"(?:higher|lower|above|below)", methodology, re.IGNORECASE)
+    if abs(v - a) < 3000 or (abs(v - a) <= max(15000.0, 0.02 * a) and not _vague_gap):
         return methodology, []
     rel = "below" if v < a else "above"
     pct = abs(v - a) / a * 100
@@ -11399,6 +11410,8 @@ def _v10_reconcile_anchor_direction_prose(methodology: str, *, final: Optional[d
             # the report read as contradicting itself (10/19 review, 2 of 4 buyer reports).
             return methodology, []
         reason = "after weighing this home's own features and today's market"
+        if rel == "below" and ((trace or {}).get("asking_price_check") or {}).get("passed_over"):
+            reason = "after a small trim because it has sat on the market longer than those homes did"
     else:
         qr = (trace or {}).get("qualitative_reconciliation") or {}
         gate_action = ((trace or {}).get("above_ask_gate") or {}).get("action")
