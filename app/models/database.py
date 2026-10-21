@@ -788,6 +788,23 @@ class PropertyPriceEvent(Base):
     __table_args__ = (Index('ix_property_price_events_listing_key', 'listing_key', 'observed_at'),)
 
 
+class PropertyFieldChange(Base):
+    """One field of one listing that a sync changed: the old and new value (as text, cut at 500
+    characters; a photo gallery as its count). Diffs only - never a copy of the whole record - so
+    it is small enough to keep forever and answers "what did this listing say before, and when did
+    it change?" for any field (property_sync_service._log_field_changes)."""
+    __tablename__ = "property_field_changes"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    listing_key = Column(String, nullable=False)
+    field = Column(String, nullable=False)
+    old_value = Column(Text, nullable=True)
+    new_value = Column(Text, nullable=True)
+    observed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (Index('ix_property_field_changes_listing_key', 'listing_key', 'observed_at'),)
+
+
 class Property(Base):
     __tablename__ = "properties"
 

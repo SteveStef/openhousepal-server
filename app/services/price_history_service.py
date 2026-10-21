@@ -93,10 +93,61 @@ async def _sibling_listings(db: AsyncSession, subject: Property) -> list[Propert
     return [r for r in rows if same_home(r)]
 
 
+_STATUS_LINE = {
+    "PENDING-BRIGHT": "Pending",
+    "ACTIVE UNDER CONTRACT-BRIGHT": "Under contract",
+    "TEMP OFF MARKET-BRIGHT": "Temporarily off market",
+    "OFF_MARKET-BRIGHT": "Taken off market",
+    "WITHDRAWN-BRIGHT": "Taken off market",
+    "EXPIRED-BRIGHT": "Taken off market",
+    "CANCELED-BRIGHT": "Taken off market",
+}
+
+
+def _status_lines(logged: list, contract_date: Optional[str]) -> list[dict]:
+    """The logged status changes of one listing as history lines. Listed / Coming soon / Sold have
+    their own (dated) lines, so moves into those aren't repeated.
+
+    Hidden: a move out of OFF_MARKET-BRIGHT with no logged move into it first. Off-market was never
+    logged before 10/21, so every such line is from the Oct 15-20 false-removal bug - the home
+    never really left - or a return we can't place against a removal date."""
+    out: list[dict] = []
+    went_off = contract_seen = False
+    for e in logged:
+        if e.kind != "status":
+            continue
+        new, prev = (e.status or "").upper(), (e.previous_status or "").upper()
+        if prev == "OFF_MARKET-BRIGHT" and not went_off:
+            continue
+        if new in _OFF_STATUSES:
+            went_off = True
+        day = _iso(e.observed_at)
+        if new.startswith("ACTIVE-BRIGHT"):
+            if prev and not prev.startswith(("ACTIVE-BRIGHT", "COMING SOON")):
+                out.append({"date": day, "event": "Back on market", "price": e.price})
+            continue
+        label = _STATUS_LINE.get(new)
+        if not label:
+            continue
+        # The MLS contract date already says when it went under contract; the sync saw that first move
+        # later. A later step (under contract -> pending) still shows.
+        if label in ("Pending", "Under contract") and not contract_seen and contract_date and day and contract_date <= day \
+                and (datetime.fromisoformat(day) - datetime.fromisoformat(contract_date)).days <= 14:
+            contract_seen = True
+            continue
+        out.append({"date": day, "event": label, "price": e.price})
+    return out
+
+
 async def get_history(db: AsyncSession, listing_key: str) -> list[dict]:
     """Newest first: [{date, event, price, change, change_pct}] - event is one of "Listed for sale",
-    "Price reduced", "Price increased", "Price changed", "Under contract", "Sold", "Taken off market",
-    "Coming soon". Prices the MLS doesn't give are None (never guessed)."""
+    "Coming soon", "Price reduced", "Price increased", "Price changed", "Pending", "Under contract",
+    "Back on market", "Temporarily off market", "Sold", "Taken off market" (or a rental's "Listed
+    for rent" / "Rented"). Prices the MLS doesn't give are None (never guessed).
+
+    Status lines come from the sync's own log (property_price_events, from Oct 15 2026 on). Bright
+    only sends a listing's current state, and our license doesn't include its prior / original
+    price, so changes before we started logging can't be shown."""
     subject = (await db.execute(select(Property).where(Property.listing_key == str(listing_key)))).scalar_one_or_none()
     if not subject:
         return []
@@ -135,13 +186,17 @@ async def get_history(db: AsyncSession, listing_key: str) -> list[dict]:
         contract = _iso(raw.get("PurchaseContractDate"))
         if contract:
             events.append({"date": contract, "event": "Under contract", "price": p.price})
+        logged_off = False
+        for e in _status_lines(mine, contract):
+            events.append(e)
+            logged_off = logged_off or e["event"] == "Taken off market"
         if status.startswith("CLOSED"):
             # The sold date/price ride on Bright's closed-status records; older rows can lack them -
             # then the day it closed in the MLS and no price (never the old asking price as "sold").
             close_date = _iso(raw.get("CloseDate")) or _iso(raw.get("StatusChangeTimestamp")) or _iso(p.modification_timestamp)
             if close_date:
                 events.append({"date": close_date, "event": "Rented" if rental else "Sold", "price": _num(raw.get("ClosePrice")), "rental": rental})
-        if status in _OFF_STATUSES:
+        if status in _OFF_STATUSES and not logged_off:
             # OhpOffMarketTimestamp: when Bright removed the listing (set by the sync's deletions step,
             # 10/21) - the last-modified date it fell back to before can be weeks earlier.
             off = (_iso(raw.get("OhpOffMarketTimestamp")) or _iso(raw.get("OffMarketDate"))

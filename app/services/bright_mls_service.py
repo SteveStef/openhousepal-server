@@ -32,6 +32,9 @@ class BrightMlsService:
     def __init__(self):
         # Flipped off the first time Bright rejects OpenHouseKey in a $select (see _get_open_houses).
         self._open_house_key_supported = True
+        # Listings whose media fetch failed or came back partial (get_media_for_properties) - the
+        # photo refill moves them into its stored queue and fetches them again.
+        self.media_retry_keys: set = set()
         # Configuration
         self.client_id = os.getenv("BRIGHT_MLS_CLIENT")
         self.client_secret = os.getenv("BRIGHT_MLS_SECRET")
@@ -259,6 +262,26 @@ class BrightMlsService:
             out += data.get("value", [])
         return out
 
+    async def get_photo_counts(self, listing_keys: List[str], chunk: int = 100) -> Dict[str, Dict[str, Any]]:
+        """{ListingKey: {"total": TotalPhotos, "hide_off_market": bool, "status": MlsStatus}} for
+        the photo refill - a three-field read, much lighter than the full record. A key Bright no
+        longer has is absent. Raises on a failed read."""
+        keys = [k for k in dict.fromkeys(str(k).strip() for k in listing_keys) if k.isdigit()]
+        out: Dict[str, Dict[str, Any]] = {}
+        for i in range(0, len(keys), chunk):
+            part = keys[i:i + chunk]
+            data = await self._make_request("BrightProperties", params={
+                "$filter": f"ListingKey in ({','.join(part)})",
+                "$top": len(part),
+                "$select": "ListingKey,MlsStatus,TotalPhotos,AutomaticallyHideMediaOffMarketYN",
+            })
+            for r in data.get("value", []):
+                out[str(r.get("ListingKey"))] = {
+                    "total": r.get("TotalPhotos"), "status": r.get("MlsStatus"),
+                    "hide_off_market": r.get("AutomaticallyHideMediaOffMarketYN") is True,
+                }
+        return out
+
     async def get_listings_for_tax_id(self, tax_id: str) -> List[Dict[str, Any]]:
         """Every listing Bright has for one parcel (any status, back to 2012) - the price history
         backfill. One parcel per query: Bright rejects OR-ing several parcels ("Query Too Complex")."""
@@ -460,9 +483,11 @@ class BrightMlsService:
         if not listing_keys: return {}
         photo_map: Dict[str, List[str]] = {}
         seen: Dict[str, set] = {}
-        chunk_size = 50
+        # 25 listings x up to ~100 photos = 2,500 rows -> 13 pages, far under the 40-page cap. The
+        # old cap (15 pages for 50 listings) silently cut the last listings' galleries short (10/21).
+        chunk_size = 25
         page_size = 200
-        max_pages_per_chunk = 15  # 50 listings x up to ~60 photos = 3000 rows -> 15 pages
+        max_pages_per_chunk = 40
         for i in range(0, len(listing_keys), chunk_size):
             chunk = listing_keys[i:i + chunk_size]
             base_params = {
@@ -473,13 +498,19 @@ class BrightMlsService:
                 "$orderby": "ResourceRecordKey asc,MediaDisplayOrder asc",
                 "$top": page_size,
             }
+            complete = False
             for page in range(max_pages_per_chunk):
                 params = {**base_params, "$skip": page * page_size}
                 try:
                     data = await self._make_request("BrightMedia", params=params)
-                except Exception as e:
-                    logger.warning(f"Failed to fetch media chunk (page {page}): {e}")
-                    break
+                except Exception:
+                    # One more try, then give up on this chunk - never a half-fetched gallery.
+                    await asyncio.sleep(2)
+                    try:
+                        data = await self._make_request("BrightMedia", params=params)
+                    except Exception as e:
+                        logger.warning(f"Media fetch failed for {len(chunk)} listings (page {page}) - their stored photos are kept and they are queued for a retry: {e}")
+                        break
                 rows = data.get("value", [])
                 for m in rows:
                     key = str(m["ResourceRecordKey"])
@@ -493,7 +524,17 @@ class BrightMlsService:
                     seen_for_key.add(photo_url)
                     bucket.append(photo_url)
                 if len(rows) < page_size:
+                    complete = True
                     break
+            if not complete:
+                # A failed page or the page cap: this chunk's galleries may be partial. Its listings are
+                # left out of the map (so _sync_single_property keeps what we have) and queued for the
+                # photo refill to fetch again (bright_data_pulls_service.photo_refill).
+                if page == max_pages_per_chunk - 1:
+                    logger.warning(f"Media for {len(chunk)} listings ran past {max_pages_per_chunk} pages - queued for a retry")
+                for key in chunk:
+                    photo_map.pop(str(key), None)
+                    self.media_retry_keys.add(str(key))
         return photo_map
 
     @staticmethod

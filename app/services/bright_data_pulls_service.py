@@ -18,6 +18,14 @@ remembering where it stopped (system_settings), until done:
                    up on the next tick (Bright audit, 10/15). New sales after that arrive through
                    the 5-minute sync's closed-listings step.
 
+Three repairs keep running for good (10/21):
+
+  recheck_off_market  weekly: every OFF_MARKET-BRIGHT listing Bright still has comes back.
+  stale_recheck       daily: every on-market listing Bright hasn't modified in 14 days is re-read
+                      by key; one Bright no longer has goes off-market (its removal notice was lost).
+  photo_refill        listings holding fewer photos than Bright's TotalPhotos get their gallery
+                      again (after sold_3y finishes), plus any media fetch that failed anywhere.
+
 Switched on by BRIGHT_DATA_PULLS (comma list, or "all"); PRICE_HISTORY_BACKFILL=true also turns on
 price_history. Nothing here sends alerts or touches Showcases - it only fills the mirror.
 """
@@ -26,7 +34,7 @@ import json
 import logging
 import os
 import time
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 
 from sqlalchemy import text
@@ -34,7 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
-PULLS = ("sold_3y", "refresh_current", "price_history", "agent_sales", "recheck_off_market")
+PULLS = ("sold_3y", "refresh_current", "price_history", "agent_sales", "recheck_off_market", "stale_recheck", "photo_refill")
 _CURRENT = ("ACTIVE-BRIGHT", "COMING SOON-BRIGHT", "PENDING-BRIGHT", "ACTIVE UNDER CONTRACT-BRIGHT")
 PAGE = 200
 
@@ -49,6 +57,9 @@ def enabled(name: str) -> bool:
     # The off-market repair rides the same switch: wherever sales are pulled, falsely deleted
     # listings get re-checked once (10/20) - no new production setting needed.
     if name == "recheck_off_market" and "sold_3y" in raw:
+        return True
+    # Same switch for the daily stale recheck and the photo refill (10/21) - production only.
+    if name in ("stale_recheck", "photo_refill") and "sold_3y" in raw:
         return True
     return "all" in raw or name in raw
 
@@ -206,13 +217,19 @@ async def recheck_off_market(db: AsyncSession, max_keys: int = 3000, pause: floa
 
     Repairs the false deletions applied before _sync_deletions started confirming with Bright
     (10/20): Bright's Deletion feed also reports listings that are still live, and those homes had
-    vanished from Showcases, IDX and CMA comps. No alerts are sent - it only fixes the mirror."""
+    vanished from Showcases, IDX and CMA comps. No alerts are sent - it only fixes the mirror.
+
+    Weekly since 10/21: a week after a pass finishes, the next one starts from the first key."""
     from app.services.bright_mls_service import bright_mls_service
     from app.services.property_sync_service import PropertySyncService
     key = "data_pull_recheck_off_market"
     st = await _get(db, key)
     if st.get("done"):
-        return {"done": True}
+        finished = date.fromisoformat(st["finished"]) if st.get("finished") else date.today()
+        if date.today() - finished < timedelta(days=7):
+            return {"done": True, "next_pass": (finished + timedelta(days=7)).isoformat()}
+        st = {"pass_started": date.today().isoformat(), "last_pass_finished": finished.isoformat()}
+        await _set(db, key, st)
     keys = list((await db.execute(text(
         "SELECT listing_key FROM properties WHERE home_status = 'OFF_MARKET-BRIGHT' AND listing_key > :after "
         "ORDER BY listing_key LIMIT :n"), {"after": st.get("after_key") or "", "n": max_keys})).scalars())
@@ -233,18 +250,179 @@ async def recheck_off_market(db: AsyncSession, max_keys: int = 3000, pause: floa
             except Exception:  # noqa: BLE001 - one bad record never stops the pass
                 await db.rollback()
                 logger.warning("recheck_off_market: listing failed", exc_info=True)
-        st = {"after_key": part[-1], "checked": int(st.get("checked") or 0) + len(part),
+        st = {**st, "after_key": part[-1], "checked": int(st.get("checked") or 0) + len(part),
               "restored": int(st.get("restored") or 0) + len(found)}
         await _set(db, key, st)
         await asyncio.sleep(pause)
     return {"done": False, **st}
 
 
+async def stale_recheck(db: AsyncSession, stale_days: int = 14, time_budget: float = 300, pause: float = 0.5) -> dict:
+    """Once a day, every on-market listing Bright hasn't modified in `stale_days` is read again by
+    key, 100 per request, a few minutes per tick until the day's pass is done:
+      - Bright still has it: re-read (a missed status change - Pending -> Sold - lands, with its event)
+      - Bright doesn't: marked off-market with a "Taken off market" event dated today (we only know
+        its removal notice was lost, not when it was sent)
+    Fixes homes stuck as Pending / Under Contract after a lost removal notice (~5,000 unmodified for
+    45+ days on 10/21). No photos are fetched - stored galleries are kept. No alerts are sent."""
+    from app.services.bright_mls_service import bright_mls_service
+    from app.services.property_sync_service import PropertySyncService
+    key = "data_pull_stale_recheck"
+    today = date.today().isoformat()
+    st = await _get(db, key)
+    if st.get("day") != today:
+        st = {"day": today, "after_key": "", "checked": 0, "updated": 0, "off_market": 0,
+              "last_pass": {k: st.get(k) for k in ("day", "checked", "updated", "off_market", "done") if k in st} or None}
+    if st.get("done"):
+        return st
+    syncer = PropertySyncService()
+    deadline = time.monotonic() + time_budget
+    while time.monotonic() < deadline:
+        rows = (await db.execute(text(
+            "SELECT listing_key FROM properties WHERE home_status = ANY(:current) "
+            "AND (modification_timestamp IS NULL OR modification_timestamp < now() - make_interval(days => :days)) "
+            "AND coalesce(is_manual, false) = false AND listing_key ~ '^[0-9]+$' AND listing_key > :after "
+            "ORDER BY listing_key LIMIT 100"),
+            {"current": list(_CURRENT), "days": stale_days, "after": st["after_key"]})).scalars().all()
+        if not rows:
+            st["done"] = True
+            break
+        # Raises if Bright can't be asked - nothing is marked, the tick is retried (never "couldn't ask" = "gone").
+        found = await bright_mls_service.get_listings_by_keys(rows)
+        found_keys = {str(r.get("ListingKey")) for r in found}
+        for raw in found:
+            try:
+                await syncer._sync_single_property(db, raw, {}, allow_inactive_insert=False)
+            except Exception:  # noqa: BLE001 - one bad record never stops the pass
+                await db.rollback()
+                logger.warning("stale_recheck: listing failed", exc_info=True)
+        missing = [k for k in rows if k not in found_keys]
+        off = await syncer.mark_off_market(db, {k: None for k in missing}) if missing else 0
+        st.update(after_key=rows[-1], checked=st["checked"] + len(rows), updated=st["updated"] + len(found_keys),
+                  off_market=st["off_market"] + off)
+        await _set(db, key, st)
+        await asyncio.sleep(pause)
+    await _set(db, key, st)
+    return st
+
+
+PHOTO_QUEUE_KEY = "photo_retry_queue"
+
+
+async def _queue_photo_retries(db: AsyncSession, keys) -> None:
+    """Adds listing keys to the stored photo retry queue (atomic - several jobs may add at once)."""
+    keys = sorted({str(k) for k in keys})
+    if not keys:
+        return
+    await db.execute(text(
+        "INSERT INTO system_settings (key, value) VALUES (:k, jsonb_build_object('keys', CAST(:new AS jsonb))) "
+        "ON CONFLICT (key) DO UPDATE SET updated_at = now(), value = jsonb_build_object('keys', ("
+        "  SELECT coalesce(jsonb_agg(DISTINCT x), '[]'::jsonb) FROM jsonb_array_elements_text("
+        "    coalesce(system_settings.value->'keys', '[]'::jsonb) || CAST(:new AS jsonb)) AS x))"),
+        {"k": PHOTO_QUEUE_KEY, "new": json.dumps(keys)})
+    await db.commit()
+
+
+async def _unqueue_photo_retries(db: AsyncSession, keys) -> None:
+    await db.execute(text(
+        "UPDATE system_settings SET updated_at = now(), value = jsonb_build_object('keys', ("
+        "  SELECT coalesce(jsonb_agg(x), '[]'::jsonb) FROM jsonb_array_elements_text(value->'keys') AS x"
+        "  WHERE NOT (x = ANY(:done)))) WHERE key = :k"), {"k": PHOTO_QUEUE_KEY, "done": [str(k) for k in keys]})
+    await db.commit()
+
+
+async def _refill_photos(db: AsyncSession, held: dict) -> dict:
+    """{listing key: photos we hold} -> fetches the gallery again where Bright has more photos
+    (TotalPhotos) than we hold and the seller didn't ask for them hidden once off market. Saves a
+    gallery only when it is longer than the stored one. Raises if Bright can't be asked."""
+    from app.models.database import PropertyFieldChange
+    from app.services.bright_mls_service import bright_mls_service
+    counts = await bright_mls_service.get_photo_counts(list(held))
+    todo = []
+    for k, n in held.items():
+        info = counts.get(k)
+        if not info or not isinstance(info.get("total"), int) or info["total"] <= n:
+            continue
+        on_market = str(info.get("status") or "") in _CURRENT
+        if info.get("hide_off_market") and not on_market:
+            continue
+        todo.append(k)
+    photos = await bright_mls_service.get_media_for_properties(todo) if todo else {}
+    filled = 0
+    for k in todo:
+        gallery = photos.get(k) or []
+        if len(gallery) <= held[k]:
+            continue
+        res = await db.execute(text(
+            "UPDATE properties SET photos = CAST(:p AS jsonb), img_src = coalesce(img_src, :first), updated_at = now() "
+            "WHERE listing_key = :k AND (CASE WHEN jsonb_typeof(photos) = 'array' THEN jsonb_array_length(photos) ELSE 0 END) < :n"),
+            {"p": json.dumps(gallery), "first": gallery[0], "k": k, "n": len(gallery)})
+        if res.rowcount:
+            db.add(PropertyFieldChange(listing_key=k, field="photos_count", old_value=str(held[k]), new_value=str(len(gallery))))
+            filled += 1
+    await db.commit()
+    return {"checked": len(held), "short": len(todo), "filled": filled}
+
+
+async def photo_refill(db: AsyncSession, max_photos: int = 5, time_budget: float = 480, pause: float = 0.5) -> dict:
+    """Galleries that came out short: older sales saved before the 10/11 media fix (a handful of
+    photos), history rows saved before 10/21 (one photo), and any listing whose media fetch failed
+    since (bright_mls_service.media_retry_keys -> the stored queue). Queued listings go first, any
+    time; the pass over every listing holding `max_photos` or fewer starts once sold_3y is done, so
+    the two never compete for Bright. One pass, remembering where it stopped."""
+    from app.services.bright_mls_service import bright_mls_service
+    key = "data_pull_photo_refill"
+    st = await _get(db, key)
+    deadline = time.monotonic() + time_budget
+    # 1. Failed media fetches from any job in this process, then the stored queue.
+    pending = set(bright_mls_service.media_retry_keys)
+    bright_mls_service.media_retry_keys.difference_update(pending)
+    await _queue_photo_retries(db, pending)
+    queued = [str(k) for k in ((await _get(db, PHOTO_QUEUE_KEY)).get("keys") or [])][:500]
+    retried = 0
+    for i in range(0, len(queued), 100):
+        if time.monotonic() >= deadline:
+            break
+        part = queued[i:i + 100]
+        held = {r.listing_key: int(r.n) for r in (await db.execute(text(
+            "SELECT listing_key, CASE WHEN jsonb_typeof(photos) = 'array' THEN jsonb_array_length(photos) ELSE 0 END AS n "
+            "FROM properties WHERE listing_key = ANY(:keys)"), {"keys": part})).all()}
+        if held:
+            retried += (await _refill_photos(db, held))["filled"]
+        await _unqueue_photo_retries(db, part)
+    if retried:
+        st = {**st, "queue_filled_total": int(st.get("queue_filled_total") or 0) + retried}
+        await _set(db, key, st)
+    # 2. The pass over short galleries - after the sales backfill.
+    if st.get("done"):
+        return {**st, "queue_filled": retried}
+    if not (await _get(db, "data_pull_sold_3y")).get("done"):
+        return {"waiting_for": "sold_3y", "queue_filled": retried}
+    while time.monotonic() < deadline:
+        rows = (await db.execute(text(
+            "SELECT listing_key, CASE WHEN jsonb_typeof(photos) = 'array' THEN jsonb_array_length(photos) ELSE 0 END AS n "
+            "FROM properties WHERE listing_key > :after AND listing_key ~ '^[0-9]+$' AND coalesce(is_manual, false) = false "
+            "AND (CASE WHEN jsonb_typeof(photos) = 'array' THEN jsonb_array_length(photos) ELSE 0 END) <= :m "
+            "ORDER BY listing_key LIMIT 100"), {"after": st.get("after_key") or "", "m": max_photos})).all()
+        if not rows:
+            st = {**st, "done": True, "finished": date.today().isoformat()}
+            await _set(db, key, st)
+            break
+        res = await _refill_photos(db, {r.listing_key: int(r.n) for r in rows})
+        st = {**st, "after_key": rows[-1].listing_key, "checked": int(st.get("checked") or 0) + res["checked"],
+              "short": int(st.get("short") or 0) + res["short"], "filled": int(st.get("filled") or 0) + res["filled"]}
+        await _set(db, key, st)
+        await asyncio.sleep(pause)
+    return {**st, "queue_filled": retried}
+
+
 # price_history runs as its own scheduler job: one batch of 300 parcels takes ~2 hours, and while it
 # shared the tick, sold_3y only got its 10 pages every ~2 hours instead of every 10 minutes (10/20).
-SALES_PULLS = ("refresh_current", "sold_3y", "agent_sales")
+# photo_refill rides the sales job: while sold_3y runs it only retries the (short) queue of failed
+# media fetches; once sold_3y is done the job's whole 8 minutes go to the photo pass.
+SALES_PULLS = ("refresh_current", "sold_3y", "agent_sales", "photo_refill")
 HISTORY_PULLS = ("price_history",)
-REPAIR_PULLS = ("recheck_off_market",)
+REPAIR_PULLS = ("recheck_off_market", "stale_recheck")
 
 
 async def run_enabled(db: AsyncSession, names: tuple = PULLS) -> dict:
@@ -257,7 +435,9 @@ async def run_enabled(db: AsyncSession, names: tuple = PULLS) -> dict:
                       ("sold_3y", lambda: pull_sold_3y(db, max_pages=60, time_budget=480)),
                       ("price_history", lambda: backfill_batch(db, max_parcels=2000, time_budget=480)),
                       ("agent_sales", lambda: pull_agent_sales(db)),
-                      ("recheck_off_market", lambda: recheck_off_market(db))):
+                      ("photo_refill", lambda: photo_refill(db, time_budget=480)),
+                      ("recheck_off_market", lambda: recheck_off_market(db)),
+                      ("stale_recheck", lambda: stale_recheck(db, time_budget=300))):
         if name not in names or not enabled(name):
             continue
         try:
@@ -283,4 +463,7 @@ async def status(db: AsyncSession) -> dict:
         "price_history": {"parcels_done": parcels_done},
         "agent_sales": {k: v for k, v in (await _get(db, "data_pull_agent_sales")).items() if k != "done_ids"},
         "recheck_off_market": await _get(db, "data_pull_recheck_off_market"),
+        "stale_recheck": await _get(db, "data_pull_stale_recheck"),
+        "photo_refill": {**await _get(db, "data_pull_photo_refill"),
+                         "queued": len((await _get(db, PHOTO_QUEUE_KEY)).get("keys") or [])},
     }

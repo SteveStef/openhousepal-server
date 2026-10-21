@@ -33,6 +33,84 @@ logger = get_logger(__name__)
 _STICKY_SOLD_KEYS = ("ClosePrice", "CloseDate", "BuyerAgentMlsId", "CoBuyerAgentMlsId", "BuyerAgentFullName",
                      "CoBuyerAgentFullName", "BuyerOfficeName", "BuyerOfficeMlsId", "PurchaseContractDate")
 
+# Field change log (property_field_changes): mapped columns left out - the raw copy itself, values that
+# move on every read (day counts, read times, Bright's own modified time) and the primary photo URL
+# (the gallery is logged as its photo count instead).
+_FIELD_LOG_SKIP = {"raw_mls_data", "dom_read_at", "updated_at", "modification_timestamp", "days_on_market",
+                   "cumulative_days_on_market", "img_src", "photos"}
+# Bright fields with no column of their own that are still worth a history.
+_FIELD_LOG_RAW = ("ClosePrice", "CloseDate", "PurchaseContractDate", "OnMarketDate", "OffMarketDate",
+                  "ExpectedOnMarketDate", "TotalPhotos", "AutomaticallyHideMediaOffMarketYN",
+                  "InternetEntireListingDisplayYN", "InternetAddressDisplayYN")
+_FIELD_LOG_MAX = 500  # characters kept of one value
+_FIELD_LOG_MAX_ROWS = 40  # fields logged for one listing in one read
+
+
+def _int_or_none(v) -> Optional[int]:
+    try:
+        return int(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _field_text(v) -> Optional[str]:
+    """One value as comparable text: the DB's copy and Bright's new copy of the same value come out
+    identical (float vs int, datetime vs string, list order), so only real changes are logged."""
+    import enum
+    import json
+    if isinstance(v, enum.Enum):  # HomeType is a str enum - compare its value, not "HomeType.CONDO"
+        v = v.value
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        f = float(v)
+        return str(int(f)) if f.is_integer() else str(round(f, 6))
+    if isinstance(v, datetime):
+        return (v if v.tzinfo else v.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).isoformat(timespec="seconds")
+    if isinstance(v, date):
+        return v.isoformat()
+    if isinstance(v, (list, dict)):
+        if not v:
+            return None
+        return json.dumps(v, sort_keys=True, default=str)[:_FIELD_LOG_MAX]
+    s = str(v).strip()
+    if s.endswith("Z") and len(s) >= 19 and s[4:5] == "-" and s[10:11] == "T":  # a Bright timestamp string
+        parsed = parse_dt(s)
+        if parsed:
+            return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+    return s[:_FIELD_LOG_MAX] or None
+
+
+def _log_field_changes(db, l_key: str, existing, mapped: Dict[str, Any]) -> int:
+    """Adds one property_field_changes row per field this read changes (old -> new). Called before
+    the new values are applied. Returns how many were logged."""
+    from app.models.database import PropertyFieldChange
+    changes: list[tuple[str, Optional[str], Optional[str]]] = []
+    for key, value in mapped.items():
+        if key in _FIELD_LOG_SKIP or not hasattr(existing, key):
+            continue
+        old, new = _field_text(getattr(existing, key)), _field_text(value)
+        if old != new:
+            changes.append((key, old, new))
+    old_photos = len(existing.photos) if isinstance(existing.photos, list) else 0
+    new_photos = len(mapped.get("photos") or []) if isinstance(mapped.get("photos"), list) else 0
+    if "photos" in mapped and old_photos != new_photos:
+        changes.append(("photos_count", str(old_photos), str(new_photos)))
+    old_raw = existing.raw_mls_data if isinstance(existing.raw_mls_data, dict) else {}
+    new_raw = mapped.get("raw_mls_data") if isinstance(mapped.get("raw_mls_data"), dict) else None
+    if new_raw is not None:
+        for key in _FIELD_LOG_RAW:
+            if key not in old_raw:  # not asked for back then (TotalPhotos before 10/21) - not a change
+                continue
+            old, new = _field_text(old_raw.get(key)), _field_text(new_raw.get(key))
+            if old != new:
+                changes.append((f"raw.{key}", old, new))
+    for field, old, new in changes[:_FIELD_LOG_MAX_ROWS]:
+        db.add(PropertyFieldChange(listing_key=l_key, field=field, old_value=old, new_value=new))
+    return len(changes[:_FIELD_LOG_MAX_ROWS])
+
 class PropertySyncService:
     """
     Global Synchronization Service.
@@ -561,37 +639,49 @@ class PropertySyncService:
 
         logger.warning(f"Applying {len(valid_deletion_keys)} verified hard deletions. Marking as off-market.")
 
-        # Each home is kept with all its data - only its status changes. Going off-market is logged
-        # in the price history (it never was before 10/21), dated when Bright removed it, and that
-        # date is kept on the row (raw_mls_data.OhpOffMarketTimestamp - Bright has no off-market
-        # date field we can read) so the history never shows the stale last-modified date instead.
-        from app.models.database import PropertyPriceEvent
         deleted_at = {d["key"]: d["timestamp"] for d in deletions}
-        batch_size = 500
-        for i in range(0, len(valid_deletion_keys), batch_size):
-            batch = valid_deletion_keys[i : i + batch_size]
+        stats["deletions"] += await self.mark_off_market(db, {k: deleted_at.get(k) for k in valid_deletion_keys})
+        await self.update_last_sync_time(db, done_through, key=self.DELETION_SYNC_KEY)
+        logger.info(f"Successfully processed {stats['deletions']} hard deletions.")
+
+    async def mark_off_market(self, db: AsyncSession, removed_at: Dict[str, Optional[str]]) -> int:
+        """Marks listings Bright no longer has as OFF_MARKET-BRIGHT ({listing key: when Bright
+        removed it, or None = now}) and commits. Returns how many changed (keys we don't hold, or
+        already off-market, are left alone).
+
+        Each home is kept with all its data - only its status changes. Going off-market is logged in
+        the price history (it never was before 10/21) and the field change log, dated when Bright
+        removed it, and that date is kept on the row (raw_mls_data.OhpOffMarketTimestamp - Bright has
+        no off-market date field we can read) so the history never shows the stale last-modified date."""
+        from app.models.database import PropertyFieldChange, PropertyPriceEvent
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        keys = list(removed_at)
+        changed = 0
+        for i in range(0, len(keys), 500):
+            batch = keys[i : i + 500]
             current = (await db.execute(
                 select(Property.listing_key, Property.home_status, Property.price)
                 .where(Property.listing_key.in_(batch), Property.home_status != 'OFF_MARKET-BRIGHT')
             )).all()
             if not current:
                 continue
+            when = {r.listing_key: removed_at.get(r.listing_key) or now_iso for r in current}
             await db.execute(text(
                 "UPDATE properties SET home_status = 'OFF_MARKET-BRIGHT', updated_at = now(), "
                 "raw_mls_data = (CASE WHEN jsonb_typeof(raw_mls_data) = 'object' THEN raw_mls_data ELSE '{}'::jsonb END) "
                 "|| jsonb_build_object('OhpOffMarketTimestamp', CAST(:ts AS text)) "
                 "WHERE listing_key = :k AND home_status <> 'OFF_MARKET-BRIGHT'"),
-                [{"k": r.listing_key, "ts": deleted_at.get(r.listing_key)} for r in current])
+                [{"k": r.listing_key, "ts": when[r.listing_key]} for r in current])
             for r in current:
+                observed = parse_dt(when[r.listing_key]) or datetime.now(timezone.utc)
                 db.add(PropertyPriceEvent(
                     listing_key=r.listing_key, kind="status", price=r.price, previous_price=r.price,
-                    status="OFF_MARKET-BRIGHT", previous_status=r.home_status,
-                    observed_at=parse_dt(deleted_at.get(r.listing_key)) or datetime.now(timezone.utc)))
-            stats["deletions"] += len(current)
-
+                    status="OFF_MARKET-BRIGHT", previous_status=r.home_status, observed_at=observed))
+                db.add(PropertyFieldChange(listing_key=r.listing_key, field="home_status", old_value=r.home_status,
+                                           new_value="OFF_MARKET-BRIGHT", observed_at=observed))
+            changed += len(current)
         await db.commit()
-        await self.update_last_sync_time(db, done_through, key=self.DELETION_SYNC_KEY)
-        logger.info(f"Successfully processed {stats['deletions']} hard deletions.")
+        return changed
 
     async def _sync_single_property(self, db: AsyncSession, raw_data: Dict[str, Any], photo_map: Dict[str, List[str]], allow_inactive_insert: bool = False) -> Optional[Dict[str, Any]]:
         """
@@ -697,21 +787,28 @@ class PropertySyncService:
 
             # Price history log: Bright only ever sends a listing's latest change, so every change
             # we see is kept here (property_price_events) - never allowed to break the sync.
+            # A price and a status change seen together (a cut on the day it goes pending) are two
+            # events - only the price used to be logged (10/21).
             try:
                 from app.models.database import PropertyPriceEvent
                 if existing.price and mapped.get("price") and mapped["price"] != existing.price:
                     db.add(PropertyPriceEvent(listing_key=l_key, kind="price", price=mapped["price"], previous_price=existing.price,
                                               status=mapped.get("home_status"), previous_status=existing.home_status))
-                elif mapped.get("home_status") and existing.home_status and mapped["home_status"] != existing.home_status:
+                if mapped.get("home_status") and existing.home_status and mapped["home_status"] != existing.home_status:
                     db.add(PropertyPriceEvent(listing_key=l_key, kind="status", price=mapped.get("price"), previous_price=existing.price,
                                               status=mapped["home_status"], previous_status=existing.home_status))
             except Exception:  # noqa: BLE001
                 logger.warning("price history event not recorded", exc_info=True)
 
             # A refresh that didn't fetch this listing's media (backfills, history pulls) only has the
-            # one primary photo - never let it shrink a full gallery we already have.
-            if (not photo_map or l_key not in photo_map) and isinstance(existing.photos, list) \
-                    and len(existing.photos) > len(mapped.get("photos") or []):
+            # one primary photo, and a failed or partial media fetch is short too - never let either
+            # shrink a fuller gallery we already have. A shorter gallery is taken only when it was
+            # fetched and holds every photo Bright says the listing has (TotalPhotos) - the agent
+            # really removed some.
+            new_photos = mapped.get("photos") or []
+            fetched_whole = bool(photo_map) and l_key in photo_map and _int_or_none(raw_data.get("TotalPhotos")) is not None \
+                and len(new_photos) >= _int_or_none(raw_data.get("TotalPhotos"))
+            if isinstance(existing.photos, list) and len(existing.photos) > len(new_photos) and not fetched_whole:
                 mapped["photos"] = existing.photos
 
             # raw_mls_data is replaced whole - but Bright only fills ClosePrice / CloseDate (and some
@@ -724,6 +821,12 @@ class PropertySyncService:
                 for k in _STICKY_SOLD_KEYS:
                     if new_raw.get(k) in (None, "") and old_raw.get(k) not in (None, ""):
                         new_raw[k] = old_raw[k]
+
+            # Every field this read changes, old -> new (property_field_changes, 10/21).
+            try:
+                _log_field_changes(db, l_key, existing, mapped)
+            except Exception:  # noqa: BLE001 - the change log never breaks the sync
+                logger.warning("field change log not recorded", exc_info=True)
 
             # Update all columns
             for key, value in mapped.items():
@@ -754,6 +857,11 @@ class PropertySyncService:
                 from app.models.database import PropertyPriceEvent
                 if is_active:  # a historical listing pulled in by the backfill isn't "listed today"
                     db.add(PropertyPriceEvent(listing_key=l_key, kind="listed", price=mapped.get("price"), status=mapped.get("home_status")))
+                elif under_contract:
+                    # First seen already under contract (10/21: these left no trace) - dated when Bright
+                    # says the status changed, else today.
+                    db.add(PropertyPriceEvent(listing_key=l_key, kind="status", price=mapped.get("price"), status=mapped.get("home_status"),
+                                              observed_at=parse_dt(raw_data.get("StatusChangeTimestamp")) or datetime.now(timezone.utc)))
             except Exception:  # noqa: BLE001
                 logger.warning("price history event not recorded", exc_info=True)
             logger.debug(f"Added NEW property: {l_key} | {mapped['street_address']} | Status: {mapped['home_status']}")

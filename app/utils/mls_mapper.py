@@ -67,6 +67,11 @@ BRIGHT_PROPERTY_SELECT_FIELDS = [
     # in our feed's $metadata.
     "InternetEntireListingDisplayYN", "InternetAddressDisplayYN",
     "InternetAutomatedValuationDisplayYN", "InternetConsumerCommentYN",
+    # How many photos the listing has and when they last changed - a gallery fetched shorter than
+    # TotalPhotos is partial and never replaces a fuller stored one; the photo refill compares
+    # them. AutomaticallyHideMediaOffMarketYN: the seller asked for photos hidden once off market.
+    # All three accepted by our feed (checked 10/21).
+    "TotalPhotos", "PhotosChangeTimestamp", "AutomaticallyHideMediaOffMarketYN",
 ]
 
 def clean_address(address: str) -> str:

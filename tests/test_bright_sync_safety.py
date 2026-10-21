@@ -121,7 +121,8 @@ def test_still_listed_deletions_are_kept(monkeypatch):
     assert stats["false_deletions_kept"] == 2
     assert stats["deletions"] == 1
     # Going off-market is logged, dated when Bright removed it, and the checkpoint moves on.
-    (ev,) = db.added
+    from app.models.database import PropertyPriceEvent
+    (ev,) = [a for a in db.added if isinstance(a, PropertyPriceEvent)]
     assert (ev.listing_key, ev.kind, ev.previous_status, ev.status) == ("222", "status", "ACTIVE-BRIGHT", "OFF_MARKET-BRIGHT")
     assert ev.observed_at == datetime(2026, 10, 20, 13, 40, tzinfo=timezone.utc)
     assert db.checkpoint == "2026-10-20T13:40:00Z"
