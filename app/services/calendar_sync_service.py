@@ -170,7 +170,9 @@ def _local(dt: datetime) -> dict:
 
 
 # Done events' title prefix - plain letters, small beside the bold to-dos.
-DONE_PREFIX = "DONE · "
+# "✓" (U+2713, a text check mark - not the ✅ emoji, which made iPhone Calendar draw the done
+# title in a bigger font, 10/19). The user missed the check on done follow-ups (10/22).
+DONE_PREFIX = "✓ DONE · "
 
 
 def _bold(text: str) -> str:
