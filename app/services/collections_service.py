@@ -1881,53 +1881,13 @@ class CollectionsService:
             except Exception as e:
                 logger.error(f"Failed to remove the deleted Showcase's follow-ups: {e}")
 
-            # Get all property IDs in this collection
-            property_ids_in_collection = [prop.id for prop in collection.properties]
-
-            # Find properties that will become orphaned after this collection is deleted
-            orphaned_properties = []
-
-            if property_ids_in_collection:
-
-                for property_id in property_ids_in_collection:
-                    # Count how many other collections this property belongs to
-                    count_query = text("""
-                        SELECT COUNT(*)
-                        FROM collection_properties
-                        WHERE property_id = :property_id AND collection_id != :collection_id
-                    """)
-
-                    count_result = await db.execute(count_query, {
-                        "property_id": property_id,
-                        "collection_id": collection_id
-                    })
-                    other_collection_count = count_result.scalar()
-
-                    # If this property has no other collection associations, it will be orphaned
-                    if other_collection_count == 0:
-                        orphaned_properties.append(property_id)
-
-
-            # Delete the collection (this will cascade delete the collection_properties relationships)
+            # Delete the collection. Its collection_properties links, likes/views and comments go
+            # with it (ON DELETE CASCADE on collection_id). The homes themselves are never deleted:
+            # they are the shared MLS mirror (history, CMA comps, IDX, other Showcases later) - a
+            # home that was in no other Showcase used to be hard-deleted here (Bright audit, 10/21).
+            # An agent's own manual listing is removed only from the Open House Manager
+            # (open_house_manager_service.delete_manual_listing).
             await db.delete(collection)
-
-            # Clean up orphaned properties and their dependencies
-            if orphaned_properties:
-
-                # Delete PropertyInteractions for orphaned properties
-                interactions_result = await db.execute(
-                    delete(PropertyInteraction).where(PropertyInteraction.property_id.in_(orphaned_properties))
-                )
-
-                # Delete PropertyComments for orphaned properties
-                comments_result = await db.execute(
-                    delete(PropertyComment).where(PropertyComment.property_id.in_(orphaned_properties))
-                )
-
-                # Delete the orphaned properties themselves
-                properties_result = await db.execute(
-                    delete(Property).where(Property.id.in_(orphaned_properties))
-                )
 
             await db.commit()
 

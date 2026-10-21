@@ -48,6 +48,7 @@ class PropertySyncService:
         self.OPEN_HOUSE_RECONCILE_KEY = "last_open_house_reconcile_date"
         self.OPEN_HOUSE_RECONCILE_MAX_PAGES = 150
         self.CLOSED_SYNC_KEY = "last_closed_property_sync_time"
+        self.DELETION_SYNC_KEY = "last_deletion_sync_time"
 
     async def get_last_sync_time(self, db: AsyncSession, key: Optional[str] = None, fallback_hours: int = 24) -> str:
         """Retrieves the last successful sync timestamp from SystemSettings.
@@ -484,15 +485,30 @@ class PropertySyncService:
                 await db.rollback()
         return ok
 
+    async def _deletion_checkpoint(self, db: AsyncSession, last_sync: str) -> str:
+        """Where the deletions step starts. Its own checkpoint (10/21) - it used to read from the
+        modifications checkpoint, which moves every cycle, so a failed or partial deletion read was
+        lost for good. Before its first save it starts where the modifications checkpoint is."""
+        setting = (await db.execute(select(SystemSettings).where(SystemSettings.key == self.DELETION_SYNC_KEY))).scalar_one_or_none()
+        if setting and isinstance(setting.value, dict) and setting.value.get("timestamp"):
+            return setting.value["timestamp"]
+        return last_sync
+
     async def _sync_deletions(self, db: AsyncSession, last_sync: str, stats: Dict[str, Any]):
-        """Helper to process hard-deleted properties from MLS."""
+        """Helper to process hard-deleted properties from MLS.
+
+        The deletions checkpoint only moves once the whole window was read, confirmed with Bright
+        and applied - any failure raises or returns before that, and the next cycle re-reads it."""
         logger.info("Checking for hard deletions...")
-        deletions = await bright_mls_service.get_recent_deletions(last_sync)
+        since = await self._deletion_checkpoint(db, last_sync)
+        deletions = await bright_mls_service.get_recent_deletions(since)
 
         if not deletions:
             logger.info("No hard deletions found.")
             return
 
+        # Rows come oldest first, so the last row's time is how far this cycle got.
+        done_through = deletions[-1]["timestamp"]
         logger.info(f"Detected {len(deletions)} hard deletions. Validating timestamps...")
 
         valid_deletion_keys = []
@@ -514,6 +530,7 @@ class PropertySyncService:
 
         if not valid_deletion_keys:
             logger.info("All deletions were older than our local modifications. No updates needed.")
+            await self.update_last_sync_time(db, done_through, key=self.DELETION_SYNC_KEY)
             return
 
         # Bright's Deletion feed (CWA_BRIGHT_ALL) also reports listings that are still live in
@@ -539,26 +556,41 @@ class PropertySyncService:
         valid_deletion_keys = [k for k in valid_deletion_keys if k not in live_keys]
         stats["false_deletions_kept"] = len(live_keys)
         if not valid_deletion_keys:
+            await self.update_last_sync_time(db, done_through, key=self.DELETION_SYNC_KEY)
             return
 
         logger.warning(f"Applying {len(valid_deletion_keys)} verified hard deletions. Marking as off-market.")
 
-        # Batch update in database
+        # Each home is kept with all its data - only its status changes. Going off-market is logged
+        # in the price history (it never was before 10/21), dated when Bright removed it, and that
+        # date is kept on the row (raw_mls_data.OhpOffMarketTimestamp - Bright has no off-market
+        # date field we can read) so the history never shows the stale last-modified date instead.
+        from app.models.database import PropertyPriceEvent
+        deleted_at = {d["key"]: d["timestamp"] for d in deletions}
         batch_size = 500
         for i in range(0, len(valid_deletion_keys), batch_size):
             batch = valid_deletion_keys[i : i + batch_size]
-            stmt = (
-                update(Property)
-                .where(Property.listing_key.in_(batch))
-                .values(
-                    home_status='OFF_MARKET-BRIGHT',
-                    updated_at=datetime.now(timezone.utc)
-                )
-            )
-            result = await db.execute(stmt)
-            stats["deletions"] += result.rowcount
+            current = (await db.execute(
+                select(Property.listing_key, Property.home_status, Property.price)
+                .where(Property.listing_key.in_(batch), Property.home_status != 'OFF_MARKET-BRIGHT')
+            )).all()
+            if not current:
+                continue
+            await db.execute(text(
+                "UPDATE properties SET home_status = 'OFF_MARKET-BRIGHT', updated_at = now(), "
+                "raw_mls_data = (CASE WHEN jsonb_typeof(raw_mls_data) = 'object' THEN raw_mls_data ELSE '{}'::jsonb END) "
+                "|| jsonb_build_object('OhpOffMarketTimestamp', CAST(:ts AS text)) "
+                "WHERE listing_key = :k AND home_status <> 'OFF_MARKET-BRIGHT'"),
+                [{"k": r.listing_key, "ts": deleted_at.get(r.listing_key)} for r in current])
+            for r in current:
+                db.add(PropertyPriceEvent(
+                    listing_key=r.listing_key, kind="status", price=r.price, previous_price=r.price,
+                    status="OFF_MARKET-BRIGHT", previous_status=r.home_status,
+                    observed_at=parse_dt(deleted_at.get(r.listing_key)) or datetime.now(timezone.utc)))
+            stats["deletions"] += len(current)
 
         await db.commit()
+        await self.update_last_sync_time(db, done_through, key=self.DELETION_SYNC_KEY)
         logger.info(f"Successfully processed {stats['deletions']} hard deletions.")
 
     async def _sync_single_property(self, db: AsyncSession, raw_data: Dict[str, Any], photo_map: Dict[str, List[str]], allow_inactive_insert: bool = False) -> Optional[Dict[str, Any]]:

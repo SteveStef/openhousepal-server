@@ -32,34 +32,60 @@ class _Row:
     def __init__(self, listing_key, ts):
         self.listing_key = listing_key
         self.modification_timestamp = ts
+        self.home_status = "ACTIVE-BRIGHT"
+        self.price = 400000.0
 
 
 class _Result:
     rowcount = 0
 
+    def scalar_one_or_none(self):
+        return None
+
 
 class FakeDB:
-    """Answers the deletion step's one SELECT and records every UPDATE's target keys."""
+    """Answers the deletion step's SELECTs (only the keys asked for) and records every UPDATE's
+    target keys and every added row (price history events)."""
 
     def __init__(self, local):
         self.local = local
         self.updated_keys = []
+        self.added = []
+        self.checkpoint = None
 
-    async def execute(self, stmt):
+    async def execute(self, stmt, params=None):
         sql = str(stmt)
+        if "system_settings" in sql:
+            return _Result()
         if sql.lstrip().upper().startswith("SELECT"):
-            return _Rows([_Row(k, ts) for k, ts in self.local.items()])
-        flat = [k for v in stmt.compile().params.values() if isinstance(v, (list, tuple)) for k in v]
+            asked = {k for v in stmt.compile().params.values() if isinstance(v, (list, tuple)) for k in v}
+            return _Rows([_Row(k, ts) for k, ts in self.local.items() if k in asked])
+        if isinstance(params, list):
+            flat = [p["k"] for p in params]
+        else:
+            flat = [k for v in stmt.compile().params.values() if isinstance(v, (list, tuple)) for k in v]
         self.updated_keys += flat
         r = _Result()
         r.rowcount = len(flat)
         return r
+
+    def add(self, obj):
+        self.added.append(obj)
 
     async def commit(self):
         pass
 
     async def rollback(self):
         pass
+
+
+@pytest.fixture(autouse=True)
+def _record_checkpoint(monkeypatch):
+    async def fake_update(self, db, timestamp, key=None):
+        if key == self.DELETION_SYNC_KEY:
+            db.checkpoint = timestamp
+
+    monkeypatch.setattr(pss.PropertySyncService, "update_last_sync_time", fake_update)
 
 
 def _run(coro):
@@ -94,6 +120,11 @@ def test_still_listed_deletions_are_kept(monkeypatch):
     assert sorted(reread) == ["111", "333"]
     assert stats["false_deletions_kept"] == 2
     assert stats["deletions"] == 1
+    # Going off-market is logged, dated when Bright removed it, and the checkpoint moves on.
+    (ev,) = db.added
+    assert (ev.listing_key, ev.kind, ev.previous_status, ev.status) == ("222", "status", "ACTIVE-BRIGHT", "OFF_MARKET-BRIGHT")
+    assert ev.observed_at == datetime(2026, 10, 20, 13, 40, tzinfo=timezone.utc)
+    assert db.checkpoint == "2026-10-20T13:40:00Z"
 
 
 def test_no_deletions_applied_when_bright_cannot_confirm(monkeypatch):
@@ -114,6 +145,7 @@ def test_no_deletions_applied_when_bright_cannot_confirm(monkeypatch):
 
     assert db.updated_keys == []
     assert stats["errors"] == 1
+    assert db.checkpoint is None  # retried next cycle
 
 
 def test_lookup_by_keys_uses_in_and_chunks(monkeypatch):

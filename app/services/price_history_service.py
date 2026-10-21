@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -94,7 +95,7 @@ async def _sibling_listings(db: AsyncSession, subject: Property) -> list[Propert
 
 async def get_history(db: AsyncSession, listing_key: str) -> list[dict]:
     """Newest first: [{date, event, price, change, change_pct}] - event is one of "Listed for sale",
-    "Price reduced", "Price increased", "Price changed", "Under contract", "Sold", "Listing removed",
+    "Price reduced", "Price increased", "Price changed", "Under contract", "Sold", "Taken off market",
     "Coming soon". Prices the MLS doesn't give are None (never guessed)."""
     subject = (await db.execute(select(Property).where(Property.listing_key == str(listing_key)))).scalar_one_or_none()
     if not subject:
@@ -141,9 +142,12 @@ async def get_history(db: AsyncSession, listing_key: str) -> list[dict]:
             if close_date:
                 events.append({"date": close_date, "event": "Rented" if rental else "Sold", "price": _num(raw.get("ClosePrice")), "rental": rental})
         if status in _OFF_STATUSES:
-            off = _iso(raw.get("OffMarketDate")) or _iso(raw.get("StatusChangeTimestamp")) or _iso(p.modification_timestamp)
+            # OhpOffMarketTimestamp: when Bright removed the listing (set by the sync's deletions step,
+            # 10/21) - the last-modified date it fell back to before can be weeks earlier.
+            off = (_iso(raw.get("OhpOffMarketTimestamp")) or _iso(raw.get("OffMarketDate"))
+                   or _iso(raw.get("StatusChangeTimestamp")) or _iso(p.modification_timestamp))
             if off:
-                events.append({"date": off, "event": "Listing removed", "price": p.price})
+                events.append({"date": off, "event": "Taken off market", "price": p.price})
     seen, out = set(), []
     for ev in sorted(events, key=lambda x: (x["date"] or "", x["event"] != "Listed for sale"), reverse=True):
         k = (ev["date"], ev["event"], ev.get("price"))
@@ -159,11 +163,50 @@ def backfill_enabled() -> bool:
     return os.getenv("PRICE_HISTORY_BACKFILL", "").lower() == "true"
 
 
-async def backfill_batch(db: AsyncSession, max_parcels: int = 300, pause_seconds: float = 0.6) -> dict:
+async def _insert_parcel_listings(db: AsyncSession, syncer, found: dict[str, list]) -> int:
+    """Save one group's listings into the mirror; returns how many were new. Listings we don't hold
+    yet get their full photo gallery first - they used to be saved with only the primary photo
+    (10/21). Ones we already have are refreshed without a media fetch (their stored gallery is kept,
+    see _sync_single_property)."""
+    from app.services.bright_mls_service import bright_mls_service
+    by_key: dict[str, dict] = {}
+    for listings in found.values():
+        if len(listings) <= _MAX_LISTINGS_PER_PARCEL:
+            for raw in listings:
+                by_key.setdefault(str(raw.get("ListingKey")), raw)
+    if not by_key:
+        return 0
+    known = set((await db.execute(select(Property.listing_key).where(Property.listing_key.in_(list(by_key))))).scalars())
+    new_keys = [k for k in by_key if k not in known]
+    try:
+        photos = await bright_mls_service.get_media_for_properties(new_keys) if new_keys else {}
+    except Exception:  # noqa: BLE001 - saved without the gallery; the photo refill catches it later
+        logger.warning("price history backfill: media fetch failed", exc_info=True)
+        photos = {}
+    added = 0
+    for key, raw in by_key.items():
+        try:
+            # New listings are added; ones we already have are refreshed too - the same pass fills in
+            # the internet-display flags, Coming Soon dates and missing sold prices.
+            await syncer._sync_single_property(db, raw, photos, allow_inactive_insert=True)
+            if key not in known:
+                added += 1
+        except Exception:  # noqa: BLE001
+            await db.rollback()
+            logger.warning("price history backfill: listing insert failed", exc_info=True, extra={"listing_key": key})
+    return added
+
+
+async def backfill_batch(db: AsyncSession, max_parcels: int = 300, pause_seconds: float = 0.6,
+                         per_request: int = 100, time_budget: Optional[float] = None) -> dict:
     """Pull every 2012+ listing Bright has for up to `max_parcels` parcels that have a listing on
     the market now and haven't been pulled yet. Inserts them into the mirror (no client alerts, no
-    Showcase matching - history only), marks each parcel done. One Bright request per parcel with
-    a pause between, so it runs quietly in the background over a few days."""
+    Showcase matching - history only), marks each parcel done.
+
+    `per_request` parcels per Bright request (one parcel per request took ~24 s each - ~44 days for
+    the whole backlog; 100 at once take about the same time, 10/21). Stops starting new groups after
+    `time_budget` seconds so a batch ends inside its 10-minute slot; parcels not reached are simply
+    picked up by the next batch."""
     from app.services.bright_mls_service import bright_mls_service
     from app.services.property_sync_service import PropertySyncService
 
@@ -176,35 +219,44 @@ async def backfill_batch(db: AsyncSession, max_parcels: int = 300, pause_seconds
         LIMIT :n"""), {"current": list(_CURRENT_STATUSES), "n": max_parcels})).scalars().all()
     syncer = PropertySyncService()
     done = added = failed = 0
-    for tax_id in rows:
+    deadline = time.monotonic() + time_budget if time_budget else None
+    blips = 0
+    for i in range(0, len(rows), per_request):
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        group = list(rows[i:i + per_request])
         try:
-            listings = await bright_mls_service.get_listings_for_tax_id(tax_id)
-        except Exception as e:  # noqa: BLE001 - one parcel failing (Bright blip) never stops the batch
-            failed += 1
-            logger.warning("price history backfill: parcel lookup failed", extra={"tax_id": tax_id})
-            # Bright refusing the query itself (a 400) will refuse it every time - record the parcel
-            # as checked so it isn't retried at the front of every batch forever. A blip (5xx,
-            # timeout) is left for the next batch.
-            if "400" in str(getattr(e, "detail", e)):
-                db.add(PriceHistoryParcel(tax_id=tax_id, listings_found=None, checked_at=datetime.now(timezone.utc)))
-                await db.commit()
-            await asyncio.sleep(pause_seconds * 4)
-            continue
-        if len(listings) <= _MAX_LISTINGS_PER_PARCEL:
-            for raw in listings:
+            found = await bright_mls_service.get_listings_for_tax_ids(group, per_request=per_request)
+        except Exception as e:  # noqa: BLE001 - one group failing (Bright blip) never stops the batch
+            if "400" not in str(getattr(e, "detail", e)):
+                # A blip (5xx, timeout): the group is left for the next batch. Bright down -> stop.
+                failed += len(group)
+                blips += 1
+                logger.warning("price history backfill: group lookup failed", extra={"parcels": len(group)})
+                if blips >= 3:
+                    break
+                await asyncio.sleep(pause_seconds * 4)
+                continue
+            # Bright refusing the query (a 400) is one bad parcel id spoiling the group - ask one at a
+            # time, and record a refused parcel as checked so it isn't retried at the front of every
+            # batch forever.
+            found = {}
+            for tax_id in group:
                 try:
-                    # New listings are added; ones we already have are refreshed too - the same pass
-                    # fills in the internet-display flags, Coming Soon dates and missing sold prices.
-                    known = (await db.execute(select(Property.id).where(Property.listing_key == str(raw.get("ListingKey"))))).scalar()
-                    await syncer._sync_single_property(db, raw, {}, allow_inactive_insert=True)
-                    if not known:
-                        added += 1
-                except Exception:  # noqa: BLE001
-                    await db.rollback()
-                    logger.warning("price history backfill: listing insert failed", exc_info=True, extra={"tax_id": tax_id})
-        db.add(PriceHistoryParcel(tax_id=tax_id, listings_found=len(listings), checked_at=datetime.now(timezone.utc)))
+                    found[tax_id] = await bright_mls_service.get_listings_for_tax_id(tax_id)
+                except Exception as e1:  # noqa: BLE001
+                    failed += 1
+                    logger.warning("price history backfill: parcel lookup failed", extra={"tax_id": tax_id})
+                    if "400" in str(getattr(e1, "detail", e1)):
+                        db.add(PriceHistoryParcel(tax_id=tax_id, listings_found=None, checked_at=datetime.now(timezone.utc)))
+                        await db.commit()
+                await asyncio.sleep(pause_seconds)
+        added += await _insert_parcel_listings(db, syncer, found)
+        now = datetime.now(timezone.utc)
+        for tax_id, listings in found.items():
+            db.add(PriceHistoryParcel(tax_id=tax_id, listings_found=len(listings), checked_at=now))
         await db.commit()
-        done += 1
+        done += len(found)
         await asyncio.sleep(pause_seconds)
     result = {"parcels": done, "listings_added": added, "failed": failed, "remaining_in_batch": len(rows) - done - failed}
     logger.info("price history backfill batch", extra={"event": "price_history_backfill", **result})

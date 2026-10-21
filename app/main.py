@@ -114,9 +114,12 @@ async def lifespan(app: FastAPI):
                 except Exception:
                     logger.error(f"{label} job failed", exc_info=True)
             return _job
+        # First tick a minute after start - a deploy/restart used to idle the sales pull for 10 minutes.
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
         scheduler.add_job(
             _pulls_job(_pulls.SALES_PULLS, "Bright data pulls"), "interval", minutes=10, id="bright_data_pulls",
             name="Production Bright data pulls", replace_existing=True, max_instances=1,
+            next_run_time=_dt.now(_tz.utc) + _td(seconds=60),
         )
         scheduler.add_job(
             _pulls_job(_pulls.HISTORY_PULLS, "Price history backfill"), "interval", minutes=10, id="bright_price_history",

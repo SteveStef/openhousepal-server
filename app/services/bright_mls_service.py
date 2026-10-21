@@ -281,6 +281,60 @@ class BrightMlsService:
                     out.append(row)
         return out
 
+    async def get_listings_for_tax_ids(self, tax_ids: List[str], per_request: int = 100, max_pages: int = 10) -> Dict[str, List[Dict[str, Any]]]:
+        """Every listing Bright has for each of these parcels - {tax id as given: [rows]}. 100 parcels
+        per request: `ListingTaxID in (...)` takes about as long as one parcel (~25-46 s for 1, 50 or
+        100 parcels, 10/21), so the price history backfill goes from ~44 days to about half a day at
+        100 per request (~1.8 listings per parcel - far under the cap). Paged past Bright's 1,000-row
+        cap; a merged parcel ("A & B") is asked for as its parts. A chunk still unfinished after
+        max_pages (a development-wide parcel id) is re-asked one parcel at a time, so no parcel is
+        recorded with half its listings. Raises on a failed read."""
+        owners: Dict[str, set] = {}  # normalized part -> the tax ids (as given) it belongs to
+        parts: List[str] = []
+        norm = lambda s: re.sub(r"[^0-9A-Z]", "", str(s or "").upper())
+        for t in dict.fromkeys(tax_ids):
+            # Only an "&" can't be sent (Bright rejects the request). Other ids are asked for whole -
+            # some real ones contain commas ("36-018-,236-,0000-"), and splitting those found nothing
+            # (or a different parcel numbered "236-").
+            if "&" in (t or ""):
+                pieces = [p.strip() for p in re.split(r"[&,;]", t) if p.strip()] or [t]
+            else:
+                pieces = [(t or "").strip()]
+            for part in pieces:
+                if norm(part) not in owners:
+                    parts.append(part)
+                owners.setdefault(norm(part), set()).add(t)
+        out: Dict[str, List[Dict[str, Any]]] = {t: [] for t in dict.fromkeys(tax_ids)}
+        seen: Dict[str, set] = {t: set() for t in out}
+
+        def take(rows: List[Dict[str, Any]], only: Optional[set] = None) -> None:
+            for row in rows:
+                for owner in owners.get(norm(row.get("ListingTaxID")), ()):
+                    if (only is None or owner in only) and row.get("ListingKey") not in seen[owner]:
+                        seen[owner].add(row.get("ListingKey"))
+                        out[owner].append(row)
+
+        for i in range(0, len(parts), per_request):
+            chunk = parts[i:i + per_request]
+            flt = "ListingTaxID in (" + ",".join("'" + p.replace("'", "''") + "'" for p in chunk) + ")"
+            rows: List[Dict[str, Any]] = []
+            for page in range(max_pages):
+                data = await self._make_request("BrightProperties", params={
+                    "$filter": flt, "$top": 1000, "$skip": page * 1000,
+                    "$orderby": "ListingKey asc", "$select": self._get_full_field_list(),
+                })
+                got = data.get("value", [])
+                rows += got
+                if len(got) < 1000:
+                    take(rows)
+                    break
+            else:
+                logger.warning(f"Tax id lookup over {max_pages * 1000} rows - asking those {len(chunk)} parcels one at a time")
+                chunk_owners = {o for p in chunk for o in owners.get(norm(p), ())}
+                for owner in chunk_owners:
+                    take(await self.get_listings_for_tax_id(owner), only={owner})
+        return out
+
     def _get_full_field_list(self) -> str:
         """Centralized list of all 90+ fields from mls_mapper."""
         return ",".join(BRIGHT_PROPERTY_SELECT_FIELDS)
@@ -369,24 +423,29 @@ class BrightMlsService:
         """
         # Paged (Bright audit, 10/15): one unpaged request only ever returned the first page, so a
         # busy day's extra deletions were never seen and those homes stayed "for sale" here.
+        # Raises on a failed page (10/21): a partial list used to be applied and the checkpoint moved
+        # past the rest, so those removals were never seen again (stale Pending/Under Contract rows).
+        # The caller keeps its deletions checkpoint and retries the whole window next cycle.
         out: List[Dict[str, str]] = []
-        skip, page = 0, 200
-        try:
-            for _ in range(50):
-                data = await self._make_request("Deletion", params={
-                    "$filter": f"DeletionTimestamp gt {since_timestamp} and TableName eq 'CWA_BRIGHT_ALL'",
-                    "$select": "DeleteKey,DeletionTimestamp",
-                    "$orderby": "DeletionTimestamp asc",
-                    "$top": page, "$skip": skip,
-                })
-                rows = data.get("value", [])
-                out += [{"key": str(d["DeleteKey"]), "timestamp": d["DeletionTimestamp"]} for d in rows]
-                if len(rows) < page:
-                    break
-                skip += page
-        except Exception as e:
-            logger.error(f"Failed to fetch deletions: {e}")
-        return out
+        skip, page, max_pages = 0, 200, 50
+        for n in range(max_pages):
+            data = await self._make_request("Deletion", params={
+                "$filter": f"DeletionTimestamp gt {since_timestamp} and TableName eq 'CWA_BRIGHT_ALL'",
+                "$select": "DeleteKey,DeletionTimestamp",
+                "$orderby": "DeletionTimestamp asc",
+                "$top": page, "$skip": skip,
+            })
+            rows = data.get("value", [])
+            out += [{"key": str(d["DeleteKey"]), "timestamp": d["DeletionTimestamp"]} for d in rows]
+            if len(rows) < page:
+                return out
+            skip += page
+        # Page cap hit: more remain. Drop the rows sharing the last timestamp, so a checkpoint set to
+        # the new last row (`gt`) can't skip any of that timestamp's rows - they come next cycle.
+        last = out[-1]["timestamp"] if out else None
+        trimmed = [d for d in out if d["timestamp"] != last]
+        logger.warning(f"Deletion feed has more than {max_pages * page} rows since {since_timestamp} - the rest come next cycle")
+        return trimmed or out
 
     async def get_media_for_properties(self, listing_keys: List[str]) -> Dict[str, List[str]]:
         """Batch fetch photos for multiple properties.

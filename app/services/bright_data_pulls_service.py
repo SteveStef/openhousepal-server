@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from datetime import date
 from typing import Optional
 
@@ -73,8 +74,12 @@ def _month_add(d: date, n: int = 1) -> date:
     return date(d.year + y, m + 1, 1)
 
 
-async def pull_sold_3y(db: AsyncSession, max_pages: int = 10, pause: float = 1.0) -> dict:
-    """Month by month (oldest first), page by page. Photos are fetched for each page."""
+async def pull_sold_3y(db: AsyncSession, max_pages: int = 10, pause: float = 1.0, time_budget: Optional[float] = None) -> dict:
+    """Month by month (oldest first), page by page. Photos are fetched for each page.
+
+    time_budget (seconds): stop starting new pages after this long. 10 pages took ~2.5 minutes, so
+    the 10-minute job sat idle the rest of the time (10/21) - the tick now pulls for ~8 minutes, still
+    one request after another (Bright has never throttled it), leaving room for agent_sales."""
     from app.services.bright_mls_service import bright_mls_service
     from app.services.property_sync_service import PropertySyncService
     key = "data_pull_sold_3y"
@@ -86,7 +91,8 @@ async def pull_sold_3y(db: AsyncSession, max_pages: int = 10, pause: float = 1.0
     skip = int(st.get("skip") or 0)
     syncer = PropertySyncService()
     pages = added = 0
-    while pages < max_pages:
+    deadline = time.monotonic() + time_budget if time_budget else None
+    while pages < max_pages and (deadline is None or time.monotonic() < deadline):
         if month > today:
             await _set(db, key, {**st, "done": True, "finished": today.isoformat()})
             return {"done": True, "added": added}
@@ -246,9 +252,10 @@ async def run_enabled(db: AsyncSession, names: tuple = PULLS) -> dict:
     - one failing (e.g. Bright rejecting its query) is logged and never stops the others from running."""
     from app.services.price_history_service import backfill_batch
     out = {}
+    # Both long pulls stop starting new work at ~8 minutes, so each tick ends inside its 10-minute slot.
     for name, run in (("refresh_current", lambda: refresh_current(db)),
-                      ("sold_3y", lambda: pull_sold_3y(db)),
-                      ("price_history", lambda: backfill_batch(db, max_parcels=300)),
+                      ("sold_3y", lambda: pull_sold_3y(db, max_pages=60, time_budget=480)),
+                      ("price_history", lambda: backfill_batch(db, max_parcels=2000, time_budget=480)),
                       ("agent_sales", lambda: pull_agent_sales(db)),
                       ("recheck_off_market", lambda: recheck_off_market(db))):
         if name not in names or not enabled(name):
