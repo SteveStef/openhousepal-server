@@ -477,3 +477,22 @@ def test_subject_total_size_in_a_comp_note_is_left_alone():
     text = "Size-adjusted to the subject's 3,130 sqft above-grade and lower-level space, the gap narrows."
     out, flags = ai._reconcile_comp_hard_facts(text, "Comp #1 (1219 SCOTT DR)", DOGWOOD_SUBJECT, comp)
     assert "3,130" in out and not any("unsupported 3,130" in f for f in flags)
+
+
+# ---- v12 grader (10/22) ---------------------------------------------------------------------------
+
+def test_value_notes_dont_claim_what_buyers_did():
+    r = {"final_fmv": 490000, "range_low": 470000, "range_high": 515000,
+         "final_valuation_summary": "Buyers have passed on the current offering longer than the fastest comparable sales."}
+    out = ai._reasoning_client_methodology(r)
+    assert "passed on" not in out and "has been on the market longer" in out
+
+
+def test_lower_level_suite_always_gets_its_own_inspection_item():
+    subj = {"public_remarks": "In 2023, an entire additional primary suite was added to the lower level, including "
+                              "the home's fourth bedroom with egress and a stunning new full bathroom."}
+    out = ai._ensure_lower_level_inspection_item("**Roof:** Check the roof age.", subj)
+    assert "**Lower-Level Suite (added 2023):**" in out and "egress" in out
+    already = "**Lower level:** Confirm the egress window meets code."
+    assert ai._ensure_lower_level_inspection_item(already, subj) == already
+    assert ai._ensure_lower_level_inspection_item("**Roof:** x", {"public_remarks": "Updated kitchen."}) == "**Roof:** x"

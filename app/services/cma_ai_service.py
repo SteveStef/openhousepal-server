@@ -1604,7 +1604,7 @@ def _explicit_accessory_features(data: Optional[dict]) -> list[str]:
 
 _SYSTEM_NAMES_RE = re.compile(
     r"\b(?:systems?|hvac|heating|cooling|air conditioning|central air|electrical|wiring|"
-    r"plumbing|water heater|boiler|furnace|sewer line|water service|roof|windows|gutters?|"
+    r"plumbing|water heater|boiler|furnace|sewer line|water service|roof|windows|siding|gutters?|"
     # 417 Dogwood Ln v6 (10/20): "water softener and UV treatment system installed in 2023, EV
     # charging added in 2024" went unrecognized and the report said no system updates were documented.
     r"water softener|water treatment|uv (?:treatment|system|filter)|ev charg(?:er|ing)|solar panels?|"
@@ -8037,10 +8037,14 @@ allowed_high; the application enforces that band. When
 asking_price_check.outpaced_by_over_ask_sales is true, the comparables that sold over asking went under
 contract much faster than this home has been on the market - do not assume it will draw the same
 over-asking competition, and do not value it above the adjusted sales on that basis. When asking_price_check.passed_over is true, the
-home has sat on the market well past the days its comps took to sell: buyers have already passed on
-it at this price, so it most likely sells at or a little under asking - do not describe competing
-offers or a premium over asking. Present that as a modest trim to what the adjusted sales say, not
-as the factor that governs the value.
+home has been on the market longer than its comps took to sell, so it most likely sells at or a
+little under asking - do not describe competing offers or a premium over asking. Say it in exactly
+that factual way ("has been on the market longer than the fastest comparable sales - a small trim,
+not a sign of distress"); never claim what buyers did or thought ("buyers have passed on it"),
+which the data can't show. Present it as a modest trim to what the adjusted sales say, not as the
+factor that governs the value. When naming the strongest comparables, name them by address -
+never describe them as a group by a trait not all of them share (e.g. "the quiet-street sales"
+when one of them is on a highway).
 
 deterministic_evidence.comp_adjustment_grid is an appraisal-style grid already inside the
 deterministic anchor: every verified comp was moved toward the subject for size, finished
@@ -10247,10 +10251,14 @@ def _apply_reasoning_authority(
 
 
 def _reasoning_client_methodology(reasoning: dict) -> str:
+    summary = str(reasoning.get('final_valuation_summary') or '').strip()
+    # The data can't show what buyers did, only how long it's been listed (v12 grader, 10/22).
+    summary = re.sub(r"\bbuyers have (?:already )?passed on (?:the current offering|the home|it|this home)(?: at (?:this|the current) price)?",
+                     "the home has been on the market", summary, flags=re.IGNORECASE)
     return (
         f"The final fair market value is ${reasoning['final_fmv']:,.0f}, with a supported valuation "
         f"range of ${reasoning['range_low']:,.0f}-${reasoning['range_high']:,.0f}. "
-        f"{str(reasoning.get('final_valuation_summary') or '').strip()}"
+        f"{summary}"
     ).strip()
 
 
@@ -10723,6 +10731,31 @@ def _listing_documents_system_claim(subject: Optional[dict], claim: str) -> bool
                 if year.group(0) in after or year.group(0) in before:
                     return True
     return False
+
+
+_LOWER_LEVEL_SUITE_RE = re.compile(
+    r"(?:lower[- ]level|basement)[^.]{0,120}?\b(?:suite|bedroom|addition|full bath(?:room)?)\b"
+    r"|\b(?:suite|bedroom|addition)\b[^.]{0,80}?(?:lower[- ]level|basement)", re.IGNORECASE)
+
+
+def _ensure_lower_level_inspection_item(text: str, subject: Optional[dict]) -> str:
+    """A bedroom suite / addition in the lower level is the riskiest thing a buyer is paying for
+    (permits, egress, a new bathroom below grade) - when the listing documents one, the inspection
+    page always gets its own item, whatever the model wrote (v12 grader, 10/22: v9 had it, v12
+    only said "confirm permits for the finished space")."""
+    if not text or re.search(r"\begress\b", text, re.IGNORECASE):
+        return text
+    blob = _authoritative_property_fact_blob(subject or {})
+    m = _LOWER_LEVEL_SUITE_RE.search(blob)
+    if not m:
+        return text
+    around = blob[max(0, m.start() - 120):m.end() + 120]
+    year = re.search(r"\b(19[5-9]\d|20[0-4]\d)\b", around)
+    when = f" (added {year.group(1)})" if year else ""
+    item = (f"**Lower-Level Suite{when}:** The listing describes a bedroom suite in the finished lower level. "
+            "Confirm it was permitted and passed inspection, that the bedroom's egress window meets code, and "
+            "have the inspector check the lower-level bathroom's plumbing, venting and any signs of moisture.")
+    return text.rstrip() + "\n\n" + item
 
 
 def _soften_unsupported_system_claims(text: Optional[str], subject: Optional[dict]) -> tuple[Optional[str], list[str]]:
@@ -14533,19 +14566,31 @@ async def _generate_ai_analysis_impl(
             "per-CMA limit - reduce the photo count per property or the number of comps and try again.",
         )
 
+    # Same inputs, same comp ratings and notes (v12 grader, 10/22: finish/interior ratings changed
+    # between runs on unchanged data): an identical prompt reuses the stored answer, like the final
+    # reasoning pass does. Any change to the comps, photos, facts, code version or model misses.
+    _comp_cache_key = "cma_comp_cache:" + hashlib.sha256(json.dumps(
+        {"c": content, "s": _SYSTEM_PROMPT, "m": model, "mode": report.mode, "v": PROMPT_VERSION},
+        sort_keys=True, default=str).encode("utf-8")).hexdigest()[:48]
+    _cached_comp = await _reasoning_cache_get(db, _comp_cache_key)
     try:
-        client = _get_client()
-        response = await client.messages.create(
-            model=model,
-            max_tokens=config["cma_ai_max_output_tokens"],
-            system=_SYSTEM_PROMPT,
-            tools=[_tool_for_mode(_SUBMIT_TOOL, report.mode)],
-            tool_choice={"type": "tool", "name": "submit_cma_analysis"},
-            messages=[{"role": "user", "content": content}],
-            # No `temperature` here: the current Claude models reject it ("deprecated for this model")
-            # and the whole generation failed (10/20). Repeatability comes from reusing the final
-            # reasoning answer for an identical evidence packet instead.
-        )
+        if isinstance(_cached_comp, dict) and _cached_comp.get("comps"):
+            from types import SimpleNamespace as _NS
+            response = _NS(stop_reason="cache", usage=_NS(input_tokens=0, output_tokens=0),
+                           content=[_NS(type="tool_use", name="submit_cma_analysis", input=copy.deepcopy(_cached_comp))])
+        else:
+            client = _get_client()
+            response = await client.messages.create(
+                model=model,
+                max_tokens=config["cma_ai_max_output_tokens"],
+                system=_SYSTEM_PROMPT,
+                tools=[_tool_for_mode(_SUBMIT_TOOL, report.mode)],
+                tool_choice={"type": "tool", "name": "submit_cma_analysis"},
+                messages=[{"role": "user", "content": content}],
+                # No `temperature` here: the current Claude models reject it ("deprecated for this
+                # model") and the whole generation failed (10/20). Repeatability comes from reusing
+                # stored answers for identical inputs instead (above, and the reasoning pass).
+            )
     except Exception as exc:
         logger.warning("CMA AI analysis call failed", extra={"report_id": report_id, "error": str(exc)})
         await reconcile_budget(db, reservation, 0.0)
@@ -14562,6 +14607,8 @@ async def _generate_ai_analysis_impl(
     result = submit_block.input if submit_block and isinstance(submit_block.input, dict) else None
     usage_input_tokens = response.usage.input_tokens
     usage_output_tokens = response.usage.output_tokens
+    if result and response.stop_reason != "cache" and result.get("comps"):
+        await _reasoning_cache_put(db, _comp_cache_key, copy.deepcopy(result))
 
     logger.info(
         "CMA AI analysis returned",
@@ -14921,6 +14968,15 @@ async def _generate_ai_analysis_impl(
         if _amenity_flags:
             comp["_amenities_fact_reconciled"] = True
         qa_flags.extend(_amenity_flags)
+        # A comp whose listing documents a new roof / siding / windows isn't worse outside than the
+        # subject on the model's photo read alone (v12 grader, 10/22: 2702 E Kings Hwy - new siding
+        # and roof in 2024 - rated "Comp Inferior" on exterior).
+        if str(_q.get("exterior") or "").lower() == "below":
+            _ext = {u for u in _documented_system_updates(comp) if u in ("roof", "siding", "windows")}
+            if _ext:
+                _q["exterior"] = "similar"
+                qa_flags.append(f"{_comp_lbl}: exterior set to Similar - its listing documents a new "
+                                f"{', '.join(sorted(_ext))}.")
         if _q:
             comp["quality"] = _q
 
@@ -15529,6 +15585,8 @@ async def _generate_ai_analysis_impl(
             qa_blocking = []
         if valuation_trace is not None:
             valuation_trace["qa"] = _qa_result
+        if inspection_concerns and report.mode == "buyer":
+            inspection_concerns = _ensure_lower_level_inspection_item(inspection_concerns, enriched_subject)
 
         new_pricing["ai_estimate"] = {
             "value": round(value),
@@ -16150,6 +16208,8 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
 
         if valuation_trace is not None:
             valuation_trace["qa"] = _qa_result
+        if inspection_concerns and report.mode == "buyer":
+            inspection_concerns = _ensure_lower_level_inspection_item(inspection_concerns, enriched_subject)
 
         new_pricing["ai_estimate"] = {
             "value": round(value),
