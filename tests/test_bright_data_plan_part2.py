@@ -301,6 +301,27 @@ def test_refill_only_where_bright_has_more_and_photos_not_hidden(monkeypatch):
     assert db.updates == ["1", "4"] and res == {"checked": 4, "short": 2, "filled": 2}
 
 
+def test_photo_refill_pass_runs_once_sold_backfill_is_done(monkeypatch):
+    store = _fake_state(monkeypatch, {"data_pull_sold_3y": {"done": True}})
+    seen = []
+
+    async def no_queue(db, keys):
+        pass
+
+    async def fake_refill(db, held):
+        seen.append(held)
+        return {"checked": len(held), "short": 1, "filled": 1}
+
+    monkeypatch.setattr(pulls, "_queue_photo_retries", no_queue)
+    monkeypatch.setattr(pulls, "_refill_photos", fake_refill)
+    monkeypatch.setattr(pss.bright_mls_service, "media_retry_keys", set())
+    rows = [SimpleNamespace(listing_key="804000001992", n=25), SimpleNamespace(listing_key="804000009780", n=48)]
+    out = _run(pulls.photo_refill(_StaleDB([rows, []]), pause=0))
+    assert seen == [{"804000001992": 25, "804000009780": 48}]
+    assert out["done"] and (out["checked"], out["filled"], out["after_key"]) == (2, 1, "804000009780")
+    assert store["data_pull_photo_refill"]["done"] is True
+
+
 # ------------------------------------------------------------------ price history lines
 
 def _ev(kind, status, prev, day, price=500000.0, prev_price=None):

@@ -364,12 +364,14 @@ async def _refill_photos(db: AsyncSession, held: dict) -> dict:
     return {"checked": len(held), "short": len(todo), "filled": filled}
 
 
-async def photo_refill(db: AsyncSession, max_photos: int = 5, time_budget: float = 480, pause: float = 0.5) -> dict:
-    """Galleries that came out short: older sales saved before the 10/11 media fix (a handful of
-    photos), history rows saved before 10/21 (one photo), and any listing whose media fetch failed
-    since (bright_mls_service.media_retry_keys -> the stored queue). Queued listings go first, any
-    time; the pass over every listing holding `max_photos` or fewer starts once sold_3y is done, so
-    the two never compete for Bright. One pass, remembering where it stopped."""
+async def photo_refill(db: AsyncSession, time_budget: float = 480, pause: float = 0.5) -> dict:
+    """Galleries that came out short: older sales saved before the 10/11 media fix (about 20 photos
+    of about 37), history rows saved before 10/21 (one photo), and any listing whose media fetch
+    failed since (bright_mls_service.media_retry_keys -> the stored queue). Queued listings go first,
+    any time; the pass starts once sold_3y is done, so the two never compete for Bright. The pass
+    compares every listing that isn't on the market (on-market ones are kept whole by the sync) with
+    Bright's TotalPhotos - a light three-field read per 100 - and fetches only the short ones. One
+    pass, remembering where it stopped."""
     from app.services.bright_mls_service import bright_mls_service
     key = "data_pull_photo_refill"
     st = await _get(db, key)
@@ -402,8 +404,8 @@ async def photo_refill(db: AsyncSession, max_photos: int = 5, time_budget: float
         rows = (await db.execute(text(
             "SELECT listing_key, CASE WHEN jsonb_typeof(photos) = 'array' THEN jsonb_array_length(photos) ELSE 0 END AS n "
             "FROM properties WHERE listing_key > :after AND listing_key ~ '^[0-9]+$' AND coalesce(is_manual, false) = false "
-            "AND (CASE WHEN jsonb_typeof(photos) = 'array' THEN jsonb_array_length(photos) ELSE 0 END) <= :m "
-            "ORDER BY listing_key LIMIT 100"), {"after": st.get("after_key") or "", "m": max_photos})).all()
+            "AND NOT (home_status = ANY(:current)) "
+            "ORDER BY listing_key LIMIT 100"), {"after": st.get("after_key") or "", "current": list(_CURRENT)})).all()
         if not rows:
             st = {**st, "done": True, "finished": date.today().isoformat()}
             await _set(db, key, st)
