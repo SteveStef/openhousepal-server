@@ -14778,13 +14778,15 @@ async def _generate_ai_analysis_impl(
         _was = _as_float(_cached_comp.pop("_subject_dom", None))
         _comp_doms = {round(d) for d in (_as_float(c.get("days_on_market")) for c in enriched_comps) if d is not None}
         _cached_comp, _ = _refresh_cached_subject_days(_cached_comp, _was, _subject_dom_now, _comp_doms)
+    # Needed on a reused answer too: the follow-up passes below call the model (v14, 10/21: it was
+    # only set on a fresh call, so a reused answer's follow-ups failed and the report fell back).
+    client = _get_client()
     try:
         if isinstance(_cached_comp, dict) and _cached_comp.get("comps"):
             from types import SimpleNamespace as _NS
             response = _NS(stop_reason="cache", usage=_NS(input_tokens=0, output_tokens=0),
                            content=[_NS(type="tool_use", name="submit_cma_analysis", input=copy.deepcopy(_cached_comp))])
         else:
-            client = _get_client()
             response = await client.messages.create(
                 model=model,
                 max_tokens=config["cma_ai_max_output_tokens"],
@@ -14812,8 +14814,7 @@ async def _generate_ai_analysis_impl(
     result = submit_block.input if submit_block and isinstance(submit_block.input, dict) else None
     usage_input_tokens = response.usage.input_tokens
     usage_output_tokens = response.usage.output_tokens
-    if result and response.stop_reason != "cache" and result.get("comps"):
-        await _reasoning_cache_put(db, _comp_cache_key, {**copy.deepcopy(result), "_subject_dom": _subject_dom_now})
+    _comp_from_cache = response.stop_reason == "cache"
 
     logger.info(
         "CMA AI analysis returned",
@@ -14928,7 +14929,9 @@ async def _generate_ai_analysis_impl(
     _needs_seller_guidance = report.mode != "buyer" and (
         _blank("listing_strategy_considerations") or _blank("listing_prep_concerns")
     )
+    _ran_followups = False
     if not _has_value or _needs_buyer_guidance or _needs_seller_guidance or _needs_qual_adjustments:
+        _ran_followups = True
         logger.info(
             "CMA AI result incomplete; running estimate-only pass",
             extra={
@@ -15028,6 +15031,7 @@ async def _generate_ai_analysis_impl(
             return True
         return len(v.strip()) < 350 or (v.count("**") >= 2 and v.count("**") < 4)
     if any(_guide_blank(k) for k in _guide_fields):
+        _ran_followups = True
         try:
             guidance_content = _guidance_content(enriched_subject, enriched_comps, result.get("comps") or [], subject_estimate_raw or {})
             _tmach.check_payload(guidance_content, "guidance prompt", comp_prices=_tm_comp_prices, raise_now=False)
@@ -15058,6 +15062,14 @@ async def _generate_ai_analysis_impl(
             raise
         except Exception as exc:  # noqa: BLE001 - the deterministic fallbacks still apply
             logger.warning("CMA guidance pass failed", extra={"report_id": report_id, "error": str(exc)})
+
+    # Stored only now, with the follow-up passes merged in: storing the main call alone (v14, 10/21)
+    # saved an answer missing its value read + inspection list, and the next run inherited the gap.
+    # (a stored answer that still needed them is replaced by the completed one)
+    if ((not _comp_from_cache or _ran_followups) and result.get("comps") and isinstance(result.get("subject_estimate"), dict)
+            and _as_float(result["subject_estimate"].get("value"))
+            and not any(_guide_blank(k) for k in _guide_fields)):
+        await _reasoning_cache_put(db, _comp_cache_key, {**copy.deepcopy(result), "_subject_dom": _subject_dom_now})
 
     cost = ai_config_service.estimate_cost_usd(config, model, usage_input_tokens, usage_output_tokens)
     await record_usage_event(
