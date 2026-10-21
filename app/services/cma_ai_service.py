@@ -9352,6 +9352,23 @@ def _reconcile_comp_hard_facts(
         if _new != out:
             out = _new
             flags.append(f"{label}: '{_town}' is only its mailing town - it is in the subject's township.")
+    # "about a mile farther out" - farther than what? (v16, 10/21: Comp #4 is 2.6 miles from the
+    # subject.) Say the real distance instead.
+    _dist = _as_float(comp.get("distance_miles"))
+    if _dist:
+        _new = re.sub(r"\babout (?:a|one|half a|\d+(?:\.\d+)?) miles? (?:farther|further) (?:out|away)\b",
+                      f"about {_dist:.1f} miles away", out, flags=re.IGNORECASE)
+        if _new != out:
+            out = _new
+            flags.append(f"{label}: replaced a vague 'farther out' with its real distance.")
+    # "original laminate-style cabinetry" is a claim about the house's history that photos can't
+    # prove (grader, v16, 1219 Scott Dr) - unless the listing itself says original, call it older.
+    if not re.search(r"\boriginal\b", str(comp.get("public_remarks") or ""), re.IGNORECASE):
+        _new = re.sub(r"\boriginal(?=(?:\s+[\w-]+){0,2}?\s+(?:cabinetry|cabinets|kitchen|tile|tiles|countertops|counters|"
+                      r"finishes|fixtures|vanit(?:y|ies)|bath(?:room)?s?)\b)", lambda m: "Older" if m.group(0)[0].isupper() else "older", out, flags=re.IGNORECASE)
+        if _new != out:
+            out = _new
+            flags.append(f"{label}: 'original' finishes softened to 'older' - the listing doesn't say original.")
     subject_updates = _documented_system_updates(subject)
     if not subject_updates:
         substitutions = (
@@ -10610,7 +10627,10 @@ def _cache_stable(obj):
 
 
 def _reasoning_cache_key(evidence_packet: dict, model: str) -> str:
-    payload = json.dumps({"p": _cache_stable(evidence_packet), "m": model, "v": PROMPT_VERSION}, sort_keys=True, default=str)
+    # The instructions are part of the key (10/21): an edit to the reasoning prompt has to get a
+    # fresh answer even when the evidence is identical, same as the comp pass's key.
+    payload = json.dumps({"p": _cache_stable(evidence_packet), "m": model, "v": PROMPT_VERSION,
+                          "s": _CMA_REASONING_SYSTEM_PROMPT}, sort_keys=True, default=str)
     return "cma_reasoning_cache:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:48]
 
 
@@ -10998,6 +11018,42 @@ def _listing_documents_system_claim(subject: Optional[dict], claim: str) -> bool
 _LOWER_LEVEL_SUITE_RE = re.compile(
     r"(?:lower[- ]level|basement)[^.]{0,120}?\b(?:suite|bedroom|addition|full bath(?:room)?)\b"
     r"|\b(?:suite|bedroom|addition)\b[^.]{0,80}?(?:lower[- ]level|basement)", re.IGNORECASE)
+
+
+_PERMIT_TOPIC_WORDS = ("egress", "addition", "suite", "bedroom", "basement", "lower-level", "lower level")
+
+
+def _dedupe_permit_checks(text: str) -> str:
+    """One permit check per thing (grader, v16: "confirm the egress window and suite addition were
+    permitted" sat in both Foundation and Lower-Level Egress/Permits). When an item is about
+    permits/egress, other items drop a permit aside about the same space; a permit check for
+    something else (the EV charger under Electrical) stays."""
+    if not text:
+        return text
+    paras = re.split(r"\n\s*\n", text.strip())
+    title_re = re.compile(r"^\*\*([^*]+?):?\*\*")
+    owners = [i for i, p in enumerate(paras)
+              if (m := title_re.match(p)) and re.search(r"permit|egress", m.group(1), re.IGNORECASE)]
+    if not owners:
+        return text
+    own_low = " ".join(paras[i] for i in owners).lower()
+    topics = [w for w in _PERMIT_TOPIC_WORDS if w in own_low]
+    if not topics:
+        return text
+
+    def _same_space(chunk: str) -> bool:
+        low = chunk.lower()
+        return bool(re.search(r"\bpermit", low)) and any(w in low for w in topics)
+
+    for i, p in enumerate(paras):
+        if i in owners or not title_re.match(p):
+            continue
+        new = re.sub(r"\s*\([^)]*\)", lambda m: "" if _same_space(m.group(0)) else m.group(0), p)
+        sents = re.split(r"(?<=[.!?])\s+", new)
+        head = sents[0]
+        rest = [s for s in sents[1:] if not _same_space(s)]
+        paras[i] = " ".join([head] + rest)
+    return "\n\n".join(paras)
 
 
 def _ensure_lower_level_inspection_item(text: str, subject: Optional[dict]) -> str:
@@ -11876,12 +11932,56 @@ def _v10_over_ask_pattern_sentence(methodology: str, *, trace: Optional[dict]) -
     return methodology.rstrip() + sentence, ["Methodology summary: added the comps' over-asking pattern."]
 
 
+_ADJ_DRIVER_LABELS = {
+    "size": "above-grade size", "below_grade": "finished lower-level space", "baths": "bathrooms",
+    "garage": "garage space", "lot": "lot size", "time": "market change since the sales",
+    "sewer": "sewer type", "age": "age", "road": "street setting",
+}
+
+
+def _anchor_adjustment_drivers(trace: Optional[dict], anchor_value: Optional[float]) -> str:
+    """The one or two grid adjustments that moved the weighted sales most (v16, 10/21: the notes said
+    sales of $410K-$452K "point to about $500,000" without saying what was adjusted). Weighted by each
+    comp's share of the anchor; anything under 1% of the anchor isn't worth naming."""
+    comps = (((trace or {}).get("anchor") or {}).get("comps") or [])
+    totals: dict = {}
+    for c in comps:
+        w = _as_float(c.get("normalized_weight")) or 0
+        fa = c.get("feature_adjustments") or {}
+        for k in _ADJ_DRIVER_LABELS:
+            v = _as_float(fa.get(k))
+            if v:
+                totals[k] = totals.get(k, 0.0) + w * abs(v)
+    floor = 0.01 * (anchor_value or 0)
+    top = [k for k, v in sorted(totals.items(), key=lambda kv: -kv[1]) if v >= floor][:2]
+    return " and ".join(_ADJ_DRIVER_LABELS[k] for k in top)
+
+
 def _v10_reconcile_anchor_direction_prose(methodology: str, *, final: Optional[dict],
                                           trace: Optional[dict]) -> tuple[str, list[str]]:
     text, flags = _v10_anchor_direction_core(methodology, final=final, trace=trace)
     text, gap_flags = _v10_asking_gap_sentence(text, final=final, trace=trace)
     text, oa_flags = _v10_over_ask_pattern_sentence(text, trace=trace)
-    return text, flags + gap_flags + oa_flags
+    text, rt_flags = _v10_range_top_at_asking_sentence(text, final=final, trace=trace)
+    return text, flags + gap_flags + oa_flags + rt_flags
+
+
+_RANGE_TOP_MARK = "range stops at the"
+
+
+def _v10_range_top_at_asking_sentence(methodology: str, *, final: Optional[dict],
+                                      trace: Optional[dict]) -> tuple[str, list[str]]:
+    """The range top was held at asking because the home has sat (_cap_passed_over_range): say so,
+    or the range reads lopsided ($470K-$500K around $490K - grader, v16)."""
+    apc = (trace or {}).get("asking_price_check") or {}
+    ask = _as_float(apc.get("asking_price"))
+    hi = _as_float((final or {}).get("range_max")) or _as_float((final or {}).get("range_high"))
+    if not methodology or not apc.get("passed_over") or not ask or not hi or abs(hi - ask) > 1000 \
+            or _RANGE_TOP_MARK in methodology:
+        return methodology, []
+    sentence = (f" The {_RANGE_TOP_MARK} ${ask:,.0f} asking price because the home hasn't drawn an accepted "
+                "offer at that price yet - homes that sit longer than their comps rarely sell above asking.")
+    return methodology.rstrip() + sentence, ["Methodology summary: explained why the range stops at the asking price."]
 
 
 def _v10_anchor_direction_core(methodology: str, *, final: Optional[dict],
@@ -11951,8 +12051,10 @@ def _v10_anchor_direction_core(methodology: str, *, final: Optional[dict],
         reason = "because homes here rarely sell this far under their asking price"
     elif rel == "below" and _band_hi and abs(v - _band_hi) <= 1000 and not _passed_over_trim:
         reason = "because homes here rarely sell this far over their asking price"
+    _drivers = _anchor_adjustment_drivers(trace, a)
     sentence = (
-        f" Weighted together, the adjusted comparable sales point to about ${round(a, -3):,.0f}; {reason}, "
+        f" Weighted together, the adjusted comparable sales point to about ${round(a, -3):,.0f}"
+        + (f" (adjusted mainly for differences in {_drivers})" if _drivers else "") + f"; {reason}, "
         f"the final value lands about {max(1, round(pct))}% {rel} that, at ${v:,.0f}."
     )
     return methodology.rstrip() + sentence, [
@@ -13010,6 +13112,13 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
                     and _subj_days > max(7.0, 1.5 * _over_doms[len(_over_doms) // 2]))
     if outpaced:
         hot = False
+    # Passed over in a market where sales went over asking: the offer page has to say why opening
+    # below asking still makes sense (v16, 10/21: two sales 14-16% over asking within 6 days, and
+    # the page just said to open 3-7% under with no reason given).
+    over_ask_passed = None
+    if _passed_over and _lts and _lts >= 1.02 and len(_over_doms) >= 2:
+        over_ask_passed = {"count": len(_over_doms), "of": len(((trace or {}).get("anchor") or {}).get("comps") or []),
+                           "median_days": _over_doms[len(_over_doms) // 2]}
     if hot:
         ceiling = round(min(lp * min(_lts, _ASKING_CHECK_RATIO_BOUNDS[1]), fmv))
     else:
@@ -13087,7 +13196,7 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
         "aggression": aggr, "underpriced": underpriced, "basis_ref": basis_ref, "passed_over": _passed_over,
         "above_ask": bool(lp and opening_high > lp),
         "hot_market": hot, "market_over_ask_pct": round((_lts - 1) * 100, 1) if hot else None,
-        "outpaced_by_comps": outpaced, "over_ask_comp_median_dom": _over_doms[len(_over_doms) // 2] if _over_doms else None,
+        "outpaced_by_comps": outpaced, "over_ask_passed": over_ask_passed, "over_ask_comp_median_dom": _over_doms[len(_over_doms) // 2] if _over_doms else None,
     }
 
 
@@ -13195,10 +13304,18 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
         else:
             _walk = (f"Treat the ${fmv:,} fair market value as your walk-away price; going past it needs a clear "
                      f"reason, such as competing offers or new property-specific information.")
+        _oap = b.get("over_ask_passed") or {}
+        _why_under = ""
+        if _oap.get("count") and lp and ol < lp:
+            _d = _as_float(_oap.get("median_days"))
+            _why_under = (f"{_oap['count']} of the {_oap['of']} comparable sales went over their asking price"
+                          + (f", most within {round(_d)} days" if _d else "")
+                          + ", but this home has now been on the market longer than that without an accepted offer, "
+                            "so it isn't drawing the same competition and opening below asking is reasonable. ")
         opener = (
             f"Given the ${fmv:,} fair market value{lp_txt}, a reasonable opening offer is roughly ${ol:,} "
             f"to ${oh:,} ({rel_open} the ${_ref:,} {_ref_name}), leaving room to settle "
-            f"toward ${tgt:,}. " + _walk
+            f"toward ${tgt:,}. " + _why_under + _walk
         )
     kept: list = []
     source_offer = _strip_under_contract_offer_frame(offer_text or "")
@@ -15959,7 +16076,7 @@ async def _generate_ai_analysis_impl(
         if valuation_trace is not None:
             valuation_trace["qa"] = _qa_result
         if inspection_concerns and report.mode == "buyer":
-            inspection_concerns = _ensure_lower_level_inspection_item(inspection_concerns, enriched_subject)
+            inspection_concerns = _dedupe_permit_checks(_ensure_lower_level_inspection_item(inspection_concerns, enriched_subject))
 
         new_pricing["ai_estimate"] = {
             "value": round(value),
@@ -16585,7 +16702,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
         if valuation_trace is not None:
             valuation_trace["qa"] = _qa_result
         if inspection_concerns and report.mode == "buyer":
-            inspection_concerns = _ensure_lower_level_inspection_item(inspection_concerns, enriched_subject)
+            inspection_concerns = _dedupe_permit_checks(_ensure_lower_level_inspection_item(inspection_concerns, enriched_subject))
 
         new_pricing["ai_estimate"] = {
             "value": round(value),

@@ -719,3 +719,85 @@ def test_v15_grader_wording_fixes():
             "target": 490000, "comfort_ceiling": 490000, "passed_over": True}
     offer, _ = ai._v10_rebuild_buyer_offer_prose("Standard contingencies are appropriate.", band, 0.04)
     assert "appraisal contingency" in offer and "inspection contingency" in offer
+
+
+def test_reasoning_cache_key_changes_with_the_reasoning_prompt(monkeypatch):
+    pkt = {"subject": {"dom": 14, "current_list_price": 500000}}
+    k = ai._reasoning_cache_key(pkt, "m")
+    monkeypatch.setattr(ai, "_CMA_REASONING_SYSTEM_PROMPT", ai._CMA_REASONING_SYSTEM_PROMPT + "\nNew rule.")
+    assert ai._reasoning_cache_key(pkt, "m") != k
+
+
+# ---- 417 Dogwood Ln v16 (10/21) -----------------------------------------------------------------
+
+def test_v16_valuation_notes_name_the_main_adjustments():
+    notes = "The final fair market value is $490,000. The home has been on the market longer than the fastest comparable sales."
+    comps = [{"normalized_weight": 0.6, "feature_adjustments": {"size": 32268, "below_grade": 17429, "baths": 4520, "time": 4347}},
+             {"normalized_weight": 0.4, "feature_adjustments": {"size": 20000, "below_grade": 30000, "garage": 2000}}]
+    trace = {"authority": "reasoning_model", "anchor": {"anchor_value": 499877, "comps": comps},
+             "asking_price_check": {"passed_over": True, "asking_price": 500000, "allowed_high_price": 490000}}
+    out, _ = ai._v10_reconcile_anchor_direction_prose(notes, final={"value": 490000, "anchor_value": 499877}, trace=trace)
+    assert "point to about $500,000 (adjusted mainly for differences in above-grade size and finished lower-level space);" in out
+    # nothing big enough to name -> the sentence reads as before
+    small = {**trace, "anchor": {"anchor_value": 499877, "comps": [{"normalized_weight": 1, "feature_adjustments": {"time": 1200}}]}}
+    out2, _ = ai._v10_reconcile_anchor_direction_prose(notes, final={"value": 490000, "anchor_value": 499877}, trace=small)
+    assert "point to about $500,000;" in out2 and "adjusted mainly" not in out2
+
+
+def test_v16_offer_explains_opening_under_asking_when_passed_over_after_over_ask_sales():
+    band = {"fmv": 490000, "list_price": 500000, "opening_low": 463000, "opening_high": 483000, "target": 490000,
+            "comfort_ceiling": 490000, "passed_over": True, "over_ask_passed": {"count": 3, "of": 5, "median_days": 6}}
+    out, _ = ai._v10_rebuild_buyer_offer_prose("Use a standard inspection contingency.", band, 0.04)
+    assert "3 of the 5 comparable sales went over their asking price, most within 6 days" in out
+    assert "opening below asking is reasonable" in out
+    once = ai._v10_rebuild_buyer_offer_prose(out, band, 0.04)[0]
+    assert once.count("went over their asking price") == 1
+    plain = ai._v10_rebuild_buyer_offer_prose("", {**band, "over_ask_passed": None}, 0.04)[0]
+    assert "went over their asking price" not in plain
+
+
+def test_v16_vague_farther_out_becomes_real_distance():
+    comp = {"distance_miles": 2.63}
+    text = "It supports its use despite sitting about a mile farther out with a Downingtown mailing address."
+    out, _ = ai._reconcile_comp_hard_facts(text, "Comp #4 (3306 E SUMMIT AVE)", DOGWOOD_SUBJECT, comp)
+    assert "about 2.6 miles away" in out and "farther out" not in out
+
+
+# ---- grader on v16 (10/21) ----------------------------------------------------------------------
+
+def test_v16_permit_check_lives_only_in_the_permit_item():
+    text = ("**Foundation/Structure:** Ask the seller for the foundation type and check for moisture, particularly given "
+            "the 2023 lower-level addition (confirm the egress window and suite addition were permitted).\n\n"
+            "**Electrical:** Verify the panel, and confirm that the 2024 EV charging installation was properly permitted.\n\n"
+            "**Lower-Level Egress/Permits:** Verify that the 2023 lower-level bedroom addition, including the egress "
+            "window, received proper permits.")
+    out = ai._dedupe_permit_checks(text)
+    assert "(confirm the egress window" not in out
+    assert "particularly given the 2023 lower-level addition." in out
+    assert "EV charging installation was properly permitted" in out
+    assert out.count("received proper permits") == 1
+    assert ai._dedupe_permit_checks(out) == out
+
+
+def test_v16_original_finishes_softened_unless_the_listing_says_original():
+    comp = {"public_remarks": "Fantastic brick ranch with a fully finished basement."}
+    text = "The main level is dated with original laminate-style cabinetry and tile. Original kitchen too."
+    out, _ = ai._reconcile_comp_hard_facts(text, "Comp #1 (1219 SCOTT DR)", DOGWOOD_SUBJECT, comp)
+    assert "older laminate-style cabinetry" in out and "Older kitchen" in out and "original" not in out.lower()
+    said = {"public_remarks": "Original kitchen, sold as-is."}
+    assert "original kitchen" in ai._reconcile_comp_hard_facts("It has an original kitchen.", "Comp #1", DOGWOOD_SUBJECT, said)[0]
+    # other "original" uses are left alone
+    assert "original hardwood" in ai._reconcile_comp_hard_facts("Carpet over original hardwood.", "Comp #2", DOGWOOD_SUBJECT, comp)[0]
+
+
+def test_v16_range_top_at_asking_is_explained():
+    notes = "The final fair market value is $490,000, with a supported valuation range of $470,000-$500,000."
+    trace = {"authority": "reasoning_model", "anchor": {"anchor_value": 499877},
+             "asking_price_check": {"passed_over": True, "asking_price": 500000, "allowed_high_price": 490000}}
+    final = {"value": 490000, "anchor_value": 499877, "range_min": 470000, "range_max": 500000}
+    out, _ = ai._v10_reconcile_anchor_direction_prose(notes, final=final, trace=trace)
+    assert "The range stops at the $500,000 asking price because the home hasn't drawn an accepted offer" in out
+    again, _ = ai._v10_reconcile_anchor_direction_prose(out, final=final, trace=trace)
+    assert again.count("range stops at the") == 1
+    fresh = {**trace, "asking_price_check": {**trace["asking_price_check"], "passed_over": False}}
+    assert "range stops" not in ai._v10_reconcile_anchor_direction_prose(notes, final=final, trace=fresh)[0]
