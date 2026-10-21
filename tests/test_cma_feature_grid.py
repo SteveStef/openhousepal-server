@@ -612,7 +612,7 @@ def test_v13_normalized_basement_wording_is_plain():
     text = ("Its finished basement is below-grade value already normalized into the comparison, and the main-level "
             "living area is dated with original cabinetry.")
     out = ai._strip_internal_data_refs(text)
-    assert "normalized" not in out and "is accounted for separately in the comparison, and the main-level" in out
+    assert out == "The main-level living area is dated with original cabinetry."
 
 
 def _oa_packets(rows):
@@ -688,3 +688,34 @@ def test_v15_offer_prose_drops_leverage_and_above_list_sentences():
     hot = {**band, "hot_market": True, "passed_over": False, "market_over_ask_pct": 6.5, "comfort_ceiling": 499800}
     kept, _ = ai._v10_rebuild_buyer_offer_prose("If multiple offers emerge, escalating modestly above list is reasonable.", hot, 0.04)
     assert "escalating modestly above list" in kept   # a hot market may say it
+
+
+def test_v15_grader_wording_fixes():
+    # basement clause: engine talk dropped, the rest of the sentence kept and capitalised
+    t = ("Its finished basement is accounted for separately in the comparison, and the main-level living area is "
+         "dated with original laminate-style cabinetry.")
+    assert ai._strip_internal_data_refs(t) == "The main-level living area is dated with original laminate-style cabinetry."
+    t2 = ("Its finished basement is below-grade value already normalized into the comparison, and the main-level "
+          "living area is dated.")
+    assert ai._strip_internal_data_refs(t2) == "The main-level living area is dated."
+    # mailing town vs township
+    subj = {"city": "COATESVILLE", "township": "Caln Twp"}
+    comp = {"city": "DOWNINGTOWN", "township": "Caln Twp"}
+    out, flags = ai._reconcile_comp_hard_facts(
+        "It sits about a mile farther out in Downingtown on a quiet cul-de-sac.", "Comp #4", subj, comp)
+    assert "with a Downingtown mailing address" in out and flags
+    other, _ = ai._reconcile_comp_hard_facts("It sits in Downingtown.", "Comp #4", subj,
+                                             {"city": "DOWNINGTOWN", "township": "Downingtown Boro"})
+    assert "in Downingtown" in other
+    # "larger lot" only when it is larger
+    comps = [{"lot_size_sqft": 47916}, {"lot_size_sqft": 17424}]
+    s = {"lot_size_sqft": 29621}
+    txt, f = ai._reconcile_lot_size_claims("Supportable given the documented updates and larger lot.", "Offer", s, comps)
+    assert "larger lot" not in txt and txt == "Supportable given the documented updates." and f
+    big, _ = ai._reconcile_lot_size_claims("Its larger lot helps.", "Offer", {"lot_size_sqft": 60000}, comps)
+    assert big == "Its larger lot helps."
+    # appraisal contingency always present
+    band = {"fmv": 490000, "list_price": 500000, "opening_low": 463000, "opening_high": 483000,
+            "target": 490000, "comfort_ceiling": 490000, "passed_over": True}
+    offer, _ = ai._v10_rebuild_buyer_offer_prose("Standard contingencies are appropriate.", band, 0.04)
+    assert "appraisal contingency" in offer and "inspection contingency" in offer

@@ -4618,6 +4618,24 @@ def _reconcile_age_condition_inference(text: str, field_label: str, subject: dic
     return revised, [f"{field_label}: softened an age-based condition inference to honest uncertainty wording (no documented deferred-maintenance finding)."]
 
 
+_LARGER_LOT_RE = re.compile(r"\b(?:larger|bigger|more generous|oversized)\s+(?:lot|parcel|acreage|yard)\b", re.IGNORECASE)
+
+
+def _reconcile_lot_size_claims(text: str, label: str, subject: dict, comps: list) -> tuple[str, list[str]]:
+    """"Larger lot" for the subject is only true when its lot beats the sales' - v15 credited the
+    subject's "larger lot" (0.68 ac) while two comps sat on 1.1 ac. Drop the adjective otherwise."""
+    if not text or not _LARGER_LOT_RE.search(text):
+        return text, []
+    s_lot = _relevance_lot_sqft(subject)
+    lots = [x for x in (_relevance_lot_sqft(c) for c in comps or [] if c.get("is_included", True)) if x]
+    if not s_lot or not lots or s_lot > max(lots):
+        return text, []
+    out = re.sub(r",?\s*(?:and|plus)\s+(?:a|the|its)?\s*(?:larger|bigger|more generous|oversized)\s+(?:lot|parcel|acreage|yard)\b",
+                 "", text, flags=re.IGNORECASE)
+    out = _LARGER_LOT_RE.sub(lambda m: m.group(0).split()[-1], out)
+    return out, [f"{label}: removed a 'larger lot' claim - {sum(1 for x in lots if x >= s_lot)} of the sales sit on as much land or more."]
+
+
 def _final_consistency_gate(
     fields: dict[str, tuple[str, str]], *, subject: dict, comps: list[dict], value: float, status_timeline: dict,
     comp_num_by_key: dict, addr_by_key: dict,
@@ -4637,7 +4655,8 @@ def _final_consistency_gate(
         txt, f5 = _reconcile_closest_comp_claims(txt, label, comps, comp_num_by_key, addr_by_key)
         txt, f6 = _reconcile_original_systems_claim(txt, label, subject)
         txt, f7 = _reconcile_age_condition_inference(txt, label, subject)
-        qa_flags.extend(f1 + f2 + f3 + f4 + f5 + f6 + f7)
+        txt, f8 = _reconcile_lot_size_claims(txt, label, subject, comps)
+        qa_flags.extend(f1 + f2 + f3 + f4 + f5 + f6 + f7 + f8)
         qa_blocking.extend(b2 + b4)
         out[key] = txt
     return out, qa_flags, qa_blocking
@@ -9260,9 +9279,14 @@ _PLAIN_WORDS = (
     (r",?\s*(?:which|that)\s+(?:depressed|reduced|trimmed|cut|lowered)\s+its\s+(?:location\s+|valuation\s+)?weight"
      r"(?:\s+in\s+the\s+(?:comp(?:arable)?[- ]sales\s+)?(?:anchor|valuation))?[^,.;]*", ""),
     (r",?\s*(?:and\s+|which\s+)?(?:anchors|drives|carries)\s+the\s+(?:valuation|value)(?:\s+(?:most heavily|the most))?", ""),
-    # "Its finished basement is below-grade value already normalized into the comparison" (v13, 10/21)
+    # "Its finished basement is below-grade value already normalized into the comparison, and the
+    # main-level living area is dated..." (v13) - how the grid treats it says nothing to a buyer
+    # (grader, v15: "accounted for separately in the comparison" is still engine talk): drop the clause.
+    (r"\b(?:Its|The)\s+finished\s+(?:basement|lower[- ]level)\s+(?:is|was)\s+(?:below[- ]grade\s+(?:value|space|area)\s+)?"
+     r"(?:already\s+)?(?:normali[sz]ed\s+(?:into|in)|accounted\s+for\s+separately\s+in)\s+the\s+"
+     r"(?:comparison|valuation|analysis|grid),?\s*(?:and\s+|while\s+)?(\w)", lambda m: m.group(1).upper()),
     (r"\b(?:is|are)\s+(?:below[- ]grade\s+|lower[- ]level\s+)?(?:value|space|area)?\s*(?:already\s+)?normali[sz]ed\s+"
-     r"(?:into|in)\s+the\s+(?:comparison|valuation|analysis|grid)", "is accounted for separately in the comparison"),
+     r"(?:into|in)\s+the\s+(?:comparison|valuation|analysis|grid)", "is valued on its own"),
     (r"\b(?:its|the) location weight (?:was |is )?(?:reduced|trimmed|cut|lowered)(?: in the (?:comp(?:arable)?[- ]sales )?anchor)?",
      "it is a weaker match"),
     (r"\bthe (?:comp(?:arable)?[- ]sales )?anchor(?:'s)? (?:rate|\$/sq ?ft|price per square foot|psf)\b",
@@ -9318,6 +9342,16 @@ def _reconcile_comp_hard_facts(
         flags.append(f"{label}: removed an internal data reference from the client note.")
     subject = subject or {}
     comp = comp or {}
+    # Same township, different mailing town: "in Downingtown" reads as a different market (grader,
+    # v15: 3306 E Summit Ave is in Caln Township like the subject, with a Downingtown address).
+    _ccity = str(comp.get("city") or "").strip()
+    if _ccity and _same_municipality(subject, comp) and _norm_token(_ccity) != _norm_token(subject.get("city")):
+        _town = _ccity.title()
+        _new = re.sub(rf"\bin {re.escape(_town)}\b(?!\s+(?:Area|School|Township|Borough|schools?)\b)",
+                      f"with a {_town} mailing address", out, flags=re.IGNORECASE)
+        if _new != out:
+            out = _new
+            flags.append(f"{label}: '{_town}' is only its mailing town - it is in the subject's township.")
     subject_updates = _documented_system_updates(subject)
     if not subject_updates:
         substitutions = (
@@ -13246,6 +13280,10 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
     if not any(re.search(r"\binspection\b", k, re.IGNORECASE) for k in kept):
         kept.append("Include a standard home inspection contingency so the items on the inspection page can be "
                     "checked before you're committed.")
+    # ...and an appraisal contingency (grader, v15: it was there in v12 only when the AI happened to say it).
+    if not any(re.search(r"\bapprais", k, re.IGNORECASE) for k in kept):
+        kept.append("Keep an appraisal contingency as well, so you're protected if the lender's appraisal comes in "
+                    "below your price.")
     body = " ".join(kept).strip()
     # "septic-alternative sewer connection" is the model's odd way of saying public sewer (v12, 10/22)
     body = re.sub(r"\bseptic[- ]alternative sewer(?: connection)?\b", "public sewer connection", body, flags=re.IGNORECASE)
