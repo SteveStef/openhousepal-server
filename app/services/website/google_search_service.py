@@ -352,6 +352,90 @@ async def after_publish(site_id: str) -> None:
         logger.error("after-publish search tasks failed", exc_info=True)
 
 
+# --------------------------------------------------------------------------- the agent's Google report
+
+REPORT_DAYS = 28
+REPORT_TTL = timedelta(hours=12)
+
+
+async def _search_analytics(site_url: str, start: str, end: str, dimensions: list[str], limit: int) -> list[dict]:
+    j = await _google("POST", f"{_WEBMASTERS}/sites/{quote(site_url, safe='')}/searchAnalytics/query", json_body={
+        "startDate": start, "endDate": end, "dimensions": dimensions, "rowLimit": limit, "dataState": "all",
+    })
+    return j.get("rows") or []
+
+
+def _totals(rows: list[dict]) -> dict:
+    """Sum day rows into one line. Average position is weighted by how often each day showed."""
+    imp = sum(int(r.get("impressions") or 0) for r in rows)
+    clicks = sum(int(r.get("clicks") or 0) for r in rows)
+    pos = sum(float(r.get("position") or 0) * int(r.get("impressions") or 0) for r in rows) / imp if imp else None
+    return {"impressions": imp, "clicks": clicks, "ctr": (clicks / imp) if imp else None, "position": round(pos, 1) if pos else None}
+
+
+def build_report(host: str, today: datetime, daily_rows: list[dict], query_rows: list[dict], page_rows: list[dict]) -> dict:
+    """Shape Search Console rows into the editor's report. `daily_rows` cover the last 2 x 28 days
+    (the earlier half is the "vs. the 28 days before" comparison)."""
+    end = today.date()
+    start = end - timedelta(days=REPORT_DAYS - 1)
+    prev_start = start - timedelta(days=REPORT_DAYS)
+    by_day = {r["keys"][0]: r for r in daily_rows if r.get("keys")}
+    days = []
+    for i in range(REPORT_DAYS):
+        d = (start + timedelta(days=i)).isoformat()
+        r = by_day.get(d) or {}
+        days.append({"date": d, "impressions": int(r.get("impressions") or 0), "clicks": int(r.get("clicks") or 0)})
+    current = _totals([r for k, r in by_day.items() if k >= start.isoformat()])
+    previous = _totals([r for k, r in by_day.items() if prev_start.isoformat() <= k < start.isoformat()])
+    origin = f"https://{host}"
+    pages = []
+    for r in page_rows[:6]:
+        url = (r.get("keys") or [""])[0]
+        path = url[len(origin):] if url.startswith(origin) else url
+        pages.append({"path": path or "/", "impressions": int(r.get("impressions") or 0), "clicks": int(r.get("clicks") or 0)})
+    return {
+        "start": start.isoformat(), "end": end.isoformat(),
+        "totals": current, "previous": previous, "days": days,
+        "queries": [{"query": (r.get("keys") or [""])[0], "impressions": int(r.get("impressions") or 0), "clicks": int(r.get("clicks") or 0),
+                     "position": round(float(r.get("position") or 0), 1)} for r in query_rows[:10]],
+        "pages": pages,
+        "fetched_at": _iso(_now()),
+    }
+
+
+async def report_for(db: AsyncSession, site: Site, *, refresh: bool = False) -> dict:
+    """The last 28 days in Google for the editor - cached 12h on the site (Google's numbers only
+    move once a day, 2-3 days behind). {"ready": False, "reason": ...} until there's anything to show."""
+    status = await status_for(db, site)
+    if status["state"] != "done":
+        return {"ready": False, "reason": status["state"]}
+    gs = dict(site.google_search or {})
+    cached = gs.get("report") or {}
+    fetched = _parse(cached.get("fetched_at"))
+    if cached.get("host") == status["host"] and fetched and _now() - fetched < REPORT_TTL and not refresh:
+        return {"ready": True, **cached}
+    site_url = status["site_url"]
+    today = _now()
+    end = today.date().isoformat()
+    start = (today.date() - timedelta(days=REPORT_DAYS - 1)).isoformat()
+    prev_start = (today.date() - timedelta(days=2 * REPORT_DAYS - 1)).isoformat()
+    try:
+        daily, queries, pages = await asyncio.gather(
+            _search_analytics(site_url, prev_start, end, ["date"], 2 * REPORT_DAYS + 5),
+            _search_analytics(site_url, start, end, ["query"], 10),
+            _search_analytics(site_url, start, end, ["page"], 6),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.info("Google report failed for %s: %s", status["host"], e)
+        if cached.get("host") == status["host"]:
+            return {"ready": True, **cached}
+        return {"ready": False, "reason": "unreachable"}
+    report = {"host": status["host"], **build_report(status["host"], today, daily, queries, pages)}
+    gs["report"] = report
+    await _save(db, site, gs)
+    return {"ready": True, **report}
+
+
 # --------------------------------------------------------------------------- status for the editor
 
 async def status_for(db: AsyncSession, site: Site) -> dict:

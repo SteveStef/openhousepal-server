@@ -329,6 +329,16 @@ async def get_my_google_status(
     return await google_search_service.status_for(db, site)
 
 
+@router.get("/me/google/report")
+async def get_my_google_report(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """The last 28 days in Google: how often the site showed, visits, what people searched."""
+    site = await _load_owned_site(db, current_user.id)
+    return await google_search_service.report_for(db, site)
+
+
 @router.post("/me/google/retry")
 async def retry_my_google(
     background_tasks: BackgroundTasks,

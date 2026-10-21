@@ -193,3 +193,40 @@ async def test_set_code_route_saves_and_clears(google, monkeypatch):
     assert exc.value.status_code == 400
     out = await site_routes.set_my_google_code(site_routes.GoogleCodeIn(code=""), db=_FakeDb(), current_user=user)
     assert out["manual_code"] is None
+
+
+def test_build_report_shapes_days_totals_and_change():
+    from datetime import datetime, timezone
+    today = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
+    daily = [
+        {"keys": ["2026-10-01"], "impressions": 100, "clicks": 4, "position": 10.0},
+        {"keys": ["2026-10-28"], "impressions": 300, "clicks": 6, "position": 6.0},
+        {"keys": ["2026-09-20"], "impressions": 50, "clicks": 1, "position": 20.0},  # the 28 days before
+    ]
+    queries = [{"keys": ["jane smith realtor"], "impressions": 80, "clicks": 9, "position": 1.23}]
+    pages = [{"keys": ["https://www.janehomes.com/neighborhoods"], "impressions": 40, "clicks": 2}, {"keys": ["https://www.janehomes.com/"], "impressions": 30, "clicks": 1}]
+    r = gss.build_report("www.janehomes.com", today, daily, queries, pages)
+    assert len(r["days"]) == gss.REPORT_DAYS and r["days"][0]["date"] == "2026-10-01" and r["days"][-1]["impressions"] == 300
+    assert r["totals"]["impressions"] == 400 and r["totals"]["clicks"] == 10
+    assert r["totals"]["position"] == 7.0  # weighted by impressions: (100*10 + 300*6) / 400
+    assert r["previous"]["impressions"] == 50
+    assert r["queries"][0] == {"query": "jane smith realtor", "impressions": 80, "clicks": 9, "position": 1.2}
+    assert [p["path"] for p in r["pages"]] == ["/neighborhoods", "/"]
+
+
+@pytest.mark.asyncio
+async def test_report_waits_until_google_has_the_site_and_caches(google, monkeypatch):
+    calls = []
+
+    async def analytics(site_url, start, end, dims, limit):
+        calls.append(dims[0])
+        return [{"keys": [end], "impressions": 12, "clicks": 1, "position": 3.0}] if dims == ["date"] else []
+
+    monkeypatch.setattr(gss, "_search_analytics", analytics)
+    site = _site()
+    assert (await gss.report_for(_FakeDb(), site)) == {"ready": False, "reason": "working"}
+    site.google_search = {"host": "www.janehomes.com", "verified_at": "x", "sitemap_submitted_at": "2026-10-20T00:00:00+00:00"}
+    r = await gss.report_for(_FakeDb(), site)
+    assert r["ready"] and r["totals"]["impressions"] == 12 and sorted(calls) == ["date", "page", "query"]
+    await gss.report_for(_FakeDb(), site)  # cached - no new Google calls
+    assert len(calls) == 3
