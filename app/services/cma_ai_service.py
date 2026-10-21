@@ -5324,10 +5324,13 @@ _V10_FEATURE_BATH_PCT = 0.02      # per full-bath difference (a half bath = 0.5)
 _V10_FEATURE_GARAGE_PCT = float(os.getenv("CMA_GRID_GARAGE_PCT", "0.015"))  # per garage-space difference x the comp's price
 _V10_FEATURE_LOT_PCT = float(os.getenv("CMA_GRID_LOT_PCT", "0"))  # per doubling of lot size x the comp's price (0 = off)
 _V10_REL_WEIGHT_POW = float(os.getenv("CMA_REL_WEIGHT_POW", "1"))  # comp weight = Match-% relevance ** this
-# Grader suggestions (10/21), off until the free backtest supports them:
+# Grader suggestions (10/21), tested on the 120-home free backtest (_cma_engine_lab/engine/edge_*.log):
+# time at 3%/yr was a little better on every buyer measure (grid 10.1% -> 9.8% median miss, with the
+# asking band 8.0% -> 7.5%), so it is on. Age (1%/decade) and a 25% lower-level rate changed nothing;
+# the busier-road line couldn't be backtested (road lookups ~1 min each) - both stay off.
 _V10_FEATURE_AGE_PCT = float(os.getenv("CMA_GRID_AGE_PCT", "0"))    # per 10 years of build-year gap x the comp's price
 _V10_FEATURE_ROAD_PCT = float(os.getenv("CMA_GRID_ROAD_PCT", "0"))  # comp on a through road, subject not: + this x its price
-_V10_TIME_PCT_PER_YEAR = float(os.getenv("CMA_GRID_TIME_PCT_YR", "0"))  # market change per year since the sale x its price
+_V10_TIME_PCT_PER_YEAR = float(os.getenv("CMA_GRID_TIME_PCT_YR", "0.03"))  # market change per year since the sale x its price
 _V10_FEATURE_CESSPOOL_PCT = 0.04  # cesspool vs not: 4% of the comp's price...
 _V10_FEATURE_CESSPOOL_MAX = 30000  # ...up to $30K (replacement / public-sewer connection)
 _V10_FEATURE_MAX_PCT = 0.30       # net adjustment capped at +-30% of the comp's sale price
@@ -8265,7 +8268,8 @@ def _build_reasoning_evidence_packet(
             for c in (a.get("comps") or [])
         ],
         # Appraisal-style grid already inside deterministic_anchor: each verified comp moved toward the
-        # subject for size, finished lower level, baths and garage. Do not price those again.
+        # subject for size, finished lower level, baths, garage and market change since the sale.
+        # Do not price those again.
         "main_uncertainties": a.get("main_uncertainties") or [],
         "comp_adjustment_grid": [
             {"comp_label": c.get("label"), "sale_price": c.get("raw_sale_price"), "size_adjustment": c.get("size_adjustment"),
@@ -8273,6 +8277,7 @@ def _build_reasoning_evidence_packet(
              "baths": (c.get("feature_adjustments") or {}).get("baths"),
              "garage": (c.get("feature_adjustments") or {}).get("garage"),
              "cesspool": (c.get("feature_adjustments") or {}).get("sewer"),
+             "market_change_since_sale": (c.get("feature_adjustments") or {}).get("time"),
              "adjusted_price": c.get("size_adjusted_price"), "normalized_weight": c.get("normalized_weight")}
             for c in (a.get("comps") or [])
         ],
@@ -14433,7 +14438,8 @@ def _format_anchor_block(anchor: Optional[dict], exposure: dict) -> str:
         _basis = "verified CLOSED sales only" if anchor["mode"] == "closed_only" else "mixed comps (no closed-sale majority - lower confidence)"
         L.append(f"  Comp anchor value: ${anchor['anchor_value']:,}  (from {_basis}; the weighted average of each "
                  f"comp's sale price adjusted to the subject for size, finished lower level, baths, garage and "
-                 f"sewer at one market rate of ${anchor.get('market_psf') or anchor['psf_indication_per_sqft']:,}/sqft)")
+                 f"sewer at one market rate of ${anchor.get('market_psf') or anchor['psf_indication_per_sqft']:,}/sqft, "
+                 f"plus {round(_V10_TIME_PCT_PER_YEAR * 100, 1):g}% a year for market change since each sale)")
         L.append(f"  Anchor range: ${anchor['anchor_low']:,} - ${anchor['anchor_high']:,}   (size model: {anchor['size_model']}, "
                  f"sale-vs-$/sqft divergence {anchor['sale_psf_divergence_pct']}%)")
         for c in anchor["comps"]:
