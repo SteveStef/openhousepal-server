@@ -140,6 +140,9 @@ class LeadOut(BaseModel):
     # space instead of a generic icon when there's no property photo to show there either.
     form_title: Optional[str] = None
     open_houses: List[LeadOpenHouseOut] = []
+    # Homes they came to you through (open house, Cheat Sheet / listing they scanned or asked about)
+    # - searchable on the Leads page. Never the homes inside their Showcase.
+    places: List[str] = []
     showcase_deleted: bool = False
     showcase_new_matches: int = 0
     has_second_visit_request: bool = False

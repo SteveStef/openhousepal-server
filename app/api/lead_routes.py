@@ -177,6 +177,24 @@ async def _fill_missing_property_photos(db: AsyncSession, leads: List[Lead], lea
             lead_out.property = LeadPropertyOut(image=prop.img_src, city=prop.city, price=prop.price, bedrooms=prop.bedrooms, bathrooms=prop.bathrooms)
 
 
+_NOT_HOW_THEY_FOUND_YOU = ('property_comment', 'property_tour', 'review_left')
+
+
+def _lead_places(events: List[LeadEvent]) -> List[str]:
+    """Addresses of the homes this person came to you through (user, 10/21: search Leads by the open
+    house they went to or the Cheat Sheet they scanned) - not the homes in their Showcase."""
+    out: List[str] = []
+    for e in events:
+        st = e.source_type or ''
+        if st.startswith(('showcase', 'collection', 'email')) or st in _NOT_HOW_THEY_FOUND_YOU:
+            continue
+        oh = getattr(e, 'open_house_event', None)
+        for a in (e.property_address, oh and ', '.join(x for x in (oh.address, oh.city) if x)):
+            if a and a not in out:
+                out.append(a)
+    return out
+
+
 def _lead_open_houses(events: List[LeadEvent]) -> List[LeadOpenHouseOut]:
     seen = set()
     open_houses: List[LeadOpenHouseOut] = []
@@ -339,6 +357,7 @@ def _to_lead_out(lead: Lead, collections: Optional[List[Collection]] = None) -> 
         property=_lead_property(events),
         form_title=last_event.form.title if last_event and last_event.source_type in ('form_submission', 'form_partial') and last_event.form else None,
         open_houses=_lead_open_houses(events),
+        places=_lead_places(events),
         showcase_deleted=bool(lead.showcase_deleted_at) and not matched_collections,
         showcase_new_matches=new_matches,
         # Only unseen-by-agent second-visit/disclosure requests count, same "cleared it by handling
@@ -566,6 +585,21 @@ async def _fetch_leads(db: AsyncSession, current_user: User, status: Optional[st
         digits = re.sub(r"\D", "", search)
         if len(digits) >= 3:  # "484-555-0177" / "(484) 555 0177" find a phone stored as 4845550177
             conds.append(func.regexp_replace(func.coalesce(Lead.phone, ''), r'\D', '', 'g').like(f"%{digits}%"))
+        # ...and the homes they came to you through: an open house they signed in at, a Cheat Sheet /
+        # listing they scanned or asked about (user, 10/21). Not the homes inside their Showcase -
+        # those are picks for them, not how they found you.
+        conds.append(exists().where(
+            LeadEvent.lead_id == Lead.id,
+            ~LeadEvent.source_type.like('showcase%'), ~LeadEvent.source_type.like('collection%'),
+            ~LeadEvent.source_type.like('email%'),
+            LeadEvent.source_type.notin_(('property_comment', 'property_tour', 'review_left')),
+            LeadEvent.property_address.ilike(like),
+        ))
+        conds.append(exists().where(
+            LeadEvent.lead_id == Lead.id,
+            LeadEvent.open_house_event_id == OpenHouseEvent.id,
+            or_(OpenHouseEvent.address.ilike(like), OpenHouseEvent.city.ilike(like)),
+        ))
         stmt = stmt.where(or_(*conds))
     result = await db.execute(stmt)
     return list(result.scalars().unique().all())
