@@ -228,13 +228,6 @@ async def send_daily_alerts(db, now: Optional[datetime] = None) -> int:
                 live_cache[site.id] = await _live_state(db, site)
             live = live_cache[site.id]
             news = changes_for(sub, live)
-            if news.get("status") == "sold":
-                # The agent's branded "This home has sold" email for a home they didn't list or
-                # sell would read as their sale (services/sold_branding) - not sent; the guest is
-                # still taken off the list below like any sold home.
-                from app.services import sold_branding
-                if not await sold_branding.branding_allowed_for_listing(db, bits["owner"], site.listing_key):
-                    news = {}
             if news:
                 price = news.get("price")
                 status = news.get("status")

@@ -482,13 +482,12 @@ async def get_site_property(site_id: str, listing_key: str, db: AsyncSession = D
         prop = await content_adapters.get_public_mls_property_detail(db, listing_key)
     if not prop:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Listing not found.")
-    # A sold home this agent didn't take part in shows without their card / contact buttons / share
-    # pill (services/sold_branding) - and never hands off to a Spotlight.
-    prop["branding_allowed"] = await sold_branding.branding_allowed_for_listing(db, user, listing_key)
     # The agent's own published Listing Spotlight for this exact home (any listing they chose to
     # spotlight, not only ones they list) - the property page shows it as the richer experience.
-    if prop["branding_allowed"]:
-        await content_adapters.attach_spotlight_urls(db, user, [prop])
+    await content_adapters.attach_spotlight_urls(db, user, [prop])
+    # Only the link preview (share image) reads this - false leaves the agent off a sold home they
+    # weren't on (services/sold_branding). The page still shows the site owner's contact card.
+    prop["branding_allowed"] = await sold_branding.branding_allowed_for_listing(db, user, listing_key)
     prop["similar"] = await content_adapters.get_similar_listings(db, user, listing_key, prop.get("city"))
     return prop
 
@@ -549,9 +548,8 @@ async def get_search_result_property(site_id: str, listing_key: str, db: AsyncSe
     prop = await content_adapters.get_public_mls_property_detail(db, listing_key)
     if not prop:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Listing not found.")
+    await content_adapters.attach_spotlight_urls(db, user, [prop])
     prop["branding_allowed"] = await sold_branding.branding_allowed_for_listing(db, user, listing_key)
-    if prop["branding_allowed"]:
-        await content_adapters.attach_spotlight_urls(db, user, [prop])
     return prop
 
 

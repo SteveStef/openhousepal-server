@@ -78,12 +78,6 @@ async def resolve_property_site(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No published property website for that address.")
     if await _listing_not_showable(db, site):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This home is no longer on the market.")
-    # A Spotlight is the agent's branded page from top to bottom - a sold home they didn't list or
-    # sell (only older Spotlights made from "any address" can be one) closes instead of reading as
-    # their sale (services/sold_branding). Their own listings that sold stay up as before.
-    from app.services import sold_branding
-    if site.listing_key and not await sold_branding.branding_allowed_for_listing(db, user, site.listing_key):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This home is no longer on the market.")
 
     payload = await render_payload(db, site, user, site.published_snapshot or {}, resolved.canonical_hostname)
     # The tab icon the agent uploaded for their own website (IDX -> Google tab) - their Spotlights
