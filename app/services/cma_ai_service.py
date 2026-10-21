@@ -5577,6 +5577,38 @@ def _anchor_main_uncertainties(subject: dict, rows: list, closed_count: int) -> 
                    "the closest available sales still differ a lot from this home.")
     if closed_count <= 2:
         out.append(f"Only {closed_count} verified sale{'s' if closed_count != 1 else ''} carr{'y' if closed_count != 1 else 'ies'} the value, so a single sale moves it a lot.")
+    for reason in _anchor_loose_fit_reasons(subject, rows):
+        if reason not in out and not (reason.startswith("Adjustments exceed") and heavy):
+            out.append(reason)
+    return out
+
+
+_LOOSE_FIT_SIZE_OVER = 1.25    # subject above grade > 25% bigger than every sale...
+_LOOSE_FIT_SIZE_UNDER = 0.80   # ...or 20% smaller than every sale
+_LOOSE_FIT_MIN_MATCH = 70      # the best sale's Match % under this
+
+
+def _anchor_loose_fit_reasons(subject: dict, rows: list) -> list:
+    """Why the sales are a loose fit for this home (owner, 10/21: an estate may have no close
+    comparables) - then "priced above / below its sales" is a rough read, not a finding."""
+    out = []
+    s_ag = _v10_sqft(subject)
+    sizes = [r["ag"] for r in rows if r.get("ag")]
+    if s_ag and sizes:
+        if s_ag > _LOOSE_FIT_SIZE_OVER * max(sizes):
+            out.append(f"This home ({round(s_ag):,} sq ft above grade) is much larger than every sale used "
+                       f"(largest {round(max(sizes)):,} sq ft), so its value leans on price-per-square-foot adjustments.")
+        elif s_ag < _LOOSE_FIT_SIZE_UNDER * min(sizes):
+            out.append(f"This home ({round(s_ag):,} sq ft above grade) is much smaller than every sale used "
+                       f"(smallest {round(min(sizes)):,} sq ft), so its value leans on price-per-square-foot adjustments.")
+    heavy = [r for r in rows if r.get("price") and (r.get("feat") or {}).get("gross", 0) / r["price"] > 0.20]
+    if rows and len(heavy) * 2 > len(rows):
+        out.append(f"Adjustments exceed 20% of the sale price on {len(heavy)} of {len(rows)} verified sales - "
+                   "the closest available sales still differ a lot from this home.")
+    matches = [_as_float((r.get("_c") or {}).get("match_score")) for r in rows]
+    matches = [m for m in matches if m is not None]
+    if matches and max(matches) < _LOOSE_FIT_MIN_MATCH:
+        out.append(f"No sale is a close match for this home (the best is a {round(max(matches))}% match).")
     return out
 
 
@@ -5995,6 +6027,7 @@ def _compute_comp_anchor(
         "anchor_validity": anchor_validity,
         "anchor_validity_reason": validity_reason,
         "main_uncertainties": _anchor_main_uncertainties(subject, rows, len(closed_rows)),
+        "loose_fit": bool(_anchor_loose_fit_reasons(subject, rows)),
         "comp_stats": comp_stats,
         "anchor_value": round(anchor_value),
         "anchor_low": round(anchor_value * (1 - spread)),
@@ -8083,7 +8116,17 @@ asking_price_check.long_unsold is true, the home has gone unsold for months at t
 adjusted sales sit well below the asking price, trust the sales and say plainly that the asking
 price looks high next to what nearby homes sold for. When asking_price_check.fresh_listing is true,
 the home was just listed - if the adjusted sales sit above the asking price, it may draw offers over
-asking; value it from the sales and say that as a possibility, never a certainty. When asking_price_check.passed_over is true, the
+asking; value it from the sales and say that as a possibility, never a certainty. When
+asking_price_check.over_ask_pattern is set, most of the comparable sales sold over their final list
+price within days and this home is still newly listed: allowed_high already makes room for the same
+outcome - follow the adjusted sales (not the asking price) up to it, and never call a bidding war
+certain. When asking_price_check.priced_above_sales is true, the asking price is already above what
+the adjusted sales support: do not suggest it will sell over asking because its comps did - the
+comps' over-asking results are likely already in its price. When asking_price_check.sales_loose_fit
+is true, no sale is a close match for this home (much larger or smaller than all of them, heavy
+adjustments, or a low best Match %): do not call it overpriced or underpriced on the strength of
+those sales alone, say plainly that the value is less certain, and keep confidence no higher than
+medium. When asking_price_check.passed_over is true, the
 home has been on the market longer than its comps took to sell, so it most likely sells at or a
 little under asking - do not describe competing offers or a premium over asking. Say it in exactly
 that factual way ("has been on the market longer than the fastest comparable sales - a small trim,
@@ -8306,7 +8349,8 @@ def _build_reasoning_evidence_packet(
     }
     packet = {"subject": subject_packet, "comparables": comp_packets, "market_tempo": _reasoning_market_tempo(comp_packets),
               "deterministic_evidence": deterministic}
-    check = _asking_price_market_check(subject_packet, tl, exposure, comp_packets)
+    check = _asking_price_market_check(subject_packet, tl, exposure, comp_packets, anchor_value=a.get("anchor_value"),
+                                       sales_loose_fit=bool(a.get("loose_fit")))
     if check:
         packet["asking_price_check"] = check
     return packet
@@ -8332,10 +8376,15 @@ _ASKING_CHECK_PASSED_OVER_RATIO = 0.98      # ...expect at most 98% of asking, a
 #   underpriced new listing under its sales in a flat market ($450K ask, $500K sales -> $472.5K).
 _ASKING_CHECK_LONG_UNSOLD_FLOORS = ((365, 0.70), (120, 0.80))   # (days on market, floor x expected)
 _ASKING_CHECK_FRESH_CAPS = ((7, 1.10), (14, 1.07))              # (days on market, ceiling x asking)
+_OVER_ASK_MIN_RATIO = 1.02   # a comp "sold over asking" at 2%+ over its final list price...
+_OVER_ASK_FAST_DAYS = 10     # ...within this many days on market
+_OVER_ASK_MAX_CAP = 1.20     # the most a fresh listing's value may reach over asking on that pattern
+_PRICED_ABOVE_SALES_TOL = 0.02   # asking more than 2% above the adjusted sales = priced above them
 
 
 def _asking_price_market_check(subject_packet: dict, status_timeline: dict, exposure: dict,
-                               comp_packets: list) -> Optional[dict]:
+                               comp_packets: list, *, anchor_value: Optional[float] = None,
+                               sales_loose_fit: bool = False) -> Optional[dict]:
     """Expected sale price of a listed subject = asking x the comps' median sold/list ratio (no
     premium once it has sat longer than its comps), and the band the final value must stay in.
     None when the subject isn't listed, has already closed, or fewer than 2 comps have a ratio."""
@@ -8379,22 +8428,53 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
         ratio = min(ratio, _ASKING_CHECK_PASSED_OVER_RATIO)
         high_mult = 1.0
         stale = True
+    # Priced above its sales (owner, 10/21): when the asking price is already more than the adjusted
+    # comparable sales support, the agent has likely priced the comps' over-asking results in - the
+    # comps selling over THEIR asking prices says nothing about this one doing it too. No over-asking
+    # premium on the expected price, and no over-asking pattern below.
+    _av = _as_float(anchor_value)
+    priced_above_sales = bool(_av and lp > _av * (1 + _PRICED_ABOVE_SALES_TOL))
+    if priced_above_sales:
+        ratio = min(ratio, 1.0)
     expected = lp * ratio
     low_mult = _ASKING_CHECK_BAND_STALE_LOW if stale else _ASKING_CHECK_BAND[0]
     long_unsold = False
-    if stale and dom is not None:
+    # Letting the sales win only makes sense when they are real matches - not for a home no sale
+    # fits well (an estate, much bigger than every sale; see _anchor_loose_fit_reasons).
+    if stale and dom is not None and not sales_loose_fit:
         for days, floor in _ASKING_CHECK_LONG_UNSOLD_FLOORS:
             if dom >= days:
                 low_mult, long_unsold = min(low_mult, floor), True
                 break
     allowed_high = expected * high_mult
     fresh_listing = False
+    # Over-asking pattern (owner, 10/21): at least half the comps with a list price sold over it
+    # (2%+) within 10 days. A home still in its first two weeks may go the same way, so the cap can
+    # reach what the hottest of those sales got over asking (up to 20%). Fast first-week sales in our
+    # Bright data: 90th / 95th percentile 1.08 / 1.11 over final list; with signs of competition
+    # (offer deadlines) 1.13 / 1.16 - so a fixed 10% cap cut off real outcomes.
+    _fast_over = [float(c["sold_list_ratio"]) for c in comp_packets
+                  if (_as_float(c.get("sold_list_ratio")) or 0) >= _OVER_ASK_MIN_RATIO and 0.75 <= float(c["sold_list_ratio"]) <= 1.5
+                  and _as_float(c.get("dom")) is not None and float(c["dom"]) <= _OVER_ASK_FAST_DAYS]
+    over_ask_pattern = None
+    if len(_fast_over) >= 2 and len(_fast_over) * 2 >= len(ratios) and not priced_above_sales:
+        _fast_days = sorted(float(c["dom"]) for c in comp_packets
+                            if (_as_float(c.get("sold_list_ratio")) or 0) >= _OVER_ASK_MIN_RATIO
+                            and _as_float(c.get("dom")) is not None and float(c["dom"]) <= _OVER_ASK_FAST_DAYS)
+        over_ask_pattern = {"count": len(_fast_over), "of": len(ratios), "top_pct": round((max(_fast_over) - 1) * 100, 1),
+                            "median_days": _v10_median(_fast_days)}
     if dom is not None and not (stale or passed_over or outpaced):
         for days, cap in _ASKING_CHECK_FRESH_CAPS:
             if dom <= days:
+                if over_ask_pattern:
+                    cap = max(cap, min(max(_fast_over), _OVER_ASK_MAX_CAP))
                 fresh_listing = lp * cap > allowed_high
                 allowed_high = max(allowed_high, lp * cap)
                 break
+        else:
+            over_ask_pattern = None   # past two weeks: the report doesn't promise competition
+    else:
+        over_ask_pattern = None
     return {
         "asking_price": round(lp),
         "comp_median_sold_to_list_ratio": round(median, 3),
@@ -8408,6 +8488,9 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
         "outpaced_by_over_ask_sales": outpaced,
         "long_unsold": long_unsold,
         "fresh_listing": fresh_listing,
+        "over_ask_pattern": over_ask_pattern,
+        "priced_above_sales": priced_above_sales,
+        "sales_loose_fit": bool(sales_loose_fit),
     }
 
 
@@ -11740,16 +11823,37 @@ def _v10_asking_gap_sentence(methodology: str, *, final: Optional[dict], trace: 
         return methodology, []
     sentence = (f" The ${ask:,.0f} asking price is about {round(abs(gap))}% {'above' if gap > 0 else 'below'} "
                 f"{_ASKING_GAP_MARK} (about ${round(a, -3):,.0f}).")
+    if ((trace or {}).get("anchor") or {}).get("loose_fit"):
+        sentence = sentence[:-1] + ", but none of those sales is a close match for this home, so treat that as a rough guide."
     return methodology.rstrip() + sentence, [
         f"Methodology summary: added the asking price vs. sales gap ({gap:+.0f}%)."
     ]
+
+
+_OVER_ASK_MARK = "sold over their asking price"
+
+
+def _v10_over_ask_pattern_sentence(methodology: str, *, trace: Optional[dict]) -> tuple[str, list[str]]:
+    """A new listing whose comps mostly sold over asking fast: say so (owner, 10/21) - it may draw
+    competing offers too. Only set while the home is in its first two weeks and hasn't sat longer
+    than those sales (see _asking_price_market_check)."""
+    pat = ((trace or {}).get("asking_price_check") or {}).get("over_ask_pattern") or {}
+    if not methodology or not pat.get("count") or _OVER_ASK_MARK in methodology:
+        return methodology, []
+    days = _as_float(pat.get("median_days"))
+    sentence = (f" {pat['count']} of the {pat['of']} comparable sales {_OVER_ASK_MARK}"
+                + (f", typically within {round(days)} days" if days else "")
+                + f" (up to {round(_as_float(pat.get('top_pct')) or 0)}% over), so this newly listed home could draw "
+                  "competing offers above its asking price.")
+    return methodology.rstrip() + sentence, ["Methodology summary: added the comps' over-asking pattern."]
 
 
 def _v10_reconcile_anchor_direction_prose(methodology: str, *, final: Optional[dict],
                                           trace: Optional[dict]) -> tuple[str, list[str]]:
     text, flags = _v10_anchor_direction_core(methodology, final=final, trace=trace)
     text, gap_flags = _v10_asking_gap_sentence(text, final=final, trace=trace)
-    return text, flags + gap_flags
+    text, oa_flags = _v10_over_ask_pattern_sentence(text, trace=trace)
+    return text, flags + gap_flags + oa_flags
 
 
 def _v10_anchor_direction_core(methodology: str, *, final: Optional[dict],
@@ -12861,7 +12965,10 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
     _exp_state = str(((trace or {}).get("exposure") or {}).get("state") or "")
     _lts = _as_float(((trace or {}).get("anchor") or {}).get("comp_list_to_sale_median"))
     _passed_over = bool(((trace or {}).get("asking_price_check") or {}).get("passed_over"))
-    hot = bool(lp and _lts and _lts >= 1.02 and not _passed_over
+    # ...and not when the asking price is already above what the adjusted sales support - the comps'
+    # over-asking results are likely priced in already (owner, 10/21).
+    _priced_above = bool(((trace or {}).get("asking_price_check") or {}).get("priced_above_sales"))
+    hot = bool(lp and _lts and _lts >= 1.02 and not _passed_over and not _priced_above
                and _exp_state not in ("elevated_exposure", "extended_exposure"))
     # The over-asking sales went under contract fast; a subject still on the market well past that
     # isn't drawing a bidding war (10/20: 417 Dogwood Ln at 14 days vs comps pending in 6 was told to
@@ -15526,6 +15633,7 @@ async def _generate_ai_analysis_impl(
                 "asking_price": _apc.get("asking_price"), "ratio_used": _apc.get("ratio_used"),
                 "passed_over": bool(_apc.get("passed_over")),
                 "long_unsold": bool(_apc.get("long_unsold")), "fresh_listing": bool(_apc.get("fresh_listing")),
+                "over_ask_pattern": _apc.get("over_ask_pattern"), "priced_above_sales": bool(_apc.get("priced_above_sales")),
             }
         valuation_trace["authoritative_evidence_snapshot"] = _evidence_snapshot.audit_metadata()
         qa_blocking.extend(_reasoning_blocking)
@@ -16228,6 +16336,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
                 "asking_price": _apc.get("asking_price"), "ratio_used": _apc.get("ratio_used"),
                 "passed_over": bool(_apc.get("passed_over")),
                 "long_unsold": bool(_apc.get("long_unsold")), "fresh_listing": bool(_apc.get("fresh_listing")),
+                "over_ask_pattern": _apc.get("over_ask_pattern"), "priced_above_sales": bool(_apc.get("priced_above_sales")),
             }
         valuation_trace["authoritative_evidence_snapshot"] = _evidence_snapshot.audit_metadata()
         qa_blocking.extend(_reasoning_blocking)
