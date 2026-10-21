@@ -4689,6 +4689,29 @@ def _prep_comp_for_ai(comp: dict) -> dict:
     return c
 
 
+_FAR_COMP_MILES = 2.0
+_OLD_COMP_DAYS = 183
+
+
+def _far_or_old_comp_flags(comps: list) -> list[str]:
+    """Agent-view notes for included sales over 2 miles away or older than 6 months (grader,
+    10/21) - legitimate when the area is thin, but worth a look before sending."""
+    flags = []
+    for i, comp in enumerate(comps or []):
+        if not comp.get("is_included", True):
+            continue
+        bits = []
+        dist = _as_float(comp.get("distance_miles"))
+        if dist is not None and dist > _FAR_COMP_MILES:
+            bits.append(f"{dist:.1f} miles away")
+        sold = _parse_iso_date(comp.get("close_date") or comp.get("sale_date"))
+        if sold and (_tmach.today() - sold).days > _OLD_COMP_DAYS:
+            bits.append(f"sold {round((_tmach.today() - sold).days / 30.4)} months ago")
+        if bits:
+            flags.append(f"{_comp_label(i, comp)} is {' and '.join(bits)} - check it still fits before sending.")
+    return flags
+
+
 def _comp_label(index: int, comp: dict) -> str:
     """'Comp #2 (112 Dovecote Ln)' - ordinal (1-based, in this generation's own comp order) plus
     street address only, no city and no raw MLS listing_key. This is the one identifier the AI
@@ -5301,6 +5324,10 @@ _V10_FEATURE_BATH_PCT = 0.02      # per full-bath difference (a half bath = 0.5)
 _V10_FEATURE_GARAGE_PCT = float(os.getenv("CMA_GRID_GARAGE_PCT", "0.015"))  # per garage-space difference x the comp's price
 _V10_FEATURE_LOT_PCT = float(os.getenv("CMA_GRID_LOT_PCT", "0"))  # per doubling of lot size x the comp's price (0 = off)
 _V10_REL_WEIGHT_POW = float(os.getenv("CMA_REL_WEIGHT_POW", "1"))  # comp weight = Match-% relevance ** this
+# Grader suggestions (10/21), off until the free backtest supports them:
+_V10_FEATURE_AGE_PCT = float(os.getenv("CMA_GRID_AGE_PCT", "0"))    # per 10 years of build-year gap x the comp's price
+_V10_FEATURE_ROAD_PCT = float(os.getenv("CMA_GRID_ROAD_PCT", "0"))  # comp on a through road, subject not: + this x its price
+_V10_TIME_PCT_PER_YEAR = float(os.getenv("CMA_GRID_TIME_PCT_YR", "0"))  # market change per year since the sale x its price
 _V10_FEATURE_CESSPOOL_PCT = 0.04  # cesspool vs not: 4% of the comp's price...
 _V10_FEATURE_CESSPOOL_MAX = 30000  # ...up to $30K (replacement / public-sewer connection)
 _V10_FEATURE_MAX_PCT = 0.30       # net adjustment capped at +-30% of the comp's sale price
@@ -5464,7 +5491,8 @@ def _v10_grid_adjustments(subject: dict, r: dict, s_ag: float, s_bg: float, s_bg
     finished lower level, baths, garage, cesspool - all at one market rate. Positive = the subject
     has more. Size ALWAYS follows the size gap (a smaller comp is adjusted up)."""
     comp, price = r["_c"], r["price"]
-    out = {"size": 0.0, "below_grade": 0.0, "baths": 0.0, "garage": 0.0, "sewer": 0.0, "lot": 0.0, "notes": [],
+    out = {"size": 0.0, "below_grade": 0.0, "baths": 0.0, "garage": 0.0, "sewer": 0.0, "lot": 0.0,
+           "age": 0.0, "road": 0.0, "time": 0.0, "notes": [],
            "market_psf": round(market_psf, 2),
            "size_rate_psf": round(market_psf * _V10_GRID_SIZE_FRAC, 2),
            "below_grade_rate_psf": round(market_psf * _V10_GRID_BG_FRAC, 2),
@@ -5496,7 +5524,18 @@ def _v10_grid_adjustments(subject: dict, r: dict, s_ag: float, s_bg: float, s_bg
         amount = min(_V10_FEATURE_CESSPOOL_PCT * price, _V10_FEATURE_CESSPOOL_MAX)
         out["sewer"] = amount if c_cess else -amount
         out["notes"].append("comp has a cesspool" if c_cess else "subject has a cesspool")
-    keys = ("size", "below_grade", "baths", "garage", "sewer", "lot")
+    s_yr, c_yr = _as_float(subject.get("year_built")), _as_float(comp.get("year_built"))
+    if _V10_FEATURE_AGE_PCT and s_yr and c_yr and s_yr > 1800 and c_yr > 1800 and abs(s_yr - c_yr) >= 5:
+        out["age"] = _clamp((s_yr - c_yr) / 10.0, -4.0, 4.0) * price * _V10_FEATURE_AGE_PCT
+        out["notes"].append(f"built {int(s_yr)} vs {int(c_yr)}")
+    if _V10_FEATURE_ROAD_PCT and float((r.get("loc_trace") or {}).get("street_weight_penalty", 1.0) or 1.0) < 1.0:
+        out["road"] = price * _V10_FEATURE_ROAD_PCT
+        out["notes"].append("comp is on a busier road than the subject")
+    sold = _parse_iso_date(comp.get("close_date") or comp.get("sale_date"))
+    if _V10_TIME_PCT_PER_YEAR and sold and (_tmach.today() - sold).days >= 30:
+        out["time"] = (_tmach.today() - sold).days / 365.0 * price * _V10_TIME_PCT_PER_YEAR
+        out["notes"].append(f"market change since the sale ({(_tmach.today() - sold).days} days)")
+    keys = ("size", "below_grade", "baths", "garage", "sewer", "lot", "age", "road", "time")
     gross = sum(abs(out[k]) for k in keys)
     net = sum(out[k] for k in keys)
     cap = _V10_FEATURE_MAX_PCT * price
@@ -10400,9 +10439,59 @@ def _reasoning_projected_cost(config: dict, evidence_packet: dict) -> tuple[floa
 _REASONING_CACHE_DAYS = 14
 
 
+# Days on market tick up daily and the comps' recency weights drift a little, so an exact-match
+# key missed every day and the same home got a fresh - slightly different - AI answer each day
+# (grader, 10/21). The key keeps what can change the conclusion (prices, facts, the exposure state
+# and the passed-over / outpaced / long-unsold / fresh flags), drops day counts, and rounds dollars
+# to $2,500 (the narrative QA tolerance) and weights/ratios to 0.01.
+_CACHE_DAY_KEYS = frozenset({"dom", "cdom", "active_market_days", "cumulative_dom", "calendar_days_since_list"})
+_CACHE_DAYS_AFTER_RE = re.compile(r"\b\d{1,4}(\s*(?:-\s*)?(?:days?|DOM)\b)", re.IGNORECASE)   # "14 days"
+_CACHE_DAYS_LABEL_RE = re.compile(r"(\bdays?\b[^.\n]{0,40}?:\s*)\d{1,4}\b", re.IGNORECASE)    # "days since list: 14"
+
+
+_CACHE_DOLLARS_RE = re.compile(r"\$\s?(\d{1,3}(?:,\d{3})+|\d{4,})(?:\.\d+)?")
+_CACHE_PCT_RE = re.compile(r"\b(\d{1,3})\.\d+\s?%")
+
+
+def _day_stable_text(text: str) -> str:
+    """Prompt text with day counts blanked, dollars rounded to $2,500 and decimal percents to whole
+    ones - the comps' weights and the grid's anchor shift a few dollars a day with sale age."""
+    text = _CACHE_DAYS_AFTER_RE.sub(lambda m: "#" + m.group(1), text)
+    text = _CACHE_DAYS_LABEL_RE.sub(lambda m: m.group(1) + "#", text)
+    text = _CACHE_DOLLARS_RE.sub(lambda m: f"${round(float(m.group(1).replace(',', '')) / 2500) * 2500:,}", text)
+    return _CACHE_PCT_RE.sub(lambda m: m.group(1) + "%", text)
+
+
+def _cache_stable(obj):
+    """A copy of obj for cache keys only: day counts dropped, numbers rounded (see above)."""
+    if isinstance(obj, dict):
+        return {k: _cache_stable(v) for k, v in obj.items() if k not in _CACHE_DAY_KEYS and "recency" not in str(k)}
+    if isinstance(obj, (list, tuple)):
+        return [_cache_stable(v) for v in obj]
+    if isinstance(obj, bool) or obj is None:
+        return obj
+    if isinstance(obj, (int, float)):
+        x = float(obj)
+        return round(x / 2500) * 2500 if abs(x) >= 1000 else round(x, 2)
+    if isinstance(obj, str):
+        return _day_stable_text(obj)
+    return obj
+
+
 def _reasoning_cache_key(evidence_packet: dict, model: str) -> str:
-    payload = json.dumps({"p": evidence_packet, "m": model, "v": PROMPT_VERSION}, sort_keys=True, default=str)
+    payload = json.dumps({"p": _cache_stable(evidence_packet), "m": model, "v": PROMPT_VERSION}, sort_keys=True, default=str)
     return "cma_reasoning_cache:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:48]
+
+
+def _refresh_cached_subject_days(raw, old_dom, new_dom, comp_doms) -> tuple:
+    """A reused answer from an earlier day cites the subject's days on market then ("listed 14
+    days"); bring that figure up to today's. Skipped (returns raw unchanged, False) when a comp has
+    the same day count, since the sentence could be about that comp."""
+    if old_dom is None or new_dom is None or round(old_dom) == round(new_dom) or round(old_dom) in comp_doms:
+        return raw, False
+    text = json.dumps(raw)
+    rx = re.compile(rf"\b{round(old_dom)}(\s*(?:-\s*)?(?:days?|DOM)\b)", re.IGNORECASE)
+    return json.loads(rx.sub(lambda m: f"{round(new_dom)}{m.group(1)}", text)), True
 
 
 async def _reasoning_cache_get(db: AsyncSession, key: str):
@@ -10470,16 +10559,29 @@ async def _run_cma_reasoning_stage(
         # swings. Its answer for an identical evidence packet is reused (no charge) for 14 days.
         _cache_key = _reasoning_cache_key(evidence_packet, model)
         cached = await _reasoning_cache_get(db, _cache_key)
+        _now_dom = _as_float((evidence_packet.get("subject") or {}).get("dom"))
+        reasoning = blockers = None
+        if isinstance(cached, dict) and "raw" in cached:
+            # possibly stored on an earlier day: refresh its day count, and re-ask if it no longer checks out
+            _comp_doms = {round(d) for d in (_as_float(c.get("dom")) for c in evidence_packet.get("comparables") or []) if d is not None}
+            raw, _ = _refresh_cached_subject_days(cached["raw"], _as_float(cached.get("subject_dom")), _now_dom, _comp_doms)
+            reasoning, blockers = _validate_reasoning_valuation(raw, evidence_packet)
+            if blockers:
+                reasoning = blockers = None
+                cached = None
+        else:
+            cached = None
         if cached is not None:
-            raw, usage = cached, {"cached": True}
+            usage = {"cached": True}
         else:
             raw, usage = await _call_cma_reasoning_model(config, evidence_packet)
         input_tokens = int(_as_float(usage.get("input_tokens")) or 0)
         output_tokens = int(_as_float(usage.get("output_tokens")) or 0)
         cost = ai_config_service.estimate_cost_usd(config, model, input_tokens, output_tokens) if cached is None else 0.0
-        reasoning, blockers = _validate_reasoning_valuation(raw, evidence_packet)
+        if reasoning is None:
+            reasoning, blockers = _validate_reasoning_valuation(raw, evidence_packet)
         if cached is None and not blockers:
-            await _reasoning_cache_put(db, _cache_key, raw)
+            await _reasoning_cache_put(db, _cache_key, {"raw": raw, "subject_dom": _now_dom})
         reasoning, guard_flags = _apply_asking_price_check(reasoning, evidence_packet)
         # the callers move these into qa_flags; the validator's own repairs go first
         reasoning["_guard_flags"] = list(reasoning.pop("_repair_flags", None) or []) + list(guard_flags)
@@ -11601,8 +11703,37 @@ _ANCHOR_UP_RE = re.compile(
 )
 
 
+_ASKING_GAP_NOTE_PCT = 5.0
+_ASKING_GAP_MARK = "what the adjusted comparable sales alone point to"
+
+
+def _v10_asking_gap_sentence(methodology: str, *, final: Optional[dict], trace: Optional[dict]) -> tuple[str, list[str]]:
+    """Say outright when the asking price and the sales disagree (grader, 10/21): the final value
+    stays near what homes here actually sell for relative to asking, so a buyer could otherwise
+    miss that the sales alone say much less (or more)."""
+    ask = _as_float(((trace or {}).get("asking_price_check") or {}).get("asking_price"))
+    a = _as_float((final or {}).get("anchor_value")) or _as_float(((trace or {}).get("anchor") or {}).get("anchor_value"))
+    if not methodology or not ask or not a or _ASKING_GAP_MARK in methodology:
+        return methodology, []
+    gap = (ask - a) / a * 100
+    if abs(gap) < _ASKING_GAP_NOTE_PCT:
+        return methodology, []
+    sentence = (f" The ${ask:,.0f} asking price is about {round(abs(gap))}% {'above' if gap > 0 else 'below'} "
+                f"{_ASKING_GAP_MARK} (about ${round(a, -3):,.0f}).")
+    return methodology.rstrip() + sentence, [
+        f"Methodology summary: added the asking price vs. sales gap ({gap:+.0f}%)."
+    ]
+
+
 def _v10_reconcile_anchor_direction_prose(methodology: str, *, final: Optional[dict],
                                           trace: Optional[dict]) -> tuple[str, list[str]]:
+    text, flags = _v10_anchor_direction_core(methodology, final=final, trace=trace)
+    text, gap_flags = _v10_asking_gap_sentence(text, final=final, trace=trace)
+    return text, flags + gap_flags
+
+
+def _v10_anchor_direction_core(methodology: str, *, final: Optional[dict],
+                               trace: Optional[dict]) -> tuple[str, list[str]]:
     """Ensure the client valuation notes affirmatively describe a material final-FMV move away
     from the comparable-sales anchor. Contradictory prose is still blocked later by QA; this helper
     only appends the missing source-of-truth direction when the notes are silent or merely neutral."""
@@ -14605,10 +14736,17 @@ async def _generate_ai_analysis_impl(
     # Same inputs, same comp ratings and notes (v12 grader, 10/22: finish/interior ratings changed
     # between runs on unchanged data): an identical prompt reuses the stored answer, like the final
     # reasoning pass does. Any change to the comps, photos, facts, code version or model misses.
+    # Day counts and day-to-day weight drift don't count as a change (see _cache_stable).
     _comp_cache_key = "cma_comp_cache:" + hashlib.sha256(json.dumps(
-        {"c": content, "s": _SYSTEM_PROMPT, "m": model, "mode": report.mode, "v": PROMPT_VERSION},
+        {"c": _cache_stable(content), "s": _SYSTEM_PROMPT, "m": model, "mode": report.mode, "v": PROMPT_VERSION},
         sort_keys=True, default=str).encode("utf-8")).hexdigest()[:48]
     _cached_comp = await _reasoning_cache_get(db, _comp_cache_key)
+    _subject_dom_now = _as_float(status_timeline.get("active_market_days")) if status_timeline.get("active_market_days") is not None \
+        else _as_float(enriched_subject.get("days_on_market"))
+    if isinstance(_cached_comp, dict) and _cached_comp.get("comps"):
+        _was = _as_float(_cached_comp.pop("_subject_dom", None))
+        _comp_doms = {round(d) for d in (_as_float(c.get("days_on_market")) for c in enriched_comps) if d is not None}
+        _cached_comp, _ = _refresh_cached_subject_days(_cached_comp, _was, _subject_dom_now, _comp_doms)
     try:
         if isinstance(_cached_comp, dict) and _cached_comp.get("comps"):
             from types import SimpleNamespace as _NS
@@ -14644,7 +14782,7 @@ async def _generate_ai_analysis_impl(
     usage_input_tokens = response.usage.input_tokens
     usage_output_tokens = response.usage.output_tokens
     if result and response.stop_reason != "cache" and result.get("comps"):
-        await _reasoning_cache_put(db, _comp_cache_key, copy.deepcopy(result))
+        await _reasoning_cache_put(db, _comp_cache_key, {**copy.deepcopy(result), "_subject_dom": _subject_dom_now})
 
     logger.info(
         "CMA AI analysis returned",
@@ -15084,6 +15222,7 @@ async def _generate_ai_analysis_impl(
     # facts BEFORE the weighted qualitative signals are computed - an inconsistent label set (a
     # "fully renovated / turnkey" comp rated finish = Similar) must not be able to neutralise Stage 3.
     qa_flags.extend(_v10_condition_rating_consistency_check(enriched_subject, new_comparables))
+    qa_flags.extend(_far_or_old_comp_flags(new_comparables))
 
     # Freeze the normalized evidence before any downstream valuation narrative, adjustment trace,
     # offer section, QA payload, or PDF field is assembled. Generated commentary is deliberately
@@ -15892,6 +16031,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
         qa_flags.extend(_v10_condition_class_review(enriched_subject, new_comparables, evidence_by_key))
         # round 15: finish-rating vs. narrative/fact consistency, before the weighted signals.
         qa_flags.extend(_v10_condition_rating_consistency_check(enriched_subject, new_comparables))
+        qa_flags.extend(_far_or_old_comp_flags(new_comparables))
 
         _narrative_drafts = [
             {"ai_commentary": c.get("ai_commentary"), "commentary": c.get("commentary")}

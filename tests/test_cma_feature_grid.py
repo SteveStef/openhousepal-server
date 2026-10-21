@@ -540,3 +540,45 @@ def test_band_edge_prose_names_the_asking_price_reason():
     text, _ = ai._v10_reconcile_anchor_direction_prose(
         "The home compares well.", final={"value": 541450, "anchor_value": 500000}, trace=trace)
     assert "rarely sell this far under their asking price" in text
+
+
+def test_reasoning_cache_key_ignores_day_counts_but_not_prices():
+    pkt = {"subject": {"dom": 14, "cdom": 14, "current_list_price": 500000},
+           "comparables": [{"sale_price": 452000, "normalized_weight": 0.2341, "sale_date": "2026-05-01"}],
+           "deterministic_evidence": {"deterministic_anchor": 496542, "exposure_state": "elevated_exposure"},
+           "asking_price_check": {"passed_over": True, "allowed_high": 490000}}
+    next_day = {**pkt, "subject": {**pkt["subject"], "dom": 15, "cdom": 15},
+                "comparables": [{**pkt["comparables"][0], "normalized_weight": 0.2338}],
+                "deterministic_evidence": {**pkt["deterministic_evidence"], "deterministic_anchor": 496610}}
+    price_cut = {**pkt, "subject": {**pkt["subject"], "current_list_price": 485000}}
+    state_change = {**pkt, "deterministic_evidence": {**pkt["deterministic_evidence"], "exposure_state": "extended_exposure"}}
+    k = ai._reasoning_cache_key(pkt, "m")
+    assert ai._reasoning_cache_key(next_day, "m") == k
+    assert ai._reasoning_cache_key(price_cut, "m") != k
+    assert ai._reasoning_cache_key(state_change, "m") != k
+    assert ai._day_stable_text("listed 14 days, comps $496,542 (23.4%)") == ai._day_stable_text("listed 15 days, comps $496,610 (23.1%)")
+
+
+def test_cached_answer_day_count_is_refreshed():
+    raw = {"methodology": "It has been listed 14 days, longer than its comps."}
+    out, changed = ai._refresh_cached_subject_days(raw, 14, 16, {6, 9})
+    assert changed and "listed 16 days" in out["methodology"]
+    same, changed = ai._refresh_cached_subject_days(raw, 14, 16, {14})   # a comp also took 14 days
+    assert not changed and same == raw
+
+
+def test_asking_gap_sentence_and_far_old_flags():
+    trace = {"asking_price_check": {"asking_price": 600000}}
+    text, _ = ai._v10_asking_gap_sentence("Notes.", final={"anchor_value": 480000}, trace=trace)
+    assert "The $600,000 asking price is about 25% above what the adjusted comparable sales alone point to (about $480,000)." in text
+    assert ai._v10_asking_gap_sentence(text, final={"anchor_value": 480000}, trace=trace)[0] == text   # once only
+    assert ai._v10_asking_gap_sentence("Notes.", final={"anchor_value": 590000}, trace=trace)[0] == "Notes."
+    from datetime import timedelta
+    old = (ai._tmach.today() - timedelta(days=300)).isoformat()
+    flags = ai._far_or_old_comp_flags([{"distance_miles": 2.6, "close_date": old, "street_address": "1 A St"},
+                                       {"distance_miles": 0.4, "close_date": ai._tmach.today().isoformat()}])
+    assert len(flags) == 1 and "2.6 miles away" in flags[0] and "months ago" in flags[0]
+
+
+def test_new_grid_knobs_are_off_by_default():
+    assert ai._V10_FEATURE_AGE_PCT == 0 and ai._V10_FEATURE_ROAD_PCT == 0 and ai._V10_TIME_PCT_PER_YEAR == 0
