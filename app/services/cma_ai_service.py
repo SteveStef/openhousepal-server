@@ -319,7 +319,9 @@ _SYSTEM_PROMPT = (
     "recency, data quality), and the adjustment layer carries the condition difference. Only "
     "classify a close-in sale weak for condition when the PRODUCT itself is radically different "
     "(a full luxury rebuild vs. an original-condition tear-down, say) so that no bounded "
-    "adjustment can bridge it. A comp's assigned_role (with share_of_value_pct) comes from the valuation "
+    "adjustment can bridge it. A property's `city` is its mailing town; its `township` is the "
+    "municipality. Two homes with the same township are in the same municipality even when their "
+    "mailing towns differ - never call that a different town or municipality. A comp's assigned_role (with share_of_value_pct) comes from the valuation "
     "engine's weighting - use it as that comp's classification unless the comp is unusable (unverified "
     "price, different product), and write its note so it reads consistently with that role. "
     "Your classification MUST agree with your own note AND with how you use "
@@ -1249,11 +1251,14 @@ _SUBJECT_FIELDS = [
     "days_on_market", "mls_status", "last_sale_date", "last_sale_price", "school_district",
     "annual_taxes", "water_source", "sewer", "public_remarks",
     # The manual-entry facts (a home not on the MLS yet) - an MLS subject has none of them, so its
-    # prompt is unchanged. Township/county stay out on purpose (see _RELEVANCE_ENRICHMENT_FIELDS).
+    # prompt is unchanged. County stays out; township is in (below).
     "full_baths", "half_baths", "garage_spaces", "stories", "heating", "cooling", "condition",
     "recent_updates",
     # OSM road/street classification summary (road_context_service) - so the model's street_context
     # rating is grounded in actual nearby road types + speed, not just the address + a map guess.
+    # township = the municipality; city is only the mailing town (3306 E Summit Ave is "Downingtown"
+    # by mail but in Caln Township like the subject - v9 called it a different town, 10/21)
+    "township",
     "road_context_note", *_PROPERTY_ENRICHMENT_FIELDS, *_RAW_PROPERTY_ENRICHMENT_KEYS,
     "authoritative_property_features", "material_issues",
 ]
@@ -1262,7 +1267,7 @@ _COMP_FIELDS = [
     "verified_close_price", "original_list_price", "list_price", "close_date", "sale_date",
     "days_on_market", "cdom", "data_note", "assigned_role", "share_of_value_pct",
     "sqft", "lot_size", "beds", "baths", "year_built",
-    "property_age_years", "garage", "basement", "price_per_sqft", "annual_taxes", "school_district", "water_source", "sewer", "match_score", "road_context_note",
+    "property_age_years", "garage", "basement", "price_per_sqft", "annual_taxes", "school_district", "water_source", "sewer", "match_score", "road_context_note", "township",
     # Computed by _comp_evidence_score (see below), not raw MLS data - grounds the AI's own
     # classification in a real, deterministic read of how comparable this comp actually is,
     # instead of relying on vibes from the data/photos alone.
@@ -6482,8 +6487,12 @@ def _v10_location_class_review(subject: dict, comps: list, evidence_by_key: dict
             "override_reason": ovr_reason or None, "weight_penalty": round(weight_penalty, 3),
             # The street part alone: Match % (continuous relevance) already scores distance and
             # market area, but not the street, so this is the piece it still applies (10/20).
+            # From the road data only (not the AI's rating), so the weight - and the strongest-first
+            # order the AI writes against - is the same before and after the AI and on every run
+            # (v9, 10/21: the AI rated set-back 2702 E Kings Hwy "below", the map "neutral").
             "street_weight_penalty": round(1.0 - _V10_LOC_NEG_STEP - _V10_LOC_STREET_STEP, 3)
-                                     if (_busier and not override_valid) else 1.0,
+                                     if (rc_verdict == "through" and subj_street_tier in ("quiet", "neutral", None)
+                                         and not override_valid) else 1.0,
         }
     return flags
 
@@ -12726,7 +12735,10 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
         # A home its buyers have passed over isn't "early in its market exposure" (v7, 10/20).
         _contradicts_passed_over = bool(b.get("passed_over") and re.search(
             r"\bearly in (?:its|the) (?:market|listing)|\b(?:still|fairly|relatively) (?:new|fresh) (?:to|on) the market"
-            r"|\bjust (?:hit|came on|listed)", low))
+            r"|\bjust (?:hit|came on|listed)"
+            # v9: "has only been actively listed for 14 days, which is too short a window to draw conclusions"
+            r"|\bonly (?:been )?(?:actively )?(?:listed|on the market|active)\b.{0,20}\b\d+\s+days"
+            r"|\btoo (?:short|early|soon)\b.{0,30}\b(?:window|conclusions?|tell|judge|read)", low))
         if (_has_open_num or _has_indicated_num or _repeats_opening_advice
                 or _mentions_internal_anchor or _has_strategy_number or _contradicts_hot
                 or _contradicts_below_ask or _contradicts_passed_over):
@@ -14033,6 +14045,18 @@ def _v10_provisional_inputs(
     """Production relevance-weighted anchor + exposure shown to the analysis model."""
     prov = [dict(c) for c in comps]
     ev = _build_evidence_by_key(subject, prov)
+    # The final weights apply a busier-street penalty from the location review; run it here too
+    # (on the map's road data, before any AI rating) so the strongest-first order the AI writes
+    # "Comp #N" against is the one the final weights keep (417 Dogwood Ln v9, 10/21: the engine
+    # check failed with "comps are not listed strongest-first").
+    # (it only reviews rated comps; before the AI a comp may have no rating yet - review it as
+    # Supporting, which never demotes anything, so only its street penalty is set)
+    _review = [c if _normalize_strength(c.get("strength")) in ("strong", "supporting") else {**c, "strength": "supporting"}
+               for c in prov]
+    _v10_location_class_review(subject, _review, ev)
+    for _c, _r in zip(prov, _review):
+        if _r.get("_loc"):
+            _c["_loc"] = _r["_loc"]
     outliers = _flag_psf_outliers(prov)
     weighted, anchor, _ = _apply_continuous_relevance_weighting(
         subject, prov, ev, outliers, density_context=density_context,

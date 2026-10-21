@@ -345,3 +345,24 @@ def test_vague_adjusted_sales_line_gets_the_number():
     assert "$497,000" in out and "$490,000" in out and "small trim" in out
     plain = "The comparable sales support this value."
     assert ai._v10_reconcile_anchor_direction_prose(plain, final={"value": 490000, "anchor_value": 497340}, trace=trace)[0] == plain
+
+
+def test_street_weight_comes_from_road_data_not_the_ai_rating():
+    subj = {"street_address": "417 DOGWOOD LN", "school_district": "X", "township": "CALN", "city": "COATESVILLE"}
+    fronting = {"listing_key": "1", "strength": "supporting", "road_context": {"verdict": "through"},
+                "quality": {"street_context": "below"}, "distance_miles": 1.0, "school_district": "X", "township": "CALN"}
+    set_back = {"listing_key": "2", "strength": "supporting", "road_context": {"verdict": "neutral"},
+                "quality": {"street_context": "below"}, "distance_miles": 1.0, "school_district": "X", "township": "CALN"}
+    comps = [fronting, set_back]
+    ai._v10_location_class_review(subj, comps, ai._build_evidence_by_key(subj, comps))
+    assert comps[0]["_loc"]["street_weight_penalty"] < 1.0
+    assert comps[1]["_loc"]["street_weight_penalty"] == 1.0
+
+
+def test_passed_over_drops_too_short_a_window_line():
+    band = {"fmv": 490000, "list_price": 500000, "opening_low": 463000, "opening_high": 483000,
+            "target": 490000, "comfort_ceiling": 490000, "passed_over": True}
+    text = ("The property has only been actively listed for 14 days, which is too short a window to draw conclusions "
+            "about seller flexibility. Key contingencies should include a standard home inspection.")
+    out, _ = ai._v10_rebuild_buyer_offer_prose(text, band, 0.04)
+    assert "too short a window" not in out and "home inspection" in out
