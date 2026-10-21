@@ -457,3 +457,23 @@ def test_asking_check_range_is_rounded():
     out, _ = ai._apply_asking_price_check(reasoning, {"asking_price_check": check})
     assert out["final_fmv"] == 490000
     assert out["range_low"] % 5000 == 0 and out["range_high"] % 5000 == 0 and out["range_low"] < 490000 < out["range_high"]
+
+
+# ---- 417 Dogwood Ln v12 (10/22) -----------------------------------------------------------------
+
+def test_passed_over_drops_short_exposure_and_no_signal_lines():
+    band = {"fmv": 490000, "list_price": 500000, "opening_low": 463000, "opening_high": 483000,
+            "target": 490000, "comfort_ceiling": 490000, "passed_over": True}
+    text = ("Given the short market exposure so far, there's no strong signal yet of pricing pressure, so a "
+            "well-supported offer is best. Key contingencies should include a standard inspection contingency "
+            "(given the well and septic-alternative sewer connection).")
+    out, _ = ai._v10_rebuild_buyer_offer_prose(text, band, 0.04)
+    assert "short market exposure" not in out and "no strong signal" not in out
+    assert "public sewer connection" in out and "septic-alternative" not in out
+
+
+def test_subject_total_size_in_a_comp_note_is_left_alone():
+    comp = {"sqft": 1472, "above_grade_finished_area": 1472, "below_grade_finished_area": 0}
+    text = "Size-adjusted to the subject's 3,130 sqft above-grade and lower-level space, the gap narrows."
+    out, flags = ai._reconcile_comp_hard_facts(text, "Comp #1 (1219 SCOTT DR)", DOGWOOD_SUBJECT, comp)
+    assert "3,130" in out and not any("unsupported 3,130" in f for f in flags)

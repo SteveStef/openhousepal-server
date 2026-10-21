@@ -9273,7 +9273,9 @@ def _reconcile_comp_hard_facts(
         # A comp note quoting one of the SUBJECT's own documented sizes is about the subject, even
         # when the owner guess says comp ("...on its much larger 3,130 sqft total" was "corrected"
         # to the comp's 1,472, 417 Dogwood Ln v6, 10/20) - leave it alone.
-        _subject_sizes = _documented_sqft_values(subject) if not is_subject else set()
+        # Any of the subject's sizes, whatever kind the wording suggests (v12, 10/22: the subject's
+        # 3,130 sqft total read as an "above grade" claim and triggered a needless rewrite).
+        _subject_sizes = _documented_sqft_values(subject)
         if raw_value and any(abs(raw_value - known) <= max(2, 0.002 * known) for known in _subject_sizes) \
                 and not any(abs(raw_value - known) <= max(2, 0.002 * known) for known in allowed):
             rebuilt.append(replacement)
@@ -12879,7 +12881,10 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
             r"|\bjust (?:hit|came on|listed)"
             # v9: "has only been actively listed for 14 days, which is too short a window to draw conclusions"
             r"|\bonly (?:been )?(?:actively )?(?:listed|on the market|active)\b.{0,20}\b\d+\s+days"
-            r"|\btoo (?:short|early|soon)\b.{0,30}\b(?:window|conclusions?|tell|judge|read)", low))
+            r"|\btoo (?:short|early|soon)\b.{0,30}\b(?:window|conclusions?|tell|judge|read)"
+            # v12: "Given the short market exposure so far, there's no strong signal yet of pricing pressure"
+            r"|\b(?:short|limited|brief|little)\s+(?:market\s+)?(?:exposure|time on (?:the )?market|listing period)"
+            r"|\bno (?:strong |clear |real )?signal (?:yet )?of\b", low))
         if (_has_open_num or _has_indicated_num or _repeats_opening_advice
                 or _mentions_internal_anchor or _has_strategy_number or _contradicts_hot
                 or _contradicts_below_ask or _contradicts_passed_over):
@@ -12897,6 +12902,8 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
         kept.append("Include a standard home inspection contingency so the items on the inspection page can be "
                     "checked before you're committed.")
     body = " ".join(kept).strip()
+    # "septic-alternative sewer connection" is the model's odd way of saying public sewer (v12, 10/22)
+    body = re.sub(r"\bseptic[- ]alternative sewer(?: connection)?\b", "public sewer connection", body, flags=re.IGNORECASE)
     new_text = (opener + (" " + body if body else "")).strip()
     return new_text, ["Offer strategy: the opening-offer figures were rebuilt deterministically from the final "
                       "FMV and the actual list price (the AI's own numeric opener was replaced)."]
