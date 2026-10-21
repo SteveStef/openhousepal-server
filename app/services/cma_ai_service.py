@@ -8036,7 +8036,12 @@ sum on the table. Explain the gap in those terms and keep final_fmv between allo
 allowed_high; the application enforces that band. When
 asking_price_check.outpaced_by_over_ask_sales is true, the comparables that sold over asking went under
 contract much faster than this home has been on the market - do not assume it will draw the same
-over-asking competition, and do not value it above the adjusted sales on that basis. When asking_price_check.passed_over is true, the
+over-asking competition, and do not value it above the adjusted sales on that basis. When
+asking_price_check.long_unsold is true, the home has gone unsold for months at this price - if the
+adjusted sales sit well below the asking price, trust the sales and say plainly that the asking
+price looks high next to what nearby homes sold for. When asking_price_check.fresh_listing is true,
+the home was just listed - if the adjusted sales sit above the asking price, it may draw offers over
+asking; value it from the sales and say that as a possibility, never a certainty. When asking_price_check.passed_over is true, the
 home has been on the market longer than its comps took to sell, so it most likely sells at or a
 little under asking - do not describe competing offers or a premium over asking. Say it in exactly
 that factual way ("has been on the market longer than the fastest comparable sales - a small trim,
@@ -8275,6 +8280,14 @@ _ASKING_CHECK_BAND = (0.90, 1.05)           # final FMV allowed within this x th
 _ASKING_CHECK_BAND_STALE_LOW = 0.85         # a stale listing can be worth well under its asking price
 _ASKING_CHECK_PASSED_OVER_DAYS = 14         # on the market this long, and 2x its comps' median days...
 _ASKING_CHECK_PASSED_OVER_RATIO = 0.98      # ...expect at most 98% of asking, and never above asking
+# Edge cases (10/21), from ~195k Bright sales in our database (sold price / final asking price):
+# - Long unsold: the 5th percentile falls to 0.81 after 4+ months and 0.72 after a year, so the
+#   0.85 stale floor held a badly overpriced listing far above its sales ($650K ask, $500K sales ->
+#   $541K at 3 years). The floor drops in steps; it only lets the sales win, never pushes value down.
+# - Fresh: in the first week the 90th/95th percentiles are 1.086/1.122, so the 1.05 cap held an
+#   underpriced new listing under its sales in a flat market ($450K ask, $500K sales -> $472.5K).
+_ASKING_CHECK_LONG_UNSOLD_FLOORS = ((365, 0.70), (120, 0.80))   # (days on market, floor x expected)
+_ASKING_CHECK_FRESH_CAPS = ((7, 1.10), (14, 1.07))              # (days on market, ceiling x asking)
 
 
 def _asking_price_market_check(subject_packet: dict, status_timeline: dict, exposure: dict,
@@ -8324,17 +8337,33 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
         stale = True
     expected = lp * ratio
     low_mult = _ASKING_CHECK_BAND_STALE_LOW if stale else _ASKING_CHECK_BAND[0]
+    long_unsold = False
+    if stale and dom is not None:
+        for days, floor in _ASKING_CHECK_LONG_UNSOLD_FLOORS:
+            if dom >= days:
+                low_mult, long_unsold = min(low_mult, floor), True
+                break
+    allowed_high = expected * high_mult
+    fresh_listing = False
+    if dom is not None and not (stale or passed_over or outpaced):
+        for days, cap in _ASKING_CHECK_FRESH_CAPS:
+            if dom <= days:
+                fresh_listing = lp * cap > allowed_high
+                allowed_high = max(allowed_high, lp * cap)
+                break
     return {
         "asking_price": round(lp),
         "comp_median_sold_to_list_ratio": round(median, 3),
         "ratio_used": round(ratio, 3),
         "expected_sale_price": round(expected),
         "allowed_low": round(expected * low_mult),
-        "allowed_high": round(expected * high_mult),
+        "allowed_high": round(allowed_high),
         "comp_ratios_counted": len(ratios),
         "exposure_state": state or None,
         "passed_over": passed_over,
         "outpaced_by_over_ask_sales": outpaced,
+        "long_unsold": long_unsold,
+        "fresh_listing": fresh_listing,
     }
 
 
@@ -11622,6 +11651,13 @@ def _v10_reconcile_anchor_direction_prose(methodology: str, *, final: Optional[d
             reason = "after crediting the features this home offers beyond those sales"
     if _passed_over_trim:
         reason = "after a small trim because it has sat on the market longer than those homes did"
+    # The asking-price band moved the value to its edge: say so instead of "this home's features".
+    _apc = (trace or {}).get("asking_price_check") or {}
+    _band_lo, _band_hi = _as_float(_apc.get("allowed_low_price")), _as_float(_apc.get("allowed_high_price"))
+    if rel == "above" and _band_lo and abs(v - _band_lo) <= 1000:
+        reason = "because homes here rarely sell this far under their asking price"
+    elif rel == "below" and _band_hi and abs(v - _band_hi) <= 1000 and not _passed_over_trim:
+        reason = "because homes here rarely sell this far over their asking price"
     sentence = (
         f" Weighted together, the adjusted comparable sales point to about ${round(a, -3):,.0f}; {reason}, "
         f"the final value lands about {max(1, round(pct))}% {rel} that, at ${v:,.0f}."
@@ -15307,6 +15343,7 @@ async def _generate_ai_analysis_impl(
                 "allowed_low_price": _apc.get("allowed_low"), "allowed_high_price": _apc.get("allowed_high"),
                 "asking_price": _apc.get("asking_price"), "ratio_used": _apc.get("ratio_used"),
                 "passed_over": bool(_apc.get("passed_over")),
+                "long_unsold": bool(_apc.get("long_unsold")), "fresh_listing": bool(_apc.get("fresh_listing")),
             }
         valuation_trace["authoritative_evidence_snapshot"] = _evidence_snapshot.audit_metadata()
         qa_blocking.extend(_reasoning_blocking)
@@ -16007,6 +16044,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
                 "allowed_low_price": _apc.get("allowed_low"), "allowed_high_price": _apc.get("allowed_high"),
                 "asking_price": _apc.get("asking_price"), "ratio_used": _apc.get("ratio_used"),
                 "passed_over": bool(_apc.get("passed_over")),
+                "long_unsold": bool(_apc.get("long_unsold")), "fresh_listing": bool(_apc.get("fresh_listing")),
             }
         valuation_trace["authoritative_evidence_snapshot"] = _evidence_snapshot.audit_metadata()
         qa_blocking.extend(_reasoning_blocking)

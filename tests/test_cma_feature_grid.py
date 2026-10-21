@@ -496,3 +496,47 @@ def test_lower_level_suite_always_gets_its_own_inspection_item():
     already = "**Lower level:** Confirm the egress window meets code."
     assert ai._ensure_lower_level_inspection_item(already, subj) == already
     assert ai._ensure_lower_level_inspection_item("**Roof:** x", {"public_remarks": "Updated kitchen."}) == "**Roof:** x"
+
+
+def _edge_check(ask, dom, state):
+    packets = [{"sale_price": 5e5, "sold_list_ratio": 1.0, "dom": 10}] * 3
+    return ai._asking_price_market_check({"current_list_price": ask, "dom": dom}, {},
+                                         {"state": state, "comp_median_dom": 10}, packets)
+
+
+def _edge_final(chk, fmv=500000):
+    out, _ = ai._apply_asking_price_check(
+        {"final_fmv": fmv, "range_low": fmv * 0.95, "range_high": fmv * 1.05, "confidence": "medium"},
+        {"asking_price_check": chk})
+    return out["final_fmv"]
+
+
+def test_time_on_market_trim_does_not_compound():
+    # a fairly priced home: one small trim once passed over, the same at 30 days or 3 years
+    vals = {d: _edge_final(_edge_check(505000, d, "extended_exposure" if d > 45 else "elevated_exposure"))
+            for d in (30, 90, 365, 1095)}
+    assert len(set(vals.values())) == 1 and vals[30] == round(505000 * 0.98)
+
+
+def test_long_unsold_overpriced_listing_lets_the_sales_win():
+    early = _edge_check(650000, 30, "elevated_exposure")
+    late = _edge_check(650000, 400, "extended_exposure")
+    assert not early["long_unsold"] and late["long_unsold"]
+    assert _edge_final(early) > 540000          # a month in, the asking price still carries weight
+    assert _edge_final(late) == 500000          # a year+ unsold: the comparable sales stand
+
+
+def test_fresh_underpriced_listing_can_value_above_the_old_cap():
+    chk = _edge_check(450000, 5, "insufficient_exposure")
+    assert chk["fresh_listing"] and chk["allowed_high"] == 495000
+    assert _edge_final(chk) == 495000
+    # not fresh any more and passed over: no premium over asking
+    assert _edge_final(_edge_check(450000, 30, "elevated_exposure")) <= 450000
+
+
+def test_band_edge_prose_names_the_asking_price_reason():
+    trace = {"anchor": {"anchor_value": 500000},
+             "asking_price_check": {"allowed_low_price": 541450, "allowed_high_price": 637000}}
+    text, _ = ai._v10_reconcile_anchor_direction_prose(
+        "The home compares well.", final={"value": 541450, "anchor_value": 500000}, trace=trace)
+    assert "rarely sell this far under their asking price" in text
