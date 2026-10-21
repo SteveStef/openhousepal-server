@@ -582,3 +582,34 @@ def test_asking_gap_sentence_and_far_old_flags():
 
 def test_grid_knob_defaults_time_on_age_road_off():
     assert ai._V10_FEATURE_AGE_PCT == 0 and ai._V10_FEATURE_ROAD_PCT == 0 and ai._V10_TIME_PCT_PER_YEAR == 0.03
+
+
+def test_v13_valuation_notes_say_trim_once():
+    notes = ("The final fair market value is $490,000. Adjusted comparable sales point somewhat higher than the final "
+             "estimate, but the current asking price and longer marketing time support a modest trim. The home has been "
+             "on the market longer than the fastest comparable sales - a small trim, not a sign of distress.")
+    trace = {"authority": "reasoning_model", "anchor": {"anchor_value": 499877},
+             "asking_price_check": {"passed_over": True, "asking_price": 500000, "allowed_high_price": 490000}}
+    out, _ = ai._v10_reconcile_anchor_direction_prose(notes, final={"value": 490000, "anchor_value": 499877}, trace=trace)
+    assert "somewhat higher" not in out
+    assert out.lower().count("trim") == 2
+    assert out.endswith("point to about $500,000; after that small time-on-market trim, the final value lands about 2% below that, at $490,000.")
+
+
+def test_v13_passed_over_range_top_held_at_asking():
+    chk = {"asking_price": 500000, "allowed_low": 416500, "allowed_high": 490000, "passed_over": True,
+           "expected_sale_price": 490000, "ratio_used": 0.98}
+    out, flags = ai._apply_asking_price_check(
+        {"final_fmv": 490000, "range_low": 475000, "range_high": 515000, "confidence": "medium"}, {"asking_price_check": chk})
+    assert out["final_fmv"] == 490000 and out["range_low"] == 475000 and out["range_high"] == 500000 and flags
+    fresh = {**chk, "passed_over": False, "allowed_high": 530000}
+    same, _ = ai._apply_asking_price_check(
+        {"final_fmv": 490000, "range_low": 475000, "range_high": 515000, "confidence": "medium"}, {"asking_price_check": fresh})
+    assert same["range_high"] == 515000
+
+
+def test_v13_normalized_basement_wording_is_plain():
+    text = ("Its finished basement is below-grade value already normalized into the comparison, and the main-level "
+            "living area is dated with original cabinetry.")
+    out = ai._strip_internal_data_refs(text)
+    assert "normalized" not in out and "is accounted for separately in the comparison, and the main-level" in out

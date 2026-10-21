@@ -8411,6 +8411,17 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
     }
 
 
+def _cap_passed_over_range(reasoning: dict, check: dict) -> tuple[dict, list]:
+    """A passed-over listing sells at or under its asking price, so its range doesn't reach above
+    it (417 Dogwood Ln v13, 10/21: $490K value, "supported range $475,000-$515,000" on a $500K ask)."""
+    ask = _as_float(check.get("asking_price"))
+    if not (check.get("passed_over") and ask) or float(reasoning.get("range_high") or 0) <= ask:
+        return reasoning, []
+    out = copy.deepcopy(reasoning)
+    out["range_high"] = int(max(ask, float(out["final_fmv"]) + 1))
+    return out, [f"Range top held at the ${ask:,.0f} asking price: the home has been on the market longer than its comps took to sell."]
+
+
 def _apply_asking_price_check(reasoning: dict, evidence_packet: dict) -> tuple[dict, list]:
     """Keep the final FMV inside the asking-price band (see _asking_price_market_check). The range
     keeps its shape around the moved value. Returns (reasoning, qa_flags)."""
@@ -8420,7 +8431,7 @@ def _apply_asking_price_check(reasoning: dict, evidence_packet: dict) -> tuple[d
     fmv = float(reasoning["final_fmv"])
     lo, hi = float(check["allowed_low"]), float(check["allowed_high"])
     if lo <= fmv <= hi:
-        return reasoning, []
+        return _cap_passed_over_range(reasoning, check)
     new = hi if fmv > hi else lo
     out = copy.deepcopy(reasoning)
     scale = new / fmv
@@ -8435,6 +8446,7 @@ def _apply_asking_price_check(reasoning: dict, evidence_packet: dict) -> tuple[d
     if abs(scale - 1) > 0.08:
         out["confidence"] = "low"
     out["asking_price_check_applied"] = {**check, "from": round(fmv), "to": round(new)}
+    out, _ = _cap_passed_over_range(out, check)
     return out, [
         f"Asking-price check: the comps' value (${fmv:,.0f}) was {'above' if fmv > hi else 'below'} what homes "
         f"here sell for relative to asking (${check['asking_price']:,.0f} x {check['ratio_used']:.3f} = "
@@ -9171,6 +9183,9 @@ _PLAIN_WORDS = (
     (r",?\s*(?:which|that)\s+(?:depressed|reduced|trimmed|cut|lowered)\s+its\s+(?:location\s+|valuation\s+)?weight"
      r"(?:\s+in\s+the\s+(?:comp(?:arable)?[- ]sales\s+)?(?:anchor|valuation))?[^,.;]*", ""),
     (r",?\s*(?:and\s+|which\s+)?(?:anchors|drives|carries)\s+the\s+(?:valuation|value)(?:\s+(?:most heavily|the most))?", ""),
+    # "Its finished basement is below-grade value already normalized into the comparison" (v13, 10/21)
+    (r"\b(?:is|are)\s+(?:below[- ]grade\s+|lower[- ]level\s+)?(?:value|space|area)?\s*(?:already\s+)?normali[sz]ed\s+"
+     r"(?:into|in)\s+the\s+(?:comparison|valuation|analysis|grid)", "is accounted for separately in the comparison"),
     (r"\b(?:its|the) location weight (?:was |is )?(?:reduced|trimmed|cut|lowered)(?: in the (?:comp(?:arable)?[- ]sales )?anchor)?",
      "it is a weaker match"),
     (r"\bthe (?:comp(?:arable)?[- ]sales )?anchor(?:'s)? (?:rate|\$/sq ?ft|price per square foot|psf)\b",
@@ -11787,6 +11802,16 @@ def _v10_anchor_direction_core(methodology: str, *, final: Optional[dict],
             reason = "after crediting the features this home offers beyond those sales"
     if _passed_over_trim:
         reason = "after a small trim because it has sat on the market longer than those homes did"
+        # the notes already say why (v13, 10/21: "trim" three times in a row) - just the number
+        if re.search(r"\bon the market longer\b", methodology, re.IGNORECASE):
+            reason = "after that small time-on-market trim"
+    # This sentence puts a number on the gap, so the vague one it answers goes ("Adjusted comparable
+    # sales point somewhat higher than the final estimate, but ...", v13).
+    if _vague_gap:
+        _sents = re.split(r"(?<=[.!?])\s+", methodology.strip())
+        _kept = [s for s in _sents if _vague_gap.group(0) not in s]
+        if _kept:
+            methodology = " ".join(_kept)
     # The asking-price band moved the value to its edge: say so instead of "this home's features".
     _apc = (trace or {}).get("asking_price_check") or {}
     _band_lo, _band_hi = _as_float(_apc.get("allowed_low_price")), _as_float(_apc.get("allowed_high_price"))
