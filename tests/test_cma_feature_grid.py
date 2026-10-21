@@ -437,3 +437,23 @@ def test_inspection_page_doesnt_point_at_the_valuation_notes():
     out, _ = ai._soften_unsupported_system_claims(
         "**Lower level:** The valuation notes a 2023 lower-level suite. Check the egress window.", {"public_remarks": "x"})
     assert "valuation" not in out.lower() and "the listing notes a 2023" in out.lower()
+
+
+# ---- 417 Dogwood Ln v11 (10/22) -----------------------------------------------------------------
+
+def test_leftover_engine_clauses_are_cut_but_ordinary_english_stays():
+    t = ("This home fronts East Kings Highway, a busier setting than the subject's cul-de-sac, which is reflected in its "
+         "reduced location weight in the valuation. It sold at the market rate the valuation anchors to. "
+         "The seller weighted the kitchen budget toward cabinets.")
+    out = ai._strip_internal_data_refs(t)
+    assert "location weight" not in out and "anchors to" not in out
+    assert "busier setting than the subject's cul-de-sac." in out and "weighted the kitchen budget" in out
+
+
+def test_asking_check_range_is_rounded():
+    reasoning = {"final_fmv": 500000, "range_low": 470000, "range_high": 530000, "confidence": "medium"}
+    check = {"allowed_low": 416500, "allowed_high": 490000, "asking_price": 500000, "ratio_used": 0.98,
+             "expected_sale_price": 490000}
+    out, _ = ai._apply_asking_price_check(reasoning, {"asking_price_check": check})
+    assert out["final_fmv"] == 490000
+    assert out["range_low"] % 5000 == 0 and out["range_high"] % 5000 == 0 and out["range_low"] < 490000 < out["range_high"]

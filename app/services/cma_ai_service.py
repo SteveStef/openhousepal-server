@@ -8348,8 +8348,13 @@ def _apply_asking_price_check(reasoning: dict, evidence_packet: dict) -> tuple[d
     out = copy.deepcopy(reasoning)
     scale = new / fmv
     out["final_fmv"] = round(new)
-    out["range_low"] = min(round(float(reasoning["range_low"]) * scale), round(new) - 1)
-    out["range_high"] = max(round(float(reasoning["range_high"]) * scale), round(new) + 1)
+    # Scaled endpoints are machine-looking ($460,600-$519,400, 417 Dogwood Ln v11, 10/22) - round
+    # them outward to whole $5K ($1K under $300K).
+    _step = 5000 if new >= 300000 else 1000
+    _lo = math.floor(float(reasoning["range_low"]) * scale / _step) * _step
+    _hi = math.ceil(float(reasoning["range_high"]) * scale / _step) * _step
+    out["range_low"] = int(min(_lo, round(new) - 1))
+    out["range_high"] = int(max(_hi, round(new) + 1))
     if abs(scale - 1) > 0.08:
         out["confidence"] = "low"
     out["asking_price_check_applied"] = {**check, "from": round(fmv), "to": round(new)}
@@ -9081,7 +9086,11 @@ _PLAIN_WORDS = (
     # (v10 review: "which is why its weight was trimmed in the valuation", "and anchors the
     # valuation most heavily"); the comparison itself stays.
     (r",?\s*(?:which is why|which|and|so)\s+(?:its|the)\s+(?:location\s+|valuation\s+)?weight\s+(?:was|is)\s+"
-     r"(?:reduced|trimmed|cut|lowered|depressed)(?:\s+in\s+the\s+(?:comp(?:arable)?[- ]sales\s+)?(?:anchor|valuation))?", ""),
+     r"(?:reduced|trimmed|cut|lowered|depressed)(?:\s+in\s+the\s+(?:comp(?:arable)?[- ]sales\s+)?(?:anchor|valuation))?"
+     r"(?:\s+(?:slightly|somewhat|a little|a bit|modestly))?", ""),
+    # "essentially in line with the market rate the valuation anchors to" (v11, 10/22)
+    (r"\bthe (?:market )?(?:rate|\$/sq ?ft|price per square foot) (?:that )?the (?:valuation|value) (?:anchors|is anchored) to\b",
+     "the typical price per square foot of these sales"),
     (r",?\s*(?:which|that)\s+(?:depressed|reduced|trimmed|cut|lowered)\s+its\s+(?:location\s+|valuation\s+)?weight"
      r"(?:\s+in\s+the\s+(?:comp(?:arable)?[- ]sales\s+)?(?:anchor|valuation))?[^,.;]*", ""),
     (r",?\s*(?:and\s+|which\s+)?(?:anchors|drives|carries)\s+the\s+(?:valuation|value)(?:\s+(?:most heavily|the most))?", ""),
@@ -9101,7 +9110,32 @@ def _strip_internal_data_refs(text: str) -> str:
     out = _INTERNAL_DATA_REF_RE.sub("", text)
     for pattern, plain in _PLAIN_WORDS:
         out = re.sub(pattern, plain, out, flags=re.IGNORECASE)
+    out = _drop_engine_clauses(out)
     return re.sub(r"\broad[- ]context data\b", "street setting", out, flags=re.IGNORECASE)
+
+
+# "weight" as the engine's noun only - "weighted toward cabinets" is ordinary English
+_ENGINE_TERM_RE = re.compile(r"\b(?:(?:location|valuation|comp|its|reduced|lower|full)\s+weights?|anchor(?:s|ed|ing)?)\b", re.IGNORECASE)
+
+
+def _drop_engine_clauses(text: str) -> str:
+    """Catch-all after the phrase rules above: any clause still talking about a comp's weight or the
+    anchor ("which is reflected in its reduced location weight in the valuation", v11 10/22) is cut
+    back to the comma before it, or the sentence goes when nothing readable would be left."""
+    if not text or not _ENGINE_TERM_RE.search(text):
+        return text
+    kept = []
+    for sent in re.split(r"(?<=[.!?])\s+", text.strip()):
+        m = _ENGINE_TERM_RE.search(sent)
+        if not m:
+            kept.append(sent)
+            continue
+        head = sent[:m.start()]
+        cut = max(head.rfind(", "), head.rfind(" - "), head.rfind("; "))
+        before = sent[:cut].rstrip(" ,;-") if cut > 0 else ""
+        if len(before.split()) >= 5:
+            kept.append(before + ("" if before.endswith((".", "!", "?")) else "."))
+    return " ".join(kept)
 
 
 def _reconcile_comp_hard_facts(
