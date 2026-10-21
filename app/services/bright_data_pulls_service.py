@@ -42,7 +42,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
-PULLS = ("sold_3y", "refresh_current", "price_history", "agent_sales", "recheck_off_market", "stale_recheck", "photo_refill")
+PULLS = ("sold_3y", "refresh_current", "price_history", "agent_sales", "recheck_off_market", "stale_recheck", "photo_refill",
+         "town_sales_1y")
 _CURRENT = ("ACTIVE-BRIGHT", "COMING SOON-BRIGHT", "PENDING-BRIGHT", "ACTIVE UNDER CONTRACT-BRIGHT")
 PAGE = 200
 
@@ -59,7 +60,7 @@ def enabled(name: str) -> bool:
     if name == "recheck_off_market" and "sold_3y" in raw:
         return True
     # Same switch for the daily stale recheck and the photo refill (10/21) - production only.
-    if name in ("stale_recheck", "photo_refill") and "sold_3y" in raw:
+    if name in ("stale_recheck", "photo_refill", "town_sales_1y") and "sold_3y" in raw:
         return True
     return "all" in raw or name in raw
 
@@ -128,6 +129,51 @@ async def pull_sold_3y(db: AsyncSession, max_pages: int = 10, pause: float = 1.0
         pages += 1
         await asyncio.sleep(pause)
     return {"done": False, **st}
+
+
+# One-time past-year sales for the towns around the CMA test home (user, 10/22: "pull it from Bright
+# now" - Downingtown-address sales Mar-Aug 2026 were ~35% priced while sold_3y caught up), same as
+# the 10/20 Bala Cynwyd / Coatesville / Exton pulls. Leases skipped. Runs once, then marks done.
+TOWN_SALES_1Y = (("Downingtown", "PA"), ("Thorndale", "PA"), ("Glenmoore", "PA"), ("Parkesburg", "PA"), ("West Chester", "PA"))
+
+
+async def pull_town_sales_1y(db: AsyncSession, time_budget: float = 420, pause: float = 0.5) -> dict:
+    from app.services.bright_mls_service import bright_mls_service
+    from app.services.property_sync_service import PropertySyncService
+    key = "data_pull_town_sales_1y"
+    st = await _get(db, key)
+    if st.get("done"):
+        return {"done": True}
+    date_from = st.get("from") or (date.today() - timedelta(days=365)).isoformat()
+    i, skip = int(st.get("town") or 0), int(st.get("skip") or 0)
+    syncer = PropertySyncService()
+    added = 0
+    deadline = time.monotonic() + time_budget
+    while i < len(TOWN_SALES_1Y) and time.monotonic() < deadline:
+        city, state = TOWN_SALES_1Y[i]
+        raw_rows = await bright_mls_service.get_sold_properties(city, state, date_from, top=PAGE, skip=skip)
+        rows = [r for r in raw_rows if "lease" not in str(r.get("PropertyType") or "").lower()]
+        if rows:
+            photos = await bright_mls_service.get_media_for_properties([str(r["ListingKey"]) for r in rows])
+            for raw in rows:
+                try:
+                    ev = await syncer._sync_single_property(db, raw, photos, allow_inactive_insert=True)
+                    added += 1 if ev and ev.get("type") in ("NEW_GLOBAL", "NEW_QUIET") else 0
+                except Exception:  # noqa: BLE001 - one bad record never stops the pull
+                    await db.rollback()
+                    logger.warning("town_sales_1y: listing failed", exc_info=True)
+        if len(raw_rows) < PAGE:
+            i, skip = i + 1, 0
+        else:
+            skip += PAGE
+        st = {"from": date_from, "town": i, "skip": skip, "read_total": int(st.get("read_total") or 0) + len(rows),
+              "added_total": int(st.get("added_total") or 0) + added}
+        if i >= len(TOWN_SALES_1Y):
+            st.update({"done": True, "finished": date.today().isoformat()})
+        await _set(db, key, st)
+        added = 0
+        await asyncio.sleep(pause)
+    return {"done": bool(st.get("done")), **st}
 
 
 async def refresh_current(db: AsyncSession, max_pages: int = 10, pause: float = 1.0) -> dict:
@@ -422,7 +468,7 @@ async def photo_refill(db: AsyncSession, time_budget: float = 480, pause: float 
 # shared the tick, sold_3y only got its 10 pages every ~2 hours instead of every 10 minutes (10/20).
 # photo_refill rides the sales job: while sold_3y runs it only retries the (short) queue of failed
 # media fetches; once sold_3y is done the job's whole 8 minutes go to the photo pass.
-SALES_PULLS = ("refresh_current", "sold_3y", "agent_sales", "photo_refill")
+SALES_PULLS = ("town_sales_1y", "refresh_current", "sold_3y", "agent_sales", "photo_refill")
 HISTORY_PULLS = ("price_history",)
 REPAIR_PULLS = ("recheck_off_market", "stale_recheck")
 
@@ -433,7 +479,8 @@ async def run_enabled(db: AsyncSession, names: tuple = PULLS) -> dict:
     from app.services.price_history_service import backfill_batch
     out = {}
     # Both long pulls stop starting new work at ~8 minutes, so each tick ends inside its 10-minute slot.
-    for name, run in (("refresh_current", lambda: refresh_current(db)),
+    for name, run in (("town_sales_1y", lambda: pull_town_sales_1y(db)),
+                      ("refresh_current", lambda: refresh_current(db)),
                       ("sold_3y", lambda: pull_sold_3y(db, max_pages=60, time_budget=480)),
                       ("price_history", lambda: backfill_batch(db, max_parcels=2000, time_budget=480)),
                       ("agent_sales", lambda: pull_agent_sales(db)),
@@ -466,6 +513,7 @@ async def status(db: AsyncSession) -> dict:
         "agent_sales": {k: v for k, v in (await _get(db, "data_pull_agent_sales")).items() if k != "done_ids"},
         "recheck_off_market": await _get(db, "data_pull_recheck_off_market"),
         "stale_recheck": await _get(db, "data_pull_stale_recheck"),
+        "town_sales_1y": await _get(db, "data_pull_town_sales_1y"),
         "photo_refill": {**await _get(db, "data_pull_photo_refill"),
                          "queued": len((await _get(db, PHOTO_QUEUE_KEY)).get("keys") or [])},
     }
