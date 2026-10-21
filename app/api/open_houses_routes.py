@@ -370,6 +370,9 @@ async def get_open_house_form_requests(
     every "Respond to this request" surface (Open Houses page, lead detail) silently rendered
     nothing instead of the real disclosure/second-visit response UI.
     """
+    # A disclosure whose follow-up was already checked off (calendar, Dash, Follow-ups) is Sent.
+    from app.services.tasks_service import resolve_done_mark_sent_requests
+    await resolve_done_mark_sent_requests(db, current_user.id)
     try:
         # Still-open requests are a bounded backlog (the agent clears them), but completed ones
         # pile up forever - capped the same way /tasks caps its "done" side, so this payload (and

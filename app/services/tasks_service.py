@@ -1538,6 +1538,62 @@ async def complete_request_followups(db: AsyncSession, owner_id: str, *, source_
         return 0
 
 
+# Requests whose only action is "send it": checking the follow-up off anywhere (Follow-ups, the Dash,
+# the done link in a reminder, deleting it, deleting its calendar event) handles the request too, so
+# its "Cheat Sheet request" alert in Forms clears (user, 10/21: a disclosure follow-up checked off on
+# the calendar left the Forms alert up for days). Requests that need an answer (tours, second visits:
+# confirm or decline) are NOT here - they stay open until the agent actually answers them.
+MARK_SENT_REQUEST_RULES = {"disclosure_request"}
+
+
+async def resolve_request_for_followup(db: AsyncSession, task: AgentTask) -> bool:
+    """The follow-up `task` was checked off or deleted: if it was made from a mark-sent request, mark
+    that request handled (Sent) and its lead event seen. Caller commits. Never raises."""
+    if task.auto_source not in MARK_SENT_REQUEST_RULES or not task.auto_source_id:
+        return False
+    try:
+        from app.models.database import LeadEvent, OpenHouseFormRequest
+        ev = await db.get(LeadEvent, task.auto_source_id)
+        if ev is None or not ev.source_id:
+            return False
+        now = datetime.now(timezone.utc)
+        changed = False
+        req = await db.get(OpenHouseFormRequest, ev.source_id)
+        if req is not None and req.completed_at is None:
+            req.completed_at = now
+            changed = True
+        if ev.agent_viewed_at is None:
+            ev.agent_viewed_at = now
+            changed = True
+        return changed
+    except Exception:  # noqa: BLE001 - never block checking off a follow-up
+        logger.warning("request not resolved from its follow-up", exc_info=True)
+        return False
+
+
+async def resolve_done_mark_sent_requests(db: AsyncSession, owner_id: str) -> int:
+    """Catch-up for requests whose follow-up was finished before the rule above existed (or by a path
+    that missed it): every open mark-sent request whose follow-up is done is marked handled. Commits."""
+    try:
+        from app.models.database import LeadEvent, OpenHouseFormRequest
+        rows = (await db.execute(
+            select(AgentTask).join(LeadEvent, LeadEvent.id == AgentTask.auto_source_id)
+            .join(OpenHouseFormRequest, OpenHouseFormRequest.id == LeadEvent.source_id)
+            .where(AgentTask.owner_id == owner_id, AgentTask.auto_source.in_(MARK_SENT_REQUEST_RULES),
+                   AgentTask.completed_at.is_not(None), OpenHouseFormRequest.completed_at.is_(None))
+        )).scalars().all()
+        n = 0
+        for t in rows:
+            n += int(await resolve_request_for_followup(db, t))
+        if n:
+            await db.commit()
+        return n
+    except Exception:  # noqa: BLE001
+        logger.warning("mark-sent request catch-up failed", exc_info=True)
+        await db.rollback()
+        return 0
+
+
 async def purge_old_completed(db: AsyncSession) -> int:
     from sqlalchemy import delete
     cutoff = datetime.now(timezone.utc) - timedelta(days=COMPLETED_RETENTION_DAYS)
@@ -2036,6 +2092,34 @@ _TIME_QUESTION_IDS = {f"preferred_{k}_{n}" for k in ("date", "time") for n in (1
 
 
 _TIME_DETAIL_RE = re.compile(r"^((1st|2nd|3rd) choice|preferred (visit )?time|wants another tour)\b", re.I)
+
+
+async def task_request(db: AsyncSession, task: AgentTask) -> Optional[dict]:
+    """The request behind a follow-up, so its card can answer it in place (Dash / Follow-ups, user
+    10/21): a Showcase tour (confirm a time or decline -> {kind: tour, tour_id, collection_id,
+    confirmed}), a second visit (Mark scheduled) or a disclosure (Mark sent) ({kind, request_id,
+    handled}). None for anything else - tours from a listing page or website are booked in
+    ShowingTime, not answered here."""
+    if task.auto_source not in ACTION_REQUEST_RULES or not task.auto_source_id:
+        return None
+    from app.models.database import LeadEvent, OpenHouseFormRequest, PropertyTour
+    event = await db.get(LeadEvent, task.auto_source_id)
+    if event is None or not event.source_id:
+        return None
+    st = event.source_type
+    if st == "property_tour":
+        tour = await db.get(PropertyTour, event.source_id)
+        if tour is None:
+            return None
+        return {"kind": "tour", "tour_id": tour.id, "collection_id": tour.collection_id,
+                "confirmed": bool(getattr(tour, "confirmed_date", None)), "done": bool(tour.is_completed)}
+    if st in ("open_house_second_visit", "open_house_disclosure"):
+        req = await db.get(OpenHouseFormRequest, event.source_id)
+        if req is None:
+            return None
+        return {"kind": "second_visit" if req.form_type == "second_visit" else "disclosure",
+                "request_id": req.id, "handled": req.completed_at is not None}
+    return None
 
 
 def card_details(details: list[str], times: Optional[list[str]] = None) -> list[str]:

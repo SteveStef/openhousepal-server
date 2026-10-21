@@ -582,6 +582,8 @@ async def _upsert_event_locked(db: AsyncSession, conn: CalendarConnection, kind:
             task = await db.get(AgentTask, source_id)
             if task is not None and task.completed_at is None:
                 task.completed_at = datetime.now(timezone.utc)
+                from app.services.tasks_service import resolve_request_for_followup
+                await resolve_request_for_followup(db, task)
             await db.delete(link)
             await db.commit()
             return
@@ -1032,6 +1034,8 @@ async def reconcile_deleted_followups(db: AsyncSession, owner_id: str) -> int:
             if not task or task.completed_at is not None:
                 continue
             task.completed_at = datetime.now(timezone.utc)
+            from app.services.tasks_service import resolve_request_for_followup
+            await resolve_request_for_followup(db, task)  # a disclosure follow-up = disclosure sent
             if link:
                 await db.delete(link)
             await db.commit()

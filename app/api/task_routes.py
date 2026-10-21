@@ -125,6 +125,7 @@ async def list_tasks(
                 try:
                     t.property = await tasks_service.followup_property(db, by_id[t.id], current_user)
                     t.requested_times = await tasks_service.task_requested_times(db, by_id[t.id]) or None
+                    t.request = await tasks_service.task_request(db, by_id[t.id])
                     if by_id[t.id].auto_source != "form_unfinished":  # its notes already list the answers so far
                         t.details = tasks_service.card_details(await tasks_service.request_details(db, by_id[t.id]), t.requested_times) or None
                 except Exception:
@@ -415,6 +416,7 @@ async def public_followup_done(code: str, request: Request, db: AsyncSession = D
     if task.completed_at is None:
         task.completed_at = datetime.now(timezone.utc)
         await tasks_service.mark_lead_contacted(db, task)
+        await tasks_service.resolve_request_for_followup(db, task)  # a disclosure follow-up = disclosure sent
         await db.commit()
         calendar_sync_service.sync_task_bg(task.owner_id, task.id)  # takes it off the calendar
     return _public_view(task, await _others_due(db, task))
@@ -519,6 +521,7 @@ async def update_task(
     if completed is True and task.completed_at is None:
         task.completed_at = datetime.now(timezone.utc)
         await tasks_service.mark_lead_contacted(db, task)
+        await tasks_service.resolve_request_for_followup(db, task)  # a disclosure follow-up = disclosure sent
     elif completed is False:
         task.completed_at = None
     # a moved due date should be able to remind again
@@ -537,6 +540,8 @@ async def delete_task(
     current_user: User = Depends(get_current_active_user),
 ):
     task = await _load_owned(db, task_id, current_user.id)
+    # deleting a mark-sent request's follow-up dismisses the request too (same as on the calendar)
+    await tasks_service.resolve_request_for_followup(db, task)
     await db.delete(task)
     await db.commit()
     calendar_sync_service.unsync_task_bg(current_user.id, task_id)
