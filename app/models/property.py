@@ -1,9 +1,10 @@
+from types import SimpleNamespace
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 from typing import Optional, List, Dict, Any, Union
 from datetime import datetime
 
-from app.utils.listing_dom import resolve_days_on_market
+from app.utils.listing_dom import dom_fetched_at, resolve_days_on_market
 
 class PropertySummaryResponse(BaseModel):
     """
@@ -59,8 +60,14 @@ class PropertySummaryResponse(BaseModel):
     mls_list_date: Optional[datetime] = Field(None, alias="MLSListDate")
     price_change_timestamp: Optional[datetime] = Field(None, alias="PriceChangeTimestamp")
     original_list_price: Optional[float] = Field(None, alias="OriginalListPrice")
-    # when Bright's DaysOnMarket was read (the sync's write time) - not sent to the browser
-    dom_read_at: Optional[datetime] = Field(None, exclude=True, validation_alias="updated_at")
+    # when Bright's DaysOnMarket was read (see listing_dom.dom_fetched_at) - not sent to the browser;
+    # row_updated_at is only the fallback for a row the sync hasn't re-read since dom_read_at existed
+    dom_read_at: Optional[datetime] = Field(None, exclude=True, validation_alias="dom_read_at")
+    row_updated_at: Optional[datetime] = Field(None, exclude=True, validation_alias="updated_at")
+    row_geocoded_at: Optional[datetime] = Field(None, exclude=True, validation_alias="google_geocoded_at")
+    row_amenities_at: Optional[datetime] = Field(None, exclude=True, validation_alias="nearby_amenities_cached_at")
+    row_modified_at: Optional[datetime] = Field(None, exclude=True, validation_alias="modification_timestamp")
+    row_created_at: Optional[datetime] = Field(None, exclude=True, validation_alias="created_at")
     # What a sold home actually sold for. `price` stays the list price; a sold page showed that as
     # "Sold for" (10/19: 345 Holt Ln "Sold for $520,000" - it sold for $601,000). None when Bright
     # never sent a closing price, so the page can say it's the last asking price instead.
@@ -71,7 +78,11 @@ class PropertySummaryResponse(BaseModel):
     @model_validator(mode='after')
     def calculate_dom(self) -> 'PropertySummaryResponse':
         self.days_on_market = resolve_days_on_market(
-            self.days_on_market, self.home_status, self.mls_list_date, fetched_at=self.dom_read_at,
+            self.days_on_market, self.home_status, self.mls_list_date,
+            fetched_at=dom_fetched_at(SimpleNamespace(
+                dom_read_at=self.dom_read_at, updated_at=self.row_updated_at, google_geocoded_at=self.row_geocoded_at,
+                nearby_amenities_cached_at=self.row_amenities_at, modification_timestamp=self.row_modified_at,
+                created_at=self.row_created_at)),
         )
         raw = self.mls_raw or {}
         if self.close_price is None and raw.get("ClosePrice"):

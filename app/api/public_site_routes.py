@@ -25,7 +25,7 @@ from app.api.public_nearby_shared import (
 from app.services.collections_service import CollectionsService
 from app.services import email_signature_service
 from app.services import blog_neighborhoods
-from app.services.website import content_adapters, domain_resolution_service
+from app.services.website import content_adapters, domain_resolution_service, google_search_service
 from app.utils.request_ip import get_client_ip as _client_ip
 import logging
 
@@ -353,9 +353,11 @@ async def resolve_site(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No published site for that domain.")
     # The agent switched their IDX website off (Settings -> IDX Website) - clean 404, same as no
     # site at all. Read live (not from the resolve cache) so the switch takes effect immediately.
-    site_enabled = (await db.execute(select(Site.is_enabled).where(Site.id == resolved.site_id))).scalar_one_or_none()
-    if site_enabled is False:
+    # google_search is read live too: a fresh Search Console code has to show within a minute.
+    live = (await db.execute(select(Site.is_enabled, Site.google_search).where(Site.id == resolved.site_id))).first()
+    if live is not None and live[0] is False:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No published site for that domain.")
+    google_search = (live[1] if live is not None else None) or {}
 
     snapshot = resolved.published_snapshot
     if not resolved.redirect_to and snapshot.get("pages"):
@@ -378,7 +380,20 @@ async def resolve_site(
         "published_snapshot": snapshot,
         "redirect_to": resolved.redirect_to,
         "canonical_hostname": resolved.canonical_hostname,
+        # <meta name="google-site-verification"> on the home page + the IndexNow key file
+        # (google_search_service) - getting the site into Google/Bing without agent steps.
+        "google_verification": google_search_service.verification_codes(google_search),
+        "indexnow_key": google_search_service.indexnow_key(resolved.site_id),
     }
+
+
+@router.get("/{site_id}/redirects")
+async def get_site_old_link(site_id: str, path: str = Query(..., max_length=400), db: AsyncSession = Depends(get_db)):
+    """Where an address from the site that used to live on this domain goes now ({target: null}
+    when it isn't one) - the public renderer asks only after none of its own pages matched. See
+    services/website/old_links_service."""
+    from app.services.website import old_links_service
+    return {"target": await old_links_service.lookup(db, site_id, path)}
 
 
 @router.get("/{site_id}/blog")

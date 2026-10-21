@@ -19,7 +19,7 @@ from app.schemas.site import (
     SiteResponse,
 )
 from app.services.areas import area_enrichment_service, boundary_sources, geocoding
-from app.services.website import content_adapters, domain_resolution_service, domain_verification_service, site_service, starter_template
+from app.services.website import content_adapters, domain_resolution_service, domain_verification_service, google_search_service, site_service, starter_template
 from app.services.website.site_service import InvalidHostname
 from app.utils.auth import get_current_active_user, require_plan_tier
 
@@ -302,11 +302,71 @@ async def apply_my_site_template(
 
 @router.post("/me/publish", response_model=SiteResponse)
 async def publish_my_site(
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
 ):
     site = await _load_owned_site(db, current_user.id)
-    return await site_service.publish_site(db, site)
+    published = await site_service.publish_site(db, site)
+    # Tell Bing (IndexNow) the site changed, and make sure Google has it - no agent steps.
+    background_tasks.add_task(google_search_service.after_publish, published.id)
+    return published
+
+
+# --------------------------------------------------------------------------- Show up on Google
+
+class GoogleCodeIn(BaseModel):
+    code: str = ""
+
+
+@router.get("/me/google")
+async def get_my_google_status(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """Is the site in Google yet (editor -> Google tab card). Everything is automatic; this only reports."""
+    site = await _load_owned_site(db, current_user.id)
+    return await google_search_service.status_for(db, site)
+
+
+@router.post("/me/google/retry")
+async def retry_my_google(
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """"Try again now" after an error - at most once a minute so a busy finger can't hammer Google."""
+    site = await _load_owned_site(db, current_user.id)
+    gs = site.google_search or {}
+    last = google_search_service._parse(gs.get("last_attempt_at"))
+    if not last or (google_search_service._now() - last).total_seconds() >= 60:
+        background_tasks.add_task(google_search_service.register_site_by_id, site.id, force=True)
+    return await google_search_service.status_for(db, site)
+
+
+@router.put("/me/google/code")
+async def set_my_google_code(
+    body: GoogleCodeIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """Advanced: the agent's OWN Search Console code (the "HTML tag" method). Live on the home page
+    within a minute - no publish needed. Blank removes it."""
+    site = await _load_owned_site(db, current_user.id)
+    try:
+        code = google_search_service.parse_verification_code(body.code)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    gs = dict(site.google_search or {})
+    if code:
+        gs["manual_code"] = code
+    else:
+        gs.pop("manual_code", None)
+    site.google_search = gs
+    db.add(site)
+    await db.commit()
+    domain_resolution_service.invalidate_site(site.id)
+    return await google_search_service.status_for(db, site)
 
 
 @router.get("/me/domains/health")
@@ -432,6 +492,93 @@ async def delete_my_site_domain(
     if was_primary:
         # Canonical hostname just fell back to the OHP subdomain - active kits should follow.
         await site_service.regenerate_owner_idx_links(db, current_user)
+
+
+# ---------- Old pages from the agent's previous website - old_links_service ----------
+
+class OldLinkUpdate(BaseModel):
+    target_path: str | None = None
+    is_enabled: bool | None = None
+
+
+async def _old_links_payload(db: AsyncSession, site: Site) -> dict:
+    from app.models.database import SiteRedirect
+    from app.services.website import old_links_service
+    ctx = await old_links_service.build_context(db, site)
+    live = ctx.live_paths()
+    rows = (await db.execute(select(SiteRedirect).where(SiteRedirect.site_id == site.id))).scalars().all()
+    domain = await old_links_service.main_custom_domain(db, site.id)
+    scan = dict(site.old_links_scan or {})
+    if old_links_service.is_running(site.id):
+        scan["status"] = "running"
+    return {
+        "domain": (domain.hostname if domain else None),
+        "scan": scan or None,
+        "redirects": [{
+            "id": r.id, "source_path": r.source_path, "target_path": r.target_path, "confidence": r.confidence,
+            "match_reason": r.match_reason, "is_enabled": r.is_enabled, "agent_approved": r.agent_approved,
+            "last_seen_at": r.last_seen_at.isoformat() if r.last_seen_at else None,
+        } for r in sorted(rows, key=lambda r: (r.target_path is None, -r.confidence, r.source_path)) if r.source_path not in live],
+        "targets": old_links_service.target_options(ctx),
+    }
+
+
+@router.get("/me/old-links")
+async def get_my_old_links(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """The Domain tab's "Old pages from your previous site" list."""
+    site = await _load_owned_site(db, current_user.id)
+    return await _old_links_payload(db, site)
+
+
+@router.post("/me/old-links/scan")
+async def scan_my_old_links(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """"Scan again" - looks up the old site's pages again in the background. The agent's own
+    choices stay as they are."""
+    from app.services.website import old_links_service
+    site = await _load_owned_site(db, current_user.id)
+    if not await old_links_service.main_custom_domain(db, site.id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Connect your own domain first.")
+    old_links_service.queue_scan(site.id)
+    payload = await _old_links_payload(db, site)
+    payload["scan"] = {**(payload["scan"] or {}), "status": "running"}
+    return payload
+
+
+@router.patch("/me/old-links/{redirect_id}")
+async def update_my_old_link(
+    redirect_id: str,
+    body: OldLinkUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """Pick where one old page goes, or turn it off. Marks it the agent's choice."""
+    from app.models.database import SiteRedirect
+    from app.services.website import old_links_service
+    site = await _load_owned_site(db, current_user.id)
+    row = (await db.execute(select(SiteRedirect).where(SiteRedirect.id == redirect_id, SiteRedirect.site_id == site.id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    fields = body.model_fields_set
+    if "target_path" in fields:
+        target = body.target_path
+        if target is not None:
+            allowed = {o["path"] for o in old_links_service.target_options(await old_links_service.build_context(db, site))}
+            if target not in allowed:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick one of your pages.")
+        row.target_path = target
+        row.is_enabled = target is not None
+        row.match_reason = "Your choice" if target else None
+    if "is_enabled" in fields and body.is_enabled is not None:
+        row.is_enabled = bool(body.is_enabled) and row.target_path is not None
+    row.agent_approved = True
+    await db.commit()
+    return {"id": row.id, "target_path": row.target_path, "is_enabled": row.is_enabled, "agent_approved": True, "match_reason": row.match_reason}
 
 
 # ---------- One-click connect (Domain Connect) - domain_connect_service ----------

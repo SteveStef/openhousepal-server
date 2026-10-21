@@ -138,6 +138,19 @@ async def lifespan(app: FastAPI):
         name="Verify custom domain DNS/HTTPS status",
         replace_existing=True,
     )
+    # Every live IDX website in Google Search Console with its sitemap - new sites, new own
+    # domains, retries after a failure. Does nothing until GOOGLE_SEARCH_SERVICE_ACCOUNT_JSON is set.
+    from app.services.website.google_search_service import scheduled_google_search_sweep
+    scheduler.add_job(
+        scheduled_google_search_sweep,
+        "interval",
+        minutes=15,
+        id="google_search_sweep",
+        name="Put IDX websites in Google Search Console",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
     # ...and once connected, is it actually opening? Every 2 hours (new domains each time - the
     # first 4 days - after that once a month). Problems show on the agent's Dash + to the admin.
     scheduler.add_job(

@@ -24,7 +24,7 @@ from app.services.cma_similarity_service import (
 )
 from app.services.cma_artifact_service import saved_artifact_matches, stamp_final_artifact_qa
 from app.utils.geo import distance_miles_sql, get_lat_long_offsets, haversine_distance, is_within_distance
-from app.utils.listing_dom import resolve_days_on_market
+from app.utils.listing_dom import dom_fetched_at, resolve_days_on_market
 
 
 _AUTHORITATIVE_SUBJECT_FACT_FIELDS = (
@@ -839,7 +839,7 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest) -> Lis
                 p.home_status,
                 p.mls_list_date,
                 # Bright's DOM is the count on the day we read it - still-active comps keep counting.
-                fetched_at=p.updated_at,
+                fetched_at=dom_fetched_at(p),
             )
         except (TypeError, ValueError):
             dom_val = None

@@ -61,9 +61,15 @@ def build_instructions(hostname: str) -> List[DnsInstruction]:
         return [DnsInstruction(type="CNAME", name=label, value=WEBSITE_CNAME_TARGET,
                                note=f"Add this record so {hostname} opens your website.")]
     apex = apex_of(hostname)
+    www = DnsInstruction(type="CNAME", name="www", value=WEBSITE_CNAME_TARGET,
+                         note=f"Points www.{apex} at your OpenHousePal website.")
+    if WEBSITE_APEX_IP:
+        # Our own redirect server answers the bare domain and sends every page - not just the home
+        # page - to the same page on www (registrar forwarding drops the page, see _forwards_paths).
+        return [www, DnsInstruction(type="A", name="@", value=WEBSITE_APEX_IP,
+                                    note=f"Sends {apex} (without www) and every page on it to your website. Replaces any forwarding on {apex}.")]
     return [
-        DnsInstruction(type="CNAME", name="www", value=WEBSITE_CNAME_TARGET,
-                       note=f"Points www.{apex} at your OpenHousePal website."),
+        www,
         DnsInstruction(type="FORWARD", name="@", value=f"https://www.{apex}",
                        note=f"Sends people who type {apex} (without www) to the same website. Use your domain company's \"forwarding\" or \"redirect\" setting - permanent (301)."),
     ]
@@ -118,10 +124,28 @@ async def check_dns(hostname: str) -> DnsCheckResult:
         return DnsCheckResult(matched=False, error="lookup_failed")
 
 
+FORWARD_PATH_PROBE = "/ohp-forward-check"
+
+
+async def _forwards_paths(apex: str) -> bool:
+    """Does https://<apex>/some/page land on https://www.<apex>/some/page? GoDaddy's forwarding
+    only sends the home page - every other page on the bare domain is a 404 on GoDaddy's own server,
+    so an old site's pages that Google still lists dead-end (user 10/20, mainlinerealty.co/about).
+    Our site answers the probe path with its own "page not found", so only where it landed counts."""
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            resp = await client.get(f"https://{apex}{FORWARD_PATH_PROBE}")
+            return (resp.url.host or "").lower() == f"www.{apex}" and resp.url.path.rstrip("/") == FORWARD_PATH_PROBE
+    except httpx.HTTPError:
+        return False
+
+
 async def check_forwarding(apex: str) -> str:
     """Does the bare domain forward to its www address (the agent's domain-company forwarding)?
-    'ok' = it lands on the working https site; 'http' = it forwards to http://www... instead (GoDaddy's
-    forwarding defaults to http:// - those visitors got a 404, user 10/19); 'none' = no forward yet."""
+    'ok' = it lands on the working https site, pages included; 'no_paths' = only the home page
+    forwards (other pages are "page not found" - see _forwards_paths); 'http' = it forwards to
+    http://www... instead (GoDaddy's forwarding defaults to http:// - those visitors got a 404,
+    user 10/19); 'none' = no forward yet."""
     target = f"www.{apex}"
     saw_http = False
     for scheme in ("https", "http"):
@@ -132,7 +156,7 @@ async def check_forwarding(apex: str) -> str:
                 if any((h.url.host or "").lower() == target and h.url.scheme == "http" for h in hops):
                     saw_http = True
                 if (resp.url.host or "").lower() == target and resp.url.scheme == "https" and resp.status_code < 400:
-                    return "ok"
+                    return "ok" if await _forwards_paths(apex) else "no_paths"
         except httpx.HTTPError:
             continue
     return "http" if saw_http else "none"
@@ -173,12 +197,14 @@ async def verify_domain(db: AsyncSession, domain: SiteDomain) -> SiteDomain:
     # to waiting with "forward_http", so the panel says exactly what to change.
     if domain.redirect_target_domain_id and not is_www(domain.hostname):
         fwd = await check_forwarding(domain.hostname)
-        if fwd == "ok" or (fwd == "none" and domain.status == "ACTIVE"):
+        if fwd in ("ok", "no_paths") or (fwd == "none" and domain.status == "ACTIVE"):
             # (one failed look at an already-working forward isn't enough to undo it)
-            if fwd == "ok":
+            if fwd in ("ok", "no_paths"):
+                # The home page forwards, so it's connected - but "forward_no_paths" makes the panel
+                # say that other pages typed (or clicked in Google) without www don't.
                 domain.status = "ACTIVE"
                 domain.verified_at = domain.verified_at or datetime.now(timezone.utc)
-                domain.last_error = None
+                domain.last_error = "forward_no_paths" if fwd == "no_paths" else None
             db.add(domain)
             await db.commit()
             await db.refresh(domain)
@@ -223,6 +249,10 @@ async def verify_domain(db: AsyncSession, domain: SiteDomain) -> SiteDomain:
     domain_resolution_service.invalidate_site(domain.site_id)
     if domain.status != prev_status and domain.status in ("ACTIVE", "FAILED") and not domain.redirect_target_domain_id:
         await _email_domain_result(db, domain)
+    if domain.status == "ACTIVE" and prev_status != "ACTIVE" and not domain.redirect_target_domain_id:
+        # Pages from the site that used to live on this domain (still in Google) -> pages here.
+        from app.services.website import old_links_service
+        old_links_service.queue_scan(domain.site_id)
     return domain
 
 

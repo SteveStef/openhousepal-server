@@ -952,6 +952,9 @@ class Property(Base):
     # Listing Intelligence
     original_list_price = Column(Float, nullable=True)
     days_on_market = Column(Integer, index=True, nullable=True)
+    # When the sync last read DaysOnMarket from Bright. Not updated_at: geocoding, the open-house
+    # pass and other jobs bump that too, which froze the day count (see utils/listing_dom.py).
+    dom_read_at = Column(DateTime(timezone=True), nullable=True)
     cumulative_days_on_market = Column(Integer, nullable=True)
 
     # Structure
@@ -2010,13 +2013,44 @@ class Site(Base):
     # published_snapshot; the editor only ever reads/writes draft_data. See site_service.py.
     draft_data = Column(JSONB, nullable=False, default=dict)
     published_snapshot = Column(JSONB, nullable=False, default=dict)
+    # Getting the site into Google/Bing (google_search_service): our Search Console code
+    # (auto_code), the agent's own pasted code (manual_code), the host it was done for, and
+    # verified_at / sitemap_submitted_at / indexnow_pinged_at / last_error. Live - no publish needed.
+    google_search = Column(JSONB, nullable=False, default=dict, server_default='{}')
 
     published_at = Column(DateTime(timezone=True), nullable=True)
+    # The old-links scan of the site that used to live on the agent's own domain (old_links_service):
+    # {domain, status: running|done|failed, started_at, finished_at, found, matched, attempts, error}.
+    old_links_scan = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     owner = relationship("User", back_populates="site")
     domains = relationship("SiteDomain", back_populates="site", cascade="all, delete-orphan")
+
+
+class SiteRedirect(Base):
+    """An address from the site that used to live on the agent's own domain (found in the Internet
+    Archive / its old sitemap - Google still lists it) -> the page here that does the same job.
+    Written by old_links_service's scan; the agent can change the target or turn one off on the
+    Domain tab. source_path is normalized (lowercase, decoded, no trailing slash or query)."""
+    __tablename__ = "site_redirects"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    site_id = Column(String, ForeignKey('sites.id', ondelete='CASCADE'), nullable=False, index=True)
+    source_path = Column(String, nullable=False)
+    target_path = Column(String, nullable=True)  # null = no good match found (agent can pick one)
+    confidence = Column(Float, nullable=False, default=0.0)
+    match_reason = Column(String, nullable=True)  # short plain-English why ("Same blog post", "Town page")
+    is_enabled = Column(Boolean, nullable=False, default=True, server_default='true')
+    agent_approved = Column(Boolean, nullable=False, default=False, server_default='false')  # the agent picked/confirmed it - a rescan never changes it
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)  # newest Archive capture of the old page
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('site_id', 'source_path', name='uq_site_redirects_site_source'),
+    )
 
 
 class SiteDomain(Base):

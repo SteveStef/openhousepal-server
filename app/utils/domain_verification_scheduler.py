@@ -57,6 +57,14 @@ async def scheduled_domain_verification():
                 )
     except Exception as e:
         logger.error("Scheduled domain verification failed", exc_info=True, extra={"error": str(e)})
+    # Old pages from the agent's previous website: scan domains connected without one (incl. before
+    # this existed) and retry failed scans (old_links_service.sweep - runs in the background).
+    try:
+        from app.services.website import old_links_service
+        async with AsyncSessionLocal() as db:
+            await old_links_service.sweep(db)
+    except Exception as e:
+        logger.error("Old links sweep failed", exc_info=True, extra={"error": str(e)})
     # Domains bought in OpenHousePal: finish paid checkouts, retry DNS, make them the main
     # address once live, expiry reminders (domain_purchase_service.sweep).
     try:

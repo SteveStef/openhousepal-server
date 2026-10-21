@@ -118,6 +118,15 @@ def issues_for(rows: list[SiteDomain], tier: Optional[str] = "IDX", enabled: Opt
                 issue = ("forward_http", f"{apex} forwards to http:// - visitors who type it get \"page not found\"",
                          f"At your domain company, open the forwarding for {apex} and switch http:// to https:// "
                          f"(on GoDaddy it's the small dropdown on the left of the address box). Forward to https://www.{apex}.")
+            elif d.last_error == "forward_no_paths":
+                from app.services.website.domain_verification_service import WEBSITE_APEX_IP
+                issue = ("forward_no_paths", f"Only your home page opens from {apex} (without the www)",
+                         (f"At your domain company, delete the forwarding on {apex} and add an A record instead: "
+                          f"name @, value {WEBSITE_APEX_IP}. Then every page works without the www too."
+                          if WEBSITE_APEX_IP else
+                          f"Your domain company's forwarding only sends the home page - any other page typed or "
+                          f"clicked (for example in Google) without the www shows \"page not found\". Always share "
+                          f"www.{apex}."))
             elif d.status != "ACTIVE" and old and d.hostname not in (no_forward or set()):
                 issue = ("forward_none", f"{apex} (without the www) doesn't open your website yet",
                          f"Add a forward from {apex} to https://www.{apex} at your domain company - the exact steps "

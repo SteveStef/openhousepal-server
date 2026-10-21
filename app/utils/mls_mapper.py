@@ -278,6 +278,7 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]] =
         "pets_allowed": item.get("PetsAllowed"),
         "original_list_price": item.get("OriginalListPrice"),
         "days_on_market": item.get("DaysOnMarket"),
+        "dom_read_at": datetime.now(timezone.utc),  # the day count above is as of right now
         "cumulative_days_on_market": item.get("CumulativeDaysOnMarket"),
         "stories": item.get("Stories"),
         "subdivision_name": item.get("SubdivisionName"),

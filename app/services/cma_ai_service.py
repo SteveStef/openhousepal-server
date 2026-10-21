@@ -39,7 +39,7 @@ from app.services import road_context_service
 # Admin accuracy-test only: "as of an earlier date" runs (see the module docstring). Inert unless
 # the backtest runner switches it on around a single generation.
 from app.services import cma_time_machine as _tmach
-from app.utils.listing_dom import resolve_days_on_market
+from app.utils.listing_dom import dom_fetched_at, resolve_days_on_market
 import contextvars as _contextvars
 
 # Tokens spent by the follow-up model calls of the CMA run in progress (comp-note rewrite, gate
@@ -2946,7 +2946,7 @@ def _subject_status_timeline(
         # Active it kept counting since (same rule as everywhere else, listing_dom). In a
         # time-machine run 'today' is the as-of date, before that read, so nothing is added.
         _fresh = resolve_days_on_market(mls_dom, raw.get("MlsStatus") or getattr(prop, "home_status", None),
-                                        None, as_of=today, fetched_at=getattr(prop, "updated_at", None))
+                                        None, as_of=today, fetched_at=dom_fetched_at(prop))
         if _fresh is not None:
             mls_dom = float(_fresh)
     if mls_dom is None and prop is not None:

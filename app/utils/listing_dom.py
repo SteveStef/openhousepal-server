@@ -85,9 +85,28 @@ def resolve_days_on_market(
 
 
 def dom_fetched_at(property_record):
-    """When this home's DaysOnMarket was read from Bright: the sync stamps updated_at on every write
-    of Bright's data (80% of active listings match it to the day; the rest are within a day)."""
-    return getattr(property_record, "updated_at", None)
+    """When this home's DaysOnMarket was read from Bright: dom_read_at, stamped by the sync's mapper
+    on every Bright write. Never updated_at alone - geocoding, the open-house pass and other jobs
+    bump it too, and each bump stopped the count (10/20: 712 Stoke Rd, listed 10/14, kept saying
+    "2 days" after a map lookup). A row the sync hasn't re-read since dom_read_at existed uses
+    updated_at - unless that was plainly a map lookup / nearby-places save (stamped within seconds
+    of it), where Bright's own last change is the better guess."""
+    read = getattr(property_record, "dom_read_at", None)
+    if read is not None:
+        return read
+    updated = getattr(property_record, "updated_at", None)
+    if updated is None:
+        return None
+    for stamp in (getattr(property_record, "google_geocoded_at", None), getattr(property_record, "nearby_amenities_cached_at", None)):
+        if isinstance(stamp, datetime) and isinstance(updated, datetime) and _same_moment(stamp, updated):
+            return getattr(property_record, "modification_timestamp", None) or getattr(property_record, "created_at", None) or updated
+    return updated
+
+
+def _same_moment(a: datetime, b: datetime, seconds: int = 10) -> bool:
+    a = a if a.tzinfo else a.replace(tzinfo=timezone.utc)
+    b = b if b.tzinfo else b.replace(tzinfo=timezone.utc)
+    return abs((a - b).total_seconds()) < seconds
 
 
 def property_days_on_market(property_record, *, as_of: Optional[DateLike] = None) -> Optional[int]:

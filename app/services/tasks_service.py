@@ -1479,13 +1479,16 @@ async def carry_forward_overdue(db: AsyncSession) -> int:
     """Morning job: re-push open automatic follow-ups whose day has passed, so the calendar shows
     them on TODAY as "Overdue - Reach Out" (see carried_forward). Covers one day past the window
     too, so a follow-up that ages out goes back to its original date instead of staying pinned
-    to yesterday. Returns how many were queued."""
+    to yesterday. Today's follow-ups are re-pushed too: their suggested text (days on market, the
+    home to open first) was written the day before, so the calendar gets this morning's version.
+    Returns how many were queued."""
     from app.services import calendar_sync_service
     now = datetime.now(timezone.utc)
+    end_of_today = datetime.combine(now.astimezone(EASTERN).date() + timedelta(days=1), time.min, tzinfo=EASTERN)
     rows = (await db.execute(select(AgentTask).where(
         AgentTask.completed_at.is_(None),
         AgentTask.due_at.is_not(None),
-        AgentTask.due_at < now,
+        AgentTask.due_at < end_of_today,
         AgentTask.due_at >= now - timedelta(days=CARRY_FORWARD_DAYS + 2),
     ).limit(2000))).scalars().all()
     for t in rows:
@@ -1970,7 +1973,27 @@ def requested_picks(event) -> list[str]:
                 picks.append(" at ".join(x for x in [_nice_date(day), _nice_clock(clock)] if x))
     else:
         picks = []
-    return [_nice_pick(p) for p in picks if p and p.strip()][:3]
+    when = getattr(event, "occurred_at", None)
+    return [_absolute_day(_nice_pick(p), when) for p in picks if p and p.strip()][:3]
+
+
+_RELATIVE_DAY_RE = re.compile(r"\b(today|tonight|tomorrow)\b", re.I)
+
+
+def _absolute_day(pick: str, asked_at) -> str:
+    """"Tomorrow at 2pm" typed on Sat -> "Sun, Oct 19 at 2pm": the agent may send the text a day
+    or two later (an overdue follow-up), when "tomorrow" would name the wrong day."""
+    if not asked_at or not _RELATIVE_DAY_RE.search(pick or ""):
+        return pick
+    if asked_at.tzinfo is None:
+        asked_at = asked_at.replace(tzinfo=timezone.utc)
+    base = asked_at.astimezone(EASTERN).date()
+
+    def repl(m):
+        d = base + timedelta(days=1 if m.group(1).lower() == "tomorrow" else 0)
+        label = f"{d:%a}, {d:%b} {d.day}"
+        return label
+    return _RELATIVE_DAY_RE.sub(repl, pick)
 
 
 _PICK_DATE_RE = re.compile(r"^(\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})\b")

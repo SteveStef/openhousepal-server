@@ -9,7 +9,7 @@ from app.database import get_db
 from app.config.logging import get_logger
 from app.utils.auth import get_current_active_user, require_mls_access, require_broker_authorization
 from app.utils.geo import get_lat_long_offsets, is_within_distance, haversine_distance, filter_properties_by_radius, distance_miles_sql
-from app.utils.listing_dom import resolve_days_on_market
+from app.utils.listing_dom import dom_fetched_at, resolve_days_on_market
 from app.services.open_house_manager_service import hosting_window
 import os
 
@@ -301,7 +301,7 @@ async def get_discovery(
         for p in properties:
             # Check if it's "new" (e.g., listed within last 3 days)
             resolved_dom = resolve_days_on_market(
-                p.days_on_market, p.home_status, p.mls_list_date, fetched_at=p.updated_at,
+                p.days_on_market, p.home_status, p.mls_list_date, fetched_at=dom_fetched_at(p),
             )
             days_on_market = resolved_dom if resolved_dom is not None else 0
             is_new = resolved_dom is not None and resolved_dom < 3
