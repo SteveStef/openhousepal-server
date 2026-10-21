@@ -93,6 +93,13 @@ async def get_pricing(domain_name: str, years: int = 1) -> dict:
     return await _call("GET", f"/core/v1/domains/{domain_name}:getPricing", params={"years": years})
 
 
+async def get_balance() -> float:
+    """Account credit left in USD - every API purchase and renewal is paid from it (never from
+    the card or PayPal on the Name.com account; too little = 402 "Insufficient Funds")."""
+    data = await _call("GET", "/core/v1/accountinfo/balance")
+    return float(data.get("balance") or 0)
+
+
 # ---------- registering + managing ----------
 
 async def create_domain(domain_name: str, contact: dict, idempotency_key: str, years: int = 1,

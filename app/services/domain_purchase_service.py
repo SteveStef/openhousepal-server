@@ -221,6 +221,16 @@ async def start(db: AsyncSession, user: User, domain: str, contact_in: dict, bac
     price, renewal = our_price(cost), our_price(float(r.get("renewalPrice") or cost))
     if cost <= 0 or price > max_price():
         raise PurchaseError("That one isn't available here - pick another.")
+    # Name.com takes the cost from our account credit only - if it can't cover this one, stop
+    # before the agent pays (rather than charging them and refunding a minute later).
+    try:
+        balance = await namecom_service.get_balance()
+    except NamecomError:
+        balance = None
+    if balance is not None and balance < cost:
+        _ping(f":rotating_light: Domain purchase BLOCKED - Name.com credit is ${balance:.2f}, {domain} costs ${cost:.2f}. "
+              "Top up at name.com > Account > Account Credit.")
+        raise PurchaseError("Buying a domain is paused for a moment - please try again later.")
 
     purchase = PurchasedDomain(owner_id=user.id, domain_name=domain, status="CHECKOUT", price_usd=price,
                                renewal_price_usd=renewal, cost_usd=cost, registrant=contact)
@@ -536,8 +546,41 @@ def as_dict(p: PurchasedDomain) -> dict:
 
 # ---------- the sweep (runs with the domain health job) ----------
 
+def credit_alert_usd() -> float:
+    return float(os.getenv("DOMAIN_CREDIT_ALERT_USD", "50"))
+
+
+async def check_credit(db: AsyncSession) -> Optional[float]:
+    """Once a day: Name.com account credit (pays every purchase + renewal) below $50 -> one
+    Discord ping that day (user, 10/20). The day's check is remembered in app_cache so a deploy
+    or restart doesn't ping again."""
+    if not namecom_service.configured():
+        return None
+    from sqlalchemy import text
+    from app.services import app_cache
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    key = "namecom_credit_checked"
+    last = (await db.execute(text("SELECT value FROM app_cache WHERE key = :k"), {"k": key})).scalar_one_or_none()
+    if last == today:
+        return None
+    try:
+        balance = await namecom_service.get_balance()
+    except NamecomError:
+        return None  # try again on the next sweep
+    await app_cache.save(key, today)
+    if balance < credit_alert_usd():
+        _ping(f":moneybag: Name.com credit is low: ${balance:.2f} left (alert below ${credit_alert_usd():.0f}). "
+              "Top it up at name.com > Account > Account Credit - new domain purchases and yearly renewals "
+              "are paid from it and stop when it runs out.")
+    return balance
+
+
 async def sweep(db: AsyncSession) -> None:
     now = datetime.now(timezone.utc)
+    try:
+        await check_credit(db)
+    except Exception:
+        logger.warning("Name.com credit check failed", exc_info=True)
     rows = (await db.execute(select(PurchasedDomain).where(PurchasedDomain.status.in_(["CHECKOUT", "REGISTERING", "ACTIVE"])))).scalars().all()
     for p in rows:
         try:
