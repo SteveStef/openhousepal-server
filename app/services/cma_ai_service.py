@@ -19,6 +19,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import traceback
@@ -5290,7 +5291,9 @@ def _v10_psf_leg_treatment(c: dict, price: float, raw_basis_sqft: float, subj_be
 _V10_GRID_SIZE_FRAC = float(os.getenv("CMA_GRID_SIZE_FRAC", "0.35"))  # each above-grade sqft of difference at this x the market rate
 _V10_GRID_BG_FRAC = float(os.getenv("CMA_GRID_BG_FRAC", "0.12"))      # each finished lower-level sqft at this x the market rate
 _V10_FEATURE_BATH_PCT = 0.02      # per full-bath difference (a half bath = 0.5) x the comp's price
-_V10_FEATURE_GARAGE_PCT = 0.015   # per garage-space difference x the comp's price
+_V10_FEATURE_GARAGE_PCT = float(os.getenv("CMA_GRID_GARAGE_PCT", "0.015"))  # per garage-space difference x the comp's price
+_V10_FEATURE_LOT_PCT = float(os.getenv("CMA_GRID_LOT_PCT", "0"))  # per doubling of lot size x the comp's price (0 = off)
+_V10_REL_WEIGHT_POW = float(os.getenv("CMA_REL_WEIGHT_POW", "1"))  # comp weight = Match-% relevance ** this
 _V10_FEATURE_CESSPOOL_PCT = 0.04  # cesspool vs not: 4% of the comp's price...
 _V10_FEATURE_CESSPOOL_MAX = 30000  # ...up to $30K (replacement / public-sewer connection)
 _V10_FEATURE_MAX_PCT = 0.30       # net adjustment capped at +-30% of the comp's sale price
@@ -5454,7 +5457,7 @@ def _v10_grid_adjustments(subject: dict, r: dict, s_ag: float, s_bg: float, s_bg
     finished lower level, baths, garage, cesspool - all at one market rate. Positive = the subject
     has more. Size ALWAYS follows the size gap (a smaller comp is adjusted up)."""
     comp, price = r["_c"], r["price"]
-    out = {"size": 0.0, "below_grade": 0.0, "baths": 0.0, "garage": 0.0, "sewer": 0.0, "notes": [],
+    out = {"size": 0.0, "below_grade": 0.0, "baths": 0.0, "garage": 0.0, "sewer": 0.0, "lot": 0.0, "notes": [],
            "market_psf": round(market_psf, 2),
            "size_rate_psf": round(market_psf * _V10_GRID_SIZE_FRAC, 2),
            "below_grade_rate_psf": round(market_psf * _V10_GRID_BG_FRAC, 2),
@@ -5477,12 +5480,16 @@ def _v10_grid_adjustments(subject: dict, r: dict, s_ag: float, s_bg: float, s_bg
     if s_g is not None and c_g is not None and s_g != c_g:
         out["garage"] = _clamp(s_g - c_g, -3.0, 3.0) * price * _V10_FEATURE_GARAGE_PCT
         out["notes"].append(f"garage {s_g:g} vs {c_g:g} spaces")
+    s_lot, c_lot = _relevance_lot_sqft(subject), _relevance_lot_sqft(comp)
+    if _V10_FEATURE_LOT_PCT and s_lot and c_lot and (s_lot / c_lot >= 1.25 or c_lot / s_lot >= 1.25):
+        out["lot"] = _clamp(math.log2(s_lot / c_lot), -2.0, 2.0) * price * _V10_FEATURE_LOT_PCT
+        out["notes"].append(f"lot {s_lot / 43560:.2f} vs {c_lot / 43560:.2f} acres")
     s_cess, c_cess = _has_cesspool(subject), _has_cesspool(comp)
     if s_cess != c_cess and subject.get("sewer") and comp.get("sewer"):
         amount = min(_V10_FEATURE_CESSPOOL_PCT * price, _V10_FEATURE_CESSPOOL_MAX)
         out["sewer"] = amount if c_cess else -amount
         out["notes"].append("comp has a cesspool" if c_cess else "subject has a cesspool")
-    keys = ("size", "below_grade", "baths", "garage", "sewer")
+    keys = ("size", "below_grade", "baths", "garage", "sewer", "lot")
     gross = sum(abs(out[k]) for k in keys)
     net = sum(out[k] for k in keys)
     cap = _V10_FEATURE_MAX_PCT * price
@@ -5664,13 +5671,17 @@ def _compute_comp_anchor(
     for r in rows:
         r["redundancy_penalty"] = round(red_pen.get(r["key"], 1.0), 3)
         if raw_weight_overrides is not None:
-            # Continuous relevance supplies a complete base weight that already includes
-            # location, recency, and reliability. Keep the production penalties for outliers and
-            # near-duplicate evidence, but do not apply role or location a second time.
+            # Continuous relevance supplies a base weight that already includes distance, market
+            # area, recency and reliability. Keep the production penalties for outliers and
+            # near-duplicate evidence, but do not apply role or those location parts a second time.
+            # The STREET is not in it: a busier street than the subject's was shown as "x0.8" in the
+            # trace but never applied (417 Dogwood Ln v7 review, 10/20: three E Kings Hwy sales
+            # weighted like the quiet cul-de-sac sale), so that part is applied here.
             r["weight"] = (
                 r["raw_weight_override"]
                 * (_V10_OUTLIER_PENALTY if r["outlier"] else 1.0)
                 * max(0.35, min(1.0, r["redundancy_penalty"]))
+                * float((r.get("loc_trace") or {}).get("street_weight_penalty", 1.0) or 1.0)
             )
         else:
             r["weight"] = _v10_comp_weight(
@@ -6237,7 +6248,7 @@ def _continuous_relevance(
         else:
             role = "supporting"
         row["proposed_role"] = role
-        row["continuous_weight_input"] = score if role in ("strong", "supporting") else 0.0
+        row["continuous_weight_input"] = (score ** _V10_REL_WEIGHT_POW) if role in ("strong", "supporting") else 0.0
     stable_payload = {
         "version": _CONTINUOUS_RELEVANCE_VERSION,
         "density": density,
@@ -6469,6 +6480,10 @@ def _v10_location_class_review(subject: dict, comps: list, evidence_by_key: dict
             "area_label": area_label, "school_township": school_township,
             "negatives": negatives, "override_applied": bool(override_valid),
             "override_reason": ovr_reason or None, "weight_penalty": round(weight_penalty, 3),
+            # The street part alone: Match % (continuous relevance) already scores distance and
+            # market area, but not the street, so this is the piece it still applies (10/20).
+            "street_weight_penalty": round(1.0 - _V10_LOC_NEG_STEP - _V10_LOC_STREET_STEP, 3)
+                                     if (_busier and not override_valid) else 1.0,
         }
     return flags
 
