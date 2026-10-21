@@ -11914,7 +11914,7 @@ def _v10_asking_gap_sentence(methodology: str, *, final: Optional[dict], trace: 
     ]
 
 
-_OVER_ASK_MARK = "sold over their asking price"
+_OVER_ASK_MARK = "sold at least 2% over their asking price"   # 2% = _OVER_ASK_MIN_RATIO; a +1.1% sale is "at list" (v17)
 
 
 def _v10_over_ask_pattern_sentence(methodology: str, *, trace: Optional[dict]) -> tuple[str, list[str]]:
@@ -11925,7 +11925,7 @@ def _v10_over_ask_pattern_sentence(methodology: str, *, trace: Optional[dict]) -
     if not methodology or not pat.get("count") or _OVER_ASK_MARK in methodology:
         return methodology, []
     days = _as_float(pat.get("median_days"))
-    sentence = (f" {pat['count']} of the {pat['of']} comparable sales {_OVER_ASK_MARK}"
+    sentence = (f" {_num_word(pat['count']).capitalize()} of the {_num_word(pat['of'])} comparable sales {_OVER_ASK_MARK}"
                 + (f", typically within {round(days)} days" if days else "")
                 + f" (up to {round(_as_float(pat.get('top_pct')) or 0)}% over), so this newly listed home could draw "
                   "competing offers above its asking price.")
@@ -11957,9 +11957,39 @@ def _anchor_adjustment_drivers(trace: Optional[dict], anchor_value: Optional[flo
     return " and ".join(_ADJ_DRIVER_LABELS[k] for k in top)
 
 
+_NUM_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten")
+
+
+def _num_word(n) -> str:
+    """Small counts as words ("Three of the five sales...") - a sentence shouldn't open on a digit (v17)."""
+    try:
+        i = int(n)
+    except (TypeError, ValueError):
+        return str(n)
+    return _NUM_WORDS[i] if 0 <= i < len(_NUM_WORDS) else str(i)
+
+
+# "This is not evidence of distress or a demonstrated condition problem." - fine after a sentence about
+# time on the market, an orphan anywhere else (v17: it followed a sentence about the lower level).
+_DISTRESS_DISCLAIMER_RE = re.compile(r"^(?:This|That|It) is not (?:evidence|a sign|an indication) of distress\b[^.!?]*[.!?]$",
+                                     re.IGNORECASE)
+_MARKET_TIME_RE = re.compile(r"\b(?:on the market|market time|days|listed|time on market|marketing time|sat)\b", re.IGNORECASE)
+
+
+def _drop_orphan_distress_disclaimer(methodology: str) -> tuple[str, list[str]]:
+    sents = re.split(r"(?<=[.!?])\s+", (methodology or "").strip())
+    kept = [s for i, s in enumerate(sents)
+            if not (_DISTRESS_DISCLAIMER_RE.match(s) and not (i and _MARKET_TIME_RE.search(sents[i - 1])))]
+    if len(kept) == len(sents):
+        return methodology, []
+    return " ".join(kept), ["Methodology summary: dropped a 'not a sign of distress' line that wasn't about time on the market."]
+
+
 def _v10_reconcile_anchor_direction_prose(methodology: str, *, final: Optional[dict],
                                           trace: Optional[dict]) -> tuple[str, list[str]]:
+    methodology, od_flags = _drop_orphan_distress_disclaimer(methodology)
     text, flags = _v10_anchor_direction_core(methodology, final=final, trace=trace)
+    flags = od_flags + flags
     text, gap_flags = _v10_asking_gap_sentence(text, final=final, trace=trace)
     text, oa_flags = _v10_over_ask_pattern_sentence(text, trace=trace)
     text, rt_flags = _v10_range_top_at_asking_sentence(text, final=final, trace=trace)
@@ -13308,7 +13338,7 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
         _why_under = ""
         if _oap.get("count") and lp and ol < lp:
             _d = _as_float(_oap.get("median_days"))
-            _why_under = (f"{_oap['count']} of the {_oap['of']} comparable sales went over their asking price"
+            _why_under = (f"{_num_word(_oap['count']).capitalize()} of the {_num_word(_oap['of'])} comparable sales went at least 2% over their asking price"
                           + (f", most within {round(_d)} days" if _d else "")
                           + ", but this home has now been on the market longer than that without an accepted offer, "
                             "so it isn't drawing the same competition and opening below asking is reasonable. ")

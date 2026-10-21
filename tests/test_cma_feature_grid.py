@@ -628,7 +628,7 @@ def test_over_ask_pattern_is_reported_not_priced_in():
     assert chk["allowed_high"] == round(400000 * 1.08 * 1.05)   # the usual band - wording only (backtest)
     trace = {"asking_price_check": {"over_ask_pattern": pat}}
     text, _ = ai._v10_over_ask_pattern_sentence("Notes.", trace=trace)
-    assert text == ("Notes. 3 of the 5 comparable sales sold over their asking price, typically within 5 days "
+    assert text == ("Notes. Three of the five comparable sales sold at least 2% over their asking price, typically within 5 days "
                     "(up to 16% over), so this newly listed home could draw competing offers above its asking price.")
     assert ai._v10_over_ask_pattern_sentence(text, trace=trace)[0] == text
 
@@ -748,12 +748,12 @@ def test_v16_offer_explains_opening_under_asking_when_passed_over_after_over_ask
     band = {"fmv": 490000, "list_price": 500000, "opening_low": 463000, "opening_high": 483000, "target": 490000,
             "comfort_ceiling": 490000, "passed_over": True, "over_ask_passed": {"count": 3, "of": 5, "median_days": 6}}
     out, _ = ai._v10_rebuild_buyer_offer_prose("Use a standard inspection contingency.", band, 0.04)
-    assert "3 of the 5 comparable sales went over their asking price, most within 6 days" in out
+    assert "Three of the five comparable sales went at least 2% over their asking price, most within 6 days" in out
     assert "opening below asking is reasonable" in out
     once = ai._v10_rebuild_buyer_offer_prose(out, band, 0.04)[0]
-    assert once.count("went over their asking price") == 1
+    assert once.count("went at least 2% over their asking price") == 1
     plain = ai._v10_rebuild_buyer_offer_prose("", {**band, "over_ask_passed": None}, 0.04)[0]
-    assert "went over their asking price" not in plain
+    assert "went at least 2% over their asking price" not in plain
 
 
 def test_v16_vague_farther_out_becomes_real_distance():
@@ -801,3 +801,15 @@ def test_v16_range_top_at_asking_is_explained():
     assert again.count("range stops at the") == 1
     fresh = {**trace, "asking_price_check": {**trace["asking_price_check"], "passed_over": False}}
     assert "range stops" not in ai._v10_reconcile_anchor_direction_prose(notes, final=final, trace=fresh)[0]
+
+
+# ---- 417 Dogwood Ln v17 (10/21) -----------------------------------------------------------------
+
+def test_v17_orphan_distress_line_dropped_but_kept_after_market_time():
+    orphan = ("No verified sale closely matches this home's finished lower level, keeping confidence moderate. "
+              "This is not evidence of distress or a demonstrated condition problem. Weighted together, the sales agree.")
+    out, flags = ai._drop_orphan_distress_disclaimer(orphan)
+    assert "distress" not in out and flags
+    fine = "The home has been on the market longer than its comps. This is not a sign of distress."
+    assert ai._drop_orphan_distress_disclaimer(fine)[0] == fine
+    assert ai._num_word(3) == "three" and ai._num_word(12) == "12"
