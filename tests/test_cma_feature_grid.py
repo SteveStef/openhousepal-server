@@ -254,3 +254,38 @@ def test_offer_prose_drops_little_room_sentence_when_value_is_below_asking():
     out, _ = ai._v10_rebuild_buyer_offer_prose(text, band, 0.04)
     assert "inspection contingency" in out
     assert "limited room" not in out
+
+
+# ---- 417 Dogwood Ln v6 (10/20) ------------------------------------------------------------------
+
+DOGWOOD_SUBJECT = {"sqft": 3130, "above_grade_finished_area": 1830, "below_grade_finished_area": 1300}
+
+
+def test_subject_size_in_a_comp_note_is_not_corrected_to_the_comps():
+    comp = {"sqft": 1472, "above_grade_finished_area": 1472, "below_grade_finished_area": 0}
+    text = "The high rate reflects a small home, not a signal the subject should price that high on its much larger 3,130 sqft total."
+    out, _ = ai._reconcile_comp_hard_facts(text, "Comp #2 (1219 SCOTT DR)", DOGWOOD_SUBJECT, comp)
+    assert "3,130" in out and "1,472 sqft total" not in out
+
+
+def test_size_followed_later_by_basement_is_not_a_basement_size():
+    comp = {"sqft": 1710, "above_grade_finished_area": 1710, "below_grade_finished_area": None}
+    note = "This 1,710 sq ft ranch with a partially finished basement sold quickly."
+    assert ai._comp_note_number_errors(note, comp, DOGWOOD_SUBJECT) == []
+    assert ai._comp_note_number_errors("It adds 1,710 sq ft of finished basement.", comp, DOGWOOD_SUBJECT)
+
+
+def test_listed_home_cannot_have_sold_today():
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().isoformat()
+    subj, flag = ai._drop_impossible_last_sale({"last_sale_date": today, "list_price": 500000, "days_on_market": 14})
+    assert subj["last_sale_date"] is None and flag
+    subj, flag = ai._drop_impossible_last_sale({"last_sale_date": "2019-05-01", "list_price": 500000, "days_on_market": 14})
+    assert subj["last_sale_date"] == "2019-05-01" and flag is None
+
+
+def test_dated_installs_count_as_system_updates():
+    found = ai._documented_system_updates({"public_remarks": "Recent improvements include a water softener and UV "
+                                           "treatment system installed in 2023, EV charging added in 2024."})
+    assert "water softener" in found and "ev charging" in found
+    assert ai._documented_system_updates({"public_remarks": "Roof and new windows."}) == ["windows"]

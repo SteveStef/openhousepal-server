@@ -1600,7 +1600,11 @@ def _explicit_accessory_features(data: Optional[dict]) -> list[str]:
 
 _SYSTEM_NAMES_RE = re.compile(
     r"\b(?:systems?|hvac|heating|cooling|air conditioning|central air|electrical|wiring|"
-    r"plumbing|water heater|boiler|furnace|sewer line|water service|roof|windows|gutters?)\b",
+    r"plumbing|water heater|boiler|furnace|sewer line|water service|roof|windows|gutters?|"
+    # 417 Dogwood Ln v6 (10/20): "water softener and UV treatment system installed in 2023, EV
+    # charging added in 2024" went unrecognized and the report said no system updates were documented.
+    r"water softener|water treatment|uv (?:treatment|system|filter)|ev charg(?:er|ing)|solar panels?|"
+    r"generator|sump pump|radon (?:mitigation|system))\b",
     re.IGNORECASE,
 )
 _SYSTEM_UPDATE_RE = re.compile(
@@ -1650,7 +1654,13 @@ def _documented_system_updates(data: Optional[dict]) -> list[str]:
             r"\s*(?:was|were|is|are|has been|have been)?\s*"
             r"(?:new|updated|upgraded|replaced|modernized|rewired)\b", after, re.IGNORECASE,
         )
-        if update_before or update_after:
+        # "...and UV treatment system installed in 2023", "EV charging added in 2024" - a dated
+        # install covers the short list before it.
+        installed_after = re.match(
+            r"(?:[\s,&]+(?:and\s+)?[\w-]+){0,6}?\s*(?:was|were)?\s*(?:installed|added|put in)\s+(?:in\s+)?(?:19|20)\d{2}\b",
+            blob[match.end():match.end() + 80], re.IGNORECASE,
+        )
+        if update_before or update_after or installed_after:
             found.append(match.group(0).lower())
     return list(dict.fromkeys(found))
 
@@ -2864,6 +2874,24 @@ def _seller_not_listed(mode: str, subject: dict, timeline: dict) -> tuple[dict, 
         subj["last_sale_date"] = str(close_date)
     subj["_status_timeline"] = new_tl
     return subj, new_tl
+
+
+def _drop_impossible_last_sale(subject: Optional[dict]) -> tuple[dict, Optional[str]]:
+    """A listed home can't have sold after it went on the market, nor in the future. An iPhone date
+    box saves TODAY when tapped, and 417 Dogwood Ln v6 (14 days on market) printed "Last sale date
+    Oct 20, 2026" - the day the report was made (10/20)."""
+    subj = dict(subject or {})
+    sold = _parse_iso_date(subj.get("last_sale_date"))
+    if not sold:
+        return subj, None
+    today = datetime.now(timezone.utc).date()
+    dom = _as_float(subj.get("days_on_market"))
+    listed_since = (today.toordinal() - int(dom)) if (dom is not None and dom >= 0 and subj.get("list_price")) else None
+    if sold > today or (listed_since is not None and sold.toordinal() >= listed_since):
+        subj["last_sale_date"] = None
+        return subj, (f"Subject: dropped a last sale date of {sold.isoformat()} - the home has been listed for "
+                      f"{int(dom)} days, so it can't have sold then (likely a phone date box filling in today).")
+    return subj, None
 
 
 def _subject_status_timeline(
@@ -9095,6 +9123,15 @@ def _reconcile_comp_hard_facts(
         is_subject = owner == "subject"
         allowed = _documented_sqft_values(record, area_kind)
         replacement = match.group(0)
+        # A comp note quoting one of the SUBJECT's own documented sizes is about the subject, even
+        # when the owner guess says comp ("...on its much larger 3,130 sqft total" was "corrected"
+        # to the comp's 1,472, 417 Dogwood Ln v6, 10/20) - leave it alone.
+        _subject_sizes = _documented_sqft_values(subject) if not is_subject else set()
+        if raw_value and any(abs(raw_value - known) <= max(2, 0.002 * known) for known in _subject_sizes) \
+                and not any(abs(raw_value - known) <= max(2, 0.002 * known) for known in allowed):
+            rebuilt.append(replacement)
+            pos = match.end()
+            continue
         if raw_value and not any(abs(raw_value - known) <= max(2, 0.002 * known) for known in allowed):
             replacement_value = (
                 comp_sqft["above_grade_sqft"] if area_kind == "above"
@@ -9169,7 +9206,10 @@ def _comp_note_number_errors(text: str, comp: dict, subject: Optional[dict] = No
         after = text[m.end():m.end() + 45].lower()
         before = text[max(0, m.start() - 30):m.start()].lower()
         ctx = before + " " + after
-        if re.search(r"basement|below[- ]grade|lower[- ]level", after[:40]):
+        # Only a figure that IS the lower level ("512 sq ft of finished basement") is checked against
+        # below-grade areas - not "1,710 sq ft ranch with a partially finished basement" (above
+        # grade, rejected as a wrong basement size: 417 Dogwood Ln v6, 10/20).
+        if re.match(r"\s*(?:(?:of|in)\s+)?(?:the\s+)?(?:(?:partially|fully)\s+)?(?:finished\s+)?(?:basement|below[- ]grade|lower[- ]level)", after):
             pool = [areas_c["below_grade_finished_area"], areas_s["below_grade_finished_area"]]
         elif re.search(r"above[- ]grade", ctx):
             pool = [areas_c["above_grade_finished_area"], areas_s["above_grade_finished_area"]]
@@ -14152,7 +14192,9 @@ async def _generate_ai_analysis_impl(
         config["cma_ai_max_photos_per_property_cap"],
     )
 
-    subject = report.subject or {}
+    subject, _last_sale_flag = _drop_impossible_last_sale(report.subject or {})
+    if _last_sale_flag:
+        report.subject = subject
     comps = [c for c in (report.comparables or []) if c.get("is_included", True)]
     if len(comps) > MAX_COMPS:
         comps = sorted(comps, key=lambda c: c.get("match_score") or 0, reverse=True)[:MAX_COMPS]
@@ -14554,6 +14596,8 @@ async def _generate_ai_analysis_impl(
     qa_blocking: list[str] = []
     if status_timeline.get("live_status_note"):
         qa_flags.append(status_timeline["live_status_note"])
+    if _last_sale_flag:
+        qa_flags.append(_last_sale_flag)
     new_comparables = []
     for comp in report.comparables or []:
         comp = dict(comp)
@@ -14618,10 +14662,15 @@ async def _generate_ai_analysis_impl(
         # when neither the agent nor the AI rated them - keeps the comparison matrix from
         # showing blanks on data we already hold. Subjective dimensions stay blank if unrated.
         _q = dict(comp.get("quality") or {})
+        _lot_s, _lot_c = _as_float(enriched_subject.get("lot_size")), _as_float(comp.get("lot_size"))
+        _lot_ratio = (_lot_c / _lot_s) if _lot_s and _lot_c else None
         for _f, _v in _derive_quality_from_data(enriched_subject, comp).items():
             # Area is a pure records comparison (school district / city / township) - the data wins
-            # over a model's rating; other derived dimensions only fill blanks.
-            if _f == "area" or not _q.get(_f):
+            # over a model's rating; other derived dimensions only fill blanks. Lot too when the gap
+            # is unmistakable (40%+ smaller / 60%+ larger): the model rated 0.35 and 1.1 acres both
+            # "Similar" to 0.68 (417 Dogwood Ln v6, 10/20).
+            if _f == "area" or not _q.get(_f) or (
+                    _f == "lot" and _lot_ratio is not None and (_lot_ratio <= 0.6 or _lot_ratio >= 1.6)):
                 _q[_f] = _v
         if not _q.get("street_context"):
             _street = _derive_street_context(enriched_subject, comp)
@@ -15425,7 +15474,9 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Generate the initial AI analysis before recomputing.")
 
     config = await ai_config_service.get_config(db)
-    subject = report.subject or {}
+    subject, _last_sale_flag = _drop_impossible_last_sale(report.subject or {})
+    if _last_sale_flag:
+        report.subject = subject
     comps = [c for c in (report.comparables or []) if c.get("is_included", True)]
     if not comps:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Add at least one comparable before recomputing.")
