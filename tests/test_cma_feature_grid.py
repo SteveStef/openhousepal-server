@@ -619,13 +619,13 @@ def _oa_packets(rows):
     return [{"sale_price": 5e5, "sold_list_ratio": r, "dom": d} for r, d in rows]
 
 
-def test_over_ask_pattern_raises_fresh_cap_and_is_reported():
+def test_over_ask_pattern_is_reported_not_priced_in():
     hot = _oa_packets([(1.16, 5), (1.12, 4), (1.08, 7), (1.00, 20), (0.97, 30)])
     chk = ai._asking_price_market_check({"current_list_price": 400000, "dom": 3}, {},
                                         {"state": "insufficient_exposure", "comp_median_dom": 7}, hot)
     pat = chk["over_ask_pattern"]
     assert pat == {"count": 3, "of": 5, "top_pct": 16.0, "median_days": 5}
-    assert chk["allowed_high"] == round(400000 * 1.16)
+    assert chk["allowed_high"] == round(400000 * 1.08 * 1.05)   # the usual band - wording only (backtest)
     trace = {"asking_price_check": {"over_ask_pattern": pat}}
     text, _ = ai._v10_over_ask_pattern_sentence("Notes.", trace=trace)
     assert text == ("Notes. 3 of the 5 comparable sales sold over their asking price, typically within 5 days "
@@ -644,15 +644,15 @@ def test_over_ask_pattern_off_when_not_most_comps_or_not_fresh():
     assert late["over_ask_pattern"] is None   # sat longer than those sales: no promise of competition
 
 
-def test_priced_above_sales_gets_no_over_ask_premium():
+def test_priced_above_sales_gets_no_over_ask_wording():
     hot = _oa_packets([(1.16, 5), (1.12, 4), (1.08, 7), (1.00, 20), (0.97, 30)])
     exp = {"state": "insufficient_exposure", "comp_median_dom": 7}
     fair = ai._asking_price_market_check({"current_list_price": 500000, "dom": 3}, {}, exp, hot, anchor_value=505000)
     high = ai._asking_price_market_check({"current_list_price": 600000, "dom": 3}, {}, exp, hot, anchor_value=520000)
     assert fair["over_ask_pattern"] and not fair["priced_above_sales"] and fair["ratio_used"] > 1
     # the agent already priced it 15% over what the sales support: no "it'll go over asking too"
-    assert high["priced_above_sales"] and high["over_ask_pattern"] is None and high["ratio_used"] <= 1.0
-    assert high["allowed_low"] == round(600000 * 0.90)
+    assert high["priced_above_sales"] and high["over_ask_pattern"] is None
+    assert high["ratio_used"] == fair["ratio_used"]   # the band itself is unchanged (backtest)
 
 
 def test_loose_fit_estate_is_flagged_and_sales_dont_win():

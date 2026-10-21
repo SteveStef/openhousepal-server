@@ -8118,9 +8118,8 @@ price looks high next to what nearby homes sold for. When asking_price_check.fre
 the home was just listed - if the adjusted sales sit above the asking price, it may draw offers over
 asking; value it from the sales and say that as a possibility, never a certainty. When
 asking_price_check.over_ask_pattern is set, most of the comparable sales sold over their final list
-price within days and this home is still newly listed: allowed_high already makes room for the same
-outcome - follow the adjusted sales (not the asking price) up to it, and never call a bidding war
-certain. When asking_price_check.priced_above_sales is true, the asking price is already above what
+price within days and this home is still newly listed: say it could draw competing offers, keep the
+value within allowed_low / allowed_high like any other listing, and never call a bidding war certain. When asking_price_check.priced_above_sales is true, the asking price is already above what
 the adjusted sales support: do not suggest it will sell over asking because its comps did - the
 comps' over-asking results are likely already in its price. When asking_price_check.sales_loose_fit
 is true, no sale is a close match for this home (much larger or smaller than all of them, heavy
@@ -8378,7 +8377,6 @@ _ASKING_CHECK_LONG_UNSOLD_FLOORS = ((365, 0.70), (120, 0.80))   # (days on marke
 _ASKING_CHECK_FRESH_CAPS = ((7, 1.10), (14, 1.07))              # (days on market, ceiling x asking)
 _OVER_ASK_MIN_RATIO = 1.02   # a comp "sold over asking" at 2%+ over its final list price...
 _OVER_ASK_FAST_DAYS = 10     # ...within this many days on market
-_OVER_ASK_MAX_CAP = 1.20     # the most a fresh listing's value may reach over asking on that pattern
 _PRICED_ABOVE_SALES_TOL = 0.02   # asking more than 2% above the adjusted sales = priced above them
 
 
@@ -8430,12 +8428,11 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
         stale = True
     # Priced above its sales (owner, 10/21): when the asking price is already more than the adjusted
     # comparable sales support, the agent has likely priced the comps' over-asking results in - the
-    # comps selling over THEIR asking prices says nothing about this one doing it too. No over-asking
-    # premium on the expected price, and no over-asking pattern below.
+    # report and offer advice don't suggest it will sell over asking too (wording only). Taking the
+    # over-asking premium out of the expected price as well was tested on the 120-home backtest and
+    # made 11 of 13 changed homes worse (the grid misses ~10%, so "priced above" is often wrong).
     _av = _as_float(anchor_value)
     priced_above_sales = bool(_av and lp > _av * (1 + _PRICED_ABOVE_SALES_TOL))
-    if priced_above_sales:
-        ratio = min(ratio, 1.0)
     expected = lp * ratio
     low_mult = _ASKING_CHECK_BAND_STALE_LOW if stale else _ASKING_CHECK_BAND[0]
     long_unsold = False
@@ -8449,10 +8446,9 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
     allowed_high = expected * high_mult
     fresh_listing = False
     # Over-asking pattern (owner, 10/21): at least half the comps with a list price sold over it
-    # (2%+) within 10 days. A home still in its first two weeks may go the same way, so the cap can
-    # reach what the hottest of those sales got over asking (up to 20%). Fast first-week sales in our
-    # Bright data: 90th / 95th percentile 1.08 / 1.11 over final list; with signs of competition
-    # (offer deadlines) 1.13 / 1.16 - so a fixed 10% cap cut off real outcomes.
+    # (2%+) within 10 days and this home is still in its first two weeks - the report says it could
+    # draw competing offers. Wording only: letting the value cap follow those sales (up to 20% over
+    # asking) made all 4 changed homes worse on the 120-home backtest, so the fresh caps stand.
     _fast_over = [float(c["sold_list_ratio"]) for c in comp_packets
                   if (_as_float(c.get("sold_list_ratio")) or 0) >= _OVER_ASK_MIN_RATIO and 0.75 <= float(c["sold_list_ratio"]) <= 1.5
                   and _as_float(c.get("dom")) is not None and float(c["dom"]) <= _OVER_ASK_FAST_DAYS]
@@ -8466,8 +8462,6 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
     if dom is not None and not (stale or passed_over or outpaced):
         for days, cap in _ASKING_CHECK_FRESH_CAPS:
             if dom <= days:
-                if over_ask_pattern:
-                    cap = max(cap, min(max(_fast_over), _OVER_ASK_MAX_CAP))
                 fresh_listing = lp * cap > allowed_high
                 allowed_high = max(allowed_high, lp * cap)
                 break
