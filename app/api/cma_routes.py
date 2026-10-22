@@ -66,6 +66,25 @@ async def search_cma_comparables(
         return await service.search_comparables(db, payload)
 
 
+@router.post("/comparables/auto-search")
+async def auto_search_cma_comparables(
+    payload: CmaCompSearchRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_mls_access),
+    _broker: User = Depends(require_broker_authorization),
+):
+    """The comp step's first search: picks its own radius and sold window (time first, then
+    distance, never past this product's limit) and says when comps are limited - see
+    cma_service.auto_search_comparables. Manual changes after that use /comparables/search."""
+    from app.services import cma_backtest_arms as _arms
+    arm = await _arms.find_arm(db, current_user.id, listing_key=payload.listing_key)
+    if arm:
+        payload = _arms.shift_search_window(payload, arm)
+    with _arms.activated(arm):
+        out = await service.auto_search_comparables(db, payload)
+    return {**out, "results": [c.model_dump() for c in out["results"]]}
+
+
 @router.get("/public/{slug}", response_model=CmaPublicResponse)
 async def get_public_cma_report(
     slug: str,

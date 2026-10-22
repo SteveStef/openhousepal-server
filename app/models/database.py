@@ -40,7 +40,11 @@ collection_properties = Table(
     Base.metadata,
     Column('collection_id', String, ForeignKey('collections.id'), primary_key=True),
     Column('property_id', String, ForeignKey('properties.id'), primary_key=True),
-    Column('added_at', DateTime(timezone=True), nullable=True)  # NULL = initial property (no NEW badge)
+    Column('added_at', DateTime(timezone=True), nullable=True),  # NULL = initial property (no NEW badge)
+    # Moved into the Showcase's Sold/Removed folder (by the buyer or the agent). A home that goes
+    # under contract / sold / off the market stays in the list with a notice until someone moves
+    # it; a home back on the market drops this (collections_service._sold_folder_ids).
+    Column('sold_filed_at', DateTime(timezone=True), nullable=True),
 )
 
 class User(Base):
@@ -1006,6 +1010,10 @@ class Property(Base):
         Index('ix_properties_raw_co_buyer_agent_mls_id', text("(raw_mls_data ->> 'CoBuyerAgentMlsId')")),
         Index('ix_properties_raw_list_agent_mls_id', text("(raw_mls_data ->> 'ListAgentMlsId')")),
         Index('ix_properties_raw_co_list_agent_mls_id', text("(raw_mls_data ->> 'CoListAgentMlsId')")),
+        # Address search (ILIKE / pg_trgm) - migration e7b2d4f6a8c1. Declared here so autogenerate
+        # never drops it again (that is how the first trigram index disappeared).
+        Index('ix_properties_full_address_trgm', 'full_address', postgresql_using='gin',
+              postgresql_ops={'full_address': 'gin_trgm_ops'}),
     )
 
 

@@ -863,6 +863,35 @@ async def recommend_property(
     return {"success": True, "recommended": body.recommended}
 
 
+class SoldFolderUpdate(BaseModel):
+    filed: bool = True
+
+
+def _sold_folder_result(result: dict) -> dict:
+    if not result["success"]:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND if result.get("error") == "Home not found" else status.HTTP_409_CONFLICT,
+            detail=result.get("error", "Could not move this home"),
+        )
+    return result
+
+
+@router.put("/{collection_id}/properties/{property_id}/sold-folder")
+async def move_to_sold_folder(
+    collection_id: str,
+    property_id: str,
+    body: SoldFolderUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """The agent moves a home that went under contract / sold / off the market into their client's
+    Sold/Removed folder (or back out) - the client's Showcase shows it the same way."""
+    coll = (await db.execute(select(Collection).where(Collection.id == collection_id))).scalar_one_or_none()
+    if not coll or coll.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    return _sold_folder_result(await CollectionsService.set_sold_filed(db, collection_id, property_id, body.filed))
+
+
 @router.post("/{collection_id}/properties/{property_id}/view")
 async def track_property_view(
     collection_id: str,
@@ -1108,6 +1137,25 @@ async def get_shared_collection(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get shared collection"
         )
+
+
+@router.put("/shared/{share_token}/properties/{property_id}/sold-folder")
+async def move_shared_to_sold_folder(
+    share_token: str,
+    property_id: str,
+    body: SoldFolderUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    """The client moves a home that went under contract / sold / off the market into their own
+    Showcase's Sold/Removed folder (or back out). Their link is the key: only homes in the Showcase
+    that link opens can be moved, and only while it's live (same rules as opening it)."""
+    await _assert_showcase_owner_active(db, share_token)
+    coll = (await db.execute(select(Collection).where(and_(
+        share_match(share_token), Collection.is_public == True, Collection.status == "ACTIVE",  # noqa: E712
+    )))).scalar_one_or_none()
+    if not coll:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found or not available for sharing")
+    return _sold_folder_result(await CollectionsService.set_sold_filed(db, coll.id, property_id, body.filed))
 
 
 async def _notify_search_changed(db: AsyncSession, collection_obj: Collection, changed: list) -> None:

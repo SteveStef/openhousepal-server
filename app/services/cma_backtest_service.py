@@ -14,6 +14,7 @@ guarantee without spending anything.
 from __future__ import annotations
 
 import asyncio
+import os
 
 import statistics
 import uuid
@@ -286,7 +287,8 @@ async def lookup_subject(db: AsyncSession, item: dict) -> tuple[dict, str]:
 
 def _score_subject(s: dict) -> dict:
     keys = ("listing_key", "source", "sqft", "above_grade_finished_area", "lot_size", "city", "school_district", "township",
-            "subdivision_name", "latitude", "longitude", "year_built", "property_type", "architectural_style", "public_remarks")
+            "subdivision_name", "latitude", "longitude", "year_built", "property_type", "architectural_style", "public_remarks",
+            "state", "list_price", "street_address", "zipcode")
     return {k: s.get(k) for k in keys}
 
 
@@ -299,11 +301,27 @@ async def wizard_comps(db: AsyncSession, subject: dict, as_of: date) -> tuple[li
     """The Studio wizard's comp step: sold comps, price band +/-35% of the list price, beds - 1,
     radius 1 mi widening while < 5 usable 70%+ matches, sold-within 200 days widening while < 5
     results; then auto-pick the top 3 + up to 5 at 60%+. Sales are capped at the as-of date."""
+    beds = subject.get("beds") or 0
+    min_beds = max(0, beds - (2 if beds >= 8 else 1)) if beds else None
+    if os.environ.get("CMA_OLD_COMP_SEARCH") != "1":
+        # The wizard's automatic search (cma_service.auto_search_comparables, grader 10/21) - the same
+        # function the comp step calls, so the backtest measures what agents get.
+        req = CmaCompSearchRequest(
+            listing_key=subject.get("listing_key"), subject=CmaSubjectProperty(**{k: v for k, v in _score_subject(subject).items() if v is not None}),
+            latitude=subject["latitude"], longitude=subject["longitude"],
+            subject_sqft=subject.get("above_grade_finished_area") or subject.get("sqft"),
+            property_type=subject.get("property_type"), statuses=["sold"], sale_date_to=as_of.isoformat(),
+            min_beds=min_beds or None,
+        )
+        out = await cma_service.auto_search_comparables(db, req, today=as_of)
+        res = sorted((c for c in out["results"] if isinstance(c.match_score, int)), key=lambda c: -c.match_score)
+        eligible = [c for c in res if _pickable(c)]
+        picks = [c for i, c in enumerate(eligible) if i < 3 or (i < _MAX_COMPS and c.match_score >= _AUTO_PICK_EXTRA_MIN_SCORE)]
+        return picks, {"search_steps": out["steps"], "radius_miles": out["radius_miles"], "sold_within_days": out["sold_within_days"],
+                       "limited": out["limited"], "price_band": out["price_band"], "min_beds": min_beds, "candidates": len(res)}
     lp = subject.get("list_price") or 0
     min_price = max(0, int(lp * 0.65 // 10000) * 10000) if lp else None
     max_price = -(-int(lp * 1.35) // 10000) * 10000 if lp else None
-    beds = subject.get("beds") or 0
-    min_beds = max(0, beds - (2 if beds >= 8 else 1)) if beds else None
     ri, si, auto_r, auto_s, extra_step = 0, 1, True, True, False
     steps = []
     res: list = []

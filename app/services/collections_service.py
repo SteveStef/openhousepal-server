@@ -40,6 +40,52 @@ def _is_property_available(home_status: Optional[str]) -> bool:
     return normalized in _AVAILABLE_STATUSES
 
 
+# Sold/Removed folder (user, 10/21): a home that goes under contract / pending / sold / off the
+# market no longer moves there by itself - it stays in the list with a notice until the buyer or
+# the agent taps "Move to Sold/Removed" (collection_properties.sold_filed_at). The folder holds the
+# filed homes that are still off the market; one back on the market shows normally again.
+def sold_folder_split(props, filed_at_lookup: Dict[str, Any]) -> tuple:
+    """(ids in the Sold/Removed folder, filed ids that are for sale again). A filed home back on
+    the market shows normally - and loses its filing (_unfile_back_on_market), so if it later goes
+    off the market again it gets a fresh notice instead of vanishing into the folder."""
+    filed, back_on_market = set(), []
+    for p in props:
+        if filed_at_lookup.get(p.id) is None:
+            continue
+        if _is_property_available(p.home_status):
+            back_on_market.append(p.id)
+        else:
+            filed.add(p.id)
+    return filed, back_on_market
+
+
+async def _unfile_back_on_market(db: AsyncSession, collection_id: str, property_ids: List[str]) -> None:
+    """One small write, only when a filed home came back. Called after the payload is built."""
+    if not property_ids:
+        return
+    try:
+        await db.execute(update(collection_properties).where(and_(
+            collection_properties.c.collection_id == collection_id,
+            collection_properties.c.property_id.in_(property_ids),
+        )).values(sold_filed_at=None))
+        await db.commit()
+    except Exception:  # noqa: BLE001 - never break loading the Showcase over it
+        logger.warning("clearing Sold/Removed for homes back on the market failed", exc_info=True)
+        await db.rollback()
+
+
+def _sale_fields(prop: Property) -> Dict[str, Any]:
+    """Sold price + date for a closed home's notice (Bright fills these only once it's closed)."""
+    if 'closed' not in str(prop.home_status or '').lower():
+        return {'ClosePrice': None, 'CloseDate': None}
+    raw = prop.raw_mls_data or {}
+    try:
+        close_price = float(raw.get('ClosePrice')) if raw.get('ClosePrice') not in (None, '') else None
+    except (TypeError, ValueError):
+        close_price = None
+    return {'ClosePrice': close_price, 'CloseDate': raw.get('CloseDate') or None}
+
+
 async def _resolve_original_property_data(db: AsyncSession, collection: Collection) -> Optional[Dict[str, Any]]:
     """The "compare against" property used both for the "Curated from {address}" line and the
     match-score badge (frontend/lib/matchScore.ts) - the agent's explicit
@@ -547,6 +593,28 @@ class CollectionsService:
             logger.error("marking collection seen failed", extra={"error": str(e)})
             await db.rollback()
             return {"success": False, "error": str(e)}
+
+    @staticmethod
+    async def set_sold_filed(db: AsyncSession, collection_id: str, property_id: str, filed: bool) -> Dict[str, Any]:
+        """Move one off-the-market home into the Showcase's Sold/Removed folder (or back out).
+        Who may do it (the buyer through their link, the agent who owns it) is checked by the
+        route. A home that's still for sale can't be filed - there'd be nothing to show it by."""
+        row = (await db.execute(
+            select(collection_properties.c.property_id, Property.home_status)
+            .join(Property, Property.id == collection_properties.c.property_id)
+            .where(and_(collection_properties.c.collection_id == collection_id,
+                        collection_properties.c.property_id == property_id))
+        )).first()
+        if row is None:
+            return {"success": False, "error": "Home not found"}
+        if filed and _is_property_available(row.home_status):
+            return {"success": False, "error": "This home is still for sale"}
+        await db.execute(update(collection_properties).where(and_(
+            collection_properties.c.collection_id == collection_id,
+            collection_properties.c.property_id == property_id,
+        )).values(sold_filed_at=datetime.now(timezone.utc) if filed else None))
+        await db.commit()
+        return {"success": True, "soldFiled": filed}
 
     @staticmethod
     async def submit_refine_request(db: AsyncSession, collection_id: str, message: str) -> Dict[str, Any]:
@@ -1476,13 +1544,15 @@ class CollectionsService:
             unread_comment_lookup: Dict[str, int] = {}
             tours_lookup = {}
             added_at_lookup = {}
+            filed_at_lookup = {}
 
             # Only query if we have properties
             if property_ids:
                 # Fetch added_at timestamps for each property from collection_properties
                 added_at_query = select(
                     collection_properties.c.property_id,
-                    collection_properties.c.added_at
+                    collection_properties.c.added_at,
+                    collection_properties.c.sold_filed_at,
                 ).where(
                     and_(
                         collection_properties.c.collection_id == collection.id,
@@ -1495,6 +1565,8 @@ class CollectionsService:
                 # Create lookup dictionary for added_at timestamps
                 for row in added_at_data:
                     added_at_lookup[row.property_id] = row.added_at
+                    filed_at_lookup[row.property_id] = row.sold_filed_at
+            sold_folder, back_on_market = sold_folder_split(collection.properties, filed_at_lookup)
 
             # Calculate "new" threshold (properties added in last 7 days)
             now = datetime.now(timezone.utc)
@@ -1603,8 +1675,12 @@ class CollectionsService:
                     'PublicRemarks': '',
                     'ModificationTimestamp': prop.modification_timestamp.isoformat() if prop.modification_timestamp else (prop.updated_at.isoformat() if prop.updated_at else None),
                     'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,
-                    'MlsStatus': prop.home_status,                    # Real interaction data from database
-                    'liked': interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
+                    'MlsStatus': prop.home_status,
+                    # Off the market: in the Sold/Removed folder, or still in the list with a notice.
+                    'soldFiled': prop.id in sold_folder,
+                    **_sale_fields(prop),
+                    # Real interaction data from database
+                    'liked':interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
                     'agentRecommended': bool(prop.id in interactions_lookup and interactions_lookup[prop.id].agent_recommended_at),
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
@@ -1718,6 +1794,7 @@ class CollectionsService:
                 'isPublic': collection.is_public
             }
 
+            await _unfile_back_on_market(db, collection.id, back_on_market)
             return collection_data
 
         except Exception as e:
@@ -1953,7 +2030,8 @@ class CollectionsService:
             # Fetch added_at timestamps for each property from collection_properties
             added_at_query = select(
                 collection_properties.c.property_id,
-                collection_properties.c.added_at
+                collection_properties.c.added_at,
+                collection_properties.c.sold_filed_at,
             ).where(
                 and_(
                     collection_properties.c.collection_id == collectionId,
@@ -1965,8 +2043,11 @@ class CollectionsService:
 
             # Create lookup dictionary for added_at timestamps
             added_at_lookup = {}
+            filed_at_lookup = {}
             for row in added_at_data:
                 added_at_lookup[row.property_id] = row.added_at
+                filed_at_lookup[row.property_id] = row.sold_filed_at
+            sold_folder, back_on_market = sold_folder_split(collection.properties, filed_at_lookup)
 
             # Calculate "new" threshold (properties added in last 7 days)
             now = datetime.now(timezone.utc)
@@ -2097,7 +2178,10 @@ class CollectionsService:
                     'PublicRemarks': '',
                     'ModificationTimestamp': prop.modification_timestamp.isoformat() if prop.modification_timestamp else (prop.updated_at.isoformat() if prop.updated_at else None),
                     'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,
-                    'MlsStatus': prop.home_status,                    'liked': interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
+                    'MlsStatus': prop.home_status,
+                    'soldFiled': prop.id in sold_folder,  # see get_shared_collection
+                    **_sale_fields(prop),
+                    'liked': interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
                     'agentRecommended': bool(prop.id in interactions_lookup and interactions_lookup[prop.id].agent_recommended_at),
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
@@ -2111,6 +2195,7 @@ class CollectionsService:
                 }
                 properties_data.append(property_dict)
 
+            await _unfile_back_on_market(db, collectionId, back_on_market)
             return properties_data
         except Exception as e:
             return []

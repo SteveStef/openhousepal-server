@@ -580,8 +580,8 @@ def test_asking_gap_sentence_and_far_old_flags():
     assert len(flags) == 1 and "2.6 miles away" in flags[0] and "months ago" in flags[0]
 
 
-def test_grid_knob_defaults_time_on_age_road_off():
-    assert ai._V10_FEATURE_AGE_PCT == 0 and ai._V10_FEATURE_ROAD_PCT == 0 and ai._V10_TIME_PCT_PER_YEAR == 0.03
+def test_grid_knob_defaults_time_and_age_on_road_off():
+    assert ai._V10_FEATURE_AGE_PCT == 0.02 and ai._V10_FEATURE_ROAD_PCT == 0 and ai._V10_TIME_PCT_PER_YEAR == 0.03
 
 
 def test_v13_valuation_notes_say_trim_once():

@@ -1,9 +1,10 @@
+import os
 import secrets
 import string
 import hashlib
 import json
 import re
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 from typing import Any, Dict, Optional, List
 
 from fastapi import HTTPException, status
@@ -664,9 +665,58 @@ def _score_comparable_candidates(
     return scored_candidates
 
 
-async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest) -> List[CmaCompCandidate]:
+def is_lease_listing(prop_or_subject) -> bool:
+    """A rental listing (Bright 'Residential Lease', or a monthly-rent-sized price). A CMA values a
+    sale - 1420 Locust St #23H ($1,995/month, 10/21) was valued at "$1,850" against lease comps."""
+    get = (lambda k: prop_or_subject.get(k)) if isinstance(prop_or_subject, dict) else (lambda k: getattr(prop_or_subject, k, None))
+    raw = get("raw_mls_data") or {}
+    kinds = " ".join(str(v or "") for v in (get("home_type"), get("property_type"), get("mls_property_type"),
+                                            raw.get("PropertyType") if isinstance(raw, dict) else None)).lower()
+    if "lease" in kinds.replace("_", " "):
+        return True
+    price = get("list_price") or get("price")
+    try:
+        return bool(price) and 0 < float(price) < MIN_SALE_PRICE
+    except (TypeError, ValueError):
+        return False
+
+
+# A sale under this, or a sale-to-list ratio outside these bounds, is a data error or a lease - never a
+# comp (814 Hessian Ave: "$500 list -> $197,500 sold, 39,400% over asking", grader 10/21).
+MIN_SALE_PRICE = 10_000
+SALE_TO_LIST_BOUNDS = (0.5, 2.0)
+
+# Same product only (grader 10/21): a condo's comps are condos, a townhouse's are townhouses/twins.
+# Families as in cma_ai_service._type_family; FARM counts as detached.
+_FAMILY_HOME_TYPES = {
+    "detached": (HomeType.SINGLE_FAMILY.value, HomeType.FARM.value),
+    "attached": (HomeType.TOWNHOUSE.value,),
+    "condo": (HomeType.CONDO.value,),
+    "multi": (HomeType.MULTI_FAMILY.value,),
+}
+
+
+def _comp_sanity_problem(c: "CmaCompCandidate") -> Optional[str]:
+    if not (c.street_address or "").strip() or len((c.street_address or "").strip()) < 4:
+        return "no street address"
+    if c.status == "sold" and c.sale_price:
+        if c.sale_price < MIN_SALE_PRICE:
+            return "sale price under $10,000"
+        if c.list_price and c.list_price > 0:
+            ratio = c.sale_price / c.list_price
+            if not (SALE_TO_LIST_BOUNDS[0] <= ratio <= SALE_TO_LIST_BOUNDS[1]):
+                return "sale-to-list ratio out of range"
+    if (c.beds or 0) >= 1 and c.baths is not None and c.baths <= 0:
+        return "bedrooms with no bathrooms on record"
+    return None
+
+
+async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, keep_all: bool = False,
+                             row_limit: int = 400) -> List[CmaCompCandidate]:
     """Finds candidate comparables around the subject from the local MLS mirror. This suggests -
-    it never decides - which properties belong in the CMA; the agent picks from these results."""
+    it never decides - which properties belong in the CMA; the agent picks from these results.
+    `keep_all` returns every scored candidate (auto_search_comparables walks its widening steps on
+    them) instead of the best 60 for the grid."""
     if req.latitude is None or req.longitude is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Subject property location is required to search for comparables.")
 
@@ -686,7 +736,21 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest) -> Lis
         # Vacant land and commercial records are never a comparable sale for a home (a land/lot
         # sale has no living area; a commercial sale prices a business). NULL-safe like the lease rule.
         or_(Property.home_type.is_(None), Property.home_type.notin_([HomeType.LAND.value, HomeType.COMMERCIAL.value])),
+        # Bright files some rentals as 'Multi-Family' with a monthly rent as the "close price" - the
+        # lease is only in PropertyType (1420 Locust St #23H got two of them as comps, 10/21).
+        ~func.coalesce(Property.raw_mls_data["PropertyType"].astext, "").ilike("%lease%"),
     )
+    # Same state only - no New Jersey comps for a Philadelphia home (grader 10/21).
+    _subj_state = ((req.subject.state if req.subject else None) or "").strip().upper()
+    if _subj_state:
+        query = query.where(or_(Property.state.is_(None), func.upper(Property.state) == _subj_state))
+    # Same product only: a condo's comps are condos, a townhouse's townhouses (grader 10/21). Rows with
+    # no type on record stay in and are scored.
+    from app.services.cma_ai_service import _type_family as _tf
+    _family = _tf(req.property_type or (req.subject.property_type if req.subject else None))
+    if _family in _FAMILY_HOME_TYPES:
+        query = query.where(or_(Property.home_type.is_(None), Property.home_type == HomeType.OTHER.value,
+                                Property.home_type.in_(_FAMILY_HOME_TYPES[_family])))
     if req.listing_key:
         query = query.where(Property.listing_key != req.listing_key)
     # The subject's OWN earlier sales are separate MLS listings (different listing_key) of the same
@@ -769,7 +833,7 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest) -> Lis
         if date_to:
             date_terms.append(func.substr(sale_day, 1, 10) <= date_to.isoformat())
         query = query.where(or_(~is_closed, and_(*date_terms)))
-    result = await db.execute(query.order_by(distance_expr.asc()).limit(400))
+    result = await db.execute(query.order_by(distance_expr.asc()).limit(row_limit))
     rows = result.scalars().all()
 
     candidates: List[CmaCompCandidate] = []
@@ -922,6 +986,9 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest) -> Lis
             property_type=p.home_type,
         ))
 
+    # Records that can't be a real sale never reach a report (no street address, a $500 list price,
+    # 4 bedrooms and 0 baths - grader 10/21).
+    candidates = [c for c in candidates if not _comp_sanity_problem(c)]
     candidates.sort(key=lambda c: (c.distance_miles is None, c.distance_miles))
     # One house, one comp: a home that sold more than once in the window (or has a sale plus a
     # current listing) kept every record, so the same house could be picked twice and counted
@@ -975,7 +1042,193 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest) -> Lis
         other_product = bool(_subject_family) and _type_family(c.property_type) not in (None, _subject_family)
         return (other_product, d.get("valuation_eligible") is False, -(c.match_score or 0), c.distance_miles or 0)
 
-    return sorted(scored, key=_grid_rank)[:60]
+    ranked = sorted(scored, key=_grid_rank)
+    return ranked if keep_all else ranked[:60]
+
+
+# ---- Automatic comp search (grader 10/21) ----------------------------------------------------------
+# It used to widen the radius 1 -> 2 -> ... -> 25 mi until FIVE comps scored 70%+, which a one-of-a-kind
+# home never reaches (239 Windham Dr topped out at 67%), so nearly every search went to 25 mi. Now:
+# time first (6 -> 12 -> 18 months), then distance, with a radius ladder by product and density, and it
+# stops when there are enough USABLE comps. Short of that at the limit, it says so instead of widening.
+AUTO_SOLD_DAYS = (183, 365, 548)
+AUTO_RADII = {
+    "urban": (0.25, 0.5, 1.0),          # condos, and city rowhomes/twins: same building first
+    "attached": (0.5, 1.0, 2.0, 3.0),   # suburban townhouses/twins
+    "detached": (1.0, 2.0, 3.0, 5.0),
+}
+AUTO_RURAL_EXTRA_RADII = (8.0, 10.0)    # detached only, when 5 mi still isn't enough
+AUTO_USABLE_MIN_SCORE = 55
+AUTO_ENOUGH_USABLE = 5
+AUTO_LIMITED_BELOW = 3                  # fewer usable comps than this -> "Limited comparable sales"
+# A city: this many same-product sales within half a mile in the last year
+_URBAN_DENSITY_SALES = 25
+# Price band around the asking price for the automatic search (fraction each way). Backtest knob.
+_AUTO_PRICE_BAND = float(os.environ.get("CMA_AUTO_PRICE_BAND", "0.35"))
+
+
+def _auto_pickable(c: CmaCompCandidate) -> bool:
+    d = c.similarity_details or {}
+    return not d.get("property_type_incompatible") and d.get("valuation_eligible") is not False
+
+
+def _sale_age_days(c: CmaCompCandidate, today: date) -> Optional[int]:
+    d = _parse_date(c.sale_date or c.close_date)
+    return (today - d).days if d else None
+
+
+def plan_auto_search(candidates: List[CmaCompCandidate], family: Optional[str], *, today: date) -> dict:
+    """Walk the widening steps over one scored candidate pool (fetched at the widest window). Pure, so
+    the backtest and the golden tests run exactly what agents get. Returns the chosen radius / sold
+    window, whether comps are limited, and the steps taken."""
+    near_year = sum(1 for c in candidates if (c.distance_miles or 99) <= 0.5 and (_sale_age_days(c, today) or 9999) <= 365)
+    if family == "condo" or (family == "attached" and near_year >= _URBAN_DENSITY_SALES):
+        ladder, extra = AUTO_RADII["urban"], ()
+    elif family == "attached":
+        ladder, extra = AUTO_RADII["attached"], ()
+    else:
+        ladder, extra = AUTO_RADII["detached"], AUTO_RURAL_EXTRA_RADII
+
+    def usable(radius: float, days: int) -> int:
+        return sum(1 for c in candidates
+                   if (c.distance_miles or 0) <= radius and (_sale_age_days(c, today) or 0) <= days
+                   and _auto_pickable(c) and (c.match_score or 0) >= AUTO_USABLE_MIN_SCORE)
+
+    steps, chosen = [], None
+    for ri, radius in enumerate(ladder):
+        for days in AUTO_SOLD_DAYS:
+            n = usable(radius, days)
+            steps.append({"radius_mi": radius, "sold_within_days": days, "usable": n})
+            if n >= AUTO_ENOUGH_USABLE:
+                chosen = (ri, days)
+                break
+        if chosen:
+            break
+    if chosen:
+        ri, days = chosen
+        # One radius step past "enough": every candidate is scored (distance is part of the score), so a
+        # wider circle only adds choices - 417 Dogwood Ln's best sale sat just past the first circle.
+        radius = ladder[min(ri + 1, len(ladder) - 1)]
+    else:
+        radius, days = ladder[-1], AUTO_SOLD_DAYS[-1]
+        for r in extra:   # rural: a little farther, never 25 mi
+            n = usable(r, days)
+            steps.append({"radius_mi": r, "sold_within_days": days, "usable": n})
+            radius = r
+            if n >= AUTO_ENOUGH_USABLE:
+                break
+    final_usable = usable(radius, days)
+    return {"radius_miles": radius, "sold_within_days": days, "usable": final_usable,
+            "limited": final_usable < AUTO_LIMITED_BELOW, "steps": steps,
+            "density": "urban" if ladder is AUTO_RADII["urban"] else ("suburban" if not extra else "suburban/rural")}
+
+
+# ---- Current competition (grader, 10/21) -----------------------------------------------------------
+# Similar homes for sale or under contract right now - shown next to the sold comps, never in the grid
+# or the sold charts. Same matching rules as the sold search (type, state, no rentals, same building
+# first for condos); actives are context only, pendings may nudge the value review a little.
+COMPETITION_RADIUS = {"condo": 1.0, "attached": 2.0, "detached": 3.0}
+COMPETITION_MIN_SCORE = 50
+COMPETITION_MAX_PER_STATUS = 3
+COMPETITION_MAX = 5
+
+
+async def _price_cuts(db: AsyncSession, listing_keys: List[str]) -> Dict[str, dict]:
+    from app.models.database import PropertyPriceEvent
+    if not listing_keys:
+        return {}
+    rows = (await db.execute(
+        select(PropertyPriceEvent.listing_key, PropertyPriceEvent.price, PropertyPriceEvent.previous_price, PropertyPriceEvent.observed_at)
+        .where(PropertyPriceEvent.listing_key.in_(listing_keys), PropertyPriceEvent.kind == "price")
+    )).all()
+    out: Dict[str, dict] = {}
+    for key, price, prev, at in rows:
+        if price and prev and price < prev:
+            d = out.setdefault(key, {"count": 0, "total": 0.0, "first_price": prev, "last_cut_at": None})
+            d["count"] += 1
+            d["total"] += prev - price
+            d["first_price"] = max(d["first_price"], prev)
+            d["last_cut_at"] = max(filter(None, [d["last_cut_at"], at.date().isoformat() if at else None]), default=None)
+    return out
+
+
+async def current_competition(db: AsyncSession, subject: dict, *, listing_key: Optional[str] = None,
+                              today: Optional[date] = None) -> List[dict]:
+    """Up to 5 similar ACTIVE and PENDING / under-contract homes (at most 3 of each), best Match first.
+    List prices, not closed sales."""
+    from app.services.cma_ai_service import _type_family as _tf
+    from app.schemas.cma import CmaSubjectProperty
+    family = _tf(subject.get("property_type"))
+    lp = subject.get("list_price")
+    fields = set(CmaSubjectProperty.model_fields)
+    req = CmaCompSearchRequest(
+        listing_key=listing_key or subject.get("listing_key"),
+        subject=CmaSubjectProperty(**{k: v for k, v in subject.items() if k in fields and v is not None}),
+        latitude=subject.get("latitude"), longitude=subject.get("longitude"),
+        subject_sqft=subject.get("above_grade_finished_area") or subject.get("sqft"),
+        property_type=subject.get("property_type"),
+        radius_miles=COMPETITION_RADIUS.get(family, COMPETITION_RADIUS["detached"]),
+        statuses=["active", "active_under_contract", "pending"],
+        min_price=round(lp * (1 - _AUTO_PRICE_BAND)) if lp else None,
+        max_price=round(lp * (1 + _AUTO_PRICE_BAND)) if lp else None,
+    )
+    if req.latitude is None or req.longitude is None:
+        return []
+    pool = await search_comparables(db, req, keep_all=True, row_limit=600)
+    pool = [c for c in pool if _auto_pickable(c) and (c.match_score or 0) >= COMPETITION_MIN_SCORE and c.list_price]
+    pool.sort(key=lambda c: -(c.match_score or 0))
+    pend = [c for c in pool if c.status in ("pending", "active_under_contract")][:COMPETITION_MAX_PER_STATUS]
+    act = [c for c in pool if c.status == "active"][:COMPETITION_MAX_PER_STATUS]
+    picked = sorted(pend + act, key=lambda c: -(c.match_score or 0))[:COMPETITION_MAX]
+    cuts = await _price_cuts(db, [c.listing_key for c in picked])
+    out = []
+    for c in picked:
+        ag = c.above_grade_finished_area or c.sqft
+        out.append({
+            "listing_key": c.listing_key, "status": "pending" if c.status in ("pending", "active_under_contract") else "active",
+            "street_address": c.street_address, "city": c.city, "state": c.state, "zipcode": c.zipcode,
+            "photo_url": c.photo_url, "list_price": c.list_price,
+            "price_per_sqft": round(c.list_price / ag) if c.list_price and ag else None,
+            "beds": c.beds, "baths": c.baths, "sqft": ag, "year_built": c.year_built,
+            "days_on_market": c.days_on_market, "distance_miles": c.distance_miles, "match_score": c.match_score,
+            "latitude": c.latitude, "longitude": c.longitude,
+            "price_cuts": cuts.get(c.listing_key),
+            "lot_size": c.lot_size, "below_grade_finished_area": c.below_grade_finished_area,
+            "garage": c.garage, "basement": c.basement, "water_source": c.water_source, "sewer": c.sewer,
+            "school_district": c.school_district, "township": c.township, "subdivision_name": c.subdivision_name,
+            "property_type": c.property_type,
+        })
+    return out
+
+
+async def auto_search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, today: Optional[date] = None) -> dict:
+    """The comp step's first, automatic search: one query at the widest window this subject could
+    need, every candidate scored once, then plan_auto_search picks the radius and sold window. The
+    price band is a loose 0.5x-2x of the asking price - a +/-35% band anchored on asking skewed the
+    pool for over- or under-priced listings."""
+    from app.services.cma_ai_service import _type_family as _tf
+    today = today or date.today()
+    if req.subject is not None and is_lease_listing(req.subject):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail="This is a rental listing - a CMA values a sale, so there are no sale comps to find for it.")
+    family = _tf(req.property_type or (req.subject.property_type if req.subject else None))
+    widest = {"condo": AUTO_RADII["urban"][-1], "attached": AUTO_RADII["attached"][-1]}.get(family, AUTO_RURAL_EXTRA_RADII[-1])
+    lp = (req.subject.list_price if req.subject else None) or None
+    date_to = _parse_date(req.sale_date_to) or today
+    wide = req.model_copy(update={
+        "radius_miles": widest, "statuses": ["sold"],
+        "sale_date_from": (date_to - timedelta(days=AUTO_SOLD_DAYS[-1])).isoformat(),
+        "sale_date_to": req.sale_date_to,
+        "min_price": round(lp * (1 - _AUTO_PRICE_BAND)) if lp else None, "max_price": round(lp * (1 + _AUTO_PRICE_BAND)) if lp else None,
+    })
+    pool = await search_comparables(db, wide, keep_all=True, row_limit=1500)
+    plan = plan_auto_search(pool, family, today=date_to)
+    chosen = [c for c in pool
+              if (c.distance_miles or 0) <= plan["radius_miles"]
+              and (_sale_age_days(c, date_to) or 0) <= plan["sold_within_days"]]
+    return {"results": chosen[:60], **plan,
+            "price_band": [wide.min_price, wide.max_price],
+            "limited_message": "Limited comparable sales - agent review recommended." if plan["limited"] else None}
 
 
 async def drop_subject_from_comps(db: AsyncSession, owner_id: str, report_id: str) -> int:

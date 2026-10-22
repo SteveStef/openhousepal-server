@@ -532,6 +532,40 @@ async def search_properties_by_address(
         logger.error(f"Address search failed: {e}")
         raise HTTPException(status_code=500, detail="Search failed")
 
+
+@router.get("/address/search", dependencies=[Depends(require_broker_authorization), Depends(require_mls_access)])
+async def search_one_home_by_address(
+    query: str = Query(..., min_length=2, max_length=200),
+    limit: int = Query(8, ge=1, le=15),
+    allow_rentals: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_broker_authorization),
+):
+    """Find ONE home by what the agent types (the CMA subject picker) - see
+    address_search_service. Understands unit numbers in any format, St/Street-style spellings and
+    a town or ZIP after the street; one row per home with its listing key (the active sale
+    listing, else the latest sale). Homes whose only records are rentals come back with
+    selectable=false and a note unless allow_rentals."""
+    from app.services import address_search_service
+    try:
+        payload = await address_search_service.search_homes(db, query, limit=limit, allow_rentals=allow_rentals)
+    except Exception as e:
+        logger.error(f"Home address search failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Search failed")
+    # CMA accuracy test only: a live arm shows its sold test home as it read on the as-of date.
+    from app.services import cma_backtest_arms as _arms
+    for _arm in await _arms.live_arms(db, current_user.id):
+        _street = _arm.address_key.split("|")[0] if _arm.address_key else None
+        if not _street:
+            continue
+        payload["results"] = [
+            {**_arms.mask_suggestion(x, _arm), "statusTier": "active", "closePrice": None, "closeDate": None,
+             "listPrice": (_arm.facts or {}).get("list_price")}
+            if _arms._street_of(x.get("address")) == _street else x
+            for x in payload["results"]
+        ]
+    return {"success": True, **payload}
+
 @router.get("/school-districts", dependencies=[Depends(require_broker_authorization)])
 async def search_school_districts(
     query: str = Query(..., min_length=1),
