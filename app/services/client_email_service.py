@@ -191,6 +191,12 @@ async def refresh_status(db, owner_id: str, email: str, *, announce: bool = True
             await _announce(db, owner_id, email, old, d["mode"], pref.reason, trigger, slept=slept)
     elif d["mode"] != "daily":
         pref.reason = d["reason"]
+        # Still ignoring everything: a Showcase kept awake while the agent was minding it (starred /
+        # opened lately) falls asleep once they stop - checked whenever its updates come round.
+        if d["mode"] == "off" and d.get("code") == "weekly_unopened" and not unsub and pref.manual not in MANUAL_OFF:
+            from app.services import showcase_sleep
+            if await showcase_sleep.sleep_for_no_response(db, owner_id, email) and announce:
+                await _announce(db, owner_id, email, "off", "off", pref.reason, trigger, slept=1)
     await db.commit()
     if woke:
         from app.services.showcase_sleep import catch_up
@@ -460,18 +466,25 @@ async def set_manual(db, owner_id: str, email: str, on: bool) -> dict:
     pref = await _pref(db, owner_id, email)
     lead = await _lead(db, owner_id, email)
     from app.services.leads_service import log_activity
+    woke: list[str] = []
     if on:
         pref.manual, pref.reset_at, pref.mode, pref.changed_at = None, _now(), "daily", _now()
         pref.reason = "Turned back on by you"
         if lead:
             await log_activity(db, owner_id=owner_id, email=email, lead=lead, source_type="email_resumed",
                                summary="Automatic emails turned back on by you", raw_snapshot={"to": "daily"})
+        # Their Showcase fell asleep because they ignored the emails - back on means awake again.
+        from app.services.showcase_sleep import wake_no_response
+        woke = await wake_no_response(db, owner_id, email)
     else:
         pref.manual, pref.mode, pref.changed_at, pref.reason = "off", "off", _now(), "Turned off by you"
         if lead:
             await log_activity(db, owner_id=owner_id, email=email, lead=lead, source_type="email_paused",
                                summary="Automatic emails turned off by you", raw_snapshot={"to": "off"})
     await db.commit()
+    if woke:
+        from app.services.showcase_sleep import catch_up
+        await catch_up(db, woke)
     return await status_for(db, owner_id, email)
 
 

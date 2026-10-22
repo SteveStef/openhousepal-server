@@ -1,7 +1,9 @@
 """Showcases that go to sleep (user, 10/22).
 
 A client who ignored 3 weekly emails in a row (client_email_service.decide -> "off") stops getting
-automatic emails, and their Showcases with that agent go to sleep: status INACTIVE with
+automatic emails, and - unless the agent is still minding them (starred the Showcase, or in the last
+2 weeks opened it, opened the lead, marked them contacted, wrote a note or checked off a follow-up;
+the agent still gets that Showcase's updates in their briefing) - their Showcases go to sleep: status INACTIVE with
 inactive_reason "no_response". Asleep = no new matches, no emails, no agent alerts - it moves to the
 Inactive tab on the agent's Showcases page. Nothing is deleted.
 
@@ -14,7 +16,7 @@ Only counts from the first delivered email: nothing is backdated (client_emails 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import and_, func, select
@@ -25,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 NO_RESPONSE = "no_response"
 AGENT = "agent"
+AGENT_WATCH = timedelta(days=14)   # the agent opened it this recently -> it stays awake
 
 
 def _now() -> datetime:
@@ -39,9 +42,45 @@ async def _their_showcases(db, owner_id: str, email: str, status: str, reason: O
     return list((await db.execute(q)).scalars().all())
 
 
+def kept_awake(col: Collection, now: Optional[datetime] = None) -> bool:
+    """The agent is still minding this one (user, 10/22): starred, or opened by the agent in the
+    last AGENT_WATCH - e.g. a Showcase they set up and text the client about themselves. It never
+    falls asleep for no response; the client's emails still slow down / stop as usual."""
+    now = now or _now()
+    looked = col.last_agent_dismissed_at   # set when the agent opens the Showcase (mark_collection_seen)
+    if looked is not None and looked.tzinfo is None:
+        looked = looked.replace(tzinfo=timezone.utc)
+    return bool(col.favorited_at) or bool(looked and now - looked < AGENT_WATCH)
+
+
+async def agent_working_lead(db, owner_id: str, email: str, now: Optional[datetime] = None) -> bool:
+    """The agent did something with this person's lead in the last AGENT_WATCH (user, 10/22): opened
+    the lead, marked them contacted, wrote a note, or checked off one of their follow-ups. Then
+    none of their Showcases fall asleep."""
+    from sqlalchemy import or_
+    from app.models.database import AgentTask, Lead, LeadNote
+    since = (now or _now()) - AGENT_WATCH
+    lead_ids = list((await db.execute(select(Lead.id).where(
+        Lead.owner_id == owner_id, func.lower(func.trim(Lead.email)) == email))).scalars().all())
+    if not lead_ids:
+        return False
+    if (await db.execute(select(Lead.id).where(Lead.id.in_(lead_ids), or_(
+            Lead.viewed_at >= since, Lead.last_contacted_at >= since)).limit(1))).first():
+        return True
+    if (await db.execute(select(LeadNote.id).where(LeadNote.lead_id.in_(lead_ids), LeadNote.author_id == owner_id,
+                                                   LeadNote.created_at >= since).limit(1))).first():
+        return True
+    return (await db.execute(select(AgentTask.id).where(AgentTask.lead_id.in_(lead_ids), AgentTask.owner_id == owner_id,
+                                                        AgentTask.completed_at >= since).limit(1))).first() is not None
+
+
 async def sleep_for_no_response(db, owner_id: str, email: str) -> int:
-    """Their ACTIVE Showcases with this agent go to sleep. Doesn't commit."""
-    cols = await _their_showcases(db, owner_id, email, "ACTIVE")
+    """Their ACTIVE Showcases with this agent go to sleep - except while the agent is minding them:
+    working the lead (agent_working_lead) or the Showcase itself (kept_awake). Safe to call again
+    later: one kept awake falls asleep once the agent stops minding it. Doesn't commit."""
+    if await agent_working_lead(db, owner_id, email):
+        return 0
+    cols = [c for c in await _their_showcases(db, owner_id, email, "ACTIVE") if not kept_awake(c)]
     for c in cols:
         c.status, c.inactive_reason, c.inactive_at = "INACTIVE", NO_RESPONSE, _now()
     if cols:

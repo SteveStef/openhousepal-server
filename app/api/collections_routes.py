@@ -613,14 +613,22 @@ async def set_collection_favorite(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_premium_plan)
 ):
-    """The agent stars a Showcase - starred ones sort first on the Showcases page."""
+    """The agent stars a Showcase - starred ones sort first on the Showcases page and never fall
+    asleep for no response (showcase_sleep.kept_awake). Starring one that already fell asleep that
+    way wakes it; the client's emails stay as the email rules left them."""
+    from app.services import showcase_sleep
     col = (await db.execute(select(Collection).where(
         Collection.id == collection_id, Collection.owner_id == current_user.id))).scalar_one_or_none()
     if col is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found or access denied")
     col.favorited_at = datetime.now(timezone.utc) if request.favorite else None
+    woke = request.favorite and col.status == "INACTIVE" and col.inactive_reason == showcase_sleep.NO_RESPONSE
+    if woke:
+        col.status, col.inactive_reason, col.inactive_at = "ACTIVE", None, None
     await db.commit()
-    return {"favorited_at": col.favorited_at.isoformat() if col.favorited_at else None}
+    if woke:
+        await showcase_sleep.catch_up(db, [col.id])
+    return {"favorited_at": col.favorited_at.isoformat() if col.favorited_at else None, "status": col.status}
 
 
 @router.patch("/{collection_id}/status")
