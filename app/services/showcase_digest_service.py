@@ -228,7 +228,11 @@ def briefing_showcases(entries: list, absolute, engagement: dict | None = None) 
         rank = (starred, engagement.get(col.id, 0), seen.timestamp() if seen else 0)
         for h in homes:
             g = groups.setdefault((h["_key"], h["is_price_drop"]), {**{k: v for k, v in h.items() if k != "_key"}, "_clients": []})
-            g["_clients"].append({"name": who or "A client", "link": link, "starred": starred, "_rank": rank})
+            same = next((c for c in g["_clients"] if who and c["name"] == who), None)
+            if same is None:
+                g["_clients"].append({"name": who or "A client", "link": link, "starred": starred, "_rank": rank})
+            elif rank > same["_rank"]:   # one person with two Showcases: named once, linking the one that ranks higher
+                same.update(link=link, starred=starred, _rank=rank)
         homes = [{k: v for k, v in h.items() if k != "_key"} for h in homes]
         new, drops, new_label, drop_label = _labels(homes, "new", "new")
         showcases.append({"visitor_name": who, "collection_name": nice_street(col.name), "collection_link": link,
@@ -304,6 +308,27 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
     def live(col: Collection | None) -> bool:
         return bool(col and col.status == "ACTIVE" and col.owner and owner_has_access(col.owner, SHOWCASE_ACCESS_TIERS))
 
+    # One client with several Showcases from the same agent gets ONE email (user, 10/22): the busiest
+    # Showcase leads, the others' homes join it (a home in both shows once) and the email links to
+    # each of their Showcases. One whose search the agent just changed keeps its own email.
+    client_link = {k[1]: next((v.get("collection_link") for v in reversed(r) if v.get("collection_link")), "") for k, r in buyer_rows.items()}
+    also: dict[tuple[str, str], list[Collection]] = {}
+    by_person: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for key, r in buyer_rows.items():
+        col = cols.get(key[1])
+        if live(col) and getattr(col, "notify_visitor", True) and col.visitor_email and not any(v.get("_kind") == "search" for v in r):
+            by_person.setdefault((key[0], col.owner_id), []).append(key)
+    for keys in by_person.values():
+        if len(keys) < 2:
+            continue
+        keys.sort(key=lambda k: -len(buyer_rows[k]))
+        first, rest = keys[0], keys[1:]
+        for k in rest:
+            buyer_rows[first].extend(buyer_rows.pop(k))
+            buyer_ids.setdefault(first, []).extend(buyer_ids.pop(k, []))
+        buyer_rows[first].sort(key=lambda v: v.get("_seq") or 0)
+        also[first] = [cols[k[1]] for k in rest]
+
     from app.services.agent_email_service import absolute, email_agent
 
     today = datetime.now(EASTERN).strftime("%m/%d/%Y")
@@ -354,7 +379,8 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
                 continue
         new, drops, new_label, drop_label = _labels(homes, "new match", "new matches")
         both = " and ".join(x for x in (new_label, drop_label) if x)
-        last = (rows or search_rows)[-1]
+        # This Showcase's own latest row (merged rows from the client's other Showcases come too).
+        last = ([v for v in rows if str(v.get("_collection_id")) == cid] or rows or search_rows)[-1]
         agent_first = (str(last.get("agent_name") or "").split(" ")[0]) or "Your agent"
         search = search_change_vars(search_rows, agent_first)
         vars_ = {
@@ -377,6 +403,13 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
             subject = (f"Your week: {_one_home_line(homes[0])}" if len(homes) == 1 else f"Your week: {both} in your Showcase")
         else:
             subject = (_one_home_line(homes[0]) if len(homes) == 1 else f"{both[0].upper() + both[1:]} in your Showcase today") if homes else ""
+        others = also.get((email, cid), [])
+        if others:
+            # Their other Showcases with this agent - links under the button ("Your other Showcases: ...").
+            vars_["other_showcases"] = [{"name": nice_street(o.name), "link": client_link.get(o.id) or ""} for o in others if client_link.get(o.id)]
+            vars_["headline"] = vars_["headline"].replace("in your Showcase", "in your Showcases")
+            vars_["more_label"] = vars_["more_label"].replace("in your Showcase", "in your Showcases")
+            subject = subject.replace("in your Showcase", "in your Showcases")
         if search:
             added = search.pop("_added")
             vars_.update(search)
