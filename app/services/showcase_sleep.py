@@ -5,9 +5,10 @@ automatic emails, and their Showcases with that agent go to sleep: status INACTI
 inactive_reason "no_response". Asleep = no new matches, no emails, no agent alerts - it moves to the
 Inactive tab on the agent's Showcases page. Nothing is deleted.
 
-It wakes up by itself when the client shows up again - opens their Showcase link (the link still
-works while asleep, unlike one the agent put to sleep by hand) or opens/clicks an old email - and
-catches up on the homes that came on the market while it slept. The agent can also wake it.
+It wakes up by itself when the client shows up again - opens their Showcase link or opens/clicks an
+old email - and catches up on the homes that came on the market while it slept. The agent can also
+wake it. A Showcase the agent switched off wakes the same way when the client opens it: only
+deleting a Showcase makes its link stop working (user, 10/22).
 
 Only counts from the first delivered email: nothing is backdated (client_emails starts 10/15)."""
 from __future__ import annotations
@@ -69,15 +70,19 @@ async def catch_up(db, collection_ids: list[str]) -> None:
 
 
 async def wake_on_visit(db, share_token: str) -> bool:
-    """The client opened a Showcase that fell asleep for no response: wake it (and their other
-    sleeping ones with this agent), emails back to daily, the agent told. Commits."""
+    """The client opened a sleeping Showcase - whatever put it to sleep (no response, the agent's
+    switch, their lead being deleted). Only deleting a Showcase makes it gone (user, 10/22). It
+    wakes, catches up on new homes, their email count starts over and the agent is told. Commits."""
     from app.services.showcase_links import share_match
     col = (await db.execute(select(Collection).where(and_(
         share_match(share_token), Collection.is_public == True,  # noqa: E712
-        Collection.status == "INACTIVE", Collection.inactive_reason == NO_RESPONSE,
+        Collection.status == "INACTIVE",
     )))).scalar_one_or_none()
     if col is None:
         return False
+    if col.inactive_reason != NO_RESPONSE:
+        await _wake_switched_off(db, col)
+        return True
     email = (col.visitor_email or "").strip().lower()
     woke: list[str] = []
     if email:
@@ -96,6 +101,30 @@ async def wake_on_visit(db, share_token: str) -> bool:
         await db.commit()
         await catch_up(db, woke)
     return True
+
+
+async def _wake_switched_off(db, col: Collection) -> None:
+    """A Showcase the agent switched off (or that went off with a deleted lead) and the client came
+    back to: on again, their automatic emails start over (an agent's own "emails off" for this
+    person stays off), the agent gets a bell. Commits, then catches up on new homes."""
+    from app.models.database import Notification
+    from app.services.client_email_service import LEAD_DELETED, MANUAL_OFF, _first, _pref
+    col.status, col.inactive_reason, col.inactive_at, col.updated_at = "ACTIVE", None, None, _now()
+    email = (col.visitor_email or "").strip().lower()
+    if email:
+        pref = await _pref(db, col.owner_id, email)
+        if pref.manual == LEAD_DELETED:
+            pref.manual = None
+        if pref.manual not in MANUAL_OFF:
+            pref.reset_at, pref.changed_at = _now(), _now()
+            pref.mode, pref.reason = "daily", "Back on - opened their Showcase"
+    who = _first(col.visitor_name, email or "Your client")
+    db.add(Notification(agent_id=col.owner_id, type="EMAIL_STATUS", reference_type="SHOWCASE_WOKE", reference_id=col.id,
+                        title=f"{who} is back", collection_id=col.id, visitor_name=col.visitor_name or None,
+                        message=f"{who} opened the Showcase you switched off, so it's back on and updating again.",
+                        link=f"/showcases?showcase={col.id}", is_read=False, created_at=_now()))
+    await db.commit()
+    await catch_up(db, [col.id])
 
 
 async def agent_changed(db, col: Collection, new_status: str) -> None:

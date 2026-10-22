@@ -192,11 +192,29 @@ def _sample(homes: list[dict], n: int) -> list[dict]:
     return picked
 
 
-def briefing_showcases(entries: list, absolute) -> dict | None:
+async def _engagement(db: AsyncSession, collection_ids: list[str]) -> dict:
+    """Showcase id -> how many homes the client liked, passed on or looked at in it."""
+    if not collection_ids:
+        return {}
+    from sqlalchemy import or_
+    from app.models.database import PropertyInteraction
+    rows = await db.execute(
+        select(PropertyInteraction.collection_id, func.count(PropertyInteraction.id))
+        .where(PropertyInteraction.collection_id.in_(collection_ids),
+               or_(PropertyInteraction.liked.is_(True), PropertyInteraction.disliked.is_(True), PropertyInteraction.view_count > 0))
+        .group_by(PropertyInteraction.collection_id))
+    return {cid: n for cid, n in rows.all()}
+
+
+def briefing_showcases(entries: list, absolute, engagement: dict | None = None) -> dict | None:
     """The briefing's Showcase section from [(Showcase, its claimed rows)] - pure, no database.
     home_groups: each HOME once, with the clients it matched (names open their Showcase), the
-    homes that reached the most clients first. showcases: the older by-Showcase list (the previous
-    template version reads it). new / drops count homes, not Showcases."""
+    homes that reached the most clients first. Under each home the named clients are the agent's
+    starred Showcases first (with a star), then the clients doing the most in their Showcase
+    (`engagement`: Showcase id -> homes they liked / passed / looked at), then the most recently
+    active (user, 10/22). showcases: the older by-Showcase list (the previous template version
+    reads it). new / drops count homes, not Showcases."""
+    engagement = engagement or {}
     showcases = []
     groups: "OrderedDict[tuple, dict]" = OrderedDict()   # (listing key, price drop?) -> the home + its clients
     for col, crow in entries:
@@ -205,9 +223,12 @@ def briefing_showcases(entries: list, absolute) -> dict | None:
             continue
         who = " ".join(_cap(w) for w in (col.visitor_name or "").split())
         link = absolute(f"/showcases?showcase={col.id}")
+        starred = bool(getattr(col, "favorited_at", None))
+        seen = getattr(col, "last_visitor_activity_at", None)
+        rank = (starred, engagement.get(col.id, 0), seen.timestamp() if seen else 0)
         for h in homes:
             g = groups.setdefault((h["_key"], h["is_price_drop"]), {**{k: v for k, v in h.items() if k != "_key"}, "_clients": []})
-            g["_clients"].append({"name": who or "A client", "link": link})
+            g["_clients"].append({"name": who or "A client", "link": link, "starred": starred, "_rank": rank})
         homes = [{k: v for k, v in h.items() if k != "_key"} for h in homes]
         new, drops, new_label, drop_label = _labels(homes, "new", "new")
         showcases.append({"visitor_name": who, "collection_name": nice_street(col.name), "collection_link": link,
@@ -220,7 +241,9 @@ def briefing_showcases(entries: list, absolute) -> dict | None:
         x.pop("_n")
     home_groups = sorted(groups.values(), key=lambda g: -len(g["_clients"]))
     for g in home_groups:
-        cl = g.pop("_clients")
+        cl = sorted(g.pop("_clients"), key=lambda c: c["_rank"], reverse=True)
+        for c in cl:
+            c.pop("_rank")
         n = len(cl)
         g["clients"] = cl[:MAX_CLIENT_NAMES]
         g["clients_more"] = f"+ {n - MAX_CLIENT_NAMES} more" if n > MAX_CLIENT_NAMES else ""
@@ -437,8 +460,9 @@ async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) ->
             cols = {c.id: c for c in (await db.execute(
                 select(Collection).options(selectinload(Collection.owner)).where(Collection.id.in_(list(per_col)))
             )).scalars().all()}
-            sc = briefing_showcases([(cols.get(cid), crow) for cid, crow in per_col.items()
-                                     if live(cols.get(cid)) and getattr(cols.get(cid), "notify_agent", True)], absolute)
+            entries = [(cols.get(cid), crow) for cid, crow in per_col.items()
+                       if live(cols.get(cid)) and getattr(cols.get(cid), "notify_agent", True)]
+            sc = briefing_showcases(entries, absolute, await _engagement(db, [c.id for c, _ in entries]))
         try:
             brief = await _briefing(db, user, now, showcase_access=owner_has_access(user, SHOWCASE_ACCESS_TIERS))
         except Exception:  # noqa: BLE001 - one agent's bad data must not stop everyone's email
