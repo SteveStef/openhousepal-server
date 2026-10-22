@@ -53,7 +53,11 @@ AGENT_TEMPLATE = "showcase_daily_digest_agent"
 # Emails stay short - a few items, then "+ N more" and a button to see everything (user, 10/06).
 MAX_HOMES = 4               # homes in one buyer email (big photos on phones); the rest are in their Showcase
 MAX_SHOWCASES = 4           # client Showcases in the agent's briefing (its button opens all of them)
-MAX_HOMES_PER_SHOWCASE = 2  # homes under each Showcase in the briefing
+MAX_HOMES_PER_SHOWCASE = 2  # homes under each Showcase in the briefing (older template version only)
+# The briefing lists each HOME once with the clients it matched (user, 10/22: one open house's 30
+# sign-ins share a search, so a by-Showcase list showed the same 4 houses over and over).
+MAX_HOME_GROUPS = 6         # homes in the briefing
+MAX_CLIENT_NAMES = 8        # client names (each opens that Showcase) under a home, then "+ N more"
 # One agent's buyer emails go out this many seconds apart, not all at 4:30 on the dot - a burst of
 # near-identical emails from one sender (especially their own Gmail / Outlook) looks like spam.
 SPREAD_SECONDS = 20
@@ -131,10 +135,11 @@ async def _spotlight_told_today(db: AsyncSession, email: str, now: datetime) -> 
     return {str(k) for k in rows if k}
 
 
-def _homes(rows: list[dict]) -> list[dict]:
+def _homes(rows: list[dict], keep_key: bool = False) -> list[dict]:
     """One entry per home (in the order they came in), shaped the way the Mailgun templates read it.
     A home that was new AND dropped its price the same day shows once, as new, at its latest price;
-    a home that dropped twice shows the price before the first drop -> the latest one."""
+    a home that dropped twice shows the price before the first drop -> the latest one.
+    keep_key: each home also carries "_key" (its listing key) - the agent briefing groups by it."""
     homes: "OrderedDict[str, dict]" = OrderedDict()
     for v in rows:
         key = str(v.get("_listing_key") or v.get("property_address"))
@@ -147,6 +152,8 @@ def _homes(rows: list[dict]) -> list[dict]:
                               "image": v.get("property_image") or "", "beds": _num(v.get("property_beds")),
                               "baths": _num(v.get("property_baths")), "sqft": _num(v.get("property_sqft")),
                               "is_price_drop": False, "_new": False}
+            if keep_key:
+                h["_key"] = key
         h["price"] = v.get("property_price") or h.get("price") or ""
         if kind == "new":
             h["_new"], h["is_price_drop"] = True, False
@@ -183,6 +190,46 @@ def _sample(homes: list[dict], n: int) -> list[dict]:
         if drop:
             picked = picked[:-1] + [drop]
     return picked
+
+
+def briefing_showcases(entries: list, absolute) -> dict | None:
+    """The briefing's Showcase section from [(Showcase, its claimed rows)] - pure, no database.
+    home_groups: each HOME once, with the clients it matched (names open their Showcase), the
+    homes that reached the most clients first. showcases: the older by-Showcase list (the previous
+    template version reads it). new / drops count homes, not Showcases."""
+    showcases = []
+    groups: "OrderedDict[tuple, dict]" = OrderedDict()   # (listing key, price drop?) -> the home + its clients
+    for col, crow in entries:
+        homes = _homes(crow, keep_key=True)
+        if not homes:
+            continue
+        who = " ".join(_cap(w) for w in (col.visitor_name or "").split())
+        link = absolute(f"/showcases?showcase={col.id}")
+        for h in homes:
+            g = groups.setdefault((h["_key"], h["is_price_drop"]), {**{k: v for k, v in h.items() if k != "_key"}, "_clients": []})
+            g["_clients"].append({"name": who or "A client", "link": link})
+        homes = [{k: v for k, v in h.items() if k != "_key"} for h in homes]
+        new, drops, new_label, drop_label = _labels(homes, "new", "new")
+        showcases.append({"visitor_name": who, "collection_name": nice_street(col.name), "collection_link": link,
+                          "new_label": new_label, "drop_label": drop_label,
+                          "properties": _sample(homes, MAX_HOMES_PER_SHOWCASE), "_n": new + drops})
+    if not showcases:
+        return None
+    showcases.sort(key=lambda x: -x["_n"])
+    for x in showcases:
+        x.pop("_n")
+    home_groups = sorted(groups.values(), key=lambda g: -len(g["_clients"]))
+    for g in home_groups:
+        cl = g.pop("_clients")
+        n = len(cl)
+        g["clients"] = cl[:MAX_CLIENT_NAMES]
+        g["clients_more"] = f"+ {n - MAX_CLIENT_NAMES} more" if n > MAX_CLIENT_NAMES else ""
+        if g["is_price_drop"]:
+            g["clients_label"] = f"In {n} clients' Showcases" if n > 1 else "In 1 client's Showcase"
+        else:
+            g["clients_label"] = f"Matched {_plural(n, 'client', 'clients')}"
+    drops_n = sum(1 for g in home_groups if g["is_price_drop"])
+    return {"showcases": showcases, "home_groups": home_groups, "new": len(home_groups) - drops_n, "drops": drops_n}
 
 
 def _one_home_line(h: dict) -> str:
@@ -390,21 +437,8 @@ async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) ->
             cols = {c.id: c for c in (await db.execute(
                 select(Collection).options(selectinload(Collection.owner)).where(Collection.id.in_(list(per_col)))
             )).scalars().all()}
-            showcases = []
-            for cid, crow in per_col.items():
-                col = cols.get(cid)
-                if not live(col) or not getattr(col, "notify_agent", True):
-                    continue
-                homes = _homes(crow)
-                if homes:
-                    new, drops, new_label, drop_label = _labels(homes, "new", "new")
-                    showcases.append({"visitor_name": " ".join(_cap(w) for w in (col.visitor_name or "").split()),
-                                      "collection_name": nice_street(col.name), "collection_link": absolute(f"/showcases?showcase={col.id}"),
-                                      "new_label": new_label, "drop_label": drop_label,
-                                      "properties": _sample(homes, MAX_HOMES_PER_SHOWCASE), "_new": new, "_drops": drops})
-            if showcases:
-                showcases.sort(key=lambda x: -(x["_new"] + x["_drops"]))
-                sc = {"showcases": showcases, "new": sum(x.pop("_new") for x in showcases), "drops": sum(x.pop("_drops") for x in showcases)}
+            sc = briefing_showcases([(cols.get(cid), crow) for cid, crow in per_col.items()
+                                     if live(cols.get(cid)) and getattr(cols.get(cid), "notify_agent", True)], absolute)
         try:
             brief = await _briefing(db, user, now, showcase_access=owner_has_access(user, SHOWCASE_ACCESS_TIERS))
         except Exception:  # noqa: BLE001 - one agent's bad data must not stop everyone's email
@@ -421,7 +455,8 @@ async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) ->
         v = {"recipient_name": user.first_name or "there", "today_date": today,
              "dashboard_link": absolute("/dash"), **brief}
         if sc:
-            new_part = _plural(sc["new"], "new match", "new matches") if sc["new"] else ""
+            # Counted per HOME, not per Showcase ("4 new homes", not "132 new matches" for 4 houses x 33 clients).
+            new_part = _plural(sc["new"], "new home", "new homes") if sc["new"] else ""
             drop_part = _plural(sc["drops"], "price drop", "price drops") if sc["drops"] else ""
             clients = _plural(len(sc["showcases"]), "client Showcase", "client Showcases")
             both = " and ".join(p for p in (new_part, drop_part) if p)
@@ -436,6 +471,10 @@ async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) ->
                 created_at=datetime.now(timezone.utc),
             ))
             v.update({"collection_label": clients, "total_new_label": new_part, "total_drop_label": drop_part,
+                      # home_groups = the current template; collections = the older version's by-Showcase list.
+                      "home_groups": sc["home_groups"][:MAX_HOME_GROUPS],
+                      "home_groups_more": _more(len(sc["home_groups"]) - MAX_HOME_GROUPS, "more home", "more homes", "in your Showcases"),
+                      "showcases_link": absolute("/showcases"),
                       "collections": sc["showcases"][:MAX_SHOWCASES], "has_showcases": True,
                       "collections_more": _more(len(sc["showcases"]) - MAX_SHOWCASES, "more Showcase updated", "more Showcases updated", "")})
         elif brief["followup_count"]:

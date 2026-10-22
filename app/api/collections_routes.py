@@ -95,6 +95,10 @@ class UpdateStatusRequest(BaseModel):
     status: str
 
 
+class FavoriteRequest(BaseModel):
+    favorite: bool
+
+
 class NotificationSettingsRequest(BaseModel):
     notify_visitor: bool
     notify_agent: bool
@@ -600,6 +604,23 @@ async def create_collection_with_preferences(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create collection"
         )
+
+
+@router.put("/{collection_id}/favorite")
+async def set_collection_favorite(
+    collection_id: str,
+    request: FavoriteRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_premium_plan)
+):
+    """The agent stars a Showcase - starred ones sort first on the Showcases page."""
+    col = (await db.execute(select(Collection).where(
+        Collection.id == collection_id, Collection.owner_id == current_user.id))).scalar_one_or_none()
+    if col is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found or access denied")
+    col.favorited_at = datetime.now(timezone.utc) if request.favorite else None
+    await db.commit()
+    return {"favorited_at": col.favorited_at.isoformat() if col.favorited_at else None}
 
 
 @router.patch("/{collection_id}/status")
@@ -1118,10 +1139,17 @@ async def get_shared_collection(
     """
     try:
         await _assert_showcase_owner_active(db, share_token)
+        # Asleep because they ignored their emails - opening it is the sign of life that wakes it.
+        from app.services.showcase_sleep import wake_on_visit
+        try:
+            await wake_on_visit(db, share_token)
+        except Exception:  # noqa: BLE001 - a failed wake shows the not-found page, never a crash
+            logger.warning("showcase wake on visit failed", exc_info=True)
+            await db.rollback()
         collection_data = await CollectionsService.get_shared_collection(
             db, share_token
         )
-        
+
         if not collection_data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,

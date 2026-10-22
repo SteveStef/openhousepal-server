@@ -66,6 +66,11 @@ class CollectionResponse(BaseModel):
     updated_at: str
     refine_request_message: Optional[str] = None
     refine_request_at: Optional[str] = None
+    favorited_at: Optional[str] = None      # starred by the agent - sorts first
+    inactive_reason: Optional[str] = None   # why it's asleep: no_response | agent
+    inactive_at: Optional[str] = None
+    email_mode: Optional[str] = None        # the client's automatic emails: daily | weekly | off
+    email_mode_reason: Optional[str] = None
     stats: Optional[dict] = None
     matchedProperties: List[dict] = []
 

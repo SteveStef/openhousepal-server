@@ -50,7 +50,10 @@ def nice_street(v: Optional[str], city: Optional[str] = None) -> str:
     if city and v.lower().endswith(" " + city.strip().lower()):
         v = v[: -len(city.strip())].rstrip(" ,")                         # " BRYN MAWR"
     v = re.sub(r"\s*(?:#|apt\.?|unit|ste\.?|suite)\s*$", "", v, flags=re.I)  # an empty unit: "1330 N Avignon Dr #"
-    return v.title() if v and v == v.upper() else v
+    if v and v == v.upper():
+        # .title() makes "21ST" "21St" - ordinals stay lower case ("731 S 21st St").
+        v = re.sub(r"\b(\d+)(St|Nd|Rd|Th)\b", lambda m: m.group(1) + m.group(2).lower(), v.title())
+    return v
 
 
 def _phone(v: Optional[str]) -> str:

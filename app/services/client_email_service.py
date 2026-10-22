@@ -15,7 +15,8 @@ we stop sending automatic updates to people who never open them.
   daily   the normal state.
   weekly  they left emails unopened on STRIKE_DAYS different days (each given GRACE to be opened) -
           the daily Showcase digest becomes one weekly digest, Spotlight alerts at most one a week.
-  off     they also left WEEKLY_STRIKES weekly digests unopened - no automatic emails at all.
+  off     they also left WEEKLY_STRIKES weekly digests unopened - no automatic emails at all, and
+          their Showcases with this agent go to sleep (showcase_sleep.py).
 
 Any sign of life - opening or clicking an email, using their Showcase, signing in at an open house -
 puts them straight back on daily (the count starts again from there). The agent can turn a person
@@ -175,25 +176,39 @@ async def refresh_status(db, owner_id: str, email: str, *, announce: bool = True
     d = decide(await _emails_for(db, owner_id, email), manual=pref.manual, reset_at=pref.reset_at,
                last_engaged=await _last_engaged(db, owner_id, email), unsubscribed=unsub)
     old = pref.mode or "daily"
+    woke: list[str] = []
     if d["mode"] != old and not unsub and pref.manual not in MANUAL_OFF:
         pref.mode, pref.changed_at = d["mode"], _now()
         pref.reason = d["reason"] or (f"Back on - {trigger}" if trigger else "Back on")
+        # Ignored 3 weekly emails -> their Showcases go to sleep; any sign of life wakes them (showcase_sleep).
+        from app.services import showcase_sleep
+        slept = 0
+        if d["mode"] == "off" and d.get("code") == "weekly_unopened":
+            slept = await showcase_sleep.sleep_for_no_response(db, owner_id, email)
+        elif old == "off":
+            woke = await showcase_sleep.wake_no_response(db, owner_id, email)
         if announce:
-            await _announce(db, owner_id, email, old, d["mode"], pref.reason, trigger)
+            await _announce(db, owner_id, email, old, d["mode"], pref.reason, trigger, slept=slept)
     elif d["mode"] != "daily":
         pref.reason = d["reason"]
     await db.commit()
+    if woke:
+        from app.services.showcase_sleep import catch_up
+        await catch_up(db, woke)
     return {**d, "since": pref.changed_at, "manual": pref.manual}
 
 
-async def _announce(db, owner_id: str, email: str, old: str, new: str, reason: str, trigger: Optional[str]) -> None:
+async def _announce(db, owner_id: str, email: str, old: str, new: str, reason: str, trigger: Optional[str], slept: int = 0) -> None:
     name = await _person_name(db, owner_id, email)
     who = _first(name, email)
     lead = await _lead(db, owner_id, email)
     if new == "weekly":
         source, title, msg = "email_weekly", f"{who}: emails now weekly", f"{who} hasn't opened their last few emails, so Showcase updates now go once a week. That keeps your emails out of junk."
     elif new == "off":
-        source, title, msg = "email_paused", f"{who}: automatic emails stopped", f"{who} didn't open 3 weekly emails in a row, so automatic emails stopped. They restart by themselves if {who} opens one or visits their Showcase."
+        if slept:
+            source, title, msg = "email_paused", f"{who}: Showcase asleep", f"{who} didn't open 3 weekly emails in a row, so automatic emails stopped and their Showcase went to sleep (Showcases -> Inactive). It wakes up by itself if {who} opens it or an old email."
+        else:
+            source, title, msg = "email_paused", f"{who}: automatic emails stopped", f"{who} didn't open 3 weekly emails in a row, so automatic emails stopped. They restart by themselves if {who} opens one or visits their Showcase."
     else:
         source, title, msg = "email_resumed", f"{who}: emails back to daily", f"{who} {trigger or 'is active again'}, so their updates are back to normal."
     if lead is not None:

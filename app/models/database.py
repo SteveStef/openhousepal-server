@@ -728,6 +728,11 @@ class Collection(Base):
     short_code = Column(String, unique=True, nullable=True, index=True)  # short personal link /s/<code> (services/showcase_links.py)
     is_public = Column(Boolean, default=True)
     status = Column(String, default="ACTIVE", nullable=False)  # ACTIVE, INACTIVE
+    # INACTIVE = asleep: no matching, no emails. 'no_response' (the client ignored 3 weekly emails -
+    # wakes by itself when they open their Showcase, services/showcase_sleep.py) | 'agent' | NULL (older rows).
+    inactive_reason = Column(String(24), nullable=True)
+    inactive_at = Column(DateTime(timezone=True), nullable=True)
+    favorited_at = Column(DateTime(timezone=True), nullable=True)  # the agent starred it - sorts first on the Showcases page
 
     # Notification Settings
     notify_visitor = Column(Boolean, default=True, nullable=False)

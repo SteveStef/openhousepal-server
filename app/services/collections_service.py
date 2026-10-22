@@ -315,6 +315,11 @@ class CollectionsService:
                     counts = activity_counts_lookup.setdefault(n.collection_id, {})
                     counts[activity_type] = counts.get(activity_type, 0) + 1
 
+            # Each client's email setting (daily / weekly / off + why) for the card's email badge.
+            from app.models.database import ClientEmailPref
+            email_prefs = {p.email: p for p in (await db.execute(
+                select(ClientEmailPref).where(ClientEmailPref.owner_id == user_id))).scalars().all()}
+
             collections_data = []
             for collection in collections:
                 # Calculate total vs active (non-disliked) properties
@@ -479,6 +484,11 @@ class CollectionsService:
                     "updated_at": collection.updated_at.isoformat() if collection.updated_at else collection.created_at.isoformat(),
                     "refine_request_message": collection.refine_request_message,
                     "refine_request_at": collection.refine_request_at.isoformat() if collection.refine_request_at else None,
+                    "favorited_at": collection.favorited_at.isoformat() if collection.favorited_at else None,
+                    "inactive_reason": collection.inactive_reason,
+                    "inactive_at": collection.inactive_at.isoformat() if collection.inactive_at else None,
+                    "email_mode": (pref.mode or "daily") if (pref := email_prefs.get((collection.visitor_email or "").strip().lower())) else "daily",
+                    "email_mode_reason": pref.reason if pref else None,
                     "stats": {
                         "totalProperties": total_count,
                         "activeProperties": active_count,
@@ -1325,6 +1335,9 @@ class CollectionsService:
             old_status = collection.status
 
             # Update the status column directly
+            if status != old_status:
+                from app.services.showcase_sleep import agent_changed
+                await agent_changed(db, collection, status)
             collection.status = status
             collection.updated_at = datetime.now(timezone.utc)
             if status == 'ACTIVE' and old_status != 'ACTIVE' and collection.visitor_email:
