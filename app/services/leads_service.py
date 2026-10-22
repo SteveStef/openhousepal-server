@@ -115,6 +115,13 @@ async def upsert_lead(
         )
         db.add(lead)
         await db.flush()  # populate lead.id for the event below
+        # A lead the agent deleted earlier is back (signed in again, filled a form...) - their
+        # emails were stopped by the delete (lead_cleanup_service); a new lead gets them as normal.
+        try:
+            from app.services.client_email_service import lift_lead_deleted
+            await lift_lead_deleted(db, owner_id, norm_email)
+        except Exception as e:  # never let email plumbing break lead capture
+            logger.warning(f"Could not lift deleted-lead email hold: {e}")
 
     event = LeadEvent(
         lead_id=lead.id,

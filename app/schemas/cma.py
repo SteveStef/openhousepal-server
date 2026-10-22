@@ -80,7 +80,8 @@ class CmaQualityAssessment(BaseModel):
     finish_quality: Optional[SimpleRating] = None
     interior: Optional[SimpleRating] = None
     exterior: Optional[SimpleRating] = None
-    lot: Optional[SimpleRating] = None
+    # 'n_a' = a condo / unit has no lot of its own (10/21) - without it every condo report failed to load
+    lot: Optional[Literal['below', 'similar', 'above', 'n_a']] = None
     amenities: Optional[SimpleRating] = None
     layout: Optional[SimpleRating] = None
     area: Optional[AreaRating] = None

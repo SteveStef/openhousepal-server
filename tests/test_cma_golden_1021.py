@@ -205,7 +205,7 @@ def test_floor_review_note_shows_both_numbers():
     note = ai._asking_band_review_note(trace, 1082000)
     assert note and note["comps_value"] == 955315 and note["final_value"] == 1082000 and "Review before sending" in note["message"]
     assert ai._asking_band_review_note({**trace, "deterministic_anchor": 1060000}, 1082000) is None   # within 5%
-    assert ai._asking_band_review_note(trace, 1150000) is None   # not at the band's edge
+    assert ai._asking_band_review_note({**trace, "deterministic_anchor": 1000000, "asking_price_check": {"allowed_low_price": 900000}}, 1080000) is None   # 8% off, not at an edge
 
 
 # ---- D: current competition -----------------------------------------------------------------------
@@ -259,3 +259,55 @@ def test_condition_line_follows_the_finish_interior_exterior_ratings():
     assert feat["condition"] == round(3 * 850000 * ai._V10_FEATURE_COND_PCT)
     better = {**comp, "quality": {"finish_quality": "above", "interior": "similar", "exterior": "similar"}}
     assert ai._v10_grid_adjustments(WINDHAM, {**r, "_c": better}, 3524, 1500, False, 260.0)["condition"] < 0
+
+
+def test_condo_report_with_lot_na_loads():
+    from app.schemas.cma import CmaQualityAssessment
+    assert CmaQualityAssessment(lot="n_a").lot == "n_a"
+
+
+# ---- V2 Windham (10/21) ------------------------------------------------------------------------------
+
+V2_TRACE = {"authority": "reasoning_model", "anchor": {"anchor_value": 976734}, "deterministic_anchor": 976734,
+            "asking_price_check": {"allowed_low_price": 1082900, "allowed_high_price": 1274000, "asking_price": 1300000,
+                                   "passed_over": True, "ratio_used": 0.98},
+            "pending_competition": {"nudge_pct": 2.5, "nudged_from": 1090000, "pendings_used": [{"listing_key": "x"}]}}
+
+
+def test_v2_value_above_comps_is_explained_and_flagged():
+    notes = "The final fair market value is $1,117,000. The concluded value sits below the asking price."
+    out, _ = ai._v10_reconcile_anchor_direction_prose(notes, final={"value": 1117000, "anchor_value": 976734}, trace=V2_TRACE)
+    assert ("Weighted together, the adjusted comparable sales point to about $977,000. How this market prices "
+            "homes like this one supports a value near $1,090,000. Similar homes now under contract nearby are listed "
+            "higher, which moves it up about 2.5% to $1,117,000.") in out
+    steps = out.split("Weighted together")[1].split("1,117,000.")[0]
+    assert "asking" not in steps   # clients never read that the asking price set the value
+    assert "floor held it at about $1,082,900" in ai._asking_band_review_note(V2_TRACE, 1117000)["message"]   # agent keeps the math
+    note = ai._asking_band_review_note(V2_TRACE, 1117000)
+    assert note and note["comps_value"] == 976734 and "14% higher" in note["message"]
+
+
+def test_v2_range_after_nudge_is_round():
+    homes = [_home("1", "pending", 1300000, 80), _home("2", "pending", 1320000, 78)]
+    v, lo, hi, info = ai._pending_competition_review(WINDHAM, homes, 1082000, 975000, 1175000, WINDHAM_TRACE)
+    assert lo % 5000 == 0 and hi % 5000 == 0
+
+
+def test_v2_comp_note_psf_on_the_card_basis():
+    comp = {"sale_price": 880000, "above_grade_finished_area": 3388, "sqft": 4388}
+    out, _ = ai._reconcile_comp_hard_facts("At $200.55/sqft on a larger total footprint it sold under list.", "Comp #2", WINDHAM, comp)
+    assert "$260/sqft above grade" in out and "200.55" not in out
+    out2, _ = ai._reconcile_comp_hard_facts("It closed at $259.74/sqft.", "Comp #2", WINDHAM, comp)
+    assert "$260/sqft" in out2 and "above grade above grade" not in out2
+
+
+def test_new_construction_pending_never_moves_the_value():
+    homes = [_home("1", "pending", 1300000, 80, new_construction=True), _home("2", "pending", 1320000, 78, new_construction=True)]
+    v, lo, hi, info = ai._pending_competition_review(WINDHAM, homes, 1082000, 975000, 1180000, WINDHAM_TRACE)
+    assert v == 1082000 and info["pendings_used"] == []
+
+
+def test_full_acre_phrase_is_checked():
+    comp = {**LOBELLA, "lot_size": 0.59 * 43560}
+    out, _ = ai._reconcile_comp_hard_facts("It has a heated pool on a full acre.", "Comp #3", WINDHAM, comp)
+    assert "0.59 acres" in out and "full acre" not in out

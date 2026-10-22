@@ -1080,7 +1080,29 @@ def _sale_age_days(c: CmaCompCandidate, today: date) -> Optional[int]:
     return (today - d).days if d else None
 
 
-def plan_auto_search(candidates: List[CmaCompCandidate], family: Optional[str], *, today: date) -> dict:
+# A usable comp must also be of the subject's era: within this many years of its build year (0 = any).
+# 239 Windham Dr (2012) V2: five 1990-2000 sales at 1.8 mi counted as "enough", so the search never
+# reached the 2010s homes 3-5 mi out (grader, 10/21). Backtest knob.
+AUTO_USABLE_MAX_YEAR_GAP = int(os.environ.get("CMA_AUTO_AGE_WINDOW", "0"))
+
+
+# Auto-pick: sales from the subject's era first when there are at least 3 of them (backtest knob, 0 = off)
+AUTO_PICK_ERA_YEARS = int(os.environ.get("CMA_AUTO_PICK_ERA", "0"))
+
+
+def era_first(ranked: list, subject_year) -> list:
+    """Keep the Match order, but move sales built within AUTO_PICK_ERA_YEARS of the subject ahead of the rest
+    when there are at least 3 of them - a 2012 home's comps are 2000s-2010s homes, not 1990s ones."""
+    if not (AUTO_PICK_ERA_YEARS and subject_year):
+        return ranked
+    same = [c for c in ranked if c.year_built and abs(float(c.year_built) - float(subject_year)) <= AUTO_PICK_ERA_YEARS]
+    if len(same) < 3:
+        return ranked
+    return same + [c for c in ranked if c not in same]
+
+
+def plan_auto_search(candidates: List[CmaCompCandidate], family: Optional[str], *, today: date,
+                     subject_year: Optional[float] = None) -> dict:
     """Walk the widening steps over one scored candidate pool (fetched at the widest window). Pure, so
     the backtest and the golden tests run exactly what agents get. Returns the chosen radius / sold
     window, whether comps are limited, and the steps taken."""
@@ -1092,10 +1114,15 @@ def plan_auto_search(candidates: List[CmaCompCandidate], family: Optional[str], 
     else:
         ladder, extra = AUTO_RADII["detached"], AUTO_RURAL_EXTRA_RADII
 
+    def era_ok(c) -> bool:
+        if not (AUTO_USABLE_MAX_YEAR_GAP and subject_year and c.year_built):
+            return True
+        return abs(float(c.year_built) - float(subject_year)) <= AUTO_USABLE_MAX_YEAR_GAP
+
     def usable(radius: float, days: int) -> int:
         return sum(1 for c in candidates
                    if (c.distance_miles or 0) <= radius and (_sale_age_days(c, today) or 0) <= days
-                   and _auto_pickable(c) and (c.match_score or 0) >= AUTO_USABLE_MIN_SCORE)
+                   and _auto_pickable(c) and (c.match_score or 0) >= AUTO_USABLE_MIN_SCORE and era_ok(c))
 
     steps, chosen = [], None
     for ri, radius in enumerate(ladder):
@@ -1184,6 +1211,12 @@ async def current_competition(db: AsyncSession, subject: dict, *, listing_key: O
     act = [c for c in pool if c.status == "active"][:COMPETITION_MAX_PER_STATUS]
     picked = sorted(pend + act, key=lambda c: -(c.match_score or 0))[:COMPETITION_MAX]
     cuts = await _price_cuts(db, [c.listing_key for c in picked])
+    # Builder listings (Bright NewConstructionYN): shown, labelled, never a guide to a resale's value
+    # (510 Newcomen Rd #B3D - a to-be-built floor plan - moved 239 Windham Dr, V2 10/21).
+    _keys = [c.listing_key for c in picked]
+    _new_rows = (await db.execute(select(Property.listing_key, Property.raw_mls_data["NewConstructionYN"].astext)
+                                   .where(Property.listing_key.in_(_keys)))).all() if _keys else []
+    new_build = {k for k, v in _new_rows if str(v).lower() in ("true", "1", "yes")}
     out = []
     for c in picked:
         ag = c.above_grade_finished_area or c.sqft
@@ -1196,6 +1229,7 @@ async def current_competition(db: AsyncSession, subject: dict, *, listing_key: O
             "days_on_market": c.days_on_market, "distance_miles": c.distance_miles, "match_score": c.match_score,
             "latitude": c.latitude, "longitude": c.longitude,
             "price_cuts": cuts.get(c.listing_key),
+            "new_construction": c.listing_key in new_build,
             "lot_size": c.lot_size, "below_grade_finished_area": c.below_grade_finished_area,
             "garage": c.garage, "basement": c.basement, "water_source": c.water_source, "sewer": c.sewer,
             "school_district": c.school_district, "township": c.township, "subdivision_name": c.subdivision_name,
@@ -1228,11 +1262,11 @@ async def auto_search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *
         "min_price": round(lp * (1 - _AUTO_PRICE_BAND)) if lp else None, "max_price": round(lp * (1 + _AUTO_PRICE_BAND)) if lp else None,
     })
     pool = await search_comparables(db, wide, keep_all=True, row_limit=800)
-    plan = plan_auto_search(pool, family, today=date_to)
+    plan = plan_auto_search(pool, family, today=date_to, subject_year=(req.subject.year_built if req.subject else None))
     if plan["radius_miles"] > widest:   # rural: still short at 5 mi - look farther
         pool = await search_comparables(db, wide.model_copy(update={"radius_miles": AUTO_RURAL_EXTRA_RADII[-1]}),
                                         keep_all=True, row_limit=800)
-        plan = plan_auto_search(pool, family, today=date_to)
+        plan = plan_auto_search(pool, family, today=date_to, subject_year=(req.subject.year_built if req.subject else None))
     chosen = [c for c in pool
               if (c.distance_miles or 0) <= plan["radius_miles"]
               and (_sale_age_days(c, date_to) or 0) <= plan["sold_within_days"]]

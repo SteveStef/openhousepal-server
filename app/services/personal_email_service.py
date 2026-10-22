@@ -20,7 +20,10 @@ from __future__ import annotations
 import html as _html
 from typing import Any
 
-PERSONAL_TEMPLATES = {"visitor_confirmation", "showcase_shared"}
+PERSONAL_TEMPLATES = {"visitor_confirmation", "showcase_shared", "event_invite", "event_rsvp"}
+# Invites (invites_service): the invitation itself and the guest's RSVP confirmation - personal
+# notes too, so they need no Mailgun template (the prod domain is at its template cap).
+INVITE_TEMPLATES = {"event_invite", "event_rsvp"}
 
 _WRAP = ('<div style="font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:1.55;color:#222222;'
          'max-width:560px">{body}</div>')
@@ -63,7 +66,38 @@ def render(template: str, subject: str, v: dict, *, link: str) -> tuple[str, str
     first = (v.get("first_name") or v.get("recipient_name") or "").strip() or "there"
     phone = (v.get("agent_phone") or "").strip()
     reach = f"just reply to this email or text me at {phone}" if phone else "just reply to this email"
-    if template == "visitor_confirmation":
+    if template in INVITE_TEMPLATES:
+        link = link or (v.get("invite_link") or "")
+        title = (v.get("invite_title") or "").strip() or "my event"
+        when = (v.get("invite_when") or "").strip()
+        place = (v.get("invite_place") or "").strip()
+        details = " · ".join(x for x in (when, place) if x)
+        if template == "event_invite":
+            subject = (f"Reminder: {title}" if v.get("is_reminder") else title)[:200]
+            note = (v.get("invite_message") or "").strip()
+            paras = [f"Hi {first},",
+                     ("Just a friendly reminder - I'd love to have you at " if v.get("is_reminder") else "I'd love for you to join me for ")
+                     + f"{title}{(' - ' + details) if details else ''}."]
+            if note:
+                paras.append(note)
+            paras += ["Here's your invitation - you can RSVP right on the page, it takes a few seconds:", "__LINK__",
+                      f"If you have any questions, {reach}."]
+        else:  # event_rsvp - the guest's confirmation
+            resp = v.get("rsvp_response")
+            if resp == "no":
+                paras = [f"Hi {first},", f"Thanks for letting me know you can't make it to {title}. You'll be missed!",
+                         "If your plans change, you can update your RSVP here:", "__LINK__"]
+            else:
+                try:
+                    count = int(v.get("guest_count") or 1)
+                except (TypeError, ValueError):
+                    count = 1
+                party = f" for {count}" if count > 1 else ""
+                lead = f"You're on the list{party} for {title}." if resp == "yes" else f"Thanks - I've got you down as a maybe for {title}."
+                paras = [f"Hi {first},", lead + (f" {details}." if details else ""),
+                         "It's in the calendar invite attached. If anything changes, you can update your RSVP here:", "__LINK__",
+                         f"See you there! If you have any questions, {reach}."]
+    elif template == "visitor_confirmation":
         street = _street(v.get("property_address") or v.get("test_property_address") or "")
         subject = f"Following up from the open house at {street}" if street else "Following up from the open house"
         try:

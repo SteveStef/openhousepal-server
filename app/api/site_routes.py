@@ -2,7 +2,7 @@ import os
 import logging
 import secrets
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy import func, select, update
@@ -21,7 +21,7 @@ from app.schemas.site import (
 from app.services.areas import area_enrichment_service, boundary_sources, geocoding
 from app.services.website import content_adapters, domain_resolution_service, domain_verification_service, google_search_service, site_service, starter_template
 from app.services.website.site_service import InvalidHostname
-from app.utils.auth import get_current_active_user, require_plan_tier
+from app.utils.auth import get_current_active_user, require_active_plan, require_plan_tier
 
 router = APIRouter(prefix="/studio/sites", tags=["website-builder"])
 logger = logging.getLogger(__name__)
@@ -838,7 +838,7 @@ async def _enrich_area_background(area_id: str, triggering_user_id: str):
 async def get_my_served_areas(
     lite: bool = False,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+    current_user: User = Depends(require_active_plan),
 ):
     """lite=1: names + research status only (the setup town picker polls this every few seconds
     while a town is researched - each town's full facts/boundary is ~50 KB it doesn't need)."""
@@ -865,7 +865,7 @@ async def add_my_served_area(
     payload: AgentMarketAreaCreate,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+    current_user: User = Depends(require_active_plan),
 ):
     """Get-or-create the shared MarketArea (instant, zero API calls, if another agent already
     researched this town), link it to this agent, and - only for a genuinely new (or previously
@@ -957,14 +957,58 @@ async def add_my_served_area(
         background_tasks.add_task(_enrich_area_background, area.id, current_user.id)
         await db.refresh(link, attribute_names=["area"])  # so the response reflects RESEARCHING, not the stale pre-claim status
 
+    await _show_in_site_neighborhoods(db, current_user.id, area.slug)
     return link
+
+
+async def _show_in_site_neighborhoods(db: AsyncSession, owner_id: str, slug: Optional[str]) -> None:
+    """A town they just added is one of their website's neighborhoods (setup flow, user 10/22).
+    The Neighborhoods section normally lists every served town by itself; only when the agent
+    hand-picked which towns it shows ('selected') would a new one be left out - add it there, in
+    the draft and the live copy, so it shows without a trip to the editor. Best effort."""
+    if not slug:
+        return
+    try:
+        site = (await db.execute(select(Site).where(Site.owner_id == owner_id))).scalar_one_or_none()
+        if not site:
+            return
+
+        def add(blob: Optional[dict]) -> Optional[dict]:
+            if not isinstance(blob, dict) or not isinstance(blob.get("pages"), list):
+                return None
+            changed = False
+            pages = []
+            for page in blob["pages"]:
+                blocks = []
+                for b in (page.get("blocks") or []) if isinstance(page, dict) else []:
+                    if not isinstance(b, dict):
+                        blocks.append(b)
+                        continue
+                    data = b.get("data") or {}
+                    if b.get("type") == "communities" and data.get("source_mode") == "selected" and slug not in (data.get("selected_ids") or []):
+                        b = {**b, "data": {**data, "selected_ids": [*(data.get("selected_ids") or []), slug]}}
+                        changed = True
+                    blocks.append(b)
+                pages.append({**page, "blocks": blocks} if isinstance(page, dict) else page)
+            return {**blob, "pages": pages} if changed else None
+
+        draft, live = add(site.draft_data), add(site.published_snapshot)
+        if draft is not None:
+            site.draft_data = draft
+        if live is not None:
+            site.published_snapshot = live
+        if draft is not None or live is not None:
+            await db.commit()
+    except Exception:
+        logger.warning("adding a town to the Neighborhoods section failed", exc_info=True)
+        await db.rollback()
 
 
 @router.delete("/me/areas/{link_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def remove_my_served_area(
     link_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+    current_user: User = Depends(require_active_plan),
 ):
     """Removes only this agent's claim to serve the area - the shared MarketArea row (and any
     other agent's link to it) is never touched."""

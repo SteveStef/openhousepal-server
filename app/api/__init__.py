@@ -47,6 +47,7 @@ from .email_signature_routes import router as email_signature_router
 from .email_avatar_routes import router as email_avatar_router
 from .client_email_routes import router as client_email_router
 from .qr_brand_routes import router as qr_brand_router
+from .invites_routes import router as invites_router
 
 router = APIRouter()
 router.include_router(auth_router)
@@ -99,3 +100,4 @@ router.include_router(email_signature_router)
 router.include_router(email_avatar_router)
 router.include_router(client_email_router)
 router.include_router(qr_brand_router)
+router.include_router(invites_router)

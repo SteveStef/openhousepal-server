@@ -37,7 +37,7 @@ def _categorize_source(source_type: str, raw_snapshot: Optional[dict]) -> LeadSo
         if form_type == 'showcase_request':
             return 'showcase'
         return 'form'
-    if source_type in ('open_house_disclosure', 'form_partial'):
+    if source_type in ('open_house_disclosure', 'form_partial', 'invite_rsvp'):
         return 'form'
     if source_type in ('open_house_second_visit', 'property_tour', 'property_website_tour_request', 'property_page_tour_request'):
         return 'tour'
@@ -53,6 +53,8 @@ def _origin_group(e: LeadEvent) -> str:
     came = snap.get('came_from') if isinstance(snap.get('came_from'), dict) else {}
     if st in ('open_house_visitor', 'open_house_second_visit', 'open_house_disclosure'):
         return 'open_house'
+    if st == 'invite_rsvp':  # Forms & Invites -> Invites
+        return 'forms'
     if st in ('form_submission', 'form_partial'):
         return 'showcase' if snap.get('form_type') == 'showcase_request' else 'forms'
     if st in ('collection_visitor', 'property_tour', 'property_comment') or st.startswith('showcase_'):
@@ -262,7 +264,7 @@ _ENGAGEMENT_EVENT_TYPES = {'property_comment', 'property_tour', 'property_websit
                            'showcase_like', 'showcase_dislike', 'showcase_view', 'showcase_refine', 'showcase_search_changed',
                            'review_left',
                            # a question or request they sent, like the Spotlight inquiry above
-                           'blog_inquiry', 'open_house_second_visit', 'open_house_disclosure',
+                           'blog_inquiry', 'open_house_second_visit', 'open_house_disclosure', 'invite_rsvp',
                            # clicked a link in your email (an open alone isn't reliable proof)
                            'email_clicked'}
 
@@ -934,6 +936,10 @@ async def _event_link(db: AsyncSession, owner_id: str, e: LeadEvent) -> Optional
             return {"href": f"/studio/property-sites/{site.id}", "label": "Open Spotlight"}
     if st == 'review_left' and sid:
         return {"href": f"/studio/reviews?review={sid}", "label": "View Review"}
+    if st == 'invite_rsvp':
+        invite_id = (e.raw_snapshot or {}).get('invite_id')
+        if invite_id:
+            return {"href": f"/studio/forms?view=invites&invite={invite_id}", "label": "View RSVP"}
     if st == 'blog_inquiry' and sid:
         return {"href": f"/studio/blogs/{sid}", "label": "View Post"}
     if st in ('property_page_inquiry', 'property_page_tour_request'):
@@ -1064,10 +1070,13 @@ async def delete_lead(
     # Their still-open follow-ups would otherwise linger as "Follow up with ..." with no person
     # behind them (and stay on the agent's calendar). Done ones are just history - kept, unlinked.
     open_tasks = await _clear_open_followups(db, lead_id, current_user.id)
+    # And no more emails to them or Showcase updates - their Showcase is turned off, not deleted.
+    from app.services import lead_cleanup_service
+    done = await lead_cleanup_service.stop_everything(db, current_user.id, lead)
     await db.delete(lead)
     await db.commit()
     _unsync(current_user.id, open_tasks)
-    return {"success": True}
+    return {"success": True, **done, "message": lead_cleanup_service.deleted_message(done["name"], done)}
 
 
 @router.get("/{lead_id}", response_model=LeadDetailOut)

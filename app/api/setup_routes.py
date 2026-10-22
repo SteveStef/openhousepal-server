@@ -81,6 +81,47 @@ async def put_state(payload: StatePatch, db: AsyncSession = Depends(get_db), cur
     return await flow.compute(db, current_user, hub)
 
 
+@router.get("/hub-link")
+async def get_hub_link(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    """The Agent Hub step's "Your link" note: the address everything they share uses (their own
+    domain once it's connected, IDX only) and what's left to do."""
+    hub = await _hub(db, current_user)
+    return await flow.hub_link_info(db, current_user, hub)
+
+
+class WebsiteSalesPatch(BaseModel):
+    on: bool
+
+
+@router.get("/website-sales")
+async def get_website_sales(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    """Whether the IDX website's Recently Sold sections are showing (the Sales step's "Website")."""
+    return await flow.website_sales_state(db, current_user)
+
+
+@router.put("/website-sales")
+async def put_website_sales(payload: WebsiteSalesPatch, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    return await flow.set_website_sales(db, current_user, payload.on)
+
+
+class FormDefaultsPatch(BaseModel):
+    animated: Optional[bool] = None
+    show_branding: Optional[bool] = None
+    redirect_to_agent_hub: Optional[bool] = None
+
+
+@router.get("/form-defaults")
+async def get_form_defaults(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    """The Forms step's switches, read from every form the agent has (see set_form_defaults)."""
+    return await flow.form_defaults_state(db, current_user)
+
+
+@router.put("/form-defaults")
+async def put_form_defaults(payload: FormDefaultsPatch, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    """Sets animated / agent branding / after-submit on every form now, and on forms made later."""
+    return await flow.set_form_defaults(db, current_user, payload.model_dump(exclude_none=True))
+
+
 @router.post("/photo")
 async def upload_photo(file: UploadFile = File(...), db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
     """Same rules as the Agent Hub photo upload, but open before a plan is active, and it writes

@@ -90,6 +90,14 @@ class FeaturedSettings(BaseModel):
     school_districts: List[str] = []
     sort: Literal['newest', 'price_desc', 'price_asc'] = 'newest'
     prioritize_my_listings: bool = True
+    # What the page is made of, as separate tick boxes (setup + website editor, 10/22). None = an
+    # older save that only has `mode` - content_adapters.featured_sources derives them from it.
+    # `prioritize_my_listings` is the order: True = "my listings first, then the rest", False =
+    # "mix them together".
+    show_mine: Optional[bool] = None          # the agent's own active listings
+    show_area_homes: Optional[bool] = None    # homes for sale in their towns (Areas tab)
+    show_custom: Optional[bool] = None        # a hand-picked search: towns / school districts
+    area_towns: List[str] = []                # which of their towns (empty = all of them)
 
 
 class MediaSettings(BaseModel):

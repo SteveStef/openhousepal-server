@@ -1327,6 +1327,11 @@ class CollectionsService:
             # Update the status column directly
             collection.status = status
             collection.updated_at = datetime.now(timezone.utc)
+            if status == 'ACTIVE' and old_status != 'ACTIVE' and collection.visitor_email:
+                # Turned off when their lead was deleted (lead_cleanup_service) - turning it back on
+                # means the agent wants them getting its updates again.
+                from app.services.client_email_service import lift_lead_deleted
+                await lift_lead_deleted(db, user_id, collection.visitor_email)
 
             await db.commit()
 

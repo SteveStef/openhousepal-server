@@ -417,11 +417,14 @@ async def get_published_spotlights(db: AsyncSession, user: User, limit: int = 12
     return out
 
 
-def _sort_cards(cards: list[dict], sort: str) -> list[dict]:
+def _sort_cards(cards: list[dict], sort: str, mixed: bool = False) -> list[dict]:
     if sort == "price_desc":
         return sorted(cards, key=lambda c: c.get("price") or 0, reverse=True)
     if sort == "price_asc":
         return sorted(cards, key=lambda c: c.get("price") or 0)
+    if mixed:
+        # two newest-first lists merged into one: fewest days on market first (unknown last)
+        return sorted(cards, key=lambda c: (c.get("days_on_market") is None, c.get("days_on_market") or 0))
     return cards  # 'newest' - already newest-first (see get_active_listings/get_properties_by_preferences ordering)
 
 
@@ -462,46 +465,72 @@ async def get_featured_page_listings(db: AsyncSession, user: User, settings: dic
     of a filtered result rather than letting them sort in wherever the full-MLS pool puts them -
     an agent showcasing the broader market still gets to lead with their own inventory if they
     want to, see schemas.site.FeaturedSettings."""
-    mode = settings.get("mode", "my_listings")
     sort = settings.get("sort", "newest")
-    towns = settings.get("towns") or []
-    school_districts = settings.get("school_districts") or []
+    show_mine, show_areas, show_custom = featured_sources(settings)
+    prioritize_mine = settings.get("prioritize_my_listings", True) is not False
+    min_price, max_price = _as_int(settings.get("min_price")), _as_int(settings.get("max_price"))
 
-    # 'served_areas': every home for sale in the towns the agent serves (the Areas tab), their
-    # own listings first - the right default for an agent with a thin personal inventory, whose
-    # Featured page otherwise showed one or two homes.
-    if mode == "served_areas":
-        towns = await served_area_names(db, user, 50)
-        school_districts = []
-        if not towns:
-            mode = "my_listings"
+    # Other homes for sale: (a) in the towns the agent serves (the Areas tab - optionally just
+    # some of them), the right default for an agent with a thin personal inventory, whose Featured
+    # page otherwise showed one or two homes; (b) a hand-picked full-MLS search (towns / school
+    # districts). Both share the price range.
+    searches: list[tuple[list[str], list[str]]] = []
+    if show_areas:
+        served = await served_area_names(db, user, 50)
+        picked = {t.strip().lower() for t in (settings.get("area_towns") or []) if isinstance(t, str)}
+        towns = [t for t in served if t.lower() in picked] if picked else served
+        if towns:
+            searches.append((towns, []))
+    if show_custom:
+        towns = settings.get("towns") or []
+        districts = settings.get("school_districts") or []
+        if towns or districts:
+            searches.append((list(towns), list(districts)))
 
-    if mode not in ("filtered", "served_areas") or not (towns or school_districts):
-        cards = await get_active_listings(db, user, limit)
-        return _sort_cards(cards, sort)[:limit]
+    own = await get_active_listings(db, user, limit) if (show_mine or not searches) else []
+    if not searches:
+        # Only their own listings (or nothing else is set up yet) - today's original page.
+        return _sort_cards(own, sort)[:limit]
 
-    prefs = _build_property_preferences(
-        cities=towns or None,
-        min_price=_as_int(settings.get("min_price")),
-        max_price=_as_int(settings.get("max_price")),
-    )
-    if school_districts:
-        prefs.school_districts = list(school_districts)
-    prioritize_mine = settings.get("prioritize_my_listings", True) or mode == "served_areas"
-    results = await PropertyService.get_properties_by_preferences(db, prefs, max_properties=limit * 2 if prioritize_mine else limit)
-    results = [p for p in results if geography.is_residential_for_sale(getattr(p, "home_type", None), getattr(p, "price", None))]
-    cards = await apply_idx_rules(db, [_listing_card(p) for p in results])
-
-    if not prioritize_mine:
-        return await _attach_spotlight_urls(db, user, await _backfill_photo_arrays(db, _sort_cards(cards, sort)[:limit]))
-
-    # Own listings always lead the page regardless of sort choice - each group is independently
-    # sorted by the chosen order rather than sorting the merged list, which would let full-MLS
-    # results intermix ahead of this agent's own inventory on a price sort.
-    own = await get_active_listings(db, user, limit)
+    others: list[dict] = []
     seen = {c["listing_key"] for c in own}
-    others = [c for c in cards if c["listing_key"] not in seen]
-    return await _attach_spotlight_urls(db, user, await _backfill_photo_arrays(db, (_sort_cards(own, sort) + _sort_cards(others, sort))[:limit]))
+    for towns, districts in searches:
+        prefs = _build_property_preferences(cities=towns or None, min_price=min_price, max_price=max_price)
+        if districts:
+            prefs.school_districts = districts
+        results = await PropertyService.get_properties_by_preferences(db, prefs, max_properties=limit * 2)
+        results = [p for p in results if geography.is_residential_for_sale(getattr(p, "home_type", None), getattr(p, "price", None))]
+        for c in await apply_idx_rules(db, [_listing_card(p) for p in results]):
+            if c["listing_key"] not in seen:
+                seen.add(c["listing_key"])
+                others.append(c)
+
+    if prioritize_mine:
+        # "My listings first, then the rest": own listings always lead regardless of sort - each
+        # group is sorted on its own, so full-MLS results never jump ahead of their inventory.
+        merged = _sort_cards(own, sort) + _sort_cards(others, sort)
+    else:
+        # "Mix them together": one list in the chosen order (newest = fewest days on market).
+        merged = _sort_cards(own + others, sort, mixed=True)
+    return await _attach_spotlight_urls(db, user, await _backfill_photo_arrays(db, merged[:limit]))
+
+
+def featured_sources(settings: dict) -> tuple[bool, bool, bool]:
+    """(own listings, homes in their towns, hand-picked search) for a Featured page. Saves from
+    before 10/22 only have `mode` - read them the way they always worked: 'my_listings' = own
+    only; 'served_areas' = own + their towns; 'filtered' = the search, with their own listings
+    only when 'prioritize' was on."""
+    mode = settings.get("mode", "my_listings")
+    mine = settings.get("show_mine")
+    areas = settings.get("show_area_homes")
+    custom = settings.get("show_custom")
+    if mine is None:
+        mine = mode != "filtered" or settings.get("prioritize_my_listings", True) is not False
+    if areas is None:
+        areas = mode == "served_areas"
+    if custom is None:
+        custom = mode == "filtered"
+    return bool(mine), bool(areas), bool(custom)
 
 
 
@@ -696,6 +725,40 @@ async def get_recent_sales(
             sales.append(apply_recent_sale_defaults(sale))
     sales.sort(key=lambda s: str(s.get("sold_date") or ""), reverse=True)
     return (await apply_idx_rules(db, sales))[:limit]
+
+
+async def hub_sales_rules(db: AsyncSession, user: User) -> dict:
+    """The agent's sales choices from their Agent Hub settings (setup flow's Sales step / Agent
+    Hub editor) that the website follows too: the minimum price a sale must clear to be shown,
+    the order sales are listed in, whether sold stats show, and which form buttons show."""
+    cfg = (await db.execute(select(AgentHub.config).where(AgentHub.owner_id == user.id))).scalar_one_or_none() or {}
+    try:
+        min_price = int(cfg.get("salesMinPrice") or 0)
+    except (TypeError, ValueError):
+        min_price = 0
+    sort = cfg.get("salesSort") if cfg.get("salesSort") in ("newest", "price-high", "price-low") else "newest"
+    buttons = cfg.get("hubFormButtons")
+    return {
+        "min_price": max(0, min_price), "sort": sort, "show_stats": cfg.get("showSalesStats") is not False,
+        "form_buttons": [b for b in buttons if isinstance(b, str)] if isinstance(buttons, list) else None,
+    }
+
+
+def apply_sales_rules(sales: list[dict], rules: dict) -> list[dict]:
+    """Drops sales under the minimum price and orders them (newest is how they already come)."""
+    out = [s for s in sales if not rules.get("min_price") or (s.get("price") or 0) >= rules["min_price"]]
+    if rules.get("sort") == "price-high":
+        out.sort(key=lambda s: s.get("price") or 0, reverse=True)
+    elif rules.get("sort") == "price-low":
+        out.sort(key=lambda s: s.get("price") or 0)
+    return out
+
+
+def stats_shown(stats: Optional[dict], rules: dict) -> Optional[dict]:
+    """Sold count / volume blanked while the agent hides their sold stats (active listings stay)."""
+    if stats is None or rules.get("show_stats", True):
+        return stats
+    return {**stats, "sold_count": 0, "sold_volume": 0}
 
 
 async def get_agent_stats(db: AsyncSession, user: User) -> dict:
@@ -914,13 +977,15 @@ async def get_agent_hub_snapshot(db: AsyncSession, user: User) -> dict:
     visible = {s["id"] for s in layout_sections if s.get("visible", True)}
 
     profile = await get_agent_profile(db, user)
-    profile["stats"] = await get_agent_stats(db, user)
+    # The hub's own sales choices (min price, order, sold stats on/off, form buttons) apply here too.
+    rules = await hub_sales_rules(db, user)
+    profile["stats"] = stats_shown(await get_agent_stats(db, user), rules)
     hub_media = await get_agent_hub_media(db, user, limit=12) if (visible & {"videos", "tours"}) else {"videos": [], "tours": []}
-    recent_sales = await get_recent_sales(db, user, limit=8) if "sales" in visible else []
+    recent_sales = apply_sales_rules(await get_recent_sales(db, user, limit=24), rules)[:8] if "sales" in visible else []
     listings = await get_active_listings(db, user, limit=8) if "listings" in visible else []
     blog_posts = await get_blog_posts(db, user, limit=6) if "blogs" in visible else []
     forms = await get_forms_list(db, user)
-    forms_by_type = {f["form_type"]: f for f in forms}
+    forms_by_type = {f["form_type"]: f for f in forms if rules["form_buttons"] is None or f["form_type"] in rules["form_buttons"]}
     return {
         "agent_hub_slug": hub.slug if hub else None,
         "profile": profile,
@@ -1965,7 +2030,8 @@ async def hydrate_page_blocks(db: AsyncSession, user: User, page: dict, featured
     # the fetch has to happen per-block, inside resolve_block below, once we know the block is
     # actually present.
     if "recent_sales" in types_present:
-        fetched["recent_sales"] = await get_recent_sales(db, user, _SELECTED_MODE_FETCH_CAP)
+        # the Agent Hub's minimum price + order (setup flow's Sales step) apply on the website too
+        fetched["recent_sales"] = apply_sales_rules(await get_recent_sales(db, user, _SELECTED_MODE_FETCH_CAP), await hub_sales_rules(db, user))
     if "open_houses" in types_present:
         fetched["open_houses"] = await get_open_houses(db, user, _SELECTED_MODE_FETCH_CAP, upcoming_only=True)
     if "blog_posts" in types_present:
@@ -2040,13 +2106,16 @@ async def hydrate_page_blocks(db: AsyncSession, user: User, page: dict, featured
             data["resolved"] = items
             if block_type == "recent_sales":
                 data["headline"] = sales_words(data.get("headline") or "Recently Sold", sales_recent)
+                # "Show my sold stats" off (setup Sales step) hides the "N Homes Sold · $X in
+                # Volume" line here too - the sold homes themselves still show.
+                data["show_stats"] = (await hub_sales_rules(db, user)).get("show_stats", True)
         elif block_type == "heading_text" and data.get("text"):
             data["text"] = sales_words(data["text"], sales_recent)
         elif block_type == "about_agent" and profile:
             # Source + override: real profile data first, then the agent's website-only field
             # overrides (see SiteBlockType docstring) layered on top, never mutating AgentHub.
             overrides = {k: v for k, v in (data.get("overrides") or {}).items() if v}
-            data["resolved"] = {**profile, **overrides, "stats": agent_stats}
+            data["resolved"] = {**profile, **overrides, "stats": stats_shown(agent_stats, await hub_sales_rules(db, user))}
         elif block_type == "contact_cta" and profile:
             # A blank phone/email falls back to the agent's real profile, so a Contact Band added
             # from the editor's catalogue works the moment it lands (typed values still win).
@@ -2105,4 +2174,14 @@ async def resolve_theme(db: AsyncSession, user: User, theme: dict) -> dict:
     merged["body_font"] = brand["body_font"]
     if brand.get("logo_url"):
         merged["logo_url"] = brand["logo_url"]
+    # The Brand Kit's LOOK (Classic / Luxe, metal, Ivory / Midnight) - only once the agent has
+    # saved one, so every site that was already following the kit keeps its template until then.
+    from app.services import brand_look_service
+    look = brand_look_service.look_of(user, None)
+    if look["saved"]:
+        merged["template"] = "luxe" if look["theme"] == "luxe" else "default"
+        merged["mode"] = "dark" if look["dark"] else "light"
+        merged["luxe_metal"] = look["metal"]
+        if look["theme"] != "luxe":
+            merged["secondary_color"] = brand_look_service.classic_accent(brand["secondary_color"])
     return merged

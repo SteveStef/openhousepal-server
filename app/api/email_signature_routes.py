@@ -58,7 +58,17 @@ async def get_my_email_signature(
     current_user: User = Depends(require_email_signature_access),
 ):
     signature = await _get_or_create_signature(db, current_user.id)
-    return {"id": signature.id, "config": email_signature_service.resolve_signature_config(signature.config)}
+    # "My Brand Kit" (the default for a signature that was never styled): the brand look is
+    # written into the config so every image endpoint renders it (brand_look_service).
+    from app.services import brand_look_service
+    look = await brand_look_service.get_look(db, current_user)
+    if brand_look_service.signature_follows_brand(signature.config):
+        nxt = brand_look_service.signature_config_with_brand(signature.config, look, current_user)
+        if nxt != (signature.config or {}):
+            signature.config = nxt
+            await db.commit()
+        return {"id": signature.id, "config": email_signature_service.resolve_signature_config(nxt), "brand_look": look}
+    return {"id": signature.id, "config": email_signature_service.resolve_signature_config(signature.config), "brand_look": look}
 
 
 @router.put("/me")
@@ -81,6 +91,10 @@ async def update_my_email_signature(
     for key in _INSTALL_KEYS:
         if key in (signature.config or {}):
             next_config[key] = signature.config[key]
+    # Following the Brand Kit: the look comes from the Brand Kit, whatever the editor sent.
+    from app.services import brand_look_service
+    if next_config.get("lookSource") == "brand":
+        next_config = brand_look_service.signature_config_with_brand(next_config, await brand_look_service.get_look(db, current_user), current_user)
     signature.config = next_config
     if not signature.public_token:
         signature.public_token = secrets.token_urlsafe(24)

@@ -315,7 +315,7 @@ async def wizard_comps(db: AsyncSession, subject: dict, as_of: date) -> tuple[li
         )
         out = await cma_service.auto_search_comparables(db, req, today=as_of)
         res = sorted((c for c in out["results"] if isinstance(c.match_score, int)), key=lambda c: -c.match_score)
-        eligible = [c for c in res if _pickable(c)]
+        eligible = cma_service.era_first([c for c in res if _pickable(c)], subject.get("year_built"))
         picks = [c for i, c in enumerate(eligible) if i < 3 or (i < _MAX_COMPS and c.match_score >= _AUTO_PICK_EXTRA_MIN_SCORE)]
         return picks, {"search_steps": out["steps"], "radius_miles": out["radius_miles"], "sold_within_days": out["sold_within_days"],
                        "limited": out["limited"], "price_band": out["price_band"], "min_beds": min_beds, "candidates": len(res)}

@@ -216,7 +216,7 @@ class AgentForm(Base):
     dark_mode = Column(Boolean, default=False, nullable=False)  # Force dark theme for visitors on this form's public page
     # The form's look: 'hub' = whatever the Agent Hub wears (theme, colour/finish, light/dark);
     # 'custom' = its own - look_theme 'classic' (accent_color) or 'luxe' (luxe_metal), dark_mode.
-    look_mode = Column(String, default='hub', server_default='hub', nullable=False)
+    look_mode = Column(String, default='brand', server_default='hub', nullable=False)  # 'brand' (Brand Kit) | 'custom' | 'hub' (legacy)
     look_theme = Column(String, nullable=True)
     luxe_metal = Column(String, nullable=True)
     redirect_to_agent_hub = Column(Boolean, default=True, nullable=False)  # After submitting, auto-redirect the visitor to the agent's public Agent Hub
@@ -2665,3 +2665,78 @@ class BuyerCashNeeded(Base):
 
     owner = relationship("User")
 
+
+
+# ---------------------------------------------------------------------------------------------
+# Invites (Forms & Invites -> Invites): an agent's invitation to an open house, a broker's open,
+# a client event / dinner, or anything custom - a designed invitation page at /i/<code> (or on the
+# agent's own IDX domain) where guests RSVP. Client RSVPs become Leads (source_type 'invite_rsvp');
+# agent RSVPs (broker's opens) never do. See app/services/invites_service.py.
+# ---------------------------------------------------------------------------------------------
+class EventInvite(Base):
+    __tablename__ = "event_invites"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    code = Column(String(16), nullable=False, unique=True, index=True)  # the short public link: /i/<code>
+    invite_type = Column(String(24), nullable=False)  # open_house | brokers_open | client_event | custom
+    audience = Column(String(12), nullable=False, default='clients')  # clients (RSVPs -> Leads) | agents (never Leads)
+    title = Column(String(140), nullable=False)
+    message = Column(Text, nullable=True)  # the host's note on the invitation
+    event_date = Column(Date, nullable=True)
+    start_time = Column(String(5), nullable=True)  # 'HH:MM' Eastern wall clock (like tours / open houses)
+    end_time = Column(String(5), nullable=True)
+    place_name = Column(String(140), nullable=True)  # "The Smith residence", "Vetri Cucina"
+    address = Column(String(300), nullable=True)
+    linked_property = Column(JSONB, nullable=True)  # snapshot: {listing_key, address, city, state, zipcode, price, beds, baths, sqft, image, photos}
+    cover_image_url = Column(String(1000), nullable=True)
+    design = Column(String(24), nullable=False, default='classic')  # classic | garden | midnight | modern
+    accent_color = Column(String(9), nullable=True)
+    questions = Column(JSONB, nullable=False, default=list)  # same shape as AgentForm.questions (+ optional 'role')
+    status = Column(String(12), nullable=False, default='live')  # live | closed (RSVPs closed, page still opens)
+    view_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    rsvps = relationship("EventInviteRsvp", back_populates="invite", cascade="all, delete-orphan", passive_deletes=True)
+
+
+class EventInviteRsvp(Base):
+    __tablename__ = "event_invite_rsvps"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    invite_id = Column(String, ForeignKey('event_invites.id', ondelete='CASCADE'), nullable=False, index=True)
+    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    # The guest's private key to come back and change their answer (kept in their browser and in
+    # their confirmation email's link) - never shown to anyone else.
+    token = Column(String(48), nullable=False, unique=True, index=True)
+    response = Column(String(8), nullable=False)  # yes | maybe | no
+    name = Column(String(140), nullable=True)
+    email = Column(String(200), nullable=True)
+    phone = Column(String(40), nullable=True)
+    guest_count = Column(Integer, nullable=False, default=1)  # people coming, them included (0 when 'no')
+    answers = Column(JSONB, nullable=False, default=list)  # [{questionId, label, type, value}]
+    lead_id = Column(String, ForeignKey('leads.id', ondelete='SET NULL'), nullable=True)
+    is_seen = Column(Boolean, nullable=False, default=False)  # the agent has looked at it
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    invite = relationship("EventInvite", back_populates="rsvps")
+
+
+class EventInviteRecipient(Base):
+    """Someone the agent emailed the invitation to (Share -> Email a list), so "Resend" can nudge
+    only the people who haven't answered yet."""
+    __tablename__ = "event_invite_recipients"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    invite_id = Column(String, ForeignKey('event_invites.id', ondelete='CASCADE'), nullable=False, index=True)
+    email = Column(String(200), nullable=False)
+    name = Column(String(140), nullable=True)
+    send_count = Column(Integer, nullable=False, default=1)
+    last_sent_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('invite_id', 'email', name='uq_event_invite_recipients_invite_email'),
+    )

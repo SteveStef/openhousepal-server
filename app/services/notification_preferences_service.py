@@ -23,7 +23,7 @@ CATEGORIES: Dict[str, dict] = {
         "help": "Someone submitted one of your forms or asked for something, and a wrap-up of each open house's guests (sent 2 hours after the last sign-in).",
         "types": [
             "OPEN_HOUSE_SIGN_IN", "FORM_SUBMISSION", "OPEN_HOUSE_FORM_REQUEST", "PROPERTY_INQUIRY",
-            "OPEN_HOUSE_DISCLOSURE", "OPEN_HOUSE_SECOND_VISIT", "PORTAL_LEAD", "LEAD",
+            "OPEN_HOUSE_DISCLOSURE", "OPEN_HOUSE_SECOND_VISIT", "PORTAL_LEAD", "LEAD", "INVITE_RSVP",
         ],
     },
     # Direct asks from a client - each one also makes a follow-up, so they email right away by
@@ -100,11 +100,12 @@ CATEGORIES: Dict[str, dict] = {
 CHANNELS = ("email", "push")
 
 # Default state per channel, per category. Push is off by default everywhere (it doesn't exist
-# yet); email defaults on for everything except the noisier low-signal categories.
+# yet); email defaults on for everything except AI media and their own listing changing (owner,
+# 10/22: agents do not need those two).
 _CATEGORY_DEFAULTS: Dict[str, Dict[str, bool]] = {
     "leads":             {"email": True,  "push": False},
     "showcase_requests": {"email": True,  "push": False},
-    "showcase_activity": {"email": False, "push": False},
+    "showcase_activity": {"email": True,  "push": False},
     "showcase_digest":   {"email": True,  "push": False},
     "spotlight_weekly":  {"email": True,  "push": False},
     "liked_homes":       {"email": True,  "push": False},

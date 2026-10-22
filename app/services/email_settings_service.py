@@ -58,9 +58,9 @@ RECEIVE_TIERS: list[dict[str, Any]] = [
     {"tier": 1, "title": "Most important", "blurb": "Someone wants you right now - leave these on.",
      "categories": ["leads", "showcase_requests", "host_requests"]},
     {"tier": 2, "title": "Good to know", "blurb": "Round-ups and news, at most a few a day.",
-     "categories": ["showcase_digest", "liked_homes", "reviews", "spotlight_weekly", "team"]},
+     "categories": ["showcase_digest", "liked_homes", "showcase_activity", "reviews", "spotlight_weekly", "team"]},
     {"tier": 3, "title": "Extras", "blurb": "Nice to have - most agents leave these off.",
-     "categories": ["showcase_activity", "listing_updates", "ai_media"]},
+     "categories": ["listing_updates", "ai_media"]},
 ]
 ALWAYS_ON = ["Sign-in codes and password resets", "Billing and plan notices", "Support replies and connection problems"]
 

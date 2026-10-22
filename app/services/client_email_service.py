@@ -59,6 +59,10 @@ SCANNER_WINDOW = timedelta(seconds=20)
 # Lead history entries that aren't the person doing something.
 _NOT_ENGAGEMENT = {"showcase_emails_off", "email_unsubscribed", "email_weekly", "email_paused", "email_resumed"}
 WEEKLY_TEMPLATE = "showcase_weekly_digest"
+# ClientEmailPref.manual when the agent deleted this person's lead (lead_cleanup_service): off like
+# "off", but lifted by itself when they become a lead again or the agent turns their Showcase back on.
+LEAD_DELETED = "lead_deleted"
+MANUAL_OFF = ("off", LEAD_DELETED)
 
 
 def _norm(email: Optional[str]) -> str:
@@ -95,6 +99,9 @@ def decide(emails: list[dict], *, manual: Optional[str], reset_at: Optional[date
         return {"mode": "off", "reason": "Unsubscribed from emails", "unopened": 0, "unopened_days": 0, "weekly_unopened": 0, "code": "unsubscribed"}
     if manual == "off":
         return {"mode": "off", "reason": "Turned off by you", "unopened": 0, "unopened_days": 0, "weekly_unopened": 0, "code": "manual_off"}
+    if manual == LEAD_DELETED:
+        return {"mode": "off", "reason": "You deleted their lead, so automatic emails to them stopped", "unopened": 0, "unopened_days": 0,
+                "weekly_unopened": 0, "code": "lead_deleted"}
     start = max([d for d in (reset_at, last_engaged) if d] or [None]) if (reset_at or last_engaged) else None
     unopened = [e for e in emails
                 if e.get("sent_at") and (start is None or e["sent_at"] > start) and e["sent_at"] <= now - GRACE
@@ -168,7 +175,7 @@ async def refresh_status(db, owner_id: str, email: str, *, announce: bool = True
     d = decide(await _emails_for(db, owner_id, email), manual=pref.manual, reset_at=pref.reset_at,
                last_engaged=await _last_engaged(db, owner_id, email), unsubscribed=unsub)
     old = pref.mode or "daily"
-    if d["mode"] != old and not unsub and pref.manual != "off":
+    if d["mode"] != old and not unsub and pref.manual not in MANUAL_OFF:
         pref.mode, pref.changed_at = d["mode"], _now()
         pref.reason = d["reason"] or (f"Back on - {trigger}" if trigger else "Back on")
         if announce:
@@ -451,6 +458,31 @@ async def set_manual(db, owner_id: str, email: str, on: bool) -> dict:
                                summary="Automatic emails turned off by you", raw_snapshot={"to": "off"})
     await db.commit()
     return await status_for(db, owner_id, email)
+
+
+async def stop_for_deleted_lead(db, owner_id: str, email: Optional[str]) -> bool:
+    """Their lead was deleted: no more automatic emails to them (shown as off, with why, on the
+    Emails page). An agent's own "off" stays as it is. Doesn't commit."""
+    email = _norm(email)
+    if not email:
+        return False
+    pref = await _pref(db, owner_id, email)
+    if pref.manual != "off":
+        pref.manual, pref.mode, pref.changed_at = LEAD_DELETED, "off", _now()
+        pref.reason = "You deleted their lead"
+    return True
+
+
+async def lift_lead_deleted(db, owner_id: str, email: Optional[str]) -> None:
+    """They're a lead again (or the agent turned their Showcase back on): emails as normal, the
+    unopened count starting over. Only undoes stop_for_deleted_lead. Doesn't commit."""
+    email = _norm(email)
+    if not email:
+        return
+    pref = await _pref(db, owner_id, email, create=False)
+    if pref is not None and pref.manual == LEAD_DELETED:
+        pref.manual, pref.mode, pref.reset_at, pref.changed_at = None, "daily", _now(), _now()
+        pref.reason = "Back on - they're one of your leads again"
 
 
 def _rate(sent: int, opened: int) -> Optional[int]:

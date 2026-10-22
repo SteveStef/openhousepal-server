@@ -792,9 +792,13 @@ async def get_or_create_forms(db: AsyncSession, owner_id: str) -> List[AgentForm
 
     if missing_types:
         next_order = max((form.order_index for form in all_forms), default=-1) + 1
+        # The agent's defaults for every form (setup flow's Forms step) - a pre-made form that
+        # arrives later (a new form type) starts with them too.
+        from app.services.setup_flow_service import apply_form_defaults, form_defaults_of
+        form_defaults = form_defaults_of((await db.execute(select(User).where(User.id == owner_id))).scalar_one_or_none())
         for form_type in missing_types:
             defaults = DEFAULT_FORMS[form_type]
-            db.add(AgentForm(
+            new_form = AgentForm(
                 owner_id=owner_id,
                 form_type=form_type,
                 slug=defaults["slug"],
@@ -807,7 +811,9 @@ async def get_or_create_forms(db: AsyncSession, owner_id: str) -> List[AgentForm
                 success_message=defaults["success_message"],
                 accent_color=defaults["accent_color"],
                 order_index=next_order,
-            ))
+            )
+            apply_form_defaults(new_form, form_defaults)
+            db.add(new_form)
             next_order += 1
 
         await db.commit()
@@ -1466,6 +1472,9 @@ async def create_form(
         accent_color=BRAND_ACCENT,
         order_index=next_order,
     )
+    # The agent's defaults for every form (setup flow's Forms step: animated, branding, after-submit).
+    from app.services.setup_flow_service import apply_form_defaults, form_defaults_of
+    apply_form_defaults(form, form_defaults_of(current_user))
     db.add(form)
     await db.commit()
     await db.refresh(form)
@@ -1535,7 +1544,7 @@ async def reset_form_to_default(
     form.accent_color = defaults["accent_color"]
     form.show_branding = True
     form.dark_mode = False
-    form.look_mode = 'hub'
+    form.look_mode = 'brand'
     form.look_theme = None
     form.luxe_metal = None
     form.redirect_to_agent_hub = True
@@ -1816,7 +1825,7 @@ _HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 def _apply_look(form: AgentForm, payload) -> None:
     """Look fields from an update (one form, or every form at once) - unknown values ignored."""
-    if payload.look_mode in ("hub", "custom"):
+    if payload.look_mode in ("brand", "hub", "custom"):
         form.look_mode = payload.look_mode
     if payload.look_theme in ("classic", "luxe"):
         form.look_theme = payload.look_theme
@@ -1824,12 +1833,23 @@ def _apply_look(form: AgentForm, payload) -> None:
         form.luxe_metal = payload.luxe_metal
 
 
-def resolve_form_look(form: AgentForm, hub_config: dict, owner) -> dict:
-    """What a visitor sees: the Agent Hub's look when the form matches it, else the form's own.
+def resolve_form_look(form: AgentForm, hub_config: dict, owner, brand_look: Optional[dict] = None) -> dict:
+    """What a visitor sees: 'brand' (the default) = the agent's Brand Kit look; 'custom' = the
+    form's own; 'hub' (legacy, before the Brand Kit became the one source) = the Agent Hub's look as
+    visitors see it (which is itself the Brand Kit while the hub follows it).
     Luxe is IDX only (same rule as the hub) - otherwise it shows as Classic."""
     from app.utils.auth import luxe_theme_allowed
+    from app.services import brand_look_service
     cfg = hub_config or {}
-    if (form.look_mode or "hub") == "hub":
+    mode = form.look_mode or "hub"
+    if mode == "brand" and brand_look is None:
+        mode = "hub"
+    if mode == "brand":
+        bl = brand_look_service.form_brand_look(brand_look)
+        theme, accent, metal, dark = bl["theme"], bl["accent"], bl["metal"], bl["dark"]
+    elif mode == "hub":
+        if brand_look is not None:
+            cfg = brand_look_service.hub_config_with_brand(cfg, brand_look)
         theme = cfg.get("hubTheme") or "classic"
         accent = cfg.get("hubAccent")
         metal = cfg.get("hubLuxeMetal")
@@ -2011,7 +2031,8 @@ async def get_public_form(
         example_properties = _get_example_properties_for_showcase(hub.config or {})
 
     hub_live = _agent_hub_is_live(agent, hub)
-    look = resolve_form_look(form, hub.config or {}, agent)
+    from app.services import brand_look_service
+    look = resolve_form_look(form, hub.config or {}, agent, await brand_look_service.get_look(db, agent))
     campaign_redirect, after_submit_mode, after_submit_url = campaign_after_submit(await active_campaign_for_token(db, form.id, c), hub_live)
 
     return PublicAgentFormResponse(

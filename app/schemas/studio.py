@@ -1,7 +1,7 @@
 import re
 
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional
+from typing import Literal, Optional
 from datetime import datetime
 
 
@@ -16,9 +16,18 @@ class BrandKitResponse(BaseModel):
     brokerage_logo_url: Optional[str] = None
     disclaimer_text: Optional[str] = None
     updated_at: Optional[datetime] = None
+    # The brand LOOK (services/brand_look_service): {theme, shown_theme, metal, dark, accent,
+    # primary, saved}. Every feature on "My Brand Kit" wears it.
+    look: Optional[dict] = None
 
     class Config:
         from_attributes = True
+
+
+class BrandLookUpdate(BaseModel):
+    theme: Optional[Literal['classic', 'luxe']] = None
+    metal: Optional[Literal['gold', 'silver', 'bronze']] = None
+    dark: Optional[bool] = None
 
 
 class BrandKitUpdate(BaseModel):
@@ -28,6 +37,7 @@ class BrandKitUpdate(BaseModel):
     heading_font: Optional[str] = None
     body_font: Optional[str] = None
     disclaimer_text: Optional[str] = Field(None, max_length=2000)
+    look: Optional[BrandLookUpdate] = None
 
     # Brand colors go straight into designs, Spotlight pages and email-signature HTML - only a
     # real #RGB / #RRGGBB color is accepted (a typo like "zzz" used to be saved and broke them).

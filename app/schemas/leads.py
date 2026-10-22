@@ -12,6 +12,8 @@ LeadSourceType = Literal[
     'portal_lead', 'form_partial',
     'property_page_inquiry', 'property_page_tour_request',
     'blog_inquiry',
+    # An RSVP to one of the agent's client Invites (invites_service) - broker's-open RSVPs never make leads.
+    'invite_rsvp',
     # Google One Tap on the agent's IDX website (google_visitor_service).
     'website_google_signin',
     # Done inside their Showcase / elsewhere - logged by leads_service.log_activity.

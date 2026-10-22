@@ -41,7 +41,15 @@ async def get_brand_kit(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_active_plan),
 ):
-    return await get_or_create_brand_kit(db, current_user.id)
+    return _kit_out(await get_or_create_brand_kit(db, current_user.id), current_user)
+
+
+def _kit_out(kit: StudioBrandKit, user: User) -> BrandKitResponse:
+    """The kit plus its brand LOOK (theme / metal / Ivory-Midnight - services/brand_look_service)."""
+    from app.services import brand_look_service
+    out = BrandKitResponse.model_validate(kit)
+    out.look = brand_look_service.look_of(user, kit)
+    return out
 
 
 @router.put("/brand-kit", response_model=BrandKitResponse)
@@ -50,12 +58,25 @@ async def update_brand_kit(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_active_plan),
 ):
+    from app.services import brand_look_service
+    from app.utils.auth import luxe_theme_allowed
     kit = await get_or_create_brand_kit(db, current_user.id)
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    data = payload.model_dump(exclude_unset=True)
+    look = data.pop("look", None)
+    for field, value in data.items():
         setattr(kit, field, value)
+    if look:
+        # Luxe is IDX only (same rule as the Hub / Signature / Studio Luxe).
+        if look.get("theme") == "luxe" and not luxe_theme_allowed(current_user):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Luxe is included with the IDX plan.")
+        brand_look_service.save_look(current_user, {k: v for k, v in look.items() if v is not None})
+    await db.flush()
+    # Every feature still on "My Brand Kit" picks the change up (the signature is written here;
+    # the hub, forms and IDX website read it live).
+    await brand_look_service.propagate(db, current_user)
     await db.commit()
     await db.refresh(kit)
-    return kit
+    return _kit_out(kit, current_user)
 
 
 @router.post("/brand-kit/logo/{slot}", response_model=BrandKitResponse)
@@ -97,7 +118,7 @@ async def upload_brand_logo(
     await storage_ledger_service.release(db, old_url)
     await storage_ledger_service.record(db, current_user.id, "brand_logo", url, len(contents))
 
-    return kit
+    return _kit_out(kit, current_user)
 
 
 @router.delete("/brand-kit/logo/{slot}", response_model=BrandKitResponse)
@@ -117,7 +138,7 @@ async def delete_brand_logo(
     s3_service.delete_by_url(old_url)
     await storage_ledger_service.release(db, old_url)
 
-    return kit
+    return _kit_out(kit, current_user)
 
 
 @router.post("/media", response_model=MediaUploadResponse)

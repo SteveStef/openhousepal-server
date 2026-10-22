@@ -6319,12 +6319,26 @@ def _same_municipality(a: Optional[dict], b: Optional[dict]) -> Optional[bool]:
     return (ca == cb) if (ca and cb) else None
 
 
+# school district / township / neighborhood / mailing city shares of the market-area factor (backtest knob)
+_MARKET_AREA_SHARES = tuple(float(x) for x in os.getenv("CMA_REL_MA_SHARES", "0.35,0.25,0.25,0.15").split(","))
+# "above" = above-grade finished area; "effective" = above grade + half the finished lower level (backtest knob)
+_RELEVANCE_SIZE_BASIS = os.getenv("CMA_REL_SIZE_BASIS", "above")
+
+
+def _relevance_size(d: dict) -> Optional[float]:
+    ag = _v10_sqft(d)
+    if _RELEVANCE_SIZE_BASIS != "effective" or not ag:
+        return ag
+    bg = _v10_finished_below_grade_sqft(d) or 0.0
+    return ag + 0.5 * bg
+
+
 def _relevance_market_area_score(subject: dict, comp: dict) -> tuple[Optional[float], dict]:
     fields = (
-        ("school_district", ("school_district", "school_district_name"), 0.35),
-        ("township", ("township", "municipality"), 0.25),
-        ("neighborhood", ("subdivision_name", "neighborhood", "neighborhood_name"), 0.25),
-        ("city", ("city",), 0.15),
+        ("school_district", ("school_district", "school_district_name"), _MARKET_AREA_SHARES[0]),
+        ("township", ("township", "municipality"), _MARKET_AREA_SHARES[1]),
+        ("neighborhood", ("subdivision_name", "neighborhood", "neighborhood_name"), _MARKET_AREA_SHARES[2]),
+        ("city", ("city",), _MARKET_AREA_SHARES[3]),
     )
     pieces = []
     detail = {}
@@ -6362,7 +6376,7 @@ def _continuous_relevance(
 ) -> dict:
     """Stable production relevance independent of model roles and generated narratives."""
     density = copy.deepcopy(density_context) if density_context else _relevance_density_context(subject, comps)
-    subject_sqft = _v10_sqft(subject)
+    subject_sqft = _relevance_size(subject)
     subject_lot = _relevance_lot_sqft(subject)
     subject_year = _as_float(subject.get("year_built"))
     subject_type = _type_family(subject.get("property_type") or subject.get("home_type"))
@@ -6387,7 +6401,7 @@ def _continuous_relevance(
         component_detail["market_area"] = area_detail
         if market_area is not None:
             components["market_area"] = market_area
-        comp_sqft = _v10_sqft(comp)
+        comp_sqft = _relevance_size(comp)
         if subject_sqft and comp_sqft:
             components["size"] = _half_life_decay(comp_sqft - subject_sqft, max(subject_sqft * 0.22, 400))
         elif subject_sqft:
@@ -8690,7 +8704,7 @@ def _pending_competition_review(subject: dict, homes: list, value, low, high, tr
          if _as_float((c.get("feature_adjustments") or {}).get("market_psf"))])
     strong = []
     for h in homes:
-        if h.get("status") != "pending" or (h.get("match_score") or 0) < _PENDING_STRONG_MATCH:
+        if h.get("status") != "pending" or (h.get("match_score") or 0) < _PENDING_STRONG_MATCH or h.get("new_construction"):
             continue
         iv = _pending_implied_value(subject, h, market_psf)
         if iv:
@@ -8724,8 +8738,10 @@ def _pending_competition_review(subject: dict, homes: list, value, low, high, tr
             break
     if new_v != round(v):
         shift = new_v - v
-        low = round(_as_float(low) + shift) if _as_float(low) else low
-        high = round(_as_float(high) + shift) if _as_float(high) else high
+        # whole $5K ends ($1K under $300K) - a shifted $975K-$1,175K range read "$1,002,000-$1,202,000" (V2)
+        step = 5000 if new_v >= 300000 else 1000
+        low = int(math.floor((_as_float(low) + shift) / step) * step) if _as_float(low) else low
+        high = int(math.ceil((_as_float(high) + shift) / step) * step) if _as_float(high) else high
         apc = t.get("asking_price_check") or {}
         if apc.get("passed_over") and _as_float(apc.get("asking_price")) and high and high > _as_float(apc.get("asking_price")):
             high = round(max(_as_float(apc.get("asking_price")), new_v + 1))
@@ -8747,14 +8763,19 @@ def _asking_band_review_note(trace: Optional[dict], value) -> Optional[dict]:
     if not (comps_value and v and (lo or hi)):
         return None
     gap = (v - comps_value) / comps_value
-    at_edge = bool((lo and v <= lo * 1.01 and gap > 0) or (hi and v >= hi * 0.99 and gap < 0))
-    if not at_edge or abs(gap) <= _ASKING_BAND_REVIEW_PCT:
+    # the value BEFORE any pending-home nudge is what the asking-price limits produced
+    before_nudge = _as_float((t.get("pending_competition") or {}).get("nudged_from")) or v
+    at_edge = bool((lo and before_nudge <= lo * 1.03 and gap > 0) or (hi and before_nudge >= hi * 0.97 and gap < 0))
+    # at a band edge 5%+ off the comps, or 10%+ off them for any reason (V2 Windham, 10/21: $1,090K at the
+    # floor, nudged to $1,117K by pendings - 14% over the comps' $977K - and no flag)
+    if not ((at_edge and abs(gap) > _ASKING_BAND_REVIEW_PCT) or abs(gap) > 0.10):
         return None
-    side = "raised" if gap > 0 else "lowered"
+    why = _value_vs_comps_reasons(t, v, "above" if gap > 0 else "below")
     return {"comps_value": round(comps_value), "final_value": round(v), "gap_pct": round(gap * 100, 1),
             "message": (f"Review before sending: the adjusted comparable sales point to about ${comps_value:,.0f}, "
-                        f"but the asking-price check {side} the value to ${v:,.0f} ({abs(gap) * 100:.0f}%). "
-                        "Check the comps - if closer matches exist, add them; if not, decide which number you stand behind.")}
+                        f"but the value is ${v:,.0f} ({abs(gap) * 100:.0f}% {'higher' if gap > 0 else 'lower'})"
+                        + (f" - {why}" if why else "") + ". Check the comps - if closer matches exist, add them; "
+                        "if not, decide which number you stand behind.")}
 
 
 def _apply_asking_price_check(reasoning: dict, evidence_packet: dict) -> tuple[dict, list]:
@@ -9613,6 +9634,9 @@ def _reconcile_comp_hard_facts(
                 return m.group(0)
             return f"{_c_ac:.2f}{m.group(2)}"
         _new = re.sub(r"\b(half|one|two|three|four|five|\d+(?:\.\d+)?)(-acre| acre)\b", _acre_fix, out, flags=re.IGNORECASE)
+        # "a full acre" / "an acre" / "nearly an acre" for a 0.59-acre lot (Welsh Ayres, V2 grader 10/21)
+        if not any(abs(1.0 - x) <= 0.25 * x for x in (_c_ac, _s_ac) if x > 0):
+            _new = re.sub(r"\b(?:a full|one full|a whole|an|a single)\s+acre\b(?!s)", f"{_c_ac:.2f} acres", _new, flags=re.IGNORECASE)
         if _new != out:
             out = _new
             flags.append(f"{label}: corrected a lot size the record doesn't support ({_c_ac:.2f} acres).")
@@ -9627,6 +9651,26 @@ def _reconcile_comp_hard_facts(
         if len(_kept) != len(_sents) and _kept:
             out = " ".join(_kept)
             flags.append(f"{label}: dropped a claim that its $/sqft is close to the subject's (${_cpsf:,.0f} vs ${_spsf:,.0f}).")
+    # The comp card shows $/sqft ABOVE GRADE, rounded; the AI wrote "$200.55/sqft" from total finished area
+    # (V2 Windham, 10/21). A figure that's the comp's own on either basis becomes its above-grade number.
+    _sp = _as_float(comp.get("sale_price") or comp.get("close_price"))
+    _ag = _as_float(comp.get("above_grade_finished_area")) or _as_float(comp.get("sqft"))
+    _tot = _as_float(comp.get("sqft"))
+    if _sp and _ag:
+        _ag_psf, _tot_psf = _sp / _ag, (_sp / _tot if _tot else None)
+
+        def _psf_fix(m):
+            n = _as_float(m.group(1).replace(",", ""))
+            if not n:
+                return m.group(0)
+            if abs(n - _ag_psf) / _ag_psf <= 0.03 or (_tot_psf and abs(n - _tot_psf) / _tot_psf <= 0.03):
+                return f"${round(_ag_psf):,}/sqft above grade" if abs(n - _ag_psf) / _ag_psf > 0.03 else f"${round(_ag_psf):,}/sqft"
+            return f"${round(n):,}{m.group(2)}"   # someone else's figure: just drop the cents
+        _new = re.sub(r"\$(\d[\d,]*(?:\.\d{1,2})?)(\s*/\s*sq\.?\s*ft\.?|/sf\b| per sq(?:uare)? f(?:oo)?t)", _psf_fix, out, flags=re.IGNORECASE)
+        _new = _new.replace("/sqft above grade above grade", "/sqft above grade")
+        if _new != out:
+            out = _new
+            flags.append(f"{label}: $/sqft figures put on the card's above-grade basis.")
     out, _tf = _tidy_prose(out, label)
     flags.extend(_tf)
     # "original laminate-style cabinetry" is a claim about the house's history that photos can't
@@ -12269,6 +12313,59 @@ def _drop_orphan_distress_disclaimer(methodology: str) -> tuple[str, list[str]]:
     return " ".join(kept), ["Methodology summary: dropped a 'not a sign of distress' line that wasn't about time on the market."]
 
 
+def _value_steps_from_comps(trace: Optional[dict], anchor: float, value: float, rel: str) -> str:
+    """Each step from the adjusted sales to the final value, with its number (grader, V2 Windham 10/21:
+    "spell out each step from $977K to $1.117M"). '' when the engine can't name what moved it."""
+    t = trace or {}
+    apc = t.get("asking_price_check") or {}
+    pend = t.get("pending_competition") or {}
+    lo, hi = _as_float(apc.get("allowed_low_price")), _as_float(apc.get("allowed_high_price"))
+    before = _as_float(pend.get("nudged_from")) or value
+    nudge = _as_float(pend.get("nudge_pct")) or 0
+    out = [f"Weighted together, the adjusted comparable sales point to about ${round(anchor, -3):,.0f}."]
+    band = False
+    # Client wording never says the asking price set the value (owner/grader 10/21: "homes here rarely
+    # sell this far under their asking price" read as if the seller's number decided it). The exact
+    # asking-price math is in the agent-only Review before sending note.
+    # (pending homes get their own sentence below - crediting them here too counted them twice)
+    if rel == "above" and lo and before <= lo * 1.03 and before > anchor * 1.02:
+        out.append(f"How this market prices homes like this one supports a value near ${round(before, -3):,.0f}.")
+        band = True
+    elif rel == "below" and hi and before >= hi * 0.97 and before < anchor * 0.98:
+        out.append(("How long this home has been on the market compared with similar homes supports"
+                    if apc.get("passed_over") else "How this market prices homes like this one supports")
+                   + f" a value near ${round(before, -3):,.0f}.")
+        band = True
+    if nudge:
+        out.append(f"Similar homes now under contract nearby are listed {'higher' if nudge > 0 else 'lower'}, which moves it "
+                   f"{'up' if nudge > 0 else 'down'} about {abs(nudge):g}% to ${round(value):,.0f}.")
+    elif band:
+        out[-1] = out[-1].rstrip(".") + f" - the final value is ${round(value):,.0f}."
+    return " ".join(out) if (band or nudge) else ""
+
+
+def _value_vs_comps_reasons(trace: Optional[dict], value: float, rel: str) -> str:
+    """Plain words for what moved the value away from the adjusted sales, from the trace: the
+    asking-price limits (value at an edge of the band) and/or pending homes (the nudge). '' if neither."""
+    t = trace or {}
+    apc = t.get("asking_price_check") or {}
+    pend = t.get("pending_competition") or {}
+    lo, hi = _as_float(apc.get("allowed_low_price")), _as_float(apc.get("allowed_high_price"))
+    before_nudge = _as_float(pend.get("nudged_from")) or value
+    reasons = []
+    _ask, _ratio = _as_float(apc.get("asking_price")), _as_float(apc.get("ratio_used"))
+    _basis = f" (${_ask:,.0f} asking x {_ratio:.2f} typical sold-to-asking" if _ask and _ratio else " ("
+    if rel == "above" and lo and before_nudge <= lo * 1.03:
+        reasons.append(f"the asking-price floor held it at about ${lo:,.0f}{_basis}, less the allowed 10-15%)")
+    if rel == "below" and hi and before_nudge >= hi * 0.97:
+        reasons.append(f"the asking-price ceiling held it at about ${hi:,.0f}{_basis}"
+                       + (", no premium once it has sat longer than its comps)" if apc.get("passed_over") else ", plus the allowed margin)"))
+    nudge = _as_float(pend.get("nudge_pct")) or 0
+    if (rel == "above" and nudge > 0) or (rel == "below" and nudge < 0):
+        reasons.append(f"pending homes under contract nearby moved it {'up' if nudge > 0 else 'down'} {abs(nudge):g}%")
+    return " and ".join(reasons)
+
+
 def _v10_reconcile_anchor_direction_prose(methodology: str, *, final: Optional[dict],
                                           trace: Optional[dict]) -> tuple[str, list[str]]:
     methodology, od_flags = _drop_orphan_distress_disclaimer(methodology)
@@ -12333,8 +12430,13 @@ def _v10_anchor_direction_core(methodology: str, *, final: Optional[dict],
         if pct > 8:
             # The reasoning model's value is the authority and its own paragraph explains it; quoting
             # a mechanical figure 15-20% away ("comps point to $1,125,000 ... lands 17% below") made
-            # the report read as contradicting itself (10/19 review, 2 of 4 buyer reports).
-            return methodology, []
+            # the report read as contradicting itself (10/19 review, 2 of 4 buyer reports). Except when
+            # the engine knows WHY it's that far off - the asking-price limits held it, or pending homes
+            # moved it (239 Windham Dr V2, 10/21: comps $977K, value $1,117K, nothing said why).
+            _steps = _value_steps_from_comps(trace, a, v, rel)
+            if not _steps:
+                return methodology, []
+            return methodology.rstrip() + " " + _steps, [f"Methodology summary: walked the value from the adjusted sales ({pct:.0f}% {rel}), step by step."]
         reason = "after weighing this home's own features and today's market"
         if rel == "below" and ((trace or {}).get("asking_price_check") or {}).get("passed_over"):
             reason = "after a small trim because it has sat on the market longer than those homes did"

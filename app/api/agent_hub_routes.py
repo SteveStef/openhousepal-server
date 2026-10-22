@@ -370,6 +370,10 @@ async def get_public_agent_hub(
     config = await live_hub_config(db, owner, hub.config or {})
     # Tagged src=hub, so a message sent from that listing's page says it came from the Agent Hub.
     config = await _with_listing_links(db, owner, config, "hub")
+    # "My Brand Kit" (the default): the hub wears the agent's Brand Kit look, read live so a
+    # Brand Kit change shows here on the next visit (services/brand_look_service).
+    from app.services import brand_look_service
+    config = brand_look_service.hub_config_with_brand(config, await brand_look_service.get_look(db, owner))
     # The Luxe hub theme is IDX only - after a downgrade the page shows the Classic look (the
     # saved choice stays, so an upgrade brings it straight back).
     if config.get("hubTheme") == "luxe" and not luxe_theme_allowed(owner):
@@ -377,6 +381,48 @@ async def get_public_agent_hub(
     # slug reflects the CURRENT canonical URL even when resolved via an old alias, so callers
     # can redirect the visitor to it.
     return {"slug": hub.slug, "config": config}
+
+
+async def hub_own_domain_base(db: AsyncSession, slug: str) -> tuple[str | None, str | None]:
+    """(canonical hub slug, "https://<own domain>" or None) for openhousepal.com/<slug>'s forward
+    to the agent's own domain. The ONE rule is site_service.owner_links().own_domain - the same one
+    that moves every link the app hands out (and the setup flow's "Your link" note,
+    setup_flow_service.hub_link_info) onto the domain: IDX plan, "use my own domain" on, website
+    published and switched on, the domain ACTIVE + primary and resolving in DNS. Plus the hub must
+    still be live for its owner (plan/subscription). Anything else - no redirect."""
+    normalized = normalize_slug(slug)
+    if not SLUG_PATTERN.fullmatch(normalized):
+        return None, None
+    # Same lookup as _resolve_public_hub (an old, rebranded-away-from slug still counts), minus its
+    # "hub has a name + contact" check - the hub's form links forward even before the hub page is built.
+    hub = (await db.execute(select(AgentHub).where(AgentHub.slug == normalized))).scalar_one_or_none()
+    if not hub:
+        hub = (await db.execute(
+            select(AgentHub).where(AgentHub.previous_slugs.op('@>')(cast([normalized], JSONB)))
+        )).scalars().first()
+    if not hub:
+        return None, None
+    owner = await db.get(User, hub.owner_id)
+    if not owner_has_access(owner, AGENT_HUB_ACCESS_TIERS):
+        return None, None
+    # Only an IDX agent with a website can have one; checked first so this public lookup never
+    # creates a site row (owner_links -> get_or_create_site), same as hub_link_info.
+    from app.models.database import Site
+    if owner.plan_tier != "IDX" or not (await db.execute(select(Site.id).where(Site.owner_id == owner.id))).first():
+        return hub.slug, None
+    links = await owner_links(db, owner, hub.slug)
+    return hub.slug, (links.base if links.own_domain else None)
+
+
+@router.get("/public/{slug}/own-domain")
+async def get_public_hub_own_domain(slug: str, db: AsyncSession = Depends(get_db)):
+    """Where openhousepal.com/<slug> forwards to (frontend proxy.ts) - {"own_domain": null} = stay."""
+    try:
+        canonical, base = await hub_own_domain_base(db, slug)
+    except Exception:  # noqa: BLE001 - fail open: the hub just stays on openhousepal.com
+        logger.exception("hub own-domain lookup failed for %s", slug)
+        canonical, base = None, None
+    return {"slug": canonical, "own_domain": base}
 
 
 @router.get("/public/{slug}/signature-card")
@@ -675,7 +721,12 @@ async def get_my_agent_hub(
     from app.services.agent_hub_video_sync import refresh_in_background, wants_sync
     if wants_sync(hub.config):
         refresh_in_background(hub.id)
-    return {"id": hub.id, "slug": hub.slug, "status": hub.status, "config": await live_hub_config(db, current_user, hub.config or {})}
+    # While the hub follows the Brand Kit the editor sees the brand look in the config (with
+    # lookSource 'brand', so a save from the editor keeps following it) - brand_look_service.
+    from app.services import brand_look_service
+    look = await brand_look_service.get_look(db, current_user)
+    config = brand_look_service.hub_config_with_brand(await live_hub_config(db, current_user, hub.config or {}), look)
+    return {"id": hub.id, "slug": hub.slug, "status": hub.status, "config": config, "brand_look": look}
 
 
 @router.put("/me/config")
