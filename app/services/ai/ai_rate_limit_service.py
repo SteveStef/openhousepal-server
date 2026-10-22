@@ -404,6 +404,88 @@ async def reserve_cma_analysis(db: AsyncSession, owner_id: str, config: dict, pl
     )
 
 
+# ---------------------------------------------------------------------------
+# CMA "Create AI Analysis" start gate: one run per report, and in-flight runs count against
+# the agent's monthly allowance (user, 10/21: "if someone starts 2 at the same time but only
+# has room for one, the second is refused cleanly instead of both running").
+# ---------------------------------------------------------------------------
+# enforce_agent_monthly_budget only sees spend that has already been RECORDED (AIUsageEvent
+# rows land as each paid pass finishes, minutes into a run). So two runs started together both
+# read the same "used" figure and both passed, and the same report could be started twice. This
+# gate runs in the route BEFORE the background run is spawned: under one lock it refuses a
+# report that is already running, and counts every other run this agent has in flight at its
+# worst-case cost (cma_ai_max_cost_per_generation_usd) on top of what's already used. A single
+# run's rule is unchanged (it starts whenever used < allowance). In-process, like
+# _InProcessLimiter above - correct for the single-worker deployment (Dockerfile runs one uvicorn
+# worker); the background runs themselves live in this process too, so a restart clears both.
+
+class CmaGenerationAlreadyRunning(Exception):
+    user_message = "This report's AI analysis is already running - it will finish on its own."
+
+
+# Same generous window as cma_service._GENERATION_STALE_AFTER_SECONDS: a hold older than this
+# belongs to a run that hung or crashed without its finally, so it stops counting.
+_CMA_HOLD_STALE_AFTER_SECONDS = 1800
+
+
+class _CmaGenerationHolds:
+    def __init__(self):
+        # report_id -> (owner_id, held_usd, monotonic start)
+        self.holds: dict[str, tuple[str, float, float]] = {}
+        self.lock = asyncio.Lock()
+
+    def prune(self) -> None:
+        now = time.monotonic()
+        for rid in [rid for rid, (_, _, t) in self.holds.items() if now - t > _CMA_HOLD_STALE_AFTER_SECONDS]:
+            self.holds.pop(rid, None)
+
+
+_cma_holds = _CmaGenerationHolds()
+
+
+def cma_generation_hold_usd(config: dict) -> float:
+    """What one in-flight CMA run is counted at until it finishes - its hard per-run cap."""
+    return float(config.get("cma_ai_max_cost_per_generation_usd") or 0.75)
+
+
+async def hold_cma_generation(db: AsyncSession, owner_id: str, report_id: str, config: dict, plan_tier: str) -> float:
+    """Claim the right to start one CMA AI run for `report_id`. Raises CmaGenerationAlreadyRunning
+    (route -> 409) if that report already has a run in flight, or AIRateLimitExceeded (route ->
+    429) if the agent's monthly allowance has no room once their other in-flight runs are counted.
+    On success the caller MUST call release_cma_generation(report_id) when the run ends, however
+    it ends. Nothing is spent or recorded here - the real reservations still happen inside the run
+    (reserve_cma_analysis / reserve_cma_reasoning)."""
+    if plan_tier not in MLS_ACCESS_TIERS:
+        raise AIRateLimitExceeded("plan_tier", "Your plan doesn't include AI CMA analysis.")
+    hold = cma_generation_hold_usd(config)
+    async with _cma_holds.lock:
+        _cma_holds.prune()
+        if report_id in _cma_holds.holds:
+            raise CmaGenerationAlreadyRunning()
+        limit = config.get("agent_monthly_ai_budget_usd_by_tier", {}).get(plan_tier)
+        if limit and owner_id not in _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS:
+            in_flight = sum(h for (o, h, _) in _cma_holds.holds.values() if o == owner_id)
+            used = await total_monthly_ai_cost(db, owner_id)
+            if used >= limit:
+                raise AIRateLimitExceeded(
+                    "agent_monthly_budget",
+                    "You've reached your AI usage limit for this month. It resets on the 1st.",
+                )
+            if used + in_flight >= limit:
+                raise AIRateLimitExceeded(
+                    "agent_monthly_budget_in_flight",
+                    "Your other CMA's AI analysis is still running, and this month's AI allowance only has "
+                    "room for that one. This one wasn't started and nothing was used - try again once it finishes.",
+                )
+        _cma_holds.holds[report_id] = (owner_id, hold, time.monotonic())
+    return hold
+
+
+async def release_cma_generation(report_id: str) -> None:
+    async with _cma_holds.lock:
+        _cma_holds.holds.pop(report_id, None)
+
+
 async def reserve_cma_reasoning(db: AsyncSession, owner_id: str, config: dict, plan_tier: str) -> Reservation:
     """Reserve the dedicated final-valuation reasoning pass independently of Claude analysis."""
     if plan_tier not in MLS_ACCESS_TIERS:

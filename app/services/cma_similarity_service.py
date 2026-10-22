@@ -267,8 +267,35 @@ def build_adaptive_proximity_context(subject: dict, references: list[dict]) -> d
     }
 
 
+# The same subject asks for its density several times in a row (the comp step's search, every refine,
+# the current-competition lookup) and it doesn't change minute to minute - its 20-mile query took
+# 0.5-4 s on the live data (10/21, slow when the rows aren't in memory). Kept per subject for 30
+# minutes; never in an accuracy-test run (the answer depends on the as-of date).
+_DENSITY_CACHE: dict = {}
+_DENSITY_CACHE_TTL_S = 1800
+
+
 async def load_local_proximity_context(db: AsyncSession, subject: dict) -> dict:
     """Load a stable, filter-independent local reference population from the MLS mirror."""
+    import time as _time
+    from app.services import cma_time_machine
+    _key = None
+    if not cma_time_machine.current():
+        _key = "|".join(str((subject or {}).get(k) or "") for k in (
+            "listing_key", "latitude", "longitude", "above_grade_finished_area", "sqft", "lot_size",
+            "year_built", "property_type", "home_type"))
+        hit = _DENSITY_CACHE.get(_key)
+        if hit and _time.monotonic() - hit[0] < _DENSITY_CACHE_TTL_S:
+            return dict(hit[1])
+    ctx = await _load_local_proximity_context(db, subject)
+    if _key:
+        if len(_DENSITY_CACHE) > 500:
+            _DENSITY_CACHE.clear()
+        _DENSITY_CACHE[_key] = (_time.monotonic(), dict(ctx))
+    return ctx
+
+
+async def _load_local_proximity_context(db: AsyncSession, subject: dict) -> dict:
     subject = dict(subject or {})
     if subject.get("listing_key"):
         authoritative = (await db.execute(

@@ -18,7 +18,9 @@ from app.schemas.cma import (
     CmaGenerateAiAnalysisRequest, CmaThemeUpdate,
 )
 from app.services import cma_ai_service, cma_service as service, cma_time_machine
-from app.services.ai.ai_rate_limit_service import AIRateLimitExceeded
+from app.services.ai.ai_rate_limit_service import (
+    AIRateLimitExceeded, CmaGenerationAlreadyRunning, hold_cma_generation, release_cma_generation,
+)
 from app.utils.auth import require_mls_access, require_broker_authorization
 
 # No router-level auth dependency (unlike open-house-manager) because this router also serves
@@ -303,12 +305,27 @@ async def generate_cma_ai_analysis(
     """Writes a short AI-drafted note per comp (ai_commentary) and a proposed value estimate
     (pricing.ai_estimate) - never overwrites the agent's own commentary/pricing, see
     cma_ai_service.py."""
+    await service.get_report(db, current_user.id, report_id)   # 404 for someone else's report
+    # Start gate (before anything is marked or spent): one run per report, and the agent's other
+    # in-flight runs count against their allowance - see ai_rate_limit_service.hold_cma_generation.
+    # Refused here, the other run's 'generating' marker is left alone.
+    from app.services.ai.ai_config_service import ai_config_service
+    try:
+        await hold_cma_generation(db, current_user.id, report_id, await ai_config_service.get_config(db), current_user.plan_tier)
+    except CmaGenerationAlreadyRunning as e:
+        raise HTTPException(status_code=409, detail=e.user_message)
+    except AIRateLimitExceeded as e:
+        raise HTTPException(status_code=429, detail=e.user_message)
+
     if payload.background:
         # Runs on its own session, untied to this request: the answer comes back at once
         # ('generating') and the page polls GET /{id} until it's 'complete' or 'failed' (with
         # generation_error saying why). Nothing the network does can break it any more.
-        await service.get_report(db, current_user.id, report_id)   # 404 for someone else's report
-        await service.mark_generation_started(db, current_user.id, report_id)
+        try:
+            await service.mark_generation_started(db, current_user.id, report_id)
+        except BaseException:
+            await release_cma_generation(report_id)
+            raise
         owner_id, tier = current_user.id, current_user.plan_tier
         opts = dict(max_photos_per_property=payload.max_photos_per_property, include_map_images=payload.include_map_images,
                     force_regenerate=payload.force_regenerate)
@@ -334,9 +351,16 @@ async def generate_cma_ai_analysis(
                 except Exception:  # noqa: BLE001
                     pass
             finally:
-                await service.mark_generation_finished(owner_id, report_id, "complete" if ok else "failed", error=err)
+                try:
+                    await service.mark_generation_finished(owner_id, report_id, "complete" if ok else "failed", error=err)
+                finally:
+                    await release_cma_generation(report_id)
 
-        task = asyncio.create_task(run())
+        try:
+            task = asyncio.create_task(run())
+        except BaseException:
+            await release_cma_generation(report_id)
+            raise
         _BACKGROUND.add(task)
         task.add_done_callback(_BACKGROUND.discard)
         return await service.get_report(db, current_user.id, report_id)
@@ -368,7 +392,10 @@ async def generate_cma_ai_analysis(
         # Clears the in-flight marker regardless of how this exited (success, a rate limit, a
         # validation HTTPException, or an unexpected error) - a no-op if generation never actually
         # started (e.g. failed validation before mark_generation_started ran).
-        await service.mark_generation_finished(current_user.id, report_id, "complete" if success else "failed")
+        try:
+            await service.mark_generation_finished(current_user.id, report_id, "complete" if success else "failed")
+        finally:
+            await release_cma_generation(report_id)
 
 
 @router.post("/{report_id}/recompute-valuation", response_model=CmaReportResponse)

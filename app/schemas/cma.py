@@ -299,6 +299,8 @@ class CmaReportListItem(BaseModel):
     export_allowed: bool = True
     qa_blocking_count: int = 0
     generation_status: Optional[Literal["generating", "complete", "failed"]] = None
+    generation_started_at: Optional[datetime] = None
+    generation_error: Optional[str] = None
     updated_at: Optional[datetime] = None
     created_at: datetime
 

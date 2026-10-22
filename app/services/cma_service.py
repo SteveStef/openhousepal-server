@@ -414,6 +414,9 @@ async def list_reports(db: AsyncSession, owner_id: str) -> List[CmaReportListIte
             export_allowed=not qa_blocking,
             qa_blocking_count=len(qa_blocking),
             generation_status=r.generation_status,
+            # The list card paces its own live % from this, and says why a run stopped.
+            generation_started_at=r.generation_started_at,
+            generation_error=r.generation_error if r.generation_status == 'failed' else None,
             updated_at=r.updated_at,
             created_at=r.created_at,
         ))
@@ -1212,7 +1215,10 @@ async def auto_search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                             detail="This is a rental listing - a CMA values a sale, so there are no sale comps to find for it.")
     family = _tf(req.property_type or (req.subject.property_type if req.subject else None))
-    widest = {"condo": AUTO_RADII["urban"][-1], "attached": AUTO_RADII["attached"][-1]}.get(family, AUTO_RURAL_EXTRA_RADII[-1])
+    # Fetch only as far as the main ladder goes (5 mi for a house); the rural 8-10 mi steps are
+    # fetched separately, only when 5 mi wasn't enough - one 10-mile fetch for every house made
+    # the comp step take 3-4 s on the live data (10/21).
+    widest = {"condo": AUTO_RADII["urban"][-1], "attached": AUTO_RADII["attached"][-1]}.get(family, AUTO_RADII["detached"][-1])
     lp = (req.subject.list_price if req.subject else None) or None
     date_to = _parse_date(req.sale_date_to) or today
     wide = req.model_copy(update={
@@ -1221,8 +1227,12 @@ async def auto_search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *
         "sale_date_to": req.sale_date_to,
         "min_price": round(lp * (1 - _AUTO_PRICE_BAND)) if lp else None, "max_price": round(lp * (1 + _AUTO_PRICE_BAND)) if lp else None,
     })
-    pool = await search_comparables(db, wide, keep_all=True, row_limit=1500)
+    pool = await search_comparables(db, wide, keep_all=True, row_limit=800)
     plan = plan_auto_search(pool, family, today=date_to)
+    if plan["radius_miles"] > widest:   # rural: still short at 5 mi - look farther
+        pool = await search_comparables(db, wide.model_copy(update={"radius_miles": AUTO_RURAL_EXTRA_RADII[-1]}),
+                                        keep_all=True, row_limit=800)
+        plan = plan_auto_search(pool, family, today=date_to)
     chosen = [c for c in pool
               if (c.distance_miles or 0) <= plan["radius_miles"]
               and (_sale_age_days(c, date_to) or 0) <= plan["sold_within_days"]]
