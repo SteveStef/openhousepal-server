@@ -62,6 +62,13 @@ def _normalize(value: Optional[str]) -> str:
     return re.sub(r"[_-]", " ", (value or "").strip().lower())
 
 
+def _district_key(value: Optional[str]) -> str:
+    """'The School District Of Philadelphia' and 'Philadelphia City' are one district (mirrors
+    lib/matchScore.ts districtKey and cma_ai_service._district_key)."""
+    t = re.sub(r"\b(the|school|district|of|sd|area|city|public|schools?|unified|regional|township|twp|boro(ugh)?)\b", " ", _normalize(value))
+    return " ".join(t.split())
+
+
 def _half_life_decay(delta: float, half_life: float) -> float:
     return math.pow(0.5, abs(delta) / half_life) if half_life > 0 else 0
 
@@ -241,8 +248,9 @@ def _market_area(p: Any, s: Any) -> Optional[float]:
         (["City", "city"], 0.15),
     ]
     pieces = []
-    for keys, w in fields:
-        sv, pv = _normalize(_get_str(s, keys)), _normalize(_get_str(p, keys))
+    for i, (keys, w) in enumerate(fields):
+        norm = _district_key if i == 0 else _normalize
+        sv, pv = norm(_get_str(s, keys)), norm(_get_str(p, keys))
         if sv and pv:
             pieces.append((1 if sv == pv else 0, w))
     den = sum(w for _, w in pieces)

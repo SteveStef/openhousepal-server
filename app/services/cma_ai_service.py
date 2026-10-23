@@ -1342,7 +1342,7 @@ def _derive_quality_from_data(subject: dict, comp: dict) -> dict:
     dimensions it can actually judge."""
     out: dict = {}
 
-    s_school, c_school = _norm_token(subject.get("school_district")), _norm_token(comp.get("school_district"))
+    s_school, c_school = _district_key(subject.get("school_district")), _district_key(comp.get("school_district"))
     matches = [m for m in (
         (s_school == c_school) if (s_school and c_school) else None,
         _same_municipality(subject, comp),
@@ -2027,7 +2027,7 @@ def _comp_evidence_score(subject: dict, comp: dict) -> dict:
         if dist > 5:
             notes.append(f"{dist:.1f} mi away")
 
-    s_school, c_school = _norm_token(subject.get("school_district")), _norm_token(comp.get("school_district"))
+    s_school, c_school = _district_key(subject.get("school_district")), _district_key(comp.get("school_district"))
     area_matches = [m for m in (
         (s_school == c_school) if (s_school and c_school) else None,
         _same_municipality(subject, comp),
@@ -6806,7 +6806,7 @@ def _v10_location_class_review(subject: dict, comps: list, evidence_by_key: dict
     and never touches a comp already rated `weak`. NOT a crude "different township => never Strong"
     rule - a single negative only trims weight; it takes >= _V10_LOC_NEG_DEMOTE to force a demote."""
     flags: list = []
-    subj_school = _norm_token(subject.get("school_district"))
+    subj_school = _district_key(subject.get("school_district"))
     subj_street_tier = _street_tier(subject)
 
     incl = [(i, c) for i, c in enumerate(comps)
@@ -6831,7 +6831,7 @@ def _v10_location_class_review(subject: dict, comps: list, evidence_by_key: dict
         if street_score is None and rc_verdict:
             street_score = {"quiet": 0.9, "neutral": 0.6, "through": 0.3}.get(rc_verdict)
 
-        c_school = _norm_token(c.get("school_district"))
+        c_school = _district_key(c.get("school_district"))
         school_match = (c_school == subj_school) if (c_school and subj_school) else None
         city_match = _same_municipality(subject, c)
         school_township = ("same" if (school_match and city_match) else
@@ -6923,7 +6923,7 @@ def _v10_condition_class_review(subject: dict, comps: list, evidence_by_key: dic
     explicit AI dismissal in its own note, or a genuinely poor physical match. Sets comp["_cond"]
     for the trace and returns qa_flags. Runs AFTER _v10_location_class_review."""
     flags: list = []
-    subj_school = _norm_token(subject.get("school_district"))
+    subj_school = _district_key(subject.get("school_district"))
     for i, c in enumerate(comps):
         if not c.get("is_included", True):
             continue
@@ -6947,7 +6947,7 @@ def _v10_condition_class_review(subject: dict, comps: list, evidence_by_key: dic
             and parts.get("area") in (None, 0.5, 1.0)
         ev_ok = score is None or score >= _V10_COND_PROMOTE_MIN_EV
 
-        c_school = _norm_token(c.get("school_district"))
+        c_school = _district_key(c.get("school_district"))
         loc_bad = bool(
             (c_school and subj_school and c_school != subj_school)
             or _same_municipality(subject, c) is False
