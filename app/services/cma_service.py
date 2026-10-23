@@ -50,6 +50,17 @@ def _missing_subject_fact(value: Any) -> bool:
     return value is None or value == "" or value == []
 
 
+def _mls_baths(prop: Property) -> Optional[float]:
+    """Bathroom count, or None when the MLS doesn't give one. Bright sends no bath count on
+    Multi-Family listings (only unit mixes), so every one arrives as 0 baths - 10/23 a duplex at
+    1703 Point Breeze Ave showed 0 baths and the "beds with no baths" junk filter threw out every
+    multi-family sale, so its comp search came back empty. Unknown, not zero."""
+    baths = getattr(prop, "bathrooms", None)
+    if not baths and getattr(prop, "mls_property_type", None) == "Multi-Family":
+        return None
+    return baths
+
+
 def _property_subject_facts(prop: Property) -> Dict[str, Any]:
     """One MLS-backed source for hard subject facts used by every match calculation."""
     raw = getattr(prop, "raw_mls_data", None) or {}
@@ -98,7 +109,7 @@ def _property_display_facts(prop: Property) -> Dict[str, Any]:
         "garage": garage,
         "basement": basement,
         "beds": getattr(prop, "bedrooms", None),
-        "baths": getattr(prop, "bathrooms", None),
+        "baths": _mls_baths(prop),
     }
 
 
@@ -111,6 +122,14 @@ async def subject_from_listing(db: AsyncSession, listing_key: str) -> Optional[D
     from app.services.property_service import PropertyService
     found = await PropertyService.get_property_by_listing_key(db, str(listing_key))
     subject = map_property_to_subject(found.model_dump(by_alias=True)) if found else {"listing_key": str(listing_key), "source": "mls"}
+    if not subject.get("baths") and _mls_baths(prop) is None:
+        # Multi-Family listing (no bath count from Bright). The same house is often also filed as
+        # a Residential listing that does carry baths - use that, else leave it for the agent.
+        twin = (await db.execute(select(Property.bathrooms).where(
+            Property.street_address == prop.street_address, Property.zipcode == prop.zipcode,
+            Property.listing_key != prop.listing_key, Property.bathrooms > 0,
+        ).order_by(Property.modification_timestamp.desc().nullslast()).limit(1))).scalar_one_or_none()
+        subject["baths"] = twin
     subject = _merge_authoritative_subject_facts(subject, prop)
     raw = getattr(prop, "raw_mls_data", None) or {}
     extra = {
@@ -972,7 +991,7 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
             below_grade_finished_area=p.below_grade_finished_area,
             lot_size=p.lot_size,
             beds=p.bedrooms,
-            baths=p.bathrooms,
+            baths=_mls_baths(p),
             year_built=p.year_built,
             architectural_style=p.architectural_style,
             levels=p.levels,
