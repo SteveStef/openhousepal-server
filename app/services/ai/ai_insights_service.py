@@ -211,6 +211,38 @@ def _lead_attention_item(lead: LeadOut) -> Optional[dict]:
     return None
 
 
+async def _email_problem_items(db: AsyncSession, owner_id: str, leads, leads_by_id) -> List[dict]:
+    """A client's email bounced or they marked it as spam (Mailgun webhooks) in the last 2 weeks:
+    the agent needs to fix the address / reach them another way. Gone once they open the lead.
+    Feeds the Dash's needs-attention list and the daily briefing's "waiting on you"."""
+    from app.models.database import ClientEmail
+    since = datetime.now(timezone.utc) - timedelta(days=14)
+    rows = (await db.execute(select(ClientEmail).where(
+        ClientEmail.owner_id == owner_id, ClientEmail.delivery.in_(("bounced", "spam")), ClientEmail.delivery_at >= since,
+    ).order_by(ClientEmail.delivery_at.desc()))).scalars().all()
+    by_email = {(l.email or "").strip().lower(): l for l in leads if l.email}
+    items, seen = [], set()
+    for r in rows:
+        raw = by_email.get(r.recipient_email)
+        if raw is None or raw.id in seen or (raw.viewed_at and r.delivery_at and raw.viewed_at > r.delivery_at):
+            continue
+        seen.add(raw.id)
+        out = leads_by_id.get(raw.id)
+        name = (out.name if out else raw.name) or r.recipient_email
+        spam = r.delivery == "spam"
+        items.append({
+            "id": f"lead-{raw.id}-email_{r.delivery}-{r.id[:8]}",
+            "kind": f"email_{r.delivery}",
+            "title": f"{name} marked your email as spam" if spam else f"{name}'s email bounced",
+            "detail": "No more emails will go to them - reach out another way." if spam
+                      else (f"{r.delivery_note}. Check the address on their lead." if r.delivery_note else "Check the address on their lead."),
+            "severity": "attention",
+            "link": f"/leads/{raw.id}",
+            "lead_name": name,
+        })
+    return items
+
+
 async def get_daily_digest(db: AsyncSession, current_user: User) -> dict:
     """Powers the Dashboard's Daily Digest panel - a "needs attention" queue (one entry per
     lead, deep-linked straight to the thing to address) plus a chronological feed of what
@@ -232,6 +264,7 @@ async def get_daily_digest(db: AsyncSession, current_user: User) -> dict:
         item for item in (_lead_attention_item(l) for l in leads_out if l.represented != 'yes')
         if item is not None and item["id"] not in dismissed_ids
     ]
+    needs_attention += [i for i in await _email_problem_items(db, current_user.id, leads, leads_by_id) if i["id"] not in dismissed_ids]
     needs_attention.sort(key=lambda i: severity_order.get(i["severity"], 3))
 
     now = datetime.now(timezone.utc)
