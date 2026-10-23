@@ -6,6 +6,7 @@ population of suitable nearby properties. Candidate properties never compute the
 """
 from __future__ import annotations
 
+import os
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -359,6 +360,7 @@ async def _load_local_proximity_context(db: AsyncSession, subject: dict) -> dict
     if subject.get("listing_key"):
         query = query.where(Property.listing_key != subject["listing_key"])
 
+    surface = await _load_price_surface(db, subject, lat, lng, subject_sqft) if PRICE_SURFACE_ENABLED else []
     rows = (await db.execute(
         query.order_by(distance_expr.asc(), Property.listing_key.asc()).limit(1000)
     )).mappings().all()
@@ -383,4 +385,57 @@ async def _load_local_proximity_context(db: AsyncSession, subject: dict) -> dict
         }
         for row in rows
     ]
-    return build_adaptive_proximity_context(subject, references)
+    ctx = build_adaptive_proximity_context(subject, references)
+    if surface:
+        ctx["_price_surface"] = surface
+    return ctx
+
+
+# Neighborhood price map (10/23): recent same-type sales of similar size around the subject, as
+# (listing_key, lat, lng, $/sqft). The Match % and the value engine read a "local price level" off it
+# for the subject and for each comp - in a city every comp shares the subject's school district,
+# township and mailing city, so those said nothing about a Grays Ferry comp ($168/sqft) for a Point
+# Breeze home ($240/sqft) half a mile away. Keys starting with "_" are never stored on a report.
+PRICE_SURFACE_ENABLED = os.getenv("CMA_PRICE_SURFACE", "1") == "1"
+PRICE_SURFACE_MILES = 6.0
+PRICE_SURFACE_DAYS = 365
+PRICE_SURFACE_SQFT_RATIO = (0.6, 1.6)
+PRICE_SURFACE_MAX_ROWS = 5000
+
+
+async def _load_price_surface(db: AsyncSession, subject: dict, lat: float, lng: float,
+                              subject_sqft: Optional[float]) -> list:
+    from app.services import cma_time_machine
+    family = property_type_family(subject.get("property_type") or subject.get("home_type"))
+    as_of = cma_time_machine.today()
+    since = (as_of - timedelta(days=PRICE_SURFACE_DAYS)).isoformat()
+    close_price = func.nullif(Property.raw_mls_data["ClosePrice"].astext, "")
+    close_date = Property.raw_mls_data["CloseDate"].astext
+    lat_offset, lng_offset = get_lat_long_offsets(lat, PRICE_SURFACE_MILES)
+    distance_expr = distance_miles_sql(Property.latitude, Property.longitude, lat, lng)
+    query = select(
+        Property.listing_key, Property.latitude, Property.longitude, Property.home_type,
+        close_price.label("close_price"),
+        func.coalesce(Property.above_grade_finished_area, Property.living_area).label("sqft"),
+    ).where(
+        Property.latitude.between(lat - lat_offset, lat + lat_offset),
+        Property.longitude.between(lng - lng_offset, lng + lng_offset),
+        Property.is_manual.is_(False),
+        func.upper(Property.home_status).like("CLOSED%"),
+        close_date >= since, close_date <= as_of.isoformat(),
+        distance_expr <= PRICE_SURFACE_MILES,
+    )
+    if subject_sqft:
+        reference_sqft = func.coalesce(Property.above_grade_finished_area, Property.living_area)
+        query = query.where(reference_sqft.between(subject_sqft * PRICE_SURFACE_SQFT_RATIO[0],
+                                                   subject_sqft * PRICE_SURFACE_SQFT_RATIO[1]))
+    rows = (await db.execute(query.order_by(distance_expr.asc()).limit(PRICE_SURFACE_MAX_ROWS))).mappings().all()
+    out = []
+    for row in rows:
+        if family and property_type_family(row["home_type"]) != family:
+            continue
+        price, sqft = _as_float(row["close_price"]), _as_float(row["sqft"])
+        if not price or price < 10000 or not sqft or sqft <= 0:
+            continue
+        out.append((str(row["listing_key"]), float(row["latitude"]), float(row["longitude"]), round(price / sqft, 2)))
+    return out

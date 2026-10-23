@@ -1240,6 +1240,8 @@ _RAW_PROPERTY_ENRICHMENT_FIELDS = {
     # and without this the model credited it with "more bedrooms on the main level" (10/20).
     "lower_level_bedrooms": "LowerLevelsTotalBedrooms",
     "lower_level_baths": "LowerLevelsTotalBaths",
+    # Listing agent's condition rating - read by the Match % condition part (10/23)
+    "property_condition": "PropertyCondition",
 }
 _RAW_PROPERTY_ENRICHMENT_KEYS = tuple(_RAW_PROPERTY_ENRICHMENT_FIELDS)
 
@@ -5374,9 +5376,26 @@ _V10_TIME_PCT_PER_YEAR = float(os.getenv("CMA_GRID_TIME_PCT_YR", "0.03"))
 # Condition (grader, 10/21): each finish / interior / exterior rating step - comp Inferior moves it up,
 # Superior down - at this x its price (so at most 3 steps). Only once the comps are rated (AI or agent).
 _V10_FEATURE_COND_PCT = float(os.getenv("CMA_GRID_COND_PCT", "0.02"))  # market change per year since the sale x its price
+# Location (10/23): this share of the gap between the comp's neighborhood price level and the subject's
+# (neighborhood price map, see _area_price_level) - a Grays Ferry sale is adjusted up toward a Point
+# Breeze subject. In a city only unless CMA_GRID_LOC_ALL=1; clamped to +-_V10_FEATURE_LOC_MAX.
+_V10_FEATURE_LOC_FRAC = float(os.getenv("CMA_GRID_LOC_FRAC", "0.5"))
+_V10_FEATURE_LOC_ALL = os.getenv("CMA_GRID_LOC_ALL", "0") == "1"
+_V10_FEATURE_LOC_MAX = 0.20
+# Condition from tiers (10/23, _condition_tier): what a home of each condition sells for vs nearby same-type
+# sales of any condition, measured on local closed sales since 10/2025 (each sale's $/sqft over the median
+# within 0.3 mi; ~1,100 Philadelphia and ~4,900 suburban sales with a known tier), smoothed to rise with
+# the tier. When the subject and the comp both have a tier, the comp moves by this x (subject index /
+# comp index - 1) and the AI-rating condition line is not applied on top.
+_V10_COND_INDEX = {
+    "urban": {0.0: 0.55, 0.5: 0.65, 1.0: 0.68, 1.5: 0.79, 2.0: 0.88, 2.5: 0.98, 3.0: 1.07, 4.0: 1.10},
+    "default": {0.0: 0.65, 0.5: 0.75, 1.0: 0.79, 1.5: 0.84, 2.0: 0.86, 2.5: 0.96, 3.0: 1.01, 4.0: 1.04},
+}
+_V10_FEATURE_COND_TIER_FRAC = float(os.getenv("CMA_GRID_COND_TIER_FRAC", "0.75"))
+_V10_FEATURE_COND_TIER_MAX = 0.40
 _V10_FEATURE_CESSPOOL_PCT = 0.04  # cesspool vs not: 4% of the comp's price...
 _V10_FEATURE_CESSPOOL_MAX = 30000  # ...up to $30K (replacement / public-sewer connection)
-_V10_FEATURE_MAX_PCT = 0.30       # net adjustment capped at +-30% of the comp's sale price
+_V10_FEATURE_MAX_PCT = float(os.getenv("CMA_GRID_MAX_PCT", "0.30"))  # net adjustment capped at +-this x the comp's sale price
 _V10_GRID_GROSS_WEIGHT_SLOPE = 1.5  # weight x (1 - 1.5 x gross adjustment %), floor 0.15
 _V10_GRID_HEAVY_GROSS = 0.25      # a comp adjusted more than this (gross) ...
 _V10_GRID_HEAVY_CAP = 0.10        # ... carries at most this share of the value
@@ -5577,7 +5596,7 @@ def _v10_grid_adjustments(subject: dict, r: dict, s_ag: float, s_bg: float, s_bg
     has more. Size ALWAYS follows the size gap (a smaller comp is adjusted up)."""
     comp, price = r["_c"], r["price"]
     out = {"size": 0.0, "below_grade": 0.0, "baths": 0.0, "garage": 0.0, "sewer": 0.0, "lot": 0.0,
-           "age": 0.0, "road": 0.0, "time": 0.0, "condition": 0.0, "notes": [],
+           "age": 0.0, "road": 0.0, "time": 0.0, "condition": 0.0, "location": 0.0, "notes": [],
            "market_psf": round(market_psf, 2),
            "size_rate_psf": round(market_psf * _V10_GRID_SIZE_FRAC, 2),
            "below_grade_rate_psf": round(market_psf * _V10_GRID_BG_FRAC, 2),
@@ -5619,14 +5638,27 @@ def _v10_grid_adjustments(subject: dict, r: dict, s_ag: float, s_bg: float, s_bg
     _q = comp.get("quality") if isinstance(comp.get("quality"), dict) else {}
     _steps = sum((1 if str(_q.get(k) or "").lower() == "below" else -1 if str(_q.get(k) or "").lower() == "above" else 0)
                  for k in ("finish_quality", "interior", "exterior"))
-    if _V10_FEATURE_COND_PCT and _steps:
+    _ap = comp.get("_area_price") if isinstance(comp.get("_area_price"), dict) else {}
+    s_tier, c_tier = _condition_tier(subject), _condition_tier(comp)
+    if _V10_FEATURE_COND_TIER_FRAC and s_tier is not None and c_tier is not None:
+        if s_tier != c_tier:
+            idx = _V10_COND_INDEX["urban" if _ap.get("urban") else "default"]
+            out["condition"] = _clamp((idx[s_tier] / idx[c_tier] - 1.0) * _V10_FEATURE_COND_TIER_FRAC,
+                                      -_V10_FEATURE_COND_TIER_MAX, _V10_FEATURE_COND_TIER_MAX) * price
+            out["notes"].append(f"condition: comp {_COND_TIER_LABEL[c_tier]} vs subject {_COND_TIER_LABEL[s_tier]} (listing condition / description)")
+    elif _V10_FEATURE_COND_PCT and _steps:
         out["condition"] = _steps * price * _V10_FEATURE_COND_PCT
         out["notes"].append(f"condition: comp rated {'below' if _steps > 0 else 'above'} the subject on {abs(_steps)} of finish / interior / exterior")
     sold = _parse_iso_date(comp.get("close_date") or comp.get("sale_date"))
     if _V10_TIME_PCT_PER_YEAR and sold and (_tmach.today() - sold).days >= 30:
         out["time"] = (_tmach.today() - sold).days / 365.0 * price * _V10_TIME_PCT_PER_YEAR
         out["notes"].append(f"market change since the sale ({(_tmach.today() - sold).days} days)")
-    keys = ("size", "below_grade", "baths", "garage", "sewer", "lot", "age", "road", "time", "condition")
+    _ratio = _as_float(_ap.get("ratio"))
+    if _V10_FEATURE_LOC_FRAC and _ratio and (_ap.get("urban") or _V10_FEATURE_LOC_ALL) and abs(_ratio - 1.0) >= 0.03:
+        out["location"] = _clamp((1.0 / _ratio - 1.0) * _V10_FEATURE_LOC_FRAC, -_V10_FEATURE_LOC_MAX, _V10_FEATURE_LOC_MAX) * price
+        out["notes"].append(f"location: homes near the comp sell for ${_ap.get('comp_area_psf')}/sqft vs "
+                            f"${_ap.get('subject_psf')}/sqft near the subject")
+    keys = ("size", "below_grade", "baths", "garage", "sewer", "lot", "age", "road", "time", "condition", "location")
     gross = sum(abs(out[k]) for k in keys)
     net = sum(out[k] for k in keys)
     cap = _V10_FEATURE_MAX_PCT * price
@@ -5742,7 +5774,7 @@ def _anchor_priced_features(anchor: Optional[dict]) -> set:
     out = set()
     for c in (anchor or {}).get("comps") or []:
         fa = c.get("feature_adjustments") or {}
-        out |= {k for k in ("below_grade", "baths", "garage", "sewer", "condition", "age", "lot") if fa.get(k)}
+        out |= {k for k in ("below_grade", "baths", "garage", "sewer", "condition", "age", "lot", "location") if fa.get(k)}
     return out
 
 
@@ -6158,7 +6190,7 @@ def _compute_comp_anchor(
     }
 
 
-_CONTINUOUS_RELEVANCE_VERSION = "continuous-relevance-v3"
+_CONTINUOUS_RELEVANCE_VERSION = "continuous-relevance-v4"
 # v3 (grader, 10/21 - 239 Windham Dr picked 1985-1992 homes over 2010s homes in the same district):
 # age 6 -> 12 points with a 12-year half-life (was 22), distance 21 -> 14 points with no penalty inside
 # the local radius, school-district names matched in normalized form, condos scored on same building
@@ -6181,12 +6213,31 @@ _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS = {
     # public water + sewer vs well / septic (281 Woodland Dr, well + septic, outranked 2010s public-utility
     # homes for 239 Windham Dr - grader 10/21)
     "utilities": float(os.getenv("CMA_REL_UTIL_W", "4")),
+    # v4 (10/23): how the comp's own few blocks price vs the subject's (neighborhood price map).
+    "area_price": float(os.getenv("CMA_REL_AREA_PRICE_W", "12")),
+    # v4: condition tier gap (Bright PropertyCondition, else the listing description) - _condition_tier
+    "condition": float(os.getenv("CMA_REL_COND_W", "10")),
 }
+_REL_COND_HALF_LIFE = float(os.getenv("CMA_REL_COND_HL", "1.0"))   # tiers apart that halve the score
 _RELEVANCE_AGE_HALF_LIFE_YEARS = 12.0
 # No distance penalty inside this radius (a home a mile away is as good a comp as one next door, when
-# everything else matches); condos: the same building.
-_RELEVANCE_FLAT_MILES = {"condo": 0.05, "default": 1.0}
-_RELEVANCE_MIN_HALF_LIFE_MILES = {"condo": 0.3, "default": float(os.getenv("CMA_REL_MIN_HL", "2.0"))}
+# everything else matches); condos: the same building. A city is tighter (v4, 10/23): a mile from
+# Point Breeze is Rittenhouse one way and Grays Ferry the other.
+_RELEVANCE_FLAT_MILES = {"condo": 0.05, "urban": float(os.getenv("CMA_REL_URBAN_FLAT", "0.25")), "default": 1.0}
+_RELEVANCE_MIN_HALF_LIFE_MILES = {"condo": 0.3, "urban": 0.5, "default": float(os.getenv("CMA_REL_MIN_HL", "2.0"))}
+# v4: a comp MISSING a fact the subject has scores this on that part, instead of the part being left
+# out. Left out = a free pass: 2623 Reed St (no year built) and two sales with no confirmed price or
+# date topped 1703 Point Breeze Ave's list at 96-97%. "off" = the old behavior.
+_REL_UNKNOWN_CREDIT = None if os.getenv("CMA_REL_UNKNOWN") == "off" else float(os.getenv("CMA_REL_UNKNOWN", "0.5"))   # "off" = v3 (left out)
+# v4: city mode (dense_urban density) - tighter distance, and the market area uses neighborhood + ZIP,
+# since school district / township / city are the same for every comp in Philadelphia.
+_REL_URBAN_MODE = os.getenv("CMA_REL_URBAN", "1") == "1"
+# Neighborhood price level: median $/sqft of the price-map sales within the first of these radii that
+# has enough of them; scored by how far the comp's level is from the subject's (half-life on the log
+# ratio: 0.12 = a 12% gap scores 0.5).
+_AREA_PRICE_RADII_MILES = (0.2, 0.35, 0.5)
+_AREA_PRICE_MIN_SALES = 6
+_AREA_PRICE_HALF_LIFE = float(os.getenv("CMA_REL_AREA_PRICE_HL", "0.12"))
 
 
 def _district_key(value) -> str:
@@ -6333,7 +6384,105 @@ def _relevance_size(d: dict) -> Optional[float]:
     return ag + 0.5 * bg
 
 
-def _relevance_market_area_score(subject: dict, comp: dict) -> tuple[Optional[float], dict]:
+# Condition tier 0-4 (10/23): the listing agent's Bright PropertyCondition when filled (Philadelphia
+# rowhomes since July: Excellent $254/sqft, Very Good $227, Good $192, Average $137, Below Average $109,
+# Major Rehab Needed $72), else the listing description. A gutted shell and a full renovation on the
+# same block are different products; Match % never looked.
+_COND_TIER_FIELD = {"major rehab needed": 0.0, "below average": 1.0, "average": 2.0, "good": 2.5,
+                    "very good": 3.0, "excellent": 4.0}
+_COND_TIER_LABEL = {0.0: "needs major rehab", 0.5: "investor / as-is", 1.0: "below average", 1.5: "needs updating",
+                    2.0: "average", 2.5: "good", 3.0: "updated", 4.0: "renovated / new"}
+_COND_TEXT_TIERS = (
+    (0.5, re.compile(r"\b(?:sold\s+as[\s-]?is|as[\s-]?is\s+(?:sale|condition|where[\s-]?is)|investor\s+special|"
+                     r"(?:handyman|contractor)\s+special|fixer[\s-]?upper|gut\s+(?:job|rehab)|shell|tear[\s-]?down|"
+                     r"needs?\s+(?:a\s+)?(?:total\s+|full\s+|complete\s+|major\s+)?(?:rehab|gut|renovation|work)|"
+                     r"cash\s+(?:only|buyers?\s+only|offers?\s+only)|great\s+investment\s+opportunity|"
+                     r"investor\s+(?:opportunity|alert|special|project)|calling\s+all\s+(?:investors|flippers|contractors)|flippers?|"
+                     r"(?:online\s+)?auction|ready\s+for\s+(?:a\s+)?(?:full\s+|complete\s+)?(?:gut|rehab|renovation)|"
+                     r"in\s+its\s+current\s+condition)\b", re.I)),
+    (1.5, re.compile(r"\b(?:needs?\s+(?:some\s+)?(?:tlc|updating|updates|cosmetic)|tlc|bring\s+your\s+(?:ideas|vision|contractor)|"
+                     r"sweat\s+equity|original\s+condition|priced\s+to\s+sell|estate\s+sale)\b", re.I)),
+    (4.0, re.compile(r"\b(?:(?:fully|completely|totally|gut|extensively|newly|meticulously|beautifully)\s+"
+                     r"(?:renovated|rehabbed|restored|remodeled|redone)|new\s+construction|newly\s+(?:built|constructed)|"
+                     r"brand[\s-]new\s+(?:home|construction|build|townhome|townhouse|rowhome)|turn[\s-]?key|"
+                     r"top[\s-]to[\s-]bottom\s+(?:renovation|rehab)|renovated\s+(?:from\s+)?top\s+to\s+bottom|tax\s+abatement)\b", re.I)),
+    (3.0, re.compile(r"\b(?:renovated|rehabbed|remodeled|updated|move[\s-]in\s+ready)\b", re.I)),
+)
+
+
+def _condition_tier(d: Optional[dict]) -> Optional[float]:
+    d = d or {}
+    raw = _first_present(d, "property_condition", "condition")
+    vals = raw if isinstance(raw, (list, tuple)) else ([raw] if raw else [])
+    tiers = [_COND_TIER_FIELD[k] for k in (_norm_token(v).replace("_", " ") for v in vals) if k in _COND_TIER_FIELD]
+    if tiers:
+        return max(tiers)
+    text = str(_first_present(d, "public_remarks", "remarks", "listing_remarks") or "")
+    if text:
+        for tier, pattern in _COND_TEXT_TIERS:
+            m = pattern.search(text)
+            if m and not _NEGATION_RE.search(text[max(0, m.start() - 20):m.start()]):
+                return tier
+    return None
+
+
+def _area_price_level(surface: list, lat, lng, exclude_key: Optional[str] = None) -> Optional[float]:
+    """Median $/sqft of the neighborhood price map's sales nearest (lat, lng) - see
+    cma_similarity_service._load_price_surface. None when too few sales are near."""
+    lat, lng = _as_float(lat), _as_float(lng)
+    if not surface or lat is None or lng is None:
+        return None
+    kx = 69.0 * math.cos(math.radians(lat))
+    near = []
+    for key, la, ln, psf in surface:
+        if key == exclude_key:
+            continue
+        d = math.hypot((la - lat) * 69.0, (ln - lng) * kx)
+        if d <= _AREA_PRICE_RADII_MILES[-1]:
+            near.append((d, psf))
+    for radius in _AREA_PRICE_RADII_MILES:
+        vals = [p for d, p in near if d <= radius]
+        if len(vals) >= _AREA_PRICE_MIN_SALES:
+            return _v10_median(vals)
+    return None
+
+
+def _relevance_market_area_score(subject: dict, comp: dict, *, urban: bool = False) -> tuple[Optional[float], dict]:
+    if urban:
+        # City: school district / township / city match for every comp (all "Philadelphia"), so they
+        # only count when they DIFFER (a Philadelphia comp for an Upper Darby home). Otherwise the
+        # neighborhood name and ZIP decide; a comp with no neighborhood on record gets the unknown credit.
+        detail = {}
+        for label, keys in (("school_district", ("school_district", "school_district_name")),
+                            ("township", ("township", "municipality")), ("city", ("city",))):
+            normalize = _district_key if label == "school_district" else _norm_token
+            sv, cv = normalize(_first_present(subject, *keys)), normalize(_first_present(comp, *keys))
+            detail[label] = None if not (sv and cv) else (1.0 if sv == cv else 0.0)
+            if sv and cv and sv != cv:
+                return 0.0, detail
+        pieces = []
+        for label, keys, weight in (("neighborhood", ("subdivision_name", "neighborhood", "neighborhood_name"), 0.6),
+                                    ("zipcode", ("zipcode", "postal_code"), 0.4)):
+            sv = _norm_token(_first_present(subject, *keys))
+            cv = _norm_token(_first_present(comp, *keys))
+            if label == "zipcode":
+                sv, cv = sv[:5], cv[:5]
+            if sv in ("none available", "none", "n a", "na", "other"):
+                sv = ""
+            if cv in ("none available", "none", "n a", "na", "other"):
+                cv = ""
+            if not sv:
+                detail[label] = None
+                continue
+            if not cv and _REL_UNKNOWN_CREDIT is None:
+                detail[label] = None
+                continue
+            value = (1.0 if sv == cv else 0.0) if cv else _REL_UNKNOWN_CREDIT
+            detail[label] = value
+            pieces.append((value, weight))
+        if not pieces:
+            return None, detail
+        return sum(v * w for v, w in pieces) / sum(w for _, w in pieces), detail
     fields = (
         ("school_district", ("school_district", "school_district_name"), _MARKET_AREA_SHARES[0]),
         ("township", ("township", "municipality"), _MARKET_AREA_SHARES[1]),
@@ -6380,6 +6529,13 @@ def _continuous_relevance(
     subject_lot = _relevance_lot_sqft(subject)
     subject_year = _as_float(subject.get("year_built"))
     subject_type = _type_family(subject.get("property_type") or subject.get("home_type"))
+    urban = _REL_URBAN_MODE and density.get("band") == "dense_urban"
+    surface = density.pop("_price_surface", None) or []
+    subject_level = _area_price_level(surface, subject.get("latitude"), subject.get("longitude"),
+                                      exclude_key=str(subject.get("listing_key") or "") or None) if surface else None
+    subject_cond = _condition_tier(subject)
+    subject_style_known = _relevance_level_class(subject) is not None or _relevance_style_family(
+        _style_text(subject.get("architectural_style") or subject.get("structure_type"))) is not None
     rows = []
     for i, comp in enumerate(comps):
         key = str(comp.get("listing_key") or f"comp-{i + 1}")
@@ -6387,7 +6543,7 @@ def _continuous_relevance(
         component_detail: dict[str, object] = {}
         distance = _as_float(comp.get("distance_miles"))
         if distance is not None:
-            _kind = "condo" if subject_type == "condo" else "default"
+            _kind = "condo" if subject_type == "condo" else ("urban" if urban else "default")
             components["proximity"] = _half_life_decay(
                 max(0.0, distance - _RELEVANCE_FLAT_MILES[_kind]),
                 max(density["distance_half_life_miles"], _RELEVANCE_MIN_HALF_LIFE_MILES[_kind]),
@@ -6397,8 +6553,16 @@ def _continuous_relevance(
             components["utilities"] = 1.0 if _su == _cu else 0.0
         if subject_type == "condo" and _building_key(subject) and _building_key(comp):
             components["building"] = 1.0 if _building_key(subject) == _building_key(comp) else 0.0
-        market_area, area_detail = _relevance_market_area_score(subject, comp)
+        market_area, area_detail = _relevance_market_area_score(subject, comp, urban=urban)
         component_detail["market_area"] = area_detail
+        if subject_level and _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["area_price"] > 0:
+            comp_level = _area_price_level(surface, comp.get("latitude"), comp.get("longitude"), exclude_key=key)
+            if comp_level:
+                components["area_price"] = _half_life_decay(math.log(comp_level / subject_level), _AREA_PRICE_HALF_LIFE)
+                component_detail["area_price"] = {"subject_psf": round(subject_level), "comp_area_psf": round(comp_level),
+                                                  "ratio": round(comp_level / subject_level, 3)}
+            else:
+                components["area_price"] = _REL_UNKNOWN_CREDIT if _REL_UNKNOWN_CREDIT is not None else 0.5
         if market_area is not None:
             components["market_area"] = market_area
         comp_sqft = _relevance_size(comp)
@@ -6421,15 +6585,30 @@ def _continuous_relevance(
         comp_lot = _relevance_lot_sqft(comp)
         if subject_lot and comp_lot and subject_type != "condo":   # a condo has no lot of its own
             components["lot"] = _half_life_decay(comp_lot - subject_lot, max(subject_lot * 0.4, 10890))
+        elif subject_lot and subject_type != "condo":
+            if _REL_UNKNOWN_CREDIT is not None: components["lot"] = _REL_UNKNOWN_CREDIT
         comp_year = _as_float(comp.get("year_built"))
         if subject_year and comp_year:
             components["age"] = _half_life_decay(comp_year - subject_year, _RELEVANCE_AGE_HALF_LIFE_YEARS)
+        elif subject_year:
+            if _REL_UNKNOWN_CREDIT is not None: components["age"] = _REL_UNKNOWN_CREDIT
         style_score = _relevance_style_score(subject, comp)
         if style_score is not None:
             components["style"] = style_score
+        elif subject_style_known:
+            if _REL_UNKNOWN_CREDIT is not None: components["style"] = _REL_UNKNOWN_CREDIT
+        if subject_cond is not None and _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["condition"] > 0:
+            comp_cond = _condition_tier(comp)
+            if comp_cond is not None:
+                components["condition"] = _half_life_decay(comp_cond - subject_cond, _REL_COND_HALF_LIFE)
+                component_detail["condition"] = {"subject_tier": subject_cond, "comp_tier": comp_cond}
+            elif _REL_UNKNOWN_CREDIT is not None:
+                components["condition"] = _REL_UNKNOWN_CREDIT
         recency = _comp_recency_weight(comp)
         if recency is not None:
             components["recency"] = recency
+        elif str(comp.get("status") or "").lower() in ("sold", "closed"):
+            if _REL_UNKNOWN_CREDIT is not None: components["recency"] = _REL_UNKNOWN_CREDIT   # a sale with no sale date on record
         components["data_reliability"] = _relevance_data_reliability(comp)
         available = [(name, score, _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS[name]) for name, score in components.items()]
         denominator = sum(weight for _, _, weight in available)
@@ -6522,6 +6701,9 @@ def _compute_continuous_relevance_anchor(
         row = by_key[key]
         comp["listing_key"] = key
         comp["strength"] = row["proposed_role"]
+        # Neighborhood price level vs the subject's, for the grid's location line (v4, 10/23).
+        comp["_area_price"] = dict((row.get("component_detail") or {}).get("area_price") or {},
+                                   urban=relevance["density_context"].get("band") == "dense_urban")
         shadow_comps.append(comp)
         weight_overrides[key] = row["continuous_weight_input"]
     evidence = evidence_by_key or _build_evidence_by_key(subject, shadow_comps)
@@ -7528,9 +7710,11 @@ def _apply_v10_valuation(anchor: Optional[dict], exposure: dict, ai_estimate: Op
             or ("condition" in _priced and fam == "renovation_condition")
             or ("age" in _priced and any(k in _txt for k in ("year built", "newer construction", "older home", "vintage", "construction era")))
             or ("lot" in _priced and fam == "lot_land")
+            # city grids price each comp's block-level price gap (10/23) - a "better neighborhood" item would repeat it
+            or ("location" in _priced and any(k in _txt for k in ("neighborhood", "neighbourhood", "location", "block", "micro-market", "micro market")))
         )
         if _dup and mid:
-            flags.append(f"Adjustment '{factor}': already priced in the comp adjustment grid (lower level / baths / garage / condition / age / lot) - not added again.")
+            flags.append(f"Adjustment '{factor}': already priced in the comp adjustment grid (lower level / baths / garage / condition / age / lot / location) - not added again.")
             mid, lo, hi = 0.0, 0.0, 0.0
         cap = _V10_ITEM_CAP[btype] * anchor_value
         capped = mid > cap
@@ -8475,6 +8659,7 @@ def _build_reasoning_evidence_packet(
              "condition": (c.get("feature_adjustments") or {}).get("condition"),
              "age": (c.get("feature_adjustments") or {}).get("age"),
              "lot": (c.get("feature_adjustments") or {}).get("lot"),
+             "location": (c.get("feature_adjustments") or {}).get("location"),
              "adjusted_price": c.get("size_adjusted_price"), "normalized_weight": c.get("normalized_weight")}
             for c in (a.get("comps") or [])
         ],

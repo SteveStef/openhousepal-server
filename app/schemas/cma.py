@@ -56,6 +56,7 @@ class CmaSubjectProperty(BaseModel):
     # MLS listing description (PublicRemarks) - fed to the AI analysis alongside the structured
     # fields and photos (see cma_ai_service.py _SUBJECT_FIELDS).
     public_remarks: Optional[str] = None
+    property_condition: Optional[Any] = None   # Bright PropertyCondition, e.g. ["Excellent"] / ["Major Rehab Needed"]
     # The agent's framing of the subject itself, shown before any comps in the client-facing
     # presentation - distinct from the pricing conclusion, which comes at the very end.
     agent_notes: Optional[str] = None
@@ -145,6 +146,7 @@ class CmaComparable(BaseModel):
     # MLS listing description (PublicRemarks) - fed to the AI analysis alongside the structured
     # fields and photos (see cma_ai_service.py _COMP_FIELDS).
     public_remarks: Optional[str] = None
+    property_condition: Optional[Any] = None   # Bright PropertyCondition, e.g. ["Excellent"] / ["Major Rehab Needed"]
     property_type: Optional[str] = None
     home_type: Optional[str] = None
     # Deterministic continuous relevance percentage. CMA generation recomputes this from the
@@ -405,6 +407,7 @@ class CmaCompCandidate(BaseModel):
     water_source: Optional[Union[List[str], str]] = None
     sewer: Optional[Union[List[str], str]] = None
     public_remarks: Optional[str] = None
+    property_condition: Optional[Any] = None   # Bright PropertyCondition, e.g. ["Excellent"] / ["Major Rehab Needed"]
     annual_taxes: Optional[float] = None
     property_type: Optional[str] = None
     similarity_context: Optional[Dict[str, Any]] = None

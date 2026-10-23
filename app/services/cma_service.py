@@ -110,6 +110,7 @@ def _property_display_facts(prop: Property) -> Dict[str, Any]:
         "basement": basement,
         "beds": getattr(prop, "bedrooms", None),
         "baths": _mls_baths(prop),
+        "property_condition": raw.get("PropertyCondition"),
     }
 
 
@@ -649,6 +650,8 @@ def _score_comparable_candidates(
         density_context=similarity_context,
     )
     rows_by_key = {row["listing_key"]: row for row in relevance["comps"]}
+    # The neighborhood price map ("_price_surface", thousands of sales) is for scoring only.
+    public_context = {k: v for k, v in similarity_context.items() if not k.startswith("_")}
     scored_candidates: List[CmaCompCandidate] = []
     for candidate in candidates:
         row = rows_by_key[candidate.listing_key]
@@ -657,7 +660,7 @@ def _score_comparable_candidates(
         details = {
             "version": relevance.get("version"),
             "display_calibration_version": MATCH_DISPLAY_CALIBRATION_VERSION,
-            "density_context": similarity_context,
+            "density_context": public_context,
             "subject_snapshot_sha256": similarity_context["subject_snapshot_sha256"],
             "candidate_distance_miles": row.get("candidate_distance_miles"),
             "component_scores": row.get("components"),
@@ -1004,6 +1007,7 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
             water_source=raw.get('WaterSource') or p.water_source,
             sewer=raw.get('Sewer') or p.sewer,
             public_remarks=raw.get('PublicRemarks'),
+            property_condition=raw.get('PropertyCondition'),
             annual_taxes=raw.get('TaxAnnualAmount'),
             property_type=p.home_type,
         ))
@@ -1055,8 +1059,9 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
     # 2702 E Kings Hwy, verified, 80%, cut by 60 nearer rows - 10/20).
     from app.services.cma_ai_service import _type_family
     _subject_family = _type_family(req.property_type or (req.subject.property_type if req.subject else None))
+    public_context = {k: v for k, v in similarity_context.items() if not k.startswith("_")}
     scored = _score_comparable_candidates(canonical_subject, [
-        candidate.model_copy(update={"similarity_context": similarity_context}) for candidate in candidates
+        candidate.model_copy(update={"similarity_context": public_context}) for candidate in candidates
     ], similarity_context)
 
     def _grid_rank(c: CmaCompCandidate):
@@ -1085,6 +1090,7 @@ AUTO_ENOUGH_USABLE = 5
 AUTO_LIMITED_BELOW = 3                  # fewer usable comps than this -> "Limited comparable sales"
 # A city: this many same-product sales within half a mile in the last year
 _URBAN_DENSITY_SALES = 25
+_AUTO_URBAN_BAND = os.environ.get("CMA_AUTO_URBAN_BAND", "1") == "1"
 # Price band around the asking price for the automatic search (fraction each way). Backtest knob.
 _AUTO_PRICE_BAND = float(os.environ.get("CMA_AUTO_PRICE_BAND", "0.35"))
 
@@ -1126,9 +1132,15 @@ def plan_auto_search(candidates: List[CmaCompCandidate], family: Optional[str], 
     the backtest and the golden tests run exactly what agents get. Returns the chosen radius / sold
     window, whether comps are limited, and the steps taken."""
     near_year = sum(1 for c in candidates if (c.distance_miles or 99) <= 0.5 and (_sale_age_days(c, today) or 9999) <= 365)
-    if family == "condo" or (family == "attached" and near_year >= _URBAN_DENSITY_SALES):
+    # The shared density read (all nearby homes, not just this price band's sales) also says "city":
+    # Point Breeze rowhomes counted as suburban when the price band or a short sold history left fewer
+    # than 25 sales within half a mile (10/23). Multi-family (duplexes, triplexes) searches like a rowhome.
+    band = next((((c.similarity_details or {}).get("density_context") or {}).get("band")
+                 for c in candidates if c.similarity_details), None)
+    city = near_year >= _URBAN_DENSITY_SALES or (_AUTO_URBAN_BAND and band == "dense_urban")
+    if family == "condo" or (family in ("attached", "multi") and city):
         ladder, extra = AUTO_RADII["urban"], ()
-    elif family == "attached":
+    elif family in ("attached", "multi"):
         ladder, extra = AUTO_RADII["attached"], ()
     else:
         ladder, extra = AUTO_RADII["detached"], AUTO_RURAL_EXTRA_RADII
