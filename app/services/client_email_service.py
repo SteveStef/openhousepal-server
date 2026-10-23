@@ -167,25 +167,6 @@ async def _person_name(db, owner_id: str, email: str) -> str:
     return name or ""
 
 
-PROBLEM_DELIVERY = ("bounced", "spam", "blocked")
-
-
-async def _problem(db, owner_id: str, email: str) -> Optional[ClientEmail]:
-    """Their latest email Mailgun said bounced / was blocked / was marked as spam (webhooks)."""
-    return (await db.execute(select(ClientEmail).where(
-        ClientEmail.owner_id == owner_id, ClientEmail.recipient_email == email, ClientEmail.delivery.in_(PROBLEM_DELIVERY))
-        .order_by(ClientEmail.delivery_at.desc()).limit(1))).scalar_one_or_none()
-
-
-async def _why_blocked(db, owner_id: str, email: str, d: dict) -> dict:
-    """Blocked because an email bounced or they called it spam: say that, not just "Unsubscribed"."""
-    if d.get("code") == "unsubscribed":
-        p = await _problem(db, owner_id, email)
-        if p is not None and p.delivery_note:
-            return {**d, "reason": p.delivery_note, "code": "bounced" if p.delivery in ("bounced", "blocked") else "spam"}
-    return d
-
-
 async def refresh_status(db, owner_id: str, email: str, *, announce: bool = True, trigger: Optional[str] = None) -> dict:
     """Work out daily / weekly / off now; when it changed, record it once (lead history + bell).
     `trigger` names what brought them back ("opened an email") for the resume message. Commits."""
@@ -194,7 +175,6 @@ async def refresh_status(db, owner_id: str, email: str, *, announce: bool = True
     unsub = await _is_unsubscribed(db, email)
     d = decide(await _emails_for(db, owner_id, email), manual=pref.manual, reset_at=pref.reset_at,
                last_engaged=await _last_engaged(db, owner_id, email), unsubscribed=unsub)
-    d = await _why_blocked(db, owner_id, email, d)
     old = pref.mode or "daily"
     woke: list[str] = []
     if d["mode"] != old and not unsub and pref.manual not in MANUAL_OFF:
@@ -258,7 +238,6 @@ async def status_for(db, owner_id: str, email: str) -> dict:
     pref = await _pref(db, owner_id, email, create=False)
     d = decide(await _emails_for(db, owner_id, email), manual=pref.manual if pref else None, reset_at=pref.reset_at if pref else None,
                last_engaged=await _last_engaged(db, owner_id, email), unsubscribed=await _is_unsubscribed(db, email))
-    d = await _why_blocked(db, owner_id, email, d)
     return {**d, "since": pref.changed_at if pref else None, "manual": pref.manual if pref else None}
 
 
@@ -548,12 +527,7 @@ async def people(db, owner_id: str) -> dict[str, dict]:
     for r in rows:
         by.setdefault(r.recipient_email, []).append(r)
     prefs = {p.email: p for p in (await db.execute(select(ClientEmailPref).where(ClientEmailPref.owner_id == owner_id))).scalars().all()}
-    problems: dict[str, ClientEmail] = {}   # latest bounced / blocked / marked-as-spam email per person (webhooks)
-    for r in (await db.execute(select(ClientEmail).where(ClientEmail.owner_id == owner_id, ClientEmail.created_at >= since,
-                                                         ClientEmail.delivery.in_(PROBLEM_DELIVERY)).order_by(ClientEmail.delivery_at.desc()))).scalars().all():
-        problems.setdefault(r.recipient_email, r)
-    # Someone whose only email bounced is still listed - that's who the agent most needs to see.
-    emails = set(by) | set(prefs) | set(problems)
+    emails = set(by) | set(prefs)
     if not emails:
         return {}
     eng = dict((await db.execute(select(Lead.email, func.max(LeadEvent.occurred_at)).join(LeadEvent, LeadEvent.lead_id == Lead.id).where(
@@ -568,9 +542,6 @@ async def people(db, owner_id: str) -> dict[str, dict]:
         last_engaged = max([d for d in (max(opens) if opens else None, eng.get(email)) if d] or [None]) if (opens or eng.get(email)) else None
         d = decide([{"sent_at": r.sent_at, "opened_at": r.opened_at, "clicked_at": r.clicked_at, "template": r.template} for r in rs],
                    manual=p.manual if p else None, reset_at=p.reset_at if p else None, last_engaged=last_engaged, unsubscribed=email in unsub)
-        pr = problems.get(email)
-        if pr is not None and d["code"] == "unsubscribed" and pr.delivery_note:
-            d = {**d, "reason": pr.delivery_note, "code": "bounced" if pr.delivery in ("bounced", "blocked") else "spam"}
         sent90 = [r for r in rs if r.sent_at >= _now() - timedelta(days=90)]
         opened90 = sum(1 for r in sent90 if r.opened_at or r.clicked_at)
         latest = rs[0] if rs else None
@@ -584,8 +555,6 @@ async def people(db, owner_id: str) -> dict[str, dict]:
             "last_template": template_label(latest.template) if latest else None,
             "last_opened_at": max(opens).isoformat() if opens else None,
             "last_clicked_at": max([r.clicked_at for r in rs if r.clicked_at] or [None]).isoformat() if any(r.clicked_at for r in rs) else None,
-            # Mailgun said their address bounced / they marked it as spam - shown as a red problem line.
-            "problem": {"delivery": pr.delivery, "note": pr.delivery_note, "at": pr.delivery_at.isoformat() if pr.delivery_at else None} if pr else None,
         }
     return out
 
@@ -593,6 +562,5 @@ async def people(db, owner_id: str) -> dict[str, dict]:
 def email_out(r: ClientEmail) -> dict:
     return {"id": r.id, "to": r.recipient_email, "subject": r.subject, "template": r.template, "label": template_label(r.template),
             "kind": r.kind, "via": r.via, "status": r.status, "error": r.error, "created_at": r.created_at.isoformat() if r.created_at else None,
-            "delivery": r.delivery, "delivery_note": r.delivery_note, "delivery_at": r.delivery_at.isoformat() if r.delivery_at else None,
             "sent_at": r.sent_at.isoformat() if r.sent_at else None, "opened_at": r.opened_at.isoformat() if r.opened_at else None,
             "open_count": r.open_count or 0, "clicked_at": r.clicked_at.isoformat() if r.clicked_at else None, "click_count": r.click_count or 0}
