@@ -428,7 +428,7 @@ app.add_middleware(
 # cookie, so a foreign page can't act as anyone. Added after CORSMiddleware = runs first.
 _PUBLIC_CORS_PREFIXES = (
     "/public/", "/agent-hub/public/", "/agent-hub/forms/public/", "/studio/blogs/public/",
-    "/email-signature/public/", "/api/cma/public/",
+    "/email-signature/public/", "/api/cma/public/", "/invites/public/",
 )
 
 
