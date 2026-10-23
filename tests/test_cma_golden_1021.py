@@ -296,8 +296,9 @@ V2_TRACE = {"authority": "reasoning_model", "anchor": {"anchor_value": 976734}, 
 def test_v2_value_above_comps_is_explained_and_flagged():
     notes = "The final fair market value is $1,117,000. The concluded value sits below the asking price."
     out, _ = ai._v10_reconcile_anchor_direction_prose(notes, final={"value": 1117000, "anchor_value": 976734}, trace=V2_TRACE)
-    assert ("Weighted together, the adjusted comparable sales point to about $977,000. How this market prices "
-            "homes like this one supports a value near $1,090,000. Similar homes now under contract nearby are listed "
+    assert ("Weighted together, the adjusted comparable sales point to about $977,000. What sets this home apart that "
+            "the sales can't fully price, and how homes like it sell in this market, put the value about $113,000 above "
+            "the adjusted sales, at $1,090,000. Similar homes now under contract nearby are listed "
             "higher, which moves it up about 2.5% to $1,117,000.") in out
     steps = out.split("Weighted together")[1].split("1,117,000.")[0]
     assert "asking" not in steps   # clients never read that the asking price set the value

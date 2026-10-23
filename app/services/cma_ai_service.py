@@ -3397,7 +3397,22 @@ def _final_polish_pass(text: str, label: str) -> tuple[str, list[str]]:
         flags.append(f"{label}: leftover QA-toned parenthetical detected - review before sending to a client.")
     # Internal engine jargon the reasoning model sometimes echoes into client prose.
     out = re.sub(r"\b(?:current\s+)?subject[- ]market exposure\b", "the home's own time on the market", out, flags=re.IGNORECASE)
+    # 10/23 grader, all three reports: "lower-level area normalization" (4913 Chancellor St),
+    # "statistical outlier", "the analyst notes" (239 Windham Dr) on client pages.
+    for pat, rep in _CLIENT_JARGON_SUBS:
+        out = pat.sub(rep, out)
     return out, flags
+
+
+_CLIENT_JARGON_SUBS = [
+    (re.compile(r"\b(?:its\s+)?(?:lower[- ]level|below[- ]grade|basement)\s+(?:area\s+)?normali[sz]ation\b", re.I), "its finished lower level"),
+    (re.compile(r"\bis\s+flagged\s+as\s+a\s+statistical\s+outlier\s+and\s+down-?weighted\s+accordingly\b", re.I),
+     "differs enough from the other sales that it counts for less"),
+    (re.compile(r"\b(?:a\s+)?statistical\s+outlier\b", re.I), "an unusual sale"),
+    (re.compile(r"\bdown-?weighted\b", re.I), "given less weight"),
+    (re.compile(r"\bthe\s+analyst\s+notes\b", re.I), "the records show"),
+    (re.compile(r"\b(?:as\s+)?the\s+analyst\s+(?:found|noted|observed)\b", re.I), "the records show"),
+]
 
 
 # v10 hedge firm-up (concern #1, DIMENSION-SPECIFIC per the hardening pass). A hedge is only
@@ -3887,7 +3902,7 @@ async def _finish_seller_strategy(strategy: str, *, subject: dict, comps: list, 
 def _strip_under_contract_offer_frame(text: str) -> str:
     """Remove prior generated status framing; one deterministic banner is added afterward."""
     kept: list[str] = []
-    for match in re.finditer(r"[^.!?]*(?:[.!?]|$)", text or ""):
+    for match in re.finditer(r"(?:[^.!?]|\.(?=\d))*(?:[.!?]|$)", text or ""):   # "1.065" is not a sentence end
         sentence = match.group(0).strip()
         if not sentence:
             continue
@@ -5066,6 +5081,60 @@ def _v10_sqft(row: dict) -> Optional[float]:
     return _as_float(row.get("above_grade_finished_area")) or _as_float(row.get("sqft"))
 
 
+_CLAIM_PSF_RE = re.compile(r"/\s?sq\.?\s?ft|per[- ](?:square[- ])?(?:foot|ft)|\bpsf\b|per-foot|price per", re.I)
+_CLAIM_VS_SUBJECT_RE = re.compile(
+    r"\b(?:(above|higher\s+than|more\s+than|over|exceed(?:s|ing)?|a\s+premium\s+(?:to|over))|"
+    r"(below|lower\s+than|less\s+than|under|beneath|a\s+discount\s+to))\s+(?:the\s+)?subject(?:'s|’s)?\b", re.I)
+_CLAIM_BASIS_INCLUDES_BG_RE = re.compile(
+    r"\b(?:basis|figure|rate|reported|blended)\b[^.;]{0,40}\binclud\w*\b[^.;]{0,40}\b(?:basement|lower[- ]level|below[- ]grade)", re.I)
+_CLAIM_BG_WORD_RE = re.compile(r"\b(?:basement|lower[- ]level|below[- ]grade)\b", re.I)
+_CLAIM_FEWER_BATHS = ((re.compile(r"\bhalf[- ](?:a[- ])?bath(?:room)?[- ]fewer\b|\bhalf\s+a\s+bath(?:room)?\s+fewer\b", re.I), 0.5),
+                      (re.compile(r"\b(?:one|a)\s+(?:full\s+)?bath(?:room)?\s+fewer\b|\bone\s+fewer\s+(?:full\s+)?bath", re.I), 1.0),
+                      (re.compile(r"\btwo\s+(?:full\s+)?bath(?:room)?s?\s+fewer\b|\btwo\s+fewer\s+(?:full\s+)?bath", re.I), 2.0))
+
+
+def _comp_note_claim_blocks(text: str, label: str, subject: dict, comp: dict) -> list[str]:
+    """Claims BUILT ON a comp's numbers (10/23 grader, all three reports): the numbers were checked,
+    the words around them weren't. 'well above the subject's $/sqft' at $246 vs $273 (417 Dogwood
+    Ln), '$260/sqft on a basis that includes 1,000 sqft of basement' when every $/sqft here is above
+    grade (239 Windham Dr), 'understates' for a basement sale (4913 Chancellor St), 'half-bath-fewer'
+    for 1.5 vs 3.5 baths, 'This comp but warrants' and a sentence cut inside a parenthesis. One
+    block per bad sentence; the repair drops that sentence."""
+    out: list[str] = []
+    c_price = _as_float(comp.get("sale_price")) or _as_float(comp.get("close_price"))
+    c_ag, s_ag = _v10_sqft(comp), _v10_sqft(subject or {})
+    c_psf = (c_price / c_ag) if c_price and c_ag else None
+    s_lp = _as_float((subject or {}).get("list_price"))
+    s_psf = (s_lp / s_ag) if s_lp and s_ag else None
+    c_bg = _as_float(comp.get("below_grade_finished_area")) or 0.0
+    s_b, c_b = _as_float((subject or {}).get("baths")), _as_float(comp.get("baths"))
+    for chunk, _s, _e in _sentence_chunks(text or ""):
+        sent = chunk.strip()
+        if not sent:
+            continue
+        why = None
+        m = _CLAIM_VS_SUBJECT_RE.search(sent)
+        if m and c_psf and s_psf and _CLAIM_PSF_RE.search(sent):
+            if m.group(1) and c_psf < s_psf * 0.97:
+                why = f"says above the subject's $/sqft but ${c_psf:,.0f} is below ${s_psf:,.0f}"
+            elif m.group(2) and c_psf > s_psf * 1.03:
+                why = f"says below the subject's $/sqft but ${c_psf:,.0f} is above ${s_psf:,.0f}"
+        if not why and _CLAIM_PSF_RE.search(sent) and _CLAIM_BASIS_INCLUDES_BG_RE.search(sent):
+            why = "says the $/sqft includes the basement - every $/sqft here is above grade only"
+        if not why and c_bg > 0 and re.search(r"\bunderstat\w*", sent, re.I) and _CLAIM_BG_WORD_RE.search(sent):
+            why = "says the above-grade $/sqft understates a home whose price includes a finished basement (it overstates)"
+        if not why and s_b is not None and c_b is not None:
+            for pat, claimed in _CLAIM_FEWER_BATHS:
+                if pat.search(sent) and abs(claimed - (s_b - c_b)) >= 0.5:
+                    why = f"bath difference stated as {claimed:g} but it is {s_b - c_b:g}"
+                    break
+        if not why and (re.match(r"This\s+(?:comp|home|sale|property)\s+but\b", sent, re.I) or sent.count("(") != sent.count(")")):
+            why = "garbled or cut-off sentence"
+        if why:
+            out.append(f"{label}: comp note claim doesn't match its numbers - {why} (\"{sent[:80]}\")")
+    return out
+
+
 def _v10_below_grade_frac(row: dict) -> float:
     below = _as_float(row.get("below_grade_finished_area")) or 0.0
     total = (_as_float(row.get("sqft")) or 0.0) or (below + (_as_float(row.get("above_grade_finished_area")) or 0.0))
@@ -5380,6 +5449,11 @@ _V10_FEATURE_COND_PCT = float(os.getenv("CMA_GRID_COND_PCT", "0.02"))  # market 
 _V10_FEATURE_LOC_FRAC = float(os.getenv("CMA_GRID_LOC_FRAC", "0.5"))
 _V10_FEATURE_LOC_ALL = os.getenv("CMA_GRID_LOC_ALL", "0") == "1"
 _V10_FEATURE_LOC_MAX = 0.20
+# 10/23 backtest knobs (4913 Chancellor St): the block-price gap is scaled down for a comp this close
+# (two neighbourhood medians 0.08 mi apart read $121 vs $180/sqft), and two homes both built before
+# this year get no age line (1915 vs 1925 rowhomes). 0 = off.
+_V10_LOC_NEAR_MILES = float(os.getenv("CMA_GRID_LOC_NEAR_MI", "0"))
+_V10_AGE_PREWAR_YEAR = float(os.getenv("CMA_GRID_AGE_PREWAR", "0"))
 # Condition from tiers (10/23, _condition_tier): what a home of each condition sells for vs nearby same-type
 # sales of any condition, measured on local closed sales since 10/2025 (each sale's $/sqft over the median
 # within 0.3 mi; ~1,100 Philadelphia and ~4,900 suburban sales with a known tier), smoothed to rise with
@@ -5627,7 +5701,8 @@ def _v10_grid_adjustments(subject: dict, r: dict, s_ag: float, s_bg: float, s_bg
         out["sewer"] = amount if c_cess else -amount
         out["notes"].append("comp has a cesspool" if c_cess else "subject has a cesspool")
     s_yr, c_yr = _as_float(subject.get("year_built")), _as_float(comp.get("year_built"))
-    if _V10_FEATURE_AGE_PCT and s_yr and c_yr and s_yr > 1800 and c_yr > 1800 and abs(s_yr - c_yr) >= 5:
+    if (_V10_FEATURE_AGE_PCT and s_yr and c_yr and s_yr > 1800 and c_yr > 1800 and abs(s_yr - c_yr) >= 5
+            and not (_V10_AGE_PREWAR_YEAR and max(s_yr, c_yr) < _V10_AGE_PREWAR_YEAR)):
         out["age"] = _clamp((s_yr - c_yr) / 10.0, -4.0, 4.0) * price * _V10_FEATURE_AGE_PCT
         out["notes"].append(f"built {int(s_yr)} vs {int(c_yr)}")
     if _V10_FEATURE_ROAD_PCT and float((r.get("loc_trace") or {}).get("street_weight_penalty", 1.0) or 1.0) < 1.0:
@@ -5638,6 +5713,12 @@ def _v10_grid_adjustments(subject: dict, r: dict, s_ag: float, s_bg: float, s_bg
                  for k in ("finish_quality", "interior", "exterior"))
     _ap = comp.get("_area_price") if isinstance(comp.get("_area_price"), dict) else {}
     s_tier, c_tier = _condition_tier(subject), _condition_tier(comp)
+    # 10/23 (4913 Chancellor St): the comp's own finish / interior / exterior ratings (photos + full
+    # description) win over the listing-field / keyword tiers - comps rated INFERIOR were adjusted DOWN
+    # because the subject's "thoughtfully renovated" text read as plain "updated".
+    _rated = any(str(_q.get(k) or "").lower() in ("below", "similar", "above") for k in ("finish_quality", "interior", "exterior"))
+    if _rated:
+        s_tier = c_tier = None
     if _V10_FEATURE_COND_TIER_FRAC and s_tier is not None and c_tier is not None:
         if s_tier != c_tier:
             idx = _V10_COND_INDEX["urban" if _ap.get("urban") else "default"]
@@ -5654,6 +5735,9 @@ def _v10_grid_adjustments(subject: dict, r: dict, s_ag: float, s_bg: float, s_bg
     _ratio = _as_float(_ap.get("ratio"))
     if _V10_FEATURE_LOC_FRAC and _ratio and (_ap.get("urban") or _V10_FEATURE_LOC_ALL) and abs(_ratio - 1.0) >= 0.03:
         out["location"] = _clamp((1.0 / _ratio - 1.0) * _V10_FEATURE_LOC_FRAC, -_V10_FEATURE_LOC_MAX, _V10_FEATURE_LOC_MAX) * price
+        _dist = _as_float(comp.get("distance_miles"))
+        if _V10_LOC_NEAR_MILES and _dist is not None and _dist < _V10_LOC_NEAR_MILES:
+            out["location"] *= _dist / _V10_LOC_NEAR_MILES
         out["notes"].append(f"location: homes near the comp sell for ${_ap.get('comp_area_psf')}/sqft vs "
                             f"${_ap.get('subject_psf')}/sqft near the subject")
     keys = ("size", "below_grade", "baths", "garage", "sewer", "lot", "age", "road", "time", "condition", "location")
@@ -5744,12 +5828,17 @@ def _anchor_integrity_errors(anchor: Optional[dict], subject: Optional[dict] = N
     total = sum(c.get("normalized_weight") or 0 for c in rows)
     if abs(total - 1.0) > 0.02:
         errs.append(f"comp weights sum to {round(total * 100)}%, not 100%")
-    for c in rows:
+    # the same caps _v10_capped_weights applied, scaled up together when too few light comps can fill
+    # 100% (4913 Chancellor St, 10/23: one light comp + four heavy = 47% by design, flagged as a failure)
+    _caps = [_V10_GRID_HEAVY_CAP if (c.get("gross_adjustment_pct") or 0) > _V10_GRID_HEAVY_GROSS * 100
+             else max(_V10_GRID_MAX_SHARE, 1.0 / len(rows)) for c in rows]
+    _scale = 1.0 / sum(_caps) if sum(_caps) < 1.0 else 1.0
+    for c, _cap in zip(rows, _caps):
         w = c.get("normalized_weight") or 0
         heavy = (c.get("gross_adjustment_pct") or 0) > _V10_GRID_HEAVY_GROSS * 100
         if heavy and w > _V10_GRID_HEAVY_CAP + 0.005 and len(rows) * _V10_GRID_HEAVY_CAP >= 1:
             errs.append(f"{c.get('label')}: adjusted {c.get('gross_adjustment_pct')}% but carries {round(w * 100)}% of the value")
-        if w > max(_V10_GRID_MAX_SHARE, 1.0 / len(rows)) + 0.005:
+        if not heavy and w > _cap * _scale + 0.005:
             errs.append(f"{c.get('label')}: carries {round(w * 100)}% of the value (cap {round(_V10_GRID_MAX_SHARE * 100)}%)")
         s_ag = _as_float((subject or {}).get("above_grade_finished_area")) or _as_float(a.get("subject_sqft_used"))
         c_ag = _as_float(c.get("above_grade_sqft")) or _as_float(c.get("sqft"))
@@ -6271,6 +6360,17 @@ def _same_name(a, b, filler=_PLACE_FILLER) -> Optional[bool]:
     if not ab or not bb:
         return None
     return ab == bb and (ak is None or bk is None or ak == bk)
+
+
+def _one_school_spelling(comps: list, subject: Optional[dict]) -> None:
+    """A comp in the subject's district shows the subject's spelling, so one report never prints both
+    "Philadelphia City" and "The School District Of Philadelphia" (4913 Chancellor St, 10/23)."""
+    sv = (subject or {}).get("school_district")
+    if not sv:
+        return
+    for c in comps or []:
+        if isinstance(c, dict) and c.get("school_district") and c["school_district"] != sv and _same_district(c["school_district"], sv):
+            c["school_district"] = sv
 
 
 def _same_district(a, b) -> Optional[bool]:
@@ -8942,6 +9042,11 @@ def _pending_competition_review(subject: dict, homes: list, value, low, high, tr
             if hi_b:
                 target = min(target, hi_b)
             new_v = round(target / 1000) * 1000
+            # stay inside the band after rounding ($392,040 floor rounded to $392,000 - 4913 Chancellor St)
+            if lo_b and new_v < lo_b:
+                new_v = math.ceil(lo_b / 1000) * 1000
+            if hi_b and new_v > hi_b:
+                new_v = math.floor(hi_b / 1000) * 1000
             if new_v != round(v):
                 info["nudged_from"] = round(v)
                 info["nudge_pct"] = round((new_v - v) / v * 100, 1)
@@ -12545,19 +12650,21 @@ def _value_steps_from_comps(trace: Optional[dict], anchor: float, value: float, 
     # sell this far under their asking price" read as if the seller's number decided it). The exact
     # asking-price math is in the agent-only Review before sending note.
     # (pending homes get their own sentence below - crediting them here too counted them twice)
+    # Name the reason and the size of the move, never "supports a value near $X - the final value is
+    # $X" (239 Windham Dr V3 grader 10/23: circular).
+    _gap = abs(round(before - anchor, -3))
     if rel == "above" and lo and before <= lo * 1.03 and before > anchor * 1.02:
-        out.append(f"How this market prices homes like this one supports a value near ${round(before, -3):,.0f}.")
+        out.append(f"What sets this home apart that the sales can't fully price, and how homes like it sell in this market, "
+                   f"put the value about ${_gap:,.0f} above the adjusted sales, at ${round(before, -3):,.0f}.")
         band = True
     elif rel == "below" and hi and before >= hi * 0.97 and before < anchor * 0.98:
-        out.append(("How long this home has been on the market compared with similar homes supports"
-                    if apc.get("passed_over") else "How this market prices homes like this one supports")
-                   + f" a value near ${round(before, -3):,.0f}.")
+        out.append(("This home has been on the market longer than similar homes took to sell, which"
+                    if apc.get("passed_over") else "How homes like this one sell here")
+                   + f" puts the value about ${_gap:,.0f} below the adjusted sales, at ${round(before, -3):,.0f}.")
         band = True
     if nudge:
         out.append(f"Similar homes now under contract nearby are listed {'higher' if nudge > 0 else 'lower'}, which moves it "
                    f"{'up' if nudge > 0 else 'down'} about {abs(nudge):g}% to ${round(value):,.0f}.")
-    elif band:
-        out[-1] = out[-1].rstrip(".") + f" - the final value is ${round(value):,.0f}."
     return " ".join(out) if (band or nudge) else ""
 
 
@@ -13954,7 +14061,7 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
         )
     kept: list = []
     source_offer = _strip_under_contract_offer_frame(offer_text or "")
-    for sm in re.finditer(r"[^.!?]*[.!?]", source_offer):
+    for sm in re.finditer(r"(?:[^.!?]|\.(?=\d))*[.!?]", source_offer):   # 417 Dogwood Ln: "(median 1." cut at the decimal
         s = sm.group(0).strip()
         if not s:
             continue
@@ -15029,6 +15136,7 @@ async def _auto_repair_export_blocks(
         label = _comp_label(idx, comp)
         out = _factual_prose_blocking(text, label, subject, comp_note=True, comp=comp)
         out += _v10_final_report_qa({"c": (label, text)}, value, range_pct, trace, known_dollars=known())[1]
+        out += _comp_note_claim_blocks(text, label, subject, comp)
         return out
 
     def recheck_external() -> list[str]:
@@ -16237,6 +16345,7 @@ async def _generate_ai_analysis_impl(
     if _hedge_flagged:
         qa_flags.append("One or more comp notes had hedged wording firmed up where that comp's quality ratings already commit to the comparison.")
 
+    _one_school_spelling(new_comparables, report.subject)
     report.comparables = new_comparables
 
     # strong_ct/weight_ct - display counts only now (see _compute_confidence for the actual
@@ -17026,6 +17135,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
         if _incl_now and not any(_normalize_strength(c.get("strength")) in ("strong", "supporting") for c in _incl_now):
             qa_flags.append("No comp met the bar for Strong or Supporting - reliable comp evidence is limited.")
 
+        _one_school_spelling(new_comparables, report.subject)
         report.comparables = new_comparables
         strong_ct = sum(1 for c in new_comparables if c.get("is_included", True) and _normalize_strength(c.get("strength")) == "strong")
         weight_ct = sum(1 for c in new_comparables if c.get("is_included", True) and _normalize_strength(c.get("strength")) in ("strong", "supporting"))
