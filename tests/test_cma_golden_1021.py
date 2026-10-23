@@ -58,9 +58,16 @@ def test_no_distance_penalty_inside_a_mile():
 
 
 def test_school_district_names_match_in_normalized_form():
-    assert ai._district_key("The School District Of Philadelphia") == ai._district_key("Philadelphia City")
-    assert ai._district_key("Downingtown Area") == ai._district_key("Downingtown Area School District")
-    assert ai._district_key("West Chester Area") != ai._district_key("Downingtown Area")
+    assert ai._same_district("The School District Of Philadelphia", "Philadelphia City")
+    assert ai._same_district("Downingtown Area", "Downingtown Area School District")
+    assert not ai._same_district("West Chester Area", "Downingtown Area")
+    # 10/23: one name, two kinds of municipality = two districts
+    assert not ai._same_district("EGG HARBOR CITY SCHOOLS", "EGG HARBOR TOWNSHIP PUBLIC SCHOOLS")
+    assert not ai._same_district("BERLIN BOROUGH PUBLIC SCHOOLS", "BERLIN TOWNSHIP PUBLIC SCHOOLS")
+    assert not ai._same_district("CHARLES CITY COUNTY PUBLIC SCHOOLS", "CHARLES COUNTY PUBLIC SCHOOLS")
+    assert not ai._same_district("DISTRICT OF COLUMBIA PUBLIC SCHOOLS", "COLUMBIA BOROUGH")
+    assert ai._same_district("HADDONFIELD BORO", "HADDONFIELD BOROUGH PUBLIC SCHOOLS")
+    assert ai._same_district("Philadelphia City", None) is None
 
 
 def test_1985_well_septic_comp_rated_inferior_is_never_strong():

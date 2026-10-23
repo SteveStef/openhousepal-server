@@ -1342,9 +1342,8 @@ def _derive_quality_from_data(subject: dict, comp: dict) -> dict:
     dimensions it can actually judge."""
     out: dict = {}
 
-    s_school, c_school = _district_key(subject.get("school_district")), _district_key(comp.get("school_district"))
     matches = [m for m in (
-        (s_school == c_school) if (s_school and c_school) else None,
+        _same_district(subject.get("school_district"), comp.get("school_district")),
         _same_municipality(subject, comp),
     ) if m is not None]
     if matches:
@@ -2027,9 +2026,8 @@ def _comp_evidence_score(subject: dict, comp: dict) -> dict:
         if dist > 5:
             notes.append(f"{dist:.1f} mi away")
 
-    s_school, c_school = _district_key(subject.get("school_district")), _district_key(comp.get("school_district"))
     area_matches = [m for m in (
-        (s_school == c_school) if (s_school and c_school) else None,
+        _same_district(subject.get("school_district"), comp.get("school_district")),
         _same_municipality(subject, comp),
     ) if m is not None]
     if area_matches:
@@ -6240,12 +6238,31 @@ _AREA_PRICE_MIN_SALES = 6
 _AREA_PRICE_HALF_LIFE = float(os.getenv("CMA_REL_AREA_PRICE_HL", "0.12"))
 
 
-def _district_key(value) -> str:
+_DISTRICT_KIND = {"city": "city", "township": "township", "twp": "township", "boro": "borough", "borough": "borough",
+                  "county": "county"}
+_DISTRICT_FILLER = {"the", "school", "schools", "district", "of", "sd", "area", "public", "unified", "regional"}
+
+
+def _district_parts(value) -> tuple:
+    """('philadelphia', 'city') for 'Philadelphia City'. Filler words dropped; a trailing
+    municipality kind kept apart, because 'Egg Harbor City' and 'Egg Harbor Township' are
+    different districts (and 'Charles City County' is not 'Charles County')."""
+    text = re.sub(r"[_-]", " ", _norm_token(value))
+    if "district of columbia" in text:
+        return "district of columbia", None
+    words = [w for w in text.split() if w not in _DISTRICT_FILLER]
+    kind = _DISTRICT_KIND.get(words[-1]) if len(words) > 1 else None
+    return " ".join(words[:-1] if kind else words), kind
+
+
+def _same_district(a, b) -> Optional[bool]:
     """'The School District Of Philadelphia' and 'Philadelphia City' are one district; so are
-    'Downingtown Area' and 'Downingtown Area School District' (grader, 10/21)."""
-    t = _norm_token(value)
-    t = re.sub(r"\b(the|school|district|of|sd|area|city|public|schools?|unified|regional|township|twp|boro(ugh)?)\b", " ", t)
-    return " ".join(t.split())
+    'Downingtown Area' and 'Downingtown Area School District' (grader, 10/21). One name with two
+    different kinds ('Berlin Borough' / 'Berlin Township') is NOT (10/23). None when either is blank."""
+    (ab, ak), (bb, bk) = _district_parts(a), _district_parts(b)
+    if not ab or not bb:
+        return None
+    return ab == bb and (ak is None or bk is None or ak == bk)
 
 
 def _building_key(d: Optional[dict]) -> Optional[str]:
@@ -6455,10 +6472,11 @@ def _relevance_market_area_score(subject: dict, comp: dict, *, urban: bool = Fal
         detail = {}
         for label, keys in (("school_district", ("school_district", "school_district_name")),
                             ("township", ("township", "municipality")), ("city", ("city",))):
-            normalize = _district_key if label == "school_district" else _norm_token
-            sv, cv = normalize(_first_present(subject, *keys)), normalize(_first_present(comp, *keys))
-            detail[label] = None if not (sv and cv) else (1.0 if sv == cv else 0.0)
-            if sv and cv and sv != cv:
+            sv, cv = _first_present(subject, *keys), _first_present(comp, *keys)
+            same = _same_district(sv, cv) if label == "school_district" else (
+                None if not (_norm_token(sv) and _norm_token(cv)) else _norm_token(sv) == _norm_token(cv))
+            detail[label] = None if same is None else (1.0 if same else 0.0)
+            if same is False:
                 return 0.0, detail
         pieces = []
         for label, keys, weight in (("neighborhood", ("subdivision_name", "neighborhood", "neighborhood_name"), 0.6),
@@ -6492,13 +6510,14 @@ def _relevance_market_area_score(subject: dict, comp: dict, *, urban: bool = Fal
     pieces = []
     detail = {}
     for label, keys, weight in fields:
-        normalize = _district_key if label == "school_district" else _norm_token
-        subject_value = normalize(_first_present(subject, *keys))
-        comp_value = normalize(_first_present(comp, *keys))
-        if not subject_value or not comp_value:
+        subject_value, comp_value = _first_present(subject, *keys), _first_present(comp, *keys)
+        same = _same_district(subject_value, comp_value) if label == "school_district" else (
+            None if not (_norm_token(subject_value) and _norm_token(comp_value))
+            else _norm_token(subject_value) == _norm_token(comp_value))
+        if same is None:
             detail[label] = None
             continue
-        value = 1.0 if subject_value == comp_value else 0.0
+        value = 1.0 if same else 0.0
         detail[label] = value
         pieces.append((value, weight))
     if not pieces:
@@ -6806,7 +6825,7 @@ def _v10_location_class_review(subject: dict, comps: list, evidence_by_key: dict
     and never touches a comp already rated `weak`. NOT a crude "different township => never Strong"
     rule - a single negative only trims weight; it takes >= _V10_LOC_NEG_DEMOTE to force a demote."""
     flags: list = []
-    subj_school = _district_key(subject.get("school_district"))
+    subj_school = subject.get("school_district")
     subj_street_tier = _street_tier(subject)
 
     incl = [(i, c) for i, c in enumerate(comps)
@@ -6831,8 +6850,7 @@ def _v10_location_class_review(subject: dict, comps: list, evidence_by_key: dict
         if street_score is None and rc_verdict:
             street_score = {"quiet": 0.9, "neutral": 0.6, "through": 0.3}.get(rc_verdict)
 
-        c_school = _district_key(c.get("school_district"))
-        school_match = (c_school == subj_school) if (c_school and subj_school) else None
+        school_match = _same_district(c.get("school_district"), subj_school)
         city_match = _same_municipality(subject, c)
         school_township = ("same" if (school_match and city_match) else
                            "partial" if (school_match or city_match) else
@@ -6923,7 +6941,7 @@ def _v10_condition_class_review(subject: dict, comps: list, evidence_by_key: dic
     explicit AI dismissal in its own note, or a genuinely poor physical match. Sets comp["_cond"]
     for the trace and returns qa_flags. Runs AFTER _v10_location_class_review."""
     flags: list = []
-    subj_school = _district_key(subject.get("school_district"))
+    subj_school = subject.get("school_district")
     for i, c in enumerate(comps):
         if not c.get("is_included", True):
             continue
@@ -6947,9 +6965,8 @@ def _v10_condition_class_review(subject: dict, comps: list, evidence_by_key: dic
             and parts.get("area") in (None, 0.5, 1.0)
         ev_ok = score is None or score >= _V10_COND_PROMOTE_MIN_EV
 
-        c_school = _district_key(c.get("school_district"))
         loc_bad = bool(
-            (c_school and subj_school and c_school != subj_school)
+            _same_district(c.get("school_district"), subj_school) is False
             or _same_municipality(subject, c) is False
             or q.get("area") == "different_from_subject"
             or q.get("street_context") == "below"

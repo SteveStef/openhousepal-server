@@ -62,11 +62,10 @@ def _normalize(value: Optional[str]) -> str:
     return re.sub(r"[_-]", " ", (value or "").strip().lower())
 
 
-def _district_key(value: Optional[str]) -> str:
-    """'The School District Of Philadelphia' and 'Philadelphia City' are one district (mirrors
-    lib/matchScore.ts districtKey and cma_ai_service._district_key)."""
-    t = re.sub(r"\b(the|school|district|of|sd|area|city|public|schools?|unified|regional|township|twp|boro(ugh)?)\b", " ", _normalize(value))
-    return " ".join(t.split())
+def _same_district(a: Optional[str], b: Optional[str]) -> Optional[bool]:
+    """Same rule as cma_ai_service._same_district and lib/matchScore.ts sameDistrict."""
+    from app.services.cma_ai_service import _same_district as same
+    return same(a, b)
 
 
 def _half_life_decay(delta: float, half_life: float) -> float:
@@ -249,10 +248,11 @@ def _market_area(p: Any, s: Any) -> Optional[float]:
     ]
     pieces = []
     for i, (keys, w) in enumerate(fields):
-        norm = _district_key if i == 0 else _normalize
-        sv, pv = norm(_get_str(s, keys)), norm(_get_str(p, keys))
-        if sv and pv:
-            pieces.append((1 if sv == pv else 0, w))
+        sv, pv = _get_str(s, keys), _get_str(p, keys)
+        same = _same_district(sv, pv) if i == 0 else (
+            None if not (_normalize(sv) and _normalize(pv)) else _normalize(sv) == _normalize(pv))
+        if same is not None:
+            pieces.append((1 if same else 0, w))
     den = sum(w for _, w in pieces)
     return sum(sc * w for sc, w in pieces) / den if den else None
 
