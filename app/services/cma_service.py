@@ -1255,6 +1255,8 @@ async def current_competition(db: AsyncSession, subject: dict, *, listing_key: O
             "listing_key": c.listing_key, "status": "pending" if c.status in ("pending", "active_under_contract") else "active",
             "street_address": c.street_address, "city": c.city, "state": c.state, "zipcode": c.zipcode,
             "photo_url": c.photo_url, "list_price": c.list_price,
+            # flip-through photos + a details sheet on each card (10/23)
+            "photos": list(c.photos or [])[:30], "public_remarks": c.public_remarks, "annual_taxes": c.annual_taxes,
             "price_per_sqft": round(c.list_price / ag) if c.list_price and ag else None,
             "beds": c.beds, "baths": c.baths, "sqft": ag, "year_built": c.year_built,
             "days_on_market": c.days_on_market, "distance_miles": c.distance_miles, "match_score": c.match_score,
