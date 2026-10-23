@@ -6238,31 +6238,52 @@ _AREA_PRICE_MIN_SALES = 6
 _AREA_PRICE_HALF_LIFE = float(os.getenv("CMA_REL_AREA_PRICE_HL", "0.12"))
 
 
-_DISTRICT_KIND = {"city": "city", "township": "township", "twp": "township", "boro": "borough", "borough": "borough",
-                  "county": "county"}
-_DISTRICT_FILLER = {"the", "school", "schools", "district", "of", "sd", "area", "public", "unified", "regional"}
+_PLACE_KIND = {"city": "city", "township": "township", "twp": "township", "boro": "borough", "borough": "borough",
+               "county": "county", "town": "town", "village": "village"}
+_PLACE_FILLER = {"the", "of"}
+_DISTRICT_FILLER = _PLACE_FILLER | {"school", "schools", "district", "sd", "area", "public", "unified", "regional"}
+_PLACE_PLACEHOLDERS = {"none available", "none", "n a", "na", "other", "not applicable", "unknown", "no"}
+_PLACE_ABBREV = {"mt": "mount", "st": "saint", "ft": "fort"}
 
 
-def _district_parts(value) -> tuple:
-    """('philadelphia', 'city') for 'Philadelphia City'. Filler words dropped; a trailing
-    municipality kind kept apart, because 'Egg Harbor City' and 'Egg Harbor Township' are
-    different districts (and 'Charles City County' is not 'Charles County')."""
-    text = re.sub(r"[_-]", " ", _norm_token(value))
+def _name_parts(value, filler=_PLACE_FILLER) -> tuple:
+    """('philadelphia', 'city') for 'Philadelphia City' or 'City of Philadelphia'. Punctuation and
+    filler words dropped, 'Mt.' = 'Mount'; a leading/trailing municipality kind kept apart, because
+    'Egg Harbor City' and 'Egg Harbor Township' (or 'Chevy Chase Village' and 'Town of Chevy Chase')
+    are different places. Placeholders ('"None Available".') come back blank."""
+    text = " ".join(re.sub(r"[^a-z0-9 ]", " ", _norm_token(value)).split())
+    if text in _PLACE_PLACEHOLDERS:
+        return "", None
     if "district of columbia" in text:
         return "district of columbia", None
-    words = [w for w in text.split() if w not in _DISTRICT_FILLER]
-    kind = _DISTRICT_KIND.get(words[-1]) if len(words) > 1 else None
-    return " ".join(words[:-1] if kind else words), kind
+    words = [_PLACE_ABBREV.get(w, w) for w in text.split() if w not in filler]
+    kind = None
+    if len(words) > 1 and words[-1] in _PLACE_KIND:
+        kind = _PLACE_KIND[words.pop()]
+    elif len(words) > 1 and words[0] in _PLACE_KIND:
+        kind = _PLACE_KIND[words.pop(0)]
+    return " ".join(words), kind
+
+
+def _same_name(a, b, filler=_PLACE_FILLER) -> Optional[bool]:
+    """None when either is blank; same base name and no conflicting kind otherwise."""
+    (ab, ak), (bb, bk) = _name_parts(a, filler), _name_parts(b, filler)
+    if not ab or not bb:
+        return None
+    return ab == bb and (ak is None or bk is None or ak == bk)
 
 
 def _same_district(a, b) -> Optional[bool]:
     """'The School District Of Philadelphia' and 'Philadelphia City' are one district; so are
     'Downingtown Area' and 'Downingtown Area School District' (grader, 10/21). One name with two
-    different kinds ('Berlin Borough' / 'Berlin Township') is NOT (10/23). None when either is blank."""
-    (ab, ak), (bb, bk) = _district_parts(a), _district_parts(b)
-    if not ab or not bb:
-        return None
-    return ab == bb and (ak is None or bk is None or ak == bk)
+    different kinds ('Berlin Borough' / 'Berlin Township') is NOT (10/23)."""
+    return _same_name(a, b, _DISTRICT_FILLER)
+
+
+def _same_place(a, b) -> Optional[bool]:
+    """Township / city / neighborhood: 'City of Gaithersburg' = 'Gaithersburg', 'Mt. Airy' = 'Mt Airy',
+    'Hamilton' = 'Hamilton Twp'; 'Egg Harbor City' != 'Egg Harbor Township' (10/23, all-DB check)."""
+    return _same_name(a, b)
 
 
 def _building_key(d: Optional[dict]) -> Optional[str]:
@@ -6379,12 +6400,10 @@ def _same_municipality(a: Optional[dict], b: Optional[dict]) -> Optional[bool]:
     """Same township/borough. The mailing city is only a fallback when either side has no
     township: 3306 E Summit Ave has a Downingtown mailing address but sits in Caln Township, like
     the subject, and was called "different municipality" (417 Dogwood Ln v7, 10/20)."""
-    ta = _norm_token(_first_present(a or {}, "township", "municipality"))
-    tb = _norm_token(_first_present(b or {}, "township", "municipality"))
-    if ta and tb:
-        return ta == tb
-    ca, cb = _norm_token((a or {}).get("city")), _norm_token((b or {}).get("city"))
-    return (ca == cb) if (ca and cb) else None
+    same = _same_place(_first_present(a or {}, "township", "municipality"), _first_present(b or {}, "township", "municipality"))
+    if same is not None:
+        return same
+    return _same_place((a or {}).get("city"), (b or {}).get("city"))
 
 
 # school district / township / neighborhood / mailing city shares of the market-area factor (backtest knob)
@@ -6473,8 +6492,7 @@ def _relevance_market_area_score(subject: dict, comp: dict, *, urban: bool = Fal
         for label, keys in (("school_district", ("school_district", "school_district_name")),
                             ("township", ("township", "municipality")), ("city", ("city",))):
             sv, cv = _first_present(subject, *keys), _first_present(comp, *keys)
-            same = _same_district(sv, cv) if label == "school_district" else (
-                None if not (_norm_token(sv) and _norm_token(cv)) else _norm_token(sv) == _norm_token(cv))
+            same = (_same_district if label == "school_district" else _same_place)(sv, cv)
             detail[label] = None if same is None else (1.0 if same else 0.0)
             if same is False:
                 return 0.0, detail
@@ -6485,17 +6503,16 @@ def _relevance_market_area_score(subject: dict, comp: dict, *, urban: bool = Fal
             cv = _norm_token(_first_present(comp, *keys))
             if label == "zipcode":
                 sv, cv = sv[:5], cv[:5]
-            if sv in ("none available", "none", "n a", "na", "other"):
-                sv = ""
-            if cv in ("none available", "none", "n a", "na", "other"):
-                cv = ""
+            else:
+                sv, cv = (v if _name_parts(v)[0] else "" for v in (sv, cv))
             if not sv:
                 detail[label] = None
                 continue
             if not cv and _REL_UNKNOWN_CREDIT is None:
                 detail[label] = None
                 continue
-            value = (1.0 if sv == cv else 0.0) if cv else _REL_UNKNOWN_CREDIT
+            same = (sv == cv) if label == "zipcode" else _same_place(sv, cv)
+            value = (1.0 if same else 0.0) if cv else _REL_UNKNOWN_CREDIT
             detail[label] = value
             pieces.append((value, weight))
         if not pieces:
@@ -6511,9 +6528,7 @@ def _relevance_market_area_score(subject: dict, comp: dict, *, urban: bool = Fal
     detail = {}
     for label, keys, weight in fields:
         subject_value, comp_value = _first_present(subject, *keys), _first_present(comp, *keys)
-        same = _same_district(subject_value, comp_value) if label == "school_district" else (
-            None if not (_norm_token(subject_value) and _norm_token(comp_value))
-            else _norm_token(subject_value) == _norm_token(comp_value))
+        same = (_same_district if label == "school_district" else _same_place)(subject_value, comp_value)
         if same is None:
             detail[label] = None
             continue

@@ -68,6 +68,12 @@ def _same_district(a: Optional[str], b: Optional[str]) -> Optional[bool]:
     return same(a, b)
 
 
+def _same_place(a: Optional[str], b: Optional[str]) -> Optional[bool]:
+    """Township / neighborhood / city - same rule as cma_ai_service._same_place and lib/matchScore.ts samePlace."""
+    from app.services.cma_ai_service import _same_place as same
+    return same(a, b)
+
+
 def _half_life_decay(delta: float, half_life: float) -> float:
     return math.pow(0.5, abs(delta) / half_life) if half_life > 0 else 0
 
@@ -249,8 +255,7 @@ def _market_area(p: Any, s: Any) -> Optional[float]:
     pieces = []
     for i, (keys, w) in enumerate(fields):
         sv, pv = _get_str(s, keys), _get_str(p, keys)
-        same = _same_district(sv, pv) if i == 0 else (
-            None if not (_normalize(sv) and _normalize(pv)) else _normalize(sv) == _normalize(pv))
+        same = (_same_district if i == 0 else _same_place)(sv, pv)
         if same is not None:
             pieces.append((1 if same else 0, w))
     den = sum(w for _, w in pieces)

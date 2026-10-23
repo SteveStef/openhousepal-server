@@ -70,6 +70,18 @@ def test_school_district_names_match_in_normalized_form():
     assert ai._same_district("Philadelphia City", None) is None
 
 
+def test_place_names_match_across_spellings():
+    # 10/23 all-DB check: one town spelled several ways scored as two places
+    assert ai._same_place("City of Gaithersburg", "Gaithersburg")
+    assert ai._same_place("Mt. Airy", "Mt Airy")
+    assert ai._same_place("Hamilton", "Hamilton Twp")
+    assert ai._same_place("Baltimore", "Baltimore City")
+    assert not ai._same_place("Egg Harbor City", "Egg Harbor Township")
+    assert not ai._same_place("Chevy Chase Village", "Town of Chevy Chase")
+    assert ai._same_place('"None Available"', "Roxborough") is None
+    assert ai._same_municipality({"township": "City of Rockville"}, {"township": "ROCKVILLE"})
+
+
 def test_1985_well_septic_comp_rated_inferior_is_never_strong():
     row = {"normalized_weight": 0.23, "gross_adjustment_pct": 8,
            "quality": {"finish_quality": "below", "interior": "below", "exterior": "below"}}
