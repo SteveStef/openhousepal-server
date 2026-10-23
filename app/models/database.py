@@ -595,6 +595,11 @@ class ClientEmail(Base):
     status = Column(String, nullable=False, default='sending')  # sending | sent | failed
     links = Column(JSONB, nullable=True)               # {"collection_link": "https://..."} - where tracked links go
     error = Column(String, nullable=True)              # why it didn't go through (provider's answer, trimmed)
+    # What Mailgun reported after sending (webhooks, client_email_routes.mailgun_events): delivered |
+    # delayed | bounced | blocked | spam, with a plain reason. NULL = no word yet / sent from their own mailbox.
+    delivery = Column(String(16), nullable=True)
+    delivery_note = Column(String(300), nullable=True)
+    delivery_at = Column(DateTime(timezone=True), nullable=True)
     sent_at = Column(DateTime(timezone=True), nullable=True)
     opened_at = Column(DateTime(timezone=True), nullable=True)
     open_count = Column(Integer, nullable=False, default=0, server_default='0')

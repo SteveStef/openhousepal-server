@@ -11,7 +11,9 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models.database import ClientEmail, Lead, User
+from datetime import datetime, timezone
+
+from app.models.database import ClientEmail, Lead, Notification, User
 from app.services import client_email_service as ce
 from app.services.agent_email_service import app_url
 from app.utils.auth import get_current_active_user
@@ -59,11 +61,39 @@ async def track_visit(track_id: str, db: AsyncSession = Depends(get_db)):
 
 # ---------------------------------------------------------------- Mailgun bounces / complaints
 
+def delivery_from_event(ev: dict) -> tuple[Optional[str], str]:
+    """Mailgun event -> (delivery, plain reason). delivery: delivered | delayed | bounced | blocked | spam.
+    Nobody can see whether a delivered email landed in the inbox or the spam folder - only that
+    their email provider took it, or that they marked it as spam."""
+    kind = ev.get("event")
+    ds = ev.get("delivery-status") or {}
+    said = str(ds.get("description") or ds.get("message") or "").strip()[:160]
+    reason = str(ev.get("reason") or "")
+    if kind == "delivered":
+        return "delivered", "Delivered to their email provider"
+    if kind == "complained":
+        return "spam", "They marked your email as spam - no more emails will go to them"
+    if kind != "failed":
+        return None, ""
+    if ev.get("severity") != "permanent":
+        return "delayed", "Their email server hasn't accepted it yet - retrying" + (f" ({said})" if said else "")
+    if reason == "suppress-bounce":
+        return "blocked", "Not sent - this address bounced before"
+    if reason == "suppress-complaint":
+        return "blocked", "Not sent - they marked an earlier email as spam"
+    if reason == "suppress-unsubscribe":
+        return "blocked", "Not sent - they unsubscribed"
+    if reason == "espblock":
+        return "blocked", "Their email provider blocked it as spam" + (f" ({said})" if said else "")
+    return "bounced", "Bounced - " + (ce.failure_reason(ds.get("code"), said) if said else "that email address doesn't exist or is closed")
+
+
 @router.post("/webhooks/mailgun-events")
 async def mailgun_events(request: Request, db: AsyncSession = Depends(get_db)):
-    """Mailgun -> Sending -> Webhooks: "Permanent failure" and "Spam complaints". Either one means
-    never email that address again (it doesn't exist, or they called it spam) - the fastest way to
-    lose inbox placement is to keep sending to those."""
+    """Mailgun -> Sending -> Webhooks: delivered, temporary + permanent failures, spam complaints.
+    Each one is written on the email it's about (shown on the Emails page and the lead). A bounce
+    or a spam complaint also means never email that address again - the fastest way to lose inbox
+    placement is to keep sending to those - and the agent hears about it."""
     from app.api.webhook_routes import _verify_mailgun_inbound
     try:
         body = await request.json()
@@ -73,34 +103,41 @@ async def mailgun_events(request: Request, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=403, detail="Bad signature")
     ev = body.get("event-data") or {}
     kind = ev.get("event")
-    if kind == "failed" and ev.get("severity") != "permanent":
-        return {"ok": True, "ignored": "temporary"}
-    if kind not in ("failed", "complained"):
+    delivery, note = delivery_from_event(ev)
+    if delivery is None:
         return {"ok": True, "ignored": kind}
     recipient = ce._norm(ev.get("recipient"))
     if not recipient:
         return {"ok": True}
+    track_id = ((ev.get("user-variables") or {}).get("ce"))
+    rec = await db.get(ClientEmail, str(track_id)[:64]) if track_id else None
+    if rec is not None and not (delivery in ("delivered", "delayed") and rec.delivery in ("bounced", "blocked", "spam")):
+        rec.delivery, rec.delivery_note, rec.delivery_at = delivery, note[:300], datetime.now(timezone.utc)
+        if delivery in ("bounced", "blocked"):
+            rec.status, rec.error = "failed", note[:300]
+    if delivery not in ("bounced", "spam"):
+        await db.commit()
+        return {"ok": True, "delivery": delivery}
     from app.services.blacklist_service import BlacklistService
     await BlacklistService.blacklist_email(db, recipient)
-    track_id = ((ev.get("user-variables") or {}).get("ce"))
-    owner_id = None
-    if track_id:
-        rec = await db.get(ClientEmail, str(track_id)[:64])
-        if rec is not None:
-            owner_id = rec.owner_id
-            if kind == "failed":
-                rec.status = "failed"
-            await db.commit()
+    await db.commit()
+    owner_id = rec.owner_id if rec is not None else None
     if owner_id:
         lead = await ce._lead(db, owner_id, recipient)
+        who = ce._first(await ce._person_name(db, owner_id, recipient), recipient)
+        title = f"{who}: email bounced" if delivery == "bounced" else f"{who} marked your email as spam"
+        db.add(Notification(agent_id=owner_id, type="EMAIL_STATUS", reference_type="CLIENT_EMAIL_DELIVERY", reference_id=rec.id,
+                            title=title, message=f"{note}. Check their email address on their lead." if delivery == "bounced" else note + ".",
+                            link=f"/leads?lead={lead.id}" if lead else "/leads/emails", is_read=False, created_at=datetime.now(timezone.utc)))
+        await db.commit()
         if lead is not None:
             from app.services.leads_service import log_activity
             await log_activity(db, owner_id=owner_id, email=recipient, lead=lead, source_type="email_paused",
-                               summary=("Email address bounced - no more emails will be sent to it" if kind == "failed"
+                               summary=("Email address bounced - no more emails will be sent to it" if delivery == "bounced"
                                         else "Marked your email as spam - no more emails will be sent to them"),
-                               raw_snapshot={"to": "off", "mailgun": kind})
+                               raw_snapshot={"to": "off", "mailgun": kind, "reason": note})
     logger.info("mailgun event: address blocked", extra={"event": kind, "recipient_domain": recipient.split("@")[-1]})
-    return {"ok": True}
+    return {"ok": True, "delivery": delivery}
 
 
 # ---------------------------------------------------------------- the agent's Emails page
