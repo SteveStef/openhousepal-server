@@ -515,7 +515,8 @@ def test_time_on_market_trim_does_not_compound():
     # a fairly priced home: one small trim once passed over, the same at 30 days or 3 years
     vals = {d: _edge_final(_edge_check(505000, d, "extended_exposure" if d > 45 else "elevated_exposure"))
             for d in (30, 90, 365, 1095)}
-    assert len(set(vals.values())) == 1 and vals[30] == round(505000 * 0.98)
+    # the band edge, rounded down to a whole $1,000 inside the band (10/24)
+    assert len(set(vals.values())) == 1 and vals[30] == (round(505000 * 0.98) // 1000) * 1000
 
 
 def test_long_unsold_overpriced_listing_lets_the_sales_win():
@@ -596,12 +597,13 @@ def test_v13_valuation_notes_say_trim_once():
     assert out.endswith("point to about $500,000; after that small time-on-market trim, the final value lands about 2% below that, at $490,000.")
 
 
-def test_v13_passed_over_range_top_held_at_asking():
+def test_v13_passed_over_range_top_not_capped_at_asking():
+    # 10/24 grader (417 Dogwood Ln): asking price + time on market move the value, they don't cap the range
     chk = {"asking_price": 500000, "allowed_low": 416500, "allowed_high": 490000, "passed_over": True,
            "expected_sale_price": 490000, "ratio_used": 0.98}
     out, flags = ai._apply_asking_price_check(
         {"final_fmv": 490000, "range_low": 475000, "range_high": 515000, "confidence": "medium"}, {"asking_price_check": chk})
-    assert out["final_fmv"] == 490000 and out["range_low"] == 475000 and out["range_high"] == 500000 and flags
+    assert out["final_fmv"] == 490000 and out["range_low"] == 475000 and out["range_high"] == 515000 and not flags
     fresh = {**chk, "passed_over": False, "allowed_high": 530000}
     same, _ = ai._apply_asking_price_check(
         {"final_fmv": 490000, "range_low": 475000, "range_high": 515000, "confidence": "medium"}, {"asking_price_check": fresh})
@@ -790,17 +792,20 @@ def test_v16_original_finishes_softened_unless_the_listing_says_original():
     assert "original hardwood" in ai._reconcile_comp_hard_facts("Carpet over original hardwood.", "Comp #2", DOGWOOD_SUBJECT, comp)[0]
 
 
-def test_v16_range_top_at_asking_is_explained():
-    notes = "The final fair market value is $490,000, with a supported valuation range of $470,000-$500,000."
-    trace = {"authority": "reasoning_model", "anchor": {"anchor_value": 499877},
-             "asking_price_check": {"passed_over": True, "asking_price": 500000, "allowed_high_price": 490000}}
-    final = {"value": 490000, "anchor_value": 499877, "range_min": 470000, "range_max": 500000}
+def test_range_top_never_explained_as_an_asking_cap():
+    # 10/24 grader (417 Dogwood Ln V20): the range is no longer capped at asking, and the old cap sentence
+    # (printed twice in V20) is dropped from earlier notes on a re-run
+    notes = ("The final fair market value is $490,000, with a supported valuation range of $470,000-$500,000. "
+             "The range stops at the $500,000 asking price because the home hasn't drawn an accepted offer at that price yet.")
+    trace = {"authority": "reasoning_model", "deterministic_anchor": 495040, "anchor": {"anchor_value": 495040},
+             "asking_price_check": {"passed_over": True, "asking_price": 500000, "allowed_high_price": 490000,
+                                    "expected_sale_price": 490000, "ratio_used": 0.98}}
+    trace["value_bridge"] = ai._v10_value_bridge(trace, value=490000, range_min=470000, range_max=500000)
+    final = {"value": 490000, "anchor_value": 495040, "range_min": 470000, "range_max": 500000}
     out, _ = ai._v10_reconcile_anchor_direction_prose(notes, final=final, trace=trace)
-    assert "The range stops at the $500,000 asking price because the home hasn't drawn an accepted offer" in out
+    assert "range stops" not in out and out.count("How the value was reached:") == 1
     again, _ = ai._v10_reconcile_anchor_direction_prose(out, final=final, trace=trace)
-    assert again.count("range stops at the") == 1
-    fresh = {**trace, "asking_price_check": {**trace["asking_price_check"], "passed_over": False}}
-    assert "range stops" not in ai._v10_reconcile_anchor_direction_prose(notes, final=final, trace=fresh)[0]
+    assert again.count("How the value was reached:") == 1
 
 
 # ---- 417 Dogwood Ln v17 (10/21) -----------------------------------------------------------------

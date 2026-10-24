@@ -26,6 +26,7 @@ from app.services.cma_similarity_service import (
 from app.services.cma_artifact_service import saved_artifact_matches, stamp_final_artifact_qa
 from app.utils.geo import distance_miles_sql, get_lat_long_offsets, haversine_distance, is_within_distance
 from app.utils.listing_dom import dom_fetched_at, resolve_days_on_market
+from app.services import cma_fact_check
 
 
 _AUTHORITATIVE_SUBJECT_FACT_FIELDS = (
@@ -61,6 +62,17 @@ def _mls_baths(prop: Property) -> Optional[float]:
     return baths
 
 
+def _sane_lot_size(p, price=None) -> Optional[float]:
+    """The lot in sq ft, or None when the MLS figure is a data error (523 Sherbrook Dr: 18,774,360 sq ft = 431
+    acres on a 2001 subdivision house - shown on the 10/23 report). Unknown beats wrong."""
+    lot = getattr(p, 'lot_size', None)
+    if not lot:
+        return lot
+    if cma_fact_check.implausible_lot(float(lot) / 43560, price or getattr(p, 'price', None), getattr(p, 'home_type', None)):
+        return None
+    return lot
+
+
 def _property_subject_facts(prop: Property) -> Dict[str, Any]:
     """One MLS-backed source for hard subject facts used by every match calculation."""
     raw = getattr(prop, "raw_mls_data", None) or {}
@@ -74,7 +86,7 @@ def _property_subject_facts(prop: Property) -> Dict[str, Any]:
         "latitude": prop.latitude,
         "longitude": prop.longitude,
         "sqft": prop.living_area,
-        "lot_size": prop.lot_size,
+        "lot_size": _sane_lot_size(prop),
         "year_built": prop.year_built,
         "property_type": prop.home_type,
         "school_district": raw.get("SchoolDistrictName") or prop.school_district_name,
@@ -992,7 +1004,7 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
             sqft=sqft,
             above_grade_finished_area=p.above_grade_finished_area,
             below_grade_finished_area=p.below_grade_finished_area,
-            lot_size=p.lot_size,
+            lot_size=_sane_lot_size(p, sale_price or list_price),
             beds=p.bedrooms,
             baths=_mls_baths(p),
             year_built=p.year_built,
@@ -1095,9 +1107,30 @@ _AUTO_URBAN_BAND = os.environ.get("CMA_AUTO_URBAN_BAND", "1") == "1"
 _AUTO_PRICE_BAND = float(os.environ.get("CMA_AUTO_PRICE_BAND", "0.35"))
 
 
+# Sales just outside the price band are still fetched and SHOWN, never auto-picked (grader 10/23: 11
+# Foxchase Rd sold for $1.85M, 40% over 8084 Goshen Rd's $1.325M asking price, and the agent never saw
+# it). The +/-35% pick band stays (0.5 tested worse on the backtest); this only stops silent drops.
+_AUTO_PRICE_SHOW_BAND = float(os.environ.get("CMA_AUTO_PRICE_SHOW_BAND", "0.6"))
+_AUTO_OUTSIDE_BAND_MAX = 12
+
+
 def _auto_pickable(c: CmaCompCandidate) -> bool:
     d = c.similarity_details or {}
-    return not d.get("property_type_incompatible") and d.get("valuation_eligible") is not False
+    return (not d.get("property_type_incompatible") and d.get("valuation_eligible") is not False
+            and not d.get("outside_price_band"))
+
+
+def _mark_outside_band(c: CmaCompCandidate, lp: float) -> CmaCompCandidate:
+    price = c.sale_price or c.close_price or c.list_price
+    pct = round((price / lp - 1) * 100) if price and lp else None
+    d = dict(c.similarity_details or {})
+    d["outside_price_band"] = {
+        "pct_vs_asking": pct,
+        "note": (f"Not auto-picked: sold for {abs(pct)}% {'more' if pct > 0 else 'less'} than this home's asking price "
+                 f"(the automatic pick stays within {round(_AUTO_PRICE_BAND * 100)}%). Add it by hand if it is a true match.")
+        if pct is not None else "Not auto-picked: outside the automatic price range.",
+    }
+    return c.model_copy(update={"similarity_details": d})
 
 
 def _sale_age_days(c: CmaCompCandidate, today: date) -> Optional[int]:
@@ -1303,7 +1336,22 @@ async def auto_search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *
     chosen = [c for c in pool
               if (c.distance_miles or 0) <= plan["radius_miles"]
               and (_sale_age_days(c, date_to) or 0) <= plan["sold_within_days"]]
-    return {"results": chosen[:60], **plan,
+    outside: List[CmaCompCandidate] = []
+    if lp and _AUTO_PRICE_SHOW_BAND > _AUTO_PRICE_BAND:
+        try:
+            near_pool = await search_comparables(db, wide.model_copy(update={
+                "radius_miles": plan["radius_miles"],
+                "sale_date_from": (date_to - timedelta(days=plan["sold_within_days"])).isoformat(),
+                "min_price": round(lp * (1 - _AUTO_PRICE_SHOW_BAND)), "max_price": round(lp * (1 + _AUTO_PRICE_SHOW_BAND)),
+            }), keep_all=True, row_limit=300)
+            lo_b, hi_b = wide.min_price or 0, wide.max_price or float("inf")
+            seen = {c.listing_key for c in chosen}
+            outside = sorted((_mark_outside_band(c, lp) for c in near_pool
+                              if c.listing_key not in seen and not (lo_b <= (c.sale_price or c.close_price or c.list_price or 0) <= hi_b)),
+                             key=lambda c: -(c.match_score or 0))[:_AUTO_OUTSIDE_BAND_MAX]
+        except Exception:  # noqa: BLE001 - a side list must never break the comp step
+            outside = []
+    return {"results": chosen[:60] + outside, **plan,
             "price_band": [wide.min_price, wide.max_price],
             "limited_message": "Limited comparable sales - agent review recommended." if plan["limited"] else None}
 

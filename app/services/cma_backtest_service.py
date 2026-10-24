@@ -294,7 +294,9 @@ def _score_subject(s: dict) -> dict:
 
 def _pickable(c) -> bool:
     d = c.similarity_details or {}
-    return not d.get("property_type_incompatible") and d.get("valuation_eligible") is not False
+    # mirrors the wizard's isAutoPickable: sales outside the price band are shown, never auto-picked (10/24)
+    return not d.get("property_type_incompatible") and d.get("valuation_eligible") is not False \
+        and not d.get("outside_price_band")
 
 
 async def wizard_comps(db: AsyncSession, subject: dict, as_of: date) -> tuple[list, dict]:
