@@ -775,14 +775,26 @@ def _bid(kind: str) -> str:
 _BOLD = re.compile(r"\*\*(.+?)\*\*")
 
 
-def _rich(text: str) -> str:
-    """Plain model text -> the editor's sanitized inline HTML (escape first, then **bold** only)."""
+_MD_LINK = re.compile(r"\[([^\[\]]{1,140})\]\((https?://[^\s()]+)\)")
+
+
+def _rich(text: str, links: Optional[set] = None) -> str:
+    """Plain model text -> the editor's sanitized inline HTML (escape first, then **bold**, then
+    [anchor](url) links - only to URLs in `links`, the article's own sources; any other link
+    keeps its words and loses the URL)."""
     escaped = html.escape((text or "").strip(), quote=False)
-    return _BOLD.sub(r"<strong>\1</strong>", escaped).replace("\n", "<br>")
+    out = _BOLD.sub(r"<strong>\1</strong>", escaped).replace("\n", "<br>")
+
+    def link(m):
+        url = html.unescape(m.group(2))
+        if links and url in links:
+            return f'<a href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">{m.group(1)}</a>'
+        return m.group(1)
+    return _MD_LINK.sub(link, out)
 
 
 def _plain(text: str) -> str:
-    return _BOLD.sub(r"\1", (text or "").strip())
+    return _MD_LINK.sub(r"\1", _BOLD.sub(r"\1", (text or "").strip()))
 
 
 def _coerce(value, kind):
@@ -812,7 +824,7 @@ def _normalize_article(article: dict) -> dict:
     return article
 
 
-def _convert_blocks(raw_blocks: list) -> list[dict]:
+def _convert_blocks(raw_blocks: list, links: Optional[set] = None) -> list[dict]:
     out = []
     for b in _coerce(raw_blocks, list):
         b = _coerce(b, dict)
@@ -826,15 +838,16 @@ def _convert_blocks(raw_blocks: list) -> list[dict]:
         elif kind in ("paragraph", "subheading", "quote", "callout"):
             text = b.get("text") or ""
             if text.strip():
-                out.append({"id": _bid(kind), "type": kind, "data": {"html": _rich(text)}})
+                out.append({"id": _bid(kind), "type": kind, "data": {"html": _rich(text, links if kind in ("paragraph", "callout") else None)}})
     return out
 
 
-def article_to_blocks(article: dict, default_label: str = "Contact Me", form_type: Optional[str] = None) -> list[dict]:
+def article_to_blocks(article: dict, default_label: str = "Contact Me", form_type: Optional[str] = None, links: Optional[set] = None) -> list[dict]:
+    """`links`: URLs the article may link inline (the pipeline passes its sources)."""
     blocks: list[dict] = []
     for para in article.get("intro") or []:
         if isinstance(para, str) and para.strip():
-            blocks.append({"id": _bid("paragraph"), "type": "paragraph", "data": {"html": _rich(para)}})
+            blocks.append({"id": _bid("paragraph"), "type": "paragraph", "data": {"html": _rich(para, links)}})
     glance = [g for g in (article.get("at_a_glance") or []) if isinstance(g, str) and g.strip()]
     if glance:
         body = "<strong>At a glance</strong><br>" + "<br>".join(f"&bull; {_rich(g)}" for g in glance)
@@ -845,13 +858,13 @@ def article_to_blocks(article: dict, default_label: str = "Contact Me", form_typ
         heading = (section.get("heading") or "").strip()
         if heading:
             blocks.append({"id": _bid("heading"), "type": "heading", "data": {"html": _rich(heading)}})
-        blocks.extend(_convert_blocks(section.get("blocks")))
+        blocks.extend(_convert_blocks(section.get("blocks"), links))
     closing = article.get("closing") or {}
     if closing.get("heading"):
         blocks.append({"id": _bid("heading"), "type": "heading", "data": {"html": _rich(closing["heading"])}})
     for para in closing.get("paragraphs") or []:
         if isinstance(para, str) and para.strip():
-            blocks.append({"id": _bid("paragraph"), "type": "paragraph", "data": {"html": _rich(para)}})
+            blocks.append({"id": _bid("paragraph"), "type": "paragraph", "data": {"html": _rich(para, links)}})
     # A button that opens one of the agent's forms wears that form's own name (not the AI's wording).
     label = default_label if form_type else (closing.get("button_label") or default_label)
     cta = {"label": label.strip()[:40], "action": "contact"}

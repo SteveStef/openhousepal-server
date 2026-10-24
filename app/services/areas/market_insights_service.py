@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import Property
 from app.services.areas import geography
-from app.services.open_house_manager_service import INACTIVE_STATUSES
+from app.services.areas.market_stats_service import FOR_SALE_STATUSES
 
 _SOLD = ("CLOSED-BRIGHT", "CLOSED")
 _BANDS = [0, 300_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000, 5_000_000, None]
@@ -97,7 +97,8 @@ async def get_area_insights(db: AsyncSession, scope: dict, district_names: Optio
     active = (await db.execute(
         select(Property.price, Property.bedrooms, Property.bathrooms, Property.living_area, Property.lot_size_acres,
                Property.year_built, Property.tax_annual_amount, Property.school_district_name)
-        .where(location_filter, resid, Property.home_status.notin_(INACTIVE_STATUSES), Property.home_status.notin_(_SOLD))
+        # Homes a buyer can still offer on - under contract / pending aren't supply (10/24).
+        .where(location_filter, resid, Property.home_status.in_(FOR_SALE_STATUSES))
     )).all()
 
     # One row shape for both: (price, beds, baths, sqft, acres, year, tax, district)

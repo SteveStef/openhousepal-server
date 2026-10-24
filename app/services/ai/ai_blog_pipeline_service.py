@@ -29,6 +29,7 @@ allowance covers the engine's typical full cost (`blog_pipeline_gate_usd`), and 
 from __future__ import annotations
 
 import json
+import re
 import logging
 import time
 from datetime import datetime, timezone
@@ -71,7 +72,16 @@ FACT VS INTERPRETATION
 State facts plainly; label analysis as analysis ("that limited supply appears to be one factor supporting prices"). No causation the evidence doesn't show. Market labels ("seller's market", "bidding wars are common", "prices are rising", "inventory is extremely low", "homes sell immediately") only when the ledger numbers show it - and then show the numbers.
 
 LOCAL GEOGRAPHY
-Mailing address / postal town, municipality or township, county, school district and ZIP code are different things and often don't line up - one postal town can span several townships and school districts. Never assume a ZIP equals a municipality or that a town has one school district; where location matters, say it depends on the specific address. Mention only towns and places that are relevant and in the ledger - never sprinkle town names for SEO.
+Mailing address / postal town, municipality or township, county, school district and ZIP code are different things and often don't line up - one postal town can span several townships and school districts. Which township, county or school district a town's homes sit in comes ONLY from the ledger's `geography` items (verified from Census boundaries and the MLS records) - name exactly the townships/districts they list for that town, never one they don't, and never generalize one town's split to another ("Villanova and Wayne both lie in..." is wrong unless the geography items say so for each). Never assume a ZIP equals a municipality or that a town has one school district; where location matters, say it depends on the specific address. Mention only towns and places that are relevant and in the ledger - never sprinkle town names for SEO.
+
+MARKET NUMBERS
+Each area's `Definition -` item says what its numbers cover (a township, or a mailing address that spans several townships). When the article uses more than one area's numbers, say in one plain sentence what each covers. Where an `Overlap:` item says areas share homes, never add their counts together or call them separate markets. "For sale" means active listings; homes under contract or pending are a separate number - never call them for sale, and when inventory matters mention both (that share already under contract is part of the story). A small-sample item stays qualified. Leave out year-ago comparisons the ledger says are unreliable.
+
+LOANS, PROGRAMS AND ABSOLUTE STATEMENTS
+Rules differ by loan type: mortgage insurance, minimum down payment and credit rules for conventional, FHA, VA, USDA and state-agency (e.g. PHFA) loans are not the same. Always name the loan type a rule applies to ("on a conventional loan with less than 20% down, lenders generally require PMI"), and mention when a common alternative differs (VA: no monthly mortgage insurance; FHA: mortgage insurance at any down payment) if the ledger has it. Words like must, always, never, required, all, every, only need a ledger item that says exactly that for the same scope - otherwise qualify them ("generally", "on most conventional loans") or name the scope.
+
+LINKS
+Link a primary source once, inline, where it backs a key figure or rule (a tax rate, program limit, loan rule): write [a few natural anchor words](the exact URL shown in that ledger item). Use only URLs that appear in the ledger, 2-6 links in the article, never in headings or the at-a-glance box, never to Bright MLS/OpenHousePal data. Town names are linked to the agent's neighborhood guides automatically - don't add links for them.
 
 SCHOOLS
 Objective only: name the districts/schools in the ledger and say attendance depends on the address and should be verified with the district. Never call a school or district best, top, excellent, great, highly rated, prestigious, desirable, sought-after or good for families. Rankings or test data only when they are in the ledger, attributed to their source.
@@ -80,7 +90,7 @@ FAIR HOUSING
 Never reference or imply race, color, religion, sex, familial status, national origin, disability, sexual orientation or age - of an area, a home or who would or should live there. Never use schools, demographics, religion, crime or safety to suggest who belongs somewhere. Never write: family/families/family-friendly, perfect for / ideal for [a type of person], safe / safe neighborhood, exclusive, integrated, traditional neighborhood, bachelor, empty nesters, young professionals, retirees, master bedroom (say primary bedroom), crime. Describe places, homes, amenities and the process - not people.
 
 THE AGENT'S EXPERIENCE
-Never invent the agent's experience: no "I recently represented...", "I helped one of my buyers...", "in one of my recent transactions...", "I see this constantly with my clients...", no client stories, years in business, sales volume, awards or credentials unless the agent wrote them in the brief. Ledger items of type agent_sales are the agent's own closed transactions, but WHICH SIDE they represented is not recorded: you may call one "a recent sale of mine" and give its public facts (address, town, price, month), but never say buyer or seller side, never describe negotiations, never reveal client details. When the brief contains the agent's personal take, it is the heart of the article - use it faithfully in their voice and add nothing to it.
+Never invent the agent's experience: no "I recently represented...", "I helped one of my buyers...", "in one of my recent transactions...", "I see this constantly with my clients...", no client stories, years in business, sales volume, awards or credentials unless the agent wrote them in the brief. Ledger items of type agent_sales are the agent's own closed transactions, but WHICH SIDE they represented is not recorded: you may call one "a recent sale of mine" and give its public facts (address, town, price, month), but never say buyer or seller side, never describe negotiations, never reveal client details. When the brief contains the agent's personal take, it is the heart of the article - use it faithfully in their voice and add nothing to it. A point in the brief that is the agent's opinion or experience rather than a checkable fact ("banks can be slower than mortgage companies") is written as theirs ("In my experience, ..."), never as a general fact - and a company named there is never praised or criticized beyond the agent's own words.
 
 OFFERS AND STRATEGY
 Protect the client. Never "do whatever it takes to win"; never tell readers to waive inspections or contingencies. Explain options and tradeoffs (price, financing, deposit, settlement timing, inspection, appraisal and mortgage risk, seller priorities) and that risk tolerance differs ("Some buyers may consider modifying inspection terms in highly competitive situations, but the risks should be understood first"). Legal and tax specifics: speak generally and point to the right professional.
@@ -94,10 +104,13 @@ SEO
 Answer the real question someone types into Google (the search intent). Primary keyword naturally in the title, the first paragraph and one H2; 3-6 secondary terms used naturally, never stuffed. H2s read like a table of contents a reader would scan. Add a "Frequently asked questions" H2 (subheading question + short paragraph answer pairs) when it genuinely helps. seo_title <= 60 characters; meta_description 140-158 characters, written to earn the click. Length: the brief's target - value per paragraph beats word count.
 
 CALL TO ACTION
-Natural and specific to the article ("If you're weighing an offer in Villanova, I can show you what has recently sold, what is competing for buyers right now, and how I'd approach a specific home") - never pushy.
+Natural and specific to the article ("If you're weighing an offer in Villanova, I can show you what has recently sold, what is competing for buyers right now, and how I'd approach a specific home") - never pushy. Say what the reader gets (a search set up for their price range and towns, the numbers for a specific home, a valuation before they offer).
+
+ELEMENTS ADDED AROUND YOUR TEXT
+The request lists cards the system inserts into the article (Town Spotlight cards, a payment example, the agent's video, the neighborhood-guide links, a Sources list). They are real - you may point to them in one short sentence ("the payment example below"), but never repeat their numbers in full or describe what a video shows beyond its title.
 
 BEFORE YOU SUBMIT
-Audit every factual sentence: is it in the ledger? current and dated? specific enough? could geography mislead? ZIP vs municipality confused? opinion dressed as fact? fair-housing sensitive? invented agent involvement? stale number? implied causation? Fix it, then submit.
+Audit every factual sentence: is it in the ledger? current and dated? specific enough? does each town's township/district match its geography item? are overlapping areas added together? is under-contract inventory called for sale? is a loan rule missing its loan type? any absolute word the ledger doesn't support? opinion dressed as fact? fair-housing sensitive? invented agent involvement? stale number? implied causation? Fix it, then submit.
 
 FORMAT
 You may use **double asterisks** for occasional bold emphasis inside paragraphs. Deliver the article ONLY by calling the submit_blog_article tool, exactly once."""
@@ -160,6 +173,7 @@ _EVIDENCE_TOOL = {
             "source_url": {"type": "string", "description": "The exact page you read it on."},
             "as_of": {"type": "string", "description": "Date or period the fact describes, e.g. '2026-09-25' or 'FY 2026-27'."},
             "confidence": {"type": "number", "description": "0-1."},
+            "note": {"type": "string", "description": "Optional researcher's caveat (never part of the claim, never shown to the writer as fact)."},
         }, "required": ["town", "topic", "claim", "source_name", "source_url", "as_of", "confidence"]}},
         "not_found": {"type": "array", "items": {"type": "string"}, "description": "What you looked for and could not verify."},
     }, "required": ["items", "not_found"]},
@@ -170,7 +184,9 @@ _RESEARCH_SYSTEM = """You are the research desk for a licensed real estate agent
 Rules:
 - Use the web_search tool. Prefer, in order: county/municipal government, school district websites, state/federal government (Census), Freddie Mac / Federal Reserve, Bright MLS / brokerage research, established real estate data providers, reputable local journalism. Never rely on random blogs, SEO listicles or AI-generated pages when a primary source exists.
 - Every item must be a fact you actually read on the page you cite, with its number, geography and date window. If two sources disagree, report the more authoritative one and say so in the claim.
+- A claim states ONLY what that page says. Your own reasoning, advice, caveats or context ("so confirm each property's municipality", "Villanova and Wayne lie partly in...") never goes in a claim - put caveats in `note`. Never state which township, county or school district a town lies in unless the cited page says exactly that for that town; the TOWNS section already gives the verified split.
 - Keep geography exact: postal town vs township/municipality vs county vs school district vs ZIP. If a fact is for a township or county rather than the town, say which.
+- Loan and program rules: keep the loan type and any conditions with the rule (e.g. "on PHFA's conventional Keystone Home Loan, ..."), never a bare "buyers must...".
 - Schools: districts, boundaries, budgets, millage, official policies - never rankings or opinions unless attributed to a named source.
 - Never research or report anything about the demographics, religion, ethnicity or "type" of residents, or crime.
 - Don't repeat facts listed under ALREADY KNOWN - find what's missing.
@@ -190,8 +206,9 @@ _REVIEW_TOOL = {
             "verdict": {"type": "string", "enum": ["supported", "partly_supported", "unsupported", "stale", "analysis"]},
         }, "required": ["quote", "evidence_ids", "verdict"]}},
         "issues": {"type": "array", "items": {"type": "object", "properties": {
-            "kind": {"type": "string", "enum": ["unsupported_claim", "wrong_number", "stale_data", "wrong_geography", "fair_housing", "school_language",
-                                                "invented_experience", "causation", "legal_tax", "generic_ai_phrasing", "repetition", "other"]},
+            "kind": {"type": "string", "enum": ["unsupported_claim", "wrong_number", "stale_data", "wrong_geography", "market_definition", "overgeneralization",
+                                                "fair_housing", "school_language", "invented_experience", "causation", "legal_tax", "generic_ai_phrasing",
+                                                "repetition", "other"]},
             "severity": {"type": "string", "enum": ["high", "medium", "low"]},
             "quote": {"type": "string"},
             "problem": {"type": "string"},
@@ -209,8 +226,8 @@ _REVIEW_TOOL = {
 _REVIEW_SYSTEM = """You are the fact-check and compliance editor for a licensed real estate agent's blog - strict, specific and fair. You receive the EVIDENCE LEDGER the writer was allowed to use, the agent's brief, and the finished ARTICLE.
 
 1. In `claims`, list every factual claim (numbers, dates, places, businesses, schools/districts, market statements, rates, taxes, statements about the agent's experience), quoted exactly, with the ledger ids that support it and a verdict: supported (the ledger says it - same number, date window and geography), partly_supported (right idea but a detail is off, unattributed or undated), unsupported (not in the ledger or brief), stale (the ledger date is too old to state as current), analysis (clearly labeled interpretation - fine).
-2. In `issues`, report every problem: unsupported_claim, wrong_number, stale_data, wrong_geography (ZIP vs township vs school district confusion, assuming one district, wrong town), fair_housing (protected classes, steering, "family", "safe", "perfect for..."), school_language (any subjective school/district wording), invented_experience (agent involvement, buyer/seller side, clients, years or volume not in the brief), causation (unsupported cause-and-effect), legal_tax (definitive legal/tax advice, advising to waive contingencies), generic_ai_phrasing (filler, hype, cliches like nestled/vibrant/dream home/hidden gem/navigating), repetition, other.
-3. Give every issue a minimal fix: `find` = an exact, verbatim substring of the ARTICLE text (copy it character for character, long enough to be unique, inside one sentence or list item), `replace` = the corrected text (qualify, attribute, add the date, soften, or "" to delete). Never add a fact that isn't in the ledger. A figure the ledger only has second-hand (a news site "citing" the primary source) or marks as unconfirmed gets DELETED, not hedged, when the primary figure is also present. The article must never talk about its own sourcing ("I haven't confirmed...", "according to my research", "the ledger") - fix those by deleting or rewriting.
+2. In `issues`, report every problem: unsupported_claim, wrong_number, stale_data, wrong_geography (check EVERY statement about which township, county or school district a town is in against that town's `geography` ledger items - a township or district they don't list is wrong even if another ledger item says it; ZIP vs township confusion; assuming one district; one town's split applied to another), market_definition (areas' counts added together or treated as separate when an Overlap item says they share homes; homes under contract or pending called "for sale"; an area's numbers described as something other than its Definition item; a small sample stated without its caveat; a year-ago comparison the ledger marks unreliable), overgeneralization (a rule stated for everyone that the ledger gives for one loan type, program or place - "buyers with under 20% down must get mortgage insurance" is conventional-only; must/always/never/required/all without a ledger item saying exactly that), fair_housing (protected classes, steering, "family", "safe", "perfect for..."), school_language (any subjective school/district wording), invented_experience (agent involvement, buyer/seller side, clients, years or volume not in the brief - but an opinion or observation the agent wrote in the brief, framed as theirs ("In my experience, ..."), is supported by the brief and must stay framed as theirs; flag it only when it is stated as a general fact), causation (unsupported cause-and-effect), legal_tax (definitive legal/tax advice, advising to waive contingencies), generic_ai_phrasing (filler, hype, cliches like nestled/vibrant/dream home/hidden gem/navigating), repetition, other.
+3. Give every issue a minimal fix: `find` = an exact, verbatim substring of the ARTICLE text (copy it character for character, long enough to be unique, inside one sentence or list item), `replace` = the corrected text (qualify, attribute, add the date, soften, correct it from the ledger, or "" to delete). Never add a fact that isn't in the ledger. Keep any [anchor](url) link markup intact in your replacement unless the link itself is the problem. Every item under AUTOMATED CHECKS is a confirmed problem - each needs an issue with a fix. The elements listed under INSERTED ELEMENTS are real parts of the article - a sentence pointing to them is not an unsupported claim. A figure the ledger only has second-hand (a news site "citing" the primary source) or marks as unconfirmed gets DELETED, not hedged, when the primary figure is also present. The article must never talk about its own sourcing ("I haven't confirmed...", "according to my research", "the ledger") - fix those by deleting or rewriting.
 4. Score 1-10 - honestly, a 9-10 must be earned: accuracy, local_specificity (could only have been written about this place), usefulness (answers the reader's real question), voice (sounds like a knowledgeable local agent, not AI), readability, seo, compliance.
 5. `summary`: 1-2 plain sentences for the agent. `improvements`: up to 4 specific things the agent could add (their own experience, a photo, a number they have) to make it stronger.
 
@@ -406,8 +423,142 @@ def _build_ledger(items: list[dict], per_town_cap: int = 70) -> tuple[list[dict]
     lines = []
     for it in ledger:
         src = it.get("source_name") or "source"
-        lines.append(f"[{it['eid']}] ({it.get('topic')} | {src}{' | as of ' + str(it['as_of']) if it.get('as_of') else ''}) {it['claim']}")
+        url = f" <{it['source_url']}>" if it.get("source_url") else ""
+        lines.append(f"[{it['eid']}] ({it.get('topic')} | {src}{' | as of ' + str(it['as_of']) if it.get('as_of') else ''}) {it['claim']}{url}")
     return ledger, "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic checks + the worked payment example (no model involved)
+# ---------------------------------------------------------------------------
+
+_LOAN_RULE = re.compile(r"\b(mortgage insurance|PMI|MIP|down payment|downpayment)\b", re.I)
+_ABSOLUTE = re.compile(r"\b(must|required|requires|have to|has to|need to|needs to|always|never|all buyers|every buyer)\b", re.I)
+_LOAN_TYPE = re.compile(r"\b(conventional|FHA|VA\b|USDA|PHFA|Keystone|HomeReady|Home Possible|jumbo|K-FIT|HFA Preferred|government)", re.I)
+_SENTENCES = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def loan_rule_lint(text: str) -> list[str]:
+    """Sentences stating a mortgage-insurance / down-payment rule as absolute without naming the
+    loan type (10/17: "Borrowers who put down less than 20% must also get mortgage insurance" -
+    true for conventional loans, not VA)."""
+    out = []
+    for s in _SENTENCES.split(text or ""):
+        if _LOAN_RULE.search(s) and _ABSOLUTE.search(s) and not _LOAN_TYPE.search(s):
+            out.append(s.strip())
+    return out
+
+
+def _monthly_pi(loan: float, rate_pct: float, years: int = 30) -> float:
+    r, n = rate_pct / 1200, years * 12
+    return loan / n if r == 0 else loan * r / (1 - (1 + r) ** -n)
+
+
+def _round_price(v: float) -> int:
+    step = 10_000 if v >= 500_000 else 5_000
+    return int(round(v / step) * step)
+
+
+_BUYER_WORDS = re.compile(r"\b(buy|buyer|buying|first[- ]time|afford|mortgage|payment|down payment|preapprov|purchase|starter)", re.I)
+
+
+def wants_payment_example(brief: dict) -> bool:
+    text = " ".join([str(brief.get("topic") or ""), str(brief.get("goal") or ""), " ".join(brief.get("audiences") or []), str(brief.get("key_points") or "")])
+    return bool(_BUYER_WORDS.search(text))
+
+
+def payment_example(entry: dict, rate: dict, area_names: list[str], *, conforming_limit: Optional[int] = None) -> Optional[dict]:
+    """A worked example for a realistic entry price (the 25th-percentile list price of homes for
+    sale across the article's towns): down payment, loan, principal & interest at Freddie Mac's
+    latest 30-year average, a property-tax estimate from similar listings' tax bills, and closing
+    costs at the CFPB's 2-5% range. Every number is computed here, never by the writer."""
+    if not entry or not entry.get("p25") or not rate or not rate.get("rate_30"):
+        return None
+    price = _round_price(entry["p25"])
+    tax_pct = entry.get("tax_pct_near_p25")
+    tax_mo = round(price * tax_pct / 100 / 12) if tax_pct else None
+    scenarios = []
+    for pct in (5, 10, 20):
+        down = round(price * pct / 100)
+        loan = price - down
+        pi = round(_monthly_pi(loan, rate["rate_30"]))
+        scenarios.append({"down_pct": pct, "down": down, "loan": loan, "principal_interest": pi,
+                          "mortgage_insurance": "none" if pct >= 20 else "lender quote", "tax": tax_mo,
+                          "monthly_before_insurance": pi + (tax_mo or 0),
+                          "jumbo": bool(conforming_limit and loan > conforming_limit)})
+    return {
+        "price": price, "price_basis": f"About a quarter of the {entry['homes']} homes for sale across {_and_list(area_names)} are listed at or below this price.",
+        "rate": rate["rate_30"], "rate_as_of": rate.get("as_of"), "term_years": 30,
+        "tax_pct": tax_pct, "tax_basis": (f"median tax bill of similar-priced homes for sale, {tax_pct}% of list price a year" if tax_pct else None),
+        "closing_low": round(price * 0.02), "closing_high": round(price * 0.05),
+        "scenarios": scenarios, "as_of": datetime.now(timezone.utc).date().isoformat(),
+    }
+
+
+def payment_example_items(ex: dict) -> list[dict]:
+    """The example's numbers as ledger items, so the writer can point to them and the number
+    audit recognizes them."""
+    m = writer._money
+    items = [f"Worked payment example (OpenHousePal calculation): a {m(ex['price'])} home. {ex['price_basis']} Rate used: Freddie Mac's 30-year average of {ex['rate']:.2f}% (week of {ex['rate_as_of']}); a buyer's own rate will differ."]
+    for s in ex["scenarios"]:
+        items.append(f"Payment example, {s['down_pct']}% down: {m(s['down'])} down, {m(s['loan'])} loan, about {m(s['principal_interest'])}/month principal and interest"
+                     + (f" plus about {m(s['tax'])}/month property tax" if s.get("tax") else "")
+                     + ("" if s["down_pct"] >= 20 else " plus mortgage insurance on a conventional loan (lender quote)")
+                     + (" - above the conforming loan limit, so a jumbo loan." if s.get("jumbo") else "."))
+    items.append(f"Payment example closing costs: {m(ex['closing_low'])}-{m(ex['closing_high'])} (the CFPB's typical 2-5% of the price), on top of the down payment.")
+    return [{"topic": "market", "claim": c, "source_name": "OpenHousePal calculation", "source_url": None, "as_of": ex["as_of"], "confidence": 0.99,
+             "town": "general", "origin": "calc"} for c in items]
+
+
+_DATE_HEAD = re.compile(r"^((?:FY\s*)?\d{4}(?:-\d{2}(?:-\d{2})?)?(?:-\d{2,4})?)")
+
+
+def _public_date(as_of) -> Optional[str]:
+    """A source's date as readers see it: '2026-10 (page read 2026-10-02)' -> '2026-10';
+    research notes in the as-of field stay in the agent's report, not on the page."""
+    m = _DATE_HEAD.match(str(as_of or "").strip())
+    return m.group(1) if m else None
+
+
+def _and_list(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1] if names else ""
+
+
+# One state-specific line under the payment card's closing costs (from that state's own facts).
+_CLOSING_NOTES = {
+    "PA": "In Pennsylvania that includes your share of the realty transfer tax (1% state plus at least 1% local, split as the Agreement of Sale says).",
+}
+
+_COST_HEADING = re.compile(r"\b(mortgage|rate|rates|afford|budget|payment|preapprov|pre-approv|cost|costs|down payment|financ|tax)", re.I)
+
+
+def place_payment_example(blocks: list[dict], ex: dict) -> list[dict]:
+    """The payment card goes at the end of the first section about mortgages / budgets / costs
+    (never the closing section), else just before the closing heading."""
+    heads = [i for i, b in enumerate(blocks) if b.get("type") == "heading"]
+    card = {"id": writer._bid("payment_example"), "type": "payment_example", "data": ex}
+    at = None
+    for n, h in enumerate(heads[:-1]):
+        text = re.sub(r"<[^>]+>", " ", str((blocks[h].get("data") or {}).get("html") or ""))
+        if _COST_HEADING.search(text):
+            at = heads[n + 1]
+            break
+    if at is None:
+        at = heads[-1] if heads else len(blocks)
+    return blocks[:at] + [card] + blocks[at:]
+
+
+_FIX_TOOL = {
+    "name": "submit_fixes",
+    "description": "Submit exact find/replace corrections.",
+    "input_schema": {"type": "object", "properties": {"fixes": {"type": "array", "items": {"type": "object", "properties": {
+        "find": {"type": "string", "description": "Exact verbatim substring of the article."},
+        "replace": {"type": "string", "description": "Corrected text; \"\" deletes it."},
+        "problem": {"type": "string"},
+    }, "required": ["find", "replace", "problem"]}}}, "required": ["fixes"]},
+}
+
+_FIX_SYSTEM = """You correct specific, confirmed errors in a real estate agent's article. For each problem you get the exact sentence and the verified facts. Return a minimal fix per problem: `find` = an exact verbatim substring of the article containing the error, `replace` = the corrected wording using ONLY the verified facts given (same voice, keep any [anchor](url) links), or "" to delete when it can't be corrected cleanly. Never add new facts. Respond only by calling submit_fixes."""
 
 
 def _article_text(a: dict) -> str:
@@ -564,8 +715,35 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
     dossiers = [await tk.town_dossier(db, a, include_bank=bool(spec.get("reuse_bank")) or regional) for a in areas]
     if regional:
         for d in dossiers:
-            d["items"] = [i for i in d["items"] if i["origin"] == "mls_live" or i["topic"] in ("schools", "transit", "downtown")][:14]
+            d["items"] = ([i for i in d["items"] if i["origin"] == "geo_verified"]
+                          + [i for i in d["items"] if i["origin"] == "mls_live" or i["topic"] in ("schools", "transit", "downtown")][:14])
     known_items = [it for d in dossiers for it in d["items"]]
+    # Geography truth for every town in the article (what the geography audit checks against),
+    # and the township names on record around them (what it recognizes in a sentence).
+    profiles = [d["geo"] for d in dossiers if d.get("geo")]
+    try:
+        known_geo = await tk.known_places(db, sorted({c for p in profiles for c in p.get("counties") or []}), state)
+    except Exception:
+        logger.warning("blog pipeline: known places lookup failed", exc_info=True)
+        known_geo = {}
+    # Areas that share homes (Wayne addresses inside Radnor Township) - so counts are never summed.
+    from app.services.areas import geography as geo_scope
+    from app.services.areas.market_stats_service import count_shared_for_sale, entry_price_profile
+    pairs = []
+    for i, a in enumerate(areas):
+        for b in areas[i + 1:]:
+            # report from the mailing-address town into the township (or the first named)
+            x, y = (b, a) if (a.municipality_type or "").lower() == "township" and (b.municipality_type or "").lower() != "township" else (a, b)
+            try:
+                shared = await count_shared_for_sale(db, geo_scope.scope_for_market_area(x), geo_scope.scope_for_market_area(y))
+            except Exception:
+                logger.warning("blog pipeline: overlap count failed", exc_info=True)
+                continue
+            total = next(((d.get("sales_snapshot") or {}).get("active_count") for d in dossiers if d["slug"] == x.slug), None)
+            if shared and total:
+                pairs.append((x, y, shared, total))
+    overlap = tk.overlap_items(pairs)
+    federal = tk.federal_items()
     # State-wide facts (transfer tax, buyer programs, rules, latest rates) - shared by every
     # article; Premium still re-verifies the ones the topic leans on.
     try:
@@ -579,6 +757,15 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
     except Exception:
         logger.warning("blog pipeline: Freddie Mac PMMS fetch failed", exc_info=True)
         rate_items = []
+    # Buying articles get a worked payment example, computed here from real listings + the rate.
+    pay_ex = None
+    if areas and not regional and wants_payment_example(brief):
+        try:
+            entry = await entry_price_profile(db, [geo_scope.scope_for_market_area(a) for a in areas])
+            pay_ex = payment_example(entry, await tk.freddie_mac_latest(), [a.name for a in areas], conforming_limit=tk.conforming_limit())
+        except Exception:
+            logger.warning("blog pipeline: payment example failed", exc_info=True)
+    calc_items = payment_example_items(pay_ex) if pay_ex else []
 
     # --- 1b. Research what's missing (web search) ----------------------------------------
     await _stage(on_stage, "research")
@@ -604,6 +791,14 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
                     "seats, the main school districts, regional rail/transit lines, and any official county housing or market figures.")
     rates_note = ("\n\nMortgage rates are already supplied from Freddie Mac's own published survey - do NOT research mortgage rates."
                   if rate_items else "")
+    # Tax research aims at the townships/districts the towns' homes really sit in (10/17 it went
+    # looking for Lower Merion's millage for Wayne, which has no Lower Merion homes).
+    tax_targets = sorted({t["name"] for p in profiles for t in p.get("townships") or [] if (t.get("share") or 0) >= 5}
+                         | {d["name"] for p in profiles for d in p.get("school_districts") or [] if (d.get("share") or 0) >= 5})
+    if tax_targets and not regional:
+        rates_note += ("\n\nThe verified townships and school districts for these towns are: " + "; ".join(tax_targets)
+                       + ". If property taxes matter to this topic, look for current millage / tax rates for exactly these (official township, county or district pages), not for other municipalities.")
+    rates_note += ("\n\nFederal loan basics (conventional/FHA/VA mortgage insurance and down payment rules, the conforming loan limit, CFPB closing-cost range) are already supplied - do NOT research them.")
     if engine == "max":
         task = ("Research this article FRESH and thoroughly: the specific question it answers, the most recent local developments "
                 "(last 12 months) that matter to it, property-tax millage for the relevant township(s)/school district(s), current mortgage "
@@ -650,6 +845,8 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
         await meter.record("research", spec["research_model"], usage, started, failed="research_error")
         logger.warning("blog pipeline: research stage failed", exc_info=True)
 
+    # Nothing that contradicts the verified geography is used - or banked for the next article.
+    research_items, geo_scrubbed = tk.scrub_geography(research_items, profiles, known_geo)
     banked = 0
     if persist and research_items:
         town_names = {a.name.lower() for a in areas}
@@ -669,11 +866,16 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
     if (brief.get("facts") or "").strip():
         brief_facts.append({"topic": "agent_brief", "claim": brief["facts"].strip(), "source_name": "The agent (brief)", "source_url": None,
                             "as_of": datetime.now(timezone.utc).date().isoformat(), "origin": "agent", "town": "general"})
-    # MLS + agent data first so they get the lowest ids, then fresh research, then stored research.
-    ordered = ([i for i in known_items if i["origin"] == "mls_live"] + rate_items + _sale_items(sales) + _listing_items(listings) + brief_facts
+    # Verified geography + MLS + agent data first so they get the lowest ids, then fresh research,
+    # then stored research.
+    ordered = ([i for i in known_items if i["origin"] == "geo_verified"] + [i for i in known_items if i["origin"] == "mls_live"] + overlap
+               + rate_items + calc_items + federal + _sale_items(sales) + _listing_items(listings) + brief_facts
                + research_items + [i for i in known_items if i["origin"] == "state_bank"]
-               + [i for i in known_items if i["origin"] not in ("mls_live", "state_bank")])
+               + [i for i in known_items if i["origin"] not in ("mls_live", "state_bank", "geo_verified")])
+    ordered, scrubbed_more = tk.scrub_geography(ordered, profiles, known_geo)
+    geo_scrubbed += scrubbed_more
     ledger, ledger_text = _build_ledger(ordered)
+    link_urls = {it["source_url"] for it in ledger if str(it.get("source_url") or "").startswith("https://")}
 
     # --- 2. Write --------------------------------------------------------------------------
     spotlight: list[dict] = []
@@ -682,11 +884,33 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
             spotlight = await writer.spotlight_for_brief(db, user, list(brief["area_slugs"]))
         except Exception:
             logger.warning("blog pipeline: spotlight cards failed", exc_info=True)
+    # The spotlight cards show the SAME numbers as the ledger (one snapshot, one moment) - they
+    # used to be computed separately and read 89 homes where the text said 92.
+    snaps = {d["slug"]: d.get("sales_snapshot") or {} for d in dossiers}
+    for c in spotlight:
+        # The town's stored AI blurb is unchecked marketing copy (10/24: "acclaimed dining",
+        # "ideal setting for discerning families" - a fair-housing problem) - an article's card
+        # carries only verified numbers, districts and places.
+        c["summary"] = None
+        snap = snaps.get(c.get("slug")) or {}
+        if snap.get("active_count") is not None:
+            c.update(active_count=snap["active_count"], median_price=snap.get("active_median_list_price"),
+                     under_contract_count=snap.get("under_contract_count"), data_through=snap.get("data_through"))
     brief_msg, _ = writer._brief_text(brief, profile, [], [], None)
     brief_msg = brief_msg.split("== REAL DATA ==")[0].rstrip()
+    inserted = []
+    if spotlight:
+        inserted.append("Town Spotlight cards for " + ", ".join(c["name"] for c in spotlight) + " (photo, homes for sale, median list price, price range, school districts), placed after the first section.")
+    if pay_ex:
+        inserted.append(f"A 'What it could cost' payment example card for a {writer._money(pay_ex['price'])} home (5%, 10% and 20% down; the numbers are the 'Payment example' ledger items), placed after the section about mortgages, budgets or costs - point to it in one sentence; don't redo its math.")
+    if writer._video(brief):
+        inserted.append("The agent's video, embedded in the section that mentions it.")
+    inserted.append("A 'Sources & data notes' list at the end with every source and what each area's numbers cover.")
+    if brief.get("area_slugs"):
+        inserted.append("Links from each town's first mention to the agent's neighborhood guide for it (homes for sale, prices, schools).")
     write_msg = (
         f"{brief_msg}\n\nToday's date: {today}.\n"
-        + ("A Town Spotlight card for " + ", ".join(c["name"] for c in spotlight) + " (photo, live numbers, districts) is inserted after the first section automatically - reference it rather than listing every figure.\n" if spotlight else "")
+        + "\nINSERTED ELEMENTS (added around your text automatically):\n" + "\n".join(f"- {x}" for x in inserted) + "\n"
         + ("This is a REGIONAL article, not about one town. The town items in the ledger are the agent's service area - use a few as concrete, dated examples where they genuinely help the reader; never force town names in or imply one town represents the region.\n" if regional else "")
         + f"\n== EVIDENCE LEDGER ({len(ledger)} items - the only facts you may use; cite ids in `claims`) ==\n{ledger_text}"
         + (f"\n\nResearch could not verify (do not state these): {'; '.join(not_found[:8])}" if not_found else "")
@@ -712,9 +936,15 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
 
     # --- 3. Fact-check ------------------------------------------------------------------------
     draft_text = _article_text(article)
+    geo_first = tk.geography_audit(draft_text, profiles, known_geo)
+    loan_first = loan_rule_lint(draft_text)
+    automated = ([f"wrong_geography: \"{f['sentence']}\" puts {f['town']} in {f['place']} ({f['kind']}) - verified: {f['truth']}." for f in geo_first]
+                 + [f"overgeneralization: \"{s}\" states a mortgage-insurance / down-payment rule without saying which loan type it applies to." for s in loan_first])
     check_msg = (
         f"Agent: {profile['name']} - {profile['brokerage']} - {profile['market'] or state}. Today's date: {today}.\n"
-        f"Agent's brief:\n{brief_msg}\n\n== EVIDENCE LEDGER ==\n{ledger_text}\n\n== ARTICLE ==\n{draft_text}"
+        f"Agent's brief:\n{brief_msg}\n\nINSERTED ELEMENTS (real parts of the article, added around the text):\n" + "\n".join(f"- {x}" for x in inserted)
+        + ("\n\nAUTOMATED CHECKS (confirmed problems - each needs a fix):\n" + "\n".join(f"- {x}" for x in automated) if automated else "")
+        + f"\n\n== EVIDENCE LEDGER ==\n{ledger_text}\n\n== ARTICLE ==\n{draft_text}"
     )
     await _stage(on_stage, "fact_check")
     started = time.monotonic()
@@ -731,12 +961,47 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
     issues = [i for i in writer._coerce(review.get("issues"), list) if isinstance(i, dict)]
     applied, issues = _apply_fixes(article, issues)
 
+    # --- 3b. Re-check what can be checked without a model; one targeted repair if needed ----------
+    geo_left = tk.geography_audit(_article_text(article), profiles, known_geo)
+    loan_left = loan_rule_lint(_article_text(article))
+    repaired = 0
+    if geo_left or loan_left:
+        geo_facts = "\n".join(f"- {i['claim']}" for i in ledger if i.get("origin") == "geo_verified")
+        loan_facts = "\n".join(f"- {i['claim']}" for i in ledger if i.get("origin") == "federal" or "mortgage insurance" in (i.get("claim") or "").lower())
+        problems = ([f"- \"{f['sentence']}\": puts {f['town']} in {f['place']} ({f['kind']}), but {f['truth']}." for f in geo_left]
+                    + [f"- \"{s}\": states a mortgage-insurance / down-payment rule as universal; name the loan type it applies to." for s in loan_left])
+        fix_msg = (f"PROBLEMS:\n" + "\n".join(problems) + f"\n\nVERIFIED GEOGRAPHY:\n{geo_facts}\n\nVERIFIED LOAN FACTS:\n{loan_facts}"
+                   + f"\n\n== ARTICLE ==\n{_article_text(article)}")
+        started = time.monotonic()
+        usage = _new_usage()
+        try:
+            got = await _run_tool_call(model=spec["check_model"], system=_FIX_SYSTEM, user_msg=fix_msg, tools=[_FIX_TOOL], tool_name="submit_fixes",
+                                       max_tokens=6000, effort="medium", usage=usage)
+            await meter.record("repair", spec["check_model"], usage, started)
+            fixes = [dict(f, kind="wrong_geography" if any(g["sentence"] in (f.get("find") or "") or (f.get("find") or "") in g["sentence"] for g in geo_left) else "overgeneralization",
+                          severity="high", quote=f.get("find")) for f in writer._coerce(got.get("fixes"), list) if isinstance(f, dict)]
+            repaired, fixes = _apply_fixes(article, fixes)
+            issues += fixes
+            applied += repaired
+        except Exception:
+            await meter.record("repair", spec["check_model"], usage, started, failed="repair_failed")
+            logger.warning("blog pipeline: repair step failed", exc_info=True)
+        geo_left = tk.geography_audit(_article_text(article), profiles, known_geo)
+        loan_left = loan_rule_lint(_article_text(article))
+    # Anything still wrong is reported to the agent as a high-severity open issue.
+    still_open = ([{"kind": "wrong_geography", "severity": "high", "quote": f["sentence"], "problem": f"Puts {f['town']} in {f['place']} - {f['truth']}.", "fixed": False} for f in geo_left]
+                  + [{"kind": "overgeneralization", "severity": "high", "quote": s, "problem": "A loan rule stated without its loan type.", "fixed": False} for s in loan_left])
+    issues += still_open
+
     # --- Assemble (same block layout as the single-call writer) --------------------------------
-    blocks = writer.article_to_blocks(article, *writer.cta_block_args(brief))
+    blocks = writer.article_to_blocks(article, *writer.cta_block_args(brief), links=link_urls)
     if spotlight:
         heads = [i for i, b in enumerate(blocks) if b["type"] == "heading"]
         at = heads[1] if len(heads) > 1 else (heads[0] if heads else min(2, len(blocks)))
         blocks[at:at] = [writer.area_spotlight_block(c) for c in spotlight]
+    if pay_ex:
+        blocks = place_payment_example(blocks, {**pay_ex, "cta_form": writer.cta_block_args(brief)[1],
+                                                "closing_note": _CLOSING_NOTES.get((state or "").upper())})
     if listings:
         cards = [{"id": writer._bid("property_card"), "type": "property_card", "data": {"property": p, "displaySize": "large"}} for p in listings]
         closing_idx = max((i for i, b in enumerate(blocks) if b["type"] == "heading"), default=len(blocks))
@@ -755,6 +1020,26 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
         if key and key not in seen_src:
             seen_src.add(key)
             sources.append({"name": it.get("source_name"), "url": it.get("source_url"), "as_of": it.get("as_of"), "topic": it.get("topic")})
+    # Sources & data notes block (public): the primary sources the article cites, the MLS window,
+    # and what each area's numbers cover - so a reader (or reviewer) can check every figure.
+    notes = [d["definition"] for d in dossiers if d.get("definition") and not regional]
+    notes += [i["claim"].replace("Overlap: ", "") for i in overlap]
+    if any(not (d.get("sales_snapshot") or {}).get("prior_year_reliable", True) for d in dossiers):
+        notes.append("Year-ago comparisons are left out where our Bright MLS history for that window is incomplete.")
+    if pay_ex:
+        notes.append(f"Payment example: principal and interest at Freddie Mac's 30-year average ({pay_ex['rate']:.2f}%, week of {pay_ex['rate_as_of']}); "
+                     "property tax estimated from tax bills on similar-priced listings; homeowners insurance, HOA fees and mortgage insurance not included.")
+    mls_through = max((d["sales_snapshot"].get("data_through") for d in dossiers if (d.get("sales_snapshot") or {}).get("data_through")), default=None)
+    public_sources = [s for s in sources if s.get("url") and s.get("topic") != "agent_brief"]
+    if public_sources or notes:
+        block = {"id": writer._bid("sources"), "type": "sources", "data": {
+            "items": [{"name": s["name"], "url": s["url"], "as_of": _public_date(s.get("as_of"))} for s in public_sources[:14]],
+            "mls": (f"Bright MLS via OpenHousePal - closed sales through {mls_through}; homes for sale as of {datetime.now(timezone.utc).date().isoformat()}." if mls_through else None),
+            "notes": notes[:8],
+        }}
+        at = next((i for i, b in enumerate(blocks) if b["type"] in ("cta", "agent_profile")), len(blocks))
+        blocks[at:at] = [block]
+
     verdicts = [c.get("verdict") for c in claims]
     open_issues = [i for i in issues if not i["fixed"] and i.get("severity") in ("high", "medium")]
     data_dates = [d["sales_snapshot"].get("data_through") for d in dossiers if (d.get("sales_snapshot") or {}).get("data_through")]
@@ -781,6 +1066,14 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
         "research_banked": banked,
         "towns": [{"town": d["town"], "facts": len(d["items"]), "gaps": d["gaps"]} for d in dossiers],
         "regional": regional,
+        "geography_checked": bool(profiles),
+        "geography": [{"town": p["town"], "townships": [t["name"] for t in p.get("townships") or []],
+                       "school_districts": [d["name"] for d in p.get("school_districts") or []]} for p in profiles],
+        "geography_flags_found": len(geo_first) + len(loan_first),
+        "geography_flags_open": len(geo_left) + len(loan_left),
+        "research_geography_removed": geo_scrubbed,
+        "payment_example": bool(pay_ex),
+        "data_notes": notes[:8],
         "data_as_of": max(data_dates) if data_dates else datetime.now(timezone.utc).date().isoformat(),
         "scores": review.get("scores") or {},
         "summary": review.get("summary") or "",

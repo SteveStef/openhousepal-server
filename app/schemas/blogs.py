@@ -11,6 +11,8 @@ BlogBlockType = Literal[
     'divider', 'callout', 'button', 'image', 'gallery', 'video', 'youtube', 'map',
     'property_card', 'agent_profile', 'contact_form', 'qr_code', 'cta', 'related_articles', 'disclaimer',
     'lead_form', 'area_spotlight', 'property_showcase', 'video_showcase',
+    # Added by the AI research pipeline: a worked payment example and the article's sources.
+    'payment_example', 'sources',
 ]
 
 

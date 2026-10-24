@@ -84,8 +84,8 @@ DEFAULT_CONFIG = {
                  "check_model": "claude-sonnet-5-5", "check_effort": "medium", "reuse_bank": True},
     },
     "blog_pipeline_default_engine": "max",  # product decision 2026-10-01: Premium for everyone
-    "blog_pipeline_typical_usd": {"max": 0.65, "lean": 0.22},  # measured on a real article - powers the "% of your AI" note
-    "blog_pipeline_gate_usd": {"max": 1.0, "lean": 0.45},
+    "blog_pipeline_typical_usd": {"max": 0.9, "lean": 0.3},  # measured on a real article (10/24: 0.93 with the geography/payment checks) - powers the "% of your AI" note
+    "blog_pipeline_gate_usd": {"max": 1.2, "lean": 0.5},
     "blog_pipeline_reservation_estimate_usd": {"max": 1.6, "lean": 0.7},
     "blog_pipeline_global_daily_cost_ceiling_usd": 75.0,
     "blog_pipeline_global_monthly_cost_ceiling_usd": 1000.0,
