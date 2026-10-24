@@ -29,6 +29,7 @@ from .ai_routes import router as ai_router
 from .admin_ai_routes import router as admin_ai_router
 from .admin_storage_routes import router as admin_storage_router
 from .admin_activity_routes import router as admin_activity_router
+from .admin_insights_routes import router as admin_insights_router
 from .admin_groups_routes import router as admin_groups_router
 from .admin_promo_routes import router as admin_promo_router
 from .site_routes import router as site_router
@@ -80,6 +81,7 @@ router.include_router(ai_router)
 router.include_router(admin_ai_router)
 router.include_router(admin_storage_router)
 router.include_router(admin_activity_router)
+router.include_router(admin_insights_router)
 router.include_router(admin_groups_router)
 router.include_router(admin_promo_router)
 router.include_router(site_router)

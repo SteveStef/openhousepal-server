@@ -916,6 +916,8 @@ async def get_property_by_qr(
 @router.post("/open-house/{open_house_event_id}/track-view")
 async def track_signin_view(
     open_house_event_id: str,
+    mode: Optional[str] = None,
+    device: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -930,9 +932,13 @@ async def track_signin_view(
         if not oh_result.scalar_one_or_none():
             raise HTTPException(status_code=404, detail="Open house not found")
 
-        db.add(OpenHouseSignInView(open_house_event_id=open_house_event_id))
+        from app.services.open_house_service import SIGNIN_DEVICES, SIGNIN_MODES, _word
+        view = OpenHouseSignInView(open_house_event_id=open_house_event_id,
+                                   mode=_word(mode, SIGNIN_MODES), device=_word(device, SIGNIN_DEVICES))
+        db.add(view)
         await db.commit()
-        return {"success": True}
+        # The page hands this back with the sign-in, so the showing counts as finished.
+        return {"success": True, "view_id": view.id}
 
     except HTTPException:
         raise

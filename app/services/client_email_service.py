@@ -351,6 +351,9 @@ async def after_send(track_id: Optional[str], ok: bool, via: str, *, code: Optio
                 return
             rec.status, rec.via = ("sent" if ok else "failed"), via
             rec.sent_at = _now() if ok else None
+            if via == "mailbox":  # Mailgun sends are counted in EmailService itself
+                from app.services import email_log_service
+                email_log_service.record(rec.template, "client", ok=ok, owner_id=rec.owner_id, client_email_id=rec.id, via="mailbox")
             rec.error = None if ok else failure_reason(code, detail)[:300]
             if not ok:
                 logger.warning("client email failed", extra={"template": rec.template, "via": via, "code": code, "detail": (detail or "")[:300]})
@@ -363,7 +366,7 @@ async def after_send(track_id: Optional[str], ok: bool, via: str, *, code: Optio
 
 
 def strip_private(variables: dict) -> dict:
-    return {k: v for k, v in variables.items() if k != "_track_id"}
+    return {k: v for k, v in variables.items() if k not in ("_track_id", "_log_owner", "_log_audience")}
 
 
 # ---------------------------------------------------------------- opens + clicks

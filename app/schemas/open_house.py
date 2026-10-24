@@ -27,6 +27,14 @@ class OpenHouseFormSubmission(BaseModel):
     # "similar" when the guest came in through a Similar Homes handout's QR (?intent=similar)
     intent: Optional[str] = None
 
+    # How the sign-in went, for the admin Insights page: the showing of the form this came from
+    # (track-view's id), seconds from first tapping the form to pressing Sign in, phone | kiosk,
+    # mobile | tablet | desktop. All optional - an old page or an offline retry simply leaves them out.
+    signin_view_id: Optional[str] = None
+    signin_seconds: Optional[float] = None
+    signin_mode: Optional[str] = None
+    signin_device: Optional[str] = None
+
 class OpenHouseFormResponse(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
     success: bool

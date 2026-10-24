@@ -140,7 +140,8 @@ def email_agent(user, notification_type: Optional[str], template: str, subject: 
             from app.services.notification_preferences_service import channel_enabled
             if not channel_enabled(user, notification_type, "email"):
                 return
-        base = {"agent_name": full_name(user), "first_name": getattr(user, "first_name", None) or "there"}
+        base = {"agent_name": full_name(user), "first_name": getattr(user, "first_name", None) or "there",
+                "_log_owner": getattr(user, "id", None), "_log_audience": "agent"}
         send(user.email, template, subject, {**base, **(variables or {})}, reply_to=reply_to)
     except Exception:  # noqa: BLE001
         logger.warning("email_agent failed", exc_info=True, extra={"template": template})
@@ -151,7 +152,8 @@ def email_person(to: Optional[str], template: str, subject: str, variables: dict
     """Email a buyer / guest (from the agent's name when one is given; from the agent's own
     mailbox when owner_id is given and they connected one)."""
     try:
-        send(to, template, subject, variables, reply_to=reply_to, from_name=from_name, owner_id=owner_id)
+        send(to, template, subject, {**variables, "_log_owner": owner_id, "_log_audience": "client"},
+             reply_to=reply_to, from_name=from_name, owner_id=owner_id)
     except Exception:  # noqa: BLE001
         logger.warning("email_person failed", exc_info=True, extra={"template": template})
 

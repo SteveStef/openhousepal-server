@@ -610,6 +610,25 @@ class ClientEmail(Base):
     __table_args__ = (Index('ix_client_emails_owner_recipient_sent', 'owner_id', 'recipient_email', 'sent_at'),)
 
 
+class EmailLog(Base):
+    """One row per email OpenHousePal sends - agent alerts, client emails (from Mailgun or the agent's
+    own mailbox) and account emails - with what Mailgun later reported. Backs the admin Insights
+    Emails page. Counts only: no address, no subject, no body (services/email_log_service.py)."""
+    __tablename__ = "email_log"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    template = Column(String(80), nullable=False)
+    audience = Column(String(12), nullable=False)         # agent | client | account
+    owner_id = Column(String, ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)  # the agent it's for / from
+    client_email_id = Column(String, nullable=True)       # ClientEmail (opens + clicks) when it's a tracked client email
+    via = Column(String(16), nullable=False)              # openhousepal | mailbox
+    status = Column(String(12), nullable=False)           # sent | failed | held (dev - never left this computer)
+    provider_id = Column(String(255), nullable=True, index=True)  # Mailgun's message id - matches its webhooks
+    delivery = Column(String(16), nullable=True)          # delivered | delayed | bounced | blocked | spam
+    delivery_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+
 class ClientEmailPref(Base):
     """Per agent + client: whether automatic emails go out daily, weekly or not at all, and why.
     `mode` is the last state the rules worked out (kept so a change can be announced once);
@@ -1135,6 +1154,12 @@ class OpenHouseVisitor(Base):
     interested_in_similar = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # How the sign-in went (admin Insights, migration c7e9a1b3d5f8): seconds from first tapping the
+    # form to pressing Sign in (NULL = not measured), phone | kiosk, and mobile | tablet | desktop.
+    signin_seconds = Column(Integer, nullable=True)
+    signin_mode = Column(String(12), nullable=True)
+    signin_device = Column(String(12), nullable=True)
+
     # Relationships
     open_house_event = relationship("OpenHouseEvent")
     lead = relationship("Lead")
@@ -1153,6 +1178,10 @@ class OpenHouseSignInView(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     open_house_event_id = Column(String, ForeignKey('open_house_events.id'), nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    # The sign-in this showing turned into (set on submit), and phone | kiosk / mobile | tablet | desktop.
+    visitor_id = Column(String, ForeignKey('open_house_visitors.id', ondelete='SET NULL'), nullable=True)
+    mode = Column(String(12), nullable=True)
+    device = Column(String(12), nullable=True)
 
     open_house_event = relationship("OpenHouseEvent")
 

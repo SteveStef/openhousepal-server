@@ -106,6 +106,11 @@ async def mailgun_events(request: Request, db: AsyncSession = Depends(get_db)):
     delivery, note = delivery_from_event(ev)
     if delivery is None:
         return {"ok": True, "ignored": kind}
+    try:  # every email's outcome, for the admin Insights Emails page
+        from app.services import email_log_service
+        await email_log_service.mark_delivery(db, ((ev.get("message") or {}).get("headers") or {}).get("message-id"), delivery)
+    except Exception:  # noqa: BLE001
+        logger.warning("email_log delivery update failed", exc_info=True)
     recipient = ce._norm(ev.get("recipient"))
     if not recipient:
         return {"ok": True}

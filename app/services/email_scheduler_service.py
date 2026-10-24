@@ -78,7 +78,8 @@ class EmailSchedulerService:
                             to_email=email_record.recipient_email,
                             subject=email_record.subject,
                             template=email_record.template_name,
-                            template_variables=variables,
+                            template_variables={**variables, "_log_owner": email_record.owner_id,
+                                                "_log_audience": "client" if email_record.owner_id else None},
                             reply_to=reply_to
                         )
                         if track_id:

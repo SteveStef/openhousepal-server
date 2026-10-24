@@ -56,6 +56,27 @@ def schedule_showcase_backfill(agent_id: str) -> None:
         logger.warning("no event loop for showcase backfill", extra={"agent_id": agent_id})
 
 
+SIGNIN_MODES = ("phone", "kiosk")
+SIGNIN_DEVICES = ("mobile", "tablet", "desktop")
+# Longer than this from the first tap is someone who wandered off mid-form - not a real timing.
+MAX_SIGNIN_SECONDS = 15 * 60
+
+
+def signin_seconds(value) -> Optional[int]:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v < 1 or v > MAX_SIGNIN_SECONDS:
+        return None
+    return int(round(v))
+
+
+def _word(value, allowed) -> Optional[str]:
+    v = (value or "").strip().lower()
+    return v if v in allowed else None
+
+
 class OpenHouseService:
 
     @staticmethod
@@ -70,10 +91,25 @@ class OpenHouseService:
             open_house_event_id=form_data.open_house_event_id,
             qr_code="",  # Will be updated by the calling code
             interested_in_similar=form_data.interested_in_similar,
-            created_at=datetime.now(timezone.utc)
+            created_at=datetime.now(timezone.utc),
+            signin_seconds=signin_seconds(form_data.signin_seconds),
+            signin_mode=_word(form_data.signin_mode, SIGNIN_MODES),
+            signin_device=_word(form_data.signin_device, SIGNIN_DEVICES),
         )
 
         db.add(visitor)
+        await db.flush()
+        # The showing of the form this sign-in came from now counts as finished.
+        if form_data.signin_view_id and form_data.open_house_event_id:
+            from sqlalchemy import update
+            from app.models.database import OpenHouseSignInView
+            await db.execute(
+                update(OpenHouseSignInView)
+                .where(OpenHouseSignInView.id == str(form_data.signin_view_id)[:64],
+                       OpenHouseSignInView.open_house_event_id == form_data.open_house_event_id,
+                       OpenHouseSignInView.visitor_id.is_(None))
+                .values(visitor_id=visitor.id)
+            )
         await db.commit()
         await db.refresh(visitor)
         return visitor

@@ -194,6 +194,30 @@ class EmailService:
         reply_to: Optional[str] = None,
         from_name: Optional[str] = None,
     ) -> Tuple[int, str]:
+        # Counted for the admin Insights Emails page (email_log_service) - who it's for and whose
+        # it is ride along as private variables and never reach the template.
+        template_variables = dict(template_variables or {})
+        owner = template_variables.pop("_log_owner", None)
+        audience = template_variables.pop("_log_audience", None)
+        track_id = template_variables.get("_track_id")
+        code, body = self._send_simple_message(to_email, subject, template, template_variables, reply_to, from_name)
+        from app.services import email_log_service
+        email_log_service.record(
+            template, "client" if track_id else (audience or "account"), ok=code < 300, held=self.is_dev,
+            owner_id=owner, client_email_id=track_id,
+            provider_id=None if self.is_dev else email_log_service.provider_id_from(body),
+        )
+        return code, body
+
+    def _send_simple_message(
+        self,
+        to_email: str,
+        subject: str,
+        template: str,
+        template_variables: Dict[str, Any],
+        reply_to: Optional[str] = None,
+        from_name: Optional[str] = None,
+    ) -> Tuple[int, str]:
         # Inject today's date for all templates
         template_variables = dict(template_variables or {})
         track_id = template_variables.pop("_track_id", None)   # client_email_service tracking id

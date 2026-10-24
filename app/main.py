@@ -48,6 +48,10 @@ async def lifespan(app: FastAPI):
     await init_db()
     await create_admin_user()
 
+    # Emails sent on worker threads hand their Insights rows back to this loop (email_log_service).
+    from app.services import email_log_service
+    email_log_service.attach_loop()
+
     # The town / IDX market numbers saved before this restart go straight back into memory, so the
     # first visitor after a deploy never waits while they're rebuilt (app/services/app_cache.py).
     try:
@@ -258,6 +262,9 @@ async def lifespan(app: FastAPI):
     # 30 minutes - if the AI library or key breaks, the admin hears about it before an agent does.
     from datetime import datetime as _dt, timedelta as _td
     from apscheduler.triggers.interval import IntervalTrigger as _Interval
+    # Backstop for email_log_service: any counted emails that didn't get written straight away.
+    scheduler.add_job(email_log_service.flush, _Interval(minutes=1), id="email_log_flush",
+                      name="Write counted emails", replace_existing=True, max_instances=1)
     from app.services.ai.ai_health_check import scheduled_ai_health_check
     scheduler.add_job(
         scheduled_ai_health_check,
