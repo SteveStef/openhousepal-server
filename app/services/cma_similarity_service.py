@@ -413,10 +413,16 @@ async def _load_price_surface(db: AsyncSession, subject: dict, lat: float, lng: 
     close_date = Property.raw_mls_data["CloseDate"].astext
     lat_offset, lng_offset = get_lat_long_offsets(lat, PRICE_SURFACE_MILES)
     distance_expr = distance_miles_sql(Property.latitude, Property.longitude, lat, lng)
+    # Each sale's condition tier rides along (5th field) so the price level can be read condition-neutral
+    # (cma_ai_service CMA_AREA_PRICE_COND - a block of unrenovated rentals is not a cheap location).
+    with_cond = os.getenv("CMA_AREA_PRICE_COND", "0") == "1"
+    cond_cols = (Property.raw_mls_data["PropertyCondition"].label("cond"),
+                 Property.raw_mls_data["PublicRemarks"].astext.label("remarks")) if with_cond else ()
     query = select(
         Property.listing_key, Property.latitude, Property.longitude, Property.home_type,
         close_price.label("close_price"),
         func.coalesce(Property.above_grade_finished_area, Property.living_area).label("sqft"),
+        *cond_cols,
     ).where(
         Property.latitude.between(lat - lat_offset, lat + lat_offset),
         Property.longitude.between(lng - lng_offset, lng + lng_offset),
@@ -430,6 +436,9 @@ async def _load_price_surface(db: AsyncSession, subject: dict, lat: float, lng: 
         query = query.where(reference_sqft.between(subject_sqft * PRICE_SURFACE_SQFT_RATIO[0],
                                                    subject_sqft * PRICE_SURFACE_SQFT_RATIO[1]))
     rows = (await db.execute(query.order_by(distance_expr.asc()).limit(PRICE_SURFACE_MAX_ROWS))).mappings().all()
+    tier_of = None
+    if with_cond:
+        from app.services.cma_ai_service import _condition_tier as tier_of
     out = []
     for row in rows:
         if family and property_type_family(row["home_type"]) != family:
@@ -437,5 +446,8 @@ async def _load_price_surface(db: AsyncSession, subject: dict, lat: float, lng: 
         price, sqft = _as_float(row["close_price"]), _as_float(row["sqft"])
         if not price or price < 10000 or not sqft or sqft <= 0:
             continue
-        out.append((str(row["listing_key"]), float(row["latitude"]), float(row["longitude"]), round(price / sqft, 2)))
+        item = (str(row["listing_key"]), float(row["latitude"]), float(row["longitude"]), round(price / sqft, 2))
+        if tier_of:
+            item += (tier_of({"property_condition": row["cond"], "public_remarks": row["remarks"]}),)
+        out.append(item)
     return out

@@ -5899,8 +5899,8 @@ def _v10_grid_adjustments(subject: dict, r: dict, s_ag: float, s_bg: float, s_bg
         _dist = _as_float(comp.get("distance_miles"))
         if _V10_LOC_NEAR_MILES and _dist is not None and _dist < _V10_LOC_NEAR_MILES:
             out["location"] *= _dist / _V10_LOC_NEAR_MILES
-        out["notes"].append(f"location: homes near the comp sell for ${_ap.get('comp_area_psf')}/sqft vs "
-                            f"${_ap.get('subject_psf')}/sqft near the subject")
+        out["notes"].append(f"location: {'homes near the comp (condition-adjusted)' if _AREA_PRICE_COND else 'homes near the comp'} "
+                            f"sell for ${_ap.get('comp_area_psf')}/sqft vs ${_ap.get('subject_psf')}/sqft near the subject")
     keys = ("size", "below_grade", "baths", "garage", "sewer", "lot", "age", "road", "time", "condition", "location")
     gross = sum(abs(out[k]) for k in keys)
     net = sum(out[k] for k in keys)
@@ -6489,6 +6489,13 @@ _REL_URBAN_MODE = os.getenv("CMA_REL_URBAN", "1") == "1"
 _AREA_PRICE_RADII_MILES = (0.2, 0.35, 0.5)
 _AREA_PRICE_MIN_SALES = 6
 _AREA_PRICE_HALF_LIFE = float(os.getenv("CMA_REL_AREA_PRICE_HL", "0.12"))
+# 10/24 (grader, 4913 Chancellor St: +$75,800 "location" for 4945 Walnut St, 0.08 mi away - homes near it
+# "$121/sqft vs $180/sqft"). Backtest knobs: SAME_RADIUS reads the subject's and the comp's price level
+# off the same-size circle (one could fall back to a wider, cheaper area); COND divides each sale's $/sqft
+# by its condition index first, so a block of unrenovated rentals doesn't read as a cheap LOCATION while
+# the grid also adjusts the comp's condition.
+_AREA_PRICE_SAME_RADIUS = os.getenv("CMA_AREA_PRICE_SAME_RADIUS", "0") == "1"
+_AREA_PRICE_COND = os.getenv("CMA_AREA_PRICE_COND", "0") == "1"
 
 
 _PLACE_KIND = {"city": "city", "township": "township", "twp": "township", "boro": "borough", "borough": "borough",
@@ -6730,25 +6737,32 @@ def _condition_tier(d: Optional[dict]) -> Optional[float]:
     return None
 
 
-def _area_price_level(surface: list, lat, lng, exclude_key: Optional[str] = None) -> Optional[float]:
+def _area_price_level(surface: list, lat, lng, exclude_key: Optional[str] = None, *,
+                      min_radius: float = 0.0, urban: bool = False, with_radius: bool = False):
     """Median $/sqft of the neighborhood price map's sales nearest (lat, lng) - see
-    cma_similarity_service._load_price_surface. None when too few sales are near."""
+    cma_similarity_service._load_price_surface. None when too few sales are near. `min_radius` starts
+    the search at that circle; `with_radius` also returns the radius used."""
     lat, lng = _as_float(lat), _as_float(lng)
     if not surface or lat is None or lng is None:
-        return None
+        return (None, None) if with_radius else None
     kx = 69.0 * math.cos(math.radians(lat))
+    idx = _V10_COND_INDEX["urban" if urban else "default"]
     near = []
-    for key, la, ln, psf in surface:
+    for row in surface:
+        key, la, ln, psf = row[0], row[1], row[2], row[3]
         if key == exclude_key:
             continue
         d = math.hypot((la - lat) * 69.0, (ln - lng) * kx)
         if d <= _AREA_PRICE_RADII_MILES[-1]:
-            near.append((d, psf))
+            tier = row[4] if _AREA_PRICE_COND and len(row) > 4 else None
+            near.append((d, psf / idx[tier] if tier in idx else psf))
     for radius in _AREA_PRICE_RADII_MILES:
+        if radius < min_radius:
+            continue
         vals = [p for d, p in near if d <= radius]
         if len(vals) >= _AREA_PRICE_MIN_SALES:
-            return _v10_median(vals)
-    return None
+            return (_v10_median(vals), radius) if with_radius else _v10_median(vals)
+    return (None, None) if with_radius else None
 
 
 _REL_SAME_STREET = os.environ.get("CMA_REL_SAME_STREET", "1") == "1"   # backtest knob
@@ -6871,8 +6885,10 @@ def _continuous_relevance(
     subject_type = _type_family(subject.get("property_type") or subject.get("home_type"))
     urban = _REL_URBAN_MODE and density.get("band") == "dense_urban"
     surface = density.pop("_price_surface", None) or []
-    subject_level = _area_price_level(surface, subject.get("latitude"), subject.get("longitude"),
-                                      exclude_key=str(subject.get("listing_key") or "") or None) if surface else None
+    _subj_key = str(subject.get("listing_key") or "") or None
+    subject_level, subject_radius = _area_price_level(
+        surface, subject.get("latitude"), subject.get("longitude"), exclude_key=_subj_key, urban=urban,
+        with_radius=True) if surface else (None, None)
     subject_cond = _condition_tier(subject)
     subject_style_known = _relevance_level_class(subject) is not None or _relevance_style_family(
         _style_text(subject.get("architectural_style") or subject.get("structure_type"))) is not None
@@ -6899,11 +6915,20 @@ def _continuous_relevance(
                 and _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["same_street"] > 0:
             components["same_street"] = 1.0
         if subject_level and _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["area_price"] > 0:
-            comp_level = _area_price_level(surface, comp.get("latitude"), comp.get("longitude"), exclude_key=key)
-            if comp_level:
-                components["area_price"] = _half_life_decay(math.log(comp_level / subject_level), _AREA_PRICE_HALF_LIFE)
-                component_detail["area_price"] = {"subject_psf": round(subject_level), "comp_area_psf": round(comp_level),
-                                                  "ratio": round(comp_level / subject_level, 3)}
+            s_level = subject_level
+            comp_level, comp_radius = _area_price_level(surface, comp.get("latitude"), comp.get("longitude"),
+                                                        exclude_key=key, urban=urban, with_radius=True)
+            if _AREA_PRICE_SAME_RADIUS and comp_level and comp_radius != subject_radius:
+                # both read off the same-size circle (the wider of the two)
+                r = max(comp_radius, subject_radius)
+                s_level = _area_price_level(surface, subject.get("latitude"), subject.get("longitude"),
+                                            exclude_key=_subj_key, urban=urban, min_radius=r)
+                comp_level = _area_price_level(surface, comp.get("latitude"), comp.get("longitude"),
+                                               exclude_key=key, urban=urban, min_radius=r)
+            if comp_level and s_level:
+                components["area_price"] = _half_life_decay(math.log(comp_level / s_level), _AREA_PRICE_HALF_LIFE)
+                component_detail["area_price"] = {"subject_psf": round(s_level), "comp_area_psf": round(comp_level),
+                                                  "ratio": round(comp_level / s_level, 3)}
             else:
                 components["area_price"] = _REL_UNKNOWN_CREDIT if _REL_UNKNOWN_CREDIT is not None else 0.5
         if market_area is not None:
@@ -12346,6 +12371,10 @@ def _v10_pre_export_qa(
     # to about $907,000") - it's a known number of the report, never a rival conclusion.
     _anchor_mid = _as_float((anchor or {}).get("anchor_value"))
     _fmv_ok = [g for g in (rmin, rmax, _anchor_lo, _anchor_hi, _anchor_mid) if g]
+    # ...nor what a pending home implies, or the home's own last sale - both quoted as record figures
+    _vt = valuation_trace if isinstance(valuation_trace, dict) else {}
+    _fmv_ok += [g for g in [_as_float(p.get("implied_value")) for p in ((_vt.get("pending_competition") or {}).get("pendings_used") or [])]
+                + [_as_float((_vt.get("subject_record") or {}).get("last_sale_price"))] if g]
     if v:
         for _key, (label, field_text) in fields.items():
             _blocked_fmv = False
@@ -12993,6 +13022,11 @@ def _bridge_driver_text(items: list, grid_families: set) -> tuple[str, bool, boo
         names.append(name)
         supported = supported or d.get("evidence_strength") == "clearly_market_supported"
         hit = any(re.search(rx, f, re.I) and fam in grid_families for fam, rx in _GRID_PRICED_WORDS)
+        # the reasoning pass's own word that it did NOT move the number for this ("already reflected in the
+        # grid and receives no second deduction" - 4913 Chancellor St's basement, 10/24)
+        if re.search(r"already (?:reflected|included|priced|captured)|no second (?:deduction|adjustment)|"
+                     r"not (?:added|adjusted|deducted|counted) (?:again|a second time|twice)", str(d.get("reason") or ""), re.I):
+            hit = True
         all_gridded = all_gridded and hit
         if not hit:
             fresh.append(name)
@@ -15210,6 +15244,15 @@ async def _finalize_gate_reconciled_prose(
             methodology = methodology.replace(_REASONING_NEUTRAL_SUMMARY, _REASONING_NEUTRAL_SUMMARY + " " + _extra)
     methodology, _adf = _v10_reconcile_anchor_direction_prose(methodology, final=_final, trace=valuation_trace)
     flags += _adf
+    # The home's own record: relisted / recently sold (4913 Chancellor St, grader 10/24)
+    _hist = (enriched_subject or {}).get("_listing_history") or {}
+    _hm = _fact_check.history_sentence(methodology, _hist, today=_tmach.today())
+    if _hm != methodology:
+        methodology = _hm
+        # the quoted last-sale price is a record figure - the stray-$ sweep must know it
+        if isinstance(valuation_trace, dict) and (_hist.get("last_sale") or {}).get("price"):
+            valuation_trace["subject_record"] = {"last_sale_price": _hist["last_sale"]["price"]}
+        flags.append("Methodology summary: stated the home's earlier listing / last sale from its MLS record.")
     # A big-ticket feature of this home the notes never mention (8084 Goshen Rd's indoor lap pool, 10/23)
     _cov = _fact_check.feature_coverage_sentence(
         methodology, enriched_subject, comps,

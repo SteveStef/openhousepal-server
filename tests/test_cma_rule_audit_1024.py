@@ -232,6 +232,24 @@ def test_judgment_does_not_name_a_factor_the_grid_already_prices():
     assert "basement" not in text and "marketing exposure" in text and not gridded
 
 
+def test_judgment_skips_a_factor_the_model_says_it_did_not_count():
+    items = [{"factor": "Unfinished basement", "reason": "Already reflected in the grid and receives no second deduction."},
+             {"factor": "Longer cumulative marketing exposure", "reason": "About 72 days across both listings."}]
+    text, _, _ = ai._bridge_driver_text(items, set())
+    assert text == "longer cumulative marketing exposure"
+
+
+def test_history_sentence_for_a_relisted_recent_flip():
+    from datetime import date
+    summary = {"relisted": True, "marketing_days_total": 72,
+               "earlier_listings": [{"listed": "2026-08-13", "ended": "2026-10-06"}],
+               "last_sale": {"date": "2026-03-13", "price": 200000}}
+    out = fc.history_sentence("The value is $395,000.", summary, today=date(2026, 10, 24))
+    assert "about 72 days on the market in total" in out and "Aug 13, 2026" in out and "$200,000" in out
+    assert fc.history_sentence(out, summary, today=date(2026, 10, 24)) == out      # said once
+    assert fc.history_sentence("x.", {"relisted": False}, today=date(2026, 10, 24)) == "x."
+
+
 def test_listing_history_survives_the_snapshot_rebuild():
     hist = {"lines": ["Listed Aug 13, 2026 at $450,000; taken off the market", "Sold Mar 13, 2026 for $200,000"]}
     subj = {"street_address": "4913 CHANCELLOR ST", "_listing_history": hist, "condo_fee": 300, "condo_fee_frequency": "Monthly"}

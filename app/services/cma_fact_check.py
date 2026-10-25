@@ -638,6 +638,37 @@ def summarize_history(events: list, *, current_list_date=None, today=None) -> di
     }
 
 
+_HISTORY_MARK = "days on the market in total"
+
+
+def _nice_date(s) -> str:
+    d = _d(s)
+    return f"{d.strftime('%b')} {d.day}, {d.year}" if d else str(s)
+
+
+def history_sentence(methodology: str, summary: Optional[dict], *, today=None) -> str:
+    """One plain sentence on the home's own record when it matters: relisted (one marketing effort, not a
+    fresh listing) and/or sold in the last 3 years. Grader 10/24, 4913 Chancellor St: "mentions longer
+    cumulative marketing exposure but doesn't clearly show the earlier listing"."""
+    from datetime import date
+    s = summary or {}
+    if not methodology or _HISTORY_MARK in methodology:
+        return methodology
+    bits = []
+    first = (s.get("earlier_listings") or [{}])[0]
+    if s.get("relisted") and s.get("marketing_days_total") and first.get("listed"):
+        ended = first.get("ended")
+        bits.append(f"This home has been for sale about {s['marketing_days_total']} {_HISTORY_MARK}: first listed "
+                    f"{_nice_date(first['listed'])}" + (f", taken off the market {_nice_date(ended)}" if ended else "")
+                    + " and relisted since - one marketing effort, not a new listing.")
+    ls = s.get("last_sale") or {}
+    sold = _d(ls.get("date"))
+    if sold and ls.get("price") and ((today or date.today()) - sold).days <= 3 * 365:
+        bits.append(f"It last sold on {_nice_date(sold.isoformat())} for ${float(ls['price']):,.0f}; what has changed "
+                    "since then should be confirmed with the seller.")
+    return (methodology.rstrip() + " " + " ".join(bits)) if bits else methodology
+
+
 # ----------------------------------------------------------------------------- high-impact features
 
 def _blob(row: Optional[dict], keys) -> str:
