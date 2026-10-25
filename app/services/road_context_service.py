@@ -214,7 +214,7 @@ async def _write_cache(db: AsyncSession, key: str, payload: dict) -> None:
         logger.debug("road_context cache write failed for %s", key, exc_info=True)
 
 
-async def _fetch_overpass(lat: float, lng: float) -> Optional[list[dict]]:
+async def _fetch_overpass(lat: float, lng: float, race: bool = False) -> Optional[list[dict]]:
     # `out geom` gives each way's polyline so we can measure how close it really passes, instead
     # of treating "within the radius" as one bucket.
     query = (
@@ -223,6 +223,30 @@ async def _fetch_overpass(lat: float, lng: float) -> Optional[list[dict]]:
         f"out tags geom;"
     )
     async with httpx.AsyncClient(timeout=20, headers=_HEADERS, follow_redirects=True) as client:
+        if race:
+            # The subject: ask every mirror at once and take the first good answer. One at a time,
+            # three slow mirrors cost 60 s before the fourth was tried, and 602 Media Line Rd's
+            # lookup gave up - so the report never knew the home fronts Media Line Road (10/25).
+            async def one(url):
+                resp = await client.post(url, data={"data": query})
+                if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("application/json"):
+                    return [e for e in ((resp.json() or {}).get("elements") or []) if (e.get("tags") or {}).get("highway")]
+                raise ValueError(resp.status_code)
+
+            for attempt in range(2):
+                pending = {asyncio.ensure_future(one(u)) for u in _ENDPOINTS}
+                try:
+                    while pending:
+                        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            if not task.cancelled() and task.exception() is None:
+                                return task.result()
+                finally:
+                    for task in pending:
+                        task.cancel()
+                if attempt == 0:
+                    await asyncio.sleep(2.0)
+            return None
         # Overpass instances 4xx/5xx under load or WAF - walk the mirror list, then one backoff
         # retry over the whole list.
         for attempt in range(2):
@@ -239,7 +263,96 @@ async def _fetch_overpass(lat: float, lng: float) -> Optional[list[dict]]:
     return None
 
 
-async def get_road_context(db: AsyncSession, lat, lng) -> Optional[dict]:
+# ---- Road-name memory (10/25) -------------------------------------------------------------------
+# Every successful lookup also remembers what KIND of road each named street near that point is, by
+# name and ~1 km map square. When a home's own lookup gets no answer (the public map servers are
+# often overloaded), its address still names the road it fronts: 602 Media Line Rd's lookup failed
+# while 538 S Media Line Rd's, 0.07 mi away, said Media Line Road is a major road - so the subject
+# fronts it too. Only a MAJOR road is ever concluded this way; a residential name proves nothing
+# about a busy road a few houses off.
+_ROAD_SUFFIX = {
+    "rd": "road", "st": "street", "ave": "avenue", "av": "avenue", "ln": "lane", "dr": "drive",
+    "ct": "court", "cir": "circle", "blvd": "boulevard", "pk": "pike", "pke": "pike", "hwy": "highway",
+    "pl": "place", "ter": "terrace", "pkwy": "parkway", "tpke": "turnpike", "rte": "route", "sq": "square",
+}
+_ROAD_DIRECTION = {"n", "s", "e", "w", "ne", "nw", "se", "sw", "north", "south", "east", "west"}
+
+
+def road_name_key(name) -> Optional[str]:
+    """'602 S Media Line Rd' / 'MEDIA LINE ROAD' -> 'media line road' (house number, unit, direction
+    words and suffix abbreviations normalised)."""
+    s = str(name or "").lower()
+    s = re.sub(r"\b(?:apt|unit|suite|ste)\b.*$|#.*$", "", s)
+    s = re.sub(r"^\s*\d+[a-z]?\b", "", s)
+    words = [w for w in re.split(r"[^a-z0-9]+", s) if w]
+    if words and words[0] in _ROAD_DIRECTION and len(words) > 2:
+        words = words[1:]
+    if words and words[-1] in _ROAD_DIRECTION and len(words) > 2:
+        words = words[:-1]
+    if words:
+        words[-1] = _ROAD_SUFFIX.get(words[-1], words[-1])
+    return " ".join(words) or None
+
+
+def _cell(lat: float, lng: float) -> str:
+    return f"{round(lat, 2):.2f}:{round(lng, 2):.2f}"
+
+
+def _neighbour_cells(lat: float, lng: float) -> list[str]:
+    return [_cell(lat + dy, lng + dx) for dy in (-0.01, 0, 0.01) for dx in (-0.01, 0, 0.01)]
+
+
+async def _remember_road_names(db: AsyncSession, lat: float, lng: float, elements: list[dict]) -> None:
+    named: dict[str, dict] = {}
+    for el in elements or []:
+        tags = el.get("tags") or {}
+        key = road_name_key(tags.get("name"))
+        kind = str(tags.get("highway") or "").lower()
+        if not key or not kind:
+            continue
+        d = named.setdefault(key, {"name": str(tags.get("name")).strip(), "kinds": set(), "speed": None})
+        d["kinds"].add(kind)
+        sp = _parse_speed_mph(tags.get("maxspeed"))
+        if sp and (d["speed"] is None or sp > d["speed"]):
+            d["speed"] = sp
+    for key, d in named.items():
+        await _write_cache(db, f"roadname:v1:{_cell(lat, lng)}:{key}",
+                           {"name": d["name"], "kinds": sorted(d["kinds"]), "max_speed_mph": d["speed"]})
+
+
+async def road_context_from_address(db: AsyncSession, lat, lng, address) -> Optional[dict]:
+    """The fallback when a home's own lookup failed: a verdict from the remembered class of the road its
+    address is on. Only 'through' (a major road) - otherwise None."""
+    key = road_name_key(address)
+    try:
+        lat, lng = float(lat), float(lng)
+    except (TypeError, ValueError):
+        return None
+    if not key:
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_CACHE_TTL_DAYS)
+    rows = (await db.execute(
+        select(ExploreNearbyCache.payload).where(
+            ExploreNearbyCache.cache_key.in_([f"roadname:v1:{c}:{key}" for c in _neighbour_cells(lat, lng)]),
+            ExploreNearbyCache.fetched_at >= cutoff,
+        )
+    )).scalars().all()
+    kinds = {k for r in rows for k in (r or {}).get("kinds") or []}
+    major = sorted(kinds & _MAJOR)
+    if not major:
+        return None
+    speed = max([(r or {}).get("max_speed_mph") or 0 for r in rows]) or None
+    name = next(((r or {}).get("name") for r in rows if (r or {}).get("name")), key.title())
+    return {
+        "verdict": "through", "road_types": major, "nearby_road_types": sorted(kinds), "max_speed_mph": speed,
+        "nearby_road_names": [name], "dead_end": False, "on_street_distance_m": None, "nearest_major_road_m": None,
+        "summary": (f"The home's address is on {name}, a major road" + (f" (posted ~{speed} mph)" if speed else "")
+                    + " - expect steady traffic noise. From the map data for this road near the home."),
+        "source": "openstreetmap-road-name",
+    }
+
+
+async def get_road_context(db: AsyncSession, lat, lng, race: bool = False) -> Optional[dict]:
     """Verdict dict {'verdict': 'quiet'|'neutral'|'through'|'unknown', 'road_types', 'max_speed_mph',
     'nearby_road_names', 'summary', 'source'} or None if it couldn't be determined."""
     try:
@@ -255,27 +368,42 @@ async def get_road_context(db: AsyncSession, lat, lng) -> Optional[dict]:
     if cached is not None:
         return cached or None
 
-    elements = await _fetch_overpass(lat, lng)
+    elements = await _fetch_overpass(lat, lng, race=race)
     if elements is None:
         return None  # transient - don't cache a failure
     result = _classify(lat, lng, elements)
     await _write_cache(db, key, result)
+    await _remember_road_names(db, lat, lng, elements)
     return result
 
 
-async def get_road_contexts(db: AsyncSession, points: list[tuple]) -> list[Optional[dict]]:
-    """Best-effort batch (subject + comps). Concurrency-limited (Overpass is strict about
-    anonymous concurrency); any single failure is just None -> caller falls back to the address."""
+async def get_road_contexts(db: AsyncSession, points: list[tuple], addresses: Optional[list] = None) -> list[Optional[dict]]:
+    """Best-effort batch (subject first, then comps). Concurrency-limited (Overpass is strict about
+    anonymous concurrency); the subject asks every mirror at once. A point with no answer falls back to
+    the remembered class of the road its address is on (road_context_from_address), then to None ->
+    the caller falls back to the address suffix."""
     sem = asyncio.Semaphore(2)
 
-    async def one(pt):
+    async def one(pt, race=False):
         if not pt or pt[0] is None or pt[1] is None:
             return None
         async with sem:
             try:
-                return await get_road_context(db, pt[0], pt[1])
+                return await get_road_context(db, pt[0], pt[1], race=race)
             except Exception:  # noqa: BLE001
                 logger.debug("road_context lookup failed for %s", pt, exc_info=True)
                 return None
 
-    return await asyncio.gather(*(one(p) for p in points))
+    if not points:
+        return []
+    first = await one(points[0], race=True)
+    out = [first] + list(await asyncio.gather(*(one(p) for p in points[1:])))
+    addresses = list(addresses or [])
+    for i, (pt, ctx) in enumerate(zip(points, out)):
+        addr = addresses[i] if i < len(addresses) else None
+        if ctx is None and addr and pt and pt[0] is not None and pt[1] is not None:
+            try:
+                out[i] = await road_context_from_address(db, pt[0], pt[1], addr)
+            except Exception:  # noqa: BLE001
+                logger.debug("road-name fallback failed for %s", addr, exc_info=True)
+    return out

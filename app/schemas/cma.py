@@ -75,6 +75,9 @@ class CmaSubjectProperty(BaseModel):
     recent_updates: Optional[str] = None
     # Where photo_url came from on a manual subject: 'upload' | 'street_view' | 'aerial'.
     photo_source: Optional[str] = None
+    # The agent's own photos of the home today (optional, seller CMA on a home not listed) - read by the
+    # same AI pass and rules as the comps' listing photos (10/25).
+    condition_photos: List[str] = []
 
 
 class CmaQualityAssessment(BaseModel):

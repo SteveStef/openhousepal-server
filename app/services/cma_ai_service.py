@@ -1288,7 +1288,7 @@ _SUBJECT_FIELDS = [
     "authoritative_property_features", "material_issues",
     # cma_fact_check.prompt_facts_subject (10/24): the facts the grader caught the model guessing at
     "subdivision_name", "list_price_per_above_grade_sqft", "lower_level_record", "association_fees",
-    "listing_and_sale_history",
+    "listing_and_sale_history", "interior_condition",
 ]
 _COMP_FIELDS = [
     "street_address", "city", "state", "zipcode", "distance_miles", "status",
@@ -2724,13 +2724,35 @@ def _apply_final_order(report) -> None:
         est["qa_flags"] = [*(est.get("qa_flags") or []), *notes]
 
 
+_INTERIOR_UNKNOWN_NOTE = (
+    "NOT DOCUMENTED - there is no description and no photo of the inside. Treat the subject as in typical "
+    "condition for its age: not original, not renovated. Rate a comp's finish_quality / interior 'above' only "
+    "when its own listing documents a renovation clearly beyond typical, 'below' only when it documents needing "
+    "work, otherwise 'similar'. Never call the subject original, dated or unrenovated; say its interior condition "
+    "wasn't documented and the value assumes typical condition for its age.")
+
+
+def _subject_interior_documented(subject: Optional[dict]) -> bool:
+    """Is there anything about the INSIDE of the subject - a description, typed condition/updates, the
+    agent's own photos, or (an MLS home) its listing gallery? 602 Media Line Rd (10/25) was entered by
+    hand with a Street View photo and no description, and the report called it original and
+    unrenovated and took a $20,632 'comps are superior on condition' deduction - though the owner had
+    added a primary suite."""
+    s = subject or {}
+    if len(str(s.get("public_remarks") or "").strip()) >= 40 or s.get("condition") or s.get("recent_updates"):
+        return True
+    if [p for p in (s.get("condition_photos") or []) if p]:
+        return True
+    return s.get("source") != "manual" and len([p for p in (s.get("photos") or []) if p]) >= 3
+
+
 def _subject_runtime_facts(subject: Optional[dict]) -> dict:
     """Facts looked up for this run that the saved subject snapshot doesn't store - the home's earlier
     listings/sales (and the fee fields read from the MLS row). The snapshot rebuild before final QA used
     to drop them, so the report's record box came out empty: 4913 Chancellor St's August listing,
     relist and $200,000 March sale never showed (10/24, after the 10/23 grader asked for exactly that)."""
     s = subject or {}
-    keep = {k: s[k] for k in ("_listing_history",) if k in s}
+    keep = {k: s[k] for k in ("_listing_history", "road_context", "road_context_note") if k in s}
     for k in ("association_fee", "association_fee_frequency", "condo_fee", "condo_fee_frequency",
               "association_fee_includes"):
         if s.get(k) not in (None, ""):
@@ -2929,7 +2951,8 @@ async def _enrich_with_property_data(db: AsyncSession, subject: dict, comps: lis
         _pts = [(subject_out.get("latitude"), subject_out.get("longitude"))] + [
             (c.get("latitude"), c.get("longitude")) for c in comps_out
         ]
-        _rc = await road_context_service.get_road_contexts(db, _pts)
+        _rc = await road_context_service.get_road_contexts(
+            db, _pts, [subject_out.get("street_address")] + [c.get("street_address") for c in comps_out])
 
         def _rc_note(ctx: dict) -> Optional[str]:
             if not ctx or not ctx.get("summary"):
@@ -5112,6 +5135,8 @@ def _compute_fingerprint(subject: dict, comps: list[dict], max_photos: int, incl
         "include_map_images": include_map_images,
         "prompt_version": PROMPT_VERSION,
     }
+    if subject.get("condition_photos"):  # new photos of the home = a new analysis
+        payload["condition_photos"] = list(subject["condition_photos"])
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
@@ -7293,6 +7318,7 @@ def _v10_location_class_review(subject: dict, comps: list, evidence_by_key: dict
     flags: list = []
     subj_school = subject.get("school_district")
     subj_street_tier = _street_tier(subject)
+    _subj_road_known = (subject.get("road_context") or {}).get("verdict") in ("quiet", "neutral", "through")
 
     incl = [(i, c) for i, c in enumerate(comps)
             if c.get("is_included", True) and _normalize_strength(c.get("strength")) in ("strong", "supporting")]
@@ -7329,7 +7355,12 @@ def _v10_location_class_review(subject: dict, comps: list, evidence_by_key: dict
             negatives.append("different municipality")
         if area_label == "different_from_subject":
             negatives.append('rated "Different Area"')
-        _busier = street_q == "below" or (rc_verdict == "through" and subj_street_tier in ("quiet", "neutral", None))
+        # Only "busier than the subject" when the subject's own road is known (or its address says a
+        # court/circle). With no road answer for the subject its tier is a blank-ish "neutral" guess:
+        # 538 S Media Line Rd was called busier than 602 Media Line Rd - the same road (10/25).
+        _subj_quieter = (subj_street_tier in ("quiet", "neutral") if _subj_road_known
+                         else subj_street_tier == "quiet")
+        _busier = street_q == "below" or (rc_verdict == "through" and _subj_quieter)
         if _busier:
             negatives.append("materially busier / through-traffic street vs. the subject")
         _far = (dist is not None and dist_median is not None and dist_mad is not None
@@ -8488,8 +8519,10 @@ def _apply_v10_valuation(anchor: Optional[dict], exposure: dict, ai_estimate: Op
     # subject prices toward the low end of the adjusted comp range instead of its weighted mean.
     # Downward only; fires alongside (not instead of) the itemised items and clears the per-bucket
     # "no offsets -> blocked" entries it now satisfies. -----------------------------------------
+    # An undocumented interior can't be "worse than the comps" (see _subject_interior_documented).
     _inf_buckets = [(b, s) for b, s in qsig.items()
                     if b in _V10_QUAL_RECON_BUCKETS
+                    and not (b == "condition" and (anchor or {}).get("subject_interior_unknown"))
                     and s["signal"] >= _V10_BROAD_INFERIORITY_SIGNAL_MIN
                     and s["weight_covered"] >= _V10_QUAL_SIGNAL_WEIGHT_COVER
                     and not (_bucket_resolution.get(b) or {}).get("captured")]  # a mechanically-captured bucket is done
@@ -16435,6 +16468,7 @@ async def _build_content(subject: dict, comps: list[dict], max_photos: int, warn
     subject_for_ai.update(_fact_check.prompt_facts_subject(subject))
     _hist_lines = (subject.get("_listing_history") or {}).get("lines") if isinstance(subject, dict) else None
     subject_for_ai["listing_and_sale_history"] = "; ".join(_hist_lines) if _hist_lines else None
+    subject_for_ai["interior_condition"] = None if _subject_interior_documented(subject) else _INTERIOR_UNKNOWN_NOTE
     add_text(_format_block("SUBJECT PROPERTY:", subject_for_ai, _SUBJECT_FIELDS))
     _timeline = subject.get("_status_timeline") if isinstance(subject, dict) else None
     if _timeline and _timeline.get("summary_lines"):
@@ -16493,7 +16527,14 @@ async def _build_content(subject: dict, comps: list[dict], max_photos: int, warn
                 else:
                     warnings.append(f"No location map available for {key} (missing coordinates or API key)")
 
-        await add_images("Subject", subject)
+        # The agent's own photos of the home today (seller CMA, home not listed) go first and are read
+        # with the same rules as every comp's listing photos (owner, 10/25).
+        _own = [u for u in (subject.get("condition_photos") or []) if u]
+        if _own:
+            add_text(f"The first {min(len(_own), max_photos)} subject photo(s) below were taken by the agent and show the home's "
+                     "CURRENT condition - read finishes, updates and condition from them the same way as the comps' photos.")
+        await add_images("Subject", {**subject, "photos": list(dict.fromkeys(_own + [u for u in (subject.get("photos") or []) if u]))}
+                         if _own else subject)
         for i, comp in enumerate(comps):
             await add_images(_comp_label(i, comp), comp)
 
@@ -17270,6 +17311,8 @@ async def _generate_ai_analysis_impl(
         exposure = _compute_exposure(
             enriched_subject, status_timeline, _v10_comp_median_dom(new_comparables), final_anchor,
         )
+        if final_anchor is not None:
+            final_anchor["subject_interior_unknown"] = not _subject_interior_documented(enriched_subject)
         _v10 = _apply_v10_valuation(final_anchor, exposure, subject_estimate_raw or {}, subject_asking, prov_anchor=prov_anchor)
         value = _v10["fmv"]
         valuation_trace = _v10["trace"]
@@ -18076,6 +18119,8 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             or _as_float(enriched_subject.get("list_price"))
         )
         # Run V10 unchanged as the deterministic benchmark before the final reasoning pass.
+        if v10_anchor is not None:
+            v10_anchor["subject_interior_unknown"] = not _subject_interior_documented(enriched_subject)
         _v10 = _apply_v10_valuation(v10_anchor, v10_exposure, subject_estimate_raw, subject_asking)
         value = _v10["fmv"]
         valuation_trace = _v10["trace"]
