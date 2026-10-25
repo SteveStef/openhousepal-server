@@ -45,17 +45,34 @@ def test_address_fallback_says_major_road_only():
 
 
 def test_failed_lookup_falls_back_to_road_name(monkeypatch):
-    async def lookup(db, lat, lng, race=False):
-        return None if lat == 1 else {"verdict": "through", "summary": "x"}
+    calls = []
+
+    async def no_cache(db, key):
+        calls.append(("read", key))
+        return None
+
+    async def fetch(lat, lng, race=False):
+        return None if lat == 1 else [{"tags": {"highway": "residential", "name": "Elliott Road"}, "geometry": [{"lat": 2, "lon": 2}]}]
+
+    async def save(db, key, payload):
+        calls.append(("write", key))
+
+    async def remember(db, lat, lng, el):
+        calls.append(("remember", lat))
 
     async def by_name(db, lat, lng, address):
         return {"verdict": "through", "source": "openstreetmap-road-name", "address": address}
 
-    monkeypatch.setattr(rc, "get_road_context", lookup)
+    monkeypatch.setattr(rc, "_read_cache", no_cache)
+    monkeypatch.setattr(rc, "_fetch_overpass", fetch)
+    monkeypatch.setattr(rc, "_write_cache", save)
+    monkeypatch.setattr(rc, "_remember_road_names", remember)
     monkeypatch.setattr(rc, "road_context_from_address", by_name)
-    out = asyncio.run(rc.get_road_contexts(None, [(1, 1), (2, 2)], ["602 Media Line Rd", "538 S Media Line Rd"]))
+    out = asyncio.run(rc.get_road_contexts(None, [(1, 1), (2, 2)], ["602 Media Line Rd", "7 Elliott Rd"]))
     assert out[0]["source"] == "openstreetmap-road-name" and out[0]["address"] == "602 Media Line Rd"
-    assert out[1] == {"verdict": "through", "summary": "x"}
+    assert out[1]["source"] == "openstreetmap"
+    # reads first, then saves - one database call at a time
+    assert [c[0] for c in calls] == ["read", "read", "write", "remember"]
 
 
 def test_interior_documented():
@@ -124,3 +141,25 @@ def test_market_demand_is_not_a_judgment_reason():
 def test_manual_subject_prompt_notes():
     assert "no MLS record" in svc._MANUAL_RECORD_NOTE and "typical condition" in svc._INTERIOR_UNKNOWN_NOTE
     assert "record_source" in svc._SUBJECT_FIELDS and "interior_condition" in svc._SUBJECT_FIELDS
+
+
+def test_road_lookup_has_a_time_limit(monkeypatch):
+    async def slow(lat, lng, race=False):
+        await asyncio.sleep(5)
+        return []
+
+    async def no_cache(db, key):
+        return None
+
+    async def no_name(db, lat, lng, address):
+        return None
+
+    monkeypatch.setattr(rc, "_fetch_overpass", slow)
+    monkeypatch.setattr(rc, "_read_cache", no_cache)
+    monkeypatch.setattr(rc, "road_context_from_address", no_name)
+    monkeypatch.setattr(rc, "_SUBJECT_BUDGET_S", 0.2)
+    monkeypatch.setattr(rc, "_COMPS_BUDGET_S", 0.3)
+    import time
+    t = time.time()
+    out = asyncio.run(rc.get_road_contexts(None, [(40.0, -75.0), (40.1, -75.1), (40.2, -75.2), (40.3, -75.3)]))
+    assert out == [None, None, None, None] and time.time() - t < 2

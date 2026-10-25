@@ -212,6 +212,10 @@ async def _write_cache(db: AsyncSession, key: str, payload: dict) -> None:
         await db.commit()
     except Exception:  # noqa: BLE001
         logger.debug("road_context cache write failed for %s", key, exc_info=True)
+        try:  # a failed save must not leave the caller's session (the whole CMA run) unusable
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _fetch_overpass(lat: float, lng: float, race: bool = False) -> Optional[list[dict]]:
@@ -352,7 +356,8 @@ async def road_context_from_address(db: AsyncSession, lat, lng, address) -> Opti
     }
 
 
-async def get_road_context(db: AsyncSession, lat, lng, race: bool = False) -> Optional[dict]:
+async def get_road_context(db: AsyncSession, lat, lng, race: bool = False,
+                           fetch_timeout: Optional[float] = None) -> Optional[dict]:
     """Verdict dict {'verdict': 'quiet'|'neutral'|'through'|'unknown', 'road_types', 'max_speed_mph',
     'nearby_road_names', 'summary', 'source'} or None if it couldn't be determined."""
     try:
@@ -368,7 +373,12 @@ async def get_road_context(db: AsyncSession, lat, lng, race: bool = False) -> Op
     if cached is not None:
         return cached or None
 
-    elements = await _fetch_overpass(lat, lng, race=race)
+    # Only the network wait is cut off at the time limit - never a cache write on the caller's session.
+    try:
+        elements = await asyncio.wait_for(_fetch_overpass(lat, lng, race=race), fetch_timeout) if fetch_timeout \
+            else await _fetch_overpass(lat, lng, race=race)
+    except asyncio.TimeoutError:
+        return None
     if elements is None:
         return None  # transient - don't cache a failure
     result = _classify(lat, lng, elements)
@@ -377,33 +387,86 @@ async def get_road_context(db: AsyncSession, lat, lng, race: bool = False) -> Op
     return result
 
 
+_SUBJECT_BUDGET_S = 30.0   # the subject: every mirror at once (a good mirror answers in 1-25 s)
+_COMPS_BUDGET_S = 45.0     # all the comps together
+
+
+def _valid_point(pt) -> Optional[tuple[float, float]]:
+    try:
+        lat, lng = float(pt[0]), float(pt[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180) or (lat == 0 and lng == 0):
+        return None
+    return lat, lng
+
+
 async def get_road_contexts(db: AsyncSession, points: list[tuple], addresses: Optional[list] = None) -> list[Optional[dict]]:
-    """Best-effort batch (subject first, then comps). Concurrency-limited (Overpass is strict about
-    anonymous concurrency); the subject asks every mirror at once. A point with no answer falls back to
-    the remembered class of the road its address is on (road_context_from_address), then to None ->
-    the caller falls back to the address suffix."""
-    sem = asyncio.Semaphore(2)
-
-    async def one(pt, race=False):
-        if not pt or pt[0] is None or pt[1] is None:
-            return None
-        async with sem:
-            try:
-                return await get_road_context(db, pt[0], pt[1], race=race)
-            except Exception:  # noqa: BLE001
-                logger.debug("road_context lookup failed for %s", pt, exc_info=True)
-                return None
-
+    """Best-effort batch (subject first, then comps). Three phases, so the caller's database session is
+    only ever used one call at a time (10/25: several lookups at once on one session made the cache saves
+    fail silently, so every report asked the slow map servers again): saved answers are read first, the
+    map servers are asked in parallel (network only, the subject from every mirror at once, all under a
+    time limit), then new answers are saved one by one. A point with no answer falls back to the
+    remembered class of the road its address is on (road_context_from_address), then to None -> the
+    caller falls back to the address suffix."""
     if not points:
         return []
-    first = await one(points[0], race=True)
-    out = [first] + list(await asyncio.gather(*(one(p) for p in points[1:])))
-    addresses = list(addresses or [])
-    for i, (pt, ctx) in enumerate(zip(points, out)):
-        addr = addresses[i] if i < len(addresses) else None
-        if ctx is None and addr and pt and pt[0] is not None and pt[1] is not None:
+    pts = [_valid_point(p) if p else None for p in points]
+    out: list[Optional[dict]] = [None] * len(points)
+    todo: list[int] = []
+    for i, p in enumerate(pts):
+        if p is None:
+            continue
+        try:
+            cached = await _read_cache(db, f"road:v3:{_round5(p[0])}:{_round5(p[1])}")
+        except Exception:  # noqa: BLE001
+            cached = None
+        if cached is not None:
+            out[i] = cached or None
+        else:
+            todo.append(i)
+
+    # A time limit on the whole lookup: with every map server timing out, 602 Media Line Rd's report spent
+    # ~5 of its 10 minutes here (10/25).
+    sem = asyncio.Semaphore(2)
+    loop = asyncio.get_running_loop()
+
+    async def fetch(i: int, deadline: float, race: bool = False):
+        async with sem:
+            left = deadline - loop.time()
+            if left <= 0:
+                return None
             try:
-                out[i] = await road_context_from_address(db, pt[0], pt[1], addr)
+                return await asyncio.wait_for(_fetch_overpass(pts[i][0], pts[i][1], race=race), left)
+            except Exception:  # noqa: BLE001 - timeout or network: no answer this time (never cached)
+                return None
+
+    found: dict[int, list] = {}
+    if todo and todo[0] == 0:
+        el = await fetch(0, loop.time() + _SUBJECT_BUDGET_S, race=True)
+        if el is not None:
+            found[0] = el
+    rest = [i for i in todo if i != 0]
+    if rest:
+        deadline = loop.time() + _COMPS_BUDGET_S
+        results = await asyncio.gather(*(fetch(i, deadline) for i in rest))
+        found.update({i: el for i, el in zip(rest, results) if el is not None})
+
+    for i, el in found.items():
+        lat, lng = pts[i]
+        out[i] = _classify(lat, lng, el)
+        try:
+            await _write_cache(db, f"road:v3:{_round5(lat)}:{_round5(lng)}", out[i])
+            await _remember_road_names(db, lat, lng, el)
+        except Exception:  # noqa: BLE001
+            logger.debug("road_context cache save failed", exc_info=True)
+
+    addresses = list(addresses or [])
+    for i, ctx in enumerate(out):
+        addr = addresses[i] if i < len(addresses) else None
+        if ctx is None and addr and pts[i] is not None:
+            try:
+                out[i] = await road_context_from_address(db, pts[i][0], pts[i][1], addr)
             except Exception:  # noqa: BLE001
                 logger.debug("road-name fallback failed for %s", addr, exc_info=True)
     return out
