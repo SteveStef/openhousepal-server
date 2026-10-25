@@ -192,6 +192,69 @@ def test_school_district_not_strong_survives_reweighting():
     assert ai._same_district(comp["school_district"], subj["school_district"]) is False
 
 
+# ---- 4913 Chancellor St remake (10/24 evening) -----------------------------------------------------
+
+def _chancellor_pendings(monkeypatch, implied):
+    it = iter(implied)
+    monkeypatch.setattr(ai, "_pending_implied_value", lambda s, h, psf: next(it))
+    homes = [{"status": "pending", "match_score": 86, "street_address": "5111 LOCUST ST", "list_price": 390000},
+             {"status": "pending", "match_score": 85, "street_address": "5321 LOCUST ST", "list_price": 299000}]
+    trace = {"anchor": {"market_psf": 193}, "asking_price_check": {"allowed_low_price": 370260, "allowed_high_price": 435600}}
+    return ai._pending_competition_review({"sqft": 2010}, homes, 395000, 355000, 430000, trace)
+
+
+def test_pendings_that_disagree_do_not_move_the_value(monkeypatch):
+    v, lo, hi, info = _chancellor_pendings(monkeypatch, [405879, 314147])
+    assert v == 395000 and info["nudged_from"] is None
+    assert [p["moved_value"] for p in info["pendings_used"]] == [False, False]
+    assert info["review"] and "5321 LOCUST ST" in info["review"]
+
+
+def test_pendings_that_agree_still_nudge(monkeypatch):
+    v, lo, hi, info = _chancellor_pendings(monkeypatch, [380000, 384000])
+    assert v < 395000 and info["nudged_from"] == 395000 and all(p["moved_value"] for p in info["pendings_used"])
+
+
+def test_pending_bridge_step_names_what_each_implies():
+    trace = {"anchor": {"anchor_value": 399000},
+             "pending_competition": {"nudged_from": 395000, "nudge_pct": -1.0, "pendings_used": [
+                 {"street_address": "5111 LOCUST ST", "implied_value": 380000, "moved_value": True},
+                 {"street_address": "5321 LOCUST ST", "implied_value": 314147, "moved_value": False}]}}
+    b = ai._v10_value_bridge(trace, value=391000, range_min=355000, range_max=430000)
+    step = next(s for s in b["steps"] if s["key"] == "pending")
+    assert "5111 Locust St (about $380,000)" in step["basis"] and "5321" not in step["basis"] and "listed lower" not in step["basis"]
+
+
+def test_judgment_does_not_name_a_factor_the_grid_already_prices():
+    items = [{"factor": "Unfinished basement relative to finished-basement alternatives"},
+             {"factor": "Longer cumulative marketing exposure"}, {"factor": "Nearby major-road influence"}]
+    text, _, gridded = ai._bridge_driver_text(items, {"below_grade"})
+    assert "basement" not in text and "marketing exposure" in text and not gridded
+
+
+def test_listing_history_survives_the_snapshot_rebuild():
+    hist = {"lines": ["Listed Aug 13, 2026 at $450,000; taken off the market", "Sold Mar 13, 2026 for $200,000"]}
+    subj = {"street_address": "4913 CHANCELLOR ST", "_listing_history": hist, "condo_fee": 300, "condo_fee_frequency": "Monthly"}
+    rebuilt = {**ai._merge_authoritative_property_facts({}, subj), **ai._subject_runtime_facts(subj)}
+    rec = ai._property_record_facts(rebuilt)
+    assert rec and rec["history_lines"] == hist["lines"] and rec["fees"]
+
+
+def test_comps_own_size_next_to_the_word_subject_is_not_flagged():
+    walnut = {"street_address": "4945 WALNUT ST", "sqft": 2025, "above_grade_finished_area": 2025}
+    chan = {"street_address": "4913 CHANCELLOR ST", "sqft": 2010, "above_grade_finished_area": 2010}
+    t = "This comp is nearly identical in size to the subject at 2,025 sq ft above grade."
+    out, flags = ai._reconcile_comp_hard_facts(t, "Comp #4", chan, walnut)
+    assert "2,025" in out and not any("unsupported" in f for f in flags)
+
+
+def test_nearest_road_is_not_a_comp_superlative():
+    comps = [{"distance_miles": 0.14}, {"distance_miles": 0.08}]
+    t = "It sits on a quieter street, with the nearest major road a couple of blocks off."
+    assert ai._fix_comp_note_superlatives(t, "Comp #1", comps[0], comps)[0] == t
+    assert "closest" not in ai._fix_comp_note_superlatives("It is the closest sale.", "Comp #1", comps[0], comps)[0]
+
+
 def test_mojibake_dash_fixed_in_range_pattern():
     src = open(ai.__file__, encoding="utf-8").read()
     assert "â€" not in src

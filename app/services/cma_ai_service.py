@@ -2640,6 +2640,20 @@ def _split_buyer_guidance(inspection_text, offer_text) -> tuple[str, str]:
     return inspection_text, offer_text
 
 
+def _subject_runtime_facts(subject: Optional[dict]) -> dict:
+    """Facts looked up for this run that the saved subject snapshot doesn't store - the home's earlier
+    listings/sales (and the fee fields read from the MLS row). The snapshot rebuild before final QA used
+    to drop them, so the report's record box came out empty: 4913 Chancellor St's August listing,
+    relist and $200,000 March sale never showed (10/24, after the 10/23 grader asked for exactly that)."""
+    s = subject or {}
+    keep = {k: s[k] for k in ("_listing_history",) if k in s}
+    for k in ("association_fee", "association_fee_frequency", "condo_fee", "condo_fee_frequency",
+              "association_fee_includes"):
+        if s.get(k) not in (None, ""):
+            keep[k] = s[k]
+    return keep
+
+
 def _property_record_facts(subject: Optional[dict]) -> Optional[dict]:
     """The record facts the report states that the subject snapshot doesn't carry: monthly HOA / condo fees
     with what they include, and the home's earlier listings and sales from our MLS mirror."""
@@ -4675,8 +4689,13 @@ def _reconcile_status_mentions(text: str, field_label: str, timeline: dict) -> t
     return out, flags, blocking
 
 
+# "the closest / nearest" said of a SALE ("the closest sale", "the closest, most recent comp", "Comp #1 is the
+# closest") - never "the closest match" (similarity) or "the nearest major road" (a place, 10/24 replay)
 _DISTANCE_SUPERLATIVE_RE = re.compile(
-    r"\b(the\s+)?(?:closest|nearest)\b(?!\s+(?:match|fit|analog|comparison|parallel|in\s+(?:size|age|style|condition|layout|finish)))",
+    r"\b(the\s+)?(?:closest|nearest)\b"
+    r"(?=(?:,?\s+(?:and\s+)?(?:most\s+recent|newest|latest|recent|direct|true|verified|sold|closed))*"
+    r",?\s+(?:sales?|sold|comps?|comparables?|comparable\s+sales?|closings?|one|of\s+the\s+(?:sales|comps|comparables))\b"
+    r"|\s*(?:[.;,]|$|\s+(?:to|of)\s+the\s+subject))",
     re.IGNORECASE)
 
 def _fix_comp_note_superlatives(text: str, label: str, comp: dict, comps: list[dict]) -> tuple[str, list[str]]:
@@ -9203,6 +9222,7 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
 _PENDING_STRONG_MATCH = 65      # a pending this good a match can inform the value review
 _PENDING_NUDGE_SHARE = 0.25     # move a quarter of the way toward what the pendings imply...
 _PENDING_NUDGE_CAP = 0.025      # ...never more than 2.5% in total
+_PENDING_NUDGE_MAX_GAP = 0.15   # pendings more than 15% apart from each other don't agree - no nudge (review only)
 _PENDING_REVIEW_MATCH = 70
 _PENDING_REVIEW_GAP = 0.10      # a strong pending implying 10%+ off our value -> agent "Review before sending"
 
@@ -9260,8 +9280,21 @@ def _pending_competition_review(subject: dict, homes: list, value, low, high, tr
                               "match_score": h.get("match_score"), "distance_miles": h.get("distance_miles"),
                               "days_on_market": h.get("days_on_market"), "sqft": h.get("sqft")} for h, iv in strong]
     new_v = v
-    if len(strong) >= 2:
-        med = _v10_median([iv for _, iv in strong])
+    # Only pendings that AGREE move the value (the rule this docstring always stated): all on the same
+    # side of it, and within 15% of each other (one far from the rest is a different home - condition,
+    # layout - and goes to the agent's review instead). 4913 Chancellor St was moved down 2.3% by the
+    # median of a pending implying $406K (above the value) and one implying $314K (19% below, 10/24).
+    pool = list(strong)
+    if len(pool) >= 3:
+        mid = _v10_median([iv for _, iv in pool])
+        pool = [(h, iv) for h, iv in pool if abs(iv - mid) / mid <= _PENDING_NUDGE_MAX_GAP]
+    ivs = [iv for _, iv in pool]
+    agree = (len(pool) >= 2 and (all(iv > v for iv in ivs) or all(iv < v for iv in ivs))
+             and max(ivs) / min(ivs) - 1 <= _PENDING_NUDGE_MAX_GAP)
+    for row, (h, iv) in zip(info["pendings_used"], strong):
+        row["moved_value"] = bool(agree and (h, iv) in pool)
+    if agree:
+        med = _v10_median([iv for _, iv in pool])
         nudge = max(-_PENDING_NUDGE_CAP, min(_PENDING_NUDGE_CAP, _PENDING_NUDGE_SHARE * (med - v) / v))
         if abs(nudge) >= 0.003:
             apc = t.get("asking_price_check") or {}
@@ -10375,8 +10408,11 @@ def _reconcile_comp_hard_facts(
             continue
         # The comp's own documented size on another basis (its total quoted where the wording reads
         # as above-grade) is a true record figure - not an "unsupported component-area claim".
-        if raw_value and not is_subject and not any(abs(raw_value - known) <= max(2, 0.002 * known) for known in allowed) \
-                and any(abs(raw_value - known) <= max(2, 0.002 * known) for known in _documented_sqft_values(comp)):
+        # ...whichever home the wording seems to name: 4945 Walnut St's own 2,025 sq ft, written next to
+        # "the subject", was flagged as an unsupported subject claim and its note rebuilt (10/24)
+        if raw_value and not any(abs(raw_value - known) <= max(2, 0.002 * known) for known in allowed) \
+                and any(abs(raw_value - known) <= max(2, 0.002 * known) for known in _documented_sqft_values(comp)) \
+                and not any(abs(raw_value - known) <= max(2, 0.002 * known) for known in _subject_sizes):
             rebuilt.append(replacement)
             pos = match.end()
             continue
@@ -12948,16 +12984,21 @@ _BRIDGE_JUDGMENT_PCT = 0.03    # judgment beyond the grid this large needs marke
 
 def _bridge_driver_text(items: list, grid_families: set) -> tuple[str, bool, bool]:
     """(plain list of the reasoning pass's named factors, any clearly market-supported, all already in the grid)."""
-    names, supported, all_gridded = [], False, bool(items)
+    names, fresh, supported, all_gridded = [], [], False, bool(items)
     for d in items or []:
         f = str(d.get("factor") or "").strip().rstrip(".")
         if not f:
             continue
-        names.append(f[:1].lower() + f[1:] if not f[:2].isupper() else f)
+        name = f[:1].lower() + f[1:] if not f[:2].isupper() else f
+        names.append(name)
         supported = supported or d.get("evidence_strength") == "clearly_market_supported"
         hit = any(re.search(rx, f, re.I) and fam in grid_families for fam, rx in _GRID_PRICED_WORDS)
         all_gridded = all_gridded and hit
-    return ("; ".join(names[:3]), supported, all_gridded and bool(names))
+        if not hit:
+            fresh.append(name)
+    # A factor the adjustment table already prices isn't a reason for the judgment step - 4913 Chancellor St
+    # named its unfinished basement here while the value drivers said "no second deduction" (10/24).
+    return ("; ".join((fresh or names)[:3]), supported, all_gridded and bool(names))
 
 
 def _v10_value_bridge(trace: Optional[dict], *, value, range_min=None, range_max=None) -> Optional[dict]:
@@ -13047,10 +13088,14 @@ def _v10_value_bridge(trace: Optional[dict], *, value, range_min=None, range_max
         steps.append({"key": "judgment", "label": "Judgment beyond the measured adjustments", "amount": round(judgment),
                       "basis": basis, "measured": False, "market_supported": jdg_supported, "already_in_grid": jdg_gridded})
     if abs(nudge) >= 500:
-        names = [p.get("street_address") for p in (pend.get("pendings_used") or []) if p.get("street_address")]
+        # only the pendings that moved it, with what each implies - "are listed lower" named a home that
+        # implied MORE than the value (4913 Chancellor St, 10/24)
+        used = [p for p in (pend.get("pendings_used") or []) if p.get("street_address") and p.get("moved_value", True)]
+        names = [f"{_title_address(p['street_address'])} (about ${round(_as_float(p.get('implied_value')) or 0, -3):,.0f})"
+                 if _as_float(p.get("implied_value")) else _title_address(p["street_address"]) for p in used[:3]]
         steps.append({"key": "pending", "label": "Similar homes now under contract", "amount": round(nudge),
-                      "basis": (f"Close matches that just went under contract{(' (' + ', '.join(names[:3]) + ')') if names else ''} are "
-                                f"listed {'higher' if nudge > 0 else 'lower'}; their contract prices aren't known yet, so they "
+                      "basis": (f"Close matches that just went under contract{(' - ' + ', '.join(names) + ' adjusted to this home -') if names else ''} "
+                                f"point {'higher' if nudge > 0 else 'lower'}; their contract prices aren't known yet, so they "
                                 "move the value only a little (never more than 2.5%)."),
                       "measured": False})
     # Whole $1,000s, the way the report states the adjusted sales ("about $1,001,000"), and they must add
@@ -13251,8 +13296,10 @@ def _v10_pending_context_sentence(methodology: str, *, final: Optional[dict], tr
          + " went under contract" + (f" after {round(dom)} days" if dom is not None else "")
          + f" at a ${lp:,.0f} asking price. Adjusted to this home for size and features, that asking price implies about "
          f"${round(iv, -3):,.0f}, {rel} this report's value. Its contract price isn't known yet, so it is not treated as a sale"
-         + (f" - with other close matches it moved the value {abs(nudge):g}% (the most pending homes may move it is 2.5%)."
-            if nudge else (" - it sits inside the supported range and backs it." if inside else
+         + (f" - with other close matches it moved the value {'up' if nudge > 0 else 'down'} {abs(nudge):g}% (the most "
+            "pending homes may move it is 2.5%)."
+            if nudge and p.get("moved_value", True) and (gap > 0) == (nudge > 0) else
+            (" - it sits inside the supported range and backs it." if inside else
                            " - it is a reason the range is as wide as it is; check its sale price when it closes.")))
     return methodology.rstrip() + s, ["Methodology summary: said how the strongest nearby home under contract was weighed."]
 
@@ -17292,10 +17339,11 @@ async def _generate_ai_analysis_impl(
 
         # Materialize every client-facing fact-bearing field before the final prose/QA pass. The
         # exact subject snapshot checked below is the same object later saved and rendered.
+        _history_keep = _subject_runtime_facts(enriched_subject)
         report.subject = _reconciled_subject_snapshot(
             _merge_authoritative_property_facts(report.subject or {}, enriched_subject), status_timeline,
         )
-        enriched_subject = dict(report.subject or {})
+        enriched_subject = {**dict(report.subject or {}), **_history_keep}
 
         # Suggested improvements are also normalized before final QA. They remain outside the
         # valuation math, but no client artifact field is allowed to appear after QA has run.
@@ -17985,10 +18033,11 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
 
         # Recompute follows the same ordering contract as initial generation: save and render the
         # exact authoritative subject snapshot that the final prose and QA inspect.
+        _history_keep = _subject_runtime_facts(enriched_subject)
         report.subject = _reconciled_subject_snapshot(
             _merge_authoritative_property_facts(report.subject or {}, enriched_subject), status_timeline,
         )
-        enriched_subject = dict(report.subject or {})
+        enriched_subject = {**dict(report.subject or {}), **_history_keep}
 
         _value_drivers = _reasoning_value_drivers(_reasoning_output, new_comparables)
         for _d in _value_drivers or []:
