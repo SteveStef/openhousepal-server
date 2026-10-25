@@ -26,12 +26,12 @@ import re
 import traceback
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import CmaReport, Property
@@ -2647,6 +2647,81 @@ def _split_buyer_guidance(inspection_text, offer_text) -> tuple[str, str]:
     elif inspection_sections:
         offer_text = ""
     return inspection_text, offer_text
+
+
+_COMP_REF_RE = re.compile(r"\b(Comps?)(\s*#?\s*)(\d+)((?:\s*(?:,|and|&|or)\s*#?\s*\d+)*)")
+
+
+def _renumber_comp_refs(text: str, mapping: dict) -> str:
+    """'Comp #3' -> 'Comp #1' (and 'Comps #2 and #4') under a re-order; numbers not in `mapping` stay."""
+    def one(m: "re.Match") -> str:
+        tail = re.sub(r"\d+", lambda d: str(mapping.get(int(d.group(0)), d.group(0))), m.group(4) or "")
+        return f"{m.group(1)}{m.group(2)}{mapping.get(int(m.group(3)), m.group(3))}{tail}"
+    return _COMP_REF_RE.sub(one, text) if isinstance(text, str) and text else text
+
+
+def _walk_strings(obj, fn):
+    if isinstance(obj, str):
+        return fn(obj)
+    if isinstance(obj, list):
+        return [_walk_strings(v, fn) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _walk_strings(v, fn) for k, v in obj.items()}
+    return obj
+
+
+def _final_strongest_first(report) -> list[str]:
+    """Strong comps first, then by share of the value - decided once the FINAL labels exist. The order is
+    fixed before the AI writes about "Comp #N", but its condition ratings can change a label afterwards,
+    so 1 in 5 live reports failed the "strongest-first" check (2701 Cornell Ct #2701, 10/25: its 97% match
+    and biggest share sat at #1 as Supporting ahead of two Strong comps). Re-sorts the comps and renumbers
+    every "Comp #N" in the saved text the same way, so labels, order, weights and prose all agree."""
+    comps = list(report.comparables or [])
+    est = (report.pricing or {}).get("ai_estimate") or {}
+    trace = est.get("valuation_trace") or {}
+    rows = {str(r.get("listing_key")): r for r in ((trace.get("anchor") or {}).get("comps") or [])}
+    if len(comps) < 2 or not rows:
+        return []
+
+    def key(item):
+        i, c = item
+        row = rows.get(str(c.get("listing_key"))) or {}
+        role = row.get("display_role") or _normalize_strength(c.get("strength")) or "supporting"
+        return (not c.get("is_included", True), role != "strong", -(row.get("normalized_weight") or 0.0), i)
+
+    ordered = sorted(enumerate(comps), key=key)
+    if [i for i, _ in ordered] == list(range(len(comps))):
+        return []
+    mapping = {old + 1: new + 1 for new, (old, _) in enumerate(ordered)}
+    fix = lambda t: _renumber_comp_refs(t, mapping)  # noqa: E731
+    report.comparables = [{**_walk_strings(c, fix), "order_index": n} for n, (_, c) in enumerate(ordered)]
+    pricing = _walk_strings(dict(report.pricing or {}), fix)
+    t2 = ((pricing.get("ai_estimate") or {}).get("valuation_trace") or {})
+    if (t2.get("anchor") or {}).get("comps"):
+        pos = {str(c.get("listing_key")): n for n, c in enumerate(report.comparables)}
+        t2["anchor"]["comps"] = sorted(t2["anchor"]["comps"], key=lambda r: pos.get(str(r.get("listing_key")), 99))
+    ec = t2.get("engine_checks") or {}
+    if isinstance(ec.get("errors"), list) and "comps are not listed strongest-first" in ec["errors"]:
+        ec["errors"] = [e for e in ec["errors"] if e != "comps are not listed strongest-first"]
+        ec["passed"] = not ec["errors"]
+    est2 = pricing.get("ai_estimate") or {}
+    if isinstance(est2.get("qa_flags"), list):
+        est2["qa_flags"] = [f for f in est2["qa_flags"] if f != "ENGINE CHECK FAILED - comps are not listed strongest-first"]
+    report.pricing = pricing
+    return [f"Comps re-ordered strongest-first after the final labels ({', '.join(f'#{a}->#{b}' for a, b in mapping.items() if a != b)}); "
+            "every 'Comp #N' in the report was renumbered to match."]
+
+
+def _apply_final_order(report) -> None:
+    """Best-effort - a re-order problem must never fail a finished, paid report."""
+    try:
+        notes = _final_strongest_first(report)
+    except Exception:  # noqa: BLE001
+        logger.warning("CMA final strongest-first re-order failed", exc_info=True)
+        return
+    est = (report.pricing or {}).get("ai_estimate")
+    if notes and isinstance(est, dict):
+        est["qa_flags"] = [*(est.get("qa_flags") or []), *notes]
 
 
 def _subject_runtime_facts(subject: Optional[dict]) -> dict:
@@ -5666,10 +5741,13 @@ def _v10_role_from_anchor_row(row: Optional[dict], comp: Optional[dict] = None, 
         return "supporting"
     # Grader, 10/21: 281 Woodland Dr (1985, well + septic, rated Inferior on finish, interior and
     # exterior) was Strong for a 2012 public-water home. A Strong comp is a like-for-like home.
+    # All three ratings off, not two (10/25): the grid prices condition, and two off demoted 2701 Cornell
+    # Ct's 97% same-subdivision match (biggest share, 11% gross) while a 74% match elsewhere stayed Strong.
+    # Woodland's year gap and private utilities still demote it below.
     quality = row.get("quality") or (comp or {}).get("quality") or {}
     _off = sum(1 for k in ("finish_quality", "interior", "exterior")
                if str(quality.get(k) or "").lower() in ("below", "above", "inferior", "superior", "comp_inferior", "comp_superior"))
-    if _off >= 2:
+    if _off >= 3:
         return "supporting"
     if subject is not None and comp is not None:
         sy, cy = _as_float(subject.get("year_built")), _as_float(comp.get("year_built"))
@@ -6480,6 +6558,12 @@ _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS = {
     # 10/24: a sale on the subject's own street, a few doors down (612 vs 660 Radnor Valley Dr ranked 6th -
     # grader). Present ONLY for same-street comps, so every other comp's Match % is unchanged.
     "same_street": float(os.getenv("CMA_REL_SAME_STREET_W", "25")),
+    # 10/25: a sale in the subject's own MLS subdivision (outside a city) - same builder, HOA and amenities
+    # (grader, 2701 Cornell Ct #2701: 103 Princeton Cir, same Willistown Knoll and HOA, sold 3 weeks earlier,
+    # scored below a 2-bed in another community). Present ONLY for same-subdivision comps, not on top of
+    # same_street. Free backtest 10/25 (~90 suburban sales): seller 4 better / 0 worse, buyer flat, same at 15
+    # and 25 - on at 15.
+    "same_subdivision": float(os.getenv("CMA_REL_SAME_SUBDIV_W", "15")),
 }
 _REL_COND_HALF_LIFE = float(os.getenv("CMA_REL_COND_HL", "1.0"))   # tiers apart that halve the score
 _RELEVANCE_AGE_HALF_LIFE_YEARS = 12.0
@@ -6781,6 +6865,7 @@ def _area_price_level(surface: list, lat, lng, exclude_key: Optional[str] = None
 
 _REL_SAME_STREET = os.environ.get("CMA_REL_SAME_STREET", "1") == "1"   # backtest knob
 _LOC_SCHOOL_NOT_STRONG = os.environ.get("CMA_LOC_SCHOOL_NOT_STRONG", "1") == "1"   # backtest knob
+_STRONG_NEEDS_OWN_SUBDIV = os.environ.get("CMA_STRONG_OWN_SUBDIV", "1") == "1"      # backtest knob (10/25; label only)
 _SAME_STREET_MAX_MI = 0.75
 _STREET_SUFFIX = {"drive": "dr", "road": "rd", "lane": "ln", "street": "st", "avenue": "ave", "court": "ct",
                   "circle": "cir", "place": "pl", "terrace": "ter", "boulevard": "blvd", "way": "way", "pike": "pike"}
@@ -6928,6 +7013,9 @@ def _continuous_relevance(
         if _REL_SAME_STREET and not urban and subject_type != "condo" and _same_street(subject, comp) \
                 and _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["same_street"] > 0:
             components["same_street"] = 1.0
+        elif not urban and subject_type != "condo" and _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["same_subdivision"] > 0 \
+                and _fact_check.same_subdivision(subject, comp) is True:
+            components["same_subdivision"] = 1.0
         if subject_level and _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["area_price"] > 0:
             s_level, s_radius, s_n = subject_level, subject_radius, subject_n
             comp_level, comp_radius, comp_n = _area_price_level(surface, comp.get("latitude"), comp.get("longitude"),
@@ -7159,6 +7247,12 @@ def _apply_continuous_relevance_weighting(
         # review and silently undid it (rule audit 10/24).
         if _LOC_SCHOOL_NOT_STRONG and _normalize_strength(comp.get("strength")) == "strong" \
                 and _same_district(comp.get("school_district"), (subject or {}).get("school_district")) is False:
+            comp["strength"] = "supporting"
+        # Another community's sale isn't Strong when the set has 2+ from the subject's own (grader 10/25:
+        # 103 Fairfield Ct, Worington Commons, Strong next to three Willistown Knoll sales)
+        if _STRONG_NEEDS_OWN_SUBDIV and _normalize_strength(comp.get("strength")) == "strong" \
+                and _fact_check.same_subdivision(subject, comp) is False \
+                and sum(1 for o in comps if o is not source and _fact_check.same_subdivision(subject, o) is True) >= 2:
             comp["strength"] = "supporting"
         if key in _anchor_rows:
             # the label the report shows, kept on the anchor row so the report order (Strong first,
@@ -9297,6 +9391,68 @@ def _pending_implied_value(subject: dict, home: dict, market_psf: Optional[float
     r = {"_c": {**home, "above_grade_finished_area": c_ag}, "price": lp, "sqft": c_ag, "ag": c_ag, "bg": c_bg, "bg_estimated": c_bg_est}
     feat = _v10_grid_adjustments(subject, r, s_ag, s_bg, s_bg_est, market_psf)
     return lp + feat["total"]
+
+
+_MISSED_SALE_DAYS = 120          # a same-community sale this recent should be in the report, or looked at
+_MISSED_SALE_MILES = 1.0
+_MISSED_SALE_SIZE = (0.65, 1.45)  # x the subject's total finished area
+
+
+async def _missed_same_community_sales(db: AsyncSession, subject: dict, comps: list) -> Optional[dict]:
+    """Recent closed sales in the subject's own MLS subdivision that aren't in the report (grader 10/25,
+    2701 Cornell Ct #2701: 103 Princeton Cir - same Willistown Knoll community and HOA, sold 3 weeks
+    earlier - was left out while a 2-bed in another community was used). However the comps were picked,
+    the agent is told by name. Agent-only; never in the client report; never in an accuracy-test run."""
+    if _tmach.current():
+        return None
+    sub = _fact_check.subdivision_of(subject)
+    lat, lng = _as_float(subject.get("latitude")), _as_float(subject.get("longitude"))
+    zipcode = str(subject.get("zipcode") or "").strip()[:5]
+    if not sub or lat is None or lng is None or not zipcode:
+        return None
+    total = _as_float(subject.get("sqft")) or _as_float(subject.get("above_grade_finished_area"))
+    family = _type_family(subject.get("property_type") or subject.get("home_type"))
+    have = {str(c.get("listing_key")) for c in comps or [] if c.get("listing_key")}
+    since = (_tmach.today() - timedelta(days=_MISSED_SALE_DAYS)).isoformat()
+    close_date = Property.raw_mls_data["CloseDate"].astext
+    try:
+        rows = (await db.execute(
+            select(Property.listing_key, Property.street_address, Property.latitude, Property.longitude,
+                   Property.home_type, Property.living_area, Property.bedrooms, Property.bathrooms,
+                   Property.raw_mls_data["SubdivisionName"].astext.label("sub"),
+                   Property.raw_mls_data["ClosePrice"].astext.label("close_price"), close_date.label("close_date"))
+            .where(Property.zipcode == zipcode, func.upper(Property.home_status).like("CLOSED%"),
+                   close_date >= since, Property.is_manual.is_(False))
+            .limit(400)
+        )).mappings().all()
+    except Exception:  # noqa: BLE001 - a side check never fails a paid run
+        logger.warning("CMA missed-sale check failed", exc_info=True)
+        return None
+    kx = 69.0 * math.cos(math.radians(lat))
+    found = []
+    for r in rows:
+        if str(r["listing_key"]) in have or str(r["listing_key"]) == str(subject.get("listing_key") or ""):
+            continue
+        if _fact_check._subdivision_key({"subdivision_name": r["sub"]}) != _fact_check._subdivision_key({"subdivision_name": sub}):
+            continue
+        if family and _type_family(r["home_type"]) != family:
+            continue
+        if r["latitude"] is None or r["longitude"] is None or \
+                math.hypot((float(r["latitude"]) - lat) * 69.0, (float(r["longitude"]) - lng) * kx) > _MISSED_SALE_MILES:
+            continue
+        sq, price = _as_float(r["living_area"]), _as_float(r["close_price"])
+        if not price or (total and sq and not (_MISSED_SALE_SIZE[0] <= sq / total <= _MISSED_SALE_SIZE[1])):
+            continue
+        found.append({"listing_key": r["listing_key"], "street_address": r["street_address"], "close_price": price,
+                      "close_date": str(r["close_date"])[:10], "sqft": sq, "beds": r["bedrooms"], "baths": r["bathrooms"]})
+    if not found:
+        return None
+    found.sort(key=lambda h: h["close_date"], reverse=True)
+    found = found[:3]
+    names = "; ".join(f"{_title_address(h['street_address'])} sold {_fact_check._nice_date(h['close_date'])} for ${h['close_price']:,.0f}"
+                      + (f" ({round(h['sqft']):,} sq ft)" if h.get("sqft") else "") for h in found)
+    return {"homes": found, "message": (f"Review before sending: recent {_title_address(sub)} sales not in this report - {names}. "
+                                        "Same community as the subject - consider adding or say why it was left out.")}
 
 
 def _pending_competition_review(subject: dict, homes: list, value, low, high, trace: Optional[dict]):
@@ -13126,6 +13282,10 @@ def _v10_value_bridge(trace: Optional[dict], *, value, range_min=None, range_max
                       if _share >= 0.95 else
                       f" The value weighs the adjusted sales against that figure, landing about {round(_share * 100)}% of the "
                       "way toward it.")
+        # the empirical support for this step (grader 10/25: "the 46% weighting needs empirical support") -
+        # the free backtest on ~220 past local sales, see _cma_engine_lab/engine (edge_*_LOCCOND / AUD1024)
+        basis += (" Tested on about 220 past local sales of listed homes, weighing the asking-price evidence this way "
+                  "cut the typical miss from about 9% (adjusted sales alone) to about 6%.")
         steps.append({"key": "listing", "label": "Asking-price evidence (how homes here sell against their asking price)",
                       "amount": round(amt), "basis": basis, "measured": False})
     jdg_text, jdg_supported, jdg_gridded = "", False, False
@@ -17600,6 +17760,8 @@ async def _generate_ai_analysis_impl(
             "exposure_state": (valuation_trace or {}).get("exposure", {}).get("state") if valuation_trace else None,
             # Agent-only: the asking-price band moved the value well away from what the comps say (grader, 10/21).
             "agent_review": _asking_band_review_note(valuation_trace, value),
+            # Agent-only: recent same-community sales left out of the report (grader, 10/25)
+            "missed_sales": await _missed_same_community_sales(db, enriched_subject, report.comparables or []),
             # Similar homes for sale / under contract now (list prices) + which pendings moved the value.
             "current_competition": {"homes": _competition or [], **(_competition_review or {})},
             # Agent-only: buyer CMA on the agent's own listing (10/24)
@@ -17721,6 +17883,7 @@ async def _generate_ai_analysis_impl(
         "images_sent": images_sent,
         "warnings": warnings,
     }
+    _apply_final_order(report)
     report.pricing = stamp_final_artifact_qa(
         subject=report.subject or {}, comparables=report.comparables or [], pricing=report.pricing or {},
         market_context=report.market_context or {}, improvements=report.improvements or [],
@@ -18232,6 +18395,8 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             "exposure_state": (valuation_trace or {}).get("exposure", {}).get("state") if valuation_trace else None,
             # Agent-only: the asking-price band moved the value well away from what the comps say (grader, 10/21).
             "agent_review": _asking_band_review_note(valuation_trace, value),
+            # Agent-only: recent same-community sales left out of the report (grader, 10/25)
+            "missed_sales": await _missed_same_community_sales(db, enriched_subject, report.comparables or []),
             # Similar homes for sale / under contract now (list prices) + which pendings moved the value.
             "current_competition": {"homes": _competition or [], **(_competition_review or {})},
             # Agent-only: buyer CMA on the agent's own listing (10/24)
@@ -18340,6 +18505,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             await reconcile_budget(db, reservation, cost)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Recompute failed - try again.") from exc
 
+    _apply_final_order(report)
     report.pricing = stamp_final_artifact_qa(
         subject=report.subject or {}, comparables=report.comparables or [], pricing=report.pricing or {},
         market_context=report.market_context or {}, improvements=report.improvements or [],

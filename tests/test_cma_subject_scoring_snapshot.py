@@ -289,10 +289,13 @@ def test_continuous_relevance_rows_carry_no_product_modifier_fields():
 _PROPERTY_TYPE_WEIGHT = 11.0 / 100.0  # matches _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["property_type"] (v2, 10/20)
 
 
-def test_property_type_eligibility_guard_does_not_change_match_percentage():
+def test_property_type_eligibility_guard_does_not_change_match_percentage(monkeypatch):
     """A condo comp's score differs from an otherwise-identical single-family comp by EXACTLY the
     property_type component's own 12/100 weight - nothing more. No separate penalty is stacked on
     top by the new eligibility guard."""
+    # the fixture homes share a subdivision; the 10/25 same-subdivision part would change the weight shares
+    from app.services import cma_ai_service as _ai
+    monkeypatch.setitem(_ai._CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS, "same_subdivision", 0.0)
     subject = _modifier_removal_subject()
     same_type = _modifier_removal_comp("same-type", property_type="SINGLE_FAMILY")
     condo = _modifier_removal_comp("condo-mismatch", property_type="CONDO")

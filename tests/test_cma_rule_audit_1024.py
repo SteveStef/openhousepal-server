@@ -290,6 +290,43 @@ def test_smaller_home_lower_psf_is_not_explained_by_size():
     assert fc.fix_text(ok, subject=chan, comp={"sqft": 1200}, who="Comp #2")[0] == ok
 
 
+# ---- 2701 Cornell Ct #2701 (10/25) ----------------------------------------------------------------
+
+def test_comp_refs_renumber_together():
+    m = {1: 3, 2: 1, 3: 2}
+    t = "Comp #1 beats Comp #3; Comps #2 and #3 sold fast. Comp 2 is close. Comp #9 stays."
+    assert ai._renumber_comp_refs(t, m) == "Comp #3 beats Comp #2; Comps #1 and #2 sold fast. Comp 1 is close. Comp #9 stays."
+
+
+def test_final_order_is_strongest_first_and_text_follows():
+    rows = [{"listing_key": "a", "display_role": "supporting", "normalized_weight": 0.30},
+            {"listing_key": "b", "display_role": "strong", "normalized_weight": 0.25},
+            {"listing_key": "c", "display_role": "strong", "normalized_weight": 0.20}]
+    report = SimpleNamespace(
+        comparables=[{"listing_key": "a", "ai_commentary": "Better than Comp #2."},
+                     {"listing_key": "b", "ai_commentary": "Same street as Comp #1."},
+                     {"listing_key": "c", "ai_commentary": "x"}],
+        pricing={"ai_estimate": {"methodology_summary": "Comp #2 and Comp #3 lead; Comp #1 supports.",
+                                 "qa_flags": ["ENGINE CHECK FAILED - comps are not listed strongest-first"],
+                                 "valuation_trace": {"anchor": {"comps": rows},
+                                                     "engine_checks": {"errors": ["comps are not listed strongest-first"], "passed": False}}}})
+    notes = ai._final_strongest_first(report)
+    assert [c["listing_key"] for c in report.comparables] == ["b", "c", "a"] and notes
+    assert report.comparables[0]["ai_commentary"] == "Same street as Comp #3."
+    est = report.pricing["ai_estimate"]
+    assert est["methodology_summary"] == "Comp #1 and Comp #2 lead; Comp #3 supports."
+    assert est["valuation_trace"]["engine_checks"]["passed"] and not est["qa_flags"]
+    assert ai._final_strongest_first(report) == []      # already in order - no change
+
+
+def test_two_condition_ratings_off_no_longer_demotes_a_close_match():
+    row = {"normalized_weight": 0.25, "gross_adjustment_pct": 10.8,
+           "quality": {"finish_quality": "below", "interior": "below", "exterior": "similar"}}
+    assert ai._v10_role_from_anchor_row(row) == "strong"
+    row3 = {**row, "quality": {"finish_quality": "below", "interior": "below", "exterior": "below"}}
+    assert ai._v10_role_from_anchor_row(row3) == "supporting"
+
+
 def test_mojibake_dash_fixed_in_range_pattern():
     src = open(ai.__file__, encoding="utf-8").read()
     assert "â€" not in src
