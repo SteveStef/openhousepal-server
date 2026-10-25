@@ -9394,6 +9394,7 @@ def _pending_implied_value(subject: dict, home: dict, market_psf: Optional[float
 
 
 _MISSED_SALE_DAYS = 120          # a same-community sale this recent should be in the report, or looked at
+_MISSED_SALE_DAYS_FEW = 730      # ...this far back when the report has fewer than 2 same-community comps
 _MISSED_SALE_MILES = 1.0
 _MISSED_SALE_SIZE = (0.65, 1.45)  # x the subject's total finished area
 
@@ -9413,7 +9414,11 @@ async def _missed_same_community_sales(db: AsyncSession, subject: dict, comps: l
     total = _as_float(subject.get("sqft")) or _as_float(subject.get("above_grade_finished_area"))
     family = _type_family(subject.get("property_type") or subject.get("home_type"))
     have = {str(c.get("listing_key")) for c in comps or [] if c.get("listing_key")}
-    since = (_tmach.today() - timedelta(days=_MISSED_SALE_DAYS)).isoformat()
+    # Fewer than 2 same-community comps in the report: look back 2 years (owner, 10/25 - same-community
+    # sales are normally the best comps, even older ones once adjusted for time)
+    own = sum(1 for c in comps or [] if c.get("is_included", True) and _fact_check.same_subdivision(subject, c) is True)
+    days = _MISSED_SALE_DAYS_FEW if own < 2 else _MISSED_SALE_DAYS
+    since = (_tmach.today() - timedelta(days=days)).isoformat()
     close_date = Property.raw_mls_data["CloseDate"].astext
     try:
         rows = (await db.execute(

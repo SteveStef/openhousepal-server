@@ -1353,9 +1353,53 @@ async def auto_search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *
                              key=lambda c: -(c.match_score or 0))[:_AUTO_OUTSIDE_BAND_MAX]
         except Exception:  # noqa: BLE001 - a side list must never break the comp step
             outside = []
-    return {"results": chosen[:60] + outside, **plan,
+    extended: List[CmaCompCandidate] = []
+    if (_AUTO_SAME_SUBDIV_DAYS > plan["sold_within_days"] and req.subject is not None
+            and plan["density"] != "urban"):
+        try:
+            extended = await _same_community_older_sales(db, wide, req.subject, chosen, plan, date_to)
+        except Exception:  # noqa: BLE001 - an extra candidate list must never break the comp step
+            extended = []
+    return {"results": chosen[:60] + extended + outside, **plan,
             "price_band": [wide.min_price, wide.max_price],
             "limited_message": "Limited comparable sales - agent review recommended." if plan["limited"] else None}
+
+
+# Same community, older (owner, 10/25): "same community or neighborhood should have an exception up to 2
+# years to find a better comp". Sales in the subject's own MLS subdivision up to this many days old join
+# the candidates even when the sold window is shorter - they're time-adjusted by the grid (3%/yr) and
+# compete on Match % (recency still counts), so an older one only wins when it really is the closer
+# match. Not in the city (urban density or condos): there it made 5 of 8 changed Philly values worse.
+# Backtest 10/25 elsewhere: neutral (about 210 homes, average change 0.0 pts). 0 = off.
+_AUTO_SAME_SUBDIV_DAYS = int(os.getenv("CMA_AUTO_SAME_SUBDIV_DAYS", "730"))
+_AUTO_SAME_SUBDIV_MILES = 1.0
+_AUTO_SAME_SUBDIV_MAX = 8
+
+
+async def _same_community_older_sales(db: AsyncSession, wide: CmaCompSearchRequest, subject, chosen: list,
+                                      plan: dict, date_to: date) -> List[CmaCompCandidate]:
+    from app.services import cma_fact_check as fc
+    sub = fc.subdivision_of({"subdivision_name": getattr(subject, "subdivision_name", None)})
+    if not sub:
+        return []
+    older = await search_comparables(db, wide.model_copy(update={
+        "radius_miles": min(_AUTO_SAME_SUBDIV_MILES, max(plan["radius_miles"], 0.5)),
+        "sale_date_from": (date_to - timedelta(days=_AUTO_SAME_SUBDIV_DAYS)).isoformat(),
+    }), keep_all=True, row_limit=300)
+    seen = {c.listing_key for c in chosen}
+    out = []
+    for c in older:
+        if c.listing_key in seen or not _auto_pickable(c):
+            continue
+        if fc.same_subdivision({"subdivision_name": sub}, {"subdivision_name": c.subdivision_name}) is not True:
+            continue
+        age = _sale_age_days(c, date_to)
+        if age is None or age <= plan["sold_within_days"]:
+            continue
+        d = dict(c.similarity_details or {})
+        d["same_community_older"] = {"days_since_sale": age}
+        out.append(c.model_copy(update={"similarity_details": d}))
+    return sorted(out, key=lambda c: -(c.match_score or 0))[:_AUTO_SAME_SUBDIV_MAX]
 
 
 async def drop_subject_from_comps(db: AsyncSession, owner_id: str, report_id: str) -> int:
