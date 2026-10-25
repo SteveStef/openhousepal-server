@@ -222,7 +222,7 @@ async def test_fetch_medical_care_prefers_closer_medical_center_over_farther_cli
     clinic and an "Orthopaedics"-spelled specialist to prove both keyword-gap fixes hold together
     in the full pipeline, not just in isolated unit checks."""
     async def fake_search_text(*args, **kwargs):
-        return [place("Some Walk In Clinic", ["medical_clinic"], lat=40.0, lng=-75.001)]
+        return [place("Premier Physical Therapy", ["physiotherapist"], lat=40.0, lng=-75.001)]  # no urgent care around
 
     async def fake_search_nearby_types(*args, **kwargs):
         included_types = _included_types(args, kwargs)
@@ -243,7 +243,6 @@ async def test_fetch_medical_care_prefers_closer_medical_center_over_farther_cli
     assert "Suburban Medical Center" in names
     assert "Downtown Medical Clinic" not in names
     assert "Rothman Orthopaedics" not in names
-    assert "Some Walk In Clinic" not in names
 
 
 def test_urgent_care_must_be_actual_urgent_care():
@@ -301,9 +300,11 @@ async def test_fetch_medical_care_returns_nearest_hospital_and_non_hospital_prov
 
     results = await svc._fetch_medical_care(None, "fake-key", 40.0, -75.0)
 
+    # 10/25: the second slot is the nearest urgent care - the doctor's offices only fill in when
+    # there is none (see test_fetch_medical_care_prefers_closer_medical_center_over_farther_clinic).
     assert [(r.place_type, r.name) for r in results] == [
         ("HOSPITAL", "Reading Hospital"),
-        ("FAMILY MEDICINE", "Tower Health Primary Care"),
+        ("URGENT CARE", "Tower Health Urgent Care - Wyomissing"),
     ]
 
 
@@ -331,14 +332,14 @@ async def test_fetch_medical_care_prefers_real_facility_over_individual_provider
 
     names = [r.name for r in results]
     assert "Jessica A. Quirin, CRNP" not in names
-    assert "Tower Health Medical Clinic" in names
+    assert "Tower Health Urgent Care" in names
 
 
 @pytest.mark.asyncio
 async def test_fetch_medical_care_hospital_search_is_one_combined_call_not_two(monkeypatch):
     """Regression: general_hospital + hospital must be searched together in ONE
     _search_nearby_types call per radius tier, not as two separate _search_nearby calls (the
-    pre-optimization shape). Fixture resolves on the first tier, so exactly one hospital-types
+    pre-optimization shape). Fixture finds two hospitals on the first tier, so exactly one hospital-types
     call should fire total, not one per type."""
     calls = []
 
@@ -349,7 +350,8 @@ async def test_fetch_medical_care_hospital_search_is_one_combined_call_not_two(m
         included_types = _included_types(args, kwargs)
         calls.append(included_types)
         if "hospital" in included_types:
-            return [place("Reading Hospital", ["hospital"], lat=40.0, lng=-75.02)]
+            # two real hospitals - enough to compare by drive, so no wider ring is searched
+            return [place("Reading Hospital", ["hospital"], lat=40.0, lng=-75.02), place("Pottstown Hospital", ["hospital"], lat=40.0, lng=-75.05)]
         return [place("Tower Health Medical Clinic", ["medical_clinic"], lat=40.0, lng=-75.003)]
 
     monkeypatch.setattr(svc, "_search_text", fake_search_text)
@@ -377,3 +379,104 @@ async def test_fetch_medical_care_leaves_unavailable_when_no_confident_match(mon
     monkeypatch.setattr(svc, "_search_nearby_types", fake_search_nearby_types)
 
     assert await svc._fetch_medical_care(None, "fake-key", 40.0, -75.0) == []
+
+
+@pytest.mark.asyncio
+async def test_hospital_slot_skips_va_long_term_care_and_closed_hospitals(monkeypatch):
+    """10/25 grader round: "Coatesville VA Medical Center" and "Kindred Hospital Philadelphia -
+    Havertown" filled the hospital slot on real sheets."""
+    async def fake_search_text(*args, **kwargs):
+        return []
+
+    async def fake_search_nearby_types(*args, **kwargs):
+        if "hospital" in _included_types(args, kwargs):
+            closed = place("Crozer-Chester Medical Center", ["hospital"], lat=40.0, lng=-75.004)
+            closed["businessStatus"] = "CLOSED_PERMANENTLY"
+            return [
+                place("Coatesville VA Medical Center", ["hospital"], lat=40.0, lng=-75.001),
+                place("Kindred Hospital Philadelphia - Havertown", ["hospital"], lat=40.0, lng=-75.002),
+                place("Children's Hospital of Philadelphia", ["hospital"], lat=40.0, lng=-75.003),
+                closed,
+                place("Bryn Mawr Hospital", ["hospital"], lat=40.0, lng=-75.03),
+            ]
+        return []
+
+    monkeypatch.setattr(svc, "_search_text", fake_search_text)
+    monkeypatch.setattr(svc, "_search_nearby_types", fake_search_nearby_types)
+
+    results = await svc._fetch_medical_care(None, "fake-key", 40.0, -75.0)
+
+    assert [r.name for r in results] == ["Bryn Mawr Hospital"]
+
+
+@pytest.mark.asyncio
+async def test_proofread_replaces_from_checked_backups_and_confirms_renames(monkeypatch):
+    """The AI proofread can only take a confirmed-wrong item out: its slot refills from that list's
+    backup (already through every rule; a backup the AI also flagged is skipped), and a rename is
+    applied only when Google shows a place by the new name at that spot."""
+    from app.models.property import NearbyPlace
+
+    def p(name, tag=None, lat=40.0, lng=-75.0, miles=1.0):
+        return NearbyPlace(name=name, place_type=tag, latitude=lat, longitude=lng, distance_miles=miles)
+
+    lists = {
+        "medical_care": [p("Coatesville VA Medical Center", "HOSPITAL"), p("AFC Urgent Care", "URGENT CARE")],
+        "parks": [p("Chinese chestnut 2"), p("Old Mill Park", lat=40.01)],
+        "airports": [p("Lancaster Airport", "MAJOR AIRPORT")],
+    }
+    backups = {
+        "medical_care:hospital": [p("Kindred Hospital", "HOSPITAL", miles=2.0), p("Chester County Hospital", "HOSPITAL", miles=9.0)],
+        "parks": [p("Rose Tree Park", miles=1.5)],
+    }
+    issues = [
+        {"id": "medical_care#0", "problem": "wrong_category"},
+        {"id": "backup:medical_care:hospital#0", "problem": "wrong_category"},
+        {"id": "parks#0", "problem": "not_a_public_place"},
+        {"id": "parks#1", "problem": "renamed", "current_name": "Mill Creek Park"},
+        {"id": "airports#0", "problem": "wrong_category"},
+    ]
+
+    async def fake_search_text(client, api_key, lat, lng, query, radius, **kwargs):
+        assert query == "Mill Creek Park"
+        return [{"displayName": {"text": "Mill Creek Park"}, "primaryType": "park", "types": ["park"],
+                 "location": {"latitude": 40.0105, "longitude": -75.0}, "businessStatus": "OPERATIONAL"}]
+
+    async def no_driving(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(svc, "_search_text", fake_search_text)
+    monkeypatch.setattr(svc, "_apply_driving_distances", no_driving)
+
+    actions = await svc._apply_proofread(None, "fake-key", 40.0, -75.0, lists, backups, issues)
+
+    assert [x.name for x in lists["medical_care"]] == ["Chester County Hospital", "AFC Urgent Care"]
+    assert [x.name for x in lists["parks"]] == ["Mill Creek Park", "Rose Tree Park"]
+    assert lists["airports"] == []
+    assert any("renamed Old Mill Park -> Mill Creek Park" in a for a in actions)
+
+
+def test_proofread_ignores_issues_without_a_source():
+    from app.services.ai.cheat_sheet_proofread_service import _clean
+    cleaned = _clean([
+        {"id": "parks#0", "problem": "closed", "explanation": "closed in 2024", "source_url": "https://example.org/news"},
+        {"id": "parks#1", "problem": "closed", "explanation": "I think it closed", "source_url": ""},
+        {"id": "parks#2", "problem": "too_far", "explanation": "far", "source_url": "https://example.org"},
+    ])
+    assert [c["id"] for c in cleaned] == ["parks#0"]
+
+
+def test_shortest_drive_wins_the_hospital_slot_and_far_schools_drop():
+    """Bryans Road MD (10/25 random test): across the Potomac the straight-line nearest hospital and
+    private schools were 24-27 miles by car."""
+    from app.models.property import NearbyPlace
+    medical = [NearbyPlace(name="Inova Mount Vernon Hospital", place_type="HOSPITAL", distance_miles=24.4),
+               NearbyPlace(name="Urgent Care", place_type="URGENT CARE", distance_miles=12.2)]
+    hospital_backups = [NearbyPlace(name="UM Charles Regional Medical Center", place_type="HOSPITAL", distance_miles=17.0)]
+    schools = [NearbyPlace(name="Aquinas Montessori", distance_miles=25.5), NearbyPlace(name="Engleside Christian", distance_miles=27.0)]
+    school_backups = [NearbyPlace(name="Grace Lutheran", distance_miles=9.0)]
+
+    svc._prefer_shortest_drive(medical, hospital_backups, schools, school_backups)
+
+    assert [m.name for m in medical] == ["UM Charles Regional Medical Center", "Urgent Care"]
+    assert [b.name for b in hospital_backups] == ["Inova Mount Vernon Hospital"]
+    assert [s.name for s in schools] == ["Grace Lutheran"]

@@ -14,28 +14,6 @@ def place(name, types=None, lat=40.0, lng=-75.0):
     }
 
 
-def test_private_school_candidate_excludes_public_and_school_like_businesses():
-    excluded = [
-        place("Wyomissing Area High School", ["school", "secondary_school"]),
-        place("Wyomissing Public Charter School", ["school"]),
-        place("Bright Horizons Daycare", ["school"]),
-        place("Kumon Math and Reading Center", ["school"]),
-        place("Main Street Driving School", ["school"]),
-        place("Berks Music School", ["school"]),
-        place("Reading Area Community College", ["university"]),
-    ]
-    for candidate in excluded:
-        assert svc._private_school_candidate(candidate) is None
-
-
-def test_private_school_candidate_accepts_traditional_private_schools():
-    assert svc._private_school_candidate(place("St. Ignatius Loyola Regional School", ["school", "primary_school"])) == (0, "ELEMENTARY")
-    assert svc._private_school_candidate(place("The Independence School", ["school"])) == (0, "PRIVATE SCHOOL")
-    assert svc._private_school_candidate(place("Malvern Preparatory School", ["school", "secondary_school"])) == (0, "HIGH SCHOOL")
-    assert svc._private_school_candidate(place("Holy Child Academy K-8", ["school"])) == (0, "K-8")
-    assert svc._private_school_candidate(place("Wilmington Christian School K-12", ["school"])) == (0, "K-12")
-
-
 def test_place_dedupe_key_prefers_google_id_and_address():
     same_one = place("The Independence School", ["school"])
     same_two = place("The Independence School Campus", ["school"])
@@ -133,71 +111,101 @@ def test_dedupe_park_sub_locations_keeps_nearest_when_no_canonical_entry():
     assert svc._place_name(result[0]) == "Tacony Creek Park, Adams Ave Gateway"
 
 
+def park(name, reviews, lat=40.0, lng=-75.0, types=None):
+    p = place(name, types or ["park"], lat=lat, lng=lng)
+    p["userRatingCount"] = reviews
+    p["businessStatus"] = "OPERATIONAL"
+    return p
+
+
 @pytest.mark.asyncio
-async def test_fetch_parks_uses_distance_rank_preference(monkeypatch):
-    captured = {}
+async def test_fetch_parks_pools_nearest_and_popular_and_drops_unvisited_entries(monkeypatch):
+    """10/25 grader round: a mapped tree ("Chinese chestnut 2"), 0-review pocket parks and youth-
+    league fields filled real sheets while Ridley Creek State Park 2 miles away never showed."""
+    captured = []
 
     async def fake_search_nearby(*args, **kwargs):
-        captured["rank_preference"] = kwargs.get("rank_preference")
-        return [place("Hunting Park", ["park"], lat=40.001, lng=-75.0)]
+        captured.append(kwargs.get("rank_preference"))
+        if kwargs.get("rank_preference") == "DISTANCE":
+            return [
+                park("Chinese chestnut 2", 0, lat=40.002),
+                park("Longview Park", 13, lat=40.008),
+                park("Camden-Wyoming Little League", 40, lat=40.009),
+                park("Louis W Scott Memorial Park", 60, lat=40.012),
+                park("Okehocking Preserve", 366, lat=40.015, types=["nature_preserve", "park"]),
+            ]
+        return [park("Ridley Creek State Park", 6000, lat=40.03), park("Ridley Creek State Park - Area 3", 40, lat=40.031)]
 
     monkeypatch.setattr(svc, "_search_nearby", fake_search_nearby)
     results = await svc._fetch_parks(None, "fake-key", 40.0, -75.0)
 
-    assert captured["rank_preference"] == "DISTANCE"
-    assert [r.name for r in results] == ["Hunting Park"]
-
-
-def test_specialized_school_is_labeled_and_deprioritized():
-    assert svc._private_school_candidate(place("New Story Schools - Wyomissing", ["school"])) == (2, "SPECIALIZED SCHOOL")
+    assert captured == ["DISTANCE", None]
+    assert [r.name for r in results] == ["Longview Park", "Okehocking Preserve", "Ridley Creek State Park"]
 
 
 @pytest.mark.asyncio
-async def test_fetch_private_schools_ranks_useful_schools_before_closer_specialized(monkeypatch):
-    async def fake_search_text(*args, **kwargs):
-        return [
-            place("New Story Schools - Wyomissing", ["school"], lat=40.0, lng=-75.01),
-            place("The Independence School", ["school"], lat=40.0, lng=-75.04),
-            place("St. Ignatius Loyola Regional School", ["school", "primary_school"], lat=40.0, lng=-75.05),
-            place("Wyomissing Area High School", ["school", "secondary_school"], lat=40.0, lng=-75.002),
-            place("Kumon Math and Reading Center", ["school"], lat=40.0, lng=-75.003),
-        ]
+async def test_fetch_parks_relaxes_review_bar_in_rural_areas(monkeypatch):
+    async def fake_search_nearby(*args, **kwargs):
+        if kwargs.get("rank_preference") == "DISTANCE":
+            return [park("Hunn Nature Park", 4, lat=40.01), park("Lebanon Landing", 2, lat=40.02),
+                    park("Town Point", 1, lat=40.03), park("Wooden Bridge", 0, lat=40.005)]
+        return []
+
+    monkeypatch.setattr(svc, "_search_nearby", fake_search_nearby)
+    results = await svc._fetch_parks(None, "fake-key", 40.0, -75.0)
+
+    assert [r.name for r in results] == ["Hunn Nature Park", "Lebanon Landing", "Town Point"]
+
+
+SURVEY = [
+    # name, city, state, lat, lng, lowest grade code, highest grade code, typology, students
+    ["JOYFUL NOISE CHRISTIAN SCHOOL", "Marlton", "NJ", 40.001, -75.0, 2, 3, 4, 11],   # PK-K
+    ["LITTLE LIGHTS ACADEMY", "Marlton", "NJ", 40.002, -75.0, 2, 7, 4, 30],           # stops at 2nd grade
+    ["AIM ACADEMY", "Conshohocken", "PA", 40.003, -75.0, 6, 17, 9, 406],               # special education
+    ["SS SIMON AND JUDE SCHOOL", "West Chester", "PA", 40.02, -75.0, 2, 13, 2, 90],     # small enough to get the Google check
+    ["TINY CHRISTIAN SCHOOL", "West Chester", "PA", 40.004, -75.0, 3, 13, 6, 12],
+    ["THE EPISCOPAL ACADEMY", "Newtown Square", "PA", 40.05, -75.0, 2, 17, 5, 1252],
+    ["FAR AWAY ACADEMY", "Nowhere", "PA", 41.0, -75.0, 2, 17, 5, 900],
+]
+
+
+def test_private_school_label_shows_real_grades():
+    assert svc._private_school_label(2, 13, 2) == "GRADES PK-8"
+    assert svc._private_school_label(14, 17, 3) == "GRADES 9-12"
+    assert svc._private_school_label(3, 17, 7) == "GRADES K-12"
+    assert svc._private_school_label(6, 17, 9) == "SPECIAL EDUCATION · GRADES 1-12"
+
+
+def test_private_school_candidates_skip_preschools_and_rank_real_schools_first(monkeypatch):
+    monkeypatch.setattr(svc, "_load_private_schools", lambda: SURVEY)
+    names = [s["name"] for s in svc._private_school_candidates(40.0, -75.0)]
+    assert names == ["SS SIMON AND JUDE SCHOOL", "THE EPISCOPAL ACADEMY", "TINY CHRISTIAN SCHOOL", "AIM ACADEMY"]
+
+
+def test_private_school_display_name():
+    assert svc._private_school_display_name("SS SIMON AND JUDE SCHOOL") == "Saints Simon and Jude School"
+    assert svc._private_school_display_name("ST MARY MAGDALEN PARISH") == "St. Mary Magdalen Parish School"
+
+
+@pytest.mark.asyncio
+async def test_fetch_private_schools_uses_google_name_and_skips_closed(monkeypatch):
+    monkeypatch.setattr(svc, "_load_private_schools", lambda: SURVEY)
+
+    async def fake_search_text(client, api_key, lat, lng, query, radius, **kwargs):
+        if "Simon" in query:
+            p = place("Saints Simon and Jude School", ["school"], lat=40.02, lng=-75.0)
+            p["businessStatus"] = "CLOSED_PERMANENTLY"
+            return [p]
+        if "Episcopal" in query:
+            p = place("The Episcopal Academy", ["school"], lat=40.0501, lng=-75.0)
+            p["businessStatus"] = "OPERATIONAL"
+            return [p]
+        return []
 
     monkeypatch.setattr(svc, "_search_text", fake_search_text)
-
     results = await svc._fetch_private_schools(None, "fake-key", 40.0, -75.0)
 
-    assert [(r.place_type, r.name) for r in results] == [
-        ("PRIVATE SCHOOL", "The Independence School"),
-        ("ELEMENTARY", "St. Ignatius Loyola Regional School"),
+    assert [(r.name, r.place_type) for r in results] == [
+        ("The Episcopal Academy", "GRADES PK-12"),
+        ("Tiny Christian School", "GRADES K-8"),
     ]
-
-
-@pytest.mark.asyncio
-async def test_fetch_private_schools_uses_specialized_only_when_no_typical_options(monkeypatch):
-    async def fake_search_text(*args, **kwargs):
-        return [
-            place("New Story Schools - Wyomissing", ["school"], lat=40.0, lng=-75.01),
-            place("Public Charter School", ["school"], lat=40.0, lng=-75.02),
-        ]
-
-    monkeypatch.setattr(svc, "_search_text", fake_search_text)
-
-    results = await svc._fetch_private_schools(None, "fake-key", 40.0, -75.0)
-
-    assert len(results) == 1
-    assert results[0].place_type == "SPECIALIZED SCHOOL"
-    assert results[0].name == "New Story Schools - Wyomissing"
-
-
-@pytest.mark.asyncio
-async def test_fetch_private_schools_returns_empty_when_no_reliable_private_school(monkeypatch):
-    async def fake_search_text(*args, **kwargs):
-        return [
-            place("Local Public School", ["school"]),
-            place("Little Learners Preschool", ["school", "preschool"]),
-        ]
-
-    monkeypatch.setattr(svc, "_search_text", fake_search_text)
-
-    assert await svc._fetch_private_schools(None, "fake-key", 40.0, -75.0) == []

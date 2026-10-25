@@ -212,7 +212,10 @@ class NearbyPlace(BaseModel):
     name: str
     address: Optional[str] = None
     distance_miles: Optional[float] = None
-    place_type: Optional[str] = None  # e.g. "Hospital", "Urgent Care", "Primary Care", "Rehabilitation", "Medical Clinic" - only set for medical_care entries
+    place_type: Optional[str] = None  # tag line: "HOSPITAL", "GRADES PK-8", "MAJOR AIRPORT"...
+    # Where the place is - used to measure the driving distance shown on the sheet.
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 class ExploreNearbyPlace(BaseModel):
     place_id: str
@@ -256,6 +259,12 @@ class NearbyAmenitiesResponse(BaseModel):
     # in that one category." The PDF omits the whole amenities section when this is False.
     available: bool = True
     cached_at: Optional[datetime] = None
+    # Which version of the nearby-places rules built this (nearby_amenities_service.AMENITIES_SCHEMA_VERSION).
+    # Saved Cheat Sheets keep it, so opening an open house's Kit can tell its nearby section is out of date.
+    schema_version: Optional[int] = None
+    # The AI proofread's findings and what was done about them (cheat_sheet_proofread_service) -
+    # kept with the saved lookup for checking later; the sheet itself doesn't show it.
+    proofread: Optional[dict] = None
 
 class PropertyLookupRequest(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, from_attributes=True)

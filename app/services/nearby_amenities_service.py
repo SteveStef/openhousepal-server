@@ -19,9 +19,10 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.logging import get_logger
-from app.models.database import City, ExploreNearbyCache, Property
+from app.models.database import ExploreNearbyCache, Property
 from app.models.property import ExploreNearbyPlace, ExploreNearbyPlaceDetails, ExploreNearbyResponse, NearbyAmenitiesResponse, NearbyPlace
 from app.services.ai.ai_config_service import ai_config_service
+from app.services.areas.boundary_service import nice_school
 from app.services.nces_school_assignment_service import resolve_school_assignment
 from app.services.usage_budget_service import BudgetExceeded, reserve as reserve_budget, reserve_bucket, usage_snapshot
 
@@ -30,8 +31,23 @@ logger = get_logger(__name__)
 # --- Temporary live-cost instrumentation (for real-world cost verification testing) ---
 # Not part of the Cheat Sheet's stored/displayed data - just logs what a real generation cost.
 PLACES_SEARCH_COST_USD = 0.032  # Nearby Search Pro / Text Search Pro, per call
-ROUTES_MATRIX_ELEMENT_COST_USD = 0.01  # Compute Route Matrix Pro is billed per element, not per call
+ROUTES_MATRIX_ELEMENT_COST_USD = 0.005  # Compute Route Matrix Essentials (no traffic-aware routing requested), billed per element
 _cost_log_var: "contextvars.ContextVar[Optional[list[tuple[str, float]]]]" = contextvars.ContextVar("_nearby_cost_log", default=None)
+
+
+# Next-best options per Cheat Sheet list, already through every rule - what the AI proofread
+# (cheat_sheet_proofread_service) refills a slot from when it removes a wrong item. Set per _fetch_live.
+_alternates_var: "contextvars.ContextVar[Optional[dict[str, list]]]" = contextvars.ContextVar("_nearby_alternates", default=None)
+ALTERNATES_PER_LIST = 2
+PROOFREAD_RENAME_MAX_MILES = 0.3    # within this, the rename keeps the item's spot
+PROOFREAD_RENAME_SEARCH_MILES = 3.0  # how far from the old pin the renamed place may be found
+HOSPITAL_BACKUPS = 4                 # more backups for the hospital - the shortest drive picks among them
+
+
+def _stash_alternates(category: str, places: list, limit: int = ALTERNATES_PER_LIST) -> None:
+    store = _alternates_var.get()
+    if store is not None:
+        store[category] = [p for p in places if p is not None][:limit]
 
 
 def _log_billable_call(section: str, cost_usd: float) -> None:
@@ -56,12 +72,24 @@ CACHE_TTL_DAYS = 180  # Schools/hospitals/parks essentially never move - safe to
 # categories, different filtering) - otherwise a cache written under the old logic (e.g. the pre-rename
 # "hospitals" field, or before the assigned-schools search existed) would silently keep being served as
 # "fresh" for up to CACHE_TTL_DAYS, masking the new behavior entirely instead of just being a cache miss.
-AMENITIES_SCHEMA_VERSION = 15
-AMENITIES_COMPATIBLE_SCHEMA_VERSIONS = {15}
+AMENITIES_SCHEMA_VERSION = 16
+AMENITIES_COMPATIBLE_SCHEMA_VERSIONS = {16}
 CACHE_FAILURE_TTL_HOURS = 12
 MAX_RESULTS_PER_CATEGORY = 5
 DOWNTOWN_MAX_DISTANCE_MILES = 10
 DOWNTOWN_CANDIDATE_POOL = 15
+DOWNTOWN_CENSUS_EXTRA = 8          # nearest incorporated towns Google didn't list, added as candidates
+DOWNTOWN_CORE_HALF_MILES = 0.5     # the square around a town's center point the restaurants and shops are counted in
+# Restaurants + shops (max 40) a candidate needs, by what its name is - calibrated 10/25 on 18 real
+# homes. Order matters: when two candidates are one place, the earlier kind's name wins.
+DOWNTOWN_MIN_SCORE_BY_KIND = {"incorporated": 15, "cdp": 30, "township": 30, "other": 38}
+DOWNTOWN_MIN_SEPARATION_MILES = 0.75
+DOWNTOWN_MAX_DRIVE_MILES = 15
+DOWNTOWN_TIEBREAK_HALF_MILES = 0.2
+DOWNTOWN_AI_MIN_SCORE = 10         # restaurants + shops an AI-named downtown still has to show at its point
+DOWNTOWN_AI_LOCATE_LOOKUPS = 2     # Google look-ups for AI names that aren't among our candidates
+DOWNTOWN_KIND_WORDS = {"incorporated": "official town", "cdp": "census community", "township": "township name", "other": "unofficial name"}
+CENSUS_PLACES_DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "census_places.json"  # 2024 Census Gazetteer places + townships by state
 DEFAULT_SEARCH_RADIUS_MILES = 8
 
 PLACES_NEARBY_URL = "https://places.googleapis.com/v1/places:searchNearby"
@@ -70,6 +98,14 @@ PLACES_DETAILS_URL = "https://places.googleapis.com/v1/places"
 ROUTES_MATRIX_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
 FIELD_MASK = "places.id,places.name,places.displayName,places.formattedAddress,places.location"
 TYPED_FIELD_MASK = FIELD_MASK + ",places.primaryType,places.primaryTypeDisplayName,places.types"
+# Cheat Sheet searches also ask whether the place is still open (10/25 grader: closed hospitals and
+# stale listings were reaching the sheet) - businessStatus is a Pro field, same price as the rest.
+CHEAT_FIELD_MASK = TYPED_FIELD_MASK + ",places.businessStatus"
+# Parks add the review count, the only signal that separates a park people actually visit from a
+# mapped tree, a youth-league field or an old name that lingers next to the renamed park. It's an
+# Enterprise field: $0.035 a call instead of $0.032.
+PARK_FIELD_MASK = CHEAT_FIELD_MASK + ",places.userRatingCount"
+PLACES_ENTERPRISE_SEARCH_COST_USD = 0.035
 EXPLORE_NEARBY_FIELD_MASK = (
     "places.id,places.displayName,places.primaryType,places.primaryTypeDisplayName,places.types,"
     "places.shortFormattedAddress,places.location"
@@ -210,7 +246,33 @@ _explore_nearby_details_inflight: dict[str, asyncio.Task[ExploreNearbyPlaceDetai
 # scheduled service), without any name-keyword guessing, and lets the true nearest commercial airport
 # surface even when it's the 3rd or 4th closest thing that merely LOOKS like an airport.
 AIRPORT_DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "major_airports.json"
-AIRPORT_CANDIDATE_POOL = 8  # nearest-by-straight-line airports sent to the Routes API for real driving-distance ranking
+# OurAirports' "medium_airport + scheduled service" still includes fields with a handful of commuter
+# flights (Lancaster, Wilmington, Trenton) and military fields with a civil terminal (Dover AFB) - the
+# 10/25 grader caught one of those listed as a "major airport". So each airport is now classed by the
+# FAA's passenger-boarding hub categories: large + medium hubs are a MAJOR AIRPORT; small hubs (real
+# daily airline service, fewer routes) are a REGIONAL AIRPORT; everything else is left off.
+MAJOR_AIRPORT_IATA = {
+    # FAA large hubs
+    "ATL", "DFW", "DEN", "ORD", "LAX", "JFK", "LAS", "MCO", "MIA", "CLT", "SEA", "PHX", "EWR", "SFO", "IAH",
+    "BOS", "FLL", "MSP", "LGA", "DTW", "PHL", "SLC", "BWI", "DCA", "SAN", "IAD", "TPA", "BNA", "AUS", "MDW",
+    "HNL",
+    # FAA medium hubs
+    "DAL", "PDX", "STL", "HOU", "SMF", "MSY", "RDU", "SJC", "SNA", "MCI", "OAK", "SAT", "RSW", "CLE", "IND",
+    "PIT", "CVG", "CMH", "PBI", "JAX", "BDL", "SJU", "OGG", "ONT", "ABQ", "BUR", "MKE", "CHS", "OMA", "RNO",
+    "OKC", "MEM", "BOI", "ANC", "BUF", "SDF", "RIC", "TUS",
+}
+REGIONAL_AIRPORT_IATA = {  # FAA small hubs
+    "ABE", "ACY", "ALB", "AMA", "ATW", "AVL", "BGR", "BHM", "BIL", "BTV", "BZN", "CAE", "CAK", "CHA", "CID",
+    "COS", "CRP", "DAY", "DSM", "ECP", "ELP", "EUG", "EYW", "FAR", "FAT", "FSD", "FWA", "GEG", "GPT", "GRR",
+    "GSO", "GSP", "HPN", "HSV", "ICT", "ILM", "ISP", "JAC", "JAN", "KOA", "LBB", "LEX", "LGB", "LIH", "LIT",
+    "MAF", "MDT", "MHT", "MLI", "MSN", "MSO", "MYR", "ORF", "PIA", "PIE", "PNS", "PSP", "PVD", "PWM", "RDM",
+    "ROC", "SAV", "SBA", "SBN", "SFB", "SGF", "SRQ", "STT", "STX", "SYR", "TUL", "TYS", "VPS", "XNA",
+}
+AIRPORT_MAJOR_CANDIDATES = 3      # nearest majors (straight line) sent to the Routes API for real driving ranking
+AIRPORT_REGIONAL_CANDIDATES = 2
+AIRPORT_MAJOR_MAX_RESULTS = 2
+AIRPORT_MAJOR_MAX_DRIVE_MILES = 150  # past this a second major isn't "nearby"; the nearest one always shows
+AIRPORT_FALLBACK_MAX_MILES = 75   # remote areas with no hub of either kind: nearest airline airport, labeled regional
 
 
 @lru_cache(maxsize=1)
@@ -248,6 +310,8 @@ GROCERY_EXCLUDED_NAME_PATTERNS = (
     "wine", "beer", "tobacco", "smoke", "pharmacy", "cvs", "walgreens", "dollar general",
     "dollar tree", "family dollar", "nutrition", "supplement", "catering", "candy",
     "chocolate", "ice cream",
+    # Dollar General's grocery-forward stores - a dollar store, not a supermarket (real 10/25 sheet).
+    "dg market", "dollar",
     # "Commissary" is used exclusively by the DoD's Defense Commissary Agency on-base grocery
     # system (confirmed via research - no civilian grocery chain uses the word), so this is a
     # general restricted-access rule, not a Dover-specific one. A real Google result, "Dover
@@ -407,6 +471,24 @@ _BARE_STREET_ADDRESS_NAME_RE = re.compile(
 HOSPITAL_FACILITY_IDENTITY_KEYWORDS = {
     "hospital", "hosp", "medical center", "medical centre", "campus",
 }
+# The hospital slot answers "where's the nearest hospital I could go to in an emergency" - a general
+# hospital anyone can walk into. These are real hospitals, just not that (10/25 grader, from real
+# sheets: "Coatesville VA Medical Center" shown as the hospital, "Kindred Hospital Philadelphia -
+# Havertown" beating Bryn Mawr Hospital): VA and military hospitals (veterans / service members),
+# long-term acute care and specialty hospitals (no public emergency room), children's, psychiatric,
+# cancer, eye and rehab hospitals, and animal hospitals Google sometimes types as "hospital".
+HOSPITAL_NOT_GENERAL_NAME_KEYWORDS = [
+    "veteran", "va medical", "va hospital", "naval", "air force", "army", "military", "walter reed",
+    "kindred", "select specialty", "vibra hospital", "lifecare", "encompass health", "post acute",
+    "post-acute", "long term acute", "long-term acute", "ltach", "specialty hospital", "transitional care",
+    "children's", "childrens", "shriners", "psychiatric", "state hospital", "behavioral", "hospice",
+    "eye hospital", "wills eye", "orthopaedic hospital", "orthopedic hospital", "surgical hospital",
+    "heart hospital", "cancer", "skilled nursing", "nursing home", "animal", "pet hospital", "veterinary",
+    "vet hospital", "equine",
+]
+_VA_NAME_RE = re.compile(r"\bva\b|\bv\.a\.|\bvamc\b")
+# "VA HOSPITAL 25" / "Building 3" - a numbered building of a campus that's already on the list by name.
+_NUMBERED_BUILDING_NAME_RE = re.compile(r"\s\d+$")
 
 
 def _is_individual_provider_name(name: str) -> bool:
@@ -433,7 +515,7 @@ SPECIALIST_MEDICAL_NAME_KEYWORDS = [
     "pediatric", "pediatrics", "radiology", "imaging", "surgery", "surgical", "oncology",
     "cancer",  # e.g. "Ann B. Barshinger Cancer Institute" - an oncology facility that doesn't
     # literally say "oncology", found outranking closer general facilities in testing.
-    "neurology", "gastroenterology", "urology", "ophthalmology", "eye", "ent", "allergy",
+    "neurology", "gastroenterology", "urology", "ophthalm", "eye", "ent", "allergy",
     "pain", "spine", "sports medicine", "women's health", "obgyn", "ob/gyn",
     # British/medical spelling variants of specialties already above - "orthopedic" is not a
     # substring of "orthopaedics", so a real result ("Rothman Orthopaedics") slipped past the
@@ -478,6 +560,7 @@ MEDICAL_EXCLUDE_TYPES = {
 }
 URGENT_CARE_EXCLUDE_TYPES = MEDICAL_EXCLUDE_TYPES - {"doctor"}
 HOSPITAL_PRIMARY_TYPES = {"general_hospital", "hospital"}
+MEDICAL_EVERYDAY_MAX_MILES = 15
 NON_HOSPITAL_MEDICAL_PRIMARY_TYPES = {"medical_clinic", "doctor", "medical_center"}
 # Flattened into 2 tiers, not a strict per-label hierarchy: FAMILY MEDICINE/MEDICAL CLINIC/DOCTOR/
 # MEDICAL CENTER are all equally "general patient care" and compete on distance alone within that
@@ -495,6 +578,23 @@ NON_HOSPITAL_MEDICAL_RANK = {
 }
 
 PRIVATE_SCHOOL_MAX_RESULTS = 2
+# Private schools come from the federal private-school list (NCES Private School Universe Survey
+# 2023-24, every US private school with its grade span, type and enrollment) instead of a Google text
+# search for "private schools". The 10/25 grader found preschools shown as private schools with no
+# grades ("Little Lights Christian Academy", "Joyful Noise Christian School" - PK-K): Google has no
+# grade data, so it can't tell a preschool calling itself an academy from a K-12 school. The federal
+# list can, and gives the real grades for the label. Rebuild app/data/private_schools_pss.json from a
+# newer survey year when NCES publishes one (columns: PINST, PCITY, PSTABB, LATITUDE24, LONGITUDE24,
+# LOGR2024, HIGR2024, TYPOLOGY, NUMSTUDS; keep rows whose highest grade is 1st or above).
+PRIVATE_SCHOOL_DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "private_schools_pss.json"
+PRIVATE_SCHOOL_RADIUS_MILES = 8
+PRIVATE_SCHOOL_MIN_HIGHEST_GRADE = 8   # 3rd grade (survey code) - a school that stops at 1st/2nd is an early-childhood center
+PRIVATE_SCHOOL_MIN_STUDENTS = 50       # smaller ones (micro-schools, home-school co-ops) only fill in behind real schools
+PRIVATE_SCHOOL_SPECIAL_EDUCATION_TYPOLOGY = 9
+PRIVATE_SCHOOL_VERIFY_LOOKUPS = 4      # Google look-ups to confirm the picks are still open (and get the proper-cased name)
+PRIVATE_SCHOOL_MAX_DRIVE_MILES = 15     # farther by car isn't "nearby" (schools across a river can be 8 mi straight, 25 by car)
+PRIVATE_SCHOOL_ESTABLISHED_STUDENTS = 150  # a school this size two years ago is still there - no look-up (saves ~3 cents a pick)
+_PSS_GRADE_NAMES = {1: "UNGRADED", 2: "PK", 3: "K", 4: "K", 5: "1"}
 PRIVATE_SCHOOL_EXCLUDE_KEYWORDS = [
     "public school", "public charter", "charter school", "school district", "isd", "school board",
     "preschool", "pre-school", "daycare", "day care", "child care", "childcare", "nursery",
@@ -504,15 +604,6 @@ PRIVATE_SCHOOL_EXCLUDE_KEYWORDS = [
     "martial arts", "karate", "taekwondo", "trade school", "vocational", "technical institute",
     "career institute", "college", "university", "seminary", "adult education", "after school",
     "afterschool", "religious education", "sunday school", "hebrew school", "catechism",
-]
-PRIVATE_SCHOOL_SPECIALIZED_KEYWORDS = [
-    "special education", "special needs", "therapeutic", "autism", "aba", "behavioral",
-    "new story", "devereux", "pathway school", "center school", "learning disabilities",
-]
-PRIVATE_SCHOOL_POSITIVE_KEYWORDS = [
-    "private school", "independent school", "academy", "school", "preparatory", "prep",
-    "college preparatory", "catholic school", "christian school", "parochial", "friends school",
-    "montessori", "waldorf", "episcopal", "lutheran", "st.", "saint", "independence school",
 ]
 # Nearby Search's default ranking ("POPULARITY") is a reasonable quality signal - it favors real, well-
 # known places over obscure ones - but with only MAX_RESULTS_PER_CATEGORY (5) requested, a handful of
@@ -553,7 +644,18 @@ PARK_SUB_FEATURE_KEYWORDS = [
     # parks slot under DISTANCE ranking.
     "headquarters", "administrative office", "administration building", "maintenance facility",
     "operations center", "ranger station", "public works",
+    # Clubs and leagues Google types as park - a sports organization or a members' club, not a park
+    # (a real sheet showed "Camden-Wyoming Little League" as a park).
+    "little league", "athletic association", "youth association", "sports association", "swim club",
+    "country club", "golf club", "anglers", "kennel",
 ]
+# Preserves and state parks count - often the best outdoor places near a home (Okehocking Preserve,
+# Tall Pines State Preserve came back typed this way, not "park").
+PARK_PRIMARY_TYPES = {"park", "state_park", "national_park", "nature_preserve", "wildlife_refuge", "botanical_garden"}
+PARK_POPULAR_RADIUS_MILES = 5
+PARK_MIN_REVIEWS = 10
+PARK_MAX_RESULTS = 3
+PARK_SCORE_MILES_PER_POINT = 1.5   # in the "worth the drive" ranking, 10x the reviews is worth 1.5 extra miles
 _HQ_ABBREVIATION_RE = re.compile(r"\bhq\b", re.IGNORECASE)
 # Residential-development/subdivision entities Google sometimes geocodes with primaryType=park even
 # though they're not a recreational destination at all - real results at a single Delaware test location
@@ -581,60 +683,97 @@ def _is_likely_subdivision_named_park(place: dict) -> bool:
     return words[-1] in {suffix.rstrip(".") for suffix in _SUBDIVISION_PARK_NAME_SUFFIXES}
 
 
-def _private_school_level_label(name: str, google_types: list[str]) -> str:
-    """Conservative school-level label. If the level is not clear from a grade-bearing Google type or
-    explicit K-8/K-12/high-school wording, use PRIVATE SCHOOL instead of guessing."""
-    name_lower = name.lower()
-    if re.search(r"\bk\s*[-–]\s*12\b|\bkindergarten\s+through\s+12", name_lower):
-        return "K-12"
-    if re.search(r"\bk\s*[-–]\s*8\b|\bkindergarten\s+through\s+8", name_lower):
-        return "K-8"
-    if "secondary_school" in google_types or "high school" in name_lower:
-        return "HIGH SCHOOL"
-    if "middle school" in name_lower or "junior high" in name_lower:
-        return "MIDDLE SCHOOL"
-    if "primary_school" in google_types or "elementary school" in name_lower:
-        return "ELEMENTARY"
-    return "PRIVATE SCHOOL"
+@lru_cache(maxsize=1)
+def _load_private_schools() -> list[list]:
+    with open(PRIVATE_SCHOOL_DATA_PATH, encoding="utf-8") as f:
+        return json.load(f)["schools"]
 
 
-def _private_school_candidate(place: dict) -> Optional[tuple[int, str]]:
-    """Returns (rank, label) for a useful nearby private K-12 candidate, or None if unreliable.
+def _pss_grade_name(code: int) -> str:
+    return _PSS_GRADE_NAMES.get(code, str(code - 5))
 
-    Rank is usefulness/confidence first, distance second. Lower rank wins.
-    """
-    name = _place_name(place)
-    name_lower = name.lower()
-    types = place.get("types") or []
-    if not name:
-        return None
-    if any(keyword in name_lower for keyword in PRIVATE_SCHOOL_EXCLUDE_KEYWORDS):
-        return None
-    if "public_school" in types or "university" in types:
-        return None
 
-    is_specialized = any(keyword in name_lower for keyword in PRIVATE_SCHOOL_SPECIALIZED_KEYWORDS)
-    positive_score = sum(1 for keyword in PRIVATE_SCHOOL_POSITIVE_KEYWORDS if keyword in name_lower)
-    has_school_type = any(t in types for t in ["school", "primary_school", "secondary_school"])
-    if positive_score == 0 and not has_school_type:
-        return None
+def _private_school_label(lowest: int, highest: int, typology: int) -> str:
+    """The sheet's tag line for a private school: its real grade span from the federal survey
+    ("GRADES PK-8", "GRADES 9-12"), flagged when it's a special-education school."""
+    low, high = _pss_grade_name(lowest), _pss_grade_name(highest)
+    grades = f"GRADES {low}-{high}" if low != high else f"GRADE {high}"
+    if typology == PRIVATE_SCHOOL_SPECIAL_EDUCATION_TYPOLOGY:
+        return f"SPECIAL EDUCATION · {grades}"
+    return grades
 
-    traditional_private_hints = [
-        "private", "independent", "independence school", "academy", "preparatory", "prep", "catholic", "christian",
-        "parochial", "friends", "montessori", "waldorf", "episcopal", "lutheran", "st.", "saint",
-    ]
-    has_private_hint = any(keyword in name_lower for keyword in traditional_private_hints)
-    # A plain "school" with no private/parochial/independent hint is too likely to be public or unknown.
-    if not has_private_hint and not is_specialized:
-        return None
 
-    label = "SPECIALIZED SCHOOL" if is_specialized else _private_school_level_label(name, types)
-    rank = 2 if is_specialized else (0 if has_private_hint else 1)
-    return rank, label
+def _private_school_candidates(lat: float, lng: float) -> list[dict]:
+    """Federal-survey private schools within PRIVATE_SCHOOL_RADIUS_MILES that teach past 2nd grade,
+    most useful first: regular schools of real size by distance, then small ones, then special-
+    education schools (a genuine school, but not the general pick a typical buyer is asking about)."""
+    lat_pad = PRIVATE_SCHOOL_RADIUS_MILES / 69.0
+    lng_pad = PRIVATE_SCHOOL_RADIUS_MILES / max(1.0, 69.0 * math.cos(math.radians(lat)))
+    out: list[tuple[int, float, dict]] = []
+    for name, city, state, s_lat, s_lng, lowest, highest, typology, students in _load_private_schools():
+        if abs(s_lat - lat) > lat_pad or abs(s_lng - lng) > lng_pad:
+            continue
+        if highest < PRIVATE_SCHOOL_MIN_HIGHEST_GRADE:
+            continue
+        distance = _haversine_miles(lat, lng, s_lat, s_lng)
+        if distance > PRIVATE_SCHOOL_RADIUS_MILES:
+            continue
+        if typology == PRIVATE_SCHOOL_SPECIAL_EDUCATION_TYPOLOGY:
+            tier = 2
+        else:
+            tier = 0 if students >= PRIVATE_SCHOOL_MIN_STUDENTS else 1
+        out.append((tier, distance, {
+            "name": name, "city": city, "state": state, "lat": s_lat, "lng": s_lng,
+            "label": _private_school_label(lowest, highest, typology), "students": students,
+        }))
+    out.sort(key=lambda item: (item[0], item[1]))
+    return [school for _, _, school in out]
+
+
+def _private_school_display_name(survey_name: str) -> str:
+    """The survey's all-caps name as people write it: "SS COLMAN-JOHN NEUMANN SCHOOL" -> "Saints
+    Colman-John Neumann School", "ST MARY MAGDALEN PARISH" -> "St. Mary Magdalen Parish School"."""
+    name = nice_school(survey_name, all_caps=True)
+    name = re.sub(r"^(?:ss|sts)\.?(?=\s)", "Saints", name, flags=re.IGNORECASE)
+    name = re.sub(r"\b(st|mt)\b(?!\.)", lambda m: m.group(1).capitalize() + ".", name, flags=re.IGNORECASE)
+    if not _SCHOOL_WORD_RE.search(name):
+        name += " School"
+    return name
+
+
+_SCHOOL_WORD_RE = re.compile(r"school|academy|prep|institute|montessori|college|seminary|learning|education|yeshiva", re.IGNORECASE)
+
+
+_SCHOOL_MATCH_STOPWORDS = {"the", "school", "academy", "of", "and", "st", "saint", "sts", "saints", "ss"}
+
+
+def _school_name_tokens(name: str) -> set[str]:
+    return {t for t in re.findall(r"[a-z0-9]+", name.lower().replace("&", " and ")) if t not in _SCHOOL_MATCH_STOPWORDS}
+
+
+def _google_place_matches_school(place: dict, school: dict) -> bool:
+    """A Google result is the same school as a federal-survey row when it sits within half a mile
+    and shares most of the name's distinctive words ("SS SIMON AND JUDE SCHOOL" = "Saints Simon and
+    Jude School")."""
+    location = place.get("location") or {}
+    if location.get("latitude") is None or location.get("longitude") is None:
+        return False
+    if _haversine_miles(school["lat"], school["lng"], location["latitude"], location["longitude"]) > 0.5:
+        return False
+    ours, theirs = _school_name_tokens(school["name"]), _school_name_tokens(_place_name(place))
+    if not ours or not theirs:
+        return False
+    return len(ours & theirs) / len(ours) >= 0.6
 
 
 def _place_name(place: dict) -> str:
     return ((place.get("displayName") or {}).get("text") or "").strip()
+
+
+def _is_open(place: dict) -> bool:
+    """False for a place Google marks closed (permanently or for now). A result fetched without
+    businessStatus in its field mask counts as open."""
+    return (place.get("businessStatus") or "OPERATIONAL") == "OPERATIONAL"
 
 
 def _place_primary_type(place: dict) -> str:
@@ -665,7 +804,7 @@ def _place_dedupe_key(place: dict) -> tuple[str, str, str]:
 def _is_parent_park_candidate(place: dict) -> bool:
     name = _place_name(place).lower()
     primary_type = _place_primary_type(place)
-    if not name or primary_type != "park":
+    if not name or primary_type not in PARK_PRIMARY_TYPES:
         return False
     if any(keyword in name for keyword in PARK_SUB_FEATURE_KEYWORDS):
         return False
@@ -703,6 +842,10 @@ def _is_legitimate_full_service_hospital(place: dict) -> bool:
         return False
     if any(keyword in name_lower for keyword in HOSPITAL_FALSE_POSITIVE_NAME_KEYWORDS):
         return False
+    if any(keyword in name_lower for keyword in HOSPITAL_NOT_GENERAL_NAME_KEYWORDS) or _VA_NAME_RE.search(name_lower):
+        return False
+    if _NUMBERED_BUILDING_NAME_RE.search(name_raw) or not _is_open(place):
+        return False
     # "MOB" (Medical Office Building) is a standard healthcare real-estate abbreviation for an
     # outpatient office building on a hospital campus, distinct from the hospital itself - a real
     # Google Places result named "Numors mob Milford" (primaryType=hospital, no other red flags)
@@ -726,12 +869,14 @@ def _non_hospital_medical_label(place: dict) -> Optional[str]:
     name_lower = name_raw.lower()
     primary_type = _place_primary_type(place)
     types = set(place.get("types") or [])
-    if not name_lower or primary_type in HOSPITAL_PRIMARY_TYPES:
+    if not name_lower or primary_type in HOSPITAL_PRIMARY_TYPES or not _is_open(place):
         return None
     if primary_type in MEDICAL_EXCLUDE_TYPES or types & MEDICAL_EXCLUDE_TYPES:
         return None
     if any(keyword in name_lower for keyword in NON_HOSPITAL_MEDICAL_EXCLUDE_NAME_KEYWORDS):
         return None
+    if "veteran" in name_lower or _VA_NAME_RE.search(name_lower):
+        return None  # a VA clinic only sees veterans
     # A named patient-care facility only - not an individual provider's solo listing (e.g. "Jessica
     # A. Quirin, CRNP", surfaced by the urgent-care text search despite having nothing to do with
     # urgent care) and not a bare street address Google failed to attach a real name to.
@@ -782,7 +927,7 @@ def _non_hospital_medical_rank(label: str, place: dict) -> int:
     return rank
 
 
-def _nearest_valid_place(raw_places: list[dict], lat: float, lng: float, predicate, label: str) -> Optional[NearbyPlace]:
+def _valid_places_sorted(raw_places: list[dict], lat: float, lng: float, predicate, label: str) -> list[NearbyPlace]:
     candidates: list[NearbyPlace] = []
     seen_places: set[tuple[str, str, str]] = set()
     for place in raw_places:
@@ -798,7 +943,12 @@ def _nearest_valid_place(raw_places: list[dict], lat: float, lng: float, predica
         nearby.place_type = label
         candidates.append(nearby)
     candidates.sort(key=lambda p: p.distance_miles if p.distance_miles is not None else float("inf"))
-    return candidates[0] if candidates else None
+    return candidates
+
+
+def _nearest_valid_place(raw_places: list[dict], lat: float, lng: float, predicate, label: str) -> Optional[NearbyPlace]:
+    found = _valid_places_sorted(raw_places, lat, lng, predicate, label)
+    return found[0] if found else None
 
 
 def _miles_to_meters(miles: float) -> float:
@@ -827,14 +977,23 @@ def _haversine_miles(lat1: float, lng1: float, lat2: float, lng2: float) -> floa
     return r * 2 * math.asin(math.sqrt(a))
 
 
+def _search_cost(field_mask: str) -> float:
+    return PLACES_ENTERPRISE_SEARCH_COST_USD if "userRatingCount" in field_mask or "rating" in field_mask else PLACES_SEARCH_COST_USD
+
+
 def _place_to_nearby(place: dict, origin_lat: float, origin_lng: float) -> Optional[NearbyPlace]:
     name = (place.get("displayName") or {}).get("text")
     if not name:
         return None
+    name = re.split(r"\s+\|\s+", name)[0]  # "Roxborough Memorial Hospital | Philadelphia" - an SEO suffix, not the name
+    name = name.strip(" ?") or name  # "Garrett memorial hospital?" - a stray question mark in Google's listing
+    if name == name.lower():
+        name = name.title()  # "vybe urgent care", "ccea" - typed in all lower case on Google
     location = place.get("location") or {}
     lat, lng = location.get("latitude"), location.get("longitude")
     distance = _haversine_miles(origin_lat, origin_lng, lat, lng) if lat is not None and lng is not None else None
-    return NearbyPlace(name=name, address=place.get("formattedAddress"), distance_miles=round(distance, 1) if distance is not None else None)
+    return NearbyPlace(name=name, address=place.get("formattedAddress"), distance_miles=round(distance, 1) if distance is not None else None,
+                       latitude=lat, longitude=lng)
 
 
 async def _search_nearby(
@@ -865,7 +1024,7 @@ async def _search_nearby(
         timeout=10.0,
     )
     response.raise_for_status()
-    _log_billable_call(section, PLACES_SEARCH_COST_USD)
+    _log_billable_call(section, _search_cost(field_mask))
     return response.json().get("places", [])
 
 
@@ -888,7 +1047,7 @@ async def _search_nearby_types(
         timeout=10.0,
     )
     response.raise_for_status()
-    _log_billable_call(section, PLACES_SEARCH_COST_USD)
+    _log_billable_call(section, _search_cost(field_mask))
     return response.json().get("places", [])
 
 
@@ -903,7 +1062,7 @@ async def _search_text(client: httpx.AsyncClient, api_key: str, lat: float, lng:
         timeout=10.0,
     )
     response.raise_for_status()
-    _log_billable_call(section, PLACES_SEARCH_COST_USD)
+    _log_billable_call(section, _search_cost(field_mask))
     return response.json().get("places", [])
 
 
@@ -1469,7 +1628,7 @@ def _is_true_grocery_or_supermarket(place: dict) -> bool:
 def _sorted_valid_grocery_candidates(raw_places: list[dict], lat: float, lng: float) -> list[tuple[dict, NearbyPlace]]:
     pairs = []
     for raw in raw_places:
-        if not _is_full_service_grocery(raw):
+        if not _is_full_service_grocery(raw) or not _is_open(raw):
             continue
         nearby = _place_to_nearby(raw, lat, lng)
         if nearby is None:
@@ -1479,28 +1638,50 @@ def _sorted_valid_grocery_candidates(raw_places: list[dict], lat: float, lng: fl
     return pairs
 
 
+def _grocery_brand_key(place: dict) -> str:
+    """"ShopRite of Sewell" and "ShopRite of Glassboro" are one brand - the sheet shows two different
+    stores to choose from, not the same chain twice (10/25: "Trader Joe's | Trader Joe's")."""
+    name = _place_name(place).lower()
+    brand = next((b for b in MAJOR_GROCERY_BRANDS if b in name), None)
+    if brand:
+        return brand.replace(" ", "").replace("-", "")
+    return re.split(r"\s+(?:of|at|-|–)\s+", name)[0].strip()
+
+
 def _select_grocery_pair(pairs: list[tuple[dict, NearbyPlace]]) -> list[NearbyPlace]:
-    """Picks up to 2 results from nearest-first valid grocery candidates, guaranteeing a true
-    grocery store/supermarket fills one slot whenever one exists in the pool - so two specialty
-    markets (farm stand, butcher, dairy, produce stand) never crowd out a legitimate grocery store
-    that's just as reasonably close."""
+    """Up to 2 nearest-first stores from different brands, real supermarkets first (a big-name
+    grocer or a store Google types supermarket - see _explore_grocery_ok); a farm market, specialty
+    or ethnic market only fills a slot when no second real supermarket is in the pool."""
     if not pairs:
         return []
-    true_grocery_pairs = [pair for pair in pairs if _is_true_grocery_or_supermarket(pair[0])]
-    if not true_grocery_pairs:
-        return [nearby for _, nearby in pairs[:2]]
-    nearest_true = true_grocery_pairs[0]
-    others = [pair for pair in pairs if pair is not nearest_true]
-    selected = [nearest_true, *others[:1]]
+    ranked = sorted(pairs, key=lambda pair: (0 if _explore_grocery_ok(pair[0]) else 1, pair[1].distance_miles if pair[1].distance_miles is not None else float("inf")))
+    selected: list[tuple[dict, NearbyPlace]] = []
+    spare: list[NearbyPlace] = []
+    brands: set[str] = set()
+    for pair in ranked:
+        brand = _grocery_brand_key(pair[0])
+        if brand in brands:
+            continue
+        brands.add(brand)
+        if len(selected) < 2:
+            selected.append(pair)
+        elif _explore_grocery_ok(pair[0]):
+            spare.append(pair[1])
+    _stash_alternates("grocery_stores", spare)
     selected.sort(key=lambda pair: pair[1].distance_miles if pair[1].distance_miles is not None else float("inf"))
     return [nearby for _, nearby in selected]
+
+
+def _real_supermarket_brands(pairs: list[tuple[dict, NearbyPlace]]) -> int:
+    return len({_grocery_brand_key(raw) for raw, _ in pairs if _explore_grocery_ok(raw)})
 
 
 async def _fetch_grocery_stores(client: httpx.AsyncClient, api_key: str, lat: float, lng: float) -> list[NearbyPlace]:
     """supermarket and grocery_store are searched together in one call per radius tier (tested
     against 3 real locations - identical final picks to searching them separately, since both
     types share the same 20-result cap either way and the selection logic below is unaffected by
-    which single call the raw pool came from)."""
+    which single call the raw pool came from). Widens the radius until two different real
+    supermarkets are in the pool."""
     collected: list[dict] = []
     seen_ids: set[tuple[str, str]] = set()
     for radius in [DEFAULT_SEARCH_RADIUS_MILES, 12, 16, 24]:
@@ -1512,7 +1693,7 @@ async def _fetch_grocery_stores(client: httpx.AsyncClient, api_key: str, lat: fl
             ["supermarket", "grocery_store"],
             max_result_count=NEARBY_CANDIDATE_POOL,
             radius_miles=radius,
-            field_mask=TYPED_FIELD_MASK,
+            field_mask=CHEAT_FIELD_MASK,
             section="grocery",
         )
         for place in raw_places:
@@ -1521,106 +1702,117 @@ async def _fetch_grocery_stores(client: httpx.AsyncClient, api_key: str, lat: fl
                 seen_ids.add(key)
                 collected.append(place)
         pairs = _sorted_valid_grocery_candidates(collected, lat, lng)
-        if len(pairs) >= 2:
+        if _real_supermarket_brands(pairs) >= 2:
             return _select_grocery_pair(pairs)
     return _select_grocery_pair(_sorted_valid_grocery_candidates(collected, lat, lng))
 
 
 async def _fetch_medical_care(client: httpx.AsyncClient, api_key: str, lat: float, lng: float) -> list[NearbyPlace]:
-    """Return nearest true hospital plus one useful non-hospital medical provider."""
-    hospital_place: Optional[NearbyPlace] = None
-    non_hospital_candidates: list[tuple[int, NearbyPlace]] = []
-    hospital_name_key: Optional[str] = None
-    seen_non_hospital: set[tuple[str, str, str]] = set()
-
-    for radius in [DEFAULT_SEARCH_RADIUS_MILES, 12, 16, 24]:
-        # general_hospital + hospital searched together in one call - kept as its OWN call,
-        # separate from the non-hospital types below, so hospital results never have to compete
-        # for the shared 20-result cap against the far more numerous doctor/clinic listings
-        # (tested: combining hospital types into the SAME call as clinic/doctor/medical_center
-        # let dense doctor-office listings crowd out real hospitals in a low-density market).
-        hospital_raw = await _search_nearby_types(
-            client,
-            api_key,
-            lat,
-            lng,
-            ["general_hospital", "hospital"],
-            max_result_count=NEARBY_CANDIDATE_POOL,
-            radius_miles=radius,
-            field_mask=TYPED_FIELD_MASK,
-            section="medical_hospital",
-        )
-        if not hospital_place:
-            hospital_place = _nearest_valid_place(hospital_raw, lat, lng, _is_legitimate_full_service_hospital, "HOSPITAL")
-            hospital_name_key = hospital_place.name.strip().lower() if hospital_place else None
-
-        medical_raw = await _search_nearby_types(
-            client,
-            api_key,
-            lat,
-            lng,
-            ["medical_clinic", "doctor", "medical_center"],
-            max_result_count=NEARBY_CANDIDATE_POOL,
-            radius_miles=radius,
-            field_mask=TYPED_FIELD_MASK,
-            section="medical_non_hospital",
-        )
-        urgent_raw = await _search_text(client, api_key, lat, lng, "urgent care", radius, field_mask=TYPED_FIELD_MASK, section="medical_urgent_care")
-        for place in [*medical_raw, *urgent_raw]:
-            label = _non_hospital_medical_label(place)
-            if not label:
-                continue
-            nearby = _place_to_nearby(place, lat, lng)
-            if not nearby:
-                continue
-            name_key = nearby.name.strip().lower()
-            dedupe_key = _place_dedupe_key(place)
-            if name_key == hospital_name_key or dedupe_key in seen_non_hospital:
-                continue
-            seen_non_hospital.add(dedupe_key)
-            nearby.place_type = label
-            non_hospital_candidates.append((_non_hospital_medical_rank(label, place), nearby))
-
-        if hospital_place and non_hospital_candidates:
-            break
-
-    non_hospital_candidates.sort(key=lambda pair: (pair[0], pair[1].distance_miles if pair[1].distance_miles is not None else float("inf")))
+    """The nearest general hospital (see _is_legitimate_full_service_hospital), plus the nearest
+    urgent care - one text search; a doctor's office / clinic search runs only when there's no urgent
+    care around. (10/25: a federal Medicare hospital list was tried for the hospital and dropped - it
+    files a health system's satellite campuses under one license, so Virtua Marlton, Jefferson
+    Washington Township and Union Hospital weren't on it and much farther hospitals were picked.)"""
     results: list[NearbyPlace] = []
-    if hospital_place:
-        results.append(hospital_place)
-    if non_hospital_candidates:
-        results.append(non_hospital_candidates[0][1])
+    hospitals = await _fetch_hospital_from_google(client, api_key, lat, lng)
+    hospital, hospital_spare = (hospitals[0], hospitals[1:]) if hospitals else (None, [])
+    if hospital is not None:
+        results.append(hospital)
+    hospital_key = hospital.name.strip().lower() if hospital else None
+
+    def best_everyday_care(raw: list[dict]) -> Optional[NearbyPlace]:
+        candidates: list[tuple[int, NearbyPlace]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for place in raw:
+            label = _non_hospital_medical_label(place)
+            nearby = _place_to_nearby(place, lat, lng) if label else None
+            if not nearby or nearby.name.strip().lower() == hospital_key or _place_dedupe_key(place) in seen:
+                continue
+            if nearby.distance_miles is not None and nearby.distance_miles > MEDICAL_EVERYDAY_MAX_MILES:
+                continue
+            seen.add(_place_dedupe_key(place))
+            nearby.place_type = label
+            candidates.append((0 if label == "URGENT CARE" else 1 + _non_hospital_medical_rank(label, place), nearby))
+        candidates.sort(key=lambda pair: (pair[0], pair[1].distance_miles if pair[1].distance_miles is not None else float("inf")))
+        everyday_spare[:] = [n for _, n in candidates[1:]]
+        return candidates[0][1] if candidates else None
+
+    everyday_spare: list[NearbyPlace] = []
+    everyday = best_everyday_care(await _search_text(client, api_key, lat, lng, "urgent care", DEFAULT_SEARCH_RADIUS_MILES, field_mask=CHEAT_FIELD_MASK, section="medical_urgent_care"))
+    if everyday is None:
+        everyday = best_everyday_care(await _search_nearby_types(
+            client, api_key, lat, lng, ["medical_clinic", "doctor", "medical_center"], max_result_count=NEARBY_CANDIDATE_POOL,
+            radius_miles=DEFAULT_SEARCH_RADIUS_MILES, field_mask=CHEAT_FIELD_MASK, section="medical_non_hospital",
+        ))
+    if everyday is not None:
+        results.append(everyday)
+    _stash_alternates("medical_care:hospital", hospital_spare, HOSPITAL_BACKUPS)
+    _stash_alternates("medical_care:everyday", everyday_spare)
     return results
 
 
+async def _fetch_hospital_from_google(client: httpx.AsyncClient, api_key: str, lat: float, lng: float) -> list[NearbyPlace]:
+    """Real general hospitals, nearest first (the first is the sheet's; the rest are its backups) -
+    Google's hospital search, widening the radius until at least two turn up, hospital types only, in a call
+    of its own so the far more numerous doctor/clinic listings never crowd real hospitals out of the
+    20-result cap."""
+    for radius in [DEFAULT_SEARCH_RADIUS_MILES, 12, 16, 24]:
+        raw = await _search_nearby_types(
+            client, api_key, lat, lng, ["general_hospital", "hospital"], max_result_count=NEARBY_CANDIDATE_POOL,
+            radius_miles=radius, field_mask=CHEAT_FIELD_MASK, section="medical_hospital",
+        )
+        found = _valid_places_sorted(raw, lat, lng, _is_legitimate_full_service_hospital, "HOSPITAL")
+        # Two to compare by drive: a lone nearest hospital can be across a river (Bryans Road MD: Inova
+        # Mount Vernon, 24 miles by car, while UM Charles Regional sat just past the first ring).
+        if len(found) >= 2:
+            return found
+    return found
+
+
 async def _fetch_private_schools(client: httpx.AsyncClient, api_key: str, lat: float, lng: float) -> list[NearbyPlace]:
-    """Returns up to two nearby private K-12 schools useful to a typical homebuyer.
+    """Up to two nearby private schools a typical buyer would weigh, each with its real grades.
 
-    Google text search returns many "school-like" businesses (public schools, daycares, tutoring,
-    music/driving schools, colleges, and specialized therapeutic programs). We rank by private-school
-    confidence/usefulness first and distance second, rather than blindly taking the closest results.
-    """
-    raw = await _search_text(client, api_key, lat, lng, "private schools", DEFAULT_SEARCH_RADIUS_MILES, field_mask=TYPED_FIELD_MASK, section="private_schools")
-
-    candidates: list[tuple[int, NearbyPlace]] = []
-    seen_names: set[str] = set()
-    for place in raw:
-        candidate = _private_school_candidate(place)
-        if candidate is None:
+    Picks come from the federal private-school list (see PRIVATE_SCHOOL_DATA_PATH), most useful
+    first. Smaller picks (under PRIVATE_SCHOOL_ESTABLISHED_STUDENTS) are looked up on Google: a school
+    Google marks closed is skipped for the next one, and a match gives the name as the school writes it
+    (the survey is all capitals). A school Google can't find stays, under the survey's name."""
+    results: list[NearbyPlace] = []
+    spare: list[NearbyPlace] = []
+    lookups = 0
+    for school in _private_school_candidates(lat, lng):
+        if len(results) >= PRIVATE_SCHOOL_MAX_RESULTS:
+            if len(spare) < ALTERNATES_PER_LIST and school["label"] and not school["label"].startswith("SPECIAL"):
+                spare.append(NearbyPlace(name=_private_school_display_name(school["name"]), address=f"{school['city']}, {school['state']}",
+                                         place_type=school["label"], latitude=school["lat"], longitude=school["lng"],
+                                         distance_miles=round(_haversine_miles(lat, lng, school["lat"], school["lng"]), 1)))
+                continue
+            break
+        name = _private_school_display_name(school["name"])
+        match: Optional[dict] = None
+        if lookups < PRIVATE_SCHOOL_VERIFY_LOOKUPS and school["students"] < PRIVATE_SCHOOL_ESTABLISHED_STUDENTS:
+            lookups += 1
+            try:
+                raw = await _search_text(client, api_key, school["lat"], school["lng"], f"{name}, {school['city']}, {school['state']}", 1.0, field_mask=CHEAT_FIELD_MASK, section="private_schools")
+                match = next((p for p in raw[:5] if _google_place_matches_school(p, school)), None)
+            except Exception as e:  # noqa: BLE001 - the survey row is good enough on its own
+                logger.warning(f"private school check failed for {name}: {e}")
+        if match is not None and not _is_open(match):
             continue
-        nearby = _place_to_nearby(place, lat, lng)
-        if nearby is None:
+        google_name = _place_name(match) if match is not None else ""
+        # Google's spelling, unless the match is the parish/church listing next door ("St Mary
+        # Magdalen Parish") rather than the school's own, or typed in all lower case.
+        if google_name and _SCHOOL_WORD_RE.search(google_name) and google_name != google_name.lower():
+            name = google_name
+        if any(r.name.lower() == name.lower() for r in results):
             continue
-        name_key = nearby.name.strip().lower()
-        if name_key in seen_names:
-            continue
-        seen_names.add(name_key)
-        rank, label = candidate
-        nearby.place_type = label
-        candidates.append((rank, nearby))
-
-    candidates.sort(key=lambda pair: (pair[0], pair[1].distance_miles if pair[1].distance_miles is not None else float("inf")))
-    return [nearby for _, nearby in candidates[:PRIVATE_SCHOOL_MAX_RESULTS]]
+        address = (match or {}).get("formattedAddress") or f"{school['city']}, {school['state']}"
+        results.append(NearbyPlace(
+            name=name, address=address, place_type=school["label"],
+            distance_miles=round(_haversine_miles(lat, lng, school["lat"], school["lng"]), 1),
+            latitude=school["lat"], longitude=school["lng"],
+        ))
+    _stash_alternates("private_schools", spare)
+    return results
 
 
 _PARK_SUB_LOCATION_SEPARATOR_KEYWORDS = ("gateway", "entrance", "trailhead", "trail head", "access point")
@@ -1664,26 +1856,26 @@ def _dedupe_park_sub_locations(candidates: list[dict], lat: float, lng: float) -
 
 
 async def _fetch_parks(client: httpx.AsyncClient, api_key: str, lat: float, lng: float) -> list[NearbyPlace]:
-    # rankPreference=DISTANCE: unset (Google's POPULARITY default) was confirmed live to systematically
-    # hide genuinely close neighborhood parks behind a metro's famous/high-traffic parks - see
-    # _search_nearby's docstring. Surfacing the true nearest pool is what makes the sub-location dedupe
-    # below necessary in the first place (a linear/greenway park's many gateway entries only become
-    # visible once ranking stops filtering the pool down to "popular" destinations first).
-    raw = await _search_nearby(
-        client,
-        api_key,
-        lat,
-        lng,
-        "park",
-        max_result_count=NEARBY_CANDIDATE_POOL,
-        field_mask=TYPED_FIELD_MASK,
-        section="parks",
-        rank_preference="DISTANCE",
+    """The nearest park people actually use, plus the best-known parks and preserves close by.
+
+    Two pools: the 20 nearest parks (rankPreference=DISTANCE - Google's POPULARITY default hides close
+    neighborhood parks behind a metro's famous ones, see _search_nearby) and the 20 most popular within
+    PARK_POPULAR_RADIUS_MILES (the DISTANCE pool alone is all pocket parks in a dense suburb and never
+    reaches a Ridley Creek State Park or a Rose Tree Park 2 miles away). Review count is the quality
+    bar (10/25 grader: a mapped tree "Chinese chestnut 2", 0-review pocket parks and a stale park name
+    were on real sheets) - see _park_review_floor."""
+    distance_pool = await _search_nearby(
+        client, api_key, lat, lng, "park", max_result_count=NEARBY_CANDIDATE_POOL,
+        field_mask=PARK_FIELD_MASK, section="parks", rank_preference="DISTANCE",
+    )
+    popular_pool = await _search_nearby(
+        client, api_key, lat, lng, "park", radius_miles=PARK_POPULAR_RADIUS_MILES,
+        max_result_count=NEARBY_CANDIDATE_POOL, field_mask=PARK_FIELD_MASK, section="parks_popular",
     )
     deduped: list[dict] = []
     seen: set[tuple[str, str, str]] = set()
-    for place in raw:
-        if not _is_parent_park_candidate(place):
+    for place in [*distance_pool, *popular_pool]:
+        if not _is_parent_park_candidate(place) or not _is_open(place):
             continue
         key = _place_dedupe_key(place)
         if key in seen:
@@ -1691,77 +1883,134 @@ async def _fetch_parks(client: httpx.AsyncClient, api_key: str, lat: float, lng:
         seen.add(key)
         deduped.append(place)
     deduped = _dedupe_park_sub_locations(deduped, lat, lng)
-    return _to_sorted_places(deduped, lat, lng)
+    deduped = _drop_park_sub_areas(deduped)
+
+    floor = _park_review_floor(deduped)
+    pairs = [(p, n) for p in deduped if _park_reviews(p) >= floor and (n := _place_to_nearby(p, lat, lng)) is not None]
+    if not pairs:
+        return []
+    pairs.sort(key=lambda pair: pair[1].distance_miles if pair[1].distance_miles is not None else float("inf"))
+    nearest, rest = pairs[0], pairs[1:]
+    # Then the parks worth the drive: popularity (log of reviews) against distance.
+    rest.sort(key=lambda pair: -(math.log10(_park_reviews(pair[0]) + 1) - (pair[1].distance_miles or 0) / PARK_SCORE_MILES_PER_POINT))
+    picked = [nearest, *rest[:PARK_MAX_RESULTS - 1]]
+    _stash_alternates("parks", [n for _, n in rest[PARK_MAX_RESULTS - 1:]])
+    picked.sort(key=lambda pair: pair[1].distance_miles if pair[1].distance_miles is not None else float("inf"))
+    return [nearby for _, nearby in picked]
 
 
-async def _rank_airports_by_driving_distance(client: httpx.AsyncClient, api_key: str, lat: float, lng: float, candidates: list[dict]) -> list[dict]:
-    """Straight-line distance regularly picks the wrong airport - a small field can be closer as the
-    crow flies while the real major airport sits a similar or shorter drive away right off a highway.
-    Ranks the curated candidate list by actual driving time via the Routes API instead. Best-effort: if
-    the call fails (e.g. Routes API not yet enabled on this key), falls back to the straight-line order
-    `candidates` already arrives in rather than dropping airports from the sheet."""
-    if len(candidates) <= 1:
-        return candidates
+def _park_reviews(place: dict) -> int:
+    return int(place.get("userRatingCount") or 0)
+
+
+def _park_review_floor(candidates: list[dict]) -> int:
+    """PARK_MIN_REVIEWS where enough parks clear it; in rural areas, where even a real park has a
+    handful of reviews, the bar drops so the section isn't empty - but never to zero-review entries."""
+    for floor in (PARK_MIN_REVIEWS, 3, 1):
+        if sum(1 for p in candidates if _park_reviews(p) >= floor) >= PARK_MAX_RESULTS:
+            return floor
+    return 1
+
+
+def _drop_park_sub_areas(candidates: list[dict]) -> list[dict]:
+    """"Cedar Lake Park at Washington Lake Park" or "Ridley Creek State Park - Area 3" when the park
+    itself is in the list - one entry per park. Also two entries within ~500 ft of each other (the
+    same park listed twice): the better-known one stays."""
+    names = {_place_name(p).lower() for p in candidates}
+
+    def is_sub_area(name: str) -> bool:
+        return any(other != name and (name.endswith(f" at {other}") or any(name.startswith(other + sep) for sep in (" - ", " – ", ", ", " area ")))
+                   for other in names)
+
+    kept = [p for p in candidates if not is_sub_area(_place_name(p).lower())]
+    kept.sort(key=lambda p: -_park_reviews(p))
+    out: list[dict] = []
+    for place in kept:
+        loc = place.get("location") or {}
+        if loc.get("latitude") is not None and any(
+            _haversine_miles(loc["latitude"], loc["longitude"], (o.get("location") or {}).get("latitude", 0), (o.get("location") or {}).get("longitude", 0)) < 0.1
+            for o in out
+        ):
+            continue
+        out.append(place)
+    return out
+
+
+async def _driving_routes(client: httpx.AsyncClient, api_key: str, lat: float, lng: float, points: list[tuple[float, float]], section: str) -> list[Optional[tuple[float, float]]]:
+    """(drive seconds, drive miles) from the home to each point, one Routes API call for all of them;
+    None for a point with no route. Best effort: any failure returns all None and callers keep
+    straight-line distances."""
+    if not points:
+        return []
     try:
         response = await client.post(
             ROUTES_MATRIX_URL,
             json={
                 "origins": [{"waypoint": {"location": {"latLng": {"latitude": lat, "longitude": lng}}}}],
-                "destinations": [
-                    {"waypoint": {"location": {"latLng": {"latitude": c["lat"], "longitude": c["lon"]}}}}
-                    for c in candidates
-                ],
+                "destinations": [{"waypoint": {"location": {"latLng": {"latitude": p_lat, "longitude": p_lng}}}} for p_lat, p_lng in points],
                 "travelMode": "DRIVE",
             },
             headers={"Content-Type": "application/json", "X-Goog-Api-Key": api_key, "X-Goog-FieldMask": ROUTES_FIELD_MASK},
             timeout=10.0,
         )
         response.raise_for_status()
-        _log_billable_call("airports", len(candidates) * ROUTES_MATRIX_ELEMENT_COST_USD)
-        rows = response.json()
-
-        duration_by_index: dict[int, float] = {}
-        distance_by_index: dict[int, float] = {}
-        for row in rows:
-            if row.get("condition") != "ROUTE_EXISTS":
-                continue
+        _log_billable_call(section, len(points) * ROUTES_MATRIX_ELEMENT_COST_USD)
+        routes: list[Optional[tuple[float, float]]] = [None] * len(points)
+        for row in response.json():
             idx = row.get("destinationIndex", 0)
-            duration_by_index[idx] = _parse_duration_seconds(row.get("duration"))
-            if row.get("distanceMeters") is not None:
-                distance_by_index[idx] = row["distanceMeters"]
-
-        if not duration_by_index:
-            return candidates
-
-        ranked_indices = sorted(range(len(candidates)), key=lambda i: duration_by_index.get(i, float("inf")))
-        ranked = []
-        for i in ranked_indices:
-            airport = dict(candidates[i])
-            if i in distance_by_index:
-                airport["_driving_miles"] = round(_meters_to_miles(distance_by_index[i]), 1)
-            ranked.append(airport)
-        return ranked
-    except Exception as e:
-        logger.warning(f"Driving-distance ranking for airports failed, falling back to straight-line: {e}")
-        return candidates
+            if row.get("condition") != "ROUTE_EXISTS" or row.get("distanceMeters") is None or not 0 <= idx < len(points):
+                continue
+            routes[idx] = (_parse_duration_seconds(row.get("duration")), round(_meters_to_miles(row["distanceMeters"]), 1))
+        return routes
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Driving distances ({section}) failed, keeping straight-line: {e}")
+        return [None] * len(points)
 
 
 async def _fetch_airports(client: httpx.AsyncClient, api_key: str, lat: float, lng: float) -> list[NearbyPlace]:
-    """Sourced entirely from the curated OurAirports dataset (see AIRPORT_DATA_PATH) rather than a live
-    Places search - see that constant's comment for why. Takes the nearest candidates by straight-line
-    distance, re-ranks them by real driving time, and shows the nearest valid one even if it's farther
-    than the closest thing that merely looks like an airport."""
+    """The nearest MAJOR AIRPORTs (FAA large/medium hubs, up to two) plus a REGIONAL AIRPORT (FAA small
+    hub) only when it's a shorter drive than the nearest major - see MAJOR_AIRPORT_IATA. Commuter and
+    military fields are never shown. Sourced from the curated OurAirports dataset (AIRPORT_DATA_PATH),
+    ranked by driving miles - not drive time, which swings with where the airport's pin sits on the
+    airfield (Reagan National ranked ahead of Dulles, 15 miles closer, for a Sterling VA home)."""
     airports = _load_major_airports()
-    nearest = sorted(airports, key=lambda a: _haversine_miles(lat, lng, a["lat"], a["lon"]))[:AIRPORT_CANDIDATE_POOL]
-    ranked = await _rank_airports_by_driving_distance(client, api_key, lat, lng, nearest)
+    by_distance = sorted(airports, key=lambda a: _haversine_miles(lat, lng, a["lat"], a["lon"]))
+    majors = [a for a in by_distance if a.get("iata") in MAJOR_AIRPORT_IATA][:AIRPORT_MAJOR_CANDIDATES]
+    regionals = [a for a in by_distance if a.get("iata") in REGIONAL_AIRPORT_IATA][:AIRPORT_REGIONAL_CANDIDATES]
+    candidates = [*majors, *regionals]
+    if not candidates:
+        return []
+    routes = await _driving_routes(client, api_key, lat, lng, [(a["lat"], a["lon"]) for a in candidates], "airports")
+    ranked = []
+    for airport, route in zip(candidates, routes):
+        straight = round(_haversine_miles(lat, lng, airport["lat"], airport["lon"]), 1)
+        # No route: straight-line miles stand in.
+        seconds, miles = route if route else (straight / 45 * 3600, straight)
+        ranked.append((seconds, miles, airport))
+    ranked.sort(key=lambda item: item[1])
+    major_rows = [r for r in ranked if r[2].get("iata") in MAJOR_AIRPORT_IATA]
+    regional_rows = [r for r in ranked if r[2].get("iata") in REGIONAL_AIRPORT_IATA]
+
+    picked: list[tuple[float, float, dict, str]] = []
+    for i, (seconds, miles, airport) in enumerate(major_rows[:AIRPORT_MAJOR_MAX_RESULTS]):
+        if i == 0 or miles <= AIRPORT_MAJOR_MAX_DRIVE_MILES:
+            picked.append((seconds, miles, airport, "MAJOR AIRPORT"))
+    nearest_major_miles = major_rows[0][1] if major_rows else float("inf")
+    if regional_rows and regional_rows[0][1] < nearest_major_miles:
+        picked.append((*regional_rows[0], "REGIONAL AIRPORT"))
+    if not picked or picked[0][1] > AIRPORT_MAJOR_MAX_DRIVE_MILES * 2:
+        # Remote area with no hub of either kind in reach: the nearest airline airport, honestly labeled.
+        nearest = by_distance[0]
+        straight = round(_haversine_miles(lat, lng, nearest["lat"], nearest["lon"]), 1)
+        if straight <= AIRPORT_FALLBACK_MAX_MILES and nearest.get("iata") not in MAJOR_AIRPORT_IATA | REGIONAL_AIRPORT_IATA:
+            picked.append((straight / 45 * 3600, straight, nearest, "REGIONAL AIRPORT"))
+    picked.sort(key=lambda item: item[1])
 
     results: list[NearbyPlace] = []
-    for airport in ranked[:MAX_RESULTS_PER_CATEGORY]:
-        distance_miles = airport.get("_driving_miles")
-        if distance_miles is None:
-            distance_miles = round(_haversine_miles(lat, lng, airport["lat"], airport["lon"]), 1)
+    for _, miles, airport, label in picked:
         address = ", ".join(part for part in [airport.get("municipality"), airport.get("region")] if part) or None
-        results.append(NearbyPlace(name=airport["name"], address=address, distance_miles=distance_miles))
+        results.append(NearbyPlace(name=airport["name"], address=address, distance_miles=miles, place_type=label,
+                                   latitude=airport["lat"], longitude=airport["lon"]))
     return results
 
 
@@ -1777,82 +2026,420 @@ async def _fetch_assigned_schools(property: Property, db) -> list[NearbyPlace]:
     return assignment.to_nearby_places(NearbyPlace)
 
 
-async def _known_locality_names(db, names: list[str]) -> set[str]:
-    """Zero-cost "is this actually a real town" check against OHP's own local `cities` reference
-    table (2,600+ names, already covers every state seen in testing - PA/DE/NJ) - not scoped by
-    state, since a downtown candidate can legitimately sit just across a state line (e.g. Camden,
-    NJ showing up for a Philadelphia property). Returns the lowercased subset of `names` that
-    matched a known real city/town name; anything not in this table is treated the same way the
-    old restaurant-validation call treated a "just a named place" result - excluded."""
-    if not names:
-        return set()
-    rows = (await db.execute(select(City.name).where(func.lower(City.name).in_([n.lower() for n in names])))).scalars().all()
-    return {n.strip().lower() for n in rows}
+async def _fetch_downtown_areas(client: httpx.AsyncClient, api_key: str, lat: float, lng: float, db, home_city: Optional[str] = None,
+                                home_state: Optional[str] = None, home_zip: Optional[str] = None) -> list[NearbyPlace]:
+    """Nearby towns with a real town center - somewhere a guest could go for dinner or shops.
 
-
-async def _fetch_downtown_areas(client: httpx.AsyncClient, api_key: str, lat: float, lng: float, db) -> list[NearbyPlace]:
-    """Text-searching the word "downtown" matches literal business names containing it (a short-term
-    rental listing titled "Beautiful Convenient Studio Downtown Devon" was outranking the actual town of
-    Devon) rather than real places. "locality" is a proper Places type for named towns/villages/boroughs -
-    verified live that it's the type Google actually uses for small unincorporated Main Line villages
-    (Wayne, Berwyn, Devon, Strafford all came back as "locality") - but it's also what Google uses for
-    small named residential/historic places that have no real downtown at all (Ithan, Allgates). Note:
-    "sublocality"/"neighborhood" are NOT valid includedTypes for Nearby Search (confirmed live - Google
-    400s on them, "Unsupported types"), so don't add them here. Google also returns duplicate entries
-    for the same locality name (verified live) - dedupe by name. Names are shown as Google returns them
-    - no "Downtown " prefix is invented.
-
-    Ranking is now two zero-cost local signals instead of a per-candidate paid restaurant-validation
-    call (tested at 3 real locations, including a rural one - identical top-2 result to the old
-    validated approach every time): (1) keep only candidates whose name matches a real town in OHP's
-    own `cities` table - this alone separates genuine towns from bare named places (verified live: it
-    correctly dropped things like "Redden"/"Wood Branch"/"Flea Hill" while keeping "Georgetown"/
-    "Milton"/"Harbeson"), then (2) within the survivors, keep Google's own natural return order - this
-    search has no rankPreference override, so it already defaults to POPULARITY, meaning the
-    busyness-based ranking the old validation loop paid to reconstruct is already sitting in the
-    response order, unused until now."""
+    10/25 audit: real sheets showed "Edgmont", "Evesham", "Deptford", "Cherry Hill Township", "Gulph
+    Mills", "Chester Springs" and subdivision names as downtowns, and missed West Chester itself. So:
+    - Candidates: every town Google lists around the home ("locality"; "sublocality"/"neighborhood"
+      aren't valid includedTypes here - Google 400s on them), plus the nearest incorporated towns
+      (boroughs, cities, towns, villages) from the Census list that Google left out
+      (CENSUS_PLACES_DATA_PATH). "... Township" names are dropped outright (the whole township,
+      pinned at its middle).
+    - Each must show a real cluster of restaurants and shops around its center point
+      (_town_center_score, free to count). How big depends on what the name is - see
+      DOWNTOWN_MIN_SCORE_BY_KIND: an incorporated town needs the least; a Census-designated
+      community (Wayne, Ardmore - but also "Haverford College"), a township municipality's name
+      (Moorestown, but also Edgmont, pinned on a shopping strip) need more; any other name (Havertown
+      is real, "Larchmont Meadows" is a subdivision) needs a full main street's worth.
+    - Two that are really one place (Rosemont and Bryn Mawr on one stretch of Lancaster Ave, "St.
+      Davids" and "Saint Davids") within DOWNTOWN_MIN_SEPARATION_MILES collapse to one name: the
+      home's own town if it's one of them, else the more official kind, then the bigger downtown.
+    - Then the AI (ai_downtown_service) gets the home's town and all these measurements and names the
+      downtowns locals would ("Marlton", not the township "Evesham"; no malls when there's a main
+      street). Each name it gives is checked against the data again (_verify_ai_downtowns) and only
+      those that hold up print; with no usable AI answer the data-only list above prints.
+    Shown nearest first; no "Downtown" prefix invented."""
     raw = await _search_nearby(client, api_key, lat, lng, "locality", radius_miles=DOWNTOWN_MAX_DISTANCE_MILES, max_result_count=DOWNTOWN_CANDIDATE_POOL, field_mask=FIELD_MASK, section="downtown")
 
-    seen: set[str] = set()
-    deduped = []
+    candidates: dict[str, tuple[NearbyPlace, str]] = {}
     for place in raw:
-        name = (place.get("displayName") or {}).get("text")
-        if not name or name.lower() in seen:
-            continue
-        seen.add(name.lower())
-        deduped.append(place)
-
-    known_names = await _known_locality_names(db, [(place.get("displayName") or {}).get("text") for place in deduped])
-
-    results: list[NearbyPlace] = []
-    for place in deduped:  # already in Google's natural (POPULARITY) return order
-        name = (place.get("displayName") or {}).get("text")
-        if not name or name.lower() not in known_names:
+        name = _place_name(place)
+        key = _town_key(name)
+        if not name or key in candidates or re.search(r"\b(township|twp\.?)$", name, re.IGNORECASE):
             continue
         nearby = _place_to_nearby(place, lat, lng)
-        if nearby:
-            results.append(nearby)
-        if len(results) >= MAX_RESULTS_PER_CATEGORY:
+        if nearby and nearby.latitude is not None:
+            candidates[key] = (nearby, _town_kind(place))
+    extra = 0
+    for name, state, t_lat, t_lng, is_cdp in sorted(_census_places_near(lat, lng, DOWNTOWN_MAX_DISTANCE_MILES), key=lambda t: _haversine_miles(lat, lng, t[2], t[3])):
+        if is_cdp or _town_key(name) in candidates:
+            continue
+        candidates[_town_key(name)] = (NearbyPlace(name=name, address=f"{name}, {state}", latitude=t_lat, longitude=t_lng,
+                                                   distance_miles=round(_haversine_miles(lat, lng, t_lat, t_lng), 1)), "incorporated")
+        extra += 1
+        if extra >= DOWNTOWN_CENSUS_EXTRA:
             break
-    return results
+    ordered = list(candidates.values())
+
+    gate = asyncio.Semaphore(8)
+
+    async def score(n: NearbyPlace) -> Optional[tuple[int, int]]:
+        async with gate:
+            return await _town_center_score(client, api_key, n.latitude, n.longitude)
+
+    scores = await asyncio.gather(*(score(n) for n, _ in ordered))
+    if all(s is None for s in scores):
+        # The free count failed outright - fall back to the incorporated towns rather than nothing.
+        passing = [(n, kind, 0) for n, kind in ordered if kind == "incorporated"]
+    else:
+        passing = [(n, kind, s[1]) for (n, kind), s in zip(ordered, scores) if s is not None and s[0] >= DOWNTOWN_MIN_SCORE_BY_KIND[kind]]
+
+    # One place, two names: the official kind wins, then the bigger downtown.
+    home_key = _town_key(home_city) if home_city else None
+    rank = list(DOWNTOWN_MIN_SCORE_BY_KIND)
+    passing.sort(key=lambda item: (rank.index(item[1]), -item[2], item[0].distance_miles or 0))
+    kept: list[tuple[NearbyPlace, str, int]] = []
+    for item in passing:
+        n, kind, size = item
+        clash = next((i for i, (k, _, _) in enumerate(kept) if _haversine_miles(n.latitude, n.longitude, k.latitude, k.longitude) < DOWNTOWN_MIN_SEPARATION_MILES), None)
+        if clash is None:
+            kept.append(item)
+            continue
+        k, k_kind, k_size = kept[clash]
+        if home_key and _town_key(n.name) == home_key:
+            kept[clash] = item  # a Bryn Mawr home's sheet says "Bryn Mawr", not its neighbor's name
+        elif home_key and _town_key(k.name) == home_key:
+            continue
+        elif kind == k_kind and size == k_size:
+            # Dead heat (both max out the count, e.g. Rosemont and Bryn Mawr on one stretch of
+            # Lancaster Ave): the name whose point sits on the denser core wins.
+            mine, theirs = await asyncio.gather(_town_center_score(client, api_key, n.latitude, n.longitude, DOWNTOWN_TIEBREAK_HALF_MILES),
+                                                _town_center_score(client, api_key, k.latitude, k.longitude, DOWNTOWN_TIEBREAK_HALF_MILES))
+            if mine and theirs and mine[1] > theirs[1]:
+                kept[clash] = item
+    kept = [n for n, _, _ in kept]
+    kept.sort(key=lambda n: n.distance_miles if n.distance_miles is not None else float("inf"))
+    data_list = kept[:MAX_RESULTS_PER_CATEGORY]
+
+    # The AI step (ai_downtown_service): it gets the home's town and these same measurements, names
+    # the downtowns locals would, and every name is checked against the data again below.
+    from app.services.ai.ai_downtown_service import downtown_picks
+    table = [{"name": n.name, "kind": DOWNTOWN_KIND_WORDS[kind], "miles": n.distance_miles, "score": s[0] if s else None,
+              "passed": bool(s) and s[0] >= DOWNTOWN_MIN_SCORE_BY_KIND[kind]}
+             for (n, kind), s in zip(ordered, scores)]
+    picks = await downtown_picks(db, home_city, home_state, home_zip, table)
+    if picks:
+        verified = await _verify_ai_downtowns(client, api_key, lat, lng, picks, ordered, scores, home_state)
+        if verified:
+            return verified
+    return data_list
+
+
+async def _verify_ai_downtowns(client: httpx.AsyncClient, api_key: str, lat: float, lng: float, picks: list[dict],
+                               ordered: list[tuple[NearbyPlace, str]], scores: list, home_state: Optional[str]) -> list[NearbyPlace]:
+    """The AI's downtowns that hold up against our data: located at a known candidate's point (or found
+    with one Google look-up, at most DOWNTOWN_AI_LOCATE_LOOKUPS), with at least DOWNTOWN_AI_MIN_SCORE
+    restaurants + shops around it and inside the search area; one per place. A main street the AI
+    gives sharpens the look-up. A shopping-center pick (only when there's no real downtown nearby)
+    is tagged so on the sheet."""
+    known = {_town_key(n.name): (n, s) for (n, _), s in zip(ordered, scores)}
+    out: list[NearbyPlace] = []
+    lookups = 0
+    for pick in picks:
+        name, kind = pick["name"], pick.get("kind")
+        hit = known.get(_town_key(name))
+        if hit:
+            point, score = (hit[0].latitude, hit[0].longitude), hit[1]
+        else:
+            if lookups >= DOWNTOWN_AI_LOCATE_LOOKUPS:
+                continue
+            lookups += 1
+            state = pick.get("state") or home_state or ""
+            query = ", ".join(x for x in [pick.get("main_street"), name, state] if x)
+            try:
+                raw = await _search_text(client, api_key, lat, lng, query, DOWNTOWN_MAX_DISTANCE_MILES, field_mask=CHEAT_FIELD_MASK, section="downtown_ai_locate")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"downtown look-up failed for {query}: {e}")
+                continue
+            loc = next(((p["location"]["latitude"], p["location"]["longitude"]) for p in raw[:3] if (p.get("location") or {}).get("latitude") is not None), None)
+            if loc is None:
+                continue
+            point, score = loc, await _town_center_score(client, api_key, loc[0], loc[1])
+        miles = _haversine_miles(lat, lng, point[0], point[1])
+        if score is None or score[0] < DOWNTOWN_AI_MIN_SCORE or miles > DOWNTOWN_MAX_DISTANCE_MILES + 2:
+            continue
+        if any(_haversine_miles(point[0], point[1], o.latitude, o.longitude) < DOWNTOWN_MIN_SEPARATION_MILES for o in out):
+            continue
+        out.append(NearbyPlace(name=name, address=f"{name}, {pick.get('state') or home_state or ''}".strip(", "), latitude=point[0], longitude=point[1],
+                               distance_miles=round(miles, 1), place_type="SHOPPING AREA" if kind == "shopping_center" else None))
+    out.sort(key=lambda n: n.distance_miles if n.distance_miles is not None else float("inf"))
+    return out[:MAX_RESULTS_PER_CATEGORY]
+
+
+def _town_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9 ]", "", re.sub(r"^saint\b", "st", name.lower().strip())).strip()
+
+
+@lru_cache(maxsize=1)
+def _load_census_places() -> dict[str, dict]:
+    with open(CENSUS_PLACES_DATA_PATH, encoding="utf-8") as f:
+        states = json.load(f)["states"]
+    return {st: {"places": v["places"], "kinds": {p[0].lower(): ("cdp" if p[3] else "incorporated") for p in v["places"]},
+                 "townships": set(v["townships"])}
+            for st, v in states.items()}
+
+
+def _census_places_near(lat: float, lng: float, miles: float) -> list[tuple[str, str, float, float, bool]]:
+    pad_lat, pad_lng = miles / 69.0, miles / max(1.0, 69.0 * math.cos(math.radians(lat)))
+    return [(name, st, p_lat, p_lng, bool(is_cdp))
+            for st, data in _load_census_places().items()
+            for name, p_lat, p_lng, is_cdp in data["places"]
+            if abs(p_lat - lat) <= pad_lat and abs(p_lng - lng) <= pad_lng and _haversine_miles(lat, lng, p_lat, p_lng) <= miles]
+
+
+_LOCALITY_STATE_RE = re.compile(r",\s*([A-Z]{2})(?:\s+\d{5})?,\s*USA$")
+
+
+def _town_kind(place: dict) -> str:
+    """What a Google locality's name is in its state, per the Census: "incorporated" (city, borough,
+    town, village - also when the state can't be read off the address), "cdp" (a Census-designated
+    community), "township" (a township/town municipality's name) or "other"."""
+    match = _LOCALITY_STATE_RE.search(place.get("formattedAddress") or "")
+    data = _load_census_places().get(match.group(1)) if match else None
+    if data is None:
+        return "incorporated"
+    name = _place_name(place).lower().strip()
+    if name in data["kinds"]:
+        return data["kinds"][name]
+    return "township" if name in data["townships"] else "other"
+
+
+async def _town_center_score(client: httpx.AsyncClient, api_key: str, lat: float, lng: float, half_miles: float = DOWNTOWN_CORE_HALF_MILES) -> Optional[tuple[int, int]]:
+    """(score, size) for the restaurants and shops within DOWNTOWN_CORE_HALF_MILES (a square) of a
+    town's center point: score counts up to 20 of each (what the DOWNTOWN_MIN_SCORE_BY_KIND bars are
+    set against), size up to 40 of each, to tell a bigger downtown from a smaller one when both max
+    out the score. Google Text Searches asking for place IDs only, which Google doesn't charge for
+    (Text Search Essentials IDs Only: unlimited, $0). None when both counts fail."""
+    pad_lat = half_miles / 69.0
+    pad_lng = half_miles / max(1.0, 69.0 * math.cos(math.radians(lat)))
+    box = {"rectangle": {"low": {"latitude": lat - pad_lat, "longitude": lng - pad_lng},
+                         "high": {"latitude": lat + pad_lat, "longitude": lng + pad_lng}}}
+
+    async def count(kind: str) -> Optional[int]:
+        total, token = 0, None
+        try:
+            for _ in range(2):
+                body = {"textQuery": kind, "includedType": kind, "strictTypeFiltering": True, "pageSize": 20, "locationRestriction": box}
+                if token:
+                    body["pageToken"] = token
+                response = await client.post(
+                    PLACES_TEXT_URL, json=body,
+                    headers={"Content-Type": "application/json", "X-Goog-Api-Key": api_key, "X-Goog-FieldMask": "places.id,nextPageToken"},
+                    timeout=10.0,
+                )
+                response.raise_for_status()
+                _log_billable_call("downtown_check", 0.0)
+                data = response.json()
+                total += len(data.get("places") or [])
+                token = data.get("nextPageToken")
+                if not token:
+                    break
+            return total
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"town center {kind} count failed: {e}")
+            return total or None
+
+    restaurants, stores = await asyncio.gather(count("restaurant"), count("store"))
+    if restaurants is None and stores is None:
+        return None
+    restaurants, stores = restaurants or 0, stores or 0
+    return min(restaurants, 20) + min(stores, 20), restaurants + stores
+
+
+async def _apply_driving_distances(client: httpx.AsyncClient, api_key: str, lat: float, lng: float, lists: dict[str, list[NearbyPlace]]) -> None:
+    """Swaps each shown place's straight-line miles for real driving miles (10/25 grader: verify the
+    distances - "1.9 mi" to a hospital across a creek can be a 4-mile drive), one Routes call for the
+    whole sheet, then re-sorts each list nearest-drive first (Medical keeps hospital-then-clinic).
+    Best effort: on failure the straight-line miles stay."""
+    places = [p for items in lists.values() for p in items if p.latitude is not None and p.longitude is not None]
+    routes = await _driving_routes(client, api_key, lat, lng, [(p.latitude, p.longitude) for p in places], "driving_distances")
+    for place, route in zip(places, routes):
+        if route:
+            place.distance_miles = route[1]
+    for key, items in lists.items():
+        if key != "medical_care":
+            items.sort(key=lambda p: p.distance_miles if p.distance_miles is not None else float("inf"))
+
+
+def _prefer_shortest_drive(medical_care: list[NearbyPlace], hospital_backups: list[NearbyPlace],
+                           private_schools: list[NearbyPlace], school_backups: list[NearbyPlace]) -> None:
+    """After driving miles are in: a backup hospital that's a clearly shorter drive takes the hospital
+    slot (the old one becomes a backup), and a private school more than PRIVATE_SCHOOL_MAX_DRIVE_MILES
+    away by car gives way to a backup within it - or just drops off."""
+    def miles(p: NearbyPlace) -> float:
+        return p.distance_miles if p.distance_miles is not None else float("inf")
+
+    if medical_care and medical_care[0].place_type == "HOSPITAL" and hospital_backups:
+        best = min(hospital_backups, key=miles)
+        if miles(best) + 1.0 < miles(medical_care[0]):
+            hospital_backups[hospital_backups.index(best)] = medical_care[0]
+            medical_care[0] = best
+    kept = [s for s in private_schools if miles(s) <= PRIVATE_SCHOOL_MAX_DRIVE_MILES]
+    for spare in sorted(school_backups, key=miles):
+        if len(kept) >= len(private_schools):
+            break
+        if miles(spare) <= PRIVATE_SCHOOL_MAX_DRIVE_MILES and spare not in kept:
+            kept.append(spare)
+    private_schools[:] = sorted(kept, key=miles)
+
+
+async def _proofread_sheet(client: httpx.AsyncClient, api_key: str, lat: float, lng: float, property: Property, db, owner_id: Optional[str],
+                           lists: dict[str, list[NearbyPlace]], backups: dict[str, list[NearbyPlace]]) -> Optional[dict]:
+    """Runs the AI proofread and applies it to `lists` in place. Returns what was found and done
+    (saved with the sheet for checking later), or None when there was no review."""
+    from app.services.ai.cheat_sheet_proofread_service import review
+    home = ", ".join(x for x in [getattr(property, "unparsed_address", None) or getattr(property, "street_address", None), property.city, getattr(property, "state", None)] if x)
+    found = await review(db, home, lists, backups, owner_id=owner_id)
+    if not found:
+        return None
+    try:
+        actions = await _apply_proofread(client, api_key, lat, lng, lists, backups, found["issues"])
+    except Exception as e:  # noqa: BLE001 - never fail a cheat sheet over the proofread
+        logger.warning(f"applying the cheat sheet proofread failed for {home}: {e}")
+        actions = ["not applied - error"]
+    return {"checked_at": datetime.now(timezone.utc).isoformat(), "issues": found["issues"], "actions": actions, "cost_usd": found["cost_usd"]}
+
+
+async def _apply_proofread(client: httpx.AsyncClient, api_key: str, lat: float, lng: float, lists: dict[str, list[NearbyPlace]],
+                           backups: dict[str, list[NearbyPlace]], issues: list[dict]) -> list[str]:
+    """What the proofread is allowed to do with each reported item:
+    - renamed: take the current name only when Google shows an open place by that name within
+      PROOFREAD_RENAME_MAX_MILES of the item (else the item stays as it is);
+    - closed / wrong_category / not_a_public_place: remove it and refill the slot from that list's
+      backups (already through every rule; any backup the AI also reported is skipped). Medical's
+      hospital and everyday-care slots each refill from their own backups. Lists without backups
+      (airports, downtowns) just lose the item.
+    Nothing the AI names itself is ever added."""
+    by_id: dict[str, tuple[str, int]] = {f"{key}#{i}": (key, i) for key, items in lists.items() for i in range(len(items))}
+    flagged_backups = {i["id"] for i in issues if i["id"].startswith("backup:")}
+    actions: list[str] = []
+    removed: list[tuple[str, int]] = []
+    refilled: list[NearbyPlace] = []
+    for issue in issues:
+        hit = by_id.get(issue["id"])
+        if not hit:
+            continue
+        key, idx = hit
+        place = lists[key][idx]
+        if issue["problem"] == "renamed":
+            new_name = issue.get("current_name")
+            found = await _confirm_rename(client, api_key, place, new_name, key) if new_name else None
+            if found is None:
+                actions.append(f"kept {place.name} ({key}) - rename to {new_name!r} not confirmed")
+                continue
+            old_name, loc = place.name, found["location"]
+            place.name = _place_name(found)
+            place.address = found.get("formattedAddress") or place.address
+            if _haversine_miles(place.latitude, place.longitude, loc["latitude"], loc["longitude"]) > PROOFREAD_RENAME_MAX_MILES:
+                place.latitude, place.longitude = loc["latitude"], loc["longitude"]
+                place.distance_miles = round(_haversine_miles(lat, lng, loc["latitude"], loc["longitude"]), 1)
+                refilled.append(place)  # moved - gets a fresh driving distance below
+            actions.append(f"renamed {old_name} -> {place.name} ({key})")
+            continue
+        removed.append((key, idx))
+
+    for key, idx in sorted(removed, key=lambda r: -r[1]):
+        old = lists[key][idx]
+        slot = key if key != "medical_care" else ("medical_care:hospital" if old.place_type == "HOSPITAL" else "medical_care:everyday")
+        shown = {p.name.lower() for p in lists[key]}
+        spare = next((b for i, b in enumerate(backups.get(slot) or [])
+                      if f"backup:{slot}#{i}" not in flagged_backups and b.name.lower() not in shown), None)
+        if spare is not None:
+            lists[key][idx] = spare
+            refilled.append(spare)
+            actions.append(f"replaced {old.name} with {spare.name} ({key})")
+        else:
+            del lists[key][idx]
+            actions.append(f"removed {old.name} ({key}) - no checked backup")
+    if refilled:
+        await _apply_driving_distances(client, api_key, lat, lng, {"refilled": refilled})
+        for key in ("private_schools", "grocery_stores", "parks"):
+            lists.get(key, []).sort(key=lambda p: p.distance_miles if p.distance_miles is not None else float("inf"))
+    return actions
+
+
+# A rename from the proofread must pass the same rule as the list it's on before it prints.
+_RENAME_RULES = {
+    "grocery_stores": _is_full_service_grocery,
+    "parks": _is_parent_park_candidate,
+}
+
+
+async def _confirm_rename(client: httpx.AsyncClient, api_key: str, place: NearbyPlace, new_name: str, key: str) -> Optional[dict]:
+    """The Google place the proofread's corrected name points to, or None. It has to be open, carry
+    that name, sit within PROOFREAD_RENAME_SEARCH_MILES of the old item (Google's pin for a misnamed
+    listing can be off - "Garrett memorial hospital?" sat away from Garrett Regional Medical Center)
+    and pass the list's own rule (a hospital must be a real general hospital, a park a park)."""
+    if place.latitude is None or place.longitude is None:
+        return None
+    try:
+        raw = await _search_text(client, api_key, place.latitude, place.longitude, new_name, PROOFREAD_RENAME_SEARCH_MILES,
+                                 field_mask=CHEAT_FIELD_MASK, section="proofread_rename")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"proofread rename check failed for {new_name}: {e}")
+        return None
+    if key == "medical_care":
+        rule = _is_legitimate_full_service_hospital if place.place_type == "HOSPITAL" else (lambda g: _non_hospital_medical_label(g) is not None)
+    else:
+        rule = _RENAME_RULES.get(key, lambda g: True)
+    wanted = _school_name_tokens(new_name)
+    for g in raw[:5]:
+        loc = g.get("location") or {}
+        if loc.get("latitude") is None or not _is_open(g):
+            continue
+        if _haversine_miles(place.latitude, place.longitude, loc["latitude"], loc["longitude"]) > PROOFREAD_RENAME_SEARCH_MILES:
+            continue
+        got = _school_name_tokens(_place_name(g))
+        if wanted and got and len(wanted & got) / len(wanted) >= 0.6 and rule(g):
+            return g
+    return None
 
 
 async def _fetch_live(client: httpx.AsyncClient, api_key: str, lat: float, lng: float, property: Property, db, owner_id: Optional[str] = None) -> NearbyAmenitiesResponse:
+    listing_key = property.listing_key  # read once, before anything else touches the session
     cost_token = _cost_log_var.set([])
+    alternates_token = _alternates_var.set({})
+    proofread: Optional[dict] = None
     try:
         schools = await _fetch_assigned_schools(property, db)
-        grocery_stores = await _fetch_grocery_stores(client, api_key, lat, lng)
-        medical_care = await _fetch_medical_care(client, api_key, lat, lng)
-        parks = await _fetch_parks(client, api_key, lat, lng)
-        airports = await _fetch_airports(client, api_key, lat, lng)
-        downtown_areas = await _fetch_downtown_areas(client, api_key, lat, lng, db)
+        # The lists look up side by side (the downtown AI alone can take ~15 s). Only the downtown step
+        # uses the database session, so nothing shares it at once.
+        grocery_stores, medical_care, parks, airports, private_schools, downtown_areas = await asyncio.gather(
+            _fetch_grocery_stores(client, api_key, lat, lng),
+            _fetch_medical_care(client, api_key, lat, lng),
+            _fetch_parks(client, api_key, lat, lng),
+            _fetch_airports(client, api_key, lat, lng),
+            _fetch_private_schools(client, api_key, lat, lng),
+            _fetch_downtown_areas(client, api_key, lat, lng, db, home_city=property.city,
+                                  home_state=getattr(property, "state", None), home_zip=getattr(property, "zipcode", None)),
+        )
+        # Parks keep straight-line miles: their Google pin sits mid-park, and a route to it measured
+        # 0.9 mi as a 5-mile drive (Ithan Valley Park) on a real sheet. Downtowns do get driving miles -
+        # a town 6 miles across the Potomac with no bridge (Poolesville, from Sterling VA) isn't nearby.
+        # The hospital and school backups get driving miles too: across a river the straight-line
+        # nearest can be the longest drive (Bryans Road MD: the "nearest" hospital and private schools
+        # were 24-27 miles by car, across the Potomac).
+        alternates = _alternates_var.get() or {}
+        hospital_backups = alternates.get("medical_care:hospital", [])
+        school_backups = alternates.get("private_schools", [])
+        await _apply_driving_distances(client, api_key, lat, lng, {
+            "private_schools": private_schools, "grocery_stores": grocery_stores, "medical_care": medical_care,
+            "downtown_areas": downtown_areas, "hospital_backups": hospital_backups, "school_backups": school_backups,
+        })
+        downtown_areas[:] = [d for d in downtown_areas if d.distance_miles is None or d.distance_miles <= DOWNTOWN_MAX_DRIVE_MILES]
+        _prefer_shortest_drive(medical_care, hospital_backups, private_schools, school_backups)
 
-        # Best-effort text search + conservative classification; questionable school-like businesses are
-        # skipped rather than shown as private schools.
-        private_schools = await _fetch_private_schools(client, api_key, lat, lng)
+        # Last: the AI proofread (cheat_sheet_proofread_service) - can only take a confirmed-wrong item
+        # out, refill its slot from that list's checked backup, or apply a rename Google confirms.
+        lists = {"private_schools": private_schools, "grocery_stores": grocery_stores, "medical_care": medical_care,
+                 "parks": parks, "airports": airports, "downtown_areas": downtown_areas}
+        proofread = await _proofread_sheet(client, api_key, lat, lng, property, db, owner_id, lists, _alternates_var.get() or {})
     finally:
         call_log = _cost_log_var.get() or []
         _cost_log_var.reset(cost_token)
+        _alternates_var.reset(alternates_token)
 
     total_cost = sum(cost for _, cost in call_log)
     by_section: dict[str, float] = {}
@@ -1860,7 +2447,7 @@ async def _fetch_live(client: httpx.AsyncClient, api_key: str, lat: float, lng: 
         by_section[section] = by_section.get(section, 0.0) + cost
     breakdown = ", ".join(f"{section}=${cost:.3f}" for section, cost in by_section.items())
     logger.info(
-        f"[CHEAT SHEET COST] listing_key={property.listing_key} CACHE MISS - live Google cost=${total_cost:.3f} "
+        f"[CHEAT SHEET COST] listing_key={listing_key} CACHE MISS - live Google cost=${total_cost:.3f} "
         f"({len(call_log)} calls) breakdown: {breakdown}"
     )
 
@@ -1883,6 +2470,8 @@ async def _fetch_live(client: httpx.AsyncClient, api_key: str, lat: float, lng: 
         downtown_areas=downtown_areas,
         airports=airports,
         available=True,
+        schema_version=AMENITIES_SCHEMA_VERSION,
+        proofread=proofread,
         cached_at=datetime.now(timezone.utc),
     )
 
@@ -1900,14 +2489,15 @@ def _cached_response(property: Property) -> Optional[NearbyAmenitiesResponse]:
         if datetime.now(timezone.utc) - cached_at > timedelta(hours=CACHE_FAILURE_TTL_HOURS):
             return None
     try:
-        return NearbyAmenitiesResponse(**property.nearby_amenities, cached_at=property.nearby_amenities_cached_at, available=True)
+        return NearbyAmenitiesResponse(**property.nearby_amenities, cached_at=property.nearby_amenities_cached_at, available=True,
+                                       schema_version=None if failed_at_raw else property.nearby_amenities.get("_schema_version"))
     except Exception:
         return None
 
 
 async def _persist_amenities_cache(db, property: Property, result: NearbyAmenitiesResponse, google_failed: bool = False) -> None:
     try:
-        data = result.model_dump(mode="json", exclude={"available", "cached_at"})
+        data = result.model_dump(mode="json", exclude={"available", "cached_at", "schema_version"})
         data["_schema_version"] = AMENITIES_SCHEMA_VERSION
         # Keep the saved web school lookup (ai_school_lookup_service) - it's paid for once per home.
         prev = property.nearby_amenities if isinstance(property.nearby_amenities, dict) else {}
@@ -1921,6 +2511,41 @@ async def _persist_amenities_cache(db, property: Property, result: NearbyAmeniti
     except Exception as e:
         logger.warning(f"Failed to persist nearby amenities cache for listing {property.listing_key}: {e}")
         await db.rollback()
+
+
+SAME_BUILDING_MAX_MILES = 0.06  # ~300 ft: another unit / the same address listed again
+
+
+async def _same_building_amenities(db, property: Property, lat: float, lng: float) -> Optional[NearbyAmenitiesResponse]:
+    """A home in the same building or at the same spot as one already looked up under the current
+    rules (another condo unit, the same house relisted under a new listing key - "191 Presidential
+    Blvd" is on file three times) has the same places around it, so it reuses that lookup instead of
+    paying Google again. Assigned schools are still worked out for this listing on its own."""
+    pad = 0.002
+    lat_col = func.coalesce(Property.google_rooftop_latitude, Property.latitude)
+    lng_col = func.coalesce(Property.google_rooftop_longitude, Property.longitude)
+    rows = (await db.execute(
+        select(Property.nearby_amenities, Property.nearby_amenities_cached_at, lat_col, lng_col)
+        .where(Property.listing_key != property.listing_key, Property.nearby_amenities.isnot(None),
+               lat_col.between(lat - pad, lat + pad), lng_col.between(lng - pad, lng + pad))
+        .limit(20)
+    )).all()
+    now = datetime.now(timezone.utc)
+    for data, cached_at, o_lat, o_lng in rows:
+        if not isinstance(data, dict) or data.get("_schema_version") != AMENITIES_SCHEMA_VERSION or data.get("_google_lookup_failed_at"):
+            continue
+        if cached_at is None or _haversine_miles(lat, lng, o_lat, o_lng) > SAME_BUILDING_MAX_MILES:
+            continue
+        if cached_at.tzinfo is None:
+            cached_at = cached_at.replace(tzinfo=timezone.utc)
+        if now - cached_at > timedelta(days=CACHE_TTL_DAYS):
+            continue
+        try:
+            return NearbyAmenitiesResponse(**{k: v for k, v in data.items() if k != "ai_schools"}, cached_at=cached_at, available=True,
+                                           schema_version=AMENITIES_SCHEMA_VERSION)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
 
 
 async def get_nearby_amenities(db, property: Property, force_refresh: bool = False, owner_id: Optional[str] = None) -> NearbyAmenitiesResponse:
@@ -1980,6 +2605,12 @@ async def _get_nearby_amenities_base(db, property: Property, force_refresh: bool
             if datetime.now(timezone.utc) - cached_at < timedelta(days=CACHE_TTL_DAYS):
                 logger.info(f"[CHEAT SHEET COST] listing_key={property.listing_key} CACHE HIT - live Google cost=$0.000 (served from cache)")
                 return cached
+        shared = await _same_building_amenities(db, property, lookup_lat, lookup_lng)
+        if shared is not None:
+            shared.schools = assigned_schools
+            logger.info(f"[CHEAT SHEET COST] listing_key={property.listing_key} SAME-BUILDING HIT - live Google cost=$0.000")
+            await _persist_amenities_cache(db, property, shared)
+            return shared
 
     # Only a home's FIRST lookup counts toward the agent's AI usage. A re-lookup because we changed
     # the cheat sheet's data format (AMENITIES_SCHEMA_VERSION - every release that bumps it would
