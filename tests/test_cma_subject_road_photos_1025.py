@@ -76,3 +76,51 @@ def test_fingerprint_changes_with_condition_photos():
     a = svc._compute_fingerprint(base, [], 8, False)
     assert a == svc._compute_fingerprint(dict(base), [], 8, False)
     assert a != svc._compute_fingerprint({**base, "condition_photos": ["k.jpg"]}, [], 8, False)
+
+
+# ---- grader 10/25 on the 602 Media Line Rd report -----------------------------------------------
+from app.services import cma_fact_check as fc
+
+MANUAL = {"source": "manual", "lot_size": 20909}
+
+
+def test_manual_subject_no_mls_record_and_unknown_not_none():
+    t = ("**Systems and Age:** The MLS record shows no documented updates to the heating, cooling, water heater, "
+         "or electrical systems. Since the home was built in 1970, buyers will ask.")
+    out, flags = fc.fix_manual_subject_record(t, MANUAL)
+    assert "MLS record" not in out and "don't say when the heating, cooling, water heater, or electrical systems were last updated" in out
+    assert flags
+    # an MLS subject, or a comp's own note, is left alone
+    assert fc.fix_manual_subject_record(t, {"source": "mls"})[0] == t
+    assert fc.fix_manual_subject_record(t, MANUAL, comp={"street_address": "x"})[0] == t
+
+
+def test_subject_lot_words_checked_against_comps():
+    comps = [{"lot_size": v} for v in (20473, 15000, 18000, 12000, 21000)]
+    t = "Presenting the home's strengths - smaller lot, ample above-grade square footage - will help."
+    out, flags = fc.fix_subject_lot_words(t, MANUAL, comps)
+    assert "smaller lot" not in out and "strengths - larger lot, ample" in out and flags
+    # about a comp, or true: unchanged
+    t2 = "Comp #3's smaller lot holds it back."
+    assert fc.fix_subject_lot_words(t2, MANUAL, comps)[0] == t2
+    assert fc.fix_subject_lot_words(t, {"lot_size": 9000}, comps)[0] == t
+
+
+def test_above_grade_psf_not_backed_out():
+    t = ("it remains a useful size and age reference point once its ~734 sqft of finished lower level is backed out "
+         "of its blended $315/sqft above grade This is a fully renovated home")
+    out, _ = fc.fix_above_grade_psf_wording(t)
+    assert "backed out" not in out and "blended" not in out and "at its $315 per above-grade sq ft" in out
+
+
+def test_market_demand_is_not_a_judgment_reason():
+    text, _sup, all_gridded = svc._bridge_driver_text(
+        [{"factor": "Relevant nearby and same-school-district sales"}, {"factor": "Competitive sale outcomes"}], set())
+    assert text == "relevant nearby and same-school-district sales" and not all_gridded
+    _t, _s, all_g = svc._bridge_driver_text([{"factor": "Competitive sale outcomes"}], set())
+    assert all_g
+
+
+def test_manual_subject_prompt_notes():
+    assert "no MLS record" in svc._MANUAL_RECORD_NOTE and "typical condition" in svc._INTERIOR_UNKNOWN_NOTE
+    assert "record_source" in svc._SUBJECT_FIELDS and "interior_condition" in svc._SUBJECT_FIELDS

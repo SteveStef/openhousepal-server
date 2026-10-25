@@ -1288,7 +1288,7 @@ _SUBJECT_FIELDS = [
     "authoritative_property_features", "material_issues",
     # cma_fact_check.prompt_facts_subject (10/24): the facts the grader caught the model guessing at
     "subdivision_name", "list_price_per_above_grade_sqft", "lower_level_record", "association_fees",
-    "listing_and_sale_history", "interior_condition",
+    "listing_and_sale_history", "interior_condition", "record_source",
 ]
 _COMP_FIELDS = [
     "street_address", "city", "state", "zipcode", "distance_miles", "status",
@@ -2730,6 +2730,12 @@ _INTERIOR_UNKNOWN_NOTE = (
     "when its own listing documents a renovation clearly beyond typical, 'below' only when it documents needing "
     "work, otherwise 'similar'. Never call the subject original, dated or unrenovated; say its interior condition "
     "wasn't documented and the value assumes typical condition for its age.")
+
+
+_MANUAL_RECORD_NOTE = (
+    "Entered by the agent - this home has no MLS listing and no MLS record. Its facts are as the agent gave them. "
+    "Never refer to 'the MLS record' or 'the listing' for the subject (say 'the details provided'), and treat "
+    "anything not given (updates, system ages, finishes) as unknown, never as absent or original.")
 
 
 def _subject_interior_documented(subject: Optional[dict]) -> bool:
@@ -13223,6 +13229,11 @@ _BRIDGE_LEAN_PCT = 0.05        # a value this far from the adjusted sales on lis
 _BRIDGE_JUDGMENT_PCT = 0.03    # judgment beyond the grid this large needs market evidence, or it is flagged
 
 
+_MARKET_DEMAND_FACTOR_RE = re.compile(
+    r"\b(?:competitive (?:sale|market|closing|bidding)|sale[- ]to[- ](?:list|asking)|(?:over|above) (?:asking|list)|"
+    r"bidding|multiple offers|buyer demand|market demand|strong demand)", re.I)
+
+
 def _bridge_driver_text(items: list, grid_families: set) -> tuple[str, bool, bool]:
     """(plain list of the reasoning pass's named factors, any clearly market-supported, all already in the grid)."""
     names, fresh, supported, all_gridded = [], [], False, bool(items)
@@ -13237,7 +13248,12 @@ def _bridge_driver_text(items: list, grid_families: set) -> tuple[str, bool, boo
         # the reasoning pass's own word that it did NOT move the number for this ("already reflected in the
         # grid and receives no second deduction" - 4913 Chancellor St's basement, 10/24)
         if re.search(r"already (?:reflected|included|priced|captured)|no second (?:deduction|adjustment)|"
-                     r"not (?:added|adjusted|deducted|counted) (?:again|a second time|twice)", str(d.get("reason") or ""), re.I):
+                     r"not (?:added|adjusted|deducted|counted) (?:again|a second time|twice)|\badd(?:ed)? again\b",
+                     str(d.get("reason") or ""), re.I):
+            hit = True
+        # Buyer competition is already inside every closed sale price - it is not a reason to go above
+        # the adjusted sales (602 Media Line Rd: "+$18,000 ... competitive sale outcomes", grader 10/25).
+        if _MARKET_DEMAND_FACTOR_RE.search(f):
             hit = True
         all_gridded = all_gridded and hit
         if not hit:
@@ -16146,10 +16162,10 @@ async def _auto_repair_export_blocks(
     # Ln V20 went out saying $246/sqft was "well above" the subject's $273). Safe rewrites first
     # (neighborhood names, "no finished basement", field names, repeated sentences), then every check.
     for key in ("m", "o", "i", "ls", "lp"):
-        texts[key], _ff = _fact_check.fix_text(texts[key], subject=subject, who=_FIELD_LABELS.get(key, "Text"))
+        texts[key], _ff = _fact_check.fix_text(texts[key], subject=subject, who=_FIELD_LABELS.get(key, "Text"), comps=comps)
         flags += _ff
     for d in vds:
-        d["note"], _ff = _fact_check.fix_text(str(d.get("note") or ""), subject=subject, who="Why this number")
+        d["note"], _ff = _fact_check.fix_text(str(d.get("note") or ""), subject=subject, who="Why this number", comps=comps)
         flags += _ff
     for idx, lbl in comp_labels().items():
         for fld in ("ai_commentary", "commentary"):
@@ -16469,6 +16485,7 @@ async def _build_content(subject: dict, comps: list[dict], max_photos: int, warn
     _hist_lines = (subject.get("_listing_history") or {}).get("lines") if isinstance(subject, dict) else None
     subject_for_ai["listing_and_sale_history"] = "; ".join(_hist_lines) if _hist_lines else None
     subject_for_ai["interior_condition"] = None if _subject_interior_documented(subject) else _INTERIOR_UNKNOWN_NOTE
+    subject_for_ai["record_source"] = _MANUAL_RECORD_NOTE if subject.get("source") == "manual" else None
     add_text(_format_block("SUBJECT PROPERTY:", subject_for_ai, _SUBJECT_FIELDS))
     _timeline = subject.get("_status_timeline") if isinstance(subject, dict) else None
     if _timeline and _timeline.get("summary_lines"):

@@ -467,11 +467,82 @@ def size_claim_problem(sentence: str, subject: Optional[dict], comp: Optional[di
     return None
 
 
-def fix_text(text: str, *, subject: Optional[dict], comp: Optional[dict] = None, who: str = "Text") -> tuple[str, list[str]]:
-    """Every deterministic rewrite above, in order. `comp` = the home a comp write-up is about."""
+# ----------------------------------------------------------------------------- hand-entered subject
+
+# A home entered by hand has no MLS record - 602 Media Line Rd's report said "The MLS record shows no
+# documented updates to the heating, cooling ..." and called the home unrenovated (grader 10/25). A fact
+# nobody entered is unknown, never a negative.
+_MANUAL_NO_UPDATES_RE = re.compile(
+    r"\b(?:the|its|this home's|the home's|the subject's)\s+MLS\s+(?:record|listing|data|remarks|description)s?\s+"
+    r"(?:shows?|lists?|documents?|has|notes?|includes?)\s+no\s+(?:documented\s+|recorded\s+|listed\s+)?"
+    r"(?:updates?|upgrades?|renovations?|improvements?)\s+(?:to|of|for|on)\s+(?:the\s+)?([^.;]+)", re.IGNORECASE)
+_MANUAL_RECORD_RE = re.compile(
+    r"\b(the|its|this home's|the home's|the subject's|the subject property's)\s+MLS\s+(record|listing|data|remarks|description)s?\b",
+    re.IGNORECASE)
+
+
+def fix_manual_subject_record(text: str, subject: Optional[dict], comp: Optional[dict] = None) -> tuple[str, list[str]]:
+    if not text or (subject or {}).get("source") != "manual" or comp is not None:
+        return text, []
+    t = _MANUAL_NO_UPDATES_RE.sub(lambda m: f"The details provided don't say when the {m.group(1).strip()} were last updated", text)
+    t = _MANUAL_RECORD_RE.sub(lambda m: ("The" if m.group(1)[0].isupper() else "the") + " details provided for the home", t)
+    return (t, ["Fact check: this home was entered by hand - 'the MLS record' about it rewritten, and missing update "
+                "details stated as unknown, not as none."]) if t != text else (text, [])
+
+
+# "Presenting the home's strengths - smaller lot, ..." for a 0.48-acre lot bigger than four of five comps.
+_SUBJECT_LOT_WORD_RE = re.compile(r"\b(smaller|larger|bigger)\s+(lot|parcel|yard)\b", re.IGNORECASE)
+_OTHER_HOME_REF_RE = re.compile(r"\bComp\s*#\s*\d|\b\d{2,5}\s+[A-Z][a-zA-Z]+\s+(?:Rd|Road|St|Street|Ave|Ln|Lane|Dr|Drive|Ct|Cir|Pl|Way)\b")
+
+
+def fix_subject_lot_words(text: str, subject: Optional[dict], comps: Optional[list] = None) -> tuple[str, list[str]]:
+    lot = _money((subject or {}).get("lot_size"))
+    others = sorted(v for v in (_money(c.get("lot_size")) for c in comps or [] if c.get("is_included", True)) if v)
+    if not text or not lot or len(others) < 2:
+        return text, []
+    mid = others[len(others) // 2] if len(others) % 2 else (others[len(others) // 2 - 1] + others[len(others) // 2]) / 2
+    out, flags = [], []
+    for s in sentences(text):
+        m = _SUBJECT_LOT_WORD_RE.search(s)
+        if m and not _OTHER_HOME_REF_RE.search(s[:m.start()]):
+            wrong = (m.group(1).lower() == "smaller" and lot >= mid * 0.95) or (m.group(1).lower() != "smaller" and lot <= mid * 1.05)
+            if wrong:
+                word = "larger" if lot > mid * 1.05 else "smaller" if lot < mid * 0.95 else "similar-size"
+                s = s[:m.start()] + f"{word} {m.group(2)}" + s[m.end():]
+                flags.append(f"Fact check: dropped '{m.group(0)}' - the home's lot ({lot / 43560:.2f} acres) isn't "
+                             f"{m.group(1).lower()} than the comps' typical {mid / 43560:.2f} acres.")
+        out.append(s)
+    return (" ".join(out), flags) if flags else (text, [])
+
+
+# 2 Paxon Cir: "once its ~734 sqft of finished lower level is backed out of its blended $315/sqft above grade" -
+# the $315 is already per ABOVE-grade foot; nothing is backed out (grader 10/25).
+_BACKED_OUT_PSF_RE = re.compile(
+    r"\s*once its\s+~?[\d,]+\s*(?:sq\.?\s*ft|sqft|square feet)\s+of finished (?:lower level|basement)\s+(?:space\s+)?is\s+"
+    r"(?:backed|taken|stripped)\s+out\s+of its\s+(?:blended\s+)?(\$[\d,]+)\s*/\s*(?:sq\.?\s*ft|sqft)\s+above[- ]grade", re.IGNORECASE)
+_BLENDED_ABOVE_RE = re.compile(r"\bblended\s+(\$[\d,]+\s*/\s*(?:sq\.?\s*ft|sqft)\s+above[- ]grade)", re.IGNORECASE)
+
+
+def fix_above_grade_psf_wording(text: str) -> tuple[str, list[str]]:
+    if not text:
+        return text, []
+    t = _BACKED_OUT_PSF_RE.sub(lambda m: f" at its {m.group(1)} per above-grade sq ft (its finished lower level isn't in that figure)", text)
+    t = re.sub(r"(isn't in that figure\))(\s+[A-Z])", r"\1.\2", t)
+    t = _BLENDED_ABOVE_RE.sub(r"\1", t)
+    return (t, ["Fact check: an above-grade $/sq ft figure was described as needing the lower level backed out - reworded."]) \
+        if t != text else (text, [])
+
+
+def fix_text(text: str, *, subject: Optional[dict], comp: Optional[dict] = None, who: str = "Text",
+             comps: Optional[list] = None) -> tuple[str, list[str]]:
+    """Every deterministic rewrite above, in order. `comp` = the home a comp write-up is about; `comps` =
+    the report's comps (report-level text only - the lot-size word check)."""
     flags: list[str] = []
     t = text or ""
     for fn in (
+        lambda x: fix_manual_subject_record(x, subject, comp),
+        lambda x: fix_subject_lot_words(x, subject, comps) if comp is None and comps else (x, []),
+        lambda x: fix_above_grade_psf_wording(x),
         lambda x: fix_community_claims(x, subject, comp),
         lambda x: fix_lower_level_claims(x, comp, who) if comp is not None else (x, []),
         lambda x: (lambda t2, f2: (t2, [f"{who}: {m}" for m in f2]))(*fix_size_claims(x, subject, comp)) if comp is not None else (x, []),
