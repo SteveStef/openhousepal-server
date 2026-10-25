@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models.database import MarketArea, Property
+from app.services.usage_owner import charge_google
 from app.services.areas import geography
 from app.services.areas import boundary_service as bs
 
@@ -88,6 +89,7 @@ async def _researched_private(client: httpx.AsyncClient, area: MarketArea, have:
                                         "locationBias": {"circle": {"center": {"latitude": area.centroid_lat, "longitude": area.centroid_lng}, "radius": 8000}}})
             r.raise_for_status()
             p = (r.json().get("places") or [None])[0]
+            await charge_google("places_text")
         except (httpx.HTTPError, ValueError):
             continue
         if not p or not p.get("location") or "school" not in " ".join(p.get("types") or []):

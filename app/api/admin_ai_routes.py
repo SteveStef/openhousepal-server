@@ -35,6 +35,7 @@ logger = get_logger(__name__)
 _EVENT_TYPE_PROVIDER = {
     "chat": "anthropic", "area_narrative": "anthropic", "area_research": "anthropic",
     "cma_ai": "anthropic", "copywrite": "anthropic", "blog_writer": "anthropic",
+    "cheat_sheet_downtown": "anthropic", "cheat_sheet_proofread": "anthropic", "school_lookup": "anthropic",
     # cma_reasoning ("Astra") is a reasoning-effort OpenAI model (api.openai.com/v1/responses -
     # see _call_cma_reasoning_model), not Anthropic, despite living in the same CMA pipeline as
     # the (Anthropic) cma_ai comp-analysis call.

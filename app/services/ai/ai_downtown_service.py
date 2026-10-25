@@ -8,9 +8,10 @@ then checks every name it gives back against that same data (a real cluster of r
 shops at that spot, within a real drive) before anything prints, so a wrong answer can't reach the
 sheet; with no usable answer the sheet keeps the data-only list.
 
-One answer per town, saved for DOWNTOWN_AI_TTL_DAYS and shared by every home in it - shared town
-data, so it's platform cost (area-research budget + the platform emergency brake), never an
-agent's AI usage.
+One answer per town, saved for DOWNTOWN_AI_TTL_DAYS and shared by every home in it. Guarded by the
+area-research budget + the platform emergency brake, and charged to the AI usage bar of the agent
+whose cheat sheet asked first (user, 10/25: "all things that use AI usage should charge the agent's
+usage bar") - later homes in that town reuse the saved answer for free.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+EVENT_TYPE = "cheat_sheet_downtown"
 DOWNTOWN_AI_TTL_DAYS = 180
 DOWNTOWN_AI_CACHE_VERSION = 2
 DOWNTOWN_AI_RESERVATION_USD = 0.25   # a generous ceiling for one Sonnet call with up to 3 web searches (~5-10 cents real)
@@ -169,7 +171,7 @@ async def _downtown_picks(db, city: str, state: str, zipcode: Optional[str], can
         logger.warning("downtown AI budget reservation failed", exc_info=True)
         return None
 
-    cost = 0.0
+    cost, usage = 0.0, None
     try:
         raw, usage = await asyncio.wait_for(_ask(city, state, zipcode, candidates, config), timeout=60)
         cost = ai_config_service.estimate_cost_usd(config, usage["model"], usage["input"], usage["output"]) \
@@ -182,6 +184,17 @@ async def _downtown_picks(db, city: str, state: str, zipcode: Optional[str], can
             await reconcile_budget(db, reservation, cost)
         except Exception:  # noqa: BLE001
             logger.warning("downtown AI budget reconcile failed", exc_info=True)
+
+    from app.services.usage_owner import current_usage_owner
+    owner_id = current_usage_owner()
+    if owner_id and usage:
+        from app.services.ai.ai_rate_limit_service import record_usage_event
+        try:
+            await record_usage_event(db, owner_id, None, usage["model"], usage["input"], usage["output"], round(cost, 5), usage["searches"],
+                                     False, None, tool_names=["cheat_sheet_downtown"], event_type=EVENT_TYPE)
+        except Exception:  # noqa: BLE001
+            logger.warning("downtown AI cost logging failed", exc_info=True)
+            await db.rollback()
 
     picks = _clean(raw)
     try:

@@ -2815,9 +2815,12 @@ async def _get_nearby_amenities_base(db, property: Property, force_refresh: bool
     # otherwise re-charge every agent ~$0.30 per home), the 180-day refresh, or a forced refresh is
     # our doing, not theirs - it stays on the platform budget like any sync call.
     charge_to = owner_id if not property.nearby_amenities and not force_refresh else None
+    from app.services.usage_owner import bill_to
     try:
-        async with httpx.AsyncClient() as client:
-            result = await _fetch_live(client, api_key, lookup_lat, lookup_lng, property, db, owner_id=charge_to)
+        # bill_to: the downtown AI follows the same rule - charged on the first lookup only.
+        with bill_to(charge_to):
+            async with httpx.AsyncClient() as client:
+                result = await _fetch_live(client, api_key, lookup_lat, lookup_lng, property, db, owner_id=charge_to)
     except Exception as e:
         logger.warning(f"Nearby amenities lookup failed for listing {property.listing_key}: {e}")
         cached = _cached_response(property)

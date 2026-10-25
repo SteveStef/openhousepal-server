@@ -718,6 +718,8 @@ DEFAULT_CONFIG = {
         "places_details_reviews": 0.025,  # Place Details with reviews = Enterprise + Atmosphere SKU
         "geocoding": 0.005,
         "routes_matrix_element": 0.005,
+        "routes_matrix_element_traffic": 0.010,  # Route Matrix Advanced (traffic-aware drive times)
+        "street_view": 0.007,
         "static_map": 0.002,
         "census": 0.0,
     },

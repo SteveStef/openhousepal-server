@@ -17,6 +17,7 @@ import httpx
 from app.config.logging import get_logger
 from app.services.areas import geography
 from app.services.nearby_amenities_service import FIELD_MASK, PLACES_TEXT_URL
+from app.services.usage_owner import charge_google
 from app.utils.geo import haversine_distance
 
 logger = get_logger(__name__)
@@ -38,6 +39,7 @@ async def geocode_place(name: str, state: str) -> tuple[float, float] | None:
             )
             response.raise_for_status()
             payload = response.json()
+        await charge_google("places_text")
     except httpx.HTTPError as exc:
         logger.warning("Area geocoding request failed", extra={"place": text_query, "error": str(exc)})
         return None
@@ -142,6 +144,7 @@ async def resolve_named_place(name: str, state: str) -> dict | None:
             )
             response.raise_for_status()
             payload = response.json()
+        await charge_google("places_text")
     except httpx.HTTPError as exc:
         logger.warning("Named place resolution request failed", extra={"place": text_query, "error": str(exc)})
         return None

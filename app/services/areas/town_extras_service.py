@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models.database import MarketArea, Property
+from app.services.usage_owner import charge_google
 from app.services.areas import geography
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,7 @@ async def _route_matrix(client: httpx.AsyncClient, key: str, lat: float, lng: fl
     r = await client.post("https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix", json=body, timeout=30,
                           headers={"X-Goog-Api-Key": key, "X-Goog-FieldMask": "originIndex,destinationIndex,duration,distanceMeters,condition"})
     r.raise_for_status()
+    await charge_google("routes_matrix_element_traffic" if mode in ("DRIVE", "TRANSIT") else "routes_matrix_element", len(dests))
     out = {}
     for row in r.json():
         if row.get("condition") == "ROUTE_EXISTS" and row.get("duration"):
@@ -299,6 +301,7 @@ async def verify_places(db: AsyncSession, area: MarketArea) -> dict:
                               "maxResultCount": 1})
                     r.raise_for_status()
                     places = r.json().get("places") or []
+                    await charge_google("places_text")
                 except httpx.HTTPError:
                     keep.append(e)
                     continue

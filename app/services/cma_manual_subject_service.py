@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config.logging import get_logger
 from app.models.database import Property, User
 from app.services import s3_service
+from app.services.usage_owner import charge_google
 from app.utils.geo import distance_miles_sql, get_lat_long_offsets
 from app.utils.image_validation import photo_to_jpeg
 
@@ -131,6 +132,7 @@ async def geocode_address(address: str) -> Optional[dict]:
             resp = await client.get(_GEOCODE_URL, params={"address": address, "components": "country:US", "key": key})
             resp.raise_for_status()
             payload = resp.json()
+        await charge_google("geocoding")
     except Exception as exc:
         logger.warning("CMA manual subject geocode failed", extra={"error": str(exc)})
         return None
@@ -201,6 +203,7 @@ async def google_photo(lat: float, lng: float, kind: str) -> bytes:
     if resp.status_code != 200 or not (resp.headers.get("content-type") or "").startswith("image/"):
         logger.warning("CMA manual subject Google photo failed", extra={"kind": kind, "status": resp.status_code})
         raise ValueError("Couldn't get a photo from Google right now - upload a photo instead.")
+    await charge_google("street_view" if kind == "street_view" else "static_map")
     return photo_to_jpeg(resp.content)
 
 

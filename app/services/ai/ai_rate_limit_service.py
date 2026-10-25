@@ -165,6 +165,7 @@ _USAGE_LABELS = {
     "chat": "AI assistant", "tts": "AI assistant", "realtime": "AI assistant",
     "external_api": "Maps & place lookups",
     "school_lookup": "Cheat sheet schools",
+    "cheat_sheet_downtown": "Cheat sheet nearby places", "cheat_sheet_proofread": "Cheat sheet nearby places",
     "area_research": "Researching your towns", "area_narrative": "Researching your towns", "area_fair_housing": "Researching your towns",
 }
 
@@ -613,7 +614,8 @@ async def release(owner_id: str):
 
 _DEFAULT_EXTERNAL_PRICES = {
     "places_nearby": 0.032, "places_text": 0.032, "places_details": 0.017, "places_details_reviews": 0.025,
-    "geocoding": 0.005, "routes_matrix_element": 0.005, "static_map": 0.002, "census": 0.0,
+    "geocoding": 0.005, "routes_matrix_element": 0.005, "routes_matrix_element_traffic": 0.010,
+    "street_view": 0.007, "static_map": 0.002, "census": 0.0,
 }
 
 
@@ -639,7 +641,7 @@ async def record_external_api_cost(
     try:
         if cost_usd is None:
             prices = ((config or {}).get("external_api_prices_usd") if config else None) or _DEFAULT_EXTERNAL_PRICES
-            cost_usd = float(prices.get(kind, 0.0)) * max(1, int(calls))
+            cost_usd = float(prices.get(kind, _DEFAULT_EXTERNAL_PRICES.get(kind, 0.0))) * max(1, int(calls))
         await record_usage_event(
             db, owner_id, None, f"google:{kind}", None, None, round(cost_usd, 6), 0,
             blocked, None, event_type="external_api",

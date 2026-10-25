@@ -32,6 +32,7 @@ _FEATURE = {
     "area_narrative": "Area narrative", "area_research": "Area research",
     "copywrite": "AI Copywriter", "blog_writer": "AI Blog Writer",
     "studio_media_image": "AI Media - image", "studio_media_video": "AI Media - video",
+    "cheat_sheet_downtown": "Cheat sheet - downtown areas", "cheat_sheet_proofread": "Cheat sheet - proofread",
 }
 
 # block_reason -> what it means, in plain words.

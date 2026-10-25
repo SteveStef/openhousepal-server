@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.logging import get_logger
 from app.models.database import Property
+from app.services.usage_owner import charge_google
 
 
 logger = get_logger(__name__)
@@ -48,6 +49,7 @@ async def ensure_google_rooftop_geocode(db: AsyncSession, property_record: Prope
             response = await client.get(GEOCODING_URL, params={"address": address, "key": api_key})
             response.raise_for_status()
             payload = response.json()
+        await charge_google("geocoding")
     except Exception as exc:
         logger.warning("Google geocoding request failed", extra={"listing_key": property_record.listing_key, "error": str(exc)})
         return property_record

@@ -100,6 +100,9 @@ async def get_current_user(
     # Admin activity tracker: last seen + days active (throttled, background, never fails a request).
     from app.services.agent_activity_tracker import touch
     touch(user.id)
+    # Paid lookups made for this request charge this agent's AI usage bar (usage_owner.py).
+    from app.services.usage_owner import set_usage_owner
+    set_usage_owner(user.id)
     return user
 
 
