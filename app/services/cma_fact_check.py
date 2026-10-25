@@ -120,7 +120,7 @@ def neighborhood_vs_subject(subject: Optional[dict], comp: Optional[dict]) -> st
 
 # "same Uwchlan Hunt community", "the same neighborhood", "same-neighborhood sale", "same subdivision"
 _SAME_AREA_RE = re.compile(
-    r"\b(?i:same)[- ](?P<name>(?:[A-Z][\w'’.&-]*\s+){1,4}?)?(?P<kind>(?i:community|neighbou?rhood|subdivision|development|enclave))\b")
+    r"\b(?i:same)[- ](?P<name>(?:[A-Z][\w'’.&-]*\s+){1,4}?)?(?P<kind>(?i:community|neighbou?rhood|subdivision|development|enclave|corridor|section|area))\b")
 _SUBJECTS_AREA_RE = re.compile(
     r"\b(?i:the\s+subject(?:'s|’s)\s+(?:own\s+)?)(?P<kind>(?i:community|neighbou?rhood|subdivision|development))\b")
 
@@ -152,6 +152,12 @@ def fix_community_claims(text: str, subject: Optional[dict], comp: Optional[dict
 
     def _ok(m: "re.Match") -> bool:
         name = (m.group("name") or "").strip()
+        if m.group("kind").lower() == "area" and not name:
+            return True     # "the same area" is a loose phrase, not a subdivision claim
+        # "the same Willistown area" names a township/city both homes are in - true, not a subdivision claim
+        if name and all(_place_key(name) in {_place_key((r or {}).get(k)) for k in ("township", "city")}
+                        for r in ((subject, comp) if comp is not None else (subject,))):
+            return True
         if comp is None:
             # no comp in view: a named community must at least be the subject's
             return not name or (s_sub is not None and _place_key(name) == _place_key(s_sub))
@@ -308,6 +314,24 @@ def _similar(a: list[str], b: list[str]) -> float:
     return len(sa & sb) / len(sa | sb)
 
 
+# Words that make two look-alike sentences about DIFFERENT things ("check the roof's age" / "check the
+# furnace's age" overlap 0.78 but are not a repeat - rule audit 10/24)
+_DISTINCT_TOPIC_WORDS = set((
+    "roof furnace hvac heater boiler ac plumbing electrical wiring panel windows siding stucco foundation basement "
+    "deck patio pool spa septic well sewer water chimney fireplace kitchen bath bathroom garage driveway solar "
+    "attic insulation gutters radon mold termite lot comp subject buyer seller sale sales pending listing").split())
+
+
+def _parallel(sentence: str, w: list[str], prev: list[str]) -> bool:
+    """True when the words two similar sentences DON'T share name different things - a number, a name
+    (capitalised word), a comp number or a house system - so the later one is a parallel point, not a repeat."""
+    diff = set(w) - set(prev)
+    if any(re.search(r"\d|\$|%", d) or d in _DISTINCT_TOPIC_WORDS for d in diff):
+        return True
+    caps = {c.lower() for c in re.findall(r"(?<=\s)[A-Z][a-z]+", sentence or "")}
+    return bool(caps & diff)
+
+
 def drop_repeated_sentences(text: str, threshold: float = 0.72) -> tuple[str, list[str]]:
     """Drop a sentence that says what an earlier sentence in the same section already said (word overlap,
     so 'The range tops out at...' and 'The range stops at...' count as the same). Paragraph breaks kept."""
@@ -323,7 +347,7 @@ def drop_repeated_sentences(text: str, threshold: float = 0.72) -> tuple[str, li
         kept = []
         for s in sentences(para):
             w = _norm_words(s)
-            if len(w) >= 7 and any(_similar(w, p) >= threshold for p in seen):
+            if len(w) >= 7 and any(_similar(w, p) >= threshold and not _parallel(s, w, p) for p in seen):
                 flags.append(f"Fact check: removed a repeated sentence (\"{s[:80]}\").")
                 continue
             if len(w) >= 7:
@@ -357,6 +381,65 @@ def implausible_lot(acres: Optional[float], price: Optional[float], home_type: O
 
 # ----------------------------------------------------------------------------- one pass over a text
 
+# ----------------------------------------------------------------------------- size comparisons
+
+_SIZE_SIMILAR = 0.06    # within 6% above grade = the same size to a buyer
+_SIZE_CLAIM_RE = re.compile(
+    r"\b(?:(much|considerably|significantly|substantially|far|notably|a\s+good\s+deal)\s+)?(larger|bigger|smaller)"
+    r"(?=\s*(?:\([^)]*\)\s*)?,?\s*(?:home|house|residence|colonial|footprint|floor\s*plan|property|newer|older|\w+-?story|\())",
+    re.I)
+_SIZE_SAKE_RE = re.compile(r"\b[Ii]ts\s+(larger|smaller|bigger)\s+size\b")
+
+
+def _size_ratio(subject: Optional[dict], comp: Optional[dict]) -> Optional[float]:
+    s, c = above_grade_sqft(subject), above_grade_sqft(comp)
+    if not (s and c):
+        s, c = _as_num((subject or {}).get("sqft")), _as_num((comp or {}).get("sqft"))
+    return c / s if s and c else None
+
+
+def _as_num(v) -> Optional[float]:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+def fix_size_claims(text: str, subject: Optional[dict], comp: Optional[dict]) -> tuple[str, list[str]]:
+    """'A much larger home' about a comp within 6% of the subject's above-grade size (629 S Warren Ave,
+    4,857 vs 4,870 sq ft, 10/24) -> 'similarly sized'; a claim in the wrong direction -> the right one."""
+    r = _size_ratio(subject, comp)
+    if not text or r is None:
+        return text, []
+    flags: list[str] = []
+
+    def sub(m: "re.Match") -> str:
+        # only a claim ABOUT this comp ("it is a much larger home") - not a general phrase like
+        # "relative to a smaller home" or "than a larger house"
+        if re.search(r"\b(?:to|than|from|vs\.?|versus|of|like|unlike)\s+(?:an?|the|any)?\s*$", text[max(0, m.start() - 25):m.start()], re.I):
+            return m.group(0)
+        said_bigger = m.group(2).lower() in ("larger", "bigger")
+        if abs(r - 1) < _SIZE_SIMILAR:
+            flags.append(f"called a comp {m.group(0).strip()!r}, but it is about the same size as the subject")
+            return "similarly sized"
+        if said_bigger != (r > 1) and abs(r - 1) >= 0.10:
+            flags.append(f"called a comp {m.group(0).strip()!r}, but it is {'larger' if r > 1 else 'smaller'} than the subject")
+            return ("larger" if r > 1 else "smaller")
+        return m.group(0)
+
+    out = _SIZE_CLAIM_RE.sub(sub, text)
+    return out, flags
+
+
+def size_claim_problem(sentence: str, subject: Optional[dict], comp: Optional[dict]) -> Optional[str]:
+    r = _size_ratio(subject, comp)
+    m = _SIZE_SAKE_RE.search(sentence or "")
+    if r is not None and m and abs(r - 1) < _SIZE_SIMILAR:
+        return f"explains a price by the comp's {m.group(1).lower()} size, but it is about the same size as the subject"
+    return None
+
+
 def fix_text(text: str, *, subject: Optional[dict], comp: Optional[dict] = None, who: str = "Text") -> tuple[str, list[str]]:
     """Every deterministic rewrite above, in order. `comp` = the home a comp write-up is about."""
     flags: list[str] = []
@@ -364,6 +447,7 @@ def fix_text(text: str, *, subject: Optional[dict], comp: Optional[dict] = None,
     for fn in (
         lambda x: fix_community_claims(x, subject, comp),
         lambda x: fix_lower_level_claims(x, comp, who) if comp is not None else (x, []),
+        lambda x: (lambda t2, f2: (t2, [f"{who}: {m}" for m in f2]))(*fix_size_claims(x, subject, comp)) if comp is not None else (x, []),
         lambda x: fix_field_name_leaks(x),
         lambda x: drop_repeated_sentences(x),
     ):
@@ -380,6 +464,9 @@ def sentence_problems(sentence: str, *, subject: Optional[dict], comp: Optional[
         out.append(p)
     if comp is not None:
         p = lower_level_claim_problem(sentence, comp)
+        if p:
+            out.append(p)
+        p = size_claim_problem(sentence, subject, comp)
         if p:
             out.append(p)
     return out
@@ -579,6 +666,12 @@ _HIGH_IMPACT = (
     ("barn", "barn / outbuilding", r"\b(?:barn|stable|equestrian)\b", r"\b(?:barn|stable|equestrian)\b"),
 )
 _NO_POOL_RE = re.compile(r"\bno\s+pool\b|\bpool:\s*no\b", re.I)
+# "community pool", "clubhouse, pool and tennis courts", "pool and courts for residents" - shared
+# amenities, not the home's own (523 Sherbrook Dr's community pool read as a private pool, 10/24)
+_SHARED_AMENITY_RE = re.compile(
+    r"\b(?:community|neighbou?rhood|hoa|association|clubhouse|club\s*house|amenit(?:y|ies)|shared|residents?'?)\b"
+    r"[^.;]{0,60}?\b(?:pools?|courts?)\b"
+    r"|\b(?:pools?|courts?)\b[^.;]{0,30}\b(?:community|clubhouse|hoa|association|residents?)\b", re.I)
 
 
 def high_impact_features(row: Optional[dict], *, condo: bool = False) -> list[tuple[str, str]]:
@@ -594,7 +687,7 @@ def high_impact_features(row: Optional[dict], *, condo: bool = False) -> list[tu
                 continue
         if key in ("barn", "elevator", "sport_court") and condo:
             continue
-        if re.search(find, blob, re.I):
+        if re.search(find, _SHARED_AMENITY_RE.sub(" ", blob) if key in ("pool", "sport_court") else blob, re.I):
             out.append((key, words))
     return out
 

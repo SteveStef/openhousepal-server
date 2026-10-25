@@ -16,6 +16,7 @@ action for that.
 import asyncio
 import base64
 import copy
+import functools
 import hashlib
 import json
 import logging
@@ -165,8 +166,8 @@ _V10_VALUATION_RULES = (
     "MARKET EXPOSURE: when the subject has had real time on the market with no accepted offer, an "
     "FMV above the current list price is hard to support. If you land above list, explain "
     "explicitly - from verified evidence - why the exposure is misleading (a specific "
-    "paired-comp premium the market has not recognised, say). If you cannot explain it "
-    "convincingly, keep the value at or below list. A price reduction already taken is downward "
+    "paired-comp premium the market has not recognised, say); if you cannot, say the evidence for "
+    "a value above list is weak. A price reduction already taken is downward "
     "evidence. A QUICK CONTRACT is evidence of strong DEMAND, not evidence of a price - it removes "
     "negative time-on-market pressure and supports confidence around the asking price, but it does "
     "NOT by itself justify an above-list value; the comps and adjustments decide that. Only a "
@@ -244,8 +245,8 @@ _V10_VALUATION_RULES = (
     "with no formulas or weights, through the actual forces that produced the value - the "
     "comparable-sales anchor, the two or three comps that moved it most, any size or "
     "finished-basement normalization, the renovation/condition read and how it was reflected or "
-    "offset, meaningful location/street differences, accessory-space value, market exposure, and "
-    "any list-price cap - then end with one clear indicated value/range. If the value is materially "
+    "offset, meaningful location/street differences, accessory-space value, and market exposure "
+    "- then end with one clear indicated value/range. If the value is materially "
     "above or below the asking price, say explicitly why the closed-sale evidence supports that.\n"
 )
 
@@ -1708,17 +1709,32 @@ def _documented_original_systems(data: Optional[dict]) -> bool:
     # independent of whether the listing happens to also use the word "original"/"dated" - a
     # description built from these facts is just as supported as one that quotes that word.
     return bool(re.search(
-        r"\boil\s+heat\b|\boil[- ]fired\b|\bknob\s+and\s+tube\b|\bfuse\s+box\b|\b\d+\s*amp\s+(?:electric|"
+        # only a small service is dated - "new 200 amp service" is an update, not proof of an old system
+        r"\boil\s+heat\b|\boil[- ]fired\b|\bknob\s+and\s+tube\b|\bfuse\s+box\b|\b(?:30|60|100)\s*-?\s*amps?\s+(?:electric|"
         r"service)\b|\bcast[- ]iron\s+radiators?\b|\bgalvanized\s+(?:pipes?|plumbing)\b",
         blob, re.IGNORECASE,
     ))
 
 
+_RECORD_DAMAGE_RE = re.compile(r"deferred[- ]maintenance|needs?\s+repairs?|\bdamaged?\b", re.IGNORECASE)
+
+
+def _record_documents_damage(blob: str) -> bool:
+    """A record that actually reports damage / needed repairs. "No water damage", "never had damage"
+    and "damage-free" don't count (they matched the old substring test - rule audit 10/24)."""
+    for m in _RECORD_DAMAGE_RE.finditer(blob or ""):
+        pre = blob[max(0, m.start() - 30):m.start()].lower()
+        if re.search(r"\b(?:no|not|never|without|free\s+of|zero)\b[\w\s-]{0,18}$", pre) or \
+                re.match(r"[- ]free\b", blob[m.end():m.end() + 6], re.IGNORECASE):
+            continue
+        return True
+    return False
+
+
 def _documented_deferred_maintenance(data: Optional[dict]) -> bool:
-    """Matches the substring check _factual_prose_blocking uses to decide an age/deferred-
-    maintenance inference is actually backed by the authoritative record."""
-    blob = _authoritative_property_fact_blob(data).lower()
-    return any(x in blob for x in ("deferred maintenance", "deferred-maintenance", "needs repair", "damage"))
+    """Matches the check _factual_prose_blocking uses to decide an age/deferred-maintenance inference
+    is actually backed by the authoritative record."""
+    return _record_documents_damage(_authoritative_property_fact_blob(data))
 
 
 def _documented_condition_deficit(data: Optional[dict]) -> bool:
@@ -2395,7 +2411,10 @@ def _fix_pct_below_list(text: str, list_price: Optional[float], fallback_low: Op
 
     def repl(match: re.Match) -> str:
         preceding = text[max(0, match.start() - 100):match.start()]
-        dollars = list(_DOLLAR_RE.finditer(preceding))
+        # the list price quoted in the sentence is the base, not the figure being compared ("$3.05M vs
+        # the $3.199M list, 4.7% below" became "0.0-4.7% below list" - rule audit 10/24)
+        dollars = [d for d in _DOLLAR_RE.finditer(preceding)
+                   if abs(_parse_dollar(d.group(1), d.group(2)) - list_price) > max(1000, 0.002 * list_price)]
         if dollars:
             recent = dollars[-2:] if len(dollars) >= 2 else dollars[-1:]
             values = [_parse_dollar(d.group(1), d.group(2)) for d in recent]
@@ -2886,8 +2905,6 @@ def classify_from_note(note: str) -> Optional[str]:
 # --------------------------------------------------------------------------------------------
 
 _UNDER_CONTRACT_STATUSES = ("contingent", "active under contract", "under contract", "pending")
-_OFF_MARKET_STATUSES = ("closed", "sold", "withdrawn", "expired", "canceled", "cancelled", "temporarily off market", "off market")
-
 
 def _parse_iso_date(value):
     """A date from an ISO string / datetime / date. None on anything unparseable."""
@@ -3509,7 +3526,10 @@ def _final_polish_pass(text: str, label: str) -> tuple[str, list[str]]:
 
 
 _CLIENT_JARGON_SUBS = [
-    (re.compile(r"\b(?:its\s+)?(?:lower[- ]level|below[- ]grade|basement)\s+(?:area\s+)?normali[sz]ation\b", re.I), "its finished lower level"),
+    # "the adjustment for lower-level space", never "its finished lower level" - that asserted a finished
+    # lower level the home may not have (rule audit 10/24)
+    (re.compile(r"\b(?:its\s+)?(?:lower[- ]level|below[- ]grade|basement)\s+(?:area\s+)?normali[sz]ation\b", re.I),
+     "the adjustment for lower-level space"),
     (re.compile(r"\bis\s+flagged\s+as\s+a\s+statistical\s+outlier\s+and\s+down-?weighted\s+accordingly\b", re.I),
      "differs enough from the other sales that it counts for less"),
     (re.compile(r"\b(?:a\s+)?statistical\s+outlier\b", re.I), "an unusual sale"),
@@ -3550,10 +3570,10 @@ def _firm_up_hedges(text: str, comps: list) -> tuple[str, list[str]]:
     if not text or not comps:
         return text, []
     # per-comp: which dimensions are committed, and the tokens that name that comp
-    comp_dims: list[tuple[set, list[str]]] = []
+    comp_dims: list[tuple[dict, list[str]]] = []
     for i, c in enumerate(comps):
         q = c.get("quality") or {}
-        committed = {d for d in _V10_ALL_DIMS if str(q.get(d) or "") in ("above", "below")}
+        committed = {d: str(q.get(d)) for d in _V10_ALL_DIMS if str(q.get(d) or "") in ("above", "below")}
         if not committed:
             continue
         toks = [f"comp #{i + 1}", f"comp #{i + 1} ", f"comp {i + 1}"]
@@ -3566,15 +3586,18 @@ def _firm_up_hedges(text: str, comps: list) -> tuple[str, list[str]]:
 
     low = text.lower()
 
-    def _committed_near(start: int, end: int, needed: Optional[tuple]) -> bool:
-        window = low[max(0, start - 170):min(len(low), end + 100)]
+    def _committed_near(start: int, end: int, needed: Optional[tuple], want: str) -> bool:
+        # Only firm a hedge whose grammatical subject is the comp ("Comp #2 may be superior"), and only
+        # when the comp's rating points the SAME way - "may be superior" became "is superior" for a comp
+        # rated below the subject, or about the subject itself (rule audit 10/24).
+        sent_start = max(low.rfind(". ", 0, start), low.rfind("\n", 0, start)) + 1
+        before = low[sent_start:start]
         for committed, toks in comp_dims:
-            if not any(t in window for t in toks):
+            hit = max((before.rfind(t) for t in toks), default=-1)
+            if hit < 0 or "subject" in before[hit:]:
                 continue
-            if needed is None:
-                if committed & {"finish_quality", "interior"}:
-                    return True
-            elif committed & set(needed):
+            dims_ok = [d for d in (needed or ("finish_quality", "interior")) if d in committed]
+            if dims_ok and all(committed[d] == want for d in dims_ok):
                 return True
         return False
 
@@ -3583,7 +3606,8 @@ def _firm_up_hedges(text: str, comps: list) -> tuple[str, list[str]]:
     for pat, repl, dims in _V10_HEDGE_SUBS:
         def _sub(m: "re.Match", _repl=repl, _dims=dims) -> str:
             nonlocal changed
-            if _committed_near(m.start(), m.end(), _dims):
+            _want = "below" if re.search(r"dated|less\s+updated|inferior", m.group(0), re.IGNORECASE) else "above"
+            if _committed_near(m.start(), m.end(), _dims, _want):
                 changed = True
                 return m.expand(_repl)
             return m.group(0)
@@ -4020,7 +4044,11 @@ def _strip_under_contract_offer_frame(text: str) -> str:
             and ("not actively negotiating" in low or "guidance" in low or "days on market" in low)
         )
         weak_demand_frame = "days on market are not a sign of weak demand" in low
-        if status_sentence or backup_frame or weak_demand_frame:
+        # the AI restating the backup-offer frame the banner and the offer opener already give
+        # (102 Steeplewood Dr said it three times, 10/24)
+        backup_restated = "backup" in low and bool(re.search(
+            r"\bbenchmark\b|\bserve\s+as\b|should\s+the\s+current\s+contract\s+fall\s+through", low))
+        if status_sentence or backup_frame or weak_demand_frame or backup_restated:
             continue
         kept.append(sentence)
     return " ".join(kept).strip()
@@ -4047,8 +4075,7 @@ def _status_aware_offer_guidance(offer_text: str, timeline: dict) -> tuple[str, 
             "Note: this property is currently under contract (under agreement"
             + (f" after {amd} active-market days" if amd is not None else "")
             + "). The guidance below is for a backup-offer position or buyer analysis only - the "
-            "seller is not actively negotiating new offers, and the listing's earlier days on "
-            "market are not a sign of weak demand."
+            "seller is not actively negotiating new offers."
         )
         if not text:
             return banner, ["Added an 'under agreement' frame to the (empty) offer section."]
@@ -4648,6 +4675,41 @@ def _reconcile_status_mentions(text: str, field_label: str, timeline: dict) -> t
     return out, flags, blocking
 
 
+_DISTANCE_SUPERLATIVE_RE = re.compile(
+    r"\b(the\s+)?(?:closest|nearest)\b(?!\s+(?:match|fit|analog|comparison|parallel|in\s+(?:size|age|style|condition|layout|finish)))",
+    re.IGNORECASE)
+
+def _fix_comp_note_superlatives(text: str, label: str, comp: dict, comps: list[dict]) -> tuple[str, list[str]]:
+    """A comp's own write-up calling it 'the closest' or 'the most recent sale' must be true of the
+    comp set (223 Warren Ct was 'the closest, most recent sale' - 113 Blue Ribbon Way was closer and
+    sold later; 102 Steeplewood Dr, 10/24)."""
+    if not text:
+        return text, []
+    flags: list[str] = []
+    dists = [d for d in (_as_float(c.get("distance_miles")) for c in comps) if d is not None]
+    mine_d = _as_float(comp.get("distance_miles"))
+    dates = [str(c.get("close_date") or c.get("sale_date") or "")[:10] for c in comps]
+    dates = [d for d in dates if d]
+    mine_dt = str(comp.get("close_date") or comp.get("sale_date") or "")[:10]
+    if mine_d is not None and len(dists) >= 2 and mine_d > min(dists) + 0.01:
+        new = _DISTANCE_SUPERLATIVE_RE.sub(lambda m: "a nearby" if m.group(1) else "nearby", text)
+        if new != text:
+            flags.append(f"{label}: called itself the closest comp ({mine_d} mi), but another comp is {min(dists)} mi away - reworded.")
+            text = new
+    if mine_dt and len(dates) >= 2 and mine_dt < max(dates):
+        # dropped, not swapped for "recent" - an 11-month-old sale isn't "recent" either
+        new = re.sub(r"\b(a\s+nearby|the\s+closest|the\s+nearest),?\s+(?:and\s+)?(?:most\s+recent|newest|latest)\s+"
+                     r"(?=sale|comp|comparable|closing)", r"\1 ", text, flags=re.IGNORECASE)
+        new = re.sub(r"\b(?:the\s+)?(?:most\s+recent|newest|latest)\s+(?=sale|comp|comparable|closing)", "a ",
+                     new, flags=re.IGNORECASE)
+        if new != text:
+            flags.append(f"{label}: called itself the most recent sale ({mine_dt}), but another comp sold {max(dates)} - reworded.")
+            text = new
+    text = re.sub(r"\b(the|a)\s+a\s+(nearby)\b", r"a \2", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text, flags
+
+
 def _reconcile_closest_comp_claims(
     text: str, field_label: str, comps: list[dict], comp_num_by_key: dict, addr_by_key: dict,
 ) -> tuple[str, list[str]]:
@@ -4672,7 +4734,8 @@ def _reconcile_closest_comp_claims(
     flags: list[str] = []
     out_parts: list[str] = []
     for chunk, _s, _e in _sentence_chunks(text):
-        if not re.search(r"\b(closest|nearest)\b", chunk, re.IGNORECASE):
+        # "the closest match" is about similarity, not distance - only distance claims are checked
+        if not _DISTANCE_SUPERLATIVE_RE.search(chunk):
             out_parts.append(chunk)
             continue
         chunk_lower = chunk.lower()
@@ -4685,8 +4748,7 @@ def _reconcile_closest_comp_claims(
         if claimed_dist <= true_dist + 0.01:
             out_parts.append(chunk)
             continue
-        fixed = re.sub(r"\bclosest\b", "a nearby", chunk, flags=re.IGNORECASE)
-        fixed = re.sub(r"\bnearest\b", "a nearby", fixed, flags=re.IGNORECASE)
+        fixed = _DISTANCE_SUPERLATIVE_RE.sub(lambda m: "a nearby" if m.group(1) else "nearby", chunk)
         claimed_label = f"Comp #{comp_num_by_key.get(claimed_key)}" if comp_num_by_key.get(claimed_key) else (addr_by_key.get(claimed_key) or "that comp")
         true_label = f"Comp #{comp_num_by_key.get(true_key)}" if comp_num_by_key.get(true_key) else (addr_by_key.get(true_key) or "another comp")
         flags.append(
@@ -4715,6 +4777,23 @@ def _reconcile_original_systems_claim(text: str, field_label: str, subject: dict
     return revised, [f"{field_label}: relabeled an unsupported 'original wiring/plumbing/systems' claim to honest uncertainty wording."]
 
 
+_CONDITION_NEGATION_RE = re.compile(
+    r"\b(?:rather than|instead of|without|not|isn't|doesn't|didn't|never|no|assuming|assume)\b(?:\s+\w+){0,4}\s*$",
+    re.IGNORECASE)
+
+
+def _soften_age_condition_words(text: str) -> str:
+    """'deferred maintenance' / 'age-related wear' asserted without a record finding -> uncertainty
+    wording. A negated mention ("without assuming deferred maintenance") is already the honest
+    wording and is left alone - rewriting it gave "without assuming possible repair items to verify
+    absent specific findings" (8084 Goshen Rd, 10/24). Same negation rule as the blocking check."""
+    def _sub(repl):
+        return lambda m: m.group(0) if _CONDITION_NEGATION_RE.search(m.string[max(0, m.start() - 60):m.start()]) else repl
+    out = re.sub(r"deferred[- ]maintenance", _sub("possible repair items to verify"), text or "", flags=re.IGNORECASE)
+    return re.sub(r"\bage[- ]related\s+(?:wear|defects?|deterioration)\b",
+                  _sub("age alone, without a documented inspection finding"), out, flags=re.IGNORECASE)
+
+
 def _reconcile_age_condition_inference(text: str, field_label: str, subject: dict) -> tuple[str, list[str]]:
     """Mirrors _factual_prose_blocking's 'infers a condition problem from age' hard-fact check for
     subject-level prose (methodology/offer/inspection) - guarantees that check can never fire on
@@ -4722,16 +4801,7 @@ def _reconcile_age_condition_inference(text: str, field_label: str, subject: dic
     ever scanned for blocking."""
     if not text or _documented_deferred_maintenance(subject):
         return text, []
-    revised = re.sub(
-        r"deferred[- ]maintenance",
-        "possible repair items to verify",
-        text, flags=re.IGNORECASE,
-    )
-    revised = re.sub(
-        r"\bage[- ]related\s+(?:wear|defects?|deterioration)\b",
-        "age alone, without a documented inspection finding",
-        revised, flags=re.IGNORECASE,
-    )
+    revised = _soften_age_condition_words(text)
     if revised == text:
         return text, []
     return revised, [f"{field_label}: softened an age-based condition inference to honest uncertainty wording (no documented deferred-maintenance finding)."]
@@ -5068,7 +5138,6 @@ _V10_DOM_EXTENDED_FLOOR = 45.0       # never "extended" exposure before 45 days 
 # anchor-validity escape hatch: a mixed-mode anchor this thin is too weak to bound a value against
 _V10_WEAK_ANCHOR_MAX_WEIGHTED = 3     # <= this many weighted comps in mixed mode is a candidate for "weak"
 _V10_WEAK_ANCHOR_SPREAD_PCT = 10.0    # ...combined with a spread/divergence at least this wide
-_V10_WEAK_ANCHOR_DIVERGENCE_PCT = 12.0
 
 # --- Fix 1: mixed above/below-grade sqft normalization for the $/sqft leg ---------------------
 _V10_SQFT_MIXED_FRAC = 0.12          # a comp with finished below-grade area >= this frac of total is "materially mixed"
@@ -5284,37 +5353,6 @@ def _v10_comp_weight(comp: dict, ev: dict, is_outlier: bool, redundancy_penalty:
     recency = 0.6 if recency is None else max(0.15, float(recency))
     return base * score * recency * (_V10_OUTLIER_PENALTY if is_outlier else 1.0) * max(0.35, min(1.0, redundancy_penalty))
 
-
-def _v10_fit_psf_size_slope(points: list) -> Optional[float]:
-    """OLS slope of $/sqft on sqft, returned ONLY when the fit is genuinely usable (a 3-point or
-    noisy fit is never preferred over the fixed-elasticity fallback - the user was explicit about
-    this). Requires: >= _V10_REGRESSION_MIN_COMPS points; real spread in size (x-range >= 15% of
-    mean size and >= 3 distinct sizes); a NEGATIVE slope (bigger homes trade at a lower $/sqft);
-    R^2 >= _V10_REGRESSION_MIN_R2; and a sane slope magnitude (implied $/sqft swing across the
-    observed size range under 55% of the mean $/sqft). None on any failure -> fixed _V10_BETA."""
-    if len(points) < _V10_REGRESSION_MIN_COMPS:
-        return None
-    xs = [float(x) for x, _ in points]
-    ys = [float(y) for _, y in points]
-    n = len(points)
-    mean_x, mean_y = sum(xs) / n, sum(ys) / n
-    x_range = max(xs) - min(xs)
-    if mean_x <= 0 or x_range < 0.15 * mean_x or len({round(x, -1) for x in xs}) < 3:
-        return None
-    sxx = sum((x - mean_x) ** 2 for x in xs)
-    if sxx <= 0:
-        return None
-    slope = sum((x - mean_x) * (y - mean_y) for x, y in points) / sxx
-    if slope >= 0:
-        return None
-    intercept = mean_y - slope * mean_x
-    ss_tot = sum((y - mean_y) ** 2 for y in ys)
-    ss_res = sum((y - (intercept + slope * x)) ** 2 for x, y in points)
-    if ss_tot <= 0 or (1 - ss_res / ss_tot) < _V10_REGRESSION_MIN_R2:
-        return None
-    if abs(slope) * x_range > 0.55 * mean_y:
-        return None
-    return slope
 
 
 def _miles_between(a: Optional[dict], b: Optional[dict]) -> Optional[float]:
@@ -7055,6 +7093,11 @@ def _apply_continuous_relevance_weighting(
         comp["strength"] = row["proposed_role"]
         if row["proposed_role"] != "weak" and key in _anchor_rows:
             comp["strength"] = _v10_role_from_anchor_row(_anchor_rows[key], comp, subject)
+        # A different school district is never Strong (10/23) - this re-rating ran after the location
+        # review and silently undid it (rule audit 10/24).
+        if _LOC_SCHOOL_NOT_STRONG and _normalize_strength(comp.get("strength")) == "strong" \
+                and _same_district(comp.get("school_district"), (subject or {}).get("school_district")) is False:
+            comp["strength"] = "supporting"
         if key in _anchor_rows:
             # the label the report shows, kept on the anchor row so the report order (Strong first,
             # then by weight) and its self-check use the same thing
@@ -7289,14 +7332,6 @@ _V10_COMP_RENO_RE = re.compile(
     r"new\s+(?:heater|furnace|hvac|roof|windows?|systems?|mechanical\w*|kitchen|bath\w*))\b",
     re.IGNORECASE,
 )
-# ...and that the SUBJECT is the more-original side (usually stated right in the comp's own note)
-_V10_SUBJ_ORIGINAL_RE = re.compile(
-    r"\bsubject('?s)?\b[^.]{0,90}\b(original|largely\s+original|dated|older\s+(?:systems|finish\w*|kitchen|bath\w*)|"
-    r"un-?renovated|un-?updated|behind|century-old|\d{2,3}[\s-]year[\s-]old|not\s+(?:been\s+)?(?:renovat|updat)\w*|"
-    r"should\s+not\s+exceed|character-driven)\b|"
-    r"\bcontrasts?\s+with\s+the\s+subject|\bbehind\s+the\s+subject|\bthan\s+the\s+subject('?s)?\b",
-    re.IGNORECASE,
-)
 # comp is a fixer / as-is / project - materially LESS finished than the subject. Deliberately
 # NARROW and comp-directed: a nuanced note often calls the SUBJECT dated/original ("contrasts with
 # the subject's dated systems"), so bare "dated systems" / "original condition" are NOT cues here -
@@ -7422,9 +7457,12 @@ def _v10_exposure_meaning(state: str, price_cut_pct: float, has_contract_price: 
                            "price. It removes negative time-on-market pressure and supports confidence in the "
                            "current asking neighbourhood, but it does NOT by itself justify a value above list - "
                            "the comps and itemised adjustments decide that."),
-        "under_contract_normal": "Under contract after normal/longer exposure - the accepted contract price (if verified) or the list price is the ceiling; don't argue materially above it.",
+        "under_contract_normal": ("Under contract after normal/longer exposure - the accepted contract price (if verified) "
+                                  "or the list price is the best evidence of what a buyer agreed to pay; a value "
+                                  "materially above it needs clear support from the sales."),
         "normal_exposure": "On the market a normal amount of time with no accepted offer - an FMV above list is allowed but must be justified from verified evidence.",
-        "elevated_exposure": "On the market longer than typical for this comp set with no offer - be skeptical of any value above list; the FMV top is capped at the list price / anchor high.",
+        "elevated_exposure": ("On the market longer than typical for this comp set with no offer - evidence that buyers "
+                              "have not agreed to the asking price yet; a value above list needs strong support from the sales."),
         "extended_exposure": "Extended time on the market with no offer - strong evidence against a value above list; the conclusion should sit near the anchor/list unless paired-market evidence clearly overrides it.",
         "closed": "Already closed - the valuation is retrospective / for comparable analysis only.",
         "not_listed": "Not on the market yet - the owner is choosing a list price now, so the comps alone decide value.",
@@ -7432,7 +7470,7 @@ def _v10_exposure_meaning(state: str, price_cut_pct: float, has_contract_price: 
     if has_contract_price:
         m += " A VERIFIED accepted contract price is available - it is the single strongest evidence point; the FMV should sit within a tight band of it."
     if price_cut_pct and price_cut_pct >= 2:
-        m += f" The price has already been cut ~{price_cut_pct:.0f}% - that reduction is itself downward evidence, and the ceiling is the reduced list, never the original."
+        m += f" The price has already been cut ~{price_cut_pct:.0f}% - that reduction is itself downward evidence - weigh the reduced list, never the original."
     return m
 
 
@@ -7579,6 +7617,17 @@ _V10_ADJ_FAMILIES = [
 ]
 
 
+# Short keywords are whole words: plain substring counting read "space" as a spa, "landscaped" as
+# land and "review" as a view (rule audit 10/24). Stems ("renovat", "remodel") still match as prefixes.
+_ADJ_WHOLE_WORDS = {"spa", "view", "land", "flow", "gym", "adu", "acre", "pool", "lot size", "parcel", "setting", "roof"}
+
+
+@functools.lru_cache(maxsize=256)
+def _adj_kw_re(k: str) -> "re.Pattern":
+    tail = r"(?:s|es)?(?![a-z])" if k in _ADJ_WHOLE_WORDS else ""
+    return re.compile(r"(?<![a-z])" + re.escape(k) + tail)
+
+
 def _v10_adj_family(factor: str, basis: str) -> str:
     """Count-scored, not first-match. A mixed adjustment that names amenities (spa, pool, gym) on
     three separate comps but only mentions "2016 renovation" once, in passing, while explaining
@@ -7591,7 +7640,7 @@ def _v10_adj_family(factor: str, basis: str) -> str:
     t = f"{factor} {basis}".lower()
     best_name, best_score = "other", 0
     for name, kws in _V10_ADJ_FAMILIES:
-        score = sum(t.count(k) for k in kws)
+        score = sum(len(_adj_kw_re(k).findall(t)) for k in kws)
         if score > best_score:
             best_name, best_score = name, score
     return best_name
@@ -8750,14 +8799,14 @@ comps' over-asking results are likely already in its price. When asking_price_ch
 is true, no sale is a close match for this home (much larger or smaller than all of them, heavy
 adjustments, or a low best Match %): do not call it overpriced or underpriced on the strength of
 those sales alone, say plainly that the value is less certain, and keep confidence no higher than
-medium. Never describe the value as "asking-price-based" or argue in the client prose about whether
-the asking price confirms the sales - explain the value from the homes and the market in plain words.
+medium. The report adds its own step-by-step explanation of how the adjusted sales and the asking
+price combine into the value, so don't repeat that arithmetic or use jargon like "asking-price-based"
+- explain the homes and the market in plain words.
 When asking_price_check.passed_over is true, the
 home has been on the market longer than its comps took to sell, so it most likely sells at or a
-little under asking - do not describe competing offers or a premium over asking. Say it in exactly
-that factual way ("has been on the market longer than the fastest comparable sales - a small trim,
-not a sign of distress"); never claim what buyers did or thought ("buyers have passed on it"),
-which the data can't show. Present it as a modest trim to what the adjusted sales say, not as the
+little under asking - do not describe competing offers or a premium over asking. Say that plainly
+and factually (it has been on the market longer than the fastest comparable sales); never claim
+what buyers did or thought ("buyers have passed on it"), which the data can't show. Present it as a modest trim to what the adjusted sales say, not as the
 factor that governs the value. When naming the strongest comparables, name them by address -
 never describe them as a group by a trait not all of them share (e.g. "the quiet-street sales"
 when one of them is on a highway).
@@ -9150,14 +9199,6 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
     }
 
 
-def _cap_passed_over_range(reasoning: dict, check: dict) -> tuple[dict, list]:
-    """A passed-over listing sells at or under its asking price, so its range doesn't reach above
-    it (417 Dogwood Ln v13, 10/21: $490K value, "supported range $475,000-$515,000" on a $500K ask)."""
-    # 10/24 (grader, 417 Dogwood Ln + 102 Steeplewood Dr): the asking price and time on market are
-    # evidence that moves the VALUE (see _asking_price_market_check), not a ceiling on the range - its
-    # ends come from the comparable evidence and its uncertainty. Kept as a no-op so callers stay simple.
-    return reasoning, []
-
 
 _PENDING_STRONG_MATCH = 65      # a pending this good a match can inform the value review
 _PENDING_NUDGE_SHARE = 0.25     # move a quarter of the way toward what the pendings imply...
@@ -9295,7 +9336,7 @@ def _apply_asking_price_check(reasoning: dict, evidence_packet: dict) -> tuple[d
     fmv = float(reasoning["final_fmv"])
     lo, hi = float(check["allowed_low"]), float(check["allowed_high"])
     if lo <= fmv <= hi:
-        return _cap_passed_over_range(reasoning, check)
+        return reasoning, []
     # whole $1,000 inside the band - the raw edge printed as "$1,081,795" (10/24 dry run)
     new = math.floor(hi / 1000) * 1000 if fmv > hi else math.ceil(lo / 1000) * 1000
     out = copy.deepcopy(reasoning)
@@ -9311,7 +9352,6 @@ def _apply_asking_price_check(reasoning: dict, evidence_packet: dict) -> tuple[d
     if abs(scale - 1) > 0.08:
         out["confidence"] = "low"
     out["asking_price_check_applied"] = {**check, "from": round(fmv), "to": round(new)}
-    out, _ = _cap_passed_over_range(out, check)
     return out, [
         f"Asking-price check: the comps' value (${fmv:,.0f}) was {'above' if fmv > hi else 'below'} what homes "
         f"here sell for relative to asking (${check['asking_price']:,.0f} x {check['ratio_used']:.3f} = "
@@ -10077,7 +10117,13 @@ def _strip_internal_data_refs(text: str) -> str:
 
 
 # "weight" as the engine's noun only - "weighted toward cabinets" is ordinary English
-_ENGINE_TERM_RE = re.compile(r"\b(?:(?:location|valuation|comp|its|reduced|lower|full)\s+weights?|anchor(?:s|ed|ing)?)\b", re.IGNORECASE)
+# "anchor" only in the valuation sense - "anchored by a stone fireplace" is ordinary English and its
+# clause used to be cut (rule audit 10/24)
+_ENGINE_TERM_RE = re.compile(
+    r"\b(?:(?:location|valuation|comp|its|reduced|lower|full)\s+weights?"
+    r"|(?:the|comp|comparable[- ]sales?|valuation|weighted)\s+anchors?"
+    r"|anchor(?:ed|ing)?\s+(?:value|figure|to\s+the\s+(?:sales|comps|value)|on\s+the\s+(?:sales|comps))"
+    r"|anchors?\s+(?:the|this)\s+(?:value|valuation))\b", re.IGNORECASE)
 
 
 def _drop_engine_clauses(text: str) -> str:
@@ -10237,16 +10283,7 @@ def _reconcile_comp_hard_facts(
     # never fire on this text waiting on an AI rewrite - guaranteed, deterministically, with zero
     # AI call, before the comp note is ever scanned for blocking.
     if not _documented_deferred_maintenance(subject) and not _documented_deferred_maintenance(comp):
-        revised = re.sub(
-            r"deferred[- ]maintenance",
-            "possible repair items to verify",
-            out, flags=re.IGNORECASE,
-        )
-        revised = re.sub(
-            r"\bage[- ]related\s+(?:wear|defects?|deterioration)\b",
-            "age alone, without a documented inspection finding",
-            revised, flags=re.IGNORECASE,
-        )
+        revised = _soften_age_condition_words(out)
         if revised != out:
             out = revised
             flags.append(f"{label}: softened an age-based condition inference to honest uncertainty wording (no documented deferred-maintenance finding).")
@@ -10319,6 +10356,27 @@ def _reconcile_comp_hard_facts(
         _subject_sizes = _documented_sqft_values(subject)
         if raw_value and any(abs(raw_value - known) <= max(2, 0.002 * known) for known in _subject_sizes) \
                 and not any(abs(raw_value - known) <= max(2, 0.002 * known) for known in allowed):
+            rebuilt.append(replacement)
+            pos = match.end()
+            continue
+        # A size DIFFERENCE ("roughly 1,100 sq ft smaller") is checked against the gap between the
+        # two homes, never "corrected" to the comp's own size - that turned a true 1,120 sq ft gap
+        # into "3,750 sq ft smaller" (8084 Goshen Rd, 10/24 rule audit).
+        _after = out[match.end():match.end() + 40].lower()
+        if raw_value and re.match(r"\s*(?:\([^)]*\)\s*)?(?:smaller|larger|bigger|more|less|fewer|of\s+additional)\b", _after):
+            _gaps = {abs(s - c) for s in _documented_sqft_values(subject) for c in _documented_sqft_values(comp)}
+            if not any(abs(raw_value - g) <= max(50, 0.08 * g) for g in _gaps):
+                replacement = ""
+                rebuilt[-1] = re.sub(r"(?:\b(?:roughly|about|nearly|approximately|around|some)\s+|\s)$", " ",
+                                     rebuilt[-1], flags=re.IGNORECASE)
+                flags.append(f"{label}: dropped an unsupported {raw_value:,.0f} sq ft size-difference figure.")
+            rebuilt.append(replacement)
+            pos = match.end()
+            continue
+        # The comp's own documented size on another basis (its total quoted where the wording reads
+        # as above-grade) is a true record figure - not an "unsupported component-area claim".
+        if raw_value and not is_subject and not any(abs(raw_value - known) <= max(2, 0.002 * known) for known in allowed) \
+                and any(abs(raw_value - known) <= max(2, 0.002 * known) for known in _documented_sqft_values(comp)):
             rebuilt.append(replacement)
             pos = match.end()
             continue
@@ -10826,6 +10884,14 @@ def _stucco_inspection_paragraph(subject: dict) -> Optional[str]:
         return ("**Stucco / EIFS:** The listing reports stucco on this pre-1980 home. " + assembly +
                 "Have the general inspector check its visible condition and confirm what it sits on; invasive "
                 "moisture testing is only worth doing if the construction or an actual finding calls for it.")
+    if yb and 1985 <= yb <= 2012 and not ("concrete block" in facts or "cmu" in facts):
+        # A stone front on a 1985-2012 home is veneer - its stucco is almost always over wood framing,
+        # the build era behind the region's hidden stucco-moisture problems (102 Steeplewood Dr, 2001,
+        # was told invasive testing was "only if" - the listing's "stone" was read as masonry walls).
+        return (f"**Stucco / EIFS:** The listing reports stucco on this {int(yb)} home. Stucco from this era is "
+                "usually applied over wood framing, where hidden moisture damage is a known concern in this "
+                "region. Ask the seller for any prior stucco moisture inspection and repair records, and consider "
+                "a qualified stucco specialist's moisture test as part of the inspection.")
     if masonry and not wood:
         return ("**Stucco / EIFS:** Stucco is reported with masonry/stone construction. Have the general "
                 "inspector assess visible condition and confirm the wall assembly; invasive moisture "
@@ -10891,18 +10957,18 @@ def _reconcile_inspection_fact_prose(text: str, subject: dict) -> tuple[str, lis
                 flags.append("Inspection concerns: removed an unsupported skylight reference.")
                 p = p2
         if p and re.search(r"\boriginal\b", p, re.IGNORECASE):
-            p2 = re.sub(
-                r"(?:confirm|verify|determine)\s+whether\s+(.{1,100}?)\s+(?:is|are|remain)\s+original(?:\s+to\s+[^.;]+)?",
-                lambda m: f"Verify the age, condition, and service history of {m.group(1).strip()}",
-                p, flags=re.IGNORECASE,
-            )
+            # "confirm whether the roof is original or has been replaced" is a question to put to the
+            # inspector, not a claim - it stays. (Rewriting it gave "Verify the age, condition, and
+            # service history of it or has been replaced", 102 Steeplewood Dr, 10/24.)
+            p2 = p
             if not _documented_original_elements(subject):
                 p2 = re.sub(
                     r"\b((?:these|those|the)\s+)?original\s+(?:architectural\s+)?elements\b",
                     lambda m: f"{m.group(1) or ''}documented architectural elements",
                     p2, flags=re.IGNORECASE,
                 )
-            if re.search(r"\b(?:is|are|was|were|remain)\s+original\b", p2, re.IGNORECASE):
+            _asserts = re.sub(r"\b(?:whether|if)\b[^.;]{0,120}?\boriginal\b", "", p2, flags=re.IGNORECASE)
+            if re.search(r"\b(?:is|are|was|were|remain)\s+original\b", _asserts, re.IGNORECASE):
                 p2 = ""
             if p2 != p:
                 flags.append("Inspection concerns: removed an undocumented claim that a feature or component is original.")
@@ -11090,7 +11156,9 @@ def _factual_prose_blocking(
         blocking.append(f"{label}: says a home sold/was offered as-is, but no record documents an as-is sale.")
     if "skylight" in low and "skylight" not in facts and "skylight" not in comp_facts:
         blocking.append(f"{label}: mentions skylights, but skylights are not documented in the supplied property facts.")
-    if re.search(r"\b(?:is|are|was|were|remain)\s+original\b", text, re.IGNORECASE) \
+    # "confirm whether the roof is original" asks the question - only an assertion counts
+    if re.search(r"\b(?:is|are|was|were|remain)\s+original\b",
+                 re.sub(r"\b(?:whether|if)\b[^.;]{0,120}?\boriginal\b", "", text, flags=re.IGNORECASE), re.IGNORECASE) \
             and "original" not in facts and "original" not in comp_facts:
         blocking.append(f"{label}: claims a feature is original without supporting property data.")
     if re.search(r"\boriginal\s+(?:wiring|plumbing|systems?)\b", text, re.IGNORECASE) \
@@ -11114,8 +11182,7 @@ def _factual_prose_blocking(
             r"\b(?:rather than|instead of|without|not|isn't|doesn't|didn't|never|no)\b(?:\s+\w+){0,4}\s*$",
             pre, re.IGNORECASE,
         ))
-    if not any(x in facts for x in ("deferred maintenance", "deferred-maintenance", "needs repair", "damage")) \
-            and not any(x in comp_facts for x in ("deferred maintenance", "deferred-maintenance", "needs repair", "damage")):
+    if not _record_documents_damage(facts) and not _record_documents_damage(comp_facts):
         _deferred_matches = list(re.finditer(r"deferred[- ]maintenance", text, re.IGNORECASE))
         _deferred_matches += list(re.finditer(r"\bage[- ]related\s+(?:wear|defects?|deterioration)\b", text, re.IGNORECASE))
         if any(not _negated_condition_claim(m) for m in _deferred_matches):
@@ -11911,11 +11978,23 @@ def _ensure_lower_level_inspection_item(text: str, subject: Optional[dict]) -> s
     if not m:
         return text
     around = blob[max(0, m.start() - 120):m.end() + 120]
-    year = re.search(r"\b(19[5-9]\d|20[0-4]\d)\b", around)
-    when = f" (added {year.group(1)})" if year else ""
-    item = (f"**Lower-Level Suite{when}:** The listing describes a bedroom suite in the finished lower level. "
-            "Confirm it was permitted and passed inspection, that the bedroom's egress window meets code, and "
-            "have the inspector check the lower-level bathroom's plumbing, venting and any signs of moisture.")
+    # Say only what the listing matched - it always said "bedroom suite ... egress window" even when the
+    # match was a bathroom or an addition, and took any nearby year as the year it was added (rule audit 10/24).
+    words = m.group(0).lower()
+    has_bed = bool(re.search(r"\b(?:bedroom|suite)\b", words))
+    has_bath = bool(re.search(r"\bbath", words)) or bool(re.search(r"\bfull bath", around, re.IGNORECASE))
+    year = re.search(r"\b(?:added|built|finished|completed|renovated|addition)\b[^.]{0,25}?\b(19[5-9]\d|20[0-4]\d)\b"
+                     r"|\b(19[5-9]\d|20[0-4]\d)\b[^.]{0,15}?\b(?:addition|renovation)\b"
+                     r"|\bin\s+(19[5-9]\d|20[0-4]\d)\b(?=[^.]{0,120}?\b(?:added|built|finished|completed)\b)", around, re.IGNORECASE)
+    when = f" (added {next(g for g in year.groups() if g)})" if year else ""
+    what = ("a bedroom suite" if has_bed else "an addition" if "addition" in words else "a full bathroom")
+    checks = ["Confirm it was permitted and passed inspection"]
+    if has_bed:
+        checks.append("that the bedroom's egress window meets code")
+    tail = (", and have the inspector check the lower-level bathroom's plumbing, venting and any signs of moisture."
+            if has_bath else ", and have the inspector check for any signs of moisture.")
+    item = (f"**Lower-Level {'Suite' if has_bed else 'Space'}{when}:** The listing describes {what} in the lower level. "
+            + ", ".join(checks) + tail)
     return text.rstrip() + "\n\n" + item
 
 
@@ -12748,6 +12827,13 @@ def _v10_asking_gap_sentence(methodology: str, *, final: Optional[dict], trace: 
     gap = (ask - a) / a * 100
     if abs(gap) < _ASKING_GAP_NOTE_PCT:
         return methodology, []
+    if _BRIDGE_MARK in methodology:
+        # the value bridge already gives both figures - only the "loose fit" caution is new
+        if ((trace or {}).get("anchor") or {}).get("loose_fit") and "rough guide" not in methodology:
+            return methodology.rstrip() + (" None of the comparable sales is a close match for this home, so treat "
+                                           "the adjusted-sales figure as a rough guide."), [
+                "Methodology summary: noted that the adjusted-sales figure is a rough guide (no close match)."]
+        return methodology, []
     sentence = (f" The ${ask:,.0f} asking price is about {round(abs(gap))}% {'above' if gap > 0 else 'below'} "
                 f"{_ASKING_GAP_MARK} (about ${round(a, -3):,.0f}).")
     if ((trace or {}).get("anchor") or {}).get("loose_fit"):
@@ -13187,20 +13273,6 @@ _OLD_BRIDGE_RE = re.compile(
 _RANGE_TOP_MARK = "range stops at the"
 
 
-def _v10_range_top_at_asking_sentence(methodology: str, *, final: Optional[dict],
-                                      trace: Optional[dict]) -> tuple[str, list[str]]:
-    """The range top was held at asking because the home has sat (_cap_passed_over_range): say so,
-    or the range reads lopsided ($470K-$500K around $490K - grader, v16)."""
-    apc = (trace or {}).get("asking_price_check") or {}
-    ask = _as_float(apc.get("asking_price"))
-    hi = _as_float((final or {}).get("range_max")) or _as_float((final or {}).get("range_high"))
-    if not methodology or not apc.get("passed_over") or not ask or not hi or abs(hi - ask) > 1000 \
-            or _RANGE_TOP_MARK in methodology:
-        return methodology, []
-    sentence = (f" The {_RANGE_TOP_MARK} ${ask:,.0f} asking price because the home hasn't drawn an accepted "
-                "offer at that price yet - homes that sit longer than their comps rarely sell above asking.")
-    return methodology.rstrip() + sentence, ["Methodology summary: explained why the range stops at the asking price."]
-
 
 def _v10_anchor_direction_core(methodology: str, *, final: Optional[dict],
                                trace: Optional[dict]) -> tuple[str, list[str]]:
@@ -13400,9 +13472,12 @@ def _reconcile_post_gate_prose(fields: dict, *, value: float, range_pct: float,
     # 1c) Fix 4 - whether or not the gate fired: if the final value sits materially above or below
     #     the asking price and the methodology never says WHY (from the closed-sale evidence), add
     #     a one-line deterministic explanation grounded in the trace.
+    #     Not when the value bridge will state the adjusted sales, the asking price and every step
+    #     between them - this line then said the same thing a second time (rule audit 10/24).
     _ask = _as_float((trace or {}).get("subject_asking"))
     m_label0, m_text0 = out.get("m", ("Methodology summary", ""))
-    if m_text0 and _ask and abs(value - _ask) > max(0.02 * _ask, 20000):
+    _bridge_will_explain = bool(_bridge_client_text((trace or {}).get("value_bridge")))
+    if m_text0 and _ask and abs(value - _ask) > max(0.02 * _ask, 20000) and not _bridge_will_explain:
         _rel = "above" if value > _ask else "below"
         _has_why = re.search(
             rf"{_rel}\s+(?:the\s+)?(?:\$\s*[\d,]+(?:\.\d+)?\s*)?(?:asking|list)",
@@ -13974,11 +14049,6 @@ def _v10_methodology_consistency_check(fields: dict, final: dict) -> tuple:
     return out, blocking, notes
 
 
-_OFFSET_CLAIM_RE = re.compile(
-    r"(offset|offsets|offsetting|counterbalanc\w*|compensat\w*|balanced?\s+(?:out\s+)?(?:by|against)|"
-    r"made\s+up\s+for|cancels?\s+out|washes?\s+out|neutraliz\w*|nets?\s+(?:out|to\s+(?:about\s+)?(?:zero|neutral)))",
-    re.IGNORECASE,
-)
 _OFFSET_FEATURE_MAP = (
     ("a guest apartment / accessory dwelling", {"accessory_dwelling", "layout_space"},
      re.compile(r"guest\s+(?:apartment|house|cottage|suite|quarters)|carriage\s+house|pool\s+house|"
@@ -14431,15 +14501,6 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
     }
 
 
-def _v10_pct_phrase(x: float, ref: float) -> str:
-    """'about 2% above' / 'roughly at' / 'about 3% below' - grammatically safe range wording."""
-    if not ref:
-        return ""
-    d = (x - ref) / ref * 100
-    if abs(d) < 1:
-        return "roughly at"
-    return f"about {round(abs(d))}% {'above' if d > 0 else 'below'}"
-
 
 def _v10_pct_range_phrase(low: float, high: float, ref: float) -> str:
     """Describe both endpoints of a numeric offer band relative to one reference price."""
@@ -14646,8 +14707,9 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
         kept.append("Keep an appraisal contingency as well, so you're protected if the lender's appraisal comes in "
                     "below your price.")
     body = " ".join(kept).strip()
-    # "septic-alternative sewer connection" is the model's odd way of saying public sewer (v12, 10/22)
-    body = re.sub(r"\bseptic[- ]alternative sewer(?: connection)?\b", "public sewer connection", body, flags=re.IGNORECASE)
+    # "septic-alternative sewer connection" is the model's odd phrasing (v12, 10/22) - plain "sewer
+    # connection", without asserting a public sewer this function can't check against the record
+    body = re.sub(r"\bseptic[- ]alternative sewer(?: connection)?\b", "sewer connection", body, flags=re.IGNORECASE)
     new_text = (opener + (" " + body if body else "")).strip()
     return new_text, ["Offer strategy: the opening-offer figures were rebuilt deterministically from the final "
                       "FMV and the actual list price (the AI's own numeric opener was replaced)."]
@@ -14764,7 +14826,7 @@ def _v10_offer_sanity_check(offer_text: str, band: Optional[dict], range_min: Op
 
     # wrong valuation range
     if range_min and range_max and fmv:
-        for m in re.finditer(r"\$\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?\s*(?:to|[-â€“â€”]|and)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?", txt):
+        for m in re.finditer(r"\$\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?\s*(?:to|[-–—]|and)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*([MmKk])?", txt):
             lo = _parse_dollar(m.group(1), m.group(2))
             hi = _parse_dollar(m.group(3), m.group(4))
             if lo < 100000 or hi < 100000 or hi <= lo:
@@ -15173,19 +15235,6 @@ async def _finalize_gate_reconciled_prose(
     # item #2: the Offer Suggestion must be built from the FINAL valuation, not a pre-final figure.
     _offer_stale_block = _v10_offer_final_valuation_check(offer, _final, valuation_trace)
     _scan_block += _offer_stale_block
-
-    def _soften_all(m_txt, o_txt, i_txt, vds):
-        out_flags: list = []
-        res = []
-        for t in (m_txt, o_txt, i_txt):
-            t2, n = _soften_unsupported_system_claims(t, enriched_subject)
-            res.append(t2)
-            out_flags += n
-        for d in vds or []:
-            if isinstance(d, dict) and d.get("note"):
-                d["note"], n = _soften_unsupported_system_claims(d["note"], enriched_subject)
-                out_flags += n
-        return res[0], res[1], res[2], out_flags
 
     # ---- 3 + 4. QA (pass 1)
     qa_result, corrected, f1, b1 = _run_qa(methodology, offer, inspection, value_drivers)
@@ -15722,9 +15771,23 @@ async def _auto_repair_export_blocks(
     def repair_comp(idx: int, rnd: int) -> None:
         comp = comps[idx]
         label = _comp_label(idx, comp)
+        # The agent's own words (commentary that isn't a copy of the AI note) are never deleted or
+        # rebuilt from a template - only the safe fact rewrites run, and the rest is flagged for them.
+        _agent_owned = bool(str(comp.get("commentary") or "").strip()) and \
+            str(comp.get("commentary") or "").strip() != str(comp.get("ai_commentary") or "").strip()
         for fld in ("ai_commentary", "commentary"):
             txt = comp.get(fld) or ""
+            if not _agent_owned and fld == "commentary":
+                if comp.get("ai_commentary"):
+                    comp["commentary"] = comp["ai_commentary"]
+                continue
             if not comp_blocks(idx, txt):
+                continue
+            if fld == "commentary":
+                t, _ff = _fact_check.fix_text(txt, subject=subject, comp=comp, who=label)
+                comp[fld] = t
+                flags.append(f"review: {label} - your own comp note may contain a claim the records don't support; "
+                             "it was left as you wrote it.")
                 continue
             t = _fix_subject_condition_words(txt, subject)
             t, _ff = _fact_check.fix_text(t, subject=subject, comp=comp, who=label)
@@ -15786,6 +15849,8 @@ async def _auto_repair_export_blocks(
         for fld in ("ai_commentary", "commentary"):
             if comps[idx].get(fld):
                 comps[idx][fld], _ff = _fact_check.fix_text(comps[idx][fld], subject=subject, comp=comps[idx], who=lbl)
+                flags += _ff
+                comps[idx][fld], _ff = _fix_comp_note_superlatives(comps[idx][fld], lbl, comps[idx], comps)
                 flags += _ff
     blocking = list(dict.fromkeys([
         *blocking, *recheck_external(),
@@ -16041,8 +16106,8 @@ def _format_anchor_block(anchor: Optional[dict], exposure: dict) -> str:
         _ncl = (anchor or {}).get("closed_comp_count", 0)
         L.append(f"  Comp anchor: NOT AVAILABLE - only {_ncl} verified closed sale(s) and fewer than two usable "
                  "Strong/Supporting comps overall. Give your best appraiser estimate in `value`; the system will "
-                 "publish a PROVISIONAL WIDE RANGE at LOW confidence, marked 'Insufficient Comparable Evidence' and "
-                 "held for agent review before it can be exported. Do NOT present a precise number.")
+                 "publish a PROVISIONAL WIDE RANGE at LOW confidence, marked 'Insufficient Comparable Evidence', "
+                 "with a review note for the agent. Do NOT present a precise number.")
     L.append("MARKET EXPOSURE (the subject's own listing behaviour - real evidence about achievable price):")
     L.append(f"  State: {exposure['state']}   |   active-market days: {exposure.get('active_market_days')}   |   {exposure['dom_basis']}")
     if exposure.get("current_list_price"):
@@ -16050,18 +16115,15 @@ def _format_anchor_block(anchor: Optional[dict], exposure: dict) -> str:
         if exposure.get("original_list_price") and exposure["original_list_price"] != exposure["current_list_price"]:
             cl += f" (original list ${exposure['original_list_price']:,}, reduced {exposure['price_cut_pct']}%)"
         L.append(cl)
-    if exposure.get("exposure_ceiling"):
-        L.append(f"  Above-ask ceiling: ${exposure['exposure_ceiling']:,} - a final value above this needs "
-                 "paired-market-evidence adjustments to cover the gap, or the system pulls it back down.")
-    if exposure.get("hard_upper"):
-        L.append(f"  Hard upper cap for this exposure state: ${exposure['hard_upper']:,}.")
+    # No "above-ask ceiling" / "hard upper cap" lines any more: the asking price is evidence, never a cap
+    # (10/24). They told this pass a cap existed that the final valuation no longer applies.
     L.append(f"  {exposure['meaning']}")
     if exposure.get("relisted_note"):
         L.append(f"  {exposure['relisted_note']}")
     L.append("HOW TO USE THIS: start from the anchor; put every material qualitative difference in "
              "`qualitative_adjustments` (each with basis_type + written basis); set `value` = anchor + your "
-             "adjustments as a cross-check. The system bounds the adjustments and applies the exposure "
-             "constraint to produce the authoritative FMV.")
+             "adjustments as a cross-check. A separate final-valuation pass weighs this evidence, the asking "
+             "price and the market's pace to set the final value.")
     return "\n".join(L)
 
 
@@ -17463,7 +17525,9 @@ async def _generate_ai_analysis_impl(
             opening_high = _as_float(_of.get("opening_offer_high"))
             strong_offer = _as_float(_of.get("strong_offer"))
             if _is_blank(new_pricing.get("estimated_fair_value")):
-                new_pricing["estimated_fair_value"] = _round_to_5k(value)
+                # Same $1,000 rounding as the offer figures and the value bridge - at $5,000 a $452,400
+                # value showed as $450,000 next to a $452,000 strong offer (rule audit 10/24).
+                new_pricing["estimated_fair_value"] = int(round(value, -3))
             if opening_low is not None and _is_blank(new_pricing.get("suggested_offer_min")):
                 new_pricing["suggested_offer_min"] = round(opening_low)
             # Suggested Offer Max is the "most you should feel comfortable paying" ceiling
@@ -18108,7 +18172,14 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
                 _old_comfort_ceiling = _old_value
             if _old_strong is None and _old_open_low and _old_value:
                 _old_strong = _round_to_5k(_old_open_low + 0.75 * (_old_value - _old_open_low))
-            _replace_ai_owned("estimated_fair_value", _round_to_5k(value), _round_to_5k(_old_value) if _old_value else None)
+            # $1,000 rounding now (matches the offers); a report filled under the old $5,000 rounding
+            # still counts as AI-owned
+            _old_fv = None
+            if _old_value:
+                _cur_fv = _as_float(new_pricing.get("estimated_fair_value"))
+                _old_fv = _round_to_5k(_old_value) if _cur_fv is not None and round(_cur_fv) == _round_to_5k(_old_value) \
+                    else int(round(_old_value, -3))
+            _replace_ai_owned("estimated_fair_value", int(round(value, -3)), _old_fv)
             if _new_open_low is not None:
                 _replace_ai_owned("suggested_offer_min", round(_new_open_low), round(_old_open_low) if _old_open_low else None)
             # Suggested Offer Max = top of the opening band (what the client sees). Older reports

@@ -469,7 +469,7 @@ def test_passed_over_drops_short_exposure_and_no_signal_lines():
             "(given the well and septic-alternative sewer connection).")
     out, _ = ai._v10_rebuild_buyer_offer_prose(text, band, 0.04)
     assert "short market exposure" not in out and "no strong signal" not in out
-    assert "public sewer connection" in out and "septic-alternative" not in out
+    assert "sewer connection" in out and "septic-alternative" not in out and "public sewer" not in out
 
 
 def test_subject_total_size_in_a_comp_note_is_left_alone():

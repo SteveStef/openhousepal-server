@@ -165,7 +165,9 @@ async def subject_from_listing(db: AsyncSession, listing_key: str) -> Optional[D
     # Heating fuel is its own Bright field (HeatingFuel, e.g. "Propane - Owned") - add it in the
     # form's own words so the Heating Fuel box isn't blank (10/20).
     fuel_text = (_join_mls_list(raw.get("HeatingFuel")) or "").lower()
-    fuel = next((name for name, words in (("Natural Gas", ("natural gas", "gas")), ("Propane", ("propane",)),
+    # propane first: Bright's "Bottled Gas" / "LP Gas" contain "gas" and read as natural gas (rule audit 10/24)
+    fuel = next((name for name, words in (("Propane", ("propane", "bottled gas", "lp gas", "lpg", "liquid petroleum")),
+                                          ("Natural Gas", ("natural gas", "gas")),
                                           ("Oil", ("oil",)), ("Electric", ("electric",))) if any(w in fuel_text for w in words)), None)
     if fuel and fuel not in (subject.get("heating") or ""):
         subject["heating"] = ", ".join(x for x in (subject.get("heating"), fuel) if x)
@@ -970,14 +972,14 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
             # Basement/BasementYN weren't populated in the raw MLS payload for this listing -
             # before giving up, check the parsed below_grade_finished_area/has_basement columns,
             # since Bright sometimes only reports basement presence through square footage, not
-            # the Basement/BasementYN fields. Always resolves to an explicit "None" rather than
-            # silently leaving the stat blank, so the frontend can show "no basement" instead of
-            # hiding the field entirely.
+            # the Basement/BasementYN fields. "None" only when the record says there is no basement -
+            # an unknown basement stays blank (it used to print, and reach the AI, as "no basement";
+            # rule audit 10/24).
             if p.below_grade_finished_area:
                 basement = "Finished"
             elif p.has_basement is True:
                 basement = "Yes"
-            else:
+            elif p.has_basement is False:
                 basement = "None"
 
         candidates.append(CmaCompCandidate(
@@ -1185,7 +1187,7 @@ def plan_auto_search(candidates: List[CmaCompCandidate], family: Optional[str], 
 
     def usable(radius: float, days: int) -> int:
         return sum(1 for c in candidates
-                   if (c.distance_miles or 0) <= radius and (_sale_age_days(c, today) or 0) <= days
+                   if (c.distance_miles or 0) <= radius and (_sale_age_days(c, today) if _sale_age_days(c, today) is not None else 9999) <= days
                    and _auto_pickable(c) and (c.match_score or 0) >= AUTO_USABLE_MIN_SCORE and era_ok(c))
 
     steps, chosen = [], None
@@ -1335,7 +1337,7 @@ async def auto_search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *
         plan = plan_auto_search(pool, family, today=date_to, subject_year=(req.subject.year_built if req.subject else None))
     chosen = [c for c in pool
               if (c.distance_miles or 0) <= plan["radius_miles"]
-              and (_sale_age_days(c, date_to) or 0) <= plan["sold_within_days"]]
+              and (_sale_age_days(c, date_to) if _sale_age_days(c, date_to) is not None else 9999) <= plan["sold_within_days"]]
     outside: List[CmaCompCandidate] = []
     if lp and _AUTO_PRICE_SHOW_BAND > _AUTO_PRICE_BAND:
         try:
