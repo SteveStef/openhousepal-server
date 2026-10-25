@@ -245,7 +245,7 @@ def test_history_sentence_for_a_relisted_recent_flip():
                "earlier_listings": [{"listed": "2026-08-13", "ended": "2026-10-06"}],
                "last_sale": {"date": "2026-03-13", "price": 200000}}
     out = fc.history_sentence("The value is $395,000.", summary, today=date(2026, 10, 24))
-    assert "about 72 days on the market in total" in out and "Aug 13, 2026" in out and "$200,000" in out
+    assert "on the market about 72 days in total" in out and "Aug 13, 2026" in out and "$200,000" in out
     assert fc.history_sentence(out, summary, today=date(2026, 10, 24)) == out      # said once
     assert fc.history_sentence("x.", {"relisted": False}, today=date(2026, 10, 24)) == "x."
 
@@ -271,6 +271,11 @@ def test_nearest_road_is_not_a_comp_superlative():
     t = "It sits on a quieter street, with the nearest major road a couple of blocks off."
     assert ai._fix_comp_note_superlatives(t, "Comp #1", comps[0], comps)[0] == t
     assert "closest" not in ai._fix_comp_note_superlatives("It is the closest sale.", "Comp #1", comps[0], comps)[0]
+
+
+def test_thoughtfully_renovated_counts_as_documented():
+    assert ai._documented_condition_renovated({"public_remarks": "Welcome to this thoughtfully renovated home, featuring top-to-bottom upgrades."})
+    assert not ai._documented_condition_renovated({"public_remarks": "Bring your ideas - this home needs renovation throughout."})
 
 
 def test_mojibake_dash_fixed_in_range_pattern():

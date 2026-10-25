@@ -1763,7 +1763,13 @@ def _documented_condition_renovated(data: Optional[dict]) -> bool:
         r"newly\s+built|extensively\s+renovat\w+|gut[\s-]?renovat\w+|completely\s+renovat\w+|"
         r"total(?:ly)?\s+renovat\w+|newly\s+renovat\w+|recently\s+renovat\w+|"
         r"renovated\s+(?:kitchen|bath)|new\s+(?:kitchen|bath\w*|roof|windows?|hvac|systems?)|"
-        r"recently\s+updated|shows\s+like\s+(?:a\s+)?(?:brand[\s-]+)?new)\b",
+        r"recently\s+updated|shows\s+like\s+(?:a\s+)?(?:brand[\s-]+)?new|"
+        # 4913 Chancellor St, 10/24: "thoughtfully renovated home, featuring top-to-bottom upgrades" didn't
+        # count, so every comp note mentioning the subject's renovation was sent back for an AI rewrite
+        r"(?:beautifully|thoughtfully|tastefully|meticulously|stunningly|expertly|lovingly|just|freshly)\s+"
+        r"(?:renovat\w+|remodel\w+|rehabbed|restored)|"
+        r"top[\s-]+to[\s-]+bottom\s+(?:renovation|remodel\w*|upgrades?|rehab)|"
+        r"renovated\s+(?:in|during)\s+(?:19|20)\d\d|(?:19|20)\d\d\s+(?:full\s+|gut\s+)?renovation)\b",
         blob, re.IGNORECASE,
     ))
 

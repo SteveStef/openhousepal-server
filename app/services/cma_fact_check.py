@@ -632,13 +632,14 @@ def summarize_history(events: list, *, current_list_date=None, today=None) -> di
                               "ended": p["end"].isoformat() if p.get("end") else None, "end_event": p.get("end_event"),
                               "days": p.get("days")} for p in sorted(chain, key=lambda p: p["start"])],
         "relisted": bool(chain),
+        "current_listed": current["start"].isoformat() if current and current.get("start") else None,
         "current_listing_days": cur_days,
         "marketing_days_total": (chain_days + (cur_days or 0)) if chain else None,
         "lines": lines,
     }
 
 
-_HISTORY_MARK = "days on the market in total"
+_HISTORY_MARK = "days in total"
 
 
 def _nice_date(s) -> str:
@@ -658,9 +659,11 @@ def history_sentence(methodology: str, summary: Optional[dict], *, today=None) -
     first = (s.get("earlier_listings") or [{}])[0]
     if s.get("relisted") and s.get("marketing_days_total") and first.get("listed"):
         ended = first.get("ended")
-        bits.append(f"This home has been for sale about {s['marketing_days_total']} {_HISTORY_MARK}: first listed "
+        rel = s.get("current_listed")
+        bits.append(f"This home has been on the market about {s['marketing_days_total']} {_HISTORY_MARK}: first listed "
                     f"{_nice_date(first['listed'])}" + (f", taken off the market {_nice_date(ended)}" if ended else "")
-                    + " and relisted since - one marketing effort, not a new listing.")
+                    + (f" and relisted {_nice_date(rel)}" if rel else " and relisted")
+                    + " - one marketing effort, not a new listing.")
     ls = s.get("last_sale") or {}
     sold = _d(ls.get("date"))
     if sold and ls.get("price") and ((today or date.today()) - sold).days <= 3 * 365:
