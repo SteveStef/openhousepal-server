@@ -278,6 +278,18 @@ def test_thoughtfully_renovated_counts_as_documented():
     assert not ai._documented_condition_renovated({"public_remarks": "Bring your ideas - this home needs renovation throughout."})
 
 
+def test_smaller_home_lower_psf_is_not_explained_by_size():
+    chan = {"sqft": 2010, "above_grade_finished_area": 2010}
+    locust = {"sqft": 1760, "above_grade_finished_area": 1760}
+    t = ("This home sold fully renovated but on a smaller footprint (1,760 sqft vs the subject's 2,010), which largely "
+         "explains why its $206 per above-grade sq ft lands below the subject's $224 list rate. It closed at $362,000.")
+    out, flags = fc.fix_text(t, subject=chan, comp=locust, who="Comp #1")
+    assert "explains why" not in out and "(1,760 sqft vs the subject's 2,010), and its $206" in out and flags
+    # the economically right direction is left alone (5146 Sansom St, 1,200 sqft, $254 > $224)
+    ok = "At 1,200 sqft it is far smaller, which explains why its $254 per above-grade sq ft is above the subject's $224."
+    assert fc.fix_text(ok, subject=chan, comp={"sqft": 1200}, who="Comp #2")[0] == ok
+
+
 def test_mojibake_dash_fixed_in_range_pattern():
     src = open(ai.__file__, encoding="utf-8").read()
     assert "â€" not in src

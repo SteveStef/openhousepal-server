@@ -432,6 +432,33 @@ def fix_size_claims(text: str, subject: Optional[dict], comp: Optional[dict]) ->
     return out, flags
 
 
+# "...on a smaller footprint (1,760 vs 2,010 sqft), which largely explains why its $206/sqft lands below the
+# subject's $224" - backwards: smaller homes sell for MORE per square foot (grader 10/24, 4913 Chancellor St;
+# the same report's 5146 Sansom St note had it right). The causal link goes; the facts stay.
+_CAUSE_RE = re.compile(r",?\s*(?:which|this|that)\s+(?:largely\s+|mostly\s+|partly\s+|likely\s+|probably\s+|mainly\s+)?"
+                       r"(?:explains|accounts\s+for)\s+why\b|,?\s*(?:largely\s+|mostly\s+)?explaining\s+why\b", re.I)
+_PSF_DIR_RE = re.compile(r"(?:\$\s*[\d,]+\s*(?:per|/)\s*(?:above[- ]grade\s+)?(?:sq\.?\s*ft|sqft|square\s+f(?:oo|ee)t)|"
+                         r"per[- ](?:square[- ]f(?:oo|ee)t|sq\.?\s*ft))[^.;]{0,80}?\b(below|under|lower|less|beneath|above|over|higher|more)\b", re.I)
+
+
+def fix_size_psf_logic(text: str, subject: Optional[dict], comp: Optional[dict]) -> tuple[str, list[str]]:
+    r = _size_ratio(subject, comp)
+    if not text or r is None or abs(r - 1) < _SIZE_SIMILAR:
+        return text, []
+    flags: list[str] = []
+    out = []
+    for s in sentences(text):
+        m, d = _CAUSE_RE.search(s), _PSF_DIR_RE.search(s)
+        if m and d and d.start() > m.start():
+            lower = d.group(1).lower() in ("below", "under", "lower", "less", "beneath")
+            if (r < 1 and lower) or (r > 1 and not lower):
+                s = s[:m.start()] + ", and" + s[m.end():]
+                flags.append(f"Fact check: dropped 'explains why' - a {'smaller' if r < 1 else 'larger'} home usually sells for "
+                             f"{'more' if r < 1 else 'less'} per square foot, not {'less' if r < 1 else 'more'}.")
+        out.append(s)
+    return (" ".join(out), flags) if flags else (text, [])
+
+
 def size_claim_problem(sentence: str, subject: Optional[dict], comp: Optional[dict]) -> Optional[str]:
     r = _size_ratio(subject, comp)
     m = _SIZE_SAKE_RE.search(sentence or "")
@@ -448,6 +475,7 @@ def fix_text(text: str, *, subject: Optional[dict], comp: Optional[dict] = None,
         lambda x: fix_community_claims(x, subject, comp),
         lambda x: fix_lower_level_claims(x, comp, who) if comp is not None else (x, []),
         lambda x: (lambda t2, f2: (t2, [f"{who}: {m}" for m in f2]))(*fix_size_claims(x, subject, comp)) if comp is not None else (x, []),
+        lambda x: fix_size_psf_logic(x, subject, comp) if comp is not None else (x, []),
         lambda x: fix_field_name_leaks(x),
         lambda x: drop_repeated_sentences(x),
     ):
