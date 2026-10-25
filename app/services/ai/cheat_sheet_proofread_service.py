@@ -12,8 +12,13 @@ a source is ignored.
 
 One review per home when its nearby places are first looked up (the same moment its Google lookup
 is charged), on the agent's AI usage like the cheat sheet's school lookup; guarded by its own
-platform-wide ceiling and the platform emergency brake. With no review (AI down, budget reached,
-timeout) the section prints as the rules built it.
+platform-wide ceiling and the platform emergency brake. With no review (switched off, AI down,
+budget reached, timeout) the section prints as the rules built it.
+
+Switched OFF by default (AI setting cheat_sheet_proofread_enabled). Owner's rule, 10/25: run it only
+while 10% or more of sheets have errors. Its catches in the first random test (5 of 15) became engine
+rules; afterwards 2 of 25 random homes still had one, so it ships off. To keep the engine improving,
+switch it on for a test batch now and then and turn what it finds into rules.
 """
 from __future__ import annotations
 
@@ -163,8 +168,11 @@ async def _review(db, home: str, lists: dict[str, list], backups: dict[str, list
     from app.services.ai.ai_rate_limit_service import AIRateLimitExceeded, reconcile_budget, record_usage_event, reserve_global_and_emergency
     try:
         config = await ai_config_service.get_config(db)
-        if not config.get("cheat_sheet_proofread_enabled", True):
-            return None  # switched off in the AI settings
+        # Off unless switched on in the AI settings (owner's rule, 10/25: only while 10%+ of sheets
+        # have errors). After the engine rules learned from its first catches, 2 of 25 random homes
+        # (8%) still had one - so it ships off, ready to switch back on.
+        if not config.get("cheat_sheet_proofread_enabled", False):
+            return None
         reservation = await reserve_global_and_emergency(
             db, "cheat_sheet_proofread_global", RESERVATION_USD,
             float(config.get("cheat_sheet_proofread_global_daily_cost_ceiling_usd", 10.0)),

@@ -480,3 +480,71 @@ def test_shortest_drive_wins_the_hospital_slot_and_far_schools_drop():
     assert [m.name for m in medical] == ["UM Charles Regional Medical Center", "Urgent Care"]
     assert [b.name for b in hospital_backups] == ["Inova Mount Vernon Hospital"]
     assert [s.name for s in schools] == ["Grace Lutheran"]
+
+
+def _raw(name, primary, address, reviews=None, types=None):
+    return {"displayName": {"text": name}, "primaryType": primary, "types": types or [primary], "formattedAddress": address,
+            "userRatingCount": reviews, "businessStatus": "OPERATIONAL"}
+
+
+def test_engine_rules_from_the_random_listing_test():
+    """10/25 random test of 15 listings: five mistakes the rules missed and the AI proofread caught,
+    now caught by the engine itself."""
+    # A Medicare long-term-care hospital, matched by street number + ZIP.
+    assert not svc._is_legitimate_full_service_hospital(_raw("BridgePoint Hospital Capitol Hill", "hospital", "223 7th St NE, Washington, DC 20002, USA"))
+    # A hand-typed listing next to the real hospital's own.
+    assert not svc._is_legitimate_full_service_hospital(_raw("Garrett memorial hospital?", "general_hospital", "888 Memorial Dr, Oakland, MD 21550, USA"))
+    assert svc._is_legitimate_full_service_hospital(_raw("Garrett Regional Medical Center", "hospital", "251 N 4th St, Oakland, MD 21550, USA"))
+    # A gas-station store typed supermarket.
+    assert not svc._is_full_service_grocery(_raw("Himalayan Market", "supermarket", "10212 Post Oak Rd, Spotsylvania, VA 22551, USA",
+                                                 types=["supermarket", "gas_station", "grocery_store"]))
+    # A house on a residential court, and a subdivision with no street address or park word.
+    assert not svc._is_parent_park_candidate(_raw("Mammal Park", "park", "6107 Koala Ct, Waldorf, MD 20603, USA", 11))
+    assert not svc._is_parent_park_candidate(_raw("Academy Hill", "park", "Newark, DE 19713, USA", 20))
+    # Real parks still pass, with or without a street address.
+    assert svc._is_parent_park_candidate(_raw("Rose Tree Park", "park", "1671 N Providence Rd, Media, PA 19063, USA", 1909))
+    assert svc._is_parent_park_candidate(_raw("Hunting Park", "park", "Philadelphia, PA 19140, USA", 900))
+
+
+def test_general_hospital_sharing_an_address_with_a_rehab_unit_is_kept():
+    """Rehab / long-term-care units often sit inside a general hospital; those addresses are left
+    out of the non-general list, so the hospital itself still counts."""
+    shared = [k for k in svc._load_non_general_hospitals()]
+    assert "223|20002" in shared
+    assert svc._is_legitimate_full_service_hospital(_raw("Bryn Mawr Hospital", "hospital", "130 S Bryn Mawr Ave, Bryn Mawr, PA 19010, USA"))
+
+
+def test_ten_town_test_rules():
+    """10-town test, 10/25: real hospitals Google labels oddly count when they sit at a Medicare
+    emergency hospital's address; a doctors' group typed hospital doesn't; Martin's is a real grocer
+    and "Sharp Shopper Grocery Outlet" isn't the Grocery Outlet chain."""
+    assert svc._is_legitimate_full_service_hospital(_raw("Winchester Medical Center", "medical_center", "1840 Amherst St, Winchester, VA 22601, USA"))
+    assert svc._is_legitimate_full_service_hospital(_raw("Beebe Healthcare", "hospital", "424 Savannah Rd, Lewes, DE 19958, USA"))
+    assert not svc._is_legitimate_full_service_hospital(_raw("Valley Hospitalists, PC", "hospital", "1840 Amherst St, Winchester, VA 22601, USA"))
+    assert not svc._is_legitimate_full_service_hospital(_raw("Beebe Medical Center: Mangrelli Meghan A", "medical_center", "424 Savannah Rd, Lewes, DE 19958, USA"))
+    # Not at a Medicare address, no hospital word: still not a hospital.
+    assert not svc._is_legitimate_full_service_hospital(_raw("Beebe Healthcare", "hospital", "999 Nowhere Rd, Lewes, DE 19958, USA"))
+    assert svc._major_grocery_brand("MARTIN'S") == "martin's"
+    assert svc._major_grocery_brand("Sharp Shopper Grocery Outlet") is None
+    assert svc._major_grocery_brand("Grocery Outlet Bargain Market") == "grocery outlet"
+
+
+def test_one_listing_per_hospital_address_prefers_the_hospital_name():
+    raw = [
+        {**_raw("Meritus Health", "general_hospital", "11116 Medical Campus Rd, Hagerstown, MD 21742, USA"), "location": {"latitude": 39.62, "longitude": -77.68}},
+        {**_raw("Meritus Medical Center", "medical_center", "11116 Medical Campus Rd, Hagerstown, MD 21742, USA"), "location": {"latitude": 39.62, "longitude": -77.68}},
+    ]
+    found = svc._one_per_hospital_address(raw, 39.6, -77.7)
+    assert [f.name for f in found] == ["Meritus Medical Center"]
+
+
+@pytest.mark.asyncio
+async def test_local_airline_airport_added_when_hubs_are_far(monkeypatch):
+    """State College / Charlottesville / Hagerstown only showed airports 70-150 miles away."""
+    async def no_routes(client, api_key, lat, lng, points, section):
+        return [None] * len(points)
+
+    monkeypatch.setattr(svc, "_driving_routes", no_routes)
+    results = await svc._fetch_airports(None, "fake-key", 38.0544, -78.4731)  # Charlottesville
+    assert results[0].name == "Charlottesville Albemarle Airport"
+    assert results[0].place_type == "REGIONAL AIRPORT"

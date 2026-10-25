@@ -161,6 +161,8 @@ MAJOR_GROCERY_BRANDS = (
     "sam's club", "bj's wholesale", "target", "walmart supercenter", "hannaford", "price chopper",
     "market basket", "mom's organic", "earth fare", "h mart", "h-mart", "save a lot", "save-a-lot",
     "grocery outlet", "landis", "kimberton whole foods", "genuardi",
+    # Giant's Martin's Food Markets (Virginia, West Virginia, central PA) - Winchester's main grocer.
+    "martin's", "martins food",
 )
 # Fast food / counter-service names that aren't a sit-down "restaurant" to a home buyer.
 FAST_FOOD_NAME_PATTERNS = (
@@ -272,7 +274,16 @@ AIRPORT_MAJOR_CANDIDATES = 3      # nearest majors (straight line) sent to the R
 AIRPORT_REGIONAL_CANDIDATES = 2
 AIRPORT_MAJOR_MAX_RESULTS = 2
 AIRPORT_MAJOR_MAX_DRIVE_MILES = 150  # past this a second major isn't "nearby"; the nearest one always shows
-AIRPORT_FALLBACK_MAX_MILES = 75   # remote areas with no hub of either kind: nearest airline airport, labeled regional
+AIRPORT_FALLBACK_MAX_MILES = 40   # how far the local airline airport may be when the hubs are far
+AIRPORT_LOCAL_WHEN_HUBS_BEYOND_MILES = 60
+# Below small-hub size but with daily airline flights - the local airport where the hubs are far.
+# Curated: OurAirports' "scheduled service" flag still lets through fields with none (Ocean City
+# Municipal turned up for a Rehoboth Beach home in the 10-town test).
+LOCAL_AIRLINE_AIRPORT_IATA = {
+    "SCE", "CHO", "HGR", "SBY", "AVP", "IPT", "SHD", "LWB", "MGW", "CKB", "ERI", "LBE", "JST", "DUJ", "BGM",
+    "ITH", "ELM", "PHF", "LYH", "ROA", "TTN", "OAJ", "EWN", "PGV", "ACK", "MVY", "HYA", "LEB", "PSM", "BFD",
+}
+_MILITARY_AIRPORT_RE = re.compile(r"air force base|\bafb\b|army airfield|naval air|joint base", re.IGNORECASE)
 
 
 @lru_cache(maxsize=1)
@@ -440,6 +451,9 @@ HOSPITAL_FALSE_POSITIVE_NAME_KEYWORDS = [
     # listings, e.g. "Bayhealth General Surgery, Sussex Campus").
     "pulmonary", "pulmonology", "pulmn", "nephrology", "psychiatry", "pathology", "hematology",
     "audiology", "specialty associates", "interventional",
+    # "Valley Hospitalists, PC" - a doctors' group based at Winchester Medical Center, typed hospital
+    # (10-town test, 10/25); "hospital" is inside "hospitalists".
+    "hospitalist",
 ]
 # A Cheat Sheet medical result must represent a named patient-care facility - not an individual
 # provider and not a bare street address that Google failed to attach a real business name to.
@@ -487,6 +501,79 @@ HOSPITAL_NOT_GENERAL_NAME_KEYWORDS = [
     "vet hospital", "equine",
 ]
 _VA_NAME_RE = re.compile(r"\bva\b|\bv\.a\.|\bvamc\b")
+# Medicare's own lists of hospitals that aren't a general hospital - long-term care, inpatient rehab,
+# psychiatric, children's, VA and military - keyed by street number|ZIP, minus any address that is also
+# a general hospital (rehab and long-term-care units often sit inside one). Catches the ones no name
+# list knows: a 10/25 random test had "BridgePoint Hospital Capitol Hill" (a long-term-care hospital)
+# as a DC home's hospital. Rebuilt from CMS provider data (xubh-q36u, azum-44iv, 7t8x-u3ir).
+NON_GENERAL_HOSPITALS_DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "non_general_hospitals.json"
+_ADDRESS_NUMBER_RE = re.compile(r"^\s*(\d+)")
+_ADDRESS_ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?,\s*USA$")
+
+
+@lru_cache(maxsize=1)
+def _load_non_general_hospitals() -> dict[str, str]:
+    with open(NON_GENERAL_HOSPITALS_DATA_PATH, encoding="utf-8") as f:
+        return json.load(f)["addresses"]
+
+
+def _address_key(place: dict) -> Optional[str]:
+    address = place.get("formattedAddress") or ""
+    number, zipcode = _ADDRESS_NUMBER_RE.match(address), _ADDRESS_ZIP_RE.search(address)
+    return f"{number.group(1)}|{zipcode.group(1)}" if number and zipcode else None
+
+
+_NAME_SMALL_WORDS = {"of", "the", "and", "at", "for", "in", "on", "by", "de", "la", "a"}
+
+
+def _looks_hand_entered(name: str) -> bool:
+    """A listing someone typed into Google by hand rather than the place's own: a question mark, or
+    mostly lower-case words ("Garrett memorial hospital?" sat on the map next to the real "Garrett
+    Regional Medical Center"; "Red mill pond", "ccea" among parks)."""
+    if "?" in name:
+        return True
+    words = [w for w in re.findall(r"[A-Za-z][A-Za-z']*", name) if w.lower() not in _NAME_SMALL_WORDS]
+    if not words:
+        return False
+    lower = sum(1 for w in words if w[0].islower())
+    return lower == len(words) or (len(words) >= 2 and lower * 2 > len(words))
+# Medicare's emergency hospitals (CMS Hospital General Information: acute care, critical access and
+# rural emergency hospitals reporting an emergency department), each with its map point (Census
+# geocoder; Google for the ~15% it couldn't place) and street number|ZIP. Only ever ADDS: a listing at
+# one of these addresses counts as a hospital however Google labels it, and one Google missed gets
+# looked up by name (_medicare_hospitals_missing) - it never removes Google's own picks, because
+# Medicare files a system's satellite campuses under one license (Virtua Marlton, Jefferson
+# Washington Township and Union Hospital aren't on it).
+ER_HOSPITAL_DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "er_hospitals.json"
+MEDICARE_CONFIRMED_PRIMARY_TYPES = {"medical_center", "medical_clinic", "health"}
+MEDICARE_HOSPITAL_SEARCH_MILES = 25
+MEDICARE_HOSPITAL_LOOKUPS = 2
+_PRACTICE_SUFFIX_RE = re.compile(r",?\s+(p\.?\s?c\.?|pllc|l\.?l\.?c\.?|inc\.?)\s*$", re.IGNORECASE)
+_NAME_WITH_PERSON_RE = re.compile(r":\s*[A-Z][a-z]+\s+[A-Z][a-z]+")
+
+
+@lru_cache(maxsize=1)
+def _load_er_hospitals() -> list[list]:
+    with open(ER_HOSPITAL_DATA_PATH, encoding="utf-8") as f:
+        return json.load(f)["hospitals"]
+
+
+def _near_medicare_hospital(place: dict, miles: float = 0.2) -> bool:
+    """The listing sits on a Medicare emergency hospital's map point - for the few Medicare records
+    without a street number to match ("One Plainsboro Road", Penn Medicine Princeton Medical Center)."""
+    loc = place.get("location") or {}
+    p_lat, p_lng = loc.get("latitude"), loc.get("longitude")
+    if p_lat is None or p_lng is None:
+        return False
+    return any(abs(h[3] - p_lat) < 0.01 and abs(h[4] - p_lng) < 0.013 and _haversine_miles(p_lat, p_lng, h[3], h[4]) <= miles
+               for h in _load_er_hospitals())
+
+
+@lru_cache(maxsize=1)
+def _er_hospital_keys() -> frozenset:
+    return frozenset(h[6] for h in _load_er_hospitals() if h[6])
+
+
 # "VA HOSPITAL 25" / "Building 3" - a numbered building of a campus that's already on the list by name.
 _NUMBERED_BUILDING_NAME_RE = re.compile(r"\s\d+$")
 
@@ -628,6 +715,8 @@ PARK_SUB_FEATURE_KEYWORDS = [
     # A real Google result, "Ceres Park Back Lot" (primaryType=park), is an overflow parking area
     # for the real Ceres Park, not a public recreational destination itself.
     "back lot", "rear lot",
+    # "Gettysburg Auto Tour Stop 8" - a stop inside a park, not the park (10-town test).
+    "tour stop", "auto tour",
     # Private/members-only community amenities Google sometimes tags primaryType=park even though
     # a typical home buyer (unless they live in that specific community) cannot use them.
     "hoa park", "homeowners association", "homeowner's association", "community association",
@@ -655,6 +744,8 @@ PARK_PRIMARY_TYPES = {"park", "state_park", "national_park", "nature_preserve", 
 PARK_POPULAR_RADIUS_MILES = 5
 PARK_MIN_REVIEWS = 10
 PARK_MAX_RESULTS = 3
+PARK_HOUSE_ADDRESS_MIN_REVIEWS = 25   # a "park" at a house number on a residential court needs this many to count
+PARK_NO_ADDRESS_MIN_REVIEWS = 50      # one with no street address and no park word in its name needs this many
 PARK_SCORE_MILES_PER_POINT = 1.5   # in the "worth the drive" ranking, 10x the reviews is worth 1.5 extra miles
 _HQ_ABBREVIATION_RE = re.compile(r"\bhq\b", re.IGNORECASE)
 # Residential-development/subdivision entities Google sometimes geocodes with primaryType=park even
@@ -713,7 +804,7 @@ def _private_school_candidates(lat: float, lng: float) -> list[dict]:
     for name, city, state, s_lat, s_lng, lowest, highest, typology, students in _load_private_schools():
         if abs(s_lat - lat) > lat_pad or abs(s_lng - lng) > lng_pad:
             continue
-        if highest < PRIVATE_SCHOOL_MIN_HIGHEST_GRADE:
+        if highest < PRIVATE_SCHOOL_MIN_HIGHEST_GRADE or lowest == highest:
             continue
         distance = _haversine_miles(lat, lng, s_lat, s_lng)
         if distance > PRIVATE_SCHOOL_RADIUS_MILES:
@@ -801,10 +892,33 @@ def _place_dedupe_key(place: dict) -> tuple[str, str, str]:
     return (_place_identity(place), _place_address_key(place), _place_name(place).lower())
 
 
+_HOUSE_STREET_SUFFIX_RE = re.compile(r"^\d+\s+[\w\s.'-]*\b(ct|court|cir|circle|ter|terrace|pl|place|cv|cove)\b", re.IGNORECASE)
+_PARK_NAME_WORD_RE = re.compile(
+    r"\b(park|parks|preserve|reserve|playground|field|fields|green|garden|gardens|arboretum|trail|forest|"
+    r"recreation|rec|commons|common|square|plaza|beach|lake|pond|woods|wildlife|nature|conservation|"
+    r"refuge|sanctuary|grove|meadow|meadows|landing|pier|wharf|marsh|creek|river|island|falls|mall|"
+    r"memorial|monument|grounds|reservation|battlefield|overlook)\b", re.IGNORECASE)
+
+
+def _looks_like_a_house_or_subdivision(place: dict) -> bool:
+    """10/25 random test: "Mammal Park" was a house (6107 Koala Ct, 11 reviews) and "Academy Hill" a
+    subdivision (no street address, no park word in its name, 20 reviews). A park on a residential
+    court with few reviews, or with no street address, no park word and few reviews, is one of these."""
+    address = (place.get("formattedAddress") or "").strip()
+    reviews = _park_reviews(place)
+    if _HOUSE_STREET_SUFFIX_RE.match(address) and reviews < PARK_HOUSE_ADDRESS_MIN_REVIEWS:
+        return True
+    no_street = not re.match(r"^\d", address)
+    plain = not set(place.get("types") or []) & _PARK_RICH_DESCRIPTOR_TYPES
+    return no_street and plain and not _PARK_NAME_WORD_RE.search(_place_name(place)) and reviews < PARK_NO_ADDRESS_MIN_REVIEWS
+
+
 def _is_parent_park_candidate(place: dict) -> bool:
     name = _place_name(place).lower()
     primary_type = _place_primary_type(place)
     if not name or primary_type not in PARK_PRIMARY_TYPES:
+        return False
+    if _looks_hand_entered(_place_name(place)) or _looks_like_a_house_or_subdivision(place):
         return False
     if any(keyword in name for keyword in PARK_SUB_FEATURE_KEYWORDS):
         return False
@@ -829,15 +943,23 @@ def _is_legitimate_urgent_care(place: dict) -> bool:
 _MOB_NAME_RE = re.compile(r"\bmob\b")
 
 
-def _is_legitimate_full_service_hospital(place: dict) -> bool:
+def _is_legitimate_full_service_hospital(place: dict, medicare_confirmed: bool = False) -> bool:
+    """A general hospital a buyer could go to in an emergency. `medicare_confirmed` (or the listing
+    sitting at a Medicare emergency hospital's street address, ER_HOSPITAL_DATA_PATH) lets through the
+    real hospitals Google labels oddly - "Winchester Medical Center" and "Meritus Medical Center" typed
+    medical_center, "Beebe Healthcare" with no hospital word in its name - which the name test below
+    turned away (10-town test, 10/25: Rehoboth, Hagerstown and Winchester all lost their hospital)."""
     name_raw = _place_name(place)
     name_lower = name_raw.lower()
     primary_type = _place_primary_type(place)
     types = set(place.get("types") or [])
     if not name_lower:
         return False
-    if primary_type not in HOSPITAL_PRIMARY_TYPES:
+    medicare = medicare_confirmed or _address_key(place) in _er_hospital_keys()
+    if primary_type not in HOSPITAL_PRIMARY_TYPES and not (medicare and primary_type in MEDICARE_CONFIRMED_PRIMARY_TYPES):
         return False
+    if _PRACTICE_SUFFIX_RE.search(name_raw) or _NAME_WITH_PERSON_RE.search(name_raw):
+        return False  # "Valley Hospitalists, PC", "Beebe Medical Center: Mangrelli Meghan A" - a practice or a doctor at the hospital
     if types & MEDICAL_EXCLUDE_TYPES:
         return False
     if any(keyword in name_lower for keyword in HOSPITAL_FALSE_POSITIVE_NAME_KEYWORDS):
@@ -845,6 +967,8 @@ def _is_legitimate_full_service_hospital(place: dict) -> bool:
     if any(keyword in name_lower for keyword in HOSPITAL_NOT_GENERAL_NAME_KEYWORDS) or _VA_NAME_RE.search(name_lower):
         return False
     if _NUMBERED_BUILDING_NAME_RE.search(name_raw) or not _is_open(place):
+        return False
+    if _looks_hand_entered(name_raw) or _address_key(place) in _load_non_general_hospitals():
         return False
     # "MOB" (Medical Office Building) is a standard healthcare real-estate abbreviation for an
     # outpatient office building on a hospital campus, distinct from the hospital itself - a real
@@ -859,7 +983,7 @@ def _is_legitimate_full_service_hospital(place: dict) -> bool:
     # Must actually read as a facility, not a ghost/administrative listing riding along on
     # primaryType=hospital - see HOSPITAL_FACILITY_IDENTITY_KEYWORDS for the real examples that
     # motivated this ("Myblood", a blood-donation service; a listing literally named "Delaware").
-    if not any(keyword in name_lower for keyword in HOSPITAL_FACILITY_IDENTITY_KEYWORDS):
+    if not medicare and not any(keyword in name_lower for keyword in HOSPITAL_FACILITY_IDENTITY_KEYWORDS):
         return False
     return True
 
@@ -1252,6 +1376,16 @@ def _explore_place_is_relevant(place: dict, category_key: str) -> bool:
     return _place_primary_type(place) not in excluded
 
 
+def _major_grocery_brand(name: str) -> Optional[str]:
+    """The big-name grocer in a store's name. "Grocery Outlet" counts only as the chain's own name -
+    "Sharp Shopper Grocery Outlet" is a surplus store (10-town test, Winchester)."""
+    name = name.lower()
+    for brand in MAJOR_GROCERY_BRANDS:
+        if brand in name and (brand != "grocery outlet" or name.startswith(brand)):
+            return brand
+    return None
+
+
 def _explore_grocery_ok(place: dict) -> bool:
     """A real grocery store (user, 10/24): one of the big names, or a genuine supermarket - never a
     corner shop, deli, convenience store or specialty market."""
@@ -1260,7 +1394,7 @@ def _explore_grocery_ok(place: dict) -> bool:
     name = _place_name(place).lower()
     if any(p in name for p in CONVENIENCE_GAS_HYBRID_NAME_PATTERNS):
         return False
-    if any(b in name for b in MAJOR_GROCERY_BRANDS):
+    if _major_grocery_brand(name):
         return True
     if any(h in name for h in GROCERY_SPECIALTY_NAME_HINTS):
         return False
@@ -1601,6 +1735,9 @@ def _is_full_service_grocery(place: dict) -> bool:
         return False
     if primary_type in GROCERY_EXCLUDED_TYPES or primary_type in {"discount_store", "department_store", "gift_shop"}:
         return False
+    if types & {"gas_station", "convenience_store"}:
+        # "Himalayan Market" was typed supermarket AND gas_station - a gas-station store (10/25 test).
+        return False
     if any(pattern in name for pattern in GROCERY_EXCLUDED_NAME_PATTERNS):
         return False
     if primary_type in GROCERY_STRONG_PRIMARY_TYPES:
@@ -1642,7 +1779,7 @@ def _grocery_brand_key(place: dict) -> str:
     """"ShopRite of Sewell" and "ShopRite of Glassboro" are one brand - the sheet shows two different
     stores to choose from, not the same chain twice (10/25: "Trader Joe's | Trader Joe's")."""
     name = _place_name(place).lower()
-    brand = next((b for b in MAJOR_GROCERY_BRANDS if b in name), None)
+    brand = _major_grocery_brand(name)
     if brand:
         return brand.replace(" ", "").replace("-", "")
     return re.split(r"\s+(?:of|at|-|–)\s+", name)[0].strip()
@@ -1752,21 +1889,75 @@ async def _fetch_medical_care(client: httpx.AsyncClient, api_key: str, lat: floa
 
 
 async def _fetch_hospital_from_google(client: httpx.AsyncClient, api_key: str, lat: float, lng: float) -> list[NearbyPlace]:
-    """Real general hospitals, nearest first (the first is the sheet's; the rest are its backups) -
-    Google's hospital search, widening the radius until at least two turn up, hospital types only, in a call
-    of its own so the far more numerous doctor/clinic listings never crowd real hospitals out of the
-    20-result cap."""
+    """Real general hospitals, nearest first (the first is the sheet's; the rest are its backups).
+    Google's hospital search, widening the radius until at least two turn up, hospital types only, in a
+    call of its own so the far more numerous doctor/clinic listings never crowd real hospitals out of
+    the 20-result cap - then any Medicare emergency hospital closer than those that Google's 20 left
+    out is looked up by name (UM Shore Medical Center at Easton never made the list for an Easton
+    home: twenty clinics typed "hospital" filled it). One entry per hospital address."""
+    found: list[NearbyPlace] = []
     for radius in [DEFAULT_SEARCH_RADIUS_MILES, 12, 16, 24]:
         raw = await _search_nearby_types(
             client, api_key, lat, lng, ["general_hospital", "hospital"], max_result_count=NEARBY_CANDIDATE_POOL,
             radius_miles=radius, field_mask=CHEAT_FIELD_MASK, section="medical_hospital",
         )
-        found = _valid_places_sorted(raw, lat, lng, _is_legitimate_full_service_hospital, "HOSPITAL")
+        found = _one_per_hospital_address(raw, lat, lng)
         # Two to compare by drive: a lone nearest hospital can be across a river (Bryans Road MD: Inova
         # Mount Vernon, 24 miles by car, while UM Charles Regional sat just past the first ring).
         if len(found) >= 2:
-            return found
+            break
+    found += await _medicare_hospitals_missing(client, api_key, lat, lng, found)
+    found.sort(key=lambda p: p.distance_miles if p.distance_miles is not None else float("inf"))
     return found
+
+
+def _one_per_hospital_address(raw: list[dict], lat: float, lng: float, medicare_confirmed: bool = False) -> list[NearbyPlace]:
+    """Valid hospitals, nearest first, one per street address - "Meritus Medical Center" and "Meritus
+    Health" are two listings for one hospital; the name that says hospital / medical center wins."""
+    best: dict[str, tuple[int, dict]] = {}
+    for place in raw:
+        if not _is_legitimate_full_service_hospital(place, medicare_confirmed):
+            continue
+        key = _address_key(place) or _place_identity(place) or _place_name(place).lower()
+        rank = 0 if any(k in _place_name(place).lower() for k in HOSPITAL_FACILITY_IDENTITY_KEYWORDS) else 1
+        if key not in best or rank < best[key][0]:
+            best[key] = (rank, place)
+    out = []
+    for _, place in best.values():
+        nearby = _place_to_nearby(place, lat, lng)
+        if nearby:
+            nearby.place_type = "HOSPITAL"
+            out.append(nearby)
+    out.sort(key=lambda p: p.distance_miles if p.distance_miles is not None else float("inf"))
+    return out
+
+
+async def _medicare_hospitals_missing(client: httpx.AsyncClient, api_key: str, lat: float, lng: float, found: list[NearbyPlace]) -> list[NearbyPlace]:
+    nearest_found = found[0].distance_miles if found and found[0].distance_miles is not None else float("inf")
+    pad_lat = MEDICARE_HOSPITAL_SEARCH_MILES / 69.0
+    pad_lng = MEDICARE_HOSPITAL_SEARCH_MILES / max(1.0, 69.0 * math.cos(math.radians(lat)))
+    nearby = sorted(
+        ((_haversine_miles(lat, lng, h[3], h[4]), h) for h in _load_er_hospitals() if abs(h[3] - lat) <= pad_lat and abs(h[4] - lng) <= pad_lng),
+        key=lambda item: item[0],
+    )
+    added: list[NearbyPlace] = []
+    lookups = 0
+    for miles, (name, city, state, h_lat, h_lng, _kind, _key) in nearby:
+        if miles > min(MEDICARE_HOSPITAL_SEARCH_MILES, nearest_found) or lookups >= MEDICARE_HOSPITAL_LOOKUPS:
+            break
+        if any(p.latitude is not None and _haversine_miles(h_lat, h_lng, p.latitude, p.longitude) <= 0.35 for p in [*found, *added]):
+            continue  # Google already has it
+        lookups += 1
+        try:
+            raw = await _search_text(client, api_key, h_lat, h_lng, f"{nice_school(name, all_caps=True)}, {city}, {state}", 1.0,
+                                     field_mask=CHEAT_FIELD_MASK, section="medical_hospital_medicare")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Medicare hospital look-up failed for {name}: {e}")
+            continue
+        close = [p for p in raw[:5] if (p.get("location") or {}).get("latitude") is not None
+                 and _haversine_miles(h_lat, h_lng, p["location"]["latitude"], p["location"]["longitude"]) <= 0.35]
+        added += _one_per_hospital_address(close, lat, lng, medicare_confirmed=True)[:1]
+    return added
 
 
 async def _fetch_private_schools(client: httpx.AsyncClient, api_key: str, lat: float, lng: float) -> list[NearbyPlace]:
@@ -1998,12 +2189,17 @@ async def _fetch_airports(client: httpx.AsyncClient, api_key: str, lat: float, l
     nearest_major_miles = major_rows[0][1] if major_rows else float("inf")
     if regional_rows and regional_rows[0][1] < nearest_major_miles:
         picked.append((*regional_rows[0], "REGIONAL AIRPORT"))
-    if not picked or picked[0][1] > AIRPORT_MAJOR_MAX_DRIVE_MILES * 2:
-        # Remote area with no hub of either kind in reach: the nearest airline airport, honestly labeled.
-        nearest = by_distance[0]
-        straight = round(_haversine_miles(lat, lng, nearest["lat"], nearest["lon"]), 1)
-        if straight <= AIRPORT_FALLBACK_MAX_MILES and nearest.get("iata") not in MAJOR_AIRPORT_IATA | REGIONAL_AIRPORT_IATA:
-            picked.append((straight / 45 * 3600, straight, nearest, "REGIONAL AIRPORT"))
+    if not picked or min(item[1] for item in picked) > AIRPORT_LOCAL_WHEN_HUBS_BEYOND_MILES:
+        # The nearest hub is a long drive: add the local airport with airline service (State College,
+        # Charlottesville, Hagerstown were left with only airports 70-150 miles away in the 10-town
+        # test). Never a military field with a civil terminal (Dover AFB).
+        local = next((a for a in by_distance if a.get("iata") in LOCAL_AIRLINE_AIRPORT_IATA
+                      and not _MILITARY_AIRPORT_RE.search(a.get("name") or "")), None)
+        straight = round(_haversine_miles(lat, lng, local["lat"], local["lon"]), 1) if local else None
+        if local and straight <= AIRPORT_FALLBACK_MAX_MILES:
+            route = (await _driving_routes(client, api_key, lat, lng, [(local["lat"], local["lon"])], "airports"))[0]
+            miles = route[1] if route else straight
+            picked.append((miles / 45 * 3600, miles, local, "REGIONAL AIRPORT"))
     picked.sort(key=lambda item: item[1])
 
     results: list[NearbyPlace] = []
@@ -2282,7 +2478,8 @@ def _prefer_shortest_drive(medical_care: list[NearbyPlace], hospital_backups: li
             break
         if miles(spare) <= PRIVATE_SCHOOL_MAX_DRIVE_MILES and spare not in kept:
             kept.append(spare)
-    private_schools[:] = sorted(kept, key=miles)
+    # Special-education schools last - a genuine school, but not the general pick a buyer is asking about.
+    private_schools[:] = sorted(kept, key=lambda p: ("SPECIAL" in (p.place_type or ""), miles(p)))
 
 
 async def _proofread_sheet(client: httpx.AsyncClient, api_key: str, lat: float, lng: float, property: Property, db, owner_id: Optional[str],
@@ -2381,7 +2578,8 @@ async def _confirm_rename(client: httpx.AsyncClient, api_key: str, place: Nearby
         logger.warning(f"proofread rename check failed for {new_name}: {e}")
         return None
     if key == "medical_care":
-        rule = _is_legitimate_full_service_hospital if place.place_type == "HOSPITAL" else (lambda g: _non_hospital_medical_label(g) is not None)
+        rule = (lambda g: _is_legitimate_full_service_hospital(g, _near_medicare_hospital(g))) if place.place_type == "HOSPITAL" \
+            else (lambda g: _non_hospital_medical_label(g) is not None)
     else:
         rule = _RENAME_RULES.get(key, lambda g: True)
     wanted = _school_name_tokens(new_name)
