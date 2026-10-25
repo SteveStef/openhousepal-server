@@ -736,6 +736,12 @@ for _ft in SHOWCASE_BUILDING_FORM_TYPES:
 URL_LOCKED_FORM_TYPES = {"showcase_request"}
 AESTHETICS_ONLY_FORM_TYPES = {"showcase_request"}
 
+
+def default_redirect_to_agent_hub(form_type: str) -> bool:
+    """A new / reverted form's Agent Hub redirect. The Showcase form opens the visitor's new
+    Showcase instead (redirect_to_showcase), so its Agent Hub redirect starts off (user, 10/24)."""
+    return form_type != "showcase_request"
+
 # Campaigns (separately-tracked links/QR codes for the same premade form) are scoped to normal
 # premade forms only - showcase_request already has its own locked/shared URL mechanics
 # (URL_LOCKED_FORM_TYPES above), and the two onboarding forms have their own restricted-editing
@@ -756,7 +762,10 @@ def _get_example_properties_for_showcase(hub_config: dict, limit: int = 4) -> Op
     raw_sales = hub_config.get("recentSales")
     if not isinstance(raw_sales, list):
         return None
-    eligible = [sale for sale in raw_sales if isinstance(sale, dict) and _is_eligible_sale(sale)]
+    # The agent's own picks apply here too: only Shown sales, over their min price, in their order.
+    from app.services.website.content_adapters import apply_sales_rules, sales_rules_from_config
+    eligible = [sale for sale in raw_sales if isinstance(sale, dict) and _is_eligible_sale(sale) and sale.get("visible", True) is not False]
+    eligible = apply_sales_rules(sorted(eligible, key=lambda s: str(s.get("sold_date") or ""), reverse=True), sales_rules_from_config(hub_config))
     if not eligible:
         return None
     return [
@@ -811,6 +820,7 @@ async def get_or_create_forms(db: AsyncSession, owner_id: str) -> List[AgentForm
                 success_message=defaults["success_message"],
                 accent_color=defaults["accent_color"],
                 order_index=next_order,
+                redirect_to_agent_hub=default_redirect_to_agent_hub(form_type),
             )
             apply_form_defaults(new_form, form_defaults)
             db.add(new_form)
@@ -1419,6 +1429,7 @@ async def duplicate_form(
         look_theme=original.look_theme,
         luxe_metal=original.luxe_metal,
         redirect_to_agent_hub=original.redirect_to_agent_hub,
+        redirect_to_showcase=original.redirect_to_showcase,
         property_photo_carousel=original.property_photo_carousel,
         background_effects=original.background_effects,
         welcome_text_effects=original.welcome_text_effects,
@@ -1547,7 +1558,8 @@ async def reset_form_to_default(
     form.look_mode = 'brand'
     form.look_theme = None
     form.luxe_metal = None
-    form.redirect_to_agent_hub = True
+    form.redirect_to_agent_hub = default_redirect_to_agent_hub(form.form_type)
+    form.redirect_to_showcase = True
     form.property_photo_carousel = False
     form.background_effects = True
     form.welcome_text_effects = True
@@ -1927,8 +1939,12 @@ async def update_form(
     if payload.dark_mode is not None:
         form.dark_mode = payload.dark_mode
     _apply_look(form, payload)
-    if payload.redirect_to_agent_hub is not None and not aesthetics_only:
+    # Where the visitor goes after submitting is the agent's call on every form, the Showcase
+    # form included (user, 10/24: its Showcase and Agent Hub redirects are both switchable).
+    if payload.redirect_to_agent_hub is not None:
         form.redirect_to_agent_hub = payload.redirect_to_agent_hub
+    if payload.redirect_to_showcase is not None:
+        form.redirect_to_showcase = payload.redirect_to_showcase
     if payload.property_photo_carousel is not None:
         form.property_photo_carousel = payload.property_photo_carousel
     if payload.background_effects is not None:
@@ -2064,6 +2080,7 @@ async def get_public_form(
         agent_photo_url=agent.photo_url,
         agent_title=agent.professional_title,
         agent_market=agent.market,
+        agent_state=agent.state,
         linked_property=form.linked_property,
         example_properties=example_properties,
     )

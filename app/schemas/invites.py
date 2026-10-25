@@ -40,10 +40,24 @@ class InviteLinkedProperty(BaseModel):
     no_cover: Optional[bool] = None  # "No photo" picked - the home's photos still show on the page
 
 
+class InviteDay(BaseModel):
+    """One more day of a several-day invite (the first day is event_date / start_time / end_time)."""
+    date: date
+    start: Optional[str] = Field(default=None, pattern=r'^\d{2}:\d{2}$')
+    end: Optional[str] = Field(default=None, pattern=r'^\d{2}:\d{2}$')
+
+
+class CoverPosition(BaseModel):
+    x: float = Field(default=50, ge=0, le=100)
+    y: float = Field(default=50, ge=0, le=100)
+
+
 class InviteSave(BaseModel):
     invite_type: InviteType
     audience: Optional[InviteAudience] = None
     title: str = Field(min_length=1, max_length=140)
+    # The flyer's line 2 (round 8): None = automatic (town / place), '' = no line 2, else exactly as typed.
+    subtitle: Optional[str] = Field(default=None, max_length=160)
     message: Optional[str] = Field(default=None, max_length=2000)
     event_date: Optional[date] = None
     start_time: Optional[str] = Field(default=None, pattern=r'^\d{2}:\d{2}$')
@@ -55,6 +69,11 @@ class InviteSave(BaseModel):
     design: InviteDesign = 'classic'
     accent_color: Optional[str] = Field(default=None, max_length=9)
     questions: List[InviteQuestion] = Field(default_factory=list, max_length=12)
+    extra_dates: List[InviteDay] = Field(default_factory=list, max_length=6)
+    motion: Literal['normal', 'luxe'] = 'normal'
+    luxe_metal: Optional[Literal['gold', 'silver', 'bronze']] = None
+    cover_position: Optional[CoverPosition] = None
+    open_house_event_id: Optional[str] = Field(default=None, max_length=64)
 
 
 class InviteStatusUpdate(BaseModel):
@@ -83,3 +102,24 @@ class RsvpSubmit(BaseModel):
     answers: List[RsvpAnswerIn] = Field(default_factory=list, max_length=20)
     # Coming back to change an answer: the private token from their browser / confirmation email.
     token: Optional[str] = Field(default=None, max_length=48)
+    # 10/24: which day(s) of a several-day invite; "Are you a real estate agent?" / "Are you working
+    # with an agent?"; "Can't make it" -> "Still interested in the home?" + "Keep me updated".
+    days: List[date] = Field(default_factory=list, max_length=7)
+    is_agent: Optional[bool] = None
+    has_agent: Optional[bool] = None
+    still_interested: Optional[bool] = None
+    keep_updated: Optional[bool] = None
+
+
+class InvitePublicRequest(BaseModel):
+    """A guest's one-tap ask from the invitation page - the Guest Pass's three: the seller
+    disclosure, a second (private) tour, or "keep me updated" on the home. Their RSVP token fills
+    in who they are; without one they type their name + email / phone in the sheet."""
+    kind: Literal['disclosure', 'second_tour', 'updates']
+    token: Optional[str] = Field(default=None, max_length=48)
+    name: Optional[str] = Field(default=None, max_length=140)
+    email: Optional[str] = Field(default=None, max_length=200)
+    phone: Optional[str] = Field(default=None, max_length=40)
+    times: Optional[str] = Field(default=None, max_length=200)  # second tour: "Sat, Nov 8 - Afternoon"
+    is_agent: Optional[bool] = None
+    has_agent: Optional[bool] = None

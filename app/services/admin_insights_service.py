@@ -423,7 +423,7 @@ async def emails(db: AsyncSession, days: int) -> dict:
     agents = await _agent_map(db)
     G, CE = m.EmailLog, m.ClientEmail
 
-    log = (await db.execute(select(G.template, G.audience, G.status, G.delivery, G.via, G.owner_id, G.client_email_id).where(_in(G.created_at, since)))).all()
+    log = (await db.execute(select(G.template, G.audience, G.status, G.delivery, G.via, G.owner_id, G.client_email_id).where(_in(G.created_at, since), G.via != "dedupe"))).all()  # repeats held back (email_dedupe_service) never went out
     tracking_from = (await db.execute(select(func.min(G.created_at)))).scalar()
     ce_rows = (await db.execute(select(CE.id, CE.owner_id, CE.template, CE.via, CE.delivery, CE.opened_at, CE.clicked_at, CE.status).where(
         CE.status.in_(("sent", "failed")), _in(func.coalesce(CE.sent_at, CE.created_at), since)))).all()

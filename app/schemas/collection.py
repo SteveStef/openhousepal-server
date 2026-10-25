@@ -58,6 +58,7 @@ class CollectionResponse(BaseModel):
     preferences: dict = {}
     property_count: int = 0
     active_property_count: int = 0
+    at_limit: bool = False   # "100+" (services/showcase_limit)
     is_anonymous: bool = False
     is_public: bool = False
     share_token: Optional[str] = None
@@ -71,6 +72,8 @@ class CollectionResponse(BaseModel):
     inactive_at: Optional[str] = None
     email_mode: Optional[str] = None        # the client's automatic emails: daily | weekly | off
     email_mode_reason: Optional[str] = None
+    came_from: Optional[dict] = None        # the open house they attended (asleep cards show it) / how it was made
+    still_using: bool = False               # the client used it lately - stays open even if emails slowed/stopped
     stats: Optional[dict] = None
     matchedProperties: List[dict] = []
 

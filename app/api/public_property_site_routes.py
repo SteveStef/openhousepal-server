@@ -10,7 +10,7 @@ from app.services import email_signature_service
 from app.api.public_nearby_shared import explore_nearby_response, explore_place_details_response, visitor_device_id
 from app.database import get_db
 from app.models.database import AgentHub, PropertyWebsite, StudioBrandKit, StudioMediaAsset, User
-from app.schemas.property_website import PropertyWebsiteAlertCreate, PropertyWebsiteInquiryCreate, PropertyWebsiteTourRequestCreate
+from app.schemas.property_website import PropertyWebsiteAlertCreate, PropertyWebsiteDocumentRequest, PropertyWebsiteInquiryCreate, PropertyWebsiteTourRequestCreate
 from app.services import property_website_service
 from app.services.nearby_amenities_service import is_explore_nearby_available
 from app.services.ai.ai_config_service import ai_config_service
@@ -252,8 +252,54 @@ async def subscribe_property_site_alerts(site_id: str, payload: PropertyWebsiteA
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Please enter a valid email.")
     from app.services import spotlight_alerts_service
     site, _user = owner
-    await spotlight_alerts_service.subscribe(db, site, name=payload.name.strip(), email=email, came_from=payload.came_from)
+    await spotlight_alerts_service.subscribe(db, site, name=payload.name.strip(), email=email, came_from=payload.came_from,
+                                             phone=(payload.phone or "").strip() or None)
     return {"success": True}
+
+
+@router.post("/{site_id}/documents")
+async def request_property_site_documents(site_id: str, payload: PropertyWebsiteDocumentRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    """A guest asks for the listing's documents (brochure, disclosures...): they're emailed to them
+    and the agent gets the lead - see property_website_service.request_documents."""
+    from app.services.public_rate_limit import check_public_submit
+    check_public_submit(request)  # bots can't flood the agent's leads/inbox
+    owner = await _published_owner(db, site_id)
+    if not owner:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Property website not found.")
+    email = payload.email.strip()
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Please enter a valid email.")
+    site, _user = owner
+    sent = await property_website_service.request_documents(
+        db, site, name=payload.name.strip(), email=email, phone=payload.phone.strip() or None,
+        urls=payload.documents, came_from=payload.came_from,
+    )
+    if not sent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="That document isn't on this page any more.")
+    return {"success": True, "sent": sent}
+
+
+@router.get("/{site_id}/vcard")
+async def property_site_vcard(site_id: str, db: AsyncSession = Depends(get_db)):
+    """The listing agent as a phone contact - photo included (user, 10/24: Save contact on a
+    Spotlight came without the agent's picture). Built from the same agent the page shows."""
+    from fastapi.responses import Response as _Resp
+    from app.services import vcard_service
+    owner = await _published_owner(db, site_id)
+    if not owner:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Property website not found.")
+    site, user = owner
+    payload = await render_payload(db, site, user, site.published_snapshot or {})
+    agent = (payload.get("agents") or [{}])[0] or {}
+    if not agent.get("name"):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No agent on this page.")
+    url = await property_website_service.public_url(db, site)
+    photo = await vcard_service.fetch_photo_base64(agent.get("photo_url"))
+    address = property_website_service._nice_address(site)
+    text = vcard_service.build_agent_vcard_text(agent, photo_base64=photo, note=f"Listing agent for {address} - {url}")
+    safe = re.sub(r"[^A-Za-z0-9 _-]", "", agent["name"]).strip() or "contact"
+    return _Resp(content=text.encode("utf-8"), media_type="text/vcard; charset=utf-8",
+                 headers={"Content-Disposition": f'attachment; filename="{safe}.vcf"', "Cache-Control": "no-store"})
 
 
 @router.get("/alerts/unsubscribe")

@@ -208,6 +208,10 @@ async def email_people(db: AsyncSession = Depends(get_db), user: User = Depends(
 async def email_log(email: Optional[str] = None, q: Optional[str] = None, limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
                     db: AsyncSession = Depends(get_db), user: User = Depends(get_current_active_user)):
     stmt = select(ClientEmail).where(ClientEmail.owner_id == user.id, ClientEmail.status.in_(("sent", "failed")))
+    # People whose lead the agent deleted don't show up here either (user, 10/24).
+    from app.models.database import ClientEmailPref
+    stmt = stmt.where(ClientEmail.recipient_email.notin_(select(ClientEmailPref.email).where(
+        ClientEmailPref.owner_id == user.id, ClientEmailPref.manual == ce.LEAD_DELETED)))
     if email:
         stmt = stmt.where(ClientEmail.recipient_email == ce._norm(email))
     if q:

@@ -60,6 +60,9 @@ def steps_for_plan(plan_tier: Optional[str], approved: bool) -> list[str]:
     steps = {"about", "contact", "license", "photo", "brand", "openhouse", "alerts", "calendar", "mailbox", "crm", "areas"}
     if plan_tier in AGENT_HUB_ACCESS_TIERS:
         steps |= {"story", "socials", "sales", "hub", "forms"}
+    if plan_tier == "NO_MLS":
+        # No Agent Hub, but the sales they add by hand fill their open house Brag Sheet (owner, 10/24).
+        steps.add("sales")
     if plan_tier in REVIEWS_ACCESS_TIERS:
         steps.add("reviews")
     if plan_tier in EMAIL_SIGNATURE_ACCESS_TIERS:

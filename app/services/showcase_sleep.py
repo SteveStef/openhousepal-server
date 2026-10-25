@@ -5,7 +5,9 @@ automatic emails, and - unless the agent is still minding them (starred the Show
 2 weeks opened it, opened the lead, marked them contacted, wrote a note or checked off a follow-up;
 the agent still gets that Showcase's updates in their briefing) - their Showcases go to sleep: status INACTIVE with
 inactive_reason "no_response". Asleep = no new matches, no emails, no agent alerts - it moves to the
-Inactive tab on the agent's Showcases page. Nothing is deleted.
+Inactive tab on the agent's Showcases page. Nothing is deleted. A client who ignores the emails but
+still uses their Showcase (client_still_using, user 10/24) keeps the email rule (weekly / off) but
+their Showcase stays awake - the agent is told exactly that.
 
 It wakes up by itself when the client shows up again - opens their Showcase link or opens/clicks an
 old email - and catches up on the homes that came on the market while it slept. The agent can also
@@ -28,6 +30,10 @@ logger = logging.getLogger(__name__)
 NO_RESPONSE = "no_response"
 AGENT = "agent"
 AGENT_WATCH = timedelta(days=14)   # the agent opened it this recently -> it stays awake
+# The client used one of their Showcases (looked at homes, liked, commented, asked for a tour) this
+# recently -> it stays awake even though they ignore the emails (user, 10/24). The span of the 3
+# ignored weekly emails; once they stop using it for that long it can fall asleep as usual.
+CLIENT_USING = timedelta(days=21)
 
 
 def _now() -> datetime:
@@ -74,11 +80,33 @@ async def agent_working_lead(db, owner_id: str, email: str, now: Optional[dateti
                                                         AgentTask.completed_at >= since).limit(1))).first() is not None
 
 
+def using_recently(col: Collection, now: Optional[datetime] = None) -> bool:
+    """This Showcase itself was used by the client within CLIENT_USING."""
+    seen = col.last_visitor_activity_at
+    if seen is None:
+        return False
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    return (now or _now()) - seen < CLIENT_USING
+
+
+async def client_still_using(db, owner_id: str, email: str, now: Optional[datetime] = None) -> bool:
+    """The client doesn't open the emails but still uses one of their Showcases with this agent
+    (user, 10/24): the email rule still applies (weekly / off), but nothing falls asleep."""
+    since = (now or _now()) - CLIENT_USING
+    return (await db.execute(select(Collection.id).where(
+        Collection.owner_id == owner_id, func.lower(func.trim(Collection.visitor_email)) == email,
+        Collection.last_visitor_activity_at >= since).limit(1))).first() is not None
+
+
 async def sleep_for_no_response(db, owner_id: str, email: str) -> int:
-    """Their ACTIVE Showcases with this agent go to sleep - except while the agent is minding them:
-    working the lead (agent_working_lead) or the Showcase itself (kept_awake). Safe to call again
-    later: one kept awake falls asleep once the agent stops minding it. Doesn't commit."""
+    """Their ACTIVE Showcases with this agent go to sleep - except while the agent is minding them
+    (working the lead - agent_working_lead - or the Showcase itself - kept_awake) or the client is
+    still using a Showcase (client_still_using). Safe to call again later: one kept awake falls
+    asleep once nobody is minding or using it. Doesn't commit."""
     if await agent_working_lead(db, owner_id, email):
+        return 0
+    if await client_still_using(db, owner_id, email):
         return 0
     cols = [c for c in await _their_showcases(db, owner_id, email, "ACTIVE") if not kept_awake(c)]
     for c in cols:

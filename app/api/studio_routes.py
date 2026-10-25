@@ -63,8 +63,12 @@ async def update_brand_kit(
     kit = await get_or_create_brand_kit(db, current_user.id)
     data = payload.model_dump(exclude_unset=True)
     look = data.pop("look", None)
+    old_secondary = kit.secondary_color
     for field, value in data.items():
         setattr(kit, field, value)
+    if "secondary_color" in data:
+        # live invitations made in the old brand color follow the new one (Branding center)
+        await brand_look_service.follow_brand_color_change(db, current_user, old_secondary, kit.secondary_color)
     if look:
         # Luxe is IDX only (same rule as the Hub / Signature / Studio Luxe).
         if look.get("theme") == "luxe" and not luxe_theme_allowed(current_user):
@@ -77,6 +81,28 @@ async def update_brand_kit(
     await db.commit()
     await db.refresh(kit)
     return _kit_out(kit, current_user)
+
+
+@router.get("/brand-kit/usage")
+async def brand_kit_usage(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
+):
+    """Branding center: which features wear the brand color right now."""
+    from app.services import brand_look_service
+    return await brand_look_service.usage(db, current_user)
+
+
+@router.post("/brand-kit/apply-all")
+async def brand_kit_apply_all(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
+):
+    """Branding center's "Use this color for all features": every feature back on My Brand Kit."""
+    from app.services import brand_look_service
+    out = await brand_look_service.apply_everywhere(db, current_user)
+    await db.commit()
+    return out
 
 
 @router.post("/brand-kit/logo/{slot}", response_model=BrandKitResponse)

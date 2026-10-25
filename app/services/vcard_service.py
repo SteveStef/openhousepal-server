@@ -115,6 +115,45 @@ async def fetch_photo_base64(photo_url: Optional[str]) -> Optional[str]:
         return None
 
 
+def build_agent_vcard_text(agent: dict, *, photo_base64: Optional[str] = None, note: Optional[str] = None) -> str:
+    """A Listing Spotlight's "Save contact": the agent exactly as the page shows them (name, title,
+    brokerage, phone + texting number, email, Agent Hub / website) with their headshot embedded -
+    the same v3.0 shape as the Agent Hub card above."""
+    name = str(agent.get("name") or "").strip() or "Agent"
+    parts = name.split()
+    first, last = (" ".join(parts[:-1]), parts[-1]) if len(parts) > 1 else (name, "")
+    lines = ["BEGIN:VCARD", "VERSION:3.0", f"N:{_escape(last)};{_escape(first)};;;", f"FN:{_escape(name)}"]
+    if (agent.get("brokerage") or "").strip():
+        lines.append(f"ORG:{_escape(agent['brokerage'].strip())}")
+    if (agent.get("title") or "").strip():
+        lines.append(f"TITLE:{_escape(agent['title'].strip())}")
+    phone = (agent.get("phone") or "").strip()
+    if phone:
+        lines.append(f"TEL;TYPE=CELL:{_escape(phone)}")
+    text = (agent.get("text_phone") or "").strip()
+    if text and re.sub(r"\D", "", text) != re.sub(r"\D", "", phone):
+        lines.append(f"item9.TEL;TYPE=CELL:{_escape(text)}")
+        lines.append("item9.X-ABLabel:Text")
+    if (agent.get("email") or "").strip():
+        lines.append(f"EMAIL;TYPE=INTERNET:{_escape(agent['email'].strip())}")
+    links = []
+    if agent.get("hub_url"):
+        links.append((agent["hub_url"], "Agent Hub"))
+    for s in agent.get("social_links") or []:
+        if isinstance(s, dict) and str(s.get("url") or "").startswith("http") and (s.get("id") == "website" or s.get("label") == "Website"):
+            links.append((s["url"], "Website"))
+            break
+    for i, (url, label) in enumerate(links, start=1):
+        lines.append(f"item{i}.URL:{_escape(url)}")
+        lines.append(f"item{i}.X-ABLabel:{_escape(label)}")
+    if note:
+        lines.append(f"NOTE:{_escape(note)}")
+    if photo_base64:
+        lines.append(f"PHOTO;ENCODING=b;TYPE=JPEG:{photo_base64}")
+    lines.append("END:VCARD")
+    return "\r\n".join(_fold(line) for line in lines) + "\r\n"
+
+
 def build_vcard_text(
     hub: AgentHub,
     owner: User,

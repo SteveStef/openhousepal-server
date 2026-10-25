@@ -8,7 +8,7 @@ from app.models.database import Property
 from app.models.property import PropertySummaryResponse, PropertyDetailResponse
 from app.services.google_geocoding_service import ensure_google_rooftop_geocode
 from app.utils.same_home import dedupe_same_homes
-from app.utils.geo import get_lat_long_offsets, filter_properties_by_radius, is_within_distance
+from app.utils.geo import get_lat_long_offsets, filter_properties_by_radius, is_within_distance, distance_miles_sql
 # Reusing the Areas module's existing ray-casting point-in-polygon SQL (no PostGIS - see that
 # module's own comments) rather than building a second polygon-filtering implementation for the
 # Showcase "Draw on Map" search area.
@@ -249,12 +249,21 @@ class PropertyService:
     @staticmethod
     async def get_properties_by_preferences(
         db: AsyncSession, 
-        preferences: CollectionPreferencesSchema, 
-        max_properties: int = 500
+        preferences: CollectionPreferencesSchema,
+        max_properties: int = 500,
+        nearest_first: bool = True,
     ) -> List[PropertySummaryResponse]:
         """
         Performs a local SQLAlchemy search against the mirrored 'properties' table.
         Implements radius filtering (Bounding Box), price, beds/baths, and location filters.
+
+        nearest_first (radius-only searches): the exact circle is applied IN the query and the cap
+        keeps the CLOSEST homes. Without it the cap keeps the most recently updated homes in the
+        square around the circle, so widening the radius pulled in newer homes from further out and
+        pushed out homes that had matched at the smaller radius (kit Similar Homes, 10/24). On by
+        default - Showcase Save / repopulate (cap 500) and both live previews (cap 200) had the same
+        bug. Town / district / county / drawn-area searches are unchanged (newest first): there is
+        no "closer" order that a wider area can't break there.
         """
         preferences = await _place_address_center(db, preferences)
         if preferences is None:
@@ -461,8 +470,19 @@ class PropertyService:
         if filters:
             query = query.where(and_(*filters))
 
-        # Sort by most recent update/sync
-        query = query.order_by(Property.modification_timestamp.desc().nulls_last())
+        radius_only = (
+            not location_filters and not getattr(preferences, 'search_polygon', None)
+            and preferences.lat is not None and preferences.long is not None and preferences.diameter
+        )
+        if nearest_first and radius_only:
+            # Exact circle + closest first BEFORE the cap: every home inside a smaller circle is
+            # closer than every home a bigger circle adds, so growing the radius never drops one.
+            dist = distance_miles_sql(Property.latitude, Property.longitude, float(preferences.lat), float(preferences.long))
+            query = query.where(dist <= float(preferences.diameter))
+            query = query.order_by(dist.asc(), Property.modification_timestamp.desc().nulls_last(), Property.listing_key)
+        else:
+            # Sort by most recent update/sync
+            query = query.order_by(Property.modification_timestamp.desc().nulls_last())
 
         # Execute
         query = query.limit(max_properties)
@@ -484,7 +504,13 @@ class PropertyService:
             )
 
         # One house listed twice (two MLS numbers / two towns) shows once - the newest listing.
-        properties = dedupe_same_homes(properties)
+        if nearest_first and radius_only:
+            # Dedupe on a newest-first copy (so the newest listing still wins), keep closest-first order.
+            newest = sorted(properties, key=lambda p: (p.modification_timestamp is not None, p.modification_timestamp or 0), reverse=True)
+            kept_ids = {id(p) for p in dedupe_same_homes(newest)}
+            properties = [p for p in properties if id(p) in kept_ids]
+        else:
+            properties = dedupe_same_homes(properties)
 
         return [PropertySummaryResponse.model_validate(p) for p in properties]
 

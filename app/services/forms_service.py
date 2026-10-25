@@ -651,18 +651,21 @@ async def submit_form(db: AsyncSession, form: AgentForm, payload: FormSubmission
         from app.services.collections_service import CollectionsService
         showcase_result = await CollectionsService.create_or_update_from_form_submission(db, form, submission, answers_by_id)
         if showcase_result and showcase_result.get("share_token"):
-            redirect_url = f"/showcase/{showcase_result['share_token']}"
+            if getattr(form, "redirect_to_showcase", True):
+                redirect_url = f"/showcase/{showcase_result['share_token']}"
             if lead is not None:
                 from app.services.tasks_service import resync_lead_followups
                 resync_lead_followups(form.owner_id, lead.id, delay=20)
     elif gate == "no":
-        # I'm Buying / How Can We Help (as a buyer, no agent): the same Showcase build, quietly -
-        # no redirect, they land on the form's normal thank-you. The follow-up message introduces
-        # it. Only when they actually told us what they want, so a blank search never overwrites
-        # a Showcase they already have.
+        # I'm Buying / How Can We Help (as a buyer, no agent): the same Showcase build. They're sent
+        # to it after the thank-you unless the agent turned "Open their Showcase" off (user, 10/24).
+        # Only when they actually told us what they want, so a blank search never overwrites a
+        # Showcase they already have.
         from app.services.collections_service import CollectionsService
         built = await CollectionsService.create_or_update_from_form_submission(
             db, form, submission, answers_by_id, require_criteria=True)
+        if built and built.get("share_token") and getattr(form, "redirect_to_showcase", True):
+            redirect_url = f"/showcase/{built['share_token']}"
         # The follow-up introduces this Showcase - once its homes are in, re-push the follow-up
         # (made in the background right after the lead) so the calendar alert has the real pitch.
         if built and lead is not None:

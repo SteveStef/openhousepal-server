@@ -68,7 +68,7 @@ class EmailSchedulerService:
                                                      email_record.subject, variables)
                             if gate is None:
                                 email_record.status = "CANCELLED"
-                                email_record.error_message = "Held back by the email rules (not opening these updates)"
+                                email_record.error_message = "Held back by the email rules (not opening these updates, or the same email already went to them today)"
                                 await db.commit()
                                 continue
                             track_id, variables = gate

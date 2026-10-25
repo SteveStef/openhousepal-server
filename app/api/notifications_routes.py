@@ -260,13 +260,27 @@ async def _email_settings_payload(db: AsyncSession, user: User) -> dict:
     s = es.resolve(user.email_settings)
     prefs = notification_preferences_service.resolve_prefs(user.notification_prefs)
     cats = {c["id"]: c for c in notification_preferences_service.categories_payload()}
+    # Only what this plan actually sends. No-MLS plans have no Showcases, Spotlights or hosting
+    # (Bright MLS features) - their clients only get tour confirmations from this list.
+    from app.utils.auth import REVIEWS_ACCESS_TIERS, STUDIO_MEDIA_ACCESS_TIERS, tier_has_mls
+    plan = getattr(user, "plan_tier", None)
+    client_rows = es.CLIENT_EMAILS
+    hidden_cats: set = set()
+    if plan and not tier_has_mls(plan):
+        client_rows = [c for c in es.CLIENT_EMAILS if c["key"] == "tour_confirmed"]
+        hidden_cats = {"showcase_requests", "host_requests", "showcase_digest", "liked_homes", "showcase_activity", "spotlight_weekly", "listing_updates", "team"}
+        if plan not in REVIEWS_ACCESS_TIERS:
+            hidden_cats.add("reviews")
+        if plan not in STUDIO_MEDIA_ACCESS_TIERS:
+            hidden_cats.add("ai_media")
+    receive = [{**t, "categories": [{**cats[c], "email": prefs[c]["email"]} for c in t["categories"] if c in cats and c not in hidden_cats]} for t in es.RECEIVE_TIERS]
     return {
-        "client": [{k: v for k, v in {**c, **s["client"][c["key"]]}.items() if k != "templates"} for c in es.CLIENT_EMAILS],
+        "client": [{k: v for k, v in {**c, **s["client"][c["key"]]}.items() if k != "templates"} for c in client_rows],
         "invite_delay": s["invite_delay"], "invite_delays": list(es.INVITE_DELAYS),
         "briefing_time": s["briefing_time"], "briefing_times": list(es.BRIEFING_TIMES),
         "mailbox": {"connected": connected, "account_email": conn.account_email if conn else None,
                     "provider": conn.provider if conn else None, "status": conn.status if conn else None},
-        "receive": [{**t, "categories": [{**cats[c], "email": prefs[c]["email"]} for c in t["categories"] if c in cats]} for t in es.RECEIVE_TIERS],
+        "receive": [t for t in receive if t["categories"]],
         "always_on": es.ALWAYS_ON,
     }
 

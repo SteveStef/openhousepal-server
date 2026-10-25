@@ -220,6 +220,7 @@ class AgentForm(Base):
     look_theme = Column(String, nullable=True)
     luxe_metal = Column(String, nullable=True)
     redirect_to_agent_hub = Column(Boolean, default=True, nullable=False)  # After submitting, auto-redirect the visitor to the agent's public Agent Hub
+    redirect_to_showcase = Column(Boolean, default=True, server_default='true', nullable=False)  # Showcase-building forms: open the Showcase the answers just built (wins over the Agent Hub)
     property_photo_carousel = Column(Boolean, default=False, nullable=False)  # Welcome screen cycles through the linked property's listing photos
     background_effects = Column(Boolean, default=True, nullable=False)  # Subtle animated background graphics across the visitor form flow
     welcome_text_effects = Column(Boolean, default=True, nullable=False)  # Entrance animation for the welcome title, subtitle, and start button
@@ -370,6 +371,9 @@ class Lead(Base):
     # newest LeadEvent.occurred_at (not `updated_at`, which SQLAlchemy bumps on any unrelated field
     # change) to decide whether the lead has unseen activity - see needs_attention in lead_routes.py.
     viewed_at = Column(DateTime(timezone=True), nullable=True)
+    # The agent starred this person (Leads page / Visitors) - separate from starring their Showcase
+    # (Collection.favorited_at): a lead can matter while their Showcase doesn't (user, 10/24).
+    is_favorite = Column(Boolean, nullable=False, default=False, server_default='false')
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -627,6 +631,34 @@ class EmailLog(Base):
     delivery = Column(String(16), nullable=True)          # delivered | delayed | bounced | blocked | spam
     delivery_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    # Emails TO an agent carry our own open pixel (/e/a/<id>.gif) and a tracked button link -
+    # agent_email_health_service. tracked = it was sent with them (older rows never were).
+    tracked = Column(Boolean, nullable=False, default=False, server_default='false')
+    opened_at = Column(DateTime(timezone=True), nullable=True)
+    open_count = Column(Integer, nullable=False, default=0, server_default='0')
+    clicked_at = Column(DateTime(timezone=True), nullable=True)
+    # (recipient, kind, event, Eastern day) hashed - one of each a day (email_dedupe_service).
+    # A stopped repeat is its own row: status held, via "dedupe".
+    dedupe_key = Column(String(64), nullable=True, index=True)
+
+
+class AgentEmailHealth(Base):
+    """Is this agent opening OpenHousePal's emails? (agent_email_health_service, user 10/24 - protect
+    our sender score.) normal -> warned after 5 unopened in a row (banner + bell) -> weekly after 5
+    more: non-critical emails wait for one weekly summary. Any open puts them straight back."""
+    __tablename__ = "agent_email_health"
+
+    user_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), primary_key=True)
+    mode = Column(String(12), nullable=False, default='normal', server_default='normal')  # normal | warned | weekly
+    warned_at = Column(DateTime(timezone=True), nullable=True)
+    weekly_at = Column(DateTime(timezone=True), nullable=True)
+    reset_at = Column(DateTime(timezone=True), nullable=True)      # count unopened emails only after this
+    dismissed_at = Column(DateTime(timezone=True), nullable=True)  # banner closed (for this warning / switch)
+    last_summary_at = Column(DateTime(timezone=True), nullable=True)
+    last_test_at = Column(DateTime(timezone=True), nullable=True)
+    held = Column(JSONB, nullable=True)                            # [{t, s, l, at}] waiting for the weekly summary
+    held_total = Column(Integer, nullable=False, default=0, server_default='0')
+    changed_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class ClientEmailPref(Base):
@@ -1118,6 +1150,10 @@ class OpenHouseEvent(Base):
     # Guest Pass footer: the host's Email Signature card (site version) in place of the plain agent
     # card - on by default; only shows when the plan has signatures and one is saved.
     pass_signature = Column(Boolean, default=True, nullable=False, server_default='true')
+    # Showcases switched OFF (auto_showcase False): the Guest Pass can still offer a "Get my
+    # Showcase" button that builds one only when the guest taps it (user, 10/24). Ignored while
+    # auto_showcase is on (then every guest without an agent already gets one).
+    pass_showcase = Column(Boolean, default=False, nullable=False, server_default='false')
     # No-MLS Pro plan (no Guest Pass - it has no Similar Homes / Cheat Sheet / Showcases): "hub"
     # sends the guest to the agent's Agent Hub after signing in; NULL / "none" = nothing.
     after_signin = Column(String, nullable=True)
@@ -1153,6 +1189,10 @@ class OpenHouseVisitor(Base):
 
     interested_in_similar = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # The agent's per-visitor Showcase switch (Visitors window, user 10/25): True = this guest gets
+    # a Showcase even though the kit's Showcases are off, False = not even though they're on,
+    # NULL = follow the kit (open_house_events.auto_showcase). See visitor_showcase_service.
+    showcase_override = Column(Boolean, nullable=True)
 
     # How the sign-in went (admin Insights, migration c7e9a1b3d5f8): seconds from first tapping the
     # form to pressing Sign in (NULL = not measured), phone | kiosk, and mobile | tablet | desktop.
@@ -1163,6 +1203,25 @@ class OpenHouseVisitor(Base):
     # Relationships
     open_house_event = relationship("OpenHouseEvent")
     lead = relationship("Lead")
+
+
+class GuestPassEvent(Base):
+    """What a guest did on their Guest Pass, with times - the agent's activity log in the Visitors
+    window (user, 10/24). kind: 'session' (one row per visit: created_at = opened, last_seen_at =
+    last heartbeat, so last_seen_at - created_at = time spent), 'similar' (key = listing key of a
+    home they opened), 'similar_list', 'cheat', 'showcase', 'map', 'request' (key = disclosure |
+    second_visit), 'question'. `session` ties events to the visit they happened in."""
+    __tablename__ = "guest_pass_events"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    visitor_id = Column(String, ForeignKey('open_house_visitors.id', ondelete='CASCADE'), nullable=False, index=True)
+    open_house_event_id = Column(String, nullable=True, index=True)
+    kind = Column(String(20), nullable=False)
+    key = Column(String(64), nullable=True)
+    label = Column(String(200), nullable=True)
+    session = Column(String(40), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class OpenHouseSignInView(Base):
@@ -1210,6 +1269,9 @@ class OpenHouseFormRequest(Base):
     # cross-ask in reverse - whether they'd also like the seller disclosure sent over.
     preferred_visit_time = Column(String, nullable=True)
     wants_disclosure = Column(Boolean, nullable=True)
+    # Where they asked (10/25): guest_pass | cheat_sheet (the QR pages) | invite. NULL = before this
+    # was recorded (those all came from the Cheat Sheet QR or, since 10/18, the Guest Pass).
+    source = Column(String(20), nullable=True)
 
     lead_id = Column(String, ForeignKey('leads.id', ondelete='SET NULL'), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -2734,6 +2796,15 @@ class EventInvite(Base):
     questions = Column(JSONB, nullable=False, default=list)  # same shape as AgentForm.questions (+ optional 'role')
     status = Column(String(12), nullable=False, default='live')  # live | closed (RSVPs closed, page still opens)
     view_count = Column(Integer, nullable=False, default=0)
+    # 10/24: several days - event_date / start_time / end_time stay the FIRST day; the rest here.
+    extra_dates = Column(JSONB, nullable=True)  # [{date: 'YYYY-MM-DD', start: 'HH:MM', end: 'HH:MM'}]
+    motion = Column(String(12), nullable=False, default='normal', server_default='normal')  # normal | luxe
+    luxe_metal = Column(String(8), nullable=True)  # gold | silver | bronze (a Luxe colour was picked)
+    cover_position = Column(JSONB, nullable=True)  # {x, y} % - the agent dragged the cover photo
+    # 10/24 round 8: the flyer's line 2 as the agent typed it (NULL = automatic town line, '' = none)
+    subtitle = Column(String(160), nullable=True)
+    open_house_event_id = Column(String, nullable=True)  # their open house for this home (Cheat Sheet, requests)
+    agent_reminded = Column(JSONB, nullable=True)  # ['YYYY-MM-DD'] days the "tomorrow" email went for
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -2757,6 +2828,14 @@ class EventInviteRsvp(Base):
     answers = Column(JSONB, nullable=False, default=list)  # [{questionId, label, type, value}]
     lead_id = Column(String, ForeignKey('leads.id', ondelete='SET NULL'), nullable=True)
     is_seen = Column(Boolean, nullable=False, default=False)  # the agent has looked at it
+    days = Column(JSONB, nullable=True)  # ['YYYY-MM-DD'] which of a several-day invite's days they're coming to
+    is_agent = Column(Boolean, nullable=True)  # "Are you a real estate agent?"
+    has_agent = Column(Boolean, nullable=True)  # "Are you working with an agent?" (non-agents)
+    # lead (a real lead) | agent | represented (has an agent) - invites_service.lead_kind_of
+    lead_kind = Column(String(12), nullable=True)
+    still_interested = Column(Boolean, nullable=True)  # "Can't make it" -> still interested in the home?
+    keep_updated = Column(Boolean, nullable=True)  # "Keep me updated on this property"
+    requests = Column(JSONB, nullable=True)  # {disclosure: iso, second_tour: {at, times}, updates: iso}
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

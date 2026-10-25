@@ -67,11 +67,19 @@ def _service_account() -> Optional[dict]:
     raw = (os.getenv("GOOGLE_SEARCH_SERVICE_ACCOUNT_JSON") or "").strip()
     if not raw:
         return None
+    # Forgiving about how it was pasted into the server settings: wrapped in quotes, or the
+    # key file base64-encoded onto one line (no spaces/quotes for an env editor to mangle).
+    if len(raw) > 1 and raw[0] == raw[-1] and raw[0] in "'\"":
+        raw = raw[1:-1].strip()
     try:
         info = json.loads(raw)
     except ValueError:
-        logger.error("GOOGLE_SEARCH_SERVICE_ACCOUNT_JSON isn't valid JSON - Google auto-register is off")
-        return None
+        try:
+            import base64
+            info = json.loads(base64.b64decode(raw).decode("utf-8"))
+        except Exception:
+            logger.error("GOOGLE_SEARCH_SERVICE_ACCOUNT_JSON isn't valid JSON - Google auto-register is off")
+            return None
     return info if info.get("client_email") and info.get("private_key") else None
 
 

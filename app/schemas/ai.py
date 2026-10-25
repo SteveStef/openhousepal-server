@@ -260,6 +260,8 @@ class CopywriteRequest(BaseModel):
 
 class CopywriteResponse(BaseModel):
     text: str
+    # What this one call cost, so a page can show "used X% of your monthly AI" afterwards (10/24).
+    cost_usd: Optional[float] = None
 
 
 class ComplianceCheckRequest(BaseModel):

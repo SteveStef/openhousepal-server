@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import RedirectResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Any, Dict, Optional
 
@@ -36,7 +37,14 @@ async def _get_or_create_signature(db: AsyncSession, owner_id: str) -> EmailSign
     if not signature:
         signature = EmailSignature(owner_id=owner_id, config={})
         db.add(signature)
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError:
+            # A brand-new agent's first visit fires two requests at once - the other one created
+            # the row a moment earlier (owner_id is unique). Use that row instead of a 500.
+            await db.rollback()
+            result = await db.execute(select(EmailSignature).where(EmailSignature.owner_id == owner_id))
+            return result.scalar_one()
         await db.refresh(signature)
     return signature
 
@@ -618,6 +626,23 @@ async def get_signature_photo_jpeg(token: str, request: Request, db: AsyncSessio
     async def render():
         return await email_signature_service.render_photo_jpeg(headshot or None, name, accent, card_bg_hex, photo_position=photo_position)
     return await _live_image(request, _fingerprint("photo.jpg", headshot, name, accent, card_bg_hex, photo_position), "image/jpeg", render)
+
+
+@router.get("/public/{token}/photo.png")
+async def get_signature_photo_png(token: str, request: Request, db: AsyncSession = Depends(get_db)):
+    """What the install HTML links to now: photo.jpg's exact picture with a see-through margin, so
+    mail apps' dark mode (which re-colors the card, never images) leaves no light frame around the
+    photo - see render_photo_png. photo.jpg stays for signatures installed before."""
+    signature, owner, hub_config = await _load_public_signature(db, token)
+    resolved = email_signature_service.resolve_signature_config(signature.config)
+    headshot = hub_config.get("profilePhotoUrl") or owner.photo_url or ""
+    card_bg_hex = email_signature_service.theme_card_bg(bool(resolved.get("darkMode")))
+    photo_position = hub_config.get("profilePhotoPosition")
+    name, accent = _agent_name(owner, hub_config), resolved["accentColor"]
+
+    async def render():
+        return await email_signature_service.render_photo_png(headshot or None, name, accent, card_bg_hex, photo_position=photo_position)
+    return await _live_image(request, _fingerprint("photo.png", headshot, name, accent, card_bg_hex, photo_position), "image/png", render)
 
 
 @router.get("/public/{token}/photo.webp")

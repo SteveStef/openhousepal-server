@@ -50,10 +50,13 @@ def provider_id_from(body: Optional[str]) -> Optional[str]:
 
 
 def record(template: str, audience: str, *, ok: bool = True, held: bool = False, owner_id: Optional[str] = None,
-           client_email_id: Optional[str] = None, via: str = "openhousepal", provider_id: Optional[str] = None) -> None:
+           client_email_id: Optional[str] = None, via: str = "openhousepal", provider_id: Optional[str] = None,
+           log_id: Optional[str] = None, tracked: bool = False, dedupe_key: Optional[str] = None) -> None:
+    """log_id / tracked: an agent email that carried our open pixel + tracked link under that id
+    (agent_email_health_service)."""
     try:
         row = {
-            "id": str(uuid.uuid4()), "template": (template or "unknown")[:80],
+            "id": log_id or str(uuid.uuid4()), "template": (template or "unknown")[:80], "tracked": bool(tracked), "dedupe_key": dedupe_key or None,
             "audience": audience if audience in AUDIENCES else "account",
             "owner_id": owner_id or None, "client_email_id": client_email_id or None, "via": via[:16],
             "status": "held" if held else ("sent" if ok else "failed"),

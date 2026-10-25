@@ -292,6 +292,7 @@ async def get_open_houses(
                 after_signin=oh.after_signin,
                 guest_pass=oh.guest_pass,
                 pass_signature=oh.pass_signature,
+                pass_showcase=bool(oh.pass_showcase),
                 guest_pass_available=guest_pass_available,
                 pass_signature_available=email_signature_service.signature_plan_allowed(current_user),
                 **_spotlight_fields(spotlights.get(oh.id), oh),
@@ -405,6 +406,7 @@ async def get_open_house_form_requests(
                 another_tour_time=req.another_tour_time,
                 preferred_visit_time=req.preferred_visit_time,
                 wants_disclosure=req.wants_disclosure,
+                source=req.source,
                 created_at=req.created_at,
                 completed_at=req.completed_at,
                 # Street + city (no state/zip - keeps the card compact while still being the "full" address).
@@ -478,6 +480,7 @@ async def complete_open_house_form_request(
             another_tour_time=req.another_tour_time,
             preferred_visit_time=req.preferred_visit_time,
             wants_disclosure=req.wants_disclosure,
+            source=req.source,
             created_at=req.created_at,
             completed_at=req.completed_at,
             property_address=f"{address}, {city}" if address and city else address,
@@ -544,6 +547,7 @@ async def get_open_house(
         after_signin=oh.after_signin,
         guest_pass=oh.guest_pass,
         pass_signature=oh.pass_signature,
+        pass_showcase=bool(oh.pass_showcase),
         guest_pass_available=_guest_pass_available(current_user),
         pass_signature_available=email_signature_service.signature_plan_allowed(current_user),
         **_spotlight_fields((await OpenHouseService.listing_spotlights(db, current_user, [oh])).get(oh.id), oh),
@@ -694,24 +698,14 @@ async def submit_open_house_form(
                     except Exception:
                         logger.exception("open house follow-up task creation failed (non-fatal)")
 
-        # Anyone who doesn't already have an agent automatically gets a showcase (and the
-        # follow-up email below) - no separate "interested in updates" opt-in anymore, across
-        # every sign-in path (kiosk, QR code, sign-in sheet) since they all submit through here.
-        collection_result = {"success": False, "properties_added": 0}
-        showcases_on = bool(open_house_info) and (
-            from_similar_qr or (await db.get(OpenHouseEvent, form_data.open_house_event_id)).auto_showcase is not False
-        )
-        if form_data.open_house_event_id and form_data.has_agent.value != "YES" and showcases_on:
-            # Builds the showcase AND schedules the guest's invite email (1 hour out) - the same
-            # helper backfill_missed_showcases() uses when a Basic agent upgrades.
-            collection_result = await OpenHouseService.create_showcase_and_invite(
-                db, visitor, form_data, send_after=timedelta(hours=1)
-            )
-            # The Showcase's homes are in now - re-push this guest's follow-up so its calendar alert
-            # carries the real pitch (home count, best match), not the empty just-created Showcase.
-            if collection_result.get("success") and visitor.lead_id and open_house_info:
-                from app.services.tasks_service import resync_lead_followups
-                resync_lead_followups(open_house_info["agent_id"], visitor.lead_id, delay=20)
+        # The guest's phone goes straight on to their Guest Pass: it opens at once and says "Your
+        # Showcase is loading" while the build + the host's alert finish in the background.
+        guest_pass_link = await _guest_pass_url(db, visitor)
+        if guest_pass_link and form_data.has_agent.value != "YES":
+            _after_signin_later(visitor.id, form_data, open_house_info, from_similar_qr, quiet)
+            collection_result = {"success": False, "properties_added": 0}
+        else:
+            collection_result = await _showcase_and_alert(db, visitor, form_data, open_house_info, from_similar_qr, quiet)
 
         # Customize message based on collection creation result
         message = "Thank you for visiting! We'll be in touch soon."
@@ -720,71 +714,12 @@ async def submit_open_house_form(
         elif collection_result["success"]:
             message = "Thank you for visiting! We've created a personalized collection for you and will be in touch soon with matching properties."
 
-        # Create notification for agent
-        if form_data.open_house_event_id and not quiet:
-            try:
-                # Get the open house event to find the agent_id
-                open_house_query = select(OpenHouseEvent).where(OpenHouseEvent.id == form_data.open_house_event_id)
-                open_house_result = await db.execute(open_house_query)
-                open_house_event = open_house_result.scalar_one_or_none()
-
-                if open_house_event:
-                    property_data_for_notif = await OpenHouseService.get_property_by_qr_code(db, form_data.open_house_event_id)
-
-                    # Build link for notification
-                    notification_link = None
-                    if collection_result.get('success') and collection_result.get('collection_id'):
-                        notification_link = f"/showcases?showcase={collection_result.get('collection_id')}"
-                    else:
-                        # Fallback to visitor list if no collection
-                        notification_link = f"/open-houses/visitors/{form_data.open_house_event_id}"
-
-                    # A Basic agent's unrepresented guest is exactly who a Showcase is for - say so
-                    # right when it matters (they get it automatically on upgrade, see
-                    # backfill_missed_showcases). Only on the Bright ladder: No-MLS has no Showcases.
-                    notif_message = "Signed in at your open house"
-                    if collection_result.get("reason") == "basic_plan":
-                        hosting_agent = await db.get(User, open_house_event.agent_id)
-                        if hosting_agent and hosting_agent.plan_tier == "BASIC":
-                            notif_message = ("Signed in without an agent - on Premium they'd already have their own "
-                                             "Showcase. Upgrade and they'll get it automatically.")
-                            notification_link = "/upgrade-required?feature=Showcases&tier=PREMIUM"
-
-                    notification = Notification(
-                        agent_id=open_house_event.agent_id,
-                        type="OPEN_HOUSE_SIGN_IN",
-                        reference_type="VISITOR",
-                        reference_id=visitor.id,
-                        title=f"New Open House Visitor: {visitor.full_name}",
-                        message=notif_message,
-                        collection_id=collection_result.get('collection_id') if collection_result.get('success') else None,
-                        collection_name=collection_result.get('collection_id') if collection_result.get('success') else None,
-                        property_address=property_data_for_notif.get('address') if property_data_for_notif else None,
-                        visitor_name=visitor.full_name,
-                        link=notification_link,
-                        is_read=False,
-                        created_at=datetime.now(timezone.utc)
-                    )
-
-                    db.add(notification)
-                    await db.commit()
-                    # No email per sign-in - the host gets ONE wrap-up 2 hours after the last guest
-                    # signs in (agent_roundup_service); the bell above still alerts live.
-                    from app.services.agent_roundup_service import queue_sign_in
-                    queue_sign_in(db, await db.get(User, open_house_event.agent_id), open_house_event, visitor,
-                                  notif_message if notif_message != "Signed in at your open house" else None,
-                                  notification_link)
-                    await db.commit()
-            except Exception as e:
-                logger.error("creating notification failed", extra={"error": str(e)})
-                # Don't fail the whole request if notification creation fails
-
         return OpenHouseFormResponse(
             success=True,
             message=message,
             visitor_id=visitor.id,
             collection_created=collection_result["success"],
-            guest_pass_url=await _guest_pass_url(db, visitor),
+            guest_pass_url=guest_pass_link,
         )
 
     except ValueError as e:
@@ -797,6 +732,123 @@ async def submit_open_house_form(
             status_code=500,
             detail="Failed to process form submission"
         )
+
+
+async def _showcase_and_alert(db: AsyncSession, visitor: OpenHouseVisitor, form_data: OpenHouseFormSubmission,
+                              open_house_info: Optional[dict], from_similar_qr: bool, quiet: bool) -> dict:
+    """After a sign-in: the guest's Showcase (no agent) + the host's bell alert and wrap-up queue.
+    Runs inside the sign-in request - or, when the guest's phone is going straight on to their
+    Guest Pass, right after it in the background (user, 10/24: "never wait for the showcase to be
+    built"), see _after_signin_later."""
+    # Anyone who doesn't already have an agent automatically gets a showcase (and the
+    # follow-up email below) - no separate "interested in updates" opt-in anymore, across
+    # every sign-in path (kiosk, QR code, sign-in sheet) since they all submit through here.
+    collection_result = {"success": False, "properties_added": 0}
+    # The kit's Showcases switch - or the agent's own switch for this one visitor (Visitors window,
+    # visitor_showcase_service), which beats it.
+    from app.services.visitor_showcase_service import wants_showcase
+    showcases_on = bool(open_house_info) and wants_showcase(
+        await db.get(OpenHouseEvent, form_data.open_house_event_id), visitor, from_similar_qr)
+    if form_data.open_house_event_id and form_data.has_agent.value != "YES" and showcases_on:
+        # Builds the showcase AND schedules the guest's invite email (1 hour out) - the same
+        # helper backfill_missed_showcases() uses when a Basic agent upgrades.
+        collection_result = await OpenHouseService.create_showcase_and_invite(
+            db, visitor, form_data, send_after=timedelta(hours=1)
+        )
+        # The Showcase's homes are in now - re-push this guest's follow-up so its calendar alert
+        # carries the real pitch (home count, best match), not the empty just-created Showcase.
+        if collection_result.get("success") and visitor.lead_id and open_house_info:
+            from app.services.tasks_service import resync_lead_followups
+            resync_lead_followups(open_house_info["agent_id"], visitor.lead_id, delay=20)
+
+    # Create notification for agent
+    if form_data.open_house_event_id and not quiet:
+        try:
+            # Get the open house event to find the agent_id
+            open_house_query = select(OpenHouseEvent).where(OpenHouseEvent.id == form_data.open_house_event_id)
+            open_house_result = await db.execute(open_house_query)
+            open_house_event = open_house_result.scalar_one_or_none()
+
+            if open_house_event:
+                property_data_for_notif = await OpenHouseService.get_property_by_qr_code(db, form_data.open_house_event_id)
+
+                # Build link for notification
+                notification_link = None
+                if collection_result.get('success') and collection_result.get('collection_id'):
+                    notification_link = f"/showcases?showcase={collection_result.get('collection_id')}"
+                else:
+                    # Fallback to visitor list if no collection
+                    notification_link = f"/open-houses/visitors/{form_data.open_house_event_id}"
+
+                # A Basic agent's unrepresented guest is exactly who a Showcase is for - say so
+                # right when it matters (they get it automatically on upgrade, see
+                # backfill_missed_showcases). Only on the Bright ladder: No-MLS has no Showcases.
+                notif_message = "Signed in at your open house"
+                if collection_result.get("reason") == "basic_plan":
+                    hosting_agent = await db.get(User, open_house_event.agent_id)
+                    if hosting_agent and hosting_agent.plan_tier == "BASIC":
+                        notif_message = ("Signed in without an agent - on Premium they'd already have their own "
+                                         "Showcase. Upgrade and they'll get it automatically.")
+                        notification_link = "/upgrade-required?feature=Showcases&tier=PREMIUM"
+
+                notification = Notification(
+                    agent_id=open_house_event.agent_id,
+                    type="OPEN_HOUSE_SIGN_IN",
+                    reference_type="VISITOR",
+                    reference_id=visitor.id,
+                    title=f"New Open House Visitor: {visitor.full_name}",
+                    message=notif_message,
+                    collection_id=collection_result.get('collection_id') if collection_result.get('success') else None,
+                    collection_name=collection_result.get('collection_id') if collection_result.get('success') else None,
+                    property_address=property_data_for_notif.get('address') if property_data_for_notif else None,
+                    visitor_name=visitor.full_name,
+                    link=notification_link,
+                    is_read=False,
+                    created_at=datetime.now(timezone.utc)
+                )
+
+                db.add(notification)
+                await db.commit()
+                # No email per sign-in - the host gets ONE wrap-up 2 hours after the last guest
+                # signs in (agent_roundup_service); the bell above still alerts live.
+                from app.services.agent_roundup_service import queue_sign_in
+                queue_sign_in(db, await db.get(User, open_house_event.agent_id), open_house_event, visitor,
+                              notif_message if notif_message != "Signed in at your open house" else None,
+                              notification_link)
+                await db.commit()
+        except Exception as e:
+            logger.error("creating notification failed", extra={"error": str(e)})
+            # Don't fail the whole request if notification creation fails
+    return collection_result
+
+
+# Visitor ids whose Showcase is being built in the background right now (single API process) -
+# the Guest Pass shows "Your Showcase is loading" meanwhile instead of offering to build another.
+SHOWCASE_BUILDING: set = set()
+_after_signin_tasks: set = set()
+
+
+def _after_signin_later(visitor_id: str, form_data: OpenHouseFormSubmission, open_house_info: Optional[dict],
+                        from_similar_qr: bool, quiet: bool) -> None:
+    """_showcase_and_alert on its own DB session, after the response has gone back."""
+    import asyncio
+    from app.database import AsyncSessionLocal
+
+    async def run():
+        try:
+            async with AsyncSessionLocal() as s:
+                v = await s.get(OpenHouseVisitor, visitor_id)
+                if v is not None:
+                    await _showcase_and_alert(s, v, form_data, open_house_info, from_similar_qr, quiet)
+        except Exception:
+            logger.exception("background showcase build after sign-in failed", extra={"visitor_id": visitor_id})
+        finally:
+            SHOWCASE_BUILDING.discard(visitor_id)
+
+    SHOWCASE_BUILDING.add(visitor_id)
+    task = asyncio.create_task(run())
+    _after_signin_tasks.add(task)
+    task.add_done_callback(_after_signin_tasks.discard)
 
 
 async def _guest_pass_url(db: AsyncSession, visitor: OpenHouseVisitor) -> Optional[str]:
@@ -868,7 +920,8 @@ async def get_property_by_qr(
         open_house_event = oh_result.scalar_one_or_none()
         if open_house_event:
             qr_dark_mode = bool(open_house_event.qr_dark_mode)
-            property_data["similarHomes"] = (open_house_event.similar_homes is not False and open_house_event.auto_showcase is not False
+            # Similar Homes no longer rides on the Showcases switch (10/24 - its own choice now).
+            property_data["similarHomes"] = (open_house_event.similar_homes is not False
                                              and bool(open_house_event.similar_properties_snapshot))
             # Where the guest's phone goes once they sign in (the host's Spotlight for this home,
             # their Agent Hub, or nowhere) - the sign-in page sends them there.
@@ -895,6 +948,9 @@ async def get_property_by_qr(
                 from app.services import sold_branding
                 property_data["brandingAllowed"] = await sold_branding.branding_allowed_for_listing(
                     db, agent, open_house_event.listing_key)
+                # The guest's phone goes on to their Guest Pass after signing in - the page starts its
+                # opening the moment they answer the last question (no "Processing").
+                property_data["guestPass"] = bool(OpenHouseService.guest_pass_on(open_house_event, agent))
 
         return {
             "success": True,
@@ -947,6 +1003,14 @@ async def track_signin_view(
         raise HTTPException(status_code=500, detail="Failed to track sign-in view")
 
 
+# How the agent is told where a request came from ("Requested the seller disclosure on their Guest Pass").
+REQUEST_WHERE = {
+    "guest_pass": "on their Guest Pass",
+    "cheat_sheet": "from your Cheat Sheet QR",
+    "invite": "from your invite",
+}
+
+
 @router.post("/open-house/{open_house_event_id}/request", response_model=OpenHouseFormRequestResponse)
 async def submit_open_house_form_request(
     open_house_event_id: str,
@@ -965,8 +1029,14 @@ async def submit_open_house_form_request(
             raise HTTPException(status_code=404, detail="Open house not found")
 
         current_time = datetime.now(timezone.utc)
+        # HOW they asked (10/25 - the agent couldn't tell): the Guest Pass, the Cheat Sheet's QR
+        # pages (they send nothing) or an invite. Rides on the request, the lead's activity, the
+        # follow-up + calendar event and the alert.
+        source = request_data.source or "cheat_sheet"
+        where = REQUEST_WHERE.get(source, "")
         form_request = OpenHouseFormRequest(
             open_house_event_id=open_house_event_id,
+            source=source,
             form_type=request_data.form_type.value,
             full_name=request_data.full_name,
             email=request_data.email,
@@ -987,17 +1057,17 @@ async def submit_open_house_form_request(
         # activity timeline, not just the bare "requested X" summary.
         request_answers = []
         if request_data.form_type == OpenHouseFormRequestType.DISCLOSURE:
-            summary = f"Requested seller disclosure - {property_address or 'Open House'}"
+            summary = f"Requested the seller disclosure {where} - {property_address or 'Open House'}"
             notif_title = f"Disclosure Request: {request_data.full_name}"
-            notif_message = "Requested the seller disclosure at your open house"
+            notif_message = f"Requested the seller disclosure {where}"
             if request_data.wants_another_tour:
                 request_answers.append({"label": "Wants another tour", "value": "Yes"})
                 if request_data.another_tour_time:
                     request_answers.append({"label": "Preferred time", "value": request_data.another_tour_time})
         else:
-            summary = f"Requested a second visit - {property_address or 'Open House'}"
+            summary = f"Requested a second visit {where} - {property_address or 'Open House'}"
             notif_title = f"Second Visit Request: {request_data.full_name}"
-            notif_message = "Requested a second visit to your open house"
+            notif_message = f"Requested a second visit {where}"
             if request_data.preferred_visit_time:
                 request_answers.append({"label": "Preferred visit time", "value": request_data.preferred_visit_time})
             if request_data.wants_disclosure:
@@ -1015,7 +1085,7 @@ async def submit_open_house_form_request(
             occurred_at=current_time,
             property_address=property_address,
             open_house_event_id=open_house_event_id,
-            raw_snapshot={"answers": request_answers} if request_answers else None,
+            raw_snapshot={"answers": request_answers, "via": source},
         )
         if lead:
             form_request.lead_id = lead.id
@@ -1027,9 +1097,9 @@ async def submit_open_house_form_request(
             # disclosure nor the showing can slip through behind the other.
             extra = None
             if request_data.form_type != OpenHouseFormRequestType.DISCLOSURE and request_data.wants_disclosure:
-                extra = ("open_house_disclosure", f"Requested seller disclosure - {property_address or 'Open House'}", None)
+                extra = ("open_house_disclosure", f"Requested the seller disclosure {where} - {property_address or 'Open House'}", None)
             elif request_data.form_type == OpenHouseFormRequestType.DISCLOSURE and request_data.wants_another_tour:
-                extra = ("open_house_second_visit", f"Requested a second visit - {property_address or 'Open House'}",
+                extra = ("open_house_second_visit", f"Requested a second visit {where} - {property_address or 'Open House'}",
                          [{"label": "Preferred visit time", "value": request_data.another_tour_time}] if request_data.another_tour_time else None)
             if extra:
                 try:
@@ -1037,7 +1107,7 @@ async def submit_open_house_form_request(
                         db, owner_id=open_house_event.agent_id, name=request_data.full_name, email=request_data.email,
                         phone=request_data.phone, source_type=extra[0], source_id=form_request.id, summary=extra[1],
                         occurred_at=current_time, property_address=property_address,
-                        open_house_event_id=open_house_event_id, raw_snapshot={"answers": extra[2]} if extra[2] else None,
+                        open_house_event_id=open_house_event_id, raw_snapshot={"answers": extra[2] or [], "via": source},
                     )
                 except Exception:
                     logger.exception("second ask on an open house request failed (non-fatal)")
@@ -1066,7 +1136,7 @@ async def submit_open_house_form_request(
             is_disclosure = request_data.form_type == OpenHouseFormRequestType.DISCLOSURE
             asked_for = "the seller disclosure" if is_disclosure else "a second tour"
             email_agent(await db.get(User, open_house_event.agent_id), f"OPEN_HOUSE_{request_data.form_type.value.upper()}", "open_house_form_request",
-                        f"{request_data.full_name} requested {asked_for}",
+                        f"{request_data.full_name} requested {asked_for} {where}",
                         {"visitor_name": request_data.full_name, "request_label": asked_for,
                          "property_address": property_address, "visitor_email": request_data.email, "visitor_phone": request_data.phone,
                          "details": "; ".join(f"{a['label']}: {a['value']}" for a in request_answers) or None,
@@ -1085,6 +1155,7 @@ async def submit_open_house_form_request(
             another_tour_time=form_request.another_tour_time,
             preferred_visit_time=form_request.preferred_visit_time,
             wants_disclosure=form_request.wants_disclosure,
+            source=form_request.source,
             created_at=form_request.created_at,
             property_address=property_address,
         )
@@ -1125,8 +1196,51 @@ async def get_open_house_visitors(
         visitor_result = await db.execute(visitor_stmt)
         visitors = visitor_result.scalars().all()
 
-        return [
-            VisitorResponse(
+        # Stars (lead + their Showcase) and Guest Pass activity, for the Visitors window (10/24).
+        from app.models.database import Collection, GuestPassEvent, Lead
+        lead_ids = [v.lead_id for v in visitors if v.lead_id]
+        starred_leads = set()
+        if lead_ids:
+            starred_leads = set((await db.execute(select(Lead.id).where(
+                Lead.id.in_(lead_ids), Lead.owner_id == current_user.id, Lead.is_favorite.is_(True)))).scalars())
+        emails = {(v.email or "").strip().lower() for v in visitors if v.email}
+        showcases: dict = {}
+        if emails:
+            for col in (await db.execute(select(Collection.id, Collection.visitor_email, Collection.favorited_at).where(
+                    Collection.owner_id == current_user.id, func.lower(Collection.visitor_email).in_(emails))
+                    .order_by(Collection.created_at.asc()))).all():
+                showcases[(col.visitor_email or "").strip().lower()] = col  # newest wins
+        pass_stats: dict = {}
+        if visitors:
+            for vid, n, last in (await db.execute(select(
+                    GuestPassEvent.visitor_id, func.count(GuestPassEvent.id),
+                    func.max(func.coalesce(GuestPassEvent.last_seen_at, GuestPassEvent.created_at)))
+                    .where(GuestPassEvent.visitor_id.in_([v.id for v in visitors]))
+                    .group_by(GuestPassEvent.visitor_id))).all():
+                pass_stats[vid] = (n, last)
+
+        # Per-visitor Showcase switch: on Showcase plans, for guests without an agent.
+        from app.models.database import ScheduledEmail
+        from app.services import visitor_showcase_service as vss
+        from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
+        showcase_plan = owner_has_access(current_user, SHOWCASE_ACCESS_TIERS)
+        from app.services.email_settings_service import client_rule, invite_delay_minutes
+        _rule = client_rule(current_user, vss.INVITE_TEMPLATE)
+        invite_delay = None if (_rule is not None and not _rule["on"]) else invite_delay_minutes(current_user)
+        invite_at: dict = {}
+        if showcase_plan and emails:
+            for em, at in (await db.execute(select(func.lower(func.trim(ScheduledEmail.recipient_email)), func.min(ScheduledEmail.scheduled_for)).where(
+                    ScheduledEmail.owner_id == current_user.id, ScheduledEmail.template_name == vss.INVITE_TEMPLATE,
+                    ScheduledEmail.status == "PENDING", func.lower(func.trim(ScheduledEmail.recipient_email)).in_(emails))
+                    .group_by(func.lower(func.trim(ScheduledEmail.recipient_email))))).all():
+                invite_at[em] = at
+
+        out = []
+        for visitor in visitors:
+            col = showcases.get((visitor.email or "").strip().lower())
+            n, last = pass_stats.get(visitor.id, (0, None))
+            switchable = showcase_plan and not vss.has_agent(visitor)
+            out.append(VisitorResponse(
                 id=visitor.id,
                 full_name=visitor.full_name,
                 email=visitor.email,
@@ -1135,10 +1249,18 @@ async def get_open_house_visitors(
                 interested_in_similar=visitor.interested_in_similar,
                 notes=visitor.notes,
                 lead_id=visitor.lead_id,
-                created_at=visitor.created_at
-            )
-            for visitor in visitors
-        ]
+                created_at=visitor.created_at,
+                is_favorite=visitor.lead_id in starred_leads,
+                showcase_id=col.id if col else None,
+                showcase_starred=bool(col and col.favorited_at),
+                pass_events=n,
+                pass_last_at=last,
+                showcase_on=switchable and vss.effective_on(open_house, visitor),
+                showcase_switchable=switchable,
+                showcase_invite_at=invite_at.get((visitor.email or "").strip().lower()) if switchable else None,
+                showcase_invite_delay=invite_delay if switchable else None,
+            ))
+        return out
 
     except HTTPException:
         raise
@@ -1290,6 +1412,8 @@ async def update_guest_settings(
         open_house.guest_pass = payload.guest_pass
     if payload.pass_signature is not None:
         open_house.pass_signature = payload.pass_signature
+    if payload.pass_showcase is not None:
+        open_house.pass_showcase = payload.pass_showcase
     mode_changed = payload.followups_mode is not None and payload.followups_mode != open_house.followups_mode
     if payload.followups_mode is not None:
         open_house.followups_mode = payload.followups_mode
@@ -1300,7 +1424,7 @@ async def update_guest_settings(
         await resync_open_house_followups(db, current_user.id, open_house.id)
     return {"success": True, "auto_showcase": open_house.auto_showcase, "similar_homes": open_house.similar_homes,
             "after_signin": open_house.after_signin, "guest_pass": open_house.guest_pass, "pass_signature": open_house.pass_signature,
-            "followups_mode": open_house.followups_mode}
+            "pass_showcase": open_house.pass_showcase, "followups_mode": open_house.followups_mode}
 
 
 @router.put("/api/visitors/{visitor_id}/note")
@@ -1346,6 +1470,48 @@ async def _load_owned_visitor(db: AsyncSession, visitor_id: str, owner_id: str) 
     if not visitor:
         raise HTTPException(status_code=404, detail="Visitor not found or access denied")
     return visitor
+
+
+from pydantic import BaseModel as _BaseModel  # noqa: E402
+
+
+class VisitorShowcaseSwitch(_BaseModel):
+    on: bool
+
+
+@router.put("/api/visitors/{visitor_id}/showcase")
+async def set_visitor_showcase(
+    visitor_id: str,
+    body: VisitorShowcaseSwitch,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
+):
+    """The Visitors window's Showcase switch for one guest - beats the kit's Showcases setting.
+    On: they get the same Showcase + invite (~1 hour out) a sign-in with Showcases on gives, and
+    their follow-up picks up the Showcase. Off: a waiting invite is cancelled and their Showcase is
+    turned off. See visitor_showcase_service."""
+    from app.services import visitor_showcase_service as vss
+    from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
+    if not owner_has_access(current_user, SHOWCASE_ACCESS_TIERS):
+        raise HTTPException(status_code=403, detail="Showcases aren't on your plan.")
+    visitor = await _load_owned_visitor(db, visitor_id, current_user.id)
+    if vss.has_agent(visitor):
+        raise HTTPException(status_code=409, detail="They said they already have an agent, so they can't get a Showcase.")
+    oh = await db.get(OpenHouseEvent, visitor.open_house_event_id)
+    return await vss.set_showcase(db, current_user, visitor, oh, body.on)
+
+
+@router.get("/api/visitors/{visitor_id}/pass-activity")
+async def visitor_pass_activity(
+    visitor_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
+):
+    """Everything this guest did on their Guest Pass (Visitors window -> Activity): each visit
+    (when, how long) and what they opened in it - homes, Cheat Sheet, map, requests, questions."""
+    from app.services import guest_pass_service
+    visitor = await _load_owned_visitor(db, visitor_id, current_user.id)
+    return await guest_pass_service.activity(db, visitor)
 
 
 @router.get("/api/visitors/{visitor_id}/notes")

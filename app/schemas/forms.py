@@ -88,6 +88,7 @@ class AgentFormResponse(BaseModel):
     look_theme: Optional[str] = None
     luxe_metal: Optional[str] = None
     redirect_to_agent_hub: bool = True
+    redirect_to_showcase: bool = True
     property_photo_carousel: bool = False
     background_effects: bool = True
     welcome_text_effects: bool = True
@@ -170,6 +171,7 @@ class AgentFormUpdate(BaseModel):
     look_theme: Optional[str] = None
     luxe_metal: Optional[str] = None
     redirect_to_agent_hub: Optional[bool] = None
+    redirect_to_showcase: Optional[bool] = None
     property_photo_carousel: Optional[bool] = None
     background_effects: Optional[bool] = None
     welcome_text_effects: Optional[bool] = None
@@ -280,6 +282,8 @@ class PublicAgentFormResponse(BaseModel):
     agent_photo_url: Optional[str] = None
     agent_title: Optional[str] = None
     agent_market: Optional[str] = None
+    # The state the agent serves (User.state, e.g. "PA") - pre-fills a form's "State" answer.
+    agent_state: Optional[str] = None
     linked_property: Optional[LinkedProperty] = None
     # A few of the agent's real recent sales - only populated for showcase_request forms, to
     # illustrate the welcome-screen preview with actual homes instead of placeholder tiles.

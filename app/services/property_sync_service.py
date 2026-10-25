@@ -1301,6 +1301,12 @@ class PropertySyncService:
                 )).scalars().all()
                 if any(is_same_home(new_prop, q) for q in linked):
                     return False
+                # A Showcase holds at most SHOWCASE_MAX_HOMES for-sale homes (owner, 10/24). Full:
+                # the new listing takes the place of the farthest / oldest-listed home nobody acted
+                # on (quietly); if every home is protected it isn't added.
+                from app.services.showcase_limit import make_room_for_new_listing
+                if not await make_room_for_new_listing(db, collection_id, new_prop):
+                    return False
             await db.execute(insert(collection_properties).values(
                 collection_id=collection_id,
                 property_id=property_id,

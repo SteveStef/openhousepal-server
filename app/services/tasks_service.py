@@ -54,6 +54,9 @@ AUTO_FOLLOWUP_RULES: list[dict] = [
      "description": "Someone without an agent fills out your How Can We Help form. Buyers and sellers each get their own message - sellers are flagged as a seller lead.", "tiers": None},
     {"key": "form_submission", "label": "Any other form", "timing": "Right away",
      "description": "Someone submits one of your other forms (onboarding, seller, home value, custom).", "tiers": None},
+    # Invites (10/24): only real leads - not agents, not people with an agent (invites_service.lead_kind_of).
+    {"key": "invite_rsvp", "label": "Invite RSVP", "timing": "Next day",
+     "description": "Someone without an agent RSVPs to one of your invites - or can't make it but is still interested in the home.", "tiers": None},
     {"key": "showing_request", "label": "Showing request", "timing": "Right away",
      "description": "Someone asks to tour a home - from their Showcase, a Spotlight site or your Schedule a Showing form. The message quotes every day and time they picked.", "tiers": None},
     {"key": "showcase_comment", "label": "Showcase comment", "timing": "Next day",
@@ -85,6 +88,22 @@ ALERT_NOTE_RULES = ALERT_ONLY_RULES | {"disclosure_request"}
 # A concrete ask from the person (send the disclosure / book the showing) - always gets its own
 # follow-up, even while a general "reach out" one is still open for them.
 ACTION_REQUEST_RULES = {"disclosure_request", "second_visit_request", "showing_request", "showcase_search_request"}
+# A concrete ask the agent must answer - the seller disclosure, a tour / second visit, a question
+# about a home, a change to their search. ALWAYS gets a follow-up, even when the person has an
+# agent (they still asked YOU). Only nurture situations (sign-in, forms, RSVPs...) skip has-agent
+# people. 10/25 live miss: a has-agent guest asked for the disclosure on her Guest Pass, the agent
+# got the alert but no follow-up.
+EXPLICIT_REQUEST_RULES = {"disclosure_request", "second_visit_request", "showing_request", "listing_inquiry", "showcase_search_request"}
+
+
+def is_explicit_request(rule: Optional[str], source_type: Optional[str] = None, alerts_signup: bool = False) -> bool:
+    """A direct ask (see EXPLICIT_REQUEST_RULES); a blog reader's question counts too. Signing up
+    for a listing's price / open house alerts is not a question."""
+    if alerts_signup:
+        return False
+    return rule in EXPLICIT_REQUEST_RULES or source_type == "blog_inquiry"
+
+
 # Forms that mean "I might sell" - a known buyer filling one in gets its own follow-up.
 SELLER_FORM_TYPES = {"home_value", "selling", "make_me_sell", "seller_onboarding"}
 # "Book the showing" follow-ups - the alert and card say to book it in ShowingTime first (with the
@@ -107,7 +126,7 @@ RULE_GROUPS: list[dict] = [
      "rules": ["open_house_signin", "similar_homes_qr", "second_visit_request", "disclosure_request"]},
     {"key": "forms", "label": "Form responses",
      "description": "Someone fills out one of your forms. The first three build the guest a Showcase.",
-     "rules": ["showcase_setup", "buyer_form", "how_can_we_help", "form_submission"]},
+     "rules": ["showcase_setup", "buyer_form", "how_can_we_help", "form_submission", "invite_rsvp"]},
     {"key": "other", "label": "Showcases, listings & reviews",
      "description": "Activity on your Showcases, listing sites, portals and review link.",
      "rules": ["showing_request", "showcase_comment", "showcase_search_request", "listing_inquiry", "website_signin", "private_feedback"]},
@@ -120,6 +139,7 @@ _SOURCE_RULES: dict[str, tuple[str, int]] = {
     "open_house_disclosure": ("disclosure_request", 0),
     "open_house_second_visit": ("second_visit_request", 0),
     "form_submission": ("form_submission", 0),
+    "invite_rsvp": ("invite_rsvp", 1),
     "portal_lead": ("listing_inquiry", 0),
     "property_tour": ("showing_request", 0),
     "property_website_tour_request": ("showing_request", 0),
@@ -171,8 +191,9 @@ def rule_available(rule: dict, plan_tier: Optional[str]) -> bool:
 
 
 # Per-rule agent settings live in User.followup_rules[key]. Older rows stored a bare bool (on/off);
-# now it's {"enabled": bool, "when": "same_day"|"next_day", "style": "timed"|"all_day"}.
-WHEN_CHOICES = ("same_day", "next_day")
+# now it's {"enabled": bool, "when": "same_day"|"later_today"|"next_day", "style": "timed"|"all_day"}.
+# same_day = soon (30 min - 2.5 h after), later_today = about 2 hours after (followup_window).
+WHEN_CHOICES = ("same_day", "later_today", "next_day")
 STYLE_CHOICES = ("timed", "all_day")
 _DEFAULT_WHEN = {r["key"]: ("next_day" if r["timing"] == "Next day" else "same_day") for r in AUTO_FOLLOWUP_RULES}
 
@@ -386,6 +407,8 @@ WORK_END_HOUR = 17
 SLOT_MINUTES = 15
 SAME_DAY_MIN_LEAD = timedelta(minutes=30)
 SAME_DAY_WINDOW = timedelta(hours=2)
+LATER_TODAY_DELAY = timedelta(hours=2)
+LATER_TODAY_END_HOUR = 20
 
 
 def _quarter_up(dt: datetime) -> datetime:
@@ -409,6 +432,15 @@ def followup_window(when: str, occurred_at: datetime) -> tuple[datetime, datetim
     local = max(base, datetime.now(timezone.utc)).astimezone(EASTERN)
     if when == "next_day":
         return _work_window(local.date() + timedelta(days=1))
+    if when == "later_today":
+        # About 2 hours after they came in (user, 10/24) - a quarter-hour slot 2:00-2:30 later, until
+        # 8 PM (evening texts after an open house are normal); later than that, first thing tomorrow.
+        day_start, _ = _work_window(local.date())
+        start = max(_quarter_up(local + LATER_TODAY_DELAY), day_start)
+        if start.hour >= LATER_TODAY_END_HOUR or start.date() != local.date():
+            nxt, _ = _work_window(local.date() + timedelta(days=1))
+            return nxt, nxt + SAME_DAY_WINDOW
+        return start, start + timedelta(minutes=30)
     day_start, day_end = _work_window(local.date())
     start = _quarter_up(local + SAME_DAY_MIN_LEAD)
     if start < day_start:
@@ -471,8 +503,15 @@ async def plan_followup(db: AsyncSession, user: User, rule: str, occurred_at: da
     return due, due, False
 
 
+_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+
+
 def new_done_code() -> str:
-    return secrets.token_urlsafe(6)
+    """Letters and digits only (10/24). token_urlsafe codes could end in "-" or "_" ("FvaafDl-"),
+    and a phone's link detector can end the link right there - "/d/FvaafDl-/text" then opened the
+    done page instead of the text page, which checks the follow-up off just by opening. Older codes
+    keep working (looked up as stored)."""
+    return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(9))
 
 
 def done_url(code: str) -> str:
@@ -494,6 +533,32 @@ def contact_url(code: str) -> str:
     import os
     base = os.getenv("FRONTEND_URL", os.getenv("CLIENT_URL", "http://localhost:3000")).rstrip("/")
     return f"{base}/d/{code}/contact"
+
+
+def showcase_go_url(code: str) -> str:
+    """The agent's tap-to-open link to this follow-up's Showcase in the calendar event: short, on
+    our own domain, the same shape as the done link (openhousepal.com/d/<code>/s, ~37 letters) -
+    it forwards to the real Showcase (that home inside it when there is one). The real Showcase
+    link on the agent's own domain is ~50 letters ("https://www.mainlinerealty.co/showcase/
+    john-92w8"): too wide for a phone line, the calendar app wrapped it after "showcase/" and only
+    linked the first half (user, 10/24). A link this short always fits on one line."""
+    import os
+    base = os.getenv("FRONTEND_URL", os.getenv("CLIENT_URL", "http://localhost:3000")).rstrip("/")
+    return f"{base}/d/{code}/s"
+
+
+# Invisible / layout characters that can ride along in pasted text (soft hyphen, zero-width
+# space/joiners, word joiner, BOM, direction marks) - inside or next to a link they end the
+# calendar app's link early. Never part of a real URL.
+_URL_JUNK = re.compile("[­​‌‍‎‏  ‪-‮⁠-⁤⁦-⁩﻿\s]")
+
+
+def clean_url(url: Optional[str]) -> Optional[str]:
+    """A link exactly as a calendar / text app should see it: no spaces, line breaks or invisible
+    characters anywhere in it, nothing glued to either end."""
+    if not url:
+        return url
+    return _URL_JUNK.sub("", str(url)).strip("<>\"'") or None
 
 
 async def lead_profile(db: AsyncSession, lead: Lead) -> dict:
@@ -714,6 +779,7 @@ DEFAULT_TEMPLATES: dict[str, str] = {
     "how_can_we_help": "Hi {first_name}, thanks for reaching out! I see you're looking for {what_they_want}.\n\n{showcase}",
     "second_visit_request": "Hi {first_name}, thanks for wanting another look at {address}! You're all set for {requested_time} - I'll send you the details beforehand. If anything changes, feel free to text here.",
     "form_submission": "Hi {first_name}, thanks for filling out my {form_name} form - I've got everything you sent over. When's a good time for a quick call to go through it together?",
+    "invite_rsvp": "Hi {first_name}, thanks for getting back to me about {form_name}! If you have any questions - or would like to see the home at another time - just text me here.",
     "showing_request": "Hi {first_name}, thanks for asking to see {address}! You're all set for {requested_time} - I'll send you the details beforehand. If anything changes, feel free to text here.",
     "listing_inquiry": "Hi {first_name}, thanks for your message about {address}! {answer} Would you like to see it in person? Just reply with a day and time that works for you.",
     "website_signin": "Hi {first_name}, thanks for visiting my website! If a home caught your eye, I'd be happy to send you more like it or set up a showing - just text me here.",
@@ -796,6 +862,7 @@ _RULE_TOKENS: dict[str, list[str]] = {
     key: ["first_name", "full_name", "address", "my_name"] for key in DEFAULT_TEMPLATES
 }
 _RULE_TOKENS["form_submission"] = ["first_name", "full_name", "form_name", "address", "my_name"]
+_RULE_TOKENS["invite_rsvp"] = ["first_name", "full_name", "form_name", "address", "my_name"]  # form_name = the invite's title
 for _k in ("second_visit_request", "showing_request"):
     _RULE_TOKENS[_k] = ["first_name", "full_name", "address", "requested_time", "my_name"]
 for _k in ("showcase_setup", "buyer_form", "how_can_we_help"):
@@ -1065,6 +1132,7 @@ async def create_auto_followup(
     lead_id: Optional[str] = None,
     source: Optional[str] = None,
     needs_reply: bool = False,
+    explicit_request: bool = False,
 ) -> Optional[AgentTask]:
     """Create (and commit) one automatic follow-up for `rule`, unless the agent switched that rule
     off, this exact trigger already made one, or this person already has an open automatic
@@ -1086,7 +1154,10 @@ async def create_auto_followup(
         user = await db.get(User, owner_id)
         if user is None or not rule_enabled(user, rule):
             return None
-        if lead_id and await _has_agent(db, lead_id):
+        # Someone with an agent gets no nurture follow-ups - but a concrete ask from them (the
+        # disclosure, a tour, a question) always does (10/25: a has-agent guest's disclosure
+        # request on her Guest Pass made no follow-up at all).
+        if lead_id and not explicit_request and await _has_agent(db, lead_id):
             return None
         dup = await db.execute(
             select(AgentTask.id).where(
@@ -1171,12 +1242,74 @@ async def create_auto_followup(
             pass
         return task
     except Exception:
-        logger.exception("create_auto_followup failed (non-fatal)")
+        logger.error("CREATE_AUTO_FOLLOWUP FAILED (%s, source %s, lead %s) - leaving a plain needs-attention follow-up",
+                     rule, source_id, lead_id, exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        # Safety net: the agent still gets something on their list and calendar, never nothing.
+        return await _plain_attention_task(db, owner_id=owner_id, lead_id=lead_id, auto_source=auto_source,
+                                           source_id=source_id, title=title, context=context, notes=notes)
+
+
+async def _plain_attention_task(db: AsyncSession, *, owner_id: str, lead_id: Optional[str], auto_source: str,
+                                source_id: str, title: str, context: Optional[str], notes: Optional[str]) -> Optional[AgentTask]:
+    """The bare minimum follow-up - due now, high priority - when building the real one failed.
+    Same auto_source/id as the real one would have (so it never doubles up). Never raises."""
+    try:
+        dup = (await db.execute(select(AgentTask.id).where(
+            AgentTask.owner_id == owner_id, AgentTask.auto_source == auto_source, AgentTask.auto_source_id == source_id).limit(1))).first()
+        if dup:
+            return None
+        task = AgentTask(
+            owner_id=owner_id, lead_id=lead_id,
+            title=f"Needs your attention: {title}"[:240],
+            notes=((notes or "") + "\n(This is a plain reminder - the full follow-up couldn't be built.)").strip(),
+            context=(context or "")[:240] or None,
+            kind="call", priority="high", due_at=datetime.now(timezone.utc), all_day=False,
+            auto_source=auto_source, auto_source_id=source_id, done_code=new_done_code(),
+        )
+        db.add(task)
+        await db.commit()
+        try:
+            from app.services import calendar_sync_service
+            calendar_sync_service.sync_task_bg(owner_id, task.id)
+        except Exception:
+            pass
+        return task
+    except Exception:
+        logger.error("PLAIN ATTENTION FOLLOW-UP ALSO FAILED (%s, source %s, lead %s)", auto_source, source_id, lead_id, exc_info=True)
         try:
             await db.rollback()
         except Exception:
             pass
         return None
+
+
+async def attention_followup(owner_id: str, lead_id: str, event_id: str, source_type: str) -> None:
+    """For a touch point whose follow-up build crashed: a plain one from the event itself (on its
+    own DB session). Only for touch points that make a follow-up at all. Never raises."""
+    try:
+        from app.database import AsyncSessionLocal
+        from app.models.database import LeadEvent
+        rule = (_SOURCE_RULES.get(source_type) or (None,))[0]
+        if rule is None:
+            return
+        async with AsyncSessionLocal() as db:
+            lead = await db.get(Lead, lead_id)
+            event = await db.get(LeadEvent, event_id)
+            owner = await db.get(User, owner_id)
+            if lead is None or event is None or owner is None or not rule_enabled(owner, rule):
+                return
+            if lead.represented == "yes" and not is_explicit_request(rule, source_type, bool((event.raw_snapshot or {}).get("alerts"))):
+                return
+            contact = "  |  ".join(b for b in [lead.email, lead.phone] if b)
+            await _plain_attention_task(db, owner_id=owner_id, lead_id=lead_id, auto_source=rule, source_id=event.id,
+                                        title=f"Follow up with {lead.name or lead.email or 'new lead'}", context=event.summary,
+                                        notes=f"Auto-created: {event.summary}" + (f"\nContact: {contact}" if contact else ""))
+    except Exception:
+        logger.error("attention_followup failed for event %s", event_id, exc_info=True)
 
 
 _AVAILABLE = {"active", "activebright", "comingsoon", "comingsoonbright"}
@@ -1236,6 +1369,54 @@ def _pick_standout(payload: dict) -> tuple[int, Optional[dict], Optional[int], O
         return len(shown), best, best_score, dom(best)
     best = min(candidates, key=lambda p: dom(p) if dom(p) is not None else 10**6)
     return len(shown), best, None, dom(best)
+
+
+def _standout_candidates(payload: dict) -> list[dict]:
+    """Every home the pitch could name (shown on the Showcase, not the toured one, has a days-on-market
+    count), with its match % when the Showcase shows one - kept so each follow-up can pick ITS home
+    (see pick_for_followup) from one Showcase load."""
+    from app.services.showcase_match_service import compute_match_score
+    shown = [p for p in (payload.get("matchedProperties") or []) if _visible_on_showcase(p)]
+    subject = payload.get("originalProperty") or None
+    toured = (subject or {}).get("listingKey")
+    show_match = (payload.get("preferences") or {}).get("show_match_score") is not False
+    out = []
+    for p in shown:
+        if toured and p.get("ListingKey") == toured:
+            continue
+        try:
+            dom = int(p.get("DaysOnMarket"))
+        except (TypeError, ValueError):
+            continue
+        out.append({"home": p, "dom": dom,
+                    "score": compute_match_score(p, subject, shown) if subject and show_match else None})
+    return out
+
+
+def pick_for_followup(candidates: list, created_at: Optional[datetime], now: Optional[datetime] = None):
+    """(home, days on market today) for one follow-up's message (user, 10/24): while it rolls over
+    as overdue it keeps naming the SAME home it named the day it was made - only the day count
+    moves on ("3 days ago" -> "4 days ago") - unless a newer match has come into the Showcase since,
+    which then takes over ("It just hit the market 1 day ago"). (None, None) = name no home."""
+    if not candidates:
+        return None, None
+    today = (now or datetime.now(timezone.utc)).astimezone(EASTERN).date()
+    made = (created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)).astimezone(EASTERN).date() if created_at else today
+    age = max(0, (today - made).days)
+    # Came on the market after the follow-up was written - the newest of them wins.
+    arrived = [c for c in candidates if c["dom"] < age]
+    if arrived:
+        best = min(arrived, key=lambda c: c["dom"])
+        return best["home"], best["dom"]
+    # Otherwise the pick as it was that day: fresh THEN (<= 3 weeks on market), best match, newest on a tie.
+    fresh = [c for c in candidates if c["dom"] - age <= PITCH_FRESH_DAYS]
+    if not fresh:
+        return None, None
+    if any(c["score"] is not None for c in fresh):
+        best = max(fresh, key=lambda c: (c["score"] or 0, -c["dom"]))
+    else:
+        best = min(fresh, key=lambda c: c["dom"])
+    return best["home"], best["dom"]
 
 
 def _pitch_parts(count: int, best: Optional[dict], days: Optional[int], url: str) -> dict:
@@ -1326,12 +1507,17 @@ async def lead_showcase_info(db: AsyncSession, owner: User, leads: list) -> dict
             except Exception:
                 logger.warning("showcase payload failed for %s", token, exc_info=True)
                 payload = {}
-            cache[token] = _pick_standout(payload)
-        count, best, _match, days = cache[token]
+            try:
+                cands = _standout_candidates(payload)
+            except Exception:  # noqa: BLE001 - the per-follow-up pick is a refinement, never fatal
+                logger.warning("showcase candidates failed for %s", token, exc_info=True)
+                cands = None
+            cache[token] = (*_pick_standout(payload), cands)
+        count, best, _match, days, cands = cache[token]
         from app.services.showcase_links import showcase_path
-        url = f"{base}{await showcase_path(share_token=token, db=db) or f'/showcase/{token}'}"
+        url = clean_url(f"{base}{await showcase_path(share_token=token, db=db) or f'/showcase/{token}'}")
         out[lead_id] = {"url": url, "count": count, "parts": _pitch_parts(count, best, days, url),
-                        "first_name": _first(by_id[lead_id].name)}
+                        "first_name": _first(by_id[lead_id].name), "candidates": cands}
     return out
 
 
@@ -1347,6 +1533,21 @@ def full_message(task: AgentTask, showcase: Optional[dict], owner: Optional[User
     msg = task.suggested_message or ""
     if not msg:
         return None
+    if showcase and showcase.get("url"):
+        # The link exactly once, exactly clean - the pitch and link_last below must see the same one.
+        url = clean_url(showcase["url"])
+        parts = {**(showcase.get("parts") or {}), "showcase_link": url}
+        if showcase.get("candidates") is not None and showcase.get("count"):
+            # This follow-up's own home: the same one each day it rolls over (day count moving on),
+            # or a newer match that arrived since - see pick_for_followup.
+            best, days = pick_for_followup(showcase["candidates"], getattr(task, "created_at", None))
+            parts = {**_pitch_parts(showcase["count"], best, days, url), "showcase_link": url}
+        showcase = {**showcase, "url": url, "parts": parts}
+    seen = guest_pass_line(task)
+    if seen:
+        # What they opened on their Guest Pass since (user, 10/24) - one sentence at the end of the
+        # reply, before the Showcase pitch.
+        msg = msg.replace(SHOWCASE_MARKER, f" {seen}{SHOWCASE_MARKER}", 1) if SHOWCASE_MARKER in msg else f"{msg.rstrip()} {seen}"
     pitch = pitch_for(task.auto_source, owner, showcase)
     if not pitch and SHOWCASE_MARKER in msg and task.auto_source in SIGNIN_MERGE_RULES:
         pitch = pitch_for("open_house_signin", owner, showcase)  # folded-in open house follow-up
@@ -1361,6 +1562,29 @@ def full_message(task: AgentTask, showcase: Optional[dict], owner: Optional[User
     # no message of its own).
     out = with_footer(out, owner) if task.auto_source and owner is not None else out
     return link_last(out, (showcase or {}).get("url")) or None
+
+
+# Written onto an open-house follow-up by guest_pass_service.note_activity.
+GUEST_PASS_SEEN = "On their Guest Pass: "
+
+
+def guest_pass_line(task) -> str:
+    """"If 12 Oak St caught your eye too, I'd be happy to show you that one as well." - for the homes
+    a guest with no agent opened on their Guest Pass after the open house; '' when none."""
+    if getattr(task, "auto_source", None) != "open_house_signin" or getattr(task, "completed_at", None) is not None:
+        return ""
+    homes = []
+    for line in (getattr(task, "notes", None) or "").splitlines():
+        if line.startswith(GUEST_PASS_SEEN + "opened ") and not line.startswith((GUEST_PASS_SEEN + "opened the ", GUEST_PASS_SEEN + "opened their ")):
+            street = line[len(GUEST_PASS_SEEN + "opened "):].split(",")[0].strip()
+            if street and street not in homes:
+                homes.append(street)
+    if not homes:
+        return ""
+    homes = homes[-2:]  # the latest two at most - a sentence, not a list
+    if len(homes) == 1:
+        return f"If {homes[0]} caught your eye too, I'd be happy to show you that one as well."
+    return f"If {homes[0]} or {homes[1]} caught your eye too, I'd be happy to show you those as well."
 
 
 _LINK_LEAD_IN = re.compile(r"(?:here'?s|here is) (?:your|the) link\s*:?\s*$|take a look here\s*:?\s*$|here it is\s*:?\s*$", re.I)
@@ -1383,6 +1607,65 @@ def link_last(message: Optional[str], url: Optional[str]) -> Optional[str]:
     tail = tail.lstrip(" .")
     body = _tidy(f"{head} {tail}" if tail and not tail.startswith("\n") else f"{head}{tail}")
     return f"{body}\n\n{url}"
+
+
+# ---- the same follow-up, written as an EMAIL (tap-to-text page's Email button, user 10/25) ----
+_EMAIL_WORDING = (
+    ("Your link is at the bottom of this text.", "Your link is at the bottom of this email."),
+    ("or just text me here", "or just reply to this email"),
+    ("just text me here", "just reply to this email"),
+    ("Just reply here", "Just reply to this email"),
+    ("just reply here", "just reply to this email"),
+    ("reply to this text", "reply to this email"),
+    ("Text me", "Reply"),
+    ("text me", "reach out"),
+)
+
+
+def email_version(message: Optional[str], owner: Optional[User], agent_phone: str = "") -> str:
+    """The ready-to-send text as a short email: the greeting on its own line, text-message wording
+    swapped for email wording, the link labelled at the bottom, and a proper sign-off with the
+    agent's name, brokerage and phone (in place of the text's "Thanks, Name | Brokerage")."""
+    msg = (message or "").strip()
+    if not msg:
+        return ""
+    footer = message_footer(owner) if owner is not None else None
+    link = None
+    lines = msg.rstrip().split("\n")
+    if lines and re.fullmatch(r"https?://\S+", lines[-1].strip()):
+        link = lines.pop().strip()
+        msg = "\n".join(lines).rstrip()
+    if footer and msg.endswith(footer):
+        msg = msg[: -len(footer)].rstrip()
+    m = re.match(r"^((?:Hi|Hello|Hey)\s+[^,\n]{1,40}),\s+(\S.*)$", msg, re.S)
+    if m:
+        rest = m.group(2)
+        msg = f"{m.group(1)},\n\n{rest[:1].upper()}{rest[1:]}"
+    for a, b in _EMAIL_WORDING:
+        msg = msg.replace(a, b)
+    if link:
+        label = "Your Showcase" if "/showcase/" in link else "Here's the link"
+        msg = f"{msg}\n\n{label}: {link}"
+    name = _my_name(owner) if owner is not None else ""
+    brokerage = (getattr(owner, "brokerage", None) or "").strip() if owner is not None else ""
+    raw_phone = agent_phone  # agent_email_service.agent_public_phone - accounts have no phone of their own
+    phone = (_pretty_phone(raw_phone) or "") if raw_phone else ""
+    sign = [x for x in [name, brokerage, phone] if x]
+    if sign:
+        msg = f"{msg}\n\nBest regards,\n" + "\n".join(sign)
+    return _tidy(msg)
+
+
+def email_subject(task: AgentTask, street: Optional[str] = None) -> str:
+    """A plain, personal subject line for the follow-up email."""
+    src = getattr(task, "auto_source", None) or ""
+    if street and src in ("open_house_signin", "similar_homes_qr", "open_house_noted"):
+        return f"Great meeting you at {street}"
+    if street and src in ("second_visit_request", "disclosure_request", "listing_inquiry"):
+        return f"About {street}"
+    if src in ("showcase_setup", "buyer_form", "how_can_we_help"):
+        return "Your home search"
+    return f"Following up - {street}" if street else "Following up"
 
 
 def resync_lead_followups(owner_id: str, lead_id: str, delay: float = 0) -> None:
@@ -1612,7 +1895,7 @@ def schedule_followup_for_lead_event(owner_id: str, lead_id: str, event_id: str,
         return
     import asyncio
 
-    async def run():
+    async def build():
         from app.database import AsyncSessionLocal
         from app.models.database import AgentForm, LeadEvent
         rule, days_after = _SOURCE_RULES[source_type]
@@ -1621,8 +1904,10 @@ def schedule_followup_for_lead_event(owner_id: str, lead_id: str, event_id: str,
             event = await db.get(LeadEvent, event_id)
             if lead is None or event is None:
                 return
-            if says_has_agent(event.raw_snapshot):
-                return  # this time they told us they have an agent - nothing to follow up on
+            # "They have an agent" (this form says so, or their lead does) skips the nurture
+            # follow-ups - but never a concrete ask (disclosure, tour, a question): that's checked
+            # once the situation is known, below (10/25 live miss).
+            told_has_agent = says_has_agent(event.raw_snapshot)
             if source_type == "website_google_signin":
                 # One follow-up per person: a returning visitor signing in again isn't new.
                 earlier = (await db.execute(select(LeadEvent.id).where(
@@ -1639,6 +1924,12 @@ def schedule_followup_for_lead_event(owner_id: str, lead_id: str, event_id: str,
             snap = event.raw_snapshot or {}
             if source_type == "blog_inquiry":
                 form_type, form_title = "blog_question", snap.get("blog_title")
+            if source_type == "invite_rsvp":
+                # Only real leads get one (invites_service.lead_kind_of) - an agent, someone with
+                # an agent or a "can't make it, no thanks" lands on the lead without a follow-up.
+                if snap.get("lead_kind") != "lead":
+                    return
+                form_title = snap.get("invite_title")
             alerts_signup = bool(snap.get("alerts"))
             if alerts_signup:
                 form_type = "spotlight_alerts"
@@ -1660,6 +1951,9 @@ def schedule_followup_for_lead_event(owner_id: str, lead_id: str, event_id: str,
                                    + (f", hoping for {price}" if price else ""))
                     elif intent:
                         context = f"{event.summary} - buying"
+            explicit = is_explicit_request(rule, source_type, alerts_signup)
+            if told_has_agent and not explicit:
+                return  # this time they told us they have an agent - nothing to nurture
             if rule == "showcase_comment" and event.property_address:
                 # The comment itself + a link to that home ride along on the card and the calendar
                 # event (lead_comment_details) - this line just says where it happened.
@@ -1696,6 +1990,8 @@ def schedule_followup_for_lead_event(owner_id: str, lead_id: str, event_id: str,
             notes = f"Auto-created: {event.summary}" + (f"\nContact: {contact}" if contact else "")
             if rule in ALERT_NOTE_RULES:
                 notes = _alert_notes(rule, lead, event)
+            if explicit and (lead.represented == "yes" or told_has_agent):
+                notes = (notes or "") + "\nThey said they already have an agent - this is just their request (no Showcase, no nurture follow-ups)."
             owner = await db.get(User, owner_id)
             made = await create_auto_followup(
                 db,
@@ -1722,12 +2018,23 @@ def schedule_followup_for_lead_event(owner_id: str, lead_id: str, event_id: str,
                 needs_reply=(rule == "listing_inquiry" and not alerts_signup and bool(str(snap.get("message") or "").strip()))
                 or source_type == "blog_inquiry"
                 or form_type in SELLER_FORM_TYPES or seller,
+                explicit_request=explicit,
             )
             if made is not None and rule in SIGNIN_MERGE_RULES:
                 await _merge_open_signin_followup(db, owner_id, lead.id, made)
             if made is None and rule == "showcase_comment":
                 # They already have an open follow-up - re-push it so the new comment shows on it.
                 resync_lead_followups(owner_id, lead.id)
+
+    async def run():
+        # Safety net (10/25): a crash while building the follow-up is logged loudly AND still
+        # leaves the agent a plain "needs your attention" follow-up - never silently nothing.
+        try:
+            await build()
+        except Exception:
+            logger.error("FOLLOW-UP BUILD FAILED for %s event %s (lead %s) - leaving a plain needs-attention follow-up",
+                         source_type, event_id, lead_id, exc_info=True)
+            await attention_followup(owner_id, lead_id, event_id, source_type)
 
     try:
         t = asyncio.get_running_loop().create_task(run())
@@ -2450,8 +2757,19 @@ async def create_open_house_followup(
             pass
         return task
     except Exception:
-        logger.exception("create_open_house_followup failed (non-fatal)")
-        return None
+        logger.error("CREATE_OPEN_HOUSE_FOLLOWUP FAILED (sign-in %s, lead %s) - leaving a plain needs-attention follow-up",
+                     signin_id, getattr(lead, "id", None), exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        # Safety net (10/25): never nothing - a plain "needs your attention" follow-up instead.
+        return await _plain_attention_task(
+            db, owner_id=owner_id, lead_id=getattr(lead, "id", None), auto_source=rule,
+            source_id=signin_id or f"lead:{getattr(lead, 'id', '')}:{int(occurred_at.timestamp())}",
+            title=f"Follow up with {getattr(lead, 'name', None) or 'open house guest'}",
+            context=f"Signed in at your open house{' - ' + property_address if property_address else ''}",
+            notes="Auto-created from an open house sign-in." + (f"\nOpen house: {property_address}" if property_address else ""))
 
 
 # ---------------------------------------------------------------- guest with an agent + a note
@@ -2788,14 +3106,14 @@ async def followup_property(db: AsyncSession, task: AgentTask, owner: Optional[U
                 from app.services.website.site_service import resolve_owner_public_base_url
                 base = (await resolve_owner_public_base_url(db, owner)).rstrip("/")
                 from app.services.showcase_links import showcase_path, home_suffix
-                out.update(url=f"{base}{await showcase_path(share_token=row[0], db=db) or f'/showcase/{row[0]}'}{home_suffix(row[1])}", where="showcase")
+                out.update(url=clean_url(f"{base}{await showcase_path(share_token=row[0], db=db) or f'/showcase/{row[0]}'}{home_suffix(row[1])}"), where="showcase")
                 return out
         # 2) the property details page
         from app.services import property_website_service as pws
         if listing_key and owner is not None:
             info = await pws.describe_listing_link(db, owner, listing_key, full, skip_spotlight=True)
             if info.get("url"):
-                out.update(url=info["url"], where="listing")
+                out.update(url=clean_url(info["url"]), where="listing")
     except Exception:
         logger.warning("follow-up property link failed for %s", task.id, exc_info=True)
     return out
@@ -2830,6 +3148,7 @@ def _sample_cases() -> dict:
                         ["How can I help you? I'm looking to sell", "When are you hoping to sell? 1-3 months"],
                         {"address": "48 Maple Ave, Wynnewood, PA", "short": "48 Maple Ave, Wynnewood", "url": None, "where": None}),
         "form_submission": ("Follow up with Jane Buyer", "Submitted What's My Home Worth?", ["Property address: 48 Maple Ave"], None),
+        "invite_rsvp": ("Follow up with Jane Buyer", "RSVP'd Coming - Open House at 12 Oak St", ["How many of you are coming? 2"], listing),
         "showing_request": ("Book the showing for Jane Buyer", "Requested a showing - 22 Birch Ln",
                             ["1st choice: Sat, Oct 3 at 2:00 PM", "2nd choice: Sun, Oct 4 at 11:00 AM", "Their message: Can we see the basement too?"], birch),
         "showcase_comment": ("Follow up with Jane Buyer", "Commented on 22 Birch Ln in their Showcase", [], birch),
@@ -2891,7 +3210,8 @@ def sample_event(owner: User, key: str, *, template: Optional[str] = None, pitch
                      "url": done_url("sample").rsplit("/d/", 1)[0] + "/showcases?showcase=sample&property=22-birch"}]
     body = _task_event_body(task, None, followup_color(owner), done_url("sample"), owner=owner,
                             contact_link=contact_url("sample"), lead_name="Jane", comments=comments, lead=lead,
-                            details=details, prop=prop, message_override=message)
+                            details=details, prop=prop, message_override=message,
+                            showcase_link=showcase_go_url("sample") if (prop or {}).get("where") == "showcase" else None)
     return {"summary": body.get("summary", ""), "description": body.get("description", ""), "all_day": task.all_day}
 
 
@@ -3090,19 +3410,31 @@ async def render_ics(db: AsyncSession, user: User) -> str:
         lines.append(_fold("SUMMARY:" + calendar_bold(f"[{task_prefix(t)}] {_ics_escape(t.title)}")))
         sc = showcases.get(t.lead_id)
         code = await ensure_done_code(db, t)
-        desc_parts = ["Mark as done: " + done_url(code)]
+        # Every link on a line of its own (nothing glued to it), the Showcase one in its short form -
+        # see showcase_go_url.
+        desc_parts = ["Mark as done:\n" + done_url(code)]
         if t.suggested_message and phones.get(t.lead_id or ""):
-            desc_parts.append("Text them from your phone (opens Messages with the text written): " + text_url(code))
+            desc_parts.append("Text / email link (opens Messages or your email with the message written):\n" + text_url(code))
         if t.context:
             desc_parts.append(t.context)
         if sc:
-            desc_parts.append("Their Showcase: " + sc["url"])
+            desc_parts.append("Their Showcase:\n" + showcase_go_url(code))
         if t.notes:
             desc_parts.append(t.notes)
         if t.suggested_message:
             desc_parts.append("Suggested message:\n" + (full_message(t, sc, user) or ""))
-        if desc_parts:
-            lines.append(_fold(f"DESCRIPTION:{_ics_escape(chr(10).join(desc_parts))}"))
+        # The same text as the event pushed to a connected Google / Outlook calendar (10/25): it
+        # also carries what they told you (their question, form answers, picked times), their
+        # Showcase comments, what they opened on their Guest Pass and your notes - the short
+        # version above (kept as the fallback) left those out of the subscribed calendar.
+        desc = chr(10).join(desc_parts)
+        try:
+            from app.services.calendar_sync_service import task_body_for
+            desc = (await task_body_for(db, t)).get("description") or desc
+        except Exception:
+            logger.warning("ics feed: full description failed for task %s", t.id, exc_info=True)
+        if desc:
+            lines.append(_fold(f"DESCRIPTION:{_ics_escape(desc)}"))
         if t.priority == "high":
             lines.append("PRIORITY:1")
         lines.append("END:VEVENT")

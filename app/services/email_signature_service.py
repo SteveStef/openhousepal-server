@@ -1115,7 +1115,7 @@ _PHOTO_JPEG_SCALE = 2  # retina - see render_photo_jpeg
 _PHOTO_SUPERSAMPLE = 3  # draw-big-then-downsample factor for the mask/ring - see render_photo_jpeg
 
 
-async def _compose_photo_unit(photo_url: Optional[str], agent_name: str, accent_hex: str, card_bg_hex: str, photo_position: Optional[dict] = None):
+async def _compose_photo_unit(photo_url: Optional[str], agent_name: str, accent_hex: str, card_bg_hex: str, photo_position: Optional[dict] = None, transparent: bool = False):
     """The static, settled composition render_photo_gif's animation eases INTO - same crop and
     baked-in Save Contact bar, just without the entrance motion and WITHOUT that GIF's soft
     gradient halo behind the photo. That halo was a handful of flat color bands (GIF's 256-color
@@ -1179,8 +1179,12 @@ async def _compose_photo_unit(photo_url: Optional[str], agent_name: str, accent_
     offset_left = round(_PHOTO_FRAME_PAD_LEFT * scale)
     offset_top = round(_PHOTO_FRAME_PAD_TOP * scale)
     canvas_w, canvas_h = round(_PHOTO_CANVAS_W * scale), round(_PHOTO_CANVAS_H * scale)
-    unit = Image.new("RGB", (canvas_w, canvas_h), card_bg_rgb)
-    unit.paste(photo, (offset_left, offset_top), photo_mask)
+    # transparent=True (photo.png, what the install HTML uses): the margin around the rounded photo
+    # is see-through instead of card-colored, so when a mail app's dark mode re-colors the card
+    # there's no light box/"white outline" left around the photo (owner, 10/24). On the normal card
+    # it looks exactly the same as the flat version.
+    unit = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0)) if transparent else Image.new("RGB", (canvas_w, canvas_h), card_bg_rgb)
+    unit.paste(photo.convert("RGBA") if transparent else photo, (offset_left, offset_top), photo_mask)
     return unit
 
 
@@ -1198,6 +1202,17 @@ async def render_photo_jpeg(photo_url: Optional[str], agent_name: str, accent_he
     unit = await _compose_photo_unit(photo_url, agent_name, accent_hex, card_bg_hex, photo_position)
     buffer = BytesIO()
     unit.convert("RGB").save(buffer, format="JPEG", quality=92, optimize=True, subsampling=0)
+    return buffer.getvalue()
+
+
+async def render_photo_png(photo_url: Optional[str], agent_name: str, accent_hex: str, card_bg_hex: str, photo_position: Optional[dict] = None) -> bytes:
+    """Dark-mode-proof photo for the install HTML: the same composition as render_photo_jpeg, but
+    with a see-through margin (see _compose_photo_unit's `transparent`). Gmail/Outlook dark mode
+    re-color the card behind it but never touch images, so a flat card-colored margin baked into
+    the picture showed up as a light frame around the photo."""
+    unit = await _compose_photo_unit(photo_url, agent_name, accent_hex, card_bg_hex, photo_position, transparent=True)
+    buffer = BytesIO()
+    unit.save(buffer, format="PNG", optimize=True)
     return buffer.getvalue()
 
 
@@ -2369,7 +2384,7 @@ def _action_row_html(links: dict, cta_buttons: list, accent: str, redirect_base_
         # blend in with the rest.
         shadow = "0 8px 18px rgba(0,0,0,.32)" if i == 0 else "0 3px 8px rgba(0,0,0,.18)"
         style = (
-            f'background:{accent};background:linear-gradient(180deg,{light_hex} 0%,{accent} 55%,{dark_hex} 100%);'
+            f'background-color:{accent};background-image:linear-gradient(180deg,{light_hex} 0%,{accent} 55%,{dark_hex} 100%);'
             f'color:{text_color};border:1px solid {border_color};box-shadow:{shadow};'
         )
         # font-size stays 9.5px (bigger, more prominent text - the actual ask), but padding pulled
@@ -2920,7 +2935,7 @@ def _build_gallery(cfg: dict, hub: dict, owner: User, redirect_base_url: str, as
         # desktop included. Clicking anywhere on the photo saving the contact is the natural
         # reading anyway. No <picture>/WebP wrapper - see _stats_img_html.
         photo_img = (
-            f'<img src="{asset_base}/photo.jpg" width="{_PHOTO_CANVAS_W}" height="{_PHOTO_CANVAS_H}" '
+            f'<img src="{asset_base}/photo.png" width="{_PHOTO_CANVAS_W}" height="{_PHOTO_CANVAS_H}" '
             f'alt="{_esc(identity["name"])}" style="display:block;width:{_PHOTO_CANVAS_W}px;height:{_PHOTO_CANVAS_H}px;border:0;" />'
         )
         photo_picture = (
@@ -2946,7 +2961,7 @@ def _build_gallery(cfg: dict, hub: dict, owner: User, redirect_base_url: str, as
     if identity["name"]:
         badge_html = (
             ' <span style="display:inline-block;width:15px;height:15px;line-height:15px;text-align:center;'
-            'background:#1685E5;color:#ffffff;border-radius:50%;font-size:9px;font-weight:900;vertical-align:middle;">&#10003;</span>'
+            'background-color:#1685E5;background-image:linear-gradient(#1685E5,#1685E5);color:#ffffff;border-radius:50%;font-size:9px;font-weight:900;vertical-align:middle;">&#10003;</span>'
         ) if cfg.get("showVerifiedBadge") else ""
         identity_parts.append(f'<div style="font-family:{font_stack};font-size:21px;font-weight:800;letter-spacing:-0.3px;color:{text_color};">{_esc(identity["name"])}{badge_html}</div>')
     sub_bits = [b for b in [identity["title"], identity["company"], identity["team"]] if b]
@@ -3151,7 +3166,7 @@ def _build_gallery(cfg: dict, hub: dict, owner: User, redirect_base_url: str, as
         # left in place as the correct-in-the-common-case value, not load-bearing any more.
         row_cells.append(
             f'<td valign="top" align="center" width="{_STATS_W}" bgcolor="{stats_light}" '
-            f'style="background:linear-gradient(180deg,{stats_light} 0%,{stats_dark} 100%);background-color:{stats_light};padding:0;border-radius:0 15px 15px 0;">'
+            f'style="background-color:{stats_light};background-image:linear-gradient(180deg,{stats_light} 0%,{stats_dark} 100%);padding:0;border-radius:0 15px 15px 0;">'
             # Matching top-right/bottom-right corner radius (15px, 1px less than the outer card's
             # own 16px to sit just inside its border) - without this, the outer card's own
             # `overflow:hidden` rounding was clipping a small rounded triangle out of the stats
@@ -3160,7 +3175,7 @@ def _build_gallery(cfg: dict, hub: dict, owner: User, redirect_base_url: str, as
             # the right and bottom... i need edge to edge... so i dont see breakup lines", explicit
             # ask - a real rendering bug, not just a style preference).
             f'<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="{_STATS_W}" height="{stats_h}" bgcolor="{stats_light}" '
-            f'style="background:linear-gradient(180deg,{stats_light} 0%,{stats_dark} 100%);background-color:{stats_light};border-radius:0 15px 15px 0;">'
+            f'style="background-color:{stats_light};background-image:linear-gradient(180deg,{stats_light} 0%,{stats_dark} 100%);border-radius:0 15px 15px 0;">'
             f'<tr><td valign="top" align="center" style="padding:{_MAIN_CELL_PAD_V}px 8px {stats_pad_bottom}px;text-align:center;">{_stats_img_html(asset_base, content_h)}</td></tr></table></td>'
         )
 

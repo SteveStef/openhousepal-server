@@ -101,9 +101,20 @@ class PropertyWebsiteInquiryCreate(BaseModel):
 
 
 class PropertyWebsiteAlertCreate(BaseModel):
-    """"Tell me about price changes and open houses" - just a name and an email."""
+    """"Tell me about price changes and open houses" - a name, an email and (10/24) a phone."""
     name: str = Field("", max_length=120)
     email: str = Field(..., min_length=3, max_length=200)
+    phone: Optional[str] = Field(None, max_length=40)
+    came_from: Optional[dict] = None
+
+
+class PropertyWebsiteDocumentRequest(BaseModel):
+    """A guest asks for the listing's documents - they're emailed to them (never a straight download)."""
+    name: str = Field(..., min_length=1, max_length=120)
+    email: str = Field(..., min_length=3, max_length=200)
+    phone: str = Field(..., min_length=7, max_length=40)
+    # The documents' own links, as the page shows them - only ones this Spotlight really lists are sent.
+    documents: List[str] = Field(..., min_length=1, max_length=20)
     came_from: Optional[dict] = None
 
 

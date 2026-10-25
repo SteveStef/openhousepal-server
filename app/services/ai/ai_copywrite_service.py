@@ -250,7 +250,7 @@ async def generate(
             cost, 0, False, None, event_type="copywrite",
         )
         await reconcile_budget(db, reservation, cost)
-        return {"text": text}
+        return {"text": text, "cost_usd": round(float(cost or 0), 6)}
     except HTTPException:
         await reconcile_budget(db, reservation, 0.0)
         raise

@@ -227,21 +227,37 @@ class OpenHouseService:
         ready" invite email. Shared by the live sign-in path (1 hour out) and the upgrade backfill
         (a few minutes out), so a backfilled guest gets the exact same showcase + email as one who
         signed in on a Premium agent's open house."""
-        from app.models.database import ScheduledEmail
-        from app.services.website.site_service import resolve_owner_public_base_url
-
         collection_result = await OpenHouseService.create_collection_for_visitor(db, visitor, form_data)
         if not (collection_result.get("success") and collection_result.get("share_token")):
             return collection_result
+        await OpenHouseService.schedule_showcase_invite(db, visitor, form_data.open_house_event_id, collection_result, send_after=send_after)
+        return collection_result
+
+    @staticmethod
+    async def schedule_showcase_invite(
+        db: AsyncSession,
+        visitor: OpenHouseVisitor,
+        open_house_event_id: str,
+        collection_result: Dict[str, Any],
+        *,
+        send_after: timedelta = timedelta(hours=1),
+    ) -> Dict[str, Any]:
+        """The guest's "your homes are ready" Showcase invite email, queued `send_after` from now
+        (the agent's Studio -> Email invite settings apply). Used right after a Showcase is built
+        (create_showcase_and_invite) and when an agent switches a visitor's Showcase on from the
+        Visitors window (visitor_showcase_service). `collection_result` needs share_token +
+        collection_id (+ properties_added). Never raises - the Showcase itself already exists."""
+        from app.models.database import ScheduledEmail
+        from app.services.website.site_service import resolve_owner_public_base_url
 
         try:
-            property_data = await OpenHouseService.get_property_by_qr_code(db, form_data.open_house_event_id)
+            property_data = await OpenHouseService.get_property_by_qr_code(db, open_house_event_id)
             if not property_data:
                 return collection_result
 
             hosting_agent = None
             oh_event = (await db.execute(
-                select(OpenHouseEvent).where(OpenHouseEvent.id == form_data.open_house_event_id)
+                select(OpenHouseEvent).where(OpenHouseEvent.id == open_house_event_id)
             )).scalar_one_or_none()
             if oh_event:
                 hosting_agent = (await db.execute(select(User).where(User.id == oh_event.agent_id))).scalar_one_or_none()

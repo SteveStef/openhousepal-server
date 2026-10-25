@@ -407,6 +407,11 @@ async def _run_blog_ai_job(blog_id: str, user_id: str, brief: dict, engine: str)
             if job.get("new"):
                 blog.slug = await next_available_slug(db, blog.owner_id, slugify(result["title"]), exclude_id=blog.id)
             _apply_ai_result(blog, result)
+            # What this run used and how long it took - the writer's "receipt" (user, 10/24).
+            blog.ai_review = {**(blog.ai_review or {}),
+                              "run_cost_usd": float((result.get("usage") or {}).get("cost_usd") or 0.0),
+                              "run_started_at": job.get("started_at"),
+                              "run_finished_at": datetime.now(timezone.utc).isoformat()}
             logger.info("AI blog draft generated", extra={"blog_id": blog.id, "owner_id": user_id, "engine": engine, "cost_usd": result["usage"]["cost_usd"]})
         # The agent may have left the page (user, 10/17: "work in the background and alert the agent
         # when it's done") - a bell alert either way. It clears itself once seen (the progress poll

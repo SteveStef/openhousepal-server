@@ -3,7 +3,7 @@ import io
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 from pydantic import BaseModel
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -362,6 +362,8 @@ def _to_lead_out(lead: Lead, collections: Optional[List[Collection]] = None) -> 
         places=_lead_places(events),
         showcase_deleted=bool(lead.showcase_deleted_at) and not matched_collections,
         showcase_new_matches=new_matches,
+        is_favorite=bool(getattr(lead, "is_favorite", False)),
+        showcase_starred=any(c.favorited_at for c in matched_collections),
         # Only unseen-by-agent second-visit/disclosure requests count, same "cleared it by handling
         # the request" rule as has_liked_property/has_disliked_property below - agent_viewed_at is
         # set on this event once the agent marks the matching request Sent/Scheduled (see
@@ -1135,6 +1137,7 @@ async def update_lead(
     current_user: User = Depends(get_current_active_user),
 ):
     lead = await _load_owned_lead(db, lead_id, current_user.id)
+    old_email, old_phone, old_name = lead.email, lead.phone, lead.name
 
     if body.name is not None:
         lead.name = body.name.strip() or None
@@ -1164,13 +1167,57 @@ async def update_lead(
         lead.last_contacted_at = datetime.now(timezone.utc)
         if lead.status == 'new':
             lead.status = 'contacted'
+    if body.is_favorite is not None:
+        lead.is_favorite = body.is_favorite
+
+    # A new email / phone / name goes everywhere they're written down (their Showcase's recipient,
+    # sign-ins, waiting emails...) and a new address starts its email rules fresh (user, 10/24).
+    from app.services import lead_contact_service
+    contact = await lead_contact_service.propagate(db, current_user.id, lead, old_email=old_email, old_phone=old_phone, old_name=old_name)
 
     db.add(lead)
     await db.commit()
+    if contact.get("showcases") or contact.get("email_changed") or (old_phone != lead.phone) or (old_name != lead.name):
+        await lead_contact_service.after_commit(current_user.id, lead_id, contact)
     # Re-fetch (rather than db.refresh with relationship attribute_names) - AsyncSession's
     # refresh() can attempt a synchronous lazy-load for relationship attributes and raise
     # MissingGreenlet; a plain re-query with selectinload is the reliable async-safe path.
     return await _detail_out(db, await _load_owned_lead(db, lead_id, current_user.id), current_user.id)
+
+
+@router.get("/{lead_id}/invite-options")
+async def lead_invite_options(
+    lead_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """After an email change: can we offer "Send them a new invitation?" - {collection_id,
+    open_house} (open_house = their Showcase came from an open house, so that invite is offered)."""
+    from app.services import lead_contact_service
+    lead = await _load_owned_lead(db, lead_id, current_user.id)
+    return await lead_contact_service.invite_options(db, current_user.id, lead)
+
+
+class LeadReinvite(BaseModel):
+    kind: Literal['open_house', 'showcase']
+
+
+@router.post("/{lead_id}/reinvite")
+async def lead_reinvite(
+    lead_id: str,
+    body: LeadReinvite,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """"Send them a new invitation" - the open-house Showcase invite or the normal Showcase invite,
+    to their current address, as if they just came in."""
+    from app.services import lead_contact_service
+    lead = await _load_owned_lead(db, lead_id, current_user.id)
+    if not lead.email:
+        raise HTTPException(status_code=400, detail="This lead has no email address.")
+    if not await lead_contact_service.send_invite(db, current_user, lead, body.kind):
+        raise HTTPException(status_code=409, detail="Couldn't send the invitation - they may have no live Showcase, or unsubscribed.")
+    return {"sent": True, "to": lead.email}
 
 
 @router.patch("/{lead_id}/hide", response_model=LeadDetailOut)

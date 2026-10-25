@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config.logging import get_logger
 from app.database import get_db
 from app.models.database import EventInvite, EventInviteRecipient, EventInviteRsvp, User
-from app.schemas.invites import InviteSave, InviteSendRequest, InviteStatusUpdate, RsvpSubmit
+from app.schemas.invites import InvitePublicRequest, InviteSave, InviteSendRequest, InviteStatusUpdate, RsvpSubmit
 from app.services import invites_service as svc
 from app.utils.auth import owner_has_access, require_active_plan
 
@@ -39,9 +39,32 @@ async def _out(db: AsyncSession, user: User, inv: EventInvite) -> dict:
 
 @router.get("/presets")
 async def get_presets(db: AsyncSession = Depends(get_db), current_user: User = Depends(require_active_plan)):
-    """The four invite types with their pre-made questions, plus the agent's own colour."""
+    """The four invite types with their pre-made questions, plus the agent's own colour and the
+    footer every invite shows (photo, name, service area, brokerage - the same profile the Agent
+    Hub and the signature use, owner 10/24 round 5)."""
+    from app.services.website import content_adapters
+    profile = await content_adapters.get_agent_profile(db, current_user)
     return {"presets": svc.presets_out(), "brand": await svc.brand_defaults(db, current_user),
-            "share_base": await svc.share_base(db, current_user)}
+            "share_base": await svc.share_base(db, current_user),
+            "host": {"name": profile.get("name") or "", "brokerage": profile.get("brokerage") or "",
+                     "market": profile.get("market") or "", "photo_url": profile.get("photo_url")}}
+
+
+@router.get("/scheduled")
+async def scheduled_for_home(listing_key: Optional[str] = Query(default=None, max_length=64), address: Optional[str] = Query(default=None, max_length=300),
+                             db: AsyncSession = Depends(get_db), current_user: User = Depends(require_active_plan)):
+    """The date step's first suggestions: this home's open houses already on the calendar (the
+    agent's own in OpenHousePal, then Bright's)."""
+    return await svc.scheduled_slots(db, current_user, listing_key=listing_key, address=address)
+
+
+async def _check_open_house(db: AsyncSession, user: User, payload: InviteSave) -> Optional[str]:
+    oid = (payload.open_house_event_id or "").strip() or None
+    if not oid:
+        return None
+    from app.models.database import OpenHouseEvent
+    oh = await db.get(OpenHouseEvent, oid)
+    return oid if oh is not None and oh.agent_id == user.id and not oh.is_deleted else None
 
 
 @router.get("")
@@ -62,6 +85,7 @@ async def create_invite(payload: InviteSave, db: AsyncSession = Depends(get_db),
     brand = await svc.brand_defaults(db, current_user)
     inv = EventInvite(owner_id=current_user.id, code=await svc.unique_code(db))
     svc.apply_save(inv, payload, brand["accent_color"])
+    inv.open_house_event_id = await _check_open_house(db, current_user, payload)
     db.add(inv)
     await db.commit()
     await db.refresh(inv)
@@ -86,6 +110,7 @@ async def get_invite(invite_id: str, db: AsyncSession = Depends(get_db), current
 async def update_invite(invite_id: str, payload: InviteSave, db: AsyncSession = Depends(get_db), current_user: User = Depends(require_active_plan)):
     inv = await _own(db, current_user, invite_id)
     svc.apply_save(inv, payload, inv.accent_color or svc.DEFAULT_ACCENT)
+    inv.open_house_event_id = await _check_open_house(db, current_user, payload)
     db.add(inv)
     await db.commit()
     await db.refresh(inv)
@@ -97,7 +122,8 @@ async def duplicate_invite(invite_id: str, db: AsyncSession = Depends(get_db), c
     src = await _own(db, current_user, invite_id)
     copy = EventInvite(owner_id=current_user.id, code=await svc.unique_code(db))
     for col in ("invite_type", "audience", "message", "event_date", "start_time", "end_time", "place_name", "address",
-                "linked_property", "cover_image_url", "design", "accent_color", "questions"):
+                "linked_property", "cover_image_url", "design", "accent_color", "questions",
+                "extra_dates", "motion", "luxe_metal", "cover_position", "open_house_event_id", "subtitle"):
         setattr(copy, col, getattr(src, col))
     copy.title = f"{src.title} (copy)"[:140]
     copy.status = "live"
@@ -190,9 +216,15 @@ async def public_invite(code: str, host: Optional[str] = Query(default=None, max
     out["host_ok"] = host_ok
     out["agent"] = {
         "name": profile.get("name") or "", "title": profile.get("title") or "", "brokerage": profile.get("brokerage") or "",
+        "market": profile.get("market") or "",
         "photo_url": profile.get("photo_url"), "phone": profile.get("phone") or "", "text_phone": profile.get("text_phone") or "",
         "email": profile.get("email") or "", "hub_slug": profile.get("hub_slug"), "logo_url": brand.get("logo_url"),
+        "id": owner.id, "first_name": owner.first_name or (profile.get("name") or "").split(" ")[0],
     }
+    # The Guest Pass's extras on the invitation (10/24): the open house's Cheat Sheet when it has one.
+    out["cheat_sheet"] = await svc.cheat_sheet_of(db, inv)
+    out["home_details"] = await svc.home_details_of(db, inv)
+    out.pop("open_house_event_id", None)
     return out
 
 
@@ -215,11 +247,14 @@ async def public_my_rsvp(code: str, token: str, db: AsyncSession = Depends(get_d
 
 
 @router.get("/public/{code}/ics")
-async def public_ics(code: str, db: AsyncSession = Depends(get_db)):
+async def public_ics(code: str, days: Optional[str] = Query(default=None, max_length=200), db: AsyncSession = Depends(get_db)):
+    """Apple / Outlook calendar file - every day, or just ?days=YYYY-MM-DD,YYYY-MM-DD (the ones
+    this guest said they're coming to)."""
     inv, owner = await _public(db, code)
     base = await svc.share_base(db, owner)
     from app.services.agent_email_service import full_name
-    text = svc.ics_text(inv, agent_name=full_name(owner), url=f"{base}/i/{inv.code}")
+    only = [d for d in (svc._as_date(x) for x in (days or "").split(",") if x) if d]
+    text = svc.ics_text(inv, agent_name=full_name(owner), url=f"{base}/i/{inv.code}", only=only or None)
     if not text:
         raise HTTPException(status_code=404, detail="This invitation has no date yet.")
     return Response(content=text, media_type="text/calendar; charset=utf-8",
@@ -242,7 +277,9 @@ async def public_rsvp(code: str, payload: RsvpSubmit, request: Request, db: Asyn
         raise HTTPException(status_code=422, detail="Add your name.")
     if email and not svc._EMAIL_RE.match(email):
         raise HTTPException(status_code=422, detail="Enter a valid email address.")
-    if not email and not phone:
+    # "Can't make it" + "not interested" = "no worries" - their name is enough (10/24).
+    declined_quietly = payload.response == "no" and not payload.still_interested
+    if not email and not phone and not declined_quietly:
         raise HTTPException(status_code=422, detail="Add an email or a phone number so the host can reach you.")
     questions = inv.questions or []
     snapshot, given = svc.answers_snapshot(questions, payload.answers)
@@ -261,7 +298,8 @@ async def public_rsvp(code: str, payload: RsvpSubmit, request: Request, db: Asyn
         rsvp = (await db.execute(select(EventInviteRsvp).where(EventInviteRsvp.invite_id == inv.id, EventInviteRsvp.email == email)
                                  .order_by(EventInviteRsvp.created_at.asc()))).scalars().first()
     changed = rsvp is not None
-    previous = rsvp.response if rsvp is not None else None
+    state = lambda r: (r.response, bool(r.still_interested), bool(r.keep_updated), tuple(r.days or []))  # noqa: E731
+    previous = state(rsvp) if rsvp is not None else None
     if rsvp is None:
         rsvp = EventInviteRsvp(invite_id=inv.id, owner_id=owner.id, token=secrets.token_urlsafe(24))
     rsvp.response = payload.response
@@ -271,6 +309,13 @@ async def public_rsvp(code: str, payload: RsvpSubmit, request: Request, db: Asyn
     rsvp.answers = snapshot
     rsvp.guest_count = svc.guest_count_of(questions, given, payload.response)
     rsvp.is_seen = False
+    # Several days: which ones they're coming to (only real days of this invite).
+    real_days = {d["date"] for d in svc.all_days(inv)}
+    rsvp.days = sorted({d.isoformat() for d in payload.days if d in real_days}) if payload.response != "no" and len(real_days) > 1 else None
+    rsvp.is_agent = payload.is_agent if inv.audience == "clients" else True
+    rsvp.has_agent = None if rsvp.is_agent else payload.has_agent
+    rsvp.still_interested = bool(payload.still_interested) if payload.response == "no" else None
+    rsvp.keep_updated = bool(payload.keep_updated) if payload.keep_updated is not None else rsvp.keep_updated
     if changed:
         rsvp.updated_at = datetime.now(timezone.utc)
     db.add(rsvp)
@@ -279,10 +324,29 @@ async def public_rsvp(code: str, payload: RsvpSubmit, request: Request, db: Asyn
 
     lead_id = rsvp.lead_id
     # A new RSVP, or a changed answer, goes on the lead's history (a re-save with the same answer doesn't).
-    if not changed or previous != rsvp.response:
+    if not changed or previous != state(rsvp):
         lead_id = await svc.attach_lead(db, owner, inv, rsvp, changed=changed)
         await svc.notify_agent(db, owner, inv, rsvp, changed=changed, lead_id=lead_id)
         base = await svc.share_base(db, owner)
         await svc.email_guest_confirmation(db, owner, inv, rsvp, f"{base}/i/{inv.code}")
+        if rsvp.keep_updated and email and not (rsvp.requests or {}).get("updates"):
+            # "Keep me updated on this property" - the same as the page's Stay updated button.
+            try:
+                from app.schemas.invites import InvitePublicRequest
+                await svc.public_request(db, owner, inv, InvitePublicRequest(kind="updates", token=rsvp.token), quiet=True)
+            except Exception:  # noqa: BLE001 - the RSVP itself is saved
+                logger.warning("invite keep-updated failed", exc_info=True)
     await db.refresh(rsvp)
     return {**svc.rsvp_out(rsvp, private=False), "email": rsvp.email, "phone": rsvp.phone, "token": rsvp.token, "updated": changed}
+
+
+@router.post("/public/{code}/request")
+async def public_request(code: str, payload: InvitePublicRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    """The Guest Pass's one-tap asks on the invitation: seller disclosure, second tour, stay updated."""
+    from app.services.public_rate_limit import check_public_submit
+    check_public_submit(request)
+    inv, owner = await _public(db, code)
+    try:
+        return await svc.public_request(db, owner, inv, payload)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))

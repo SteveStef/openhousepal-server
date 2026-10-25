@@ -182,7 +182,7 @@ async def test_site_form_metadata_fetch_does_not_track_view(monkeypatch):
     monkeypatch.setattr(public_site_routes, "_get_site_form", fake_get_site_form)
     db = _FakeDb(None)
 
-    response = await public_site_routes.get_site_public_form("site-a", "form-a", False, db)
+    response = await public_site_routes.get_site_public_form("site-a", "form-a", track_view=False, c=None, db=db)
 
     assert db.added == []
     assert db.commits == 0
@@ -206,7 +206,7 @@ async def test_site_form_real_render_tracks_one_view(monkeypatch):
     monkeypatch.setattr(public_site_routes, "_get_site_form", fake_get_site_form)
     db = _FakeDb(None)
 
-    await public_site_routes.get_site_public_form("site-a", "form-a", True, db)
+    await public_site_routes.get_site_public_form("site-a", "form-a", track_view=True, c=None, db=db)
 
     assert len(db.added) == 1
     assert db.added[0].event_type == "form_view"
@@ -250,7 +250,7 @@ async def test_site_showcase_creator_submit_uses_existing_form_pipeline(monkeypa
     monkeypatch.setattr(public_site_routes, "_get_site_showcase_creator_form", fake_creator_form)
     monkeypatch.setattr(public_site_routes.forms_service, "submit_form", fake_submit)
 
-    response = await public_site_routes.submit_site_showcase_creator("site-a", payload, _FakeDb(None))
+    response = await public_site_routes.submit_site_showcase_creator("site-a", payload, request=SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.9")), db=_FakeDb(None))
 
     assert called == {"site_id": "site-a", "form": form, "payload": payload}
     assert response.redirect_url == "/showcase/token-a"

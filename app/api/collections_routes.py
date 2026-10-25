@@ -196,6 +196,8 @@ async def get_all_collections(
 class PreviewMatchesResponse(BaseModel):
     properties: List[PropertySummaryResponse]
     count: int
+    # More match than a Showcase holds (services/showcase_limit) - the screens say "100+".
+    at_limit: bool = False
 
 
 @router.post("/preview-matches", response_model=PreviewMatchesResponse, dependencies=[Depends(require_broker_authorization)])
@@ -212,9 +214,10 @@ async def preview_matches(
     search implementation.
     """
     try:
-        properties = await property_service.get_properties_by_preferences(db, preferences, max_properties=200)
+        from app.services.showcase_limit import SHOWCASE_FETCH, SHOWCASE_MAX_HOMES, cap_matches
+        properties, more = cap_matches(await property_service.get_properties_by_preferences(db, preferences, max_properties=SHOWCASE_FETCH))
         count = await property_service.get_properties_count_by_preferences(db, preferences)
-        return PreviewMatchesResponse(properties=properties, count=count)
+        return PreviewMatchesResponse(properties=properties, count=count, at_limit=more or count > SHOWCASE_MAX_HOMES)
     except Exception as e:
         logger.error("previewing showcase matches failed", extra={"error": str(e)})
         raise HTTPException(
@@ -614,17 +617,19 @@ async def set_collection_favorite(
     current_user: User = Depends(require_premium_plan)
 ):
     """The agent stars a Showcase - starred ones sort first on the Showcases page and never fall
-    asleep for no response (showcase_sleep.kept_awake). Starring one that already fell asleep that
-    way wakes it; the client's emails stay as the email rules left them."""
+    asleep for no response (showcase_sleep.kept_awake). Starring one that's asleep - for no
+    response or switched off by the agent - wakes it and moves it to Active (user, 10/24), the same
+    as switching it back on (showcase_sleep.agent_changed)."""
     from app.services import showcase_sleep
     col = (await db.execute(select(Collection).where(
         Collection.id == collection_id, Collection.owner_id == current_user.id))).scalar_one_or_none()
     if col is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found or access denied")
     col.favorited_at = datetime.now(timezone.utc) if request.favorite else None
-    woke = request.favorite and col.status == "INACTIVE" and col.inactive_reason == showcase_sleep.NO_RESPONSE
+    woke = request.favorite and col.status == "INACTIVE"
     if woke:
-        col.status, col.inactive_reason, col.inactive_at = "ACTIVE", None, None
+        await showcase_sleep.agent_changed(db, col, "ACTIVE")
+        col.status = "ACTIVE"
     await db.commit()
     if woke:
         await showcase_sleep.catch_up(db, [col.id])
@@ -1405,10 +1410,12 @@ async def preview_shared_collection_matches(
     try:
         saved = CollectionPreferencesBase.model_validate(collection_obj.preferences, from_attributes=True).model_dump()
         merged = CollectionPreferencesBase(**{**saved, **_self_serve_payload(preferences_update.model_dump(exclude_unset=True))})
-        properties = await property_service.get_properties_by_preferences(db, merged, max_properties=200)
+        from app.services.showcase_limit import SHOWCASE_FETCH, SHOWCASE_MAX_HOMES, cap_matches
+        properties, more = cap_matches(await property_service.get_properties_by_preferences(db, merged, max_properties=SHOWCASE_FETCH))
         count = await property_service.get_properties_count_by_preferences(db, merged)
         return {
             "count": count,
+            "at_limit": more or count > SHOWCASE_MAX_HOMES,
             "points": [
                 {"id": p.listing_key, "lat": p.latitude, "lng": p.longitude}
                 for p in properties if p.latitude is not None and p.longitude is not None

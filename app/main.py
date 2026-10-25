@@ -278,6 +278,11 @@ async def lifespan(app: FastAPI):
     from apscheduler.triggers.date import DateTrigger as _Once
     from app.api.public_site_routes import warm_area_caches
     scheduler.add_job(warm_area_caches, _Once(run_date=_dt.now() + _td(seconds=10)), id="warm_area_caches", name="Warm town-page caches", replace_existing=True)
+    # Invites: the agent's "Tomorrow" email (who's coming) - hourly, sent from 9 AM Eastern the day
+    # before each day of an invite, once per day (invites_service.send_day_before).
+    from app.services.invites_service import scheduled_day_before
+    scheduler.add_job(scheduled_day_before, CronTrigger(minute=7), id="invite_day_before",
+                      name="Invites: tomorrow's guest list to the agent", replace_existing=True, max_instances=1, coalesce=True)
 
     # DISABLE_SCHEDULER=true for a second local/test copy of the API, so it never repeats the
     # real server's jobs (MLS sync, reminder emails, digests...).

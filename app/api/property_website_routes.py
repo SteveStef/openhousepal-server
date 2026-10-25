@@ -28,6 +28,15 @@ async def _out(db: AsyncSession, site) -> PropertyWebsiteOut:
     return out
 
 
+async def _read_capped(file: UploadFile, max_bytes: int) -> bytes:
+    """Never pulls more than the limit into memory - one byte over is enough to say "too big"."""
+    data = await file.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                            detail=f"That file is too big - the limit is {max_bytes // (1024 * 1024)}MB.")
+    return data
+
+
 async def _load_owned(db: AsyncSession, site_id: str, owner_id: str):
     site = await property_website_service.get_owned(db, owner_id, site_id)
     if not site:
@@ -111,13 +120,30 @@ async def publish_property_website(
     return await _out(db, site)
 
 
+@router.post("/{site_id}/publish-when-ready", response_model=PropertyWebsiteOut)
+async def publish_property_website_when_ready(
+    site_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_spotlight_access),
+):
+    """Publish pressed while the editor's first-open setup is still writing (user, 10/24): the
+    server publishes as soon as it's done - even if the agent leaves the page (it finishes the
+    missing pieces itself). See spotlight_publish_service."""
+    from app.services import spotlight_publish_service
+    site = await _load_owned(db, site_id, current_user.id)
+    site = await spotlight_publish_service.request_publish(db, site)
+    return await _out(db, site)
+
+
 @router.post("/{site_id}/unpublish", response_model=PropertyWebsiteOut)
 async def unpublish_property_website(
     site_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_spotlight_access),
 ):
+    from app.services import spotlight_publish_service
     site = await _load_owned(db, site_id, current_user.id)
+    site = await spotlight_publish_service.cancel(db, site)  # a waiting "publish when ready" too
     site = await property_website_service.unpublish(db, site)
     return await _out(db, site)
 
@@ -143,8 +169,10 @@ async def upload_property_website_document(
     """Just uploads + returns a URL - the caller still PATCHes it into draft_data.documents
     themselves (same two-step shape as every other Studio upload), so a file only actually
     attaches to the site once the agent hits Save, not the instant it finishes uploading."""
-    await _load_owned(db, site_id, current_user.id)  # 404s before spending an S3 call on someone else's site
-    data = await file.read()
+    site = await _load_owned(db, site_id, current_user.id)  # 404s before spending an S3 call on someone else's site
+    if len([d for d in (site.draft_data or {}).get("documents") or [] if isinstance(d, dict) and d.get("url")]) >= property_website_service.MAX_DOCUMENTS:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"A page can have up to {property_website_service.MAX_DOCUMENTS} documents - remove one to add another.")
+    data = await _read_capped(file, property_website_service.upload_limit_bytes("document", file.content_type or ""))
     try:
         url = await property_website_service.upload_document(db, current_user, data, file.content_type or "application/octet-stream")
     except ValueError as exc:
@@ -160,7 +188,7 @@ async def upload_property_website_floor_plan(
     current_user: User = Depends(require_spotlight_access),
 ):
     await _load_owned(db, site_id, current_user.id)
-    data = await file.read()
+    data = await _read_capped(file, property_website_service.upload_limit_bytes("floor_plan", file.content_type or ""))
     try:
         url = await property_website_service.upload_floor_plan(db, current_user, data, file.content_type or "image/jpeg")
     except ValueError as exc:

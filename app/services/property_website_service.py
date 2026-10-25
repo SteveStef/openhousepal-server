@@ -58,6 +58,35 @@ _DOCUMENT_MAX_BYTES = 25 * 1024 * 1024  # generous for a brochure/disclosure PDF
 _FLOOR_PLAN_MAX_BYTES = 12 * 1024 * 1024  # matches the existing image upload cap elsewhere
 _ALLOWED_DOCUMENT_CONTENT_TYPES = {"application/pdf", "image/jpeg", "image/png"}
 _ALLOWED_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png"}
+# Upload limits (owner, 10/24: "make sure nobody can upload stuff too large"). The editor checks the
+# same numbers before it sends anything (frontend property-sites/[id] UPLOAD_LIMITS).
+_DOCUMENT_IMAGE_MAX_BYTES = 15 * 1024 * 1024  # a JPG/PNG used as a document (a scanned page, a flyer)
+MAX_DOCUMENTS = 10
+MAX_FLOOR_PLANS = 10
+# What the first bytes of each allowed type really look like - the browser's content type alone is
+# just a claim (a renamed .exe would otherwise go up as "application/pdf").
+_MAGIC = {"application/pdf": (b"%PDF-",), "image/jpeg": (bytes([0xFF, 0xD8, 0xFF]),), "image/png": (bytes([0x89, 0x50, 0x4E, 0x47]),)}
+
+
+def _check_file(data: bytes, content_type: str, allowed: set, max_bytes: int, what: str) -> None:
+    """Type, real content and size - raises ValueError with a message the agent can act on."""
+    if content_type not in allowed:
+        raise ValueError("Please upload a PDF, JPG, or PNG." if "application/pdf" in allowed else "Please upload a JPG or PNG.")
+    if not data:
+        raise ValueError("That file is empty.")
+    # A PDF may carry a few junk bytes before its header (readers allow it within the first 1KB).
+    head = data[:1024] if content_type == "application/pdf" else data[:8]
+    if not any((sig in head) if content_type == "application/pdf" else head.startswith(sig) for sig in _MAGIC.get(content_type, ())):
+        raise ValueError(f"That file doesn't look like a real {'PDF' if content_type == 'application/pdf' else 'JPG or PNG'} - try saving it again and re-uploading.")
+    if len(data) > max_bytes:
+        raise ValueError(f"{what} must be {max_bytes // (1024 * 1024)}MB or smaller.")
+
+
+def upload_limit_bytes(kind: str, content_type: str) -> int:
+    """The most a route should read for one file of this kind (+1 byte to notice "too big")."""
+    if kind == "document":
+        return _DOCUMENT_MAX_BYTES if content_type == "application/pdf" else _DOCUMENT_IMAGE_MAX_BYTES
+    return _FLOOR_PLAN_MAX_BYTES
 
 
 def _extension_for(content_type: str) -> str:
@@ -365,12 +394,25 @@ def _clean_chapters(chapters: list) -> list:
             "enabled": bool(chapter.get("enabled", True)),
             "photos": photos,
             "copy": str(chapter.get("copy") or "")[:1200],
+            # The agent tapped "Looks good" on this room in the editor's fine-tuning list (10/24).
+            "confirmed": bool(chapter.get("confirmed")),
         })
     return cleaned
 
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TIME_RE = re.compile(r"^\d{2}:\d{2}(:\d{2})?$")
+
+
+def _clean_files(rows: Any, url_key: str, limit: int) -> list:
+    """Documents / floor plans: a real http(s) link and a short name each, at most `limit`."""
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict) or not _url(r.get(url_key)):
+            continue
+        out.append({**{k: v for k, v in r.items() if k in ("label", "display_name", "name")}, url_key: _url(r.get(url_key)),
+                    "label": str(r.get("label") or "")[:120]})
+    return out[:limit]
 
 
 def _clean_open_houses(events: list) -> list:
@@ -480,6 +522,10 @@ def _clean_town_photo(raw) -> Optional[dict]:
 
 
 async def update_draft(db: AsyncSession, site: PropertyWebsite, patch: dict) -> PropertyWebsite:
+    # Merge into the row as it is NOW (locked until this commit), not as it was when the request
+    # started - two saves landing together (the editor's autosave + "publish when ready", or the
+    # AI photo pass) used to drop each other's keys.
+    await db.refresh(site, with_for_update=True)
     draft = dict(site.draft_data or {})
     before = _uploaded_urls(draft) if ("documents" in patch or "floor_plans" in patch) else set()
     if "highlights" in patch:
@@ -490,6 +536,10 @@ async def update_draft(db: AsyncSession, site: PropertyWebsite, patch: dict) -> 
         patch["chapters"] = _clean_chapters(patch["chapters"])
     if "template_id" in patch and patch["template_id"] not in TEMPLATE_IDS:
         patch.pop("template_id")
+    if "documents" in patch:
+        patch["documents"] = _clean_files(patch["documents"], "url", MAX_DOCUMENTS)
+    if "floor_plans" in patch:
+        patch["floor_plans"] = _clean_files(patch["floor_plans"], "image_url", MAX_FLOOR_PLANS)
     if "open_houses" in patch:
         patch["open_houses"] = _clean_open_houses(patch["open_houses"])
     if "story_mode" in patch and patch["story_mode"] not in ("short", "original", None):
@@ -525,6 +575,9 @@ async def update_draft(db: AsyncSession, site: PropertyWebsite, patch: dict) -> 
 
 
 async def publish(db: AsyncSession, site: PropertyWebsite) -> PropertyWebsite:
+    # A "publish once the setup is done" request (spotlight_publish_service) is answered by this.
+    if "publish_when_ready" in (site.draft_data or {}):
+        site.draft_data = {k: v for k, v in (site.draft_data or {}).items() if k != "publish_when_ready"}
     site.published_snapshot = deepcopy(site.draft_data)
     # Switching templates is a draft edit like any other (see update_draft) - it only reaches the
     # live page when the agent publishes, same as every other change.
@@ -564,14 +617,16 @@ async def upload_document(db: AsyncSession, owner: User, data: bytes, content_ty
     agent's own storage cap exactly like every other upload in the app, and returns its public
     (CDN-fronted) URL - see s3_service.PUBLIC_URL_HOST for the CloudFront layer already in front
     of S3, so repeated visitor downloads don't hit S3 per-request."""
-    if content_type not in _ALLOWED_DOCUMENT_CONTENT_TYPES:
-        raise ValueError("Please upload a PDF, JPG, or PNG.")
-    if len(data) > _DOCUMENT_MAX_BYTES:
-        raise ValueError("File must be 25MB or smaller.")
+    _check_file(data, content_type, _ALLOWED_DOCUMENT_CONTENT_TYPES, upload_limit_bytes("document", content_type),
+                "A PDF" if content_type == "application/pdf" else "An image document")
     config = await ai_config_service.get_config(db)
     await storage_ledger_service.enforce_cap(db, owner.id, config, owner.plan_tier, len(data))
     try:
-        url = s3_service.upload_bytes(data, _DOCUMENT_S3_PREFIX, _extension_for(content_type), content_type)
+        # Off the event loop (10/24 - "uploads are very slow"): a big PDF going up to S3 used to
+        # freeze every other request on this worker, the editor's own autosave included.
+        import asyncio
+        url = await asyncio.to_thread(s3_service.upload_bytes, data, _DOCUMENT_S3_PREFIX, _extension_for(content_type), content_type,
+                                      "public, max-age=31536000, immutable")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Couldn't save that file.") from exc
     await storage_ledger_service.record(db, owner.id, "property_site_document", url, len(data))
@@ -579,14 +634,13 @@ async def upload_document(db: AsyncSession, owner: User, data: bytes, content_ty
 
 
 async def upload_floor_plan(db: AsyncSession, owner: User, data: bytes, content_type: str) -> str:
-    if content_type not in _ALLOWED_IMAGE_CONTENT_TYPES:
-        raise ValueError("Please upload a JPG or PNG.")
-    if len(data) > _FLOOR_PLAN_MAX_BYTES:
-        raise ValueError("Image must be 12MB or smaller.")
+    _check_file(data, content_type, _ALLOWED_IMAGE_CONTENT_TYPES, _FLOOR_PLAN_MAX_BYTES, "An image")
     config = await ai_config_service.get_config(db)
     await storage_ledger_service.enforce_cap(db, owner.id, config, owner.plan_tier, len(data))
     try:
-        url = s3_service.upload_bytes(data, _FLOOR_PLAN_S3_PREFIX, _extension_for(content_type), content_type)
+        import asyncio
+        url = await asyncio.to_thread(s3_service.upload_bytes, data, _FLOOR_PLAN_S3_PREFIX, _extension_for(content_type), content_type,
+                                      "public, max-age=31536000, immutable")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Couldn't save that image.") from exc
     await storage_ledger_service.record(db, owner.id, "property_site_floor_plan", url, len(data))
@@ -729,6 +783,60 @@ async def submit_inquiry(db: AsyncSession, site: PropertyWebsite, *, name: str, 
         message=f"{name or 'A visitor'} asked about {address} on your Spotlight.",
         visitor_name=name, email=email, phone=phone, lead_message=message,
     )
+
+
+def published_documents(site: PropertyWebsite) -> list[dict]:
+    """The documents the live page lists: [{label, url}] (a display name wins over the file label)."""
+    out = []
+    for d in (site.published_snapshot or {}).get("documents") or []:
+        if isinstance(d, dict) and isinstance(d.get("url"), str) and d["url"].startswith("http"):
+            label = str(d.get("display_name") or d.get("name") or d.get("label") or "").strip() or "Document"
+            out.append({"label": label[:120], "url": d["url"]})
+    return out
+
+
+async def request_documents(db: AsyncSession, site: PropertyWebsite, *, name: str, email: str, phone: Optional[str],
+                            urls: list[str], came_from: Optional[dict] = None) -> int:
+    """A guest asked for the listing's documents (user, 10/24 - the Download button no longer hands
+    the file over on the spot): they become the agent's lead, the agent hears about it, and the
+    documents are emailed to the guest - from the agent's own Gmail / Outlook when connected
+    (agent_mailbox_service), otherwise from OpenHousePal. Only documents this page really lists
+    are ever sent. Returns how many went out."""
+    from app.services.agent_email_service import email_person
+    from app.services.spotlight_alerts_service import _agent_bits
+    from app.services.visit_source import clean_came_from
+    wanted = set(urls or [])
+    docs = [d for d in published_documents(site) if d["url"] in wanted]
+    if not docs:
+        return 0
+    address = _nice_address(site)
+    labels = ", ".join(d["label"] for d in docs)
+    snapshot = {"message": f"Asked for the documents: {labels}", "property_website_id": site.id, "documents": [d["label"] for d in docs]}
+    if came_from is not None:
+        snapshot["came_from"] = clean_came_from(came_from)
+    lead = await leads_service.upsert_lead(
+        db, owner_id=site.owner_id, name=name, email=email, phone=phone,
+        source_type="property_website_inquiry", source_id=site.id,
+        summary=f"Asked for the documents for {address} ({labels})",
+        occurred_at=datetime.now(timezone.utc), property_address=address,
+        raw_snapshot=snapshot,
+    )
+    await _notify_owner(
+        db, site, lead, title=f"Documents requested: {name or email}",
+        message=f"{name or 'A visitor'} asked for {labels} on your {address} Spotlight - they were emailed to them.",
+        visitor_name=name, email=email, phone=phone, lead_message=f"Asked for: {labels}",
+    )
+    bits = await _agent_bits(db, site)
+    url = await public_url(db, site)
+    street = address.split(",")[0]
+    subject = f"The documents for {street}" if len(docs) > 1 else f"{docs[0]['label']} - {street}"
+    email_person(email, "spotlight_documents", subject, {
+        "first_name": (name or "").split(" ")[0] or "there",
+        "property_address": street, "site_url": url,
+        "documents": docs,
+        **{k: v for k, v in bits.items() if k != "owner"},
+    }, reply_to=bits.get("agent_email"), from_name=bits.get("agent_name") or "OpenHousePal", owner_id=site.owner_id)
+    return len(docs)
 
 
 # One visit row per (site, visitor) at most this often - a reload or a second page within the

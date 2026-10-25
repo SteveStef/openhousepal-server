@@ -6,7 +6,7 @@ appends the shared PRESERVATION_CLAUSE once. AI-video prompts pair a single came
 instruction with the video preservation text. Bump PROMPT_VERSION on any wording change.
 """
 
-PROMPT_VERSION = "v22"
+PROMPT_VERSION = "v23"  # v23 (10/24): removals also take shadows/reflections; masked removal keeps non-targets sharp
 
 # Appended after PRESERVATION_CLAUSE on every image edit. A watermark / logo / overlay is NOT a
 # property feature, so removing it doesn't conflict with "preserve everything" above - call it
@@ -78,7 +78,7 @@ _ENHANCEMENT_HINTS = {
     # Rewritten 2026-10-07: the old "remove only SMALL distractions" wording made the model keep a
     # car that filled half the frame (user report). Removal is now explicit about size.
     "declutter": "remove every vehicle (cars, trucks, vans, motorcycles, boats, trailers) and all "
-                 "movable clutter (trash and recycling bins, hoses, cones, toys, bikes, tools, "
+                 "movable clutter (trash and recycling bins, hoses, cones, toys, bikes, loose tools lying on the ground, "
                  "ladders, boxes, bags, signs on stakes) - REGARDLESS OF SIZE, even an object that "
                  "covers a large part of the photo",
     "remove_furniture": "remove all movable furniture and loose decor - chairs, sofas, tables, "
@@ -108,7 +108,10 @@ _REMOVAL_FILL = (
     "Where each removed object was, show what would naturally be there, continuing the surrounding "
     "surfaces seamlessly - the same driveway, road, lawn, floor, rug-free flooring, wall, siding "
     "and trim, with matching texture, pattern, perspective, lighting and shadows - so no outline, "
-    "blur, smudge or ghost of the object remains. Where an object hid part of the house, continue "
+    "blur, smudge or ghost of the object remains. Remove each object's shadow with it - the shadow "
+    "it casts on the ground, floor or wall, the dark contact shadow right under it - and its "
+    "reflection and any stain or flattened patch it leaves, so that spot is lit exactly like the "
+    "surface around it. Where an object hid part of the house, continue "
     "only what the visible parts clearly show; never invent new windows, doors or features. "
     "These are movable, non-permanent items, so removing them does not conflict with the "
     "preservation rules below."
@@ -328,7 +331,12 @@ def split_masked_removal(effects: list[str], options: dict | None):
         "OBJECT REMOVAL - the only job of this edit: "
         + "; ".join(_ENHANCEMENT_HINTS[x] for x in picks) + ". "
         + "Remove ONLY the objects inside the area marked for editing; everything outside that "
-        "area must stay exactly as it is. " + _REMOVAL_FILL
+        "area must stay exactly as it is. The marked area is drawn loosely and may also take in "
+        "things that are NOT to be removed - walls, anything mounted on a wall or ceiling "
+        "(pegboards and the tools hanging on them, shelves, cabinets, outlets, switches, "
+        "windows, doors, trim), floor drains and built-in features: redraw those exactly as "
+        "they are, sharp, unblurred and in line with the parts outside the area, never cut off "
+        "or blended into the wall. " + _REMOVAL_FILL
     )
     prompt = f"{removal}\n\n{PRESERVATION_CLAUSE}\n\n{DEBRAND_CLAUSE}"
     rest_enh = [x for x in enh if x not in MASKABLE_REMOVALS]

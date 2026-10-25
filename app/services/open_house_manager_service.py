@@ -541,6 +541,30 @@ def _bright_mls_synthetic_opens(prop: Property, existing: List[ScheduledOpenResp
     return opens
 
 
+def _spotlight_synthetic_opens(prop: Property, existing: List[ScheduledOpenResponse], slots: Optional[List[dict]], owner: Optional[User]) -> List[ScheduledOpenResponse]:
+    """Dates the listing agent added on their Listing Spotlight ("Add a date yourself" -
+    spotlight_open_houses) - the listing agent hosting their own listing, shown like any other
+    scheduled open (user, 10/24). A day already covered by a kit / request / Bright is skipped."""
+    covered = {(e.scheduled_date, e.scheduled_start_time) for e in existing} | {e.scheduled_date for e in existing}
+    opens: List[ScheduledOpenResponse] = []
+    for slot in slots or []:
+        if slot["date"] in covered:
+            continue
+        covered.add(slot["date"])
+        opens.append(ScheduledOpenResponse(
+            id=f"spotlight-{prop.listing_key}-{slot['date']}-{slot['start'].strftime('%H%M') if slot['start'] else 'x'}",
+            scheduled_date=slot["date"],
+            scheduled_start_time=slot["start"],
+            scheduled_end_time=slot["end"],
+            hosting_agent_id=slot.get("owner_id") or (owner.id if owner else BRIGHT_MLS_AGENT_ID),
+            hosting_agent_name=_agent_name(owner) if owner else "Listing agent",
+            hosting_agent_brokerage=owner.brokerage if owner else None,
+            hosting_agent_photo_url=owner.photo_url if owner else None,
+            kit_built=True,
+        ))
+    return opens
+
+
 async def get_listing_open_house_statuses(db: AsyncSession, listing_keys: List[str]) -> Dict[str, dict]:
     """Used by Discovery to show 'No Open House' on listings that aren't yours - checks any
     agent's OpenHouseEvent for that listing_key, not just the current user's. Also surfaces the
@@ -566,6 +590,9 @@ async def get_listing_open_house_statuses(db: AsyncSession, listing_keys: List[s
     )
     # Every upcoming Bright slot per listing, soonest first (listings with none are left out).
     mls_open_houses = {row.listing_key: slots for row in mls_result.all() if (slots := upcoming_mls_open_houses(row, today))}
+    # Dates the listing agent added on their Listing Spotlight count like a posted open house.
+    from app.services.spotlight_open_houses import spotlight_slots
+    spotlight_by_listing = await spotlight_slots(db, listing_keys, today)
 
     # Approved host requests don't always have a kit built yet (see _confirmed_pending_kit_previews
     # for the Manager's own equivalent) - a date is genuinely "already scheduled" for Discovery's
@@ -631,6 +658,16 @@ async def get_listing_open_house_statuses(db: AsyncSession, listing_keys: List[s
                 "scheduled_end_time": m["end"],
                 "hosting_agent_id": BRIGHT_MLS_AGENT_ID,
             })
+        spot_slots = spotlight_by_listing.get(key) or []
+        for s in spot_slots:
+            if any(o["scheduled_date"] == s["date"] for o in all_upcoming.values()):
+                continue
+            all_upcoming[(s["date"], s["start"], s["end"])] = {
+                "scheduled_date": s["date"], "scheduled_start_time": s["start"], "scheduled_end_time": s["end"],
+                "hosting_agent_id": s["owner_id"],
+            }
+        if not mls_slots and spot_slots:
+            mls_slots = [{"date": s["date"], "start": s["start"], "end": s["end"]} for s in spot_slots]
         all_upcoming = sorted(all_upcoming.values(), key=lambda o: (o["scheduled_date"], o["scheduled_start_time"] or datetime.min.time()))
 
         # A real dated in-app kit is the most authoritative - someone is actively hosting on a
@@ -750,6 +787,9 @@ async def get_my_listings(db: AsyncSession, current_user: User) -> MyListingsRes
 
     notes_result = await db.execute(select(OpenHouseListingNote).where(OpenHouseListingNote.listing_key.in_(listing_keys)))
     notes_by_listing = {n.listing_key: n for n in notes_result.scalars().all()}
+    # Dates the agent added on a Listing Spotlight ("Add a date yourself").
+    from app.services.spotlight_open_houses import spotlight_slots
+    spotlight_by_listing = await spotlight_slots(db, listing_keys)
 
     listings: List[MyListingItem] = []
     total_guests_all = 0
@@ -784,10 +824,11 @@ async def get_my_listings(db: AsyncSession, current_user: User) -> MyListingsRes
         )
         scheduled_opens = scheduled_opens + covered_by_existing_kit
         scheduled_opens = scheduled_opens + _bright_mls_synthetic_opens(prop, scheduled_opens + confirmed_pending_kit)
+        scheduled_opens = scheduled_opens + _spotlight_synthetic_opens(prop, scheduled_opens + confirmed_pending_kit, spotlight_by_listing.get(prop.listing_key), current_user)
         scheduled_opens = sorted(scheduled_opens, key=lambda p: (p.scheduled_date or date.max, p.scheduled_start_time or datetime.min.time()))
-        # An open house the listing agent posted in Bright already has someone covering it - the
-        # listing reads "Host booked", not "Hosts needed" (same as Discovery shows it).
-        if open_house_status == "needs_host" and any(o.hosting_agent_id == BRIGHT_MLS_AGENT_ID for o in scheduled_opens):
+        # An open house the listing agent posted in Bright (or added on their Spotlight) already has
+        # someone covering it - the listing reads "Host booked", not "Hosts needed" (same as Discovery).
+        if open_house_status == "needs_host" and any(o.hosting_agent_id == BRIGHT_MLS_AGENT_ID or o.id.startswith("spotlight-") for o in scheduled_opens):
             open_house_status = "scheduled"
         note = notes_by_listing.get(prop.listing_key)
         manual_priority = bool(note and note.is_priority_override)
@@ -1100,6 +1141,10 @@ async def _date_already_booked(db: AsyncSession, listing_key: str, target_date: 
     # An open house the listing agent already posted in Bright for that day - someone's hosting it.
     bright_prop = (await db.execute(select(Property).where(Property.listing_key == listing_key))).scalar_one_or_none()
     if bright_prop is not None and any(slot["date"] == target_date for slot in upcoming_mls_open_houses(bright_prop)):
+        return True
+    # ...or one the listing agent added on their Listing Spotlight.
+    from app.services.spotlight_open_houses import spotlight_slots
+    if any(s["date"] == target_date for s in (await spotlight_slots(db, [listing_key])).get(listing_key, [])):
         return True
 
     event_result = await db.execute(
@@ -2565,6 +2610,9 @@ async def get_listing_detail(db: AsyncSession, current_user: User, listing_key: 
     # match the kit's own scheduled_date - see _confirmed_pending_kit_previews.
     scheduled_opens = scheduled_opens + covered_by_existing_kit
     scheduled_opens = scheduled_opens + _bright_mls_synthetic_opens(prop, scheduled_opens + confirmed_pending_kit)
+    from app.services.spotlight_open_houses import spotlight_slots
+    spot = (await spotlight_slots(db, [listing_key])).get(listing_key)
+    scheduled_opens = scheduled_opens + _spotlight_synthetic_opens(prop, scheduled_opens + confirmed_pending_kit, spot, current_user)
     scheduled_opens = sorted(scheduled_opens, key=lambda o: (o.scheduled_date or date.max, o.scheduled_start_time or datetime.min.time()))
 
     pending_result = await db.execute(

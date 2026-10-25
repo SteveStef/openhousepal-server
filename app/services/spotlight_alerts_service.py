@@ -102,7 +102,8 @@ async def _agent_bits(db, site: PropertyWebsite) -> dict:
 
 # ---------------------------------------------------------------- guest sign-up
 
-async def subscribe(db, site: PropertyWebsite, *, name: str, email: str, came_from: Optional[dict] = None) -> SpotlightAlertSubscription:
+async def subscribe(db, site: PropertyWebsite, *, name: str, email: str, came_from: Optional[dict] = None,
+                    phone: Optional[str] = None) -> SpotlightAlertSubscription:
     from app.services import leads_service, property_website_service as pws
     from app.services.agent_email_service import email_person
     from app.services.visit_source import clean_came_from
@@ -120,7 +121,7 @@ async def subscribe(db, site: PropertyWebsite, *, name: str, email: str, came_fr
     lead = None
     if not again:
         lead = await leads_service.upsert_lead(
-            db, owner_id=site.owner_id, name=name, email=email, phone=None,
+            db, owner_id=site.owner_id, name=name, email=email, phone=phone,
             source_type="property_website_inquiry", source_id=site.id,
             summary=f"Asked for price & open house alerts on {address}",
             occurred_at=datetime.now(timezone.utc), property_address=address, raw_snapshot=snapshot,
@@ -128,7 +129,7 @@ async def subscribe(db, site: PropertyWebsite, *, name: str, email: str, came_fr
         await pws._notify_owner(
             db, site, lead, title=f"New Spotlight alert sign-up: {name or email}",
             message=f"{name or 'A visitor'} wants price & open house updates for {address}.",
-            visitor_name=name, email=email, phone=None, lead_message="Asked to be told about price changes and open houses.",
+            visitor_name=name, email=email, phone=phone, lead_message="Asked to be told about price changes and open houses.",
         )
     live = await _live_state(db, site)
     state = {"status": live["status"], "open_houses": [o.get("id") for o in live["open_houses"]]}
@@ -244,7 +245,12 @@ async def send_daily_alerts(db, now: Optional[datetime] = None) -> int:
                     "price_changed": bool(price), "new_price": _money(price["new"]) if price else None,
                     "old_price": _money(price["old"]) if price else None, "price_down": bool(price and price["down"]),
                     "price_cut": _money(price["old"] - price["new"]) if price and price["down"] and price.get("old") and price.get("new") else None,
-                    "status_line": {"sold": "This home has sold.", "pending": "This home is now under contract."}.get(status or ""),
+                    # The nudge to reach out to the listing agent rides in the same line (10/24) - the
+                    # agent's card with tap-to-call / email sits right under it in the template.
+                    "status_line": {
+                        "sold": "This home has sold. Still looking? I can help you find one like it - just reply or give me a call.",
+                        "pending": "This home is now under contract. Want to know if it comes back, or see similar homes? Just reply or give me a call.",
+                    }.get(status or ""),
                     "open_houses": [_oh_label(o) for o in news.get("open_houses", [])],
                     "site_url": url, "unsubscribe_url": _unsubscribe_url(sub.token),
                     **{k: v for k, v in bits.items() if k != "owner"},

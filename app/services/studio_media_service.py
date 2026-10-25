@@ -391,6 +391,66 @@ async def create_asset(
     db: AsyncSession, user: User, payload: StudioMediaGenerateRequest,
     *, group_id: Optional[str] = None, parent_asset_id: Optional[str] = None,
 ) -> StudioMediaAsset:
+    rid = (payload.client_request_id or "").strip() or None
+    if rid:
+        existing = await _asset_for_request(db, user.id, rid)
+        if existing is None and (user.id, rid) in _INFLIGHT_REQUESTS:
+            # The first copy of this same press is still submitting (a video's provider call
+            # takes a few seconds before its row exists) - wait for it rather than run twice.
+            for _ in range(60):
+                await asyncio.sleep(0.5)
+                existing = await _asset_for_request(db, user.id, rid)
+                if existing is not None or (user.id, rid) not in _INFLIGHT_REQUESTS:
+                    break
+        if existing is not None:
+            return existing
+        _INFLIGHT_REQUESTS.add((user.id, rid))
+    try:
+        return await _create_asset_body(db, user, payload, rid, group_id=group_id, parent_asset_id=parent_asset_id)
+    finally:
+        if rid:
+            _INFLIGHT_REQUESTS.discard((user.id, rid))
+
+
+# (owner id, client_request_id) pairs whose Generate is mid-submit in this worker.
+_INFLIGHT_REQUESTS: set[tuple[str, str]] = set()
+# Photo edits running in the background (see _run_image_job) - strong refs so the event loop
+# never garbage-collects one mid-run.
+_IMAGE_JOBS: set[asyncio.Task] = set()
+# A photo edit normally takes 40-90s (a circled removal + its quality re-try + the main pass at
+# most ~4 model calls). A row still "processing" long after that lost its worker (a restart or
+# deploy mid-run) and is shown as failed instead of spinning forever.
+_IMAGE_JOB_STALE_SECONDS = 12 * 60
+
+
+async def _asset_for_request(db: AsyncSession, owner_id: str, rid: str) -> Optional[StudioMediaAsset]:
+    res = await db.execute(select(StudioMediaAsset).where(
+        StudioMediaAsset.owner_id == owner_id,
+        StudioMediaAsset.options["client_request_id"].astext == rid,
+    ).limit(1))
+    return res.scalar_one_or_none()
+
+
+async def expire_stale_image_job(db: AsyncSession, asset: StudioMediaAsset) -> StudioMediaAsset:
+    """A photo edit whose background run died (server restart mid-run) - mark it failed so the
+    agent sees "try again" instead of an endless spinner. No-op for anything else."""
+    if asset.kind != "image" or asset.status != "processing" or not asset.created_at:
+        return asset
+    from datetime import datetime, timezone
+    created = asset.created_at if asset.created_at.tzinfo else asset.created_at.replace(tzinfo=timezone.utc)
+    if (datetime.now(timezone.utc) - created).total_seconds() < _IMAGE_JOB_STALE_SECONDS:
+        return asset
+    asset.status = "failed"
+    asset.error_message = "This edit didn't finish - please try again."
+    await db.commit()
+    await db.refresh(asset)
+    return asset
+
+
+async def _create_asset_body(
+    db: AsyncSession, user: User, payload: StudioMediaGenerateRequest, rid: Optional[str],
+    *, group_id: Optional[str] = None, parent_asset_id: Optional[str] = None,
+) -> StudioMediaAsset:
     options = payload.options or StudioMediaOptions()
     has_mls = tier_has_mls(user.plan_tier)
     linked_property = payload.linked_property if has_mls else None
@@ -430,11 +490,76 @@ async def create_asset(
 
     prompt = build_stacked_prompt(effects, options.model_dump(exclude_none=True))
     action_label = "+".join(effects)
-    return await _run_image(db, user, payload, effects, action_label, options, config, prompt,
-                            group_id, parent_asset_id, linked_property)
+
+    # The edit itself runs in the background (user, 10/24: leaving the page mid-generate on a
+    # phone showed "Network error" and the agent pressed Generate again - two copies). The
+    # project row exists from the first second as "processing", the page and the Media Lab list
+    # poll it, and the run carries on whatever the browser does.
+    placeholder = StudioMediaAsset(
+        owner_id=user.id, group_id=group_id, parent_asset_id=parent_asset_id,
+        kind="image", action=action_label, status="processing",
+        source_photo_url=payload.source_photo_url, source_kind=payload.source_kind,
+        linked_property=linked_property.model_dump() if linked_property else None,
+        options={**options.model_dump(exclude_none=True), "effects": effects,
+                 **({"client_request_id": rid} if rid else {})},
+        prompt=prompt, prompt_version=PROMPT_VERSION,
+    )
+    db.add(placeholder)
+    await db.commit()
+    await db.refresh(placeholder)
+    task = asyncio.create_task(_run_image_job(
+        placeholder.id, user.id, payload, effects, action_label, options, prompt,
+        group_id, parent_asset_id, linked_property,
+    ))
+    _IMAGE_JOBS.add(task)
+    task.add_done_callback(_IMAGE_JOBS.discard)
+    return placeholder
+
+
+async def _run_image_job(asset_id, owner_id, payload, effects, action_label, options, prompt,
+                         group_id, parent_asset_id, linked_property) -> None:
+    """Background half of a photo edit: its own DB session (the request's is gone by now). Any
+    error lands on the project row as "failed" + a readable message."""
+    from app.database import AsyncSessionLocal
+    async with AsyncSessionLocal() as s:
+        error: Optional[str] = None
+        try:
+            user = await s.get(User, owner_id)
+            if user is None:
+                return
+            config = await ai_config_service.get_config(s)
+            await _run_image(s, user, payload, effects, action_label, options, config, prompt,
+                             group_id, parent_asset_id, linked_property, placeholder_id=asset_id)
+            return
+        except HTTPException as exc:
+            error = str(exc.detail)
+        except Exception:  # noqa: BLE001
+            logger.exception("studio media image job crashed", extra={"asset_id": asset_id})
+            error = "Couldn't finish that edit. Try again in a moment."
+        try:
+            await s.rollback()
+            asset = await s.get(StudioMediaAsset, asset_id)
+            if asset is not None and asset.status == "processing":
+                asset.status = "failed"
+                asset.error_message = error
+                await s.commit()
+        except Exception:  # noqa: BLE001
+            logger.warning("studio media image job: couldn't mark failed", extra={"asset_id": asset_id})
 
 
 # ------------------------------------------------------------------- circled object removal
+
+def _dilate(mask, px: int):
+    """Grow a white-on-black "L" mask by ~px pixels. Done on a shrunk copy - a full-size
+    MaxFilter of a 40px reach took ~5s on a 2500px photo (and blocked the server meanwhile)."""
+    from PIL import Image, ImageFilter
+    w, h = mask.size
+    scale = max(1, px // 6)
+    small = mask.resize((max(1, w // scale), max(1, h // scale)), Image.BILINEAR).point(lambda v: 255 if v > 0 else 0)
+    k = max(3, (px // scale) * 2 + 1)
+    small = small.filter(ImageFilter.MaxFilter(k if k % 2 else k + 1))
+    return small.resize((w, h), Image.BILINEAR).point(lambda v: 255 if v >= 96 else 0)
+
 
 def _removal_masks(source_bytes: bytes, areas: list) -> tuple[bytes, Any]:
     """From the agent's circled shapes (fractions of the photo): (the API mask - a PNG the size of
@@ -449,8 +574,16 @@ def _removal_masks(source_bytes: bytes, areas: list) -> tuple[bytes, Any]:
     draw = ImageDraw.Draw(area)
     for shape in areas:
         draw.polygon([(x * w, y * h) for x, y in shape], fill=255)
-    grow = max(3, int(min(w, h) * 0.025)) | 1  # odd size for MaxFilter
-    area = area.filter(ImageFilter.MaxFilter(grow))
+        # The object's shadow (user, 10/24: a removed car and chair left their shadows behind -
+        # the shadow lay just under the circle, outside the area the AI may touch, so the
+        # paste-back put it right back). Every circle also covers a band under its lower edge,
+        # where a car's or chair's cast / contact shadow falls on the floor or driveway.
+        xs = [x * w for x, _ in shape]
+        ys = [y * h for _, y in shape]
+        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+        bw, bh = x1 - x0, y1 - y0
+        draw.ellipse((x0 - bw * 0.06, y1 - bh * 0.18, x1 + bw * 0.06, min(h, y1 + max(bh * 0.16, h * 0.02))), fill=255)
+    area = _dilate(area, max(3, int(min(w, h) * 0.016)))
     api = Image.new("RGBA", (w, h), (0, 0, 0, 255))
     api.putalpha(Image.eval(area, lambda v: 255 - v))
     buf = BytesIO()
@@ -472,19 +605,157 @@ def _paste_back_original(result_bytes: bytes, source_bytes: bytes, blend) -> byt
     return buf.getvalue()
 
 
-async def _masked_removal_pass(db, user, provider, config, source_bytes, source_ct, prompt, areas) -> tuple[bytes, float]:
+def _shift(img, dx: float, dy: float):
+    from PIL import Image
+    return img.transform(img.size, Image.AFFINE, (1, 0, dx, 0, 1, dy), resample=Image.BILINEAR)
+
+
+def _removal_qc(edit_bytes: bytes, source_bytes: bytes, blend) -> dict:
+    """Free (no AI) check of a circled-removal result, run before it's kept (user, 10/24: a
+    removal smeared the wall and cut off a pegboard at the circle's edge).
+    - align: the model sometimes returns the whole photo nudged a few pixels, so what it painted
+      inside the circle no longer lines up with the original pasted back around it (the "cut
+      off" seam). Measured outside the circles, where the photo should be unchanged, and the best
+      small shift that fixes it is found (`shift`, in full-size pixels).
+    - removed: how much the inside of the circles changed. ~0 = the object is still there.
+    - sharp: detail inside the circles vs the original just around them. Very low = a blurry
+      smear instead of a real floor / wall / driveway.
+    `bad` lists what failed; an empty list = keep it."""
+    from io import BytesIO
+    from PIL import Image, ImageChops, ImageFilter, ImageStat
+    original = Image.open(BytesIO(source_bytes)).convert("L")
+    w, h = original.size
+    edited = Image.open(BytesIO(_match_source_dimensions(edit_bytes, source_bytes))).convert("L")
+    sw = 384
+    sh = max(1, round(h * sw / w))
+    o = original.resize((sw, sh), Image.BILINEAR)
+    e = edited.resize((sw, sh), Image.BILINEAR)
+    a = blend.resize((sw, sh), Image.BILINEAR).point(lambda v: 255 if v > 24 else 0)
+    if not ImageStat.Stat(a).sum[0]:
+        return {"bad": [], "shift": [0, 0]}
+    outside = ImageChops.invert(a.filter(ImageFilter.MaxFilter(9)))
+    inside = a.filter(ImageFilter.MinFilter(5))
+    ring = ImageChops.subtract(a.filter(ImageFilter.MaxFilter(21)), a.filter(ImageFilter.MaxFilter(5)))
+
+    def mean_diff(img, mask, ref=None) -> float:
+        st = ImageStat.Stat(ImageChops.difference(img, o if ref is None else ref), mask)
+        return st.mean[0] if st.count[0] else 0.0
+
+    # Alignment is judged on softened copies - fine grain (and the model's own re-rendered
+    # grain) would otherwise swamp a real few-pixel shift.
+    ob, eb = o.filter(ImageFilter.GaussianBlur(1.5)), e.filter(ImageFilter.GaussianBlur(1.5))
+    align = mean_diff(eb, outside, ob)
+    best = (align, 0.0, 0.0)
+    if align > 5:
+        for step, reach, centre in ((1.0, 6, (0.0, 0.0)), (0.5, 1, None)):
+            bx, by = centre if centre is not None else (best[1], best[2])
+            n = int(round(reach / step))
+            for iy in range(-n, n + 1):
+                for ix in range(-n, n + 1):
+                    dx, dy = bx + ix * step, by + iy * step
+                    if (dx, dy) == (best[1], best[2]):
+                        continue
+                    m = mean_diff(_shift(eb, dx, dy), outside, ob)
+                    if m < best[0] - 0.2:
+                        best = (m, dx, dy)
+    e_al = _shift(e, best[1], best[2]) if (best[1] or best[2]) else e
+    removed = mean_diff(e_al, inside) if ImageStat.Stat(inside).sum[0] else 99.0
+    edges_final = Image.composite(e_al, o, a).filter(ImageFilter.FIND_EDGES)
+    ring_st = ImageStat.Stat(o.filter(ImageFilter.FIND_EDGES), ring)
+    in_st = ImageStat.Stat(edges_final, inside)
+    ring_sharp = ring_st.mean[0] if ring_st.count[0] else 0.0
+    in_sharp = in_st.mean[0] if in_st.count[0] else 0.0
+    sharp = (in_sharp / ring_sharp) if ring_sharp > 2 else 1.0
+    bad = []
+    if best[0] > 20:
+        bad.append("misaligned")
+    if removed < 4:
+        bad.append("not_removed")
+    if sharp < 0.3:
+        bad.append("smeared")
+    return {
+        "bad": bad, "align": round(align, 2), "align_fixed": round(best[0], 2),
+        "shift": [round(best[1] * w / sw, 1), round(best[2] * h / sh, 1)],
+        "removed": round(removed, 2), "sharp": round(sharp, 3),
+    }
+
+
+def _qc_score(qc: dict) -> float:
+    """Lower = better, for keeping the better of two tries."""
+    return len(qc.get("bad") or []) * 100 + float(qc.get("align_fixed") or 0) - min(float(qc.get("sharp") or 0), 1.0) * 10
+
+
+def _apply_shift(edit_bytes: bytes, source_bytes: bytes, shift) -> bytes:
+    """The edit moved back into line with the original (see _removal_qc), at full size."""
+    dx, dy = (shift or [0, 0])[:2]
+    if not dx and not dy:
+        return edit_bytes
+    from io import BytesIO
+    from PIL import Image
+    img = Image.open(BytesIO(_match_source_dimensions(edit_bytes, source_bytes))).convert("RGB")
+    buf = BytesIO()
+    _shift(img, dx, dy).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+# Re-try wording when the first removal failed its check - same job, the failure spelled out.
+_REMOVAL_RETRY_NOTE = {
+    "not_removed": "The previous attempt left the object in place. It must be completely gone.",
+    "smeared": "The previous attempt left a blurry smear. Rebuild the floor, ground, wall and trim there with real, sharp texture that matches the photo around it.",
+    "misaligned": "The previous attempt shifted the photo. Keep every pixel outside the marked area exactly where it is, at the same framing and scale.",
+}
+
+
+async def _masked_removal_pass(db, user, provider, config, source_bytes, source_ct, prompt, areas) -> tuple[bytes, float, dict]:
     """Pass 1 for a photo with circled areas: remove inside the circles, paste the original back
-    outside them. Its own budget reservation, settled at its own cost. Returns (PNG bytes, cost)."""
+    outside them, then a free quality check (_removal_qc). A result that fails it gets ONE more
+    try (its own budget reservation - the agent's AI allowance and the platform caps still gate
+    it, studio_media_removal_qc_retry turns it off); the better of the two is kept. Returns
+    (PNG bytes, total cost, the check's numbers)."""
+    try:
+        mask_png, blend = await asyncio.to_thread(_removal_masks, source_bytes, areas)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Couldn't read the circled areas - try circling again.") from exc
+    retry_on = bool(config.get("studio_media_removal_qc_retry", True))
+    total = 0.0
+    best_bytes, best_qc = None, None
+    tries = 2 if retry_on else 1
+    for attempt in range(tries):
+        try_prompt = prompt
+        if attempt and best_qc:
+            try_prompt = prompt + "\n\n" + " ".join(_REMOVAL_RETRY_NOTE[b] for b in best_qc["bad"] if b in _REMOVAL_RETRY_NOTE)
+        try:
+            raw, cost = await _one_masked_edit(db, user, provider, config, source_bytes, source_ct, try_prompt, mask_png)
+        except HTTPException:
+            if best_bytes is None:
+                raise
+            break  # the re-try couldn't run (allowance, provider) - keep the first result
+        total += cost
+        try:
+            qc = await asyncio.to_thread(_removal_qc, raw, source_bytes, blend)
+        except Exception as exc:  # noqa: BLE001 - a check that can't run never blocks the edit
+            logger.warning("studio media removal QC skipped", extra={"error": _exc_text(exc)})
+            qc = {"bad": [], "shift": [0, 0], "error": True}
+        qc["attempt"] = attempt + 1
+        if qc.get("shift") and any(qc["shift"]):
+            raw = await asyncio.to_thread(_apply_shift, raw, source_bytes, qc.get("shift"))
+        if best_qc is None or _qc_score(qc) < _qc_score(best_qc):
+            best_bytes, best_qc = raw, qc
+        if not qc["bad"]:
+            break
+        logger.info("studio media removal QC flagged", extra={"qc": qc})
+    best_qc["tries"] = min(attempt + 1, tries)
+    out = await asyncio.to_thread(_paste_back_original, best_bytes, source_bytes, blend)
+    return out, total, best_qc
+
+
+async def _one_masked_edit(db, user, provider, config, source_bytes, source_ct, prompt, mask_png) -> tuple[bytes, float]:
+    """One masked model call under its own budget reservation, settled at its own cost."""
     try:
         reservation = await reserve_studio_media_image(db, user.id, config, user.plan_tier)
     except AIRateLimitExceeded as exc:
         raise _rate_limit_http(exc)
     est_cost = config["studio_media_image_reservation_estimate_usd"]
-    try:
-        mask_png, blend = _removal_masks(source_bytes, areas)
-    except Exception as exc:  # noqa: BLE001
-        await reconcile_budget(db, reservation, 0.0)
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Couldn't read the circled areas - try circling again.") from exc
     req = ImageEditRequest(
         image_bytes=source_bytes, image_content_type=source_ct, prompt=prompt,
         size=config["studio_media_image_size"], quality=config["studio_media_image_quality"], mask_bytes=mask_png,
@@ -511,13 +782,13 @@ async def _masked_removal_pass(db, user, provider, config, source_bytes, source_
     await record_usage_event(db, user.id, None, provider.model, None, None, cost, 0,
                              False, None, event_type="studio_media_image")
     await reconcile_budget(db, reservation, cost)
-    return _paste_back_original(result.image_bytes, source_bytes, blend), cost
+    return result.image_bytes, cost
 
 
 # ------------------------------------------------------------------------------- photo edit
 
 async def _run_image(db, user, payload, effects, action_label, options, config, prompt,
-                     group_id, parent_asset_id, linked_property):
+                     group_id, parent_asset_id, linked_property, placeholder_id=None):
     # Photo first: a link that won't load used to fail AFTER the budget was reserved, and that
     # reservation was never released (the agent's AI allowance shrank for nothing).
     source_bytes, source_ct = await _fetch_source_bytes(payload.source_photo_url)
@@ -532,14 +803,17 @@ async def _run_image(db, user, payload, effects, action_label, options, config, 
     # the result as-is (no whole-photo re-render that could touch anything else).
     cost = 0.0
     masked_bytes = None
+    removal_qc = None
     removal_prompt, rest_effects, rest_options = split_masked_removal(effects, options.model_dump(exclude_none=True)) if options.remove_areas else (None, effects, None)
     if removal_prompt:
-        masked_bytes, cost = await _masked_removal_pass(db, user, provider, config, source_bytes, source_ct, removal_prompt, options.remove_areas)
+        masked_bytes, cost, removal_qc = await _masked_removal_pass(db, user, provider, config, source_bytes, source_ct, removal_prompt, options.remove_areas)
         prompt = (removal_prompt + ("\n\n--- then ---\n\n" + build_stacked_prompt(rest_effects, rest_options) if rest_effects else ""))
         if not rest_effects:
             return await _store_image_asset(db, user, payload, effects, action_label, options, config, provider,
                                             prompt, masked_bytes, source_bytes, cost, est_cost, group_id,
-                                            parent_asset_id, linked_property, reservation=None, settled_cost=cost)
+                                            parent_asset_id, linked_property, reservation=None, settled_cost=cost,
+                                            placeholder_id=placeholder_id,
+                                            extra_options={"removal_qc": removal_qc} if removal_qc else None)
         passes = 1  # the second pass is a whole-photo edit; no extra refine passes on top
         keep = KEEP_EXCEPT_DEBRIS_CLAUSE if "yard_cleanup" in (rest_options.get("enhancements") or []) else KEEP_EVERYTHING_CLAUSE
         main_prompt = f"{keep}\n\n{build_stacked_prompt(rest_effects, rest_options)}"
@@ -582,12 +856,14 @@ async def _run_image(db, user, payload, effects, action_label, options, config, 
     return await _store_image_asset(db, user, payload, effects, action_label, options, config, provider,
                                     prompt, result.image_bytes, source_bytes, pre_cost + cost, est_cost,
                                     group_id, parent_asset_id, linked_property,
-                                    reservation=reservation, settled_cost=pre_cost)
+                                    reservation=reservation, settled_cost=pre_cost, placeholder_id=placeholder_id,
+                                    extra_options={"removal_qc": removal_qc} if removal_qc else None)
 
 
 async def _store_image_asset(db, user, payload, effects, action_label, options, config, provider, prompt,
                              image_bytes, source_bytes, cost, est_cost, group_id, parent_asset_id, linked_property,
-                             reservation=None, settled_cost: float = 0.0):
+                             reservation=None, settled_cost: float = 0.0, placeholder_id=None,
+                             extra_options: Optional[dict] = None):
     """Save a finished photo edit: matched to the source photo's exact size, optional upscale,
     stored, and recorded as the project asset. Settles the spend not settled yet (`settled_cost`
     = already settled, e.g. the circled-removal pass) - against `reservation` when there is one,
@@ -623,16 +899,33 @@ async def _store_image_asset(db, user, payload, effects, action_label, options, 
     if reservation is not None:
         await reconcile_budget(db, reservation, unsettled)
 
-    asset = StudioMediaAsset(
-        owner_id=user.id, group_id=group_id, parent_asset_id=parent_asset_id,
-        kind="image", action=action_label, status="succeeded",
-        source_photo_url=payload.source_photo_url, source_kind=payload.source_kind,
-        linked_property=linked_property.model_dump() if linked_property else None,
-        options={**(options.model_dump(exclude_none=True)), "effects": effects, "size_bytes": len(final_bytes)},
-        provider=provider.name, provider_model=provider.model,
-        result_url=result_url, prompt=prompt, prompt_version=PROMPT_VERSION, cost_usd=cost,
-    )
-    db.add(asset)
+    if placeholder_id:
+        # Background run: fill in the "processing" row the agent already sees.
+        asset = await db.get(StudioMediaAsset, placeholder_id)
+        if asset is None:
+            # Deleted while it was still working - nothing to keep (the spend above is real and
+            # stays counted; only the file goes).
+            s3_service.delete_by_url(result_url)
+            raise HTTPException(status.HTTP_410_GONE, "That project was deleted.")
+        keep = {k: v for k, v in (asset.options or {}).items() if k in ("client_request_id", "custom_name", "staging_tag")}
+        asset.options = {**(options.model_dump(exclude_none=True)), **keep, "effects": effects,
+                         "size_bytes": len(final_bytes), **(extra_options or {})}
+        asset.status = "succeeded"
+        asset.provider, asset.provider_model = provider.name, provider.model
+        asset.result_url, asset.prompt, asset.prompt_version, asset.cost_usd = result_url, prompt, PROMPT_VERSION, cost
+        asset.error_message = None
+    else:
+        asset = StudioMediaAsset(
+            owner_id=user.id, group_id=group_id, parent_asset_id=parent_asset_id,
+            kind="image", action=action_label, status="succeeded",
+            source_photo_url=payload.source_photo_url, source_kind=payload.source_kind,
+            linked_property=linked_property.model_dump() if linked_property else None,
+            options={**(options.model_dump(exclude_none=True)), "effects": effects, "size_bytes": len(final_bytes),
+                     **(extra_options or {})},
+            provider=provider.name, provider_model=provider.model,
+            result_url=result_url, prompt=prompt, prompt_version=PROMPT_VERSION, cost_usd=cost,
+        )
+        db.add(asset)
     await db.commit()
     await db.refresh(asset)
     await storage_ledger_service.record(db, user.id, "ai_media_image", result_url, len(final_bytes))
@@ -793,6 +1086,8 @@ async def _run_video(db, user, payload, photos, options, config, group_id, paren
         "projected_cost_breakdown": projected_cost,
         "projected_over_variant_cap": projected_over_cap,
     }
+    if getattr(payload, "client_request_id", None):
+        asset_options["client_request_id"] = payload.client_request_id
     if variant_data:
         asset_options["video_variant_effective"] = {
             **variant_data,

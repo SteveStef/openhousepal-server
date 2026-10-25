@@ -104,6 +104,38 @@ async def put_website_sales(payload: WebsiteSalesPatch, db: AsyncSession = Depen
     return await flow.set_website_sales(db, current_user, payload.on)
 
 
+KIT_PREF_KEYS = ("flyerBrand", "qrDark", "matchScore", "recap", "bragStats")
+
+
+def _kit_prefs_of(user: User) -> dict:
+    raw = (user.setup_state or {}).get("kit_prefs") if isinstance(user.setup_state, dict) else None
+    return {k: v for k, v in (raw or {}).items() if k in KIT_PREF_KEYS and isinstance(v, bool)}
+
+
+@router.get("/kit-prefs")
+async def get_kit_prefs(current_user: User = Depends(get_current_active_user)):
+    """The open house kit's print choices (sign-in look, Brand, Match %, Recap, Sold Stats), saved
+    to the ACCOUNT so every computer / phone starts a kit the same way. Only the choices the agent
+    has made are returned - anything missing uses the kit's own default. users.setup_state["kit_prefs"]
+    (no migration)."""
+    return {"prefs": _kit_prefs_of(current_user)}
+
+
+class KitPrefsPatch(BaseModel):
+    prefs: dict[str, bool]
+
+
+@router.put("/kit-prefs")
+async def put_kit_prefs(payload: KitPrefsPatch, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    chosen = {k: v for k, v in payload.prefs.items() if k in KIT_PREF_KEYS and isinstance(v, bool)}
+    if chosen:
+        st = dict(current_user.setup_state or {})
+        st["kit_prefs"] = {**_kit_prefs_of(current_user), **chosen}
+        current_user.setup_state = st
+        await db.commit()
+    return {"prefs": _kit_prefs_of(current_user)}
+
+
 class FormDefaultsPatch(BaseModel):
     animated: Optional[bool] = None
     show_branding: Optional[bool] = None

@@ -132,7 +132,9 @@ def _showcase_example_properties(hub_config: dict, limit: int = 4) -> list[Examp
     raw_sales = hub_config.get("recentSales")
     if not isinstance(raw_sales, list):
         return None
-    eligible = [sale for sale in raw_sales if isinstance(sale, dict) and _is_eligible_showcase_example_sale(sale)]
+    # The agent's own picks apply here too: only Shown sales, over their min price, in their order.
+    eligible = [sale for sale in raw_sales if isinstance(sale, dict) and _is_eligible_showcase_example_sale(sale) and sale.get("visible", True) is not False]
+    eligible = content_adapters.apply_sales_rules(sorted(eligible, key=lambda s: str(s.get("sold_date") or ""), reverse=True), content_adapters.sales_rules_from_config(hub_config))
     if not eligible:
         return None
     return [
@@ -255,6 +257,7 @@ async def _public_form_response(db: AsyncSession, user: User, form: AgentForm, c
         agent_photo_url=user.photo_url,
         agent_title=user.professional_title,
         agent_market=user.market,
+        agent_state=getattr(user, "state", None),
         linked_property=form.linked_property,
         example_properties=example_properties,
     )
@@ -331,6 +334,30 @@ async def list_warm_hosts(db: AsyncSession = Depends(get_db)):
     )).scalars().all()
     hosts = [default_hostname(s) for s in rows if s.subdomain_slug]
     return {"hosts": hosts[:500]}
+
+
+@router.get("/subdomain/{slug}/own-domain")
+async def get_subdomain_own_domain(slug: str, db: AsyncSession = Depends(get_db)):
+    """Where <slug>.openhousepal.com forwards to (frontend proxy.ts) - {"own_domain": null} = stay.
+    Same rule as every link the agent hands out (site_service.resolve_owner_public_base_url): only
+    an IDX agent's own domain that is ACTIVE + primary, with "use my own domain" on, on a published
+    site that's switched on, and that actually opens. Any doubt or error = stay (fail open)."""
+    try:
+        from app.services.website import site_service
+        site = (await db.execute(select(Site).where(Site.subdomain_slug == slug.strip().lower(), Site.status == "PUBLISHED"))).scalar_one_or_none()
+        if not site:
+            return {"own_domain": None}
+        owner = await db.get(User, site.owner_id)
+        if not owner or not _idx_owner_live(owner):
+            return {"own_domain": None}
+        base = await site_service.resolve_owner_public_base_url(db, owner)
+        platform = os.getenv("FRONTEND_URL", os.getenv("CLIENT_URL", "http://localhost:3000")).rstrip("/")
+        if not base or base.rstrip("/") == platform or not base.startswith("https://"):
+            return {"own_domain": None}
+        return {"own_domain": base.rstrip("/")}
+    except Exception:  # noqa: BLE001
+        logger.exception("subdomain own-domain lookup failed for %s", slug)
+        return {"own_domain": None}
 
 
 @router.get("/resolve")
@@ -769,6 +796,7 @@ async def get_site_area(site_id: str, slug: str, db: AsyncSession = Depends(get_
     from app.services.areas.fair_housing_service import clean_area_payload
     facts, narrative_clean = clean_area_payload(facts, area.narrative)
     facts.pop("_fair_housing", None)
+    hub_rules = await content_adapters.hub_sales_rules(db, user)
     return {
         "name": area.name,
         "state": area.state,
@@ -779,8 +807,9 @@ async def get_site_area(site_id: str, slug: str, db: AsyncSession = Depends(get_
         "explore_origin": (lambda origin: {"lat": origin[0], "lng": origin[1]} if origin else None)(_area_explore_origin(area)),
         "facts": content_adapters.fix_mojibake_deep(facts),
         "narrative": content_adapters.fix_mojibake_deep(narrative_clean),
-        "my_listings": await content_adapters.get_active_listings(db, user, 6, area_scope=area_scope),
-        "sales": await content_adapters.get_recent_sales(db, user, 6, area_scope=area_scope),
+        # The Agent Hub's picks (hidden homes, min price, order) apply on town pages too (owner, 10/24).
+        "my_listings": content_adapters.drop_hidden_listings(await content_adapters.get_active_listings(db, user, 12, area_scope=area_scope), hub_rules)[:6],
+        "sales": content_adapters.apply_sales_rules(await content_adapters.get_recent_sales(db, user, 12, area_scope=area_scope), hub_rules)[:6],
         "open_houses": await content_adapters.get_open_houses(db, user, 4, area_scope=area_scope),
         "related_areas": await content_adapters.cached_market(f"related:{user.id}:{area.id}", lambda d: content_adapters.get_area_related(d, user, area.id, limit=3), db),
         # Live market trends (12 months of closed sales, what's for sale now) and the latest

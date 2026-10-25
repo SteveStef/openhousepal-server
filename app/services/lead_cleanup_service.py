@@ -1,6 +1,10 @@
 """What deleting a lead switches off (user, 10/21): every automatic email to that person and their
 Showcase - so a deleted lead never keeps getting emails, and their Showcase stops updating.
 
+10/24 (user): deleting the LEAD makes them disappear from everything - the Email Tracker (the
+"You deleted their lead" hold stays on, but they're no longer listed), Activity, and their Showcase
+is deleted (not just turned off). Deleting only their Showcase keeps the lead and the rest.
+
 - Automatic emails: off for them on the Emails page ("You deleted their lead" - client_email_service
   LEAD_DELETED), which holds every future digest / Spotlight update.
 - Waiting emails: every not-yet-sent email to them from this agent (scheduled invite, queued
@@ -16,9 +20,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 
-from app.models.database import Collection, Lead, LeadEvent, ScheduledEmail, SpotlightAlertSubscription, User
+from app.models.database import (Collection, Lead, LeadEvent, ScheduledEmail, SpotlightAlertSubscription, User,
+                                 collection_properties)
 from app.services import client_email_service as ce
 
 # ScheduledEmail rows that haven't gone out yet: due (PENDING) or waiting for the digest (DIGEST).
@@ -47,17 +52,16 @@ async def stop_everything(db, owner_id: str, lead: Lead) -> dict:
         email = ""  # the agent added themselves as a lead - never stop the agent's own emails
 
     showcases = await lead_showcases(db, owner_id, lead)
-    turned_off = 0
-    for col in showcases:
-        if col.status == "ACTIVE":
-            col.status, col.updated_at = "INACTIVE", now
-            turned_off += 1
+    col_ids = [c.id for c in showcases]
+    # 10/24: deleting the LEAD removes them everywhere - their Showcase is deleted too (its homes
+    # list, likes, comments, tours and its Activity alerts go with it). Deleting only a Showcase
+    # (Showcases page) still keeps the lead and everything else.
+    deleted = len(col_ids)
 
     cancelled = alerts_off = 0
     stopped = False
     if email:
         stopped = await ce.stop_for_deleted_lead(db, owner_id, email)
-        col_ids = [c.id for c in showcases]
         vars_ = ScheduledEmail.template_variables
         mine = [ScheduledEmail.owner_id == owner_id, vars_["_owner_id"].astext == owner_id]
         if col_ids:
@@ -71,15 +75,45 @@ async def stop_everything(db, owner_id: str, lead: Lead) -> dict:
             SpotlightAlertSubscription.unsubscribed_at.is_(None),
         ).values(unsubscribed_at=now).execution_options(synchronize_session=False))
         alerts_off = res.rowcount or 0
+    activity = await _forget_activity(db, owner_id, lead, email, col_ids)
+    if col_ids:
+        # collection_properties has no ON DELETE rule; everything else hanging off a Showcase cascades.
+        await db.execute(delete(collection_properties).where(collection_properties.c.collection_id.in_(col_ids)))
+        await db.execute(delete(Collection).where(Collection.id.in_(col_ids), Collection.owner_id == owner_id)
+                         .execution_options(synchronize_session=False))
     return {"name": lead.name, "emails_stopped": stopped, "emails_cancelled": cancelled,
-            "showcases_off": turned_off, "spotlight_alerts_off": alerts_off}
+            "showcases_deleted": deleted, "showcases_off": 0, "spotlight_alerts_off": alerts_off,
+            "activity_removed": activity}
+
+
+async def _forget_activity(db, owner_id: str, lead: Lead, email: str, col_ids: list[str]) -> int:
+    """Their rows on the Activity page (the agent's notifications) - anything pointing at the lead,
+    their sign-ins, their requests / form answers, their tours or their Showcase. The Showcase's own
+    alerts also cascade when it's deleted. Doesn't commit."""
+    from app.models.database import ClientEmailPref, Notification, OpenHouseVisitor, PropertyTour
+    ids = {lead.id}
+    for ev_id, src_id in (await db.execute(select(LeadEvent.id, LeadEvent.source_id).where(LeadEvent.lead_id == lead.id))).all():
+        ids.add(ev_id)
+        if src_id:
+            ids.add(str(src_id))
+    ids |= set((await db.execute(select(OpenHouseVisitor.id).where(OpenHouseVisitor.lead_id == lead.id))).scalars().all())
+    if col_ids:
+        ids |= set(col_ids)
+        ids |= set((await db.execute(select(PropertyTour.id).where(PropertyTour.collection_id.in_(col_ids)))).scalars().all())
+    if email:
+        ids |= set((await db.execute(select(ClientEmailPref.id).where(ClientEmailPref.owner_id == owner_id, ClientEmailPref.email == email))).scalars().all())
+    res = await db.execute(delete(Notification).where(Notification.agent_id == owner_id, Notification.reference_id.in_(list(ids)))
+                           .execution_options(synchronize_session=False))
+    return res.rowcount or 0
 
 
 def deleted_message(name: Optional[str], done: dict) -> str:
-    """The agent's confirmation: "Emails to Jane stopped and their Showcase was turned off." """
+    """The agent's confirmation: "Emails to Jane stopped and their Showcase was deleted." """
     who = ((name or "").strip().split(" ")[0] or "").title() or "this lead"
-    n = done.get("showcases_off") or 0
-    showcase = "their Showcase was turned off" if n == 1 else f"their {n} Showcases were turned off" if n else ""
+    n = done.get("showcases_deleted") or 0
+    off = done.get("showcases_off") or 0
+    showcase = ("their Showcase was deleted" if n == 1 else f"their {n} Showcases were deleted" if n
+                else "their Showcase was turned off" if off == 1 else f"their {off} Showcases were turned off" if off else "")
     if done.get("emails_stopped") and showcase:
         return f"Emails to {who} stopped and {showcase}."
     if done.get("emails_stopped"):

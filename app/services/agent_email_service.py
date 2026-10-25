@@ -142,7 +142,23 @@ def email_agent(user, notification_type: Optional[str], template: str, subject: 
                 return
         base = {"agent_name": full_name(user), "first_name": getattr(user, "first_name", None) or "there",
                 "_log_owner": getattr(user, "id", None), "_log_audience": "agent"}
-        send(user.email, template, subject, {**base, **(variables or {})}, reply_to=reply_to)
+        merged = {**base, **(variables or {})}
+        uid = getattr(user, "id", None)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if uid and loop is not None:
+            # Open tracking + the "are they opening our emails?" rules (agent_email_health_service):
+            # an agent on weekly gets non-critical ones in one weekly summary instead.
+            import uuid as _uuid
+            from app.services import agent_email_health_service as health
+            from app.services.agent_mailbox_service import spawn
+            log_id = str(_uuid.uuid4())
+            merged = health.with_tracking(log_id, {**merged, "_log_id": log_id})
+            spawn(health.send_gated(uid, user.email, template, subject, merged, reply_to, always))
+            return
+        send(user.email, template, subject, merged, reply_to=reply_to)
     except Exception:  # noqa: BLE001
         logger.warning("email_agent failed", exc_info=True, extra={"template": template})
 

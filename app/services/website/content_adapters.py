@@ -741,12 +741,62 @@ async def hub_sales_rules(db: AsyncSession, user: User) -> dict:
     return {
         "min_price": max(0, min_price), "sort": sort, "show_stats": cfg.get("showSalesStats") is not False,
         "form_buttons": [b for b in buttons if isinstance(b, str)] if isinstance(buttons, list) else None,
+        # Sales / listings the agent switched off in the Agent Hub editor stay off on the website
+        # too (owner, 10/24: "make sure those settings are used everywhere").
+        "hidden_sales": _hidden_keys(cfg.get("recentSales")),
+        "hidden_listings": _hidden_keys(cfg.get("myListings")),
     }
 
 
+def sales_rules_from_config(cfg: Optional[dict]) -> dict:
+    """hub_sales_rules for a hub config already in hand (no DB read): hidden picks, min price,
+    order - for callers that only have the config (Showcase form examples, the AI blog writer)."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    try:
+        min_price = int(cfg.get("salesMinPrice") or 0)
+    except (TypeError, ValueError):
+        min_price = 0
+    sort = cfg.get("salesSort") if cfg.get("salesSort") in ("newest", "price-high", "price-low") else "newest"
+    return {"min_price": max(0, min_price), "sort": sort,
+            "hidden_sales": _hidden_keys(cfg.get("recentSales")), "hidden_listings": _hidden_keys(cfg.get("myListings"))}
+
+
+def _addr_key(address) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(address or "").split(",")[0].lower())
+
+
+def _hidden_keys(items) -> set[str]:
+    """ids (listing keys) + street keys of the hub items marked hidden (visible False)."""
+    out: set[str] = set()
+    for it in items if isinstance(items, list) else []:
+        if isinstance(it, dict) and it.get("visible") is False:
+            if it.get("id") not in (None, ""):
+                out.add(f"id:{it['id']}")
+            if _addr_key(it.get("address")):
+                out.add(f"addr:{_addr_key(it.get('address'))}")
+    return out
+
+
+def is_hidden_in_hub(item: dict, hidden: set[str]) -> bool:
+    if not hidden:
+        return False
+    keys = {f"id:{item.get(k)}" for k in ("listing_key", "id") if item.get(k) not in (None, "")}
+    if _addr_key(item.get("address")):
+        keys.add(f"addr:{_addr_key(item.get('address'))}")
+    return bool(keys & hidden)
+
+
+def drop_hidden_listings(listings: list[dict], rules: dict) -> list[dict]:
+    """Active listings minus the ones the agent hid in the Agent Hub editor."""
+    hidden = rules.get("hidden_listings") or set()
+    return [l for l in listings if not is_hidden_in_hub(l, hidden)]
+
+
 def apply_sales_rules(sales: list[dict], rules: dict) -> list[dict]:
-    """Drops sales under the minimum price and orders them (newest is how they already come)."""
-    out = [s for s in sales if not rules.get("min_price") or (s.get("price") or 0) >= rules["min_price"]]
+    """Drops sales the agent hid or that are under the minimum price, and orders them (newest
+    is how they already come)."""
+    hidden = rules.get("hidden_sales") or set()
+    out = [s for s in sales if (not rules.get("min_price") or (s.get("price") or 0) >= rules["min_price"]) and not is_hidden_in_hub(s, hidden)]
     if rules.get("sort") == "price-high":
         out.sort(key=lambda s: s.get("price") or 0, reverse=True)
     elif rules.get("sort") == "price-low":
@@ -982,7 +1032,7 @@ async def get_agent_hub_snapshot(db: AsyncSession, user: User) -> dict:
     profile["stats"] = stats_shown(await get_agent_stats(db, user), rules)
     hub_media = await get_agent_hub_media(db, user, limit=12) if (visible & {"videos", "tours"}) else {"videos": [], "tours": []}
     recent_sales = apply_sales_rules(await get_recent_sales(db, user, limit=24), rules)[:8] if "sales" in visible else []
-    listings = await get_active_listings(db, user, limit=8) if "listings" in visible else []
+    listings = drop_hidden_listings(await get_active_listings(db, user, limit=16), rules)[:8] if "listings" in visible else []
     blog_posts = await get_blog_posts(db, user, limit=6) if "blogs" in visible else []
     forms = await get_forms_list(db, user)
     forms_by_type = {f["form_type"]: f for f in forms if rules["form_buttons"] is None or f["form_type"] in rules["form_buttons"]}
@@ -2045,7 +2095,7 @@ async def hydrate_page_blocks(db: AsyncSession, user: User, page: dict, featured
         # Same source as Featured Listings' own-inventory pool (get_active_listings, already
         # newest-first) - a distinct presentational block (rotating card-stack carousel, see
         # NewlyListedBlock), not a second listing source.
-        fetched["newly_listed"] = await get_active_listings(db, user, _SELECTED_MODE_FETCH_CAP)
+        fetched["newly_listed"] = drop_hidden_listings(await get_active_listings(db, user, _SELECTED_MODE_FETCH_CAP), await hub_sales_rules(db, user))
     if "spotlights" in types_present:
         fetched["spotlights"] = await get_published_spotlights(db, user, _SELECTED_MODE_FETCH_CAP)
     profile = await get_agent_profile(db, user) if ("about_agent" in types_present or "hero" in types_present or "contact_cta" in types_present) else None

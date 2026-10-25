@@ -1190,7 +1190,9 @@ async def get_similar_properties(
             **type_flags
         )
 
-        results = await property_service.get_properties_by_preferences(db, prefs, max_properties=100)
+        # nearest_first: the cap keeps the closest homes, so a wider radius only ever ADDS homes
+        # (it used to keep the newest-updated ones and drop homes that matched at a smaller radius).
+        results = await property_service.get_properties_by_preferences(db, prefs, max_properties=150, nearest_first=True)
 
         if request.listing_key:
             results = [p for p in results if str(p.listing_key) != str(request.listing_key)]

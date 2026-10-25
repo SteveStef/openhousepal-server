@@ -111,6 +111,8 @@ class OpenHouseResponse(BaseModel):
     after_signin: Optional[str] = None
     guest_pass: bool = True
     pass_signature: bool = True
+    # Showcases off: the Guest Pass still offers a build-on-tap Showcase button.
+    pass_showcase: bool = False
     # The plan includes the Guest Pass (Bright MLS plans with a live subscription).
     guest_pass_available: bool = False
     # The plan includes Email Signature (IDX / No-MLS Pro) - shows the Guest Pass footer switch.
@@ -149,6 +151,23 @@ class VisitorResponse(BaseModel):
     notes: Optional[str] = None
     lead_id: Optional[str] = None
     created_at: datetime
+    # The agent's star on this person's lead (PATCH /leads/{lead_id} {"is_favorite": bool}).
+    is_favorite: bool = False
+    # Their Showcase (latest, any status) and whether it's starred (PUT /collections/{id}/favorite).
+    showcase_id: Optional[str] = None
+    showcase_starred: bool = False
+    # Guest Pass activity: logged things + visits, and the last time (None = never opened it).
+    pass_events: int = 0
+    pass_last_at: Optional[datetime] = None
+    # The per-visitor Showcase switch (PUT /api/visitors/{id}/showcase {"on": bool}): its state
+    # (their own setting, else the kit's), whether it can be used (plan has Showcases, guest has no
+    # agent) and when a not-yet-sent invite goes out.
+    showcase_on: bool = False
+    showcase_switchable: bool = False
+    showcase_invite_at: Optional[datetime] = None
+    # The agent's Studio -> Email "Showcase invite" delay in minutes (what switching it on waits
+    # before the invite goes out); None = their Showcase invite email is switched off.
+    showcase_invite_delay: Optional[int] = None
 
 class NoteUpdate(BaseModel):
     notes: str
@@ -164,6 +183,7 @@ class GuestSettingsUpdate(BaseModel):
     similar_homes: Optional[bool] = None
     guest_pass: Optional[bool] = None
     pass_signature: Optional[bool] = None
+    pass_showcase: Optional[bool] = None
     after_signin: Optional[Literal["hub", "none"]] = None
     followups_mode: Optional[Literal["on", "no_calendar", "off"]] = None
 
@@ -192,6 +212,9 @@ class OpenHouseFormRequestCreate(BaseModel):
     another_tour_time: Optional[str] = None
     preferred_visit_time: Optional[str] = None
     wants_disclosure: Optional[bool] = None
+    # Where they asked: the Cheat Sheet QR pages send nothing (= cheat_sheet); the Guest Pass and
+    # invites pass their own.
+    source: Optional[Literal["cheat_sheet", "guest_pass", "invite"]] = None
 
 
 class OpenHouseFormRequestResponse(BaseModel):
@@ -206,6 +229,7 @@ class OpenHouseFormRequestResponse(BaseModel):
     another_tour_time: Optional[str] = None
     preferred_visit_time: Optional[str] = None
     wants_disclosure: Optional[bool] = None
+    source: Optional[str] = None
     created_at: datetime
     completed_at: Optional[datetime] = None
     # Denormalized for display in the Forms/Open House results lists, without a join round-trip.

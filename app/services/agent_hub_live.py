@@ -143,6 +143,14 @@ async def live_hub_config(db: AsyncSession, owner: Optional[User], config: Optio
     cfg = dict(config or {})
     if owner is None:
         return cfg
+    from app.utils.auth import tier_has_mls
+    if not tier_has_mls(owner.plan_tier):
+        # No-MLS plans never show Bright data - only what the agent typed in themselves, even if an
+        # MLS id is on file or Bright items were saved back when they were on a Bright plan.
+        for key in ("myListings", "recentSales"):
+            cfg[key] = [s for s in (cfg.get(key) or []) if isinstance(s, dict) and s.get("source") == "manual"]
+        from app.services.website_link_service import apply_auto_website
+        return await apply_auto_website(db, owner, cfg)
     try:
         cfg["myListings"] = await _merged_listings(db, owner, cfg.get("myListings") or [])
         cfg["recentSales"] = await _merged_sales(db, owner, cfg.get("recentSales") or [])

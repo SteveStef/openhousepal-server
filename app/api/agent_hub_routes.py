@@ -606,6 +606,10 @@ async def get_marketing_moments(
     from app.services.agent_hub_live import live_listings, _listing_item, nice
     from app.services.website.content_adapters import get_recent_sales
 
+    # No-MLS plans: the mirror is Bright data - nothing to suggest from it.
+    if not tier_has_mls(current_user.plan_tier):
+        return {"needs_spotlight": [], "newest_listing": None, "latest_sale": None, "studio_picks": []}
+
     listings = await live_listings(db, current_user)
     keys_with_site = set((await db.execute(
         select(PropertyWebsite.listing_key).where(PropertyWebsite.owner_id == current_user.id, PropertyWebsite.listing_key.is_not(None))
@@ -1371,7 +1375,9 @@ async def upload_my_photo(
 async def upload_my_sale_photo(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_agent_hub_access),
+    # Every plan (not just Agent Hub plans): Settings > Recent Sales / My Listings and the kit's
+    # Brag Sheet "Add a sale" are on every plan - plain No-MLS and Basic add sales by hand too.
+    current_user: User = Depends(require_active_plan),
 ):
     """Uploads a photo for a manually-added Recent Sales entry. Separate from /me/photo since
     that endpoint overwrites the user's single profile photo_url - sale photos are their own

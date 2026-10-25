@@ -186,6 +186,9 @@ class LeadOut(BaseModel):
     # Much busier than their usual week (lead_warmth) - the moment to reach out.
     heating_up: bool = False
     warmth_reason: Optional[str] = None
+    # The agent's star on this person, and whether their Showcase is starred (Showcases page).
+    is_favorite: bool = False
+    showcase_starred: bool = False
 
     class Config:
         from_attributes = True
@@ -210,6 +213,7 @@ class LeadUpdate(BaseModel):
     tags: Optional[List[str]] = None
     notes: Optional[str] = None
     mark_contacted: bool = False
+    is_favorite: Optional[bool] = None
 
 
 class LeadNoteOut(BaseModel):

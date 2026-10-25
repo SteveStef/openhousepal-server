@@ -519,14 +519,6 @@ async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) ->
             both = " and ".join(p for p in (new_part, drop_part) if p)
             # names the price drops too ("3 new matches and 1 price drop across 2 client Showcases")
             headline = f"{both} across {clients}"
-            bell = (f"{both} across {len(sc['showcases'])} clients' Showcases" if len(sc["showcases"]) > 1
-                    else f"{both} in {sc['showcases'][0]['visitor_name'] or 'a client'}'s Showcase")
-            db.add(Notification(
-                agent_id=user.id, type="SHOWCASE_DIGEST", reference_type="SHOWCASE_DIGEST",
-                reference_id=f"digest-{local_day}", title="Today's Showcase update",
-                message=bell[0].upper() + bell[1:] + ".", link="/showcases", is_read=False,
-                created_at=datetime.now(timezone.utc),
-            ))
             v.update({"collection_label": clients, "total_new_label": new_part, "total_drop_label": drop_part,
                       # home_groups = the current template; collections = the older version's by-Showcase list.
                       "home_groups": sc["home_groups"][:MAX_HOME_GROUPS],
@@ -543,6 +535,15 @@ async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) ->
             headline = _plural(n, "thing waiting on you", "things waiting on you")
         v["headline"] = headline
         v["has_showcase_section"] = bool(sc or brief["client_activity"])
+        # The bell's "Today's Rundown" (user, 10/24) - one a day, whenever the briefing goes out (not
+        # only on Showcase news). Clicking it opens the Rundown window in place (TodaysRundown.tsx);
+        # the link is only the fallback (Dash opens the Rundown from ?rundown=1).
+        db.add(Notification(
+            agent_id=user.id, type="SHOWCASE_DIGEST", reference_type="SHOWCASE_DIGEST",
+            reference_id=f"digest-{local_day}", title="Today's Rundown",
+            message=headline[0].upper() + headline[1:] + ".", link="/dash?rundown=1", is_read=False,
+            created_at=datetime.now(timezone.utc),
+        ))
         agent_emails.append((user, f"Your daily briefing: {headline}", v))
         await db.execute(text(
             "INSERT INTO system_settings (key, value) VALUES (:k, CAST(:v AS jsonb)) "
@@ -570,9 +571,10 @@ def _more(n: int, one: str, many: str, tail: str) -> str:
     return f"+ {n} {one if n == 1 else many}" + (f" {tail}" if tail else "")
 
 
-async def _briefing(db: AsyncSession, user: User, now: datetime, showcase_access: bool) -> dict:
+async def _briefing(db: AsyncSession, user: User, now: datetime, showcase_access: bool, full: bool = False) -> dict:
     """The non-Showcase parts of the daily briefing - the same things the app flags with a red
-    badge, each in exactly one section (nothing repeats between sections)."""
+    badge, each in exactly one section (nothing repeats between sections).
+    full: the in-app Today's Rundown (rundown_service) - nothing capped (the email shows a few)."""
     from app.models.database import AgentTask, FormSubmission, SupportTicket
     from app.services.agent_email_service import absolute
     from app.services.tasks_service import compute_bucket, task_day
@@ -597,7 +599,7 @@ async def _briefing(db: AsyncSession, user: User, now: datetime, showcase_access
         is_over = t in overdue
         d = task_day(t)
         when = f"Overdue · was due {d.strftime('%a, %b')} {d.day}" if is_over and d else "Today"
-        followups.append({"title": t.title, "when": when, "overdue": is_over, "_key": f"task:{t.id}"})
+        followups.append({"title": t.title, "when": when, "overdue": is_over, "_key": f"task:{t.id}", "_link": f"/leads/tasks?task={t.id}"})
     # Two open follow-ups with the same title (one person, two different reasons - each card in the
     # app shows its own reason) read as a duplicate in an email that only shows titles: one line each.
     merged: "OrderedDict[str, dict]" = OrderedDict()
@@ -695,6 +697,9 @@ async def _briefing(db: AsyncSession, user: User, now: datetime, showcase_access
         except Exception:  # noqa: BLE001
             logger.warning("briefing search changes failed", exc_info=True)
 
+    if full:
+        return {"followups": followups, "followup_count": len(overdue) + len(today_), "followup_overdue": len(overdue),
+                "followups_label": label, "actions": actions, "client_activity": activity}
     more = len(actions) - MAX_ACTIONS
     return {
         "followups": followups[:MAX_FOLLOWUPS],

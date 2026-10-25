@@ -203,6 +203,9 @@ async def list_assets(
         db, current_user.id, group_id=group_id, limit=limit,
         kind=kind, exclude_kind=None if kind else "upload",
     )
+    for i, a in enumerate(assets):
+        if a.kind == "image" and a.status == "processing":
+            assets[i] = await studio_media_service.expire_stale_image_job(db, a)
     return StudioMediaAssetListResponse(assets=assets)
 
 
@@ -216,6 +219,8 @@ async def get_asset(
     # A video still processing gets polled here so the client only ever calls this one endpoint.
     if asset.kind == "video" and asset.status == "processing":
         asset = await studio_media_service.poll_asset(db, current_user, asset)
+    elif asset.kind == "image" and asset.status == "processing":
+        asset = await studio_media_service.expire_stale_image_job(db, asset)
     return asset
 
 

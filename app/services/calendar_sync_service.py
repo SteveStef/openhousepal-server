@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, time, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -172,7 +173,20 @@ def _local(dt: datetime) -> dict:
 # Done events' title prefix - plain letters, small beside the bold to-dos.
 # "✓" (U+2713, a text check mark - not the ✅ emoji, which made iPhone Calendar draw the done
 # title in a bigger font, 10/19). The user missed the check on done follow-ups (10/22).
-DONE_PREFIX = "✓ DONE · "
+# 10/24: the user wants the check GREEN (only the ✅ emoji is green) and the done ones to read
+# smaller than the bold to-dos - "Done" in lower case, the rest of the title plain letters.
+DONE_PREFIX = "✅ Done · "
+
+
+_INVISIBLE = re.compile("[­​‎‏⁠-⁤‪-‮⁦-⁩﻿]")
+
+
+def _plain_notes(text: str) -> str:
+    """Event notes the way every calendar app reads them cleanly: one kind of line break, plain
+    spaces (a pasted no-break space next to a link glues words onto it) and no invisible
+    characters (soft hyphens, zero-width spaces... end a link early). Emoji joiners stay."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").replace(" ", " ").replace(" ", " ")
+    return _INVISIBLE.sub("", text)
 
 
 def _bold(text: str) -> str:
@@ -185,7 +199,8 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
                      done_link: Optional[str] = None, owner=None, contact_link: Optional[str] = None,
                      your_notes: Optional[list] = None, lead_name: Optional[str] = None,
                      comments: Optional[list] = None, lead=None, details: Optional[list] = None,
-                     prop: Optional[dict] = None, message_override: Optional[str] = None) -> dict:
+                     prop: Optional[dict] = None, message_override: Optional[str] = None,
+                     showcase_link: Optional[str] = None) -> dict:
     """Google-shaped event for a follow-up. The description is PLAIN TEXT on purpose: Google's web
     view renders HTML, but the iPhone Calendar app (and other synced clients) showed the raw tags
     ("<b><a href=...>&#9989;"). So no bold / italics / underline - sections are told apart with an
@@ -195,8 +210,9 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
     contacts -> why + the home (linked) -> what they told you -> Showcase comments -> your notes ->
     the ready-to-send text, last, so "copy everything below" is literally true.
     `message_override` = an already-assembled message (the settings page's live preview)."""
-    from app.services.tasks_service import (ALERT_NOTE_RULES, FILL_IN_ANSWER, FILL_IN_TIME, NOTED_GUEST_SOURCE, SHOWING_RULES, _pretty_phone, carried_forward,
-                                            full_message, reminder_overrides, task_day, task_prefix)
+    from app.services.tasks_service import (ALERT_NOTE_RULES, FILL_IN_ANSWER, FILL_IN_TIME, GUEST_PASS_SEEN, NOTED_GUEST_SOURCE, SHOWING_RULES, _pretty_phone, carried_forward,
+                                            clean_url, full_message, reminder_overrides, task_day, task_prefix)
+    done_link, contact_link, showcase_link = clean_url(done_link), clean_url(contact_link), clean_url(showcase_link)
     due = _to_utc(task.due_at)
     done = task.completed_at is not None
     summary = f"[{task_prefix(task)}] {task.title}"
@@ -242,26 +258,38 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
         if prop.get("url"):
             # Their own Showcase link - safe to forward. Opened while signed in, the page knows it's
             # the agent: their clicks don't count as the client's, and it offers the agent view.
-            label = f"Open {first}'s Showcase" if prop.get("where") == "showcase" else "See the listing"
-            why.append(f"\U0001F449 {label}:\n{prop['url']}")
+            # The tap-to-open copy is the SHORT /d/<code>/s link (it forwards to this same page): the
+            # full link on the agent's own domain is too wide for a phone line, and the calendar app
+            # only linked the part before the wrap (user, 10/24 - "john-92w8" was dead).
+            on_showcase = prop.get("where") == "showcase"
+            label = f"Open {first}'s Showcase" if on_showcase else "See the listing"
+            why.append(f"\U0001F449 {label}:\n{showcase_link if on_showcase and showcase_link else clean_url(prop['url'])}")
+    if showcase_link and (showcase or {}).get("url") and not (prop and prop.get("url") and prop.get("where") == "showcase"):
+        # They have a Showcase but this follow-up's home isn't in it (or isn't about a home): still
+        # one tap to it, near the top - not only the long link at the very end of the text.
+        why.append(f"\U0001F449 Open {first}'s Showcase:\n{showcase_link}")
     if why:
         parts.append("\n".join(why))
     # Notes minus the auto-written lines the event already shows (the context line, contact info).
     skip = ("Auto-created", "Open house: ", "Contact: ")
     if task.auto_source in ALERT_NOTE_RULES:
         skip += ("Email: ", "Phone: ")  # shown in the contact block above
-    notes = "\n".join(l for l in (task.notes or "").splitlines() if not l.startswith(skip)).strip()
+    # What they opened on their Guest Pass since the open house gets its own section (below).
+    seen = [l[len(GUEST_PASS_SEEN):] for l in (task.notes or "").splitlines() if l.startswith(GUEST_PASS_SEEN)]
+    notes = "\n".join(l for l in (task.notes or "").splitlines() if not l.startswith(skip) and not l.startswith(GUEST_PASS_SEEN)).strip()
     # A line of space between the heads-up and the agent's own note.
     notes = notes.replace("\nYour note: ", "\n\nYour note: ")
     if notes:
         parts.append(("\U0001F6A8 WHAT TO DO\n" if task.auto_source in ALERT_NOTE_RULES else "\U0001F5D2️ ") + notes)
+    if seen and not done:
+        parts.append("\U0001F440 ON THEIR GUEST PASS SINCE\n" + "\n".join(f"• {s[:1].upper()}{s[1:]}" for s in seen))
     if details and not done:
         parts.append("\U0001F4CB WHAT THEY TOLD YOU\n" + "\n".join(f"• {d}" for d in details[:8]))
     if comments and not done:
         # What they said on their Showcase, which home, and a link that opens that exact home on
         # the agent's Showcases page (signed in).
         parts.append(f"\U0001F4AC THEIR SHOWCASE COMMENT{'S' if len(comments) > 1 else ''}\n" + "\n\n".join(
-            f'“{c["text"][:400]}”\n\U0001F3E0 {c["home"]}\n\U0001F449 Open it in your Showcases:\n{c["url"]}' for c in comments[:3]))
+            f'“{c["text"][:400]}”\n\U0001F3E0 {c["home"]}\n\U0001F449 Open it in your Showcases:\n{clean_url(c["url"])}' for c in comments[:3]))
     if your_notes and task.auto_source != NOTED_GUEST_SOURCE:  # that alert already quotes the note
         parts.append("\U0001F4DD YOUR NOTES\n" + "\n".join(
             f"• {'(' + label + ') ' if label else ''}{text[:280]}" for label, text in your_notes[:3]))
@@ -290,15 +318,15 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
             block += [f"✏️ BEFORE YOU SEND: replace {FILL_IN_TIME} with the showing you booked.", ""]
         if FILL_IN_ANSWER in msg:
             block += [f"✏️ BEFORE YOU SEND: replace {FILL_IN_ANSWER} with your answer to their message (it's above).", ""]
-        if done_link and getattr(lead, "phone", None):
-            # One tap: Messages opens with their number and this text written, from the agent's own
-            # cell - and the follow-up checks itself off.
-            block += [f"\U0001F4F2 Text {first} from your phone - opens Messages with the text below already written:", f"{done_link}/text", ""]
+        if done_link and (getattr(lead, "phone", None) or getattr(lead, "email", None)):
+            # One tap: Messages (or their email, written as an email - 10/25) opens with this
+            # message written, from the agent's own phone / mailbox - and the follow-up checks itself off.
+            block += [f"\U0001F4F2 Text / email link for {first} - opens Messages or your email with the message below already written:", f"{done_link}/text", ""]
         block += ["\U0001F4AC SUGGESTED TEXT - copy everything below ⬇️", "", msg]
         parts.append("\n".join(block))
     body: dict = {
         "summary": summary,
-        "description": "\n\n".join(parts) or None,
+        "description": _plain_notes("\n\n".join(parts)) or None,
         # Google shows this as a named link on the event (web) - the same one-tap done page.
         "source": {"title": ("Undo - OpenHousePal" if done else "Mark as done - OpenHousePal"), "url": done_link} if done_link
         else {"title": "OpenHousePal", "url": "https://openhousepal.com/leads/tasks"},
@@ -811,8 +839,30 @@ async def sync_tour_now(owner_id: str, tour_id: str, timeout: float = 12.0) -> s
     return "error" if any_connected else "not_connected"
 
 
+# One follow-up's syncs run one at a time, each reading the follow-up fresh INSIDE the turn (10/24).
+# Before, "done" then a quick "undo" built their bodies side by side: the done one (slower - it loads
+# the Showcase) could land on the calendar LAST, so an un-done follow-up stayed crossed out until
+# the next morning's re-sync ("took forever to come back"). Now the last change always wins.
+_TASK_SYNC_LOCKS: dict[tuple, list] = {}  # key -> [lock, users]
+
+
 async def _sync_task(db: AsyncSession, conn: CalendarConnection, task_id: str) -> None:
-    task = (await db.execute(select(AgentTask).where(AgentTask.id == task_id))).scalar_one_or_none()
+    key = (conn.id, task_id)
+    entry = _TASK_SYNC_LOCKS.setdefault(key, [asyncio.Lock(), 0])
+    entry[1] += 1
+    try:
+        async with entry[0]:
+            await _sync_task_locked(db, conn, task_id)
+    finally:
+        entry[1] -= 1
+        if entry[1] <= 0:
+            _TASK_SYNC_LOCKS.pop(key, None)
+
+
+async def _sync_task_locked(db: AsyncSession, conn: CalendarConnection, task_id: str) -> None:
+    # populate_existing: the follow-up as it is NOW, even if this session saw it before the wait.
+    task = (await db.execute(select(AgentTask).where(AgentTask.id == task_id)
+                             .execution_options(populate_existing=True))).scalar_one_or_none()
     if not task or task.owner_id != conn.owner_id:
         return
     # A task with no date can't sit on the calendar. A completed one stays, crossed out
@@ -883,10 +933,13 @@ async def task_body_for(db: AsyncSession, task: AgentTask) -> dict:
         prop = await followup_property(db, task, owner)
     except Exception:
         logger.warning("follow-up property lookup failed for task %s", task.id, exc_info=True)
-    return _task_event_body(task, await _showcase_info_for(db, task), followup_color(owner), done_url(code),
+    from app.services.tasks_service import showcase_go_url
+    showcase = await _showcase_info_for(db, task)
+    return _task_event_body(task, showcase, followup_color(owner), done_url(code),
                             owner=owner, contact_link=contact_url(code) if lead is not None else None,
                             your_notes=your_notes, lead_name=(lead.name or "").split(" ")[0] if lead is not None else None,
-                            comments=comments, lead=lead, details=details, prop=prop)
+                            comments=comments, lead=lead, details=details, prop=prop,
+                            showcase_link=showcase_go_url(code) if (showcase or (prop or {}).get("where") == "showcase") else None)
 
 
 async def _sync_open_house(db: AsyncSession, conn: CalendarConnection, oh_id: str) -> None:
@@ -1094,8 +1147,9 @@ async def scheduled_reconcile_deleted_followups() -> None:
             logger.warning("calendar delete check failed for %s", owner_id, exc_info=True)
 
 
-# Events re-titled before this moment may still carry the old "✅ DONE ·" / crossed-out title.
-_RETITLE_BEFORE = datetime(2026, 10, 23, tzinfo=timezone.utc)
+# Events re-titled before this moment may still carry an older title / notes (10/25: green "✅ Done ·",
+# whole short Showcase link, Guest Pass section) - re-pushed once after the deploy.
+_RETITLE_BEFORE = datetime(2026, 10, 25, 4, tzinfo=timezone.utc)
 
 
 async def retitle_done_events() -> None:

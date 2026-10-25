@@ -66,11 +66,21 @@ async def scheduled_task_reminders():
             except Exception:
                 logger.error("agent roll-up emails failed", exc_info=True)
             try:
+                from app.services.agent_email_health_service import send_weekly_summaries
+                await send_weekly_summaries(db)  # agents who stopped opening our emails: one summary a week
+            except Exception:
+                logger.error("agent weekly email summaries failed", exc_info=True)
+            try:
                 from app.services.spotlight_alerts_service import send_daily_alerts, send_weekly_reports
                 await send_daily_alerts(db)  # Spotlight guests: price / open house / status news (10 AM)
                 await send_weekly_reports(db)  # agents: the Monday Spotlight report (8 AM)
             except Exception:
                 logger.error("spotlight alerts / weekly report failed", exc_info=True)
+            try:
+                from app.services.spotlight_publish_service import sweep_pending
+                await sweep_pending(db)  # Spotlights waiting to publish once their setup is done
+            except Exception:
+                logger.error("spotlight pending publish sweep failed", exc_info=True)
             from app.services.showcase_digest_service import is_digest_time, send_agent_briefings, send_showcase_digests
             if _last_digest != local.date() and is_digest_time():
                 _last_digest = local.date()

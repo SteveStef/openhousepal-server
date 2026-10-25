@@ -41,6 +41,21 @@ REDESIGNED_TEMPLATES = {
 TEMPLATE_VERSION_SUFFIX = "_v2"
 
 
+AGENT_HEALTH_TEMPLATES = {"agent_weekly_summary", "agent_email_test"}
+
+
+def with_open_pixel(html: str, url: Optional[str]) -> str:
+    """Our 1x1 open pixel at the end of an email we render ourselves (Mailgun templates carry their
+    own `{{#if track_open}}` block). Nothing when there's no tracking address."""
+    if not url or not isinstance(url, str) or not url.startswith("http") or url in html:
+        return html
+    from html import escape
+    img = (f'<img src="{escape(url, quote=True)}" width="1" height="1" alt="" '
+           'style="display:block;width:1px;height:1px;border:0;overflow:hidden;opacity:0">')
+    i = html.lower().rfind("</body>")
+    return html[:i] + img + html[i:] if i >= 0 else html + img
+
+
 def mailgun_template_name(template: str) -> str:
     """The name to ask Mailgun for (the app always uses the plain name everywhere else)."""
     return f"{template}{TEMPLATE_VERSION_SUFFIX}" if template in REDESIGNED_TEMPLATES else template
@@ -199,13 +214,20 @@ class EmailService:
         template_variables = dict(template_variables or {})
         owner = template_variables.pop("_log_owner", None)
         audience = template_variables.pop("_log_audience", None)
+        log_id = template_variables.pop("_log_id", None)            # agent_email_health_service pixel id
+        dedupe_key = template_variables.pop("_dedupe_key", None)    # email_dedupe_service
         track_id = template_variables.get("_track_id")
         code, body = self._send_simple_message(to_email, subject, template, template_variables, reply_to, from_name)
+        if code >= 300 and dedupe_key:
+            from app.services.email_dedupe_service import forget
+            forget(dedupe_key)   # a retry later today is not a repeat
+            dedupe_key = None
         from app.services import email_log_service
         email_log_service.record(
             template, "client" if track_id else (audience or "account"), ok=code < 300, held=self.is_dev,
             owner_id=owner, client_email_id=track_id,
             provider_id=None if self.is_dev else email_log_service.provider_id_from(body),
+            log_id=log_id, tracked=bool(log_id and template_variables.get("track_open")), dedupe_key=dedupe_key,
         )
         return code, body
 
@@ -262,10 +284,20 @@ class EmailService:
                 "o:tag": template,
                 "o:tracking": "no",
             }
+            from app.services.invite_email_service import CODE_TEMPLATES as INVITE_CODE_TEMPLATES
             if template in PERSONAL_TEMPLATES:
                 from app.services.personal_email_service import render as render_personal
                 link = template_variables.get("showcase_link") or template_variables.get("collection_link") or ""
                 data["subject"], data["html"], data["text"] = render_personal(template, subject, template_variables, link=link)
+            elif template in INVITE_CODE_TEMPLATES:
+                # Invites' agent emails (invite_email_service) - designed v2 look, rendered here
+                # (the prod Mailgun domain is at its template cap).
+                from app.services.invite_email_service import render as render_invite
+                data["subject"], data["html"], data["text"] = render_invite(template, subject, template_variables)
+            elif template in AGENT_HEALTH_TEMPLATES:
+                # The weekly summary / test email of agent_email_health_service - rendered here too.
+                from app.services.agent_email_health_service import render as render_health
+                data["subject"], data["html"], data["text"] = render_health(template, subject, template_variables)
             else:
                 data.update({
                     "template": mailgun_template_name(template),
@@ -275,6 +307,8 @@ class EmailService:
                     "t:text": "yes",
                     "t:variables": json.dumps(template_variables),
                 })
+            if data.get("html") and template not in PERSONAL_TEMPLATES:
+                data["html"] = with_open_pixel(data["html"], template_variables.get("track_open"))
             if track_id:
                 data["v:ce"] = track_id   # comes back on Mailgun's bounce / complaint webhooks
             from urllib.parse import quote

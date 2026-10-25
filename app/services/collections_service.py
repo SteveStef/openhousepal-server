@@ -25,6 +25,8 @@ from app.services.blacklist_service import BlacklistService
 from app.services.leads_service import upsert_lead
 from app.services.website.content_adapters import get_agent_profile
 from app.utils.listing_dom import dom_fetched_at, resolve_days_on_market
+from app.services import showcase_sleep as _sleep_rules
+from app.services.showcase_limit import at_limit_from_active
 
 logger = get_logger(__name__)
 
@@ -154,6 +156,28 @@ async def _resolve_original_property_data(db: AsyncSession, collection: Collecti
         }
 
     return None
+
+
+def _came_from(collection: Collection, original: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Where this client came from (user, 10/24) - an asleep Showcase's card shows this instead of
+    photos: the open house they attended (photo + price + address), or how it was made. Uses the
+    already-loaded OpenHouseEvent only - no extra query."""
+    oh = collection.original_open_house_event if collection.original_open_house_event_id else None
+    if oh is None:
+        return {"kind": collection.source or "manual"}
+    image = oh.cover_image_url
+    if not image and original and original.get("listingKey") and original.get("listingKey") == original.get("touredListingKey"):
+        image = original.get("image")
+    when = getattr(oh, "scheduled_date", None) or getattr(oh, "created_at", None)
+    return {
+        "kind": "open_house",
+        "address": oh.address or None,
+        "city": oh.city or None,
+        "state": oh.state or None,
+        "price": oh.price,
+        "image": image,
+        "date": when.isoformat() if when else None,
+    }
 
 
 # NEW tags - one set of rules everywhere:
@@ -472,10 +496,15 @@ class CollectionsService:
                     "visitor_phone": collection.visitor_phone,
                     "source": collection.source,
                     "originalProperty": original_property_data,
+                    "came_from": _came_from(collection, original_property_data),
+                    # Used it lately - with emails weekly/off, the card says it stays open anyway.
+                    "still_using": _sleep_rules.using_recently(collection),
                     "preferences": preferences_data,
                     "matchedProperties": properties_data,  # Add actual properties data
                     "property_count": total_count,
                     "active_property_count": active_count,
+                    # "100+": the Showcase holds the most homes it can (services/showcase_limit).
+                    "at_limit": at_limit_from_active(sum(1 for p in (collection.properties or []) if _is_property_available(p.home_status))),
                     "is_anonymous": collection.owner_id is None,
                     "is_public": bool(collection.is_public) if collection.is_public is not None else False,
                     "share_token": collection.share_token,
@@ -982,6 +1011,7 @@ class CollectionsService:
                 "properties": properties,
                 "property_count": total_count,
                 "active_property_count": active_count,
+                "at_limit": at_limit_from_active(sum(1 for p in (collection.properties or []) if _is_property_available(p.home_status))),
                 "is_anonymous": collection.owner_id is None,
                 "is_public": collection.is_public or False,
                 "share_token": collection.share_token,
@@ -1803,6 +1833,8 @@ class CollectionsService:
                 } if collection.preferences else {},
                 'stats': {
                     'totalProperties': total_properties,
+                    # "100+" - the client's Showcase holds the most homes it can.
+                    'atLimit': at_limit_from_active(sum(1 for p in (collection.properties or []) if _is_property_available(p.home_status))),
                     'viewedProperties': viewed_properties,
                     'likedProperties': liked_properties,
                     'lastActivity': collection.last_visitor_activity_at.isoformat() if collection.last_visitor_activity_at else None
@@ -1845,7 +1877,11 @@ class CollectionsService:
             await fill_missing_coordinates(db, preferences)
 
             # 2. Fetch new matching properties from the local database
-            matching_properties = await property_service.get_properties_by_preferences(db, preferences)
+            # A Showcase holds at most SHOWCASE_MAX_HOMES matches (services/showcase_limit) - the
+            # closest for a distance search, else the newest. Asked for a few more to know if it's "100+".
+            from app.services.showcase_limit import SHOWCASE_FETCH, cap_matches
+            matching_properties, at_limit = cap_matches(
+                await property_service.get_properties_by_preferences(db, preferences, max_properties=SHOWCASE_FETCH))
             new_match_ids = {p.id for p in matching_properties}
 
             # 3. Identify IDs of properties to PROTECT (those with user interactions)
@@ -1922,6 +1958,7 @@ class CollectionsService:
             return {
                 'success': True,
                 'properties_found': len(new_match_ids),
+                'at_limit': at_limit,
                 'new_links_created': len(ids_to_insert),
                 'protected_count': len(protected_ids)
             }

@@ -741,7 +741,7 @@ async def find_areas(db: AsyncSession, *, slugs: list[str] = (), names: list[str
     return list(found.values())
 
 
-async def town_dossier(db: AsyncSession, area: MarketArea, *, include_bank: bool = True) -> dict:
+async def town_dossier(db: AsyncSession, area: MarketArea, *, include_bank: bool = True, mls: bool = True) -> dict:
     """Everything we already know about one town, as evidence items + a coverage report:
     {"town", "slug", "items": [...], "covered": {topic: count}, "gaps": [topic], "stale": [topic],
     "sales_snapshot", "geo" (geography_profile), "cost" (listing cost profile)}."""
@@ -756,18 +756,23 @@ async def town_dossier(db: AsyncSession, area: MarketArea, *, include_bank: bool
         geo = {"town": area.name, "kind": "", "townships": [], "school_districts": [], "counties": [], "mailing_towns": [],
                "norm": {"townships": set(), "districts": set(), "counties": set(), "mailing": set()}, "items": []}
     items = list(geo["items"]) + research_items(area)
-    try:
-        snap = await get_area_sales_snapshot(db, scope)
-    except Exception:
-        logger.warning("town dossier: sales snapshot failed for %s", area.slug, exc_info=True)
-        snap = {}
-    items += sales_snapshot_items(area, snap, geo)
-    try:
-        cost = await get_area_cost_profile(db, scope)
-    except Exception:
-        logger.warning("town dossier: cost profile failed for %s", area.slug, exc_info=True)
-        cost = {}
-    items += cost_items(area, cost)
+    # mls=False (No-MLS plans): no Bright MLS sales snapshot or listing cost profile - those are
+    # built from the Bright mirror, which those agents may not use.
+    snap: dict = {}
+    cost: dict = {}
+    if mls:
+        try:
+            snap = await get_area_sales_snapshot(db, scope)
+        except Exception:
+            logger.warning("town dossier: sales snapshot failed for %s", area.slug, exc_info=True)
+            snap = {}
+        items += sales_snapshot_items(area, snap, geo)
+        try:
+            cost = await get_area_cost_profile(db, scope)
+        except Exception:
+            logger.warning("town dossier: cost profile failed for %s", area.slug, exc_info=True)
+            cost = {}
+        items += cost_items(area, cost)
     if include_bank:
         items += bank_items(area)
     # Stored research can carry geography that contradicts the records (see scrub_geography).

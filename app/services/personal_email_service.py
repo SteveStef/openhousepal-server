@@ -20,7 +20,9 @@ from __future__ import annotations
 import html as _html
 from typing import Any
 
-PERSONAL_TEMPLATES = {"visitor_confirmation", "showcase_shared", "event_invite", "event_rsvp"}
+PERSONAL_TEMPLATES = {"visitor_confirmation", "showcase_shared", "event_invite", "event_rsvp", "spotlight_documents"}
+# spotlight_documents (10/24): the documents a guest asked for on a Listing Spotlight - a short note
+# with each document's link written out (no Mailgun template; the prod domain is at its cap).
 # Invites (invites_service): the invitation itself and the guest's RSVP confirmation - personal
 # notes too, so they need no Mailgun template (the prod domain is at its template cap).
 INVITE_TEMPLATES = {"event_invite", "event_rsvp"}
@@ -66,9 +68,22 @@ def render(template: str, subject: str, v: dict, *, link: str) -> tuple[str, str
     first = (v.get("first_name") or v.get("recipient_name") or "").strip() or "there"
     phone = (v.get("agent_phone") or "").strip()
     reach = f"just reply to this email or text me at {phone}" if phone else "just reply to this email"
+    if template == "event_rsvp":
+        # The guest's RSVP confirmation is a designed v2-look email now (user, 10/24) - it's a reply
+        # to something they just did, not an unexpected note, so the Promotions worry above doesn't
+        # apply. Still sent as the agent's personal note (their mailbox / their name).
+        from app.services.invite_email_service import render_guest_confirmation
+        return render_guest_confirmation(subject, v, link or (v.get("invite_link") or ""))
     if template in INVITE_TEMPLATES:
         link = link or (v.get("invite_link") or "")
         title = (v.get("invite_title") or "").strip() or "my event"
+        # the flyer's line 2 when the agent typed their own (round 8) - unless it just repeats the place
+        sub = (v.get("invite_subtitle") or "").strip()
+        _n = lambda s: "".join(ch for ch in s.lower() if ch.isalnum())  # noqa: E731
+        if sub and (_n(sub) in _n(v.get("invite_place") or "") or _n(sub) == _n(title)):
+            sub = ""
+        if sub:
+            title = f"{title} ({sub})"
         when = (v.get("invite_when") or "").strip()
         place = (v.get("invite_place") or "").strip()
         details = " · ".join(x for x in (when, place) if x)
@@ -97,6 +112,15 @@ def render(template: str, subject: str, v: dict, *, link: str) -> tuple[str, str
                 paras = [f"Hi {first},", lead + (f" {details}." if details else ""),
                          "It's in the calendar invite attached. If anything changes, you can update your RSVP here:", "__LINK__",
                          f"See you there! If you have any questions, {reach}."]
+    elif template == "spotlight_documents":
+        street = _street(v.get("property_address") or "")
+        docs = [d for d in (v.get("documents") or []) if isinstance(d, dict) and d.get("url")]
+        one = len(docs) == 1
+        what = f"the {docs[0].get('label') or 'document'}" if one else "the documents"
+        paras = [f"Hi {first},", f"{'Here is' if one else 'Here are'} {what} for {street or 'the home'} you asked for:", "__DOCS__"]
+        if v.get("site_url"):
+            paras += ["Every photo and detail of the home is here:", "__SITE__"]
+        paras.append(f"If you have any questions about it, {reach}.")
     elif template == "visitor_confirmation":
         street = _street(v.get("property_address") or v.get("test_property_address") or "")
         subject = f"Following up from the open house at {street}" if street else "Following up from the open house"
@@ -137,6 +161,19 @@ def render(template: str, subject: str, v: dict, *, link: str) -> tuple[str, str
     body = []
     text = []
     for p in paras:
+        if p == "__DOCS__":
+            for d in (v.get("documents") or []):
+                if not isinstance(d, dict) or not d.get("url"):
+                    continue
+                label, url = d.get("label") or "Document", d["url"]
+                body.append(_P.format(f'<b>{_e(label)}</b><br><a href="{_e(url)}" style="color:#1a56b8">{_e(url)}</a>'))
+                text.append(f"{label}\n{url}")
+            continue
+        if p == "__SITE__":
+            site = v.get("site_url") or ""
+            body.append(_P.format(f'<a href="{_e(site)}" style="color:#1a56b8">{_e(site)}</a>'))
+            text.append(site)
+            continue
         if p == "__LINK__":
             body.append(_P.format(f'<a href="{_e(link)}" style="color:#1a56b8">{_e(link)}</a>'))
             text.append(link)

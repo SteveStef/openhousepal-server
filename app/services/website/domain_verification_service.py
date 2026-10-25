@@ -250,6 +250,23 @@ async def verify_domain(db: AsyncSession, domain: SiteDomain) -> SiteDomain:
     if domain.status != prev_status and domain.status in ("ACTIVE", "FAILED") and not domain.redirect_target_domain_id:
         await _email_domain_result(db, domain)
     if domain.status == "ACTIVE" and prev_status != "ACTIVE" and not domain.redirect_target_domain_id:
+        # The first own domain that goes live becomes the website's default address (owner, 10/24 -
+        # bought domains already did this, see domain_purchase_service.make_primary_when_live), so
+        # shared links move onto it without a hidden "Make Default" click. Never steals it from
+        # another domain the agent already made default.
+        try:
+            from sqlalchemy import select as _select
+            from app.models.database import Site, User
+            from app.services.website import site_service
+            has_primary = (await db.execute(_select(SiteDomain.id).where(
+                SiteDomain.site_id == domain.site_id, SiteDomain.is_primary.is_(True)))).first()
+            if not has_primary and not domain.is_primary:
+                site = await db.get(Site, domain.site_id)
+                owner = await db.get(User, domain.owner_id)
+                if site and owner:
+                    await site_service.set_primary_domain(db, site, domain, owner)
+        except Exception:  # noqa: BLE001 - the domain is live either way; "Make Default" still works
+            pass
         # Pages from the site that used to live on this domain (still in Google) -> pages here.
         from app.services.website import old_links_service
         old_links_service.queue_scan(domain.site_id)

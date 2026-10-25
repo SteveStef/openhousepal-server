@@ -168,6 +168,7 @@ async def _person_name(db, owner_id: str, email: str) -> str:
 
 
 PROBLEM_DELIVERY = ("bounced", "spam", "blocked")
+_DEDUPE_PENDING: dict[str, str] = {}   # ClientEmail id -> email_dedupe_service key (mailbox sends)
 
 
 async def _problem(db, owner_id: str, email: str) -> Optional[ClientEmail]:
@@ -207,8 +208,10 @@ async def refresh_status(db, owner_id: str, email: str, *, announce: bool = True
             slept = await showcase_sleep.sleep_for_no_response(db, owner_id, email)
         elif old == "off":
             woke = await showcase_sleep.wake_no_response(db, owner_id, email)
+        # Not opening the emails, but still using their Showcase: it stays open - say so (10/24).
+        using = d["mode"] in ("weekly", "off") and not slept and await showcase_sleep.client_still_using(db, owner_id, email)
         if announce:
-            await _announce(db, owner_id, email, old, d["mode"], pref.reason, trigger, slept=slept)
+            await _announce(db, owner_id, email, old, d["mode"], pref.reason, trigger, slept=slept, still_using=using)
     elif d["mode"] != "daily":
         pref.reason = d["reason"]
         # Still ignoring everything: a Showcase kept awake while the agent was minding it (starred /
@@ -224,14 +227,19 @@ async def refresh_status(db, owner_id: str, email: str, *, announce: bool = True
     return {**d, "since": pref.changed_at, "manual": pref.manual}
 
 
-async def _announce(db, owner_id: str, email: str, old: str, new: str, reason: str, trigger: Optional[str], slept: int = 0) -> None:
+async def _announce(db, owner_id: str, email: str, old: str, new: str, reason: str, trigger: Optional[str], slept: int = 0,
+                    still_using: bool = False) -> None:
     name = await _person_name(db, owner_id, email)
     who = _first(name, email)
     lead = await _lead(db, owner_id, email)
     if new == "weekly":
         source, title, msg = "email_weekly", f"{who}: emails now weekly", f"{who} hasn't opened their last few emails, so Showcase updates now go once a week. That keeps your emails out of junk."
+        if still_using:
+            msg += f" {who} keeps using their Showcase, so it stays open."
     elif new == "off":
-        if slept:
+        if still_using and not slept:
+            source, title, msg = "email_paused", f"{who}: automatic emails stopped", f"{who} didn't open 3 weekly emails in a row, so automatic emails stopped - but {who} keeps using their Showcase, so it stays open and keeps updating."
+        elif slept:
             source, title, msg = "email_paused", f"{who}: Showcase asleep", f"{who} didn't open 3 weekly emails in a row, so automatic emails stopped and their Showcase went to sleep (Showcases -> Inactive). It wakes up by itself if {who} opens it or an old email."
         else:
             source, title, msg = "email_paused", f"{who}: automatic emails stopped", f"{who} didn't open 3 weekly emails in a row, so automatic emails stopped. They restart by themselves if {who} opens one or visits their Showcase."
@@ -268,6 +276,13 @@ async def before_send(owner_id: Optional[str], to: Optional[str], template: str,
                       variables: dict) -> Optional[tuple[Optional[str], dict]]:
     """None = the rules hold this one back (don't send). Otherwise (tracking id or None, variables
     with tracked links + the open pixel)."""
+    # One of each kind per person per event per day (email_dedupe_service) - a repeat isn't sent.
+    from app.services import email_dedupe_service as dd
+    dkey = dd.key_for(to, template, subject, variables)
+    if await dd.is_repeat(dkey, template, "client", owner_id):
+        return None
+    if dkey:
+        variables = {**variables, "_dedupe_key": dkey}
     if not owner_id or not to or template not in TRACKED_TEMPLATES:
         return None, variables
     from app.database import AsyncSessionLocal
@@ -280,6 +295,7 @@ async def before_send(owner_id: Optional[str], to: Optional[str], template: str,
             rule = client_rule(await db.get(User, owner_id), template)
             if rule is not None and not rule["on"]:
                 logger.info("client email held (agent turned it off)", extra={"template": template, "owner_id": owner_id})
+                dd.forget(dkey)
                 return None
             kind = "auto" if template in AUTO_TEMPLATES else "personal"
             if kind == "auto":
@@ -288,6 +304,7 @@ async def before_send(owner_id: Optional[str], to: Optional[str], template: str,
                     st = {**st, "mode": "weekly"}
                 if st["mode"] == "off":
                     logger.info("client email held (off)", extra={"template": template, "owner_id": owner_id, "code": st.get("code")})
+                    dd.forget(dkey)
                     return None
                 today_start = datetime.combine(_now().astimezone(EASTERN).date(), datetime.min.time(), EASTERN)
                 autos_today = (await db.execute(select(func.count()).select_from(ClientEmail).where(
@@ -296,6 +313,7 @@ async def before_send(owner_id: Optional[str], to: Optional[str], template: str,
                     func.coalesce(ClientEmail.sent_at, ClientEmail.created_at) >= today_start))).scalar() or 0
                 if autos_today >= MAX_AUTO_PER_DAY:
                     logger.info("client email held (daily limit)", extra={"template": template, "owner_id": owner_id})
+                    dd.forget(dkey)
                     return None
                 if st["mode"] == "weekly" and template != WEEKLY_TEMPLATE:
                     last_auto = (await db.execute(select(func.max(ClientEmail.sent_at)).where(
@@ -303,11 +321,14 @@ async def before_send(owner_id: Optional[str], to: Optional[str], template: str,
                         ClientEmail.status == "sent"))).scalar()
                     if template == "showcase_daily_digest" or (last_auto and _now() - last_auto < WEEKLY_GAP):
                         logger.info("client email held (weekly)", extra={"template": template, "owner_id": owner_id})
+                        dd.forget(dkey)
                         return None
             links = {k: variables[k] for k in LINK_VARS if isinstance(variables.get(k), str) and variables[k].startswith("http")}
             rec = ClientEmail(owner_id=owner_id, recipient_email=email, template=template, subject=(subject or "")[:500],
                               kind=kind, status="sending", links=links or None)
             db.add(rec)
+            if dkey:
+                _DEDUPE_PENDING[rec.id] = dkey   # recorded with the email if it goes from their own mailbox
             await db.commit()
             base = api_base()
             out = dict(variables)
@@ -344,6 +365,10 @@ async def after_send(track_id: Optional[str], ok: bool, via: str, *, code: Optio
     if not track_id:
         return
     from app.database import AsyncSessionLocal
+    dkey = _DEDUPE_PENDING.pop(track_id, None)
+    if not ok and via == "mailbox" and dkey:
+        from app.services.email_dedupe_service import forget
+        forget(dkey)   # a retry later today is not a repeat
     try:
         async with AsyncSessionLocal() as db:
             rec = await db.get(ClientEmail, track_id)
@@ -353,7 +378,8 @@ async def after_send(track_id: Optional[str], ok: bool, via: str, *, code: Optio
             rec.sent_at = _now() if ok else None
             if via == "mailbox":  # Mailgun sends are counted in EmailService itself
                 from app.services import email_log_service
-                email_log_service.record(rec.template, "client", ok=ok, owner_id=rec.owner_id, client_email_id=rec.id, via="mailbox")
+                email_log_service.record(rec.template, "client", ok=ok, owner_id=rec.owner_id, client_email_id=rec.id, via="mailbox",
+                                         dedupe_key=dkey if ok else None)
             rec.error = None if ok else failure_reason(code, detail)[:300]
             if not ok:
                 logger.warning("client email failed", extra={"template": rec.template, "via": via, "code": code, "detail": (detail or "")[:300]})
@@ -366,7 +392,7 @@ async def after_send(track_id: Optional[str], ok: bool, via: str, *, code: Optio
 
 
 def strip_private(variables: dict) -> dict:
-    return {k: v for k, v in variables.items() if k not in ("_track_id", "_log_owner", "_log_audience")}
+    return {k: v for k, v in variables.items() if k not in ("_track_id", "_log_owner", "_log_audience", "_dedupe_key", "_log_id")}
 
 
 # ---------------------------------------------------------------- opens + clicks
@@ -557,6 +583,9 @@ async def people(db, owner_id: str) -> dict[str, dict]:
         problems.setdefault(r.recipient_email, r)
     # Someone whose only email bounced is still listed - that's who the agent most needs to see.
     emails = set(by) | set(prefs) | set(problems)
+    # A deleted lead disappears from the Email Tracker (user, 10/24) - the hold on their automatic
+    # emails stays (prefs keep LEAD_DELETED), they're just not listed until they're a lead again.
+    emails -= {e for e, p in prefs.items() if p.manual == LEAD_DELETED}
     if not emails:
         return {}
     eng = dict((await db.execute(select(Lead.email, func.max(LeadEvent.occurred_at)).join(LeadEvent, LeadEvent.lead_id == Lead.id).where(

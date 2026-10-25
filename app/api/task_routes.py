@@ -329,6 +329,29 @@ async def public_followup_contact(code: str, request: Request, db: AsyncSession 
     )
 
 
+@public_router.get("/{code}/showcase")
+async def public_followup_showcase(code: str, db: AsyncSession = Depends(get_db)):
+    """Where the short "Open X's Showcase" link in a calendar event (openhousepal.com/d/<code>/s)
+    goes: this follow-up's home inside their Showcase when it's in there, else the Showcase itself -
+    the exact page the full link opens. Read-only."""
+    task = await _task_by_code(db, code)
+    owner = await db.get(User, task.owner_id)
+    url = None
+    if owner is not None and task.lead is not None:
+        try:
+            prop = await tasks_service.followup_property(db, task, owner)
+            if prop and prop.get("where") == "showcase":
+                url = prop.get("url")
+        except Exception:
+            logger.warning("follow-up home lookup failed for showcase link %s", task.id, exc_info=True)
+        if not url:
+            sc = (await tasks_service.lead_showcase_info(db, owner, [task.lead])).get(task.lead.id)
+            url = sc["url"] if sc else None
+    if not url:
+        raise HTTPException(status_code=404, detail="This Showcase isn't active anymore.")
+    return {"url": tasks_service.clean_url(url)}
+
+
 @public_router.get("/{code}/text")
 async def public_followup_text(code: str, request: Request, db: AsyncSession = Depends(get_db)):
     """The tap-to-text page: the guest's number and the ready-to-send message (the same text the
@@ -338,8 +361,10 @@ async def public_followup_text(code: str, request: Request, db: AsyncSession = D
     check_public_submit(request)
     task = await _task_by_code(db, code)
     lead = task.lead
-    if lead is None or not (lead.phone or "").strip():
-        raise HTTPException(status_code=404, detail="There's no phone number on this follow-up.")
+    has_phone = bool(lead is not None and (lead.phone or "").strip())
+    has_email = bool(lead is not None and (lead.email or "").strip())
+    if lead is None or not (has_phone or has_email):
+        raise HTTPException(status_code=404, detail="There's no phone number or email on this follow-up.")
     owner = await db.get(User, task.owner_id)
     sc = None
     try:
@@ -348,17 +373,64 @@ async def public_followup_text(code: str, request: Request, db: AsyncSession = D
         logger.warning("showcase lookup failed for text link %s", task.id, exc_info=True)
     message = tasks_service.full_message(task, sc, owner) or ""
     fill_ins = [f for f in (tasks_service.FILL_IN_TIME, tasks_service.FILL_IN_ANSWER) if f in message]
-    digits = "".join(ch for ch in lead.phone if ch.isdigit())
+    digits = "".join(ch for ch in (lead.phone or "") if ch.isdigit())
     if len(digits) == 10:
         digits = "1" + digits
+    # The Email button (10/25): the same message written as an email, a subject line, and which
+    # mailbox the agent connected for send-as-agent (that one goes first on the computer's chooser).
+    email_subject = email_body = mail_provider = None
+    if has_email:
+        street = None
+        try:
+            prop = await tasks_service.followup_property(db, task, owner) if owner else None
+            street = ((prop or {}).get("short") or (prop or {}).get("address") or "").split(",")[0].strip() or None
+        except Exception:
+            logger.warning("follow-up home lookup failed for email link %s", task.id, exc_info=True)
+        agent_phone = ""
+        try:
+            from app.services.agent_email_service import agent_public_phone
+            agent_phone = await agent_public_phone(db, owner)
+        except Exception:
+            pass
+        email_subject = tasks_service.email_subject(task, street)
+        email_body = tasks_service.email_version(message, owner, agent_phone)
+        from app.models.database import MailConnection
+        conn = (await db.execute(select(MailConnection).where(MailConnection.owner_id == task.owner_id))).scalar_one_or_none()
+        if conn is not None and conn.enabled:
+            mail_provider = {"google": "gmail", "microsoft": "outlook"}.get(conn.provider)
     return {
         **_public_view(task),
         "first_name": (lead.name or "").split(" ")[0] or None,
-        "phone": lead.phone,
-        "sms_to": f"+{digits}" if digits else lead.phone,
+        "phone": lead.phone if has_phone else None,
+        "sms_to": (f"+{digits}" if digits else lead.phone) if has_phone else None,
         "message": message,
         "fill_ins": fill_ins,
+        "email": (lead.email or "").strip() if has_email else None,
+        "email_subject": email_subject,
+        "email_body": email_body,
+        "mail_provider": mail_provider,
+        # For the computer layout (10/25): the home, what happened, and the follow-up's own notes.
+        **(await _text_page_extras(db, task, owner)),
     }
+
+
+async def _text_page_extras(db: AsyncSession, task: AgentTask, owner) -> dict:
+    out: dict = {"home": None, "details": [], "notes": None, "due_at": task.due_at.isoformat() if task.due_at else None,
+                 "all_day": bool(task.all_day)}
+    try:
+        prop = await tasks_service.followup_property(db, task, owner) if owner else None
+        if prop:
+            out["home"] = {"address": prop.get("address"), "short": prop.get("short"), "photo": prop.get("photo"), "url": prop.get("url")}
+    except Exception:
+        logger.warning("text page home lookup failed for %s", task.id, exc_info=True)
+    try:
+        out["details"] = [l[2:] if l.startswith("- ") else l for l in (await _situation(db, task))[1:]]
+    except Exception:
+        logger.warning("text page details failed for %s", task.id, exc_info=True)
+    skip = ("Auto-created", "Contact: ", "Email: ", "Phone: ", "Open house: ")
+    notes = "\n".join(l for l in (task.notes or "").splitlines() if l.strip() and not l.startswith(skip)).strip()
+    out["notes"] = notes or None
+    return out
 
 
 @public_router.get("/{code}/card")

@@ -203,10 +203,30 @@ async def _showcase_url(db: AsyncSession, host: User, col: Collection) -> Option
 def showcases_offered(host: User, visitor: OpenHouseVisitor, oh: Optional[OpenHouseEvent] = None) -> bool:
     """The Showcase button: only for a guest without an agent, on a plan with Showcases, at an open
     house whose Showcases switch is on (a listing agent sitting their own listing turns it off so
-    guests aren't sent shopping other homes)."""
+    guests aren't sent shopping other homes) - or, with that switch off, whose "Showcase on the
+    Guest Pass" choice is on (built only when the guest taps it - user, 10/24)."""
     from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
+    # The agent's own switch for this visitor (Visitors window) beats the kit either way.
+    override = getattr(visitor, "showcase_override", None)
+    if override is False:
+        return False
     return (visitor.has_agent != "YES" and owner_has_access(host, SHOWCASE_ACCESS_TIERS)
-            and (oh is None or oh.auto_showcase is not False))
+            and (override is True or oh is None or oh.auto_showcase is not False or bool(getattr(oh, "pass_showcase", False))))
+
+
+def _building(visitor: OpenHouseVisitor, oh: OpenHouseEvent) -> bool:
+    """Their Showcase is still being made right after sign-in (open_houses_routes builds it in the
+    background so the pass opens at once) - the pass says "Your Showcase is loading" and checks back."""
+    from app.api.open_houses_routes import SHOWCASE_BUILDING
+    if visitor.id in SHOWCASE_BUILDING:
+        return True
+    if oh is not None and oh.auto_showcase is False:
+        return False   # built only when they tap it
+    created = visitor.created_at
+    if created is not None and created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    # A moment's grace (another API process, or the build just finishing its write).
+    return created is not None and datetime.now(timezone.utc) - created < timedelta(seconds=45)
 
 
 async def payload(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEvent, host: User) -> dict:
@@ -228,11 +248,13 @@ async def payload(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEven
         theme = {**theme, **(hub.config or {})["openHouseRequestTheme"]}
     theme["darkMode"] = bool(oh.qr_dark_mode)
 
-    # Similar Homes switch off, or Showcases off for this open house (user, 10/17) -> no similar
-    # homes on the pass (the saved picks stay for later).
+    # Similar Homes switch off -> no similar homes on the pass (the saved picks stay for later).
+    # Independent of the Showcases switch since 10/24: turning Showcases off asks the agent whether
+    # guests still get Similar Homes, and that answer IS this switch (user: "if Similar Homes is off
+    # but Showcases is on, showcases must still work, and vice versa").
     similar = await _live_similar(db, [{k: v for k, v in (item or {}).items() if k not in _HEAVY_KEYS}
                                        for item in (oh.similar_properties_snapshot or []) if isinstance(item, dict)]) \
-        if oh.similar_homes is not False and oh.auto_showcase is not False else []
+        if oh.similar_homes is not False else []
 
     cheat = None
     snap = oh.cheat_sheet_snapshot or {}
@@ -243,11 +265,12 @@ async def payload(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEven
     if spotlight:
         spotlight = f"{with_src(spotlight, 'pass')}&oh={oh.id}"
 
-    # The Showcase button rides with the Similar Homes sheet: none made (or Showcases off) -> no pitch.
+    # The Showcase button: whenever Showcases are offered here - with or without a Similar Homes
+    # sheet (the page shows the pitch on its own when there are no similar homes).
     showcase = None
-    if similar and showcases_offered(host, visitor, oh):
+    if showcases_offered(host, visitor, oh):
         col = await _showcase(db, host, visitor)
-        showcase = {"url": await _showcase_url(db, host, col)} if col else {"url": None}
+        showcase = {"url": await _showcase_url(db, host, col)} if col else {"url": None, "building": _building(visitor, oh)}
 
     requested = {r for r in (await db.execute(
         select(OpenHouseFormRequest.form_type).where(
@@ -316,8 +339,11 @@ async def send_request(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHous
         phone=visitor.phone or "",
         # A second tour carries the two times they picked - shown on the request + lead activity.
         preferred_visit_time=((preferred_time or "").strip()[:200] or None) if kind == "second_visit" else None,
+        source="guest_pass",  # the agent sees "on their Guest Pass" (10/25)
     )
     await submit_open_house_form_request(oh.id, data, db)
+    await log_event(db, visitor, oh, "request", key=kind,
+                    label=((preferred_time or "").strip()[:200] or None) if kind == "second_visit" else None)
     return {"sent": True, "already": False}
 
 
@@ -336,6 +362,7 @@ async def ask_question(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHous
         message=text[:2000], came_from={"src": "pass", "oh": oh.id},
     ), db)
     await _note_on_open_followup(db, host, visitor, text[:2000])
+    await log_event(db, visitor, oh, "question", label=text[:200])
     return {"sent": True}
 
 
@@ -371,6 +398,168 @@ async def _note_on_open_followup(db: AsyncSession, host: User, visitor: OpenHous
         logger.warning("guest pass question: follow-up note failed", exc_info=True)
 
 
+GUEST_PASS_SEEN = "On their Guest Pass: "
+
+# A visit = heartbeats with no gap longer than this; a later ping starts a new visit row.
+_VISIT_GAP = timedelta(minutes=30)
+
+
+async def log_event(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEvent, kind: str,
+                    key: Optional[str] = None, label: Optional[str] = None, session: Optional[str] = None) -> None:
+    """One line in the guest's Guest Pass activity log (agent's Visitors window). Never raises."""
+    try:
+        from app.models.database import GuestPassEvent
+        if kind in ("similar", "map", "similar_list") and session:
+            # The same thing twice in one visit is one line.
+            dup = (await db.execute(select(GuestPassEvent.id).where(
+                GuestPassEvent.visitor_id == visitor.id, GuestPassEvent.session == session[:40],
+                GuestPassEvent.kind == kind, GuestPassEvent.key.is_(None) if key is None else GuestPassEvent.key == key[:64],
+            ).limit(1))).first()
+            if dup:
+                return
+        if kind == "similar" and key and not label:
+            row = (await db.execute(select(Property.street_address, Property.city).where(Property.listing_key == key[:64]).limit(1))).first()
+            if row and row[0]:
+                from app.services.email_service import tidy_caps
+                label = tidy_caps(str(row[0]).split(",")[0].strip()) + (f", {tidy_caps(row[1])}" if row[1] else "")
+        db.add(GuestPassEvent(visitor_id=visitor.id, open_house_event_id=oh.id if oh else None, kind=kind[:20],
+                              key=(key or None) and key[:64], label=(label or None) and label[:200],
+                              session=(session or None) and session[:40]))
+        await db.commit()
+    except Exception:  # noqa: BLE001 - tracking never breaks the pass
+        await db.rollback()
+        logger.warning("guest pass event log failed", exc_info=True)
+
+
+async def ping(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEvent, session: str) -> None:
+    """Heartbeat while the pass is open on screen: extends this visit's time, or opens a new visit
+    row when it's the first ping (or the guest came back after a long gap). Never raises."""
+    try:
+        from app.models.database import GuestPassEvent
+        now = datetime.now(timezone.utc)
+        session = (session or "")[:40] or "anon"
+        row = (await db.execute(select(GuestPassEvent).where(
+            GuestPassEvent.visitor_id == visitor.id, GuestPassEvent.kind == "session", GuestPassEvent.session == session,
+        ).order_by(GuestPassEvent.created_at.desc()).limit(1))).scalars().first()
+        last = row.last_seen_at or row.created_at if row else None
+        if last is not None and last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        if row is not None and last is not None and now - last < _VISIT_GAP:
+            row.last_seen_at = now
+        else:
+            db.add(GuestPassEvent(visitor_id=visitor.id, open_house_event_id=oh.id if oh else None, kind="session",
+                                  session=session, created_at=now, last_seen_at=now))
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+        logger.warning("guest pass ping failed", exc_info=True)
+
+
+async def activity(db: AsyncSession, visitor: OpenHouseVisitor) -> dict:
+    """The agent's full activity log for one guest's Guest Pass: visits (when, how long), and what
+    they did in each (homes opened, Cheat Sheet, map, requests, questions), newest visit first."""
+    from app.models.database import GuestPassEvent
+    rows = (await db.execute(select(GuestPassEvent).where(GuestPassEvent.visitor_id == visitor.id)
+                             .order_by(GuestPassEvent.created_at.asc()))).scalars().all()
+    def iso(d):
+        if d is None:
+            return None
+        return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).isoformat()
+    visits, loose = [], []
+    by_session: dict[str, list] = {}
+    for r in rows:
+        if r.kind == "session":
+            secs = 0
+            if r.last_seen_at and r.created_at:
+                a = r.created_at if r.created_at.tzinfo else r.created_at.replace(tzinfo=timezone.utc)
+                b = r.last_seen_at if r.last_seen_at.tzinfo else r.last_seen_at.replace(tzinfo=timezone.utc)
+                secs = max(0, int((b - a).total_seconds()))
+            v = {"session": r.session, "started_at": iso(r.created_at), "last_seen_at": iso(r.last_seen_at),
+                 "seconds": secs, "events": []}
+            visits.append(v)
+            by_session.setdefault(r.session or "", []).append(v)
+    for r in rows:
+        if r.kind == "session":
+            continue
+        ev = {"kind": r.kind, "key": r.key, "label": r.label, "at": iso(r.created_at)}
+        # Into the visit (same session) that was open at that moment, else listed on its own.
+        cands = by_session.get(r.session or "", []) if r.session else []
+        target = None
+        for v in cands:
+            if v["started_at"] <= ev["at"]:
+                target = v
+        if target is None and cands:
+            target = cands[0]
+        (target["events"] if target else loose).append(ev)
+    days = sorted({(v["started_at"] or "")[:10] for v in visits if v["started_at"]} | {(e["at"] or "")[:10] for e in loose})
+    signed = visitor.created_at
+    signed_day = iso(signed)[:10] if signed else None
+    return {
+        "visits": list(reversed(visits)),
+        "other": list(reversed(loose)),
+        "total_seconds": sum(v["seconds"] for v in visits),
+        "visit_count": len(visits),
+        "days": days,
+        "came_back": any(d != signed_day for d in days) if signed_day else len(days) > 1,
+        "signed_in_at": iso(signed),
+    }
+
+
+async def note_activity(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEvent, host: User,
+                        view: str, key: Optional[str] = None) -> bool:
+    """What the guest does on their Guest Pass after the open house (user, 10/24 - "they clicked
+    another property"): a line on their open sign-in follow-up ("On their Guest Pass: opened 12 Oak
+    St, Wayne") and its calendar event re-pushed, so the alert and the suggested text say it. Once
+    per thing; only for guests with no agent (an agent's client gets the "has an agent" follow-up).
+    Returns True when a new line was added. Never raises."""
+    try:
+        from app.models.database import AgentTask
+        from app.services.calendar_sync_service import sync_task_bg
+        if (visitor.has_agent or "").upper() == "YES":
+            return False
+        if view == "similar" and key:
+            row = (await db.execute(select(Property.street_address, Property.city).where(Property.listing_key == key[:64]).limit(1))).first()
+            if not row or not row[0]:
+                return False
+            from app.services.email_service import tidy_caps
+            street = tidy_caps(str(row[0]).split(",")[0].strip())
+            if street.lower() == (oh.address or "").split(",")[0].strip().lower():
+                return False  # the home they toured
+            label = f"opened {street}" + (f", {tidy_caps(row[1])}" if row[1] else "")
+        elif view == "similar":
+            label = "looked through the Similar Homes"
+        elif view == "cheat":
+            label = "opened the Cheat Sheet"
+        elif view == "showcase":
+            label = "opened their Showcase"
+        else:
+            return False
+        task = (await db.execute(select(AgentTask).where(
+            AgentTask.owner_id == host.id, AgentTask.auto_source == "open_house_signin",
+            AgentTask.auto_source_id == visitor.id, AgentTask.completed_at.is_(None),
+        ))).scalars().first()
+        if task is None and visitor.lead_id:
+            # Their sign-in follow-up was folded into an older open one for the same person.
+            task = (await db.execute(select(AgentTask).where(
+                AgentTask.owner_id == host.id, AgentTask.lead_id == visitor.lead_id,
+                AgentTask.auto_source == "open_house_signin", AgentTask.completed_at.is_(None),
+            ).order_by(AgentTask.created_at.desc()))).scalars().first()
+        if task is None:
+            return False
+        line = GUEST_PASS_SEEN + label
+        lines = (task.notes or "").splitlines()
+        if line in lines or len([l for l in lines if l.startswith(GUEST_PASS_SEEN)]) >= 6:
+            return False
+        task.notes = f"{task.notes}\n{line}" if task.notes else line
+        db.add(task)
+        await db.commit()
+        sync_task_bg(host.id, task.id)
+        return True
+    except Exception:  # noqa: BLE001 - tracking never breaks the pass
+        logger.warning("guest pass activity note failed", exc_info=True)
+        return False
+
+
 async def open_showcase(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEvent, host: User) -> dict:
     """Their Showcase link - building it now, the same way the sign-in would have (homes like this
     one + the "your homes are ready" email an hour out), when it wasn't made at sign-in (the build
@@ -380,6 +569,15 @@ async def open_showcase(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHou
     if not showcases_offered(host, visitor, oh):
         raise HTTPException(status_code=404, detail="Showcases aren't available here.")
     col = await _showcase(db, host, visitor)
+    # Still being built from the sign-in (background) - wait for that one instead of making a second.
+    from app.api.open_houses_routes import SHOWCASE_BUILDING
+    if not col and visitor.id in SHOWCASE_BUILDING:
+        import asyncio
+        for _ in range(60):
+            await asyncio.sleep(0.5)
+            if visitor.id not in SHOWCASE_BUILDING:
+                break
+        col = await _showcase(db, host, visitor)   # read-committed: sees the background write
     if not col:
         form = OpenHouseFormSubmission(
             full_name=visitor.full_name, email=visitor.email, phone=visitor.phone or "",

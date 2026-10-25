@@ -712,7 +712,11 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
     regional = not areas and (not named or all(any(w in n.lower() for w in region_words) for n in named))
     if regional:
         areas = list(await _served_areas(db, user, 5))
-    dossiers = [await tk.town_dossier(db, a, include_bank=bool(spec.get("reuse_bank")) or regional) for a in areas]
+    # No-MLS plans: no Bright MLS numbers anywhere in the article (snapshot, overlap counts,
+    # listing-based payment example) - only public research, state/federal facts and their own brief.
+    from app.utils.auth import tier_has_mls
+    mls_ok = tier_has_mls(user.plan_tier)
+    dossiers = [await tk.town_dossier(db, a, include_bank=bool(spec.get("reuse_bank")) or regional, mls=mls_ok) for a in areas]
     if regional:
         for d in dossiers:
             d["items"] = ([i for i in d["items"] if i["origin"] == "geo_verified"]
@@ -730,7 +734,7 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
     from app.services.areas import geography as geo_scope
     from app.services.areas.market_stats_service import count_shared_for_sale, entry_price_profile
     pairs = []
-    for i, a in enumerate(areas):
+    for i, a in enumerate(areas if mls_ok else []):
         for b in areas[i + 1:]:
             # report from the mailing-address town into the township (or the first named)
             x, y = (b, a) if (a.municipality_type or "").lower() == "township" and (b.municipality_type or "").lower() != "township" else (a, b)
@@ -759,7 +763,7 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
         rate_items = []
     # Buying articles get a worked payment example, computed here from real listings + the rate.
     pay_ex = None
-    if areas and not regional and wants_payment_example(brief):
+    if mls_ok and areas and not regional and wants_payment_example(brief):
         try:
             entry = await entry_price_profile(db, [geo_scope.scope_for_market_area(a) for a in areas])
             pay_ex = payment_example(entry, await tk.freddie_mac_latest(), [a.name for a in areas], conforming_limit=tk.conforming_limit())

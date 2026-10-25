@@ -22,6 +22,7 @@ logger = get_logger(__name__)
 DISPLAY = 56           # largest size the templates show it at (px)
 SCALE = 3              # rendered at 3x so it stays sharp on phones
 BACKGROUNDS = {"dark": (23, 20, 15), "light": (255, 255, 255)}   # header band INK / white card
+CLEAR = "clear"   # transparent PNG - right on any background, dark-mode mail apps included (10/24)
 RING = (201, 162, 77)  # the emails' gold line colour
 
 _CACHE: "OrderedDict[str, bytes]" = OrderedDict()
@@ -61,7 +62,10 @@ async def agent_email_vars(db, user) -> dict:
         base = _api_base()
         if base:
             v = _version(profile.get("photo_url") or "", name, hub_photo_pos)
-            out["agent_photo"] = f"{base}/email-avatar/{user.id}.jpg?bg=light&v={v}"
+            # The contact card's photo is a see-through round PNG (dark-mode safe - a mail app that
+            # darkens the card no longer leaves a white square around it). The header band is always
+            # dark, so its JPEG baked onto that ink stays.
+            out["agent_photo"] = f"{base}/email-avatar/{user.id}.png?bg={CLEAR}&v={v}"
             out["agent_photo_dark"] = f"{base}/email-avatar/{user.id}.jpg?bg=dark&v={v}"
         return out
     except Exception:  # noqa: BLE001
@@ -90,16 +94,23 @@ async def render_avatar(photo_url: Optional[str], name: str, bg: str, focal=None
     face = _cover_crop(raw, big, big, focal=fxy) if raw is not None else _initials_avatar(name, big, RING)
 
     ring_w = 2 * SCALE * 3                           # 2px gold ring at display size
-    canvas = Image.new("RGB", (big, big), bg_rgb)
+    clear = bg == CLEAR
+    canvas = Image.new("RGBA", (big, big), (0, 0, 0, 0)) if clear else Image.new("RGB", (big, big), bg_rgb)
     ring = Image.new("L", (big, big), 0)
     ImageDraw.Draw(ring).ellipse((0, 0, big - 1, big - 1), fill=255)
-    canvas.paste(Image.new("RGB", (big, big), RING), (0, 0), ring)
+    canvas.paste(Image.new(canvas.mode, (big, big), RING + ((255,) if clear else ())), (0, 0), ring)
     inner = Image.new("L", (big, big), 0)
     ImageDraw.Draw(inner).ellipse((ring_w, ring_w, big - 1 - ring_w, big - 1 - ring_w), fill=255)
-    canvas.paste(face, (0, 0), inner)
+    canvas.paste(face.convert(canvas.mode), (0, 0), inner)
     out = canvas.resize((size, size), Image.LANCZOS)
     buf = BytesIO()
-    out.save(buf, format="JPEG", quality=86, optimize=True, progressive=True)
+    if clear:
+        # Round with a see-through outside (PNG alpha): it sits right on ANY background - including a
+        # mail app's dark mode, where the old white-baked JPEG showed a white box around the face in
+        # the contact card (user, 10/24).
+        out.save(buf, format="PNG", optimize=True)
+    else:
+        out.save(buf, format="JPEG", quality=86, optimize=True, progressive=True)
     return buf.getvalue()
 
 

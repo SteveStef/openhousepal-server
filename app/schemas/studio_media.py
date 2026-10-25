@@ -86,6 +86,10 @@ class StudioMediaGenerateRequest(BaseModel):
     effects: Optional[List[ImageEffect]] = None
     # AI Video: up to 8 source photos, each becomes a 5s clip; concatenated server-side.
     photos: Optional[List[str]] = None
+    # One id per Generate press, made by the browser. The same id sent twice (a double tap, a
+    # phone that resent the request after waking up) returns the first project instead of
+    # running - and charging - a second copy (user, 10/24: "Done made two copies").
+    client_request_id: Optional[str] = Field(None, max_length=64)
 
 
 class StudioMediaRegenerateRequest(BaseModel):

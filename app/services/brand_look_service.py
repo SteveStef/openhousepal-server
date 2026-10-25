@@ -191,3 +191,77 @@ async def propagate(db: AsyncSession, user: User) -> None:
         nxt = signature_config_with_brand(sig.config, look, user)
         if nxt != (sig.config or {}):
             sig.config = nxt
+
+
+# ---------- Branding center (Studio -> Branding) ----------
+
+async def usage(db: AsyncSession, user: User) -> dict:
+    """Which features wear the brand right now - the Branding center's quick view. Read only."""
+    from sqlalchemy import func
+    from app.models.database import AgentForm, AgentHub, DesignProject, EventInvite, PropertyWebsite, Site
+    look = await get_look(db, user)
+    hub = (await db.execute(select(AgentHub).where(AgentHub.owner_id == user.id))).scalar_one_or_none()
+    sig = (await db.execute(select(EmailSignature).where(EmailSignature.owner_id == user.id))).scalar_one_or_none()
+    site = (await db.execute(select(Site).where(Site.owner_id == user.id))).scalar_one_or_none()
+    forms = (await db.execute(select(AgentForm.look_mode).where(AgentForm.owner_id == user.id))).scalars().all()
+    hub_follows = hub is None or hub_follows_brand(hub.config)
+    form_follow = sum(1 for m in forms if m == "brand" or (m in (None, "hub") and hub_follows))
+    designs = (await db.execute(select(DesignProject.color_mode).where(DesignProject.owner_id == user.id))).scalars().all()
+    invites = (await db.execute(select(EventInvite.accent_color).where(EventInvite.owner_id == user.id, EventInvite.status == "live"))).scalars().all()
+    spot = (await db.execute(select(func.count()).select_from(PropertyWebsite).where(PropertyWebsite.owner_id == user.id))).scalar() or 0
+    theme = ((site.draft_data or {}).get("theme") or {}) if site is not None else {}
+    accent = look["accent"].upper()
+    return {
+        "hub": {"exists": hub is not None, "follows": hub_follows},
+        "signature": {"exists": sig is not None, "follows": sig is None or signature_follows_brand(sig.config)},
+        "forms": {"total": len(forms), "follows": form_follow},
+        "idx": {"exists": site is not None, "follows": site is None or theme.get("follow_brand_kit", True) is not False},
+        "designs": {"total": len(designs), "brand": sum(1 for m in designs if str(m or "").split("@")[0] == "brand")},
+        "invites": {"total": len(invites), "follows": sum(1 for a in invites if (a or "").upper() == accent)},
+        "spotlight": {"total": int(spot)},
+    }
+
+
+async def apply_everywhere(db: AsyncSession, user: User) -> dict:
+    """"Use this color for all features": the hub, signature, every form and the IDX site go back to
+    "My Brand Kit", and live invitations take the brand color. Caller commits."""
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.models.database import AgentForm, AgentHub, EventInvite, Site
+    look = await get_look(db, user)
+    hub = (await db.execute(select(AgentHub).where(AgentHub.owner_id == user.id))).scalar_one_or_none()
+    if hub is not None and (hub.config or {}).get("lookSource") != "brand":
+        hub.config = {**(hub.config or {}), "lookSource": "brand"}
+        flag_modified(hub, "config")
+    sig = (await db.execute(select(EmailSignature).where(EmailSignature.owner_id == user.id))).scalar_one_or_none()
+    if sig is not None:
+        sig.config = {**(sig.config or {}), **signature_patch(look, user)}
+        flag_modified(sig, "config")
+    for form in (await db.execute(select(AgentForm).where(AgentForm.owner_id == user.id))).scalars().all():
+        if form.look_mode != "brand":
+            form.look_mode = "brand"
+    site = (await db.execute(select(Site).where(Site.owner_id == user.id))).scalar_one_or_none()
+    if site is not None:
+        # Follow-the-kit is resolved when a page renders, so the live copy follows too - no republish.
+        for attr in ("draft_data", "published_snapshot"):
+            data = dict(getattr(site, attr) or {})
+            if attr == "published_snapshot" and not data:
+                continue
+            data["theme"] = {**(data.get("theme") or {}), "follow_brand_kit": True}
+            setattr(site, attr, data)
+            flag_modified(site, attr)
+    for inv in (await db.execute(select(EventInvite).where(EventInvite.owner_id == user.id, EventInvite.status == "live"))).scalars().all():
+        inv.accent_color = look["accent"]
+    await db.flush()
+    return await usage(db, user)
+
+
+async def follow_brand_color_change(db: AsyncSession, user: User, old_secondary: Any, new_secondary: Any) -> None:
+    """A new brand color: live invitations that were in the OLD brand color (the "Brand" chip when
+    they were made) take the new one. Caller commits."""
+    from app.models.database import EventInvite
+    old, new = classic_accent(old_secondary), classic_accent(new_secondary)
+    if old == new:
+        return
+    for inv in (await db.execute(select(EventInvite).where(EventInvite.owner_id == user.id, EventInvite.status == "live"))).scalars().all():
+        if (inv.accent_color or "").upper() == old.upper():
+            inv.accent_color = new

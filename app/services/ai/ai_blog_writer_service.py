@@ -258,10 +258,25 @@ def _agent_profile(user: User, config: dict) -> dict:
     }
 
 
+def _num(v) -> float:
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _recent_sales(config: dict, limit: int = 8) -> list[dict]:
+    # Only sales the agent shows on their hub and that clear their "Min price to display" (owner,
+    # 10/24). Listed newest first on purpose - this is the interview's "recent sales" list.
+    try:
+        min_price = int(config.get("salesMinPrice") or 0)
+    except (TypeError, ValueError):
+        min_price = 0
     out = []
     for sale in config.get("recentSales") or []:
         if not isinstance(sale, dict) or sale.get("visible") is False:
+            continue
+        if min_price and _num(sale.get("price")) < min_price:
             continue
         status_text = str(sale.get("status") or "").replace("-BRIGHT", "").replace("_", " ").strip().lower()
         if not ("sold" in status_text or "closed" in status_text):
@@ -524,6 +539,17 @@ async def area_spotlight_cards(db: AsyncSession, user: User, extra_slugs: Option
         rows = (await db.execute(select(MarketArea).where(MarketArea.slug.in_(extra), MarketArea.enrichment_status == "ENRICHED"))).scalars().all()
         for area in rows:
             out.append(await town_card_for_area(db, area))
+    # No-MLS plans may not use Bright data - their town cards keep the photos, districts and places
+    # but none of the MLS numbers (median / for-sale count / price range / market notes).
+    from app.utils.auth import tier_has_mls
+    if not tier_has_mls(getattr(user, "plan_tier", None)):
+        for c in out:
+            for k in ("median_price", "active_count", "min_price", "max_price", "price_range_basis",
+                      "under_contract_count", "data_through", "days_on_market", "median_dom"):
+                if k in c:
+                    c[k] = None
+            if isinstance(c.get("nearby"), dict) and c["nearby"].get("market"):
+                c["nearby"] = {k: v for k, v in c["nearby"].items() if k != "market"}
     return out
 
 
@@ -591,7 +617,14 @@ async def build_context(db: AsyncSession, user: User) -> dict:
     listings: list[dict] = []
     try:
         from app.services.website.content_adapters import get_active_listings
-        for card in await get_active_listings(db, user, limit=30):
+        from app.utils.auth import tier_has_mls
+        # No-MLS plans: their Bright listings are off limits - only the ones they typed into their hub.
+        mls_cards = await get_active_listings(db, user, limit=30) if tier_has_mls(user.plan_tier) else [
+            {"listing_key": s.get("id"), "address": s.get("address"), "city": s.get("city"), "price": s.get("price"),
+             "beds": s.get("beds"), "baths": s.get("baths"), "sqft": s.get("sqft"), "status": s.get("status"),
+             "photo": s.get("image"), "state": s.get("state")}
+            for s in (config.get("myListings") or []) if isinstance(s, dict) and s.get("source") == "manual" and s.get("visible") is not False]
+        for card in mls_cards:
             listings.append({
                 "id": card.get("listing_key") or "",
                 "address": card.get("address") or "",

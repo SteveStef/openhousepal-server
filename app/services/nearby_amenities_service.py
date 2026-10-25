@@ -100,14 +100,48 @@ EXPLORE_NEARBY_DETAILS_ESTIMATED_COST_USD = 0.025  # Enterprise + Atmosphere SKU
 # rather than the current viewer's exact center - a minor effect confined to the outer ~15-20% of the
 # radius, acceptable for an informational "nearby amenities" feature.
 EXPLORE_NEARBY_CACHE_GEO_PRECISION = 2
+# 10/24 audit (user: "grocery = major grocery stores, not tiny family shops or convenience stores;
+# hospital = major hospitals, not small practices; schools public AND private; restaurants = real
+# restaurants, not Wawa / fast food / gas stations"): grocery searches supermarkets only and keeps
+# the big chains + true supermarkets (_explore_grocery_ok), "medical" is now Hospitals (full-service
+# hospitals only, same test as the Cheat Sheet's), a Schools tab finds public and private K-12
+# schools, and restaurants drop fast food / takeout counters / chains (_explore_restaurant_ok).
+# Bump EXPLORE_NEARBY_CACHE_VERSION with any change here, so old cached lists aren't served.
+EXPLORE_NEARBY_CACHE_VERSION = 3
 EXPLORE_NEARBY_CATEGORIES: dict[str, dict[str, Any]] = {
     "restaurants": {"label": "Restaurants", "types": ["restaurant"], "radius_miles": 2.5},
     "coffee": {"label": "Coffee", "types": ["cafe", "coffee_shop"], "radius_miles": 2.0},
-    "grocery": {"label": "Grocery", "types": ["supermarket", "grocery_store"], "radius_miles": 3.0},
+    "grocery": {"label": "Grocery", "types": ["supermarket", "grocery_store"], "radius_miles": 5.0},
+    "schools": {"label": "School", "types": ["primary_school", "secondary_school", "school"], "radius_miles": 3.0},
     "parks": {"label": "Parks", "types": ["park"], "radius_miles": 3.0},
     "shopping": {"label": "Shopping", "types": ["shopping_mall", "department_store", "clothing_store"], "radius_miles": 3.0},
-    "medical": {"label": "Medical", "types": ["hospital", "doctor", "medical_clinic"], "radius_miles": 4.0},
+    "medical": {"label": "Hospital", "types": ["hospital", "general_hospital"], "radius_miles": 12.0},
 }
+# The big grocery names people mean by "the grocery store" (East Coast first, then national).
+MAJOR_GROCERY_BRANDS = (
+    "acme", "giant", "wegmans", "whole foods", "trader joe", "shoprite", "shop rite", "weis", "aldi",
+    "lidl", "safeway", "stop & shop", "stop and shop", "food lion", "harris teeter", "redner",
+    "fresh grocer", "sprouts", "the fresh market", "fresh market", "kroger", "publix", "costco",
+    "sam's club", "bj's wholesale", "target", "walmart supercenter", "hannaford", "price chopper",
+    "market basket", "mom's organic", "earth fare", "h mart", "h-mart", "save a lot", "save-a-lot",
+    "grocery outlet", "landis", "kimberton whole foods", "genuardi",
+)
+# Fast food / counter-service names that aren't a sit-down "restaurant" to a home buyer.
+FAST_FOOD_NAME_PATTERNS = (
+    "mcdonald", "burger king", "wendy's", "wendys", "taco bell", "kfc", "kentucky fried", "popeyes",
+    "chick-fil-a", "chick fil a", "arby's", "arbys", "subway", "jersey mike", "jimmy john", "sonic drive",
+    "dairy queen", "hardee", "carl's jr", "jack in the box", "white castle", "checkers", "rally's",
+    "five guys", "shake shack", "chipotle", "qdoba", "moe's southwest", "firehouse subs", "potbelly",
+    "domino's", "dominos", "pizza hut", "papa john", "little caesars", "wingstop", "panda express",
+    "boston market", "auntie anne", "dunkin", "starbucks", "tim hortons", "krispy kreme", "baskin",
+    "cold stone", "rita's", "ritas italian ice", "jamba", "smoothie king", "tropical smoothie",
+    "panera", "cosi", "saladworks", "chopt", "sweetgreen", "steak 'n shake", "steak n shake",
+    "raising cane", "zaxby", "bojangles", "church's chicken", "long john silver", "del taco",
+    "el pollo loco", "whataburger", "in-n-out", "culver's", "jet's pizza", "marco's pizza",
+)
+FAST_FOOD_PRIMARY_TYPES = {"fast_food_restaurant", "meal_takeaway", "food_court", "cafeteria", "sandwich_shop",
+                           "hamburger_restaurant", "dessert_shop", "ice_cream_shop", "juice_shop", "snack_bar"}
+SCHOOL_PRIMARY_TYPES = {"primary_school", "secondary_school", "school"}
 # Denylist per category for the off-category noise Google's soft includedTypes match lets through -
 # see the comment on EXPLORE_NEARBY_MAX_RESULTS above. Grocery uses the existing, more thorough
 # _is_full_service_grocery predicate instead (below) rather than a simple denylist, since "real grocery
@@ -1021,7 +1055,18 @@ def _explore_place_is_relevant(place: dict, category_key: str) -> bool:
     already existed elsewhere in this file. Quality over count throughout: this only ever removes
     candidates, never backfills to hit a target count - a category with 4 genuine matches shows 4."""
     if category_key == "grocery":
-        return _is_full_service_grocery(place)
+        return _explore_grocery_ok(place)
+    if category_key == "medical":
+        # "VA HOSPITAL 25" - a numbered building of a campus that's already on the list by name.
+        return _is_legitimate_full_service_hospital(place) and not re.search(r"\s\d+$", _place_name(place))
+    if category_key == "coffee":
+        # A real coffee shop / cafe - not a bookstore or breakfast diner that happens to pour coffee.
+        if _place_primary_type(place) not in {"cafe", "coffee_shop", "coffee_roastery", "coffee_stand", "tea_house"}:
+            return False
+    if category_key == "parks" and re.match(r"^(playground|sports fields?|ball ?fields?|tennis courts?|basketball courts?|dog park)\b", _place_name(place).lower()):
+        return False   # a nameless feature, not a park someone would look up
+    if category_key == "schools":
+        return _explore_school_label(place) is not None
 
     # Applied to every remaining category, not just restaurants - gas_station/convenience_store are
     # not normal secondary tags on a genuine restaurant/cafe/shop, unlike broad parent categories (see
@@ -1036,7 +1081,7 @@ def _explore_place_is_relevant(place: dict, category_key: str) -> bool:
         name_lower = _place_name(place).lower()
         if any(pattern in name_lower for pattern in CONVENIENCE_GAS_HYBRID_NAME_PATTERNS):
             return False
-        return _place_primary_type(place) in RESTAURANT_PRIMARY_TYPES
+        return _explore_restaurant_ok(place)
 
     excluded = EXPLORE_NEARBY_EXCLUDED_TYPES.get(category_key)
     if not excluded:
@@ -1046,6 +1091,71 @@ def _explore_place_is_relevant(place: dict, category_key: str) -> bool:
     # excluded set against secondary types produced false positives (e.g. wiped out real coffee shops
     # because "restaurant" is excluded there but also a common secondary tag on cafes).
     return _place_primary_type(place) not in excluded
+
+
+def _explore_grocery_ok(place: dict) -> bool:
+    """A real grocery store (user, 10/24): one of the big names, or a genuine supermarket - never a
+    corner shop, deli, convenience store or specialty market."""
+    if not _is_full_service_grocery(place):
+        return False
+    name = _place_name(place).lower()
+    if any(p in name for p in CONVENIENCE_GAS_HYBRID_NAME_PATTERNS):
+        return False
+    if any(b in name for b in MAJOR_GROCERY_BRANDS):
+        return True
+    if any(h in name for h in GROCERY_SPECIALTY_NAME_HINTS):
+        return False
+    return _place_primary_type(place) == "supermarket"
+
+
+def _explore_restaurant_ok(place: dict) -> bool:
+    """A sit-down restaurant (user, 10/24): not fast food, a takeout counter or a chain quick-serve."""
+    primary = _place_primary_type(place)
+    if primary not in RESTAURANT_PRIMARY_TYPES or primary in FAST_FOOD_PRIMARY_TYPES:
+        return False
+    if "fast_food_restaurant" in set(place.get("types") or []):
+        return False
+    name = _place_name(place).lower()
+    return not any(p in name for p in FAST_FOOD_NAME_PATTERNS)
+
+
+def _explore_school_label(place: dict) -> Optional[str]:
+    """K-12 schools, public and private (user, 10/24) - with a plain label ("Private · High school",
+    "Elementary school"). None for daycare, tutoring, colleges, district offices and the like."""
+    name = _place_name(place)
+    low = name.lower()
+    types = place.get("types") or []
+    if not name or _place_primary_type(place) not in SCHOOL_PRIMARY_TYPES:
+        return None
+    skip = [k for k in PRIVATE_SCHOOL_EXCLUDE_KEYWORDS if k not in {"public school", "public charter", "charter school"}]
+    if any(k in low for k in skip) or "university" in types or "preschool" in types:
+        return None
+    if any(k in low for k in ("administration", "admin building", "district office", "bus garage", "transportation")):
+        return None
+    if re.search(r"\bk\s*[-–]\s*12\b", low):
+        level = "K-12 school"
+    elif re.search(r"\bk\s*[-–]\s*8\b", low):
+        level = "K-8 school"
+    elif re.search(r"middle school|junior high|\bintermediate\b|\bmiddle\b", low):
+        level = "Middle school"
+    elif re.search(r"elementary|\bprimary\b|kindergarten", low):
+        level = "Elementary school"
+    elif re.search(r"high school|\bhigh\b|secondary|\bhs\b", low):
+        level = "High school"
+    elif "secondary_school" in types:
+        level = "High school"
+    elif "primary_school" in types:
+        level = "Elementary school"
+    else:
+        level = "School"
+    private_hints = ("private", "independent", "academy", "preparatory", " prep", "catholic", "christian",
+                     "parochial", "friends", "montessori", "waldorf", "episcopal", "lutheran", "st.", "sts.", "saint",
+                     "day school", "country day", "baptist", "hebrew", "jewish", "islamic", "yeshiva")
+    if any(h in low for h in private_hints) and "charter" not in low:
+        return f"Private · {level[0].lower() + level[1:]}" if level != "School" else "Private school"
+    if "charter" in low:
+        return "Charter school"
+    return level
 
 
 def _rehydrate_places_for_origin(payload: dict, lat: float, lng: float) -> dict:
@@ -1098,10 +1208,21 @@ async def _fetch_explore_nearby_live(
         )
         response.raise_for_status()
     raw_places = [raw for raw in response.json().get("places", []) if _explore_place_is_relevant(raw, category_key)]
-    places = [
-        p for p in (_explore_place_to_response(raw, category["label"], lat, lng) for raw in raw_places)
-        if p is not None
-    ]
+    places = []
+    for raw in raw_places:
+        p = _explore_place_to_response(raw, category["label"], lat, lng)
+        if p is None:
+            continue
+        # Plain labels a buyer reads at a glance (not Google's own "Secondary school").
+        if category_key == "schools":
+            p.category = _explore_school_label(raw) or p.category
+        elif category_key == "medical":
+            p.category = "Hospital"
+        # The same name twice a few doors apart (two listings for one Starbucks) - once is enough.
+        if any(q.name.strip().lower() == p.name.strip().lower()
+               and _haversine_miles(q.latitude, q.longitude, p.latitude, p.longitude) < 0.25 for q in places):
+            continue
+        places.append(p)
     places.sort(key=lambda p: p.distance_miles if p.distance_miles is not None else float("inf"))
     places = places[:EXPLORE_NEARBY_DISPLAY_LIMIT]
     elapsed_ms = round((time.perf_counter() - started) * 1000)
@@ -1164,7 +1285,7 @@ async def get_explore_nearby(
         f"{round(float(lat), EXPLORE_NEARBY_CACHE_GEO_PRECISION)}:{round(float(lng), EXPLORE_NEARBY_CACHE_GEO_PRECISION)}:"
         f"{normalized_category}:{round(safe_radius, 2)}"
     )
-    cache_key = f"search:{grid_key}"
+    cache_key = f"search:v{EXPLORE_NEARBY_CACHE_VERSION}:{grid_key}"
 
     config = await ai_config_service.get_config(db)
 
