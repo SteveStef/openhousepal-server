@@ -415,7 +415,7 @@ async def _load_price_surface(db: AsyncSession, subject: dict, lat: float, lng: 
     distance_expr = distance_miles_sql(Property.latitude, Property.longitude, lat, lng)
     # Each sale's condition tier rides along (5th field) so the price level can be read condition-neutral
     # (cma_ai_service CMA_AREA_PRICE_COND - a block of unrenovated rentals is not a cheap location).
-    with_cond = os.getenv("CMA_AREA_PRICE_COND", "0") == "1"
+    with_cond = os.getenv("CMA_AREA_PRICE_COND", "1") == "1"
     cond_cols = (Property.raw_mls_data["PropertyCondition"].label("cond"),
                  Property.raw_mls_data["PublicRemarks"].astext.label("remarks")) if with_cond else ()
     query = select(

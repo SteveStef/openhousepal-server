@@ -5908,8 +5908,11 @@ def _v10_grid_adjustments(subject: dict, r: dict, s_ag: float, s_bg: float, s_bg
         _dist = _as_float(comp.get("distance_miles"))
         if _V10_LOC_NEAR_MILES and _dist is not None and _dist < _V10_LOC_NEAR_MILES:
             out["location"] *= _dist / _V10_LOC_NEAR_MILES
-        out["notes"].append(f"location: {'homes near the comp (condition-adjusted)' if _AREA_PRICE_COND else 'homes near the comp'} "
-                            f"sell for ${_ap.get('comp_area_psf')}/sqft vs ${_ap.get('subject_psf')}/sqft near the subject")
+        def _ev(n, r):
+            return f" ({n} sales within {r:g} mi)" if n and r else ""
+        out["notes"].append(f"location: {'similar-condition homes' if _ap.get('condition_adjusted') else 'homes'} near the comp "
+                            f"sell for ${_ap.get('comp_area_psf')}/sqft{_ev(_ap.get('comp_sales'), _ap.get('comp_radius_mi'))} vs "
+                            f"${_ap.get('subject_psf')}/sqft near the subject{_ev(_ap.get('subject_sales'), _ap.get('subject_radius_mi'))}")
     keys = ("size", "below_grade", "baths", "garage", "sewer", "lot", "age", "road", "time", "condition", "location")
     gross = sum(abs(out[k]) for k in keys)
     net = sum(out[k] for k in keys)
@@ -6503,8 +6506,10 @@ _AREA_PRICE_HALF_LIFE = float(os.getenv("CMA_REL_AREA_PRICE_HL", "0.12"))
 # off the same-size circle (one could fall back to a wider, cheaper area); COND divides each sale's $/sqft
 # by its condition index first, so a block of unrenovated rentals doesn't read as a cheap LOCATION while
 # the grid also adjusts the comp's condition.
+# Free backtest 10/24 (120 Philadelphia sales): COND - adjusted-sales miss 9.0% -> 8.7% median (43 homes
+# better / 32 worse), seller 15.8% -> 15.2%, buyer band flat; ON. SAME_RADIUS - buyer band 6.3% -> 7.0%; OFF.
 _AREA_PRICE_SAME_RADIUS = os.getenv("CMA_AREA_PRICE_SAME_RADIUS", "0") == "1"
-_AREA_PRICE_COND = os.getenv("CMA_AREA_PRICE_COND", "0") == "1"
+_AREA_PRICE_COND = os.getenv("CMA_AREA_PRICE_COND", "1") == "1"
 
 
 _PLACE_KIND = {"city": "city", "township": "township", "twp": "township", "boro": "borough", "borough": "borough",
@@ -6753,7 +6758,7 @@ def _area_price_level(surface: list, lat, lng, exclude_key: Optional[str] = None
     the search at that circle; `with_radius` also returns the radius used."""
     lat, lng = _as_float(lat), _as_float(lng)
     if not surface or lat is None or lng is None:
-        return (None, None) if with_radius else None
+        return (None, None, 0) if with_radius else None
     kx = 69.0 * math.cos(math.radians(lat))
     idx = _V10_COND_INDEX["urban" if urban else "default"]
     near = []
@@ -6770,8 +6775,8 @@ def _area_price_level(surface: list, lat, lng, exclude_key: Optional[str] = None
             continue
         vals = [p for d, p in near if d <= radius]
         if len(vals) >= _AREA_PRICE_MIN_SALES:
-            return (_v10_median(vals), radius) if with_radius else _v10_median(vals)
-    return (None, None) if with_radius else None
+            return (_v10_median(vals), radius, len(vals)) if with_radius else _v10_median(vals)
+    return (None, None, 0) if with_radius else None
 
 
 _REL_SAME_STREET = os.environ.get("CMA_REL_SAME_STREET", "1") == "1"   # backtest knob
@@ -6895,9 +6900,9 @@ def _continuous_relevance(
     urban = _REL_URBAN_MODE and density.get("band") == "dense_urban"
     surface = density.pop("_price_surface", None) or []
     _subj_key = str(subject.get("listing_key") or "") or None
-    subject_level, subject_radius = _area_price_level(
+    subject_level, subject_radius, subject_n = _area_price_level(
         surface, subject.get("latitude"), subject.get("longitude"), exclude_key=_subj_key, urban=urban,
-        with_radius=True) if surface else (None, None)
+        with_radius=True) if surface else (None, None, 0)
     subject_cond = _condition_tier(subject)
     subject_style_known = _relevance_level_class(subject) is not None or _relevance_style_family(
         _style_text(subject.get("architectural_style") or subject.get("structure_type"))) is not None
@@ -6924,20 +6929,24 @@ def _continuous_relevance(
                 and _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["same_street"] > 0:
             components["same_street"] = 1.0
         if subject_level and _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["area_price"] > 0:
-            s_level = subject_level
-            comp_level, comp_radius = _area_price_level(surface, comp.get("latitude"), comp.get("longitude"),
-                                                        exclude_key=key, urban=urban, with_radius=True)
+            s_level, s_radius, s_n = subject_level, subject_radius, subject_n
+            comp_level, comp_radius, comp_n = _area_price_level(surface, comp.get("latitude"), comp.get("longitude"),
+                                                                exclude_key=key, urban=urban, with_radius=True)
             if _AREA_PRICE_SAME_RADIUS and comp_level and comp_radius != subject_radius:
                 # both read off the same-size circle (the wider of the two)
                 r = max(comp_radius, subject_radius)
-                s_level = _area_price_level(surface, subject.get("latitude"), subject.get("longitude"),
-                                            exclude_key=_subj_key, urban=urban, min_radius=r)
-                comp_level = _area_price_level(surface, comp.get("latitude"), comp.get("longitude"),
-                                               exclude_key=key, urban=urban, min_radius=r)
+                s_level, s_radius, s_n = _area_price_level(surface, subject.get("latitude"), subject.get("longitude"),
+                                                           exclude_key=_subj_key, urban=urban, min_radius=r, with_radius=True)
+                comp_level, comp_radius, comp_n = _area_price_level(surface, comp.get("latitude"), comp.get("longitude"),
+                                                                    exclude_key=key, urban=urban, min_radius=r, with_radius=True)
             if comp_level and s_level:
                 components["area_price"] = _half_life_decay(math.log(comp_level / s_level), _AREA_PRICE_HALF_LIFE)
+                # the evidence behind a location line: how many sales, how far (grader 10/24)
                 component_detail["area_price"] = {"subject_psf": round(s_level), "comp_area_psf": round(comp_level),
-                                                  "ratio": round(comp_level / s_level, 3)}
+                                                  "ratio": round(comp_level / s_level, 3),
+                                                  "subject_sales": s_n, "subject_radius_mi": s_radius,
+                                                  "comp_sales": comp_n, "comp_radius_mi": comp_radius,
+                                                  "condition_adjusted": _AREA_PRICE_COND}
             else:
                 components["area_price"] = _REL_UNKNOWN_CREDIT if _REL_UNKNOWN_CREDIT is not None else 0.5
         if market_area is not None:
