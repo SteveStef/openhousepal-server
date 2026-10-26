@@ -30,6 +30,14 @@ FREE_PER_MONTH = {"essentials": 10_000, "pro": 5_000, "enterprise": 1_000}
 FREE_SHARE = 0.95  # stop a little early: Google's own count and ours can differ by a few calls
 _MAPS_HOSTS = {"places.googleapis.com", "routes.googleapis.com", "maps.googleapis.com"}
 
+# Calls Google already counted this month that this counter never saw: the counter went live on
+# 10/26, and local testing shares the live key (10/26 town checks: ~2,400 Text Search Pro, ~500
+# Enterprise, ~2,800 route elements) plus live use before then. Rounded up so we stop early, not late.
+USED_BEFORE_COUNTING = {
+    "2026-10": {"text_search_pro": 3000, "text_search_enterprise": 650, "nearby_search_pro": 500,
+                "place_details_pro": 300, "route_matrix_essentials": 3000, "route_matrix_pro": 1500},
+}
+
 # Places fields that move a call up a tier (Places API (New) pricing tables).
 _ENTERPRISE_FIELDS = {
     "rating", "userratingcount", "websiteuri", "nationalphonenumber", "internationalphonenumber",
@@ -119,13 +127,26 @@ def monthly_limit(tier: str) -> int:
     return int(FREE_PER_MONTH[tier] * FREE_SHARE)
 
 
+def _used_before(sku: str, month: str) -> int:
+    return USED_BEFORE_COUNTING.get(month, {}).get(sku, 0)
+
+
+def _tier_of(sku: str) -> str:
+    if sku.endswith("enterprise") or sku == "place_photos":
+        return "enterprise"
+    if sku.endswith("_pro") or sku in ("legacy_places", "places_other"):
+        return "pro"
+    return "essentials"
+
+
 async def _take(sku: str, tier: str, units: int) -> bool:
     """Count `units` calls against this month's free allowance; False once it's used up."""
     from app.database import AsyncSessionLocal
     from app.services.usage_budget_service import _period_keys, reserve_bucket
     _day, month = _period_keys()
     async with AsyncSessionLocal() as db:
-        ok = await reserve_bucket(db, f"google_free:{sku}", "month", month, units, 0, monthly_limit(tier), None)
+        room = max(0, monthly_limit(tier) - _used_before(sku, month))
+        ok = await reserve_bucket(db, f"google_free:{sku}", "month", month, units, 0, room, None)
         await db.commit()
         return ok
 
@@ -169,9 +190,10 @@ async def month_usage(db) -> list[dict]:
         .where(UsageBudgetCounter.bucket.like("google_free:%"), UsageBudgetCounter.period_type == "month",
                UsageBudgetCounter.period_key == month)
     )).all()
+    counted = {bucket.split(":", 1)[1]: count for bucket, count in rows}
     out = []
-    for bucket, count in rows:
-        sku = bucket.split(":", 1)[1]
-        tier = "enterprise" if sku.endswith("enterprise") or sku == "place_photos" else "pro" if sku.endswith("_pro") or sku == "legacy_places" or sku == "places_other" else "essentials"
-        out.append({"sku": sku, "used": count, "free": FREE_PER_MONTH[tier], "stops_at": monthly_limit(tier)})
+    for sku in set(counted) | set(USED_BEFORE_COUNTING.get(month, {})):
+        tier = _tier_of(sku)
+        out.append({"sku": sku, "used": counted.get(sku, 0) + _used_before(sku, month),
+                    "free": FREE_PER_MONTH[tier], "stops_at": monthly_limit(tier)})
     return sorted(out, key=lambda r: -r["used"] / max(1, r["stops_at"]))

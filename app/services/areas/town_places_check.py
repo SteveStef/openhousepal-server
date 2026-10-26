@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import re
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote_plus
@@ -32,6 +33,16 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.models.database import MarketArea
 from app.services import nearby_amenities_service as nas
+from app.services.google_free_tier import GoogleFreeTierPaused
+
+# Look-ups skipped this run because Google's free calls for the month were used up (see check_town_places).
+_paused: ContextVar[Optional[list]] = ContextVar("town_places_paused", default=None)
+
+
+def _note_paused(exc: Exception) -> None:
+    hits = _paused.get()
+    if hits is not None and isinstance(exc, GoogleFreeTierPaused):
+        hits.append(1)
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +245,7 @@ async def _lookup(client: httpx.AsyncClient, key: str, area: MarketArea, categor
                                      field_mask=mask, section="town_places_check")
     except httpx.HTTPError as exc:
         logger.info("Town place look-up failed", extra={"area": area.slug, "place": name, "error": str(exc)})
+        _note_paused(exc)
         raise
     fits = [p for p in raw[:5] if _same_place(name, p, area.name) and (category == "private_schools" or _kind_fits(category, p))]
 
@@ -284,6 +296,7 @@ async def _hospitals(client: httpx.AsyncClient, key: str, area: MarketArea) -> l
         found = await nas._fetch_hospital_from_google(client, key, area.centroid_lat, area.centroid_lng)
     except httpx.HTTPError as exc:
         logger.info("Town hospital search failed", extra={"area": area.slug, "error": str(exc)})
+        _note_paused(exc)
         return []
     out = []
     for p in found[: TOWN_HOSPITALS + 2]:
@@ -424,9 +437,18 @@ async def check_town_places(db: AsyncSession, area: MarketArea) -> dict:
     if not any((facts.get(c) or {}).get("entities") for c in (*CHECK_CATEGORIES, "private_schools")):
         return {"checked": 0}  # not researched yet - nothing to check (and no half-built lists)
     now = datetime.now(timezone.utc).isoformat()
-    checked = removed_count = 0
     lists: dict[str, list[dict]] = {}
     removed: dict[str, list[dict]] = {}
+    paused: list = []
+    token = _paused.set(paused)
+    try:
+        return await _check(db, area, key, facts, now, lists, removed, paused)
+    finally:
+        _paused.reset(token)
+
+
+async def _check(db, area, key, facts, now, lists, removed, paused) -> dict:
+    checked = removed_count = 0
     async with httpx.AsyncClient() as client:
         for cat in CHECK_CATEGORIES:
             block = facts.get(cat) or {}
@@ -518,6 +540,12 @@ async def check_town_places(db: AsyncSession, area: MarketArea) -> dict:
 
     facts["_places_verified_at"] = now
     facts["_places_check_version"] = PLACES_CHECK_VERSION
+    # Google's free calls ran out part-way: the places it couldn't check stay (with no guessed
+    # distance) and town upkeep finishes the check once the free calls are back.
+    if paused:
+        facts["_places_check_waiting"] = True
+    else:
+        facts.pop("_places_check_waiting", None)
     area.facts = facts
     flag_modified(area, "facts")
     db.add(area)

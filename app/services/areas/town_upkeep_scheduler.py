@@ -19,6 +19,7 @@ from sqlalchemy import select
 
 from app.database import AsyncSessionLocal
 from app.models.database import AgentMarketArea, MarketArea, User
+from app.services.areas import town_places_check
 from app.services.areas.town_places_check import CHECK_CATEGORIES
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,21 @@ async def run_town_upkeep() -> dict:
                     facts = area.facts or {}
 
                 if paid >= MAX_PAID_TOWNS_PER_DAY:
+                    continue
+                # A town whose place check stopped part-way at Google's free-call line finishes it
+                # once the calls are back (the 1st) - filling in, not a re-check on a timer.
+                if facts.get("_places_check_waiting"):
+                    result = await town_places_check.check_town_places(db, area)
+                    paid += 1
+                    summary["places_checked"] += result.get("checked", 0)
+                    summary["places_removed"] += result.get("removed", 0)
+                    if result.get("removed"):  # the write-up must not name a place that was just dropped
+                        user = await db.get(User, owner_id)
+                        narrative = await area_enrichment_service._generate_narrative(db, area, user) if user else None
+                        if narrative:
+                            area.narrative = narrative
+                            db.add(area)
+                            await db.commit()
                     continue
                 # No paid re-checks on a timer (owner, 10/26: "forget the checkup") - a town's places
                 # are checked once when it's researched; the live Explore Nearby covers what changes.

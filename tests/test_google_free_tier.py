@@ -59,3 +59,33 @@ async def test_a_used_up_call_is_stopped_before_it_goes_out(monkeypatch):
             await c.post("https://places.googleapis.com/v1/places:searchText", headers={"X-Goog-FieldMask": "places.displayName,places.location"}, json={})
         await c.get("https://www.googleapis.com/calendar/v3/x")  # not Maps - never blocked
     assert len(sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_calls_google_saw_before_the_counter_started_count_toward_the_month(monkeypatch):
+    import app.database as database
+    from app.services import usage_budget_service as ubs
+    limits = []
+
+    class _Db:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def commit(self):
+            pass
+
+    async def reserve(_db, bucket, _ptype, _month, _units, _cost, limit, _cost_limit):
+        limits.append((bucket, limit))
+        return True
+    monkeypatch.setattr(database, "AsyncSessionLocal", _Db)
+    monkeypatch.setattr(ubs, "reserve_bucket", reserve)
+    monkeypatch.setattr(ubs, "_period_keys", lambda: ("2026-10-26", "2026-10"))
+    await gft._take("text_search_pro", "pro", 1)
+    await gft._take("geocoding", "essentials", 1)
+    assert limits == [("google_free:text_search_pro", 4750 - 3000), ("google_free:geocoding", 9500)]
+    monkeypatch.setattr(ubs, "_period_keys", lambda: ("2026-11-01", "2026-11"))
+    await gft._take("text_search_pro", "pro", 1)
+    assert limits[-1] == ("google_free:text_search_pro", 4750)  # a new month starts clean

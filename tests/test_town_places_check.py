@@ -231,3 +231,33 @@ async def test_unresearched_town_is_left_alone(monkeypatch):
     monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "k")
     area = SimpleNamespace(centroid_lat=40.0, centroid_lng=-75.4, facts={"amenities": {"items": []}, "parks": {"items": []}})
     assert await tpc.check_town_places(None, area) == {"checked": 0}
+
+
+@pytest.mark.asyncio
+async def test_free_calls_running_out_leaves_the_town_waiting_to_finish(monkeypatch):
+    import httpx
+    from app.services.google_free_tier import GoogleFreeTierPaused
+
+    async def paused(*_a, **_k):
+        raise GoogleFreeTierPaused("free calls used up", request=httpx.Request("POST", "https://places.googleapis.com/v1/places:searchText"))
+
+    async def no_hospitals(*_a, **_k):
+        raise GoogleFreeTierPaused("free calls used up", request=httpx.Request("POST", "https://places.googleapis.com/v1/places:searchText"))
+
+    class Db:
+        def add(self, _o):
+            pass
+
+        async def commit(self):
+            pass
+
+    monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "k")
+    monkeypatch.setattr(nas, "_search_text", paused)
+    monkeypatch.setattr(nas, "_fetch_hospital_from_google", no_hospitals)
+    monkeypatch.setattr(tpc, "flag_modified", lambda *_a: None)
+    area = SimpleNamespace(slug="malvern-pa", name="Malvern", state="PA", centroid_lat=40.04, centroid_lng=-75.51,
+                           facts={"restaurants": {"entities": [{"name": "Brick & Brew", "city": "Malvern", "distance_miles": 0.2}]}})
+    await tpc.check_town_places(Db(), area)
+    kept = area.facts["restaurants"]["entities"]
+    assert area.facts["_places_check_waiting"] is True
+    assert [e["name"] for e in kept] == ["Brick & Brew"] and "distance_miles" not in kept[0]  # kept, no guessed miles
