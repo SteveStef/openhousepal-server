@@ -32,6 +32,7 @@ from .admin_activity_routes import router as admin_activity_router
 from .admin_insights_routes import router as admin_insights_router
 from .admin_groups_routes import router as admin_groups_router
 from .admin_promo_routes import router as admin_promo_router
+from .admin_area_routes import router as admin_area_router
 from .site_routes import router as site_router
 from .public_site_routes import router as public_site_router
 from .property_website_routes import router as property_website_router
@@ -86,6 +87,7 @@ router.include_router(admin_activity_router)
 router.include_router(admin_insights_router)
 router.include_router(admin_groups_router)
 router.include_router(admin_promo_router)
+router.include_router(admin_area_router)
 router.include_router(site_router)
 router.include_router(public_site_router)
 router.include_router(property_website_router)

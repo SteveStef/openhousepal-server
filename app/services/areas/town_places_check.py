@@ -447,9 +447,24 @@ async def check_town_places(db: AsyncSession, area: MarketArea) -> dict:
         _paused.reset(token)
 
 
+def _admin_clash(e: dict, held: list[dict], gone: list[dict]) -> bool:
+    """The same place as one the admin added/edited (held) or took off the list (gone) - by name or spot."""
+    return any(_tokens(_research_name(e.get("name", ""))) == _tokens(_research_name(h.get("name", ""))) or _near(e, h.get("lat"), h.get("lng"), 0.05)
+               for h in (*held, *gone))
+
+
 async def _check(db, area, key, facts, now, lists, removed, paused) -> dict:
     checked = removed_count = 0
+    # Admin changes (Neighborhoods tab, admin_area_routes) are never re-checked: an added or edited
+    # place keeps its spot and every field, and a place the admin took off is never added back.
+    held: dict[str, list[tuple[int, dict]]] = {}
+    admin_gone = {c: [r for r in ((facts.get(c) or {}).get("_removed") or []) if isinstance(r, dict) and r.get("admin_removed")]
+                  for c in (*CHECK_CATEGORIES, "private_schools")}
     async with httpx.AsyncClient() as client:
+        for cat in (*CHECK_CATEGORIES, "private_schools"):
+            for i, e in enumerate((facts.get(cat) or {}).get("entities") or []):
+                if isinstance(e, dict) and e.get("admin_edited"):
+                    held.setdefault(cat, []).append((i, e))
         for cat in CHECK_CATEGORIES:
             block = facts.get(cat) or {}
             ents = block.get("entities")
@@ -457,7 +472,7 @@ async def _check(db, area, key, facts, now, lists, removed, paused) -> dict:
                 continue
             keep, gone = [], removed.setdefault(cat, [])
             for e in ents:
-                if not isinstance(e, dict) or not e.get("name"):
+                if not isinstance(e, dict) or not e.get("name") or e.get("admin_edited"):
                     continue
                 if cat == "downtown_centers":
                     # What the research itself says it is: an office park isn't a downtown ("Radnor Corporate
@@ -498,11 +513,15 @@ async def _check(db, area, key, facts, now, lists, removed, paused) -> dict:
         # The nearest general hospitals are always there, whatever the research found.
         med = lists.setdefault("medical", [])
         for h in await _hospitals(client, key, area):
-            if not any(_near(m, h["lat"], h["lng"]) or _tokens(m.get("name", "")) == _tokens(h["name"]) for m in med):
+            if not any(_near(m, h["lat"], h["lng"]) or _tokens(m.get("name", "")) == _tokens(h["name"]) for m in med) \
+                    and not _admin_clash(h, [e for _, e in held.get("medical", [])], admin_gone["medical"]):
                 med.append(h)
 
         # Always: even when the research found none, the federal survey knows the real schools nearby.
-        lists["private_schools"] = await _check_private_schools(client, key, area, facts.get("private_schools") or {}, removed.setdefault("private_schools", []), now)
+        ps_block = dict(facts.get("private_schools") or {})
+        ps_block["entities"] = [e for e in ps_block.get("entities") or [] if not (isinstance(e, dict) and e.get("admin_edited"))]
+        lists["private_schools"] = [e for e in await _check_private_schools(client, key, area, ps_block, removed.setdefault("private_schools", []), now)
+                                    if not _admin_clash(e, [h for _, h in held.get("private_schools", [])], admin_gone["private_schools"])]
 
         everything = [e for items in lists.values() for e in items]
         await _drive_miles(client, key, area, everything)
@@ -529,6 +548,15 @@ async def _check(db, area, key, facts, now, lists, removed, paused) -> dict:
             for h in hospitals[TOWN_HOSPITALS:]:
                 removed.setdefault(cat, []).append({**h, "removed_reason": f"{TOWN_HOSPITALS} closer hospitals already listed", "removed_at": now})
             seen = hospitals[:TOWN_HOSPITALS] + others
+        mine = held.get(cat, [])
+        if mine:  # the admin's places back in their own spots, untouched; a checked copy of one drops out
+            seen = [e for e in seen if not _admin_clash(e, [h for _, h in mine], [])]
+            for i, e in mine:
+                seen.insert(min(i, len(seen)), e)
+        order = (facts.get(cat) or {}).get("_admin_order")
+        if isinstance(order, list) and order:  # the admin's own order of the list
+            pos = {n: i for i, n in enumerate(order)}
+            seen = sorted(seen, key=lambda e: pos.get(e.get("name"), len(order)))
         block = dict(facts.get(cat) or {})
         block["entities"] = seen
         gone = removed.get(cat) or []
