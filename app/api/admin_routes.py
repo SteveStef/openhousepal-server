@@ -157,6 +157,46 @@ async def update_user_plan(
         )
 
 
+@router.patch("/users/{user_id}/test-copy")
+async def set_test_copy(
+    user_id: str,
+    source_user_id: str = "",
+    db: AsyncSession = Depends(get_db),
+    admin: UserModel = Depends(require_admin_user),
+):
+    """Make an account a test copy of a real agent (owner, 10/26): it takes that agent's MLS ID, so it
+    sees their listings, sales and open houses, and is approved. Only an admin can do this - sign-up
+    still refuses an MLS ID that's taken. An empty source_user_id stops it: the MLS ID comes off.
+    Notices about the agent's listings (host requests, sync news) keep going to the real agent."""
+    user = await db.get(UserModel, user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+    if user.is_admin:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="The admin account can't be a test copy")
+    if not source_user_id:
+        if user.test_copy_of_user_id:
+            user.test_copy_of_user_id = None
+            user.mls_id = None
+            await db.commit()
+        return {"success": True, "user_id": user_id, "test_copy_of_user_id": None, "mls_id": user.mls_id}
+    source = await db.get(UserModel, source_user_id)
+    if not source or source.id == user.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick a different agent to copy")
+    if source.test_copy_of_user_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That account is itself a test copy - pick the real agent")
+    if not source.mls_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That agent has no MLS ID to share")
+    if user.mls_id and not user.test_copy_of_user_id and user.mls_id != source.mls_id:
+        # A real agent's own MLS ID is never overwritten by a misclick.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This agent has their own MLS ID - only an account without one can be a test copy")
+    user.test_copy_of_user_id = source.id
+    user.mls_id = source.mls_id
+    user.broker_authorized = True
+    await db.commit()
+    logger.info("Admin made a test copy", extra={"admin": admin.id, "copy": user.id, "of": source.id})
+    return {"success": True, "user_id": user_id, "test_copy_of_user_id": source.id, "mls_id": user.mls_id}
+
+
 async def _re_enrich_area_background(area_id: str, admin_user_id: str):
     """Same standalone-session background pattern as site_routes._enrich_area_background - runs
     after the response is already sent."""
@@ -166,7 +206,9 @@ async def _re_enrich_area_background(area_id: str, admin_user_id: str):
         if not area or not admin:
             return
         try:
-            await area_enrichment_service.enrich_area(db, area, admin)
+            from app.services.usage_owner import bill_to
+            with bill_to(None):  # platform cost, like every town research
+                await area_enrichment_service.enrich_area(db, area, admin)
         except Exception:
             logger.exception("Admin-triggered area re-enrichment failed", extra={"area_id": area_id})
 

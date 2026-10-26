@@ -263,67 +263,10 @@ async def refresh_flood(db: AsyncSession, area: MarketArea) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------- keep researched places current
-_BUSINESS_CATEGORIES = ("restaurants", "shopping", "grocery", "medical")
 _PLACES_SEARCH = "https://places.googleapis.com/v1/places:searchText"
 
 
-def _tokens(s: str) -> set[str]:
-    return {w for w in re.sub(r"[^a-z0-9 ]", " ", (s or "").lower()).split() if w not in {"the", "and", "of", "at", "inc", "llc", "co"}}
-
-
 async def verify_places(db: AsyncSession, area: MarketArea) -> dict:
-    """Each researched business is looked up on Google. Permanently closed -> removed. Found but
-    more than 25 miles from the town -> removed (the research named the wrong place). Not found at
-    all -> kept (plenty of real places, like a trail, aren't Google businesses). Removed entries
-    are kept under the category's '_removed' list with the reason, for admin review."""
-    key = os.getenv("GOOGLE_PLACES_API_KEY")
-    if not key or area.centroid_lat is None:
-        return {"checked": 0}
-    facts = dict(area.facts or {})
-    checked = removed = 0
-    now = datetime.now(timezone.utc).isoformat()
-    async with httpx.AsyncClient() as client:
-        for cat in _BUSINESS_CATEGORIES:
-            block = dict(facts.get(cat) or {})
-            ents = block.get("entities")
-            if not isinstance(ents, list) or not ents:
-                continue
-            keep, gone = [], list(block.get("_removed") or [])
-            for e in ents:
-                if not isinstance(e, dict) or not e.get("name"):
-                    keep.append(e)
-                    continue
-                try:
-                    r = await client.post(_PLACES_SEARCH, timeout=15, headers={
-                        "X-Goog-Api-Key": key, "X-Goog-FieldMask": "places.displayName,places.businessStatus,places.location"},
-                        json={"textQuery": f"{e['name']}, {e.get('city') or area.name}, {area.state}",
-                              "locationBias": {"circle": {"center": {"latitude": area.centroid_lat, "longitude": area.centroid_lng}, "radius": 30000}},
-                              "maxResultCount": 1})
-                    r.raise_for_status()
-                    places = r.json().get("places") or []
-                    await charge_google("places_text")
-                except httpx.HTTPError:
-                    keep.append(e)
-                    continue
-                checked += 1
-                p = places[0] if places else None
-                same = p and len(_tokens(e["name"]) & _tokens((p.get("displayName") or {}).get("text", ""))) >= max(1, len(_tokens(e["name"])) // 2)
-                if same and p.get("businessStatus") == "CLOSED_PERMANENTLY":
-                    gone.append({**e, "removed_reason": "permanently closed (Google)", "removed_at": now})
-                    removed += 1
-                    continue
-                if same and p.get("location") and _miles(area.centroid_lat, area.centroid_lng, p["location"]["latitude"], p["location"]["longitude"]) > 25:
-                    gone.append({**e, "removed_reason": "not near this town (Google)", "removed_at": now})
-                    removed += 1
-                    continue
-                keep.append({**e, "verified_at": now} if same else e)
-            block["entities"] = keep
-            if gone:
-                block["_removed"] = gone[-50:]
-            facts[cat] = block
-    facts["_places_verified_at"] = now
-    area.facts = facts
-    flag_modified(area, "facts")
-    db.add(area)
-    await db.commit()
-    return {"checked": checked, "removed": removed}
+    """Every researched place held to the Cheat Sheet's rules - see town_places_check."""
+    from app.services.areas.town_places_check import check_town_places
+    return await check_town_places(db, area)

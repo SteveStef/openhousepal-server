@@ -1,0 +1,61 @@
+"""Google Maps calls stop at the free monthly allowance (owner, 10/26) - app/services/google_free_tier.py."""
+import json
+
+import httpx
+import pytest
+
+from app.services import google_free_tier as gft
+
+
+def req(url, mask=None, body=None):
+    headers = {"X-Goog-FieldMask": mask} if mask else {}
+    return httpx.Request("POST", url, headers=headers, content=json.dumps(body).encode() if body is not None else None)
+
+
+def test_each_call_is_counted_under_the_sku_google_bills():
+    base = "places.googleapis.com/v1/places"
+    assert gft.classify(req(f"https://{base}:searchText", "places.id,places.displayName,places.location,places.types,places.businessStatus")) == ("text_search_pro", "pro", 1)
+    assert gft.classify(req(f"https://{base}:searchText", "places.id,places.displayName,places.userRatingCount")) == ("text_search_enterprise", "enterprise", 1)
+    assert gft.classify(req(f"https://{base}:searchText", "places.id")) is None  # IDs only: free, no cap
+    assert gft.classify(req(f"https://{base}:searchNearby", "places.displayName,places.location")) == ("nearby_search_pro", "pro", 1)
+    route = req("https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix", body={"origins": [1], "destinations": [1, 2, 3], "travelMode": "DRIVE"})
+    assert gft.classify(route) == ("route_matrix_essentials", "essentials", 3)
+    traffic = req("https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix", body={"origins": [1], "destinations": [1, 2], "routingPreference": "TRAFFIC_AWARE"})
+    assert gft.classify(traffic) == ("route_matrix_pro", "pro", 2)
+    assert gft.classify(httpx.Request("GET", "https://maps.googleapis.com/maps/api/geocode/json?address=x")) == ("geocoding", "essentials", 1)
+    assert gft.classify(httpx.Request("GET", "https://maps.googleapis.com/maps/api/streetview/metadata?location=x")) is None
+    # Gmail, Calendar, Search Console are free - never counted
+    assert gft.classify(httpx.Request("GET", "https://gmail.googleapis.com/gmail/v1/users/me/messages")) is None
+    assert gft.classify(httpx.Request("GET", "https://www.googleapis.com/calendar/v3/calendars")) is None
+
+
+def test_stops_just_under_the_free_allowance():
+    assert gft.monthly_limit("pro") == 4750
+    assert gft.monthly_limit("enterprise") == 950
+    assert gft.monthly_limit("essentials") == 9500
+
+
+@pytest.mark.asyncio
+async def test_a_used_up_call_is_stopped_before_it_goes_out(monkeypatch):
+    sent = []
+
+    async def fake_original(self, request, *a, **k):
+        sent.append(str(request.url))
+        return httpx.Response(200, json={"places": []}, request=request)
+
+    budget = {"left": 1}
+
+    async def take(sku, tier, units):
+        budget["left"] -= units
+        return budget["left"] >= 0
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", fake_original)
+    monkeypatch.setattr(gft, "_installed", False)
+    monkeypatch.setattr(gft, "_take", take)
+    gft.install()
+    async with httpx.AsyncClient() as c:
+        await c.post("https://places.googleapis.com/v1/places:searchText", headers={"X-Goog-FieldMask": "places.displayName,places.location"}, json={})
+        with pytest.raises(httpx.HTTPError):  # every caller's "Google failed" path catches this
+            await c.post("https://places.googleapis.com/v1/places:searchText", headers={"X-Goog-FieldMask": "places.displayName,places.location"}, json={})
+        await c.get("https://www.googleapis.com/calendar/v3/x")  # not Maps - never blocked
+    assert len(sent) == 2

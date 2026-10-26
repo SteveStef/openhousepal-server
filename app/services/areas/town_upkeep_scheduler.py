@@ -4,13 +4,12 @@ and accurate without anyone doing anything. Runs once a day (app/main.py, 4:15 A
   every day, every town (free):
     - school districts re-checked against Bright listings (content_adapters.check_and_store_public_schools)
     - Fair Housing wording pass with the fixed rules (fair_housing_service, no AI)
-  when due, a few towns per day (small paid lookups, spread out):
-    - places re-verified against Google every 120 days (closed / wrong-town places come off)
-    - commute times and FEMA flood share every 365 days (or when missing)
+  a few towns per day, only to fill in what a town never got (no paid re-checks on a timer -
+  owner, 10/26; the live Explore Nearby covers places that change):
+    - a town whose research never came back is researched again after 3 days
+    - commute times and FEMA flood share, when missing
     - town map borders (Census) and what's within a walk (OpenStreetMap) every 365 days - free
-    - full re-research every 365 days (new restaurants, shops, parks...), then the AI Fair Housing
-      pass over the new text - same budgets/ceilings as first-time research
-The daily caps keep spend smooth; a town added by an agent is researched right away by the normal
+A town added by an agent is researched (and its places checked once) right away by the normal
 add-area path (site_routes), not here.
 """
 import logging
@@ -20,15 +19,20 @@ from sqlalchemy import select
 
 from app.database import AsyncSessionLocal
 from app.models.database import AgentMarketArea, MarketArea, User
+from app.services.areas.town_places_check import CHECK_CATEGORIES
 
 logger = logging.getLogger(__name__)
 
-PLACES_EVERY_DAYS = 120
 EXTRAS_EVERY_DAYS = 365
-RESEARCH_EVERY_DAYS = 365
 MAX_PAID_TOWNS_PER_DAY = 5
 MAX_RESEARCH_PER_DAY = 2
 MAX_FREE_MAP_TOWNS_PER_DAY = 3
+RESEARCH_RETRY_DAYS = 3  # a town whose research never came back is tried again this soon, not in a year
+
+
+def _has_research(area: MarketArea) -> bool:
+    facts = area.facts or {}
+    return any((facts.get(k) or {}).get("entities") for k in (*CHECK_CATEGORIES, "private_schools"))
 
 
 def _age_days(iso) -> float:
@@ -66,7 +70,9 @@ async def run_town_upkeep() -> dict:
                     summary["schools_fixed"] += 1
                 summary["wording_fixed"] += await fair_housing_service.fix_area_text(db, area, owner_id, use_ai=False)
 
-                if researched < MAX_RESEARCH_PER_DAY and _age_days(area.last_enriched_at) > RESEARCH_EVERY_DAYS:
+                # Only a town whose research never came back is researched again - no yearly redo.
+                due = not _has_research(area) and _age_days(area.last_enriched_at) > RESEARCH_RETRY_DAYS
+                if researched < MAX_RESEARCH_PER_DAY and due:
                     user = await db.get(User, owner_id)
                     if user:
                         area = await area_enrichment_service.enrich_area(db, area, user)
@@ -87,16 +93,14 @@ async def run_town_upkeep() -> dict:
 
                 if paid >= MAX_PAID_TOWNS_PER_DAY:
                     continue
+                # No paid re-checks on a timer (owner, 10/26: "forget the checkup") - a town's places
+                # are checked once when it's researched; the live Explore Nearby covers what changes.
+                # Paid steps here only fill in something the town never got.
                 did_paid = False
-                if _age_days(facts.get("_places_verified_at")) > PLACES_EVERY_DAYS:
-                    r = await town_extras_service.verify_places(db, area)
-                    summary["places_checked"] += r.get("checked", 0)
-                    summary["places_removed"] += r.get("removed", 0)
-                    did_paid = True
-                if _age_days((facts.get("commute") or {}).get("computed_at")) > EXTRAS_EVERY_DAYS:
+                if not (facts.get("commute") or {}).get("computed_at"):
                     await town_extras_service.refresh_commute(db, area)
                     did_paid = True
-                if _age_days((facts.get("flood") or {}).get("computed_at")) > EXTRAS_EVERY_DAYS:
+                if not (facts.get("flood") or {}).get("computed_at"):
                     await town_extras_service.refresh_flood(db, area)
                     did_paid = True
                 if did_paid:

@@ -975,8 +975,8 @@ class PropertySyncService:
         owner_mls_id = mapped.get("list_agent_mls_id") or mapped.get("co_list_agent_mls_id")
         if not owner_mls_id:
             return
-        owner_result = await db.execute(select(User).where(User.mls_id == owner_mls_id))
-        owner = owner_result.scalar_one_or_none()
+        owner_result = await db.execute(select(User).where(User.mls_id == owner_mls_id).order_by(User.test_copy_of_user_id.isnot(None), User.created_at))
+        owner = owner_result.scalars().first()  # the real agent, not a test copy sharing the ID
         if not owner:
             return
 

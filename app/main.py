@@ -48,6 +48,10 @@ async def lifespan(app: FastAPI):
     await init_db()
     await create_admin_user()
 
+    # Google Maps calls stop at the free monthly allowance and wait for the 1st (owner, 10/26).
+    from app.services import google_free_tier
+    google_free_tier.install()
+
     # Emails sent on worker threads hand their Insights rows back to this loop (email_log_service).
     from app.services import email_log_service
     email_log_service.attach_loop()

@@ -75,6 +75,7 @@ class User(UserBase):
     restrict_host_requests_to_team: bool = False
     idx_domain_migration_agreed_at: Optional[datetime] = None  # null = IDX agent hasn't seen/agreed to the domain-migration prompt yet
     billing_group_id: Optional[str] = None  # paid for by a brokerage group (admin)
+    test_copy_of_user_id: Optional[str] = None  # an admin-made test copy of this agent (shares their MLS ID)
     last_seen_at: Optional[datetime] = None
 
     class Config:

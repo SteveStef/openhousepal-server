@@ -266,7 +266,8 @@ async def get_discovery(
         owner_by_mls_id: dict = {}
         if mls_ids:
             known_result = await db.execute(select(User).where(User.mls_id.in_(mls_ids)))
-            owner_by_mls_id = {u.mls_id: u for u in known_result.scalars().all()}
+            # The real agent wins over an admin-made test copy that shares the ID (sorted last = kept).
+            owner_by_mls_id = {u.mls_id: u for u in sorted(known_result.scalars().all(), key=lambda u: u.test_copy_of_user_id is None)}
             known_mls_ids = set(owner_by_mls_id.keys())
 
         # Batch-resolve which of those on-platform owners the current agent is an accepted My

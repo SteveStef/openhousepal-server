@@ -68,19 +68,61 @@ def _squash(name: str) -> str:
     return re.sub(r"[^a-z]", "", (name or "").lower().replace("the ", ""))
 
 
+def _survey_private_in(x0: float, y0: float, x1: float, y1: float) -> list[dict]:
+    """Private schools inside the box from the federal private school survey - the same file the
+    Cheat Sheet uses, with each school's real grades. Preschools and early-childhood centers (top
+    grade below 3rd, or one grade only) are left off, like on the Cheat Sheet (10/26: Malvern's map
+    showed "Charlestown Playhouse" and a kindergarten)."""
+    from app.services import nearby_amenities_service as nas
+    out = []
+    for name, city, state, lat, lng, lowest, highest, typology, students in nas._load_private_schools():
+        if not (x0 <= lng <= x1 and y0 <= lat <= y1):
+            continue
+        if highest < nas.PRIVATE_SCHOOL_MIN_HIGHEST_GRADE or lowest == highest or bs._NOT_A_SCHOOL.search(name):
+            continue
+        grades = f"{nas._pss_grade_name(lowest)}-{nas._pss_grade_name(highest)}"
+        # "BISHOP WALSH SCHOOL,K-12/DIOCESE" - the survey's own note after the comma isn't the name
+        out.append({"id": f"pss:{_squash(name)}:{round(lat, 4)}", "name": nas._private_school_display_name(name.split(",")[0]),
+                    "lat": round(lat, 6), "lng": round(lng, 6), "grades": grades,
+                    **({"special_education": True} if typology == nas.PRIVATE_SCHOOL_SPECIAL_EDUCATION_TYPOLOGY else {})})
+    return bs.dedupe_schools(out)
+
+
+def _same_school(name: str, lat: float, lng: float, have: list[dict]) -> bool:
+    """"Fusion Academy Malvern" = "Fusion Malvern"; "Villa Maria Academy" = its Lower/High School campus."""
+    from app.services import nearby_amenities_service as nas
+    ours = nas._school_name_tokens(name)
+    for s in have:
+        theirs = nas._school_name_tokens(s["name"])
+        if not ours or not theirs or _miles(lat, lng, s["lat"], s["lng"]) > 1.5:
+            continue
+        shared = len(ours & theirs)
+        if shared / len(ours) >= 0.6 or shared / len(theirs) >= 0.6:
+            return True
+    return False
+
+
 async def _researched_private(client: httpx.AsyncClient, area: MarketArea, have: list[dict]) -> list[dict]:
     """Private schools the town research named that the federal list doesn't have (it's a voluntary
-    survey - The Haverford School isn't in it) - placed with one Google lookup each, kept only when
-    Google finds a school within 3 miles."""
+    survey - The Haverford School isn't in it). The place check (town_places_check) already put each
+    one on the map; an older record gets one Google lookup each, kept only when Google finds a school
+    within 3 miles."""
     key = os.getenv("GOOGLE_PLACES_API_KEY")
     entities = (((area.facts or {}).get("private_schools") or {}).get("entities") or [])[:10]
-    if not key or not entities or area.centroid_lat is None:
+    if not entities or area.centroid_lat is None:
         return []
     known = {_squash(s["name"]) for s in have}
     out = []
     for e in entities:
         n = e.get("name") or ""
-        if not n or _squash(n) in known:
+        if not n or _squash(n) in known or bs._NOT_A_SCHOOL.search(n):
+            continue
+        if e.get("lat") is not None and e.get("lng") is not None:
+            if _miles(area.centroid_lat, area.centroid_lng, e["lat"], e["lng"]) <= 3 and not _same_school(n, e["lat"], e["lng"], have + out):
+                out.append({"id": f"g:{_squash(n)}", "name": n, "lat": round(e["lat"], 6), "lng": round(e["lng"], 6),
+                            "grades": (e.get("category") or "").replace("Grades ", "").replace("Grade ", "") or None})
+            continue
+        if not key:
             continue
         try:
             r = await client.post(_PLACES_SEARCH, timeout=20,
@@ -95,7 +137,7 @@ async def _researched_private(client: httpx.AsyncClient, area: MarketArea, have:
         if not p or not p.get("location") or "school" not in " ".join(p.get("types") or []):
             continue
         lat, lng = p["location"]["latitude"], p["location"]["longitude"]
-        if _miles(area.centroid_lat, area.centroid_lng, lat, lng) > 3:
+        if _miles(area.centroid_lat, area.centroid_lng, lat, lng) > 3 or _same_school(n, lat, lng, have + out):
             continue
         out.append({"id": f"g:{_squash(n)}", "name": n, "lat": round(lat, 6), "lng": round(lng, 6), "grades": e.get("grades_served")})
     return out
@@ -125,6 +167,16 @@ async def refresh_boundaries(db: AsyncSession, area: MarketArea) -> Optional[dic
             # sits in one of each, so both kinds are kept and labelled.
             split = [(f, "elementary") for f in await bs.tiger(client, bs.ELSD, **env)] + \
                     [(f, "secondary") for f in await bs.tiger(client, bs.SCSD, **env)]
+            # The county most of the town's homes are in - the town record never had one (every live
+            # town's county was blank, 10/26), so the "outside any town" row and the page's County
+            # line never showed (Rehoboth Beach read "Rehoboth Beach City 14%", nothing else).
+            if not area.county:
+                counties = await bs.tiger(client, bs.COUNTY, with_geometry=True, **env)
+                if counties:
+                    cshares = _shares(pts, [f["geometry"]["rings"] for f in counties])
+                    top = max(zip(counties, cshares), key=lambda t: t[1])
+                    if top[1] >= 50 and top[0]["attributes"].get("NAME"):
+                        area.county = top[0]["attributes"]["NAME"]
             zips = [str(z) for z in (area.zip_codes or []) if str(z).isdigit()][:12]
             zcta = await bs.tiger(client, bs.ZCTA, where="ZCTA5 IN (" + ",".join(f"'{z}'" for z in zips) + ")") if zips and not is_township else []
     except (httpx.HTTPError, ValueError, KeyError) as exc:
@@ -197,7 +249,7 @@ async def refresh_boundaries(db: AsyncSession, area: MarketArea) -> Optional[dic
                 # town-sized one; a big county/city system or a sliver neighbor shows only the ones nearby.
                 whole = share_of.get(leaid, 0) >= 25 and len(lst) <= 16
                 schools["public"] += lst if whole else [s for s in lst if near[0] <= s["lng"] <= near[2] and near[1] <= s["lat"] <= near[3]]
-            priv = await bs.private_schools_in(client, frame[0] - 0.004, frame[1] - 0.004, frame[2] + 0.004, frame[3] + 0.004)
+            priv = _survey_private_in(frame[0] - 0.004, frame[1] - 0.004, frame[2] + 0.004, frame[3] + 0.004)
             if outline:
                 ob = bs.bbox(outline["rings"])
                 priv = [s for s in priv if bs.contains(outline["rings"], s["lng"], s["lat"], ob)] or priv

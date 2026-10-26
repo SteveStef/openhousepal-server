@@ -108,7 +108,7 @@ PARK_FIELD_MASK = CHEAT_FIELD_MASK + ",places.userRatingCount"
 PLACES_ENTERPRISE_SEARCH_COST_USD = 0.035
 EXPLORE_NEARBY_FIELD_MASK = (
     "places.id,places.displayName,places.primaryType,places.primaryTypeDisplayName,places.types,"
-    "places.shortFormattedAddress,places.location"
+    "places.shortFormattedAddress,places.location,places.businessStatus"  # Pro field like the rest - same price
 )
 EXPLORE_NEARBY_DETAILS_FIELD_MASK = "id,rating,userRatingCount"
 ROUTES_FIELD_MASK = "originIndex,destinationIndex,duration,distanceMeters,condition"
@@ -498,9 +498,11 @@ HOSPITAL_NOT_GENERAL_NAME_KEYWORDS = [
     "children's", "childrens", "shriners", "psychiatric", "state hospital", "behavioral", "hospice",
     "eye hospital", "wills eye", "orthopaedic hospital", "orthopedic hospital", "surgical hospital",
     "heart hospital", "cancer", "skilled nursing", "nursing home", "animal", "pet hospital", "veterinary",
-    "vet hospital", "equine",
+    "vet hospital", "equine", "nemours", "pediatric",
 ]
-_VA_NAME_RE = re.compile(r"\bva\b|\bv\.a\.|\bvamc\b")
+# "\bchop\b": the Children's Hospital of Philadelphia's own name for its campuses ("CHOP King of
+# Prussia Hospital, Middleman Family Pavilion" - town page check 10/26, no "children's" in it).
+_VA_NAME_RE = re.compile(r"\bva\b|\bv\.a\.|\bvamc\b|\bchop\b")
 # Medicare's own lists of hospitals that aren't a general hospital - long-term care, inpatient rehab,
 # psychiatric, children's, VA and military - keyed by street number|ZIP, minus any address that is also
 # a general hospital (rehab and long-term-care units often sit inside one). Catches the ones no name
@@ -532,7 +534,9 @@ def _looks_hand_entered(name: str) -> bool:
     Regional Medical Center"; "Red mill pond", "ccea" among parks)."""
     if "?" in name:
         return True
-    words = [w for w in re.findall(r"[A-Za-z][A-Za-z']*", name) if w.lower() not in _NAME_SMALL_WORDS]
+    # The name itself, not a tagline after a comma or colon ("Chanticleer, a pleasure garden" - 1,491
+    # reviews; "Stoneleigh: a natural garden").
+    words = [w for w in re.findall(r"[A-Za-z][A-Za-z']*", re.split(r"[,:]", name)[0]) if w.lower() not in _NAME_SMALL_WORDS]
     if not words:
         return False
     lower = sum(1 for w in words if w[0].islower())
@@ -576,6 +580,9 @@ def _er_hospital_keys() -> frozenset:
 
 # "VA HOSPITAL 25" / "Building 3" - a numbered building of a campus that's already on the list by name.
 _NUMBERED_BUILDING_NAME_RE = re.compile(r"\s\d+$")
+_HAS_STREET_NUMBER_RE = re.compile(r"^\s*(?:\d|one\b|two\b|three\b)", re.IGNORECASE)  # "1 Plainsboro Rd", "One Hospital Dr"
+# A suite or unit number in the street address: an office in a building, not a hospital (town page check 10/26).
+_SUITE_ADDRESS_RE = re.compile(r"^[^,]*(?:#\s*\w+|\b(?:ste|suite|unit|fl|floor)\.?\s+\w+)", re.IGNORECASE)
 
 
 def _is_individual_provider_name(name: str) -> bool:
@@ -968,6 +975,12 @@ def _is_legitimate_full_service_hospital(place: dict, medicare_confirmed: bool =
         return False
     if _NUMBERED_BUILDING_NAME_RE.search(name_raw) or not _is_open(place):
         return False
+    if not medicare and _SUITE_ADDRESS_RE.search(place.get("formattedAddress") or ""):
+        return False  # "Medical Center of Princeton, 88 Princeton Hightstown Rd #202" - an office suite, typed general_hospital
+    if not medicare and not _HAS_STREET_NUMBER_RE.match(place.get("formattedAddress") or "") and not _near_medicare_hospital(place):
+        # "University of Maryland Shore Regional Medical Center, Easton, MD 21601" - a hospital still being
+        # built (opens 2028) that Google already lists as open: no street address yet (town page check 10/26).
+        return False
     if _looks_hand_entered(name_raw) or _address_key(place) in _load_non_general_hospitals():
         return False
     # "MOB" (Medical Office Building) is a standard healthcare real-estate abbreviation for an
@@ -1337,6 +1350,8 @@ def _explore_place_is_relevant(place: dict, category_key: str) -> bool:
     denylist, since that finer-grained "real grocery store vs. mini-mart vs. specialty market" logic
     already existed elsewhere in this file. Quality over count throughout: this only ever removes
     candidates, never backfills to hit a target count - a category with 4 genuine matches shows 4."""
+    if not _is_open(place):
+        return False  # closed for good or for now (the Cheat Sheet's same rule, 10/26 town page check)
     if category_key == "grocery":
         return _explore_grocery_ok(place)
     if category_key == "medical":
@@ -1348,6 +1363,8 @@ def _explore_place_is_relevant(place: dict, category_key: str) -> bool:
             return False
     if category_key == "parks" and re.match(r"^(playground|sports fields?|ball ?fields?|tennis courts?|basketball courts?|dog park)\b", _place_name(place).lower()):
         return False   # a nameless feature, not a park someone would look up
+    if category_key == "parks" and (_looks_hand_entered(_place_name(place)) or _is_likely_subdivision_named_park(place)):
+        return False   # "Red mill pond", "Academy Hill" - the Cheat Sheet's park rules
     if category_key == "schools":
         return _explore_school_label(place) is not None
 

@@ -83,26 +83,95 @@ def clean_text(text: Optional[str]) -> str:
     return out.strip()
 
 
+def population_area_label(geography: str) -> Optional[str]:
+    """What the Census population number actually covers, in words: "Malvern borough", "Wayne
+    (Census area)", "ZIP 19035". The town page covers the whole mailing-address area, which can be far
+    bigger than the borough or Census area of the same name - the label says which. None for an old
+    record that averaged several ZIPs' head counts (wrong - fixed in census_service)."""
+    if geography.startswith("ZCTA average") and "," in geography:
+        return None
+    m = re.search(r" - (.+?), [A-Za-z ]+$", geography)
+    if m:
+        name = m.group(1)
+        return re.sub(r"\s+CDP$", " census area", name)
+    m = re.search(r"\((\d{5})\)", geography)
+    if m:
+        return f"ZIP {m.group(1)}"
+    return geography or None  # "ZIP 19035" / "ZIPs 19341, 19355" (census_service)
+
+
 def clean_area_payload(facts: dict, narrative: Optional[dict]) -> tuple[dict, Optional[dict]]:
     """Render-time pass over everything a town page prints (see public_site_routes)."""
+    from app.services.areas.town_places_check import medical_label, tidy_research_text
     facts = dict(facts or {})
+    checked = bool(facts.get("_places_check_version"))
+    # Outside sites' price figures (Movoto, Redfin, blogs) disagreed with each other and with the live
+    # MLS numbers on the same page (Malvern: "up 2.5%" and "down 2%") - the page shows the MLS only.
+    facts.pop("market_context", None)
     for key, block in list(facts.items()):
         if not isinstance(block, dict):
             continue
         block = dict(block)
+        block.pop("_removed", None)
         if isinstance(block.get("notes"), str):
-            block["notes"] = clean_text(block["notes"])
+            block["notes"] = tidy_research_text(clean_text(block["notes"]))
         if isinstance(block.get("entities"), list):
-            block["entities"] = [({**e, "description": clean_text(e.get("description"))} if isinstance(e, dict) and e.get("description") else e) for e in block["entities"]]
+            ents = []
+            for e in block["entities"]:
+                if not isinstance(e, dict):
+                    ents.append(e)
+                    continue
+                e = dict(e)
+                if e.get("description"):
+                    e["description"] = tidy_research_text(clean_text(e["description"]))
+                if key == "medical":
+                    e["category"] = medical_label(e.get("category"))
+                if not checked or not e.get("google_checked") and not e.get("survey_matched"):
+                    e.pop("distance_miles", None)  # the research's own guess ("0 mi") - never shown
+                ents.append(e)
+            block["entities"] = ents
         facts[key] = block
     # Only the town's population leaves the server - age, income, household make-up and similar
     # resident descriptions are never shown on a home-sale site (Fair Housing).
     demo = facts.get("demographics")
     if isinstance(demo, dict):
-        facts["demographics"] = {k: v for k, v in demo.items() if k in ("population", "source", "fetched_at", "geography", "year", "vintage")}
+        demo = {k: v for k, v in demo.items() if k in ("population", "source", "fetched_at", "geography", "year", "vintage")}
+        pop = demo.get("population")
+        if isinstance(pop, dict):
+            label = population_area_label(str(pop.get("geography") or ""))
+            if label is None:
+                demo.pop("population")  # an old multi-ZIP average - a head count can't be averaged
+            else:
+                demo["population"] = {**pop, "label": label}
+        facts["demographics"] = demo
+    _one_school_district_share(facts)
     if narrative and isinstance(narrative.get("summary"), str):
-        narrative = {**narrative, "summary": clean_text(narrative["summary"])}
+        narrative = {**narrative, "summary": tidy_research_text(clean_text(narrative["summary"]))}
     return facts, narrative
+
+
+def _one_school_district_share(facts: dict) -> None:
+    """The Schools list and the town map said different shares for the same district (Wayne: Radnor
+    48% vs 45%) - the list counted MLS school fields, the map Census borders. The page shows one
+    number: the map's (every home's location against the real district border)."""
+    from app.services.areas.boundary_service import district_key
+    mapped = {district_key(d.get("name") or ""): d.get("share") for d in ((facts.get("boundaries") or {}).get("school_districts") or [])
+              if isinstance(d, dict) and d.get("share") is not None}
+    ps = facts.get("public_schools")
+    if not mapped or not isinstance(ps, dict) or not isinstance(ps.get("districts"), list):
+        return
+    districts = []
+    for d in ps["districts"]:
+        share = mapped.get(district_key(d.get("name") or "")) if isinstance(d, dict) else None
+        districts.append({**d, "share": share} if share is not None else d)
+    out = {**ps, "districts": districts}
+    caveat = ps.get("boundary_caveat")
+    if isinstance(caveat, str):  # the sentence under the list quotes the same shares
+        for d in districts:
+            if isinstance(d, dict) and d.get("name") and d.get("share") is not None:
+                caveat = re.sub(rf"({re.escape(d['name'])} \()\d+(% of homes\))", rf"\g<1>{d['share']}\g<2>", caveat)
+        out["boundary_caveat"] = caveat
+    facts["public_schools"] = out
 
 
 # ---------------------------------------------------------------- AI pass (store time only)

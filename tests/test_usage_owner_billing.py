@@ -139,3 +139,42 @@ async def test_downtown_ai_charges_the_agent_whose_cheat_sheet_asked(monkeypatch
     with bill_to(None):  # a re-lookup we caused: platform pays
         await dt._downtown_picks(FakeDb(), "Media", "PA", "19063", [])
     assert events == [("agent-3", "cheat_sheet_downtown", True)]
+
+
+@pytest.mark.asyncio
+async def test_adding_a_town_never_charges_the_agent(recorded, monkeypatch):
+    """User, 10/26: the only thing that never counts on an agent's AI usage is adding a town."""
+    from app.api import site_routes
+
+    async def fake_enrich(area_id, user_id):
+        await charge_google("places_text", 5)
+        await asyncio.gather(charge_google("routes_matrix_element_traffic", 4))
+
+    monkeypatch.setattr(site_routes, "_enrich_area", fake_enrich)
+    with bill_to("agent-1"):  # the agent who added the town is signed in
+        await site_routes._enrich_area_background("area-1", "agent-1")
+        await charge_google("geocoding")  # their next own lookup still charges them
+    assert recorded == [("agent-1", "geocoding", 1)]
+
+
+@pytest.mark.asyncio
+async def test_town_research_ai_stays_off_the_agent_bar():
+    from sqlalchemy.dialects import postgresql
+
+    class CaptureDb:
+        statements = []
+
+        async def execute(self, stmt):
+            self.statements.append(str(stmt.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})))
+
+            class R:
+                def scalar_one(self):
+                    return 0.0
+            return R()
+
+    db = CaptureDb()
+    await ai_rate_limit_service.total_monthly_ai_cost(db, "agent-1")
+    await ai_rate_limit_service.monthly_cost_so_far(db, "agent-1", event_type="area_research")
+    total_sql, own_type_sql = db.statements
+    assert "NOT IN ('area_research', 'area_narrative', 'area_fair_housing')" in total_sql
+    assert "NOT IN" not in own_type_sql  # the platform's own research ceiling still sees them

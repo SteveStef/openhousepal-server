@@ -72,6 +72,7 @@ class UserService:
 
     @staticmethod
     async def get_user_by_mls_id(db: AsyncSession, mls_id: str) -> Optional[User]:
-        result = await db.execute(select(User).where(User.mls_id == mls_id))
-        return result.scalar_one_or_none()
+        # The real agent with this MLS ID, never an admin-made test copy that shares it.
+        result = await db.execute(select(User).where(User.mls_id == mls_id).order_by(User.test_copy_of_user_id.isnot(None), User.created_at))
+        return result.scalars().first()
 

@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -343,6 +343,8 @@ async def _generate_narrative(db: AsyncSession, area: MarketArea, triggering_use
             messages=[{"role": "user", "content": f"Town: {area.name}, {area.state}\n\nVerified facts:\n{area.facts}"}],
         )
         text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
+        # Plain prose only - the model sometimes opens with a markdown title ("# Gettysburg, Pennsylvania").
+        text = re.sub(r"(?m)^\s*#+[^\n]*\n+", "", text).replace("**", "").strip()
         if not text:
             raise ValueError("empty narrative")
     except Exception as exc:
@@ -372,9 +374,18 @@ async def _derive_zip_codes(db: AsyncSession, name: str, state: str) -> list[str
     else in Website Builder. An area with no matching local listings yet simply starts with no
     ZIP codes (Census/market-stats gracefully have less to work with, not guessed data)."""
     rows = (await db.execute(
-        select(Property.zipcode).where(Property.city.ilike(name), Property.state == state, Property.zipcode.is_not(None)).distinct()
-    )).scalars().all()
-    return sorted({z for z in rows if z})
+        select(Property.zipcode, func.count()).where(Property.city.ilike(name), Property.state == state, Property.zipcode.is_not(None))
+        .group_by(Property.zipcode)
+    )).all()
+    counts = {str(z)[:5]: 0 for z, _ in rows if z}
+    for z, n in rows:
+        if z:
+            counts[str(z)[:5]] += n
+    total = sum(counts.values()) or 1
+    # Real ZIPs only ("00000" came through on Princeton), and not one a couple of mistyped listings
+    # dragged in (Malvern picked up Exton's 19341 and Phoenixville's 19460).
+    return sorted(z for z, n in counts.items()
+                  if re.fullmatch(r"\d{5}", z) and z != "00000" and (n >= 5 or n / total >= 0.05))
 
 
 async def enrich_area(db: AsyncSession, area: MarketArea, triggering_user: User) -> MarketArea:
@@ -480,6 +491,18 @@ async def enrich_area(db: AsyncSession, area: MarketArea, triggering_user: User)
     except Exception:
         logger.exception("school district check after research failed for %s", area.slug)
 
+    # Every researched place held to the Cheat Sheet's rules (open, real, right kind, real driving
+    # distance, nearest hospitals) BEFORE the write-up, so the write-up never names a dropped place.
+    try:
+        from app.services.areas import town_places_check
+        await town_places_check.check_town_places(db, area)
+        await db.refresh(area)
+        facts = area.facts
+    except Exception:
+        logger.exception("town place check failed for %s", area.slug)
+        await db.rollback()
+        await db.refresh(area)
+
     if facts:
         narrative = await _generate_narrative(db, area, triggering_user)
         if narrative:
@@ -491,11 +514,11 @@ async def enrich_area(db: AsyncSession, area: MarketArea, triggering_user: User)
     await db.commit()
     await db.refresh(area)
 
-    # Commute times, FEMA flood share, a Google check of every researched business, the town map
-    # (Census borders) and what's within a walk (OpenStreetMap), and the Fair
-    # Housing wording pass (AI + fixed rules) - each isolated, none can undo the research above.
+    # Commute times, FEMA flood share, the town map (Census borders) and what's within a walk
+    # (OpenStreetMap), and the Fair Housing wording pass (AI + fixed rules) - each isolated, none can
+    # undo the research above.
     from app.services.areas import fair_housing_service, town_extras_service, town_map_service
-    for step in (town_extras_service.refresh_commute, town_extras_service.refresh_flood, town_extras_service.verify_places,
+    for step in (town_extras_service.refresh_commute, town_extras_service.refresh_flood,
                  town_map_service.refresh_boundaries, town_map_service.refresh_walkability):
         try:
             await step(db, area)
@@ -592,8 +615,6 @@ async def _run_ai_research(db: AsyncSession, area: MarketArea, facts: dict, trig
         logger.warning("Grouped AI area research failed", extra={"area_id": area.id, "error": str(exc)})
         raw_result, usage = None, None
 
-    area.research_version = area_research_service.CURRENT_RESEARCH_VERSION
-
     if raw_result is None:
         logger.warning("Grouped AI area research produced no structured result", extra={"area_id": area.id})
         await record_usage_event(
@@ -602,8 +623,11 @@ async def _run_ai_research(db: AsyncSession, area: MarketArea, facts: dict, trig
             event_type=area_research_service.AREA_RESEARCH_EVENT_TYPE,
         )
         await reconcile_budget(db, reservation, (usage or {}).get("estimated_cost_usd") or 0.0)
-        return True
+        return True  # research_version stays as it was, so the nightly upkeep tries this town again
 
+    # Only a run that came back with research marks the town current (10/15 on live: six towns got
+    # nothing, were stamped current anyway and never researched again).
+    area.research_version = area_research_service.CURRENT_RESEARCH_VERSION
     running_cost = (usage or {}).get("estimated_cost_usd") or 0.0
     all_calls: list[dict] = list((usage or {}).get("calls") or [])
     total_input_tokens = (usage or {}).get("input_tokens") or 0

@@ -14,7 +14,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import AIUsageEvent
@@ -91,6 +91,16 @@ async def _count_since(db: AsyncSession, owner_id: str, since: datetime, event_t
     return result.scalar_one() or 0
 
 
+# Researching a town an agent adds (one shared record every agent who serves it reuses) is the
+# platform's cost, never the agent's (user, 10/26). These rows keep the agent's id only so admin
+# can see who started the research; they never count on that agent's Monthly AI Usage bar or limit.
+PLATFORM_PAID_EVENT_TYPES = ("area_research", "area_narrative", "area_fair_housing")
+
+
+def _counts_on_agent_bar():
+    return or_(AIUsageEvent.event_type.is_(None), AIUsageEvent.event_type.notin_(PLATFORM_PAID_EVENT_TYPES))
+
+
 async def _cost_since(db: AsyncSession, owner_id: str, since: datetime, event_type: Optional[str] = None) -> float:
     stmt = select(func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0.0)).where(
         AIUsageEvent.owner_id == owner_id,
@@ -99,6 +109,8 @@ async def _cost_since(db: AsyncSession, owner_id: str, since: datetime, event_ty
     )
     if event_type:
         stmt = stmt.where(AIUsageEvent.event_type == event_type)
+    else:
+        stmt = stmt.where(_counts_on_agent_bar())
     result = await db.execute(stmt)
     return float(result.scalar_one() or 0.0)
 
@@ -166,7 +178,6 @@ _USAGE_LABELS = {
     "external_api": "Maps & place lookups",
     "school_lookup": "Cheat sheet schools",
     "cheat_sheet_downtown": "Cheat sheet nearby places", "cheat_sheet_proofread": "Cheat sheet nearby places",
-    "area_research": "Researching your towns", "area_narrative": "Researching your towns", "area_fair_housing": "Researching your towns",
 }
 
 
@@ -189,7 +200,8 @@ async def monthly_ai_budget_snapshot(db: AsyncSession, owner_id: str, config: di
     # of the allowance. Refunded / blocked events are left out, same as the total.
     rows = (await db.execute(
         select(AIUsageEvent.event_type, func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0.0))
-        .where(AIUsageEvent.owner_id == owner_id, AIUsageEvent.blocked.is_(False), AIUsageEvent.created_at >= _start_of_month())
+        .where(AIUsageEvent.owner_id == owner_id, AIUsageEvent.blocked.is_(False), AIUsageEvent.created_at >= _start_of_month(),
+               _counts_on_agent_bar())
         .group_by(AIUsageEvent.event_type)
     )).all()
     groups: dict[str, float] = {}

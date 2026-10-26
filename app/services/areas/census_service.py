@@ -41,6 +41,7 @@ _VARIABLES = {
     "B25003_001E": "_occupied_housing_units",   # intermediate, used to derive homeownership_rate
     "B25003_002E": "_owner_occupied_units",     # intermediate
 }
+_COUNT_VARIABLES = {"B01003_001E", "B11001_001E", "B25003_001E", "B25003_002E"}
 
 STATE_FIPS = {
     "AL": "01", "AK": "02", "AZ": "04", "AR": "05", "CA": "06", "CO": "08", "CT": "09", "DE": "10",
@@ -196,7 +197,9 @@ async def get_demographics(state: str, zip_codes: list[str], place_name: str) ->
         for code, key in _VARIABLES.items():
             values = [float(r[code]) for r in zcta_rows if r.get(code) not in (None, "") and float(r[code]) >= 0]
             if values:
-                merged[code] = sum(values) / len(values)
+                # Head counts add up across the ZIPs (two ZIPs of 20,000 people = 40,000, not 20,000);
+                # medians can only be approximated by their average.
+                merged[code] = sum(values) if code in _COUNT_VARIABLES else sum(values) / len(values)
 
-        geography = f"ZCTA average ({', '.join(zip_codes[:5])})"
+        geography = f"ZIP {zip_codes[0]}" if len(zcta_rows) == 1 else f"ZIPs {', '.join(zip_codes[:5])}"
         return _to_facts({k: str(v) for k, v in merged.items()}, geography)

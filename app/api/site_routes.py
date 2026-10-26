@@ -19,6 +19,7 @@ from app.schemas.site import (
     SiteResponse,
 )
 from app.services.areas import area_enrichment_service, boundary_sources, geocoding
+from app.services.usage_owner import bill_to
 from app.services.website import content_adapters, domain_resolution_service, domain_verification_service, google_search_service, site_service, starter_template
 from app.services.website.site_service import InvalidHostname
 from app.utils.auth import get_current_active_user, require_active_plan, require_plan_tier
@@ -822,7 +823,13 @@ async def _enrich_area_background(area_id: str, triggering_user_id: str):
     since the request-scoped one is gone by the time BackgroundTasks fires, same standalone-
     session pattern as domain_verification_scheduler.py. Never raises into the caller - a
     failed enrichment just leaves the area PENDING/PARTIAL for the next attempt, same as any
-    other best-effort background job in this app."""
+    other best-effort background job in this app. Platform cost: researching a town an agent
+    adds never touches their AI usage bar (user, 10/26)."""
+    with bill_to(None):
+        await _enrich_area(area_id, triggering_user_id)
+
+
+async def _enrich_area(area_id: str, triggering_user_id: str):
     async with AsyncSessionLocal() as db:
         area = (await db.execute(select(MarketArea).where(MarketArea.id == area_id))).scalar_one_or_none()
         user = (await db.execute(select(User).where(User.id == triggering_user_id))).scalar_one_or_none()
@@ -889,7 +896,8 @@ async def add_my_served_area(
     geography_definition = None
 
     if area_type == "neighborhood":
-        resolved = await geocoding.resolve_named_place(name, state)
+        with bill_to(None):  # finding the town is part of adding it - platform cost
+            resolved = await geocoding.resolve_named_place(name, state)
         if not resolved:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

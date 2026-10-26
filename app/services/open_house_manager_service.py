@@ -619,13 +619,15 @@ async def get_listing_open_house_statuses(db: AsyncSession, listing_keys: List[s
     )
     prop_rows = props_result.all()
     mls_ids = {r.list_agent_mls_id for r in prop_rows if r.list_agent_mls_id} | {r.co_list_agent_mls_id for r in prop_rows if r.co_list_agent_mls_id}
-    owner_user_id_by_mls_id: Dict[str, str] = {}
+    # Every account with the listing's MLS ID owns it - the agent, and any admin-made test copy of them.
+    owner_user_ids_by_mls_id: Dict[str, set] = {}
     if mls_ids:
         owners_result = await db.execute(select(User.id, User.mls_id).where(User.mls_id.in_(mls_ids)))
-        owner_user_id_by_mls_id = {row.mls_id: row.id for row in owners_result.all()}
+        for row in owners_result.all():
+            owner_user_ids_by_mls_id.setdefault(row.mls_id, set()).add(row.id)
     listing_owner_ids: Dict[str, set] = {}
     for r in prop_rows:
-        owners = {owner_user_id_by_mls_id[mid] for mid in (r.list_agent_mls_id, r.co_list_agent_mls_id) if mid and mid in owner_user_id_by_mls_id}
+        owners = {uid for mid in (r.list_agent_mls_id, r.co_list_agent_mls_id) if mid for uid in owner_user_ids_by_mls_id.get(mid, ())}
         if owners:
             listing_owner_ids[r.listing_key] = owners
 
@@ -1260,8 +1262,8 @@ async def create_host_request(db: AsyncSession, current_user: User, payload: Cre
     if owner_mls_id and owner_mls_id.startswith("user:"):  # hand-entered by an agent outside Bright
         listing_owner = (await db.execute(select(User).where(User.id == owner_mls_id[5:]))).scalar_one_or_none()
     elif owner_mls_id:
-        owner_result = await db.execute(select(User).where(User.mls_id == owner_mls_id))
-        listing_owner = owner_result.scalar_one_or_none()
+        owner_result = await db.execute(select(User).where(User.mls_id == owner_mls_id).order_by(User.test_copy_of_user_id.isnot(None), User.created_at))
+        listing_owner = owner_result.scalars().first()  # the real agent, not a test copy sharing the ID
     if not listing_owner:
         # The listing's MLS agent has no OpenHousePal account - nothing to persist or notify.
         # The frontend falls back to the email template for this case.
@@ -1928,8 +1930,8 @@ async def add_team_member(db: AsyncSession, current_user: User, payload: AddTeam
     if not identifier:
         raise ValueError("Enter an email or MLS ID to add.")
 
-    result = await db.execute(select(User).where(or_(User.email.ilike(identifier), User.mls_id == identifier)))
-    agent = result.scalar_one_or_none()
+    result = await db.execute(select(User).where(or_(User.email.ilike(identifier), User.mls_id == identifier)).order_by(User.test_copy_of_user_id.isnot(None), User.created_at))
+    agent = result.scalars().first()
     if not agent:
         raise ValueError("No OpenHousePal agent found with that email or MLS ID.")
     if agent.id == current_user.id:

@@ -317,6 +317,15 @@ async def get_ai_overview(
             global_budget_status.append(status_entry)
         if google_places_month_cost:
             cost_by_provider_month["google_places"] = google_places_month_cost
+        # Every kind of Google Maps call against its free monthly allowance - calls stop at the
+        # line and wait for the 1st (google_free_tier.py, owner 10/26).
+        from app.services import google_free_tier
+        for row in await google_free_tier.month_usage(db):
+            global_budget_status.append(AIAdminBudgetStatus(
+                bucket=f"google_free:{row['sku']}", label=f"Google free calls - {row['sku'].replace('_', ' ')}",
+                day_spent_usd=0.0, month_spent_usd=0.0, month_count=row["used"], month_count_limit=row["stops_at"],
+                free_tier_note=f"Google gives {row['free']:,} free a month. Stops at {row['stops_at']:,} and waits for the 1st - never billed.",
+            ))
 
         top_consumers = (
             await _top_consumers(db, "ip", config["ip_daily_cost_limit_usd"])

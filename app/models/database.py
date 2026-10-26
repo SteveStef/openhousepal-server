@@ -49,6 +49,9 @@ collection_properties = Table(
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        Index('ux_users_mls_id_real', 'mls_id', unique=True, postgresql_where=text('test_copy_of_user_id IS NULL')),
+    )
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     email = Column(String, unique=True, index=True, nullable=False)
@@ -57,7 +60,10 @@ class User(Base):
     last_name = Column(String, nullable=False)
     state = Column(String, nullable=False)  # Agent's state
     brokerage = Column(String, nullable=False)  # Agent's brokerage
-    mls_id = Column(String, unique=True, index=True, nullable=True)  # Agent's Bright MLS ID - NULL for agents outside Bright MLS
+    # Agent's Bright MLS ID - NULL for agents outside Bright MLS. One real account per ID: the unique
+    # index ux_users_mls_id_real skips admin-made test copies (test_copy_of_user_id), which share it.
+    mls_id = Column(String, index=True, nullable=True)
+    test_copy_of_user_id = Column(String, ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
     license_number = Column(String, nullable=True)  # Real-estate license # - how agents outside Bright MLS identify themselves
     broker_authorized = Column(Boolean, default=False, nullable=False)
     # When True, only accepted OpenHouseTeamMembers may Request to Host this agent's listings.
