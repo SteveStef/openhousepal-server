@@ -62,6 +62,22 @@ async def tier_for_promo_plan(db: AsyncSession, plan_id: Optional[str]) -> Tuple
     return row[0], bool(row[1])
 
 
+async def test_copy_source(db: AsyncSession, code: str, mls_id: Optional[str]):
+    """A test-account code at Bright sign-up: (real agent being copied, code, "") when the code is
+    usable and made for this MLS ID, else (None, None, reason). The use is counted at checkout."""
+    from app.models.database import User
+
+    promo, why = await find_usable(db, code)
+    if promo is None:
+        return None, None, why
+    source = await db.get(User, promo.test_copy_of_user_id) if promo.test_copy_of_user_id else None
+    if source is None or source.test_copy_of_user_id or not source.mls_id:
+        return None, None, "That code isn't a test account code."
+    if (mls_id or "").strip() != source.mls_id:
+        return None, None, "That code is for a different MLS ID."
+    return source, promo, ""
+
+
 async def idx_waiver(db: AsyncSession, code: str):
     """A code that lets an agent move onto IDX without the setup fee: a usable 'special PayPal
     plan' code for the IDX plan. Returns (code, "") or (None, reason)."""

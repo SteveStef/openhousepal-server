@@ -54,6 +54,7 @@ class CodeIn(BaseModel):
     expires_at: Optional[datetime] = None
     is_active: Optional[bool] = None
     notes: Optional[str] = None
+    test_copy_of_user_id: Optional[str] = None
 
 
 def _out(c: PromoCode, agents: list, groups: dict) -> dict:
@@ -71,6 +72,7 @@ def _out(c: PromoCode, agents: list, groups: dict) -> dict:
         "custom_price": c.custom_price, "billing_cycle": c.billing_cycle, "billing_group_id": c.billing_group_id,
         "billing_group_name": groups.get(c.billing_group_id), "max_uses": c.max_uses, "uses": c.uses,
         "expires_at": c.expires_at, "is_active": c.is_active, "state": state, "notes": c.notes, "created_at": c.created_at,
+        "test_copy_of_user_id": c.test_copy_of_user_id,
         "agents": [{
             "id": u.id, "name": f"{u.first_name or ''} {u.last_name or ''}".strip() or u.email, "email": u.email,
             "plan_tier": u.plan_tier, "subscription_status": u.subscription_status, "joined_at": u.subscription_started_at or u.created_at,
@@ -131,9 +133,19 @@ async def _apply(db: AsyncSession, c: PromoCode, body: CodeIn) -> None:
         c.is_active = data["is_active"]
     if "paypal_plan_id" in data:
         c.paypal_plan_id = (data["paypal_plan_id"] or "").strip() or None
+    if "test_copy_of_user_id" in data:
+        sid = data["test_copy_of_user_id"] or None
+        source = await db.get(User, sid) if sid else None
+        if sid and (source is None or source.test_copy_of_user_id or not source.mls_id or source.is_admin):
+            raise HTTPException(status_code=400, detail="Pick a real agent with an MLS ID to copy.")
+        c.test_copy_of_user_id = sid
 
     if not c.code:
         raise HTTPException(status_code=400, detail="Give the code a name, like SMITHTEAM.")
+    if c.test_copy_of_user_id:
+        # A test account never pays: no PayPal, no price, no invoice.
+        c.kind = "billed_by_us"
+        c.custom_price = None
     if c.kind == "paypal_plan":
         if not c.paypal_plan_id:
             raise HTTPException(status_code=400, detail="Pick or paste the PayPal plan this code uses.")
@@ -175,6 +187,15 @@ async def known_plans(_admin=Depends(require_admin_user)):
         if plan_id:
             out.append({"plan_tier": tier, "plan_id": plan_id, "label": label})
     return out
+
+
+@router.get("/test-sources")
+async def test_sources(db: AsyncSession = Depends(get_db), _admin=Depends(require_admin_user)):
+    """Real agents a test-account code can copy (they have an MLS ID and aren't copies themselves)."""
+    rows = (await db.execute(select(User).where(User.mls_id.isnot(None), User.test_copy_of_user_id.is_(None))
+                             .order_by(User.first_name, User.last_name))).scalars().all()
+    return [{"id": u.id, "name": f"{u.first_name or ''} {u.last_name or ''}".strip() or u.email, "mls_id": u.mls_id}
+            for u in rows if not u.is_admin]
 
 
 @router.get("/plan-check")

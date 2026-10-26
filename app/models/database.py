@@ -489,6 +489,10 @@ class PromoCode(Base):
     expires_at = Column(DateTime(timezone=True), nullable=True)
     is_active = Column(Boolean, nullable=False, server_default='true', default=True)
     notes = Column(Text, nullable=True)
+    # A test-account code (owner, 10/26): the Bright sign-up takes this agent's MLS ID with the code
+    # and the new account becomes their test copy. Always billed_by_us with no price - nobody pays.
+    test_copy_of_user_id = Column(String, ForeignKey('users.id', ondelete='SET NULL', use_alter=True,
+                                                     name='fk_promo_codes_test_copy_of_user_id'), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

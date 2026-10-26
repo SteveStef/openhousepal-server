@@ -25,6 +25,9 @@ class UserCreate(UserBase):
     password: str = Field(min_length=8)
     # False = an agent outside Bright MLS: no MLS ID, a license number instead, No-MLS plans only.
     is_bright: bool = True
+    # An admin test-account code (from the sign-up link): lets a Bright sign-up take the MLS ID of
+    # the agent the code copies. Ignored outside Bright.
+    signup_code: Optional[str] = None
 
     _email = field_validator("email", mode="before")(_clean_email)
 
@@ -44,6 +47,8 @@ class UserCreate(UserBase):
             if not self.license_number or len(self.license_number) > 40:
                 raise ValueError("License number is required")
             self.mls_id = None  # never stored in the MLS ID slot - it could match a real Bright ID
+            self.signup_code = None
+        self.signup_code = (self.signup_code or "").strip() or None
         return self
 
 class UserUpdate(BaseModel):

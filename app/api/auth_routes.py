@@ -27,6 +27,8 @@ logger = get_logger(__name__)
 BASIC_PLAN_ID = os.getenv("PAYPAL_BASIC_PLAN_ID")
 PREMIUM_PLAN_ID = os.getenv("PAYPAL_PREMIUM_PLAN_ID")
 
+TEST_CODE_ONLY = "That code only works for the test account it was made for."
+
 @router.post("/send-verification-code", status_code=status.HTTP_200_OK)
 async def send_verification_code(
     user_data: UserCreate,
@@ -45,6 +47,13 @@ async def send_verification_code(
                 detail="Email already registered"
             )
 
+        # A test-account code (admin "Codes") lets this sign-up share the copied agent's MLS ID.
+        if user_data.signup_code:
+            from app.services.promo_code_service import test_copy_source
+            source, _promo, why = await test_copy_source(db, user_data.signup_code, user_data.mls_id)
+            if source is None:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=why)
+
         is_dev_mode = os.getenv("DEV", 'false') == 'true' # we are defaulting to prod
         if user_data.is_bright and not is_dev_mode:
             logger.info("Skipping the mls id verification")
@@ -56,7 +65,7 @@ async def send_verification_code(
                         )
 
             existing_mls_id = await UserService.get_user_by_mls_id(db, user_data.mls_id)
-            if existing_mls_id:
+            if existing_mls_id and not user_data.signup_code:
                 raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="This MLS ID is already associated with another account."
@@ -82,6 +91,7 @@ async def send_verification_code(
             "mls_id": user_data.mls_id,
             "license_number": user_data.license_number,
             "is_bright": user_data.is_bright,
+            "signup_code": user_data.signup_code,
             "password": user_data.password  # Will be hashed by verification_service
         }
         await verification_service.store_code(user_data.email, code, form_data, db)
@@ -154,6 +164,14 @@ async def verify_code(
     if await UserService.get_user_by_email(db, email):
         raise HTTPException(status_code=400, detail="Email already registered. Please log in instead.")
 
+    # A test-account code is checked again - it may have been switched off since the email was sent.
+    test_source = test_promo = None
+    if form_data.get("signup_code"):
+        from app.services.promo_code_service import test_copy_source
+        test_source, test_promo, why = await test_copy_source(db, form_data["signup_code"], form_data.get("mls_id"))
+        if test_source is None:
+            raise HTTPException(status_code=400, detail=why)
+
     # 3. Create the User (restricted status)
     try:
         new_user = UserModel(
@@ -169,7 +187,9 @@ async def verify_code(
             # Bright agents wait for Bright to approve OpenHousePal's data feed (an admin then
             # authorizes them). Agents outside Bright have no feed to approve - straight to checkout.
             broker_authorized=form_data.get("is_bright", True) is False,
-            plan_tier=None
+            plan_tier=None,
+            test_copy_of_user_id=test_source.id if test_source else None,
+            promo_code_id=test_promo.id if test_promo else None,
         )
         db.add(new_user)
         await db.flush()
@@ -189,7 +209,10 @@ async def verify_code(
 
         # Tell the team someone is waiting - they can't pay until an admin authorizes them.
         try:
-            if new_user.mls_id:
+            if test_source:
+                notifier.send(f"TEST account signed up: {new_user.first_name} {new_user.last_name} - test copy of "
+                              f"{test_source.first_name} {test_source.last_name} (code {test_promo.code}). Authorize them in Admin to continue the test.")
+            elif new_user.mls_id:
                 notifier.send(f"New agent signed up: {new_user.first_name} {new_user.last_name} ({new_user.brokerage}, MLS ID {new_user.mls_id}). "
                               f"Authorize them in Admin once Bright approves their feed.")
             else:
@@ -299,6 +322,8 @@ async def verify_bundle_code(
             raise HTTPException(status_code=400, detail=why)
         if not tier_allowed_for(current_user, promo.plan_tier):
             raise HTTPException(status_code=400, detail=NOT_IN_BRIGHT_MESSAGE)
+        if promo.test_copy_of_user_id and current_user.test_copy_of_user_id != promo.test_copy_of_user_id:
+            raise HTTPException(status_code=400, detail=TEST_CODE_ONLY)
         billed_by_us = promo.kind == "billed_by_us"
         return {
             "valid": True, "code": promo.code, "kind": promo.kind, "plan_tier": promo.plan_tier,
@@ -306,6 +331,7 @@ async def verify_bundle_code(
             "plan_id": None if billed_by_us else promo.paypal_plan_id,
             "custom_price": promo.custom_price if billed_by_us else None,
             "billing_cycle": (promo.billing_cycle or "monthly") if billed_by_us else None,
+            "test_account": bool(promo.test_copy_of_user_id),
             "message": "Code applied!",
         }
 
@@ -344,6 +370,8 @@ async def redeem_billed_by_us_code(
         raise HTTPException(status_code=400, detail="This code is used with PayPal checkout.")
     if not tier_allowed_for(current_user, promo.plan_tier):
         raise HTTPException(status_code=400, detail=NOT_IN_BRIGHT_MESSAGE)
+    if promo.test_copy_of_user_id and current_user.test_copy_of_user_id != promo.test_copy_of_user_id:
+        raise HTTPException(status_code=400, detail=TEST_CODE_ONLY)  # a free plan for test accounts only
     if not await claim(db, promo.id):
         await db.rollback()
         raise HTTPException(status_code=400, detail="That code was just used up. Please contact us.")
@@ -368,8 +396,12 @@ async def redeem_billed_by_us_code(
 
     cycle = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}.get(promo.billing_cycle or "monthly", "month")
     price = f"${promo.custom_price:,.2f}/{cycle}" if promo.custom_price is not None else "no price set"
-    notifier.send(f"Agent {current_user.first_name} {current_user.last_name} ({current_user.email}) switched on "
-                  f"{display_name_for_tier(promo.plan_tier)} with code {promo.code} - billed by us, {price}. Send them their first invoice.")
+    if promo.test_copy_of_user_id:
+        notifier.send(f"TEST account {current_user.first_name} {current_user.last_name} switched on "
+                      f"{display_name_for_tier(promo.plan_tier)} with test code {promo.code} - nothing to bill.")
+    else:
+        notifier.send(f"Agent {current_user.first_name} {current_user.last_name} ({current_user.email}) switched on "
+                      f"{display_name_for_tier(promo.plan_tier)} with code {promo.code} - billed by us, {price}. Send them their first invoice.")
     from app.services.agent_email_service import absolute, email_agent, plan_name
     email_agent(current_user, None, "agent_welcome", f"Welcome to OpenHousePal, {current_user.first_name or 'friend'}",
                 {"plan_name": plan_name(promo.plan_tier), "plan_tier": plan_name(promo.plan_tier), "trial_end_date": "",
