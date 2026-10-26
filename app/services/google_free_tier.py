@@ -34,8 +34,8 @@ _MAPS_HOSTS = {"places.googleapis.com", "routes.googleapis.com", "maps.googleapi
 # 10/26, and local testing shares the live key (10/26 town checks: ~2,400 Text Search Pro, ~500
 # Enterprise, ~2,800 route elements) plus live use before then. Rounded up so we stop early, not late.
 USED_BEFORE_COUNTING = {
-    "2026-10": {"text_search_pro": 3000, "text_search_enterprise": 650, "nearby_search_pro": 500,
-                "place_details_pro": 300, "route_matrix_essentials": 3000, "route_matrix_pro": 1500},
+    "2026-10": {"text_search_pro": 3100, "text_search_enterprise": 680, "nearby_search_pro": 500,  # + Malvern's
+                "place_details_pro": 300, "route_matrix_essentials": 3100, "route_matrix_pro": 1550},   # local research
 }
 
 # Places fields that move a call up a tier (Places API (New) pricing tables).

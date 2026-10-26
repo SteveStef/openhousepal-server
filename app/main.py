@@ -280,6 +280,9 @@ async def lifespan(app: FastAPI):
     # Town pages: recompute every published site's market numbers right after start (the saved copy
     # above serves visitors meanwhile) - public_site_routes.warm_area_caches.
     from apscheduler.triggers.date import DateTrigger as _Once
+    # Finished towns shipped with the code are put on this server once (areas/town_seeds.py).
+    from app.services.areas.town_seeds import scheduled_apply_town_seeds
+    scheduler.add_job(scheduled_apply_town_seeds, _Once(run_date=_dt.now() + _td(seconds=3)), id="town_seeds", name="Load finished towns", replace_existing=True)
     from app.api.public_site_routes import warm_area_caches
     scheduler.add_job(warm_area_caches, _Once(run_date=_dt.now() + _td(seconds=10)), id="warm_area_caches", name="Warm town-page caches", replace_existing=True)
     # Invites: the agent's "Tomorrow" email (who's coming) - hourly, sent from 9 AM Eastern the day

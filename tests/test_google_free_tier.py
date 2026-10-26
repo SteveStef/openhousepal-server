@@ -85,7 +85,7 @@ async def test_calls_google_saw_before_the_counter_started_count_toward_the_mont
     monkeypatch.setattr(ubs, "_period_keys", lambda: ("2026-10-26", "2026-10"))
     await gft._take("text_search_pro", "pro", 1)
     await gft._take("geocoding", "essentials", 1)
-    assert limits == [("google_free:text_search_pro", 4750 - 3000), ("google_free:geocoding", 9500)]
+    assert limits == [("google_free:text_search_pro", 4750 - 3100), ("google_free:geocoding", 9500)]
     monkeypatch.setattr(ubs, "_period_keys", lambda: ("2026-11-01", "2026-11"))
     await gft._take("text_search_pro", "pro", 1)
     assert limits[-1] == ("google_free:text_search_pro", 4750)  # a new month starts clean

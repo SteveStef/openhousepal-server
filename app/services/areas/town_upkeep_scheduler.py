@@ -6,11 +6,11 @@ and accurate without anyone doing anything. Runs once a day (app/main.py, 4:15 A
     - Fair Housing wording pass with the fixed rules (fair_housing_service, no AI)
   a few towns per day, only to fill in what a town never got (no paid re-checks on a timer -
   owner, 10/26; the live Explore Nearby covers places that change):
-    - a town whose research never came back is researched again after 3 days
+    - a town whose place check stopped at Google's free-call line finishes it
     - commute times and FEMA flood share, when missing
     - town map borders (Census) and what's within a walk (OpenStreetMap) every 365 days - free
 A town added by an agent is researched (and its places checked once) right away by the normal
-add-area path (site_routes), not here.
+add-area path (site_routes) or in a planned batch - never here (no nightly research retries).
 """
 import logging
 from datetime import datetime, timedelta, timezone
@@ -20,20 +20,12 @@ from sqlalchemy import select
 from app.database import AsyncSessionLocal
 from app.models.database import AgentMarketArea, MarketArea, User
 from app.services.areas import town_places_check
-from app.services.areas.town_places_check import CHECK_CATEGORIES
 
 logger = logging.getLogger(__name__)
 
 EXTRAS_EVERY_DAYS = 365
 MAX_PAID_TOWNS_PER_DAY = 5
-MAX_RESEARCH_PER_DAY = 2
 MAX_FREE_MAP_TOWNS_PER_DAY = 3
-RESEARCH_RETRY_DAYS = 3  # a town whose research never came back is tried again this soon, not in a year
-
-
-def _has_research(area: MarketArea) -> bool:
-    facts = area.facts or {}
-    return any((facts.get(k) or {}).get("entities") for k in (*CHECK_CATEGORIES, "private_schools"))
 
 
 def _age_days(iso) -> float:
@@ -52,7 +44,7 @@ async def run_town_upkeep() -> dict:
     from app.services.areas import area_enrichment_service, fair_housing_service, town_extras_service, town_map_service
     from app.services.website.content_adapters import check_and_store_public_schools
 
-    summary = {"towns": 0, "schools_fixed": 0, "wording_fixed": 0, "places_checked": 0, "places_removed": 0, "extras": 0, "researched": 0}
+    summary = {"towns": 0, "schools_fixed": 0, "wording_fixed": 0, "places_checked": 0, "places_removed": 0, "extras": 0}
     async with AsyncSessionLocal() as db:
         rows = (await db.execute(
             select(MarketArea, AgentMarketArea.owner_id).join(AgentMarketArea, AgentMarketArea.area_id == MarketArea.id)
@@ -62,7 +54,7 @@ async def run_town_upkeep() -> dict:
         for area, owner_id in rows:
             towns.setdefault(area.id, (area, owner_id))
         summary["towns"] = len(towns)
-        paid = researched = free = 0
+        paid = free = 0
         # Oldest-checked first, so every town gets its turn.
         order = sorted(towns.values(), key=lambda t: min(_age_days((t[0].facts or {}).get("_places_verified_at")), _age_days(t[0].last_enriched_at)), reverse=True)
         for area, owner_id in order:
@@ -71,15 +63,8 @@ async def run_town_upkeep() -> dict:
                     summary["schools_fixed"] += 1
                 summary["wording_fixed"] += await fair_housing_service.fix_area_text(db, area, owner_id, use_ai=False)
 
-                # Only a town whose research never came back is researched again - no yearly redo.
-                due = not _has_research(area) and _age_days(area.last_enriched_at) > RESEARCH_RETRY_DAYS
-                if researched < MAX_RESEARCH_PER_DAY and due:
-                    user = await db.get(User, owner_id)
-                    if user:
-                        area = await area_enrichment_service.enrich_area(db, area, user)
-                        researched += 1
-                        summary["researched"] += 1
-                        continue  # enrich_area runs every check below itself
+                # No research here at all (owner, 10/26): towns are researched when an agent adds
+                # them, or in a planned batch - never retried on a nightly drip.
 
                 facts = area.facts or {}
                 # Free (Census borders, OpenStreetMap) - yearly, no paid cap; a few towns a day keeps
