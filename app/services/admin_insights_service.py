@@ -162,8 +162,7 @@ async def overview(db: AsyncSession, days: int) -> dict:
     active_series = {b: len({u for u, d in active_rows if b <= d < b + timedelta(days=step)}) for b in buckets}
     joined = await _count_series(db, m.User.created_at, unit, since, m.User.id.in_(ids))
 
-    signins = await _count_series(db, m.OpenHouseVisitor.created_at, unit, since, m.OpenHouseEvent.is_deleted.isnot(True),
-                                  m.OpenHouseEvent.agent_id.in_(ids),
+    signins = await _count_series(db, m.OpenHouseVisitor.created_at, unit, since, m.OpenHouseEvent.agent_id.in_(ids),
                                   joins=[(m.OpenHouseEvent, m.OpenHouseEvent.id == m.OpenHouseVisitor.open_house_event_id)])
     showcases = await _count_series(db, m.Collection.created_at, unit, since)
     leads = await _count_series(db, m.Lead.created_at, unit, since)
@@ -209,7 +208,7 @@ async def signins(db: AsyncSession, days: int) -> dict:
 
     rows = (await db.execute(
         select(E.agent_id, V.signin_seconds, V.signin_mode, V.signin_device, V.has_agent, V.lead_id, func.timezone(TZ, V.created_at))
-        .join(E, E.id == V.open_house_event_id).where(_in(V.created_at, since), E.is_deleted.isnot(True))
+        .join(E, E.id == V.open_house_event_id).where(_in(V.created_at, since))
     )).all()
     views = await _by_owner(db, select(E.agent_id, func.count()).select_from(W).join(E, E.id == W.open_house_event_id)
                             .where(_in(W.created_at, since)).group_by(E.agent_id))
@@ -230,12 +229,13 @@ async def signins(db: AsyncSession, days: int) -> dict:
     buckets_s = [(0, 30, "Under 30 sec"), (30, 60, "30-60 sec"), (60, 120, "1-2 min"), (120, 300, "2-5 min"), (300, 10 ** 6, "Over 5 min")]
 
     # Open houses that happened in the period (scheduled date, else created) - and how many got sign-ins.
+    # Deleted ones count too (owner 10/27): they were held, and their sign-ins were real.
     today = now.astimezone(_eastern()).date()
     start_day = since.astimezone(_eastern()).date() if since else None
     vis_n = select(V.open_house_event_id.label("oh"), func.count().label("n")).group_by(V.open_house_event_id).subquery()
     oh_rows = (await db.execute(
         select(E.agent_id, E.scheduled_date, E.created_at, func.coalesce(vis_n.c.n, 0))
-        .outerjoin(vis_n, vis_n.c.oh == E.id).where(E.is_deleted.is_(False) | E.is_deleted.is_(None))
+        .outerjoin(vis_n, vis_n.c.oh == E.id)
     )).all()
     held: dict[str, list] = {}
     for uid, sched, created, n in oh_rows:

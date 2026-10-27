@@ -184,9 +184,9 @@ async def _open_house_stats(db: AsyncSession, agent_id: Optional[str] = None) ->
     visitors = (select(m.OpenHouseVisitor.open_house_event_id.label("oh"), func.count().label("n"))
                 .group_by(m.OpenHouseVisitor.open_house_event_id).subquery())
     today = _today_eastern()
-    # Deleted open houses don't count (they did here but not on Insights, so the two disagreed).
+    # Deleted open houses still count (owner 10/27): they really happened, and so did their sign-ins.
     q = (select(m.OpenHouseEvent.agent_id, m.OpenHouseEvent.scheduled_date, m.OpenHouseEvent.created_at, func.coalesce(visitors.c.n, 0))
-         .outerjoin(visitors, visitors.c.oh == m.OpenHouseEvent.id).where(m.OpenHouseEvent.is_deleted.isnot(True)))
+         .outerjoin(visitors, visitors.c.oh == m.OpenHouseEvent.id))
     if agent_id:
         q = q.where(m.OpenHouseEvent.agent_id == agent_id)
     out: dict[str, dict] = {}
