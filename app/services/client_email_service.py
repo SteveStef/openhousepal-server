@@ -428,9 +428,27 @@ async def _sent_folder_burst(db, rec: ClientEmail, at: datetime) -> Optional[lis
     return burst or None
 
 
+async def _drop_resumed(db, owner_id: str, email: str, when: datetime, lead=None) -> int:
+    """The "emails back to daily" notice (bell + lead history) an open set off, when that open turns
+    out to be the agent's Sent folder (owner, 10/26: "it said Nishit opened his email today but I
+    don't see what email he opened"). Doesn't commit."""
+    from sqlalchemy import delete
+    lo, hi = when - timedelta(minutes=1), when + SENT_FOLDER_WINDOW
+    res = await db.execute(delete(Notification).where(
+        Notification.agent_id == owner_id, Notification.type == "EMAIL_STATUS", Notification.reference_id == email,
+        Notification.title.like("%emails back to daily"), Notification.created_at >= lo, Notification.created_at <= hi,
+    ).execution_options(synchronize_session=False))
+    if lead is not None:
+        await db.execute(delete(LeadEvent).where(
+            LeadEvent.lead_id == lead.id, LeadEvent.source_type == "email_resumed",
+            LeadEvent.occurred_at >= lo, LeadEvent.occurred_at <= hi,
+        ).execution_options(synchronize_session=False))
+    return res.rowcount or 0
+
+
 async def _undo_open(db, rec: ClientEmail) -> None:
     """An open that turned out to be the agent's Sent folder: off the email, the lead's history and
-    the bell. Doesn't commit."""
+    the bell (and the "back to daily" it set off). Doesn't commit."""
     when = rec.opened_at
     rec.opened_at, rec.open_count = None, 0
     lead = await _lead(db, rec.owner_id, rec.recipient_email)
@@ -440,6 +458,7 @@ async def _undo_open(db, rec: ClientEmail) -> None:
                                                  LeadEvent.source_id == rec.id).execution_options(synchronize_session=False))
     await db.flush()
     if when is not None:
+        await _drop_resumed(db, rec.owner_id, rec.recipient_email, when, lead)
         await _day_note(db, rec.owner_id, rec.recipient_email, when, lead)
 
 
@@ -574,6 +593,12 @@ async def correct_sent_folder_opens(db) -> int:
         for r in g:
             r.sent_folder_seen_at = r.opened_at
             await _undo_open(db, r)
+            touched.add((r.owner_id, r.recipient_email))
+            fixed += 1
+    # Opens set aside before the notice was taken back with them (Nishit, 10/26).
+    for r in (await db.execute(select(ClientEmail).where(ClientEmail.sent_folder_seen_at.isnot(None)))).scalars().all():
+        lead = await _lead(db, r.owner_id, r.recipient_email)
+        if await _drop_resumed(db, r.owner_id, r.recipient_email, r.sent_folder_seen_at, lead):
             touched.add((r.owner_id, r.recipient_email))
             fixed += 1
     if fixed:

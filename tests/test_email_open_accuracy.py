@@ -147,3 +147,42 @@ async def test_past_sent_folder_opens_are_corrected_and_real_ones_kept(db):
     assert fixed >= 2 and ea.opened_at is None and eb.opened_at is None
     assert es.opened_at == T0 + timedelta(hours=2)
     assert ea.sent_folder_seen_at == T0
+
+
+async def _resumed(db, owner_id, lead):
+    return (await db.execute(select(Notification).where(Notification.agent_id == owner_id, Notification.type == "EMAIL_STATUS",
+                                                        Notification.reference_id == lead.email))).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_a_sent_folder_open_takes_back_its_back_to_daily_notice(db):
+    """Nishit, 10/26: the first open of a Sent-folder scroll set off "emails back to daily", and that
+    notice stayed after the open itself was taken back."""
+    owner = await _owner(db)
+    a, b = await _lead(db, owner, "nish"), await _lead(db, owner, "other")
+    ea = await _email(db, owner, a, T0 - timedelta(days=5))
+    eb = await _email(db, owner, b, T0 - timedelta(days=2))
+    await ce.record_open(db, ea.id)
+    db.add(Notification(agent_id=owner, type="EMAIL_STATUS", reference_type="CLIENT_EMAIL_PREF", reference_id=a.email,
+                        title="Test: emails back to daily", message="Test opened an email, so their updates are back to normal.",
+                        is_read=False, created_at=T0 + timedelta(milliseconds=40)))
+    await db.flush()
+    db.clock.now = T0 + timedelta(seconds=30)
+    await ce.record_open(db, eb.id)                 # the Sent folder after all
+    assert ea.opened_at is None and await _resumed(db, owner, a) == []
+
+
+@pytest.mark.asyncio
+async def test_past_back_to_daily_notices_from_sent_folder_opens_are_cleared(db):
+    owner = await _owner(db)
+    a = await _lead(db, owner, "past")
+    ea = await _email(db, owner, a, T0 - timedelta(days=5))
+    ea.sent_folder_seen_at = T0
+    db.add(Notification(agent_id=owner, type="EMAIL_STATUS", reference_type="CLIENT_EMAIL_PREF", reference_id=a.email,
+                        title="Test: emails back to daily", message="x", is_read=False, created_at=T0 + timedelta(milliseconds=40)))
+    keep = Notification(agent_id=owner, type="EMAIL_STATUS", reference_type="CLIENT_EMAIL_PREF", reference_id=a.email,
+                        title="Test: emails back to daily", message="a real one, days later", is_read=False, created_at=T0 + timedelta(days=2))
+    db.add(keep)
+    await db.flush()
+    await ce.correct_sent_folder_opens(db)
+    assert [n.message for n in await _resumed(db, owner, a)] == ["a real one, days later"]
