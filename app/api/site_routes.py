@@ -851,8 +851,9 @@ async def get_my_served_areas(
     while a town is researched - each town's full facts/boundary is ~50 KB it doesn't need)."""
     result = await db.execute(
         select(AgentMarketArea)
+        .join(MarketArea, MarketArea.id == AgentMarketArea.area_id)
         .where(AgentMarketArea.owner_id == current_user.id)
-        .order_by(AgentMarketArea.created_at.desc())
+        .order_by(*content_adapters.SERVED_AREA_ORDER)
     )
     links = result.scalars().all()
     for link in links:
@@ -865,6 +866,31 @@ async def get_my_served_areas(
         a.area.facts, a.area.geography, a.area.narrative = {}, {}, None
         out.append(a)
     return out
+
+
+class AreaOrderRequest(BaseModel):
+    link_ids: List[str]
+
+
+@router.put("/me/areas/order", status_code=status.HTTP_204_NO_CONTENT)
+async def reorder_my_served_areas(
+    payload: AreaOrderRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
+):
+    """The Areas list's up/down arrows - saves the agent's town order, which the website's
+    Neighborhoods page, home page towns and footer all follow. Ids not theirs are ignored; any of
+    their towns missing from the list keep their place after the listed ones."""
+    links = (await db.execute(
+        select(AgentMarketArea).where(AgentMarketArea.owner_id == current_user.id)
+    )).scalars().all()
+    by_id = {link.id: link for link in links}
+    ordered = [by_id[i] for i in dict.fromkeys(payload.link_ids) if i in by_id]
+    rest = [link for link in links if link not in ordered]
+    for n, link in enumerate(ordered + rest):
+        link.sort_order = n
+    await db.commit()
+    content_adapters.forget_served_areas(current_user.id)
 
 
 @router.post("/me/areas", response_model=AgentMarketAreaResponse, status_code=status.HTTP_201_CREATED)
@@ -930,7 +956,11 @@ async def add_my_served_area(
     )).scalar_one()
     _validate_served_area_slot(existing_count, existing_link)
 
-    link = AgentMarketArea(owner_id=current_user.id, area_id=area.id)
+    # Once the agent has ordered their towns, a new one joins at the end of that order.
+    last = (await db.execute(
+        select(func.max(AgentMarketArea.sort_order)).where(AgentMarketArea.owner_id == current_user.id)
+    )).scalar_one()
+    link = AgentMarketArea(owner_id=current_user.id, area_id=area.id, sort_order=None if last is None else last + 1)
     db.add(link)
     await db.commit()
     await db.refresh(link)

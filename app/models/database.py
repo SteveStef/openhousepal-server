@@ -1091,6 +1091,10 @@ class Property(Base):
         # never drops it again (that is how the first trigram index disappeared).
         Index('ix_properties_full_address_trgm', 'full_address', postgresql_using='gin',
               postgresql_ops={'full_address': 'gin_trgm_ops'}),
+        # Town-name matching (city/township ILIKE - town pages, search, market stats) - migration
+        # c4f8a2e6b9d1. Without these every town lookup read the whole table.
+        Index('ix_properties_city_trgm', 'city', postgresql_using='gin', postgresql_ops={'city': 'gin_trgm_ops'}),
+        Index('ix_properties_township_trgm', 'township', postgresql_using='gin', postgresql_ops={'township': 'gin_trgm_ops'}),
     )
 
 
@@ -2449,6 +2453,9 @@ class AgentMarketArea(Base):
     owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     area_id = Column(String, ForeignKey('market_areas.id', ondelete='CASCADE'), nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # The agent's own order (Areas list up/down arrows) - every town list on their site follows it.
+    # NULL until they first reorder; those sort by name after any ordered ones (SERVED_AREA_ORDER).
+    sort_order = Column(Integer, nullable=True)
 
     __table_args__ = (
         UniqueConstraint('owner_id', 'area_id', name='uq_agent_market_areas_owner_area'),

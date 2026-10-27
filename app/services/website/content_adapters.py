@@ -1565,11 +1565,22 @@ async def _build_served_areas_summary(db: AsyncSession, user: User, limit: int =
         select(MarketArea)
         .join(AgentMarketArea, AgentMarketArea.area_id == MarketArea.id)
         .where(AgentMarketArea.owner_id == user.id)
-        .order_by(MarketArea.name)
+        .order_by(*SERVED_AREA_ORDER)
         .limit(limit)
     )
     areas = result.scalars().all()
     return [await area_summary_card(db, a, with_stats) for a in areas]
+
+
+# The agent's own town order (Areas list arrows), then by name for towns never ordered - the
+# Areas list and every town list on the site use this, so they always match.
+SERVED_AREA_ORDER = (AgentMarketArea.sort_order.asc().nullslast(), MarketArea.name)
+
+
+def forget_served_areas(user_id: str) -> None:
+    """Drop this agent's cached town cards (this worker) so a reorder shows on the next visit."""
+    for key in [k for k in _served_areas_cache if k[0] == str(user_id)]:
+        _served_areas_cache.pop(key, None)
 
 
 async def area_summary_card(db: AsyncSession, a: MarketArea, with_stats: bool = False) -> dict:
@@ -2272,6 +2283,11 @@ async def hydrate_page_blocks(db: AsyncSession, user: User, page: dict, featured
                 # "Show my sold stats" off (setup Sales step) hides the "N Homes Sold · $X in
                 # Volume" line here too - the sold homes themselves still show.
                 data["show_stats"] = (await hub_sales_rules(db, user)).get("show_stats", True)
+                # The line counts ALL the agent's sales (their Agent Hub list, get_agent_stats) -
+                # it used to add up only the few cards shown, so it said 6 / $17M right under an
+                # About strip saying 10 / $21M (user, 10/27).
+                data["sold_count"] = (agent_stats or {}).get("sold_count") or 0
+                data["sold_volume"] = (agent_stats or {}).get("sold_volume") or 0
         elif block_type == "heading_text" and data.get("text"):
             data["text"] = sales_words(data["text"], sales_recent)
         elif block_type == "about_agent" and profile:

@@ -11,7 +11,7 @@ from app.services.showcase_links import share_match
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models.database import AgentForm, AgentHub, AgentHubEvent, AgentMarketArea, CmaReport, Collection, MarketArea, Property, Site, SiteDomain, User
+from app.models.database import AgentForm, AgentHub, AgentHubEvent, AgentMarketArea, CmaReport, Collection, MarketArea, Property, Site, SiteDomain, StudioBrandKit, User
 from app.schemas.forms import ExampleProperty, FormProgressUpdate, FormSubmissionCreate, FormSubmissionResponse, PublicAgentFormResponse
 from app.services import forms_service
 from app.services.areas import geography, market_stats_service, market_insights_service
@@ -814,7 +814,7 @@ async def area_page_payload(db: AsyncSession, area: MarketArea, user: Optional[U
         "narrative": content_adapters.fix_mojibake_deep(narrative_clean),
         # The Agent Hub's picks (hidden homes, min price, order) apply on town pages too (owner, 10/24).
         "my_listings": content_adapters.drop_hidden_listings(await content_adapters.get_active_listings(db, user, 12, area_scope=area_scope), hub_rules)[:6] if user else [],
-        "sales": content_adapters.apply_sales_rules(await content_adapters.get_recent_sales(db, user, 12, area_scope=area_scope), hub_rules)[:6] if user else [],
+        "sales": content_adapters.apply_sales_rules(await content_adapters.get_recent_sales(db, user, 24, area_scope=area_scope), hub_rules)[:24] if user else [],
         "open_houses": await content_adapters.get_open_houses(db, user, 4, area_scope=area_scope) if user else [],
         "related_areas": await content_adapters.cached_market(f"related:{user.id}:{area.id}", lambda d: content_adapters.get_area_related(d, user, area.id, limit=3), db) if user else [],
         # Live market trends (12 months of closed sales, what's for sale now) and the latest
@@ -955,6 +955,7 @@ async def get_site_profile(site_id: str, db: AsyncSession = Depends(get_db)):
     from app.services.sales_wording import sales_are_recent
     profile = await content_adapters.get_agent_profile(db, user)
     hub = (await db.execute(select(AgentHub).where(AgentHub.owner_id == user.id))).scalar_one_or_none()
+    kit = (await db.execute(select(StudioBrandKit).where(StudioBrandKit.owner_id == user.id))).scalar_one_or_none()
     forms = await content_adapters.get_forms_list(db, user)
     site_reviews = await content_adapters.get_site_reviews(db, user, limit=0)
     from app.utils.auth import REVIEWS_ACCESS_TIERS, owner_has_access
@@ -966,6 +967,9 @@ async def get_site_profile(site_id: str, db: AsyncSession = Depends(get_db)):
         "email": profile.get("email"),
         "brokerage": profile.get("brokerage"),
         "photo_url": profile.get("photo_url"),
+        # The site's loading mark falls back to the Brand Kit logo (then initials) when the agent
+        # didn't upload a separate loading logo - components/website-public/SiteShell.
+        "brand_logo_url": kit.personal_logo_url if kit else None,
         # Site-wide chrome (the luxe footer + header wordmark) shows these too.
         "title": profile.get("title"),
         "market": profile.get("market"),
