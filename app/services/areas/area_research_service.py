@@ -490,9 +490,12 @@ async def _run_group_call(client, model: str, group: _GroupSpec, user_text: str)
     messages: list[dict] = [{"role": "user", "content": user_text}]
     usage = {"input_tokens": 0, "output_tokens": 0, "web_search_requests": 0}
 
+    # 3000 on Haiku 4.5; Haiku 5.5 counts the same words as ~30% more tokens. Medium effort: at low,
+    # Haiku 5.5 is more likely to skip a search.
     response = await client.messages.create(
-        model=model, max_tokens=3000, system=group.system_prompt,
+        model=model, max_tokens=4000, system=group.system_prompt,
         tools=[web_search_tool, submit_tool], tool_choice={"type": "auto"}, messages=messages,
+        **ai_config_service.model_options(model, "medium"),
     )
     usage["input_tokens"] += response.usage.input_tokens
     usage["output_tokens"] += response.usage.output_tokens
@@ -504,8 +507,9 @@ async def _run_group_call(client, model: str, group: _GroupSpec, user_text: str)
         messages.append({"role": "assistant", "content": response.content})
         messages.append({"role": "user", "content": "Call submit_research now with your complete findings for this request based on the research above."})
         response2 = await client.messages.create(
-            model=model, max_tokens=3000, system=group.system_prompt,
+            model=model, max_tokens=4000, system=group.system_prompt,
             tools=[submit_tool], tool_choice={"type": "tool", "name": "submit_research"}, messages=messages,
+            **ai_config_service.model_options(model, "medium"),
         )
         usage["input_tokens"] += response2.usage.input_tokens
         usage["output_tokens"] += response2.usage.output_tokens
@@ -535,7 +539,7 @@ async def research_community_grouped(
     Claude doesn't report usage split by output field) but a real one, unlike just reusing the
     whole job's grand total for every category's metadata."""
     config = await ai_config_service.get_config(db)
-    model = config.get("area_research_model", "claude-haiku-4-5")
+    model = config.get("area_research_model", "claude-haiku-5-5")
     client = _get_client()
     user_text = f"Community: {area.name}, {area.state}\n\n{secondary_evidence_text}"
 
@@ -625,7 +629,7 @@ async def run_solo_category_research(
     across 2-3. Defaults to Haiku; `model_override` is how the narrow public-schools-only Sonnet
     fallback (see module docstring) asks for a stronger model on that one call."""
     config = await ai_config_service.get_config(db)
-    model = model_override or config.get("area_research_model", "claude-haiku-4-5")
+    model = model_override or config.get("area_research_model", "claude-haiku-5-5")
     client = _get_client()
 
     rule_text = _CATEGORY_RULE_TEXT[category]

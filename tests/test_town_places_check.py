@@ -506,3 +506,59 @@ def test_inside_claim_must_be_about_the_place_elsewhere():
         "entities": [{"name": "Radnor Trail", "city": "Wayne", "google_checked": True}]}}
     out, _ = clean_area_payload(facts, None, None, "Villanova")
     assert "Willows Park is within town boundaries" in out["parks"]["notes"]
+
+
+def test_round_three_text_rules():
+    t = tpc.tidy_research_text
+    assert t("Ranked among top hospitals by U.S. News & World Report. Has a trauma center.") == "Has a trauma center."
+    assert t("Vybe urgent care is located in St. Davids near the station.") == "Vybe urgent care is located in St. Davids near the station."
+    assert t("Charlottesville is an a welcoming community.") == "Charlottesville is a welcoming community."
+    assert t("Natural Lands preserve (10 acres) with trails.") == "Natural Lands preserve with trails."
+    assert t("\u2019 Historic downtown Gettysburg has shops.") == "Historic downtown Gettysburg has shops."
+    assert t("SEPTA Paoli/Thorndale Line (R5) regional rail station.") == "SEPTA Paoli/Thorndale Line regional rail station."
+    assert t("Malvern has five major full-service supermarkets nearby.") == "Malvern has major full-service supermarkets nearby."
+    assert t("The district covers five surrounding townships: Benner and College.") == "The district covers surrounding townships: Benner and College."
+    assert t("Four fixed routes (Lincoln, Blue, Gray, and Gold lines) with daily service. Parking downtown.") == "Parking downtown."
+
+
+def test_round_three_page_rules():
+    facts = {"_places_check_version": 1,
+             "parks": {"entities": [{"name": "Bryn Coed Preserve", "distance_miles": 21.9, "google_checked": True},
+                                    {"name": "Penn-Roosevelt State Park", "distance_miles": 17.3, "google_checked": True},
+                                    {"name": "White Clay Creek Preserve Office", "distance_miles": 3.1, "google_checked": True}]},
+             "transportation": {"entities": [{"name": "Gettysburg Tour Center", "category": "Battlefield bus tours"}]},
+             "medical": {"entities": [{"name": "MLH Urgent Care", "category": "URGENT_CARE", "description": "Urgent care facility providing emergency care services."}]},
+             "private_schools": {"entities": [{"name": "Main Line Classical Academy", "category": "Grades K-11", "description": "Independent K-8 school"},
+                                              {"name": "St Patrick", "category": "Grades PK-8", "description": "Catholic school, PreK-8"}]}}
+    out, _ = clean_area_payload(facts, None, None, "Bryn Mawr")
+    assert [e["name"] for e in out["parks"]["entities"]] == ["Penn-Roosevelt State Park", "White Clay Creek Preserve"]
+    assert out["transportation"]["entities"] == []
+    assert out["medical"]["entities"][0]["description"] == "Urgent care facility providing walk-in care services."
+    assert "description" not in out["private_schools"]["entities"][0]
+    assert out["private_schools"]["entities"][1]["description"] == "Catholic school, PreK-8"
+
+
+def test_county_label_mostly_one_county():
+    from app.services.areas.town_map_service import county_label
+    rows = [{"name": "Mercer County", "share": 88, "kind": "county"}, {"name": "Middlesex County", "share": 7, "kind": "county"},
+            {"name": "Somerset County", "share": 5, "kind": "county"}]
+    assert county_label(rows) == "Mercer County (some homes in Middlesex and Somerset counties)"
+    assert county_label([{"name": "Montgomery County", "share": 55, "kind": "county"}, {"name": "Delaware County", "share": 45, "kind": "county"}]) \
+        == "Montgomery and Delaware counties"
+
+
+def test_counts_never_touch_distances():
+    t = tpc.tidy_research_text
+    assert "15 minutes" in t("It is 15 minutes from parks and shops.") or t("It is 15 minutes from parks and shops.") == ""
+    assert t("Bryn Mawr has three public parks.") == "Bryn Mawr has public parks."
+
+
+def test_grade_spans_are_not_counts():
+    t = tpc.tidy_research_text
+    assert t("Enrollment is high (32% of K-12 students attend private schools).") == "Enrollment is high (32% of K-12 students attend private schools)."
+    assert t("Serves grades 9-12 schools in the district.") == "Serves grades 9-12 schools in the district."
+
+
+def test_quote_closing_after_period_moves_inside():
+    assert tpc.tidy_research_text("Where residents 'go into town.' The downtown includes State Street.") == \
+        "Where residents 'go into town'. The downtown includes State Street."

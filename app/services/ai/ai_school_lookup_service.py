@@ -64,9 +64,10 @@ def _address_line(prop) -> str:
 
 
 async def _ask(prop, missing: list[str], config: dict) -> tuple[dict, dict]:
+    from app.services.ai.ai_config_service import ai_config_service
     from app.services.ai.ai_orchestrator_service import _get_client
     client = _get_client()
-    model = config.get("school_lookup_model") or config.get("area_research_model") or "claude-haiku-4-5"
+    model = config.get("school_lookup_model") or config.get("area_research_model") or "claude-haiku-5-5"
     district = getattr(prop, "school_district_name", None)
     known = {lvl: v for lvl, v in (("elementary", getattr(prop, "elementary_school", None)), ("middle", getattr(prop, "middle_or_junior_school", None)), ("high", getattr(prop, "high_school", None))) if v}
     text = (
@@ -86,12 +87,14 @@ async def _ask(prop, missing: list[str], config: dict) -> tuple[dict, dict]:
         if getattr(resp.usage, "server_tool_use", None):
             usage["searches"] += resp.usage.server_tool_use.web_search_requests or 0
 
-    resp = await client.messages.create(model=model, max_tokens=1500, system=_SYSTEM, tools=[search, submit], tool_choice={"type": "auto"}, messages=messages)
+    resp = await client.messages.create(model=model, max_tokens=2000, system=_SYSTEM, tools=[search, submit], tool_choice={"type": "auto"}, messages=messages,
+                                        **ai_config_service.model_options(model, "medium"))
     add(resp)
     block = next((b for b in resp.content if getattr(b, "type", None) == "tool_use" and b.name == "submit_schools"), None)
     if not block:
         messages += [{"role": "assistant", "content": resp.content}, {"role": "user", "content": "Call submit_schools now with what you found (null for any level you are not sure of)."}]
-        resp = await client.messages.create(model=model, max_tokens=800, system=_SYSTEM, tools=[submit], tool_choice={"type": "tool", "name": "submit_schools"}, messages=messages)
+        resp = await client.messages.create(model=model, max_tokens=1100, system=_SYSTEM, tools=[submit], tool_choice={"type": "tool", "name": "submit_schools"}, messages=messages,
+                                            **ai_config_service.model_options(model))
         add(resp)
         block = next((b for b in resp.content if getattr(b, "type", None) == "tool_use" and b.name == "submit_schools"), None)
     result = block.input if block and isinstance(block.input, dict) else {}

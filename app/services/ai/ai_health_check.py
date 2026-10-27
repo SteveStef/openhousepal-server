@@ -22,7 +22,8 @@ from app.config.logging import get_logger
 logger = get_logger(__name__)
 
 _last_ok: Optional[bool] = None
-MODEL = os.getenv("ANTHROPIC_HEALTH_CHECK_MODEL", "claude-haiku-4-5")
+MODEL = os.getenv("ANTHROPIC_HEALTH_CHECK_MODEL", "claude-haiku-5-5")
+MODEL = {"claude-haiku-4-5": "claude-haiku-5-5"}.get(MODEL, MODEL)  # Haiku 4.5 retired here (10/27)
 
 
 async def check_once() -> tuple[bool, str]:
@@ -37,7 +38,9 @@ async def check_once() -> tuple[bool, str]:
     try:
         # Same library + transport as every feature (AsyncAnthropic over httpx), its own client.
         client = anthropic.AsyncAnthropic(timeout=30.0, max_retries=1)
-        resp = await client.messages.create(model=MODEL, max_tokens=5, messages=[{"role": "user", "content": "Reply with OK"}])
+        # Thinking off: Haiku 5.5 thinks by default, and a 5-token reply has no room for it.
+        extra = {"thinking": {"type": "disabled"}, "output_config": {"effort": "low"}} if MODEL.startswith("claude-haiku-5") else {}
+        resp = await client.messages.create(model=MODEL, max_tokens=5, messages=[{"role": "user", "content": "Reply with OK"}], **extra)
         if not getattr(resp, "content", None):
             return False, f"anthropic {version}: empty reply"
         return True, f"anthropic {version}: ok"

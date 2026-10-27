@@ -346,9 +346,10 @@ async def _generate_narrative(db: AsyncSession, area: MarketArea, triggering_use
         client = _get_client()
         response = await client.messages.create(
             model=config["model"],
-            max_tokens=250,
+            max_tokens=350,  # 250 on Haiku 4.5; Haiku 5.5 counts the same words as ~30% more tokens
             system=_NARRATIVE_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": f"Town: {area.name}, {area.state}\n\nVerified facts:\n{grounding}"}],
+            **ai_config_service.model_options(config["model"]),
         )
         text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
         # Plain prose only - the model sometimes opens with a markdown title ("# Gettysburg, Pennsylvania").
@@ -700,7 +701,7 @@ async def _run_ai_research(db: AsyncSession, area: MarketArea, facts: dict, trig
             )
         except Exception as exc:
             logger.warning("Completion-pass call failed", extra={"area_id": area.id, "category": category, "error": str(exc)})
-            solo_result, solo_usage = None, {"input_tokens": 0, "output_tokens": 0, "web_search_requests": 0, "estimated_cost_usd": 0.0, "model": "claude-haiku-4-5"}
+            solo_result, solo_usage = None, {"input_tokens": 0, "output_tokens": 0, "web_search_requests": 0, "estimated_cost_usd": 0.0, "model": "claude-haiku-5-5"}
 
         running_cost += solo_usage.get("estimated_cost_usd") or 0.0
         total_input_tokens += solo_usage.get("input_tokens") or 0
@@ -712,7 +713,7 @@ async def _run_ai_research(db: AsyncSession, area: MarketArea, facts: dict, trig
             new_cleaned, new_dropped = area_research_service.validate_category_result(category, raw_value)
             cleaned_by_category[category] = new_cleaned
             dropped_by_category[category] = new_dropped
-            category_usage[category] = {"model": solo_usage.get("model", "claude-haiku-4-5"), "web_search_requests": solo_usage.get("web_search_requests", 0), "escalated": False}
+            category_usage[category] = {"model": solo_usage.get("model", "claude-haiku-5-5"), "web_search_requests": solo_usage.get("web_search_requests", 0), "escalated": False}
 
     # Narrow Sonnet fallback - public_schools only, and only if a genuine, checkable evidence
     # conflict remains (our own real MLS school_district_name evidence names a district the model

@@ -254,7 +254,9 @@ async def get_area_market_trends(db: AsyncSession, scope: dict, months: int = 12
             yy, mm = yy + 1, 1
 
     median_now = _median(current)
-    median_prior = _median(prior)
+    # A year-earlier median from only a handful of sales isn't a comparison (Rittenhouse showed a
+    # "70.7% drop" from a thin year): it needs 10+ sales and at least half the current year's count.
+    median_prior = _median(prior) if len(prior) >= max(10, len(current) // 2) else None
     yoy = round(((median_now - median_prior) / median_prior) * 100, 1) if median_now and median_prior else None
 
     active_rows = (await db.execute(

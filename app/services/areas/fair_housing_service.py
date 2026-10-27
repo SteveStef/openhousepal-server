@@ -135,8 +135,18 @@ def clean_area_payload(facts: dict, narrative: Optional[dict], origin: Optional[
                     ents.append(e)
                     continue
                 e = dict(e)
-                if key == "transportation" and _BUS_ROUTE_NAME_RE.search(str(e.get("name") or "")):
-                    continue  # a numbered bus route - they change every few months (SEPTA Route 106)
+                if key == "transportation" and (_BUS_ROUTE_NAME_RE.search(str(e.get("name") or ""))
+                                                or re.search(r"\btours?\b", f"{e.get('name')} {e.get('category')}", re.IGNORECASE)):
+                    continue  # a numbered bus route (SEPTA Route 106 ended) or a sightseeing tour (Gettysburg Tour Center)
+                if key == "parks" and (e.get("distance_miles") or 0) > FAR_PARK_MILES \
+                        and not re.search(r"\b(?:state|national)\s+(?:park|forest|seashore|recreation area)\b", str(e.get("name") or ""), re.IGNORECASE):
+                    continue  # not a local park (Bryn Coed Preserve, 22 mi from Bryn Mawr; Glenolden's sports complex for Radnor)
+                if key == "parks" and e.get("name"):
+                    e["name"] = re.sub(r"\s+(?:Park\s+)?(?:Office|Headquarters|Visitor Center)$", "", str(e["name"])) or e["name"]  # "White Clay Creek Preserve Office"
+                if key == "medical" and e.get("description") and "urgent" in str(e.get("category") or "").lower():
+                    e["description"] = re.sub(r"\bemergency care\b", "walk-in care", str(e["description"]), flags=re.IGNORECASE)  # urgent care isn't an ER
+                if key == "private_schools" and e.get("description") and _grades_disagree(e.get("category"), e["description"]):
+                    e.pop("description")  # "Grades K-11" over "Independent K-8 school" (Main Line Classical Academy)
                 if e.get("description"):
                     e["description"] = tidy_research_text(clean_text(e["description"]))
                     e["description"] = _not_in_another_town(e["description"], town, e.get("city"))
@@ -186,9 +196,27 @@ def town_display(area, facts: Optional[dict] = None, narrative: Optional[dict] =
     facts = tidy_school_facts(dict(getattr(area, "facts", None) or {}) if facts is None else facts, center)
     facts, narrative = clean_area_payload(facts, getattr(area, "narrative", None) if narrative is None else narrative, center, getattr(area, "name", None))
     facts.pop("_fair_housing", None)
+    if isinstance(facts.get("counties"), list) and facts["counties"]:
+        from app.services.areas.town_map_service import county_label
+        facts["county_label"] = county_label(facts["counties"]) or facts.get("county_label")  # today's wording, not the stored one
     if facts.get("commute"):  # no "Princeton -> Princeton" trip (town_extras_service.is_self_destination)
         facts["commute"] = commute_for_page(facts["commute"], getattr(area, "name", None), lat, lng)
     return facts, narrative
+
+
+FAR_PARK_MILES = 15
+_GRADE_SPAN_RE = re.compile(r"\b(Pre-?K|PK|K|N|\d{1,2})\s*(?:-|–|through|to)\s*(\d{1,2})\b", re.IGNORECASE)
+
+
+def _grades_disagree(category, description: str) -> bool:
+    """The card's checked grades ("Grades K-11", from the federal survey) against a grade span the
+    research wrote into the description ("Independent K-8 school")."""
+    shown = _GRADE_SPAN_RE.search(str(category or "")) if str(category or "").lower().startswith("grades") else None
+    said = _GRADE_SPAN_RE.search(description or "")
+    if not shown or not said:
+        return False
+    low = lambda g: "0" if g.lower() in ("k", "pk", "pre-k", "prek", "n") else g  # noqa: E731
+    return (low(shown.group(1)), shown.group(2)) != (low(said.group(1)), said.group(2))
 
 
 _BUS_ROUTE_NAME_RE = re.compile(r"\broutes?\s*\d+|\bbus route\b", re.IGNORECASE)
@@ -314,6 +342,7 @@ async def ai_fix_text(db: AsyncSession, text: str, triggering_user_id: Optional[
                 "describing a place's walkability as acceptable."),
             tools=[_COMPLIANCE_TOOL], tool_choice={"type": "tool", "name": "report_flags"},
             messages=[{"role": "user", "content": f"Review this real estate copy:\n\n{text}"}],
+            **ai_config_service.model_options(model),
         )
         cost = ai_config_service.estimate_cost_usd(config, model, resp.usage.input_tokens, resp.usage.output_tokens)
         await record_usage_event(db, triggering_user_id, None, model, resp.usage.input_tokens, resp.usage.output_tokens,

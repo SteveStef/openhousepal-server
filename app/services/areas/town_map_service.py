@@ -182,6 +182,13 @@ def county_label(rows: list[dict]) -> Optional[str]:
     if not rows:
         return None
     if all(r["kind"] == "county" for r in rows):
+        rows = sorted(rows, key=lambda r: -(r.get("share") or 0))
+        if len(rows) > 1 and (rows[0].get("share") or 0) >= 70:
+            # Mostly one county: Princeton is a Mercer County town whose mailing area reaches a little
+            # into Middlesex and Somerset - "Mercer, Middlesex and Somerset counties" read as equal parts.
+            rest = [re.sub(r"\s+County$", "", r["name"]) for r in rows[1:]]
+            tail = rest[0] if len(rest) == 1 else ", ".join(rest[:-1]) + " and " + rest[-1]
+            return f"{rows[0]['name']} (some homes in {tail} {'County' if len(rest) == 1 else 'counties'})"
         return _join_counties([r["name"] for r in rows])
     if len(rows) == 1:
         return "Independent city"

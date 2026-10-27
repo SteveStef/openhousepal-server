@@ -239,6 +239,7 @@ async def generate(
             max_tokens=5000 if purpose == "property_site_town_facts" else config["copywrite_max_output_tokens"],
             system=_SYSTEM,
             messages=[{"role": "user", "content": user_msg}],
+            **ai_config_service.model_options(model, "medium"),
         )
         text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
         # Plain text lands in designs, captions and bios as-is - "**Headline**" would print the stars.
@@ -286,6 +287,7 @@ async def compliance_check(db, owner_id: str, plan_tier: str, *, text: str) -> d
             tools=[_COMPLIANCE_TOOL],
             tool_choice={"type": "tool", "name": "report_flags"},
             messages=[{"role": "user", "content": f"Review this real estate copy:\n\n{text}"}],
+            **ai_config_service.model_options(model),
         )
         flags = []
         for b in resp.content:
@@ -380,6 +382,7 @@ async def parse_reviews(db, owner_id: str, plan_tier: str, *, text: str) -> dict
             tools=[_REVIEWS_TOOL],
             tool_choice={"type": "tool", "name": "save_reviews"},
             messages=[{"role": "user", "content": f"Here is what I copied:\n\n{text}"}],
+            **ai_config_service.model_options(model),
         )
         found = []
         for b in resp.content:

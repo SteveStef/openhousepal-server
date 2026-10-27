@@ -828,11 +828,24 @@ _PROCESS_RE = re.compile(
     r"i (?:found|searched|could not|couldn't|was unable)|sources? (?:show|indicate|provide)|according to (?:my|the) search|"
     r"also identified|were identified|identified \d+|not able to (?:find|verify|confirm)|searched|searching|"
     r"sources? (?:from \d{4} )?confirm|multiple sources|within walking distance|research confirmed|confirmed finding|"
-    r"platform data|existing data|well[- ]documented|consistently listed|according to (?:yelp|google|tripadvisor|the research)|"
+    r"platform data|existing data|platform's note|the platform|data aligns|well[- ]documented|consistently listed|according to (?:yelp|google|tripadvisor|the research)|"
     r"documented as|(?:only|main)\b[^.]{0,40}\bidentified)\b", re.IGNORECASE)
 _LABEL_RE = re.compile(r"\b(?:IN_AREA|ADJACENT|NEARBY|OTHER_MAJOR_MEDICAL|URGENT_CARE)\b")  # the research's own labels, all caps
 _DISTANCE_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:-\s*\d+(?:\.\d+)?\s*)?(?:mi|miles?|minutes?|min)\b", re.IGNORECASE)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")  # "1.4 miles" and "St. Davids" stay whole
+_ABBREV_END_RE = re.compile(r"(?:^|[\s(])(?:U\.S|St|Ste|Mt|Ft|Dr|Rd|Ave|Blvd|Ln|Pkwy|No|Jr|Sr|Inc|Co|vs|approx|e\.g|i\.e|a\.m|p\.m|[A-Z])\.$")
+
+
+def split_sentences(text: str) -> list[str]:
+    """Sentences, with abbreviations kept whole - splitting at "U.S. News" left Lankenau's description
+    reading "News & World Report." and Radnor's "Vybe urgent care is located in St."."""
+    parts: list[str] = []
+    for p in _SENTENCE_SPLIT_RE.split(text or ""):
+        if parts and _ABBREV_END_RE.search(parts[-1].rstrip()):
+            parts[-1] += " " + p
+        else:
+            parts.append(p)
+    return [p for p in parts if p.strip()]
 
 
 def tidy_research_text(text: Optional[str], drop_distances: bool = True) -> str:
@@ -855,10 +868,12 @@ def tidy_research_text(text: Optional[str], drop_distances: bool = True) -> str:
     out = _SIZE_OF_RE.sub("", out)
     out = _SIZE_WITH_RE.sub("", out)
     out = _HOURS_RE.sub("", out)  # before the 24-hour sentence rule, so "open 24 hours" loses only those words
+    out = _LEGACY_LINE_RE.sub("", out)  # SEPTA's retired "R5" names
+    # "residents 'go into town.' The downtown..." - a quote closing after the period hid the sentence
+    # end, and the page's sentence splitter then showed "' The downtown...".
+    out = re.sub("([.!?])(['\"’”])(?=\\s|$)", r"\2\1", out)
     keep, skipped = [], False
-    for s in _SENTENCE_SPLIT_RE.split(out):
-        if not s.strip():
-            continue
+    for s in split_sentences(out):
         # A sentence leaning on a dropped one ("All are privately operated...") goes with it.
         skipped = bool(_PROCESS_RE.search(s) or _LABEL_RE.search(s) or (drop_distances and _DISTANCE_RE.search(s))
                        or _is_bus_route_sentence(s) or _STALE_CLAIM_RE.search(s) or _SIZE_LEFT_RE.search(s)
@@ -874,21 +889,38 @@ def tidy_research_text(text: Optional[str], drop_distances: bool = True) -> str:
     out = _ADDRESS_RE.sub(" ", out)
     out = re.sub(r"\s+([,.;])", r"\1", re.sub(r"\s{2,}", " ", out)).strip()
     out = re.sub(r"[,;]+\.", ".", out)  # "Orange Theory Fitness;." once a trailing count is gone
-    out = re.sub(r"\s{2,}", " ", re.sub(r"(^|\s)['\"](?=\s|$)", " ", out)).strip()  # a lone quote mark left by the research ("borough. ' The downtown")
+    out = re.sub(r"\s{2,}", " ", re.sub("(^|\\s)['\"‘’“”](?=\\s|$)", " ", out)).strip()  # a lone quote mark left by the research ("borough. ' The downtown")
+    out = re.sub("^['\"‘’“”]+(?=[A-Za-z])", "", out)  # one opening the text with no partner
+    out = re.sub(r"\s*\(\s*\)", "", out)  # "Natural Lands preserve ()" once a size inside it is gone
+    out = re.sub(r"\b(?:an?|the)\s+(an?|the)\b", r"\1", out, flags=re.IGNORECASE)  # "is an a welcoming community"
+    out = re.sub(r"\s+([,.;])", r"\1", out)
     out = re.sub(r"^[,;\s]+", "", out)
     return out[:1].upper() + out[1:] if out else out
+
+
+# SEPTA's retired Regional Rail numbers ("R5"), in or out of brackets - riders now see line names.
+_LEGACY_LINE_RE = re.compile(r"\s*\((?:designated\s+)?R[1-8](?:\s+[A-Z][\w/]*)?\)|\bR[1-8]\b\s*(?=[A-Z(]|$)?")
 
 
 # How many stores / restaurants / rides a place has goes stale and the research's sources disagree
 # (Rehoboth: "223 total restaurants", Tanger "140+" stores - 115 today, Funland "20 rides" - 18).
 _COUNTED = (r"restaurants?|eateries|eatery|stores?|shops?|outlets?|boutiques?|brands?|rides?|attractions?|"
-            r"vendors?|galleries|gallery|dining options?|businesses|merchants?|tenants?|retailers?")
-_NUMBER = r"\d[\d,]*(?:\s*(?:-|–|to)\s*\d[\d,]*)?\+?"  # "40-50", "20+", "1,200"
+            r"vendors?|galleries|gallery|dining options?|businesses|merchants?|tenants?|retailers?|"
+            # the research miscounts its own lists (Malvern "five major supermarkets" - four listed;
+            # State College "five surrounding townships" - six named)
+            r"supermarkets?|grocery stores?|hospitals?|urgent care (?:centers?|facilities|clinics?)|parks?|preserves?|"
+            r"townships?|boroughs?|stations?|schools?")
+_NUMBER = (r"(?:\d[\d,]*(?:\s*(?:-|–|to)\s*\d[\d,]*)?\+?|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+           r"Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten)")  # "40-50", "20+", "1,200", "five"
 _COUNT_COMPOUND_RE = re.compile(rf"\b{_NUMBER}[- ](?:restaurant|store|shop|outlet|boutique|brand|ride|attraction|vendor|gallery|merchant|tenant|retailer|seat)"
                                 r"\s+(?=[a-z])")  # "a 140+ store outlet mall"
-_COUNT_RE = re.compile(rf"\b(?:(?:over|more than|nearly|almost|about|approximately|around|some|roughly)\s+)?{_NUMBER}\s+"
+_COUNT_RE = re.compile(rf"(?<![-–/])(?<!grades )(?<!grade )(?<!Grades )\b(?:(?:over|more than|nearly|almost|about|approximately|around|some|roughly)\s+)?{_NUMBER}\s+"  # not "K-12"
                        rf"(?:total\s+|different\s+|unique\s+)?"
-                       rf"(?=(?:more\s+)?(?:brand[- ]name\s+|local\s+|independent\s+)?(?:{_COUNTED})\b)", re.IGNORECASE)
+                       # up to three describing words between ("five major full-service supermarkets"),
+                       # never a distance or time ("15 minutes from parks")
+                       rf"(?=(?:(?!(?:from|to|of|in|on|at|within|by|for|away|minutes?|miles?|hours?|blocks?|walk|drive|min|mi|"
+                       rf"students?|homes?|residents?|people|percent|years?|attending|serving|with)\b)"
+                       rf"[a-z][\w'-]*\s+){{0,3}}(?:{_COUNTED})\b)", re.IGNORECASE)
 # A street address inside a sentence - the checked address is shown on its own line, and the
 # research's one was sometimes another branch (Beebe Walk-In Care "at 18941 John J Williams Hwy").
 _ADDRESS_CORE = (r"(?:at|on|and)\s+\d{1,6}\s+(?:[A-Z][\w.']*\s+){1,5}"
@@ -899,11 +931,15 @@ _ADDRESS_OPENER_RE = re.compile(r"(^|[.!?]\s+)Located\s+" + _ADDRESS_CORE + r",?
 # Bus route numbers and colored bus "lines" change every few months (SEPTA ended Route 106 on
 # 8/24/2026; rabbittransit's Gold Line is seasonal) - only stations, which the check confirms, stay.
 _BUS_WORD_RE = re.compile(r"\b(?:bus(?:es)?|transit|SEPTA|DART|ChescoBus|SCCOOT|rabbittransit|Krapf)\b", re.IGNORECASE)
-_BUS_ROUTE_RE = re.compile(r"\broutes?\s+\d|\b(?:Red|Blue|Gold|Green|Orange|Purple|Yellow|Silver|Brown) Line\b", re.IGNORECASE)
+_BUS_ROUTE_RE = re.compile(r"\broutes?\s+\d|\b(?:Red|Blue|Gold|Green|Gray|Grey|Orange|Purple|Yellow|Silver|Brown) Line\b|"
+                           r"\bfixed routes?\b|\b(?:Red|Blue|Gold|Green|Gray|Grey|Orange|Purple|Yellow|Silver|Brown)\b[^.]{0,40}\blines\b",
+                           re.IGNORECASE)  # rabbittransit "Four fixed routes (Lincoln, Blue, Gray, and Gold lines)... daily"
 
 
 def _is_bus_route_sentence(s: str) -> bool:
     # "the D1 (formerly Route 101 Media line)" names a trolley line's history, not a bus route.
+    if re.search(r"\bfixed routes?\b", s, re.IGNORECASE):
+        return True
     return bool(_BUS_WORD_RE.search(s) and _BUS_ROUTE_RE.search(re.sub(r"formerly\s+Route\s+\d+", "", s, flags=re.IGNORECASE)))
 
 
@@ -939,7 +975,7 @@ def drop_removed_mentions(text: Optional[str], removed_names: list[str]) -> str:
     if not text or not removed_names:
         return text or ""
     pats = [re.compile(r"\b" + re.escape(n) + r"\b", re.IGNORECASE) for n in removed_names if len(n) >= 5]
-    sentences = [s for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    sentences = split_sentences(text)
     keep, dropped, any_dropped = [], False, False
     for s in sentences:
         dropped = any(p.search(s) for p in pats) or (dropped and bool(_LEANS_BACK_RE.match(s.strip())))

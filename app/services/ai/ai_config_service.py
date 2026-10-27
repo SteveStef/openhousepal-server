@@ -15,9 +15,11 @@ from app.models.database import SystemSettings
 
 AI_CONFIG_KEY = "ai_assistant_config"
 
+RETIRED_MODELS = {"claude-haiku-4-5": "claude-haiku-5-5"}
+
 DEFAULT_CONFIG = {
-    "model": "claude-haiku-4-5",
-    "max_output_tokens": 700,
+    "model": "claude-haiku-5-5",
+    "max_output_tokens": 900,  # Haiku 5.5 counts the same text as ~30% more tokens than 4.5 (700 then)
     "max_input_chars": 12000,
 
     # Rate limiting
@@ -44,8 +46,8 @@ DEFAULT_CONFIG = {
     # Fair-Housing compliance check. Short single-shot Claude calls on the cheap model. Per-user
     # spend is the shared agent_monthly_ai_budget_usd_by_tier pool (same as CMA / Studio Media);
     # these are the platform-wide + reservation figures. See ai_rate_limit_service.reserve_copywrite.
-    "copywrite_model": "claude-haiku-4-5",
-    "copywrite_max_output_tokens": 1600,
+    "copywrite_model": "claude-haiku-5-5",
+    "copywrite_max_output_tokens": 2100,  # 1600 on Haiku 4.5; the new tokenizer counts ~30% more
     "copywrite_reservation_estimate_usd": 0.03,   # worst case ~a few K input + 1600 out on Haiku; trued up after
     "copywrite_global_daily_cost_ceiling_usd": 25.0,
     "copywrite_global_monthly_cost_ceiling_usd": 300.0,
@@ -120,6 +122,9 @@ DEFAULT_CONFIG = {
     # $ per million tokens, keyed by model id, for estimated_cost_usd bookkeeping.
     "model_pricing": {
         "claude-haiku-4-5": {"input_per_mtok": 1.0, "output_per_mtok": 5.0},
+        # Two rate cards by prompt length: $0.10 / $0.50 up to 100K prompt tokens, $0.50 / $2.50 above.
+        "claude-haiku-5-5": {"input_per_mtok": 0.10, "output_per_mtok": 0.50, "long_prompt_tokens": 100_000,
+                             "long_input_per_mtok": 0.50, "long_output_per_mtok": 2.50},
         "claude-sonnet-5": {"input_per_mtok": 2.0, "output_per_mtok": 10.0},
         "claude-opus-5": {"input_per_mtok": 5.0, "output_per_mtok": 25.0},
         "claude-opus-5-5": {"input_per_mtok": 4.0, "output_per_mtok": 20.0, "cache_read_multiplier": 0.05},
@@ -200,7 +205,7 @@ DEFAULT_CONFIG = {
     #   3. Shared canonical MarketArea reuse (get_or_create_market_area) - the primary control on
     #      total VOLUME: the same real-world town is only ever researched once, platform-wide,
     #      no matter how many agents later add it to their own site.
-    "area_research_model": "claude-haiku-4-5",
+    "area_research_model": "claude-haiku-5-5",
     "area_research_escalation_model": "claude-sonnet-5",
     "area_research_max_cost_per_community_usd": 1.0,
     "area_research_global_daily_cost_ceiling_usd": 50.0,
@@ -771,6 +776,10 @@ class AIConfigService:
             merged = cls._merge(DEFAULT_CONFIG, setting.value)
         else:
             merged = dict(DEFAULT_CONFIG)
+        # A saved override naming a retired model moves with the rest (owner, 10/27: Haiku 4.5 -> 5.5 everywhere).
+        for key, value in list(merged.items()):
+            if key.endswith("model") and value in RETIRED_MODELS:
+                merged[key] = RETIRED_MODELS[value]
 
         cls._cache = merged
         return merged
@@ -801,13 +810,25 @@ class AIConfigService:
         pricing = config.get("model_pricing", {}).get(model)
         if not pricing:
             return 0.0
-        inp = pricing["input_per_mtok"]
+        inp, out = pricing["input_per_mtok"], pricing["output_per_mtok"]
+        # Haiku 5.5 bills a long prompt (over 100K tokens, cache included) on its higher rate card.
+        if pricing.get("long_prompt_tokens") and input_tokens + cache_write_tokens + cache_read_tokens > pricing["long_prompt_tokens"]:
+            inp, out = pricing["long_input_per_mtok"], pricing["long_output_per_mtok"]
         return (
             (input_tokens / 1_000_000) * inp
             + (cache_write_tokens / 1_000_000) * inp * 1.25
             + (cache_read_tokens / 1_000_000) * inp * pricing.get("cache_read_multiplier", 0.1)
-            + (output_tokens / 1_000_000) * pricing["output_per_mtok"]
+            + (output_tokens / 1_000_000) * out
         )
+
+    @staticmethod
+    def model_options(model: str, effort: str = "low") -> dict:
+        """Extra request fields a model needs. Claude Haiku 5.5 thinks by default (Haiku 4.5 didn't),
+        and thinking eats into the small max_tokens our short calls use - it runs with thinking off,
+        as 4.5 did, at the given effort. Other models: nothing extra."""
+        if str(model).startswith("claude-haiku-5"):
+            return {"thinking": {"type": "disabled"}, "output_config": {"effort": effort}}
+        return {}
 
     @staticmethod
     def estimate_tts_cost_usd(config: dict, model: str, char_count: int) -> float:

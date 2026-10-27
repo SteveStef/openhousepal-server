@@ -1,6 +1,10 @@
 {
  "2026-10": {
-  "nearby_search_pro": 1,
-  "place_photos": 8
+  "nearby_search_pro": 39,
+  "place_photos": 8,
+  "route_matrix_essentials": 1331,
+  "route_matrix_pro": 99,
+  "text_search_enterprise": 179,
+  "text_search_pro": 1032
  }
 }

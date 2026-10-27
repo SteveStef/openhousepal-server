@@ -76,6 +76,7 @@ async def maybe_compact(db: AsyncSession, current_user: User, conversation: AICo
             max_tokens=config["compaction_max_output_tokens"],
             system=COMPACTION_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": transcript}],
+            **ai_config_service.model_options(config["model"]),
         )
         input_tokens = response.usage.input_tokens
         output_tokens = response.usage.output_tokens

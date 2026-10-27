@@ -150,6 +150,7 @@ async def run_turn(
             system=system_blocks,
             tools=ai_tools.TOOL_DEFINITIONS,
             messages=messages,
+            **ai_config_service.model_options(config["model"], "medium"),
         )
 
     async def _run() -> str:
