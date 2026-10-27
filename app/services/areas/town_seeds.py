@@ -100,6 +100,6 @@ async def scheduled_apply_town_seeds() -> None:
     try:
         async with AsyncSessionLocal() as db:
             result = await apply_town_seeds(db)
-        logger.info("Town seeds applied", extra=result)
+        logger.info("Town seeds applied: %s", result)
     except Exception:
         logger.exception("applying town seeds failed")

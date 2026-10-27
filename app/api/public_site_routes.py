@@ -780,9 +780,15 @@ async def get_site_area(site_id: str, slug: str, db: AsyncSession = Depends(get_
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Site not found.")
     site, user = owner
     area = await _get_owned_area(db, site, slug)
+    return await area_page_payload(db, area, user)
 
+
+async def area_page_payload(db: AsyncSession, area: MarketArea, user: Optional[User]) -> dict:
+    """The town page's data for one agent's site - or, with user=None, the same page with no agent
+    (the admin's town preview, admin_area_routes.preview_town_page): the agent's own listings,
+    sales, open houses and other towns are then simply empty. Everything else is shared."""
     area_scope = geography.scope_for_market_area(area)
-    facts = dict(area.facts)
+    facts = dict(area.facts or {})
     if "photos" in facts:
         facts["photos"] = content_adapters.resolve_photo_urls(facts["photos"])
     stats_seed = facts.get("market_stats")
@@ -796,7 +802,7 @@ async def get_site_area(site_id: str, slug: str, db: AsyncSession = Depends(get_
     from app.services.areas.fair_housing_service import clean_area_payload
     facts, narrative_clean = clean_area_payload(facts, area.narrative)
     facts.pop("_fair_housing", None)
-    hub_rules = await content_adapters.hub_sales_rules(db, user)
+    hub_rules = await content_adapters.hub_sales_rules(db, user) if user else None
     return {
         "name": area.name,
         "state": area.state,
@@ -808,10 +814,10 @@ async def get_site_area(site_id: str, slug: str, db: AsyncSession = Depends(get_
         "facts": content_adapters.fix_mojibake_deep(facts),
         "narrative": content_adapters.fix_mojibake_deep(narrative_clean),
         # The Agent Hub's picks (hidden homes, min price, order) apply on town pages too (owner, 10/24).
-        "my_listings": content_adapters.drop_hidden_listings(await content_adapters.get_active_listings(db, user, 12, area_scope=area_scope), hub_rules)[:6],
-        "sales": content_adapters.apply_sales_rules(await content_adapters.get_recent_sales(db, user, 12, area_scope=area_scope), hub_rules)[:6],
-        "open_houses": await content_adapters.get_open_houses(db, user, 4, area_scope=area_scope),
-        "related_areas": await content_adapters.cached_market(f"related:{user.id}:{area.id}", lambda d: content_adapters.get_area_related(d, user, area.id, limit=3), db),
+        "my_listings": content_adapters.drop_hidden_listings(await content_adapters.get_active_listings(db, user, 12, area_scope=area_scope), hub_rules)[:6] if user else [],
+        "sales": content_adapters.apply_sales_rules(await content_adapters.get_recent_sales(db, user, 12, area_scope=area_scope), hub_rules)[:6] if user else [],
+        "open_houses": await content_adapters.get_open_houses(db, user, 4, area_scope=area_scope) if user else [],
+        "related_areas": await content_adapters.cached_market(f"related:{user.id}:{area.id}", lambda d: content_adapters.get_area_related(d, user, area.id, limit=3), db) if user else [],
         # Live market trends (12 months of closed sales, what's for sale now) and the latest
         # closed sales across the whole MLS - see market_stats_service.get_area_market_trends.
         "market_trends": await content_adapters.cached_market(f"trends:{area.id}", lambda d: market_stats_service.get_area_market_trends(d, area_scope), db),
@@ -875,6 +881,13 @@ async def get_site_area_listings(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Site not found.")
     site, _user = owner
     area = await _get_owned_area(db, site, slug)
+    return await area_listings_payload(db, area, limit=limit, offset=offset, min_price=min_price, max_price=max_price, sort=sort)
+
+
+async def area_listings_payload(db: AsyncSession, area: MarketArea, *, limit: int, offset: int = 0,
+                                min_price: Optional[int] = None, max_price: Optional[int] = None, sort: str = "newest") -> dict:
+    """Everything for sale in the town (full MLS) - the same for every agent, so the admin's town
+    preview uses it too."""
     listings, total = await content_adapters.get_area_inventory(
         db,
         geography.scope_for_market_area(area),

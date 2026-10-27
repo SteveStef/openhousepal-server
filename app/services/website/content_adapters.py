@@ -1462,36 +1462,39 @@ async def _build_served_areas_summary(db: AsyncSession, user: User, limit: int =
         .limit(limit)
     )
     areas = result.scalars().all()
-    out = []
-    for a in areas:
-        area_scope = geography.scope_for_market_area(a)
-        # Photo + stats go through the town pages' shared market cache (same keys warm_area_caches
-        # fills): built cold they took ~20 s for 8 towns - the first home-page visit after a restart.
-        photo = await cached_market(f"photo:{a.id}", lambda d, sc=area_scope: _area_top_listing_photo(d, sc), db)
-        if not photo:
-            resolved_photos = resolve_photo_urls(a.facts.get("photos"))
-            items = (resolved_photos or {}).get("items") or []
-            photo = items[0]["url"] if items else None
-        card = {
-            "slug": a.slug,
-            "name": a.name,
-            "state": a.state,
-            "county": a.county,
-            "photo": photo,
-            "summary": (a.narrative or {}).get("summary"),
-        }
-        if with_stats:
-            stats = await cached_market(f"stats:{a.id}", lambda d, sc=area_scope, ms=a.facts.get("market_stats"): get_area_live_market_stats(d, sc, ms), db)
-            card["median_price"] = stats.get("median_price")
-            card["active_count"] = stats.get("active_count")
-            card["min_price"] = stats.get("min_price")
-            card["max_price"] = stats.get("max_price")
-            card["price_range_basis"] = stats.get("price_range_basis")
-            checked = await reconcile_public_schools(db, a, area_scope) if (a.facts or {}).get("public_schools") else None
-            card["school_districts"] = _public_school_districts({"public_schools": checked} if checked else a.facts, stats.get("school_districts") or [])
-            card["hover_facts"] = _area_hover_facts(a.facts, stats)
-        out.append(card)
-    return out
+    return [await area_summary_card(db, a, with_stats) for a in areas]
+
+
+async def area_summary_card(db: AsyncSession, a: MarketArea, with_stats: bool = False) -> dict:
+    """One town's card in the served-areas list. Also used on its own by the admin's town preview
+    for a town no agent serves yet (admin_area_routes.preview_town_page)."""
+    area_scope = geography.scope_for_market_area(a)
+    # Photo + stats go through the town pages' shared market cache (same keys warm_area_caches
+    # fills): built cold they took ~20 s for 8 towns - the first home-page visit after a restart.
+    photo = await cached_market(f"photo:{a.id}", lambda d, sc=area_scope: _area_top_listing_photo(d, sc), db)
+    if not photo:
+        resolved_photos = resolve_photo_urls((a.facts or {}).get("photos"))
+        items = (resolved_photos or {}).get("items") or []
+        photo = items[0]["url"] if items else None
+    card = {
+        "slug": a.slug,
+        "name": a.name,
+        "state": a.state,
+        "county": a.county,
+        "photo": photo,
+        "summary": (a.narrative or {}).get("summary"),
+    }
+    if with_stats:
+        stats = await cached_market(f"stats:{a.id}", lambda d, sc=area_scope, ms=(a.facts or {}).get("market_stats"): get_area_live_market_stats(d, sc, ms), db)
+        card["median_price"] = stats.get("median_price")
+        card["active_count"] = stats.get("active_count")
+        card["min_price"] = stats.get("min_price")
+        card["max_price"] = stats.get("max_price")
+        card["price_range_basis"] = stats.get("price_range_basis")
+        checked = await reconcile_public_schools(db, a, area_scope) if (a.facts or {}).get("public_schools") else None
+        card["school_districts"] = _public_school_districts({"public_schools": checked} if checked else a.facts, stats.get("school_districts") or [])
+        card["hover_facts"] = _area_hover_facts(a.facts, stats)
+    return card
 
 
 async def get_forms_list(db: AsyncSession, user: User) -> list[dict]:

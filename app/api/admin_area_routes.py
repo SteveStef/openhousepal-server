@@ -170,7 +170,7 @@ async def _agents_for(db: AsyncSession, area: MarketArea) -> list[dict]:
         out.append({
             "id": user.id, "name": f"{user.first_name or ''} {user.last_name or ''}".strip() or user.email,
             "email": user.email, "plan_tier": user.plan_tier,
-            "site_host": host, "site_live": live,
+            "site_id": site.id if site else None, "site_host": host, "site_live": live,
             "page_url": f"https://{host}/{area.slug}" if host and live else None,
         })
     return out
@@ -258,6 +258,69 @@ async def _area_or_404(db: AsyncSession, area_id: str) -> MarketArea:
 @router.get("/{area_id}")
 async def get_area(area_id: str, db: AsyncSession = Depends(get_db), admin: User = Depends(require_admin_user)):
     return await area_detail(db, await _area_or_404(db, area_id))
+
+
+# ---------------------------------------------------------------- page preview
+
+# Stands in for the agent on a preview with no agent - the spots their name, photo and buttons take.
+SAMPLE_PROFILE = {
+    "name": "Your name here", "phone": None, "email": None, "brokerage": "Your brokerage", "photo_url": None,
+    "title": "Real estate agent", "market": None, "license_number": None, "social_links": [],
+    "signature_hub_slug": None, "sales_recent": False, "agent_hub_slug": None, "forms": [],
+    "rating": None, "google_rating": None, "sample": True,
+}
+NO_REVIEWS = {"show": False, "summary": {"count": 0, "average": None}, "reviews": [], "hub_slug": None}
+
+
+@router.get("/{area_id}/preview")
+async def preview_town_page(
+    area_id: str,
+    site: str = Query("", max_length=64, description="An agent's site id, 'none' for no agent, empty = an agent who serves it"),
+    limit: int = Query(9, ge=1, le=48), sort: str = Query("newest", pattern="^(newest|price_desc|price_asc)$"),
+    min_price: Optional[int] = None, max_price: Optional[int] = None,
+    db: AsyncSession = Depends(get_db), admin: User = Depends(require_admin_user),
+):
+    """Everything the IDX town page shows, for the admin's preview (frontend /admin/town-preview/[areaId]) -
+    as one agent's live site shows it (the very same public functions build it), or with no agent at
+    all, so a town nobody serves yet can be looked at too. Admin only; nothing is changed."""
+    from app.api import public_site_routes as ps
+    from app.services.website import content_adapters as ca
+    from app.services.website.domain_resolution_service import OHP_BASE_DOMAIN
+
+    area = await _area_or_404(db, area_id)
+    # Live sites only; real agents before test accounts (@example.com), so the default is a real site.
+    live = [a for a in await _agents_for(db, area) if a["site_live"] and a["site_id"]]
+    live.sort(key=lambda a: (a["email"] or "").lower().endswith("@example.com"))
+    agents = [{"site_id": a["site_id"], "name": a["name"], "host": a["site_host"]} for a in live]
+    if site == "none":
+        chosen = None
+    elif site:
+        chosen = next((a for a in agents if a["site_id"] == site), None)
+        if not chosen:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "That agent's website doesn't show this town.")
+    else:
+        chosen = agents[0] if agents else None
+
+    out = {"area_id": area.id, "slug": area.slug, "agents": agents, "site": None}
+    if chosen:
+        site_id = chosen["site_id"]
+        row = await db.get(Site, site_id)
+        resolved = await ps.resolve_site(host=f"{row.subdomain_slug}.{OHP_BASE_DOMAIN}", path=area.slug, db=db)
+        snapshot = resolved.get("published_snapshot") or {}
+        out["site"] = {"site_id": site_id, "subdomain_slug": resolved["subdomain_slug"], "host": chosen["host"], "agent_name": chosen["name"],
+                       "theme": snapshot.get("theme") or {}, "pages": snapshot.get("pages") or []}
+        out["area"] = await ps.get_site_area(site_id, area.slug, db)
+        out["listings"] = await ps.get_site_area_listings(site_id, area.slug, limit=limit, offset=0, min_price=min_price, max_price=max_price, sort=sort, db=db)
+        out["profile"] = await ps.get_site_profile(site_id, db)
+        out["areas"] = await ps.list_site_areas(site_id, db)
+        out["reviews"] = await ps.get_site_reviews(site_id, db)
+    else:
+        out["area"] = await ps.area_page_payload(db, area, None)
+        out["listings"] = await ps.area_listings_payload(db, area, limit=limit, min_price=min_price, max_price=max_price, sort=sort)
+        out["profile"] = dict(SAMPLE_PROFILE)
+        out["areas"] = [await ca.area_summary_card(db, area, with_stats=True)]
+        out["reviews"] = copy.deepcopy(NO_REVIEWS)
+    return out
 
 
 # ---------------------------------------------------------------- edits (pure - see tests)
