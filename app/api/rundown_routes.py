@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config.logging import get_logger
 from app.database import get_db
 from app.models.database import User
-from app.services.rundown_service import build_rundown, mark_today_read
+from app.services.rundown_service import build_rundown, mark_seen, mark_today_read, todays_status
 from app.utils.auth import get_current_active_user
 
 logger = get_logger(__name__)
@@ -42,6 +42,23 @@ async def todays_rundown(db: AsyncSession = Depends(get_db), current_user: User 
 
 @router.post("/api/v1/rundown/today/read")
 async def todays_rundown_read(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
-    """Mark all as read: today's notifications (the Rundown's own included)."""
+    """Mark all as read: today's notifications (the Rundown's own included) - and that counts as
+    having looked at today's Rundown."""
     _recent.pop(current_user.id, None)
-    return {"success": True, "marked": await mark_today_read(db, current_user)}
+    marked = await mark_today_read(db, current_user)
+    await mark_seen(db, current_user)
+    return {"success": True, "marked": marked}
+
+
+@router.post("/api/v1/rundown/today/seen")
+async def todays_rundown_seen(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    """The agent opened today's Rundown in the app - the Dash card becomes the header button."""
+    _recent.pop(current_user.id, None)
+    await mark_seen(db, current_user)
+    return {"success": True}
+
+
+@router.get("/api/v1/rundown/today/status")
+async def todays_rundown_status(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    """The header "Briefing" button: seen today yet, and how many new things since."""
+    return await todays_status(db, current_user)

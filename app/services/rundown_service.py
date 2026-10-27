@@ -41,6 +41,60 @@ _GROUP_OF = {t: key for key, _, types in _GROUPS for t in types}
 _GROUP_LABEL = {key: label for key, label, _ in _GROUPS} | {"other": "Everything else"}
 RUNDOWN_TYPE = "SHOWCASE_DIGEST"   # the bell's "Today's Rundown" (older ones say "Today's Showcase update")
 MAX_TIMELINE = 120
+BRIEFING_EMAIL = "showcase_daily_digest_agent%"   # the daily briefing email (and its _v2 template)
+
+
+# Once the agent has looked at today's Rundown - opened it in the app, or opened / clicked today's
+# briefing email - the big Dash card steps aside for a small "Oct 26 Briefing" button in the header
+# (owner, 10/26). Anything that happens after that look lights the button up with how many.
+async def seen_state(db: AsyncSession, user: User, now: datetime | None = None, bell: Notification | None = None,
+                     bell_known: bool = False) -> dict[str, Any]:
+    from app.models.database import EmailLog
+    now = now or datetime.now(timezone.utc)
+    start = day_start(now)
+    local_day = now.astimezone(EASTERN).date().isoformat()
+    looks: list[tuple[datetime, str]] = []
+    row = (await db.execute(text("SELECT value FROM system_settings WHERE key = :k"), {"k": f"rundown_seen:{user.id}"})).scalar()
+    if isinstance(row, dict) and row.get("day") == local_day and row.get("at"):
+        try:
+            looks.append((datetime.fromisoformat(row["at"]), "app"))
+        except ValueError:
+            pass
+    opened = (await db.execute(select(func.max(func.greatest(EmailLog.opened_at, EmailLog.clicked_at))).where(
+        EmailLog.owner_id == user.id, EmailLog.audience == "agent", EmailLog.template.like(BRIEFING_EMAIL),
+        EmailLog.created_at >= start))).scalar()
+    if opened:
+        looks.append((opened, "email"))
+    if not looks:
+        return {"seen": False, "seen_at": None, "via": None, "new_since": 0}
+    at, via = max(looks, key=lambda t: t[0])
+    new = await _count(db, select(func.count(Notification.id)).where(
+        Notification.agent_id == user.id, Notification.created_at > at, Notification.created_at >= start,
+        Notification.type != RUNDOWN_TYPE))
+    if not bell_known:
+        bell = (await db.execute(select(Notification).where(
+            Notification.agent_id == user.id, Notification.type == RUNDOWN_TYPE, Notification.reference_id == f"digest-{local_day}",
+        ).limit(1))).scalars().first()
+    if bell is not None and bell.created_at and bell.created_at > at:
+        new += 1   # the briefing itself went out after they looked
+    return {"seen": True, "seen_at": at, "via": via, "new_since": new}
+
+
+async def mark_seen(db: AsyncSession, user: User, now: datetime | None = None) -> None:
+    import json
+    now = now or datetime.now(timezone.utc)
+    value = {"day": now.astimezone(EASTERN).date().isoformat(), "at": now.isoformat()}
+    await db.execute(text(
+        "INSERT INTO system_settings (key, value) VALUES (:k, CAST(:v AS jsonb)) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"), {"k": f"rundown_seen:{user.id}", "v": json.dumps(value)})
+    await db.commit()
+
+
+async def todays_status(db: AsyncSession, user: User, now: datetime | None = None) -> dict[str, Any]:
+    """The header button's few facts - cheap enough to ask every minute (no Rundown build)."""
+    now = now or datetime.now(timezone.utc)
+    local = now.astimezone(EASTERN)
+    return {"date": local.date().isoformat(), **await seen_state(db, user, now)}
 
 
 def day_start(now: datetime | None = None) -> datetime:
@@ -243,6 +297,7 @@ async def build_rundown(db: AsyncSession, user: User, now: datetime | None = Non
         "happened": happened,
         "happened_count": len(notes),
         "unread_today": unread_today,
+        "seen": await seen_state(db, user, now, bell=bell, bell_known=True),
     }
 
 

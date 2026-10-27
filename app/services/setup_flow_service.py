@@ -42,6 +42,9 @@ REQUIRED = {"about", "contact", "license"}
 # Steps whose answer is a choice with a working default - done once the agent confirms it here
 # (or it was set inside the feature itself).
 CONFIRM_STEPS = {"sales", "brand", "hub", "forms", "signature", "openhouse", "alerts", "homes", "website", "domain"}
+# Connect steps an agent can answer "I don't use this" (no CRM, no calendar app...) - that counts as
+# finished, so it leaves the dashboard for good (owner, 10/26). Connecting later still works.
+NOT_USING_STEPS = {"calendar", "mailbox", "crm"}
 
 # Before a plan is chosen (waiting for broker approval, or not checked out yet) the flow offers
 # the head start every plan shares.
@@ -80,6 +83,7 @@ def state_of(user: User) -> dict:
     st = dict(user.setup_state or {})
     st.setdefault("skipped", [])
     st.setdefault("confirmed", [])
+    st.setdefault("not_using", [])
     st.setdefault("last_step", None)
     return st
 
@@ -304,11 +308,13 @@ async def compute(db: AsyncSession, user: User, hub: AgentHub) -> dict:
             )
 
     skipped = set(st["skipped"])
+    not_using = set(st["not_using"]) & NOT_USING_STEPS
     items = []
     for step in steps:
-        status = "done" if done[step] else ("skipped" if step in skipped and step not in REQUIRED else "todo")
+        status = ("done" if done[step] else "not_using" if step in not_using
+                  else "skipped" if step in skipped and step not in REQUIRED else "todo")
         items.append({"id": step, "status": status, "required": step in REQUIRED})
-    remaining = [i for i in items if i["status"] != "done"]
+    remaining = [i for i in items if i["status"] not in ("done", "not_using")]
     return {
         "plan": plan,
         "approved": approved,

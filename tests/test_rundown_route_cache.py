@@ -21,6 +21,7 @@ async def test_requests_together_build_once_and_read_drops_it(monkeypatch):
 
     monkeypatch.setattr(rundown_routes, "build_rundown", build)
     monkeypatch.setattr(rundown_routes, "mark_today_read", mark)
+    monkeypatch.setattr(rundown_routes, "mark_seen", mark)
     rundown_routes._recent.clear()
     me = SimpleNamespace(id="agent-1")
     results = await asyncio.gather(*[rundown_routes.todays_rundown(db=None, current_user=me) for _ in range(4)])

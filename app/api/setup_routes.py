@@ -55,6 +55,9 @@ class StatePatch(BaseModel):
     skip: Optional[str] = Field(default=None, max_length=40)
     unskip: Optional[str] = Field(default=None, max_length=40)
     confirm: Optional[str] = Field(default=None, max_length=40)
+    # "I don't use this" on a connect step (and its undo)
+    not_using: Optional[str] = Field(default=None, max_length=40)
+    use_again: Optional[str] = Field(default=None, max_length=40)
     # steps the agent has now seen in the flow - later (after an upgrade) the ones they haven't
     # seen yet are marked "New"
     seen: Optional[list[str]] = None
@@ -73,6 +76,11 @@ async def put_state(payload: StatePatch, db: AsyncSession = Depends(get_db), cur
     if payload.confirm in flow.CONFIRM_STEPS and payload.confirm not in st["confirmed"]:
         st["confirmed"] = [*st["confirmed"], payload.confirm]
         st["skipped"] = [s for s in st["skipped"] if s != payload.confirm]
+    if payload.not_using in flow.NOT_USING_STEPS and payload.not_using not in st["not_using"]:
+        st["not_using"] = [*st["not_using"], payload.not_using]
+        st["skipped"] = [s for s in st["skipped"] if s != payload.not_using]
+    if payload.use_again:
+        st["not_using"] = [s for s in st["not_using"] if s != payload.use_again]
     if payload.seen:
         st["seen"] = sorted(set(st.get("seen") or []) | {s for s in payload.seen if s in known})
     current_user.setup_state = st
