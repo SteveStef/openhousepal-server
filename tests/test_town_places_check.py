@@ -160,7 +160,7 @@ def test_research_text_is_cleaned_for_visitors():
     out = tpc.tidy_research_text(shopping)
     assert "cite" not in out and "Searched" not in out and "entities" not in out and "1.4 miles" not in out
     assert out.startswith("Malvern Borough is a walkable small town")
-    assert "2.5-mile Radnor Trail" in out  # a length, not a distance from town
+    assert "The Radnor Trail is popular." in out and "2.5-mile" not in out  # lengths the check can't confirm go (10/27 audit)
     grocery = ("State College has strong grocery access with multiple full-service supermarkets in the IN_AREA category. "
                "Wegmans and Giant are regional chains. All are within walking distance of downtown. "
                "Searched comprehensively for private schools. Nearby state forests have trails.")
@@ -339,3 +339,138 @@ async def test_finishing_a_paused_check_only_looks_up_what_it_never_reached(monk
     assert names == {"Restaurant Alba": 0.3, "Brick & Brew Malvern": 0.4}
     assert "_places_check_waiting" not in area.facts
     tpc._LOOKUP_CACHE.clear()
+
+
+def test_fix_district_names_restores_shortened_names():
+    real = ["Great Valley School District", "Tredyffrin-Easttown School District", "West Chester Area School District"]
+    text = "Residents enjoy schools through the Valley School District. Some homes are in Tredyffrin School District."
+    assert tpc.fix_district_names(text, real) == (
+        "Residents enjoy schools through the Great Valley School District. Some homes are in Tredyffrin-Easttown School District.")
+    # real names, a capitalised word in front, and repeated runs stay as they are
+    ok = "In Great Valley School District and West Chester Area School District."
+    assert tpc.fix_district_names(ok, real) == ok
+    fixed = tpc.fix_district_names(text, real)
+    assert tpc.fix_district_names(fixed, real) == fixed
+    # a part that fits two districts is not guessed
+    two = ["Upper Merion Area School District", "Lower Merion School District"]
+    assert tpc.fix_district_names("the Merion School District", two) == "the Merion School District"
+
+
+def test_clean_area_payload_fixes_district_in_summary():
+    facts = {"boundaries": {"school_districts": [{"name": "Great Valley School District", "share": 89}]}}
+    _, nar = clean_area_payload(facts, {"summary": "Schools are part of the Valley School District."})
+    assert nar["summary"] == "Schools are part of the Great Valley School District."
+
+
+def test_tidy_drops_counts_and_addresses():
+    t = tpc.tidy_research_text
+    assert t("Family amusement park on the boardwalk with 20 rides, arcade games, and midway attractions.") == \
+        "Family amusement park on the boardwalk with rides, arcade games, and midway attractions."
+    assert t('Known as the "Mile of Style," Tanger Outlets is home to over 140 brand-name outlets on Route 1.') == \
+        'Known as the "Mile of Style," Tanger Outlets is home to brand-name outlets on Route 1.'
+    assert t("Tanger Outlets, a major 140+ store outlet mall complex.") == "Tanger Outlets, a major outlet mall complex."
+    assert t("Urgent care walk-in clinic at 18941 John J Williams Hwy offering non-emergency outpatient care.") == \
+        "Urgent care walk-in clinic offering non-emergency outpatient care."
+    assert t("Located at 17616 Coastal Highway, hub for year-round DART bus routes.") == "Hub for year-round DART bus routes."
+    assert t("Open-air shopping alley at 42 Rehoboth Avenue in the heart of downtown.") == "Open-air shopping alley in the heart of downtown."
+
+
+def test_notes_drop_sentences_about_removed_places():
+    facts = {"grocery": {"notes": "Rehoboth Beach has robust grocery access. Major chains include Safeway and Stop & Shop.",
+                         "entities": [{"name": "Safeway"}], "_removed": [{"name": "Stop & Shop"}]}}
+    out, _ = clean_area_payload(facts, None)
+    assert out["grocery"]["notes"] == "Rehoboth Beach has robust grocery access."
+
+
+def test_short_distances_are_straight_line_from_the_center():
+    facts = {"_places_check_version": 1, "shopping": {"entities": [
+        {"name": "Penny Lane Mall", "lat": 38.716229, "lng": -75.0774569, "distance_miles": 1.1, "google_checked": True},
+        {"name": "Far", "lat": 38.7377903, "lng": -75.1418237, "distance_miles": 4.6, "google_checked": True}]}}
+    out, _ = clean_area_payload(facts, None, (38.7209454, -75.0760137))
+    assert [e["distance_miles"] for e in out["shopping"]["entities"]] == [0.3, 4.6]
+
+
+def test_office_listing_is_not_a_shop_and_other_place_descriptions_drop():
+    office = {"displayName": {"text": "Rehoboth Beach Main Street Inc"}, "primaryType": "non_profit_organization", "types": ["non_profit_organization"],
+              "businessStatus": "OPERATIONAL"}
+    assert tpc._rule_failure("shopping", {}, office)
+    assert not tpc._description_is_about("Rehoboth Mall is a shopping center on Coastal Highway.", "Rehoboth Beach Main Street Inc", "Rehoboth Beach")
+    assert tpc._description_is_about("Village By The Sea is another quirky shopping area.", "Village by the Sea", "Rehoboth Beach")
+    assert tpc._description_is_about("Discount grocery store with produce.", "ALDI", "Rehoboth Beach")
+
+
+def test_tidy_drops_total_counts():
+    assert tpc.tidy_research_text("A vibrant dining scene with 223 total restaurants reflecting its character.") == \
+        "A vibrant dining scene with restaurants reflecting its character."
+
+
+def test_tidy_edge_cases_from_the_all_towns_scan():
+    t = tpc.tidy_research_text
+    assert t("Open-air mall with 255,000 sq ft, around 40-50 stores and restaurants.") == "Open-air mall with 255,000 sq ft, stores and restaurants."
+    assert t("Downtown featuring over 250 independent retailers and cafes.") == "Downtown featuring independent retailers and cafes."
+    assert t("Independent urgent care facility located at 14302 Barton Boulevard SW, providing walk-in care.") == \
+        "Independent urgent care facility providing walk-in care."
+    assert t("Amtrak station providing passenger rail connections, located at 201 East Harrison Street.") == \
+        "Amtrak station providing passenger rail connections."
+    assert t("Located at 20055 Shuttle Road with free parking.") == "With free parking."
+    assert t("Open until 6 p.m. on weekdays, e.g. on Mondays.") == "Open until 6 p.m. on weekdays, e.g. on Mondays."
+
+
+def test_a_sentence_leaning_on_a_dropped_one_goes_too():
+    text = "Ardmore has two supermarkets (Trader Joe's and Spring Grocery Store). These are the primary options. Parking is easy."
+    assert tpc.drop_removed_mentions(text, ["Spring Grocery Store"]) == ""  # never a third sentence pulled up
+    text = "Good grocery access. Chains include Safeway and Stop & Shop. A third, weaker sentence."
+    assert tpc.drop_removed_mentions(text, ["Stop & Shop"]) == "Good grocery access."
+    assert tpc.drop_removed_mentions(text, ["Nothing Here"]) == text
+    assert tpc.tidy_research_text("ACME has locations at 500 E State St and 1095 W Baltimore Pike with pharmacy.") == "ACME has locations with pharmacy."
+
+
+def test_tidy_drops_a_sentence_leaning_on_process_talk():
+    assert tpc.tidy_research_text("I searched for private schools near Gettysburg. All are privately operated. Delone Catholic is nearby.") == \
+        "Delone Catholic is nearby."
+
+
+def test_tidy_drops_stale_claims_sizes_hours_and_bus_routes():
+    t = tpc.tidy_research_text
+    assert t("Served by SEPTA Regional Rail. Local bus service via Routes 92 and regional service via Route 106 provides options.") == \
+        "Served by SEPTA Regional Rail."
+    assert t("The Rabbit Transit Blue Line includes a stop at the hospital. Parking is free.") == "Parking is free."
+    assert t("Shopping center on Route 30 with dining.") == "Shopping center on Route 30 with dining."
+    assert t("Modern supermarket open 24 hours with online ordering.") == "Modern supermarket with online ordering."
+    assert t("Walk-in care for all ages, open 8 AM to 8 PM daily with no appointment necessary.") == \
+        "Walk-in care for all ages with no appointment necessary."
+    assert t("3.2-mile trail at the northern edge of the park.") == "Trail at the northern edge of the park."
+    assert "264" not in t("A 264-bed acute care hospital.")
+    assert t("Parks include Community Park North (71 acres) and Walnut Creek.") == "Parks include Community Park North and Walnut Creek."
+    assert t("Arboretum featuring more than three miles of color-coded hiking trails.") == "Arboretum featuring color-coded hiking trails."
+    assert t("The Borough maintains over 80 acres across 11 parks. It has a pool.") == ""
+    assert t("Lankenau ranks among the top five hospitals in the region. It has an ER.") == ""
+    assert t("AFC Havertown is the closest urgent care. Walk-ins welcome.") == "Walk-ins welcome."
+    assert t("Media is a dense borough with 5,350 residents. Primary parks include Rose Tree.") == "Primary parks include Rose Tree."
+
+
+def test_page_rules_for_bus_entities_wrong_town_and_park_labels():
+    facts = {"transportation": {"entities": [{"name": "SEPTA Route 106"}, {"name": "Ardmore Station", "category": "Regional rail station"}]},
+             "restaurants": {"entities": [{"name": "Green Engine Coffee Co.", "city": "Haverford", "description": "Coffee roaster in Gladwyne, beloved locally."}]},
+             "parks": {"entities": [{"name": "Ashbridge Memorial Park", "category": "Regional park"},
+                                    {"name": "Cape Henlopen State Park", "category": "State park"}]}}
+    out, _ = clean_area_payload(facts, None, None, "Gladwyne")
+    assert [e["name"] for e in out["transportation"]["entities"]] == ["Ardmore Station"]
+    assert out["restaurants"]["entities"][0]["description"] == "Coffee roaster, beloved locally."
+    assert [e["category"] for e in out["parks"]["entities"]] == ["Park", "State park"]
+
+
+def test_more_address_shapes_and_streets_are_not_shops():
+    t = tpc.tidy_research_text
+    assert t("Urgent care facility at 1149 Seminole Trail.") == "Urgent care facility."
+    assert t("Urgent care center located at 920 High Street, Suite 102.") == "Urgent care center."
+    street = {"displayName": {"text": "Louella Drive"}, "primaryType": "route", "types": ["route"], "businessStatus": "OPERATIONAL"}
+    assert tpc._rule_failure("shopping", {}, street)
+
+
+def test_tidy_drops_24_hour_claims_but_not_emergency_rooms():
+    t = tpc.tidy_research_text
+    assert t("Good grocery access. Wegmans is 24-hour with a cafe.") == "Good grocery access."
+    assert t("Hospital with a 24-hour emergency department.") == "Hospital with a 24-hour emergency department."
+    assert t("Includes CVS, Wegmans and T.J. Maxx; and 20+ more stores.").endswith("T.J. Maxx; and more stores.")
+    assert t("Includes CVS and Wegmans;.") == "Includes CVS and Wegmans."

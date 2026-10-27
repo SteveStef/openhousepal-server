@@ -61,3 +61,19 @@ async def test_never_overwrites(facts):
     db = Db(live)
     assert (await town_seeds.apply_town_seeds(db, [SEED]))["kept"] == 1 and db.commits == 0
     assert live.facts == facts
+
+
+@pytest.mark.asyncio
+async def test_a_newer_seed_replaces_an_older_seed_unless_an_admin_edited_it():
+    newer = {**SEED, "seed_id": "2026-10-27"}
+    live = MarketArea(name="Wayne", state="PA", slug="wayne-pa-2", canonical_key="PA|city|wayne", enrichment_status="ENRICHED",
+                      facts={"_seeded_from": "2026-10-26", "_places_check_version": 1, "restaurants": {"entities": [{"name": "Old"}]}})
+    db = Db(live)
+    assert (await town_seeds.apply_town_seeds(db, [newer]))["updated"] == 1
+    assert live.slug == "wayne-pa-2" and live.facts["_seeded_from"] == "2026-10-27"
+    assert live.facts["restaurants"]["entities"][0]["name"] == "Matador"
+    edited = MarketArea(name="Wayne", state="PA", slug="wayne-pa", canonical_key="PA|city|wayne", enrichment_status="ENRICHED",
+                        facts={"_seeded_from": "2026-10-26", "_places_check_version": 1,
+                               "parks": {"entities": [{"name": "X", "admin_edited": True}]}})
+    db = Db(edited)
+    assert (await town_seeds.apply_town_seeds(db, [newer]))["kept"] == 1 and db.commits == 0

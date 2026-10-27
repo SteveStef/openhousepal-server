@@ -5,6 +5,7 @@ NOT a reuse of cma_service.search_comparables (a radius comp search around one p
 rollup) - it's a new, small, aggregate query, the kind of thing that genuinely didn't exist
 anywhere in this codebase yet (confirmed during Phase 3 planning research).
 """
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -21,6 +22,39 @@ _SOLD_STATUSES = {"CLOSED-BRIGHT", "CLOSED"}
 # 30-50% on town pages and in articles (10/24: Wayne read 76 "for sale"; 46 really were).
 FOR_SALE_STATUSES = ("ACTIVE-BRIGHT", "ACTIVE")
 UNDER_CONTRACT_STATUSES = ("ACTIVE UNDER CONTRACT-BRIGHT", "PENDING-BRIGHT")
+
+
+SOLD_STATUSES = tuple(sorted(_SOLD_STATUSES))
+
+
+def sales_window(today=None, months: int = 12):
+    """THE "last 12 months" of every town-page number (owner, 10/27: Ardmore's gauge said 125 sales
+    while its monthly chart said 118 - the gauge counted back 365 days, the chart from the 1st of
+    a month, the days-on-market box a third way). From the 1st of the month `months-1` months ago
+    through today, so the chart's monthly bars and every count/median agree. Returns (start, end)."""
+    from datetime import date
+    today = today or date.today()
+    y, m = today.year, today.month - (months - 1)
+    while m <= 0:
+        y, m = y - 1, m + 12
+    return date(y, m, 1), today
+
+
+def closed_sales_filter(model, start, end):
+    """THE "a sale in this window" filter, shared by the stats, the trends chart and the market
+    gauge: a closed residential sale, closing on or after `start` and no later than `end` (a few
+    listings carry future close dates), at a real price (geography.MIN_PLAUSIBLE_SALE_PRICE -
+    $1 transfers and data-entry rows are not sales). Combine with a location filter."""
+    from sqlalchemy import and_
+    close_date = model.raw_mls_data["CloseDate"].astext
+    close_price = cast(func.nullif(model.raw_mls_data["ClosePrice"].astext, ""), Numeric)
+    return and_(
+        geography.residential_for_sale_filter(model),
+        model.home_status.in_(SOLD_STATUSES),
+        close_date >= start.isoformat(),
+        func.substr(close_date, 1, 10) <= end.isoformat(),
+        close_price >= geography.MIN_PLAUSIBLE_SALE_PRICE,
+    )
 
 
 def _location_filter(zip_codes: list[str], city: Optional[str]):
@@ -86,6 +120,16 @@ async def get_area_market_stats(db: AsyncSession, zip_codes: list[str] | dict, c
         )
     )).first()
 
+    # How long homes took to sell (closed in the last 12 months - the shared sales_window, so it
+    # matches the trends chart and the gauge). median_dom above is how long today's listings have
+    # sat so far - Malvern's FAQ called that 63 "days on the market" while its sold homes took 12.
+    win_start, win_end = sales_window()
+    sold_doms = [float(v) for v in (await db.execute(
+        select(Property.raw_mls_data["DaysOnMarket"].astext).where(
+            location_filter, closed_sales_filter(Property, win_start, win_end),
+        )
+    )).scalars().all() if v and re.fullmatch(r"\d+(?:\.\d+)?", str(v).strip())]
+
     # Real MLS field per listing (School District Name), not the NCES attendance-boundary lookup
     # baked into MarketArea.facts.schools - reuses data already ingested for every property, so
     # it's as reliable/fresh as anything else on this page rather than depending on a separate
@@ -115,6 +159,9 @@ async def get_area_market_stats(db: AsyncSession, zip_codes: list[str] | dict, c
         stats["max_price"] = round(float(range_row[2]))
         stats["price_range_basis"] = "sold_2y"
         stats["price_range_sales"] = int(range_row[0])
+    if sold_doms:
+        stats["median_sold_dom"] = round(_median(sold_doms))
+        stats["sold_window_start"] = win_start.isoformat()
     if sold_count:
         stats["recently_sold_count"] = sold_count
         if sold_row[1] is not None:
@@ -147,19 +194,19 @@ async def get_area_market_trends(db: AsyncSession, scope: dict, months: int = 12
         return {}
     resid = geography.residential_for_sale_filter(Property)
     close_date = Property.raw_mls_data["CloseDate"].astext
-    today = date.today()
-    first_of_month = today.replace(day=1)
-    # First day of the month `months-1` months ago, then the same again one year earlier.
-    y, m = first_of_month.year, first_of_month.month - (months - 1)
-    while m <= 0:
-        y, m = y - 1, m + 12
-    window_start = date(y, m, 1)
-    prior_start = date(y - 1, m, 1)
+    # The shared window (sales_window): the 1st of the month `months-1` months ago through today;
+    # the year-earlier comparison is the same stretch of days one year back.
+    window_start, today = sales_window(months=months)
+    prior_start = date(window_start.year - 1, window_start.month, 1)
+    try:
+        prior_end = today.replace(year=today.year - 1)
+    except ValueError:  # Feb 29
+        prior_end = today.replace(year=today.year - 1, day=28)
 
     rows = (await db.execute(
         select(close_date, Property.raw_mls_data["ClosePrice"].astext, Property.raw_mls_data["ListPrice"].astext,
                Property.raw_mls_data["DaysOnMarket"].astext, Property.living_area)
-        .where(location_filter, resid, Property.home_status.in_(_SOLD_STATUSES), close_date >= prior_start.isoformat())
+        .where(location_filter, closed_sales_filter(Property, prior_start, today))
     )).all()
 
     def _f(v):
@@ -192,7 +239,7 @@ async def get_area_market_trends(db: AsyncSession, scope: dict, months: int = 12
                 doms.append(domv)
             if sqft and sqft > 0:
                 ppsf.append(price / sqft)
-        elif day >= prior_start.isoformat() and day < (date(prior_start.year + 1, prior_start.month, 1)).isoformat():
+        elif day >= prior_start.isoformat() and day <= prior_end.isoformat():
             prior.append(price)
 
     series = []
@@ -256,6 +303,105 @@ async def get_area_market_trends(db: AsyncSession, scope: dict, months: int = 12
         "window_end": today.isoformat(),
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ---------------------------------------------------------------- MLS coverage guard
+# Some towns sit mostly in ANOTHER MLS's territory, so our Bright feed sees a sliver of their
+# market (10/27 Charlottesville, VA - the CAAR MLS area: Bright stopped carrying CAAR's shared
+# listings on 7/15/2026, leaving 13 homes for sale and ~30 sales a year in a city of ~20,000
+# households, and locally 200+ "under contract" rows frozen since that day). A buyer's/seller's
+# verdict or a sales chart built on that is wrong, so such a town's page keeps its homes for sale
+# but drops the sales-based numbers.
+STALE_CONTRACT_DAYS = 90       # an under-contract/pending listing with no MLS update in 90+ days
+MIN_STALE_CONTRACTS = 20       # ...counts against a town only when there are 20+ of them
+THIN_PER_1000_HOUSEHOLDS = 5   # homes for sale now + sales in the last 12 months, per 1,000 households
+_SALES_STAT_KEYS = ("under_contract_count", "median_sold_dom", "sold_window_start", "recently_sold_count",
+                    "median_sold_price", "min_price", "max_price", "price_range_basis", "price_range_sales")
+
+
+def coverage_verdict(active: int, sales_12: int, under_contract: int, stale_under_contract: int,
+                     households: Optional[float]) -> dict:
+    """Pure rule (tested): thin when stale under-contract rows are 20+ and at least half of all
+    under-contract rows (a feed that stopped updating), or when the town has a real household count
+    (1,000+) and fewer than 5 homes for sale + 12-month sales per 1,000 households (a normal town
+    in our data runs 17-35; Charlottesville 1-2)."""
+    reasons = []
+    if stale_under_contract >= MIN_STALE_CONTRACTS and stale_under_contract * 2 >= max(under_contract, 1):
+        reasons.append("stale_under_contract")
+    per_1000 = None
+    if households and households >= 1000:
+        per_1000 = round((active + sales_12) * 1000 / households, 1)
+        if per_1000 < THIN_PER_1000_HOUSEHOLDS:
+            reasons.append("low_mls_volume")
+    return {"thin": bool(reasons), "reasons": reasons, "active": active, "sales_12": sales_12,
+            "under_contract": under_contract, "stale_under_contract": stale_under_contract,
+            "households": households, "per_1000_households": per_1000}
+
+
+async def get_area_market_coverage(db: AsyncSession, scope: dict, households: Optional[float] = None) -> dict:
+    from datetime import date, timedelta
+    location_filter = geography.location_filter(Property, scope)
+    if location_filter is None:
+        return {"thin": False, "reasons": []}
+    resid = geography.residential_for_sale_filter(Property)
+    stale_before = (date.today() - timedelta(days=STALE_CONTRACT_DAYS)).isoformat()
+    mod = Property.raw_mls_data["ModificationTimestamp"].astext
+    active = (await db.execute(select(func.count(Property.id)).where(
+        location_filter, resid, Property.home_status.in_(FOR_SALE_STATUSES)))).scalar() or 0
+    uc_row = (await db.execute(select(func.count(Property.id), func.sum(case((mod < stale_before, 1), else_=0))).where(
+        location_filter, resid, Property.home_status.in_(UNDER_CONTRACT_STATUSES)))).first()
+    start, end = sales_window()
+    sales_12 = (await db.execute(select(func.count(Property.id)).where(
+        location_filter, closed_sales_filter(Property, start, end)))).scalar() or 0
+    out = coverage_verdict(int(active), int(sales_12), int(uc_row[0] or 0), int(uc_row[1] or 0), households)
+    out["window_start"] = start.isoformat()
+    return out
+
+
+def town_households(area) -> Optional[float]:
+    try:
+        v = (((area.facts or {}).get("demographics") or {}).get("household_count") or {}).get("value")
+        return float(v) if v else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def apply_coverage_guard(payload: dict, coverage: dict) -> dict:
+    """Town page payload with the sales-based market numbers taken off when coverage is thin:
+    the trends chart, the buyer's/seller's gauge and what-your-money-buys (both built on sales),
+    and the stats' sold / under-contract figures. Homes for sale, taxes and recent sales stay."""
+    if not (coverage or {}).get("thin"):
+        return payload
+    facts = payload.get("facts")
+    if isinstance(facts, dict) and isinstance(facts.get("market_stats"), dict):
+        ms = dict(facts["market_stats"])
+        for k in _SALES_STAT_KEYS:
+            ms.pop(k, None)
+        facts["market_stats"] = ms
+    payload["market_trends"] = {}
+    if isinstance(payload.get("insights"), dict):
+        ins = dict(payload["insights"])
+        ins.pop("gauge", None)
+        ins.pop("money_buys", None)
+        payload["insights"] = ins
+    payload["market_coverage"] = {
+        "thin": True, "reasons": coverage.get("reasons") or [],
+        "note": "Our MLS feed covers only part of this area's home sales, so sales statistics and market trends aren't shown here.",
+    }
+    return payload
+
+
+async def guard_town_market(db: AsyncSession, area, scope: dict, payload: dict) -> dict:
+    """The page-time hook (public_site_routes.area_page_payload): coverage cached like the other
+    live market numbers, then apply_coverage_guard. Never breaks the page - on any error the
+    payload goes out unchanged."""
+    from app.services.website import content_adapters
+    try:
+        coverage = await content_adapters.cached_market(
+            f"coverage:{area.id}", lambda d: get_area_market_coverage(d, scope, town_households(area)), db)
+    except Exception:
+        return payload
+    return apply_coverage_guard(payload, coverage)
 
 
 def _median(values: list[float]) -> Optional[float]:

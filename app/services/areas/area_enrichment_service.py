@@ -309,8 +309,9 @@ _NARRATIVE_SYSTEM_PROMPT = (
     "an agent's website. You will be given a JSON object of ALREADY-VERIFIED facts about the "
     "town. Only describe what is present in the JSON - never state a specific number, name, "
     "statistic, or claim that is not literally present in the input. If the facts are sparse, "
-    "write a shorter, more general paragraph rather than inventing detail. Output only the "
-    "paragraph text, no preamble."
+    "write a shorter, more general paragraph rather than inventing detail. Write every school "
+    "district, school and place name in full exactly as the input spells it - never shorten one. "
+    "Output only the paragraph text, no preamble."
 )
 
 
@@ -334,17 +335,25 @@ async def _generate_narrative(db: AsyncSession, area: MarketArea, triggering_use
         logger.info("Skipping area narrative generation - global monthly cost ceiling reached")
         return None
 
+    # The summary is written from what the page itself may show (clean_area_payload): no outside
+    # price figures, no income/age rows (Malvern's summary leaned on "median household income"),
+    # no places the check removed, and the checked school districts by their full names.
+    from app.services.areas.fair_housing_service import clean_area_payload, town_district_names
+    from app.services.areas.town_places_check import fix_district_names
+    grounding, _ = clean_area_payload(dict(area.facts or {}), None)
+    grounding = {k: v for k, v in grounding.items() if not k.startswith("_") and k not in ("photos", "boundaries", "schools")}
     try:
         client = _get_client()
         response = await client.messages.create(
             model=config["model"],
             max_tokens=250,
             system=_NARRATIVE_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": f"Town: {area.name}, {area.state}\n\nVerified facts:\n{area.facts}"}],
+            messages=[{"role": "user", "content": f"Town: {area.name}, {area.state}\n\nVerified facts:\n{grounding}"}],
         )
         text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
         # Plain prose only - the model sometimes opens with a markdown title ("# Gettysburg, Pennsylvania").
         text = re.sub(r"(?m)^\s*#+[^\n]*\n+", "", text).replace("**", "").strip()
+        text = fix_district_names(text, town_district_names(dict(area.facts or {})))
         if not text:
             raise ValueError("empty narrative")
     except Exception as exc:
@@ -373,6 +382,7 @@ async def _derive_zip_codes(db: AsyncSession, name: str, state: str) -> list[str
     match) rather than any external source - the same "reuse OHP data" principle as everywhere
     else in Website Builder. An area with no matching local listings yet simply starts with no
     ZIP codes (Census/market-stats gracefully have less to work with, not guessed data)."""
+    from sqlalchemy import case, or_
     rows = (await db.execute(
         select(Property.zipcode, func.count()).where(Property.city.ilike(name), Property.state == state, Property.zipcode.is_not(None))
         .group_by(Property.zipcode)
@@ -384,8 +394,35 @@ async def _derive_zip_codes(db: AsyncSession, name: str, state: str) -> list[str
     total = sum(counts.values()) or 1
     # Real ZIPs only ("00000" came through on Princeton), and not one a couple of mistyped listings
     # dragged in (Malvern picked up Exton's 19341 and Phoenixville's 19460).
-    return sorted(z for z, n in counts.items()
-                  if re.fullmatch(r"\d{5}", z) and z != "00000" and (n >= 5 or n / total >= 0.05))
+    candidates = [z for z, n in counts.items()
+                  if re.fullmatch(r"\d{5}", z) and z != "00000" and (n >= 5 or n / total >= 0.05)]
+    if not candidates:
+        return []
+    # ...and only a ZIP that is really this town's postal area: most of THAT ZIP's own listings use
+    # this town's name (10/27: Charlottesville held Barboursville's 22923 - 98% of its listings say
+    # Barboursville; Princeton held Princeton Junction's 08550). A township town also owns the ZIP
+    # when most of its listings sit in the township.
+    owners = select(Property.zipcode, func.count(), func.sum(case((Property.city.ilike(name), 1), else_=0)),
+                    func.sum(case((Property.township.ilike(name), 1), (Property.township.ilike(f"{name} township"), 1), else_=0))) \
+        .where(Property.state == state, or_(*[Property.zipcode.like(f"{z}%") for z in candidates])).group_by(Property.zipcode)
+    own: dict[str, list[int]] = {}
+    for z, n, by_city, by_township in (await db.execute(owners)).all():
+        acc = own.setdefault(str(z)[:5], [0, 0, 0])
+        acc[0] += n or 0
+        acc[1] += by_city or 0
+        acc[2] += by_township or 0
+    return sorted(z for z in candidates if zip_belongs_to_town(*own.get(z, [0, 0, 0])))
+
+
+ZIP_OWNER_SHARE = 0.5
+
+
+def zip_belongs_to_town(zip_listings: int, named_this_town: int, in_this_township: int = 0) -> bool:
+    """A ZIP joins a town when at least half of the ZIP's own listings carry the town's name (or,
+    for a township town, sit in the township)."""
+    if zip_listings <= 0:
+        return False
+    return max(named_this_town, in_this_township) / zip_listings >= ZIP_OWNER_SHARE
 
 
 async def enrich_area(db: AsyncSession, area: MarketArea, triggering_user: User) -> MarketArea:

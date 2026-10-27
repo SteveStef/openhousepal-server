@@ -1160,6 +1160,109 @@ def _district_key(name: str) -> str:
     return " ".join(n.split())
 
 
+# Charter schools are applied to, not assigned by address, so they are never a town's "assigned"
+# public schools (grader, 10/27: Rittenhouse listed Freire Middle School - a charter - as the middle
+# school for its addresses). The research names them without the word "charter" ("Freire Middle
+# School"; the federal file says "Freire CS"), so they're found in the federal list of every charter
+# school (NCES 2024-25, app/data/charter_schools_nces.json, rebuilt from EDGE_ADMINDATA_PUBLICSCH_<year>
+# where CHARTER_TEXT = 'Yes'): same state, within CHARTER_NEAR_MILES of the town, the same telling
+# words, and grades that fit the level it was listed under.
+CHARTER_NEAR_MILES = 10
+_CHARTER_PLAIN_WORDS = {"the", "of", "and", "at", "school", "schools", "sch", "charter", "cs", "chs", "pcs", "public", "st", "saint"}
+_CHARTER_LEVEL_WORDS = {"elementary": "elementary", "el": "elementary", "primary": "elementary", "middle": "middle", "ms": "middle",
+                        "high": "high", "hs": "high", "junior": "middle", "senior": "high", "intermediate": "middle"}
+_LEVEL_GRADES = {"elementary_schools": (1, 4), "middle_schools": (6, 8), "high_schools": (9, 12)}
+
+
+def _charter_rows() -> dict[str, list[list]]:
+    global _CHARTERS
+    if _CHARTERS is None:
+        import json
+        from pathlib import Path
+        path = Path(__file__).resolve().parent.parent.parent / "data" / "charter_schools_nces.json"
+        by_state: dict[str, list[list]] = {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                for row in json.load(f)["schools"]:
+                    by_state.setdefault(str(row[1]).strip().upper(), []).append(row)
+        except (OSError, ValueError, KeyError):
+            logger.warning("charter school list missing - charter check skipped")
+        _CHARTERS = by_state
+    return _CHARTERS
+
+
+_CHARTERS: Optional[dict[str, list[list]]] = None
+
+
+def _charter_words(name: str) -> tuple[set[str], set[str]]:
+    words = re.findall(r"[a-z0-9]+", str(name or "").lower().replace("'", "").replace("&", " and "))
+    levels = {_CHARTER_LEVEL_WORDS[w] for w in words if w in _CHARTER_LEVEL_WORDS}
+    return {w for w in words if w not in _CHARTER_PLAIN_WORDS and w not in _CHARTER_LEVEL_WORDS}, levels
+
+
+def _charter_grade(g) -> Optional[int]:
+    g = str(g or "").strip().upper()
+    return -1 if g == "PK" else 0 if g == "KG" else int(g) if g.isdigit() else None
+
+
+def is_charter_school(name: str, state: Optional[str], lat: Optional[float], lng: Optional[float], level_key: Optional[str] = None,
+                      local_words: frozenset = frozenset(), district_schools: tuple = ()) -> bool:
+    """`local_words`: the town's and its districts' own names - "Princeton Middle School" is the
+    district's school, not Princeton Charter School. `district_schools`: the district's own schools
+    from the federal file (the town map) - a name found there is the district's."""
+    if re.search(r"\bcharter\b", str(name or ""), re.IGNORECASE):
+        return True
+    if not state or lat is None or lng is None:
+        return False
+    # "Delta High School (democratic program of choice)" - what's in brackets is a note, not the name.
+    words, levels = _charter_words(re.sub(r"\(.*?\)", "", str(name or "")))
+    if not words or words <= local_words or any(_charter_words(n)[0] == words for n in district_schools):
+        return False
+    span = _LEVEL_GRADES.get(level_key or "")
+    for row in _charter_rows().get(state.strip().upper(), []):
+        c_name, _, c_lat, c_lng, lo, hi = row[:6]
+        if abs(c_lat - lat) > 0.3 or abs(c_lng - lng) > 0.4:
+            continue
+        c_words, c_levels = _charter_words(c_name)
+        if c_words != words or (levels and c_levels and not levels & c_levels):
+            continue
+        if math.hypot((c_lat - lat) * 69.0, (c_lng - lng) * 69.0 * math.cos(math.radians(lat))) > CHARTER_NEAR_MILES:
+            continue
+        g_lo, g_hi = _charter_grade(lo), _charter_grade(hi)
+        if span and g_lo is not None and g_hi is not None and (g_hi < span[0] or g_lo > span[1]):
+            continue  # a charter high school doesn't make the district's middle school of the same name one
+        return True
+    return False
+
+
+def _without_charters(ps: dict, area: MarketArea) -> dict:
+    """The public school lists with charter schools taken off (see is_charter_school), and the
+    research's own sentences naming them dropped from the note."""
+    from app.services.areas.town_places_check import drop_removed_mentions
+    facts = area.facts or {}
+    local = " ".join([str(area.name or ""), str(area.county or "")]
+                     + [str((d or {}).get("name") or "") for d in (ps.get("districts") or []) if isinstance(d, dict)]
+                     + [str((d or {}).get("name") or "") for d in ((facts.get("boundaries") or {}).get("school_districts") or []) if isinstance(d, dict)])
+    local_words = frozenset(_charter_words(local)[0])
+    district_schools = tuple(str(s.get("name") or "") for s in (((facts.get("boundaries") or {}).get("schools") or {}).get("public") or [])
+                             if isinstance(s, dict) and not s.get("charter"))
+    gone: list[str] = []
+    for lvl in _SCHOOL_LEVELS:
+        items = ps.get(lvl)
+        if not isinstance(items, list):
+            continue
+        keep = []
+        for x in items:
+            if isinstance(x, dict) and is_charter_school(x.get("name"), area.state, area.centroid_lat, area.centroid_lng, lvl, local_words, district_schools):
+                gone.append(str(x.get("name")))
+                continue
+            keep.append(x)
+        ps[lvl] = keep
+    if gone and isinstance(ps.get("boundary_caveat"), str):
+        ps["boundary_caveat"] = drop_removed_mentions(ps["boundary_caveat"], gone)
+    return ps
+
+
 async def reconcile_public_schools(db: AsyncSession, area: MarketArea, area_scope: dict) -> dict:
     """facts.public_schools with its districts checked against Bright (see above). Cached 5 min."""
     facts = area.facts or {}
@@ -1168,6 +1271,7 @@ async def reconcile_public_schools(db: AsyncSession, area: MarketArea, area_scop
     ps = dict(facts.get("public_schools_research") or facts.get("public_schools") or {})
     for k in ("checked_against_listings_at",):
         ps.pop(k, None)
+    ps = _without_charters(ps, area)
     hit = _schools_cache.get(area.id)
     now = time.monotonic()
     if hit and now - hit[0] < _SCHOOLS_TTL_S:
@@ -1235,6 +1339,7 @@ async def reconcile_public_schools(db: AsyncSession, area: MarketArea, area_scop
         kept.sort(key=lambda d: d.get("share", 0), reverse=True)
         ps["districts"] = kept
         ps.update(levels)
+        ps = _without_charters(ps, area)  # schools borrowed from another town's research too
         if len(kept) > 1:
             ps["crosses_district_boundary"] = True
             split = " and ".join(f"{d['name']} ({d.get('share', 0)}% of homes)" for d in kept[:3])
@@ -1286,8 +1391,10 @@ def _area_hover_facts(facts: dict, stats: dict) -> dict:
         market_bits.append(f"{stats['active_count']} homes for sale")
     if stats.get("median_price") is not None:
         market_bits.append(f"${int(stats['median_price']):,} median")
-    if stats.get("median_dom") is not None:
-        market_bits.append(f"{stats['median_dom']} median days")
+    if stats.get("median_sold_dom") is not None:
+        market_bits.append(f"{stats['median_sold_dom']} median days on market")
+    elif stats.get("median_dom") is not None:
+        market_bits.append(f"listed a median of {stats['median_dom']} days so far")
 
     downtown = _entity_names(facts, "downtown_centers", 1)
     parks = _entity_names(facts, "parks", 2)
@@ -1482,8 +1589,11 @@ async def area_summary_card(db: AsyncSession, a: MarketArea, with_stats: bool = 
         "state": a.state,
         "county": a.county,
         "photo": photo,
-        "summary": (a.narrative or {}).get("summary"),
     }
+    # The card says what the town page says (fair_housing_service.town_display).
+    from app.services.areas.fair_housing_service import town_display
+    shown_facts, shown_narrative = town_display(a)
+    card["summary"] = (shown_narrative or {}).get("summary")
     if with_stats:
         stats = await cached_market(f"stats:{a.id}", lambda d, sc=area_scope, ms=(a.facts or {}).get("market_stats"): get_area_live_market_stats(d, sc, ms), db)
         card["median_price"] = stats.get("median_price")
@@ -1493,7 +1603,7 @@ async def area_summary_card(db: AsyncSession, a: MarketArea, with_stats: bool = 
         card["price_range_basis"] = stats.get("price_range_basis")
         checked = await reconcile_public_schools(db, a, area_scope) if (a.facts or {}).get("public_schools") else None
         card["school_districts"] = _public_school_districts({"public_schools": checked} if checked else a.facts, stats.get("school_districts") or [])
-        card["hover_facts"] = _area_hover_facts(a.facts, stats)
+        card["hover_facts"] = _area_hover_facts(shown_facts, stats)
     return card
 
 

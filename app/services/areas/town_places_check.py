@@ -173,6 +173,25 @@ _FOOD_TYPES_EXACT = {"bar", "pub", "night_club", "wine_bar", "cafe", "coffee_sho
 _AREA_NAME_RE = re.compile(r"\b(district|downtown|corridor|main street|town center|town centre|village center|business area|historic)\b", re.IGNORECASE)
 
 
+_OFFICE_TYPES = {"corporate_office", "non_profit_organization", "association_or_organization", "local_government_office",
+                 "government_office", "city_hall", "consultant", "real_estate_agency", "insurance_agency", "lawyer", "accounting",
+                 # services, not shopping (Charlottesville's "Rio Hill Shopping Center" came back as Rio Hill Cleaners)
+                 "laundry", "dry_cleaner", "car_wash", "car_repair", "hair_salon", "hair_care", "beauty_salon", "nail_salon",
+                 "bank", "atm", "storage", "post_office", "gym", "dentist", "doctor"}
+_OFFICE_NAME_RE = re.compile(r"\b(?:inc|llc|association|organization|foundation|chamber of commerce|council|alliance)\.?\s*$|"
+                             r"\b(?:cleaners|dry cleaning|laundromat)\b", re.IGNORECASE)
+
+
+def _description_is_about(description: str, name: str, town: str = "") -> bool:
+    """False when the research's sentence is plainly about another place ("Rehoboth Mall is a shopping
+    center..." under the Main Street office's listing). A sentence with no named subject passes."""
+    m = re.match(r"\s*(?:<cite[^>]*>)?\s*((?:[A-Z][\w'&.-]*\s+){0,5}[A-Z][\w'&.-]*)\s+(?:is|was|has|offers|features|includes)\b", description or "")
+    if not m:
+        return True
+    subject = _tokens(m.group(1), town) - _GENERIC_WORDS
+    return not subject or bool(subject & _tokens(name, town))
+
+
 def _kind_fits(category: str, place: dict) -> bool:
     types = set(place.get("types") or []) | {nas._place_primary_type(place)}
     if category == "transportation":
@@ -214,6 +233,12 @@ def _rule_failure(category: str, entity: dict, place: dict) -> Optional[str]:
         if not any(w in t for t in [primary, *types] for w in _FOOD_TYPE_WORDS):
             return f"not a place to eat (Google: {nas._place_type_label(place) or primary})"
         return None
+    if category in ("shopping", "restaurants", "grocery") and primary == "route":
+        # A street, not the place: Wayne's "Louella" boutique came back as Louella Drive.
+        return "a street, not a place (Google: Route)"
+    if category in ("shopping", "downtown_centers") and (primary in _OFFICE_TYPES or _OFFICE_NAME_RE.search(name)):
+        # Rehoboth's "Rehoboth Mall" came back as "Rehoboth Beach Main Street Inc" - a nonprofit's office.
+        return f"an office or service business, not a place to shop (Google: {nas._place_type_label(place) or primary})"
     if category == "parks":
         # A lower-case listing with real visitors is the place's own ("Stoneleigh: a natural garden").
         hand = nas._looks_hand_entered(name) and nas._park_reviews(place) < nas.PARK_NO_ADDRESS_MIN_REVIEWS
@@ -286,6 +311,15 @@ def _placed(entity: dict, place: dict, category: str) -> dict:
     out = {**entity, "name": name,
            "lat": loc.get("latitude"), "lng": loc.get("longitude"), "address": place.get("formattedAddress"),
            "google_checked": True}
+    if name != entity.get("name"):
+        out["research_name"] = entity.get("name")  # what the research called it - its description is about that
+    if out.get("description") and not _description_is_about(out["description"], name or "", str(entity.get("city") or "")):
+        out.pop("description")
+    if category == "parks" and "trail" in str(out.get("category") or "").lower() and not set(place.get("types") or []) & {"route", "hiking_area"}:
+        # Researched as a trail, matched to the park it runs through (Gordons Pond Trail -> Cape
+        # Henlopen State Park): the trail's length and route don't describe the park.
+        out["category"] = nas._place_type_label(place) or "Park"
+        out.pop("description", None)
     city = _city_of(place.get("formattedAddress") or "")
     if city:
         out["city"] = city
@@ -338,7 +372,120 @@ def _survey_schools_near(lat: float, lng: float, miles: float) -> list[dict]:
         if d <= miles:
             out.append({"name": name, "city": city, "lat": s_lat, "lng": s_lng, "lowest": lowest, "highest": highest,
                         "typology": typology, "students": students, "miles": d})
+    return _one_row_per_school(out)
+
+
+def _one_row_per_school(rows: list[dict]) -> list[dict]:
+    """The survey lists some schools twice - same spot, same grades, two spellings ("ARCHBISHOP
+    CARROLL HIGH SCHOOL", Malvern and "ARCHBISHOP JOHN CARROLL HIGH SCHOOL", Radnor; "FUSION ACADEMY -
+    ARDMORE" twice). One row per school: the fuller name, which also carries the right town."""
+    out: list[dict] = []
+    for s in sorted(rows, key=lambda s: -len(_match_tokens(s["name"].split(",")[0]))):
+        if any(o["lowest"] == s["lowest"] and o["highest"] == s["highest"] and nas._haversine_miles(o["lat"], o["lng"], s["lat"], s["lng"]) < 0.03
+               for o in out):
+            continue
+        out.append(s)
     return out
+
+
+# ---- matching a researched school to its survey row (10/27 grader: the nearest close-enough name won -
+# "Sacred Heart Academy" (Bryn Mawr, K-12) became Sacred Heart Catholic School in Havertown, "The
+# Haverford School" became Friends School Haverford (PK-5), "Main Line Montessori" became Main Line
+# Classical Academy). Now: the best name wins, not the nearest one.
+_MATCH_STOPWORDS = {"the", "school", "schools", "schl", "sch", "of", "and", "st", "saint", "sts", "saints", "ss", "at", "for", "a", "inc"}
+# The survey's short forms ("OUR LADY OF MT CARMEL SCHOOL" = "Our Lady of Mount Carmel School").
+_MATCH_SAME_WORD = {"mt": "mount", "ft": "fort", "hs": "high", "ms": "middle", "el": "elementary", "elem": "elementary",
+                    "acad": "academy", "prep": "preparatory", "intl": "international", "ctr": "center", "jr": "junior", "sr": "senior"}
+# Words that say what kind of school it is, not which one ("Sacred Heart Academy" = "Sacred Heart
+# Catholic School" by these alone) - they rank a match, they never make one.
+_SOFT_SCHOOL_WORDS = {"academy", "prep", "preparatory", "catholic", "christian", "regional", "parish", "parochial",
+                      "interparochial", "day", "country", "institute", "independent", "private"}
+# "Friends' Central School Lower School" / "Villa Maria Academy - Upper School": one campus of a school.
+_CAMPUS_RE = re.compile(r"[\s,:–—-]*\(?\b(lower|middle|upper)\s+(school|campus|division)\)?\s*$", re.IGNORECASE)
+_RELIGIOUS_WORDS_RE = re.compile(r"\b(catholic|parochial|parish|diocese|archdiocese|christian|jewish|hebrew|torah|yeshiva|islamic|quaker|lutheran|episcopal|baptist|religious|faith-based|church)\b", re.IGNORECASE)
+_SECULAR_WORDS_RE = re.compile(r"\b(nonsectarian|non-sectarian|secular|non-religious|nonreligious)\b", re.IGNORECASE)
+_CATHOLIC_TYPOLOGY, _NONSECTARIAN_TYPOLOGY = {1, 2, 3}, {7, 8, 9}  # the survey's TYPOLOGY codes
+
+
+def _match_tokens(name: str, city: str = "") -> set[str]:
+    """A school name's words for matching - "Academy" counts ("Sacred Heart Academy" is not "Sacred
+    Heart Catholic School"); the survey row's own town doesn't ("SACRED HEART ACADEMY BRYN MAWR")."""
+    words = re.findall(r"[a-z0-9]+", (name or "").lower().replace("'", "").replace("’", "").replace("&", " and "))
+    toks = {_MATCH_SAME_WORD.get(w, w) for w in words if w not in _MATCH_STOPWORDS}
+    without = toks - set(re.findall(r"[a-z0-9]+", (city or "").lower()))
+    return without or toks
+
+
+def _grade_number(code: int) -> Optional[int]:
+    """The survey's grade code as a grade: PK = -1, K = 0, 1st = 1 ... (ungraded = None)."""
+    return None if code <= 1 else -1 if code == 2 else 0 if code in (3, 4) else code - 5
+
+
+def _research_grades(text) -> Optional[tuple[int, int]]:
+    """"Pre-K - 12" / "PK, K-8" / "NS-K" / "6 - 12" -> (lowest, highest), PK = -1, K = 0."""
+    s = str(text or "").lower()
+    if not s or "age" in s:
+        return None
+    s = re.sub(r"pre-?\s?k(indergarten)?|nursery|\bns\b|\bn\b|preschool", " pk ", s)
+    s = re.sub(r"kindergarten|\bkg\b", " k ", s)
+    found = []
+    for t in re.findall(r"\bpk\b|\bk\b|\b\d{1,2}\b", s):
+        found.append(-1 if t == "pk" else 0 if t == "k" else int(t))
+    found = [g for g in found if -1 <= g <= 12]
+    return (min(found), max(found)) if found else None
+
+
+def _grades_clash(research: Optional[tuple[int, int]], s: dict) -> bool:
+    """The research's grades and the survey row's share less than half of the shorter span (research
+    6-12 vs Sacred Heart Catholic School's PK-8) - not the same school. One that only overstates
+    (research PK-12, survey PK-8) is the same school with the research wrong."""
+    lo, hi = _grade_number(s["lowest"]), _grade_number(s["highest"])
+    if not research or lo is None or hi is None:
+        return False
+    overlap = min(research[1], hi) - max(research[0], lo) + 1
+    shorter = min(research[1] - research[0], hi - lo) + 1
+    return overlap / shorter < 0.5
+
+
+def _survey_name_score(research_name: str, s: dict) -> Optional[float]:
+    """How well a researched name fits a survey row (None = not the same school)."""
+    city = s.get("city") or ""
+    ours, theirs = _match_tokens(_CAMPUS_RE.sub("", research_name) or research_name, city), _match_tokens(s["name"].split(",")[0], city)
+    ours |= _match_tokens(research_name, city) & _SCHOOL_LEVEL_WORDS  # a campus word still has to agree
+    if not ours or not theirs:
+        return None
+    # "Saints Peter & Paul High School" is not "Saints Peter & Paul Elementary School" (Easton).
+    lo, lt = ours & _SCHOOL_LEVEL_WORDS, theirs & _SCHOOL_LEVEL_WORDS
+    if lo and lt and not lo & lt:
+        return None
+    core_o = (ours - _SOFT_SCHOOL_WORDS - _SCHOOL_LEVEL_WORDS) or (ours - _SCHOOL_LEVEL_WORDS) or ours
+    core_t = (theirs - _SOFT_SCHOOL_WORDS - _SCHOOL_LEVEL_WORDS) or (theirs - _SCHOOL_LEVEL_WORDS) or theirs
+    shared = core_o & core_t
+    if len(shared) / len(core_o) < 0.6 or len(shared) / len(core_t) < 0.5:
+        return None
+    # One name has a telling word the other lacks, and the other has any word of its own ("Main Line
+    # Montessori" / "Main Line Classical"; "Princeton Academy of the Sacred Heart" / "Stuart Country
+    # Day School of the Sacred Heart") - two schools sharing words. A survey name that only adds to the
+    # research's ("Caskey Torah Academy ..." for "Torah Academy ...") is the same school.
+    if core_t - core_o and ours - theirs or core_o - core_t and theirs - ours:
+        return None
+    return len(ours & theirs) / len(ours | theirs)
+
+
+def _best_survey_match(e: dict, survey: list[dict]) -> Optional[dict]:
+    name = _research_name(e.get("name") or "")
+    research = _research_grades(e.get("grades_served"))
+    best, best_key = None, None
+    for s in survey:
+        if s["miles"] > SURVEY_MATCH_MILES:  # "St. Patrick School" two towns over is another school
+            continue
+        score = _survey_name_score(name, s)
+        if score is None or _grades_clash(research, s):
+            continue
+        key = (score, -s["miles"])
+        if best_key is None or key > best_key:
+            best, best_key = s, key
+    return best
 
 
 def _school_label(s: dict) -> str:
@@ -350,35 +497,89 @@ def _is_early_childhood(s: dict) -> bool:
     return s["highest"] < nas.PRIVATE_SCHOOL_MIN_HIGHEST_GRADE or s["lowest"] == s["highest"]
 
 
+def _shown_school_name(research: str, s: dict) -> str:
+    """The name a matched school is shown under.
+    - The research named one campus ("Friends' Central School Lower School") and the survey row is the
+      whole school (no Lower/Middle/Upper in its name): the row's grades and spot are the whole
+      school's (PK-12, main campus), so the name is too - "Friends' Central School". Showing the
+      campus name with the whole school's grades is what the grader caught (Lower School "PK-12").
+    - The survey's name holds the research's and says more ("Torah Academy of Greater Philadelphia" ->
+      "Caskey Torah Academy of Greater Philadelphia", "Archbishop Carroll" -> "Archbishop John
+      Carroll"): the fuller, official name. A town ("... Bryn Mawr") or a kind word ("Parish") isn't more."""
+    city = s.get("city") or ""
+    survey_name = _survey_display_name(s)
+    theirs = _match_tokens(s["name"].split(",")[0], city)
+    name = research
+    if _CAMPUS_RE.search(research) and not theirs & {"lower", "middle", "upper"}:
+        name = _CAMPUS_RE.sub("", research).strip(" -–—,") or survey_name
+    ours = _match_tokens(name, city)
+    if ours < theirs and (theirs - ours) - _SOFT_SCHOOL_WORDS:
+        return survey_name
+    return name
+
+
+def _survey_display_name(s: dict) -> str:
+    """"MAIN LINE CLASSICAL ACADEMY INC" -> "Main Line Classical Academy" (the company suffix isn't the name)."""
+    name = nas._private_school_display_name(s["name"].split(",")[0])
+    return re.sub(r",?\s+(?:Inc|Incorporated|LLC)\.?$", "", name, flags=re.IGNORECASE) or name
+
+
 def _survey_entity(s: dict, base: Optional[dict] = None) -> dict:
-    return {**(base or {}), "name": nas._private_school_display_name(s["name"].split(",")[0]) if not base else _research_name(base.get("name") or ""),
-            "category": _school_label(s), "city": (s.get("city") or "").title() or (base or {}).get("city"),
-            "lat": s["lat"], "lng": s["lng"], "survey_matched": True,
-            **({} if base else {"relationship": "NEARBY", "source_type": "nces_pss",
-                                "source_url": "https://nces.ed.gov/surveys/pss/privateschoolsearch/"})}
+    if not base:
+        return {"name": _survey_display_name(s), "category": _school_label(s),
+                "city": (s.get("city") or "").title() or None, "lat": s["lat"], "lng": s["lng"], "survey_matched": True,
+                "relationship": "NEARBY", "source_type": "nces_pss", "source_url": "https://nces.ed.gov/surveys/pss/privateschoolsearch/"}
+    research = _research_name(base.get("research_name") or base.get("name") or "")
+    research = re.sub(r",?\s+(?:Inc|Incorporated|LLC)\.?$", "", research, flags=re.IGNORECASE) or research
+    out = {k: v for k, v in base.items() if k not in ("address", "google_checked", "research_name")}
+    if base.get("lat") is None or base.get("lng") is None or nas._haversine_miles(base["lat"], base["lng"], s["lat"], s["lng"]) > 0.05:
+        out.pop("distance_miles", None)  # a different spot than last time - driven again
+    out.update({"name": _shown_school_name(research, s), "category": _school_label(s),
+                "city": (s.get("city") or "").title() or base.get("city"), "lat": s["lat"], "lng": s["lng"], "survey_matched": True})
+    if out["name"] != research:
+        out["research_name"] = research
+    # The survey says what kind of school it is: a research line calling nonsectarian St. Peter's School
+    # "Catholic" (Rittenhouse, 10/27) - or a Catholic school "secular" - is dropped, not shown.
+    desc = str(out.get("description") or "")
+    if desc and (s["typology"] in _NONSECTARIAN_TYPOLOGY and _RELIGIOUS_WORDS_RE.search(desc)
+                 or s["typology"] in _CATHOLIC_TYPOLOGY and _SECULAR_WORDS_RE.search(desc)):
+        out.pop("description")
+    return out
+
+
+def _as_researched(e: dict) -> tuple[dict, bool]:
+    """An entry of a list that was checked before, back to what the research said: a survey row's
+    grades are that earlier match's answer, and outlived it when the match was wrong (Easton's high
+    school kept the elementary school's "Grades PK-8" after the level rule landed). Also says whether
+    its spot is a survey row's (no Google listing) - dropped if the survey no longer matches."""
+    e = dict(e)
+    survey_spot = False
+    if e.pop("survey_matched", None):
+        e.pop("category", None)
+        if e.get("research_name"):
+            e["name"] = e.pop("research_name")
+        survey_spot = not e.get("google_checked")
+    return e, survey_spot
 
 
 async def _check_private_schools(client: httpx.AsyncClient, key: str, area: MarketArea, block: dict, removed: list, now: str) -> list[dict]:
     lat, lng = area.centroid_lat, area.centroid_lng
     survey = _survey_schools_near(lat, lng, 12)
     keep: list[dict] = []
+    used: list[dict] = []
     for e in block.get("entities") or []:
         if not isinstance(e, dict) or not e.get("name"):
             continue
-        ours = nas._school_name_tokens(_research_name(e["name"]))
-        match = None
-        for s in sorted(survey, key=lambda s: s["miles"]):
-            if s["miles"] > SURVEY_MATCH_MILES:  # "St. Patrick School" two towns over is another school
-                break
-            theirs = nas._school_name_tokens(s["name"])
-            # "Saints Peter & Paul High School" is not "Saints Peter & Paul Elementary School" (Easton).
-            levels_ours, levels_theirs = ours & _SCHOOL_LEVEL_WORDS, theirs & _SCHOOL_LEVEL_WORDS
-            if levels_ours and levels_theirs and not levels_ours & levels_theirs:
-                continue
-            if ours and theirs and len(ours & theirs) / len(ours) >= 0.6 and len(ours & theirs) / len(theirs) >= 0.5:
-                match = s
-                break
+        e, survey_spot = _as_researched(e)
+        match = _best_survey_match({**e, "name": e.get("research_name") or e["name"]}, survey)
+        if match and any(u is match for u in used):
+            # The research named the same school twice ("Friends' Central" and its Lower School).
+            removed.append({**e, "removed_reason": "listed twice (same school in the federal survey)", "removed_at": now})
+            continue
+        if not match and survey_spot:  # the survey row it was matched to before isn't this school
+            e = {k: v for k, v in e.items() if k not in ("lat", "lng", "distance_miles")}
         if match:
+            used.append(match)
             if _is_early_childhood(match):
                 removed.append({**e, "removed_reason": "preschool / early-childhood center (federal private school survey)", "removed_at": now})
                 continue
@@ -395,6 +596,12 @@ async def _check_private_schools(client: httpx.AsyncClient, key: str, area: Mark
             continue
         if any(k in e["name"].lower() for k in nas.PRIVATE_SCHOOL_EXCLUDE_KEYWORDS) or re.search(r"\b(children'?s house|kindergarten|playhouse|pre-?k)\b", e["name"].lower()):
             removed.append({**e, "removed_reason": "preschool, daycare or not a K-12 school", "removed_at": now})
+            continue
+        # Its own listed grades stop before 3rd grade ("Main Line Montessori School", "NS-K"): an
+        # early-childhood program, whatever it's called - no look-up needed.
+        grades = _research_grades(e.get("grades_served"))
+        if grades and grades[1] < 3:
+            removed.append({**e, "removed_reason": "preschool / early-childhood program (its own grades)", "removed_at": now})
             continue
         # Not in the survey (it's voluntary - The Haverford School isn't in it): Google must know it as a school.
         try:
@@ -620,7 +827,8 @@ _PROCESS_RE = re.compile(
     r"comprehensive (?:web )?search|entities|listed above|all entities|research (?:confirms|shows|found|indicates)|"
     r"i (?:found|searched|could not|couldn't|was unable)|sources? (?:show|indicate|provide)|according to (?:my|the) search|"
     r"also identified|were identified|identified \d+|not able to (?:find|verify|confirm)|searched|searching|"
-    r"sources? (?:from \d{4} )?confirm|multiple sources|within walking distance)\b", re.IGNORECASE)
+    r"sources? (?:from \d{4} )?confirm|multiple sources|within walking distance|research confirmed|confirmed finding|"
+    r"platform data|existing data)\b", re.IGNORECASE)
 _LABEL_RE = re.compile(r"\b(?:IN_AREA|ADJACENT|NEARBY|OTHER_MAJOR_MEDICAL|URGENT_CARE)\b")  # the research's own labels, all caps
 _DISTANCE_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:-\s*\d+(?:\.\d+)?\s*)?(?:mi|miles?|minutes?|min)\b", re.IGNORECASE)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")  # "1.4 miles" and "St. Davids" stay whole
@@ -640,16 +848,143 @@ def tidy_research_text(text: Optional[str], drop_distances: bool = True) -> str:
     # "comprehensive sports and comprehensive sports and recreational amenities" - a phrase said twice in a row
     out = re.sub(r"\b((?:\w+\s+){1,4}\w+)\s+(?:and\s+)?\1\b", r"\1", out)
     out = re.sub(r"\b(the|a|an|and|of|to|in)\s+\1\b", r"\1", out, flags=re.IGNORECASE)
-    keep = []
+    # Sizes the check can't confirm (Willows Park "5 acres" - it's 47.5; Radnor Trail "four miles" - 2.4).
+    out = _SIZE_MODIFIER_RE.sub("", out)
+    out = _SIZE_PAREN_RE.sub("", out)
+    out = _SIZE_OF_RE.sub("", out)
+    out = _SIZE_WITH_RE.sub("", out)
+    out = _HOURS_RE.sub("", out)  # before the 24-hour sentence rule, so "open 24 hours" loses only those words
+    keep, skipped = [], False
     for s in _SENTENCE_SPLIT_RE.split(out):
         if not s.strip():
             continue
-        if _PROCESS_RE.search(s) or _LABEL_RE.search(s) or (drop_distances and _DISTANCE_RE.search(s)):
+        # A sentence leaning on a dropped one ("All are privately operated...") goes with it.
+        skipped = bool(_PROCESS_RE.search(s) or _LABEL_RE.search(s) or (drop_distances and _DISTANCE_RE.search(s))
+                       or _is_bus_route_sentence(s) or _STALE_CLAIM_RE.search(s) or _SIZE_LEFT_RE.search(s)
+                       or (skipped and _LEANS_BACK_RE.match(s.strip())))
+        if skipped:
             continue
         keep.append(s.strip())
     out = " ".join(keep)
-    out = re.sub(r"\s{2,}", " ", out).strip()
-    return out
+    out = _COUNT_COMPOUND_RE.sub("", out)
+    out = _COUNT_RE.sub("", out)
+    # "Located at 17616 Coastal Highway, hub for..." opening a sentence -> "Hub for..."
+    out = _ADDRESS_OPENER_RE.sub(lambda m: m.group(1) + m.group(2).upper(), out)
+    out = _ADDRESS_RE.sub(" ", out)
+    out = re.sub(r"\s+([,.;])", r"\1", re.sub(r"\s{2,}", " ", out)).strip()
+    out = re.sub(r"[,;]+\.", ".", out)  # "Orange Theory Fitness;." once a trailing count is gone
+    out = re.sub(r"^[,;\s]+", "", out)
+    return out[:1].upper() + out[1:] if out else out
+
+
+# How many stores / restaurants / rides a place has goes stale and the research's sources disagree
+# (Rehoboth: "223 total restaurants", Tanger "140+" stores - 115 today, Funland "20 rides" - 18).
+_COUNTED = (r"restaurants?|eateries|eatery|stores?|shops?|outlets?|boutiques?|brands?|rides?|attractions?|"
+            r"vendors?|galleries|gallery|dining options?|businesses|merchants?|tenants?|retailers?")
+_NUMBER = r"\d[\d,]*(?:\s*(?:-|–|to)\s*\d[\d,]*)?\+?"  # "40-50", "20+", "1,200"
+_COUNT_COMPOUND_RE = re.compile(rf"\b{_NUMBER}[- ](?:restaurant|store|shop|outlet|boutique|brand|ride|attraction|vendor|gallery|merchant|tenant|retailer)"
+                                r"\s+(?=[a-z])")  # "a 140+ store outlet mall"
+_COUNT_RE = re.compile(rf"\b(?:(?:over|more than|nearly|almost|about|approximately|around|some|roughly)\s+)?{_NUMBER}\s+"
+                       rf"(?:total\s+|different\s+|unique\s+)?"
+                       rf"(?=(?:more\s+)?(?:brand[- ]name\s+|local\s+|independent\s+)?(?:{_COUNTED})\b)", re.IGNORECASE)
+# A street address inside a sentence - the checked address is shown on its own line, and the
+# research's one was sometimes another branch (Beebe Walk-In Care "at 18941 John J Williams Hwy").
+_ADDRESS_CORE = (r"(?:at|on|and)\s+\d{1,6}\s+(?:[A-Z][\w.']*\s+){1,5}"
+                 r"(?:Rd|Road|Hwy|Highway|Ave|Avenue|St|Street|Way|Wy|Blvd|Boulevard|Dr|Drive|Ln|Lane|Pike|Pkwy|Parkway|Ct|Court|"
+                 r"Plaza|Pl|Place|Route|Rte|Circle|Cir|Terrace|Trail|Trl)\b(?:\s+(?:N|S|E|W|NE|NW|SE|SW)\b)?(?:,?\s*(?:#|Unit|Suite|Ste\.?)\s*\w+)?")
+_ADDRESS_RE = re.compile(r",?\s*\b(?:[Ll]ocated\s+)?" + _ADDRESS_CORE + ",?")
+_ADDRESS_OPENER_RE = re.compile(r"(^|[.!?]\s+)Located\s+" + _ADDRESS_CORE + r",?\s*([a-z])")
+# Bus route numbers and colored bus "lines" change every few months (SEPTA ended Route 106 on
+# 8/24/2026; rabbittransit's Gold Line is seasonal) - only stations, which the check confirms, stay.
+_BUS_WORD_RE = re.compile(r"\b(?:bus(?:es)?|transit)\b", re.IGNORECASE)
+_BUS_ROUTE_RE = re.compile(r"\broutes?\s+\d|\b(?:Red|Blue|Gold|Green|Orange|Purple|Yellow|Silver|Brown) Line\b", re.IGNORECASE)
+
+
+def _is_bus_route_sentence(s: str) -> bool:
+    return bool(_BUS_WORD_RE.search(s) and _BUS_ROUTE_RE.search(s))
+
+
+# Claims that go stale or can't be checked: rankings (Lankenau "top five" - No. 10 in 2026-27),
+# "closest" (AFC Havertown for Ardmore - Wynnewood is nearer), resident counts that disagree with
+# the Census row (Media "5,350 residents" vs 5,868), and how the research found things.
+_STALE_CLAIM_RE = re.compile(
+    r"\branked\b|\bU\.?\s?S\.? News\b|\btop[- ](?:\d+|five|ten|three)\b|\bNo\. \d+\b|\b(?:closest|nearest)\b|"
+    r"\b\d[\d,]{2,}\s+(?:residents|people|inhabitants)\b|\bpopulation of\b|\bsearch results\b|\bmarkets itself\b|"
+    r"\b24[- ]hours?\b(?!\s+(?:emergency|ER\b))", re.IGNORECASE)  # "Wegmans is 24-hour" - it's 6 a.m. to midnight
+_SPELLED = r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty"
+_SIZE_MODIFIER_RE = re.compile(rf"\b(?:(?:nearly|about|approximately|over|more than|roughly|some|almost)\s+)?(?:\d[\d,]*(?:\.\d+)?|{_SPELLED})\+?-(?:mile|acre|bed)\s+",
+                               re.IGNORECASE)  # "3.2-mile trail", "a 264-bed hospital"
+_SIZE_PAREN_RE = re.compile(r"\s*\(\s*(?:about\s+|approximately\s+|over\s+)?\d[\d,.]*\+?\s*acres?\s*\)", re.IGNORECASE)  # "(71 acres)"
+_SIZE_OF_RE = re.compile(rf"\b(?:(?:nearly|about|approximately|over|more than|roughly|some|almost)\s+)?(?:\d[\d,.]*\+?|{_SPELLED})\s+(?:miles|acres)\s+of\s+",
+                         re.IGNORECASE)  # "12+ miles of hiking trails" -> "hiking trails"
+_SIZE_WITH_RE = re.compile(r"\s+with\s+(?:about\s+|over\s+)?\d[\d,.]*\+?\s+acres\b", re.IGNORECASE)  # "Haverford Reserve with 124 acres"
+_SIZE_LEFT_RE = re.compile(r"\b\d[\d,.]*\+?\s+acres?\b", re.IGNORECASE)
+# Opening hours (Wegmans Malvern "open 24 hours" - it's 6 a.m. to midnight).
+_HOURS_RE = re.compile(
+    r",?\s*\bopen\s+(?:24\s+hours(?:\s+a\s+day)?|24/7|around the clock|(?:daily\s+)?(?:from\s+)?\d{1,2}(?::\d\d)?\s*(?:a\.?m\.?|p\.?m\.?)\s*(?:to|-|–)\s*"
+    r"(?:\d{1,2}(?::\d\d)?\s*(?:a\.?m\.?|p\.?m\.?)|midnight|noon)(?:\s+daily)?)", re.IGNORECASE)
+# A sentence leaning on the one before it ("These are the primary grocery options...") goes with it.
+_LEANS_BACK_RE = re.compile(r"^(?:These|This|They|Those|All|Both|Each|It|Together|Additionally|Additional|Also|Of these|"
+                            r"The (?:hospital|school|station|store|market|park|center|mall|restaurant))\b")
+
+
+def drop_removed_mentions(text: Optional[str], removed_names: list[str]) -> str:
+    """Sentences that name a place the check took off the page (Rehoboth's grocery text still listed
+    "Stop & Shop", which has no Delaware stores; its school text named a surf school)."""
+    if not text or not removed_names:
+        return text or ""
+    pats = [re.compile(r"\b" + re.escape(n) + r"\b", re.IGNORECASE) for n in removed_names if len(n) >= 5]
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    keep, dropped, any_dropped = [], False, False
+    for s in sentences:
+        dropped = any(p.search(s) for p in pats) or (dropped and bool(_LEANS_BACK_RE.match(s.strip())))
+        any_dropped = any_dropped or dropped
+        keep.append(None if dropped else s)
+    if not any_dropped:
+        return text
+    # The page shows the first two sentences: what's left of those, never a third pulled up in
+    # their place (the later ones were weaker - "Research confirmed finding...").
+    return " ".join(s for s in keep[:2] if s).strip()
+
+
+_DISTRICT_MENTION_RE = re.compile(r"\b((?:[A-Z][\w.'&]*(?:-[A-Z][\w.'&]*)*\s+){1,6})School District\b")
+
+
+def fix_district_names(text: Optional[str], districts: list[str]) -> str:
+    """Puts the town's real school district names back into AI-written text that shortened them -
+    Malvern's summary said "Valley School District" for Great Valley School District. A mention
+    that is part of exactly one real name ("Valley", "Tredyffrin") becomes that full name; a real
+    name, or a part that fits more than one district, is left alone. Safe to run any number of times."""
+    if not text or not isinstance(text, str) or not districts:
+        return text or ""
+
+    def words(core: str) -> list[str]:
+        return [w for w in re.split(r"[\s-]+", core.strip()) if w]
+
+    cores = {}
+    for d in districts:
+        m = re.match(r"(.+?)\s+School District\b", str(d or "").strip())
+        if m:
+            cores[m.group(1).strip()] = words(m.group(1))
+
+    def holders(part: list[str]) -> list[str]:
+        n = len(part)
+        return [c for c, ws in cores.items() if any(ws[i:i + n] == part for i in range(len(ws) - n + 1))]
+
+    def fix(m: re.Match) -> str:
+        mention = words(m.group(1))
+        # "In Great Valley School District" - the real name is a tail of the capitalised run.
+        for i in range(len(mention)):
+            if any(ws == mention[i:] for ws in cores.values()):
+                return m.group(0)
+        for i in range(len(mention)):
+            found = holders(mention[i:])
+            if len(found) == 1:
+                lead = m.group(1).split()[:i] if i and len(m.group(1).split()) == len(mention) else []
+                return " ".join(lead + [found[0], "School District"])
+        return m.group(0)
+
+    return _DISTRICT_MENTION_RE.sub(fix, text)
 
 
 def medical_label(category: Optional[str]) -> Optional[str]:

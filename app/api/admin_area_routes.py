@@ -192,7 +192,8 @@ def _entity_out(e: dict, shown: Optional[dict], category: str) -> dict:
 async def area_detail(db: AsyncSession, area: MarketArea) -> dict:
     facts = copy.deepcopy(area.facts or {})
     narrative = copy.deepcopy(area.narrative or {})
-    page_facts, page_narrative = clean_area_payload(copy.deepcopy(facts), copy.deepcopy(narrative))
+    from app.services.areas.fair_housing_service import town_display
+    page_facts, page_narrative = town_display(area, copy.deepcopy(facts), copy.deepcopy(narrative))
     lists = []
     for key, label, section in PLACE_LISTS:
         block = facts.get(key) if isinstance(facts.get(key), dict) else {}

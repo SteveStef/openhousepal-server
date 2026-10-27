@@ -94,12 +94,58 @@ def _miles(a_lat: float, a_lng: float, b_lat: float, b_lng: float) -> float:
     return 2 * r * math.asin(math.sqrt(math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2))
 
 
-def pick_destinations(lat: float, lng: float) -> list[dict]:
+# A commute "to" the town itself is no commute (10/27: Princeton's page listed Princeton as a
+# destination; Charlottesville's listed Downtown Charlottesville). A city / job-center destination
+# is dropped when it's within SELF_MILES of the town center, or named like the town and within
+# SELF_NAMED_MILES (so Washington, PA still gets Downtown Washington, D.C.). Airports always stay.
+SELF_MILES = 3.0
+SELF_NAMED_MILES = 15.0
+_DEST_COORDS = {d[0]: (d[1], d[2]) for d in _DESTINATIONS}
+
+
+def _named_like(dest_name: str, town_name: Optional[str]) -> bool:
+    t = re.sub(r"[^a-z ]", " ", (town_name or "").lower()).split()
+    if not t:
+        return False
+    return re.search(r"\b" + r"\s+".join(map(re.escape, t)) + r"\b", re.sub(r"[^a-z ]", " ", dest_name.lower())) is not None
+
+
+def is_self_destination(dest_name: str, kind: Optional[str], town_name: Optional[str],
+                        lat: Optional[float], lng: Optional[float], drive_miles: Optional[float] = None) -> bool:
+    if kind == "airport":
+        return False
+    dist = None
+    coords = _DEST_COORDS.get(dest_name)
+    if coords and lat is not None and lng is not None:
+        dist = _miles(lat, lng, coords[0], coords[1])
+    elif drive_miles is not None:
+        dist = float(drive_miles) * 0.8  # road miles run longer than straight-line
+    if dist is not None and dist <= SELF_MILES:
+        return True
+    return _named_like(dest_name, town_name) and (dist is None or dist <= SELF_NAMED_MILES)
+
+
+def commute_for_page(commute: Optional[dict], town_name: Optional[str], lat: Optional[float], lng: Optional[float]) -> Optional[dict]:
+    """The stored commute minus any destination that is the town itself (page time, free - the
+    stored drive times came from the paid Routes API and stay as they are). None when nothing is
+    left."""
+    if not isinstance(commute, dict):
+        return commute
+    rows = [r for r in commute.get("destinations") or []
+            if isinstance(r, dict) and not is_self_destination(str(r.get("name") or ""), r.get("kind"), town_name, lat, lng, r.get("miles"))]
+    if not rows:
+        return None
+    return {**commute, "destinations": rows}
+
+
+def pick_destinations(lat: float, lng: float, town_name: Optional[str] = None) -> list[dict]:
     """Up to 3: the nearest major downtown (within 90 mi, else simply the nearest), the nearest
     regional job center within 25 mi that isn't the same place, and the nearest hub airport
-    (within 100 mi, else the nearest airport of any size)."""
+    (within 100 mi, else the nearest airport of any size). Never the town itself
+    (is_self_destination) - then the next one out."""
     out = []
-    ranked = sorted(_DESTINATIONS, key=lambda d: _miles(lat, lng, d[1], d[2]))
+    ranked = [d for d in sorted(_DESTINATIONS, key=lambda d: _miles(lat, lng, d[1], d[2]))
+              if not is_self_destination(d[0], "city", town_name, lat, lng)]
     major = next((d for d in ranked if d[3] == 1 and _miles(lat, lng, d[1], d[2]) <= 90), None) or next(d for d in ranked if d[3] == 1)
     out.append({"name": major[0], "lat": major[1], "lng": major[2], "kind": "city"})
     local = next((d for d in ranked if d[3] == 2 and _miles(lat, lng, d[1], d[2]) <= 25 and _miles(major[1], major[2], d[1], d[2]) > 5), None)
@@ -147,7 +193,7 @@ async def refresh_commute(db: AsyncSession, area: MarketArea) -> Optional[dict]:
     key = os.getenv("GOOGLE_PLACES_API_KEY") or os.getenv("GOOGLE_MAPS_API_KEY")
     if not key or area.centroid_lat is None or area.centroid_lng is None:
         return None
-    dests = pick_destinations(area.centroid_lat, area.centroid_lng)
+    dests = pick_destinations(area.centroid_lat, area.centroid_lng, area.name)
     try:
         async with httpx.AsyncClient() as client:
             drive = await _route_matrix(client, key, area.centroid_lat, area.centroid_lng, dests, "DRIVE")

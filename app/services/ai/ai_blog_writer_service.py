@@ -320,15 +320,25 @@ async def town_card_for_area(db: AsyncSession, area: MarketArea) -> dict:
     )
     from app.services.areas import geography
     scope = geography.scope_for_market_area(area)
-    facts = area.facts or {}
+    # What the town page itself shows (fair_housing_service.town_display), not the raw research.
+    from app.services.areas.fair_housing_service import town_display
+    facts, shown_narrative = town_display(area)
     stats = await get_area_live_market_stats(db, scope, facts.get("market_stats"))
+    # Too little MLS coverage: no sold-price range on the card either (Charlottesville).
+    from app.services.areas.market_stats_service import get_area_market_coverage, town_households
+    try:
+        if (await get_area_market_coverage(db, scope, town_households(area))).get("thin"):
+            stats = {k: v for k, v in stats.items() if k not in ("min_price", "max_price", "price_range_basis", "median_sold_price",
+                                                                 "recently_sold_count", "median_sold_dom", "under_contract_count")}
+    except Exception:
+        logger.warning("town card: coverage check failed for %s", area.slug, exc_info=True)
     checked = await reconcile_public_schools(db, area, scope) if facts.get("public_schools") else None
     items = ((resolve_photo_urls(facts.get("photos")) or {}).get("items") or [])
     photos = [{"url": it["url"], "credit": it.get("attribution") or it.get("author") or "Google Maps"} for it in items[:4] if it.get("url")]
     return {
         "slug": area.slug, "name": area.name, "state": area.state, "county": area.county,
         "photo": photos[0]["url"] if photos else None, "photos": photos,
-        "summary": _objective_summary((area.narrative or {}).get("summary")),
+        "summary": _objective_summary((shown_narrative or {}).get("summary")),
         "median_price": stats.get("median_price"), "active_count": stats.get("active_count"),
         "min_price": stats.get("min_price"), "max_price": stats.get("max_price"), "price_range_basis": stats.get("price_range_basis"),
         "school_districts": _public_school_districts({"public_schools": checked} if checked else facts, stats.get("school_districts") or []),

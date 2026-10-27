@@ -103,13 +103,13 @@ _PLACE_ENTITY_SCHEMA = {
     "type": "object",
     "properties": {
         "name": {"type": "string"},
-        "category": {"type": "string", "description": "A short label for what this is, e.g. 'Full-service supermarket', 'Regional rail station', 'Community park'."},
+        "category": {"type": "string", "description": "A short label for what this is, as the place itself or Google Maps would put it, e.g. 'Full-service supermarket', 'Regional rail station', 'Community park', 'Healthy bowls restaurant' - never a flattering guess like 'Contemporary American' for a bowls cafe."},
         "relationship": {"type": "string", "enum": list(_RELATIONSHIP_VALUES), "description": "IN_AREA = physically inside the community. ADJACENT = in an immediately bordering town. NEARBY = a short drive away but genuinely relevant. Never claim IN_AREA for something outside the community's actual boundaries."},
         "city": {"type": "string"},
         "distance_miles": {"type": "number", "description": "Approximate driving distance in miles from the community's center."},
         "source_url": {"type": "string", "description": "A real URL you found this at. Required."},
         "source_type": {"type": "string", "description": "e.g. 'official_website', 'government', 'news', 'business_directory', 'transit_authority'."},
-        "description": {"type": "string", "description": "One short factual sentence, only if useful."},
+        "description": {"type": "string", "description": "One short factual sentence about THIS place only, only if useful. Never include: counts that change (number of stores, restaurants, rides), a street address, opening seasons or schedules unless the official source states them, what it legally sells (alcohol rules differ by state), or claims about who runs or manages something. Say what kind of place it is and what it is known for."},
         "confidence": {"type": "number", "description": "0.0-1.0, your confidence this entry is accurate and current."},
     },
     "required": ["name", "relationship", "source_url", "confidence"],
@@ -127,7 +127,9 @@ def _place_tool_schema(extra_notes_hint: str) -> dict:
                     f"{extra_notes_hint} REQUIRED if entities is empty: state plainly that you actually searched "
                     "for this category and found nothing relevant (say what you searched for), so an empty list "
                     "here always means a real confirmed absence, never an unexplained gap. Optional if entities "
-                    "is non-empty."
+                    "is non-empty. Only name places that are also in entities, no counts of businesses, no "
+                    "season or schedule claims you didn't read on the official source, and say an organization "
+                    "promotes or supports an area rather than that it manages or runs it unless that is its role."
                 ),
             },
         },

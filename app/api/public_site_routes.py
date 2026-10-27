@@ -682,9 +682,8 @@ async def compare_site_areas(
         market_stats = await content_adapters.get_area_live_market_stats(db, area_scope, facts.get("market_stats"))
         facts["market_stats"] = market_stats
         listings, inventory_total = await content_adapters.get_area_inventory(db, area_scope, limit=3)
-        from app.services.areas.fair_housing_service import clean_area_payload
-        facts, compare_narrative = clean_area_payload(facts, area.narrative)
-        facts.pop("_fair_housing", None)
+        from app.services.areas.fair_housing_service import town_display
+        facts, compare_narrative = town_display(area, facts)
         compared.append({
             "name": area.name,
             "state": area.state,
@@ -799,11 +798,11 @@ async def area_page_payload(db: AsyncSession, area: MarketArea, user: Optional[U
 
     # Fair Housing wording, fixed rules, on every page served (the stored text was already checked;
     # this catches anything older than a rule) - fair_housing_service.
-    from app.services.areas.fair_housing_service import clean_area_payload
-    facts, narrative_clean = clean_area_payload(facts, area.narrative)
-    facts.pop("_fair_housing", None)
+    # School dots, text clean-up, commute - the same step every page showing a town uses.
+    from app.services.areas.fair_housing_service import town_display
+    facts, narrative_clean = town_display(area, facts)
     hub_rules = await content_adapters.hub_sales_rules(db, user) if user else None
-    return {
+    out = {
         "name": area.name,
         "state": area.state,
         "slug": area.slug,
@@ -830,6 +829,9 @@ async def area_page_payload(db: AsyncSession, area: MarketArea, user: Optional[U
         "municipalities": [{"name": m["name"], "share": m["share"]} for m in ((facts.get("boundaries") or {}).get("municipalities") or [])]
         or await content_adapters.cached_market(f"munis:{area.id}", lambda d: market_insights_service.get_area_municipalities(d, area_scope), db),
     }
+    # Too little MLS coverage (Charlottesville: CAAR's shared listings stopped 7/15/2026) - the
+    # market verdict, trends and sold stats come off rather than show a wrong picture.
+    return await market_stats_service.guard_town_market(db, area, area_scope, out)
 
 
 @router.get("/{site_id}/nearby/availability")

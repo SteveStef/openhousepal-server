@@ -7,8 +7,8 @@
     the town's homes that sit inside it (real borders, checked against every home's coordinates -
     not the MLS's mailing-address field). Drawn on the town page map.
   - walk (facts['walk']): how much is within an easy walk of the town's homes - the share of homes
-    with a grocery store / restaurants or cafes / a park / a train station within about
-    a 15-minute walk, plus the train stations themselves. OpenStreetMap (Overpass API, free, no key).
+    with a grocery store / restaurants or cafes / a park / a train or trolley stop (never a
+    tourist railway) within about a 15-minute walk, plus the stops themselves. OpenStreetMap (Overpass API, free, no key).
     Our own measure, not the licensed "Walk Score" (its free plan excludes subscription services).
 
 Both are free, so the daily upkeep job refreshes them once a year without counting against its paid
@@ -143,6 +143,106 @@ async def _researched_private(client: httpx.AsyncClient, area: MarketArea, have:
     return out
 
 
+# ---------------------------------------------------------------- counties
+# A mailing-address town can cross county lines (Ardmore: Montgomery + Delaware; Wayne/19087:
+# Delaware, Chester and Montgomery) and a Virginia city is often no county at all - an
+# "independent city" Census treats as a county-equivalent (Charlottesville is not in Albemarle
+# County, 10/27). Every county with a real share of homes is kept, each marked county or
+# independent city.
+_COUNTY_MIN_SHARE = 3
+
+
+def _county_kind(attrs: dict) -> str:
+    # COUNTYCC C7 = an incorporated place independent of any county (Virginia's cities, Baltimore,
+    # St. Louis, Carson City); LSADC 25 = "city" as the county-level name.
+    if attrs.get("COUNTYCC") == "C7" or attrs.get("LSADC") == "25":
+        return "independent_city"
+    return "county"
+
+
+def county_rows(features: list[dict], shares: list[int]) -> list[dict]:
+    """[{name, share, kind}] for every county-level area holding 3%+ of the town's homes, biggest
+    first. An independent city is named by its base name ("Charlottesville"), a county by its
+    full name ("Montgomery County")."""
+    rows = []
+    for f, sh in zip(features, shares):
+        a = f.get("attributes") or {}
+        kind = _county_kind(a)
+        name = (a.get("BASENAME") if kind == "independent_city" else a.get("NAME")) or a.get("NAME")
+        if name and sh >= _COUNTY_MIN_SHARE:
+            rows.append({"name": name, "share": sh, "kind": kind})
+    return sorted(rows, key=lambda r: -r["share"])
+
+
+def county_label(rows: list[dict]) -> Optional[str]:
+    """The page's words: "Montgomery County", "Montgomery and Delaware counties", "Independent city"
+    (a town that is all one independent city), "Charlottesville (independent city) and Albemarle
+    County" (a mailing area that's partly city, partly county). TownPage.tsx shows it as
+    facts['county_label']."""
+    if not rows:
+        return None
+    if all(r["kind"] == "county" for r in rows):
+        return _join_counties([r["name"] for r in rows])
+    if len(rows) == 1:
+        return "Independent city"
+    ordered = [r for r in rows if r["kind"] == "independent_city"] + [r for r in rows if r["kind"] == "county"]
+    parts = [f"{r['name']} (independent city)" if r["kind"] == "independent_city" else r["name"] for r in ordered]
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def _join_counties(names: list[str]) -> str:
+    if len(names) == 1:
+        return names[0]
+    bare = [re.sub(r"\s+County$", "", n) for n in names]
+    return (", ".join(bare[:-1]) + " and " + bare[-1]) + " counties"
+
+
+def _apply_counties(area: MarketArea, rows: list[dict]) -> None:
+    """facts['counties'] = every row; area.county = the biggest real county (an independent city
+    is not a county - the column stays blank for a town that's mostly one, so no page or card
+    says "Charlottesville city County")."""
+    facts = dict(area.facts or {})
+    facts["counties"] = rows
+    facts["county_label"] = county_label(rows)  # what the town page shows (TownPage.tsx)
+    area.facts = facts
+    flag_modified(area, "facts")
+    top = rows[0] if rows else None
+    if top and top["kind"] == "county" and top["share"] >= 50:
+        area.county = top["name"]
+    elif top and top["kind"] == "independent_city":
+        area.county = None
+    elif top and not area.county:
+        area.county = top["name"]
+
+
+async def _refresh_counties_with(client: httpx.AsyncClient, area: MarketArea, pts: list, env: dict) -> list[dict]:
+    feats = await bs.tiger(client, bs.COUNTY, with_geometry=True, **env)
+    if not feats:
+        return []
+    rows = county_rows(feats, _shares(pts, [f["geometry"]["rings"] for f in feats]))
+    if rows:
+        _apply_counties(area, rows)
+    return rows
+
+
+async def refresh_counties(db: AsyncSession, area: MarketArea) -> Optional[list[dict]]:
+    """Counties only (free Census TIGERweb, no other lookups) - for a one-off backfill."""
+    pts = await _home_points(db, area)
+    if len(pts) < 20:
+        return None
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    try:
+        async with httpx.AsyncClient(headers={"User-Agent": "OpenHousePal/1.0"}) as client:
+            rows = await _refresh_counties_with(client, area, pts, bs.envelope(min(xs), min(ys), max(xs), max(ys)))
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        logger.info("Census county lookup failed", extra={"area": area.slug, "error": str(exc)})
+        return None
+    if rows:
+        db.add(area)
+        await db.commit()
+    return rows
+
+
 async def refresh_boundaries(db: AsyncSession, area: MarketArea) -> Optional[dict]:
     pts = await _home_points(db, area)
     if len(pts) < 20:
@@ -167,16 +267,9 @@ async def refresh_boundaries(db: AsyncSession, area: MarketArea) -> Optional[dic
             # sits in one of each, so both kinds are kept and labelled.
             split = [(f, "elementary") for f in await bs.tiger(client, bs.ELSD, **env)] + \
                     [(f, "secondary") for f in await bs.tiger(client, bs.SCSD, **env)]
-            # The county most of the town's homes are in - the town record never had one (every live
-            # town's county was blank, 10/26), so the "outside any town" row and the page's County
-            # line never showed (Rehoboth Beach read "Rehoboth Beach City 14%", nothing else).
-            if not area.county:
-                counties = await bs.tiger(client, bs.COUNTY, with_geometry=True, **env)
-                if counties:
-                    cshares = _shares(pts, [f["geometry"]["rings"] for f in counties])
-                    top = max(zip(counties, cshares), key=lambda t: t[1])
-                    if top[1] >= 50 and top[0]["attributes"].get("NAME"):
-                        area.county = top[0]["attributes"]["NAME"]
+            # Every county the town's homes are in (facts['counties'], 3%+ each) and the main one
+            # (area.county) - see _apply_counties.
+            await _refresh_counties_with(client, area, pts, env)
             zips = [str(z) for z in (area.zip_codes or []) if str(z).isdigit()][:12]
             zcta = await bs.tiger(client, bs.ZCTA, where="ZCTA5 IN (" + ",".join(f"'{z}'" for z in zips) + ")") if zips and not is_township else []
     except (httpx.HTTPError, ValueError, KeyError) as exc:
@@ -288,6 +381,41 @@ _WALK_GROUPS = {
 }
 
 
+# Not a way to get to work: tourist / heritage railways (10/27: Gettysburg's "train station" was its
+# historic depot, used only by excursion trains) and disused stations.
+_TOURIST_WORDS = re.compile(r"touris|excursion|heritage|scenic|museum|dinner train|historic|steam train", re.I)
+
+
+def station_kind(tags: dict) -> Optional[str]:
+    """'train' (commuter / intercity rail, subway), 'trolley' (light rail, tram, trolley - Ardmore's
+    SEPTA Metro M stops), or None for a station that shouldn't count (tourist / heritage /
+    disused)."""
+    t = tags or {}
+    if t.get("railway") not in ("station", "halt"):
+        return None
+    if any(k in t for k in ("tourism", "heritage", "railway:historic", "disused", "abandoned")) \
+            or t.get("usage") in ("tourism", "heritage") or t.get("railway:preserved") == "yes" \
+            or any(_TOURIST_WORDS.search(str(t.get(k) or "")) for k in ("operator", "network")):
+        return None
+    # Softer signs (a historic-building tag, "tourist rail" in the description) count only against
+    # a station no real rail network serves - plenty of working SEPTA/Amtrak stations are historic
+    # buildings.
+    served = bool(t.get("network") or t.get("railway:ref"))
+    if not served and ("historic" in t or any(_TOURIST_WORDS.search(str(t.get(k) or "")) for k in ("description", "name", "note"))):
+        return None
+    if t.get("station") in ("light_rail", "tram") or t.get("light_rail") == "yes" or t.get("tram") == "yes":
+        return "trolley"
+    return "train"
+
+
+def walk_pct_words(pct: Optional[int]) -> Optional[str]:
+    """95%+ reads "nearly all" - our 0.6-mile straight line is an estimate, not a promise for every
+    home (owner/grader 10/27: "100% of homes near a train station")."""
+    if pct is None:
+        return None
+    return "Nearly all" if pct >= 95 else f"{pct}%"
+
+
 def _miles(a_lat: float, a_lng: float, b_lat: float, b_lng: float) -> float:
     dlat = (b_lat - a_lat) * 69.0
     dlng = (b_lng - a_lng) * 69.0 * math.cos(math.radians((a_lat + b_lat) / 2))
@@ -318,6 +446,8 @@ async def refresh_walkability(db: AsyncSession, area: MarketArea) -> Optional[di
         return None
 
     places: dict[str, list[tuple[float, float, str]]] = {k: [] for k in _WALK_GROUPS}
+    trolley_names: set[str] = set()
+    train_names: set[str] = set()
     for e in elements:
         t = e.get("tags") or {}
         lat = e.get("lat") or (e.get("center") or {}).get("lat")
@@ -331,7 +461,12 @@ async def refresh_walkability(db: AsyncSession, area: MarketArea) -> Optional[di
         elif t.get("leisure") in ("park", "playground", "nature_reserve"):
             k = "park"
         elif t.get("railway") in ("station", "halt"):
+            kind = station_kind(t)
+            if not kind:
+                continue
             k = "transit"
+            if t.get("name"):
+                (trolley_names if kind == "trolley" else train_names).add(t["name"])
         else:
             continue
         places[k].append((float(lat), float(lng), t.get("name") or ""))
@@ -348,13 +483,6 @@ async def refresh_walkability(db: AsyncSession, area: MarketArea) -> Optional[di
                         break
         return round(100 * n / len(homes))
 
-    rows = [
-        {"key": "grocery", "label": _WALK_GROUPS["grocery"][1], "pct": near("grocery")},
-        {"key": "food", "label": "Three or more restaurants or cafes", "pct": near("food", 3)},
-        {"key": "park", "label": _WALK_GROUPS["park"][1], "pct": near("park")},
-        {"key": "transit", "label": _WALK_GROUPS["transit"][1], "pct": near("transit")},
-    ]
-    # (No bus-stop row - OpenStreetMap's U.S. bus stops are too patchy to state a share honestly.)
     # Station names inside (or right at the edge of) the town, nearest-to-most-homes first.
     stations: dict[str, int] = {}
     for lat, lng, name in places["transit"]:
@@ -362,12 +490,28 @@ async def refresh_walkability(db: AsyncSession, area: MarketArea) -> Optional[di
             served = sum(1 for x, y in homes if _miles(y, x, lat, lng) <= _WALK_MILES)
             if served:
                 stations[name] = max(stations.get(name, 0), served)
+    # Trolley / light-rail stops count, and then the row says so (Ardmore: three of its five
+    # "train stations" were SEPTA Metro M stops).
+    has_trolley = any(n in trolley_names for n in stations)
+    # "Bryn Mawr" / "Haverford" / "Villanova" are both a Regional Rail station and a Metro M stop -
+    # only a name that is a trolley stop and nothing else gets the "(trolley)" tag.
+    trolley_only = trolley_names - train_names
+    rows = [
+        {"key": "grocery", "label": _WALK_GROUPS["grocery"][1], "pct": near("grocery")},
+        {"key": "food", "label": "Three or more restaurants or cafes", "pct": near("food", 3)},
+        {"key": "park", "label": _WALK_GROUPS["park"][1], "pct": near("park")},
+        {"key": "transit", "label": "A train or trolley stop" if has_trolley else _WALK_GROUPS["transit"][1], "pct": near("transit")},
+    ]
+    for r in rows:
+        r["pct_words"] = walk_pct_words(r["pct"])
+    # (No bus-stop row - OpenStreetMap's U.S. bus stops are too patchy to state a share honestly.)
     everyday = (rows[0]["pct"] + rows[1]["pct"]) / 2
     level = "Very walkable" if everyday >= 70 else "Walkable in parts" if everyday >= 35 else "Mostly by car"
     walk = {
         "level": level,
         "rows": rows,
-        "stations": [n for n, _ in sorted(stations.items(), key=lambda s: -s[1])][:5],
+        "stations": [f"{n} (trolley)" if n in trolley_only else n for n, _ in sorted(stations.items(), key=lambda s: -s[1])][:5],
+        "has_trolley": has_trolley,
         "homes_checked": len(homes),
         "walk_minutes": 15,
         "computed_at": datetime.now(timezone.utc).isoformat(),

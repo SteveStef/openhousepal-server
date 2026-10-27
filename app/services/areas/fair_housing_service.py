@@ -100,11 +100,19 @@ def population_area_label(geography: str) -> Optional[str]:
     return geography or None  # "ZIP 19035" / "ZIPs 19341, 19355" (census_service)
 
 
-def clean_area_payload(facts: dict, narrative: Optional[dict]) -> tuple[dict, Optional[dict]]:
-    """Render-time pass over everything a town page prints (see public_site_routes)."""
-    from app.services.areas.town_places_check import medical_label, tidy_research_text
+def clean_area_payload(facts: dict, narrative: Optional[dict], origin: Optional[tuple[float, float]] = None,
+                       town: Optional[str] = None) -> tuple[dict, Optional[dict]]:
+    """Render-time pass over everything a town page prints (see public_site_routes). `origin` is the
+    town center the checked distances were measured from; `town` the page's own town name."""
+    from app.services import nearby_amenities_service as nas
+    from app.services.areas.town_places_check import drop_removed_mentions, fix_district_names, medical_label, tidy_research_text
     facts = dict(facts or {})
     checked = bool(facts.get("_places_check_version"))
+    districts = town_district_names(facts)
+    kept = {str(e.get("name") or "").lower() for b in facts.values() if isinstance(b, dict)
+            for e in (b.get("entities") or []) if isinstance(e, dict)}
+    removed = [str(r.get("name")) for b in facts.values() if isinstance(b, dict)
+               for r in (b.get("_removed") or []) if isinstance(r, dict) and r.get("name") and str(r["name"]).lower() not in kept]
     # Outside sites' price figures (Movoto, Redfin, blogs) disagreed with each other and with the live
     # MLS numbers on the same page (Malvern: "up 2.5%" and "down 2%") - the page shows the MLS only.
     facts.pop("market_context", None)
@@ -114,7 +122,7 @@ def clean_area_payload(facts: dict, narrative: Optional[dict]) -> tuple[dict, Op
         block = dict(block)
         block.pop("_removed", None)
         if isinstance(block.get("notes"), str):
-            block["notes"] = tidy_research_text(clean_text(block["notes"]))
+            block["notes"] = fix_district_names(drop_removed_mentions(tidy_research_text(clean_text(block["notes"])), removed), districts)
         if isinstance(block.get("entities"), list):
             ents = []
             for e in block["entities"]:
@@ -122,12 +130,24 @@ def clean_area_payload(facts: dict, narrative: Optional[dict]) -> tuple[dict, Op
                     ents.append(e)
                     continue
                 e = dict(e)
+                if key == "transportation" and _BUS_ROUTE_NAME_RE.search(str(e.get("name") or "")):
+                    continue  # a numbered bus route - they change every few months (SEPTA Route 106)
                 if e.get("description"):
                     e["description"] = tidy_research_text(clean_text(e["description"]))
+                    e["description"] = _not_in_another_town(e["description"], town, e.get("city"))
+                if key == "parks":
+                    e["category"] = _plain_park_label(e.get("category"), e.get("name"))
                 if key == "medical":
                     e["category"] = medical_label(e.get("category"))
                 if not checked or not e.get("google_checked") and not e.get("survey_matched"):
                     e.pop("distance_miles", None)  # the research's own guess ("0 mi") - never shown
+                elif origin and e.get("lat") is not None and e.get("lng") is not None and e.get("distance_miles") is not None:
+                    # Inside a mile, one-way downtown streets made driving miles jumble the order
+                    # (Rehoboth: Penny Lane 1.1 mi by car, Cafe Azafran 0.6 - both a few blocks off);
+                    # the straight-line distance from the same town center reads true there.
+                    straight = nas._haversine_miles(origin[0], origin[1], e["lat"], e["lng"])
+                    if straight < 1:
+                        e["distance_miles"] = round(straight, 1)
                 ents.append(e)
             block["entities"] = ents
         facts[key] = block
@@ -146,8 +166,61 @@ def clean_area_payload(facts: dict, narrative: Optional[dict]) -> tuple[dict, Op
         facts["demographics"] = demo
     _one_school_district_share(facts)
     if narrative and isinstance(narrative.get("summary"), str):
-        narrative = {**narrative, "summary": tidy_research_text(clean_text(narrative["summary"]))}
+        narrative = {**narrative, "summary": fix_district_names(tidy_research_text(clean_text(narrative["summary"])), districts)}
     return facts, narrative
+
+
+def town_display(area, facts: Optional[dict] = None, narrative: Optional[dict] = None) -> tuple[dict, Optional[dict]]:
+    """A town's facts and summary exactly as visitors may see them - the one step every place that
+    shows a town uses (IDX town page, compare page, neighborhood cards, blog town cards, admin
+    preview), so a fix to what the page says reaches all of them. Free: rules only, no lookups."""
+    from app.services.areas.school_display import tidy_school_facts
+    from app.services.areas.town_extras_service import commute_for_page
+    lat, lng = getattr(area, "centroid_lat", None), getattr(area, "centroid_lng", None)
+    center = (lat, lng) if lat is not None and lng is not None else None
+    facts = tidy_school_facts(dict(getattr(area, "facts", None) or {}) if facts is None else facts, center)
+    facts, narrative = clean_area_payload(facts, getattr(area, "narrative", None) if narrative is None else narrative, center, getattr(area, "name", None))
+    facts.pop("_fair_housing", None)
+    if facts.get("commute"):  # no "Princeton -> Princeton" trip (town_extras_service.is_self_destination)
+        facts["commute"] = commute_for_page(facts["commute"], getattr(area, "name", None), lat, lng)
+    return facts, narrative
+
+
+_BUS_ROUTE_NAME_RE = re.compile(r"\broutes?\s*\d+|\bbus route\b", re.IGNORECASE)
+
+
+def _not_in_another_town(description: str, town: Optional[str], city: Optional[str]) -> str:
+    """"Coffee roaster in Gladwyne" under a listing whose address is Haverford: the town part goes."""
+    if not description or not town or not city or str(city).strip().lower() == town.strip().lower():
+        return description
+    out = re.sub(rf",?\s*\b(?:located\s+)?in\s+(?:downtown\s+|central\s+)?{re.escape(town)}\b(?:\s+proper)?", "", description, flags=re.IGNORECASE)
+    out = re.sub(r"\s+([,.;])", r"\1", out).strip()
+    return out[:1].upper() + out[1:] if out else out
+
+
+def _plain_park_label(category: Optional[str], name: Optional[str]) -> Optional[str]:
+    """"Regional park" for a township park (Ashbridge Memorial Park, Lower Merion): the research's
+    rank word only stays when the park's own name says regional / county / state / national."""
+    if not category:
+        return category
+    word = re.search(r"\b(regional|county|state|national)\b", category, re.IGNORECASE)
+    if word and not re.search(rf"\b{word.group(1)}\b", str(name or ""), re.IGNORECASE):
+        out = re.sub(r"\s+", " ", re.sub(rf"\b{word.group(1)}\b", "", category, flags=re.IGNORECASE)).strip()
+        return out[:1].upper() + out[1:] if out else "Park"
+    return category
+
+
+def town_district_names(facts: dict) -> list[str]:
+    """Every real school district name the town record holds: the checked list, the research's own
+    list and the Census borders on the town map."""
+    names: list[str] = []
+    for block in ((facts.get("public_schools") or {}).get("districts"), (facts.get("public_schools_research") or {}).get("districts"),
+                  (facts.get("boundaries") or {}).get("school_districts")):
+        for d in block or []:
+            name = str((d.get("name") if isinstance(d, dict) else d) or "")
+            if name and name not in names:
+                names.append(name)
+    return names
 
 
 def _one_school_district_share(facts: dict) -> None:
@@ -246,10 +319,13 @@ async def fix_area_text(db: AsyncSession, area: MarketArea, triggering_user_id: 
     log = dict(facts.get("_fair_housing") or {})
     originals = dict(log.get("originals") or {})
     changed = 0
+    from app.services.areas.town_places_check import fix_district_names
+    districts = town_district_names(facts)
 
     async def fix(key: str, value: str) -> str:
         nonlocal changed
         new = await ai_fix_text(db, value, triggering_user_id) if use_ai else clean_text(value)
+        new = fix_district_names(new, districts)  # shortened district names, fixed in the stored text too
         if new != value:
             originals.setdefault(key, value)
             changed += 1

@@ -23,9 +23,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import Property
 from app.services.areas import geography
-from app.services.areas.market_stats_service import FOR_SALE_STATUSES
+from app.services.areas.market_stats_service import FOR_SALE_STATUSES, sales_window
 
 _SOLD = ("CLOSED-BRIGHT", "CLOSED")
+PACE_MONTHS = 6
 _BANDS = [0, 300_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000, 5_000_000, None]
 MIN_PER_BAND = 5
 MIN_PER_DISTRICT = 8
@@ -103,7 +104,11 @@ async def get_area_insights(db: AsyncSession, scope: dict, district_names: Optio
 
     # One row shape for both: (price, beds, baths, sqft, acres, year, tax, district)
     homes = []
-    since_12 = (today - timedelta(days=365)).isoformat()
+    # "Last 12 months" = the window every town-page number shares (market_stats_service.sales_window
+    # - 10/27 the gauge counted back 365 days and said 125 sales next to a chart of 118). The pace
+    # behind months of supply stays the last 6 months (PACE_MONTHS) and says so in the payload.
+    win_start, win_end = sales_window(today)
+    since_12, until = win_start.isoformat(), win_end.isoformat()
     since_6 = (today - timedelta(days=183)).isoformat()
     closed_12 = closed_6 = over = 0
     ratios, doms = [], []
@@ -111,8 +116,10 @@ async def get_area_insights(db: AsyncSession, scope: dict, district_names: Optio
         price = _f(cp)
         if not price or price < geography.MIN_PLAUSIBLE_SALE_PRICE:
             continue
-        homes.append((price, beds, baths, sqft, acres, year, tax, dist))
         day = str(cd or "")[:10]
+        if day > until:  # a future close date isn't a sale yet
+            continue
+        homes.append((price, beds, baths, sqft, acres, year, tax, dist))
         if day >= since_12:
             closed_12 += 1
             lpv = _f(lp)
@@ -151,7 +158,7 @@ async def get_area_insights(db: AsyncSession, scope: dict, district_names: Optio
     # ---- Buyer's / seller's market
     active_count = len([a for a in active if a[0] and a[0] >= geography.MIN_PLAUSIBLE_SALE_PRICE])
     if closed_12 >= 6:
-        pace = closed_6 / 6 if closed_6 else closed_12 / 12
+        pace = closed_6 / PACE_MONTHS if closed_6 else closed_12 / 12
         months = round(active_count / pace, 1) if pace else None
         if months is not None:
             label = "Seller's market" if months < 3 else "Buyer's market" if months > 6 else "Balanced market"
@@ -166,6 +173,10 @@ async def get_area_insights(db: AsyncSession, scope: dict, district_names: Optio
             "median_sale_to_list_pct": round(_median(ratios) * 100, 1) if ratios else None,
             "median_days_on_market": round(_median(doms)) if doms else None,
             "sales_counted": closed_12,
+            "sales_window_start": since_12,
+            # months of supply = homes for sale / the monthly sales pace of the last PACE_MONTHS months
+            "pace_months": PACE_MONTHS if closed_6 else 12,
+            "pace_sales": closed_6 if closed_6 else closed_12,
         }
 
     # ---- Property taxes per square foot

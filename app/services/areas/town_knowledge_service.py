@@ -761,6 +761,14 @@ async def town_dossier(db: AsyncSession, area: MarketArea, *, include_bank: bool
     snap: dict = {}
     cost: dict = {}
     if mls:
+        # Too little MLS coverage (Charlottesville - CAAR's listings left Bright 7/15/2026): the article
+        # gets no MLS numbers, the same rule the town page uses (market_stats_service.coverage_verdict).
+        from app.services.areas.market_stats_service import get_area_market_coverage, town_households
+        try:
+            mls = not (await get_area_market_coverage(db, scope, town_households(area))).get("thin")
+        except Exception:
+            logger.warning("town dossier: coverage check failed for %s", area.slug, exc_info=True)
+    if mls:
         try:
             snap = await get_area_sales_snapshot(db, scope)
         except Exception:

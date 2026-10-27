@@ -153,13 +153,19 @@ _NOT_A_SCHOOL = re.compile(r"day ?care|child ?care|childcare|pre-?school|nursery
 
 
 def dedupe_schools(items: list[dict]) -> list[dict]:
-    """Same school twice (NCES lists some twice, once with a typo): same name, or within ~60 m."""
+    """Same school twice (NCES lists some twice, once with a typo): same name, or within ~60 m. When
+    the two names share a word, the fuller one stays - the survey has "Archbishop Carroll High
+    School" (Malvern) and "Archbishop John Carroll High School" (Radnor) on one spot (grader, 10/27)."""
     out: list[dict] = []
+    words = lambda n: set(re.findall(r"[a-z]{3,}", n.lower())) - {"the", "school", "academy", "and", "high", "elementary", "middle"}
     for s in items:
         key = re.sub(r"[^a-z]", "", s["name"].lower())
-        if any(re.sub(r"[^a-z]", "", o["name"].lower()) == key or (abs(o["lat"] - s["lat"]) < 0.0006 and abs(o["lng"] - s["lng"]) < 0.0006) for o in out):
-            continue
-        out.append(s)
+        dup = next((i for i, o in enumerate(out) if re.sub(r"[^a-z]", "", o["name"].lower()) == key
+                    or (abs(o["lat"] - s["lat"]) < 0.0006 and abs(o["lng"] - s["lng"]) < 0.0006)), None)
+        if dup is None:
+            out.append(s)
+        elif words(out[dup]["name"]) & words(s["name"]) and len(s["name"]) > len(out[dup]["name"]):
+            out[dup] = s
     return out
 
 
