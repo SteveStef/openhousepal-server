@@ -212,6 +212,10 @@ async def email_log(email: Optional[str] = None, q: Optional[str] = None, limit:
     from app.models.database import ClientEmailPref
     stmt = stmt.where(ClientEmail.recipient_email.notin_(select(ClientEmailPref.email).where(
         ClientEmailPref.owner_id == user.id, ClientEmailPref.manual == ce.LEAD_DELETED)))
+    # ...nor anyone who isn't one of their leads any more (deleted before 10/24, or never a lead).
+    from app.models.database import Lead
+    stmt = stmt.where(or_(ClientEmail.recipient_email.in_(select(Lead.email).where(Lead.owner_id == user.id)),
+                          ClientEmail.recipient_email == ce._norm(user.email)))
     if email:
         stmt = stmt.where(ClientEmail.recipient_email == ce._norm(email))
     if q:

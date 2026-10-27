@@ -56,6 +56,13 @@ MAX_AUTO_PER_DAY = 2
 # Mail scanners (Outlook Safe Links, corporate filters) fetch images and follow links the moment a
 # message arrives - that isn't the person.
 SCANNER_WINDOW = timedelta(seconds=20)
+# An email sent from the agent's own Gmail / Outlook keeps a copy - tracking image and all - in their
+# Sent folder, so scrolling through Sent "opens" it (owner, 10/26: four clients "opened" within one
+# minute, one of them a deleted lead). That looks like several different people's older emails
+# opening within a few minutes of each other: not counted, and any just counted are taken back. A
+# client opening the evening update right after it arrives is still counted (it isn't stale yet).
+SENT_FOLDER_WINDOW = timedelta(minutes=3)
+SENT_FOLDER_STALE = timedelta(minutes=30)
 
 # Lead history entries that aren't the person doing something.
 _NOT_ENGAGEMENT = {"showcase_emails_off", "email_unsubscribed", "email_weekly", "email_paused", "email_resumed"}
@@ -401,9 +408,62 @@ def _scanner(rec: ClientEmail) -> bool:
     return bool(rec.sent_at and _now() - rec.sent_at < SCANNER_WINDOW)
 
 
+def _stale(rec: ClientEmail, at: datetime) -> bool:
+    return bool(rec.sent_at and at - rec.sent_at > SENT_FOLDER_STALE)
+
+
+async def _sent_folder_burst(db, rec: ClientEmail, at: datetime) -> Optional[list[ClientEmail]]:
+    """The other emails opening alongside this one if this looks like the agent's Sent folder (see
+    SENT_FOLDER_WINDOW), else None. Only emails sent from the agent's own mailbox have a Sent copy."""
+    if rec.via != "mailbox" or rec.clicked_at or not _stale(rec, at):
+        return None
+    since = at - SENT_FOLDER_WINDOW
+    from sqlalchemy import or_
+    rows = (await db.execute(select(ClientEmail).where(
+        ClientEmail.owner_id == rec.owner_id, ClientEmail.id != rec.id, ClientEmail.via == "mailbox",
+        ClientEmail.recipient_email != rec.recipient_email, ClientEmail.clicked_at.is_(None),
+        or_(ClientEmail.opened_at >= since, ClientEmail.sent_folder_seen_at >= since),
+    ))).scalars().all()
+    burst = [r for r in rows if _stale(r, max(d for d in (r.opened_at, r.sent_folder_seen_at) if d))]
+    return burst or None
+
+
+async def _undo_open(db, rec: ClientEmail) -> None:
+    """An open that turned out to be the agent's Sent folder: off the email, the lead's history and
+    the bell. Doesn't commit."""
+    when = rec.opened_at
+    rec.opened_at, rec.open_count = None, 0
+    lead = await _lead(db, rec.owner_id, rec.recipient_email)
+    if lead is not None:
+        from sqlalchemy import delete
+        await db.execute(delete(LeadEvent).where(LeadEvent.lead_id == lead.id, LeadEvent.source_type == "email_opened",
+                                                 LeadEvent.source_id == rec.id).execution_options(synchronize_session=False))
+    await db.flush()
+    if when is not None:
+        await _day_note(db, rec.owner_id, rec.recipient_email, when, lead)
+
+
 async def record_open(db, track_id: str) -> None:
     rec = await db.get(ClientEmail, track_id)
     if rec is None or rec.status != "sent" or _scanner(rec):
+        return
+    now = _now()
+    burst = await _sent_folder_burst(db, rec, now)
+    if burst is not None or (rec.sent_folder_seen_at and now - rec.sent_folder_seen_at < SENT_FOLDER_WINDOW and not rec.clicked_at):
+        rec.sent_folder_seen_at = now
+        undone = set()
+        if rec.opened_at and now - rec.opened_at < SENT_FOLDER_WINDOW and not rec.clicked_at:
+            await _undo_open(db, rec)
+            undone.add(rec.recipient_email)
+        for other in burst or []:
+            if other.opened_at and other.opened_at >= now - SENT_FOLDER_WINDOW:
+                other.sent_folder_seen_at = other.opened_at
+                await _undo_open(db, other)
+                undone.add(other.recipient_email)
+        await db.commit()
+        for email in undone:
+            await refresh_status(db, rec.owner_id, email, announce=False)
+        logger.info("Email open ignored - the agent's Sent folder", extra={"client_email": rec.id, "undone": len(undone)})
         return
     rec.open_count = (rec.open_count or 0) + 1
     first = rec.opened_at is None
@@ -456,6 +516,84 @@ def template_label(t: str) -> str:
     return _TEMPLATE_LABEL.get(t, "email")
 
 
+async def _day_note(db, owner_id: str, email: str, at: datetime, lead: Optional[Lead], *, latest_label: Optional[str] = None,
+                    name: Optional[str] = None, fresh: bool = False) -> None:
+    """The bell row "Jane opened 2 emails today" for `email` on the (Eastern) day of `at`, from what
+    is counted now - removed when nothing is left that day. Doesn't commit."""
+    ref = f"{email}|{_day(at)}"
+    n = (await db.execute(select(Notification).where(Notification.agent_id == owner_id, Notification.type == "EMAIL_ACTIVITY",
+                                                     Notification.reference_id == ref))).scalar_one_or_none()
+    day_start = datetime.combine(at.astimezone(EASTERN).date(), datetime.min.time(), EASTERN)
+    day_end = day_start + timedelta(days=1)
+    mine = (ClientEmail.owner_id == owner_id, ClientEmail.recipient_email == email)
+    opened_rows = (await db.execute(select(ClientEmail).where(*mine, ClientEmail.opened_at >= day_start, ClientEmail.opened_at < day_end)
+                                    .order_by(ClientEmail.opened_at.desc()))).scalars().all()
+    clicked = (await db.execute(select(func.count()).select_from(ClientEmail).where(
+        *mine, ClientEmail.clicked_at >= day_start, ClientEmail.clicked_at < day_end))).scalar() or 0
+    opened = len(opened_rows)
+    if lead is None or (not opened and not clicked):
+        if n is not None:
+            await db.delete(n)
+        return
+    who = _first(name or lead.name, email)
+    label = latest_label or template_label(opened_rows[0].template if opened_rows else "")
+    title = f"{who} {'opened and clicked your email' if clicked else 'opened your email'}"
+    bits = [f"opened {opened} email{'s' if opened != 1 else ''}"] + ([f"clicked {clicked}"] if clicked else [])
+    message = f"{who} {' and '.join(bits)} today - latest: your {label}."
+    link = f"/leads?lead={lead.id}"
+    if n is None:
+        if fresh:
+            db.add(Notification(agent_id=owner_id, type="EMAIL_ACTIVITY", reference_type="CLIENT_EMAIL_DAY", reference_id=ref,
+                                title=title, message=message, visitor_name=name or lead.name or None, link=link, is_read=False, created_at=_now()))
+    elif fresh:
+        n.title, n.message, n.link, n.is_read, n.read_at, n.created_at = title, message, link, False, None, _now()
+    else:
+        n.title, n.message = title, message
+
+
+async def correct_sent_folder_opens(db) -> int:
+    """One-time fix of opens counted before the Sent-folder rule (owner, 10/26): among emails sent
+    from agents' own mailboxes, two or more different people's older emails first "opened" within
+    SENT_FOLDER_WINDOW of each other, none clicked, were the agent's Sent folder. Commits."""
+    rows = (await db.execute(select(ClientEmail).where(
+        ClientEmail.via == "mailbox", ClientEmail.opened_at.isnot(None), ClientEmail.clicked_at.is_(None),
+    ).order_by(ClientEmail.owner_id, ClientEmail.opened_at))).scalars().all()
+    groups: list[list[ClientEmail]] = []
+    for r in rows:
+        if not _stale(r, r.opened_at):
+            continue
+        g = groups[-1] if groups else None
+        if g and g[-1].owner_id == r.owner_id and r.opened_at - g[-1].opened_at <= SENT_FOLDER_WINDOW:
+            g.append(r)
+        else:
+            groups.append([r])
+    fixed, touched = 0, set()
+    for g in groups:
+        if len({r.recipient_email for r in g}) < 2:
+            continue
+        for r in g:
+            r.sent_folder_seen_at = r.opened_at
+            await _undo_open(db, r)
+            touched.add((r.owner_id, r.recipient_email))
+            fixed += 1
+    if fixed:
+        await db.commit()
+        for owner_id, email in touched:
+            await refresh_status(db, owner_id, email, announce=False)
+    return fixed
+
+
+async def scheduled_correct_sent_folder_opens() -> None:
+    from app.database import AsyncSessionLocal
+    try:
+        async with AsyncSessionLocal() as db:
+            n = await correct_sent_folder_opens(db)
+        if n:
+            logger.info("Corrected email opens that were the agent's Sent folder: %s", n)
+    except Exception:  # noqa: BLE001
+        logger.exception("correcting Sent-folder email opens failed")
+
+
 async def _engaged(db, rec: ClientEmail, what: str) -> None:
     """First open / first click of one email: lead history, one bell row per person per day, and
     back to daily if they had been slowed down."""
@@ -484,24 +622,13 @@ async def _engaged(db, rec: ClientEmail, what: str) -> None:
                                    source_type="email_clicked" if what == "clicked" else "email_opened",
                                    summary=f"{'Opened and clicked a link in' if what == 'clicked' else 'Opened'} your {label}",
                                    source_id=rec.id, raw_snapshot={"subject": rec.subject, "template": rec.template})
-        # one bell row per person per day, updated as they open / click more
-        ref = f"{rec.recipient_email}|{_day(_now())}"
-        n = (await db.execute(select(Notification).where(Notification.agent_id == rec.owner_id, Notification.type == "EMAIL_ACTIVITY",
-                                                         Notification.reference_id == ref))).scalar_one_or_none()
-        day_start = datetime.combine(_now().astimezone(EASTERN).date(), datetime.min.time(), EASTERN)
-        opened = (await db.execute(select(func.count()).select_from(ClientEmail).where(
-            ClientEmail.owner_id == rec.owner_id, ClientEmail.recipient_email == rec.recipient_email, ClientEmail.opened_at >= day_start))).scalar() or 0
-        clicked = (await db.execute(select(func.count()).select_from(ClientEmail).where(
-            ClientEmail.owner_id == rec.owner_id, ClientEmail.recipient_email == rec.recipient_email, ClientEmail.clicked_at >= day_start))).scalar() or 0
-        title = f"{who} {'opened and clicked your email' if clicked else 'opened your email'}"
-        bits = [f"opened {opened} email{'s' if opened != 1 else ''}"] + ([f"clicked {clicked}"] if clicked else [])
-        message = f"{who} {' and '.join(bits)} today - latest: your {label}."
-        link = f"/leads?lead={lead.id}" if lead else "/leads/emails"
-        if n is None:
-            db.add(Notification(agent_id=rec.owner_id, type="EMAIL_ACTIVITY", reference_type="CLIENT_EMAIL_DAY", reference_id=ref,
-                                title=title, message=message, visitor_name=name or None, link=link, is_read=False, created_at=_now()))
-        else:
-            n.title, n.message, n.link, n.is_read, n.read_at, n.created_at = title, message, link, False, None, _now()
+        # One bell row per person per day, updated as they open / click more - only for someone who is
+        # one of the agent's leads. A deleted lead (or an address that never was one) opening an old
+        # email is no news to the agent (owner, 10/26).
+        if lead is None:
+            await db.commit()
+            return
+        await _day_note(db, rec.owner_id, rec.recipient_email, _now(), lead, latest_label=label, name=name, fresh=True)
         await db.commit()
         await refresh_status(db, rec.owner_id, rec.recipient_email, trigger="opened an email" if what == "opened" else "clicked an email")
     except Exception:  # noqa: BLE001
@@ -563,6 +690,19 @@ async def lift_lead_deleted(db, owner_id: str, email: Optional[str]) -> None:
         pref.reason = "Back on - they're one of your leads again"
 
 
+async def listed_emails(db, owner_id: str, emails) -> set[str]:
+    """The addresses the Email Tracker shows: the agent's current leads, and the agent's own."""
+    emails = {_norm(e) for e in emails if e}
+    if not emails:
+        return set()
+    keep = set((await db.execute(select(Lead.email).where(Lead.owner_id == owner_id, Lead.email.in_(emails)))).scalars().all())
+    from app.models.database import User
+    owner = await db.get(User, owner_id)
+    if owner is not None and _norm(owner.email) in emails:
+        keep.add(_norm(owner.email))
+    return keep
+
+
 def _rate(sent: int, opened: int) -> Optional[int]:
     return round(100 * opened / sent) if sent else None
 
@@ -586,6 +726,9 @@ async def people(db, owner_id: str) -> dict[str, dict]:
     # A deleted lead disappears from the Email Tracker (user, 10/24) - the hold on their automatic
     # emails stays (prefs keep LEAD_DELETED), they're just not listed until they're a lead again.
     emails -= {e for e, p in prefs.items() if p.manual == LEAD_DELETED}
+    # ...and so does anyone who isn't one of their leads at all (deleted before 10/24, or never a
+    # lead) - except the agent themself, for the copies they send to their own address.
+    emails &= await listed_emails(db, owner_id, emails)
     if not emails:
         return {}
     eng = dict((await db.execute(select(Lead.email, func.max(LeadEvent.occurred_at)).join(LeadEvent, LeadEvent.lead_id == Lead.id).where(

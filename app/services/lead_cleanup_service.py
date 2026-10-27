@@ -104,7 +104,48 @@ async def _forget_activity(db, owner_id: str, lead: Lead, email: str, col_ids: l
         ids |= set((await db.execute(select(ClientEmailPref.id).where(ClientEmailPref.owner_id == owner_id, ClientEmailPref.email == email))).scalars().all())
     res = await db.execute(delete(Notification).where(Notification.agent_id == owner_id, Notification.reference_id.in_(list(ids)))
                            .execution_options(synchronize_session=False))
-    return res.rowcount or 0
+    removed = res.rowcount or 0
+    if email:
+        # "Jane opened your email" rows are keyed "<email>|<day>", not by the lead (owner, 10/26).
+        res = await db.execute(delete(Notification).where(
+            Notification.agent_id == owner_id, Notification.type == "EMAIL_ACTIVITY",
+            Notification.reference_id.startswith(email + "|", autoescape=True),
+        ).execution_options(synchronize_session=False))
+        removed += res.rowcount or 0
+    return removed
+
+
+async def forget_orphan_email_activity(db) -> int:
+    """One-time tidy (owner, 10/26): "opened your email" rows about someone who is no longer one of
+    the agent's leads - deleted before that row was cleaned up with the lead. Commits."""
+    from app.models.database import Notification
+    rows = (await db.execute(select(Notification.id, Notification.agent_id, Notification.reference_id).where(
+        Notification.type == "EMAIL_ACTIVITY", Notification.reference_type == "CLIENT_EMAIL_DAY"))).all()
+    by_agent: dict[str, list[tuple[str, str]]] = {}
+    for nid, agent_id, ref in rows:
+        email = ce._norm((ref or "").split("|", 1)[0])
+        if email:
+            by_agent.setdefault(agent_id, []).append((nid, email))
+    gone: list[str] = []
+    for agent_id, items in by_agent.items():
+        keep = await ce.listed_emails(db, agent_id, {e for _, e in items})
+        gone += [nid for nid, e in items if e not in keep]
+    if gone:
+        await db.execute(delete(Notification).where(Notification.id.in_(gone)).execution_options(synchronize_session=False))
+        await db.commit()
+    return len(gone)
+
+
+async def scheduled_forget_orphan_email_activity() -> None:
+    import logging
+    from app.database import AsyncSessionLocal
+    try:
+        async with AsyncSessionLocal() as db:
+            n = await forget_orphan_email_activity(db)
+        if n:
+            logging.getLogger(__name__).info("Removed email-open notifications about deleted leads: %s", n)
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).exception("removing email-open notifications about deleted leads failed")
 
 
 def deleted_message(name: Optional[str], done: dict) -> str:

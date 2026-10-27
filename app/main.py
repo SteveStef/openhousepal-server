@@ -283,6 +283,14 @@ async def lifespan(app: FastAPI):
     # Finished towns shipped with the code are put on this server once (areas/town_seeds.py).
     from app.services.areas.town_seeds import scheduled_apply_town_seeds
     scheduler.add_job(scheduled_apply_town_seeds, _Once(run_date=_dt.now() + _td(seconds=3)), id="town_seeds", name="Load finished towns", replace_existing=True)
+    # "Opened your email" rows about leads deleted before that was cleaned up with the lead.
+    from app.services.lead_cleanup_service import scheduled_forget_orphan_email_activity
+    scheduler.add_job(scheduled_forget_orphan_email_activity, _Once(run_date=_dt.now() + _td(seconds=20)), id="orphan_email_activity",
+                      name="Remove email activity about deleted leads", replace_existing=True)
+    # Email opens that were really the agent scrolling their own Sent folder (client_email_service).
+    from app.services.client_email_service import scheduled_correct_sent_folder_opens
+    scheduler.add_job(scheduled_correct_sent_folder_opens, _Once(run_date=_dt.now() + _td(seconds=30)), id="sent_folder_opens",
+                      name="Correct Sent-folder email opens", replace_existing=True)
     from app.api.public_site_routes import warm_area_caches
     scheduler.add_job(warm_area_caches, _Once(run_date=_dt.now() + _td(seconds=10)), id="warm_area_caches", name="Warm town-page caches", replace_existing=True)
     # Invites: the agent's "Tomorrow" email (who's coming) - hourly, sent from 9 AM Eastern the day
