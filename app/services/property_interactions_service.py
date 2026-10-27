@@ -93,6 +93,11 @@ class PropertyInteractionsService:
                                         "Liked {home} in their Showcase" if liked else "Passed on {home} in their Showcase",
                                         property_id=property_id, dedupe_hours=1)
             await db.refresh(interaction)
+        # Their "homes you liked" follow-up (owner, 10/27): a like adds the home to it; taking a like
+        # back or passing on a home takes it off (tasks_service.schedule_likes_followup).
+        if user_id is None and (interaction.liked != was_liked or (interaction.disliked and not was_disliked)):
+            from app.services.tasks_service import schedule_likes_followup
+            schedule_likes_followup(collection_id)
 
         # Send email to agent if visitor liked the property (NOT if agent themselves liked it)
         if interaction.liked:
@@ -113,7 +118,8 @@ class PropertyInteractionsService:
                 )
                 property_obj = property_result.scalar_one_or_none()
 
-                if agent and agent.email and property_obj:
+                from app.services.tasks_service import lead_emails_off
+                if agent and agent.email and property_obj and not await lead_emails_off(db, collection.owner_id, collection.visitor_email):
                     # No email per like - it joins the agent's hourly "liked homes" roll-up
                     # (agent_roundup_service), so a client hearting 12 homes is one email, not 12.
                     from app.services.agent_roundup_service import queue_like
@@ -388,8 +394,10 @@ class PropertyInteractionsService:
                 full_address = f"{property_obj.street_address}, {property_obj.city}, {property_obj.state} {property_obj.zipcode or ''}".strip()
 
                 from app.services.notification_preferences_service import channel_enabled
+                from app.services.tasks_service import lead_emails_off
                 email_service = EmailService()
-                if channel_enabled(agent, "PROPERTY_COMMENT", "email"):
+                # (The agent can turn these off for one person - their alert settings, owner 10/27.)
+                if channel_enabled(agent, "PROPERTY_COMMENT", "email") and not await lead_emails_off(db, collection.owner_id, lead_email):
                   from app.services.agent_email_service import send_simple_bg
                   send_simple_bg(
                     to_email=agent.email,

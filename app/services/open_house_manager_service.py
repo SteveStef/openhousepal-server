@@ -814,12 +814,14 @@ async def get_my_listings(db: AsyncSession, current_user: User) -> MyListingsRes
         total_guests_all += listing_guest_count
         total_opens_all += opens_hosted_count
 
-        # A host's evergreen kit isn't "scheduled" forever - their upcoming dates come from the
-        # approved requests (covered/confirmed_pending_kit below). Only the listing agent's own
-        # kits speak for themselves.
+        # A kit is evergreen (no date), so having one - the host's OR the listing agent's own - never
+        # makes a listing "Host booked" (owner, 10/27: Windham/Dogwood read "Host booked" off his
+        # own undated kits). Only a real upcoming date counts: an approved request, a dated kit, or
+        # a Bright / Spotlight open (below).
         own_active_events = [e for e in active_listing_events if e.agent_id == current_user.id]
         upcoming_approved = [r for r in approved_requests_by_listing.get(prop.listing_key, []) if r.requested_date >= today]
-        open_house_status = "scheduled" if (upcoming_approved or _find_scheduled_event(own_active_events)) else "needs_host"
+        own_dated = any(e.scheduled_date is not None and e.scheduled_date >= today for e in own_active_events)
+        open_house_status = "scheduled" if (upcoming_approved or own_dated) else "needs_host"
         scheduled_opens = _scheduled_open_previews(own_active_events, agents_by_id)
         covered_by_existing_kit, confirmed_pending_kit = _confirmed_pending_kit_previews(
             approved_requests_by_listing.get(prop.listing_key, []), active_listing_events, agents_by_id

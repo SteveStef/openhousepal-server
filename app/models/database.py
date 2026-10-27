@@ -380,6 +380,9 @@ class Lead(Base):
     # The agent starred this person (Leads page / Visitors) - separate from starring their Showcase
     # (Collection.favorited_at): a lead can matter while their Showcase doesn't (user, 10/24).
     is_favorite = Column(Boolean, nullable=False, default=False, server_default='false')
+    # The agent's alert switches for this one person (owner, 10/27) - {"calendar", "in_app",
+    # "emails"}: bool; missing / NULL = on. See tasks_service.lead_alerts.
+    alert_prefs = Column(JSONB, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

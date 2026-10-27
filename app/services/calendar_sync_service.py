@@ -878,6 +878,15 @@ async def _sync_task_locked(db: AsyncSession, conn: CalendarConnection, task_id:
     if task.auto_source in SIGNIN_FOLLOWUP_SOURCES and await open_house_followups_mode(db, task.auto_source_id) != "on":
         await _remove_event(db, conn, "task", task_id)
         return
+    # The agent took this one person off their calendar (their alert settings, owner 10/27): the
+    # follow-ups stay in OpenHousePal only.
+    if task.lead_id:
+        from app.models.database import Lead
+        from app.services.tasks_service import lead_alerts
+        lead = await db.get(Lead, task.lead_id)
+        if lead is not None and not lead_alerts(lead)["calendar"]:
+            await _remove_event(db, conn, "task", task_id)
+            return
     await _upsert_event(db, conn, "task", task_id, await task_body_for(db, task))
 
 

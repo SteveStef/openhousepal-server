@@ -9,7 +9,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -225,7 +225,8 @@ async def update_auto_rules(
 
 # --------------------------------------------------------------------------- one-tap "Mark as done"
 # Linked from every follow-up's calendar event (openhousepal.com/d/<code>). No login: the code is
-# the credential, and all it can do is check that ONE follow-up off or undo that.
+# the credential, and all it can do is check that ONE follow-up off (or undo that) and set the
+# alert switches for the ONE person it is about.
 public_router = APIRouter(prefix="/public/followups", tags=["tasks"])
 
 
@@ -264,6 +265,8 @@ def _public_view(task: AgentTask, others: Optional[list] = None) -> dict:
         "contact": {"name": lead.name, "phone": lead.phone, "email": lead.email} if lead else None,
         "done": task.completed_at is not None,
         "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+        # This person's alert switches (calendar / in OpenHousePal / emails) - shown on the page.
+        "alerts": tasks_service.lead_alerts(lead) if lead else None,
     }
     if others is not None:
         out["others"] = others
@@ -492,6 +495,24 @@ async def public_followup_done(code: str, request: Request, db: AsyncSession = D
         await db.commit()
         calendar_sync_service.sync_task_bg(task.owner_id, task.id)  # takes it off the calendar
     return _public_view(task, await _others_due(db, task))
+
+
+@public_router.post("/{code}/alerts")
+async def public_followup_alerts(code: str, request: Request, payload: dict = Body(...), db: AsyncSession = Depends(get_db)):
+    """The person's alert switches from the check-off page (owner, 10/27) - {calendar?, in_app?,
+    emails?}: bool. Only ever about the lead on THIS follow-up."""
+    from app.services.public_rate_limit import check_public_submit
+    check_public_submit(request)
+    task = await _task_by_code(db, code)
+    lead = task.lead
+    if lead is None:
+        raise HTTPException(status_code=400, detail="This follow-up isn't about a person.")
+    before = tasks_service.lead_alerts(lead)["calendar"]
+    lead.alert_prefs = tasks_service.merge_lead_alerts(lead.alert_prefs, payload)
+    await db.commit()
+    if tasks_service.lead_alerts(lead)["calendar"] != before:
+        tasks_service.apply_lead_alerts_bg(task.owner_id, lead.id)
+    return {"alerts": tasks_service.lead_alerts(lead)}
 
 
 @public_router.post("/{code}/undo")

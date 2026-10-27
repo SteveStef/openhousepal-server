@@ -194,9 +194,23 @@ class LeadOut(BaseModel):
         from_attributes = True
 
 
+class LeadAlertsOut(BaseModel):
+    """The agent's alert switches for this one person (tasks_service.lead_alerts)."""
+    calendar: bool = True
+    in_app: bool = True
+    emails: bool = True
+
+
+class LeadAlertsUpdate(BaseModel):
+    calendar: Optional[bool] = None
+    in_app: Optional[bool] = None
+    emails: Optional[bool] = None
+
+
 class LeadDetailOut(LeadOut):
     events: List[LeadEventOut] = []
     showcases: List[LeadShowcaseOut] = []
+    alerts: LeadAlertsOut = LeadAlertsOut()
 
 
 class LeadHandleRequest(BaseModel):

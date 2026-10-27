@@ -15,7 +15,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -61,6 +61,10 @@ AUTO_FOLLOWUP_RULES: list[dict] = [
      "description": "Someone asks to tour a home - from their Showcase, a Spotlight site or your Schedule a Showing form. The message quotes every day and time they picked.", "tiers": None},
     {"key": "showcase_comment", "label": "Showcase comment", "timing": "Next day",
      "description": "A client comments on a home in their Showcase. You get an alert with what they said, which home and a link to it - reply in your own words.", "tiers": "showcase"},
+    # Owner, 10/27: any like - every home liked that day (morning or night) rides on ONE follow-up
+    # for the next morning, naming the homes (schedule_likes_followup).
+    {"key": "showcase_likes", "label": "Showcase likes", "timing": "Next day",
+     "description": "A client likes homes in their Showcase - even just one. Every home they like that day, morning or night, goes on one follow-up for the next morning, with a text that names the homes.", "tiers": "showcase"},
     {"key": "showcase_search_request", "label": "Showcase search change", "timing": "Right away",
      "description": "A client messages you from their Showcase asking you to change their search. You get an alert with exactly what they asked for and a link to their Showcase - update it, then let them know.", "tiers": "showcase"},
     {"key": "listing_inquiry", "label": "Listing inquiry", "timing": "Right away",
@@ -111,6 +115,8 @@ SELLER_FORM_TYPES = {"home_value", "selling", "make_me_sell", "seller_onboarding
 SHOWING_RULES = {"second_visit_request", "showing_request"}
 # How Can We Help, seller side: its own message + clearly marked as a seller lead.
 SELLER_SOURCE = "how_can_we_help_seller"
+# Homes they liked in their Showcase - one open card per person, the day's likes gathered on it.
+LIKES_RULE = "showcase_likes"
 # The part of a message the agent must fill in before sending (the showing they booked).
 FILL_IN_TIME = "[ADD DATE & TIME]"
 # Left in a message where the agent answers the question the person asked (Spotlight / listing inquiries).
@@ -129,7 +135,7 @@ RULE_GROUPS: list[dict] = [
      "rules": ["showcase_setup", "buyer_form", "how_can_we_help", "form_submission", "invite_rsvp"]},
     {"key": "other", "label": "Showcases, listings & reviews",
      "description": "Activity on your Showcases, listing sites, portals and review link.",
-     "rules": ["showing_request", "showcase_comment", "showcase_search_request", "listing_inquiry", "website_signin", "private_feedback"]},
+     "rules": ["showing_request", "showcase_comment", "showcase_likes", "showcase_search_request", "listing_inquiry", "website_signin", "private_feedback"]},
 ]
 _RULE_GROUP = {k: g["key"] for g in RULE_GROUPS for k in g["rules"]}
 
@@ -707,6 +713,8 @@ def task_prefix(task: AgentTask) -> str:
         base = "Reply to Comment"
     elif task.auto_source == "showcase_search_request":
         base = "Update Search"
+    elif task.auto_source == LIKES_RULE:
+        base = "Liked Homes"
     elif task.auto_source == "private_feedback":
         base = "Reach Out - Unhappy Review"
     elif task.auto_source:
@@ -759,6 +767,8 @@ MESSAGE_TOKENS: dict[str, dict] = {
     "answer": {"label": "Your answer to their question", "kind": "property", "sample": FILL_IN_ANSWER, "fallback": ""},
     "showcase": {"label": "Their Showcase + link", "kind": "link", "sample": "", "fallback": ""},
     "my_name": {"label": "Your name", "kind": "you", "sample": "", "fallback": ""},
+    # The homes they liked in their Showcase ("12 Oak St and 22 Birch Ln" / "5 homes, including ...").
+    "homes": {"label": "Homes they liked", "kind": "property", "sample": "12 Oak St and 22 Birch Ln", "fallback": "a few homes"},
 }
 # A sentence holding one of these is dropped when it has nothing to say ("You mentioned a price of
 # around ." would read broken).
@@ -785,6 +795,7 @@ DEFAULT_TEMPLATES: dict[str, str] = {
     "website_signin": "Hi {first_name}, thanks for visiting my website! If a home caught your eye, I'd be happy to send you more like it or set up a showing - just text me here.",
     # Sent once the agent has emailed it (the card says so).
     "disclosure_request": "Hi {first_name}, I just emailed you the seller's disclosure for {address}. Let me know if you need anything else!",
+    "showcase_likes": "Hi {first_name}, I saw you liked {homes} in your Showcase! Would you like me to set up a showing? Feel free to text here.",
 }
 # What's My Home Worth (an "any other form" form): it names their home and the next step, instead
 # of the generic "thanks for filling out my form". Used while that situation's message is still
@@ -870,6 +881,7 @@ for _k in ("showcase_setup", "buyer_form", "how_can_we_help"):
 for _k in ("buyer_form", "how_can_we_help"):
     _RULE_TOKENS[_k] = ["first_name", "full_name", "what_they_want", "my_name"]
 _RULE_TOKENS["listing_inquiry"] = ["first_name", "full_name", "address", "answer", "my_name"]
+_RULE_TOKENS["showcase_likes"] = ["first_name", "full_name", "homes", "my_name"]
 for _k in PITCH_RULES:
     _RULE_TOKENS[_k] = _RULE_TOKENS[_k] + ["showcase"]
 
@@ -1022,7 +1034,7 @@ def render_rule_message(user: Optional[User], rule: str, *, name: Optional[str] 
                         requested_time: Optional[str] = None, price: Optional[str] = None,
                         seller: bool = False, what_they_want: Optional[str] = None,
                         asked: bool = False, form_type: Optional[str] = None, virtual: bool = False,
-                        wants_tour: bool = False) -> Optional[str]:
+                        wants_tour: bool = False, homes: Optional[str] = None) -> Optional[str]:
     """The agent's template for this situation (or the default), filled for one lead. None for an
     alert-only situation (there's no message to send). `what_they_want` = their search in words
     (see search_summary); `asked` = they wrote a question, so the message leaves a spot to answer
@@ -1049,7 +1061,7 @@ def render_rule_message(user: Optional[User], rule: str, *, name: Optional[str] 
         "first_name": _first(name), "full_name": (name or "").strip(),
         "address": address, "form_name": form_name, "my_name": _my_name(user),
         "requested_time": requested_time, "price": price,
-        "what_they_want": what_they_want, "answer": FILL_IN_ANSWER if asked else "",
+        "what_they_want": what_they_want, "answer": FILL_IN_ANSWER if asked else "", "homes": homes,
     })
 
 
@@ -1096,10 +1108,60 @@ async def _open_auto_task_for_lead(db: AsyncSession, owner_id: str, lead_id: str
             AgentTask.owner_id == owner_id,
             AgentTask.lead_id == lead_id,
             AgentTask.auto_source.is_not(None),
+            AgentTask.auto_source != LIKES_RULE,   # a "homes they liked" card doesn't block the rest
             AgentTask.completed_at.is_(None),
         ).limit(1)
     )
     return row.scalar_one_or_none() is not None
+
+
+# The agent's alert switches for ONE person (owner, 10/27) - Lead.alert_prefs, set from the "Mark
+# as done" page or the lead's Follow-ups section:
+#   calendar - their follow-ups go on the agent's calendar (off = OpenHousePal only)
+#   in_app   - automatic follow-ups are made for them at all (off = stop them completely)
+#   emails   - activity alert emails about them (likes, comments, tour asks ...)
+# Missing / NULL = on. No calendar without the follow-up itself, so in_app off means calendar off.
+LEAD_ALERT_KEYS = ("calendar", "in_app", "emails")
+
+
+def lead_alerts(lead) -> dict:
+    prefs = getattr(lead, "alert_prefs", None) if lead is not None else None
+    prefs = prefs if isinstance(prefs, dict) else {}
+    out = {k: prefs.get(k) is not False for k in LEAD_ALERT_KEYS}
+    if not out["in_app"]:
+        out["calendar"] = False
+    return out
+
+
+def merge_lead_alerts(existing: Optional[dict], payload: dict) -> dict:
+    merged = {k: v for k, v in (existing or {}).items() if k in LEAD_ALERT_KEYS}
+    for k in LEAD_ALERT_KEYS:
+        if isinstance((payload or {}).get(k), bool):
+            merged[k] = payload[k]
+    if merged.get("calendar") is True:
+        merged["in_app"] = True   # turning the calendar back on brings the follow-ups back too
+    return merged
+
+
+async def lead_followups_off(db: AsyncSession, lead_id: Optional[str]) -> bool:
+    """The agent stopped automatic follow-ups for this person completely."""
+    if not lead_id:
+        return False
+    lead = await db.get(Lead, lead_id)
+    return lead is not None and not lead_alerts(lead)["in_app"]
+
+
+async def lead_emails_off(db: AsyncSession, owner_id: str, email: Optional[str] = None, lead_id: Optional[str] = None) -> bool:
+    """The agent turned off activity alert emails about this person. Never raises (False = send)."""
+    try:
+        lead = await db.get(Lead, lead_id) if lead_id else None
+        if lead is None and email:
+            from app.services.leads_service import find_lead_by_contact
+            lead = await find_lead_by_contact(db, owner_id, email, None)
+        return lead is not None and not lead_alerts(lead)["emails"]
+    except Exception:
+        logger.warning("lead email-alert check failed", exc_info=True)
+        return False
 
 
 async def _has_agent(db: AsyncSession, lead_id: str) -> bool:
@@ -1154,6 +1216,8 @@ async def create_auto_followup(
         user = await db.get(User, owner_id)
         if user is None or not rule_enabled(user, rule):
             return None
+        if await lead_followups_off(db, lead_id):
+            return None  # the agent stopped this person's follow-ups (their own switch)
         # Someone with an agent gets no nurture follow-ups - but a concrete ask from them (the
         # disclosure, a tour, a question) always does (10/25: a has-agent guest's disclosure
         # request on her Guest Pass made no follow-up at all).
@@ -1260,7 +1324,7 @@ async def _plain_attention_task(db: AsyncSession, *, owner_id: str, lead_id: Opt
     try:
         dup = (await db.execute(select(AgentTask.id).where(
             AgentTask.owner_id == owner_id, AgentTask.auto_source == auto_source, AgentTask.auto_source_id == source_id).limit(1))).first()
-        if dup:
+        if dup or await lead_followups_off(db, lead_id):
             return None
         task = AgentTask(
             owner_id=owner_id, lead_id=lead_id,
@@ -1695,6 +1759,32 @@ def resync_lead_followups(owner_id: str, lead_id: str, delay: float = 0) -> None
     t.add_done_callback(_PENDING.discard)
 
 
+def apply_lead_alerts_bg(owner_id: str, lead_id: str) -> None:
+    """Their calendar switch just changed: re-push every follow-up of theirs that can sit on the
+    calendar (open ones + the crossed-out ones from the last two weeks) - _sync_task_locked puts
+    each on or takes it off."""
+    import asyncio
+
+    async def run():
+        from app.database import AsyncSessionLocal
+        from app.services import calendar_sync_service
+        since = datetime.now(timezone.utc) - timedelta(days=14)
+        async with AsyncSessionLocal() as db:
+            ids = (await db.execute(select(AgentTask.id).where(
+                AgentTask.owner_id == owner_id, AgentTask.lead_id == lead_id, AgentTask.due_at.is_not(None),
+                (AgentTask.completed_at.is_(None)) | (AgentTask.completed_at >= since),
+            ))).scalars().all()
+        for tid in ids:
+            calendar_sync_service.sync_task_bg(owner_id, tid)
+
+    try:
+        t = asyncio.get_running_loop().create_task(run())
+    except RuntimeError:
+        return
+    _PENDING.add(t)
+    t.add_done_callback(_PENDING.discard)
+
+
 LINK_REFRESH_DAYS = 2
 
 
@@ -2046,6 +2136,157 @@ def schedule_followup_for_lead_event(owner_id: str, lead_id: str, event_id: str,
 
 
 _PENDING: set = set()
+
+
+# ---------------------------------------------------------------- Showcase likes (owner, 10/27)
+# Any like makes a follow-up - even one. Every home liked that day (morning or night) lands on ONE
+# card for the next morning: a like while their card is still open adds the home to it; un-liking
+# or passing on a home takes it back off (and a card left with no homes goes away). Once the agent
+# checks it off, the next like starts a new card. It never blocks (or is blocked by) any other
+# follow-up for the person, and it skips nobody for having an agent (owner: a Showcase made for
+# them means they may not really have one). Their own alert switches still apply (lead_alerts).
+LIKES_LOOKBACK = timedelta(hours=24)
+
+
+def _and_list(items: list[str]) -> str:
+    items = [i for i in items if i]
+    if len(items) <= 2:
+        return " and ".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _home_street(address: Optional[str]) -> str:
+    return _nice_case((address or "").split(",")[0])
+
+
+async def _likes_window_start(db: AsyncSession, owner_id: str, lead_id: str, anchor: datetime) -> datetime:
+    """Likes from the 24 hours before `anchor`, but none a checked-off card already covered."""
+    last_done = (await db.execute(select(func.max(AgentTask.completed_at)).where(
+        AgentTask.owner_id == owner_id, AgentTask.lead_id == lead_id, AgentTask.auto_source == LIKES_RULE,
+        AgentTask.completed_at.is_not(None)))).scalar_one_or_none()
+    start = anchor - LIKES_LOOKBACK
+    return max(start, last_done) if last_done else start
+
+
+async def _liked_homes(db: AsyncSession, lead_id: str, since: datetime) -> list[dict]:
+    """[{event, address}] newest first - each home once, and only homes they STILL like (not
+    un-liked, not passed on since)."""
+    from app.models.database import LeadEvent, PropertyInteraction
+    events = (await db.execute(select(LeadEvent).where(
+        LeadEvent.lead_id == lead_id, LeadEvent.source_type == "showcase_like", LeadEvent.occurred_at >= since,
+    ).order_by(LeadEvent.occurred_at.desc()))).scalars().all()
+    out, seen = [], set()
+    for ev in events:
+        key = ev.source_id or (ev.property_address or "").lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        if ev.collection_id and ev.source_id:
+            inter = (await db.execute(select(PropertyInteraction).where(
+                PropertyInteraction.collection_id == ev.collection_id,
+                PropertyInteraction.property_id == ev.source_id).limit(1))).scalar_one_or_none()
+            if inter is None or not inter.liked:
+                continue
+        out.append({"event": ev, "address": ev.property_address})
+    return out
+
+
+async def likes_task_homes(db: AsyncSession, task: AgentTask) -> list[dict]:
+    if task.auto_source != LIKES_RULE or not task.lead_id:
+        return []
+    since = await _likes_window_start(db, task.owner_id, task.lead_id, task.created_at or datetime.now(timezone.utc))
+    return await _liked_homes(db, task.lead_id, since)
+
+
+def likes_text(owner: Optional[User], lead: Lead, homes: list[dict]) -> tuple[str, str, str, Optional[str]]:
+    """(title, context, notes, message) for a "homes they liked" card."""
+    name = lead.name or lead.email or "this client"
+    streets = [_home_street(h["address"]) or "a home" for h in homes]
+    n = len(streets)
+    if n == 1:
+        title, context = f"Text {name} about {streets[0]}", f"Liked {streets[0]} in their Showcase"
+    elif n <= 3:
+        title, context = f"Text {name} about {_and_list(streets)}", f"Liked {n} homes in their Showcase"
+    else:
+        title, context = f"Text {name} about the {n} homes they liked", f"Liked {n} homes in their Showcase"
+    homes_words = _and_list(streets) if n <= 3 else f"{n} homes, including {streets[0]} and {streets[1]}"
+    # The homes themselves ride on the card / calendar as "Liked: ..." lines (request_details) -
+    # not listed again here.
+    contact = "  |  ".join(b for b in [lead.email, lead.phone] if b)
+    notes = "Auto-created: " + context + (f"\nContact: {contact}" if contact else "")
+    message = render_rule_message(owner, LIKES_RULE, name=lead.name, homes=homes_words)
+    return title, context, notes, message
+
+
+def schedule_likes_followup(collection_id: str) -> None:
+    """Called after a client likes, un-likes or passes on a home in their Showcase. Runs on its own
+    session in the background - never slows down or breaks the like itself."""
+    import asyncio
+
+    async def run():
+        try:
+            await _likes_followup(collection_id)
+        except Exception:
+            logger.error("LIKES FOLLOW-UP FAILED for Showcase %s", collection_id, exc_info=True)
+
+    try:
+        t = asyncio.get_running_loop().create_task(run())
+    except RuntimeError:
+        return
+    _PENDING.add(t)
+    t.add_done_callback(_PENDING.discard)
+
+
+async def _likes_followup(collection_id: str) -> Optional[AgentTask]:
+    from app.database import AsyncSessionLocal
+    from app.models.database import Collection
+    from app.services.leads_service import find_lead_by_contact
+    from app.services import calendar_sync_service
+    from sqlalchemy import text as _sql
+    async with AsyncSessionLocal() as db:
+        col = await db.get(Collection, collection_id)
+        if col is None or not col.visitor_email:
+            return None
+        owner_id = col.owner_id
+        lead = await find_lead_by_contact(db, owner_id, col.visitor_email, None)
+        if lead is None:
+            return None
+        # Five quick likes run side by side - one at a time per person, so they all land on one card.
+        await db.execute(_sql("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": f"followup:{lead.id}"})
+        owner = await db.get(User, owner_id)
+        now = datetime.now(timezone.utc)
+        open_task = (await db.execute(select(AgentTask).where(
+            AgentTask.owner_id == owner_id, AgentTask.lead_id == lead.id, AgentTask.auto_source == LIKES_RULE,
+            AgentTask.completed_at.is_(None)).order_by(AgentTask.created_at.desc()).limit(1))).scalar_one_or_none()
+        if open_task is not None:
+            homes = await likes_task_homes(db, open_task)
+            if not homes:
+                # Every home on it was un-liked or passed on - nothing left to text about.
+                tid = open_task.id
+                await db.delete(open_task)
+                await db.commit()
+                calendar_sync_service.unsync_task_bg(owner_id, tid)
+                return None
+            title, context, notes, message = likes_text(owner, lead, homes)
+            open_task.title, open_task.context, open_task.notes = title, context[:240], notes
+            open_task.suggested_message = message
+            open_task.auto_source_id = homes[0]["event"].id   # the card's home = the newest one
+            await db.commit()
+            calendar_sync_service.sync_task_bg(owner_id, open_task.id)
+            return open_task
+        if owner is None or not rule_enabled(owner, LIKES_RULE):
+            return None
+        homes = await _liked_homes(db, lead.id, await _likes_window_start(db, owner_id, lead.id, now))
+        if not homes:
+            return None
+        title, context, notes, message = likes_text(owner, lead, homes)
+        newest = homes[0]["event"]
+        # needs_reply: its own card even while another follow-up is open for them (and that one's
+        # same-kind lookup finds nothing - this lock holder just checked); explicit_request: no
+        # has-agent skip (owner, 10/27).
+        return await create_auto_followup(
+            db, owner_id=owner_id, rule=LIKES_RULE, source_id=newest.id, title=title, context=context, notes=notes,
+            message=message, occurred_at=newest.occurred_at or now, lead_id=lead.id, needs_reply=True, explicit_request=True)
 
 # A concrete ask (second visit / disclosure) right after an open house sign-in: one conversation,
 # not two texts - the unsent "thanks for stopping by" follow-up folds into the new one, which
@@ -2441,6 +2682,13 @@ async def request_details(db: AsyncSession, task: AgentTask) -> list[str]:
     the time they picked, their message) - for the calendar event and their contact card."""
     if not task.auto_source_id or not task.lead_id:
         return []
+    if task.auto_source == LIKES_RULE:
+        # Every home on the card, newest first (the card's own home tile is the newest one).
+        try:
+            return [f"Liked: {_nice_case(h['address'] or '')}" for h in await likes_task_homes(db, task)]
+        except Exception:
+            logger.warning("liked homes lookup failed for %s", task.id, exc_info=True)
+            return []
     from app.models.database import LeadEvent
     try:
         event = await db.get(LeadEvent, task.auto_source_id)
@@ -2654,7 +2902,7 @@ async def create_open_house_followup(
     before lead creation. Safe to call from the sign-in path; never raises."""
     try:
         owner = await db.get(User, owner_id)
-        if owner is None or not rule_enabled(owner, rule) or lead.represented == "yes":
+        if owner is None or not rule_enabled(owner, rule) or lead.represented == "yes" or not lead_alerts(lead)["in_app"]:
             return None
         # The agent switched follow-ups off for this one open house (kit setting) - none at all.
         if await open_house_followups_mode(db, signin_id) == "off":
@@ -2682,6 +2930,7 @@ async def create_open_house_followup(
         # (Once it's done, a later sign-in gets a fresh one.) The visit is still on their lead.
         open_task = (await db.execute(select(AgentTask).where(
             AgentTask.owner_id == owner_id, AgentTask.lead_id == lead.id, AgentTask.auto_source.is_not(None),
+            AgentTask.auto_source != LIKES_RULE,   # a "homes they liked" card never stands in for this
             AgentTask.completed_at.is_(None)).order_by(AgentTask.created_at.desc()).limit(1))).scalar_one_or_none()
         if open_task is not None:
             if open_task.auto_source in ("open_house_signin", "similar_homes_qr") and property_address:
@@ -2859,7 +3108,7 @@ async def on_visitor_note(db: AsyncSession, owner_id: str, visitor) -> None:
         if not visitor.lead_id:
             return
         lead = await db.get(Lead, visitor.lead_id)
-        if lead is None:
+        if lead is None or not lead_alerts(lead)["in_app"]:
             return
         if (visitor.has_agent or "").upper() != "YES":
             resync_lead_followups(owner_id, lead.id)
@@ -3026,6 +3275,9 @@ async def followup_property(db: AsyncSession, task: AgentTask, owner: Optional[U
             elif event.source_type in ("property_website_inquiry", "property_website_tour_request"):
                 site_id = snap.get("property_website_id") or event.source_id
                 site = await db.get(PropertyWebsite, site_id) if site_id else None
+            elif event.source_type in ("showcase_like", "showcase_view") and event.source_id:
+                prop = await db.get(Property, event.source_id)   # source_id = the home they liked
+                origin = "Liked it in their Showcase" if event.source_type == "showcase_like" else None
             elif event.form_id:
                 form = await db.get(AgentForm, event.form_id)
                 linked = (getattr(form, "linked_property", None) or {}) if form else {}
@@ -3152,6 +3404,8 @@ def _sample_cases() -> dict:
         "showing_request": ("Book the showing for Jane Buyer", "Requested a showing - 22 Birch Ln",
                             ["1st choice: Sat, Oct 3 at 2:00 PM", "2nd choice: Sun, Oct 4 at 11:00 AM", "Their message: Can we see the basement too?"], birch),
         "showcase_comment": ("Follow up with Jane Buyer", "Commented on 22 Birch Ln in their Showcase", [], birch),
+        "showcase_likes": ("Text Jane Buyer about 12 Oak St and 22 Birch Ln", "Liked 2 homes in their Showcase",
+                           ["Liked: 12 Oak St, Ardmore", "Liked: 22 Birch Ln, Wayne"], birch),
         "listing_inquiry": ("Follow up with Jane Buyer", "Asked a question about 12 Oak St on its Spotlight site",
                             ["Their question: Is the roof new?"], listing),
         "showcase_search_request": ("Update Jane Buyer's Showcase search", "Asked you to change their Showcase search", [], None),
@@ -3189,7 +3443,8 @@ def sample_event(owner: User, key: str, *, template: Optional[str] = None, pitch
                   "form_name": "What's My Home Worth?", "my_name": _my_name(owner),
                   "requested_time": _SAMPLE_MESSAGE_TIMES.get(key), "price": "$650,000",
                   "what_they_want": MESSAGE_TOKENS["what_they_want"]["sample"] if key in ("buyer_form", "how_can_we_help") else "",
-                  "answer": FILL_IN_ANSWER if key == "listing_inquiry" else ""}
+                  "answer": FILL_IN_ANSWER if key == "listing_inquiry" else "",
+                  "homes": MESSAGE_TOKENS["homes"]["sample"]}
         msg = render_template(tpl, values)
         pitch_text = ""
         if key in PITCH_RULES and src != SELLER_SOURCE and owner_has_showcases(owner):
@@ -3371,6 +3626,9 @@ async def render_ics(db: AsyncSession, user: User) -> str:
         leads = (await db.execute(select(Lead).where(Lead.id.in_(lead_ids)))).scalars().all()
         showcases = await lead_showcase_info(db, user, list(leads))
         phones = {l.id: bool((l.phone or "").strip()) for l in leads}
+        # People the agent took off their calendar (their alert settings) stay off this feed too.
+        off = {l.id for l in leads if not lead_alerts(l)["calendar"]}
+        tasks = [t for t in tasks if t.lead_id not in off]
 
     oh_rows = await db.execute(
         select(OpenHouseEvent).where(

@@ -15,7 +15,7 @@ from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.models.database import AgentTask, Collection, Lead, LeadEvent, LeadNote, OpenHouseEvent, OpenHouseVisitor, Property, User
 from app.schemas.leads import (
-    LeadDetailOut, LeadEventOut, LeadHandleRequest, LeadHideRequest, LeadMomentOut, LeadNoteCreate, LeadNoteOut, LeadNoteUpdate,
+    LeadAlertsOut, LeadAlertsUpdate, LeadDetailOut, LeadEventOut, LeadHandleRequest, LeadHideRequest, LeadMomentOut, LeadNoteCreate, LeadNoteOut, LeadNoteUpdate,
     LeadOpenHouseOut, LeadOut, LeadPropertyOut, LeadShowcaseOut, LeadSort, LeadSourceFilter, LeadStatus, LeadRepresented,
     LeadTodoOut, LeadUpdate,
 )
@@ -556,8 +556,9 @@ async def _detail_out(db: AsyncSession, lead: Lead, owner_id: str) -> LeadDetail
     await _fill_missing_property_photos(db, [lead], [lead_out])
     await _enrich(db, owner_id, [lead], [lead_out], collections)
     events = sorted(lead.events or [], key=lambda e: e.occurred_at, reverse=True)
+    from app.services.tasks_service import lead_alerts
     return LeadDetailOut(**lead_out.model_dump(), events=await _events_out(db, owner_id, events),
-                         showcases=await _showcases_out(lead, collections))
+                         showcases=await _showcases_out(lead, collections), alerts=lead_alerts(lead))
 
 
 async def _load_owned_lead(db: AsyncSession, lead_id: str, owner_id: str) -> Lead:
@@ -1127,6 +1128,26 @@ async def mark_request_handled(
         raise HTTPException(status_code=400, detail="Unknown request kind")
     await db.commit()
     return await _detail_out(db, await _load_owned_lead(db, lead_id, current_user.id), current_user.id)
+
+
+@router.put("/{lead_id}/alerts", response_model=LeadAlertsOut)
+async def update_lead_alerts(
+    lead_id: str,
+    body: LeadAlertsUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """This person's alert switches (owner, 10/27): their follow-ups on the calendar, in
+    OpenHousePal at all, and activity alert emails about them. Same switches as the check-off page."""
+    from app.services import tasks_service
+    lead = await _load_owned_lead(db, lead_id, current_user.id)
+    before = tasks_service.lead_alerts(lead)["calendar"]
+    lead.alert_prefs = tasks_service.merge_lead_alerts(lead.alert_prefs, body.model_dump(exclude_none=True))
+    await db.commit()
+    alerts = tasks_service.lead_alerts(lead)
+    if alerts["calendar"] != before:
+        tasks_service.apply_lead_alerts_bg(current_user.id, lead.id)
+    return LeadAlertsOut(**alerts)
 
 
 @router.patch("/{lead_id}", response_model=LeadDetailOut)
