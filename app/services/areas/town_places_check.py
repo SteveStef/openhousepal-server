@@ -828,7 +828,8 @@ _PROCESS_RE = re.compile(
     r"i (?:found|searched|could not|couldn't|was unable)|sources? (?:show|indicate|provide)|according to (?:my|the) search|"
     r"also identified|were identified|identified \d+|not able to (?:find|verify|confirm)|searched|searching|"
     r"sources? (?:from \d{4} )?confirm|multiple sources|within walking distance|research confirmed|confirmed finding|"
-    r"platform data|existing data)\b", re.IGNORECASE)
+    r"platform data|existing data|well[- ]documented|consistently listed|according to (?:yelp|google|tripadvisor|the research)|"
+    r"documented as|(?:only|main)\b[^.]{0,40}\bidentified)\b", re.IGNORECASE)
 _LABEL_RE = re.compile(r"\b(?:IN_AREA|ADJACENT|NEARBY|OTHER_MAJOR_MEDICAL|URGENT_CARE)\b")  # the research's own labels, all caps
 _DISTANCE_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:-\s*\d+(?:\.\d+)?\s*)?(?:mi|miles?|minutes?|min)\b", re.IGNORECASE)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")  # "1.4 miles" and "St. Davids" stay whole
@@ -873,6 +874,7 @@ def tidy_research_text(text: Optional[str], drop_distances: bool = True) -> str:
     out = _ADDRESS_RE.sub(" ", out)
     out = re.sub(r"\s+([,.;])", r"\1", re.sub(r"\s{2,}", " ", out)).strip()
     out = re.sub(r"[,;]+\.", ".", out)  # "Orange Theory Fitness;." once a trailing count is gone
+    out = re.sub(r"\s{2,}", " ", re.sub(r"(^|\s)['\"](?=\s|$)", " ", out)).strip()  # a lone quote mark left by the research ("borough. ' The downtown")
     out = re.sub(r"^[,;\s]+", "", out)
     return out[:1].upper() + out[1:] if out else out
 
@@ -882,7 +884,7 @@ def tidy_research_text(text: Optional[str], drop_distances: bool = True) -> str:
 _COUNTED = (r"restaurants?|eateries|eatery|stores?|shops?|outlets?|boutiques?|brands?|rides?|attractions?|"
             r"vendors?|galleries|gallery|dining options?|businesses|merchants?|tenants?|retailers?")
 _NUMBER = r"\d[\d,]*(?:\s*(?:-|–|to)\s*\d[\d,]*)?\+?"  # "40-50", "20+", "1,200"
-_COUNT_COMPOUND_RE = re.compile(rf"\b{_NUMBER}[- ](?:restaurant|store|shop|outlet|boutique|brand|ride|attraction|vendor|gallery|merchant|tenant|retailer)"
+_COUNT_COMPOUND_RE = re.compile(rf"\b{_NUMBER}[- ](?:restaurant|store|shop|outlet|boutique|brand|ride|attraction|vendor|gallery|merchant|tenant|retailer|seat)"
                                 r"\s+(?=[a-z])")  # "a 140+ store outlet mall"
 _COUNT_RE = re.compile(rf"\b(?:(?:over|more than|nearly|almost|about|approximately|around|some|roughly)\s+)?{_NUMBER}\s+"
                        rf"(?:total\s+|different\s+|unique\s+)?"
@@ -896,12 +898,13 @@ _ADDRESS_RE = re.compile(r",?\s*\b(?:[Ll]ocated\s+)?" + _ADDRESS_CORE + ",?")
 _ADDRESS_OPENER_RE = re.compile(r"(^|[.!?]\s+)Located\s+" + _ADDRESS_CORE + r",?\s*([a-z])")
 # Bus route numbers and colored bus "lines" change every few months (SEPTA ended Route 106 on
 # 8/24/2026; rabbittransit's Gold Line is seasonal) - only stations, which the check confirms, stay.
-_BUS_WORD_RE = re.compile(r"\b(?:bus(?:es)?|transit)\b", re.IGNORECASE)
+_BUS_WORD_RE = re.compile(r"\b(?:bus(?:es)?|transit|SEPTA|DART|ChescoBus|SCCOOT|rabbittransit|Krapf)\b", re.IGNORECASE)
 _BUS_ROUTE_RE = re.compile(r"\broutes?\s+\d|\b(?:Red|Blue|Gold|Green|Orange|Purple|Yellow|Silver|Brown) Line\b", re.IGNORECASE)
 
 
 def _is_bus_route_sentence(s: str) -> bool:
-    return bool(_BUS_WORD_RE.search(s) and _BUS_ROUTE_RE.search(s))
+    # "the D1 (formerly Route 101 Media line)" names a trolley line's history, not a bus route.
+    return bool(_BUS_WORD_RE.search(s) and _BUS_ROUTE_RE.search(re.sub(r"formerly\s+Route\s+\d+", "", s, flags=re.IGNORECASE)))
 
 
 # Claims that go stale or can't be checked: rankings (Lankenau "top five" - No. 10 in 2026-27),
@@ -922,7 +925,9 @@ _SIZE_LEFT_RE = re.compile(r"\b\d[\d,.]*\+?\s+acres?\b", re.IGNORECASE)
 # Opening hours (Wegmans Malvern "open 24 hours" - it's 6 a.m. to midnight).
 _HOURS_RE = re.compile(
     r",?\s*\bopen\s+(?:24\s+hours(?:\s+a\s+day)?|24/7|around the clock|(?:daily\s+)?(?:from\s+)?\d{1,2}(?::\d\d)?\s*(?:a\.?m\.?|p\.?m\.?)\s*(?:to|-|–)\s*"
-    r"(?:\d{1,2}(?::\d\d)?\s*(?:a\.?m\.?|p\.?m\.?)|midnight|noon)(?:\s+daily)?)", re.IGNORECASE)
+    r"(?:\d{1,2}(?::\d\d)?\s*(?:a\.?m\.?|p\.?m\.?)|midnight|noon)(?:\s+daily)?|(?:7|seven) days a week)"
+    r"|,?\s*\b(?:and\s+)?closed\s+(?:on\s+)?(?:Sun|Mon|Tues|Tue|Wednes|Wed|Thurs|Thu|Fri|Satur|Sat)\w*"
+    r"(?:\s*(?:,|and|&)\s*(?:Sun|Mon|Tues|Tue|Wednes|Wed|Thurs|Thu|Fri|Satur|Sat)\w*)*", re.IGNORECASE)  # "closed Sundays and Mondays"
 # A sentence leaning on the one before it ("These are the primary grocery options...") goes with it.
 _LEANS_BACK_RE = re.compile(r"^(?:These|This|They|Those|All|Both|Each|It|Together|Additionally|Additional|Also|Of these|"
                             r"The (?:hospital|school|station|store|market|park|center|mall|restaurant))\b")

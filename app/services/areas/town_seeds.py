@@ -55,17 +55,25 @@ def _finished_here(area: MarketArea) -> bool:
         for e in (v.get("entities") or []) if isinstance(e, dict)) or bool(facts.get("_admin_edited_at"))
 
 
+def _admin_edited(area: MarketArea) -> bool:
+    facts = area.facts or {}
+    return bool(facts.get("_admin_edited_at")) or any(
+        e.get("admin_edited") for k, v in facts.items() if isinstance(v, dict)
+        for e in (v.get("entities") or []) if isinstance(e, dict))
+
+
 def _older_seed_untouched(area: MarketArea, seed_id: str) -> bool:
     """This server's copy came from an older seed (seed ids are dates, "2026-10-26") and no admin
     has edited it since."""
-    facts = area.facts or {}
-    older = facts.get("_seeded_from")
-    if not older or str(older) >= str(seed_id):
-        return False
-    edited_at = str(facts.get("_admin_edited_at") or "")
-    return not edited_at and not any(
-        e.get("admin_edited") for k, v in facts.items() if isinstance(v, dict)
-        for e in (v.get("entities") or []) if isinstance(e, dict))
+    older = (area.facts or {}).get("_seeded_from")
+    return bool(older) and str(older) < str(seed_id) and not _admin_edited(area)
+
+
+def _live_research_untouched(area: MarketArea) -> bool:
+    """A town this server researched itself (an agent added it - Kennett Square, Landenberg) that a
+    seed marked replaces_live_research may update: the seed is that same research brought here,
+    with the later fixes. Never once an admin has edited it."""
+    return not (area.facts or {}).get("_seeded_from") and not _admin_edited(area)
 
 
 def _fill(area: MarketArea, town: dict, seed_id: str, keep_identity: bool) -> None:
@@ -97,7 +105,7 @@ async def apply_town_seeds(db: AsyncSession, seeds: list[dict] | None = None) ->
             elif (area.facts or {}).get("_seeded_from") == seed_id:
                 summary["kept"] += 1
                 continue
-            elif _older_seed_untouched(area, seed_id):
+            elif _older_seed_untouched(area, seed_id) or (seed.get("replaces_live_research") and _live_research_untouched(area)):
                 # A newer finished version of a town this server got from an older seed (10/27 grader
                 # fixes) - replaces it, unless an admin has edited the town here since.
                 _fill(area, town, seed_id, keep_identity=True)

@@ -474,3 +474,35 @@ def test_tidy_drops_24_hour_claims_but_not_emergency_rooms():
     assert t("Hospital with a 24-hour emergency department.") == "Hospital with a 24-hour emergency department."
     assert t("Includes CVS, Wegmans and T.J. Maxx; and 20+ more stores.").endswith("T.J. Maxx; and more stores.")
     assert t("Includes CVS and Wegmans;.") == "Includes CVS and Wegmans."
+
+
+def test_kennett_landenberg_patterns():
+    t = tpc.tidy_research_text
+    assert t("Modern American with mushroom appetizers, closed Sundays and Mondays.") == "Modern American with mushroom appetizers."
+    assert t("Walk-in urgent care with X-ray, open 7 days a week.") == "Walk-in urgent care with X-ray."
+    assert "240" not in t("Fine dining with an elegant 240-seat space.")
+    assert t("Downtown is on State Street. ' The downtown includes Union Street.") == "Downtown is on State Street. The downtown includes Union Street."
+    assert t("GIANT is a supermarket. Walmart is well-documented with a specific address.") == "GIANT is a supermarket."
+    assert t("The store is documented as CLOSED according to Yelp. Parking is free.") == "Parking is free."
+    assert t("Primary transfer point for SEPTA Routes 92, 104, 135. Has parking.") == "Has parking."
+    assert t("SEPTA light rail terminus for the D1 (formerly Route 101 Media line).") == "SEPTA light rail terminus for the D1 (formerly Route 101 Media line)."
+
+
+def test_notes_drop_inside_claims_about_places_elsewhere():
+    facts = {"_places_check_version": 1, "medical": {
+        "notes": "Landenberg has direct access to Chester County Hospital within the community. Other hospitals are a short drive away.",
+        "entities": [{"name": "Chester County Hospital", "city": "West Chester", "google_checked": True, "lat": 39.9, "lng": -75.6, "distance_miles": 22}]}}
+    out, _ = clean_area_payload(facts, None, (39.78, -75.78), "Landenberg")
+    assert out["medical"]["notes"] == "Other hospitals are a short drive away."
+    facts = {"_places_check_version": 1, "shopping": {"entities": [
+        {"name": "Next Door", "lat": 39.7801, "lng": -75.7801, "distance_miles": 0.0, "google_checked": True}]}}
+    out, _ = clean_area_payload(facts, None, (39.78, -75.78), "Landenberg")
+    assert out["shopping"]["entities"][0]["distance_miles"] == 0.1
+
+
+def test_inside_claim_must_be_about_the_place_elsewhere():
+    facts = {"_places_check_version": 1, "parks": {
+        "notes": "Great parks. Willows Park is within town boundaries, plus nearby access to Radnor Trail and parks in Bryn Mawr.",
+        "entities": [{"name": "Radnor Trail", "city": "Wayne", "google_checked": True}]}}
+    out, _ = clean_area_payload(facts, None, None, "Villanova")
+    assert "Willows Park is within town boundaries" in out["parks"]["notes"]

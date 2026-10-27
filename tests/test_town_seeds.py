@@ -77,3 +77,20 @@ async def test_a_newer_seed_replaces_an_older_seed_unless_an_admin_edited_it():
                                "parks": {"entities": [{"name": "X", "admin_edited": True}]}})
     db = Db(edited)
     assert (await town_seeds.apply_town_seeds(db, [newer]))["kept"] == 1 and db.commits == 0
+
+
+@pytest.mark.asyncio
+async def test_a_seed_can_replace_a_town_researched_here_only_when_marked_and_unedited():
+    marked = {**SEED, "seed_id": "2026-10-27", "replaces_live_research": True}
+    live = MarketArea(name="Wayne", state="PA", slug="wayne-pa", canonical_key="PA|city|wayne", enrichment_status="ENRICHED",
+                      facts={"_places_check_version": 1, "restaurants": {"entities": [{"name": "Old"}]}})
+    db = Db(live)
+    assert (await town_seeds.apply_town_seeds(db, [marked]))["updated"] == 1
+    assert live.facts["restaurants"]["entities"][0]["name"] == "Matador"
+    unmarked = {**SEED, "seed_id": "2026-10-27"}
+    live = MarketArea(name="Wayne", state="PA", slug="wayne-pa", canonical_key="PA|city|wayne", enrichment_status="ENRICHED",
+                      facts={"_places_check_version": 1})
+    assert (await town_seeds.apply_town_seeds(Db(live), [unmarked]))["kept"] == 1
+    edited = MarketArea(name="Wayne", state="PA", slug="wayne-pa", canonical_key="PA|city|wayne", enrichment_status="ENRICHED",
+                        facts={"_places_check_version": 1, "_admin_edited_at": "2026-10-27"})
+    assert (await town_seeds.apply_town_seeds(Db(edited), [marked]))["kept"] == 1

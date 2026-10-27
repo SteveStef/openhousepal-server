@@ -181,3 +181,11 @@ def test_guard_drops_only_the_sales_based_numbers():
 def test_guard_leaves_a_normal_town_alone():
     payload = {"market_trends": {"series": [1]}}
     assert mss.apply_coverage_guard(payload, {"thin": False}) == {"market_trends": {"series": [1]}}
+
+
+def test_freight_railroads_are_not_train_stations():
+    from app.services.areas.town_map_service import station_kind
+    assert station_kind({"railway": "station", "name": "East Penn Railroad"}) is None
+    assert station_kind({"railway": "station", "name": "Yard", "usage": "freight"}) is None
+    assert station_kind({"railway": "station", "name": "Malvern", "network": "SEPTA"}) == "train"
+    assert station_kind({"railway": "station", "name": "Paoli Station"}) == "train"

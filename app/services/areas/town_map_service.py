@@ -403,6 +403,11 @@ def station_kind(tags: dict) -> Optional[str]:
     served = bool(t.get("network") or t.get("railway:ref"))
     if not served and ("historic" in t or any(_TOURIST_WORDS.search(str(t.get(k) or "")) for k in ("description", "name", "note"))):
         return None
+    # Freight only - no passengers (Kennett Square's "East Penn Railroad" yard counted as a station).
+    if t.get("usage") == "freight" or t.get("passenger") == "no" or "freight" in str(t.get("railway:traffic_mode") or "") \
+            or (not served and re.search(r"\b(?:rail\s?road|railway|freight|yard)\b", str(t.get("name") or ""), re.IGNORECASE)
+                and not re.search(r"\bstation\b", str(t.get("name") or ""), re.IGNORECASE)):
+        return None
     if t.get("station") in ("light_rail", "tram") or t.get("light_rail") == "yes" or t.get("tram") == "yes":
         return "trolley"
     return "train"

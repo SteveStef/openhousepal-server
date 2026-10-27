@@ -113,6 +113,10 @@ def clean_area_payload(facts: dict, narrative: Optional[dict], origin: Optional[
             for e in (b.get("entities") or []) if isinstance(e, dict)}
     removed = [str(r.get("name")) for b in facts.values() if isinstance(b, dict)
                for r in (b.get("_removed") or []) if isinstance(r, dict) and r.get("name") and str(r["name"]).lower() not in kept]
+    # Checked places whose own address is in another town (Chester County Hospital, West Chester).
+    elsewhere = [str(e.get("name")) for b in facts.values() if isinstance(b, dict) for e in (b.get("entities") or [])
+                 if isinstance(e, dict) and e.get("name") and e.get("google_checked") and e.get("city") and town
+                 and str(e["city"]).strip().lower() != town.strip().lower()]
     # Outside sites' price figures (Movoto, Redfin, blogs) disagreed with each other and with the live
     # MLS numbers on the same page (Malvern: "up 2.5%" and "down 2%") - the page shows the MLS only.
     facts.pop("market_context", None)
@@ -123,6 +127,7 @@ def clean_area_payload(facts: dict, narrative: Optional[dict], origin: Optional[
         block.pop("_removed", None)
         if isinstance(block.get("notes"), str):
             block["notes"] = fix_district_names(drop_removed_mentions(tidy_research_text(clean_text(block["notes"])), removed), districts)
+            block["notes"] = _drop_wrong_place_claims(block["notes"], town, elsewhere)
         if isinstance(block.get("entities"), list):
             ents = []
             for e in block["entities"]:
@@ -147,7 +152,7 @@ def clean_area_payload(facts: dict, narrative: Optional[dict], origin: Optional[
                     # the straight-line distance from the same town center reads true there.
                     straight = nas._haversine_miles(origin[0], origin[1], e["lat"], e["lng"])
                     if straight < 1:
-                        e["distance_miles"] = round(straight, 1)
+                        e["distance_miles"] = max(0.1, round(straight, 1))  # never "0 mi" for a place down the street
                 ents.append(e)
             block["entities"] = ents
         facts[key] = block
@@ -187,6 +192,22 @@ def town_display(area, facts: Optional[dict] = None, narrative: Optional[dict] =
 
 
 _BUS_ROUTE_NAME_RE = re.compile(r"\broutes?\s*\d+|\bbus route\b", re.IGNORECASE)
+
+
+def _drop_wrong_place_claims(notes: str, town: Optional[str], elsewhere: list[str]) -> str:
+    """"Landenberg has direct access to Chester County Hospital within the community" - but its checked
+    address is West Chester, 22 miles away. A sentence that puts such a place inside the town goes."""
+    if not notes or not town or not elsewhere:
+        return notes
+    inside = (rf"(?:\bwithin (?:the )?(?:community|town|borough|city|village)\b|\b{re.escape(town)}\s+proper\b|"
+              rf"\b(?:located|based) in {re.escape(town)}\b|\bin {re.escape(town)} itself\b)")
+    # The claim has to be about that place: its name, then the "inside" words shortly after, with no
+    # "nearby / adjacent / plus" between (Villanova: "Willows Park ... within town, plus nearby Radnor Trail").
+    gap = r"(?:(?!\b(?:nearby|adjacent|neighbou?ring|plus|outside)\b)[^.]){0,60}?"
+    claims = [re.compile(r"\b" + re.escape(n) + r"\b" + gap + inside, re.IGNORECASE) for n in elsewhere if len(n) >= 5]
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", notes) if s.strip()]
+    keep = [s for s in sentences if not any(p.search(s) for p in claims)]
+    return notes if len(keep) == len(sentences) else " ".join(keep).strip()
 
 
 def _not_in_another_town(description: str, town: Optional[str], city: Optional[str]) -> str:
