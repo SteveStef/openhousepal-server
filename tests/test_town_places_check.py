@@ -261,3 +261,81 @@ async def test_free_calls_running_out_leaves_the_town_waiting_to_finish(monkeypa
     kept = area.facts["restaurants"]["entities"]
     assert area.facts["_places_check_waiting"] is True
     assert [e["name"] for e in kept] == ["Brick & Brew"] and "distance_miles" not in kept[0]  # kept, no guessed miles
+
+
+def _fake_db():
+    class Db:
+        def add(self, _o):
+            pass
+
+        async def commit(self):
+            pass
+    return Db()
+
+
+@pytest.mark.asyncio
+async def test_same_lookup_is_paid_for_once_across_towns(monkeypatch):
+    """Neighbouring towns name the same places - the second town reuses the first town's answer."""
+    calls = []
+
+    async def search(_c, _k, _lat, _lng, query, _r, **_kw):
+        calls.append(query)
+        return [gplace("Bryn Mawr Hospital", "hospital", ("general_hospital",), address="130 S Bryn Mawr Ave, Bryn Mawr, PA 19010, USA")]
+
+    async def no_hospitals(*_a, **_k):
+        return []
+
+    async def no_drive(*_a, **_k):
+        return [None] * len(_a[4])
+
+    tpc._LOOKUP_CACHE.clear()
+    monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "k")
+    monkeypatch.setattr(nas, "_search_text", search)
+    monkeypatch.setattr(nas, "_fetch_hospital_from_google", no_hospitals)
+    monkeypatch.setattr(nas, "_driving_routes", no_drive)
+    monkeypatch.setattr(tpc, "flag_modified", lambda *_a: None)
+    for town in ("Haverford", "Gladwyne"):
+        area = SimpleNamespace(slug=town.lower(), name=town, state="PA", centroid_lat=40.02, centroid_lng=-75.3,
+                               facts={"medical": {"entities": [{"name": "Bryn Mawr Hospital", "city": "Bryn Mawr", "category": "HOSPITAL"}]}})
+        await tpc.check_town_places(_fake_db(), area)
+        assert [e["name"] for e in area.facts["medical"]["entities"]] == ["Bryn Mawr Hospital"]
+    assert calls == ["Bryn Mawr Hospital, Bryn Mawr, PA"]
+    tpc._LOOKUP_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_finishing_a_paused_check_only_looks_up_what_it_never_reached(monkeypatch):
+    calls, routed = [], []
+
+    async def search(_c, _k, _lat, _lng, query, _r, **_kw):
+        calls.append(query)
+        return [gplace("Brick & Brew Malvern", "restaurant", address="70 E King St, Malvern, PA 19355, USA")]
+
+    async def no_hospitals(*_a, **_k):
+        return []
+
+    async def drive(_c, _k, _lat, _lng, points, _s):
+        routed.extend(points)
+        return [(300, 0.4)] * len(points)
+
+    tpc._LOOKUP_CACHE.clear()
+    monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "k")
+    monkeypatch.setattr(nas, "_search_text", search)
+    monkeypatch.setattr(nas, "_fetch_hospital_from_google", no_hospitals)
+    monkeypatch.setattr(nas, "_driving_routes", drive)
+    monkeypatch.setattr(tpc, "flag_modified", lambda *_a: None)
+    async def no_schools(*_a, **_k):
+        return []
+
+    monkeypatch.setattr(tpc, "_check_private_schools", no_schools)
+    done = {"name": "Restaurant Alba", "city": "Malvern", "google_checked": True, "lat": 40.03, "lng": -75.51, "distance_miles": 0.3}
+    area = SimpleNamespace(slug="malvern-pa", name="Malvern", state="PA", centroid_lat=40.04, centroid_lng=-75.51,
+                           facts={"_places_check_waiting": True,
+                                  "restaurants": {"entities": [done, {"name": "Brick & Brew", "city": "Malvern"}]}})
+    await tpc.check_town_places(_fake_db(), area)
+    assert calls == ["Brick & Brew, Malvern, PA"]          # Alba was checked last time
+    assert len(routed) == 1                                  # and keeps its driving distance
+    names = {e["name"]: e.get("distance_miles") for e in area.facts["restaurants"]["entities"]}
+    assert names == {"Restaurant Alba": 0.3, "Brick & Brew Malvern": 0.4}
+    assert "_places_check_waiting" not in area.facts
+    tpc._LOOKUP_CACHE.clear()

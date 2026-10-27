@@ -63,6 +63,7 @@ async def test_a_used_up_call_is_stopped_before_it_goes_out(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_calls_google_saw_before_the_counter_started_count_toward_the_month(monkeypatch):
+    monkeypatch.setattr(gft, "_used_locally", {})
     import app.database as database
     from app.services import usage_budget_service as ubs
     limits = []
@@ -89,3 +90,12 @@ async def test_calls_google_saw_before_the_counter_started_count_toward_the_mont
     monkeypatch.setattr(ubs, "_period_keys", lambda: ("2026-11-01", "2026-11"))
     await gft._take("text_search_pro", "pro", 1)
     assert limits[-1] == ("google_free:text_search_pro", 4750)  # a new month starts clean
+
+
+def test_live_server_adds_the_calls_made_on_the_owners_computer(monkeypatch):
+    monkeypatch.setattr(gft, "_used_locally", {"2026-10": {"text_search_pro": 900}})
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@open-house-pal-postgresdb:5432/ohp")
+    assert gft._used_before("text_search_pro", "2026-10") == 3100 + 900
+    assert gft._used_before("text_search_pro", "2026-11") == 0
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@localhost:5432/ohp")
+    assert gft._used_before("text_search_pro", "2026-10") == 3100  # the local counter already has them

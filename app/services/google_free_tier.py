@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -127,8 +128,49 @@ def monthly_limit(tier: str) -> int:
     return int(FREE_PER_MONTH[tier] * FREE_SHARE)
 
 
+# Town research runs on the owner's computer with the same Google key, and its counter lives in the
+# local database. Before each push export_local_usage() writes that month's local counts here, and
+# the live server adds them to its own - so both together never pass the free line. The local
+# server ignores the file (its own counter already has those calls).
+USED_LOCALLY_FILE = Path(__file__).resolve().parents[1] / "data" / "google_used_locally.json"
+_used_locally: Optional[dict] = None
+
+
+def _is_local() -> bool:
+    url = os.getenv("DATABASE_URL", "")
+    return "localhost" in url or "127.0.0.1" in url
+
+
+def _local_counts() -> dict:
+    global _used_locally
+    if _used_locally is None:
+        try:
+            _used_locally = json.loads(USED_LOCALLY_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _used_locally = {}
+    return _used_locally
+
+
 def _used_before(sku: str, month: str) -> int:
-    return USED_BEFORE_COUNTING.get(month, {}).get(sku, 0)
+    before = USED_BEFORE_COUNTING.get(month, {}).get(sku, 0)
+    if not _is_local():
+        before += int((_local_counts().get(month) or {}).get(sku, 0))
+    return before
+
+
+async def export_local_usage(db) -> dict:
+    """This computer's counted Google calls per month (not the hand-entered starting numbers), written
+    to USED_LOCALLY_FILE for the live server. Run locally before a push."""
+    from sqlalchemy import select
+    from app.models.database import UsageBudgetCounter
+    assert _is_local(), "run on the local database only"
+    rows = (await db.execute(select(UsageBudgetCounter.bucket, UsageBudgetCounter.period_key, UsageBudgetCounter.count)
+                             .where(UsageBudgetCounter.bucket.like("google_free:%"), UsageBudgetCounter.period_type == "month"))).all()
+    out: dict = {}
+    for bucket, month, count in rows:
+        out.setdefault(month, {})[bucket.split(":", 1)[1]] = int(count)
+    USED_LOCALLY_FILE.write_text(json.dumps(out, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    return out
 
 
 def _tier_of(sku: str) -> str:

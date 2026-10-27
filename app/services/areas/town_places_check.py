@@ -39,6 +39,28 @@ from app.services.google_free_tier import GoogleFreeTierPaused
 _paused: ContextVar[Optional[list]] = ContextVar("town_places_paused", default=None)
 
 
+# The same Google look-up is never paid for twice in a run of towns (owner, 10/26: "are we being
+# wasteful?"): neighbouring towns name the same places (Bryn Mawr Hospital, Lankenau, Suburban
+# Square - 114 of the first 881 look-ups were repeats), and research sometimes lists a place twice.
+# The query names the place and its town, so the answer doesn't depend on which town asked.
+_LOOKUP_CACHE: dict[tuple[str, str], tuple[float, list]] = {}
+LOOKUP_CACHE_HOURS = 24
+_LOOKUP_CACHE_MAX = 5000
+
+
+async def _search_once(client: httpx.AsyncClient, key: str, area: MarketArea, query: str, mask: str) -> list:
+    import time
+    hit = _LOOKUP_CACHE.get((query.lower(), mask))
+    if hit and time.time() - hit[0] < LOOKUP_CACHE_HOURS * 3600:
+        return hit[1]
+    raw = await nas._search_text(client, key, area.centroid_lat, area.centroid_lng, query, LOOKUP_RADIUS_MILES,
+                                 field_mask=mask, section="town_places_check")
+    if len(_LOOKUP_CACHE) >= _LOOKUP_CACHE_MAX:
+        _LOOKUP_CACHE.clear()
+    _LOOKUP_CACHE[(query.lower(), mask)] = (time.time(), raw)
+    return raw
+
+
 def _note_paused(exc: Exception) -> None:
     hits = _paused.get()
     if hits is not None and isinstance(exc, GoogleFreeTierPaused):
@@ -240,9 +262,7 @@ async def _lookup(client: httpx.AsyncClient, key: str, area: MarketArea, categor
         return None
     mask = nas.PARK_FIELD_MASK if category == "parks" else nas.CHEAT_FIELD_MASK
     try:
-        raw = await nas._search_text(client, key, area.centroid_lat, area.centroid_lng,
-                                     f"{name}, {entity.get('city') or area.name}, {area.state}", LOOKUP_RADIUS_MILES,
-                                     field_mask=mask, section="town_places_check")
+        raw = await _search_once(client, key, area, f"{name}, {entity.get('city') or area.name}, {area.state}", mask)
     except httpx.HTTPError as exc:
         logger.info("Town place look-up failed", extra={"area": area.slug, "place": name, "error": str(exc)})
         _note_paused(exc)
@@ -412,7 +432,9 @@ async def _check_private_schools(client: httpx.AsyncClient, key: str, area: Mark
 
 
 async def _drive_miles(client: httpx.AsyncClient, key: str, area: MarketArea, ents: list[dict]) -> None:
-    pts = [e for e in ents if e.get("lat") is not None and e.get("lng") is not None]
+    # A place that already has its driving distance (checked before a paused run stopped) isn't routed again.
+    pts = [e for e in ents if e.get("lat") is not None and e.get("lng") is not None
+           and not isinstance(e.get("distance_miles"), (int, float))]
     for i in range(0, len(pts), 25):
         chunk = pts[i:i + 25]
         routes = await nas._driving_routes(client, key, area.centroid_lat, area.centroid_lng, [(e["lat"], e["lng"]) for e in chunk], "town_places_check")
@@ -455,6 +477,9 @@ def _admin_clash(e: dict, held: list[dict], gone: list[dict]) -> bool:
 
 async def _check(db, area, key, facts, now, lists, removed, paused) -> dict:
     checked = removed_count = 0
+    # Finishing a check Google's free-call line stopped part-way: only the places it never reached
+    # are looked up - the ones it did check keep their result and driving distance.
+    finishing = bool(facts.get("_places_check_waiting"))
     # Admin changes (Neighborhoods tab, admin_area_routes) are never re-checked: an added or edited
     # place keeps its spot and every field, and a place the admin took off is never added back.
     held: dict[str, list[tuple[int, dict]]] = {}
@@ -473,6 +498,9 @@ async def _check(db, area, key, facts, now, lists, removed, paused) -> dict:
             keep, gone = [], removed.setdefault(cat, [])
             for e in ents:
                 if not isinstance(e, dict) or not e.get("name") or e.get("admin_edited"):
+                    continue
+                if finishing and e.get("google_checked") and isinstance(e.get("distance_miles"), (int, float)):
+                    keep.append(e)
                     continue
                 if cat == "downtown_centers":
                     # What the research itself says it is: an office park isn't a downtown ("Radnor Corporate
