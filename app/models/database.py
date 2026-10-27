@@ -2631,11 +2631,13 @@ class AIMessage(Base):
 class AIUsageEvent(Base):
     """One row per AI request attempt (allowed or blocked) - the security/audit log and the
     source of truth for burst/daily/monthly/cost-ceiling enforcement in ai_rate_limit_service.py.
-    Never stores message content - that lives only in AIMessage."""
+    Never stores message content - that lives only in AIMessage. Also the platform's record of
+    what AI cost us (Admin > Costs): owner_id is NULL for work nobody signed in started (the
+    platform paid), and for rows whose agent was later deleted - the cost row stays."""
     __tablename__ = "ai_usage_events"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    owner_id = Column(String, ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
     conversation_id = Column(String, ForeignKey('ai_conversations.id', ondelete='SET NULL'), nullable=True)
 
     model = Column(String, nullable=True)

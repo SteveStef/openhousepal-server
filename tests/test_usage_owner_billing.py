@@ -136,9 +136,9 @@ async def test_downtown_ai_charges_the_agent_whose_cheat_sheet_asked(monkeypatch
 
     with bill_to("agent-3"):
         await dt._downtown_picks(FakeDb(), "Media", "PA", "19063", [])
-    with bill_to(None):  # a re-lookup we caused: platform pays
+    with bill_to(None):  # a re-lookup we caused: platform pays - written down with no agent (Admin site spend)
         await dt._downtown_picks(FakeDb(), "Media", "PA", "19063", [])
-    assert events == [("agent-3", "cheat_sheet_downtown", True)]
+    assert events == [("agent-3", "cheat_sheet_downtown", True), (None, "cheat_sheet_downtown", True)]
 
 
 @pytest.mark.asyncio

@@ -132,12 +132,12 @@ async def fill_missing_schools(db, prop, schools: list, owner_id: Optional[str] 
                 return schools
             cost = ai_config_service.estimate_cost_usd(config, usage["model"], usage["input"], usage["output"]) \
                 + usage["searches"] * float(config.get("area_research_web_search_cost_usd", 0.01) or 0.01)
-            if owner_id:
-                try:
-                    await record_usage_event(db, owner_id, None, usage["model"], usage["input"], usage["output"], round(cost, 5), usage["searches"],
-                                             False, None, tool_names=["cheat_sheet_schools"], event_type=EVENT_TYPE)
-                except Exception:  # noqa: BLE001
-                    logger.warning("AI school lookup cost logging failed", exc_info=True)
+            # No owner: still written down - the platform paid (owner_id NULL, on no agent's bar).
+            try:
+                await record_usage_event(db, owner_id, None, usage["model"], usage["input"], usage["output"], round(cost, 5), usage["searches"],
+                                         False, None, tool_names=["cheat_sheet_schools"], event_type=EVENT_TYPE)
+            except Exception:  # noqa: BLE001
+                logger.warning("AI school lookup cost logging failed", exc_info=True)
             levels = {}
             for lvl in LEVELS:
                 entry = found.get(lvl) if isinstance(found, dict) else None

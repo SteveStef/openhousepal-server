@@ -17933,6 +17933,10 @@ async def _generate_ai_analysis_impl(
         await record_usage_event(
             db, owner_id, None, model, _ex_in, _ex_out, _extra_cost, 0, False, None, event_type="cma_ai",
         )
+        # The reservation was settled before these ran - add them to the site-wide CMA / all-features
+        # totals too (they were missing there, so Admin's CMA spend read low).
+        from app.services.usage_budget_service import add_spend
+        await add_spend(db, ["cma_ai_global", "platform_emergency"], _extra_cost)
         cost += _extra_cost
     report.ai_analysis = {
         "generated_at": datetime.now(timezone.utc).isoformat(),

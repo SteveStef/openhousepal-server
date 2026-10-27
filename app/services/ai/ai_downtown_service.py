@@ -187,7 +187,8 @@ async def _downtown_picks(db, city: str, state: str, zipcode: Optional[str], can
 
     from app.services.usage_owner import current_usage_owner
     owner_id = current_usage_owner()
-    if owner_id and usage:
+    # No owner (a public page, a job): still written down - the platform paid (owner_id NULL).
+    if usage:
         from app.services.ai.ai_rate_limit_service import record_usage_event
         try:
             await record_usage_event(db, owner_id, None, usage["model"], usage["input"], usage["output"], round(cost, 5), usage["searches"],

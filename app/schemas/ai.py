@@ -184,6 +184,9 @@ class AIAdminOverview(BaseModel):
     total_cost_month_usd: float
     total_cost_today_usd: float = 0.0
     total_cost_all_time_usd: float
+    # CMA (comp analysis + final valuation + recompute) - the real cost rows, Eastern day/month.
+    cma_cost_today_usd: float = 0.0
+    cma_cost_month_usd: float = 0.0
     messages_month: int
     active_agents_30d: int
     blocked_count_month: int

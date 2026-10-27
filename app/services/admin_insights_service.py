@@ -162,7 +162,9 @@ async def overview(db: AsyncSession, days: int) -> dict:
     active_series = {b: len({u for u, d in active_rows if b <= d < b + timedelta(days=step)}) for b in buckets}
     joined = await _count_series(db, m.User.created_at, unit, since, m.User.id.in_(ids))
 
-    signins = await _count_series(db, m.OpenHouseVisitor.created_at, unit, since)
+    signins = await _count_series(db, m.OpenHouseVisitor.created_at, unit, since, m.OpenHouseEvent.is_deleted.isnot(True),
+                                  m.OpenHouseEvent.agent_id.in_(ids),
+                                  joins=[(m.OpenHouseEvent, m.OpenHouseEvent.id == m.OpenHouseVisitor.open_house_event_id)])
     showcases = await _count_series(db, m.Collection.created_at, unit, since)
     leads = await _count_series(db, m.Lead.created_at, unit, since)
     guest = await _count_series(db, m.LeadEvent.occurred_at, unit, since, m.LeadEvent.source_type.in_(SHOWCASE_GUEST_EVENTS))
@@ -181,7 +183,7 @@ async def overview(db: AsyncSession, days: int) -> dict:
         "agents": {
             "total": len(agents), "joined": sum(joined.values()),
             "active_today": active_within(1), "active_7": active_within(7), "active_30": active_within(30),
-            "active_in_period": len({u for u, d in active_rows if not since or d >= since.astimezone(_eastern()).date()}),
+            "active_in_period": len({u for u, d in active_rows if not since or d > since.astimezone(_eastern()).date()}),  # N days incl. today
             "paying": statuses.count("ACTIVE"), "trial": statuses.count("TRIAL"),
             "cancelled": sum(1 for s in statuses if s in ("CANCELLED", "EXPIRED", "SUSPENDED")),
             "plans": plans,
@@ -207,7 +209,7 @@ async def signins(db: AsyncSession, days: int) -> dict:
 
     rows = (await db.execute(
         select(E.agent_id, V.signin_seconds, V.signin_mode, V.signin_device, V.has_agent, V.lead_id, func.timezone(TZ, V.created_at))
-        .join(E, E.id == V.open_house_event_id).where(_in(V.created_at, since))
+        .join(E, E.id == V.open_house_event_id).where(_in(V.created_at, since), E.is_deleted.isnot(True))
     )).all()
     views = await _by_owner(db, select(E.agent_id, func.count()).select_from(W).join(E, E.id == W.open_house_event_id)
                             .where(_in(W.created_at, since)).group_by(E.agent_id))
@@ -238,7 +240,7 @@ async def signins(db: AsyncSession, days: int) -> dict:
     held: dict[str, list] = {}
     for uid, sched, created, n in oh_rows:
         d = sched or (created.astimezone(_eastern()).date() if created else today)
-        if d <= today and (start_day is None or d >= start_day):
+        if d <= today and (start_day is None or d > start_day):
             held.setdefault(uid, []).append(n)
     showcases_from_oh = (await db.execute(select(func.count()).select_from(m.Collection).where(
         m.Collection.original_open_house_event_id.isnot(None), _in(m.Collection.created_at, since)))).scalar() or 0
@@ -551,7 +553,7 @@ async def tools(db: AsyncSession, days: int) -> dict:
 
     active = await _by_owner(db, select(m.AgentActiveDay.user_id, func.count()).where(
         m.AgentActiveDay.user_id.in_(ids) if ids else true(),
-        m.AgentActiveDay.day >= since.astimezone(_eastern()).date() if since else true()).group_by(m.AgentActiveDay.user_id))
+        m.AgentActiveDay.day > since.astimezone(_eastern()).date() if since else true()).group_by(m.AgentActiveDay.user_id))
     first = (await db.execute(select(func.min(m.AgentActiveDay.day)))).scalar()
     buckets = _buckets(days, now, first)
     action_series: dict[date, int] = {}
@@ -583,8 +585,10 @@ async def guests(db: AsyncSession, days: int) -> dict:
     agents = await _agent_map(db)
     H, PV, PW, B, L, S = m.AgentHubEvent, m.PropertyWebsiteView, m.PropertyWebsite, m.BlogEvent, m.LeadEvent, m.FormViewSession
 
-    hub = dict((await db.execute(select(H.event_type, func.count()).where(_in(H.created_at, since)).group_by(H.event_type))).all())
-    hub_unique = (await db.execute(select(func.count(distinct(H.visitor_id))).where(H.event_type == "visit", _in(H.created_at, since)))).scalar() or 0
+    hub = dict((await db.execute(select(H.event_type, func.count()).where(_in(H.created_at, since), H.owner_id.in_(list(agents)))
+                                 .group_by(H.event_type))).all())
+    hub_unique = (await db.execute(select(func.count(distinct(H.visitor_id))).where(H.event_type == "visit", _in(H.created_at, since),
+                                                                                  H.owner_id.in_(list(agents))))).scalar() or 0
     spot = (await db.execute(select(func.count(), func.count(distinct(PV.visitor_id))).where(_in(PV.created_at, since)))).one()
     blog = dict((await db.execute(select(B.event_type, func.count()).where(_in(B.created_at, since)).group_by(B.event_type))).all())
     form = (await db.execute(select(func.count(), func.count(S.started_at), func.count(S.completed_at)).where(_in(S.created_at, since)))).one()

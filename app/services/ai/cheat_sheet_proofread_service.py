@@ -199,7 +199,8 @@ async def _review(db, home: str, lists: dict[str, list], backups: dict[str, list
         except Exception:  # noqa: BLE001
             logger.warning("cheat sheet proofread budget reconcile failed", exc_info=True)
 
-    if owner_id and usage:
+    # No owner: still written down - the platform paid (owner_id NULL, on no agent's bar).
+    if usage:
         try:
             await record_usage_event(db, owner_id, None, usage["model"], usage["input"], usage["output"], round(cost, 5), usage["searches"],
                                      False, None, tool_names=["cheat_sheet_proofread"], event_type=EVENT_TYPE)

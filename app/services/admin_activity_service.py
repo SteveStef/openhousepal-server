@@ -142,7 +142,15 @@ def _admin_email() -> str:
 
 
 async def _agents(db: AsyncSession) -> list:
-    return list((await db.execute(select(m.User).where(m.User.email != _admin_email()))).scalars().all())
+    # Real agents only: not the admin, and not an admin-made test copy of an agent (owner 10/27 -
+    # Lori, the copy of Peter, made Admin say 5 agents / 5 paying when there are 4).
+    return list((await db.execute(select(m.User).where(
+        m.User.email != _admin_email(), m.User.test_copy_of_user_id.is_(None)))).scalars().all())
+
+
+def _today_eastern() -> date:
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York")).date()
 
 
 async def _feature_stats(db: AsyncSession, f: Feature, now: datetime, agent_id: Optional[str] = None) -> dict[str, dict]:
@@ -175,9 +183,10 @@ async def _open_house_stats(db: AsyncSession, agent_id: Optional[str] = None) ->
     """Per agent: open houses, how many have already happened, how many of those got sign-ins."""
     visitors = (select(m.OpenHouseVisitor.open_house_event_id.label("oh"), func.count().label("n"))
                 .group_by(m.OpenHouseVisitor.open_house_event_id).subquery())
-    today = date.today()
+    today = _today_eastern()
+    # Deleted open houses don't count (they did here but not on Insights, so the two disagreed).
     q = (select(m.OpenHouseEvent.agent_id, m.OpenHouseEvent.scheduled_date, m.OpenHouseEvent.created_at, func.coalesce(visitors.c.n, 0))
-         .outerjoin(visitors, visitors.c.oh == m.OpenHouseEvent.id))
+         .outerjoin(visitors, visitors.c.oh == m.OpenHouseEvent.id).where(m.OpenHouseEvent.is_deleted.isnot(True)))
     if agent_id:
         q = q.where(m.OpenHouseEvent.agent_id == agent_id)
     out: dict[str, dict] = {}
@@ -247,22 +256,27 @@ async def overview_and_agents(db: AsyncSession) -> dict:
         })
 
     adoption = []
+    agent_ids = {a.id for a in agents}
     for f in FEATURES:
         st = stats[f.key]
-        statuses = [feature_status(v["total"], v["last_at"], v["weeks_8"], now) for uid, v in st.items() if uid in {a.id for a in agents}]
+        statuses = [feature_status(v["total"], v["last_at"], v["weeks_8"], now) for uid, v in st.items() if uid in agent_ids]
         adoption.append({
             "key": f.key, "label": f.label, "group": f.group, "kind": f.kind,
-            "agents_ever": len(statuses), "agents_30": sum(1 for s in statuses if s in ("regular", "recent")),
+            # "this month" = really used it in the last 30 days ("regular" alone can be 0 uses lately)
+            "agents_ever": len(statuses), "agents_30": sum(1 for uid, v in st.items() if uid in agent_ids and v["last_30"]),
             "regular": statuses.count("regular"), "once": statuses.count("once"), "stopped": statuses.count("stopped"),
-            "uses_30": sum(v["last_30"] for uid, v in st.items()),
+            "uses_30": sum(v["last_30"] for uid, v in st.items() if uid in agent_ids),
         })
     seen = [r["last_seen_at"] for r in rows]
     within = lambda d: sum(1 for s in seen if s and (now - s).days < d)
+    from zoneinfo import ZoneInfo
+    today_et = _today_eastern()
+    in_today = sum(1 for s in seen if s and s.astimezone(ZoneInfo("America/New_York")).date() == today_et)  # today, Eastern - not the last 24 hours
     all_oh = [r["open_houses"] for r in rows]
     return {
         "generated_at": now,
         "totals": {
-            "agents": len(rows), "active_today": within(1), "active_7": within(7), "active_30": within(30),
+            "agents": len(rows), "active_today": in_today, "active_7": within(7), "active_30": within(30),
             "paying": sum(1 for r in rows if (r["subscription_status"] or "").upper() == "ACTIVE"),
             "open_houses_held": sum(o["held"] for o in all_oh), "open_houses_with_signins": sum(o["held_with_signins"] for o in all_oh),
             "signins": sum(o["signins"] for o in all_oh), "leads_30": sum(r["leads_30"] for r in rows),
@@ -298,7 +312,7 @@ async def agent_detail(db: AsyncSession, agent_id: str) -> Optional[dict]:
         .where(m.OpenHouseEvent.agent_id == agent_id)
         .order_by(func.coalesce(cast(m.OpenHouseEvent.scheduled_date, Date), cast(m.OpenHouseEvent.created_at, Date)).desc())
     )).all()
-    today = date.today()
+    today = _today_eastern()
     open_houses = [{
         "id": oh.id, "address": _street(oh.address) or "Open house", "city": (oh.city or "").title() or None,
         "date": oh.scheduled_date or (oh.created_at.date() if oh.created_at else None),

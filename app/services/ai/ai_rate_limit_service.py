@@ -689,7 +689,7 @@ def classify_provider_error(exc: Exception) -> str:
 
 async def record_usage_event(
     db: AsyncSession,
-    owner_id: str,
+    owner_id: Optional[str],
     conversation_id: Optional[str],
     model: Optional[str],
     input_tokens: Optional[int],

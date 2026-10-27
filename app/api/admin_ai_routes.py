@@ -12,9 +12,10 @@ at the model layer.
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.logging import get_logger
@@ -98,8 +99,86 @@ _PROVIDER_FAILURE_REASONS = {
 }
 
 
+_ET = ZoneInfo("America/New_York")
+
+# The rest of event_type -> vendor (the dict above predates these features).
+_EVENT_TYPE_PROVIDER.update({
+    "area_fair_housing": "anthropic", "cma_ai_recompute": "anthropic",
+    "studio_media_image": "openai", "studio_media_video": "fal",
+    "external_api": "google", "explore_nearby": "google_places",
+})
+
+_CMA_EVENT_TYPES = ("cma_ai", "cma_reasoning", "cma_ai_recompute")
+
+# Blocked rows whose numbers are a guess made BEFORE a call that never happened - not money spent.
+# Every other blocked row that carries tokens/cost was really paid for (a blog run refunded to the
+# agent, a chat turn that errored part-way, area research that came back empty).
+_NOT_SPENT_REASONS = ("cma_cost_cap",)
+
+# Not "calls we stopped": the run happened and its cost was handed back to the agent.
+_NOT_A_BLOCK_REASONS = ("refunded_failed_run",)
+
+
 def _month_start(now: datetime) -> datetime:
-    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    """The 1st of this month, midnight Eastern (the owner's month), as a UTC-comparable time."""
+    return now.astimezone(_ET).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def _day_start(now: datetime) -> datetime:
+    return now.astimezone(_ET).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _real_cost(config: dict):
+    """What one ai_usage_events row really cost us. Owner 10/27: Admin's site spend read ~$9
+    while CMA alone was ~$20 - every live row written before 2026-10-23 21:39 UTC had its cost
+    set to $0 afterwards (tokens kept), refunded blog runs were left out as "blocked", and the
+    CMA cap's pre-call guess was counted as spend. So: the saved cost; when that's $0 but the row
+    has tokens, the same price the code would have charged (model_pricing, which reproduces every
+    non-zeroed CMA row to the cent); $0 for a guess."""
+    priced_back = [
+        (AIUsageEvent.model == model,
+         func.coalesce(AIUsageEvent.input_tokens, 0) * (float(p["input_per_mtok"]) / 1_000_000)
+         + func.coalesce(AIUsageEvent.output_tokens, 0) * (float(p["output_per_mtok"]) / 1_000_000))
+        for model, p in (config.get("model_pricing") or {}).items()
+        if isinstance(p, dict) and "input_per_mtok" in p and "output_per_mtok" in p
+    ]
+    stored = func.coalesce(AIUsageEvent.estimated_cost_usd, 0.0)
+    return case(
+        (AIUsageEvent.block_reason.in_(_NOT_SPENT_REASONS), 0.0),
+        (stored > 0, stored),
+        *priced_back,
+        else_=0.0,
+    )
+
+
+def _spent(config: dict, *where):
+    total = func.sum(_real_cost(config))
+    return func.coalesce(total.filter(*where) if where else total, 0.0)
+
+
+def _a_real_block():
+    return and_(AIUsageEvent.blocked.is_(True),
+                or_(AIUsageEvent.block_reason.is_(None), AIUsageEvent.block_reason.notin_(_NOT_A_BLOCK_REASONS)))
+
+
+async def _places_spend(db: AsyncSession) -> dict:
+    """Explore Nearby (Google Places for visitors on agents' pages) - not on any agent's bar, so it
+    has no ai_usage_events row; its cost lives only in the places_* budget counters (UTC days)."""
+    day_key, month_key = datetime.now(timezone.utc).date().isoformat(), datetime.now(timezone.utc).strftime("%Y-%m")
+    out = {"day": 0.0, "month": 0.0, "all": 0.0}
+    rows = (await db.execute(
+        select(UsageBudgetCounter.period_type, UsageBudgetCounter.period_key, UsageBudgetCounter.cost_micros)
+        .where(UsageBudgetCounter.bucket.in_(("places_search", "places_details")))
+    )).all()
+    for period_type, period_key, micros in rows:
+        usd = micros_to_usd(micros or 0)
+        if period_type == "month":
+            out["all"] += usd
+            if period_key == month_key:
+                out["month"] += usd
+        elif period_key == day_key:
+            out["day"] += usd
+    return out
 
 
 async def _top_consumers(db: AsyncSession, kind: str, limit_usd: float, limit: int = 5) -> List[AIAdminTopConsumer]:
@@ -142,16 +221,16 @@ async def _agent_site_spend(db: AsyncSession, owner_id: str, config: dict) -> di
     }
 
 
-async def _cost_by_type(db: AsyncSession, since: datetime, owner_id: Optional[str] = None) -> dict:
+async def _cost_by_type(db: AsyncSession, since: datetime, config: dict, owner_id: Optional[str] = None) -> dict:
     stmt = (
-        select(AIUsageEvent.event_type, func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0.0))
-        .where(AIUsageEvent.blocked.is_(False), AIUsageEvent.created_at >= since)
+        select(AIUsageEvent.event_type, _spent(config))
+        .where(AIUsageEvent.created_at >= since)
         .group_by(AIUsageEvent.event_type)
     )
     if owner_id:
         stmt = stmt.where(AIUsageEvent.owner_id == owner_id)
     result = await db.execute(stmt)
-    return {event_type: float(cost) for event_type, cost in result.all()}
+    return {event_type: float(cost) for event_type, cost in result.all() if float(cost or 0) > 0}
 
 
 async def _call_counts_by_type(db: AsyncSession, since: datetime) -> dict:
@@ -192,16 +271,20 @@ async def _recent_provider_failures(db: AsyncSession, since: datetime, limit: in
     ]
 
 
-async def _monthly_trend(db: AsyncSession, owner_id: str, months: int = 12) -> List[AIAdminMonthlyPoint]:
-    """Last `months` calendar months of this agent's AI cost/message count, oldest first - the
-    "what have they been doing, month over month" history the 30-day daily_trend can't show
-    once a month rolls off that window."""
+def _eastern(col):
+    return func.timezone("America/New_York", col)
+
+
+async def _monthly_trend(db: AsyncSession, owner_id: str, config: dict, months: int = 12) -> List[AIAdminMonthlyPoint]:
+    """Last `months` calendar months (Eastern) of this agent's AI cost/message count, oldest
+    first - the "what have they been doing, month over month" history the 30-day daily_trend
+    can't show once a month rolls off that window."""
     since = _month_start(datetime.now(timezone.utc)) - timedelta(days=31 * (months - 1))
     since = since.replace(day=1)
-    month = func.to_char(AIUsageEvent.created_at, 'YYYY-MM').label('month')
+    month = func.to_char(_eastern(AIUsageEvent.created_at), 'YYYY-MM').label('month')
     stmt = (
-        select(month, func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0.0), func.count(AIUsageEvent.id))
-        .where(AIUsageEvent.blocked.is_(False), AIUsageEvent.owner_id == owner_id, AIUsageEvent.created_at >= since)
+        select(month, _spent(config), func.count(AIUsageEvent.id).filter(AIUsageEvent.blocked.is_(False)))
+        .where(AIUsageEvent.owner_id == owner_id, AIUsageEvent.created_at >= since)
         .group_by(month)
         .order_by(month)
     )
@@ -209,11 +292,11 @@ async def _monthly_trend(db: AsyncSession, owner_id: str, months: int = 12) -> L
     return [AIAdminMonthlyPoint(month=m, cost_usd=float(c), messages=int(n)) for m, c, n in result.all()]
 
 
-async def _daily_trend(db: AsyncSession, since: datetime, owner_id: Optional[str] = None) -> List[AIAdminDailyPoint]:
-    day = func.date_trunc('day', AIUsageEvent.created_at).label('day')
+async def _daily_trend(db: AsyncSession, since: datetime, config: dict, owner_id: Optional[str] = None) -> List[AIAdminDailyPoint]:
+    day = func.date_trunc('day', _eastern(AIUsageEvent.created_at)).label('day')
     stmt = (
-        select(day, func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0.0), func.count(AIUsageEvent.id))
-        .where(AIUsageEvent.blocked.is_(False), AIUsageEvent.created_at >= since)
+        select(day, _spent(config), func.count(AIUsageEvent.id).filter(AIUsageEvent.blocked.is_(False)))
+        .where(AIUsageEvent.created_at >= since)
         .group_by(day)
         .order_by(day)
     )
@@ -233,29 +316,26 @@ async def get_ai_overview(
 ):
     try:
         now = datetime.now(timezone.utc)
-        month_start = _month_start(now)
+        month_start = _month_start(now)   # Eastern, like the rest of Admin
+        day_start = _day_start(now)
         window_30d = now - timedelta(days=30)
+        config = await ai_config_service.get_config(db)
 
-        month_cost, month_messages = (
+        # Every cost row counts (blocked ones too - a refunded run was still paid for), priced by
+        # _real_cost; plus Explore Nearby, which only the Places counters record.
+        month_cost, month_messages, today_cost, all_time_cost, cma_month, cma_today = (
             await db.execute(
-                select(func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0.0), func.count(AIUsageEvent.id))
-                .where(AIUsageEvent.blocked.is_(False), AIUsageEvent.created_at >= month_start)
+                select(
+                    _spent(config, AIUsageEvent.created_at >= month_start),
+                    func.count(AIUsageEvent.id).filter(AIUsageEvent.blocked.is_(False), AIUsageEvent.created_at >= month_start),
+                    _spent(config, AIUsageEvent.created_at >= day_start),
+                    _spent(config),
+                    _spent(config, AIUsageEvent.created_at >= month_start, AIUsageEvent.event_type.in_(_CMA_EVENT_TYPES)),
+                    _spent(config, AIUsageEvent.created_at >= day_start, AIUsageEvent.event_type.in_(_CMA_EVENT_TYPES)),
+                )
             )
         ).first()
-
-        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_cost = (
-            await db.execute(
-                select(func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0.0))
-                .where(AIUsageEvent.blocked.is_(False), AIUsageEvent.created_at >= day_start)
-            )
-        ).scalar_one()
-
-        all_time_cost = (
-            await db.execute(
-                select(func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0.0)).where(AIUsageEvent.blocked.is_(False))
-            )
-        ).scalar_one()
+        places = await _places_spend(db)
 
         active_agents = (
             await db.execute(
@@ -265,30 +345,30 @@ async def get_ai_overview(
 
         blocked_month = (
             await db.execute(
-                select(func.count(AIUsageEvent.id)).where(AIUsageEvent.blocked.is_(True), AIUsageEvent.created_at >= month_start)
+                select(func.count(AIUsageEvent.id)).where(_a_real_block(), AIUsageEvent.created_at >= month_start)
             )
         ).scalar_one()
 
         reason_rows = (
             await db.execute(
                 select(AIUsageEvent.block_reason, func.count(AIUsageEvent.id))
-                .where(AIUsageEvent.blocked.is_(True), AIUsageEvent.created_at >= month_start)
+                .where(_a_real_block(), AIUsageEvent.created_at >= month_start)
                 .group_by(AIUsageEvent.block_reason)
                 .order_by(func.count(AIUsageEvent.id).desc())
                 .limit(5)
             )
         ).all()
 
-        cost_by_type_month = await _cost_by_type(db, month_start)
+        cost_by_type_month = await _cost_by_type(db, month_start, config)
+        if places["month"] > 0:
+            cost_by_type_month["explore_nearby"] = places["month"]
         call_counts_month = await _call_counts_by_type(db, month_start)
         cost_by_provider_month: dict = {}
         for event_type, cost in cost_by_type_month.items():
             provider = _EVENT_TYPE_PROVIDER.get(event_type, "other")
             cost_by_provider_month[provider] = cost_by_provider_month.get(provider, 0.0) + cost
 
-        config = await ai_config_service.get_config(db)
         global_budget_status: List[AIAdminBudgetStatus] = []
-        google_places_month_cost = 0.0
         for bucket, label, day_cost_key, month_cost_key, day_count_key, month_count_key in _BUDGET_BUCKETS:
             snapshot = await usage_snapshot(db, bucket)
             status_entry = AIAdminBudgetStatus(
@@ -313,10 +393,7 @@ async def get_ai_overview(
                 status_entry.day_count_limit = config.get(day_count_key) if day_count_key else None
                 status_entry.month_count = snapshot["month_count"]
                 status_entry.month_count_limit = config.get(month_count_key) if month_count_key else None
-                google_places_month_cost += snapshot["month_cost_usd"]
             global_budget_status.append(status_entry)
-        if google_places_month_cost:
-            cost_by_provider_month["google_places"] = google_places_month_cost
         # Every kind of Google Maps call against its free monthly allowance - calls stop at the
         # line and wait for the 1st (google_free_tier.py, owner 10/26).
         from app.services import google_free_tier
@@ -334,14 +411,16 @@ async def get_ai_overview(
         top_consumers.sort(key=lambda c: c.spent_today_usd, reverse=True)
 
         return AIAdminOverview(
-            total_cost_month_usd=float(month_cost or 0.0),
-            total_cost_today_usd=float(today_cost or 0.0),
-            total_cost_all_time_usd=float(all_time_cost or 0.0),
+            total_cost_month_usd=float(month_cost or 0.0) + places["month"],
+            total_cost_today_usd=float(today_cost or 0.0) + places["day"],
+            total_cost_all_time_usd=float(all_time_cost or 0.0) + places["all"],
+            cma_cost_month_usd=float(cma_month or 0.0),
+            cma_cost_today_usd=float(cma_today or 0.0),
             messages_month=int(month_messages or 0),
             active_agents_30d=int(active_agents or 0),
             blocked_count_month=int(blocked_month or 0),
             top_block_reasons=[{"reason": r or "unknown", "count": int(c)} for r, c in reason_rows],
-            daily_trend_30d=await _daily_trend(db, window_30d),
+            daily_trend_30d=await _daily_trend(db, window_30d, config),
             cost_by_type_month=cost_by_type_month,
             cost_by_provider_month=cost_by_provider_month,
             global_budget_status=global_budget_status,
@@ -362,6 +441,7 @@ async def list_agent_ai_usage(
     try:
         now = datetime.now(timezone.utc)
         since = _month_start(now) if period == "month" else datetime(2000, 1, 1, tzinfo=timezone.utc)
+        config = await ai_config_service.get_config(db)
 
         stmt = (
             select(
@@ -369,23 +449,22 @@ async def list_agent_ai_usage(
                 UserModel.first_name,
                 UserModel.last_name,
                 UserModel.email,
-                func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0.0),
+                _spent(config),
                 func.count(AIUsageEvent.id).filter(AIUsageEvent.blocked.is_(False)),
                 func.coalesce(func.sum(AIUsageEvent.tool_call_count), 0),
-                func.count(AIUsageEvent.id).filter(AIUsageEvent.blocked.is_(True)),
+                func.count(AIUsageEvent.id).filter(_a_real_block()),
                 func.max(AIUsageEvent.created_at),
             )
             .join(UserModel, UserModel.id == AIUsageEvent.owner_id)
             .where(AIUsageEvent.created_at >= since)
             .group_by(AIUsageEvent.owner_id, UserModel.first_name, UserModel.last_name, UserModel.email)
-            .order_by(func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0.0).desc())
+            .order_by(_spent(config).desc())
         )
         rows = (await db.execute(stmt)).all()
         # Scoped to agents with AI feature usage (the join above) - an agent whose only spend is
         # IDX-site Explore Nearby traffic and who has never used chat/CMA AI/etc won't appear
         # here, since there'd be nothing else to show on this particular leaderboard. Their site
         # spend is still fully tracked (usage_budget_counters) and enforced regardless.
-        config = await ai_config_service.get_config(db)
         return [
             AIAdminAgentSummary(
                 owner_id=owner_id,
@@ -416,13 +495,14 @@ async def get_agent_ai_usage_detail(
         if not user:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
 
+        config = await ai_config_service.get_config(db)
         totals = (
             await db.execute(
                 select(
-                    func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0.0),
+                    _spent(config),
                     func.count(AIUsageEvent.id).filter(AIUsageEvent.blocked.is_(False)),
                     func.coalesce(func.sum(AIUsageEvent.tool_call_count), 0),
-                    func.count(AIUsageEvent.id).filter(AIUsageEvent.blocked.is_(True)),
+                    func.count(AIUsageEvent.id).filter(_a_real_block()),
                     func.max(AIUsageEvent.created_at),
                 ).where(AIUsageEvent.owner_id == owner_id)
             )
@@ -437,7 +517,6 @@ async def get_agent_ai_usage_detail(
             tool_usage.update(names or [])
 
         window_30d = datetime.now(timezone.utc) - timedelta(days=30)
-        config = await ai_config_service.get_config(db)
 
         return AIAdminAgentDetail(
             owner_id=owner_id,
@@ -448,10 +527,10 @@ async def get_agent_ai_usage_detail(
             tool_calls=int(tool_calls or 0),
             blocked_count=int(blocked or 0),
             last_active=last_active,
-            daily_trend=await _daily_trend(db, window_30d, owner_id=owner_id),
-            monthly_trend=await _monthly_trend(db, owner_id),
+            daily_trend=await _daily_trend(db, window_30d, config, owner_id=owner_id),
+            monthly_trend=await _monthly_trend(db, owner_id, config),
             tool_usage=dict(tool_usage),
-            cost_by_type=await _cost_by_type(db, datetime(2000, 1, 1, tzinfo=timezone.utc), owner_id=owner_id),
+            cost_by_type=await _cost_by_type(db, datetime(2000, 1, 1, tzinfo=timezone.utc), config, owner_id=owner_id),
             **await _agent_site_spend(db, owner_id, config),
         )
     except HTTPException:

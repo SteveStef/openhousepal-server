@@ -162,6 +162,24 @@ async def reconcile(db: AsyncSession, reservation: Reservation, actual_cost_usd:
         logger.warning("Usage budget reconciliation failed", extra={"buckets": reservation.buckets, "error": str(exc)})
 
 
+async def add_spend(db: AsyncSession, buckets: list[str], cost_usd: float) -> None:
+    """Adds money already spent to today's/this month's running totals, no limit check - for a
+    follow-up call made after the reservation was settled (the CMA's comp-note rewrites), which
+    used to be on the AI cost record but missing from these totals. Never raises."""
+    cost_micros = usd_to_micros(cost_usd)
+    if cost_micros <= 0:
+        return
+    day_key, month_key = _period_keys()
+    try:
+        for bucket in buckets:
+            for period_type, period_key in (("day", day_key), ("month", month_key)):
+                await reserve_bucket(db, bucket, period_type, period_key, 0, cost_micros, None, None)
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        logger.warning("Usage budget add_spend failed", extra={"buckets": buckets, "error": str(exc)})
+
+
 async def usage_snapshot(db: AsyncSession, bucket: str, now: Optional[datetime] = None) -> dict:
     """Current day+month count/cost for one bucket - for admin reporting only, not used for
     any gating decision (reserve() is the sole source of truth for that)."""
