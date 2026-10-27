@@ -3191,7 +3191,14 @@ def _nice_case(text: Optional[str]) -> str:
     t = (text or "").strip()
     if not t or not t.isupper():
         return t
-    return " ".join(w.lower() if w[:1].isdigit() else w.capitalize() for w in t.split())
+    # Units: "#RETAIL" -> "#Retail", "#111A" stays "#111A" (str.capitalize lowered all of it).
+    def word(w: str) -> str:
+        if w[:1].isdigit():
+            return w.lower()
+        if w[:1] == "#":
+            return w if w[1:2].isdigit() else "#" + w[1:].capitalize()
+        return w.capitalize()
+    return " ".join(word(w) for w in t.split())
 
 
 def display_address(street: Optional[str], city: Optional[str] = None, state: Optional[str] = None) -> tuple[str, str]:
