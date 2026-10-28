@@ -21,6 +21,7 @@ from app.schemas.site import (
 from app.services.areas import area_enrichment_service, boundary_sources, geocoding
 from app.services.usage_owner import bill_to
 from app.services.website import content_adapters, domain_resolution_service, domain_verification_service, google_search_service, site_service, starter_template
+from app.services.sales_wording import sales_are_recent
 from app.services.website.site_service import InvalidHostname
 from app.utils.auth import get_current_active_user, require_active_plan, require_plan_tier
 
@@ -226,7 +227,9 @@ async def get_my_seo_pages(
         logger.warning("SEO pages: featured listings lookup failed", exc_info=True)
         featured = []
     return {
-        "agent": {k: profile.get(k) for k in ("name", "brokerage", "market", "phone", "title", "bio")},
+        "agent": {**{k: profile.get(k) for k in ("name", "brokerage", "market", "phone", "title", "bio")},
+                  # "recently sold" vs "sold" in the Sold page's Google wording (the $50M rule)
+                  "sales_recent": sales_are_recent((await content_adapters.get_agent_stats(db, current_user)).get("sold_volume"))},
         "areas": await content_adapters.get_served_areas_summary(db, current_user, 50, with_stats=True),
         "posts": [{
             "id": b.id, "slug": b.slug, "title": b.title, "subtitle": b.subtitle,

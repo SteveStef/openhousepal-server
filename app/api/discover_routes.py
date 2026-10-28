@@ -27,6 +27,8 @@ class DiscoveryPropertyResponse(BaseModel):
     Zipcode: str
     Price: str
     Image: str
+    # A few more listing photos so a card can be flipped through without opening it (user, 10/27).
+    Photos: List[str] = []
     Beds: int
     Baths: int
     SquareFeet: int
@@ -95,6 +97,93 @@ class GetDiscoveryResponse(BaseModel):
     success: bool
     data: List[DiscoveryPropertyResponse]
     preferences: Optional[DiscoveryPreferencesResponse] = None
+
+# Photos sent per Discovery card - enough to flip through, small enough for 50 cards.
+_CARD_PHOTOS = 10
+
+
+class DiscoveryAgentSuggestion(BaseModel):
+    name: str
+    office: Optional[str] = None
+    listings: int
+
+
+@router.get("/api/discovery/agents", dependencies=[Depends(require_broker_authorization)])
+async def suggest_discovery_agents(
+    q: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_mls_access),
+):
+    """Agents to pick in Discovery's Exclude / Only Show filter: the ones who have listed homes in
+    the areas this agent serves (their Areas towns, plus the area their Discovery search covers),
+    busiest first. Unlike the old list (agents in the current results), it stays full after an
+    agent is picked - Only Show one agent used to leave nobody else to suggest (user, 10/27)."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from app.models.database import AgentMarketArea, MarketArea
+
+    prefs = (await db.execute(
+        select(DiscoveryPreferences).where(DiscoveryPreferences.user_id == current_user.id)
+    )).scalar_one_or_none()
+
+    area = []
+    zips = set()
+    for codes in (await db.execute(
+        select(MarketArea.zip_codes).join(AgentMarketArea, AgentMarketArea.area_id == MarketArea.id)
+        .where(AgentMarketArea.owner_id == current_user.id)
+    )).scalars().all():
+        zips |= {str(z).strip()[:5] for z in (codes or []) if z}
+    if zips:
+        area.append(Property.zipcode.in_(sorted(zips)))
+    if prefs and prefs.latitude is not None and prefs.longitude is not None and prefs.miles:
+        lat_off, lon_off = get_lat_long_offsets(prefs.latitude, prefs.miles)
+        area.append(and_(
+            Property.latitude.between(float(prefs.latitude) - lat_off, float(prefs.latitude) + lat_off),
+            Property.longitude.between(float(prefs.longitude) - lon_off, float(prefs.longitude) + lon_off),
+            distance_miles_sql(Property.latitude, Property.longitude, float(prefs.latitude), float(prefs.longitude)) <= float(prefs.miles),
+        ))
+    if prefs and prefs.cities:
+        area.append(Property.city.in_([c.split(',')[0].strip() for c in prefs.cities]))
+    if prefs and prefs.school_districts:
+        area.append(Property.school_district_name.in_([d.split(',')[0].strip() for d in prefs.school_districts]))
+    if not area and current_user.mls_id:
+        # No Areas and no search area yet: the towns this agent has listed homes in themselves.
+        own_towns = (await db.execute(
+            select(Property.city).where(
+                or_(Property.list_agent_mls_id == current_user.mls_id, Property.co_list_agent_mls_id == current_user.mls_id),
+                Property.city.isnot(None),
+            ).distinct().limit(40)
+        )).scalars().all()
+        if own_towns:
+            area.append(Property.city.in_(own_towns))
+    if not area:
+        return {"success": True, "data": []}
+
+    filters = [
+        or_(*area),
+        Property.list_agent_full_name.isnot(None),
+        Property.list_agent_full_name != '',
+        Property.is_manual.is_(False),
+        # Listed in the last two years - agents still working the area, not one sale in 2019.
+        or_(Property.mls_list_date.is_(None), Property.mls_list_date >= _dt.now(_tz.utc) - _td(days=730)),
+    ]
+    if current_user.mls_id:
+        filters.append(or_(Property.list_agent_mls_id.is_(None), Property.list_agent_mls_id != current_user.mls_id))
+    if q and q.strip():
+        filters.append(Property.list_agent_full_name.ilike(f"%{q.strip()}%"))
+
+    n = func.count(Property.listing_key)
+    rows = (await db.execute(
+        select(Property.list_agent_full_name, func.max(Property.list_office_name), n)
+        .where(and_(*filters))
+        .group_by(Property.list_agent_full_name)
+        .order_by(n.desc(), Property.list_agent_full_name)
+        .limit(40)
+    )).all()
+    return {"success": True, "data": [
+        DiscoveryAgentSuggestion(name=name, office=office, listings=count).model_dump()
+        for name, office, count in rows
+    ]}
+
 
 @router.get("/api/discovery", response_model=GetDiscoveryResponse, dependencies=[Depends(require_broker_authorization)])
 async def get_discovery(
@@ -323,6 +412,7 @@ async def get_discovery(
                 Zipcode=str(p.zipcode) if p.zipcode is not None else "",
                 Price=f"${int(p.price):,}" if p.price is not None else "$0",
                 Image=str(p.img_src) if p.img_src is not None else "",
+                Photos=[str(u) for u in (p.photos or [])[:_CARD_PHOTOS] if u],
                 Beds=int(p.bedrooms) if p.bedrooms is not None else 0,
                 Baths=int(p.bathrooms) if p.bathrooms is not None else 0,
                 SquareFeet=int(p.living_area) if p.living_area is not None else 0,

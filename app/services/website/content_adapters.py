@@ -2294,6 +2294,10 @@ async def hydrate_page_blocks(db: AsyncSession, user: User, page: dict, featured
             # Source + override: real profile data first, then the agent's website-only field
             # overrides (see SiteBlockType docstring) layered on top, never mutating AgentHub.
             overrides = {k: v for k, v in (data.get("overrides") or {}).items() if v}
+            # A website-only phone is the number for Text too - the profile's own texting number
+            # kept winning, so "Different phone" only moved the Call button (10/27 audit).
+            if overrides.get("phone") and not overrides.get("text_phone"):
+                overrides["text_phone"] = overrides["phone"]
             data["resolved"] = {**profile, **overrides, "stats": stats_shown(agent_stats, await hub_sales_rules(db, user))}
         elif block_type == "contact_cta" and profile:
             # A blank phone/email falls back to the agent's real profile, so a Contact Band added
@@ -2318,7 +2322,9 @@ async def hydrate_page_blocks(db: AsyncSession, user: User, page: dict, featured
                 data["resolved_suggestions"] = hero_suggestions
             if profile and profile.get("market"):
                 data["resolved_market"] = profile["market"]
-            if data.get("photo_source_mode") == "auto":
+            # Anything but "manual" is the newest homes - same as the editor and HeroBlock read a
+            # header saved before this setting existed (it showed no homes at all - 10/27 audit).
+            if data.get("photo_source_mode") != "manual":
                 criteria = {
                     "price_min": data.get("photo_price_min"),
                     "price_max": data.get("photo_price_max"),

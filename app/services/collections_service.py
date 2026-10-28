@@ -463,6 +463,8 @@ class CollectionsService:
                         ),
                         'AssociationYN': prop.has_association,
                         'ListPictureURL': prop.img_src,
+                        # Up to 10 more photos so a card can be flipped through on a phone (user, 10/27).
+                        'Photos': [u for u in (prop.photos or [])[:10] if u],
                         'PublicRemarks': '',
                         'ModificationTimestamp': prop.modification_timestamp.isoformat() if prop.modification_timestamp else (prop.updated_at.isoformat() if prop.updated_at else None),
                         'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,
@@ -938,6 +940,8 @@ class CollectionsService:
                     ),
                     'AssociationYN': prop.has_association,
                     'ListPictureURL': prop.img_src,
+                    # Up to 10 more photos so a card can be flipped through on a phone (user, 10/27).
+                    'Photos': [u for u in (prop.photos or [])[:10] if u],
                     'PublicRemarks': '',
                     'ModificationTimestamp': prop.modification_timestamp.isoformat() if prop.modification_timestamp else (prop.updated_at.isoformat() if prop.updated_at else None),
                     'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,
@@ -1720,6 +1724,8 @@ class CollectionsService:
                     ),
                     'AssociationYN': prop.has_association,
                     'ListPictureURL': prop.img_src,
+                    # Up to 10 more photos so a card can be flipped through on a phone (user, 10/27).
+                    'Photos': [u for u in (prop.photos or [])[:10] if u],
                     'PublicRemarks': '',
                     'ModificationTimestamp': prop.modification_timestamp.isoformat() if prop.modification_timestamp else (prop.updated_at.isoformat() if prop.updated_at else None),
                     'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,
@@ -2230,6 +2236,8 @@ class CollectionsService:
                     ),
                     'AssociationYN': prop.has_association,
                     'ListPictureURL': prop.img_src,
+                    # Up to 10 more photos so a card can be flipped through on a phone (user, 10/27).
+                    'Photos': [u for u in (prop.photos or [])[:10] if u],
                     'PublicRemarks': '',
                     'ModificationTimestamp': prop.modification_timestamp.isoformat() if prop.modification_timestamp else (prop.updated_at.isoformat() if prop.updated_at else None),
                     'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,
