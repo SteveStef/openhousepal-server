@@ -499,6 +499,8 @@ HOSPITAL_NOT_GENERAL_NAME_KEYWORDS = [
     "eye hospital", "wills eye", "orthopaedic hospital", "orthopedic hospital", "surgical hospital",
     "heart hospital", "cancer", "skilled nursing", "nursing home", "animal", "pet hospital", "veterinary",
     "vet hospital", "equine", "nemours", "pediatric",
+    # a university's student clinic and a psychiatric crisis center aren't general hospitals (Philly grader 10/27)
+    "student health", "crisis response", "crisis center",
 ]
 # "\bchop\b": the Children's Hospital of Philadelphia's own name for its campuses ("CHOP King of
 # Prussia Hospital, Middleman Family Pavilion" - town page check 10/26, no "children's" in it).
@@ -957,7 +959,7 @@ def _is_legitimate_full_service_hospital(place: dict, medicare_confirmed: bool =
     medical_center, "Beebe Healthcare" with no hospital word in its name - which the name test below
     turned away (10-town test, 10/25: Rehoboth, Hagerstown and Winchester all lost their hospital)."""
     name_raw = _place_name(place)
-    name_lower = name_raw.lower()
+    name_lower = name_raw.lower().replace("’", "'")  # "Children’s Hospital" is still a children's hospital
     primary_type = _place_primary_type(place)
     types = set(place.get("types") or [])
     if not name_lower:

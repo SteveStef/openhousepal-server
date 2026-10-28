@@ -182,6 +182,12 @@ _OFFICE_NAME_RE = re.compile(r"\b(?:inc|llc|association|organization|foundation|
                              r"\b(?:cleaners|dry cleaning|laundromat)\b", re.IGNORECASE)
 
 
+_NOT_SHOPPING_TYPES = {"apartment_building", "apartment_complex", "condominium_complex", "housing_complex", "school",
+                       "primary_school", "secondary_school", "educational_institution", "preschool", "child_care_agency"}
+_NOT_SHOPPING_NAME_RE = re.compile(r"\b(apartments?|condominiums?|learning center|school)\b", re.IGNORECASE)
+_SHOPPING_CENTER_WORDS_RE = re.compile(r"shopping (?:center|centre|district|cluster|plaza)|\bmall\b|retail (?:center|plaza)", re.IGNORECASE)
+
+
 def _description_is_about(description: str, name: str, town: str = "") -> bool:
     """False when the research's sentence is plainly about another place ("Rehoboth Mall is a shopping
     center..." under the Main Street office's listing). A sentence with no named subject passes."""
@@ -214,6 +220,18 @@ def _city_of(address: str) -> Optional[str]:
     return None
 
 
+_JUNK_ADDRESS_PART_RE = re.compile(r"[~!]|#\d{5,}")
+
+
+def clean_address(address: Optional[str]) -> Optional[str]:
+    """Google's address with any garbled piece left out - its listing for two Philadelphia stations
+    reads "District of Freedom#8573311~!#, Philadelphia, PA 19144" (grader 10/27: Manayunk Station)."""
+    if not address:
+        return address
+    parts = [p.strip() for p in str(address).split(",") if p.strip() and not _JUNK_ADDRESS_PART_RE.search(p)]
+    return ", ".join(parts) or None
+
+
 def _maps_url(place: dict) -> str:
     return "https://www.google.com/maps/search/?api=1&query=" + quote_plus(f"{nas._place_name(place)} {place.get('formattedAddress') or ''}".strip())
 
@@ -236,6 +254,11 @@ def _rule_failure(category: str, entity: dict, place: dict) -> Optional[str]:
     if category in ("shopping", "restaurants", "grocery") and primary == "route":
         # A street, not the place: Wayne's "Louella" boutique came back as Louella Drive.
         return "a street, not a place (Google: Route)"
+    if category in ("shopping", "downtown_centers") and (primary in _NOT_SHOPPING_TYPES or _NOT_SHOPPING_NAME_RE.search(name)
+                                                         or primary in {"sandwich_shop", "deli", "meal_takeaway", "fast_food_restaurant"}):
+        # Philly grader 10/27: "Midtown Apartments" as a shopping district, "Strawberry Mansion Learning
+        # Center" as a shopping center, "Northeast Sandwich Co." as a retail plaza.
+        return f"not a place to shop (Google: {nas._place_type_label(place) or primary})"
     if category in ("shopping", "downtown_centers") and (primary in _OFFICE_TYPES or _OFFICE_NAME_RE.search(name)):
         # Rehoboth's "Rehoboth Mall" came back as "Rehoboth Beach Main Street Inc" - a nonprofit's office.
         return f"an office or service business, not a place to shop (Google: {nas._place_type_label(place) or primary})"
@@ -309,7 +332,7 @@ def _placed(entity: dict, place: dict, category: str) -> dict:
     name = google.name if google else entity.get("name")
     name = re.sub(r"\s*[,:]\s+(?:a|an|the)\s+[a-z].*$", "", name or "") or name  # "Chanticleer, a pleasure garden"
     out = {**entity, "name": name,
-           "lat": loc.get("latitude"), "lng": loc.get("longitude"), "address": place.get("formattedAddress"),
+           "lat": loc.get("latitude"), "lng": loc.get("longitude"), "address": clean_address(place.get("formattedAddress")),
            "google_checked": True}
     if name != entity.get("name"):
         out["research_name"] = entity.get("name")  # what the research called it - its description is about that
@@ -326,6 +349,10 @@ def _placed(entity: dict, place: dict, category: str) -> dict:
     if not out.get("source_url") or "/search" in str(out.get("source_url")) or "find_loc" in str(out.get("source_url")):
         out["source_url"] = _maps_url(place)  # a Yelp search page is not this place's source
     out.pop("distance_miles", None)
+    if category == "shopping" and _SHOPPING_CENTER_WORDS_RE.search(str(out.get("category") or "")) \
+            and nas._place_primary_type(place) not in {"shopping_mall", "outlet_store", "department_store", "market"}:
+        # The research called a single store a shopping center ("Penn Bookstore") - Google's own label.
+        out["category"] = nas._place_type_label(place) or "Store"
     if category == "transportation":
         # What Google knows it is - the research called Doylestown's train station a "Bus route".
         types = set(place.get("types") or []) | {nas._place_primary_type(place)}
@@ -356,7 +383,7 @@ async def _hospitals(client: httpx.AsyncClient, key: str, area: MarketArea) -> l
     for p in found[: TOWN_HOSPITALS + 2]:
         out.append({
             "name": p.name, "category": "HOSPITAL", "city": _city_of(p.address or ""), "lat": p.latitude, "lng": p.longitude,
-            "address": p.address, "relationship": "NEARBY", "source_type": "google_places", "google_checked": True,
+            "address": clean_address(p.address), "relationship": "NEARBY", "source_type": "google_places", "google_checked": True,
             "source_url": "https://www.google.com/maps/search/?api=1&query=" + quote_plus(f"{p.name} {p.address or ''}"),
         })
     return out
@@ -801,6 +828,13 @@ async def _check(db, area, key, facts, now, lists, removed, paused) -> dict:
         block["_checked_at"] = now
         facts[cat] = block
 
+    if getattr(area, "area_type", None) == "neighborhood" and (getattr(area, "geography", None) or {}).get("geometry"):
+        # A city neighborhood: in it or nearby-in-which-one, and nothing from across town (neighborhood_places).
+        from app.services.areas import boundary_sources, neighborhood_places
+        if str(area.parent_area_name or "").lower() == "philadelphia":
+            await boundary_sources.load_philly_neighborhoods()
+        facts = neighborhood_places.apply(area.name, area.geography["geometry"], facts, now, (*CHECK_CATEGORIES, "private_schools"))
+
     facts["_places_verified_at"] = now
     facts["_places_check_version"] = PLACES_CHECK_VERSION
     # Google's free calls ran out part-way: the places it couldn't check stay (with no guessed
@@ -949,6 +983,8 @@ def _is_bus_route_sentence(s: str) -> bool:
 _STALE_CLAIM_RE = re.compile(
     r"\branked\b|\bU\.?\s?S\.? News\b|\btop[- ](?:\d+|five|ten|three)\b|\bNo\. \d+\b|\b(?:closest|nearest)\b|"
     r"\b\d[\d,]{2,}\s+(?:residents|people|inhabitants)\b|\bpopulation of\b|\bsearch results\b|\bmarkets itself\b|"
+    r"\b(?:walk|transit|bike)\s?scores?\b|"  # a licensed score we never checked (Bella Vista "transit scores in the 90s")
+    r"\bwikipedia\b|\bparking spaces\b|"  # Tulpehocken "about 35 parking spaces; Wikipedia lists it as not accessible"
     r"\b24[- ]hours?\b(?!\s+(?:emergency|ER\b))", re.IGNORECASE)  # "Wegmans is 24-hour" - it's 6 a.m. to midnight
 _SPELLED = r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty"
 _SIZE_MODIFIER_RE = re.compile(rf"\b(?:(?:nearly|about|approximately|over|more than|roughly|some|almost)\s+)?(?:\d[\d,]*(?:\.\d+)?|{_SPELLED})\+?-(?:mile|acre|bed)\s+",

@@ -311,6 +311,11 @@ _NARRATIVE_SYSTEM_PROMPT = (
     "statistic, or claim that is not literally present in the input. If the facts are sparse, "
     "write a shorter, more general paragraph rather than inventing detail. Write every school "
     "district, school and place name in full exactly as the input spells it - never shorten one. "
+    "A place whose \"where\" says \"Nearby in ...\" is outside the area: call it nearby, never in the area. "
+    "Never call a large park or trail walkable from every home, never say every home is assigned to one "
+    "school, and describe parks in proportion to what is listed (a playground is not abundant green space). "
+    "Never describe who lives there or who it suits (no families, children, retirees, students) - Fair Housing. "
+    "No percentages, sizes (acres, miles) or awards. "
     "Output only the paragraph text, no preamble."
 )
 
@@ -348,7 +353,10 @@ async def _generate_narrative(db: AsyncSession, area: MarketArea, triggering_use
             model=config["model"],
             max_tokens=350,  # 250 on Haiku 4.5; Haiku 5.5 counts the same words as ~30% more tokens
             system=_NARRATIVE_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": f"Town: {area.name}, {area.state}\n\nVerified facts:\n{grounding}"}],
+            # A city neighborhood isn't a town of its own (Philly grader 10/27: "friendly or inviting neighborhood Center City neighborhood").
+            messages=[{"role": "user", "content": (f"Neighborhood: {area.name}, {area.parent_area_name}, {area.state}"
+                                                   if area.area_type == "neighborhood" and area.parent_area_name else f"Town: {area.name}, {area.state}")
+                       + f"\n\nVerified facts:\n{grounding}"}],
             **ai_config_service.model_options(config["model"]),
         )
         text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()

@@ -939,6 +939,9 @@ async def add_my_served_area(
             await boundary_sources.resolve_named_area_boundary(name, parent_area_name, state)
             or resolved.get("geography")
         )
+        if (geography_definition or {}).get("center"):
+            # The shape's own middle, not the geocoder's point (Roxborough's sat 2.3 mi off, in Manayunk).
+            centroid = tuple(geography_definition["center"])
 
     area = await area_enrichment_service.get_or_create_market_area(
         db,

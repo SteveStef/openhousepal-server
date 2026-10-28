@@ -1344,6 +1344,14 @@ async def reconcile_public_schools(db: AsyncSession, area: MarketArea, area_scop
             ps["crosses_district_boundary"] = True
             split = " and ".join(f"{d['name']} ({d.get('share', 0)}% of homes)" for d in kept[:3])
             ps["boundary_caveat"] = f"{area.name} addresses are split between {split} - the exact address decides which schools a home is assigned to."
+        # Philadelphia: the district's own zone maps say which schools the homes are assigned to -
+        # the research's list mixed in citywide schools you apply to (philly_schools).
+        from app.services.areas import philly_schools
+        if philly_schools.is_philadelphia(ps, area.state):
+            from app.services.areas.town_map_service import _home_points
+            zoned = philly_schools.zoned_schools(await _home_points(db, area))
+            if zoned:
+                ps = philly_schools.apply_zones(ps, zoned)
     except Exception:
         logger.exception("school district check failed for %s", area.slug)
     _schools_cache[area.id] = (now, ps)
@@ -1362,7 +1370,10 @@ async def check_and_store_public_schools(db: AsyncSession, area: MarketArea) -> 
     _schools_cache.pop(area.id, None)
     checked = await reconcile_public_schools(db, area, geography.scope_for_market_area(area))
     names = lambda ps: [(_district_key(d.get("name", "")), d.get("share")) for d in (ps or {}).get("districts") or []]
-    if names(checked) == names(facts.get("public_schools")) and all(len(checked.get(l) or []) == len(facts["public_schools"].get(l) or []) for l in _SCHOOL_LEVELS):
+    # Philadelphia's zoned schools can change by name with the same count (a new school year's zones).
+    zoned = lambda ps: [[(x or {}).get("name") for x in (ps or {}).get(l) or []] for l in _SCHOOL_LEVELS] if (ps or {}).get("zones") else None
+    if names(checked) == names(facts.get("public_schools")) and all(len(checked.get(l) or []) == len(facts["public_schools"].get(l) or []) for l in _SCHOOL_LEVELS) \
+            and zoned(checked) == zoned(facts.get("public_schools")):
         return False
     facts.setdefault("public_schools_research", facts["public_schools"])
     checked["checked_against_listings_at"] = datetime.now(timezone.utc).isoformat()

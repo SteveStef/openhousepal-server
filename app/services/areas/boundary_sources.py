@@ -184,6 +184,80 @@ def merge_pieces(geometries: list[dict[str, Any]]) -> dict[str, Any]:
     return {"type": "MultiPolygon", "coordinates": merged}
 
 
+def interior_point(geometry: dict[str, Any]) -> Optional[tuple[float, float]]:
+    """(lat, lng) of the middle of the biggest piece - a point that is always INSIDE it. The geocoder's
+    point for a neighborhood can sit outside its border (Roxborough's was 2.3 mi from the middle, so
+    every distance on the page was measured from Manayunk); the shape's own middle is used instead.
+    The area-weighted center when it falls inside, else the inside grid point nearest to it."""
+    polys = sorted(_polygons(geometry), key=lambda p: abs(_ring_area(p[0])) if p and p[0] else 0, reverse=True)
+    if not polys or not polys[0]:
+        return None
+    ring = polys[0][0]
+    a = _ring_area(ring)
+    if not a:
+        return None
+    cx = sum((ring[i][0] + ring[i + 1][0]) * (ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1]) for i in range(len(ring) - 1)) / (6 * a)
+    cy = sum((ring[i][1] + ring[i + 1][1]) * (ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1]) for i in range(len(ring) - 1)) / (6 * a)
+
+    def inside(x: float, y: float) -> bool:
+        return _ring_contains(ring, x, y) and not any(_ring_contains(h, x, y) for h in polys[0][1:])
+    if inside(cx, cy):
+        return (cy, cx)
+    xs, ys = [p[0] for p in ring], [p[1] for p in ring]
+    steps = 40
+    best = None
+    for i in range(1, steps):
+        for j in range(1, steps):
+            x = min(xs) + (max(xs) - min(xs)) * i / steps
+            y = min(ys) + (max(ys) - min(ys)) * j / steps
+            if inside(x, y):
+                d = (x - cx) ** 2 + (y - cy) ** 2
+                if best is None or d < best[0]:
+                    best = (d, y, x)
+    return (best[1], best[2]) if best else None
+
+
+def _piece_name(feature: dict[str, Any]) -> str:
+    """The name people use for a map piece: "Germantown - Morton" -> "Germantown"."""
+    props = feature.get("properties") or {}
+    raw = str(props.get("MAPNAME") or props.get("LISTNAME") or props.get("NAME") or "").replace("_", " ").strip()
+    for whole, pieces in _PHILLY_COMBINED.items():
+        if raw in pieces:
+            return " ".join(w.capitalize() for w in whole.split())
+    return raw.split(" - ", 1)[0].strip()
+
+
+def philly_neighborhood_at(lat: float, lng: float) -> Optional[str]:
+    """Which Philadelphia neighborhood a spot is in (from the cached city map; None if not loaded
+    or outside the city). Labels a place outside the page's own neighborhood: "Nearby in Fairmount"."""
+    for f in _PHILLY_FEATURE_CACHE or []:
+        if any(_ring_contains(poly[0], lng, lat) for poly in _polygons(f.get("geometry") or {}) if poly):
+            return _piece_name(f)
+    return None
+
+
+def philly_neighborhood_names() -> set[str]:
+    return {_piece_name(f) for f in _PHILLY_FEATURE_CACHE or []} - {""}
+
+
+async def load_philly_neighborhoods() -> bool:
+    global _PHILLY_FEATURE_CACHE
+    if _PHILLY_FEATURE_CACHE is None:
+        try:
+            _PHILLY_FEATURE_CACHE = await _fetch_philadelphia_neighborhoods()
+        except httpx.HTTPError as exc:
+            logger.warning("Philadelphia neighborhood boundary fetch failed", extra={"error": str(exc)})
+            return False
+    return True
+
+
+def _with_center(result: dict[str, Any]) -> dict[str, Any]:
+    center = interior_point(result["geometry"])
+    if center:
+        result["center"] = [round(center[0], 6), round(center[1], 6)]
+    return result
+
+
 async def _philadelphia_neighborhood_boundary(name: str, parent_area_name: Optional[str], state: str) -> Optional[dict[str, Any]]:
     if state.upper() != "PA" or _normalize_name(parent_area_name) not in _PHILLY_NAMES:
         return None
@@ -203,14 +277,14 @@ async def _philadelphia_neighborhood_boundary(name: str, parent_area_name: Optio
             geometry = merge_pieces([f.get("geometry") or {} for f in found])
             bounds = _geometry_bounds(geometry)
             if bounds:
-                return {
+                return _with_center({
                     "type": "polygon", "geometry": geometry, "bounds": bounds,
                     "source": "opendataphilly_philadelphia_neighborhoods",
                     "source_name": "OpenDataPhilly Philadelphia Neighborhoods",
                     "source_url": PHILADELPHIA_NEIGHBORHOODS_GEOJSON_URL, "license": "CC-BY-4.0",
                     "matched_name": " ".join(w.capitalize() for w in _normalize_name(name, drop_square=False).split()),
                     "map_pieces": pieces,
-                }
+                })
 
     # The full name first: "Logan Square" is its own map piece, not "Logan". Dropping "Square" is only
     # a fallback so "Rittenhouse Square" still finds the "Rittenhouse" piece.
@@ -225,7 +299,7 @@ async def _philadelphia_neighborhood_boundary(name: str, parent_area_name: Optio
     if not bounds:
         return None
     props = match.get("properties") or {}
-    return {
+    return _with_center({
         "type": "polygon",
         "geometry": geometry,
         "bounds": bounds,
@@ -234,7 +308,7 @@ async def _philadelphia_neighborhood_boundary(name: str, parent_area_name: Optio
         "source_url": PHILADELPHIA_NEIGHBORHOODS_GEOJSON_URL,
         "license": "CC-BY-4.0",
         "matched_name": props.get("MAPNAME") or props.get("LISTNAME") or props.get("NAME"),
-    }
+    })
 
 
 async def resolve_named_area_boundary(name: str, parent_area_name: Optional[str], state: str) -> Optional[dict[str, Any]]:
