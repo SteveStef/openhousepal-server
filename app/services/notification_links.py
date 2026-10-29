@@ -11,7 +11,7 @@ from typing import Dict, List
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.database import FormSubmission, Lead, LeadEvent, Notification, OpenHouseHostRequest
+from app.models.database import Collection, FormSubmission, Lead, LeadEvent, Notification, OpenHouseHostRequest
 
 _TOUR_SOURCE_TYPES = ("property_tour", "property_website_tour_request", "property_page_tour_request")
 _INQUIRY_SOURCE_TYPES = ("property_page_inquiry", "property_website_inquiry")
@@ -19,6 +19,24 @@ _INQUIRY_SOURCE_TYPES = ("property_page_inquiry", "property_website_inquiry")
 
 def _ids(notifications: List[Notification], reference_type: str) -> List[str]:
     return list({n.reference_id for n in notifications if n.reference_type == reference_type and n.reference_id})
+
+
+async def submission_showcases(db: AsyncSession, agent_id: str, submission_ids) -> Dict[str, str]:
+    """form submission id -> the Showcase it built (or last refreshed) - its "Open Showcase" button
+    on the form's results, the Rundown and the Dash (user, 10/28)."""
+    ids = list({s for s in submission_ids if s})
+    if not ids:
+        return {}
+    rows = await db.execute(select(Collection.source_form_submission_id, Collection.id).where(
+        Collection.owner_id == agent_id, Collection.source_form_submission_id.in_(ids)))
+    return {sid: cid for sid, cid in rows.all()}
+
+
+async def showcase_links(db: AsyncSession, agent_id: str, notifications: List[Notification]) -> Dict[str, str]:
+    """notification id -> its form answer's Showcase (only form responses that built one)."""
+    built = await submission_showcases(db, agent_id, _ids(notifications, "FORM_SUBMISSION"))
+    return {n.id: f"/showcases?showcase={built[n.reference_id]}" for n in notifications
+            if n.reference_type == "FORM_SUBMISSION" and n.reference_id in built}
 
 
 async def exact_links(db: AsyncSession, agent_id: str, notifications: List[Notification]) -> Dict[str, str]:

@@ -1656,8 +1656,11 @@ async def get_form_submissions(
     # the card's meta-line - FormSubmissionListItem.campaign_name stays None for those rows.
     names_result = await db.execute(select(FormCampaign.id, FormCampaign.name).where(FormCampaign.form_id == form_id))
     names = dict(names_result.all())
+    from app.services.notification_links import submission_showcases
+    built = await submission_showcases(db, current_user.id, [s.id for s in submissions])
     for submission in submissions:
         submission.campaign_name = names.get(submission.campaign_id)
+        submission.showcase_id = built.get(submission.id)
     return submissions
 
 

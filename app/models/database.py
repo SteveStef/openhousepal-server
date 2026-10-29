@@ -377,8 +377,8 @@ class Lead(Base):
     # newest LeadEvent.occurred_at (not `updated_at`, which SQLAlchemy bumps on any unrelated field
     # change) to decide whether the lead has unseen activity - see needs_attention in lead_routes.py.
     viewed_at = Column(DateTime(timezone=True), nullable=True)
-    # The agent starred this person (Leads page / Visitors) - separate from starring their Showcase
-    # (Collection.favorited_at): a lead can matter while their Showcase doesn't (user, 10/24).
+    # The agent starred this person (Leads page / Visitors). Since 10/28 it's one star with their
+    # Showcase's (Collection.favorited_at) - each sets the other (services/star_sync.py).
     is_favorite = Column(Boolean, nullable=False, default=False, server_default='false')
     # The agent's alert switches for this one person (owner, 10/27) - {"calendar", "in_app",
     # "emails"}: bool; missing / NULL = on. See tasks_service.lead_alerts.

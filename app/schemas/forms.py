@@ -223,6 +223,9 @@ class FormSubmissionListItem(BaseModel):
     campaign_name: Optional[str] = None
     # Schedule a Showing only - see FormSubmission.showing.
     showing: Optional[dict] = None
+    # The Showcase this answer built (or last refreshed) - its "Open Showcase" button. Transient,
+    # set in get_form_submissions.
+    showcase_id: Optional[str] = None
     created_at: datetime
 
     class Config:

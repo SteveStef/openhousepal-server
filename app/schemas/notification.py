@@ -34,6 +34,8 @@ class NotificationResponse(BaseModel):
     property_address: Optional[str] = None
     visitor_name: Optional[str] = None
     link: Optional[str] = None
+    # A form answer that built a Showcase: that Showcase (worked out on read - notification_links).
+    showcase_link: Optional[str] = None
     is_read: bool
     read_at: Optional[datetime] = None
     created_at: datetime

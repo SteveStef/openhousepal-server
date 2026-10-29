@@ -1188,8 +1188,12 @@ async def update_lead(
         lead.last_contacted_at = datetime.now(timezone.utc)
         if lead.status == 'new':
             lead.status = 'contacted'
+    woken_showcases = []
     if body.is_favorite is not None:
         lead.is_favorite = body.is_favorite
+        # One star: their Showcase(s) star / un-star with them (user, 10/28).
+        from app.services.star_sync import star_showcases
+        woken_showcases = await star_showcases(db, current_user.id, lead.email, body.is_favorite)
 
     # A new email / phone / name goes everywhere they're written down (their Showcase's recipient,
     # sign-ins, waiting emails...) and a new address starts its email rules fresh (user, 10/24).
@@ -1198,6 +1202,9 @@ async def update_lead(
 
     db.add(lead)
     await db.commit()
+    if woken_showcases:
+        from app.services import showcase_sleep
+        await showcase_sleep.catch_up(db, [c.id for c in woken_showcases])
     if contact.get("showcases") or contact.get("email_changed") or (old_phone != lead.phone) or (old_name != lead.name):
         await lead_contact_service.after_commit(current_user.id, lead_id, contact)
     # Re-fetch (rather than db.refresh with relationship attribute_names) - AsyncSession's

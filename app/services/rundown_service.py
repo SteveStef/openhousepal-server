@@ -177,7 +177,7 @@ def _headline(sc: dict | None, brief: dict, happened: int) -> str:
 async def build_rundown(db: AsyncSession, user: User, now: datetime | None = None) -> dict[str, Any]:
     from app.models.database import FormSubmission, GuestPassEvent, Lead, LeadEvent, OpenHouseEvent, PropertyInteraction
     from app.services.email_settings_service import briefing_hm, briefing_label
-    from app.services.notification_links import exact_links
+    from app.services.notification_links import exact_links, showcase_links
     from app.services.showcase_digest_service import _briefing
     from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
 
@@ -233,15 +233,16 @@ async def build_rundown(db: AsyncSession, user: User, now: datetime | None = Non
     ).order_by(Notification.created_at.desc()).limit(MAX_TIMELINE))).scalars().all()
     try:
         links = await exact_links(db, user.id, list(notes))
+        showcases = await showcase_links(db, user.id, list(notes))
     except Exception:  # noqa: BLE001
         logger.warning("rundown exact links failed", exc_info=True)
-        links = {}
+        links, showcases = {}, {}
     groups: dict[str, list[dict]] = {}
     for n in notes:
         key = _GROUP_OF.get(n.type, "other")
         groups.setdefault(key, []).append({
             "id": n.id, "type": n.type, "title": n.title, "message": n.message, "address": n.property_address,
-            "link": links.get(n.id) or n.link or "", "is_read": bool(n.is_read), "at": n.created_at,
+            "link": links.get(n.id) or n.link or "", "showcase_link": showcases.get(n.id), "is_read": bool(n.is_read), "at": n.created_at,
         })
     order = [k for k, _, _ in _GROUPS] + ["other"]
     happened = [{"key": k, "label": _GROUP_LABEL[k], "items": groups[k]} for k in order if groups.get(k)]

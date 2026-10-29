@@ -630,6 +630,9 @@ async def set_collection_favorite(
     if woke:
         await showcase_sleep.agent_changed(db, col, "ACTIVE")
         col.status = "ACTIVE"
+    # One star: their lead stars / un-stars with it (user, 10/28).
+    from app.services.star_sync import star_lead
+    await star_lead(db, current_user.id, col.visitor_email, bool(request.favorite))
     await db.commit()
     if woke:
         await showcase_sleep.catch_up(db, [col.id])

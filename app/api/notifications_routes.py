@@ -14,7 +14,7 @@ from app.schemas.notification import (
     NotificationPreferencesUpdate,
 )
 from app.services import notification_preferences_service
-from app.services.notification_links import exact_links
+from app.services.notification_links import exact_links, showcase_links
 from app.config.logging import get_logger
 
 logger = get_logger(__name__)
@@ -68,8 +68,13 @@ async def get_notifications(
         # Each one opens the exact thing it talks about (see notification_links) - computed here,
         # never written back, so the stored link stays the fallback.
         links = await exact_links(db, current_user.id, notifications)
+        # A form answer that built a Showcase also gets a button straight to it.
+        showcases = await showcase_links(db, current_user.id, notifications)
         return [
-            NotificationResponse.model_validate(n).model_copy(update={"link": links[n.id]}) if n.id in links else n
+            NotificationResponse.model_validate(n).model_copy(update={
+                **({"link": links[n.id]} if n.id in links else {}),
+                **({"showcase_link": showcases[n.id]} if n.id in showcases else {}),
+            }) if n.id in links or n.id in showcases else n
             for n in notifications
         ]
 
