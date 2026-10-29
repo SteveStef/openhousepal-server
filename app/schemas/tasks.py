@@ -19,6 +19,9 @@ class TaskCreate(BaseModel):
     remind_at: Optional[datetime] = None
     lead_id: Optional[str] = None
     suggested_message: Optional[str] = None
+    # The message is OpenHousePal's (a "Suggested from what they just did" follow-up), not the
+    # agent's own words: sign it with their footer like the automatic ones.
+    signed: bool = False
 
 
 class TaskUpdate(BaseModel):

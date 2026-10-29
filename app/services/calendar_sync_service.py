@@ -322,7 +322,8 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
         if done_link and (getattr(lead, "phone", None) or getattr(lead, "email", None)):
             # One tap: Messages (or their email, written as an email - 10/25) opens with this
             # message written, from the agent's own phone / mailbox - and the follow-up checks itself off.
-            block += [f"\U0001F4F2 Text / email link for {first} - opens Messages or your email with the message below already written:", f"{done_link}/text", ""]
+            # Says text OR email (user, 10/29): the page offers both, not just a text.
+            block += [f"\U0001F4F2 Text or email {first} instantly - tap the link, pick Text or Email, and the message below is already written for you:", f"{done_link}/text", ""]
         block += ["\U0001F4AC SUGGESTED TEXT - copy everything below ⬇️", "", msg]
         parts.append("\n".join(block))
     body: dict = {

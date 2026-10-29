@@ -1597,9 +1597,13 @@ def checkin_message(lead_name: Optional[str], owner: Optional[User], showcase_ur
     me = _guest_first(getattr(owner, "first_name", None)) if owner is not None else ""
     hi = f"Hi {first}, it's {me}!" if me else f"Hi {first}!"
     if showcase_url:
-        return (f"{hi} Just wanted to check in - did any of the homes in your Showcase catch your eye? "
-                f"I'd be happy to set up a time for you to tour any of them.\n\n{clean_url(showcase_url)}")
-    return f"{hi} Just wanted to check in and see how your home search is going. Let me know if there's anything I can help with."
+        text = (f"{hi} Just wanted to check in - did any of the homes in your Showcase catch your eye? "
+                "I'd be happy to set up a time for you to tour any of them.")
+    else:
+        text = f"{hi} Just wanted to check in and see how your home search is going. Let me know if there's anything I can help with."
+    # Signed like the automatic ones, the Showcase link last (iMessage's preview).
+    text = with_footer(text, owner) or text
+    return f"{text}\n\n{clean_url(showcase_url)}" if showcase_url else text
 
 
 def full_message(task: AgentTask, showcase: Optional[dict], owner: Optional[User] = None,
@@ -1634,6 +1638,10 @@ def full_message(task: AgentTask, showcase: Optional[dict], owner: Optional[User
         pitch = pitch_for("open_house_signin", owner, showcase)  # folded-in open house follow-up
     if not pitch and SHOWCASE_MARKER in msg:
         pitch = NO_SHOWCASE_CLOSING.get(task.auto_source or "", "")
+    if not pitch and SHOWCASE_MARKER in msg and not task.auto_source and showcase and showcase.get("url"):
+        # A suggested follow-up's own message (TasksPanel SUGGEST): just their Showcase link there -
+        # link_last below moves it after the footer.
+        pitch = showcase["url"]
     if SHOWCASE_MARKER in msg:
         # The pitch is a paragraph of its own wherever the pill sits (never glued mid-sentence).
         out = _tidy(msg.replace(SHOWCASE_MARKER, f"\n\n{pitch}\n\n" if pitch else ""))
@@ -3699,7 +3707,7 @@ async def render_ics(db: AsyncSession, user: User) -> str:
         desc_parts = ["Mark as done:\n" + done_url(code)]
         message = full_message(t, sc, user, lead_name=names.get(t.lead_id) if t.lead_id in names else None)
         if message and phones.get(t.lead_id or ""):
-            desc_parts.append("Text / email link (opens Messages or your email with the message written):\n" + text_url(code))
+            desc_parts.append("Text or email them instantly - tap the link, pick Text or Email, and the message is already written for you:\n" + text_url(code))
         if t.context:
             desc_parts.append(t.context)
         if sc:

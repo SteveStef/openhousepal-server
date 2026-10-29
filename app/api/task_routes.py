@@ -574,7 +574,7 @@ async def create_task(
         due_at=payload.due_at,
         all_day=payload.all_day,
         remind_at=payload.remind_at,
-        suggested_message=payload.suggested_message,
+        suggested_message=tasks_service.with_footer(payload.suggested_message, current_user) if payload.signed else payload.suggested_message,
     )
     db.add(task)
     await db.commit()
