@@ -293,7 +293,8 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
     if your_notes and task.auto_source != NOTED_GUEST_SOURCE:  # that alert already quotes the note
         parts.append("\U0001F4DD YOUR NOTES\n" + "\n".join(
             f"• {'(' + label + ') ' if label else ''}{text[:280]}" for label, text in your_notes[:3]))
-    msg = None if done else (message_override if message_override is not None else full_message(task, showcase, owner))
+    msg = None if done else (message_override if message_override is not None else full_message(
+        task, showcase, owner, lead_name=(getattr(lead, "name", None) or lead_name or "") if (lead is not None or lead_name) else None))
     if msg:
         # Steps before sending, on their own lines apart from the text to copy (instructions, not
         # part of it): book it in ShowingTime, then fill in the time.

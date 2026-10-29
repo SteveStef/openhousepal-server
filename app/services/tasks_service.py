@@ -1589,12 +1589,29 @@ async def lead_showcase_urls(db: AsyncSession, owner: User, leads: list) -> dict
     return {k: v["url"] for k, v in (await lead_showcase_info(db, owner, leads)).items()}
 
 
-def full_message(task: AgentTask, showcase: Optional[dict], owner: Optional[User] = None) -> Optional[str]:
+def checkin_message(lead_name: Optional[str], owner: Optional[User], showcase_url: Optional[str] = None) -> str:
+    """A text follow-up with no message of its own (added from "Suggested from what they just did",
+    or by hand): a short check-in from the agent. Never names the homes they looked at - the event
+    tells the agent exactly what happened; the text mustn't make the client feel watched (user, 10/29)."""
+    first = _guest_first(lead_name) or "there"
+    me = _guest_first(getattr(owner, "first_name", None)) if owner is not None else ""
+    hi = f"Hi {first}, it's {me}!" if me else f"Hi {first}!"
+    if showcase_url:
+        return (f"{hi} Just wanted to check in - did any of the homes in your Showcase catch your eye? "
+                f"I'd be happy to set up a time for you to tour any of them.\n\n{clean_url(showcase_url)}")
+    return f"{hi} Just wanted to check in and see how your home search is going. Let me know if there's anything I can help with."
+
+
+def full_message(task: AgentTask, showcase: Optional[dict], owner: Optional[User] = None,
+                 lead_name: Optional[str] = None) -> Optional[str]:
     """The suggested message, with this situation's Showcase pitch (link last) wherever the agent's
     template put the {showcase} pill - or nothing there when this guest has no Showcase, or the
     situation isn't one that makes a Showcase. Older follow-ups made before templates had no
-    marker: the pitch is appended at the end for those."""
+    marker: the pitch is appended at the end for those. A text follow-up with no message gets
+    checkin_message when the caller passes the person's name."""
     msg = task.suggested_message or ""
+    if not msg and lead_name is not None and task.kind == "text" and task.completed_at is None:
+        return checkin_message(lead_name, owner, (showcase or {}).get("url"))
     if not msg:
         return None
     if showcase and showcase.get("url"):
@@ -3629,10 +3646,12 @@ async def render_ics(db: AsyncSession, user: User) -> str:
     lead_ids = list({t.lead_id for t in tasks if t.lead_id})
     showcases = {}
     phones: dict[str, bool] = {}
+    names: dict[str, Optional[str]] = {}
     if lead_ids:
         leads = (await db.execute(select(Lead).where(Lead.id.in_(lead_ids)))).scalars().all()
         showcases = await lead_showcase_info(db, user, list(leads))
         phones = {l.id: bool((l.phone or "").strip()) for l in leads}
+        names = {l.id: l.name for l in leads}
         # People the agent took off their calendar (their alert settings) stay off this feed too.
         off = {l.id for l in leads if not lead_alerts(l)["calendar"]}
         tasks = [t for t in tasks if t.lead_id not in off]
@@ -3678,7 +3697,8 @@ async def render_ics(db: AsyncSession, user: User) -> str:
         # Every link on a line of its own (nothing glued to it), the Showcase one in its short form -
         # see showcase_go_url.
         desc_parts = ["Mark as done:\n" + done_url(code)]
-        if t.suggested_message and phones.get(t.lead_id or ""):
+        message = full_message(t, sc, user, lead_name=names.get(t.lead_id) if t.lead_id in names else None)
+        if message and phones.get(t.lead_id or ""):
             desc_parts.append("Text / email link (opens Messages or your email with the message written):\n" + text_url(code))
         if t.context:
             desc_parts.append(t.context)
@@ -3686,8 +3706,8 @@ async def render_ics(db: AsyncSession, user: User) -> str:
             desc_parts.append("Their Showcase:\n" + showcase_go_url(code))
         if t.notes:
             desc_parts.append(t.notes)
-        if t.suggested_message:
-            desc_parts.append("Suggested message:\n" + (full_message(t, sc, user) or ""))
+        if message:
+            desc_parts.append("Suggested message:\n" + message)
         # The same text as the event pushed to a connected Google / Outlook calendar (10/25): it
         # also carries what they told you (their question, form answers, picked times), their
         # Showcase comments, what they opened on their Guest Pass and your notes - the short

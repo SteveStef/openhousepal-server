@@ -120,7 +120,7 @@ async def list_tasks(
                 t.showcase_url = sc["url"]
             # The copy button sends the whole thing: the reply with the Showcase pitch (link last)
             # where the agent's template puts it - or the {showcase} marker removed if there's none.
-            t.suggested_message = tasks_service.full_message(by_id[t.id], sc, current_user)
+            t.suggested_message = tasks_service.full_message(by_id[t.id], sc, current_user, lead_name=by_id[t.id].lead.name if by_id[t.id].lead is not None else None)
             if not t.completed_at and by_id[t.id].auto_source:
                 try:
                     t.property = await tasks_service.followup_property(db, by_id[t.id], current_user)
@@ -374,7 +374,7 @@ async def public_followup_text(code: str, request: Request, db: AsyncSession = D
         sc = (await tasks_service.lead_showcase_info(db, owner, [lead])).get(lead.id) if owner else None
     except Exception:
         logger.warning("showcase lookup failed for text link %s", task.id, exc_info=True)
-    message = tasks_service.full_message(task, sc, owner) or ""
+    message = tasks_service.full_message(task, sc, owner, lead_name=lead.name) or ""
     fill_ins = [f for f in (tasks_service.FILL_IN_TIME, tasks_service.FILL_IN_ANSWER) if f in message]
     digits = "".join(ch for ch in (lead.phone or "") if ch.isdigit())
     if len(digits) == 10:
@@ -453,7 +453,7 @@ async def public_followup_card(code: str, request: Request, db: AsyncSession = D
             sc = (await tasks_service.lead_showcase_info(db, owner, [lead])).get(lead.id)
         except Exception:
             logger.warning("showcase lookup failed for follow-up card %s", task.id, exc_info=True)
-    message = (tasks_service.full_message(task, sc, owner) or "") if task.completed_at is None else ""
+    message = (tasks_service.full_message(task, sc, owner, lead_name=lead.name if lead is not None else None) or "") if task.completed_at is None else ""
     situation = await _situation(db, task)
     google_url = None
     try:
