@@ -375,6 +375,10 @@ async def public_followup_text(code: str, request: Request, db: AsyncSession = D
     except Exception:
         logger.warning("showcase lookup failed for text link %s", task.id, exc_info=True)
     message = tasks_service.full_message(task, sc, owner, lead_name=lead.name) or ""
+    if not message and task.kind == "text":
+        # Checked off already: still the same check-in, so Text again / Email again / Undo come back
+        # with it written (owner, 10/30 - the bubble was blank once it was done).
+        message = tasks_service.checkin_message(lead.name, owner, (sc or {}).get("url"))
     fill_ins = [f for f in (tasks_service.FILL_IN_TIME, tasks_service.FILL_IN_ANSWER) if f in message]
     digits = "".join(ch for ch in (lead.phone or "") if ch.isdigit())
     if len(digits) == 10:

@@ -13,7 +13,7 @@ Once each (Eastern) morning it also:
   forms_service.UNFINISHED_RETENTION_DAYS (the visits still count in form stats).
 
 Every minute it also sends any roll-ups that are due (agent_roundup_service): the hourly liked-homes
-email and each open house's wrap-up (2 hours after its last sign-in).
+email. (Each open house's wrap-up goes in the agent's daily briefing since 10/30.)
 
 And once each afternoon (4:30 PM Eastern) it sends the Showcase daily digest - every new match and
 price drop of the day in one email per buyer (showcase_digest_service); each agent's daily briefing goes
@@ -60,9 +60,8 @@ async def scheduled_task_reminders():
                 logger.info("Daily follow-up upkeep", extra={"event": "task_daily", "purged": purged,
                                                              "unfinished_cleared": cleared})
             try:
-                from app.services.agent_roundup_service import send_like_roundups, send_open_house_recaps
-                await send_like_roundups(db)
-                await send_open_house_recaps(db)
+                from app.services.agent_roundup_service import send_like_roundups
+                await send_like_roundups(db)  # open house wrap-ups ride in the daily briefing (10/30)
             except Exception:
                 logger.error("agent roll-up emails failed", exc_info=True)
             try:

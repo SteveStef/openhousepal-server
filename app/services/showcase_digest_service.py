@@ -440,7 +440,8 @@ _BRIEFED: set[tuple[str, str]] = set()   # (user id, day) this process already h
 
 async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) -> dict:
     """Each agent's daily briefing, at the time THEY picked in Studio -> Email (4:30 PM by default):
-    follow-ups, what's waiting on them, and their clients' Showcase news since their last briefing.
+    follow-ups, what's waiting on them, each open house that's over (its guests - 10/30, was its
+    own email), and their clients' Showcase news since their last briefing.
     Safe to call every minute - a per-agent per-day claim in system_settings means one a day, even
     across restarts / several workers, and the Showcase rows are claimed per agent."""
     from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
@@ -455,6 +456,7 @@ async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) ->
         return bool(col and col.status == "ACTIVE" and col.owner and owner_has_access(col.owner, SHOWCASE_ACCESS_TIERS))
 
     agent_emails: list[tuple[User, str, dict]] = []
+    wrapup_emails: list[tuple[User, dict]] = []   # briefing email turned off: each wrap-up on its own
     agents = 0
     # Deploy day: the old one-for-everyone 4:30 run may already have gone out today.
     legacy = (await db.execute(text("SELECT value FROM system_settings WHERE key = 'daily_briefing_last_sent'"))).scalar()
@@ -476,6 +478,19 @@ async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) ->
         if legacy_sent_today:
             await db.commit()
             continue
+        # Open house wrap-ups (owner, 10/30): each open house that's over rides in this briefing
+        # instead of its own email. One still going waits for tomorrow's.
+        from app.services.agent_roundup_service import claim_open_house_wrapups
+        from app.services.notification_preferences_service import channel_enabled
+        try:
+            wrapups = await claim_open_house_wrapups(db, user.id, now)
+        except Exception:  # noqa: BLE001
+            logger.warning("briefing open house wrap-ups failed", exc_info=True, extra={"user_id": user.id})
+            wrapups = []
+        if wrapups and not channel_enabled(user, "SHOWCASE_DIGEST", "email"):
+            # They turned the briefing email off - turning one off must never lose the other.
+            wrapup_emails += [(user, w) for w in wrapups]
+            wrapups = []
         rows_claimed = (await db.execute(
             update(ScheduledEmail)
             .where(ScheduledEmail.status == QUEUED, ScheduledEmail.created_at < now,
@@ -501,12 +516,12 @@ async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) ->
         except Exception:  # noqa: BLE001 - one agent's bad data must not stop everyone's email
             logger.warning("daily briefing sections failed", exc_info=True, extra={"user_id": user.id})
             brief = {"followups": [], "actions": [], "client_activity": [], "followups_label": "", "followup_count": 0}
-        if not sc and not brief["followups"] and not brief["actions"] and not brief["client_activity"]:
+        if not sc and not wrapups and not brief["followups"] and not brief["actions"] and not brief["client_activity"]:
             await db.commit()
             continue  # nothing to say today - no email
         keys = brief.pop("_keys", [])
         seen_row = (await db.execute(text("SELECT value FROM system_settings WHERE key = :k"), {"k": f"briefing_seen:{user.id}"})).scalar()
-        if not sc and not (set(keys) - set(seen_row or [])):
+        if not sc and not wrapups and not (set(keys) - set(seen_row or [])):
             await db.commit()
             continue  # only things they were already told about yesterday - no email
         v = {"recipient_name": user.first_name or "there", "today_date": today,
@@ -533,6 +548,16 @@ async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) ->
         else:
             n = len(brief["actions"]) + len(brief["client_activity"])
             headline = _plural(n, "thing waiting on you", "things waiting on you")
+        if wrapups:
+            guests = sum(w["guest_count"] for w in wrapups)
+            # The title says it too, so it doesn't read as a normal briefing (owner, 10/30)
+            v.update({"open_houses": wrapups,
+                      "open_houses_title": "Your open house" if len(wrapups) == 1 else "Your open houses",
+                      "open_houses_went": "how your open house went" if len(wrapups) == 1 else "how your open houses went"})
+            # The freshest news leads: "5 guests at your open house at 732 Buck Ln"
+            oh_part = (f"{_plural(guests, 'guest', 'guests')} at your open house at {wrapups[0]['property_address']}"
+                       if len(wrapups) == 1 else f"{_plural(guests, 'guest', 'guests')} at {len(wrapups)} open houses")
+            headline = oh_part if not (sc or brief["followup_count"]) else f"{oh_part}, plus {headline}"
         v["headline"] = headline
         v["has_showcase_section"] = bool(sc or brief["client_activity"])
         # The bell's "Today's Rundown" (user, 10/24) - one a day, whenever the briefing goes out (not
@@ -544,7 +569,8 @@ async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) ->
             message=headline[0].upper() + headline[1:] + ".", link="/dash?rundown=1", is_read=False,
             created_at=datetime.now(timezone.utc),
         ))
-        agent_emails.append((user, f"Your daily briefing: {headline}", v))
+        title = f"Your daily briefing + {v['open_houses_went']}" if wrapups else "Your daily briefing"
+        agent_emails.append((user, f"{title}: {headline}", v))
         await db.execute(text(
             "INSERT INTO system_settings (key, value) VALUES (:k, CAST(:v AS jsonb)) "
             "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"), {"k": f"briefing_seen:{user.id}", "v": json.dumps(keys)})
@@ -554,6 +580,10 @@ async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) ->
     # Only after the claims are saved - a failed save must not leave emails out that a retry repeats.
     for user, subject, variables in agent_emails:
         email_agent(user, "SHOWCASE_DIGEST", AGENT_TEMPLATE, subject, variables)
+    if wrapup_emails:
+        from app.services.agent_roundup_service import send_wrapup_email
+        for user, w in wrapup_emails:
+            send_wrapup_email(user, w)
     if agents:
         logger.info("Daily briefings", extra={"event": "daily_briefing", "agents": agents})
     return {"agents": agents}

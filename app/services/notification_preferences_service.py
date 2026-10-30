@@ -20,7 +20,7 @@ from typing import Dict
 CATEGORIES: Dict[str, dict] = {
     "leads": {
         "label": "New leads & sign-ins",
-        "help": "Someone submitted one of your forms or asked for something, and a wrap-up of each open house's guests (sent 2 hours after the last sign-in).",
+        "help": "Someone submitted one of your forms or asked for something. Your open house guests come in your daily briefing once the open house is over.",
         "types": [
             "OPEN_HOUSE_SIGN_IN", "FORM_SUBMISSION", "OPEN_HOUSE_FORM_REQUEST", "PROPERTY_INQUIRY",
             "OPEN_HOUSE_DISCLOSURE", "OPEN_HOUSE_SECOND_VISIT", "PORTAL_LEAD", "LEAD", "INVITE_RSVP",
@@ -44,7 +44,7 @@ CATEGORIES: Dict[str, dict] = {
     },
     "showcase_digest": {
         "label": "Daily briefing",
-        "help": "One email a day: your follow-ups, anything waiting on you, and new matches & price drops in your clients' Showcases. Skipped on days with nothing to report.",
+        "help": "One email a day: your follow-ups, anything waiting on you, a wrap-up of each open house that's over, and new matches & price drops in your clients' Showcases. Skipped on days with nothing to report.",
         "types": ["SHOWCASE_DIGEST"],
     },
     "spotlight_weekly": {

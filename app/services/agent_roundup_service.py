@@ -2,11 +2,13 @@
 
 - Liked homes: the first like from any client starts a one-hour window; when it closes, ONE email
   covers every home every client liked in that hour ("3 clients liked 5 homes").
-- Open house wrap-up: every sign-in is queued, and once TWO hours pass with no new sign-in at that
-  open house, ONE email lists all the guests (the in-app bell still alerts on each sign-in live).
+- Open house wrap-up: every sign-in is queued; once the open house is over, its guests go in the
+  agent's next daily briefing (showcase_digest_service) - no separate email since 10/30. The in-app
+  bell still alerts on each sign-in live.
 
 Both queue ScheduledEmail rows with their own status (process_due_emails only sends PENDING, so it
-never touches them) and are sent by task_reminder_scheduler's every-minute tick. Rows are claimed
+never touches them). Likes are sent by task_reminder_scheduler's every-minute tick; wrap-ups by
+the daily briefing. Rows are claimed
 with a single UPDATE ... WHERE status = <queued>, so a restart or a second worker can't double-send.
 Same approach as the Showcase daily digest (showcase_digest_service)."""
 from __future__ import annotations
@@ -161,7 +163,7 @@ async def send_like_roundups(db: AsyncSession, now: Optional[datetime] = None) -
 # --------------------------------------------------------------------------- open house wrap-up
 
 def queue_sign_in(db: AsyncSession, agent: User, oh, visitor, note: Optional[str], lead_link: Optional[str]) -> None:
-    """Called on every open house sign-in. The wrap-up goes out once the sign-ins stop for 2 hours."""
+    """Called on every open house sign-in. Its wrap-up goes in the next daily briefing once it's over."""
     if not agent or not agent.email:
         return
     has_agent = {"YES": "Has an agent", "NO": "No agent"}.get(str(getattr(visitor, "has_agent", "") or "").upper(), "")
@@ -172,29 +174,46 @@ def queue_sign_in(db: AsyncSession, agent: User, oh, visitor, note: Optional[str
     })
 
 
-async def send_open_house_recaps(db: AsyncSession, now: Optional[datetime] = None) -> int:
+def _oh_ended_at(oh) -> Optional[datetime]:
+    """A booked open house's end (its scheduled date + end time, Eastern) - None for an undated kit."""
+    if oh is None or not getattr(oh, "scheduled_date", None) or not getattr(oh, "scheduled_end_time", None):
+        return None
+    from app.services.tasks_service import EASTERN
+    return datetime.combine(oh.scheduled_date, oh.scheduled_end_time, tzinfo=EASTERN)
+
+
+async def claim_open_house_wrapups(db: AsyncSession, owner_id: str, now: Optional[datetime] = None,
+                                   max_guests: int = 6) -> list[dict]:
+    """The open house wrap-ups for this agent's daily briefing (owner, 10/30: "make the open house
+    wrap up email in the daily briefing email so we don't have to send two separate ones"). Only
+    open houses that are OVER: past their booked end time - or, for an undated kit, 2 hours since
+    the last sign-in. One still going when the briefing goes out waits for the next day's.
+    Claims the sign-ins (OH_QUEUED -> OH_ROLLED) - the caller must send what this returns."""
+    from app.models.database import OpenHouseEvent
     now = now or datetime.now(timezone.utc)
-    ready = list((await db.execute(
-        select(_group_col()).where(ScheduledEmail.status == OH_QUEUED)
-        .group_by(_group_col()).having(func.max(ScheduledEmail.created_at) <= now - OH_QUIET)
-    )).scalars().all())
+    groups = (await db.execute(
+        select(_group_col(), func.max(ScheduledEmail.created_at))
+        .where(ScheduledEmail.status == OH_QUEUED,
+               ScheduledEmail.template_variables.op("->>")(literal_column("'_owner_id'")) == owner_id)
+        .group_by(_group_col())
+    )).all()
+    ready = []
+    for group, last in groups:
+        oh = await db.get(OpenHouseEvent, str(group or "").removeprefix("oh:"))
+        ends = _oh_ended_at(oh)
+        if (ends is not None and ends <= now) or (ends is None and last <= now - OH_QUIET):
+            ready.append(group)
     rows = await _claim(db, OH_QUEUED, OH_SENT, ready)
-    await db.commit()
     if not rows:
-        return 0
-    from app.services.agent_email_service import absolute, email_agent
+        return []
+    from app.services.agent_email_service import absolute
     from app.services.tasks_service import EASTERN
 
     by_oh: "OrderedDict[str, list[dict]]" = OrderedDict()
     for r in rows:
         by_oh.setdefault(str(r.get("_oh_id")), []).append(r)
-    owner_ids = {str(r.get("_owner_id")) for r in rows}
-    owners = {u.id: u for u in (await db.execute(select(User).where(User.id.in_(list(owner_ids))))).scalars().all()}
-    sent = 0
+    out = []
     for oh_id, guests in by_oh.items():
-        user = owners.get(str(guests[0].get("_owner_id")))
-        if user is None:
-            continue
         seen, people = set(), []
         for g in guests:
             key = (g.get("email") or g.get("phone") or g.get("name") or "").lower()
@@ -207,21 +226,30 @@ async def send_open_house_recaps(db: AsyncSession, now: Optional[datetime] = Non
                              "lead_link": absolute(g.get("_lead_link")) if g.get("_lead_link") else ""})
         no_agent = sum(1 for p in people if p["no_agent"])
         first = guests[0]["_at"].astimezone(EASTERN)
-        address = guests[0].get("_address")
-        email_agent(user, "OPEN_HOUSE_SIGN_IN", OH_TEMPLATE,
-                    f"Open house wrap-up: {_plural(len(people), 'guest', 'guests')} at {address}", {
-                        "recipient_name": user.first_name or "there", "property_address": address,
-                        "city": guests[0].get("_city") or "",
-                        "date_label": f"{first.strftime('%A, %B')} {first.day}",
-                        "date_short": f"{first.strftime('%b')} {first.day}",
-                        "guest_label": _plural(len(people), "guest signed in", "guests signed in"),
-                        "no_agent_label": _plural(no_agent, "guest has no agent", "guests have no agent") if no_agent else "",
-                        # short email: the first 8 guests (no-agent guests first), then "+ N more"
-                        "guests": sorted(people, key=lambda p: not p["no_agent"])[:8],
-                        "guests_more": (f"+ {len(people) - 8} more {'guest' if len(people) - 8 == 1 else 'guests'}" if len(people) > 8 else ""),
-                        "link": absolute(f"/open-houses/visitors/{oh_id}"),
-                        "followups_link": absolute("/leads/tasks"),
-                    })
-        sent += 1
-    logger.info("Open house wrap-ups", extra={"event": "oh_recap", "emails": sent, "sign_ins": len(rows)})
-    return sent
+        out.append({
+            "property_address": guests[0].get("_address"), "city": guests[0].get("_city") or "",
+            "date_label": f"{first.strftime('%A, %B')} {first.day}",
+            "date_short": f"{first.strftime('%b')} {first.day}",
+            "guest_count": len(people),
+            "guest_label": _plural(len(people), "guest signed in", "guests signed in"),
+            "no_agent_label": _plural(no_agent, "guest has no agent", "guests have no agent") if no_agent else "",
+            # short: the first few guests (no-agent guests first), then "+ N more"
+            "guests": sorted(people, key=lambda p: not p["no_agent"])[:max_guests],
+            "guests_more": (f"+ {len(people) - max_guests} more {'guest' if len(people) - max_guests == 1 else 'guests'}"
+                            if len(people) > max_guests else ""),
+            "link": absolute(f"/open-houses/visitors/{oh_id}"),
+        })
+    logger.info("Open house wrap-ups claimed", extra={"event": "oh_recap", "owner_id": owner_id,
+                                                      "open_houses": len(out), "sign_ins": len(rows)})
+    return out
+
+
+def send_wrapup_email(user: User, wrapup: dict) -> None:
+    """The old stand-alone wrap-up email - now only for an agent who turned the daily briefing
+    email off but still wants sign-in emails (so turning one off never loses the other)."""
+    from app.services.agent_email_service import absolute, email_agent
+    email_agent(user, "OPEN_HOUSE_SIGN_IN", OH_TEMPLATE,
+                f"Open house wrap-up: {_plural(wrapup['guest_count'], 'guest', 'guests')} at {wrapup['property_address']}", {
+                    "recipient_name": user.first_name or "there", **{k: v for k, v in wrapup.items() if k != "guest_count"},
+                    "followups_link": absolute("/leads/tasks"),
+                })

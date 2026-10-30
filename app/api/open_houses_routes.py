@@ -809,8 +809,8 @@ async def _showcase_and_alert(db: AsyncSession, visitor: OpenHouseVisitor, form_
 
                 db.add(notification)
                 await db.commit()
-                # No email per sign-in - the host gets ONE wrap-up 2 hours after the last guest
-                # signs in (agent_roundup_service); the bell above still alerts live.
+                # No email per sign-in - the host gets the guests in their next daily briefing once the
+                # open house is over (agent_roundup_service); the bell above still alerts live.
                 from app.services.agent_roundup_service import queue_sign_in
                 queue_sign_in(db, await db.get(User, open_house_event.agent_id), open_house_event, visitor,
                               notif_message if notif_message != "Signed in at your open house" else None,
