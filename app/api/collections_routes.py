@@ -318,9 +318,174 @@ async def add_home_to_showcase(
         db.add(row)
     row.disliked = False
     row.agent_recommended_at = row.agent_recommended_at or now
+    row.agent_removed_at = None  # an agent who took it out earlier can always put it back
     coll.updated_at = now
     await db.commit()
     return {"success": True, "added": not already, "property_id": home_id}
+
+
+# ---- Send a home (or several) to the client by text / email --------------------------------------
+# The agent's phone / computer does the sending (sms: / mail compose links) - the server only keeps
+# the agent's saved intro + mail app (they follow the agent to every device) and whether this client
+# already got the intro by text, so later texts start with just the links.
+SEND_MAIL_APPS = {"gmail", "outlook", "default"}
+SEND_MESSAGE_MAX = 600
+
+
+class SendHomePrefsUpdate(BaseModel):
+    # None leaves it as it is; "" puts the message back to the default / forgets the mail app.
+    message: Optional[str] = None
+    mail_app: Optional[str] = None
+
+
+def _send_prefs(user: User) -> dict:
+    p = user.home_send_prefs or {}
+    app = p.get("mail_app")
+    return {"message": (p.get("message") or None), "mail_app": app if app in SEND_MAIL_APPS else None}
+
+
+@router.put("/send-home/prefs")
+async def update_send_home_prefs(
+    body: SendHomePrefsUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Save the agent's own intro message (for every Showcase) and/or the email app they send with."""
+    prefs = dict(current_user.home_send_prefs or {})
+    if body.message is not None:
+        msg = body.message.strip()[:SEND_MESSAGE_MAX]
+        if msg:
+            prefs["message"] = msg
+        else:
+            prefs.pop("message", None)
+    if body.mail_app is not None:
+        if body.mail_app in SEND_MAIL_APPS:
+            prefs["mail_app"] = body.mail_app
+        elif body.mail_app == "":
+            prefs.pop("mail_app", None)
+        else:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown email app")
+    current_user.home_send_prefs = prefs or None
+    await db.execute(update(User).where(User.id == current_user.id).values(home_send_prefs=prefs or None))
+    await db.commit()
+    return _send_prefs(current_user)
+
+
+@router.get("/{collection_id}/send-home")
+async def get_send_home_state(
+    collection_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """What the Send window starts with: the agent's saved message + mail app, and whether this
+    client already got the intro by text."""
+    coll = (await db.execute(select(Collection).where(Collection.id == collection_id))).scalar_one_or_none()
+    if not coll or coll.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    return {**_send_prefs(current_user), "intro_texted_at": coll.home_intro_texted_at}
+
+
+class SendHomeSent(BaseModel):
+    method: str  # 'text' | 'email'
+    with_intro: bool = False
+    property_ids: List[str] = []
+
+
+@router.post("/{collection_id}/send-home/sent")
+async def mark_home_sent(
+    collection_id: str,
+    body: SendHomeSent,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """The agent opened Messages / their email app with the home link(s) for this client. A text
+    with the intro marks the intro as said, so the next text starts without it."""
+    coll = (await db.execute(select(Collection).where(Collection.id == collection_id))).scalar_one_or_none()
+    if not coll or coll.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    if body.method == "text" and body.with_intro and coll.home_intro_texted_at is None:
+        coll.home_intro_texted_at = datetime.now(timezone.utc)
+        await db.commit()
+    return {"success": True, "intro_texted_at": coll.home_intro_texted_at}
+
+
+class BulkHomesAction(BaseModel):
+    # like / unlike / dislike / undislike / recommend / unrecommend / sold / unsold / remove
+    action: str
+    property_ids: List[str]
+
+
+BULK_ACTIONS = {"like", "unlike", "dislike", "undislike", "recommend", "unrecommend", "sold", "unsold", "remove"}
+
+
+@router.post("/{collection_id}/properties/bulk")
+async def bulk_homes_action(
+    collection_id: str,
+    body: BulkHomesAction,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Select mode on the agent's Showcase: one action on many homes at once - the same rules as the
+    one-home buttons. "remove" takes the homes out of the Showcase for good (the search won't add
+    them back). Returns how many homes it changed and which it skipped (e.g. a home still for sale
+    can't go into Sold/Removed)."""
+    from sqlalchemy import delete as sa_delete
+    from app.models.database import PropertyInteraction, collection_properties
+    from app.schemas.property_interactions import PropertyInteractionUpdate
+    if body.action not in BULK_ACTIONS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown action")
+    coll = (await db.execute(select(Collection).where(Collection.id == collection_id))).scalar_one_or_none()
+    if not coll or coll.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    wanted = list(dict.fromkeys(str(i) for i in body.property_ids))[:200]
+    linked = {r[0] for r in (await db.execute(select(collection_properties.c.property_id).where(
+        collection_properties.c.collection_id == collection_id, collection_properties.c.property_id.in_(wanted)))).all()} if wanted else set()
+    ids = [i for i in wanted if i in linked]
+    done: List[str] = []
+    skipped: List[str] = [i for i in wanted if i not in linked]
+    now = datetime.now(timezone.utc)
+
+    async def row_for(pid: str) -> "PropertyInteraction":
+        row = (await db.execute(select(PropertyInteraction).where(and_(
+            PropertyInteraction.collection_id == collection_id, PropertyInteraction.property_id == pid)))).scalar_one_or_none()
+        if row is None:
+            row = PropertyInteraction(collection_id=collection_id, property_id=pid, liked=False, disliked=False, created_at=now, updated_at=now)
+            db.add(row)
+        return row
+
+    a = body.action
+    for pid in ids:
+        if a in ("like", "unlike", "dislike", "undislike"):
+            field = "liked" if a in ("like", "unlike") else "disliked"
+            await PropertyInteractionsService.create_property_interaction(
+                db, collection_id, pid, PropertyInteractionUpdate(**{field: not a.startswith("un")}), user_id=current_user.id)
+            done.append(pid)
+        elif a in ("recommend", "unrecommend"):
+            row = await row_for(pid)
+            if a == "recommend":
+                row.disliked = False  # recommending a home they passed on puts it back in Matches
+                row.agent_recommended_at = row.agent_recommended_at or now
+            else:
+                row.agent_recommended_at = None
+            row.updated_at = now
+            done.append(pid)
+        elif a in ("sold", "unsold"):
+            res = await CollectionsService.set_sold_filed(db, collection_id, pid, a == "sold")
+            (done if res.get("success") else skipped).append(pid)
+        elif a == "remove":
+            row = await row_for(pid)
+            row.agent_removed_at = now
+            row.liked = False
+            row.disliked = False
+            row.agent_recommended_at = None
+            row.updated_at = now
+            await db.execute(sa_delete(collection_properties).where(and_(
+                collection_properties.c.collection_id == collection_id, collection_properties.c.property_id == pid)))
+            done.append(pid)
+    if a == "remove" and done:
+        coll.updated_at = now
+    await db.commit()
+    return {"success": True, "action": a, "done": done, "skipped": skipped}
 
 
 @router.get("/refine-requests/count")

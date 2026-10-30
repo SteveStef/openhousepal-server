@@ -1289,6 +1289,12 @@ class PropertySyncService:
         )
         existing = await db.execute(stmt)
         if not existing.fetchone():
+            # The agent took this home out of the Showcase - it stays out.
+            removed = (await db.execute(select(PropertyInteraction.id).where(and_(
+                PropertyInteraction.collection_id == collection_id, PropertyInteraction.property_id == property_id,
+                PropertyInteraction.agent_removed_at.is_not(None))))).first()
+            if removed:
+                return False
             # The same house under a second MLS number (often filed under the next town over) -
             # the Showcase already has it.
             from app.utils.same_home import is_same_home

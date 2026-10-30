@@ -1889,6 +1889,11 @@ class CollectionsService:
             matching_properties, at_limit = cap_matches(
                 await property_service.get_properties_by_preferences(db, preferences, max_properties=SHOWCASE_FETCH))
             new_match_ids = {p.id for p in matching_properties}
+            # Homes the agent took out of this Showcase never come back from the search.
+            removed_ids = {r[0] for r in (await db.execute(select(PropertyInteraction.property_id).where(and_(
+                PropertyInteraction.collection_id == collection_id, PropertyInteraction.agent_removed_at.is_not(None))))).all()}
+            matching_properties = [p for p in matching_properties if p.id not in removed_ids]
+            new_match_ids -= removed_ids
 
             # 3. Identify IDs of properties to PROTECT (those with user interactions)
             # We don't want to remove properties the user has actually engaged with (Liked, Commented, Toured)

@@ -89,6 +89,9 @@ class User(Base):
     # The one-time setup flow's own bookkeeping: {"last_step", "skipped": [...], "confirmed": [...]}.
     # The answers themselves live where every feature reads them - see setup_flow_service.
     setup_state = Column(JSONB, nullable=True)
+    # "Send" on a home in a client's Showcase: {"message": the agent's own intro text (None = the
+    # default), "mail_app": "gmail" | "outlook" | "default" (None = ask)}. See collections_routes send-home.
+    home_send_prefs = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     @property
@@ -832,6 +835,9 @@ class Collection(Base):
     # dismisses it (see collections_routes.py). Single most-recent message only, not a thread.
     refine_request_message = Column(Text, nullable=True)
     refine_request_at = Column(DateTime(timezone=True), nullable=True)
+    # When the agent first texted this client a home with the intro message ("Hey Dana, it's Peter!") -
+    # later texts start with just the links (the intro is said once).
+    home_intro_texted_at = Column(DateTime(timezone=True), nullable=True)
 
     # Relationships
     owner = relationship("User", back_populates="collections")
@@ -1328,6 +1334,10 @@ class PropertyInteraction(Base):
     # The agent's "I recommend this home for you" - set from their Showcase view; the home wears a
     # Recommended tag on both sides and sorts first. Cleared when the client passes on it.
     agent_recommended_at = Column(DateTime(timezone=True), nullable=True)
+
+    # The agent took this home out of the Showcase (select mode > Remove). The link row is gone and
+    # the search never puts it back; adding it by hand from the home's page clears this.
+    agent_removed_at = Column(DateTime(timezone=True), nullable=True)
 
     # Last time each side actually read this property's comment thread - drives the
     # per-property unread message badge independently for the agent and the visitor.
