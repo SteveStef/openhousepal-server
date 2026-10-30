@@ -111,6 +111,10 @@ class User(Base):
     billing_group_id = Column(String, ForeignKey('billing_groups.id', ondelete='SET NULL'), nullable=True, index=True)
     # The admin-made sign-up code this agent used at checkout (admin "Codes"), if any.
     promo_code_id = Column(String, ForeignKey('promo_codes.id', ondelete='SET NULL'), nullable=True, index=True)
+    # When they ticked "I agree" at sign-up, and which Terms ("Last updated" date). NULL = signed up
+    # before this was recorded.
+    terms_accepted_at = Column(DateTime(timezone=True), nullable=True)
+    terms_version = Column(String, nullable=True)
     # When the one-time $500 IDX setup fee was paid or waived (a code, an admin plan). Set once -
     # going onto IDX again later never charges it twice.
     idx_setup_settled_at = Column(DateTime(timezone=True), nullable=True)

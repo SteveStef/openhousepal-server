@@ -31,7 +31,7 @@ from app.services.ai.ai_realtime_service import (
     create_ephemeral_session, end_realtime_session, record_realtime_usage, sweep_abandoned_sessions,
 )
 from app.services.ai.ai_tts_service import synthesize_speech
-from app.utils.auth import get_current_active_user, require_admin_user
+from app.utils.auth import get_current_active_user, require_admin_user, require_active_plan
 
 logger = get_logger(__name__)
 
@@ -285,7 +285,7 @@ async def estimate_ai_copywrite(
 async def ai_copywrite(
     payload: CopywriteRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_active_plan),
 ):
     """AI copywriter - Design Studio template text, Blogs AI mode, Agent Hub bio polish, plus
     caption/email/text drafts. Metered against the shared Monthly AI Usage allowance."""
@@ -299,7 +299,7 @@ async def ai_copywrite(
 async def ai_compliance_check(
     payload: ComplianceCheckRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_active_plan),
 ):
     """Fair-Housing / MLS advertising review. ADVISORY: returns risky phrases with a suggested
     swap; the agent accepts or ignores each. Never rewrites the text. Metered."""

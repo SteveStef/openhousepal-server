@@ -65,6 +65,7 @@ class StatePatch(BaseModel):
 
 @router.put("/state")
 async def put_state(payload: StatePatch, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    await flow.lock_setup_state(db, current_user)
     st = flow.state_of(current_user)
     known = set(flow.STEP_ORDER)
     if payload.last_step in known:
@@ -137,6 +138,7 @@ class KitPrefsPatch(BaseModel):
 async def put_kit_prefs(payload: KitPrefsPatch, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
     chosen = {k: v for k, v in payload.prefs.items() if k in KIT_PREF_KEYS and isinstance(v, bool)}
     if chosen:
+        await flow.lock_setup_state(db, current_user)
         st = dict(current_user.setup_state or {})
         st["kit_prefs"] = {**_kit_prefs_of(current_user), **chosen}
         current_user.setup_state = st

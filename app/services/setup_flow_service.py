@@ -30,7 +30,7 @@ from app.models.database import (
     StudioBrandKit, User,
 )
 from app.utils.auth import (
-    AGENT_HUB_ACCESS_TIERS, EMAIL_SIGNATURE_ACCESS_TIERS, REVIEWS_ACCESS_TIERS, tier_has_mls,
+    AGENT_HUB_ACCESS_TIERS, EMAIL_SIGNATURE_ACCESS_TIERS, REVIEWS_ACCESS_TIERS, subscription_is_active, tier_has_mls,
 )
 
 # Every step the flow knows, in the order it asks. Required steps can't be skipped.
@@ -77,6 +77,13 @@ def steps_for_plan(plan_tier: Optional[str], approved: bool) -> list[str]:
 
 def _s(v: Any) -> str:
     return v.strip() if isinstance(v, str) else ""
+
+
+async def lock_setup_state(db: AsyncSession, user: User) -> None:
+    """Re-read users.setup_state under a row lock before changing it. Several saves rewrite the
+    whole field (step state, kit prefs, form defaults, the Brand look) and can land together -
+    without the lock the later one would put back what the earlier one changed."""
+    await db.refresh(user, attribute_names=["setup_state"], with_for_update=True)
 
 
 def state_of(user: User) -> dict:
@@ -241,7 +248,8 @@ async def compute(db: AsyncSession, user: User, hub: AgentHub) -> dict:
     info = effective_info(user, cfg)
     st = state_of(user)
     approved = bool(user.broker_authorized) or user.is_admin
-    plan = user.plan_tier if approved else None
+    # An ended subscription gets the profile steps only - its plan's tools are switched off.
+    plan = user.plan_tier if approved and subscription_is_active(user) else None
     steps = steps_for_plan(plan, approved)
     confirmed = set(st["confirmed"])
 
@@ -261,9 +269,12 @@ async def compute(db: AsyncSession, user: User, hub: AgentHub) -> dict:
         elif step == "story":
             done[step] = bool(info["about"])
         elif step == "socials":
-            done[step] = bool(info["linkedin"]) or any(isinstance(l, dict) and l.get("enabled") and _s(l.get("url")) for l in (cfg.get("socialLinks") or []))
+            # The "website" link is filled in for them (their hub / IDX site) - only a link they add counts.
+            done[step] = bool(info["linkedin"]) or any(isinstance(l, dict) and l.get("id") != "website" and l.get("enabled") and _s(l.get("url")) for l in (cfg.get("socialLinks") or []))
         elif step == "sales":
-            done[step] = "sales" in confirmed or (not tier_has_mls(plan) and bool(cfg.get("recentSales")))
+            # No-MLS: only sales they typed in (MLS sales kept from an earlier Bright plan don't show).
+            done[step] = "sales" in confirmed or (not tier_has_mls(plan) and any(
+                isinstance(x, dict) and x.get("source") == "manual" for x in (cfg.get("recentSales") or [])))
         elif step == "reviews":
             r = cfg.get("reviews") or {}
             done[step] = bool(_s(r.get("google_review_url")) or _s(r.get("zillow_review_url")) or _s(r.get("google_place_id")))
@@ -271,7 +282,9 @@ async def compute(db: AsyncSession, user: User, hub: AgentHub) -> dict:
             kit = (await db.execute(select(StudioBrandKit).where(StudioBrandKit.owner_id == user.id))).scalar_one_or_none()
             done[step] = "brand" in confirmed or bool(kit and (kit.personal_logo_url or kit.team_logo_url or kit.brokerage_logo_url))
         elif step == "hub":
-            done[step] = "hub" in confirmed or "hubTheme" in cfg
+            # A hub that follows the Brand Kit gets hubTheme written back by any save (the brand look is
+            # laid over the config the editors load) - so that alone isn't the agent setting up the hub.
+            done[step] = "hub" in confirmed or ("hubTheme" in cfg and cfg.get("lookSource") != "brand")
         elif step == "forms":
             # Forms match the hub out of the box - done once confirmed, or a form got its own look.
             done[step] = "forms" in confirmed or await _exists(
@@ -513,6 +526,7 @@ async def set_form_defaults(db: AsyncSession, user: User, patch: dict) -> dict:
     if chosen:
         for form in await get_or_create_forms(db, user.id):
             apply_form_defaults(form, chosen)
+        await lock_setup_state(db, user)
         st = dict(user.setup_state or {})
         st["form_defaults"] = {**form_defaults_of(user), **chosen}
         user.setup_state = st

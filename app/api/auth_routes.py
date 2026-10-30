@@ -28,6 +28,8 @@ BASIC_PLAN_ID = os.getenv("PAYPAL_BASIC_PLAN_ID")
 PREMIUM_PLAN_ID = os.getenv("PAYPAL_PREMIUM_PLAN_ID")
 
 TEST_CODE_ONLY = "That code only works for the test account it was made for."
+# The "Last updated" date on the Terms page (frontend app/terms/page.tsx) - change both together.
+TERMS_VERSION = "2026-09-17"
 
 @router.post("/send-verification-code", status_code=status.HTTP_200_OK)
 async def send_verification_code(
@@ -92,6 +94,8 @@ async def send_verification_code(
             "license_number": user_data.license_number,
             "is_bright": user_data.is_bright,
             "signup_code": user_data.signup_code,
+            # The "I agree" box was ticked (UserCreate refuses it unticked) - saved on the account below.
+            "terms_accepted_at": datetime.now(timezone.utc).isoformat(),
             "password": user_data.password  # Will be hashed by verification_service
         }
         await verification_service.store_code(user_data.email, code, form_data, db)
@@ -190,6 +194,8 @@ async def verify_code(
             plan_tier=None,
             test_copy_of_user_id=test_source.id if test_source else None,
             promo_code_id=test_promo.id if test_promo else None,
+            terms_accepted_at=datetime.fromisoformat(form_data["terms_accepted_at"]) if form_data.get("terms_accepted_at") else None,
+            terms_version=TERMS_VERSION if form_data.get("terms_accepted_at") else None,
         )
         db.add(new_user)
         await db.flush()
@@ -348,6 +354,27 @@ async def verify_bundle_code(
         raise HTTPException(status_code=400, detail=NOT_IN_BRIGHT_MESSAGE)
     return {"valid": True, "code": code_str, "kind": "bundle", "plan_tier": "PREMIUM", "plan_name": "Premium",
             "plan_id": bundle_plan_id, "message": "Promo code applied successfully!"}
+
+
+@router.get("/signup-code")
+async def get_signup_code(
+    db: AsyncSession = Depends(get_db),
+    current_user: UserModel = Depends(require_broker_authorization),
+):
+    """The test-account code this agent signed up with, checked like a typed one - checkout applies
+    it so it isn't asked for twice. {"code": None} for everyone else (or once it can't be used)."""
+    from app.models.database import PromoCode
+
+    if not current_user.test_copy_of_user_id or not current_user.promo_code_id or current_user.subscription_id \
+            or current_user.subscription_status not in (None, "PENDING_PAYMENT"):
+        return {"code": None}
+    promo = await db.get(PromoCode, current_user.promo_code_id)
+    if not promo or promo.test_copy_of_user_id != current_user.test_copy_of_user_id:
+        return {"code": None}
+    try:
+        return await verify_bundle_code({"code": promo.code}, db, current_user)
+    except HTTPException:
+        return {"code": None}  # switched off or used up since sign-up - they can still type another
 
 
 @router.post("/redeem-code")

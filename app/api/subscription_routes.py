@@ -571,7 +571,7 @@ async def complete_new_subscription(
 
         # Determine if this plan has a trial period
         has_trial = plan_id_has_trial(paypal_plan_id)
-        trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "30"))
+        trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "14"))
 
         # The old subscription they're replacing (e.g. a suspended one after a failed card)
         # must stop, or PayPal could retry/charge it alongside the new one.

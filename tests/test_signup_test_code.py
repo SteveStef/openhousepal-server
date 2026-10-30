@@ -71,9 +71,16 @@ async def test_code_for_a_copy_is_refused(monkeypatch):
 
 
 def test_signup_code_only_kept_for_bright():
-    base = dict(email="a@b.com", first_name="Lori", last_name="D'Onofrio", state="PA", brokerage="COMPASS RE", password="x" * 8)
+    base = dict(email="a@b.com", first_name="Lori", last_name="D'Onofrio", state="PA", brokerage="COMPASS RE", password="x" * 8, agree_to_terms=True)
     assert UserCreate(**base, mls_id="3372275", signup_code=" LORITEST ").signup_code == "LORITEST"
     assert UserCreate(**base, is_bright=False, license_number="RS1", signup_code="LORITEST").signup_code is None
+
+
+def test_signup_needs_the_terms_box():
+    base = dict(email="a@b.com", first_name="Lori", last_name="D'Onofrio", state="PA", brokerage="COMPASS RE", password="x" * 8, mls_id="3372275")
+    for agreed in (None, False):
+        with pytest.raises(ValueError, match="Terms of Service"):
+            UserCreate(**base, agree_to_terms=agreed)
 
 
 @pytest.mark.asyncio

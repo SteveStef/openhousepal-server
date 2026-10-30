@@ -200,7 +200,7 @@ class PreviewMatchesResponse(BaseModel):
     at_limit: bool = False
 
 
-@router.post("/preview-matches", response_model=PreviewMatchesResponse, dependencies=[Depends(require_broker_authorization)])
+@router.post("/preview-matches", response_model=PreviewMatchesResponse, dependencies=[Depends(require_broker_authorization), Depends(require_premium_plan)])
 async def preview_matches(
     preferences: CollectionPreferencesBase,
     db: AsyncSession = Depends(get_db),
@@ -259,7 +259,10 @@ async def showcase_membership(
     offer the others (the ones that have it shown greyed out)."""
     from sqlalchemy import func
     from app.models.database import PropertyInteraction, collection_properties
+    from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
     ids = await _home_ids(db, property_id, listing_key)
+    if not owner_has_access(current_user, SHOWCASE_ACCESS_TIERS):
+        return {"home_ids": ids, "showcases": []}
     cols = (await db.execute(select(Collection).where(Collection.owner_id == current_user.id)
                              .order_by(Collection.updated_at.desc().nullslast(), Collection.created_at.desc()))).scalars().all()
     if not cols:
@@ -292,7 +295,7 @@ async def add_home_to_showcase(
     collection_id: str,
     body: AddHomeBody,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_premium_plan),
 ):
     """The agent puts one home into one of their client's Showcases from that home's page. It's
     marked as the agent's pick (Recommended) - which also keeps it there when the Showcase refreshes
@@ -348,7 +351,7 @@ def _send_prefs(user: User) -> dict:
 async def update_send_home_prefs(
     body: SendHomePrefsUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_premium_plan),
 ):
     """Save the agent's own intro message (for every Showcase) and/or the email app they send with."""
     prefs = dict(current_user.home_send_prefs or {})
@@ -375,7 +378,7 @@ async def update_send_home_prefs(
 async def get_send_home_state(
     collection_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_premium_plan),
 ):
     """What the Send window starts with: the agent's saved message + mail app, and whether this
     client already got the intro by text."""
@@ -396,7 +399,7 @@ async def mark_home_sent(
     collection_id: str,
     body: SendHomeSent,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_premium_plan),
 ):
     """The agent opened Messages / their email app with the home link(s) for this client. A text
     with the intro marks the intro as said, so the next text starts without it."""
@@ -423,7 +426,7 @@ async def bulk_homes_action(
     collection_id: str,
     body: BulkHomesAction,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_premium_plan),
 ):
     """Select mode on the agent's Showcase: one action on many homes at once - the same rules as the
     one-home buttons. "remove" takes the homes out of the Showcase for good (the search won't add
@@ -496,6 +499,9 @@ async def get_pending_refine_requests_count(
     """Drives the Showcases nav badge - how many showcases have a visitor's refine-search
     message still sitting unaddressed. Registered ahead of /{collection_id} so "refine-requests"
     doesn't get swallowed as a collection_id path param."""
+    from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
+    if not owner_has_access(current_user, SHOWCASE_ACCESS_TIERS):
+        return {"count": 0}  # polled by the nav on every plan - no badge without Showcases
     count = await CollectionsService.count_pending_refine_requests(db, str(current_user.id))
     return {"count": count}
 
@@ -503,7 +509,7 @@ async def get_pending_refine_requests_count(
 @router.get("/inbox")
 async def get_showcases_inbox(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     """The Showcases page header's Tour requests + Activity inboxes (registered ahead of
     /{collection_id} so "inbox" isn't read as a collection id)."""
@@ -513,7 +519,7 @@ async def get_showcases_inbox(
 @router.post("/inbox/read")
 async def mark_showcases_inbox_read(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     await CollectionsService.mark_inbox_read(db, str(current_user.id))
     return {"success": True}
@@ -523,7 +529,7 @@ async def mark_showcases_inbox_read(
 async def get_collection_delete_preview(
     collection_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     """What else goes when this Showcase is deleted - shown in the delete confirmation."""
     preview = await CollectionsService.delete_preview(db, collection_id, str(current_user.id))
@@ -888,7 +894,7 @@ async def update_collection_notifications(
 async def dismiss_new_listings(
     collection_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     result = await CollectionsService.dismiss_new_listings(db, collection_id, str(current_user.id))
     if not result["success"]:
@@ -903,7 +909,7 @@ async def dismiss_new_listings(
 async def mark_collection_seen(
     collection_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     """Called once when the agent opens a showcase (e.g. clicking into it from a Leads/Dashboard
     alert) - clears every pending like/dislike/comment/tour-request tag on it at once."""
@@ -951,7 +957,7 @@ async def submit_refine_request(
 async def dismiss_refine_request(
     collection_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     result = await CollectionsService.dismiss_refine_request(db, collection_id, str(current_user.id))
     if not result["success"]:
@@ -1041,7 +1047,7 @@ async def recommend_property(
     property_id: str,
     body: RecommendUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_premium_plan),
 ):
     """The agent's "I recommend this home for you" on one home in a client's Showcase (or taking it
     back). The home shows a Recommended tag on both sides and sorts to the top."""
@@ -1084,7 +1090,7 @@ async def move_to_sold_folder(
     property_id: str,
     body: SoldFolderUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_premium_plan),
 ):
     """The agent moves a home that went under contract / sold / off the market into their client's
     Sold/Removed folder (or back out) - the client's Showcase shows it the same way."""
@@ -1634,7 +1640,7 @@ async def update_shared_collection_notifications(
 async def get_properties_from_collection(
     collectionId: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_premium_plan)
 ):
     """The agent's own Showcase homes (their Showcases page). Guests load homes through
     /shared/{share_token}, which honours a switched-off link and a paused plan - this used to answer

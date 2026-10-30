@@ -28,6 +28,8 @@ class UserCreate(UserBase):
     # An admin test-account code (from the sign-up link): lets a Bright sign-up take the MLS ID of
     # the agent the code copies. Ignored outside Bright.
     signup_code: Optional[str] = None
+    # The "I agree to the Terms" box - recorded on the account (terms_accepted_at / terms_version).
+    agree_to_terms: Optional[bool] = None
 
     _email = field_validator("email", mode="before")(_clean_email)
 
@@ -37,6 +39,12 @@ class UserCreate(UserBase):
         self.brokerage = self.brokerage.strip()
         if not (self.first_name and self.last_name and self.brokerage):
             raise ValueError("Name and brokerage are required")
+        # The sign-up dropdown sends a 2-letter code; it also seeds Discovery's state.
+        self.state = (self.state or "").strip().upper()
+        if not (len(self.state) == 2 and self.state.isalpha()):
+            raise ValueError("Please pick your state")
+        if self.agree_to_terms is not True:
+            raise ValueError("Please agree to the Terms of Service")
         if self.is_bright:
             self.mls_id = (self.mls_id or "").strip()
             if not self.mls_id:
@@ -82,6 +90,8 @@ class User(UserBase):
     billing_group_id: Optional[str] = None  # paid for by a brokerage group (admin)
     test_copy_of_user_id: Optional[str] = None  # an admin-made test copy of this agent (shares their MLS ID)
     last_seen_at: Optional[datetime] = None
+    terms_accepted_at: Optional[datetime] = None  # ticked "I agree" at sign-up (null = before this was recorded)
+    terms_version: Optional[str] = None
 
     class Config:
         from_attributes = True

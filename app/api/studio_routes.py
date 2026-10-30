@@ -73,6 +73,8 @@ async def update_brand_kit(
         # Luxe is IDX only (same rule as the Hub / Signature / Studio Luxe).
         if look.get("theme") == "luxe" and not luxe_theme_allowed(current_user):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Luxe is included with the IDX plan.")
+        from app.services.setup_flow_service import lock_setup_state
+        await lock_setup_state(db, current_user)
         brand_look_service.save_look(current_user, {k: v for k, v in look.items() if v is not None})
     await db.flush()
     # Every feature still on "My Brand Kit" picks the change up (the signature is written here;
