@@ -962,11 +962,30 @@ _SHOWCASE_ORIGIN = {
 
 
 async def _events_out(db: AsyncSession, owner_id: str, events: List[LeadEvent]) -> List[LeadEventOut]:
+    # Open house sign-ins: is the guest represented, and was it the agent's own listing (user, 10/29 -
+    # a represented guest at someone else's listing isn't worth a suggested follow-up).
+    has_agent, own_oh = None, set()
+    visits = [e for e in events if e.source_type == "open_house_visitor" and e.open_house_event_id]
+    if visits:
+        try:
+            from app.services.open_house_service import OpenHouseService
+            lead = await db.get(Lead, visits[0].lead_id)
+            has_agent = (getattr(lead, "represented", None) == "yes") if lead is not None else None
+            ohs = (await db.execute(select(OpenHouseEvent.id, OpenHouseEvent.listing_key).where(
+                OpenHouseEvent.id.in_({e.open_house_event_id for e in visits})))).all()
+            owner = await db.get(User, owner_id)
+            mine = await OpenHouseService.owned_listing_keys(db, owner, {k for _, k in ohs if k}) if owner is not None else set()
+            own_oh = {oid for oid, k in ohs if k and k in mine}
+        except Exception:
+            logger.warning("own-listing check failed for lead events", exc_info=True)
     out = []
     for e in events:
         item = LeadEventOut.model_validate(e)
         item.summary = _nice_summary(e)
         item.handled = e.agent_viewed_at is not None
+        if e.source_type == "open_house_visitor" and e.open_house_event_id:
+            item.guest_has_agent = has_agent
+            item.own_listing = e.open_house_event_id in own_oh
         try:
             item.link = await _event_link(db, owner_id, e)
         except Exception:

@@ -86,6 +86,10 @@ class LeadEventOut(BaseModel):
     came_from: Optional[str] = None
     # The agent already dealt with it (opened / marked done) - "Waiting on you" points at one that isn't.
     handled: bool = False
+    # Open house sign-ins only: the guest has their own agent / the home is the agent's own listing -
+    # the Leads page suggests a follow-up for a represented guest only at the agent's own listing.
+    guest_has_agent: Optional[bool] = None
+    own_listing: Optional[bool] = None
 
     class Config:
         from_attributes = True
