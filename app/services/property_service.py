@@ -350,7 +350,10 @@ class PropertyService:
         # independent areas (OR). School districts then narrow the result (AND) - see below.
         geo_filters = list(location_filters)
 
-        if preferences.lat is not None and preferences.long is not None and preferences.diameter:
+        # The radius is its own area only when no town / township / county is picked (owner, 11/01:
+        # a Showcase set to Exton kept the open house's 1.5 mi circle and showed Downingtown homes).
+        # Same rule as the new-listing matcher (property_sync_service) and the AI helper.
+        if not location_filters and preferences.lat is not None and preferences.long is not None and preferences.diameter:
             lat_offset, long_offset = get_lat_long_offsets(preferences.lat, preferences.diameter)
             geo_filters.append(and_(
                 Property.latitude >= float(preferences.lat) - lat_offset,
@@ -622,7 +625,10 @@ class PropertyService:
                     _polygon_filter(Property, preferences.search_polygon),
                 ))
 
-        if preferences.lat is not None and preferences.long is not None and preferences.diameter:
+        # The radius is its own area only when no town / township / county is picked (owner, 11/01:
+        # a Showcase set to Exton kept the open house's 1.5 mi circle and showed Downingtown homes).
+        # Same rule as the new-listing matcher (property_sync_service) and the AI helper.
+        if not location_filters and preferences.lat is not None and preferences.long is not None and preferences.diameter:
             lat_offset, long_offset = get_lat_long_offsets(preferences.lat, preferences.diameter)
             geo_filters.append(and_(
                 Property.latitude >= float(preferences.lat) - lat_offset,

@@ -69,6 +69,7 @@ Showcases and CMA in depth: every Showcase search option, match score, compare h
 ## Can't do
 - **Delete Showcase** is permanent (homes, likes, comments, search; the client stays in Leads; open follow-ups about it may be removed - the window lists them). Use **Turn Off** to pause.
 - Turning a kit's Guest Showcases on doesn't build them for guests who already signed in - use the Visitors window's Showcase switch for those.
+- Picking towns, townships or counties makes the search those places only - a radius from the starting home no longer adds homes from nearby towns (the "Searching around · X mi" chip only shows on radius-only Showcases). A school district narrows whatever area is picked.
 - No Showcases on No-MLS plans (no MLS homes to match).
 
 # CMA (Tools → CMA, "Price it right, prove it")
