@@ -309,6 +309,21 @@ async def _daily_trend(db: AsyncSession, since: datetime, config: dict, owner_id
     ]
 
 
+@router.get("/helper-switch")
+async def get_ai_helper_switch(db: AsyncSession = Depends(get_db), admin: UserModel = Depends(require_admin_user)):
+    """The one switch for the bottom-right AI helper: on = every paying agent has it (10/30)."""
+    from app.services.ai.ai_helper_access import helper_open_to_all
+    return {"open_to_all": await helper_open_to_all(db)}
+
+
+@router.put("/helper-switch")
+async def set_ai_helper_switch(payload: dict, db: AsyncSession = Depends(get_db), admin: UserModel = Depends(require_admin_user)):
+    from app.services.ai.ai_helper_access import helper_open_to_all, set_helper_open_to_all
+    await set_helper_open_to_all(db, bool(payload.get("open_to_all")))
+    logger.info("AI helper switch", extra={"event": "ai_helper_switch", "open_to_all": bool(payload.get("open_to_all"))})
+    return {"open_to_all": await helper_open_to_all(db)}
+
+
 @router.get("/overview", response_model=AIAdminOverview)
 async def get_ai_overview(
     db: AsyncSession = Depends(get_db),

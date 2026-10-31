@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.logging import get_logger
 from app.models.database import User
-from app.services.ai import ai_tools
+from app.services.ai import ai_actions, ai_tools, ai_ui_tools
 from app.services.ai.ai_config_service import ai_config_service
 from app.services.ai.ai_prompt_service import SYSTEM_PROMPT
 
@@ -99,6 +99,9 @@ def _extract_result_refs(tool_name: str, result: Any) -> List[dict]:
     return refs
 
 
+PLAN_NAMES = {"NO_MLS": "No-MLS Basic", "PRO_NO_MLS": "No-MLS Premium", "BASIC": "Basic", "PREMIUM": "Premium", "IDX": "IDX"}
+
+
 VOICE_MODE_BLOCK = {
     "type": "text",
     "text": (
@@ -128,6 +131,8 @@ async def run_turn(
     messages: List[dict] = list(conversation_history) + [{"role": "user", "content": user_message}]
     all_refs: List[dict] = []
     usage_state = {"model": config["model"], "input_tokens": 0, "output_tokens": 0, "tool_call_count": 0, "tool_names": []}
+    # Lookups this plan gets + things it can set up for a Confirm tap (ai_actions.py, 10/30).
+    tools = ai_tools.tools_for(current_user) + ai_actions.action_tools_for(current_user) + ai_ui_tools.UI_TOOL_DEFINITIONS
 
     async def _call_model():
         # Second system block is deliberately NOT cached (no cache_control) and rebuilt every
@@ -136,7 +141,12 @@ async def run_turn(
         # morning or a week ago, and will guess - see ai_prompt_service.py's recency guidance.
         now_block = {
             "type": "text",
-            "text": f"Current date and time: {datetime.now(timezone.utc):%A, %B %d, %Y %I:%M %p} UTC.",
+            "text": f"Current date and time: {datetime.now(timezone.utc):%A, %B %d, %Y %I:%M %p} UTC.\n"
+                    # Their plan, so how-to answers never offer something it doesn't include (10/30).
+                    f"This agent is on the {PLAN_NAMES.get(current_user.plan_tier, current_user.plan_tier)} plan"
+                    f"{'' if current_user.broker_authorized else ' and their broker has NOT approved them yet (Broker Authorization in the top menu) - MLS features stay locked until then'}. "
+                    "Only suggest features this plan includes (see the plan table in the guide); for anything else, say which plan has it. "
+                    f"The agent is {current_user.first_name} {current_user.last_name}. Never decide yourself whether a listing or sale is theirs from names in lookups (MLS names often differ, e.g. middle names) - call the action tool; it checks by MLS ID and tells you.",
         }
         system_blocks = [
             {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
@@ -148,7 +158,7 @@ async def run_turn(
             model=config["model"],
             max_tokens=config["max_output_tokens"],
             system=system_blocks,
-            tools=ai_tools.TOOL_DEFINITIONS,
+            tools=tools,
             messages=messages,
             **ai_config_service.model_options(config["model"], "medium"),
         )
@@ -169,6 +179,10 @@ async def run_turn(
 
             tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
             messages.append({"role": "assistant", "content": response.content})
+            said = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
+            # Only buttons (choices / Go there) on a reply that's already written: show them with
+            # it and stop - another model call would just repeat the text.
+            only_ui = said and all(b.name in ai_ui_tools.UI_TOOL_NAMES for b in tool_use_blocks)
 
             tool_results = []
             for block in tool_use_blocks:
@@ -184,6 +198,24 @@ async def run_turn(
 
                 args = block.input if isinstance(block.input, dict) else {}
                 usage_state["tool_names"].append(block.name)
+                if block.name in ai_ui_tools.UI_TOOL_NAMES:
+                    # Choices / "Go there" buttons shown under the reply - nothing to look up or change.
+                    result, entry = ai_ui_tools.run(block.name, args)
+                    if entry:
+                        all_refs.append(entry)
+                    tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(result)})
+                    continue
+                if ai_actions.is_action(block.name):
+                    # Only SETS IT UP - the agent's Confirm tap on the card runs it.
+                    usage_state["actions"] = usage_state.get("actions", 0) + 1
+                    if usage_state["actions"] > ai_actions.MAX_ACTIONS_PER_TURN:
+                        result, entry = {"error": "too_many", "message": "Set up at most 3 things at once - ask the agent to confirm these first."}, None
+                    else:
+                        result, entry = await ai_actions.propose(db, current_user, block.name, args)
+                    if entry:
+                        all_refs.append(entry)
+                    tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(result, default=str)})
+                    continue
                 all_refs.extend(_extract_record_refs(block.name, args))
                 result = await ai_tools.execute_tool(db, current_user, block.name, args, config)
                 all_refs.extend(_extract_result_refs(block.name, result))
@@ -193,6 +225,8 @@ async def run_turn(
                     "content": json.dumps(result, default=str),
                 })
 
+            if only_ui:
+                return said
             messages.append({"role": "user", "content": tool_results})
 
         return "I wasn't able to finish researching that within my turn budget. Try asking a more specific question, or split it into smaller questions."

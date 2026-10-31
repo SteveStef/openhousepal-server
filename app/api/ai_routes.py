@@ -31,6 +31,7 @@ from app.services.ai.ai_realtime_service import (
     create_ephemeral_session, end_realtime_session, record_realtime_usage, sweep_abandoned_sessions,
 )
 from app.services.ai.ai_tts_service import synthesize_speech
+from app.services.ai.ai_helper_access import can_use_helper, require_ai_helper_user
 from app.utils.auth import get_current_active_user, require_admin_user, require_active_plan
 
 logger = get_logger(__name__)
@@ -55,6 +56,18 @@ async def _get_owned_conversation(
     return conversation
 
 
+_CARD_STATUS = {"pending": "waiting for them to tap Confirm", "running": "running", "done": "the agent tapped Confirm and it went through - it is done",
+                "failed": "the agent tapped Confirm but it failed - nothing changed", "cancelled": "the agent tapped Cancel - nothing changed", "expired": "expired untapped"}
+
+
+def _card_note(m: AIMessage) -> str:
+    """What happened to the Confirm cards on a past reply (10/30) - otherwise the model only sees its
+    own "tap Confirm" text and can't tell a done action from an untapped one."""
+    cards = [t for t in (m.tool_calls or []) if isinstance(t, dict) and t.get("record_type") == "action"]
+    return "".join(f"\n[Card: {c.get('title')} - {_CARD_STATUS.get(c.get('status'), c.get('status'))}"
+                   + (f" ({c.get('result_message')})" if c.get("status") == "failed" and c.get("result_message") else "") + "]" for c in cards)
+
+
 async def _build_history(db: AsyncSession, conversation: AIConversation, max_messages: int) -> List[dict]:
     """Recent-message replay window, oldest first. Only the final text of each past turn is
     replayed - not the tool calls that produced it - so token cost stays flat as a
@@ -71,16 +84,75 @@ async def _build_history(db: AsyncSession, conversation: AIConversation, max_mes
         stmt = stmt.where(AIMessage.created_at > conversation.summary_covers_through)
     result = await db.execute(stmt)
     messages = list(reversed(result.scalars().all()))
-    history = [{"role": m.role, "content": m.content} for m in messages]
+    history = [{"role": m.role, "content": m.content + _card_note(m)} for m in messages]
     if conversation.summary:
         history.insert(0, {"role": "user", "content": f"[Summary of earlier conversation: {conversation.summary}]"})
     return history
 
 
+@router.get("/helper/status")
+async def get_ai_helper_status(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Whether to show the bottom-right AI helper for this agent (every plan since 10/30, unless
+    the Admin switch is off) and whether its voice parts show (admin only - pricier models)."""
+    # Voice (read-aloud, Talk to OHP) is off for everyone, admin too, until it's polished (owner, 10/30).
+    # Typing by voice with the mic is the browser's own dictation and stays.
+    return {"enabled": await can_use_helper(db, current_user), "voice": False}
+
+
+@router.post("/actions/{action_id}/confirm")
+async def confirm_ai_action(
+    action_id: str,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_ai_helper_user),
+):
+    """The agent tapped Confirm on something the helper set up - the only way an action runs."""
+    from app.services.ai import ai_actions
+    try:
+        return await ai_actions.confirm(db, current_user, str(payload.get("message_id") or ""), action_id)
+    except ai_actions.ActionError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/actions/{action_id}/client-result")
+async def client_ai_action_result(
+    action_id: str,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_ai_helper_user),
+):
+    """The agent's browser finished building something the helper set up (a design) - record it."""
+    from app.services.ai import ai_actions
+    try:
+        return await ai_actions.client_result(
+            db, current_user, str(payload.get("message_id") or ""), action_id, bool(payload.get("ok")),
+            str(payload.get("message") or ""), payload.get("link"), payload.get("made") if isinstance(payload.get("made"), dict) else None,
+        )
+    except ai_actions.ActionError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/actions/{action_id}/cancel")
+async def cancel_ai_action(
+    action_id: str,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_ai_helper_user),
+):
+    from app.services.ai import ai_actions
+    try:
+        return await ai_actions.cancel(db, current_user, str(payload.get("message_id") or ""), action_id)
+    except ai_actions.ActionError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @router.post("/conversations", response_model=AIConversationListItem, status_code=201)
 async def create_ai_conversation(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_user),
+    current_user: User = Depends(require_ai_helper_user),
 ):
     conversation = AIConversation(owner_id=current_user.id)
     db.add(conversation)
@@ -92,7 +164,7 @@ async def create_ai_conversation(
 @router.get("/conversations", response_model=List[AIConversationListItem])
 async def list_ai_conversations(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_user),
+    current_user: User = Depends(require_ai_helper_user),
 ):
     stmt = (
         select(AIConversation)
@@ -108,7 +180,7 @@ async def list_ai_conversations(
 async def get_ai_conversation(
     conversation_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_user),
+    current_user: User = Depends(require_ai_helper_user),
 ):
     return await _get_owned_conversation(db, conversation_id, current_user.id, load_messages=True)
 
@@ -117,7 +189,7 @@ async def get_ai_conversation(
 async def delete_ai_conversation(
     conversation_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_user),
+    current_user: User = Depends(require_ai_helper_user),
 ):
     """Soft-delete only - sets archived_at. The conversation row and its messages are never
     destroyed, so the audit trail (AIUsageEvent) always resolves back to a real conversation."""
@@ -132,7 +204,7 @@ async def send_ai_message(
     conversation_id: str,
     payload: AISendMessageRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin_user),
+    current_user: User = Depends(require_ai_helper_user),
 ):
     conversation = await _get_owned_conversation(db, conversation_id, current_user.id)
     config = await ai_config_service.get_config(db)

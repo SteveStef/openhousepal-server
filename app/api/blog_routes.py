@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.hub_slugs import hub_by_slug
 from app.database import get_db
 from app.models.database import AgentHub, Blog, BlogEvent, Notification, User
 from app.services import s3_service, storage_ledger_service
@@ -794,8 +795,7 @@ async def list_public_blogs(
     category: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    hub_result = await db.execute(select(AgentHub).where(AgentHub.slug == normalize_slug(agent_slug)))
-    hub = hub_result.scalar_one_or_none()
+    hub = await hub_by_slug(db, normalize_slug(agent_slug))  # current link or its kept old one
     if not hub:
         return []
 
@@ -834,6 +834,15 @@ async def list_public_blogs(
     ]
 
 
+async def article_site_url(db: AsyncSession, agent: User, blog: Blog) -> Optional[str]:
+    """The article's address on the agent's live IDX website (only when it's shown there). Then that
+    copy is the one Google lists; the openhousepal.com copy points at it (owner, 10/30)."""
+    if not blog.idx_visible:
+        return None
+    base, _ = await blog_neighborhoods.website_base_url(db, agent)
+    return f"{base}/blog/{blog.slug}" if base else None
+
+
 async def _public_blocks(db: AsyncSession, blocks) -> list:
     from app.services.ai import ai_blog_writer_service
     try:
@@ -853,8 +862,7 @@ async def get_public_blog(
     db: AsyncSession = Depends(get_db),
     viewer: Optional[User] = Depends(get_current_user_optional),
 ):
-    hub_result = await db.execute(select(AgentHub).where(AgentHub.slug == normalize_slug(agent_slug)))
-    hub = hub_result.scalar_one_or_none()
+    hub = await hub_by_slug(db, normalize_slug(agent_slug))  # current link or its kept old one
     if not hub:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This article could not be found.")
 
@@ -895,6 +903,7 @@ async def get_public_blog(
         socialDescription=blog.social_description,
         socialImageUrl=blog.social_image_url,
         isIndexed=blog.is_indexed,
+        siteUrl=await article_site_url(db, agent, blog),
         publishedAt=blog.published_at,
         readingTimeMinutes=estimate_reading_time(blog.blocks),
         agentName=f"{agent.first_name} {agent.last_name}".strip(),
@@ -974,7 +983,7 @@ async def submit_blog_lead(
     from app.services.forms_service import _EMAIL_RE
     if email and not _EMAIL_RE.match(email):
         raise HTTPException(status_code=422, detail="Enter a valid email address.")
-    hub = (await db.execute(select(AgentHub).where(AgentHub.slug == normalize_slug(agent_slug)))).scalar_one_or_none()
+    hub = await hub_by_slug(db, normalize_slug(agent_slug))  # current link or its kept old one
     blog = (await db.execute(
         select(Blog).where(Blog.owner_id == hub.owner_id, Blog.slug == normalize_slug(blog_slug), Blog.status == "PUBLISHED")
     )).scalar_one_or_none() if hub else None
@@ -1019,8 +1028,7 @@ async def track_blog_event(
     # signed-in viewer (the agent checking their own article) isn't a reader.
     if payload.event_type == "view" and viewer:
         return
-    hub_result = await db.execute(select(AgentHub).where(AgentHub.slug == normalize_slug(agent_slug)))
-    hub = hub_result.scalar_one_or_none()
+    hub = await hub_by_slug(db, normalize_slug(agent_slug))  # current link or its kept old one
     if not hub:
         return
 

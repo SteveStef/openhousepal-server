@@ -11,6 +11,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.hub_slugs import hub_by_slug
 from app.services.email_avatar_service import agent_email_vars
 from app.database import get_db
 from app.models.database import AgentForm, AgentHub, AgentHubEvent, FormCampaign, FormSubmission, FormViewSession, Notification, User
@@ -1975,7 +1976,7 @@ async def public_agent_busy(agent_slug: str, days: int = 8, db: AsyncSession = D
     """The agent's busy blocks (start/end only) so the client's time picker only offers times the
     agent is actually free (user, 10/18). [] when no calendar is connected."""
     from app.services import calendar_sync_service
-    hub = (await db.execute(select(AgentHub).where(AgentHub.slug == normalize_form_slug(agent_slug)))).scalar_one_or_none()
+    hub = await hub_by_slug(db, normalize_form_slug(agent_slug))  # current link or its kept old one
     if not hub:
         return {"busy": []}
     return {"busy": await calendar_sync_service.public_busy(db, hub.owner_id, days)}
@@ -1986,8 +1987,7 @@ async def list_public_forms(
     agent_slug: str,
     db: AsyncSession = Depends(get_db),
 ):
-    hub_result = await db.execute(select(AgentHub).where(AgentHub.slug == normalize_form_slug(agent_slug)))
-    hub = hub_result.scalar_one_or_none()
+    hub = await hub_by_slug(db, normalize_form_slug(agent_slug))  # current link or its kept old one
     if not hub:
         return []
 
@@ -2012,8 +2012,7 @@ async def get_public_form(
     preview: bool = Query(False, description="An editor's live preview (setup flow / form Settings) - not a visit."),
     db: AsyncSession = Depends(get_db),
 ):
-    hub_result = await db.execute(select(AgentHub).where(AgentHub.slug == normalize_form_slug(agent_slug)))
-    hub = hub_result.scalar_one_or_none()
+    hub = await hub_by_slug(db, normalize_form_slug(agent_slug))  # current link or its kept old one
     if not hub:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This form could not be found.")
 
@@ -2101,8 +2100,7 @@ async def track_form_progress(
     Stats drop-off funnel - never raises, since a tracking failure must never surface to the
     visitor filling out the form."""
     try:
-        hub_result = await db.execute(select(AgentHub).where(AgentHub.slug == normalize_form_slug(agent_slug)))
-        hub = hub_result.scalar_one_or_none()
+        hub = await hub_by_slug(db, normalize_form_slug(agent_slug))  # current link or its kept old one
         if not hub:
             return {"success": True}
 
@@ -2141,8 +2139,7 @@ async def submit_public_form(
 ):
     from app.services.public_rate_limit import check_public_submit
     check_public_submit(request)
-    hub_result = await db.execute(select(AgentHub).where(AgentHub.slug == normalize_form_slug(agent_slug)))
-    hub = hub_result.scalar_one_or_none()
+    hub = await hub_by_slug(db, normalize_form_slug(agent_slug))  # current link or its kept old one
     if not hub:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This form could not be found.")
 
@@ -2173,7 +2170,7 @@ async def get_public_showing_status(
 ):
     """A visitor coming back to their Schedule a Showing link: their request (remembered on their
     device by submission id) as Pending or Confirmed - the same status the Showcase shows."""
-    hub = (await db.execute(select(AgentHub).where(AgentHub.slug == normalize_form_slug(agent_slug)))).scalar_one_or_none()
+    hub = await hub_by_slug(db, normalize_form_slug(agent_slug))  # current link or its kept old one
     form = (await db.execute(
         select(AgentForm).where(AgentForm.owner_id == hub.owner_id, AgentForm.slug == normalize_form_slug(form_slug))
     )).scalar_one_or_none() if hub else None

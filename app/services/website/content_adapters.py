@@ -940,6 +940,8 @@ def _blog_card(b: Blog) -> dict:
         "cover_image_url": _blog_photo(b),
         "category": b.category,
         "published_at": b.published_at.isoformat() if b.published_at else None,
+        # "Let Google find this article" - the site's sitemap leaves it out when off.
+        "is_indexed": b.is_indexed is not False,
         # Real signal, not a guess - lets the Media hub show a "Watch" badge on posts that
         # actually embed a YouTube block, distinguishing video content from articles without
         # needing a separate media-library system (see content_adapters module docstring).

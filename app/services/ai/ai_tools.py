@@ -289,6 +289,7 @@ async def _get_open_house_guests(db: AsyncSession, current_user: User, args: dic
         "open_house_address": event.address,
         "results": [
             {
+                "visitor_id": v.id,   # for the helper's per-guest actions (10/30)
                 "lead_id": v.lead_id,
                 "name": v.full_name,
                 "email": v.email,
@@ -634,9 +635,36 @@ _DISPATCH: Dict[str, Callable] = {
 _FORBIDDEN_ARG_KEYS = {"owner_id", "user_id", "agent_id", "current_user_id"}
 
 
+# MLS listing lookups follow the app's own require_mls_access: a No-MLS plan never gets Bright
+# data through the helper either (owner, 10/30 - the helper opened to every plan).
+_MLS_TOOLS = {"search_properties", "get_property_detail", "get_similar_properties"}
+
+
+def _allowed(current_user: User, tool_name: str) -> bool:
+    from app.utils.auth import MLS_ACCESS_TIERS
+    return tool_name not in _MLS_TOOLS or current_user.is_admin or current_user.plan_tier in MLS_ACCESS_TIERS
+
+
+def tools_for(current_user: User) -> list:
+    """The tool list this agent's plan gets - what the model is even told exists. The typed
+    helper also gets ai_lookups (the app's own pages' GETs, 10/30); voice keeps the core set."""
+    from app.services.ai import ai_lookups
+    return [t for t in TOOL_DEFINITIONS if _allowed(current_user, t["name"])] + ai_lookups.definitions_for(current_user)
+
+
 async def execute_tool(db: AsyncSession, current_user: User, tool_name: str, raw_args: dict, config: dict) -> Dict[str, Any]:
     executor = _DISPATCH.get(tool_name)
+    if executor and not _allowed(current_user, tool_name):
+        return {"error": "not_on_plan", "message": "MLS listing data isn't part of this agent's plan."}
     if not executor:
+        from app.services.ai import ai_lookups
+        if tool_name in ai_lookups.LOOKUPS:
+            args = {k: v for k, v in (raw_args or {}).items() if k not in _FORBIDDEN_ARG_KEYS}
+            try:
+                return await ai_lookups.run_lookup(db, current_user, tool_name, args)
+            except Exception:
+                logger.exception("AI lookup '%s' failed for user %s", tool_name, current_user.id)
+                return {"error": "tool_failed", "message": "Something went wrong retrieving that information."}
         return {"error": "unknown_tool", "message": f"Tool '{tool_name}' does not exist."}
 
     args = {k: v for k, v in (raw_args or {}).items() if k not in _FORBIDDEN_ARG_KEYS}

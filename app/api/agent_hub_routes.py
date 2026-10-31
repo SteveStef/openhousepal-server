@@ -265,6 +265,75 @@ async def fetch_bright_agent_sales(identifier: str, identifier_type: str, limit:
     return sorted_sales
 
 
+# Agent pages on openhousepal.com are noindex (proxy.ts, 10/29), but Google kept showing hubs and
+# forms as sitelinks under OpenHousePal's own result until it recrawls them. Listing them in the
+# marketing sitemap for a while gets them recrawled sooner, so the noindex is seen and they drop
+# (owner, 10/30). Paths only - every one of these pages is already public.
+RECHECK_UNTIL = datetime(2026, 12, 15, tzinfo=timezone.utc)
+_recheck_cache: Dict[str, Any] = {}
+
+
+@router.get("/public-recheck-paths")
+async def public_recheck_paths(db: AsyncSession = Depends(get_db)):
+    if datetime.now(timezone.utc) >= RECHECK_UNTIL:
+        return {"paths": []}
+    hit = _recheck_cache.get("v")
+    if hit and time.time() - hit[0] < 3600:
+        return {"paths": hit[1]}
+    from app.models.database import AgentForm
+    paths: list = []
+    hubs = (await db.execute(select(AgentHub.owner_id, AgentHub.slug, AgentHub.previous_slugs))).all()
+    forms = (await db.execute(select(AgentForm.owner_id, AgentForm.slug).where(AgentForm.slug.isnot(None)))).all()
+    by_owner: Dict[str, list] = {}
+    for owner_id, fslug in forms:
+        by_owner.setdefault(owner_id, []).append(fslug)
+    for owner_id, slug, previous in hubs:
+        if not slug:
+            continue
+        for s in [slug, *[p for p in (previous or []) if isinstance(p, str)]]:
+            paths.append(f"/{s}")
+        paths += [f"/{slug}/{x}" for x in ("sales", "listings", "blogs", "review")]
+        paths += [f"/{slug}/{f}" for f in by_owner.get(owner_id, [])]
+    paths = sorted({p for p in paths if re.fullmatch(r"/[A-Za-z0-9/_-]+", p)})[:5000]
+    _recheck_cache["v"] = (time.time(), paths)
+    return {"paths": paths}
+
+
+_blog_paths_cache: Dict[str, Any] = {}
+
+
+@router.get("/public-blog-paths")
+async def public_blog_paths(db: AsyncSession = Depends(get_db)):
+    """Articles Google may list on openhousepal.com (owner, 10/30: Premium blogs should be found):
+    published, "Let Google find this article" on, agent on a plan with Blogs, and not also on a live
+    IDX website (there the website's copy is the listed one). For the marketing sitemap."""
+    hit = _blog_paths_cache.get("v")
+    if hit and time.time() - hit[0] < 3600:
+        return {"posts": hit[1]}
+    from app.api.blog_routes import article_site_url
+    from app.models.database import Blog
+    from app.utils.auth import owner_has_access, STUDIO_DESIGN_ACCESS_TIERS
+    rows = (await db.execute(
+        select(Blog, User, AgentHub.slug)
+        .join(User, User.id == Blog.owner_id)
+        .join(AgentHub, AgentHub.owner_id == Blog.owner_id)
+        .where(Blog.status == "PUBLISHED", Blog.is_indexed.is_(True))
+        .order_by(Blog.published_at.desc().nullslast())
+        .limit(5000)
+    )).all()
+    posts: list = []
+    for blog, owner, hub_slug in rows:
+        if not hub_slug or not blog.slug or not owner_has_access(owner, STUDIO_DESIGN_ACCESS_TIERS):
+            continue
+        if await article_site_url(db, owner, blog):
+            continue
+        posts.append({"path": f"/{hub_slug}/blogs/{blog.slug}",
+                      "lastmod": (blog.updated_at or blog.published_at).isoformat() if (blog.updated_at or blog.published_at) else None})
+    _blog_paths_cache["v"] = (time.time(), posts)
+    return {"posts": posts}
+
+
+
 @router.get("/slug/check")
 async def check_slug(
     slug: str = Query(..., min_length=3, max_length=80),
@@ -276,7 +345,9 @@ async def check_slug(
     normalized = validate_slug(slug)
     result = await db.execute(select(AgentHub).where(AgentHub.slug == normalized))
     hub = result.scalar_one_or_none()
-    available = hub is None or hub.owner_id == current_user.id
+    # Taken = another agent's current link or the old link they still keep (services/hub_slugs.py).
+    from app.services.hub_slugs import slug_held_by_another_agent
+    available = not await slug_held_by_another_agent(db, normalized, current_user.id)
 
     return {
         "slug": normalized,
@@ -514,9 +585,8 @@ async def track_agent_hub_event(
     if viewer:
         return None
 
-    normalized = normalize_slug(slug)
-    result = await db.execute(select(AgentHub).where(AgentHub.slug == normalized))
-    hub = result.scalar_one_or_none()
+    from app.services.hub_slugs import hub_by_slug
+    hub = await hub_by_slug(db, normalize_slug(slug))   # an old link's visits count too
     if not hub:
         return None
 
@@ -1268,9 +1338,8 @@ async def update_my_agent_hub_slug(
     current_user: User = Depends(require_active_plan),
 ):
     slug = validate_slug(payload.slug)
-    slug_result = await db.execute(select(AgentHub).where(AgentHub.slug == slug))
-    existing_slug_hub = slug_result.scalar_one_or_none()
-    if existing_slug_hub and existing_slug_hub.owner_id != current_user.id:
+    from app.services.hub_slugs import renamed_previous_slugs, slug_held_by_another_agent
+    if await slug_held_by_another_agent(db, slug, current_user.id):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This Agent Hub URL is already being used.",
@@ -1281,13 +1350,11 @@ async def update_my_agent_hub_slug(
 
     if hub:
         if hub.slug != slug:
-            # Keep the old slug resolving (see get_public_agent_hub) so any link/QR already
-            # printed with it - e.g. an Open House Cheat Sheet - doesn't 404 after a rebrand.
-            previous = list(hub.previous_slugs or [])
-            if hub.slug not in previous:
-                previous.append(hub.slug)
-            previous = [s for s in previous if s != slug]
-            hub.previous_slugs = previous
+            # Keep the link they're leaving working (see get_public_agent_hub) so any link/QR
+            # already printed with it - e.g. an Open House Cheat Sheet - doesn't 404 after a
+            # rebrand. Only that ONE (owner, 10/30): renaming again lets the older one go, so an
+            # agent can't hold a pile of names by renaming over and over.
+            hub.previous_slugs = renamed_previous_slugs(hub.slug, slug)
         hub.slug = slug
     else:
         hub = AgentHub(owner_id=current_user.id, slug=slug)

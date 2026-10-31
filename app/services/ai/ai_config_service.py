@@ -96,8 +96,8 @@ DEFAULT_CONFIG = {
     "blog_pipeline_cache_read_multiplier": 0.1,
 
     # Orchestration budget (per user turn)
-    "max_tool_calls_per_turn": 8,
-    "max_iterations": 4,
+    "max_tool_calls_per_turn": 10,   # 8 before the helper got buttons + actions (10/30)
+    "max_iterations": 6,             # 4 before 10/30: lookup -> set up -> Go there -> answer
     "request_timeout_seconds": 60,
 
     # Conversation replay window (messages, not tokens). Once a conversation's uncovered

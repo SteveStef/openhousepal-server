@@ -174,6 +174,8 @@ class PublicBlogDetail(BaseModel):
     socialDescription: Optional[str] = None
     socialImageUrl: Optional[str] = None
     isIndexed: bool = True
+    # The same article on the agent's live IDX website, when it's shown there - Google's main copy.
+    siteUrl: Optional[str] = None
     publishedAt: Optional[datetime] = None
     readingTimeMinutes: int = 1
     agentName: str
