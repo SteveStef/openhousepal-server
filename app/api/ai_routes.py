@@ -14,7 +14,7 @@ from app.schemas.ai import (
     AISendMessageRequest, AISendMessageResponse, AIInsightsResponse, AISpeechRequest,
     AIRealtimeSessionOut, AIRealtimeToolCallRequest, AIRealtimeToolCallResponse,
     AIRealtimeUsageRequest, AIRealtimeUsageResponse, AIRealtimeHeartbeatRequest, AIRealtimeEndRequest,
-    DailyDigestResponse, DigestDismissRequest, MonthlyAIUsageResponse,
+    DailyDigestResponse, DigestDismissRequest, MonthlyAIUsageResponse, ChatUsageResponse,
     CopywriteRequest, CopywriteResponse, ComplianceCheckRequest, ComplianceCheckResponse,
 )
 from app.services.ai import ai_copywrite_service, ai_insights_service, ai_tools
@@ -24,7 +24,7 @@ from app.services.ai.ai_orchestrator_service import (
     AIOrchestratorError, run_turn, _extract_record_refs, _extract_result_refs,
 )
 from app.services.ai.ai_rate_limit_service import (
-    AIRateLimitExceeded, check_and_reserve, check_input_length, monthly_ai_budget_snapshot,
+    AIRateLimitExceeded, chat_usage_snapshot, check_and_reserve, check_input_length, monthly_ai_budget_snapshot,
     monthly_cost_so_far, record_usage_event, release, reconcile_budget, reserve_global_and_emergency,
 )
 from app.services.ai.ai_realtime_service import (
@@ -70,7 +70,8 @@ def _card_note(m: AIMessage) -> str:
         return ""
     return "(App note, not from the agent - the cards your last reply showed: " + "; ".join(
         f"“{c.get('title')}” - {_CARD_STATUS.get(c.get('status'), c.get('status'))}"
-        + (f" ({c.get('result_message')})" if c.get("status") == "failed" and c.get("result_message") else "") for c in cards) + ")\n\n"
+        + (f" ({c.get('result_message')})" if c.get("status") == "failed" and c.get("result_message") else "")
+        + (f" - its link (shown as a preview card): {c['share']['url']}" if isinstance(c.get("share"), dict) and c["share"].get("url") else "") for c in cards) + ")\n\n"
 
 
 async def _build_history(db: AsyncSession, conversation: AIConversation, max_messages: int) -> tuple[List[dict], str]:
@@ -124,7 +125,8 @@ async def confirm_ai_action(
     """The agent tapped Confirm on something the helper set up - the only way an action runs."""
     from app.services.ai import ai_actions
     try:
-        return await ai_actions.confirm(db, current_user, str(payload.get("message_id") or ""), action_id)
+        picks = payload.get("picks") if isinstance(payload.get("picks"), dict) else None   # choices made on the card
+        return await ai_actions.confirm(db, current_user, str(payload.get("message_id") or ""), action_id, picks)
     except ai_actions.ActionError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -344,6 +346,20 @@ async def get_monthly_ai_usage(
     percent=null for a tier with no configured budget (the frontend then shows no meter)."""
     config = await ai_config_service.get_config(db)
     return await monthly_ai_budget_snapshot(db, current_user.id, config, current_user.plan_tier)
+
+
+@router.get("/usage/chat", response_model=ChatUsageResponse)
+async def get_chat_usage(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """The "Chat usage" bar (owner, 11/01): the AI helper chat's own allowance for this billing
+    period, by plan, separate from the Monthly AI Usage bar. Shown as a percent only."""
+    config = await ai_config_service.get_config(db)
+    snap = await chat_usage_snapshot(db, current_user.id, config, current_user.plan_tier)
+    if not await can_use_helper(db, current_user):
+        snap["percent"] = None  # no chat for them yet - the bar doesn't show
+    return snap
 
 
 @router.get("/copywrite/estimate")

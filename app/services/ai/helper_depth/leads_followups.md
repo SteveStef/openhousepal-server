@@ -21,6 +21,8 @@ Leads and follow-ups in depth: the Leads list and a lead's page, statuses, tags,
 - **Edit** name, email or phone. Changing the email moves their Showcase, sign-ins and queued emails to the new address and restarts that address's email rules. If they have a Showcase you're asked **Send a new invite?** → **No thanks** or **Yes, send one** → **Showcase from an open house** or **Normal Showcase invite**. Two leads can't share one email.
 - **Where they stand**: New ("Haven't talked yet"), Contacted ("You've reached out"), In talks ("Actively working together"), Signed ("Your client").
 - **Do they have an agent?**: No agent ("Free to work with you"), Not sure ("Haven't asked yet"), Has an agent (moves them to the Has agent tab; most nurture follow-ups stop for them, but direct requests - disclosure, showings, questions, search changes - still get follow-ups).
+  - Changing it for someone who signed in at your open house updates their sign-in too (the Visitors window shows the new answer). Changing it to **No agent** makes their open house follow-up ("Follow up with ...", due per your Open house sign-in setting); if they had a "has an agent" heads-up from a note, that same follow-up becomes it, with your notes and a line saying they first said they had an agent. Then it asks "No agent - give them a Showcase?" (Premium/IDX). Changing it to **Has an agent** asks whether to turn their Showcase off if they have one.
+- **Showcase** card (open house guests, Premium/IDX): the same "Showcase for this visitor" switch as the Visitors window, plus "Open their Showcase".
 - **How they found you**: Came from, First touch, Latest, "What they told you", **See it in Activity**.
 - **Waiting on you**: each open request with **Open** and **Done** ("I've handled this - clear it").
 - **Follow-ups** with **Alert settings** and **All follow-ups**; **Their Showcase** (Homes/Liked/Passed, last active, Showcase emails on/off, **Open**, **Their link**); **Emails** (sent, opened, clicked, automatic emails on/weekly/off); **Activity** (Everything, Forms & requests, Showcase); **Open houses they came to**.
@@ -29,9 +31,9 @@ Leads and follow-ups in depth: the Leads list and a lead's page, statuses, tags,
 - **Record**: Lead since, Last contacted, Last active, **Mark contacted** / **Contacted them again** (checking off a follow-up does this for you).
 - **Hide** ("Take them off your lists - nothing is deleted"; also clears their open follow-ups, which don't come back when shown again). **Delete** removes them for good: activity, notes, Activity feed, Email Tracker and their Showcase; automatic emails stop. No undo.
 
-## Per-lead alert switches (Alert settings, "Just for [name]")
-- **Put [name]'s follow-ups on my calendar**: off asks "Still want [name]'s follow-ups in OpenHousePal?" → **Yes, keep them here** (Follow-ups page and Dash only) or **No, stop them** (no new follow-ups for this person).
-- **Email me when [name] likes or comments**: off = still in their activity, no email.
+## Per-lead alert switches (Alert settings, "Just for the client")
+- **Put the client's follow-ups on my calendar**: off asks "Still want the client's follow-ups in OpenHousePal?" → **Yes, keep them here** (Follow-ups page and Dash only) or **No, stop them** (no new follow-ups for this person).
+- **Email me when the client likes or comments**: off = still in their activity, no email.
 - The same switches show on the "Mark as done" page opened from a calendar alert.
 
 ## Follow-ups page (Leads → Follow-ups, "Never miss a follow-up")
@@ -68,10 +70,10 @@ Each situation has:
 ## Calendar alerts for follow-ups
 - "How follow-ups show on your calendar": buzz 0, 5, 10, 15, 30 or 60 minutes before (default 15) and **Again at the time** (default on). Outlook allows one buzz per event, so it uses the first.
 - Follow-ups only reach your phone once a calendar is connected (**Connect your calendar** / **Reconnect your calendar**). They go on the "OpenHousePal" calendar.
-- Each event carries links: **Mark as done** (checks it off and crosses it out; "Did you also do these?" lists today's others; **Undo - not done yet**), **Text [name] from your phone**, and **Save to contacts** (their contact card with notes).
+- Each event carries links: **Mark as done** (checks it off and crosses it out; "Did you also do these?" lists today's others; **Undo - not done yet**), **Text the client from your phone**, and **Save to contacts** (their contact card with notes).
 
 ## Tap-to-text
-- **Text [name] from your phone** opens a page where **Text** opens your own Messages app with their number and the suggested text filled in (sent from your real cell). **Email** opens your mail app instead. Either one checks the follow-up off. On a computer you get **Copy text** and a QR code to scan with your phone.
+- **Text the client from your phone** opens a page where **Text** opens your own Messages app with their number and the suggested text filled in (sent from your real cell). **Email** opens your mail app instead. Either one checks the follow-up off. On a computer you get **Copy text** and a QR code to scan with your phone.
 
 ## Email Tracker (Leads → Email Tracker, "Every email, tracked")
 - Last 30 days: **Sent**, **Opened**, **Clicked**, **Slowed**. Tabs **People** / **Sent emails**. Filters All, On, Weekly, Off, Not in your leads; sort Latest email, Most engaged, Least engaged, Name A-Z.

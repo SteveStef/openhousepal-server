@@ -116,10 +116,16 @@ VOICE_MODE_BLOCK = {
 }
 
 
+# "Tap Confirm on the card", "the card below", "tap Save"... - a reply that says a card is there.
+_CLAIMS_CARD = re.compile(r"\btap\s+(confirm|save|make it|the button)\b|\bon the card\b|\bcard (below|is waiting|is ready)\b|\bcard is already\b", re.I)
+
+
 async def _my_listings_and_sales(db: AsyncSession, user: User) -> str:
     """Their own active listings (newest listed first) and recent sales, one line each - so "my newest
-    listing" or "my last sale" is known without a lookup. Empty when they have no MLS ID."""
-    if not user.mls_id:
+    listing" or "my last sale" is known without a lookup. Empty when they have no MLS ID - and on a
+    No-MLS plan or before their broker approved them: this IS MLS data (same rule as the lookups)."""
+    from app.utils.auth import tier_has_mls
+    if not user.mls_id or not user.is_admin and (not tier_has_mls(user.plan_tier) or not user.broker_authorized):
         return ""
     from app.services.website import content_adapters as ca
     lines: list[str] = []
@@ -179,8 +185,14 @@ async def run_turn(
                     f"This agent is on the {PLAN_NAMES.get(current_user.plan_tier, current_user.plan_tier)} plan"
                     f"{'' if current_user.broker_authorized else ' and their broker has NOT approved them yet (Broker Authorization in the top menu) - MLS features stay locked until then'}. "
                     "Only suggest features this plan includes (see the plan table in the guide); for anything else, say which plan has it. "
-                    f"The agent is {current_user.first_name} {current_user.last_name}. Never decide yourself whether a listing or sale is theirs from names in lookups (MLS names often differ, e.g. middle names) - call the action tool; it checks by MLS ID and tells you. "
-                    "A Confirm card exists ONLY when you call an action tool in this turn - never type a card, “[Card: …]” or “tap Confirm” without calling the tool."
+                    + (" This is a No-MLS plan: it has NO home/MLS data at all - no listing searches, comps, Showcases, CMAs, Discovery or Manager. "
+                       "Never offer or describe those as theirs, never say listings will 'come from the MLS'; their own homes and sales are only the ones they typed in. "
+                       if current_user.plan_tier in ("NO_MLS", "PRO_NO_MLS") else "")
+                    + f"The agent is {current_user.first_name} {current_user.last_name}. Never decide yourself whether a listing or sale is theirs from names in lookups (MLS names often differ, e.g. middle names) - call the action tool; it checks by MLS ID and tells you. "
+                    "A Confirm card exists ONLY when you call an action tool in this turn - never type a card, “[Card: …]” or “tap Confirm” without calling the tool. "
+                    "AI usage is ONLY ever a percent of their monthly allowance - never say a dollar amount, cost or the allowance's size. "
+                    "For 'what should I do / anything I should do', call get_things_to_do and answer from it in that order (overdue follow-ups first, then what's waiting on them) - at most 3 things, one short line each, and a show_link button to the first one's page (/leads/tasks for follow-ups); unseen Showcase matches are never the answer. "
+                    "Don't keep bringing up an earlier topic (a wrong design, an old alert) once it's been answered."
                     + mine_text,
         }
         system_blocks = [
@@ -198,7 +210,10 @@ async def run_turn(
             **ai_config_service.model_options(config["model"], "medium"),
         )
 
+    nudged = False
+
     async def _run() -> str:
+        nonlocal nudged
         for _ in range(config["max_iterations"]):
             response = await _call_model()
             usage_state["input_tokens"] += response.usage.input_tokens
@@ -207,9 +222,23 @@ async def run_turn(
             # input_tokens - counted separately so the meter matches Anthropic's bill.
             usage_state["cache_write_tokens"] = usage_state.get("cache_write_tokens", 0) + (getattr(response.usage, "cache_creation_input_tokens", 0) or 0)
             usage_state["cache_read_tokens"] = usage_state.get("cache_read_tokens", 0) + (getattr(response.usage, "cache_read_input_tokens", 0) or 0)
+            # Priced per call: Haiku 5.5's long-prompt rate card goes by ONE request's prompt
+            # length. Pricing the turn's summed tokens put any turn with a lookup (2 calls x ~60K)
+            # over 100K and on the 5x card (11/01 probe: $0.0099 logged for a $0.0020 turn).
+            usage_state["estimated_cost_usd"] = usage_state.get("estimated_cost_usd", 0.0) + ai_config_service.estimate_cost_usd(
+                config, usage_state["model"], response.usage.input_tokens, response.usage.output_tokens,
+                getattr(response.usage, "cache_creation_input_tokens", 0) or 0, getattr(response.usage, "cache_read_input_tokens", 0) or 0,
+            )
 
             if response.stop_reason != "tool_use":
                 text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
+                # In a long chat it sometimes says "tap Confirm on the card" without making one
+                # (owner's test, 11/01) - one nudge to make the real card, then whatever it says.
+                if not nudged and _CLAIMS_CARD.search(text or "") and not any(r.get("record_type") == "action" for r in all_refs):
+                    nudged = True
+                    messages.append({"role": "assistant", "content": response.content})
+                    messages.append({"role": "user", "content": "(App note: no card was made this turn - nothing shows for them to tap. Call the action tool now to set it up, then reply in one short line. If you still need an answer from them first, ask only that.)"})
+                    continue
                 return text or "I wasn't able to come up with a response. Please try rephrasing your question."
 
             tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
@@ -286,11 +315,41 @@ async def run_turn(
             "unexpected_error", "The AI assistant is temporarily unavailable. Please try again shortly.", usage=usage_state
         ) from e
 
-    usage_state["estimated_cost_usd"] = ai_config_service.estimate_cost_usd(
-        config, usage_state["model"], usage_state["input_tokens"], usage_state["output_tokens"],
-        usage_state.get("cache_write_tokens", 0), usage_state.get("cache_read_tokens", 0),
-    )
+    usage_state.setdefault("estimated_cost_usd", 0.0)  # summed per call in _run
+    _howto_button(user_message, all_refs)
     return _no_pretend_cards(text, all_refs), all_refs, usage_state
+
+
+# "How do I make / create / start X?" always ends with a button into X's create screen (owner,
+# 10/31-11/01: the model added one only some of the time). Added by the app, not the model - free.
+_HOWTO = re.compile(r"\b(how (do|can|would|should) i|how to|where (do|can) i|help me|walk me through|show me how)\b.*\b(make|create|start|set ?up|build|add|send|write|do|get)\b", re.I)
+_CREATE_LINKS = [
+    (r"showcase", "Create a Showcase", "/showcases?new=1"),
+    (r"spotlight|listing (web)?site|property (web)?site", "Make a Spotlight", "/studio/property-sites?new=1"),
+    (r"\bcma\b|comps|market analysis|home value report", "Create a CMA", "/studio/cma?new=1"),
+    (r"blog|article", "Write a blog post", "/studio/blogs?new=1"),
+    (r"invite|invitation|rsvp|event", "Make an invite", "/studio/forms?view=invites&newInvite=1"),
+    (r"\bform\b|sign-?up form|questionnaire", "Make a form", "/studio/forms?new=1"),
+    (r"flyer|postcard|door hanger|post\b|instagram|social|design|mailer|just listed|just sold|coming soon", "Make a design", "/studio/design?new=1"),
+    (r"open house kit|\bkit\b|sign-?in sheet|open house", "Start an Open House Kit", "/open-houses?newKit=1"),
+    (r"signature", "Open Email Signature", "/studio/email-signature"),
+    (r"review", "Open Reviews", "/studio/reviews"),
+    (r"town|neighborhood|website", "Open your website", "/studio/website"),
+    (r"follow-?up|reminder|task", "Open Follow-ups", "/leads/tasks"),
+    (r"brand|colou?rs?|logo", "Open Branding", "/studio/brand-kit"),
+]
+
+
+def _howto_button(user_message: str, refs: List[dict]) -> None:
+    msg = (user_message or "").split("\n\n")[-1]   # past any "(App note...)" prefix
+    if not _HOWTO.search(msg) or any(r.get("record_type") in ("link", "action") for r in refs):
+        return
+    for pattern, label, page in _CREATE_LINKS:
+        if re.search(pattern, msg, re.I):
+            _, entry = ai_ui_tools.run("show_link", {"label": label, "page": page})
+            if entry:
+                refs.append(entry)
+            return
 
 
 def _no_pretend_cards(text: str, refs: List[dict]) -> str:
@@ -298,8 +357,7 @@ def _no_pretend_cards(text: str, refs: List[dict]) -> str:
     "[Card: ... waiting for them to tap Confirm]" and there was no button). Typed card text is
     removed, and a "tap the button" reply with no card says so plainly instead of leaving them hunting."""
     import re
+    # (A "the card didn't come through" add-on used to follow any "tap Confirm" with no card - it fired on
+    # replies that were only asking a question first, owner 10/31, so it's gone; the prompt rule covers it.)
     cleaned = re.sub(r"\n?\[Card:[^\]]*\]", "", text or "").strip()
-    made_card = any(r.get("record_type") == "action" for r in refs)
-    if not made_card and re.search(r"\btap\b[^.\n]{0,40}\b(confirm|make it|button on the card)\b", cleaned, re.I):
-        cleaned += "\n\nThe card didn't come through on my side - say “go ahead” and I'll put it here for you to tap."
     return cleaned or text

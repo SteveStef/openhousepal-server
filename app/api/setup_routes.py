@@ -146,6 +146,49 @@ async def put_kit_prefs(payload: KitPrefsPatch, db: AsyncSession = Depends(get_d
     return {"prefs": _kit_prefs_of(current_user)}
 
 
+# The agent's own wording for messages they send from their phone / email app (owner, 10/31):
+# "host_request" (Discovery - asking a listing agent to host; Showcase Send keeps its own saved
+# message, collections send-home prefs). Saved with {placeholders} - {agent_first_name}, {address},
+# {city}, {my_name}, {my_brokerage}, {my_phone} - so names and the home fill in fresh every time.
+# users.setup_state["message_templates"] (no migration).
+MESSAGE_TEMPLATE_KEYS = ("host_request",)
+
+
+def _templates_of(user: User) -> dict:
+    raw = (user.setup_state or {}).get("message_templates") if isinstance(user.setup_state, dict) else None
+    return {k: {f: str(v.get(f))[:4000] for f in ("subject", "body") if isinstance(v, dict) and v.get(f)}
+            for k, v in (raw or {}).items() if k in MESSAGE_TEMPLATE_KEYS and isinstance(v, dict)}
+
+
+@router.get("/message-templates")
+async def get_message_templates(current_user: User = Depends(get_current_active_user)):
+    return {"templates": _templates_of(current_user)}
+
+
+class MessageTemplatePatch(BaseModel):
+    key: str
+    subject: Optional[str] = Field(default=None, max_length=300)
+    body: Optional[str] = Field(default=None, max_length=4000)
+    reset: bool = False   # back to OpenHousePal's own wording
+
+
+@router.put("/message-templates")
+async def put_message_template(payload: MessageTemplatePatch, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    if payload.key not in MESSAGE_TEMPLATE_KEYS:
+        raise HTTPException(status_code=400, detail="Unknown message.")
+    await flow.lock_setup_state(db, current_user)
+    st = dict(current_user.setup_state or {})
+    templates = _templates_of(current_user)
+    if payload.reset:
+        templates.pop(payload.key, None)
+    else:
+        templates[payload.key] = {**templates.get(payload.key, {}), **{f: v for f, v in (("subject", payload.subject), ("body", payload.body)) if v is not None}}
+    st["message_templates"] = templates
+    current_user.setup_state = st
+    await db.commit()
+    return {"templates": _templates_of(current_user)}
+
+
 class FormDefaultsPatch(BaseModel):
     animated: Optional[bool] = None
     show_branding: Optional[bool] = None

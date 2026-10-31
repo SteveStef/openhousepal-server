@@ -19,7 +19,7 @@ from app.config.logging import get_logger
 from app.models.database import AIConversation, AIMessage, User
 from app.services.ai.ai_config_service import ai_config_service
 from app.services.ai.ai_orchestrator_service import _get_client
-from app.services.ai.ai_rate_limit_service import monthly_cost_so_far, record_usage_event
+from app.services.ai.ai_rate_limit_service import chat_usage_snapshot, record_usage_event
 
 logger = get_logger(__name__)
 
@@ -52,8 +52,8 @@ async def maybe_compact(db: AsyncSession, current_user: User, conversation: AICo
 
     # Leave a cushion so compaction itself is never the call that trips the ceiling - it's a
     # quality improvement, not something worth blocking the user's real message over.
-    cost_so_far = await monthly_cost_so_far(db, current_user.id, "chat")
-    if cost_so_far >= config["monthly_cost_ceiling_usd"] * 0.9:
+    chat = await chat_usage_snapshot(db, current_user.id, config, current_user.plan_tier)
+    if chat["limit_usd"] and chat["used_usd"] >= chat["limit_usd"] * 0.9:
         logger.info("Skipping compaction for conversation %s - near monthly cost ceiling", conversation.id)
         return None
 

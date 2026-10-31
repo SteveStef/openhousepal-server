@@ -212,6 +212,9 @@ class AIAdminAgentSummary(BaseModel):
     tool_calls: int
     blocked_count: int
     last_active: Optional[datetime] = None
+    # The AI helper chat on its own (event_type "chat" only - never other features on the same models).
+    chat_cost_usd: float = 0.0
+    chat_messages: int = 0
     # This agent's own IDX/public-site spend (Explore Nearby, attributed via agent_site_daily/
     # agent_total_daily buckets - see nearby_amenities_service.py) - separate from cost_usd
     # above, which is their own AI feature usage (chat/tts/cma/etc via AIUsageEvent).
@@ -252,6 +255,21 @@ class MonthlyAIUsageResponse(BaseModel):
     studio_media_cap_usd: Optional[float] = None
     # This month's spend by feature: [{label, usd, percent}] - the meter's "What used it".
     breakdown: list = []
+    resets_at: Optional[str] = None  # end of this billing period - the bar resets then
+
+
+class ChatUsageResponse(BaseModel):
+    """GET /ai/usage/chat - the AI helper chat's own "Chat usage" bar (owner, 11/01)."""
+    tier: str
+    used_usd: float
+    limit_usd: Optional[float] = None
+    percent: Optional[int] = None
+    recent_used_usd: float = 0.0
+    recent_percent: Optional[int] = None
+    near_limit: bool = False
+    exhausted: bool = False
+    resets_at: Optional[str] = None
+    upgrade: Optional[dict] = None  # {tier, name, times} - the plan with more chat, if any
 
 
 class CopywriteRequest(BaseModel):

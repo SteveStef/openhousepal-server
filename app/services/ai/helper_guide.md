@@ -382,7 +382,6 @@ The same Settings tab also shows:
   - **License Number**: locked once saved. If it's empty, the **Not set - add it** link takes you to Account setup.
 - **Social Links**: shown on your public Agent Hub.
 - **My Listings**, **Where Your Listings Link To** and **Recent Sales**: the same panels as in the Agent Hub editor.
-- **The middle of your QR codes**: choose **Our house logo**. On IDX you can also choose **Your logo** or **Your initials**. Codes you already printed keep working.
 
 ### Notifications tab
 
@@ -633,7 +632,7 @@ MLS plans. Opens another agent approved you to host appear here. Tap **Open kit*
 4. **Say hello and send** - a note is written for you; change it if you like. Tap **Send request** (or **Send 2 requests**).
 5. The listing agent is told right away. Track it under **My Requests**.
 
-If the listing agent isn't on OpenHousePal, you get an **Example Outreach Email** to copy and send yourself.
+If the listing agent isn't on OpenHousePal, a note to them opens ("Say hi to" the listing agent) - change anything, then **Continue** and pick **Text** or **Email**: your own Messages or email app opens with it written (you press send). Tick **Use my wording for every request** and your version is used next time, with that agent's name and the address filled in fresh (**Use OpenHousePal's note** goes back to ours). It never includes an OpenHousePal link to the listing. If the listing agent IS on OpenHousePal, after the request sends you can tap **Also text or email** them for the same note by text or email.
 
 **My Requests** (button on Discovery): your **Sent Requests**, **Team Requests** (a team asked for a host - say yes in one tap), **Team Invites** (someone wants you on their Open House Team), and **Declined / Cancelled**. On a request you can **Accept New Time**, **Decline**, propose **Other time**, or **Withdraw request** / **Can't host anymore?**.
 
@@ -761,9 +760,9 @@ Click a lead to open it. You'll see:
 - **Hide** ("Take them off your lists - nothing is deleted") and **Delete**.
 
 ### Per-lead alert switches
-In a lead's Follow-ups section tap **Alert settings** ("Just for [name]"). Only this person changes - other leads aren't affected.
-- **Put [name]'s follow-ups on my calendar** - on: each follow-up shows on your calendar with an alert. Turning it off asks **"Still want [name]'s follow-ups in OpenHousePal?"**: **Yes, keep them here** (they stay on the Follow-ups page and Dash, just not your calendar) or **No, stop them** (no new follow-ups for this person).
-- **Email me when [name] likes or comments** - off means you'll still see it in their activity, you just won't get the email.
+In a lead's Follow-ups section tap **Alert settings** ("Just for the client"). Only this person changes - other leads aren't affected.
+- **Put the client's follow-ups on my calendar** - on: each follow-up shows on your calendar with an alert. Turning it off asks **"Still want the client's follow-ups in OpenHousePal?"**: **Yes, keep them here** (they stay on the Follow-ups page and Dash, just not your calendar) or **No, stop them** (no new follow-ups for this person).
+- **Email me when the client likes or comments** - off means you'll still see it in their activity, you just won't get the email.
 
 The same switches also appear on the "Mark as done" page that opens from a calendar alert.
 
@@ -788,7 +787,7 @@ The same switches also appear on the "Mark as done" page that opens from a calen
 The **Follow-ups** switch at the top of the page. Off = "No automatic follow-ups"; nothing new is added and follow-ups are hidden from your Dashboard, Leads page and daily email. Your situations, messages and phone alerts are saved - flip it back on to pick up where you left off. Useful if your CRM already reminds you.
 
 ### Add your own follow-up
-1. Tap **Add** (on the Follow-ups page) or **Add a follow-up for [name]** (inside a lead).
+1. Tap **Add** (on the Follow-ups page) or **Add a follow-up for the client** (inside a lead).
 2. Type what needs doing ("What needs doing?").
 3. Under **When**, pick **Today**, **Tomorrow**, **Pick a day…** or **Someday**. Quick picks also include **In 3 days** and **Next Monday**.
 4. Optional: **Add a time** - with a time it buzzes your phone; with no time it's an all-day item.
@@ -816,7 +815,7 @@ Situations: Open house sign-in, Similar Homes QR scan, Second visit request, Dis
 ### From the calendar alert (on your phone)
 Every follow-up's calendar event has links:
 - **Mark as done** - checks it off in OpenHousePal and crosses it out on your calendar. Below it, "Did you also do these?" lists your other follow-ups due today. **Undo - not done yet** reverses it.
-- **Text [name] from your phone** - opens a page where one tap on **Text** opens your own Messages app with their number and the suggested text already written (it goes from your real cell number). **Email** opens your mail app with it written as an email. Either one checks the follow-up off. On a computer you get the text with **Copy text** and a QR code - **Scan with your phone**.
+- **Text the client from your phone** - opens a page where one tap on **Text** opens your own Messages app with their number and the suggested text already written (it goes from your real cell number). **Email** opens your mail app with it written as an email. Either one checks the follow-up off. On a computer you get the text with **Copy text** and a QR code - **Scan with your phone**.
 - **Save to contacts** - adds them to your phone, notes included.
 - Missed follow-ups move to today each morning for up to a week. There's only ever one open follow-up per person - no duplicates.
 
@@ -861,8 +860,8 @@ Every follow-up's calendar event has links:
 
 ### Create a Showcase for a client
 1. Tap **Create** (or **+ Create a Showcase** when you have none).
-2. **About them:** Client's full name, Email, Phone (optional), Showcase name (filled in from the client's name - change it to anything). Switch **Email [name] their Showcase** on to send them their link, what it looks for and a few homes as soon as you create it.
-3. Tap **Continue**, then answer **Why is [name] looking?** (Looking to buy soon, Just browsing, Interested in area, Investment opportunity, Curious about property) and **Does [name] have an agent?**
+2. **About them:** Client's full name, Email, Phone (optional), Showcase name (filled in from the client's name - change it to anything). Switch **Email the client their Showcase** on to send them their link, what it looks for and a few homes as soon as you create it.
+3. Tap **Continue**, then answer **Why is the client looking?** (Looking to buy soon, Just browsing, Interested in area, Investment opportunity, Curious about property) and **Does the client have an agent?**
 4. Tap **Set the search area** and set the search on the map: price, Bedrooms & baths, Size, lot & age, **Towns**, **School districts**, **Counties**, a **Search center** with a radius, or **Draw a search area**; Property type; **Match score** ("Showing the % Match badge"); and a **Comparing to** home.
 5. Tap **Create Showcase**. The client is added to your Leads.
 
@@ -876,7 +875,7 @@ Click a card. You'll see the client's name, email and phone, and:
 
 ### Change the search
 Tap **Edit** (card or Showcase), change anything, then **Save search**. Their client hears about it in the afternoon email: what the search is now and homes added or gone.
-If the client asked you to change it, you'll see "[name] asked you to refine their search" with their message - tap **Edit Search**, or the x to dismiss it.
+If the client asked you to change it, you'll see "the client asked you to refine their search" with their message - tap **Edit Search**, or the x to dismiss it.
 
 ### Tours
 Tap **Tours**. For each request: **Confirm**, then pick the time and **Yes, Confirm Tour** - only do this once it's scheduled in ShowingTime and the listing agent accepted, because it tells the client their tour is happening (they get a confirmation email and it's added to your connected calendar). **Unconfirm** reverses it. **Mark Done** ("You've answered this another way - stop flagging it") clears a request without telling the client it's booked; **Reopen** undoes that.
@@ -1104,7 +1103,7 @@ If your profile is missing something ads must show (like your brokerage or phone
 
 ### Common questions
 - *Why is Media Lab locked?* It's on IDX and No-MLS Premium only.
-- *Why did it stop letting me generate?* You've likely used this month's AI allowance - it resets monthly.
+- *Why did it stop letting me generate?* You've likely used this month's AI allowance - it resets monthly on your billing day.
 - *Deleting a project* frees storage and can't be undone.
 
 ---
@@ -1117,7 +1116,7 @@ If your profile is missing something ads must show (like your brokerage or phone
 
 - **Your look**: **Classic** or **Luxe** (Luxe is IDX only), Ivory (bright pages) or Midnight (deep pages), and for Luxe the metal (gold, silver or bronze).
 - **Your brand color**: pick a swatch or **Custom color**. **Where it shows** lists every feature and whether it uses your brand ("Uses your brand", "Its own look", "Not set up yet"). **Use this color for all features** switches every feature back to your Brand Kit ("You can still give any one of them its own look later, in that feature").
-- **Logos, fonts & print**: **Logos** (personal, team and brokerage - "JPG or PNG. Used on your designs, Spotlight and signature."), **Fonts** (**Heading font**, **Body font**: Editorial Serif, Modern Sans, Structured Mono), **Print background**, and **Default Disclaimer** ("Shown on print materials where required. Leave blank to omit.").
+- **Logos, fonts & print**: **Logos** (personal, team and brokerage - "JPG or PNG. Used on your designs, Spotlight and signature."), **Fonts** (**Heading font**, **Body font**: Editorial Serif, Modern Sans, Structured Mono), **The middle of your QR codes** (**Our house logo** on every plan; **Your logo** or **Your initials** on IDX - the logo is your Personal logo; printed codes keep working), and **Default Disclaimer** ("Shown on print materials where required. Leave blank to omit.").
 
 *Why didn't my Agent Hub change color?* It only follows your brand while its "Look comes from" is set to **My Brand Kit**.
 

@@ -53,10 +53,16 @@ Order in each line: No-MLS Basic / No-MLS Premium / Basic / Premium / IDX.
 ## AI allowance (the "Monthly AI Usage" meter)
 - One shared monthly allowance covers every AI tool together. The agent decides how to spend it.
 - Relative size: No-MLS Basic and Basic = 1x. No-MLS Premium and Premium = 2x ("2X Basic's AI Credits"). IDX = 4x ("4X Basic's AI Credits"). It is shown as a percent, never as dollars.
-- It resets on the 1st of each month. At 100% you see "You've reached this month's AI limit - it resets on the 1st."
-- At 90% Media Lab photo and video pause ("AI Studio photo and video are paused until it resets on the 1st. CMAs, cheat sheets and chat still work").
-- What uses it: CMA AI analysis (the biggest everyday user), Cheat Sheet Recap, Polish with AI on your bio, the Blog AI writer and its rewrite tools, Spotlight's automatic setup and Room by Room, Media Lab, pasting reviews to import, and the in-app AI helper. Some map and place lookups your actions trigger also count a little.
+- It resets every month on the agent's billing day (the day their plan renews), not the 1st. At 100% you see "You've reached this month's AI limit - it resets on [their date]."
+- At 90% Media Lab photo and video pause ("AI Studio photo and video are paused until it resets").
+- What uses it: CMA AI analysis (the biggest everyday user), Cheat Sheet Recap, Polish with AI on your bio, the Blog AI writer and its rewrite tools, Spotlight's automatic setup and Room by Room, Media Lab and pasting reviews to import. Some map and place lookups your actions trigger also count a little. Chatting with the AI helper does NOT use it.
 - The meter shows in Settings and inside the AI tools before you run them (for example "under 1% of your monthly AI").
+
+## AI helper chat (the "Chat Usage" meter)
+- The AI helper chat has its own separate allowance, shown as a percent on the "Chat Usage" meter (on the helper's start screen and in Settings). It never uses the Monthly AI Usage allowance.
+- Relative size: No-MLS Basic and Basic = 1x. No-MLS Premium and Premium = 2x. IDX = 4x. Each plan has double the chat of the one below it. Never say dollar amounts.
+- It resets on the same billing day as the AI meter. Near the limit the meter appears above the typing box with an upgrade button ("Upgrade to Premium for 2x the chat"). At 100% the chat says it's used up, when it resets, and which plan has double.
+- Things the helper makes for you (designs, Showcases, forms, follow-ups) don't cost extra - only the chat messages count. Starting the Blog AI writer from the chat uses the Monthly AI Usage allowance, same as starting it on the Blogs page.
 - Media Lab also has its own count limits on how many photo edits and videos can be made per day and per month.
 
 ## Storage

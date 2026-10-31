@@ -36,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.database import AgentHub, AgentMarketArea, MarketArea, User
 from app.services.ai.ai_config_service import ai_config_service
 from app.services.ai.ai_rate_limit_service import (
-    AIRateLimitExceeded, _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS, monthly_ai_budget_snapshot,
+    AIRateLimitExceeded, _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS, monthly_ai_budget_snapshot, resets_text,
     reconcile_budget, record_usage_event, reserve_blog_writer,
 )
 
@@ -671,7 +671,7 @@ async def build_context(db: AsyncSession, user: User) -> dict:
         "area_cards": area_cards,
         "usage_percent": snapshot.get("percent"),
         "ai_available": not exhausted,
-        "blocked_message": "You've reached your AI usage limit for this month. It resets on the 1st - or upgrade your plan for more AI credits." if exhausted else None,
+        "blocked_message": f"You've reached your AI usage limit for this month. {resets_text(datetime.fromisoformat(snapshot['resets_at']))} Or upgrade your plan for more AI." if exhausted else None,
     }
 
 

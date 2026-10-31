@@ -380,18 +380,22 @@ async def get_send_home_state(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_premium_plan),
 ):
-    """What the Send window starts with: the agent's saved message + mail app, and whether this
-    client already got the intro by text."""
+    """What the Send window starts with: the agent's saved message + mail app, whether this
+    client already got the intro by text, and every home sent to them before (how and when)."""
     coll = (await db.execute(select(Collection).where(Collection.id == collection_id))).scalar_one_or_none()
     if not coll or coll.owner_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
-    return {**_send_prefs(current_user), "intro_texted_at": coll.home_intro_texted_at}
+    return {**_send_prefs(current_user), "intro_texted_at": coll.home_intro_texted_at, "sends": coll.home_sends or []}
+
+
+SEND_LOG_MAX = 300  # entries kept per Showcase (oldest dropped)
 
 
 class SendHomeSent(BaseModel):
     method: str  # 'text' | 'email'
     with_intro: bool = False
     property_ids: List[str] = []
+    copied: bool = False  # copied the text instead of opening Messages / the email app
 
 
 @router.post("/{collection_id}/send-home/sent")
@@ -401,15 +405,23 @@ async def mark_home_sent(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_premium_plan),
 ):
-    """The agent opened Messages / their email app with the home link(s) for this client. A text
-    with the intro marks the intro as said, so the next text starts without it."""
-    coll = (await db.execute(select(Collection).where(Collection.id == collection_id))).scalar_one_or_none()
+    """The agent opened Messages / their email app (or copied the text) with the home link(s) for
+    this client. Logged so the Showcase marks those homes "Sent" (owner 10/31). A text with the
+    intro marks the intro as said, so the next text starts without it."""
+    if body.method not in ("text", "email"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown send method")
+    coll = (await db.execute(select(Collection).where(Collection.id == collection_id).with_for_update())).scalar_one_or_none()
     if not coll or coll.owner_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    now = datetime.now(timezone.utc)
     if body.method == "text" and body.with_intro and coll.home_intro_texted_at is None:
-        coll.home_intro_texted_at = datetime.now(timezone.utc)
-        await db.commit()
-    return {"success": True, "intro_texted_at": coll.home_intro_texted_at}
+        coll.home_intro_texted_at = now
+    ids = [str(i)[:64] for i in body.property_ids if str(i).strip()][:50]
+    if ids:
+        entry = {"at": now.isoformat(), "method": body.method, "ids": ids, "intro": bool(body.with_intro), "copied": bool(body.copied)}
+        coll.home_sends = ([*(coll.home_sends or []), entry])[-SEND_LOG_MAX:]
+    await db.commit()
+    return {"success": True, "intro_texted_at": coll.home_intro_texted_at, "sends": coll.home_sends or []}
 
 
 class BulkHomesAction(BaseModel):

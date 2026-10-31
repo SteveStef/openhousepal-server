@@ -75,7 +75,46 @@ _route("get_my_listings_for_hosting", "The agent's own listings in Opens -> Mana
 _route("get_team_host_asks", "Asks from the agent's team for someone to host an open house, with ids.", "/api/open-house-manager/team/broadcasts/incoming", plans=MLS, max_list=20)
 
 # --- Account / settings / site ---
-_route("get_ai_usage", "How much of this month's AI allowance the agent has used (percent).", "/ai/usage/monthly")
+async def _ai_usage(db: AsyncSession, user: User, args: dict) -> Any:
+    """Percentages only - an agent never hears the dollar size of their AI allowance (owner, 10/31:
+    the helper said "$8.41 of your $20.00"). Every dollar field is dropped before the model sees it."""
+    ok, data = await lookup(user, "/ai/usage/monthly")
+    if not ok or not isinstance(data, dict):
+        return data
+    ok_chat, chat = await lookup(user, "/ai/usage/chat")
+    chat = chat if ok_chat and isinstance(chat, dict) else {}
+    return {
+        # This chat has its own allowance and "Chat usage" bar (11/01) - not part of the AI bar.
+        "chat_usage_percent": chat.get("percent"),
+        "chat_resets_on": (chat.get("resets_at") or "")[:10] or None,
+        "chat_upgrade_plan_for_double": (chat.get("upgrade") or {}).get("name"),
+        "ai_usage_resets_on": (data.get("resets_at") or "")[:10] or None,
+        "percent_used_this_month": data.get("percent"),
+        "near_limit": data.get("near_limit"), "used_up": data.get("exhausted"),
+        "what_used_it": [{"feature": b.get("label"), "percent_of_allowance": b.get("percent")}
+                         for b in (data.get("breakdown") or []) if isinstance(b, dict)],
+        "note": "Share percentages only - never a dollar amount, cost or allowance size.",
+    }
+
+async def _things_to_do(db: AsyncSession, user: User, args: dict) -> Any:
+    """Today's Rundown "Things to do" - the daily briefing's own list, in its order (follow-ups due,
+    requests waiting on them, client asks), plus the day's numbers. For "what should I do?"."""
+    ok, data = await lookup(user, "/api/v1/rundown/today")
+    if not ok or not isinstance(data, dict):
+        return data
+    return {
+        "follow_ups_due": [{"title": f.get("title"), "when": f.get("when"), "overdue": f.get("overdue")} for f in (data.get("followups") or [])[:10]],
+        "waiting_on_you": [{"title": a.get("title"), "detail": a.get("detail")} for a in (data.get("actions") or [])[:10]],
+        "client_asks": [{"title": a.get("title"), "detail": a.get("detail")} for a in (data.get("client_activity") or [])[:10]],
+        "todays_numbers": {s.get("label"): s.get("value") for s in (data.get("stats") or []) if s.get("value")},
+        "note": "Answer 'what should I do' from follow_ups_due, waiting_on_you and client_asks, in that order (overdue first). "
+                "New Showcase matches are NOT a to-do - clients get them by email on their own; mention them only if asked.",
+    }
+
+LOOKUPS["get_things_to_do"] = ("What the agent should do now: today's follow-ups due (overdue first), requests waiting on them (tour requests, host requests, form answers) and client asks - the daily briefing's own list, in order. Use for 'what should I do / anything I should do / what's waiting on me'.",
+                               _obj(), None, _things_to_do)
+
+LOOKUPS["get_ai_usage"] = ("How much of this month's AI allowance the agent has used, as a percent, and which features used it (percent each).", _obj(), None, _ai_usage)
 _route("get_email_settings", "Which notification emails the agent gets, their daily briefing time, the Showcase invite delay, client email rules, and whether Gmail is connected.", "/api/v1/email-settings", max_str=200)
 _route("get_my_towns", "The towns/areas the agent serves (used for forms, buyer matching, blog cards and IDX town pages), in order, with whether each town's info is ready.", "/studio/sites/me/areas", query=lambda a: {"lite": "true"}, max_list=15)
 _route("get_my_reviews", "The agent's client reviews: average rating, counts, recent reviews with ids and whether each shows, and review settings (Google/Zillow links, show on hub/website, minimum stars).", "/agent-hub/reviews", plans=REVIEWS, max_list=15)

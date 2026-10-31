@@ -13,14 +13,15 @@ import re
 from datetime import date as _date, datetime
 from typing import Any, Callable, Dict, Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import (
-    AgentReview, AgentTask, Collection, Lead, OpenHouseEvent, OpenHouseFormRequest, OpenHouseHostRequest,
+    AgentReview, AgentTask, Collection, CollectionPreferences, Lead, OpenHouseEvent, OpenHouseFormRequest, OpenHouseHostRequest,
     OpenHouseVisitor, Property, PropertyTour, PropertyWebsite, SupportTicket, User,
 )
 from app.services.ai.ai_actions import ActionError, Prepared, register
+from app.services.email_service import tidy_caps
 from app.services.ai.ai_route_bridge import RouteError, call_as_agent
 
 MLS = {"BASIC", "PREMIUM", "IDX"}
@@ -310,11 +311,20 @@ async def _p_new_task(db, user, a):
     lines = [title]
     if a.get("lead_id"):
         lead = await _lead(db, user, a); body["lead_id"] = lead.id; lines.append(f"For: {lead.name}")
+    elif _s(a.get("lead_name")):
+        # "remind me to call Test Client..." - attach the lead by name (owner's test, 11/01: it was
+        # saved with no lead). Two people with that name: ask which.
+        name = _s(a["lead_name"])
+        rows = (await db.execute(select(Lead).where(Lead.owner_id == user.id, Lead.hidden_at.is_(None), Lead.name.ilike(f"%{name}%")).limit(3))).scalars().all()
+        if len(rows) > 1:
+            raise ActionError("Which one? " + ", ".join(f"{l.name} ({l.email or l.phone or 'no email'})" for l in rows) + " - give me the lead_id.")
+        if rows:
+            body["lead_id"] = rows[0].id; lines.append(f"For: {rows[0].name}")
     due = _when(a)
     if due:
         body["due_at"] = due; body["all_day"] = not _s(a.get("due_time"))
         lines.append(f"Due: {_nice_date(due)}" + ("" if body["all_day"] else f" at {_nice_time(due[11:16])}"))
-    if _s(a.get("notes")):
+    if _s(a.get("notes")) and _s(a["notes"]).lower() != title.lower():   # not the title again
         body["notes"] = _s(a["notes"]); lines.append(f"Notes: {body['notes'][:200]}")
     if _s(a.get("suggested_message")):
         body["suggested_message"] = _s(a["suggested_message"]); lines.append(f"Message to send: “{body['suggested_message'][:300]}”")
@@ -325,8 +335,8 @@ async def _r_new_task(db, user, p):
     out = await _run_route(user, "POST", "/tasks", p["body"])
     return {"message": "Follow-up added (and on your calendar if it's connected).", "link": f"/leads/tasks?task={(out or {}).get('id', '')}"}
 
-_simple("create_followup", "Add a follow-up (to-do) for the agent, optionally for one lead, with a due date/time (Eastern) and a message to send. Dates YYYY-MM-DD, times HH:MM 24h.",
-        _obj({"title": {"type": "string"}, "lead_id": {"type": "string"}, "kind": {"type": "string", "enum": ["call", "text", "email", "showing", "general"]},
+_simple("create_followup", "Add a follow-up (to-do) for the agent, optionally for one lead, with a due date/time (Eastern) and a message to send. Dates YYYY-MM-DD, times HH:MM 24h. When it's about a person, pass lead_id, or lead_name and it finds them. notes only when there's more than the title says.",
+        _obj({"title": {"type": "string"}, "lead_id": {"type": "string"}, "lead_name": {"type": "string"}, "kind": {"type": "string", "enum": ["call", "text", "email", "showing", "general"]},
               "due_date": {"type": "string"}, "due_time": {"type": "string"}, "notes": {"type": "string"}, "suggested_message": {"type": "string"}}, ["title"]),
         _p_new_task, _r_new_task)
 
@@ -399,7 +409,8 @@ _simple("set_followup_rules", "Turn all automatic follow-ups on/off, or one rule
 _SEARCH_PROPS = {
     "min_price": {"type": "integer"}, "max_price": {"type": "integer"}, "min_beds": {"type": "integer"}, "max_beds": {"type": "integer"},
     "min_baths": {"type": "number"}, "max_baths": {"type": "number"}, "min_sqft": {"type": "number"}, "max_sqft": {"type": "number"},
-    "cities": {"type": "array", "items": {"type": "string"}}, "townships": {"type": "array", "items": {"type": "string"}},
+    "cities": {"type": "array", "items": {"type": "string"}, "description": "Towns as people say them (Bryn Mawr, Gladwyne, Wayne) - almost always this one."},
+    "townships": {"type": "array", "items": {"type": "string"}, "description": "Only a township by its township name (Lower Merion, Radnor) - never a town like Bryn Mawr."},
     "school_districts": {"type": "array", "items": {"type": "string"}},
     "is_single_family": {"type": "boolean"}, "is_town_house": {"type": "boolean"}, "is_condo": {"type": "boolean"}, "is_multi_family": {"type": "boolean"},
 }
@@ -426,21 +437,68 @@ async def _p_new_showcase(db, user, a):
     search, lines = _search_lines(a)
     if not any(k in search for k in ("cities", "townships", "school_districts")):
         raise ActionError("Which towns, townships or school districts should their search cover?")
+    await _towns_not_townships(db, search, lines)
     send = bool(a.get("email_client"))
-    body = {"name": f"{name}'s Showcase", "visitor_name": name, "visitor_email": email, "visitor_phone": _s(a.get("client_phone")),
-            "visiting_reason": "buying", "has_agent": "no", "email_client": send, **search}
-    return Prepared(f"Make a Showcase for {name}", [f"Client: {name} ({email})"] + lines + ["Also adds them to your leads"], {"body": body},
-                    warning=f"This emails {name} their Showcase right away." if send else None)
+    # "Don't email her yet" = no emails to the client at all - the welcome AND the daily new-match
+    # emails (owner's test, 11/01: only the welcome was skipped). Default: their daily emails run.
+    quiet = a.get("client_emails") is False
+    body = {"name": f"{name}'s Showcase", "visitor_name": name, "visitor_email": email, "visitor_phone": _s(a.get("client_phone")) or None,
+            "visiting_reason": "buying", "has_agent": "no", "email_client": send and not quiet, **search}
+    lines = [f"Client: {name} ({email})"] + lines + ["Also adds them to your leads"]
+    if quiet:
+        lines.append("No emails to them for now - turn their emails on in the Showcase whenever you're ready")
+    elif not send:
+        lines.append("No welcome email now; they get new matches by email each day")
+    return Prepared(f"Make a Showcase for {name}", lines, {"body": body, "quiet": quiet},
+                    warning=f"This emails {name} their Showcase right away." if send and not quiet else None)
+
+
+async def _share(db, user, path: str | None, url: str | None = None) -> dict | None:
+    """The link a client would get by text (owner, 10/31): `url` is what they'd receive (their own
+    domain when they use one), `preview` the openhousepal.com path its preview card is read from."""
+    if not path:
+        return None
+    from app.services.website.site_service import resolve_owner_public_base_url
+    try:
+        base = (await resolve_owner_public_base_url(db, user)).rstrip("/")
+    except Exception:  # noqa: BLE001
+        base = ""
+    return {"url": url or f"{base}{path}", "preview": path}
 
 
 async def _r_new_showcase(db, user, p):
     out = await _run_route(user, "POST", "/collections/create-manually", p["body"])
     cid = (out or {}).get("id")
-    return {"message": "Showcase made.", "link": f"/showcases?showcase={cid}" if cid else "/showcases"}
+    if cid and p.get("quiet"):
+        await _run_route(user, "PATCH", f"/collections/{cid}/notifications", {"notify_visitor": False, "notify_agent": True})
+    share = None
+    if cid:
+        from app.services.showcase_links import showcase_path
+        col = await db.get(Collection, cid)
+        share = await _share(db, user, (await showcase_path(col) or (f"/showcase/{col.share_token}" if col and col.share_token else None)) if col else None)
+    return {"message": "Showcase made.", "link": f"/showcases?showcase={cid}" if cid else "/showcases", "share": share}
 
-_simple("create_showcase", "Make a new Showcase (saved home search that updates itself) for a client - also adds them as a lead. Needs at least one town/township/school district. email_client=true emails them now.",
-        _obj({"client_name": {"type": "string"}, "client_email": {"type": "string"}, "client_phone": {"type": "string"}, "email_client": {"type": "boolean"}, **_SEARCH_PROPS},
+_simple("create_showcase", "Make a new Showcase (saved home search that updates itself) for a client - also adds them as a lead. Needs at least one town/township/school district. email_client=true emails them their Showcase now. client_emails=false when they say not to email the client (no emails at all until the agent turns them on; otherwise they get daily new-match emails).",
+        _obj({"client_name": {"type": "string"}, "client_email": {"type": "string"}, "client_phone": {"type": "string"}, "email_client": {"type": "boolean"}, "client_emails": {"type": "boolean"}, **_SEARCH_PROPS},
              ["client_name", "client_email"]), _p_new_showcase, _r_new_showcase, SHOWCASE)
+
+
+async def _towns_not_townships(db, search: dict, lines: list) -> None:
+    """A place put under townships that no listing has as its township ("Bryn Mawr" - a town, not a
+    township, so it matched 0 homes) moves to towns when listings do have it as their town."""
+    moved = []
+    for t in list(search.get("townships") or []):
+        is_twp = (await db.execute(select(Property.id).where(func.lower(Property.township) == t.strip().lower()).limit(1))).first()
+        is_town = not is_twp and (await db.execute(select(Property.id).where(func.lower(Property.city) == t.strip().lower()).limit(1))).first()
+        if is_town:
+            search["townships"].remove(t); search.setdefault("cities", []).append(t); moved.append(t)
+    if moved:
+        if not search.get("townships"):
+            search.pop("townships", None)
+        lines[:] = [l for l in lines if not l.startswith(("Towns:", "Townships:"))]
+        for k, label in (("cities", "Towns"), ("townships", "Townships")):
+            if search.get(k):
+                lines.append(f"{label}: {', '.join(search[k])}")
 
 
 async def _p_showcase_search(db, user, a):
@@ -448,6 +506,14 @@ async def _p_showcase_search(db, user, a):
     search, lines = _search_lines(a)
     if not search:
         raise ActionError("What should change in their search?")
+    await _towns_not_townships(db, search, lines)
+    # Towns replace a distance / drawn-area search - left in place, the old circle adds its homes on
+    # top (owner, 10/31: Bryn Mawr + Gladwyne showed Penn Valley, Narberth, Bala Cynwyd, Ardmore).
+    if any(k in search for k in ("cities", "townships")):
+        pref = (await db.execute(select(CollectionPreferences).where(CollectionPreferences.collection_id == c.id))).scalar_one_or_none()
+        if pref and ((pref.diameter and pref.lat is not None) or pref.search_polygon):
+            search.update({"address": None, "lat": None, "long": None, "diameter": None, "search_polygon": None})
+            lines.append("Drops the old distance / drawn-area search, so only these towns count")
     return Prepared(f"Change {_sc_name(c)} search", lines + ["Only these parts change; the rest stays"], {"collection_id": c.id, "body": search},
                     warning=f"{c.visitor_name or 'Your client'} hears about the new search in their next daily email.")
 
@@ -804,7 +870,7 @@ async def _p_spotlight(db, user, a):
         raise ActionError("That listing isn't active any more.")
     have = (await db.execute(select(PropertyWebsite.id).where(PropertyWebsite.owner_id == user.id, PropertyWebsite.listing_key == key))).first()
     style = "editorial_estate" if a.get("style") == "editorial" else "cinematic_luxury"
-    return Prepared(f"Make a Spotlight for {prop.street_address}", [f"Look: {'Editorial Estate' if style == 'editorial_estate' else 'Luxe'}",
+    return Prepared(f"Make a Spotlight for {tidy_caps(prop.street_address)}", [f"Look: {'Editorial Estate' if style == 'editorial_estate' else 'Luxe'}",
                     "Saved as a draft with your listing's photos and details", "When you open it, it writes the highlights, story and town for you - then you review and publish"]
                     + (["You already have a Spotlight for this home - this makes another"] if have else []), {"listing_key": key, "template_id": style})
 
@@ -829,7 +895,13 @@ async def _p_spotlight_pub(db, user, a):
 
 async def _r_spotlight_pub(db, user, p):
     await _run_route(user, "POST", f"/studio/property-sites/{p['spotlight_id']}/{'publish' if p['publish'] else 'unpublish'}")
-    return {"message": "Published." if p["publish"] else "Taken down.", "link": f"/studio/property-sites/{p['spotlight_id']}"}
+    share = None
+    if p["publish"]:
+        from app.services.property_website_service import public_url
+        site = await db.get(PropertyWebsite, p["spotlight_id"])
+        url = await public_url(db, site) if site else None
+        share = {"url": url, "preview": url} if url else None   # its own address - the preview reads it there
+    return {"message": "Published." if p["publish"] else "Taken down.", "link": f"/studio/property-sites/{p['spotlight_id']}", "share": share}
 
 _simple("publish_spotlight", "Publish (publish=true) or take down (false) one of the agent's Listing Spotlights (spotlight_id from list_my_spotlights).",
         _obj({"spotlight_id": {"type": "string"}, "publish": {"type": "boolean"}}, ["spotlight_id", "publish"]), _p_spotlight_pub, _r_spotlight_pub, IDX)
@@ -848,18 +920,60 @@ async def _p_brand(db, user, a):
         if a["look"] == "luxe" and user.plan_tier != "IDX" and not user.is_admin:
             raise ActionError("The Luxe look comes with the IDX plan.")
         body["look"] = {"theme": a["look"]}; lines.append(f"Look: {a['look'].title()}")
+    # No exact colors named: the card itself shows the Branding page's choices - look, color, Luxe
+    # finish, Ivory/Midnight - starting from what they have now (owner, 10/31: "show me my options").
+    kit = {}
+    try:
+        kit = await _run_route(user, "GET", "/studio/brand-kit") or {}
+    except Exception:  # noqa: BLE001
+        kit = {}
+    look = kit.get("look") or {}
+    current = {"theme": look.get("theme") or "classic", "metal": look.get("metal") or "gold", "dark": bool(look.get("dark")),
+               "secondary_color": kit.get("secondary_color") or "#C9A24D", "idx": user.plan_tier == "IDX" or bool(user.is_admin)}
     if not body:
-        raise ActionError("What should change in your Branding?")
-    return Prepared("Update your Branding", lines, {"body": body}, warning="Everything set to follow your Branding (hub, forms, signature, website) changes right away.")
+        return Prepared("Your Branding", ["Pick a look, color and Ivory or Midnight - your hub, forms, signature and website wear it"],
+                        {"body": {}, "current": current},
+                        confirm_label="Save", picker="brand")
+    return Prepared("Update your Branding", lines + ["Your hub, forms, signature and website wear it"], {"body": body, "current": current},
+                    picker="brand")
+
+
+def _adjust_brand(user, payload: dict, picks: dict) -> dict:
+    """The swatches tapped on the card -> the Branding update (same rules as the Branding page)."""
+    body = dict(payload.get("body") or {})
+    look = dict(body.get("look") or {})
+    if picks.get("theme") in ("classic", "luxe"):
+        if picks["theme"] == "luxe" and user.plan_tier != "IDX" and not user.is_admin:
+            raise ActionError("The Luxe look comes with the IDX plan.")
+        look["theme"] = picks["theme"]
+    if picks.get("metal") in ("gold", "silver", "bronze"):
+        look["metal"] = picks["metal"]
+    if isinstance(picks.get("dark"), bool):
+        look["dark"] = picks["dark"]
+    if picks.get("secondary_color"):
+        if not _HEX.match(str(picks["secondary_color"])):
+            raise ActionError("That color isn't one I can use.")
+        body["secondary_color"] = str(picks["secondary_color"])
+    if look:
+        body["look"] = look
+    if not body:
+        raise ActionError("Pick something to change first.")
+    return {**payload, "body": body}
 
 
 async def _r_brand(db, user, p):
+    if not p.get("body"):
+        raise ActionError("Pick something to change first.")
     await _run_route(user, "PUT", "/studio/brand-kit", p["body"])
-    return {"message": "Branding saved.", "link": "/studio/brand-kit"}
+    return {"message": "Branding saved - your hub, forms, signature and website wear it now. Logos, fonts and your disclaimer are on the Branding page.",
+            "link": "/studio/brand-kit"}
 
-_simple("update_branding", "Change the agent's Branding (brand kit) colors (hex) or Classic/Luxe look.",
-        _obj({"primary_color": {"type": "string"}, "secondary_color": {"type": "string"}, "accent_color": {"type": "string"}, "look": {"type": "string", "enum": ["classic", "luxe"]}}),
-        _p_brand, _r_brand)
+register({"name": "update_branding", "description": (
+    "Change the agent's Branding (brand kit). For 'change my colors / show me my options / change my look / put my colors back / undo' call it WITHOUT colors - "
+    "the card shows every color, the Classic/Luxe look, the Luxe finish and Ivory/Midnight for them to tap, exactly like the Branding page. "
+    "Only pass hex colors or look when they named exact ones."),
+    "input_schema": _obj({"primary_color": {"type": "string"}, "secondary_color": {"type": "string"}, "accent_color": {"type": "string"}, "look": {"type": "string", "enum": ["classic", "luxe"]}})},
+    _p_brand, _r_brand, None, adjust=_adjust_brand)
 
 
 Q_TYPES = {"short_text": "Short answer", "long_text": "Long answer", "select": "Pick one", "multi_select": "Pick any",
@@ -884,19 +998,46 @@ async def _p_form(db, user, a):
         qs.append({"id": f"ai_q{i + 1}", "type": qt, "label": label[:200], "required": bool(q.get("required")),
                    **({"options": opts} if qt in ("select", "multi_select") else {})})
         lines.append(f"{label} ({Q_TYPES[qt]}{': ' + ', '.join(opts) if opts else ''}){' - required' if q.get('required') else ''}")
-    return Prepared(f"Make a new form: {title}", lines + ["You can change the look and add more in the form editor"], {"title": title[:120], "questions": qs})
+    payload = {"title": title[:120], "questions": qs}
+    # The look choices the editor would ask about (owner, 10/31): moving background on/off, and a home
+    # it's about (one of their own listings, from their listings list).
+    if isinstance(a.get("background_effects"), bool):
+        payload["background_effects"] = a["background_effects"]
+        lines.append(f"Moving background: {'on' if a['background_effects'] else 'off'}")
+    key = _s(a.get("listing_key"))
+    if key:
+        prop = await _one(db, select(Property).where(Property.listing_key == key), "I couldn't find that home in the listings.")
+        photos = prop.photos if isinstance(getattr(prop, "photos", None), list) else []
+        payload["linked_property"] = {k: v for k, v in {
+            "listing_key": key, "address": prop.street_address, "city": prop.city, "state": prop.state, "zipcode": getattr(prop, "zipcode", None),
+            "price": prop.price, "beds": getattr(prop, "bedrooms", None), "baths": getattr(prop, "bathrooms", None), "sqft": getattr(prop, "living_area", None),
+            "image_url": photos[0] if photos and isinstance(photos[0], str) else None}.items() if v is not None}
+        lines.append(f"About this home: {prop.street_address}, {prop.city}")
+    return Prepared(f"Make a new form: {title}", lines + ["You can change the look and add more in the form editor"], payload)
 
 
 async def _r_form(db, user, p):
     out = await _run_route(user, "POST", "/agent-hub/forms", {"title": p["title"]})
     fid = (out or {}).get("id")
+    update = {k: p[k] for k in ("background_effects", "linked_property") if k in p}
     if fid and p.get("questions"):
-        await _run_route(user, "PUT", f"/agent-hub/forms/{fid}", {"questions": list((out or {}).get("questions") or []) + p["questions"]})
-    return {"message": "Form made - it's at the top of your Forms list.", "link": "/studio/forms"}
+        update["questions"] = list((out or {}).get("questions") or []) + p["questions"]
+    if fid and update:
+        await _run_route(user, "PUT", f"/agent-hub/forms/{fid}", update)
+    share = None
+    if (out or {}).get("slug"):
+        from app.services.website.site_service import owner_links
+        links = await owner_links(db, user)
+        if links.hub_slug:
+            share = await _share(db, user, f"/{links.hub_slug}/{out['slug']}", url=links.form(out["slug"]))
+    return {"message": "Form made. In its editor you can also change the look and colors, the welcome text, the thank-you page and where it sends people after.",
+            "link": f"/studio/forms?edit={fid}" if fid else "/studio/forms", "share": share}
 
-_simple("create_form", "Make a new custom form (Forms & Invites) with a title and the agent's own questions (types: " + ", ".join(Q_TYPES) + "; select/multi_select need options). Full name, email and phone are always there already.",
+_simple("create_form", "Make a new custom form (Forms & Invites) with a title and the agent's own questions (types: " + ", ".join(Q_TYPES) + "; select/multi_select need options). Full name, email and phone are always there already. "
+        "Before setting it up, ask in ONE short message (with offer_choices) whether they want the moving background effect (some people prefer it off) - and if the form is about one home, which of their listings to link (listing_key from their listings list).",
         _obj({"title": {"type": "string"}, "questions": {"type": "array", "items": {"type": "object", "properties": {
-            "label": {"type": "string"}, "type": {"type": "string", "enum": list(Q_TYPES)}, "options": {"type": "array", "items": {"type": "string"}}, "required": {"type": "boolean"}}}}},
+            "label": {"type": "string"}, "type": {"type": "string", "enum": list(Q_TYPES)}, "options": {"type": "array", "items": {"type": "string"}}, "required": {"type": "boolean"}}}},
+            "background_effects": {"type": "boolean"}, "listing_key": {"type": "string"}},
              ["title"]), _p_form, _r_form)
 
 INVITE_TYPES = {"open_house": "Open house", "brokers_open": "Broker's open", "client_event": "Client event", "custom": "Other event"}
@@ -923,17 +1064,31 @@ async def _p_invite(db, user, a):
         if _s(a.get(k)):
             body[k] = _s(a[k])[:n]
             lines.append(f"{label}: {body[k][:200]}")
-    return Prepared("Make an event invite", lines + ["Saved as a draft - nothing is sent until you send it from Forms & Invites"], {"body": body})
+    return Prepared("Make an event invite", lines + ["It gets its own link - nobody receives it until you send it from Forms & Invites"], {"body": body},
+                    picker="invite")   # the four designs on the card
 
 
 async def _r_invite(db, user, p):
-    await _run_route(user, "POST", "/invites", p["body"])
-    return {"message": "Invite made - open it to add a cover photo and send it.", "link": "/studio/forms"}
+    out = await _run_route(user, "POST", "/invites", p["body"])
+    code = (out or {}).get("code")
+    share = await _share(db, user, f"/i/{code}", url=(out or {}).get("share_url")) if code else None
+    iid = (out or {}).get("id")
+    return {"message": "Invite made - open it to add a cover photo, pick who to send it to and send it.",
+            "link": f"/studio/forms?view=invites&invite={iid}" if iid else "/studio/forms?view=invites", "share": share}
 
-_simple("create_invite", "Make an event invite with RSVP (open house, broker's open, client event, other) - date YYYY-MM-DD, times HH:MM, place, address, message, design (classic, garden, midnight, modern). Saved as a draft; never sends.",
-        _obj({"kind": {"type": "string", "enum": list(INVITE_TYPES)}, "title": {"type": "string"}, "date": {"type": "string"}, "start_time": {"type": "string"}, "end_time": {"type": "string"},
-              "place_name": {"type": "string"}, "address": {"type": "string"}, "message": {"type": "string"}, "design": {"type": "string", "enum": list(INVITE_DESIGNS)}}, ["title"]),
-        _p_invite, _r_invite)
+def _adjust_invite(user, payload: dict, picks: dict) -> dict:
+    """The design tapped on the card."""
+    if picks.get("design") in INVITE_DESIGNS:
+        return {**payload, "body": {**payload.get("body", {}), "design": picks["design"]}}
+    return payload
+
+register({"name": "create_invite", "description": (
+    "Make an event invite with RSVP (open house, broker's open, client event, other) - date YYYY-MM-DD, times HH:MM, place, address, message, design (classic, garden, midnight, modern). "
+    "Never sends it. Before setting it up, if they didn't say WHERE (place name and address), ask that in one short question - don't fill in a place yourself. "
+    "The card lets them tap the design, so don't ask about that."),
+    "input_schema": _obj({"kind": {"type": "string", "enum": list(INVITE_TYPES)}, "title": {"type": "string"}, "date": {"type": "string"}, "start_time": {"type": "string"}, "end_time": {"type": "string"},
+                          "place_name": {"type": "string"}, "address": {"type": "string"}, "message": {"type": "string"}, "design": {"type": "string", "enum": list(INVITE_DESIGNS)}}, ["title"])},
+    _p_invite, _r_invite, None, adjust=_adjust_invite)
 
 
 async def _p_blog(db, user, a):
@@ -1151,7 +1306,9 @@ async def _p_design(db, user, a):
         raise ActionError("The Luxe look comes with the IDX plan.")
     if color not in DESIGN_COLORS:
         color = "light"
-    lines = [f"{label} {DESIGN_FORMATS[fmt]}", f"Look: {DESIGN_LAYOUTS.get(layout, 'the recommended layout')}, {DESIGN_COLORS[color]} colors"]
+    # "Open House" + "Open House Flyer" reads "Open House Flyer", not "Open House Open House Flyer" (owner's test, 11/01)
+    kind = DESIGN_FORMATS[fmt] if DESIGN_FORMATS[fmt].lower().startswith(label.lower()) else f"{label} {DESIGN_FORMATS[fmt]}"
+    lines = [kind, f"Look: {DESIGN_LAYOUTS.get(layout, 'the recommended layout')}, {DESIGN_COLORS[color]} colors"]
     payload = {"situation": sit, "format": fmt, "layout": layout, "colors": color}
     if rule:
         key = _need_id(a, "listing_key")
@@ -1170,7 +1327,7 @@ async def _p_design(db, user, a):
                 OpenHouseHostRequest.status == "approved"))).first()
             if not hosting:
                 raise ActionError("An Open House design has to be your own listing, or one its listing agent approved you to host.")
-        addr = ", ".join(x for x in (prop.street_address, prop.city) if x)
+        addr = tidy_caps(", ".join(x for x in (prop.street_address, prop.city) if x))   # the MLS sends ALL CAPS
         payload.update(listing_key=key, address=addr)
         lines.insert(1, f"Home: {addr}")
         if sit == "open_house" and _s(a.get("open_house_date")):
@@ -1184,7 +1341,7 @@ async def _p_design(db, user, a):
     elif _s(a.get("headline")):
         payload["headline"] = _s(a["headline"])[:90]; lines.append(f"Headline: “{payload['headline']}”")
     lines.append("Made in your Studio - you'll see it here with a Download button, and can still edit it")
-    return Prepared(f"Make a {label} {DESIGN_FORMATS[fmt]}", lines, payload, confirm_label="Make it")
+    return Prepared(f"Make {'an' if kind[:1].lower() in 'aeiou' else 'a'} {kind}", lines, payload, confirm_label="Make it")
 
 register({"name": "create_design", "description": (
     "Make a Studio design (flyer, postcard, door hanger, social post...) that appears in the chat with a Download button. "

@@ -11,8 +11,8 @@ Showcases and CMA in depth: every Showcase search option, match score, compare h
 - By hand: Showcases → **Create**. Sort by **Came from** to see the source.
 
 ## Creating one for a client
-1. **About them**: Client's full name, Email, Phone (optional), **Showcase name** ("Named from your client - change it to anything"). **Email [name] their Showcase** sends their link, what it looks for and a few homes when you create it.
-2. **Why is [name] looking?** (Looking to buy soon, Just browsing, Interested in area, Investment opportunity, Curious about property) and **Does [name] have an agent?** (Yes, they have an agent / No, they don't have an agent / They're looking for an agent).
+1. **About them**: Client's full name, Email, Phone (optional), **Showcase name** ("Named from your client - change it to anything"). **Email the client their Showcase** sends their link, what it looks for and a few homes when you create it.
+2. **Why is the client looking?** (Looking to buy soon, Just browsing, Interested in area, Investment opportunity, Curious about property) and **Does the client have an agent?** (Yes, they have an agent / No, they don't have an agent / They're looking for an agent).
 3. **Set the search area** (the map window "Where should we look"), then **Create Showcase**. The client is added to your Leads.
 
 ## Every search option
@@ -46,7 +46,7 @@ Showcases and CMA in depth: every Showcase search option, match score, compare h
 
 ## Changing the search
 - **Edit** → change anything → **OK, save search**. The client hears about it in that afternoon's email (what it looks for now, homes added or gone).
-- If the client asked ("[name] asked you to refine their search"), tap **Edit Search** or dismiss it. Clients can also change their own search; that shows in your briefing.
+- If the client asked ("the client asked you to refine their search"), tap **Edit Search** or dismiss it. Clients can also change their own search; that shows in your briefing.
 
 ## Client emails and digests
 - Showcase invite after your open house: 1 hour after sign-in by default (Right away, 15, 30 minutes or 1 hour in Tools → Email).

@@ -36,7 +36,7 @@ from app.services import s3_service
 from app.services import storage_ledger_service
 from app.services.ai.ai_config_service import ai_config_service
 from app.services.ai.ai_rate_limit_service import (
-    _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS, AIRateLimitExceeded, classify_provider_error, reconcile_budget,
+    _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS, AIRateLimitExceeded, classify_provider_error, reconcile_budget, resets_text, usage_period,
     record_usage_event, reserve_studio_media_image, reserve_studio_media_video, total_monthly_ai_cost,
 )
 from app.services.studio_media.prompts import (
@@ -1001,7 +1001,7 @@ async def _run_video(db, user, payload, photos, options, config, group_id, paren
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
                 "That many photos would use more AI budget than you have left this month. "
-                "Try fewer photos, or wait until your budget resets on the 1st.",
+                f"Try fewer photos, or wait until it resets. {resets_text((await usage_period(db, user.id))[1])}",
             )
 
     try:

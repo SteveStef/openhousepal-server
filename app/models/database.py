@@ -842,6 +842,10 @@ class Collection(Base):
     # When the agent first texted this client a home with the intro message ("Hey Dana, it's Peter!") -
     # later texts start with just the links (the intro is said once).
     home_intro_texted_at = Column(DateTime(timezone=True), nullable=True)
+    # Every time the agent sent this client home(s) by text / email (owner 10/31): newest last,
+    # [{"at", "method", "ids", "intro", "copied"}] - the Showcase marks those homes "Sent" and the
+    # Send window says how and when (collections_routes.mark_home_sent).
+    home_sends = Column(JSONB, nullable=True)
 
     # Relationships
     owner = relationship("User", back_populates="collections")

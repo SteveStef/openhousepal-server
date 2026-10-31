@@ -61,7 +61,8 @@ Open House Kits in depth: building a kit (MLS and No-MLS), every document and it
 ## Visitors window
 - Counts: **Visitors**, **No agent**, **Has agent**; everyone grouped by day with email and phone.
 - **Star** (asks **Star Showcase too** or **Just the lead**), **Notes** (shared with their lead), **Activity** ("Everything they did on their Guest Pass" - e.g. Looked through the Similar Homes, Opened the Cheat Sheet, Asked for the seller disclosure, time on it, came back).
-- **Showcase for this visitor** (Premium/IDX, guests without an agent): ON builds their Showcase and schedules the invite; OFF cancels a waiting invite and turns their Showcase off. If the invite email is switched off in Tools → Email, no invite is sent.
+- **Showcase for this visitor** (Premium/IDX, guests without an agent): ON builds their Showcase and schedules the invite; OFF cancels a waiting invite and turns their Showcase off. If the invite email is switched off in Tools → Email, no invite is sent. The same switch is on their Lead page.
+- **Opens list order:** an open house with a sign-in in the last week moves to the top, newest sign-in first.
 
 ## Disclosure & Second Visits (MLS plans)
 - Requests from the Cheat Sheet QR or Guest Pass sit at the top of My Opens while waiting. Tabs **Upcoming** / **Past**. Each shows the source (Guest Pass or Cheat Sheet QR) and "Also wants disclosure" when asked.
@@ -72,7 +73,7 @@ Open House Kits in depth: building a kit (MLS and No-MLS), every document and it
 
 ## Hosting another agent's listing (MLS plans)
 - **Discovery** (Opens → Discovery): set your area (**Enter address or landmark** + miles) and filters (Brokerages, Exclude/Only Agents, Cities, Districts, Min Bedrooms/Bathrooms/Sqft/Price; **Reset All**). Saved automatically.
-- **Request to Host** (or tap an empty weekend day): pick one day, or two to offer a second open → time → note → **Send request** / **Send 2 requests**. If the listing agent isn't on OpenHousePal you get an **Example Outreach Email** to send yourself.
+- **Request to Host** (or tap an empty weekend day): pick one day, or two to offer a second open → time → note → **Send request** / **Send 2 requests**. If the listing agent isn't on OpenHousePal: your note (remembered with **Use my wording for every request**) -> **Text** or **Email** from your own phone. On OpenHousePal: after sending, **Also text or email** them the same note.
 - Refusals: the day passed, under contract/off market, coming soon before it goes active ("Hosting once it's active"), that day already booked, you already host another open that day (one per day), or "Not Accepting Host Requests" (team-only or a different brokerage).
 - **My Requests**: Sent Requests, Team Requests (one tap to say yes - first to claim wins), Team Invites, Declined / Cancelled. **Accept New Time**, **Decline**, **Other time**, **Withdraw request** / **Can't host anymore?**. Each side can suggest another time only once; then it's yes or no.
 - Once approved it shows under "You're confirmed to host" on My Opens: **Open kit** ("Kit ready - use the same one") or **Build kit**. Guests who sign in on your kit are your leads.

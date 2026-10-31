@@ -17,7 +17,7 @@ LINK_HELP = (
     "/leads, /leads/<lead_id>, /leads/tasks (Follow-ups), /leads/tasks?task=<task_id>, /leads/emails (Email Tracker), /activity, "
     "/studio (Tools), /studio/design?new=1 (new design), /studio/design?address=<street address> (new design for that home), "
     "/studio/property-sites?new=1 (new Spotlight), /studio/property-sites/<spotlight_id>, /studio/cma?new=1 (new CMA), /studio/cma/<report_id>, "
-    "/studio/blogs?new=1 (new blog post), /studio/forms (Forms & Invites), /studio/media (Media Lab), /studio/brand-kit (Branding), "
+    "/studio/blogs?new=1 (new blog post), /studio/forms (Forms & Invites), /studio/forms?new=1 (new custom form), /studio/media (Media Lab), /studio/brand-kit (Branding), "
     "/studio/email (Email settings + briefing time), /studio/email-signature, /studio/calendar, /studio/reviews, /studio/website (IDX website), "
     "/studio/site (Agent Hub editor), /settings, /settings/help (Help), /settings/help?compose=1&category=bug, /settings/subscription (Billing), /setup (Account setup)."
 )
@@ -30,7 +30,10 @@ UI_TOOL_DEFINITIONS = [
     },
     {
         "name": "show_link",
-        "description": "Show a 'Go there' button under your reply that opens a page in OpenHousePal - use it whenever you tell them where something is or when the page itself is the best way to finish. " + LINK_HELP,
+        "description": "Show a 'Go there' button under your reply that opens a page in OpenHousePal - use it whenever you tell them where something is or when the page itself is the best way to finish. "
+                       "ALWAYS for a 'how do I make / create / start X' question (owner, 10/31): one button that opens X's create screen itself, as if they'd clicked its Create button - "
+                       "label it 'Create a Showcase', 'Make a design', 'Start an Open House Kit'... (e.g. /showcases?new=1, /studio/design?new=1, /studio/forms?new=1, /studio/cma?new=1, /studio/blogs?new=1, /studio/property-sites?new=1, /open-houses?kit=<address>). "
+                       "Keep the steps short; the button is the main answer. " + LINK_HELP,
         "input_schema": {"type": "object", "properties": {"label": {"type": "string"}, "page": {"type": "string"}}, "required": ["label", "page"]},
     },
 ]

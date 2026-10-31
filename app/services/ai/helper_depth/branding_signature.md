@@ -1,4 +1,4 @@
-Branding and the Email Signature in depth: your look (Classic/Luxe, Ivory/Midnight, metals), brand color and "use it everywhere", logos, fonts, print background and disclaimer; then every signature section, the banner and stats, buttons, looks, smart links, installing in each email app and when to re-copy.
+Branding and the Email Signature in depth: your look (Classic/Luxe, Ivory/Midnight, metals), brand color and "use it everywhere", logos, the middle of your QR codes, fonts and disclaimer; then every signature section, the banner and stats, buttons, looks, smart links, installing in each email app and when to re-copy.
 
 ## Branding (Brand Kit)
 **Who**: every plan. The **Luxe** look is IDX only ("Included with the IDX plan") - others can preview it.
@@ -25,7 +25,7 @@ Each feature shows a status: **Uses your brand**, **Its own look**, **Not set up
 
 ### Logos, fonts & print
 - **Logos**: three slots - **Personal**, **Team**, **Brokerage**. "JPG or PNG. Used on your designs, Spotlight and signature." Up to 10MB. **Upload** / **Replace** / remove. In a Studio design you pick which one shows (or none) and its size.
-- **Print background**: "The background color on your flyers, social posts, CMA and Spotlight. Your brand color comes from Your look above."
+- **The middle of your QR codes** (under Logos): **Our house logo** (every plan); **Your logo** (your Personal logo) or **Your initials** (IDX only). Used on every kit, design, form and sign-in screen; codes you already printed keep working.
 - **Fonts**: **Heading font** and **Body font** - **Editorial Serif**, **Modern Sans**, **Structured Mono**.
 - **Default Disclaimer**: "Shown on print materials where required. Leave blank to omit." (e.g. "Equal Housing Opportunity. Information deemed reliable but not guaranteed."). Studio designs use it as their fine print unless you type a per-design one.
 

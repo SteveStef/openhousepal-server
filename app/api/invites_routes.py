@@ -284,7 +284,7 @@ async def public_rsvp(code: str, payload: RsvpSubmit, request: Request, db: Asyn
     questions = inv.questions or []
     snapshot, given = svc.answers_snapshot(questions, payload.answers)
     if payload.response != "no":
-        missing = [q["label"] for q in questions if q.get("required") and q["id"] not in given]
+        missing = [q["label"] for q in questions if q.get("required") and q["id"] not in given and not svc.asked_by_rsvp(q, inv.audience)]
         if missing:
             raise HTTPException(status_code=422, detail=f"Please answer: {missing[0]}")
     else:

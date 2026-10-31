@@ -344,12 +344,21 @@ async def build_rundown(db: AsyncSession, user: User, now: datetime | None = Non
     except Exception:  # noqa: BLE001
         logger.warning("rundown exact links failed", exc_info=True)
         links, showcases = {}, {}
+    # Open house guests say whether they have an agent, like the briefing email (owner, 11/01).
+    from app.models.database import OpenHouseVisitor
+    visitor_ids = [n.reference_id for n in notes if n.reference_type == "VISITOR" and n.reference_id]
+    agent_of: dict[str, str] = {}
+    if visitor_ids:
+        for vid, has in (await db.execute(select(OpenHouseVisitor.id, OpenHouseVisitor.has_agent)
+                                          .where(OpenHouseVisitor.id.in_(visitor_ids)))).all():
+            agent_of[vid] = {"YES": "Has an agent", "NO": "No agent"}.get(str(has or "").upper(), "")
     groups: dict[str, list[dict]] = {}
     for n in notes:
         key = _GROUP_OF.get(n.type, "other")
         groups.setdefault(key, []).append({
             "id": n.id, "type": n.type, "title": n.title, "message": n.message, "address": n.property_address,
             "link": links.get(n.id) or n.link or "", "showcase_link": showcases.get(n.id), "is_read": bool(n.is_read), "at": n.created_at,
+            "agent_status": agent_of.get(n.reference_id) if n.reference_type == "VISITOR" else None,
         })
     order = [k for k, _, _ in _GROUPS] + ["other"]
     happened = [{"key": k, "label": _GROUP_LABEL[k], "items": groups[k]} for k in order if groups.get(k)]

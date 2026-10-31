@@ -469,6 +469,10 @@ async def list_agent_ai_usage(
                 func.coalesce(func.sum(AIUsageEvent.tool_call_count), 0),
                 func.count(AIUsageEvent.id).filter(_a_real_block()),
                 func.max(AIUsageEvent.created_at),
+                # The AI helper chat alone (owner, 10/31) - its own event type, nothing else that
+                # happens to run on the same models.
+                _spent(config, AIUsageEvent.event_type == "chat"),
+                func.count(AIUsageEvent.id).filter(AIUsageEvent.blocked.is_(False), AIUsageEvent.event_type == "chat"),
             )
             .join(UserModel, UserModel.id == AIUsageEvent.owner_id)
             .where(AIUsageEvent.created_at >= since)
@@ -490,9 +494,11 @@ async def list_agent_ai_usage(
                 tool_calls=int(tool_calls or 0),
                 blocked_count=int(blocked or 0),
                 last_active=last_active,
+                chat_cost_usd=float(chat_cost or 0.0),
+                chat_messages=int(chat_messages or 0),
                 **await _agent_site_spend(db, owner_id, config),
             )
-            for owner_id, first, last, email, cost, messages, tool_calls, blocked, last_active in rows
+            for owner_id, first, last, email, cost, messages, tool_calls, blocked, last_active, chat_cost, chat_messages in rows
         ]
     except Exception as e:
         logger.error(f"Failed to list agent AI usage: {e}")

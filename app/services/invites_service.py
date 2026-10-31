@@ -404,6 +404,20 @@ def guest_count_of(questions: list[dict], answers: dict[str, Any], response: str
     return 1
 
 
+_AGENT_Q_RE = re.compile(r"\b(working with|have|got)\s+(a|an|your own)\s+(real estate\s+)?agent\b|\bare you (a|an)\s+(real estate\s+)?agent\b", re.I)
+
+
+def asked_by_rsvp(q: dict, audience: Optional[str]) -> bool:
+    """A client invite's own "Are you a real estate agent?" / "working with one?" question - the RSVP
+    asks both itself (is_agent / has_agent), so the guest page leaves this one out and it is never
+    required (owner, 10/31: older invites still carried the pre-10/24 "Are you working with a real
+    estate agent?" and every RSVP failed with "Please answer: ..."). Keep in step with the guest
+    page's askedByRsvp (frontend/lib/invites.ts)."""
+    if audience != "clients":
+        return False
+    return q.get("role") == "represented" or bool(_AGENT_Q_RE.search(q.get("label") or ""))
+
+
 def represented_of(questions: list[dict], answers: dict[str, Any], has_agent: Optional[bool] = None) -> Optional[str]:
     if has_agent is not None:
         return "yes" if has_agent else "no"

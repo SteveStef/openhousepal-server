@@ -23,11 +23,14 @@ DEFAULT_CONFIG = {
     "max_input_chars": 12000,
 
     # Rate limiting
-    "requests_per_minute": 5,
+    "requests_per_minute": 8,   # 5 was hit by normal back-and-forth (tapping answer buttons) - 11/01; spend caps still apply
     "max_concurrent_requests": 2,
     "daily_message_limit": 75,
     "monthly_message_limit": 1500,
-    "monthly_cost_ceiling_usd": 5.0,
+    "monthly_cost_ceiling_usd": 5.0,  # chat allowance for a plan missing from the table below
+    # The AI helper chat's own allowance per billing period, by plan - the "Chat usage" bar
+    # (owner, 11/01). Each plan is double the one below it, so the upgrade offer is "2x the chat".
+    "chat_allowance_usd_by_tier": {"NO_MLS": 2.5, "BASIC": 2.5, "PRO_NO_MLS": 5.0, "PREMIUM": 5.0, "IDX": 10.0},
 
     # Platform-wide (ALL agents combined) chat safety ceiling - Layer 3, on top of the per-user
     # limits above. A last-resort circuit breaker, not a day-to-day limiter: sized so it should

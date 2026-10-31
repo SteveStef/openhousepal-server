@@ -42,7 +42,7 @@ from app.models.database import User
 from app.services.ai import ai_blog_writer_service as writer
 from app.services.ai.ai_config_service import ai_config_service
 from app.services.ai.ai_rate_limit_service import (
-    AIRateLimitExceeded, _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS, reconcile_budget, record_usage_event,
+    AIRateLimitExceeded, _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS, reconcile_budget, record_usage_event, resets_text, usage_period,
     reserve_global_and_emergency, total_monthly_ai_cost,
 )
 from app.services.areas import town_knowledge_service as tk
@@ -382,7 +382,7 @@ async def _gate(db: AsyncSession, user: User, config: dict, engine: str) -> None
     if await total_monthly_ai_cost(db, user.id) + need > float(limit):
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
-            "There isn't enough AI usage left this month for a full researched article. It resets on the 1st.",
+            f"There isn't enough AI usage left this month for a full researched article. {resets_text((await usage_period(db, user.id))[1])}",
         )
 
 

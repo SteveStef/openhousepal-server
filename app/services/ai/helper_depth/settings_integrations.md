@@ -8,7 +8,6 @@ Tabs: **Profile**, **Notifications**, **Tools**, **IDX Website** (IDX only), **B
 - **About**: up to 280 characters / 3 lines so the Brag Sheet fits one page. **Polish with AI** (tones: Professional, Warm, Luxury, Energetic, Concise; uses a little AI allowance). Compliance hints show under the box.
 - Contact: **Mobile Number (Call)**, **Text Phone Number**, **Contact Email** (required), **Office Phone (optional)** (goes on your Save Contact card), **Your Brokerage's Phone** (required - printed on designs for compliance), **Market** (required), **License Number** (locked once saved; **Not set - add it** opens setup).
 - Social Links, **My Listings**, **Where Your Listings Link To**, **Recent Sales** (same panels as the Agent Hub editor - editing in either place updates both).
-- **The middle of your QR codes**: **Our house logo** (every plan); **Your logo** or **Your initials** (IDX only; logo needs a Brand Kit logo). Printed codes keep working.
 
 **Notifications** - which alerts also email you (the in-app bell always shows everything). Each row has an Email switch:
 - New leads & sign-ins, Client requests in Showcases, Showcase activity, Daily briefing, Spotlight weekly report (Mondays), Liked homes (hourly), Open house host requests, Team & broadcasts, My listing updates (off by default), AI media ready (off by default), New reviews, Account & support. Phone push isn't available.

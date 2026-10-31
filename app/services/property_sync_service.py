@@ -1,5 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_, text, update
+from sqlalchemy import select, func, and_, or_, text, update, case
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import selectinload, joinedload
 from typing import List, Dict, Any, Optional
@@ -1061,121 +1061,97 @@ class PropertySyncService:
             .where(Collection.status == 'ACTIVE')
         )
 
-        # 1. Geography Match (Exclusive Logic: Cities/Townships/Districts OR Radius)
-        geo_conditions = []
-        location_filters = []
+        # 1. Geography - the same rules as the Showcase search itself
+        # (property_service.get_properties_by_preferences): towns and townships each add area (OR),
+        # a school district NARROWS whatever area was picked (AND) - alone it's the whole district.
+        # (Owner 10/31: a Bryn Mawr + Lower Merion schools Showcase was getting every Lower Merion
+        # listing - Penn Valley, Narberth, Bala Cynwyd - because the district was OR'd in here.)
+        def _none_picked(col):
+            # NULL, JSON null, not a list, or [] = nothing picked
+            return case((func.jsonb_typeof(col) == 'array', func.jsonb_array_length(col)), else_=0) == 0
+
         params = {}
-        
+        place_filters = []
         if city:
             params["city_name"] = city.upper()
             params["state_name"] = state.upper() if state else ""
-            location_filters.append(text("""
+            place_filters.append(text("""
                 EXISTS (
                     SELECT 1 FROM jsonb_array_elements_text(
-                        CASE 
-                            WHEN jsonb_typeof(collection_preferences.cities) = 'array' 
-                            THEN collection_preferences.cities 
-                            ELSE '[]'::jsonb 
-                        END
-                    ) AS pref_city 
-                    WHERE 
-                        UPPER(TRIM(SPLIT_PART(pref_city, ',', 1))) = :city_name
-                        AND (
-                            TRIM(SPLIT_PART(pref_city, ',', 2)) = '' 
-                            OR UPPER(TRIM(SPLIT_PART(pref_city, ',', 2))) = :state_name
-                        )
+                        CASE WHEN jsonb_typeof(collection_preferences.cities) = 'array'
+                             THEN collection_preferences.cities ELSE '[]'::jsonb END
+                    ) AS pref_city
+                    WHERE UPPER(TRIM(SPLIT_PART(pref_city, ',', 1))) = :city_name
+                      AND (TRIM(SPLIT_PART(pref_city, ',', 2)) = ''
+                           OR UPPER(TRIM(SPLIT_PART(pref_city, ',', 2))) = :state_name)
                 )
             """))
-        
         if township:
             params["township_name"] = township.upper()
             params["state_name"] = state.upper() if state else ""
-            location_filters.append(text("""
+            place_filters.append(text("""
                 EXISTS (
-                    SELECT 1 
-                    FROM jsonb_array_elements_text(
-                        CASE 
-                            WHEN jsonb_typeof(collection_preferences.townships) = 'array' 
-                            THEN collection_preferences.townships 
-                            ELSE '[]'::jsonb 
-                        END
-                    ) AS pref_town 
-                    WHERE 
-                        UPPER(TRIM(REGEXP_REPLACE(SPLIT_PART(pref_town, ',', 1), '\\s+(Township|Twp|Boro|Borough|City|Town)$', '', 'i'))) = :township_name
-                        AND (
-                            TRIM(SPLIT_PART(pref_town, ',', 2)) = '' 
-                            OR UPPER(TRIM(SPLIT_PART(pref_town, ',', 2))) = :state_name
-                        )
+                    SELECT 1 FROM jsonb_array_elements_text(
+                        CASE WHEN jsonb_typeof(collection_preferences.townships) = 'array'
+                             THEN collection_preferences.townships ELSE '[]'::jsonb END
+                    ) AS pref_town
+                    WHERE UPPER(TRIM(REGEXP_REPLACE(SPLIT_PART(pref_town, ',', 1), '\\s+(Township|Twp|Boro|Borough|City|Town)$', '', 'i'))) = :township_name
+                      AND (TRIM(SPLIT_PART(pref_town, ',', 2)) = ''
+                           OR UPPER(TRIM(SPLIT_PART(pref_town, ',', 2))) = :state_name)
                 )
             """))
 
+        no_district_picked = _none_picked(CollectionPreferences.school_districts)
         if school_district:
             params["sd_name"] = school_district.upper()
             params["sd_state"] = state.upper() if state else ""
-            location_filters.append(text("""
+            # Same match as the search: the picked name is part of the home's district name
+            # ("LOWER MERION" in "LOWER MERION", "UPPER MERION" in "UPPER MERION AREA").
+            in_picked_district = text("""
                 EXISTS (
-                    SELECT 1 
-                    FROM jsonb_array_elements_text(
-                        CASE 
-                            WHEN jsonb_typeof(collection_preferences.school_districts) = 'array' 
-                            THEN collection_preferences.school_districts 
-                            ELSE '[]'::jsonb 
-                        END
-                    ) AS sd 
-                    WHERE 
-                        UPPER(TRIM(SPLIT_PART(sd, ',', 1))) = :sd_name
-                        AND (
-                            TRIM(SPLIT_PART(sd, ',', 2)) = '' 
-                            OR UPPER(TRIM(SPLIT_PART(sd, ',', 2))) = :sd_state
-                        )
+                    SELECT 1 FROM jsonb_array_elements_text(
+                        CASE WHEN jsonb_typeof(collection_preferences.school_districts) = 'array'
+                             THEN collection_preferences.school_districts ELSE '[]'::jsonb END
+                    ) AS sd
+                    WHERE TRIM(SPLIT_PART(sd, ',', 1)) <> ''
+                      AND POSITION(UPPER(TRIM(SPLIT_PART(sd, ',', 1))) IN :sd_name) > 0
+                      AND (TRIM(SPLIT_PART(sd, ',', 2)) = ''
+                           OR UPPER(TRIM(SPLIT_PART(sd, ',', 2))) = :sd_state)
                 )
-            """))
-        
-        # Priority 1: If user has explicit location lists, only match those
-        if location_filters:
-            geo_conditions.append(or_(*location_filters))
-        
-        # Priority 2: Fallback to Radius only if no City/Township/District is provided
+            """)
+            district_ok = or_(no_district_picked, in_picked_district)
+        else:
+            district_ok = no_district_picked  # no district on record = can't show it's in the picked one
+
+        area_conditions = []
+        if place_filters:
+            area_conditions.append(or_(*place_filters))
         if lat and lng:
-            lat_offset, long_offset = get_lat_long_offsets(lat, 1.0) # Get offsets for 1 mile
-            
-            radius_condition = and_(
-                # Ensure user hasn't specified other locations (The "Exclusive" part)
-                or_(
-                    CollectionPreferences.cities == None, 
-                    and_(
-                        func.jsonb_typeof(CollectionPreferences.cities) == 'array',
-                        func.jsonb_array_length(CollectionPreferences.cities) == 0
-                    ),
-                    func.jsonb_typeof(CollectionPreferences.cities) != 'array'
-                ),
-                or_(
-                    CollectionPreferences.townships == None, 
-                    and_(
-                        func.jsonb_typeof(CollectionPreferences.townships) == 'array',
-                        func.jsonb_array_length(CollectionPreferences.townships) == 0
-                    ),
-                    func.jsonb_typeof(CollectionPreferences.townships) != 'array'
-                ),
-                or_(
-                    CollectionPreferences.school_districts == None, 
-                    and_(
-                        func.jsonb_typeof(CollectionPreferences.school_districts) == 'array',
-                        func.jsonb_array_length(CollectionPreferences.school_districts) == 0
-                    ),
-                    func.jsonb_typeof(CollectionPreferences.school_districts) != 'array'
-                ),
-                # Standard radius box
+            lat_offset, long_offset = get_lat_long_offsets(lat, 1.0)  # offsets for 1 mile
+            area_conditions.append(and_(
+                # Radius only for Showcases without towns. The district no longer blocks it -
+                # "within 3 mi AND in Radnor schools" is checked by district_ok below.
+                _none_picked(CollectionPreferences.cities),
+                _none_picked(CollectionPreferences.townships),
                 CollectionPreferences.lat.isnot(None),
                 CollectionPreferences.long.isnot(None),
                 CollectionPreferences.diameter.isnot(None),
                 func.abs(CollectionPreferences.lat - lat) <= (CollectionPreferences.diameter * lat_offset),
-                func.abs(CollectionPreferences.long - lng) <= (CollectionPreferences.diameter * long_offset)
-            )
-            geo_conditions.append(radius_condition)
-        
-        if geo_conditions:
-            stmt = stmt.where(or_(*geo_conditions))
+                func.abs(CollectionPreferences.long - lng) <= (CollectionPreferences.diameter * long_offset),
+            ))
+        # A Showcase that searches a school district and nothing else (no town, township, county,
+        # radius or drawn area) covers the whole district.
+        area_conditions.append(and_(
+            ~no_district_picked,
+            _none_picked(CollectionPreferences.cities),
+            _none_picked(CollectionPreferences.townships),
+            _none_picked(CollectionPreferences.counties),
+            or_(CollectionPreferences.search_polygon.is_(None), func.jsonb_typeof(CollectionPreferences.search_polygon) == 'null'),
+            or_(CollectionPreferences.lat.is_(None), CollectionPreferences.long.is_(None),
+                func.coalesce(CollectionPreferences.diameter, 0) <= 0),
+        ))
+        stmt = stmt.where(or_(*area_conditions))
+        stmt = stmt.where(district_ok)
 
         # 2. Financial & Size Match (with Smart Exemptions)
         # Types that don't always have traditional bed/bath data (Exempt from numeric filters)

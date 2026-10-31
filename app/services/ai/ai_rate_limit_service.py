@@ -17,7 +17,7 @@ from typing import Optional
 from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.database import AIUsageEvent
+from app.models.database import AIUsageEvent, User
 from app.utils.auth import MLS_ACCESS_TIERS
 
 logger = logging.getLogger(__name__)
@@ -97,8 +97,69 @@ async def _count_since(db: AsyncSession, owner_id: str, since: datetime, event_t
 PLATFORM_PAID_EVENT_TYPES = ("area_research", "area_narrative", "area_fair_housing")
 
 
+# The AI helper chat has its own allowance and its own "Chat usage" bar (owner, 11/01) - it never
+# counts on the Monthly AI Usage bar. Read-aloud and live voice are part of the chat.
+CHAT_EVENT_TYPES = ("chat", "tts", "realtime")
+
+
 def _counts_on_agent_bar():
-    return or_(AIUsageEvent.event_type.is_(None), AIUsageEvent.event_type.notin_(PLATFORM_PAID_EVENT_TYPES))
+    return or_(AIUsageEvent.event_type.is_(None), AIUsageEvent.event_type.notin_(PLATFORM_PAID_EVENT_TYPES + CHAT_EVENT_TYPES))
+
+
+# ---------------------------------------------------------------------------
+# Usage periods follow each agent's billing date (owner, 11/01): both bars reset the day they're
+# charged, not on the 1st. Platform-wide ceilings and the count-based safety limits stay monthly.
+# ---------------------------------------------------------------------------
+
+def _add_months(d: datetime, n: int) -> datetime:
+    y, m = divmod(d.month - 1 + n, 12)
+    y, m = d.year + y, m + 1
+    last = [31, 29 if (y % 4 == 0 and (y % 100 or y % 400 == 0)) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]
+    return d.replace(year=y, month=m, day=min(d.day, last))
+
+
+def _utc(d: Optional[datetime]) -> Optional[datetime]:
+    if d is None:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def billing_period(user: Optional[User], now: Optional[datetime] = None) -> tuple[datetime, datetime]:
+    """(start, end) of this agent's current usage period. PayPal's next charge date when it's
+    known; during a free trial, up to the trial's end (their first charge); otherwise monthly
+    from the day they're billed (trial end, else subscription start, else sign-up). Calendar
+    month only when there's nothing to go on."""
+    now = now or datetime.now(timezone.utc)
+    if user is None:
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return start, _add_months(start, 1)
+    nxt = _utc(user.next_billing_date)
+    if nxt and now < nxt <= now + timedelta(days=32):
+        return _add_months(nxt, -1), nxt
+    trial_end = _utc(user.trial_ends_at)
+    if trial_end and now < trial_end:
+        joined = _utc(user.created_at) or _add_months(trial_end, -1)
+        return max(joined, _add_months(trial_end, -1)), trial_end
+    anchor = trial_end or _utc(user.subscription_started_at) or _utc(user.created_at)
+    if not anchor or anchor > now:
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return start, _add_months(start, 1)
+    months = (now.year - anchor.year) * 12 + (now.month - anchor.month)
+    start = _add_months(anchor, months)
+    if start > now:
+        start = _add_months(anchor, months - 1)
+    return start, _add_months(start, 1)
+
+
+async def usage_period(db: AsyncSession, owner_id: str) -> tuple[datetime, datetime]:
+    return billing_period(await db.get(User, owner_id))
+
+
+def resets_text(end: datetime) -> str:
+    """'It resets on Nov 14.' - the billing day itself (dates are stored in UTC; a midnight-UTC
+    date shown in Eastern time would read as the day before)."""
+    d = end.astimezone(timezone.utc)
+    return f"It resets on {d:%b} {d.day}."
 
 
 async def _cost_since(db: AsyncSession, owner_id: str, since: datetime, event_type: Optional[str] = None) -> float:
@@ -160,13 +221,14 @@ def _start_of_month() -> datetime:
 
 
 async def total_monthly_ai_cost(db: AsyncSession, owner_id: str) -> float:
-    """This owner's spend since the 1st across ALL AI event_types combined."""
-    return await _cost_since(db, owner_id, _start_of_month(), event_type=None)
+    """This owner's spend this billing period across every AI tool on the Monthly AI Usage bar
+    (not the chat, which has its own)."""
+    return await _cost_since(db, owner_id, (await usage_period(db, owner_id))[0], event_type=None)
 
 
 async def studio_media_monthly_cost(db: AsyncSession, owner_id: str) -> float:
-    """This owner's Studio AI Media spend (image + video) since the 1st."""
-    return await _cost_since_types(db, owner_id, _start_of_month(), _STUDIO_MEDIA_EVENT_TYPES)
+    """This owner's Studio AI Media spend (image + video) this billing period."""
+    return await _cost_since_types(db, owner_id, (await usage_period(db, owner_id))[0], _STUDIO_MEDIA_EVENT_TYPES)
 
 
 _USAGE_LABELS = {
@@ -174,7 +236,6 @@ _USAGE_LABELS = {
     "cma_ai": "CMA reports", "cma_reasoning": "CMA reports", "cma_ai_recompute": "CMA reports",
     "copywrite": "Copywriter & wording checks",
     "studio_media_image": "AI Media pictures", "studio_media_video": "AI Media videos",
-    "chat": "AI assistant", "tts": "AI assistant", "realtime": "AI assistant",
     "external_api": "Maps & place lookups",
     "school_lookup": "Cheat sheet schools",
     "cheat_sheet_downtown": "Cheat sheet nearby places", "cheat_sheet_proofread": "Cheat sheet nearby places",
@@ -187,6 +248,7 @@ async def monthly_ai_budget_snapshot(db: AsyncSession, owner_id: str, config: di
     exact-dollar readout while testing - the permanent UI is the percentage only."""
     limit = config.get("agent_monthly_ai_budget_usd_by_tier", {}).get(plan_tier)
     media_cap = config.get("studio_media_monthly_spend_cap_usd_by_tier", {}).get(plan_tier)
+    period_start, period_end = await usage_period(db, owner_id)
     used = await total_monthly_ai_cost(db, owner_id)
     media_used = await studio_media_monthly_cost(db, owner_id)
     percent = None if not limit else min(100, int(round(used / limit * 100)))
@@ -200,7 +262,7 @@ async def monthly_ai_budget_snapshot(db: AsyncSession, owner_id: str, config: di
     # of the allowance. Refunded / blocked events are left out, same as the total.
     rows = (await db.execute(
         select(AIUsageEvent.event_type, func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0.0))
-        .where(AIUsageEvent.owner_id == owner_id, AIUsageEvent.blocked.is_(False), AIUsageEvent.created_at >= _start_of_month(),
+        .where(AIUsageEvent.owner_id == owner_id, AIUsageEvent.blocked.is_(False), AIUsageEvent.created_at >= period_start,
                _counts_on_agent_bar())
         .group_by(AIUsageEvent.event_type)
     )).all()
@@ -224,6 +286,59 @@ async def monthly_ai_budget_snapshot(db: AsyncSession, owner_id: str, config: di
         "exhausted": bool(limit and used >= limit),
         "studio_media_used_usd": round(media_used, 4),
         "studio_media_cap_usd": media_cap,
+        "resets_at": period_end.isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# AI helper chat allowance (owner, 11/01): its own per-plan dollar allowance and "Chat usage" bar,
+# each plan double the one below it so an upgrade is an easy "2x the chat". Same billing period.
+# ---------------------------------------------------------------------------
+
+CHAT_UPGRADE_TO = {"NO_MLS": "PRO_NO_MLS", "BASIC": "PREMIUM", "PREMIUM": "IDX"}
+_PLAN_NAMES = {"NO_MLS": "No-MLS Basic", "PRO_NO_MLS": "No-MLS Premium", "BASIC": "Basic", "PREMIUM": "Premium", "IDX": "IDX"}
+
+
+def chat_allowance_usd(config: dict, plan_tier: Optional[str]) -> float:
+    return float(config.get("chat_allowance_usd_by_tier", {}).get(plan_tier or "", config["monthly_cost_ceiling_usd"]))
+
+
+def _chat_upgrade(config: dict, plan_tier: Optional[str]) -> Optional[dict]:
+    up = CHAT_UPGRADE_TO.get(plan_tier or "")
+    if not up:
+        return None
+    mine = chat_allowance_usd(config, plan_tier)
+    times = chat_allowance_usd(config, up) / mine if mine else 0
+    return {"tier": up, "name": _PLAN_NAMES[up], "times": int(round(times)) if times >= 1.5 else None}
+
+
+def chat_limit_message(config: dict, plan_tier: Optional[str], end: datetime) -> str:
+    up = _chat_upgrade(config, plan_tier)
+    more = (f" Upgrade to {up['name']} for {'double' if up['times'] == 2 else 'more'} the chat." if up else "")
+    return f"You've used this month's AI chat allowance. {resets_text(end)}{more}"
+
+
+async def chat_usage_snapshot(db: AsyncSession, owner_id: str, config: dict, plan_tier: Optional[str]) -> dict:
+    """Powers GET /ai/usage/chat - the "Chat usage" bar. Percent only on screen, like the AI bar."""
+    start, end = await usage_period(db, owner_id)
+    limit = chat_allowance_usd(config, plan_tier)
+    used = await _cost_since_types(db, owner_id, start, CHAT_EVENT_TYPES)
+    recent = min(used, await _cost_since_types(db, owner_id, datetime.now(timezone.utc) - timedelta(hours=1), CHAT_EVENT_TYPES))
+    percent = None if not limit else min(100, int(round(used / limit * 100)))
+    recent_percent = None if not limit else min(percent or 0, int(round(recent / limit * 100)))
+    if recent_percent == 0 and recent > 0.0005 and limit:
+        recent_percent = 1 if (percent or 0) >= 1 else 0
+    return {
+        "tier": plan_tier or "",
+        "used_usd": round(used, 4),
+        "limit_usd": limit,
+        "percent": percent,
+        "recent_used_usd": round(recent, 4),
+        "recent_percent": recent_percent,
+        "near_limit": bool(percent is not None and percent >= 80),
+        "exhausted": bool(limit and used >= limit),
+        "resets_at": end.isoformat(),
+        "upgrade": _chat_upgrade(config, plan_tier),
     }
 
 
@@ -239,7 +354,7 @@ async def enforce_agent_monthly_budget(db: AsyncSession, owner_id: str, config: 
     if await total_monthly_ai_cost(db, owner_id) >= limit:
         raise AIRateLimitExceeded(
             "agent_monthly_budget",
-            "You've reached your AI usage limit for this month. It resets on the 1st.",
+            f"You've reached your AI usage limit for this month. {resets_text((await usage_period(db, owner_id))[1])}",
         )
 
 
@@ -267,7 +382,7 @@ async def enforce_studio_soft_cap(db: AsyncSession, owner_id: str, config: dict,
         raise AIRateLimitExceeded(
             "studio_soft_cap",
             "You've used most of this month's AI allowance, so AI Studio photo and video are "
-            "paused until it resets on the 1st. CMAs, cheat sheets and chat still work.",
+            f"paused until it resets. {resets_text((await usage_period(db, owner_id))[1])} CMAs and cheat sheets still work.",
         )
 
 
@@ -284,7 +399,7 @@ async def enforce_studio_media_monthly_cap(db: AsyncSession, owner_id: str, conf
     if await studio_media_monthly_cost(db, owner_id) >= cap:
         raise AIRateLimitExceeded(
             "studio_media_monthly_cap",
-            "You've reached your AI usage limit for this month. It resets on the 1st.",
+            f"You've reached your AI usage limit for this month. {resets_text((await usage_period(db, owner_id))[1])}",
         )
 
 
@@ -348,11 +463,10 @@ async def check_and_reserve(db: AsyncSession, owner_id: str, config: dict, plan_
     the returned Reservation (see reserve_global_and_emergency) once the turn's real
     cost is known, or with 0.0 if the turn never actually ran."""
     await _limiter.check_burst(owner_id, config["requests_per_minute"])
-    await enforce_agent_monthly_budget(db, owner_id, config, plan_tier)
 
     now = datetime.now(timezone.utc)
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    start_of_month, period_end = await usage_period(db, owner_id)
 
     daily_count = await _count_since(db, owner_id, start_of_day, event_type="chat")
     if daily_count >= config["daily_message_limit"]:
@@ -366,13 +480,12 @@ async def check_and_reserve(db: AsyncSession, owner_id: str, config: dict, plan_
             "monthly_limit", "You've reached your AI usage limit for this month."
         )
 
-    # Scoped to "chat" only - tts/realtime/area_narrative/area_research each own an
-    # independent cost ceiling (see ai_config_service.py) and must never eat into this one.
-    monthly_cost = await _cost_since(db, owner_id, start_of_month, event_type="chat")
-    if monthly_cost >= config["monthly_cost_ceiling_usd"]:
-        raise AIRateLimitExceeded(
-            "cost_ceiling", "You've reached your AI usage limit for this month."
-        )
+    # The plan's chat allowance (chat + read-aloud + live voice), this billing period - the
+    # "Chat usage" bar. Separate from the Monthly AI Usage bar (owner, 11/01).
+    if owner_id not in _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS:
+        monthly_cost = await _cost_since_types(db, owner_id, start_of_month, CHAT_EVENT_TYPES)
+        if monthly_cost >= chat_allowance_usd(config, plan_tier):
+            raise AIRateLimitExceeded("cost_ceiling", chat_limit_message(config, plan_tier, period_end))
 
     reservation = await reserve_global_and_emergency(
         db, "chat_global", config["chat_global_reservation_estimate_usd"],
@@ -482,7 +595,7 @@ async def hold_cma_generation(db: AsyncSession, owner_id: str, report_id: str, c
             if used >= limit:
                 raise AIRateLimitExceeded(
                     "agent_monthly_budget",
-                    "You've reached your AI usage limit for this month. It resets on the 1st.",
+                    f"You've reached your AI usage limit for this month. {resets_text((await usage_period(db, owner_id))[1])}",
                 )
             if used + in_flight >= limit:
                 raise AIRateLimitExceeded(

@@ -1495,7 +1495,8 @@ async def set_visitor_showcase(
     if not owner_has_access(current_user, SHOWCASE_ACCESS_TIERS):
         raise HTTPException(status_code=403, detail="Showcases aren't on your plan.")
     visitor = await _load_owned_visitor(db, visitor_id, current_user.id)
-    if vss.has_agent(visitor):
+    # Switching OFF is always allowed - e.g. the Lead page just changed them to "has an agent" (11/01).
+    if vss.has_agent(visitor) and body.on:
         raise HTTPException(status_code=409, detail="They said they already have an agent, so they can't get a Showcase.")
     oh = await db.get(OpenHouseEvent, visitor.open_house_event_id)
     return await vss.set_showcase(db, current_user, visitor, oh, body.on)

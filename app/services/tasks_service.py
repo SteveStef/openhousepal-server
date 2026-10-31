@@ -3194,6 +3194,101 @@ async def on_visitor_note(db: AsyncSession, owner_id: str, visitor) -> None:
             pass
 
 
+# ---------------------------------------------------------------- "has an agent" changed on the lead
+async def on_represented_change(db: AsyncSession, owner_id: str, lead: Lead, old: Optional[str], new: Optional[str]) -> dict:
+    """The agent changed a guest's "has an agent" answer on their lead (owner, 11/01: signed in
+    saying they had one, the agent left a note, then the guest said they don't). Their open house
+    sign-ins follow the change - the Visitors list and its Showcase switch read them - and so does
+    the follow-up:
+    - now NO agent: the real "Follow up with ..." for their latest sign-in. A has-an-agent heads-up
+      that's still open BECOMES it (same card, due date kept), saying what happened, with the notes.
+    - now HAS an agent: nothing new (the Lead page asks about their Showcase).
+    The caller has already set lead.represented. Commits. Never raises."""
+    from app.models.database import OpenHouseVisitor
+    out: dict = {"visitors": 0, "followup_id": None, "visitor_id": None}
+    if new not in ("yes", "no") or old == new:
+        return out
+    try:
+        rows = (await db.execute(
+            select(OpenHouseVisitor).join(OpenHouseEvent, OpenHouseEvent.id == OpenHouseVisitor.open_house_event_id)
+            .where(OpenHouseVisitor.lead_id == lead.id, OpenHouseEvent.agent_id == owner_id)
+            .order_by(OpenHouseVisitor.created_at.desc())
+        )).scalars().all()
+        for v in rows:
+            v.has_agent = "YES" if new == "yes" else "NO"
+        out["visitors"] = len(rows)
+        out["visitor_id"] = rows[0].id if rows else None
+        if new != "no" or not rows:
+            await db.commit()
+            return out
+
+        visitor = rows[0]
+        oh = await db.get(OpenHouseEvent, visitor.open_house_event_id) if visitor.open_house_event_id else None
+        address = getattr(oh, "address", None)
+        owner = await db.get(User, owner_id)
+        now = datetime.now(timezone.utc)
+        today = now.astimezone(EASTERN)
+        signed = visitor.created_at.astimezone(EASTERN) if visitor.created_at else None
+        story = ("They said they had an agent when they signed in"
+                 + (f" ({signed:%b} {signed.day})" if signed else "")
+                 + f", then told you they don't - you changed it on {today:%b} {today.day}.")
+        notes = await _visitor_notes(db, visitor)
+        note_lines = ([f'Your note: "{notes[0][:500]}"'] if len(notes) == 1 else
+                      ["Your notes:\n" + "\n".join(f'- "{n[:300]}"' for n in notes[:3])] if notes else [])
+        contact = "  |  ".join(b for b in [_pretty_phone(lead.phone or visitor.phone), lead.email or visitor.email] if b)
+        body = "\n".join([story, *note_lines] + ([f"Open house: {_tidy_context(address)}"] if address else []) + ([f"Contact: {contact}"] if contact else []))
+        # No Showcase was made at sign-in (they said they had an agent). Their switch reads Off - not
+        # the kit's default On with nothing behind it - until the agent answers "give them one?".
+        from app.services import visitor_showcase_service as vss
+        col = await vss.visitor_showcase(db, owner_id, visitor)
+        if visitor.showcase_override is None and (col is None or col.status != "ACTIVE"):
+            visitor.showcase_override = False
+        context = _tidy_context(f"Told you they don't have an agent - signed in at your open house{' - ' + address if address else ''}")[:240]
+        name = lead.name or visitor.full_name or "open house guest"
+
+        heads_up = (await db.execute(select(AgentTask).where(
+            AgentTask.owner_id == owner_id, AgentTask.auto_source == NOTED_GUEST_SOURCE,
+            AgentTask.auto_source_id.in_([v.id for v in rows]), AgentTask.completed_at.is_(None),
+        ).order_by(AgentTask.created_at.desc()).limit(1))).scalar_one_or_none()
+        task = None
+        if heads_up is not None:
+            task = heads_up
+            task.auto_source = "open_house_signin"
+            task.auto_source_id = heads_up.auto_source_id
+            task.title = f"Follow up with {name}"
+            task.priority = "high"
+            task.context = context
+            task.notes = body
+            task.suggested_message = render_rule_message(owner, "open_house_signin", name=name,
+                                                         address=await _open_house_short(db, heads_up.auto_source_id, address))
+            if task.due_at is not None and task.due_at < now:
+                task.due_at, task.remind_at, task.all_day = await plan_followup(db, owner, "open_house_signin", now)
+        else:
+            task = await create_open_house_followup(db, owner_id=owner_id, lead=lead, signin_id=visitor.id,
+                                                    property_address=address, occurred_at=now)
+            if task is not None:
+                task.context = context
+                task.notes = body
+        await db.commit()
+        if task is not None:
+            out["followup_id"] = task.id
+            try:
+                from app.services import calendar_sync_service
+                calendar_sync_service.sync_task_bg(owner_id, task.id)
+            except Exception:
+                pass
+        else:
+            resync_lead_followups(owner_id, lead.id)
+        return out
+    except Exception:
+        logger.exception("on_represented_change failed (non-fatal)")
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        return out
+
+
 def noted_guest_sample(user: Optional[User]) -> str:
     """What the heads-up looks like - shown (read-only) under the Open house sign-in situation."""
     return "\n".join([

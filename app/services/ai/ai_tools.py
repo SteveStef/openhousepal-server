@@ -83,9 +83,24 @@ async def _search_properties(db: AsyncSession, current_user: User, args: dict, c
         return {"results": [], "count": 0, "note": "No search text provided."}
 
     like = f"%{query}%"
+    # A town name ("Wayne") is that town - not every address containing it (Waynesboro, Wayne Ave)
+    # - and never rentals; prices filter here so the answer can't contradict itself (owner's test, 11/01).
+    is_town = not any(ch.isdigit() for ch in query)
+    where = [or_(func.lower(Property.city) == query.lower(), Property.listing_key == query) if is_town
+             else or_(Property.full_address.ilike(like), Property.street_address.ilike(like), Property.listing_key == query)]
+    lease = Property.raw_mls_data["PropertyType"].astext
+    where.append(or_(lease.is_(None), ~lease.ilike("%lease%")))
+    if args.get("for_sale_only", True):
+        where.append(or_(Property.home_status.ilike("%active%"), Property.home_status.ilike("%coming%")))
+    for key, op in (("min_price", "__ge__"), ("max_price", "__le__")):
+        try:
+            if args.get(key) not in (None, ""):
+                where.append(getattr(Property.price, op)(float(args[key])))
+        except (TypeError, ValueError):
+            pass
     stmt = (
         select(Property)
-        .where(or_(Property.full_address.ilike(like), Property.street_address.ilike(like), Property.listing_key == query))
+        .where(*where)
         .order_by(Property.mls_list_date.desc().nullslast())
         .limit(limit)
     )
@@ -502,8 +517,10 @@ TOOL_DEFINITIONS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Address or city text to search for, e.g. '26 Old Gulph Road' or 'Villanova'."},
+                "query": {"type": "string", "description": "An address ('26 Old Gulph Road') or ONE town name exactly ('Villanova')."},
                 "limit": {"type": "integer", "description": "Max results to return."},
+                "min_price": {"type": "number"}, "max_price": {"type": "number"},
+                "for_sale_only": {"type": "boolean", "description": "Default true: only homes for sale now (active / coming soon). false to include sold and off-market."},
             },
             "required": ["query"],
         },
@@ -642,7 +659,8 @@ _MLS_TOOLS = {"search_properties", "get_property_detail", "get_similar_propertie
 
 def _allowed(current_user: User, tool_name: str) -> bool:
     from app.utils.auth import MLS_ACCESS_TIERS
-    return tool_name not in _MLS_TOOLS or current_user.is_admin or current_user.plan_tier in MLS_ACCESS_TIERS
+    # ...and like the app's MLS pages (require_broker_authorization), only once their broker approved them.
+    return tool_name not in _MLS_TOOLS or current_user.is_admin or (current_user.plan_tier in MLS_ACCESS_TIERS and bool(current_user.broker_authorized))
 
 
 def tools_for(current_user: User) -> list:

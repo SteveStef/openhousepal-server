@@ -1178,6 +1178,7 @@ async def update_lead(
 ):
     lead = await _load_owned_lead(db, lead_id, current_user.id)
     old_email, old_phone, old_name = lead.email, lead.phone, lead.name
+    old_represented = lead.represented
 
     if body.name is not None:
         lead.name = body.name.strip() or None
@@ -1226,10 +1227,56 @@ async def update_lead(
         await showcase_sleep.catch_up(db, [c.id for c in woken_showcases])
     if contact.get("showcases") or contact.get("email_changed") or (old_phone != lead.phone) or (old_name != lead.name):
         await lead_contact_service.after_commit(current_user.id, lead_id, contact)
+    if body.represented is not None and body.represented != old_represented:
+        # Their open house sign-ins and follow-up follow the new answer (owner, 11/01).
+        from app.services.tasks_service import on_represented_change
+        await on_represented_change(db, current_user.id, await _load_owned_lead(db, lead_id, current_user.id),
+                                    old_represented, body.represented)
     # Re-fetch (rather than db.refresh with relationship attribute_names) - AsyncSession's
     # refresh() can attempt a synchronous lazy-load for relationship attributes and raise
     # MissingGreenlet; a plain re-query with selectinload is the reliable async-safe path.
     return await _detail_out(db, await _load_owned_lead(db, lead_id, current_user.id), current_user.id)
+
+
+@router.get("/{lead_id}/open-house-showcase")
+async def lead_open_house_showcase(
+    lead_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """The Visitors window's Showcase switch, on their lead (owner, 11/01): their latest open house
+    sign-in, whether its Showcase is on, the waiting invite. `visitor_id` is null when they never
+    signed in at one of this agent's open houses; `switchable` is false without an agent's plan for
+    Showcases or when they have an agent (then only switching it OFF is offered)."""
+    from app.services import visitor_showcase_service as vss
+    from app.services.email_settings_service import client_rule, invite_delay_minutes
+    from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
+    await _load_owned_lead(db, lead_id, current_user.id)
+    visitor = (await db.execute(
+        select(OpenHouseVisitor).join(OpenHouseEvent, OpenHouseEvent.id == OpenHouseVisitor.open_house_event_id)
+        .where(OpenHouseVisitor.lead_id == lead_id, OpenHouseEvent.agent_id == current_user.id)
+        .order_by(OpenHouseVisitor.created_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    if visitor is None:
+        return {"visitor_id": None}
+    oh = await db.get(OpenHouseEvent, visitor.open_house_event_id)
+    plan = owner_has_access(current_user, SHOWCASE_ACCESS_TIERS)
+    col = await vss.visitor_showcase(db, current_user.id, visitor) if plan else None
+    on = plan and vss.effective_on(oh, visitor)
+    rule = client_rule(current_user, vss.INVITE_TEMPLATE)
+    return {
+        "visitor_id": visitor.id,
+        "open_house_id": oh.id if oh else None,
+        "address": oh.address if oh else None,
+        "signed_in_at": visitor.created_at,
+        "has_agent": visitor.has_agent,
+        "plan": plan,
+        "switchable": plan and not vss.has_agent(visitor),
+        "showcase_on": bool(on or (col is not None and col.status == "ACTIVE")),
+        "showcase_id": col.id if col is not None else None,
+        "showcase_invite_at": await vss.pending_invite_at(db, current_user.id, visitor) if plan else None,
+        "showcase_invite_delay": None if (rule is not None and not rule["on"]) else invite_delay_minutes(current_user),
+    }
 
 
 @router.get("/{lead_id}/invite-options")

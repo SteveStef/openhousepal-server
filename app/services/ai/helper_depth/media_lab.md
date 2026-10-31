@@ -56,7 +56,7 @@ Media Lab in depth: every photo effect and option, AI video and its title/brandi
 - Every run uses part of your **monthly AI allowance** - the same pool as CMAs, blog writing and other AI tools. Before you press Generate you see "Estimated: about X% of this month's AI usage (you're at Y% now)", plus a usage meter. Videos show "~X% of your monthly allowance" as you add photos.
 - Videos cost far more than photo edits, and more photos = more cost. A timelapse is a single clip.
 - If a run would use up the rest: "This may use up the rest of your monthly allowance."
-- When you've used most of it: "AI Studio photo & video are paused until it resets on the 1st. CMAs, cheat sheets and chat still work."
+- When you've used most of it: "AI Studio photo and video are paused until it resets" (on their billing day). CMAs and cheat sheets still work; the AI helper chat has its own separate allowance.
 - A run that fails isn't charged.
 - **Storage**: results count toward your media storage. When it's full, generating stops: "You've used your [X] GB of media storage. Delete some photos, videos, blog images or designs to free space, then try again."
 

@@ -42,6 +42,7 @@ class Prepared:
     payload: Dict[str, Any]         # what `run` needs - resolved, owner-checked ids
     warning: Optional[str] = None   # e.g. "This emails Dana right away."
     confirm_label: str = "Confirm"
+    picker: Optional[str] = None     # the card shows this picker (e.g. "brand") - its picks come back on Confirm
 
 
 @dataclass
@@ -53,13 +54,16 @@ class Action:
     # Built in the agent's browser on Confirm (designs - their builders only exist in the app's
     # own code), which then reports back through client_result(). `run` is None for these.
     client: Optional[str] = None
+    # Picks made on the card (a picker) folded into the payload on Confirm - checked like the
+    # prepare step (10/31: Branding swatches in the chat). (user, payload, picks) -> payload.
+    adjust: Optional[Callable[[User, dict, dict], dict]] = None
 
 
 ACTIONS: Dict[str, Action] = {}
 
 
-def register(definition: dict, prepare, run, plans: Optional[set] = None, client: Optional[str] = None) -> None:
-    ACTIONS[definition["name"]] = Action(definition, prepare, run, plans, client)
+def register(definition: dict, prepare, run, plans: Optional[set] = None, client: Optional[str] = None, adjust=None) -> None:
+    ACTIONS[definition["name"]] = Action(definition, prepare, run, plans, client, adjust)
 
 
 def _allowed(user: User, a: Action) -> bool:
@@ -91,11 +95,11 @@ async def propose(db: AsyncSession, user: User, name: str, args: dict) -> tuple[
         return {"error": "cannot_prepare", "message": "Something went wrong setting that up."}, None
     entry = {
         "tool": name, "record_type": "action", "record_id": str(uuid.uuid4()),
-        "title": p.title, "details": p.details, "warning": p.warning, "confirm_label": p.confirm_label,
+        "title": p.title, "details": p.details, "warning": p.warning, "confirm_label": p.confirm_label, "picker": p.picker,
         "payload": p.payload, "status": "pending", "client_action": a.client,
         "expires_at": (datetime.now(timezone.utc) + timedelta(hours=PENDING_HOURS)).isoformat(),
     }
-    return {"status": "waiting_for_agent_to_confirm", "card_title": p.title, "card_details": p.details,
+    return {"status": "waiting_for_agent_to_confirm", "card_title": p.title, "card_details": p.details, "card_button": p.confirm_label,
             "warning": p.warning}, entry
 
 
@@ -114,10 +118,10 @@ async def _save(db: AsyncSession, msg: AIMessage, entry: dict, **changes) -> dic
     entry.update(changes)
     flag_modified(msg, "tool_calls")
     await db.commit()
-    return {k: entry.get(k) for k in ("record_id", "status", "result_message", "result_link", "made")}
+    return {k: entry.get(k) for k in ("record_id", "status", "result_message", "result_link", "made", "share")}
 
 
-async def confirm(db: AsyncSession, user: User, message_id: str, action_id: str) -> dict:
+async def confirm(db: AsyncSession, user: User, message_id: str, action_id: str, picks: Optional[dict] = None) -> dict:
     msg, entry = await _owned_entry(db, user, message_id, action_id)
     if entry.get("client_action") and entry.get("status") == "running" and entry.get("started_at") and \
             datetime.fromisoformat(entry["started_at"]) < datetime.now(timezone.utc) - timedelta(minutes=10):
@@ -130,6 +134,11 @@ async def confirm(db: AsyncSession, user: User, message_id: str, action_id: str)
     a = ACTIONS.get(entry["tool"])
     if not a or not _allowed(user, a):
         return await _save(db, msg, entry, status="failed", result_message="That isn't something I can do on this plan.")
+    if picks and a.adjust:
+        try:
+            entry["payload"] = a.adjust(user, dict(entry.get("payload") or {}), picks)
+        except ActionError as e:
+            return {"record_id": action_id, "status": "pending", "result_message": str(e), "result_link": None}
     if a.client:
         # The browser builds it now and reports back (client_result) - claimed so a double tap
         # can't build two.
@@ -150,7 +159,9 @@ async def confirm(db: AsyncSession, user: User, message_id: str, action_id: str)
         return await _save(db, msg, entry, status="failed", result_message="Something went wrong - nothing was changed.")
     msg, entry = await _owned_entry(db, user, message_id, action_id)
     logger.info("AI action done", extra={"event": "ai_action", "action": entry["tool"], "user_id": user.id})
-    return await _save(db, msg, entry, status="done", result_message=out.get("message") or "Done.", result_link=out.get("link"))
+    # share: the link a client would get by text ({url, preview}) - the chat shows its Messages-style card
+    return await _save(db, msg, entry, status="done", result_message=out.get("message") or "Done.", result_link=out.get("link"),
+                       share=out.get("share") if isinstance(out.get("share"), dict) else None)
 
 
 async def client_result(db: AsyncSession, user: User, message_id: str, action_id: str, ok: bool, message: str,
