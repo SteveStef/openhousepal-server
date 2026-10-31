@@ -710,10 +710,14 @@ async def mark_marketing_moment_done(
     return {"ok": True}
 
 
+# /me, /me/config, /me/profile and /me/photo are the agent's own profile - Settings reads and saves
+# it through these. Any signed-in agent: one waiting on Bright's approval (or on paying, or whose plan
+# ended) still fills in Settings like the setup flow lets them. The public page is what the plan
+# gates (owner_has_access on /public/{slug}).
 @router.get("/me")
 async def get_my_agent_hub(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_active_plan),
+    current_user: User = Depends(get_current_active_user),
 ):
     hub = await _ensure_hub(db, current_user)
     # Blanks (license, email, photo...) filled from what the agent typed at sign-up.
@@ -737,7 +741,7 @@ async def get_my_agent_hub(
 async def update_my_agent_hub_config(
     payload: AgentHubConfigUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_active_plan),
+    current_user: User = Depends(get_current_active_user),
 ):
     """Persists the full Agent Hub page-builder payload so it's visible from any device/session,
     and so it's what actually gets served to public visitors at /agent-hub/public/{slug}."""
@@ -1304,7 +1308,7 @@ async def update_my_agent_hub_slug(
 async def update_my_profile(
     payload: AgentHubProfileUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_active_plan),
+    current_user: User = Depends(get_current_active_user),
 ):
     """Keeps the User row's name/brokerage/title/market in sync with whatever the agent last
     saved in Settings or the Agent Hub editor's Profile section (config.profile) - public lead
@@ -1334,7 +1338,7 @@ async def update_my_profile(
 async def upload_my_photo(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_active_plan),
+    current_user: User = Depends(get_current_active_user),
 ):
     if file.content_type not in HEADSHOT_CONTENT_TYPES:
         raise HTTPException(
