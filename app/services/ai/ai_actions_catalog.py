@@ -1191,7 +1191,9 @@ register({"name": "create_design", "description": (
     "situation: " + ", ".join(DESIGN_SITUATIONS) + ". format must be one the situation offers: "
     + "; ".join(f"{k}: {', '.join(v[2])}" for k, v in DESIGN_SITUATIONS.items())
     + ". just_listed/coming_soon/price_improvement/under_contract need one of the agent's own listings (listing_key); just_sold a sale they had; open_house their listing or one they're approved to host (+ optional date/time). "
-    "The others (home_valuation, make_me_sell, find_your_dream_home, social_ad) need no home - optional headline. layout: keepsake, billboard, slant, postage, filmstrip, luxe (IDX). colors: light (Ivory), stone, dark (Charcoal), forest, brand, luxe (IDX)."),
+    "The others (home_valuation, make_me_sell, find_your_dream_home, social_ad) need no home - optional headline. layout: keepsake, billboard, slant, postage, filmstrip, luxe (IDX). colors: light (Ivory), stone, dark (Charcoal), forest, brand, luxe (IDX). "
+    "The card itself lets the agent pick the layout and colors before tapping Make it - don't ask about the look first; pass layout/colors only when they named one. "
+    "Use the listing_key from their listings/sales list in your instructions - never a search result for a look-alike address."),
     "input_schema": _obj({"situation": {"type": "string", "enum": list(DESIGN_SITUATIONS)}, "format": {"type": "string", "enum": list(DESIGN_FORMATS)},
                           "listing_key": {"type": "string"}, "layout": {"type": "string", "enum": list(DESIGN_LAYOUTS)}, "colors": {"type": "string", "enum": list(DESIGN_COLORS)},
                           "headline": {"type": "string"}, "open_house_date": {"type": "string"}, "start_time": {"type": "string"}, "end_time": {"type": "string"}},

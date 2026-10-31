@@ -154,6 +154,113 @@ async def _showcase_news(db: AsyncSession, user: User, start: datetime) -> dict 
     return briefing_showcases(entries, lambda p: p, await _engagement(db, [c.id for c, _ in entries]))
 
 
+MAX_STAT_PEOPLE = 30
+
+
+def _who(name: str | None, fallback: str = "A client") -> str:
+    return " ".join(w[:1].upper() + w[1:] for w in (name or "").split()) or fallback
+
+
+async def _stat_people(db: AsyncSession, user: User, start: datetime, notes: list, links: dict, sc: dict | None) -> dict[str, list[dict]]:
+    """Who is behind each of the day's numbers (owner, 10/30: "3 homes viewed" has to say WHO and take
+    you to that exact person / home). stat key -> rows {who, what, at, link}, newest first. A link
+    to a Showcase home carries &glow=<home> so the Showcases page scrolls to it and lights it up.
+    Each list is its own query - one failing leaves that tile with just its page link."""
+    from app.models.database import FormSubmission, GuestPassEvent, Lead, LeadEvent, OpenHouseEvent, OpenHouseVisitor, Property, PropertyInteraction
+    from app.services.agent_roundup_service import nice_street
+    out: dict[str, list[dict]] = {}
+
+    async def rows(key: str, build) -> None:
+        try:
+            out[key] = (await build())[:MAX_STAT_PEOPLE]
+        except Exception:  # noqa: BLE001
+            logger.warning("rundown stat people failed", exc_info=True, extra={"stat": key})
+            await db.rollback()
+
+    def street(p) -> str:
+        return nice_street(p.street_address or p.unparsed_address or "", p.city or "") if p else "a home"
+
+    async def new_leads():
+        res = await db.execute(select(Lead).where(Lead.owner_id == user.id, Lead.created_at >= start, Lead.hidden_at.is_(None))
+                               .order_by(Lead.created_at.desc()).limit(MAX_STAT_PEOPLE))
+        return [{"who": _who(l.name, l.email or "New lead"), "what": "New lead", "at": l.created_at, "link": f"/leads/{l.id}"}
+                for l in res.scalars().all()]
+
+    async def lead_events(kinds: list[str], what: str):
+        res = await db.execute(select(LeadEvent, Lead).join(Lead, Lead.id == LeadEvent.lead_id)
+                               .where(Lead.owner_id == user.id, LeadEvent.source_type.in_(kinds), LeadEvent.occurred_at >= start)
+                               .order_by(LeadEvent.occurred_at.desc()).limit(MAX_STAT_PEOPLE))
+        return [{"who": _who(l.name, l.email or "A visitor"), "what": e.summary or what, "at": e.occurred_at, "link": f"/leads/{l.id}"}
+                for e, l in res.all()]
+
+    async def forms():
+        res = await db.execute(select(FormSubmission).where(FormSubmission.owner_id == user.id, FormSubmission.created_at >= start)
+                               .order_by(FormSubmission.created_at.desc()).limit(MAX_STAT_PEOPLE))
+        return [{"who": _who(s.contact_name, s.contact_email or "Someone"),
+                 "what": f"Answered your {(s.form_type or 'form').replace('_', ' ')} form" + (f" · {s.property_address}" if s.property_address else ""),
+                 "at": s.created_at, "link": f"/studio/forms?tab=results&formId={s.form_id}&submission={s.id}"}
+                for s in res.scalars().all()]
+
+    async def guest_pass():
+        res = await db.execute(select(GuestPassEvent, OpenHouseVisitor, OpenHouseEvent)
+                               .join(OpenHouseVisitor, OpenHouseVisitor.id == GuestPassEvent.visitor_id)
+                               .join(OpenHouseEvent, OpenHouseEvent.id == GuestPassEvent.open_house_event_id)
+                               .where(OpenHouseEvent.agent_id == user.id, GuestPassEvent.kind == "session", GuestPassEvent.created_at >= start)
+                               .order_by(GuestPassEvent.created_at.desc()).limit(MAX_STAT_PEOPLE))
+        return [{"who": _who(v.full_name, "A guest"), "what": "Opened their Guest Pass", "at": g.created_at,
+                 "link": f"/leads/{v.lead_id}" if v.lead_id else "/open-houses"} for g, v, _ in res.all()]
+
+    async def emails():
+        return [{"who": n.title, "what": n.message or "", "at": n.created_at, "link": links.get(n.id) or n.link or "/activity"}
+                for n in notes if n.type == "EMAIL_ACTIVITY"]
+
+    async def likes():
+        return [{"who": n.title, "what": n.message or n.property_address or "", "at": n.created_at, "link": links.get(n.id) or n.link or "/showcases"}
+                for n in notes if n.type == "PROPERTY_INTERACTION" and (n.message or "").startswith("Liked")]
+
+    async def browsing():
+        res = await db.execute(select(Collection).where(Collection.owner_id == user.id, Collection.last_visitor_activity_at >= start)
+                               .order_by(Collection.last_visitor_activity_at.desc()).limit(MAX_STAT_PEOPLE))
+        return [{"who": _who(c.visitor_name), "what": f"Looking at their Showcase · {nice_street(c.name)}", "at": c.last_visitor_activity_at,
+                 "link": f"/showcases?showcase={c.id}"} for c in res.scalars().all()]
+
+    async def viewed():
+        res = await db.execute(select(PropertyInteraction, Collection, Property)
+                               .join(Collection, Collection.id == PropertyInteraction.collection_id)
+                               .join(Property, Property.id == PropertyInteraction.property_id)
+                               .where(Collection.owner_id == user.id, PropertyInteraction.last_viewed_at >= start)
+                               .order_by(PropertyInteraction.last_viewed_at.desc()).limit(MAX_STAT_PEOPLE))
+        return [{"who": _who(c.visitor_name), "what": f"Viewed {street(p)}", "at": i.last_viewed_at,
+                 "link": f"/showcases?showcase={c.id}&glow={p.id}"} for i, c, p in res.all()]
+
+    def matches(drop: bool) -> list[dict]:
+        items = []
+        for g in (sc or {}).get("home_groups") or []:
+            if bool(g.get("is_price_drop")) != drop:
+                continue
+            what = (f"Price drop: {g.get('street_address')} · now {g.get('new_price') or g.get('price')}" if drop
+                    else f"New match: {g.get('street_address')}" + (f" · {g.get('price')}" if g.get("price") else ""))
+            key = g.get("listing_key") or ""
+            for c in g.get("clients") or []:
+                link = c.get("link") or "/showcases"
+                items.append({"who": c.get("name") or "A client", "what": what, "at": None,
+                              "link": f"{link}&glow={key}" if key and "?" in link else link})
+        return items
+
+    await rows("new_leads", new_leads)
+    await rows("sign_ins", lambda: lead_events(["open_house_visitor"], "Signed in at your open house"))
+    await rows("forms", forms)
+    await rows("tours", lambda: lead_events(["property_tour", "property_page_tour_request", "property_website_tour_request"], "Asked for a tour"))
+    await rows("guest_pass", guest_pass)
+    await rows("emails", emails)
+    await rows("likes", likes)
+    await rows("active_clients", browsing)
+    await rows("homes_viewed", viewed)
+    out["new_homes"] = matches(False)[:MAX_STAT_PEOPLE]
+    out["price_drops"] = matches(True)[:MAX_STAT_PEOPLE]
+    return out
+
+
 def _headline(sc: dict | None, brief: dict, happened: int) -> str:
     """Same wording as the briefing email's headline, with a calm line for a quiet day."""
     from app.services.showcase_digest_service import _plural
@@ -278,6 +385,9 @@ async def build_rundown(db: AsyncSession, user: User, now: datetime | None = Non
                                     .where(Collection.owner_id == user.id, PropertyInteraction.last_viewed_at >= start))},
             {"key": "likes", "label": "Likes", "link": "/showcases", "value": likes},
         ]
+    people = await _stat_people(db, user, start, list(notes), links, sc)
+    for s in stats:
+        s["people"] = people.get(s["key"], [])
 
     to_do_count = len(followups) + len(todo) + len(client_asks)
     return {

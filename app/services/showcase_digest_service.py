@@ -227,7 +227,8 @@ def briefing_showcases(entries: list, absolute, engagement: dict | None = None) 
         seen = getattr(col, "last_visitor_activity_at", None)
         rank = (starred, engagement.get(col.id, 0), seen.timestamp() if seen else 0)
         for h in homes:
-            g = groups.setdefault((h["_key"], h["is_price_drop"]), {**{k: v for k, v in h.items() if k != "_key"}, "_clients": []})
+            # listing_key: the in-app Rundown links each client straight to this home (&glow=); emails ignore it
+            g = groups.setdefault((h["_key"], h["is_price_drop"]), {**{k: v for k, v in h.items() if k != "_key"}, "listing_key": h["_key"], "_clients": []})
             same = next((c for c in g["_clients"] if who and c["name"] == who), None)
             if same is None:
                 g["_clients"].append({"name": who or "A client", "link": link, "starred": starred, "_rank": rank})

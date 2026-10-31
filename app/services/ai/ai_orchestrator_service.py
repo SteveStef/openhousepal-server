@@ -116,6 +116,34 @@ VOICE_MODE_BLOCK = {
 }
 
 
+async def _my_listings_and_sales(db: AsyncSession, user: User) -> str:
+    """Their own active listings (newest listed first) and recent sales, one line each - so "my newest
+    listing" or "my last sale" is known without a lookup. Empty when they have no MLS ID."""
+    if not user.mls_id:
+        return ""
+    from app.services.website import content_adapters as ca
+    lines: list[str] = []
+    try:
+        listings = await ca.get_active_listings(db, user, limit=12)
+        for i, l in enumerate(listings):
+            dom = l.get("days_on_market")
+            price = f"${float(l['price']):,.0f}" if l.get("price") else ""
+            addr = ", ".join(x for x in (l.get("address") or l.get("street_address"), l.get("city")) if x)
+            lines.append(f"- {addr} | {l.get('status') or ''} | {price} | {f'{dom} days on market' if dom is not None else 'days on market unknown'} | listing_key {l.get('listing_key')}"
+                         + (" | NEWEST" if i == 0 else ""))
+        listing_part = ("\nTheir active listings (newest listed first - the first is 'my newest listing'):\n" + "\n".join(lines)) if lines else "\nThey have no active listings right now."
+        sales = await ca.get_recent_sales(db, user, limit=8)
+        sale_lines = [f"- {s.get('address') if ',' in str(s.get('address') or '') else ', '.join(x for x in (s.get('address'), s.get('city')) if x)} | sold {str(s.get('sold_date') or s.get('close_date') or '')[:10] or '?'} | "
+                      f"{('$' + format(float(s['price']), ',.0f')) if s.get('price') else ''} | listing_key {s.get('listing_key')}" for s in sales]
+        sales_part = ("\nTheir recent sales (newest first):\n" + "\n".join(sale_lines)) if sale_lines else ""
+        return (listing_part + sales_part + "\nUse these exact homes and listing keys - never another unit or a look-alike address. "
+                "If the agent says it's the wrong home, pick from this list or ask which one; don't search again.")
+    except Exception:  # noqa: BLE001 - the chat still works without it
+        logger.warning("ai listings context failed", exc_info=True)
+        await db.rollback()
+        return ""
+
+
 async def run_turn(
     db: AsyncSession,
     current_user: User,
@@ -134,6 +162,11 @@ async def run_turn(
     # Lookups this plan gets + things it can set up for a Confirm tap (ai_actions.py, 10/30).
     tools = ai_tools.tools_for(current_user) + ai_actions.action_tools_for(current_user) + ai_ui_tools.UI_TOOL_DEFINITIONS
 
+    # The agent's own listings and sales, known up front (owner, 10/30: it guessed "your newest listing"
+    # from days on market, then lost it on a follow-up) - newest first, with each one's listing key so
+    # an action uses that exact home (a building has many units).
+    mine_text = await _my_listings_and_sales(db, current_user)
+
     async def _call_model():
         # Second system block is deliberately NOT cached (no cache_control) and rebuilt every
         # call - it's the model's only anchor for "now". Without it, the model has no way to
@@ -146,7 +179,9 @@ async def run_turn(
                     f"This agent is on the {PLAN_NAMES.get(current_user.plan_tier, current_user.plan_tier)} plan"
                     f"{'' if current_user.broker_authorized else ' and their broker has NOT approved them yet (Broker Authorization in the top menu) - MLS features stay locked until then'}. "
                     "Only suggest features this plan includes (see the plan table in the guide); for anything else, say which plan has it. "
-                    f"The agent is {current_user.first_name} {current_user.last_name}. Never decide yourself whether a listing or sale is theirs from names in lookups (MLS names often differ, e.g. middle names) - call the action tool; it checks by MLS ID and tells you.",
+                    f"The agent is {current_user.first_name} {current_user.last_name}. Never decide yourself whether a listing or sale is theirs from names in lookups (MLS names often differ, e.g. middle names) - call the action tool; it checks by MLS ID and tells you. "
+                    "A Confirm card exists ONLY when you call an action tool in this turn - never type a card, “[Card: …]” or “tap Confirm” without calling the tool."
+                    + mine_text,
         }
         system_blocks = [
             {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
@@ -255,4 +290,16 @@ async def run_turn(
         config, usage_state["model"], usage_state["input_tokens"], usage_state["output_tokens"],
         usage_state.get("cache_write_tokens", 0), usage_state.get("cache_read_tokens", 0),
     )
-    return text, all_refs, usage_state
+    return _no_pretend_cards(text, all_refs), all_refs, usage_state
+
+
+def _no_pretend_cards(text: str, refs: List[dict]) -> str:
+    """A card exists only when an action tool ran this turn (owner, 10/30: the reply TYPED
+    "[Card: ... waiting for them to tap Confirm]" and there was no button). Typed card text is
+    removed, and a "tap the button" reply with no card says so plainly instead of leaving them hunting."""
+    import re
+    cleaned = re.sub(r"\n?\[Card:[^\]]*\]", "", text or "").strip()
+    made_card = any(r.get("record_type") == "action" for r in refs)
+    if not made_card and re.search(r"\btap\b[^.\n]{0,40}\b(confirm|make it|button on the card)\b", cleaned, re.I):
+        cleaned += "\n\nThe card didn't come through on my side - say “go ahead” and I'll put it here for you to tap."
+    return cleaned or text

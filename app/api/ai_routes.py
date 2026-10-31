@@ -62,13 +62,18 @@ _CARD_STATUS = {"pending": "waiting for them to tap Confirm", "running": "runnin
 
 def _card_note(m: AIMessage) -> str:
     """What happened to the Confirm cards on a past reply (10/30) - otherwise the model only sees its
-    own "tap Confirm" text and can't tell a done action from an untapped one."""
+    own "tap Confirm" text and can't tell a done action from an untapped one. It rides on the NEXT
+    user message, never inside the reply itself: written there, the model copied it as plain text
+    ("[Card: ... waiting for them to tap Confirm]") instead of calling the tool - no button showed."""
     cards = [t for t in (m.tool_calls or []) if isinstance(t, dict) and t.get("record_type") == "action"]
-    return "".join(f"\n[Card: {c.get('title')} - {_CARD_STATUS.get(c.get('status'), c.get('status'))}"
-                   + (f" ({c.get('result_message')})" if c.get("status") == "failed" and c.get("result_message") else "") + "]" for c in cards)
+    if not cards:
+        return ""
+    return "(App note, not from the agent - the cards your last reply showed: " + "; ".join(
+        f"“{c.get('title')}” - {_CARD_STATUS.get(c.get('status'), c.get('status'))}"
+        + (f" ({c.get('result_message')})" if c.get("status") == "failed" and c.get("result_message") else "") for c in cards) + ")\n\n"
 
 
-async def _build_history(db: AsyncSession, conversation: AIConversation, max_messages: int) -> List[dict]:
+async def _build_history(db: AsyncSession, conversation: AIConversation, max_messages: int) -> tuple[List[dict], str]:
     """Recent-message replay window, oldest first. Only the final text of each past turn is
     replayed - not the tool calls that produced it - so token cost stays flat as a
     conversation grows, per the configured max_conversation_messages cap. If the conversation
@@ -84,10 +89,17 @@ async def _build_history(db: AsyncSession, conversation: AIConversation, max_mes
         stmt = stmt.where(AIMessage.created_at > conversation.summary_covers_through)
     result = await db.execute(stmt)
     messages = list(reversed(result.scalars().all()))
-    history = [{"role": m.role, "content": m.content + _card_note(m)} for m in messages]
+    # Each reply's card note goes at the start of the message after it (the newest one's comes back
+    # as `trailing`, for the message being sent now).
+    history, note = [], ""
+    for m in messages:
+        if m.role == "user":
+            history.append({"role": "user", "content": note + m.content}); note = ""
+        else:
+            history.append({"role": m.role, "content": m.content}); note = _card_note(m)
     if conversation.summary:
         history.insert(0, {"role": "user", "content": f"[Summary of earlier conversation: {conversation.summary}]"})
-    return history
+    return history, note
 
 
 @router.get("/helper/status")
@@ -239,7 +251,7 @@ async def send_ai_message(
                 detail="This conversation has gotten long enough that quality may suffer. Please start a new conversation to continue.",
             )
 
-        history = await _build_history(db, conversation, config["max_conversation_messages"])
+        history, card_note = await _build_history(db, conversation, config["max_conversation_messages"])
 
         user_msg = AIMessage(conversation_id=conversation.id, role="user", content=message_text)
         db.add(user_msg)
@@ -247,7 +259,7 @@ async def send_ai_message(
         await db.refresh(user_msg)
 
         try:
-            text, refs, usage = await run_turn(db, current_user, history, message_text, voice_mode=payload.voice_mode)
+            text, refs, usage = await run_turn(db, current_user, history, card_note + message_text, voice_mode=payload.voice_mode)
         except AIOrchestratorError as e:
             # What the partial turn really cost (the orchestrator only prices a finished turn).
             # Logged as blocked, so it never counts on the agent's meter - they got no answer -
