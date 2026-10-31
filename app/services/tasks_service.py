@@ -963,6 +963,19 @@ EMPTY_PITCHES = {
                    "home. If you have any questions, just text me here."),
 }
 EMPTY_PITCHES["how_can_we_help"] = EMPTY_PITCHES["buyer_form"]
+# An open house guest's Showcase the agent re-set to what the guest is looking for (took off the
+# open house's distance circle - Edit Showcase, owner 11/01): it isn't "similar to the one you
+# toured" any more. Fixed wording - a rare case, not one of the agent's editable situations.
+TAILORED_OPEN_HOUSE_PITCH = (
+    "I also set up a personal home search for you, called a Showcase, based on what you told me you're "
+    "looking for. It already has {home_count} that fit, and it updates the moment something new hits the "
+    "market. The one I'd look at first is {best_home}. {why_now} Here's your link: {showcase_link}"
+    "\n\nInside it, you can like, comment on or request a tour of any home - or just text me here.")
+TAILORED_OPEN_HOUSE_EMPTY = (
+    "I also set up a personal home search for you, called a Showcase, based on what you told me you're "
+    "looking for. Nothing matches just yet, but the moment a home that fits hits the market, it shows up "
+    "there and you'll get an alert. Here's your link: {showcase_link}"
+    "\n\nInside it, you can like, comment on or request a tour of any home - or just text me here.")
 # I'm Buying / How Can We Help with no Showcase at all (plan without Showcases): the close the pitch
 # would have carried.
 NO_SHOWCASE_CLOSING = {
@@ -1527,6 +1540,8 @@ def pitch_for(rule: Optional[str], owner: Optional[User], showcase: Optional[dic
     parts = dict(showcase.get("parts") or {})
     parts["first_name"] = showcase.get("first_name") or ""
     parts["my_name"] = _my_name(owner)
+    if rule == "open_house_signin" and showcase.get("tailored"):
+        return render_pitch(TAILORED_OPEN_HOUSE_PITCH if parts.get("home_count") else TAILORED_OPEN_HOUSE_EMPTY, parts)
     if not parts.get("home_count"):
         return render_pitch(EMPTY_PITCHES.get(rule, EMPTY_PITCH), parts)
     template = rule_settings(owner, rule)["pitch"] if owner is not None else DEFAULT_PITCHES[rule]
@@ -1545,7 +1560,7 @@ async def lead_showcase_info(db: AsyncSession, owner: User, leads: list) -> dict
     if not by_id or not owner_has_access(owner, SHOWCASE_ACCESS_TIERS):
         return {}
     rows = (await db.execute(
-        select(LeadEvent.lead_id, Collection.share_token, Collection.created_at)
+        select(LeadEvent.lead_id, Collection.share_token, Collection.created_at, Collection.id)
         .join(Collection, Collection.id == LeadEvent.collection_id)
         .where(
             LeadEvent.lead_id.in_(list(by_id)),
@@ -1558,8 +1573,16 @@ async def lead_showcase_info(db: AsyncSession, owner: User, leads: list) -> dict
     if not rows:
         return {}
     latest: dict[str, str] = {}
-    for lead_id, token, _ in rows:  # ascending, so the newest Showcase wins
+    col_of: dict[str, str] = {}
+    for lead_id, token, _, cid in rows:  # ascending, so the newest Showcase wins
         latest[lead_id] = token
+        col_of[token] = cid
+    # Showcases with no distance circle left = re-set to what the guest wants (see pitch_for).
+    from app.models.database import CollectionPreferences
+    tailored = {cid for cid, addr, dia in (await db.execute(
+        select(CollectionPreferences.collection_id, CollectionPreferences.address, CollectionPreferences.diameter)
+        .where(CollectionPreferences.collection_id.in_(list(set(col_of.values())))))).all()
+        if not (addr or "").strip() or not dia}
     from app.services.website.site_service import resolve_owner_public_base_url
     base = (await resolve_owner_public_base_url(db, owner)).rstrip("/")
     out: dict[str, dict] = {}
@@ -1581,7 +1604,8 @@ async def lead_showcase_info(db: AsyncSession, owner: User, leads: list) -> dict
         from app.services.showcase_links import showcase_path
         url = clean_url(f"{base}{await showcase_path(share_token=token, db=db) or f'/showcase/{token}'}")
         out[lead_id] = {"url": url, "count": count, "parts": _pitch_parts(count, best, days, url),
-                        "first_name": _first(by_id[lead_id].name), "candidates": cands}
+                        "first_name": _first(by_id[lead_id].name), "candidates": cands,
+                        "tailored": col_of.get(token) in tailored}
     return out
 
 

@@ -1026,6 +1026,9 @@ class CollectionsService:
                 "is_blacklisted": is_blacklisted,
                 "created_at": collection.created_at.isoformat(),
                 "updated_at": collection.updated_at.isoformat() if collection.updated_at else collection.created_at.isoformat(),
+                # What the client asked the agent to change (Edit Showcase shows it, 11/01).
+                "refine_request_message": collection.refine_request_message,
+                "refine_request_at": collection.refine_request_at.isoformat() if collection.refine_request_at else None,
                 "stats": {
                     "totalProperties": total_count,
                     "activeProperties": active_count,

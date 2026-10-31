@@ -1,5 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_, text, update, case
+from sqlalchemy import select, func, and_, or_, text, update, case, literal
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import selectinload, joinedload
 from typing import List, Dict, Any, Optional
@@ -1049,6 +1049,9 @@ class PropertySyncService:
         h_type_upper = h_type.upper() if h_type else "OTHER"
         lat = prop.get("latitude")
         lng = prop.get("longitude")
+        county = (prop.get("county") or "").strip()
+        sqft = prop.get("living_area")
+        acres = prop.get("lot_size_acres")
 
         # Reverse Query Logic
         stmt = (
@@ -1123,9 +1126,28 @@ class PropertySyncService:
         else:
             district_ok = no_district_picked  # no district on record = can't show it's in the picked one
 
+        # Counties (owner, 11/01 - the matcher never read them, so a county Showcase got no new
+        # listings): alone they're the area; with towns they narrow them, as in the search.
+        no_county_picked = _none_picked(CollectionPreferences.counties)
+        if county:
+            params["county_name"] = county.upper()
+            in_picked_county = text("""
+                EXISTS (
+                    SELECT 1 FROM jsonb_array_elements_text(
+                        CASE WHEN jsonb_typeof(collection_preferences.counties) = 'array'
+                             THEN collection_preferences.counties ELSE '[]'::jsonb END
+                    ) AS pref_county
+                    WHERE UPPER(TRIM(SPLIT_PART(pref_county, ',', 1))) = :county_name
+                )
+            """)
+        else:
+            in_picked_county = literal(False)
         area_conditions = []
         if place_filters:
-            area_conditions.append(or_(*place_filters))
+            area_conditions.append(and_(or_(*place_filters), or_(no_county_picked, in_picked_county)))
+        area_conditions.append(and_(_none_picked(CollectionPreferences.cities), _none_picked(CollectionPreferences.townships), in_picked_county))
+        # A drawn area: checked exactly (point in shape) after the query - see _area_ok below.
+        area_conditions.append(func.jsonb_typeof(CollectionPreferences.search_polygon) == 'object')
         if lat and lng:
             lat_offset, long_offset = get_lat_long_offsets(lat, 1.0)  # offsets for 1 mile
             area_conditions.append(and_(
@@ -1176,6 +1198,26 @@ class PropertySyncService:
                 or_(CollectionPreferences.max_year_built == None, CollectionPreferences.max_year_built >= year)
             ))
 
+        # Max beds / baths, sq ft (owner, 11/01: a "3,000 sq ft max" Showcase was getting 4,500 sq ft
+        # new listings - the matcher never read size).
+        numeric_conditions.append(or_(func.coalesce(CollectionPreferences.max_beds, 0) <= 0, CollectionPreferences.max_beds >= (beds or 0)))
+        numeric_conditions.append(or_(func.coalesce(CollectionPreferences.max_baths, 0) <= 0, CollectionPreferences.max_baths >= (baths or 0.0)))
+        if sqft:
+            numeric_conditions.append(and_(
+                func.coalesce(CollectionPreferences.min_sqft, 0) <= sqft,
+                or_(func.coalesce(CollectionPreferences.max_sqft, 0) <= 0, CollectionPreferences.max_sqft >= sqft)))
+        else:
+            numeric_conditions.append(and_(func.coalesce(CollectionPreferences.min_sqft, 0) <= 0, func.coalesce(CollectionPreferences.max_sqft, 0) <= 0))
+        if not year:
+            numeric_conditions.append(and_(CollectionPreferences.min_year_built.is_(None), CollectionPreferences.max_year_built.is_(None)))
+        # Lot size applies to every kind of home (same as the search).
+        if acres:
+            stmt = stmt.where(and_(
+                func.coalesce(CollectionPreferences.min_acres, 0) <= acres,
+                or_(func.coalesce(CollectionPreferences.max_acres, 0) <= 0, CollectionPreferences.max_acres >= acres)))
+        else:
+            stmt = stmt.where(and_(func.coalesce(CollectionPreferences.min_acres, 0) <= 0, func.coalesce(CollectionPreferences.max_acres, 0) <= 0))
+
         # Apply: (Is Exempt Type) OR (Matches all numeric filters)
         if h_type_upper in exempt_types:
             # If exempt, we only care about the price (if provided)
@@ -1217,43 +1259,8 @@ class PropertySyncService:
         result = await db.execute(stmt, params)
         collections = result.scalars().all()
 
-        # 4. Circular Post-Filtering (Trim the Corners)
-        # If the property has lat/long, ensure it's precisely within the radius of matching collections
-        if lat and lng:
-            refined_collections = []
-            for col in collections:
-                # If collection has a radius search, verify exact distance
-                if col.preferences and col.preferences.lat and col.preferences.long and col.preferences.diameter:
-                    # Skip circular check if collection matches via City/Township (inclusive logic)
-                    matches_via_city = False
-                    if city and col.preferences.cities:
-                        city_names = [c.split(',')[0].strip().upper() for c in col.preferences.cities]
-                        if city.upper() in city_names:
-                            matches_via_city = True
-                    
-                    if not matches_via_city and township and col.preferences.townships:
-                        # Simple check for townships
-                        town_names = [t.split(',')[0].strip().upper() for t in col.preferences.townships]
-                        if township.upper() in town_names:
-                            matches_via_city = True
-
-                    if matches_via_city:
-                        refined_collections.append(col)
-                    else:
-                        # Must match via Radius - perform precise check
-                        if is_within_distance(
-                            col.preferences.lat, col.preferences.long, 
-                            lat, lng, 
-                            col.preferences.diameter
-                        ):
-                            refined_collections.append(col)
-                else:
-                    # Match via other criteria, keep it
-                    refined_collections.append(col)
-            
-            return refined_collections
-
-        return collections
+        # 4. Exact area check (trims the radius box's corners, and checks drawn areas)
+        return [col for col in collections if _area_ok(col.preferences, city, township, county, lat, lng)]
 
     async def _link_property_to_collection(self, db: AsyncSession, collection_id: str, property_id: str) -> bool:
         """Silently links a property to a collection if not already linked. True = it was added now."""
@@ -1448,3 +1455,51 @@ class PropertySyncService:
 
         # 3. In-app alert: none per change any more - the digest adds ONE bell alert per agent a day.
 
+
+
+
+_PLACE_SUFFIX = re.compile(r"\s+(TOWNSHIP|TWP|BOROUGH|BORO|CITY|TOWN)$")
+
+
+def _place_name(v) -> str:
+    return _PLACE_SUFFIX.sub("", str(v or "").split(",")[0].strip().upper())
+
+
+def _in_shape(lat: float, lng: float, geometry: dict) -> bool:
+    """Point in a GeoJSON Polygon / MultiPolygon (outer ring in, holes out) - ray casting."""
+    def in_ring(ring) -> bool:
+        inside = False
+        j = len(ring) - 1
+        for i in range(len(ring)):
+            xi, yi = ring[i][0], ring[i][1]
+            xj, yj = ring[j][0], ring[j][1]
+            if (yi > lat) != (yj > lat) and lng < (xj - xi) * (lat - yi) / ((yj - yi) or 1e-12) + xi:
+                inside = not inside
+            j = i
+        return inside
+    polys = [geometry.get("coordinates") or []] if geometry.get("type") == "Polygon" else (geometry.get("coordinates") or []) if geometry.get("type") == "MultiPolygon" else []
+    for poly in polys:
+        if poly and in_ring(poly[0]) and not any(in_ring(h) for h in poly[1:]):
+            return True
+    return False
+
+
+def _area_ok(p, city, township, county, lat, lng) -> bool:
+    """Is a new listing really inside this Showcase's area? The query already matched towns,
+    townships, counties and school districts exactly; this settles the parts it can only box:
+    the radius circle (only when no town/township/county is picked) and a drawn area."""
+    if p is None:
+        return True
+    cities = {_place_name(c) for c in (p.cities or []) if isinstance(c, str)}
+    towns = {_place_name(t) for t in (p.townships or []) if isinstance(t, str)}
+    counties = {_place_name(c) for c in (p.counties or []) if isinstance(c, str)}
+    if (city and _place_name(city) in cities | towns) or (township and _place_name(township) in towns | cities) \
+            or (county and _place_name(county) in counties and not (cities or towns)):
+        return True
+    shape = p.search_polygon if isinstance(p.search_polygon, dict) else None
+    if shape and lat and lng and _in_shape(float(lat), float(lng), shape):
+        return True
+    if not (cities or towns or counties) and p.lat and p.long and p.diameter:
+        return bool(lat and lng and is_within_distance(p.lat, p.long, lat, lng, p.diameter))
+    # No circle / shape / place to check here: district-only (the query checked it)
+    return not (cities or towns or counties or shape)

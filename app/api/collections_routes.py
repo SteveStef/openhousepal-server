@@ -27,7 +27,7 @@ from app.services.blacklist_service import BlacklistService
 from app.services.leads_service import upsert_lead
 from app.utils.auth import get_current_active_user, get_current_user_optional, require_premium_plan, require_broker_authorization
 from app.models.database import User, Collection, Notification
-from sqlalchemy import select, update, and_
+from sqlalchemy import select, update, and_, func
 from app.services.showcase_links import share_match
 from sqlalchemy.orm import joinedload
 from app.config.logging import get_logger
@@ -1476,6 +1476,32 @@ def _describe_search_change(payload: dict) -> list:
     return rows
 
 
+async def _after_search_change(db: AsyncSession, collection_obj: Collection, home_count: int) -> None:
+    """After a Showcase's search changes (the agent's edit or the client's own, owner 11/01): an
+    open house invite still waiting to go out gets the new home count, and the client's open
+    follow-ups re-push their calendar events (they read the Showcase live: count, newest, link).
+    Never raises - the search itself is already saved."""
+    try:
+        if collection_obj.visitor_email:
+            from app.models.database import ScheduledEmail
+            waiting = (await db.execute(select(ScheduledEmail).where(
+                ScheduledEmail.owner_id == collection_obj.owner_id, ScheduledEmail.status == "PENDING",
+                ScheduledEmail.template_name == "visitor_confirmation",
+                func.lower(ScheduledEmail.recipient_email) == collection_obj.visitor_email.strip().lower(),
+            ))).scalars().all()
+            for row in waiting:
+                row.template_variables = {**(row.template_variables or {}), "properties_count": home_count}
+            if waiting:
+                await db.commit()
+        from app.services.leads_service import find_lead_by_contact
+        from app.services.tasks_service import resync_lead_followups
+        lead = await find_lead_by_contact(db, collection_obj.owner_id, collection_obj.visitor_email, collection_obj.visitor_phone)
+        if lead is not None:
+            resync_lead_followups(collection_obj.owner_id, lead.id, delay=1)
+    except Exception:
+        logger.warning("after-search-change updates failed", exc_info=True)
+
+
 @router.put("/shared/{share_token}/update-preferences-and-refresh")
 async def update_shared_collection_preferences(
     share_token: str,
@@ -1557,6 +1583,9 @@ async def update_shared_collection_preferences(
         await log_showcase_activity(db, collection_obj.id, "showcase_search_changed", "Changed their Showcase search",
                                     raw_snapshot={"answers": changed} if changed else None)
         await _notify_search_changed(db, collection_obj, changed)
+        # Same as when the agent edits it: a waiting invite and their follow-up show the new search.
+        from app.services.showcase_digest_service import showcase_home_ids
+        await _after_search_change(db, collection_obj, len(await showcase_home_ids(db, collection_obj.id)))
 
         collection_data = await CollectionsService.get_shared_collection(db, share_token)
         if not collection_data:
@@ -1714,8 +1743,12 @@ async def update_preferences_and_refresh(
             from sqlalchemy import update as _update
             await db.execute(_update(Collection).where(Collection.id == collection_id).values(last_agent_dismissed_at=datetime.now(timezone.utc)))
             await db.commit()
+            after_ids = await showcase_home_ids(db, collection_id)
+            await _after_search_change(db, collection_obj, len(after_ids))
             return {
                 "success": True,
+                "added": len(set(after_ids) - set(before_ids)),
+                "removed": len(set(before_ids) - set(after_ids)),
                 "message": result['message'],
                 "preferences_updated": result['preferences_updated'],
                 "properties_refreshed": result['properties_refreshed'],

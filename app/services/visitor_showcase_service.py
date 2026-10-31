@@ -121,11 +121,19 @@ async def set_showcase(db, owner: User, visitor: OpenHouseVisitor, oh: OpenHouse
     elif visitor.lead_id:
         # The follow-up's message / calendar event read the Showcase live - re-push them now.
         resync_lead_followups(owner.id, visitor.lead_id)
+    invite_at = (await pending_invite_at(db, owner.id, visitor)) if on else None
+    if on and build and invite_at is None:
+        # Being built now - its invite is queued an hour out (see _build_later), unless the agent
+        # switched the Showcase invite email off. Say when, so the switch can show it (11/01).
+        from app.services.email_settings_service import client_rule
+        rule = client_rule(owner, INVITE_TEMPLATE)
+        if rule is None or rule["on"]:
+            invite_at = datetime.now(timezone.utc) + timedelta(hours=1)
     return {
         "showcase_on": bool(on),
         "building": build or visitor.id in _building,
         "showcase_id": col.id if col is not None else None,
-        "invite_at": (await pending_invite_at(db, owner.id, visitor)) if on else None,
+        "invite_at": invite_at,
         "invites_cancelled": cancelled,
     }
 
