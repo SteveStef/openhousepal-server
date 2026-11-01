@@ -477,6 +477,9 @@ async def get_site_blog_post(site_id: str, slug: str, db: AsyncSession = Depends
         "agent_brokerage": user.brokerage,
         "agent_photo_url": user.photo_url,
         "agent_title": user.professional_title,
+        # The article's small "Ask me about this" rows (Call / Text / Email) - the same contact
+        # the site's footer already shows.
+        **{f"agent_{k}": v for k, v in (await content_adapters.article_contact(db, user)).items()},
         "signature_card": bool(getattr(post, "use_signature_card", True)) and await email_signature_service.has_signature_card(db, user),
         "luxe_metal": getattr(post, "luxe_metal", None),
         "area_towns": [t.get("town") for t in ((post.ai_review or {}).get("towns") or []) if isinstance(t, dict) and t.get("town")][:4],

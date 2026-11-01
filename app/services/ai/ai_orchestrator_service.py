@@ -117,6 +117,27 @@ VOICE_MODE_BLOCK = {
 
 
 # "Tap Confirm on the card", "the card below", "tap Save"... - a reply that says a card is there.
+# "I'll check the sign-in lists..." as the LAST thing it says, with nothing done (owner, 11/01: waited
+# for a search that never ran) - one nudge to actually do it this turn.
+_PROMISE = re.compile(r"\b(I'?ll|I will|let me|I'?m going to|going to)\s+(now\s+)?(check(?!\s+(back|in)\b)|look|search|pull|find|go through|review|dig|scan)\b[^.?!]*[.…]?\s*$", re.I)
+
+# What the chat shows while a reply is coming (owner, 11/01: "it should show that it's loading here and
+# actually working"): saved per agent (app_cache - any worker can answer the poll), read by GET /ai/progress.
+_STEP_WORDS = {
+    "find_open_house_guests": "Searching your open house guests", "get_open_house_guests": "Reading the sign-in list",
+    "search_open_houses": "Looking through your open houses", "search_leads": "Searching your leads", "get_lead_detail": "Opening their lead",
+    "search_properties": "Searching the MLS", "get_property_detail": "Reading the listing", "look_up_agent": "Looking up that agent",
+    "get_property_matches": "Matching homes", "get_showcase_info": "Opening the Showcase", "get_similar_properties": "Finding similar homes",
+    "get_cma_summary": "Reading the CMA", "get_agent_activity_summary": "Reading your activity", "get_priority_summary": "Checking what needs you",
+    "show_homes": "Pulling up the homes",
+}
+
+
+def _progress(user_id: str, label: Optional[str]) -> None:
+    from app.services import app_cache
+    app_cache.save_bg(f"ai_progress:{user_id}", {"label": label, "at": datetime.now(timezone.utc).isoformat()})
+
+
 _CLAIMS_CARD = re.compile(r"\btap\s+(confirm|save|make it|the button)\b|\bon the card\b|\bcard (below|is waiting|is ready)\b|\bcard is already\b", re.I)
 
 
@@ -166,7 +187,8 @@ async def run_turn(
     all_refs: List[dict] = []
     usage_state = {"model": config["model"], "input_tokens": 0, "output_tokens": 0, "tool_call_count": 0, "tool_names": []}
     # Lookups this plan gets + things it can set up for a Confirm tap (ai_actions.py, 10/30).
-    tools = ai_tools.tools_for(current_user) + ai_actions.action_tools_for(current_user) + ai_ui_tools.UI_TOOL_DEFINITIONS
+    from app.services.ai import ai_home_cards
+    tools = ai_tools.tools_for(current_user) + ai_actions.action_tools_for(current_user) + ai_ui_tools.UI_TOOL_DEFINITIONS + [ai_home_cards.TOOL]
 
     # The agent's own listings and sales, known up front (owner, 10/30: it guessed "your newest listing"
     # from days on market, then lost it on a follow-up) - newest first, with each one's listing key so
@@ -211,9 +233,11 @@ async def run_turn(
         )
 
     nudged = False
+    promised = False
+    _progress(current_user.id, "Thinking")
 
     async def _run() -> str:
-        nonlocal nudged
+        nonlocal nudged, promised
         for _ in range(config["max_iterations"]):
             response = await _call_model()
             usage_state["input_tokens"] += response.usage.input_tokens
@@ -232,6 +256,12 @@ async def run_turn(
 
             if response.stop_reason != "tool_use":
                 text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
+                if not promised and _PROMISE.search((text or "").strip()[-220:]) and usage_state["tool_call_count"] < config["max_tool_calls_per_turn"] - 1:
+                    promised = True
+                    messages.append({"role": "assistant", "content": response.content})
+                    messages.append({"role": "user", "content": "(App note: you said you'd look but didn't - do it now with your tools in this same turn (find_open_house_guests searches every sign-in list at once), then answer. Never end a reply on a promise to do something later.)"})
+                    _progress(current_user.id, "Still looking")
+                    continue
                 # In a long chat it sometimes says "tap Confirm on the card" without making one
                 # (owner's test, 11/01) - one nudge to make the real card, then whatever it says.
                 if not nudged and _CLAIMS_CARD.search(text or "") and not any(r.get("record_type") == "action" for r in all_refs):
@@ -246,7 +276,7 @@ async def run_turn(
             said = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
             # Only buttons (choices / Go there) on a reply that's already written: show them with
             # it and stop - another model call would just repeat the text.
-            only_ui = said and all(b.name in ai_ui_tools.UI_TOOL_NAMES for b in tool_use_blocks)
+            only_ui = said and all(b.name in ai_ui_tools.UI_TOOL_NAMES or b.name == ai_home_cards.NAME for b in tool_use_blocks)
 
             tool_results = []
             for block in tool_use_blocks:
@@ -262,6 +292,14 @@ async def run_turn(
 
                 args = block.input if isinstance(block.input, dict) else {}
                 usage_state["tool_names"].append(block.name)
+                _progress(current_user.id, _STEP_WORDS.get(block.name) or ("Setting up the card" if ai_actions.is_action(block.name) else "Looking that up"))
+                if block.name == ai_home_cards.NAME:
+                    # Their listings / sales as small home cards under the reply (owner, 11/01).
+                    result, entry = await ai_home_cards.run(db, current_user, args)
+                    if entry:
+                        all_refs.append(entry)
+                    tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(result, default=str)})
+                    continue
                 if block.name in ai_ui_tools.UI_TOOL_NAMES:
                     # Choices / "Go there" buttons shown under the reply - nothing to look up or change.
                     result, entry = ai_ui_tools.run(block.name, args)
@@ -283,6 +321,15 @@ async def run_turn(
                 all_refs.extend(_extract_record_refs(block.name, args))
                 result = await ai_tools.execute_tool(db, current_user, block.name, args, config)
                 all_refs.extend(_extract_result_refs(block.name, result))
+                # Homes to host come back as home cards under the reply on their own (owner, 11/01:
+                # homes as cards, never a typed list) - the model just sums them up.
+                if block.name == "find_homes_to_host" and isinstance(result, dict) and result.get("homes"):
+                    keys = [h.get("listing_key") for h in result["homes"] if isinstance(h, dict) and h.get("listing_key")][:40]
+                    if keys:
+                        _, entry = await ai_home_cards.run(db, current_user, {"which": "homes", "listing_keys": keys, "title": "Homes to host"})
+                        if entry:
+                            all_refs.append(entry)
+                            result = {**result, "shown_as_cards": True, "note": "These homes already show as cards under your reply - just sum them up in a line or two."}
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,

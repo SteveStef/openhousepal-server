@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.hub_slugs import hub_by_slug
 from app.services.email_avatar_service import agent_email_vars
+from app.services.form_question_heal import heal_questions
 from app.database import get_db
 from app.models.database import AgentForm, AgentHub, AgentHubEvent, FormCampaign, FormSubmission, FormViewSession, Notification, User
 from app.schemas.forms import (
@@ -860,6 +861,13 @@ async def get_or_create_forms(db: AsyncSession, owner_id: str) -> List[AgentForm
         upgraded = upgrade_legacy_showing(form.form_type, form.questions or [])
         if upgraded is not None:
             form.questions = upgraded
+            needs_resync = True
+
+    # A question saved as JSON text (AI helper chat, 11/01) opens back up into real questions.
+    for form in all_forms:
+        healed = heal_questions(form.questions)
+        if healed is not None:
+            form.questions = healed
             needs_resync = True
 
     # Forms made before I'm Buying / How Can We Help built Showcases get the home-search block.
@@ -2060,7 +2068,8 @@ async def get_public_form(
         title=form.title,
         headline=form.headline,
         subtitle=form.subtitle,
-        questions=form.questions,
+        # (a JSON-text question shows as real questions even before the agent's forms page heals it)
+        questions=heal_questions(form.questions) or form.questions,
         success_heading=form.success_heading,
         success_message=form.success_message,
         accent_color=form.accent_color,

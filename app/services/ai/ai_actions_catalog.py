@@ -4,9 +4,10 @@ Confirm). Every run calls the SAME route the page's own button calls, as the age
 ai_route_bridge - so plan, broker-authorization, ownership and validation rules are the app's own.
 
 Rules every action here follows (see ai_actions.py): no deletes, no billing, nothing paid without
-saying so, and anything that emails or notifies a real person says so on the card. Left out on
-purpose: Media Lab and CMA AI analysis (real money per run - the agent starts those on the page),
-publishing the IDX website draft (no undo), connecting calendars/mailboxes (needs the agent's own
+saying so, and anything that emails or notifies a real person says so on the card. Paid AI from
+the chat says so on its card ("This uses your monthly AI allowance") - the AI CMA and the AI blog
+writer (11/01); Media Lab is still left out until the owner decides it should be too. Left out on
+purpose: publishing the IDX website draft (no undo), connecting calendars/mailboxes (needs the agent's own
 sign-in), domains, reviews imports (the agent must attest they're real).
 """
 import re
@@ -1123,19 +1124,83 @@ FORM_QUESTION_BANK = [
     {"label": "Anything else I should know?", "type": "long_text"},
 ]
 
+# The card's "Common ones" follow what the form is for (owner, 11/01: "not good enough suggestion wise
+# based on the situation"); the model's own `ideas` for this exact form come first on the card.
+FORM_BANKS = {
+    "seller": [
+        {"label": "What's the address of your home?", "type": "short_text"},
+        {"label": "When are you thinking of selling?", "type": "select", "options": ["As soon as possible", "1-3 months", "3-6 months", "6+ months", "Just curious"]},
+        {"label": "Have you made any updates to the home?", "type": "long_text"},
+        {"label": "Do you need to buy your next home first?", "type": "select", "options": ["Yes", "No", "Not sure yet"]},
+        {"label": "What price are you hoping for?", "type": "currency"},
+        {"label": "Are you working with an agent?", "type": "select", "options": ["Yes", "No"]},
+    ],
+    "buyer": [
+        {"label": "When are you hoping to move?", "type": "select", "options": ["As soon as possible", "1-3 months", "3-6 months", "6+ months", "Just looking"]},
+        {"label": "What price range are you looking in?", "type": "select", "options": ["Under $400K", "$400K-$700K", "$700K-$1M", "$1M-$2M", "$2M+"]},
+        {"label": "Are you pre-approved for a mortgage?", "type": "select", "options": ["Yes", "Not yet", "Paying cash"]},
+        {"label": "How many bedrooms do you need?", "type": "select", "options": ["1", "2", "3", "4", "5+"]},
+        {"label": "Which towns are you looking in?", "type": "short_text"},
+        {"label": "Do you have a home to sell first?", "type": "select", "options": ["Yes", "No"]},
+        {"label": "Are you working with an agent?", "type": "select", "options": ["Yes", "No"]},
+    ],
+    "event": [
+        {"label": "Will you be attending?", "type": "select", "options": ["Yes", "No", "Maybe"]},
+        {"label": "How many people are coming with you?", "type": "select", "options": ["Just me", "+1", "+2", "+3 or more"]},
+        {"label": "Any food allergies or needs?", "type": "short_text"},
+        {"label": "How did you hear about this?", "type": "select", "options": ["Email", "Social media", "A friend", "Other"]},
+    ],
+    "feature": [
+        {"label": "Tell me a little about your home", "type": "long_text"},
+        {"label": "What's the address?", "type": "short_text"},
+        {"label": "What's the best time to reach you?", "type": "select", "options": ["Morning", "Afternoon", "Evening"]},
+        {"label": "Can you share a few photos?", "type": "select", "options": ["Yes", "Not right now"]},
+    ],
+    "rental": [
+        {"label": "When do you need to move in?", "type": "date"},
+        {"label": "What's your monthly budget?", "type": "currency"},
+        {"label": "How many people will live there?", "type": "select", "options": ["1", "2", "3", "4+"]},
+        {"label": "Do you have pets?", "type": "select", "options": ["No", "Dog", "Cat", "Other"]},
+    ],
+}
+
+
+def _form_bank(title: str) -> list:
+    t = (title or "").lower()
+    kind = ("seller" if any(w in t for w in ("sell", "seller", "listing", "home value", "valuation", "what's my home", "worth")) else
+            "rental" if any(w in t for w in ("rent", "lease", "tenant")) else
+            "event" if any(w in t for w in ("event", "rsvp", "party", "invite", "seminar", "workshop", "class", "dinner")) else
+            "feature" if any(w in t for w in ("feature", "show", "youtube", "podcast", "spotlight", "story", "kitchen", "tour my")) else
+            "buyer" if any(w in t for w in ("buy", "buyer", "search", "looking", "first-time", "relocat")) else "")
+    bank = FORM_BANKS.get(kind, [])
+    seen = {b["label"].lower() for b in bank}
+    return bank + [b for b in FORM_QUESTION_BANK if b["label"].lower() not in seen]
+
+
+def _safe_form_questions(raw) -> list:
+    """Like _form_questions, but a bad idea is skipped instead of stopping the card."""
+    out = []
+    for q in (raw if isinstance(raw, list) else [raw] if raw else []):
+        try:
+            out.extend(_form_questions([q])[0])
+        except ActionError:
+            continue
+    return out
+
 
 def _form_questions(raw) -> tuple[list, list]:
     """Questions as the model or the card sends them -> the form's questions + the card's lines."""
+    from app.services.form_question_heal import looks_like_blob, parse_blob
     qs, lines = [], []
     if isinstance(raw, str):   # the model sometimes sends the list as JSON text
-        try:
-            import json
-            raw = json.loads(raw)
-        except ValueError:
-            raw = [ln for ln in raw.splitlines() if ln.strip()]
+        # (whole or cut off - 11/01 a text that didn't parse became one question showing raw JSON)
+        raw = parse_blob(raw) if looks_like_blob(raw) else [ln for ln in raw.splitlines() if ln.strip()]
     if not isinstance(raw, list):
         raw = []
-    for i, q in enumerate(raw[:15]):
+    flat = []
+    for q in raw:   # ...or one item of the list is itself JSON text
+        flat.extend((parse_blob(q) or []) if isinstance(q, str) and looks_like_blob(q) else [q])
+    for i, q in enumerate(flat[:15]):
         # ...or a question as just its words - a short answer
         q = {"label": q} if isinstance(q, str) else q if isinstance(q, dict) else {}
         label, qt = _s(q.get("label")), _s(q.get("type")) or "short_text"
@@ -1170,7 +1235,8 @@ async def _p_form(db, user, a):
         homes = [{"listing_key": r.listing_key, "address": tidy_caps(r.street_address) or "", "city": tidy_caps(r.city) or "",
                   "photo": (r.photos[0] if isinstance(r.photos, list) and r.photos and isinstance(r.photos[0], str) else None)} for r in rows]
     key = _s(a.get("listing_key"))
-    payload = {"title": title[:120], "questions": qs, "homes": homes, "bank": FORM_QUESTION_BANK,
+    ideas = [q for q in _safe_form_questions(a.get("ideas") or []) if q["label"].lower() not in {x["label"].lower() for x in qs}][:6]
+    payload = {"title": title[:120], "questions": qs, "homes": homes, "ideas": ideas, "bank": _form_bank(title),
                "background_effects": a["background_effects"] if isinstance(a.get("background_effects"), bool) else True,
                "listing_key": key if any(h["listing_key"] == key for h in homes) or not key else key}
     return Prepared(f"Make a new form: {title}", lines + ["You can change the look and add more in the form editor"], payload, picker="form")
@@ -1212,9 +1278,12 @@ async def _r_form(db, user, p):
             "link": f"/studio/forms?edit={fid}" if fid else "/studio/forms", "share": share}
 
 _simple("create_form", "Make a new custom form (Forms & Invites) with a title and the agent's own questions (types: " + ", ".join(Q_TYPES) + "; select/multi_select need options). Full name, email and phone are always there already. "
-        "Set it up right away with a few fitting questions - the card itself lets them switch questions on/off, tap common ones in and type their own, plus the moving-background switch and their listings to link (don't ask about any of those in chat). Pass listing_key only if they named the home.",
+        "Set it up right away with 3-5 questions that fit exactly what this form is for (pick-one questions with clear answers where it helps), plus `ideas`: 4-6 MORE fitting questions they can tap in - think about the situation (who fills it in and what the agent needs to know next). "
+        "The card itself lets them take questions off, tap ideas and common ones in and type their own, plus the moving-background switch and their listings to link (don't ask about any of those in chat). Send questions and ideas as real lists, never as text. Pass listing_key only if they named the home.",
         _obj({"title": {"type": "string"}, "questions": {"type": "array", "items": {"type": "object", "properties": {
             "label": {"type": "string"}, "type": {"type": "string", "enum": list(Q_TYPES)}, "options": {"type": "array", "items": {"type": "string"}}, "required": {"type": "boolean"}}}},
+            "ideas": {"type": "array", "items": {"type": "object", "properties": {
+            "label": {"type": "string"}, "type": {"type": "string", "enum": list(Q_TYPES)}, "options": {"type": "array", "items": {"type": "string"}}}}},
             "background_effects": {"type": "boolean"}, "listing_key": {"type": "string"}},
              ["title"]), _p_form, _r_form, adjust=_adjust_form)
 
@@ -1355,13 +1424,29 @@ def _money_short(v) -> str:
     return f"${v / 1e6:.2f}".rstrip("0").rstrip(".") + "M" if v >= 1e6 else f"${round(v / 1e3)}K"
 
 
+def _strs(raw, n: int, cap: int = 160) -> list:
+    out = []
+    for x in raw if isinstance(raw, list) else []:
+        t = _s(x)[:cap]
+        if t and t.lower() not in {o.lower() for o in out}:
+            out.append(t)
+    return out[:n]
+
+
+def _yt(url: str) -> bool:
+    import re
+    return bool(re.search(r"(youtube\.com/(watch\?v=|shorts/|embed/|live/)|youtu\.be/)[\w-]{6,}", url or ""))
+
+
 async def _p_blog(db, user, a):
     topic = _s(a.get("topic"))
     if not topic:
         raise ActionError("What should the blog post be about?")
-    # The Blogs page's own questions, as taps on the card (owner, 11/01: "ask the steps in chat - look
-    # and options"): who it's for, towns (+ Town Spotlight), your sales, tone, length, the ending
-    # button, key points / your take - and each length's share of the AI allowance.
+    # The Blogs page's own interview as the card's steps (owner, 11/01: "exactly how it would be if you
+    # were actually on the blog ... questions answered by checking off boxes"): Topic (an angle + what
+    # readers walk away with), Readers (who + towns + Town Spotlight), Key points (ideas to check off,
+    # their take, numbers), Your homes (sales + listings), Video (their YouTube, "Fits" first), Style
+    # (tone, length with its share of the AI allowance, the ending button).
     percents = {}
     for ln in BLOG_LENGTHS:
         try:
@@ -1378,8 +1463,13 @@ async def _p_blog(db, user, a):
         ctx = {}
     areas = [x for x in (ctx.get("served_areas") or []) if x][:10]
     cards = {str(c.get("name") or "").lower(): c.get("slug") for c in (ctx.get("area_cards") or []) if c.get("slug")}
-    sales = [{"id": str(x.get("id")), "label": ", ".join(v for v in (x.get("address"), x.get("city")) if v) + (f" \u00b7 {_money_short(x.get('price'))}" if x.get("price") else "")}
-             for x in (ctx.get("recent_sales") or [])[:8] if x.get("id")]
+    # every sale (newest first) - the card recommends the ones in the towns picked and shows 5 at a time
+    sales = [{"id": str(x.get("id")), "address": x.get("address") or "", "city": x.get("city") or "", "price": x.get("price"),
+              "date": str(x.get("sold_date") or "")[:7], "photo": x.get("image_url")}
+             for x in (ctx.get("recent_sales") or [])[:60] if x.get("id")]
+    listings = [{k: x.get(k) for k in ("id", "address", "city", "state", "price", "beds", "baths", "sqft", "status", "image_url")}
+                for x in (ctx.get("listings") or [])[:12] if x.get("id")]
+    videos = [{k: v.get(k) for k in ("id", "title", "url", "image", "kind")} for v in (ctx.get("videos") or []) if _yt(v.get("url") or "")][:24]
     want_areas = [t for t in (a.get("areas") or []) if isinstance(t, str) and t.strip()][:5]
     body = {"topic": topic[:500], "tone": a.get("tone") if a.get("tone") in BLOG_TONES else "warm",
             "length": a.get("length") if a.get("length") in BLOG_LENGTHS else "standard",
@@ -1388,8 +1478,12 @@ async def _p_blog(db, user, a):
             "area_slugs": [cards[t.lower()] for t in want_areas if t.lower() in cards]}
     if _s(a.get("key_points")):
         body["key_points"] = _s(a["key_points"])[:2000]
+    if _s(a.get("goal")):
+        body["goal"] = _s(a["goal"])[:300]
+    options = {"areas": areas, "area_cards": cards, "sales": sales, "listings": listings, "videos": videos,
+               "angles": _strs(a.get("angles"), 5, 200), "goals": _strs(a.get("goals"), 4, 200), "point_ideas": _strs(a.get("point_ideas"), 7, 200)}
     return Prepared("Write a blog post with AI", [f"Topic: {topic[:200]}", "Saved as a draft - never published until you do"],
-                    {"body": body, "percents": percents, "options": {"areas": areas, "area_cards": cards, "sales": sales}},
+                    {"body": body, "percents": percents, "options": options},
                     warning="This uses your monthly AI allowance.", confirm_label="Write it", picker="blog")
 
 
@@ -1397,6 +1491,8 @@ def _adjust_blog(user, payload: dict, picks: dict) -> dict:
     out = dict(payload)
     body = dict(out.get("body") or {})
     opts = out.get("options") or {}
+    if _s(picks.get("topic")):
+        body["topic"] = _s(picks["topic"])[:500]
     if picks.get("tone") in BLOG_TONES:
         body["tone"] = picks["tone"]
     if picks.get("length") in BLOG_LENGTHS:
@@ -1413,9 +1509,28 @@ def _adjust_blog(user, payload: dict, picks: dict) -> dict:
         allowed = {x["id"] for x in (opts.get("sales") or [])}
         body["sale_ids"] = [str(i) for i in picks["sale_ids"] if str(i) in allowed][:4]
         body["include_recent_sales"] = bool(body["sale_ids"])
-    for k in ("key_points", "personal_take"):
+    if isinstance(picks.get("listing_ids"), list):
+        by = {x["id"]: x for x in (opts.get("listings") or [])}
+        body["listings"] = [{"listing_key": by[i]["id"], **{k: by[i][k] for k in ("address", "city", "state", "price", "beds", "baths", "sqft", "status", "image_url") if by[i].get(k) is not None}}
+                            for i in picks["listing_ids"] if i in by][:6]
+    if "video" in picks:
+        v = picks.get("video") if isinstance(picks.get("video"), dict) else None
+        if v and _yt(_s(v.get("url"))):
+            body["video"] = {"url": _s(v["url"])[:400], **({"title": _s(v.get("title"))[:200]} if _s(v.get("title")) else {})}
+        else:
+            body.pop("video", None)
+    # checked key points + their own, as bullets (the writer reads them like the page's box)
+    if isinstance(picks.get("points"), list):
+        pts = _strs(picks["points"], 12, 300)
+        own = _s(picks.get("key_points"))
+        text = "\n".join(f"- {x}" for x in pts) + (("\n" if pts else "") + own if own else "")
+        if text.strip():
+            body["key_points"] = text[:2000]
+        else:
+            body.pop("key_points", None)
+    for k, cap in (("personal_take", 2000), ("facts", 2000), ("goal", 300)):
         if k in picks:
-            v = _s(picks.get(k))[:2000]
+            v = _s(picks.get(k))[:cap]
             if v:
                 body[k] = v
             else:
@@ -1439,11 +1554,14 @@ async def _r_blog(db, user, p):
                        "ready, even if you close the site."}
 
 _simple("write_blog_post", "Start the AI blog writer on a topic (draft only; uses the agent's AI allowance). Plans with Blogs. "
-        "You CAN write blog posts - never say otherwise. The card asks the Blogs page's own questions as taps (who it's for, towns + Town Spotlight, their sales to mention, tone, length, the ending button, key points / their take) - set it up as soon as you have the topic; never ask those in chat (pass them only if they already said).",
-        _obj({"topic": {"type": "string"}, "key_points": {"type": "string"}, "tone": {"type": "string", "enum": list(BLOG_TONES)},
+        "You CAN write blog posts - never say otherwise. The card is the Blogs page's own interview as check-box steps (topic angle + what readers walk away with, who it's for, towns + Town Spotlight, key points, their take and numbers, their sales and listings, one of their YouTube videos, tone, length, the ending button) - "
+        "set it up as soon as you have the topic and never ask those in chat (pass them only if they already said). ALWAYS pass angles (4-5 sharper titles on their topic), goals (3-4 one-line things a reader should walk away knowing or doing) and point_ideas (5-7 specific key points worth covering) - they're the check boxes on the card.",
+        _obj({"topic": {"type": "string"}, "key_points": {"type": "string"}, "goal": {"type": "string"}, "tone": {"type": "string", "enum": list(BLOG_TONES)},
               "length": {"type": "string", "enum": list(BLOG_LENGTHS)}, "audiences": {"type": "array", "items": {"type": "string", "enum": list(BLOG_AUDIENCES)}},
               "areas": {"type": "array", "items": {"type": "string"}, "description": "Towns the article is about, if they named any (up to 5)."},
-              "cta": {"type": "string", "enum": list(BLOG_CTAS)}}, ["topic"]), _p_blog, _r_blog, STUDIO, adjust=_adjust_blog)
+              "cta": {"type": "string", "enum": list(BLOG_CTAS)},
+              "angles": {"type": "array", "items": {"type": "string"}}, "goals": {"type": "array", "items": {"type": "string"}},
+              "point_ideas": {"type": "array", "items": {"type": "string"}}}, ["topic"]), _p_blog, _r_blog, STUDIO, adjust=_adjust_blog)
 
 
 # ================================================================ SETTINGS / PROFILE / SITE
@@ -1699,3 +1817,166 @@ register({"name": "create_design", "description": (
                           "headline": {"type": "string"}, "open_house_date": {"type": "string"}, "start_time": {"type": "string"}, "end_time": {"type": "string"}},
                          ["situation", "format"])},
          _p_design, None, STUDIO, client="create_design")
+
+
+
+# ================================================================ OPEN HOUSE KIT
+# Owner, 11/01 (capability review: "it can't build an Open House Kit, the core feature"): the card picks
+# the home, the cover photo, the kit's pieces and what happens after a guest signs in; "Build my kit"
+# runs the Opens page's own kit maker with those choices (the browser does it, like a design - the same
+# QR sign-in, Similar Homes, Cheat Sheet and saves) and stops on Review & Save for the agent's tap.
+
+async def _p_kit(db, user, a):
+    from app.utils.plan_ids import listing_owner_key
+    mine = listing_owner_key(user)
+    key = _s(a.get("listing_key"))
+    rows = []
+    if mine:
+        rows = list((await db.execute(select(Property).where(
+            or_(Property.list_agent_mls_id == mine, Property.co_list_agent_mls_id == mine),
+            Property.home_status.in_(("ACTIVE-BRIGHT", "COMING SOON-BRIGHT"))).order_by(Property.mls_list_date.desc().nulls_last()).limit(8))).scalars().all())
+    if key and not any(r.listing_key == key for r in rows):
+        other = (await db.execute(select(Property).where(Property.listing_key == key))).scalars().first()
+        if other is None:
+            raise ActionError("I couldn't find that home in the listings.")
+        rows.insert(0, other)
+    if not rows:
+        raise ActionError("Which home is the open house at? Give me the address and I'll set it up.")
+
+    def home(r):
+        photos = [x for x in (r.photos if isinstance(r.photos, list) else []) if isinstance(x, str) and not x.startswith("data:")][:12]
+        return {"listing_key": r.listing_key, "address": r.full_address or r.street_address or "", "street": tidy_caps(r.street_address) or "",
+                "city": tidy_caps(r.city) or "", "lat": r.latitude, "lng": r.longitude, "price": r.price, "photos": photos,
+                "own": bool(mine) and mine in (r.list_agent_mls_id, r.co_list_agent_mls_id)}
+    homes = [home(r) for r in rows]
+    pick = next((h for h in homes if h["listing_key"] == key), homes[0])
+    return Prepared("Build an Open House Kit", ["QR sign-in sheet, flyer and the pieces you pick", "Built on your Opens page - you'll look it over and tap Save"],
+                    {"homes": homes, "listing_key": pick["listing_key"]}, confirm_label="Build my kit", picker="kit")
+
+register({"name": "build_open_house_kit", "description": (
+    "Build an Open House Kit (QR sign-in sheet, flyer, Brag Sheet, Similar Homes, Cheat Sheet) for one of the agent's listings or a home they're hosting. "
+    "The card asks which home (their active listings; pass listing_key for another home they named, from search_properties), the cover photo, "
+    "the kit's pieces and what happens after a guest signs in - set it up right away and never ask those in chat. Building it opens their Opens page "
+    "with everything done; they look it over and tap Save."),
+    "input_schema": _obj({"listing_key": {"type": "string"}})},
+    _p_kit, None, MLS, client="build_open_house_kit")
+
+
+
+# ================================================================ DISCOVERY SEARCH AREA
+# Owner, 11/01: "if they have not set a filter yet in their discovery, the chat bot should say that ...
+# what are you looking for, and basically make that filter for them in discovery, and it saves". The
+# card's center choices are their listings, their towns and the place they named - placed from our own
+# MLS copy (a town = the middle of its homes), never a paid geocode - plus miles, a price floor and beds.
+# It saves through the Discovery page's own PATCH, so the page shows the same filter.
+
+async def _town_center(db, town: str):
+    t = (town or "").split(",")[0].strip()
+    if not t:
+        return None
+    row = (await db.execute(select(func.avg(Property.latitude), func.avg(Property.longitude), func.count(Property.id), func.max(Property.state))
+                            .where(func.lower(Property.city) == t.lower(), Property.latitude.isnot(None)))).first()
+    if not row or not row[2]:
+        return None
+    return {"label": f"{tidy_caps(t)}, {row[3] or ''}".strip(", "), "lat": round(float(row[0]), 6), "lng": round(float(row[1]), 6), "kind": "town"}
+
+
+async def _address_center(db, text: str, mine: Optional[str] = None):
+    # An address starts with its house number ("417 Dogwood" is never "42417 Dogwood Glen Sq") - and
+    # the agent's own listing wins over a look-alike elsewhere.
+    t = (text or "").strip()
+    street = t.split(",")[0].strip()
+    if not re.match(r"^\d+\s+\S", street):
+        return None
+    q = select(Property).where(Property.street_address.ilike(f"{street}%"), Property.latitude.isnot(None))
+    if mine:
+        q = q.order_by((or_(Property.list_agent_mls_id == mine, Property.co_list_agent_mls_id == mine)).desc())
+    p = (await db.execute(q.limit(1))).scalars().first()
+    if p is None:
+        return None
+    return {"label": ", ".join(x for x in (tidy_caps(p.street_address), tidy_caps(p.city)) if x), "lat": p.latitude, "lng": p.longitude, "kind": "home"}
+
+
+async def _p_discovery(db, user, a):
+    from app.utils.plan_ids import listing_owner_key
+    try:
+        cur = (await call_as_agent(user, "GET", "/api/discovery")) or {}
+    except RouteError:
+        cur = {}
+    prefs = cur.get("preferences") or {}
+    centers = []
+    mine = listing_owner_key(user)
+    want = _s(a.get("center"))
+    if want:
+        c = await _address_center(db, want, mine) or await _town_center(db, want)
+        if c:
+            centers.append(c)
+    if mine:
+        for r in (await db.execute(select(Property).where(
+                or_(Property.list_agent_mls_id == mine, Property.co_list_agent_mls_id == mine),
+                Property.home_status.in_(("ACTIVE-BRIGHT", "COMING SOON-BRIGHT")), Property.latitude.isnot(None))
+                .order_by(Property.mls_list_date.desc().nulls_last()).limit(4))).scalars().all():
+            centers.append({"label": ", ".join(x for x in (tidy_caps(r.street_address), tidy_caps(r.city)) if x), "lat": r.latitude, "lng": r.longitude, "kind": "listing"})
+    from app.models.database import MarketArea, AgentMarketArea
+    try:
+        towns = [n for (n,) in (await db.execute(select(MarketArea.name).join(AgentMarketArea, AgentMarketArea.area_id == MarketArea.id)
+                                                  .where(AgentMarketArea.owner_id == user.id).order_by(AgentMarketArea.sort_order.nulls_last()).limit(6))).all()]
+    except Exception:  # noqa: BLE001 - towns are a nice-to-have here
+        await db.rollback()
+        towns = []
+    for t in towns:
+        c = await _town_center(db, t)
+        if c:
+            centers.append(c)
+    seen, uniq = set(), []
+    for c in centers:
+        k = c["label"].lower()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(c)
+    if not uniq:
+        raise ActionError("Where should your Discovery search be centered? Tell me a town or an address.")
+    miles = a.get("miles") if isinstance(a.get("miles"), (int, float)) and 1 <= a["miles"] <= 100 else (prefs.get("miles") or 10)
+    payload = {"centers": uniq[:8], "center": uniq[0]["label"], "miles": miles,
+               "min_price": a.get("min_price") if isinstance(a.get("min_price"), (int, float)) else prefs.get("min_price"),
+               "max_price": a.get("max_price") if isinstance(a.get("max_price"), (int, float)) else prefs.get("max_price"),
+               "min_bedrooms": a.get("min_bedrooms") if isinstance(a.get("min_bedrooms"), int) else prefs.get("min_bedrooms"),
+               "had": bool(prefs.get("landmark_address"))}
+    title = "Change your Discovery search" if payload["had"] else "Set up your Discovery search"
+    return Prepared(title, [f"Now: {prefs['landmark_address']} · {prefs.get('miles') or 10} mi" if payload["had"] else "Pick where to look - it saves to your Discovery page"],
+                    payload, confirm_label="Save my search", picker="discovery")
+
+
+def _adjust_discovery(user, payload: dict, picks: dict) -> dict:
+    out = dict(payload)
+    labels = {c["label"] for c in out.get("centers") or []}
+    if picks.get("center") in labels:
+        out["center"] = picks["center"]
+    if isinstance(picks.get("miles"), (int, float)) and 1 <= picks["miles"] <= 100:
+        out["miles"] = picks["miles"]
+    for k in ("min_price", "max_price", "min_bedrooms"):
+        if k in picks:
+            v = picks.get(k)
+            out[k] = v if isinstance(v, (int, float)) and v > 0 else None
+    return out
+
+
+async def _r_discovery(db, user, p):
+    c = next((x for x in p.get("centers") or [] if x["label"] == p.get("center")), None)
+    if c is None:
+        raise ActionError("Pick where to center the search first.")
+    await _run_route(user, "PATCH", "/api/discovery/preferences", {
+        "landmark_address": c["label"], "latitude": c["lat"], "longitude": c["lng"], "miles": p.get("miles") or 10,
+        "min_price": p.get("min_price"), "max_price": p.get("max_price"), "min_bedrooms": p.get("min_bedrooms")})
+    return {"message": f"Saved - your Discovery now looks within {p.get('miles') or 10} miles of {c['label']}. Ask me \"what can I host this weekend?\" any time.",
+            "link": "/discovery"}
+
+_simple("set_discovery_search", "Set up or change the agent's Discovery search (where they look for homes to host): the center (one of their listings, a town they serve, or a place they named), "
+        "how many miles, and an optional price range (min and max) / minimum beds - saved to their Discovery page. Use it when find_homes_to_host says their search area isn't set, or 'look around Wayne instead'. "
+        "Set it up right away (pass center if they named a place); the card asks the rest.",
+        _obj({"center": {"type": "string"}, "miles": {"type": "number"}, "min_price": {"type": "number"}, "max_price": {"type": "number"}, "min_bedrooms": {"type": "integer"}}),
+        _p_discovery, _r_discovery, MLS, adjust=_adjust_discovery)
+
+
+# 11/01 additions (capability review): forms/invites follow-through, hosting, blogs, account items.
+from app.services.ai import ai_actions_forms, ai_actions_more  # noqa: E402,F401

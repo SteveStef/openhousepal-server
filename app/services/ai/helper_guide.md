@@ -59,11 +59,23 @@ The bell and the light/dark switch sit next to the menu button.
 ---
 
 ### The AI helper (this chat)
-- The round button at the bottom right with the little OpenHousePal robot opens it (a red number on it = a chat has news, like a finished AI CMA). Phone: it opens as a sheet - drag the bar up for full screen, down to shrink or close. Computer: a corner window with a Make bigger button.
-- It's an on-call helper: opened again 30 minutes or more after the last message, it starts a fresh chat. Older chats are under **Your chats** (the clock button) - open one to carry on, or delete it.
+- The round gold button at the bottom right with Chat Pal (a little speech bubble with a roof and a face) opens it (a red number on it = a chat has news, like a finished AI CMA). Phone: it opens as a sheet - drag the bar up for full screen, down to shrink or close. Computer: a corner window with a Make bigger button.
+- It's an on-call helper: opened again 30 minutes or more after the last message, it starts a fresh chat, and old chats are cleared away - there is no chat history (it also keeps each chat's usage small). **New chat** (the speech-bubble button) starts over any time. A chat that is still making something (an AI CMA, a blog) stays until its finished message is read.
+- The chat's top line always says **AI Assistant** with its usage bar beside it. Phones: drag the pull tab up for full screen, down to shrink, further down to close.
+- Something still being made (an AI CMA, a blog post) shows as a progress bar right under the top line until it's done - they can keep chatting about anything meanwhile.
+- Their listings and sales show in the chat as small home cards - the little photo with Active / Pending / Sold on it and the street: the newest five, then **+N more**. Photo choices on any card are one row to swipe; picking one folds the step.
+- While a reply is coming, the chat shows what it's doing right now ("Searching your open house guests...") and the seconds going by.
 - When a button in the chat takes them to a page (Open it, Go there, Create a Showcase, make an Open House Kit...), the chat steps aside: on a phone it slides down to a short bar (tap it to bring the chat back), on a computer the big window drops back to the corner.
 - Cards: things the helper sets up show as a card with the choices as steps (each folds to one line once picked - tap it to change), then Confirm / Make it. A design made in the chat has **Download** - on a phone that opens the Share sheet (Save Image to the camera roll), on a computer it downloads.
 
+- **What the helper can do for you in the chat** (each one shows a card; nothing happens until you tap its button - deleting, billing, sign-ins and passwords always stay on the page):
+  - Leads & follow-ups: find a lead or an open house guest, add or change follow-ups and their rules, star, move or mark leads.
+  - Open houses: build an Open House Kit, switch a kit's guest Showcases / Similar Homes / Guest Pass / follow-ups, refresh Similar Homes, add a private note, a note on a guest, share the guest list with the listing agent, mark a disclosure sent or a second visit scheduled.
+  - Hosting: find homes to host on Discovery, ask to host, withdraw, offer another time, answer a team ask or a listing agent's request.
+  - Showcases: make one, change its search, add a home, re-send the invite, confirm a tour, reply to a comment.
+  - Studio: designs (with Download), Listing Spotlights (make, publish), CMAs (AI or manual), blog posts (write, publish, schedule, stats), forms (make, copy, tracking links, read answers, mark reviewed), invites (make, send to leads, remind, who's coming, close RSVPs, copy).
+  - Your brand & account: Branding, email signature switches, email settings and the daily briefing, profile, towns, review settings, website on/off, calendar status and resync, CRM status and a test lead, Help tickets (open, read the reply, answer), account setup steps.
+  - Look-ups: your listings and sales as home cards, other agents' sales and listings, MLS homes, stats for your forms, blog and Agent Hub, your plan and AI usage.
 - Other agents: ask "how many homes has <agent> sold" or "what is <agent> listing around $2M" - the helper looks them up in the MLS records (office, contact, sales in the last 12 months on both sides, listings for sale now) and can set up a request to host an open house at one.
 - Sign-in: **Remember me** (ticked by default) keeps you signed in for 30 days, renewed each day you use the app; untick it on a shared computer (1 day).
 

@@ -35,10 +35,12 @@ Tabs: **Profile**, **Notifications**, **Tools**, **IDX Website** (IDX only), **B
 
 ## Calendar (Tools → Calendar, "Your follow-ups, on your calendar"; every plan)
 - **Google Calendar** → **Connect Google** → sign in ("If Google says 'unverified app': Advanced → Go to OpenHousePal → Allow") → you land back synced.
-- Creates one calendar called "OpenHousePal" - it never touches your other calendars. Shows follow-ups (with your buzz settings), scheduled open houses and approved hosting dates, and confirmed Showcase tours. Two-way: edit events in Google, and new follow-ups skip times you're already booked.
+- Creates one calendar called "OpenHousePal" - it never touches your other calendars. Shows follow-ups (with your buzz settings), scheduled open houses and approved hosting dates, and confirmed Showcase tours. Two-way for follow-ups: move one to another day or time in your calendar and the follow-up moves with it in OpenHousePal (Follow-ups, the Dash, the daily briefing) - next time Follow-ups opens or within a few minutes - and the app never moves it back; delete it in your calendar and it's marked done. New follow-ups skip times you're already booked.
 - **Sync now** pushes everything again. **Disconnect** removes the OpenHousePal calendar and its events from Google. **Sign-in expired** → **Reconnect**.
 - **Outlook Calendar**: "Coming soon".
 - Times use Eastern time.
+
+- From the chat: "is my calendar connected?" and "resync my calendar" (Sync now). Connecting stays on the page.
 
 ## CRM (Tools → CRM, "Every lead, where it belongs"; every plan)
 Two separate switches - set up either or both.
@@ -50,11 +52,15 @@ Two separate switches - set up either or both.
 - **Leads IN** - portal leads: copy **Your private forwarding address** and follow **How to forward from each portal** (Zillow, Realtor.com, Homes.com, Facebook). Forwarded lead emails appear in Leads tagged "Portal Lead" and trigger the Listing inquiry follow-up. Generating a new address stops the old one immediately.
 - The Leads page shows a CRM chip (connected / Connect CRM).
 
+- From the chat: "is my CRM hooked up?" and "send a test lead". Keys and a new forwarding address stay on the page.
+
 ## Help tickets (question-mark icon; phone: Account → Help; "We're here to help")
 - **Submit a Ticket** → pick **Contact support** ("What do you need help with?", "Tell us more", **How urgent is it?**: Whenever / Soon / Urgent), **Report a bug** ("Sum it up in a few words", "What happened?", "What did you expect to happen?", **Where did it happen?**: Dashboard, Open Houses, Showcases, Leads, CMA, Design Studio, Spotlight, IDX Website, Agent Hub, Discovery, Settings & billing, Something else) or **Suggest a feature** ("Your idea in a few words", "What would you like?", "How would it help you?").
 - Up to 3 screenshots. Buttons: **Send to support** / **Send bug report** / **Send my idea**. You get a Reference #.
 - A real person replies on the page; you get a notification and the Help icon shows a red dot. **Type a reply...**. Tabs Open / Closed; replying to a closed ticket reopens it. **Close Ticket** / **Reopen**.
 - CMA problems: use **Submit Ticket** inside the CMA so the Report Code is attached.
+
+- From the chat: read the team's actual reply, and answer back (reopens a closed ticket).
 
 ## Account setup checklist (clipboard icon; phone: Account → Account setup)
 - Saves as you type and remembers where you left off. **Continue**, **Back**, **Skip** (each optional step says what skipping means), **Finish** on the last step.
@@ -70,6 +76,8 @@ Two separate switches - set up either or both.
 - Waiting on broker approval: the About you steps can be done early.
 - Finish shows shortcuts: **Open my Agent Hub**, **My email signature** (IDX, No-MLS Premium), **My website** (IDX).
 - Settings shows a red "!" while a required item is missing.
+
+- From the chat: skip a step, mark Calendar / Your email / Your CRM as not using, or bring a step back.
 
 ## Can't do / common mistakes
 - Can't change sign-in email, MLS ID or a saved license number yourself - Contact support.

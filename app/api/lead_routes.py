@@ -557,8 +557,16 @@ async def _detail_out(db: AsyncSession, lead: Lead, owner_id: str) -> LeadDetail
     await _enrich(db, owner_id, [lead], [lead_out], collections)
     events = sorted(lead.events or [], key=lambda e: e.occurred_at, reverse=True)
     from app.services.tasks_service import lead_alerts
+    showcases = await _showcases_out(lead, collections)
+    if showcases:
+        # Whether each Showcase's invite email ever reached them (owner, 11/01).
+        from app.services.showcase_invite_status import invite_status
+        by_id = {c.id: c for c in collections}
+        invites = await invite_status(db, [by_id[s.id] for s in showcases if s.id in by_id])
+        for s in showcases:
+            s.invite = invites.get(s.id)
     return LeadDetailOut(**lead_out.model_dump(), events=await _events_out(db, owner_id, events),
-                         showcases=await _showcases_out(lead, collections), alerts=lead_alerts(lead))
+                         showcases=showcases, alerts=lead_alerts(lead))
 
 
 async def _load_owned_lead(db: AsyncSession, lead_id: str, owner_id: str) -> Lead:

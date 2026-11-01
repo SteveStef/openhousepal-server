@@ -851,6 +851,11 @@ async def article_site_url(db: AsyncSession, agent: User, blog: Blog) -> Optiona
     return f"{base}/blog/{blog.slug}" if base else None
 
 
+async def _article_contact(db: AsyncSession, agent: User) -> dict:
+    from app.services.website import content_adapters
+    return await content_adapters.article_contact(db, agent)
+
+
 async def _public_blocks(db: AsyncSession, blocks) -> list:
     from app.services.ai import ai_blog_writer_service
     try:
@@ -920,6 +925,7 @@ async def get_public_blog(
         agentId=agent.id,
         agentTitle=agent.professional_title,
         agentMarket=agent.market,
+        **{f"agent{k.title().replace('_', '')}": v for k, v in (await _article_contact(db, agent)).items()},
         # A Luxe article whose author left IDX shows in the default look (the choice is kept).
         theme=blog.theme if blog.theme != "luxe_plus" or luxe_blog_theme_allowed(agent) else "luxe",
         previewImageUrl=blog_preview_image(blog),

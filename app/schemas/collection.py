@@ -75,6 +75,7 @@ class CollectionResponse(BaseModel):
     came_from: Optional[dict] = None        # the open house they attended (asleep cards show it) / how it was made
     still_using: bool = False               # the client used it lately - stays open even if emails slowed/stopped
     stats: Optional[dict] = None
+    invite: Optional[dict] = None           # did they get their invite email (services/showcase_invite_status)
     matchedProperties: List[dict] = []
 
 # Forward reference for PropertySummary will be resolved when property schemas are imported

@@ -1,8 +1,8 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -117,11 +117,27 @@ async def get_ai_helper_status(
 
 
 @router.get("/unread")
-async def get_ai_unread(current_user: User = Depends(get_current_active_user)):
+async def get_ai_unread(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
     """Chats where the helper finished something while the agent was away (an AI CMA) - the chat
-    button shows the count on every device until that chat is opened (ai_notify)."""
+    button shows the count on every device until that chat is opened (ai_notify) - and the jobs
+    still running, for the chat's progress strip."""
     from app.services.ai import ai_notify
-    return {"conversations": ai_notify.unread(current_user)}
+    return {"conversations": ai_notify.unread(current_user), "working": await ai_notify.working(db, current_user)}
+
+
+@router.get("/progress")
+async def get_ai_progress(current_user: User = Depends(get_current_active_user)):
+    """What the helper is doing right now for this agent's reply ("Searching your open house
+    guests") - the chat polls it while a reply is coming (owner, 11/01). Older than 3 minutes = none."""
+    from app.services import app_cache
+    v = await app_cache.load(f"ai_progress:{current_user.id}")
+    if not isinstance(v, dict) or not v.get("label"):
+        return {"label": None}
+    try:
+        fresh = datetime.now(timezone.utc) - datetime.fromisoformat(v.get("at")) < timedelta(minutes=3)
+    except (TypeError, ValueError):
+        fresh = False
+    return {"label": v["label"] if fresh else None}
 
 
 @router.post("/unread/{conversation_id}/read")
@@ -187,6 +203,16 @@ async def create_ai_conversation(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_ai_helper_user),
 ):
+    # One chat at a time (owner, 11/01: no chat history - a clean slate after 30 minutes, and every
+    # old chat resent as context costs their allowance). Starting one tidies the others away the way
+    # the delete route does (archived, never destroyed - the duplicate-job guard and Admin counts
+    # still read them); a chat waiting on a job or holding unread news stays until it's read.
+    from app.services.ai import ai_notify
+    keep = ai_notify.busy_conversations(current_user)
+    tidy = update(AIConversation).where(AIConversation.owner_id == current_user.id, AIConversation.archived_at.is_(None))
+    if keep:
+        tidy = tidy.where(AIConversation.id.notin_(keep))
+    await db.execute(tidy.values(archived_at=datetime.now(timezone.utc)))
     conversation = AIConversation(owner_id=current_user.id)
     db.add(conversation)
     await db.commit()

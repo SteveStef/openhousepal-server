@@ -744,6 +744,9 @@ class CalendarEventLink(Base):
     external_event_id = Column(String, nullable=False)
     # What we last sent - a sync that would send the same event again skips the call.
     body_hash = Column(String, nullable=True)
+    # Where the app last put the event ("2026-11-03T15:00" UTC / "date:2026-11-03") - the event
+    # starting anywhere else means the agent moved it on their calendar (owner, 11/01).
+    pushed_start = Column(String(32), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
@@ -1803,6 +1806,7 @@ class DiscoveryPreferences(Base):
     min_bathrooms = Column(Integer, nullable=True)
     min_square_feet = Column(Integer, nullable=True)
     min_price = Column(Float, nullable=True)
+    max_price = Column(Float, nullable=True)  # owner, 11/01 - next to the min price
 
     # Array of strings
     brokerages = Column(JSONB, nullable=True)

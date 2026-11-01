@@ -196,6 +196,25 @@ async def delete_event(access_token: str, calendar_id: str, event_id: str) -> No
         raise
 
 
+async def event_state(access_token: str, calendar_id: str, event_id: str) -> tuple[Optional[bool], Optional[dict]]:
+    """(still there?, its start) - start as Google gives it ({"dateTime": ...} or {"date": ...}).
+    (False, None) = the agent deleted it; (None, None) = couldn't tell (network, auth...)."""
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
+            r = await c.get(f"{_CAL}/calendars/{calendar_id}/events/{event_id}",
+                            headers={"Authorization": f"Bearer {access_token}"})
+    except httpx.HTTPError:
+        return None, None
+    if r.status_code in (404, 410):
+        return False, None
+    if r.status_code >= 300:
+        return None, None
+    ev = r.json() if r.text else {}
+    if ev.get("status") == "cancelled":
+        return False, None
+    return True, ev.get("start")
+
+
 async def event_exists(access_token: str, calendar_id: str, event_id: str) -> Optional[bool]:
     """True = still on the calendar, False = the agent deleted it (Google keeps a deleted event as
     status "cancelled", or answers 404/410), None = couldn't tell (network, auth...)."""

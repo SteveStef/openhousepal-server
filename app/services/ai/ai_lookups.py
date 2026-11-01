@@ -200,3 +200,21 @@ async def run_lookup(db: AsyncSession, user: User, name: str, args: dict) -> Any
         return await fn(db, user, args or {})
     except ValueError as e:
         return {"error": "bad_input", "message": str(e)}
+
+
+
+async def _fair_housing(db: AsyncSession, user: User, args: dict) -> Any:
+    """The app's own Fair Housing / compliance check on copy (the copywriter's - same rules, same
+    allowance). 11/01 capability review: listing descriptions the helper wrote skipped it."""
+    from fastapi import HTTPException
+    from app.services.ai import ai_copywrite_service
+    try:
+        return await ai_copywrite_service.compliance_check(db, user.id, user.plan_tier, text=str(args.get("text") or "")[:6000])
+    except HTTPException as e:
+        return {"error": "not_checked", "message": str(e.detail)}
+LOOKUPS["check_fair_housing"] = ("Check real-estate copy (a listing description, a social caption, an ad) against Fair Housing and the app's compliance rules - returns any risky phrases with a safer rewrite. "
+                                 "ALWAYS run it on a listing description or marketing copy you wrote before giving it to them, and fix what it flags.",
+                                 _obj({"text": {"type": "string"}}), None, _fair_housing)
+
+# 11/01 additions (capability review) - they add to LOOKUPS above.
+from app.services.ai import ai_lookups_forms, ai_lookups_more  # noqa: E402,F401

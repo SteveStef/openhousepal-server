@@ -608,6 +608,7 @@ async def _upsert_event_locked(db: AsyncSession, conn: CalendarConnection, kind:
             return  # already exactly this on their calendar - "Sync now" doesn't touch it again
         try:
             await client.patch_event(token, calendar_id, link.external_event_id, body)
+            link.pushed_start = _start_key(body.get("start"))
         except Exception as e:  # noqa: BLE001
             gone = any(c in str(e) for c in ("404", "410"))
             if not (gone and kind == "task"):
@@ -629,7 +630,8 @@ async def _upsert_event_locked(db: AsyncSession, conn: CalendarConnection, kind:
         return
 
     event_id = await client.insert_event(token, calendar_id, body)
-    db.add(CalendarEventLink(connection_id=conn_id, kind=kind, source_id=source_id, external_event_id=event_id, body_hash=digest))
+    db.add(CalendarEventLink(connection_id=conn_id, kind=kind, source_id=source_id, external_event_id=event_id, body_hash=digest,
+                             pushed_start=_start_key(body.get("start"))))
     try:
         await db.commit()
     except IntegrityError:
@@ -646,6 +648,79 @@ async def _upsert_event_locked(db: AsyncSession, conn: CalendarConnection, kind:
             existing.updated_at = datetime.now(timezone.utc)
             db.add(existing)
             await db.commit()
+
+
+def _start_key(start: Optional[dict]) -> Optional[str]:
+    """An event's start as one comparable string: "date:YYYY-MM-DD" (all-day) or the UTC minute
+    "YYYY-MM-DDTHH:MM" - so the start we sent and the start the calendar has can be compared."""
+    if not start:
+        return None
+    if start.get("date"):
+        return "date:" + str(start["date"])[:10]
+    raw = str(start.get("dateTime") or "")
+    if not raw:
+        return None
+    # Outlook adds 7-digit fractions ("...T15:00:00.0000000"); Google sends an offset - both read the same.
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?$", raw.strip())
+    if not m:
+        return None
+    try:
+        d = datetime.fromisoformat(m.group(1) + ("+00:00" if m.group(2) == "Z" else (m.group(2) or "")))
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        try:
+            d = d.replace(tzinfo=ZoneInfo(start.get("timeZone") or "UTC"))
+        except Exception:  # noqa: BLE001 - a zone name we can't read: leave it alone
+            return None
+    return d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+
+
+async def _adopt_calendar_move(db: AsyncSession, conn: CalendarConnection, task: AgentTask, link: CalendarEventLink,
+                               start: Optional[dict]) -> bool:
+    """The agent moved this follow-up's event on their own calendar (owner, 11/01: "if someone in
+    their calendar moves around a follow-up ... does it also reflect in the follow-ups and on the
+    dashboard"): its due day/time follows the calendar - Follow-ups, the Dash and the briefing all read
+    it - and the event is never moved back. True when it moved."""
+    key = _start_key(start)
+    if not key or task.completed_at is not None or task.due_at is None:
+        return False
+    if link.pushed_start is None:
+        # An event pushed before we kept its start: only when nothing changed in the app since that
+        # push (same body) can a different start mean the agent moved it. Otherwise remember it.
+        body = await task_body_for(db, task)
+        same = link.body_hash == _body_hash(body)
+        if not same or key == _start_key(body.get("start")):
+            if same:
+                link.pushed_start = key
+                db.add(link)
+                await db.commit()
+            return False
+    elif key == link.pushed_start:
+        return False
+    old = task.due_at
+    if key.startswith("date:"):
+        day = datetime.fromisoformat(key[5:]).date()
+        clock = old.astimezone(EASTERN).timetz().replace(tzinfo=None) if old else time(9, 0)
+        task.all_day = True
+        task.due_at = datetime.combine(day, clock, tzinfo=EASTERN).astimezone(timezone.utc)
+    else:
+        task.all_day = False
+        task.due_at = datetime.strptime(key, "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc)
+    shift = task.due_at - old
+    if task.remind_at is not None:
+        task.remind_at = task.remind_at + shift
+        if task.remind_at > datetime.now(timezone.utc):
+            task.reminder_sent_at = None
+    body = await task_body_for(db, task)
+    link.body_hash = _body_hash(body)
+    link.pushed_start = _start_key(body.get("start")) or key
+    link.updated_at = datetime.now(timezone.utc)
+    db.add(task)
+    db.add(link)
+    await db.commit()
+    logger.info("follow-up %s moved on the %s calendar: %s -> %s", task.id, conn.provider, old, task.due_at)
+    return True
 
 
 def _body_hash(body: dict) -> str:
@@ -892,6 +967,16 @@ async def _sync_task_locked(db: AsyncSession, conn: CalendarConnection, task_id:
         if lead is not None and not lead_alerts(lead)["calendar"]:
             await _remove_event(db, conn, "task", task_id)
             return
+    # Before pushing the app's version, take any move the agent made on their calendar (so a note
+    # or check-off in the app never drags a moved event back to the old day).
+    link = await _link(db, conn.id, "task", task_id)
+    if link is not None and task.completed_at is None:
+        try:
+            exists, start = await _client_for(conn).event_state(await _valid_access_token(db, conn), conn.calendar_id, link.external_event_id)
+            if exists:
+                await _adopt_calendar_move(db, conn, task, link, start)
+        except Exception:  # noqa: BLE001 - the push below still happens
+            logger.warning("calendar move check failed for follow-up %s", task_id, exc_info=True)
     await _upsert_event(db, conn, "task", task_id, await task_body_for(db, task))
 
 
@@ -1096,7 +1181,21 @@ async def reconcile_deleted_followups(db: AsyncSession, owner_id: str) -> int:
         except Exception:  # noqa: BLE001 - a broken connection shows on the Calendar card instead
             continue
         for link_id, event_id, task_id in rows:
-            if await client.event_exists(token, calendar_id, event_id) is not False:
+            exists, start = await client.event_state(token, calendar_id, event_id)
+            if exists is None:
+                continue
+            if exists:
+                # Still there - but moved to another day/time by the agent? The follow-up follows it,
+                # and every other calendar they connected gets the new time too.
+                task = await db.get(AgentTask, task_id)
+                link = await db.get(CalendarEventLink, link_id)
+                if task is not None and link is not None and await _adopt_calendar_move(db, conn, task, link, start):
+                    for other in await get_connections(db, owner_id):
+                        if other.id != conn_id and other.calendar_id:
+                            try:
+                                await _sync_task(db, other, task_id)
+                            except Exception:  # noqa: BLE001
+                                logger.warning("could not move follow-up %s on the %s calendar", task_id, other.provider, exc_info=True)
                 continue
             task = await db.get(AgentTask, task_id)
             link = await db.get(CalendarEventLink, link_id)

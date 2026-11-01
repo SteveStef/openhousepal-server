@@ -183,8 +183,13 @@ async def get_all_collections(
     """
     try:
         collections = await CollectionsService.get_user_collections(db, current_user.id)
+        # Each card says whether its client ever got the invite (owner, 11/01).
+        from app.services.showcase_invite_status import invite_status
+        invites = await invite_status(db, [{**c, "owner_id": current_user.id} for c in collections])
+        for c in collections:
+            c["invite"] = invites.get(str(c.get("id")))
         return collections
-        
+
     except Exception as e:
         logger.error("fetching collections failed", extra={"error": str(e)})
         raise HTTPException(
@@ -288,6 +293,36 @@ async def showcase_membership(
 class AddHomeBody(BaseModel):
     property_id: Optional[str] = None
     listing_key: Optional[str] = None
+
+
+@router.post("/{collection_id}/send-invite", dependencies=[Depends(require_broker_authorization)])
+async def send_showcase_invite(
+    collection_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_premium_plan),
+):
+    """The agent's Send invite / Send invite again button (Showcases card + the lead's page, owner
+    11/01): their Showcase link by email now. A Showcase the agent built by hand gets "Some homes I
+    picked out for you"; one from an open house or a form gets "Your Showcase is ready". The agent
+    asked for it, so a same-day repeat or a held-back email kind still goes - an unsubscribe or a
+    client who turned Showcase emails off never does."""
+    from app.services.showcase_digest_service import queue_showcase_ready
+    from app.services.showcase_invite_status import invite_status
+    coll = await db.get(Collection, collection_id)
+    if not coll or coll.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    if not coll.visitor_email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This Showcase has no email address.")
+    if await BlacklistService.is_blacklisted(db, coll.visitor_email):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="They unsubscribed from emails, so it can't be sent.")
+    if not coll.notify_visitor:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Showcase emails are off for them - turn them on first.")
+    if coll.status != "ACTIVE":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This Showcase is asleep - wake it up first.")
+    by_hand = coll.source == "manual" or (coll.source is None and not coll.original_open_house_event_id)
+    if not await queue_showcase_ready(db, coll.id, from_agent=by_hand, manual=True):
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="The invite couldn't be sent - try again in a minute.")
+    return {"invite": (await invite_status(db, [coll])).get(coll.id)}
 
 
 @router.post("/{collection_id}/add-home", dependencies=[Depends(require_broker_authorization)])

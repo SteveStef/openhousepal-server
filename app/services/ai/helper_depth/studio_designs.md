@@ -93,3 +93,4 @@ Header: Undo (Ctrl+Z) / Redo (Ctrl+Shift+Z), zoom (50%-250%, tap the % to fit), 
 - Brand theme looks wrong? It uses your Branding color - change it in Branding.
 - Changing a campaign's after-submit page later affects QR codes already printed.
 - Studio doesn't print or mail for you - download and send to your printer.
+- Made from the AI helper chat: the card's steps are Home (already picked when they named it), **Layout**, **Colors** and **Luxe finish** - tap through them to see each one on the live preview, then the check (**Done**) folds the step - and **Photo**. Picking the photo folds everything and the preview grows: drag the picture to move the photo in its frame, like the Studio's photo framing.

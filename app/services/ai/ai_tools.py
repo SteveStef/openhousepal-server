@@ -266,6 +266,11 @@ async def _search_open_houses(db: AsyncSession, current_user: User, args: dict, 
     )
     count_result = await db.execute(count_stmt)
     visitor_counts = dict(count_result.all())
+    # Kits are undated (evergreen) - the days guests actually signed in are the open house dates.
+    days_rows = (await db.execute(
+        select(OpenHouseVisitor.open_house_event_id, func.min(OpenHouseVisitor.created_at), func.max(OpenHouseVisitor.created_at))
+        .where(OpenHouseVisitor.open_house_event_id.in_(ids)).group_by(OpenHouseVisitor.open_house_event_id))).all()
+    signin_days = {r[0]: (r[1], r[2]) for r in days_rows}
 
     return {
         "results": [
@@ -276,6 +281,8 @@ async def _search_open_houses(db: AsyncSession, current_user: User, args: dict, 
                 "scheduled_date": e.scheduled_date.isoformat() if e.scheduled_date else None,
                 "is_active": e.is_active,
                 "visitor_count": visitor_counts.get(e.id, 0),
+                "first_sign_in": signin_days[e.id][0].isoformat() if e.id in signin_days and signin_days[e.id][0] else None,
+                "last_sign_in": signin_days[e.id][1].isoformat() if e.id in signin_days and signin_days[e.id][1] else None,
                 "price": e.price,
             }
             for e in events
@@ -321,6 +328,40 @@ async def _get_open_house_guests(db: AsyncSession, current_user: User, args: dic
             for v in visitors
         ],
         "count": len(visitors),
+    }
+
+
+async def _find_open_house_guests(db: AsyncSession, current_user: User, args: dict, config: dict) -> dict:
+    """Guests across ALL of the agent's open houses at once - by name, email or phone, and/or by when
+    they signed in (owner, 11/01: "a guest named Matt at one of my open houses last week" made the
+    helper open each sign-in list one by one, run out of steps and stop at "I'll check...")."""
+    from datetime import datetime, timedelta, timezone
+    name = (args.get("name") or "").strip()
+    days = args.get("days_back")
+    try:
+        days = max(1, min(400, int(days))) if days is not None else None
+    except (TypeError, ValueError):
+        days = None
+    stmt = (select(OpenHouseVisitor, OpenHouseEvent.address, OpenHouseEvent.city, OpenHouseEvent.id)
+            .join(OpenHouseEvent, OpenHouseEvent.id == OpenHouseVisitor.open_house_event_id)
+            .where(OpenHouseEvent.agent_id == current_user.id, OpenHouseEvent.is_deleted.is_(False)))
+    if name:
+        words = [w for w in name.split() if w][:3]
+        for w in words:
+            like = f"%{w}%"
+            stmt = stmt.where(or_(OpenHouseVisitor.full_name.ilike(like), OpenHouseVisitor.email.ilike(like), OpenHouseVisitor.phone.ilike(like)))
+    if days:
+        stmt = stmt.where(OpenHouseVisitor.created_at >= datetime.now(timezone.utc) - timedelta(days=days))
+    rows = (await db.execute(stmt.order_by(OpenHouseVisitor.created_at.desc()).limit(40))).all()
+    return {
+        "results": [{
+            "name": v.full_name, "email": v.email, "phone": v.phone, "has_agent": v.has_agent,
+            "signed_in_at": v.created_at.isoformat() if v.created_at else None,
+            "open_house": ", ".join(x for x in (addr, city) if x), "open_house_id": oh_id,
+            "visitor_id": v.id, "lead_id": v.lead_id,
+            "lead_page": f"/leads/{v.lead_id}" if v.lead_id else None,
+        } for v, addr, city, oh_id in rows],
+        "count": len(rows),
     }
 
 
@@ -647,13 +688,23 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "search_open_houses",
-        "description": "Search the logged-in agent's own open houses, past and upcoming.",
+        "description": "Search the logged-in agent's own open houses, past and upcoming. Kits aren't dated - first_sign_in / last_sign_in say when guests actually came.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "search": {"type": "string", "description": "Address or city text."},
                 "limit": {"type": "integer"},
             },
+        },
+    },
+    {
+        "name": "find_open_house_guests",
+        "description": "Find guests across ALL of the agent's open houses in one call - by name (first, last or part of it), email or phone, "
+                       "and/or by how many days back they signed in (e.g. 'Matt last week' = name 'Matt', days_back 10). Returns each match with "
+                       "the open house, the sign-in date and their lead page. Use this instead of opening sign-in lists one by one.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "days_back": {"type": "integer"}},
         },
     },
     {
@@ -726,6 +777,7 @@ _DISPATCH: Dict[str, Callable] = {
     "get_lead_detail": _get_lead_detail,
     "search_open_houses": _search_open_houses,
     "get_open_house_guests": _get_open_house_guests,
+    "find_open_house_guests": _find_open_house_guests,
     "get_property_matches": _get_property_matches,
     "get_showcase_info": _get_showcase_info,
     "get_similar_properties": _get_similar_properties,

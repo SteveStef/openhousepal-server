@@ -33,7 +33,8 @@ Showcases and CMA in depth: every Showcase search option, match score, compare h
 
 ## The Showcases page
 - Search "Search visitor, property, location...", **Tours** and **Activity** buttons, **Budgets** filter, sort (Activity, New matches, Newest, Fell asleep, Came from), **Active** / **Inactive** tabs, **New matches** filter.
-- Card: star, copy client email/phone, new-match count (**Dismiss new matches**), activity badges, **Edit**, **Share**, **Delete**, **On / Off**.
+- Card: star, copy client email/phone, new-match count (**Dismiss new matches**), activity badges, **Edit**, **Share**, **Delete**, the invite button, **On / Off**.
+- Invite button on each card: a small **Email** button once the client got their Showcase invite email (tap = **Send invite again**); an amber **Send invite** (just **Invite** on a narrow phone) when they never got one - it was never sent, held back by the email settings, or didn't go through. Either asks first ("We'll email ... their Showcase link with the N homes in it, from you, right now" -> **Send invite** / **Not now**). It goes even if the same email went out that day. Not offered when the Showcase is asleep, the client unsubscribed, or Showcase emails are off for them.
 
 ## Inside one Showcase
 - Tabs **Matches**, **Liked**, **Disliked**, **Sold/Removed**. Sort: Best Match, Days on Market, Last Updated, Price per Sq Ft, Square Feet, Lot Size (Acres), Bedrooms, Bathrooms, Year Built (low/high).
@@ -50,6 +51,7 @@ Showcases and CMA in depth: every Showcase search option, match score, compare h
 
 ## Client emails and digests
 - Showcase invite after your open house: 1 hour after sign-in by default (Right away, 15, 30 minutes or 1 hour in Tools → Email).
+- Did a client get their invite? The lead's page (Their Showcase card) says **Invite emailed** + date, or **Invite never sent** / **Invite not sent - held back by your email settings** / **Invite didn't go through**, with **Send invite** or **Send invite again**. When it was opened is in that lead's **Emails** card.
 - **New homes & price drops**: at most one email a day at 4:30 PM Eastern, only on days something changed. Or **Once a week** for everyone (Tools → Email → How often: Up to daily / Once a week). Each person can also be slowed automatically.
 - Every row in Tools → Email can be switched off and sent **From your email** (connected Gmail) or **OpenHousePal**.
 - Automatic slowing: unopened on 3 different days → weekly; 3 ignored weekly emails → automatic emails stop. Opening one or using the Showcase turns daily back on.

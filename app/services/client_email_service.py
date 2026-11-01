@@ -284,9 +284,13 @@ async def before_send(owner_id: Optional[str], to: Optional[str], template: str,
     """None = the rules hold this one back (don't send). Otherwise (tracking id or None, variables
     with tracked links + the open pixel)."""
     # One of each kind per person per event per day (email_dedupe_service) - a repeat isn't sent.
+    # "_manual": the agent pressed Send invite (again) themselves - it goes, same day or not, and a
+    # Studio -> Email switch for that kind doesn't hold it back (only an unsubscribe would).
     from app.services import email_dedupe_service as dd
+    manual = bool(variables.get("_manual"))
+    variables = {k: v for k, v in variables.items() if k != "_manual"}
     dkey = dd.key_for(to, template, subject, variables)
-    if await dd.is_repeat(dkey, template, "client", owner_id):
+    if not manual and await dd.is_repeat(dkey, template, "client", owner_id):
         return None
     if dkey:
         variables = {**variables, "_dedupe_key": dkey}
@@ -300,7 +304,7 @@ async def before_send(owner_id: Optional[str], to: Optional[str], template: str,
             from app.models.database import User
             from app.services.email_settings_service import client_rule
             rule = client_rule(await db.get(User, owner_id), template)
-            if rule is not None and not rule["on"]:
+            if rule is not None and not rule["on"] and not manual:
                 logger.info("client email held (agent turned it off)", extra={"template": template, "owner_id": owner_id})
                 dd.forget(dkey)
                 return None

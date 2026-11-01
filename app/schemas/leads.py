@@ -66,6 +66,7 @@ class LeadShowcaseOut(BaseModel):
     last_active_at: Optional[datetime] = None
     emails_on: bool = True
     refine_message: Optional[str] = None
+    invite: Optional[dict] = None   # did they get their invite email (services/showcase_invite_status)
 
 
 class LeadEventOut(BaseModel):

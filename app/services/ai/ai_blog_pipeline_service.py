@@ -60,19 +60,24 @@ ENGINES = ("max", "lean")
 _ENGINE_RULES = """You are an expert real estate blog writer, local market researcher, SEO strategist, compliance-aware editor and fact checker, writing in the first person as the agent named in the request. The goal is not the most impressive-sounding article - it is the most useful, locally knowledgeable, credible, accurate and search-effective article possible: one the agent's clients and anyone who finds it on Google (buyers, sellers, neighbors - not other agents) can read start to finish and come away knowing what to do, where every factual statement survives a fact-check. Accuracy comes before writing quality.
 
 WHO YOU'RE WRITING FOR
-A smart reader who is NOT in real estate: a first-time buyer, a homeowner thinking about selling, someone moving to the area. Write the way the agent would explain it across a kitchen table to a client. Plain words first: when a real estate or tax term genuinely matters (days on market, sale-to-list ratio, seller assist, mortgage contingency, millage, conforming loan limit, jumbo loan, Agreement of Sale), explain it in a few words the first time it appears ("days on market - how long a home took to find a buyer"); otherwise use the everyday word. Never write for other agents: no industry shorthand, no valuation-method talk ("comparable adjustments", "a sound valuation works through...", "my valuation reports"), no talk about how the data was gathered ("homes checked", "records matched", "Census boundaries matched to MLS records", "the ledger", "our data") - just say what the numbers are and the date they're from. Every sentence says something concrete a reader can use - no vague filler ("the full selection at every price", "a range of options"). Turn numbers into meaning: after a key figure, add one plain sentence on what it means for the reader ("half of these homes sold within about a week, so a home you like may not wait for a second visit").
+A smart reader who is NOT in real estate: a first-time buyer, a homeowner thinking about selling, someone moving to the area. Write the way the agent would explain it across a kitchen table to a client. Plain words first: when a real estate or tax term genuinely matters (days on market, sale-to-list ratio, seller assist, mortgage contingency, millage, conforming loan limit, jumbo loan, Agreement of Sale), explain it in a few words the first time it appears ("days on market - how long a home took to find a buyer"); otherwise use the everyday word. Never write for other agents: no industry shorthand, no valuation-method talk ("comparable adjustments", "a sound valuation works through...", "my valuation reports"), no talk about how the data was gathered ("homes checked", "records matched", "Census boundaries matched to MLS records", "the ledger", "our data") - just say what the numbers are and the date they're from. Every sentence says something concrete a reader can use - no vague filler ("the full selection at every price", "a range of options"). The agent's About text is background, not copy: never turn it into a mission statement ("My work centers on careful valuation...", "My focus is making sure you understand...", "My goal with every buyer is...") - use a detail from it only when it is a concrete fact this reader cares about (they grew up in this town). Never write the same point twice in a row in different words. Turn numbers into meaning: after a key figure, add one plain sentence on what it means for the reader ("half of these homes sold within about a week, so a home you like may not wait for a second visit").
 
 A COMPLETE ARTICLE - NEVER A TEMPLATE
 This article is published as-is to the public. Never leave a blank, placeholder or note for the agent in it: no "$___", no "[insert ...]", no "[Median price for (area)]", no "(date)", no "TBD", no "add your numbers here", no section that tells the reader numbers are coming. Every heading must have real content under it. If the ledger has no figure for something, make the point in words or leave that point out - and if a whole section would be empty, drop the section. Ideas for what the agent could add go ONLY in review.improvements, never in the article.
 
 STRUCTURE THAT HELPS A READER
 The title and subtitle are what a reader scans in Google or on the blog page: the subtitle is one short, plain sentence (under 160 characters) about what the reader will learn - no township, county or school-district details there (those belong in the body). Open with the direct answer to the reader's question. When the topic is prices, values or the market and the ledger has dated MLS numbers, an early section gives them town by town in a short bulleted list (one line per town: median sale price, how fast homes sold, homes for sale - each line with what area it covers when that matters) followed by what the numbers mean for the reader. Keep sections focused; a reader should be able to skim the H2s and get the story. End the body with a short "bottom line" section - 2-4 sentences or 3 bullets on what the reader should actually do next - before the closing call to action.
+A share that comes from only part of the sales or listings (how buyers paid, listings that show a fee) always carries its count ("53% of the 88 sales that recorded how the buyer paid") - never as a share of the whole market. Name the towns before referring to them as a group ("these areas", "these towns"). A number that looks out of line with its neighbors gets its reason in the same sentence when the ledger gives it (a quarter-price far below the median sale price: say how much of that quarter is condos or townhomes). Compare towns only on the same footing: tax bills from different tax years go in separate sentences, each with its year - never ranked against each other. When the agent's video is in the article, the section it sits in says in one plain sentence what the video covers (from its title) and that it's just below.
+
+RULES, PROGRAMS AND DEADLINES - NAME THEM, NEVER SPELL THEM OUT
+Laws and contract rights, review or cancellation periods, disclosure rules, assistance programs (grants or loans), tax breaks, exemptions, credits and rebates, loan limits, insurance requirements - anything with eligibility conditions - change often, their conditions matter more than their headline number, and nobody re-checks a published article. So name it in one plain sentence and say what it does in general words ("Frederick County has down payment help for first-time buyers", "Delaware has a school-tax credit for some homeowners 65 and older", "Virginia law gives condo buyers a short window to review the association's documents and cancel"), say that conditions apply, link the official page when the ledger has it, and send the reader to the agent. NEVER state its dollar amounts, benefit percentages, income or age cut-offs, residency periods, day counts, deadlines, repayment terms or loan-limit figures - even when the ledger has them. Right after that sentence add an `ask_agent` block whose text names the topic in 2-6 words ("down payment help", "the senior school-tax credit") - the page shows a small "Ask [agent] about ..." line with call, text and email under it. At most 3 ask_agent blocks, never two in a row, none in the closing. NOT rules (state these normally, dated): the ledger's market numbers (prices, days on market, homes for sale, fees, what sold), this week's dated mortgage rate, the usual transfer-tax percentage and who customarily pays it ("confirm the exact amount at settlement"), and plain explanations of how something works (what a rent-back or a reserve study is).
+A one-level home means one floor - never imply step-free entry or an elevator unless the ledger says so. Association records (board minutes, reserve study, budget): tell the reader to ask for them early - never promise they come with the resale package.
 
 EVIDENCE - THE ONLY SOURCE OF FACTS
-The request contains an EVIDENCE LEDGER: numbered items [E1], [E2]... each with its source and date. Every statistic, price, count, date, rate, tax figure, school or district statement, named place, business, park or station, and every statement about market conditions must come from a ledger item or from the agent's own brief. Never use a second-hand figure (a news site "citing" Freddie Mac) when the primary figure is in the ledger, and never talk about your own sourcing in the article ("I haven't confirmed...", "my research shows"). If a point would benefit from a fact that is not in the ledger, leave it out, make the point qualitatively, or tell the reader what to verify - never invent, estimate or "round into" a figure. Never turn an assumption into a fact. In `claims`, list every factual sentence with the ledger ids it rests on.
+The request contains an EVIDENCE LEDGER: numbered items [E1], [E2]... each with its source and date. Every statistic, price, count, date, rate, tax figure, school or district statement, named place, business, park or station, and every statement about market conditions must come from a ledger item or from the agent's own brief. Never use a second-hand figure (a news site "citing" Freddie Mac) when the primary figure is in the ledger, and never talk about your own sourcing in the article ("I haven't confirmed...", "my research shows", "as the 2020 version of the code reads; current law may differ") - cite a law by its name and what it says; if the ledger's copy of a rule may be out of date, tell the reader to confirm the current rule with their attorney or settlement company, without saying which copy you read. If a point would benefit from a fact that is not in the ledger, leave it out, make the point qualitatively, or tell the reader what to verify - never invent, estimate or "round into" a figure. Never turn an assumption into a fact. In `claims`, list every factual sentence with the ledger ids it rests on.
 
 CONFIDENCE
-Bright MLS / agent data, government, school-district, Census and Freddie Mac items are VERIFIED - state them plainly. Third-party estimates (Zillow, Redfin, Realtor.com, news, directories) are LIKELY - attribute them ("Zillow's June 2026 estimate puts..."). Anything weaker is UNVERIFIED - leave it out.
+Bright MLS / agent data, government, school-district, Census and Freddie Mac items are VERIFIED - state them plainly. Third-party estimates (Zillow, Redfin, Realtor.com, news, directories) are LIKELY - attribute them ("Zillow's June 2026 estimate puts..."). Anything weaker is UNVERIFIED - leave it out. Trip planners (Rome2rio, Moovit) are never a source for travel times or fares - use the transit agency's item or leave the number out.
 
 DATES
 Anything that changes over time (prices, inventory, days on market, rates, taxes, programs, rules) carries its date or window from the ledger: "In the 90 days ending September 9, 2026..." / "Freddie Mac's survey for the week of September 25, 2026...". Never make stale information sound current. Prefer numbers to adjectives, but one sale or one month never proves a trend - use transactions as examples, not universal evidence.
@@ -119,7 +124,7 @@ ELEMENTS ADDED AROUND YOUR TEXT
 The request lists cards the system inserts into the article (Town Spotlight cards, a payment example, the agent's video, the neighborhood-guide links, a Sources list). They are real - you may point to them in one short sentence ("the payment example below"), but never repeat their numbers in full or describe what a video shows beyond its title.
 
 BEFORE YOU SUBMIT
-Read it as a buyer or seller who has never worked in real estate: is every term they wouldn't know explained or replaced? does any sentence sound like it was written for another agent? is there any blank, bracket or placeholder anywhere? does every heading have real content under it? is there a clear bottom line and a reason to contact the agent? Then audit every factual sentence: is it in the ledger? current and dated? specific enough? does each town's township/district match its geography item? are overlapping areas added together? is under-contract inventory called for sale? is a loan rule missing its loan type? any absolute word the ledger doesn't support? opinion dressed as fact? fair-housing sensitive? invented agent involvement? stale number? implied causation? Fix it, then submit.
+Read it as a buyer or seller who has never worked in real estate: is every term they wouldn't know explained or replaced? does any sentence sound like it was written for another agent? is there any blank, bracket or placeholder anywhere? does every heading have real content under it? does "these areas" ever come before the areas are named? does every surprising number carry its reason? is there a clear bottom line and a reason to contact the agent? Then audit every factual sentence: is it in the ledger? current and dated? specific enough? does each town's township/district match its geography item? are overlapping areas added together? is under-contract inventory called for sale? is a loan rule missing its loan type? any absolute word the ledger doesn't support? opinion dressed as fact? fair-housing sensitive? invented agent involvement? stale number? implied causation? Fix it, then submit.
 
 FORMAT
 You may use **double asterisks** for occasional bold emphasis inside paragraphs. Deliver the article ONLY by calling the submit_blog_article tool, exactly once."""
@@ -130,6 +135,29 @@ Use Pennsylvania terms and practice: Agreement of Sale, mortgage contingency, in
 }
 _STATE_DEFAULT = """STATE PRACTICE
 Use the terminology and practices of the agent's state. Don't import other states' procedures, and avoid state-specific legal claims that aren't in the ledger."""
+
+
+_COVERAGE = (
+    # (what the brief says, what research should verify, what the writer should cover)
+    (re.compile(r"downsiz|empty[- ]?nest|retir|55\+|smaller home|right[- ]?siz|senior|buy smaller", re.I),
+     "This is a DOWNSIZING article. Make sure the evidence covers, from official sources for the ARTICLE'S state and county: property-tax "
+     "relief for older homeowners (who qualifies, income limits, the amount and the deadline - e.g. Pennsylvania's Property Tax/Rent "
+     "Rebate Program from revenue.pa.gov; for another state, its own revenue or tax agency's program and any county senior credit); "
+     "how any homestead exclusion or credit works once approved (whether it stays in place and what changes each year); and what a "
+     "post-settlement occupancy (rent-back) agreement is in that state's standard sales contract.",
+     "A downsizing reader also expects: how to avoid moving twice - a rent-back (staying in the sold home for a set time after "
+     "settlement, under a written agreement) and a bridge loan (a short-term loan against the current home), one plain sentence each, "
+     "no rates or terms the ledger doesn't give; what smaller homes look like here - condos and townhomes, one-level homes, manufactured "
+     "homes (check whether the land is owned or leased) and 55+ communities, with the ledger's counts and prices; and the state's or "
+     "county's tax relief for older homeowners, NAMED only (no amounts, income limits, ages or residency periods) with an ask_agent line."),
+)
+
+
+def _coverage(brief: dict, part: int) -> str:
+    """The research (part 1) or writer (part 2) checklist for this kind of article (11/01: a downsizing
+    article skipped rent-backs, one-floor living, 55+ communities and senior tax relief)."""
+    said = " ".join(str(brief.get(k) or "") for k in ("topic", "goal", "key_points")) + " " + " ".join(brief.get("audiences") or [])
+    return "\n".join(c[part] for c in _COVERAGE if c[0].search(said))
 
 
 def _writer_system(state: Optional[str]) -> str:
@@ -194,6 +222,9 @@ Rules:
 - Use the web_search tool. Prefer, in order: county/municipal government, school district websites, state/federal government (Census), Freddie Mac / Federal Reserve, Bright MLS / brokerage research, established real estate data providers, reputable local journalism. Never rely on random blogs, SEO listicles or AI-generated pages when a primary source exists.
 - Every item must be a fact you actually read on the page you cite, with its number, geography and date window. If two sources disagree, report the more authoritative one and say so in the claim.
 - A claim states ONLY what that page says. Your own reasoning, advice, caveats or context ("so confirm each property's municipality", "Villanova and Wayne lie partly in...") never goes in a claim - put caveats in `note`. Never state which township, county or school district a town lies in unless the cited page says exactly that for that town; the TOWNS section already gives the verified split.
+- Train, bus and ferry times and fares come only from the transit agency's own schedule or fare pages (NJ Transit, SEPTA, MARC, VRE, WMATA, DART, Amtrak for Amtrak trains) - never trip planners or aggregators (Rome2rio, Moovit, Wanderu); name the line and the stations.
+- Never cite a political party, caucus or campaign site (a "House Democrats" or "Senate Republicans" page) - find the same fact on the government agency's own page or a news report.
+- Laws and regulations come from the CURRENT official code or agency page (the state legislature's code site, e.g. law.lis.virginia.gov, legis.delaware.gov, mgaleg.maryland.gov, njleg.state.nj.us, legis.state.pa.us) - never an archived or dated copy (a 2020 code edition, a law firm's old summary); cite the section and say if it was renumbered or replaced.
 - Keep geography exact: postal town vs township/municipality vs county vs school district vs ZIP. If a fact is for a township or county rather than the town, say which.
 - Loan and program rules: keep the loan type and any conditions with the rule (e.g. "on PHFA's conventional Keystone Home Loan, ..."), never a bare "buyers must...".
 - Schools: districts, boundaries, budgets, millage, official policies - never rankings or opinions unless attributed to a named source.
@@ -217,7 +248,7 @@ _REVIEW_TOOL = {
         "issues": {"type": "array", "items": {"type": "object", "properties": {
             "kind": {"type": "string", "enum": ["unsupported_claim", "wrong_number", "stale_data", "wrong_geography", "market_definition", "overgeneralization",
                                                 "fair_housing", "school_language", "invented_experience", "causation", "legal_tax", "generic_ai_phrasing",
-                                                "repetition", "placeholder", "reader_voice", "other"]},
+                                                "repetition", "placeholder", "reader_voice", "rule_detail", "other"]},
             "severity": {"type": "string", "enum": ["high", "medium", "low"]},
             "quote": {"type": "string"},
             "problem": {"type": "string"},
@@ -229,16 +260,21 @@ _REVIEW_TOOL = {
         }, "required": ["accuracy", "local_specificity", "usefulness", "voice", "readability", "seo", "compliance"]},
         "summary": {"type": "string"},
         "improvements": {"type": "array", "items": {"type": "string"}},
-    }, "required": ["claims", "issues", "scores", "summary", "improvements"]},
+        "rules_mentioned": {"type": "array", "description": "Every law, contract right, program, tax break, exemption, credit, loan limit or "
+                            "deadline the article names (after your fixes).", "items": {"type": "object", "properties": {
+            "name": {"type": "string"}, "official_source": {"type": "string", "description": "The ledger's official URL for it, if any."}},
+            "required": ["name"]}},
+    }, "required": ["claims", "issues", "scores", "summary", "improvements", "rules_mentioned"]},
 }
 
 _REVIEW_SYSTEM = """You are the fact-check and compliance editor for a licensed real estate agent's blog - strict, specific and fair. You receive the EVIDENCE LEDGER the writer was allowed to use, the agent's brief, and the finished ARTICLE.
 
 1. In `claims`, list every factual claim (numbers, dates, places, businesses, schools/districts, market statements, rates, taxes, statements about the agent's experience), quoted exactly, with the ledger ids that support it and a verdict: supported (the ledger says it - same number, date window and geography), partly_supported (right idea but a detail is off, unattributed or undated), unsupported (not in the ledger or brief), stale (the ledger date is too old to state as current), analysis (clearly labeled interpretation - fine).
-2. In `issues`, report every problem: unsupported_claim, wrong_number, stale_data, wrong_geography (check EVERY statement about which township, county or school district a town is in against that town's `geography` ledger items - a township or district they don't list is wrong even if another ledger item says it; ZIP vs township confusion; assuming one district; one town's split applied to another), market_definition (areas' counts added together or treated as separate when an Overlap item says they share homes; homes under contract or pending called "for sale"; an area's numbers described as something other than its Definition item; a small sample stated without its caveat; a year-ago comparison the ledger marks unreliable), overgeneralization (a rule stated for everyone that the ledger gives for one loan type, program or place - "buyers with under 20% down must get mortgage insurance" is conventional-only; must/always/never/required/all without a ledger item saying exactly that), fair_housing (protected classes, steering, "family", "safe", "perfect for..."), school_language (any subjective school/district wording), invented_experience (agent involvement, buyer/seller side, clients, years or volume not in the brief - but an opinion or observation the agent wrote in the brief, framed as theirs ("In my experience, ..."), is supported by the brief and must stay framed as theirs; flag it only when it is stated as a general fact), causation (unsupported cause-and-effect), legal_tax (definitive legal/tax advice, advising to waive contingencies), generic_ai_phrasing (filler, hype, cliches like nestled/vibrant/dream home/hidden gem/navigating), repetition, placeholder (any blank, bracketed template text, "$___", "(area)", "(date)", "[insert ...]", "TBD" or note to the agent - the article is published to the public as-is: fill it from the ledger or delete it with ""), reader_voice (the article is for the agent's clients and the public, not other agents: insider jargon left unexplained - days on market, sale-to-list, seller assist, millage, conforming limit, jumbo, contingency - wording aimed at agents, valuation-method talk, or talk about how the data was gathered such as "homes checked" or "records matched": rewrite in plain words a buyer or seller would use, same facts), other.
+2. In `issues`, report every problem: unsupported_claim, wrong_number, stale_data, wrong_geography (check EVERY statement about which township, county or school district a town is in against that town's `geography` ledger items - a township or district they don't list is wrong even if another ledger item says it; ZIP vs township confusion; assuming one district; one town's split applied to another), market_definition (areas' counts added together or treated as separate when an Overlap item says they share homes; homes under contract or pending called "for sale"; an area's numbers described as something other than its Definition item; a small sample stated without its caveat; a year-ago comparison the ledger marks unreliable), overgeneralization (a rule stated for everyone that the ledger gives for one loan type, program or place - "buyers with under 20% down must get mortgage insurance" is conventional-only; must/always/never/required/all without a ledger item saying exactly that), fair_housing (protected classes, steering, "family", "safe", "perfect for..."), school_language (any subjective school/district wording), invented_experience (agent involvement, buyer/seller side, clients, years or volume not in the brief - but an opinion or observation the agent wrote in the brief, framed as theirs ("In my experience, ..."), is supported by the brief and must stay framed as theirs; flag it only when it is stated as a general fact), causation (unsupported cause-and-effect), legal_tax (definitive legal/tax advice, advising to waive contingencies), generic_ai_phrasing (filler, hype, cliches like nestled/vibrant/dream home/hidden gem/navigating), repetition, rule_detail (a law, contract right, deadline, program, tax break, exemption, credit, rebate or loan limit stated WITH its amounts, benefit percentages, income or age cut-offs, residency periods, day counts, deadlines, repayment terms or loan-limit figures - the article may only name it and what it does in general words: replace the detail with one sentence that names it, says conditions apply and sends the reader to the agent; keep any "Ask" line under it; the usual transfer-tax percentage, who customarily pays it and a dated mortgage rate are allowed), placeholder (any blank, bracketed template text, "$___", "(area)", "(date)", "[insert ...]", "TBD" or note to the agent - the article is published to the public as-is: fill it from the ledger or delete it with ""), reader_voice (the article is for the agent's clients and the public, not other agents: insider jargon left unexplained - days on market, sale-to-list, seller assist, millage, conforming limit, jumbo, contingency - wording aimed at agents, valuation-method talk, or talk about how the data was gathered such as "homes checked" or "records matched", talk about which copy of a law or source was read ("as the 2020 code reads; current law may differ"), or a mission statement lifted from the agent's About text ("My work centers on careful valuation"): rewrite in plain words a buyer or seller would use, same facts), other.
 3. Give every issue a minimal fix: `find` = an exact, verbatim substring of the ARTICLE text (copy it character for character, long enough to be unique, inside one sentence or list item), `replace` = the corrected text (qualify, attribute, add the date, soften, correct it from the ledger, or "" to delete). Never add a fact that isn't in the ledger. Keep any [anchor](url) link markup intact in your replacement unless the link itself is the problem. Every item under AUTOMATED CHECKS is a confirmed problem - each needs an issue with a fix. The elements listed under INSERTED ELEMENTS are real parts of the article - a sentence pointing to them is not an unsupported claim. A figure the ledger only has second-hand (a news site "citing" the primary source) or marks as unconfirmed gets DELETED, not hedged, when the primary figure is also present. The article must never talk about its own sourcing ("I haven't confirmed...", "according to my research", "the ledger") - fix those by deleting or rewriting.
 4. Score 1-10 - honestly, a 9-10 must be earned: accuracy, local_specificity (could only have been written about this place), usefulness (answers the reader's real question), voice (sounds like a knowledgeable local agent talking to a client, not AI and not agent-to-agent), readability (a buyer or seller with no real estate background can follow it), seo, compliance.
 5. `summary`: 1-2 plain sentences for the agent. `improvements`: up to 4 specific things the agent could add (their own experience, a photo, a number they have) to make it stronger.
+6. `rules_mentioned`: every law, contract right, deadline, program, tax break, exemption, credit, rebate or loan limit the article names (after your fixes) - the transfer tax and a first-time-buyer transfer-tax break count - each with the ledger's official URL when it has one. An empty list only when the article names none.
 
 Respond only by calling submit_review, exactly once."""
 
@@ -547,9 +583,21 @@ def place_payment_example(blocks: list[dict], ex: dict) -> list[dict]:
     heads = [i for i, b in enumerate(blocks) if b.get("type") == "heading"]
     card = {"id": writer._bid("payment_example"), "type": "payment_example", "data": ex}
     at = None
+
+    def plain(b: dict) -> str:
+        d = b.get("data") or {}
+        return re.sub(r"<[^>]+>", " ", " ".join(str(x) for x in [d.get("html") or d.get("text") or ""] + list(d.get("items") or [])))
+    # The section whose text points to the card ("the payment example below") gets it (11/01
+    # Frederick: the card went after "What starter homes ... cost" while the text pointing to it
+    # sat a section later); else the first section with a cost/mortgage heading.
     for n, h in enumerate(heads[:-1]):
-        text = re.sub(r"<[^>]+>", " ", str((blocks[h].get("data") or {}).get("html") or ""))
-        if _COST_HEADING.search(text):
+        if any(re.search(r"payment example", plain(b), re.I) for b in blocks[h + 1:heads[n + 1]]):
+            at = heads[n + 1]
+            break
+    for n, h in enumerate(heads[:-1]):
+        if at is not None:
+            break
+        if _COST_HEADING.search(plain(blocks[h])):
             at = heads[n + 1]
             break
     if at is None:
@@ -713,6 +761,17 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
     # --- 1. What we already know (free) ---------------------------------------------------
     areas = await tk.find_areas(db, slugs=list(brief.get("area_slugs") or []), names=list(brief.get("areas") or []), state=state)
     areas = areas[:4]
+    # The article's towns decide the state, not the agent's profile: 11/01 a PA agent writing about
+    # Frederick, MD would otherwise get Pennsylvania's transfer tax, programs and research.
+    town_states = {(a.state or "").upper() for a in areas if a.state}
+    # Towns outside every state the agent works in (their own state + their served towns'): the
+    # article never claims local experience there, but keeps the agent's chosen closing - owner
+    # 11/01: a showing request is still the lead they want (they can refer it to a local agent).
+    agent_states = {(getattr(user, "state", None) or "").upper()} | {(a.state or "").upper() for a in await _served_areas(db, user, 50)}
+    agent_states.discard("")
+    out_of_area = sorted(town_states - agent_states) if town_states and agent_states and not (town_states & agent_states) else []
+    if len(town_states) == 1:
+        state = next(iter(town_states))
     # A general article ("buying a home in the Philly suburbs", "PA closing costs") names no town:
     # the agent's own served towns become REGIONAL context - a few dated market numbers and the
     # basics per town for examples - and research focuses on state/county-level facts instead.
@@ -732,7 +791,7 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
         # article had no median price or days on market for any town and the writer left a
         # fill-in-the-blanks box instead.
         for d in dossiers:
-            mls_items = [i for i in d["items"] if i["origin"] == "mls_live"][:10]
+            mls_items = [i for i in d["items"] if i["origin"] == "mls_live"][:16]
             d["items"] = ([i for i in d["items"] if i["origin"] == "geo_verified"] + mls_items
                           + [i for i in d["items"] if i["origin"] != "mls_live" and i["topic"] in ("schools", "transit", "downtown")][:6])
     known_items = [it for d in dossiers for it in d["items"]]
@@ -837,6 +896,7 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
         + "\nTOWNS:\n" + ("\n\n".join(town_lines) if town_lines else "(no towns with stored research)")
         + (f"\n\nTowns with NO stored research (research their basics: municipality/township, county, school district(s), rail/transit, downtown): {', '.join(unknown_towns)}" if unknown_towns else "")
         + f"\n\nYOUR TASK: {task}{general}{rates_note}"
+        + (f"\n\n{_coverage(brief, 1)}" if _coverage(brief, 1) else "")
     )
     tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": int(spec["research_searches"]),
               "user_location": {"type": "approximate", "region": "Pennsylvania" if state == "PA" else state, "country": "US"}},
@@ -929,6 +989,11 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
     write_msg = (
         f"{brief_msg}\n\nToday's date: {today}.\n"
         + "\nINSERTED ELEMENTS (added around your text automatically):\n" + "\n".join(f"- {x}" for x in inserted) + "\n"
+        + (f"\nWHAT THIS READER EXPECTS: {_coverage(brief, 2)}\n" if _coverage(brief, 2) else "")
+        + (f"\nOUTSIDE THE AGENT'S AREA: the agent works in {', '.join(sorted(agent_states))}; this article's towns are in {', '.join(out_of_area)}. "
+           "Never claim to live, work or have sold homes there, and never invent local experience. Keep the closing the agent chose "
+           "(a showing request, a home value, a question) - the agent arranges it, personally or through a trusted local agent; you may "
+           "say that in one plain clause.\n" if out_of_area else "")
         + ("This is a REGIONAL article, not about one town. The town items in the ledger are the agent's service area - use a few as concrete, dated examples where they genuinely help the reader; never force town names in or imply one town represents the region.\n" if regional else "")
         + f"\n== EVIDENCE LEDGER ({len(ledger)} items - the only facts you may use; cite ids in `claims`) ==\n{ledger_text}"
         + (f"\n\nResearch could not verify (do not state these): {'; '.join(not_found[:8])}" if not_found else "")
@@ -1111,6 +1176,11 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
         "agent_claims": [x for x in writer._coerce(writer_review.get("agent_specific_claims"), list) if isinstance(x, str)][:8],
         "image_ideas": [x for x in writer._coerce(writer_review.get("image_ideas"), list) if isinstance(x, dict)][:5],
         "numbers_to_verify": writer.number_audit(full_text, source_text),
+        # Laws, programs and deadlines the article names - the agent checks each against its official
+        # page before publishing (the article never spells out their terms).
+        "out_of_area": out_of_area,
+        "rules_to_check": [{"name": str(r.get("name"))[:120], "source": r.get("official_source") or None}
+                           for r in writer._coerce(review.get("rules_mentioned"), list) if isinstance(r, dict) and r.get("name")][:8],
     }
     return {
         "title": (article.get("title") or "").strip()[:200],
@@ -1143,7 +1213,9 @@ _STATE_PACK_TASK = {
            "(3) the Pennsylvania Real Estate Seller Disclosure Law (what sellers must disclose, the Seller's Property Disclosure Statement); "
            "(4) Pennsylvania settlement basics (title insurance is customary, who typically pays what); "
            "(6) property tax basics in Montgomery, Delaware and Chester counties (millage, reassessment status) with sources; "
-           "(7) Pennsylvania homestead/farmstead exclusion basics. Use the town value 'general' for every item."),
+           "(7) Pennsylvania homestead/farmstead exclusion basics (who applies, the March 1 deadline, whether it stays in place once approved, what changes each year); "
+           "(8) the Pennsylvania Property Tax/Rent Rebate Program for older homeowners (who qualifies, income limit, maximum rebate, deadline); "
+           "(9) post-settlement occupancy (rent-back) in the standard Pennsylvania Agreement of Sale. Use the town value 'general' for every item."),
 }
 
 

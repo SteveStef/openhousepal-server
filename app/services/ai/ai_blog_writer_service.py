@@ -85,7 +85,7 @@ HARD RULES - never break these:
 1. NO FABRICATED FACTS. Every number (prices, percentages, days on market, inventory, rates, dates, counts, rankings, school ratings, tax figures, HOA fees) must come from the AGENT BRIEF or REAL DATA sections of the request. If a point would benefit from a statistic you were not given, make the point qualitatively or tell the reader what to ask about - never invent or estimate a figure. Do not invent quotes, clients, stories, awards, years of experience, how long the agent has worked an area, sales volume, credentials, or the age/history of homes and neighborhoods. Mortgage rates, market predictions and legal/tax specifics: speak generally and suggest the reader confirm with the right professional.
 2. PLACES. You may mention the towns/areas the agent listed and widely known, long-standing geography you are highly confident about (town names, major roads, rail lines, large public parks). Never invent or name specific businesses, restaurants, events, developments or schools unless the agent named them.
 3. FAIR HOUSING / MLS ADVERTISING. Never reference or imply race, color, religion, sex, familial status, national origin, disability, sexual orientation, or age - of an area, a home, or who would or should live there. Do not use: "family"/"families"/"family-friendly", "perfect for", "ideal for [type of person]", "safe"/"safe neighborhood", "walking distance"/"walk to", "exclusive", "integrated", "traditional neighborhood", "bachelor", "empty nesters", "young professionals", "retirees", "his and hers", "master bedroom" (say "primary bedroom"), "crime", or any phrase steering a type of person toward or away from an area. Describe places, homes, amenities and the process - not the people who belong there. Schools may only be named as neutral, factual proximity if the agent named them.
-4. PUBLISHED AS-IS, FOR THE PUBLIC. The readers are the agent's clients and everyday buyers, sellers and neighbors - never other agents. Never leave a blank, bracket or placeholder ("$___", "[insert ...]", "(area)", "TBD") or a note to the agent anywhere; every heading needs real content under it - if you have nothing for a section, drop it. Use plain words, and explain any real estate term the first time it appears ("days on market - how long a home took to find a buyer").
+4. PUBLISHED AS-IS, FOR THE PUBLIC. The readers are the agent's clients and everyday buyers, sellers and neighbors - never other agents. Never leave a blank, bracket or placeholder ("$___", "[insert ...]", "(area)", "TBD") or a note to the agent anywhere; every heading needs real content under it - if you have nothing for a section, drop it. Use plain words, and explain any real estate term the first time it appears ("days on market - how long a home took to find a buyer"). Laws, contract deadlines, assistance programs, tax breaks, exemptions and loan limits: name them and say what they do in general words, say conditions apply, and send the reader to the agent - never their amounts, cut-offs, day counts or deadlines - then add an `ask_agent` block naming the topic in 2-6 words (at most 3, never in the closing).
 5. The agent's personal take / local story, when given, is the heart of the article - weave it in faithfully in their voice (you may lightly polish wording, never add facts to it). A pull-quote should be a faithful line from it.
 6. No hype words ("dream home", "stunning", "nestled", "boasts", "don't miss out"), no clickbait, no emojis, no hashtags. Write like a sharp local expert, not an ad.
 
@@ -126,8 +126,8 @@ _ARTICLE_TOOL = {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "type": {"type": "string", "enum": ["paragraph", "subheading", "bulleted_list", "numbered_list", "quote", "callout"]},
-                                    "text": {"type": "string", "description": "For paragraph/subheading/quote/callout."},
+                                    "type": {"type": "string", "enum": ["paragraph", "subheading", "bulleted_list", "numbered_list", "quote", "callout", "ask_agent"]},
+                                    "text": {"type": "string", "description": "For paragraph/subheading/quote/callout; for ask_agent, the topic in 2-6 words ('down payment help')."},
                                     "items": {"type": "array", "items": {"type": "string"}, "description": "For bulleted_list/numbered_list."},
                                 },
                                 "required": ["type"],
@@ -753,6 +753,14 @@ def place_video(blocks: list[dict], brief: dict) -> list[dict]:
     else:
         at = heads[0] if heads else min(1, len(blocks))
     block = {"id": _bid("youtube"), "type": "youtube", "data": {"url": v["url"], "title": v["title"]}}
+    # 11/01: the writer skipped its "watch the video below" line and the video sat between two
+    # sections with no context - say what it is when the section doesn't already.
+    start = max((h for h in heads if h < at), default=-1)
+    if not any(re.search(r"\b(video|watch)\b", text(b)) for b in blocks[start + 1:at]):
+        name = re.split(r"\s+[|\-–—]\s+", v["title"])[0].strip(" .:") if v["title"] else ""
+        # A pasted link may not be the agent's own video - never say "my video".
+        lead = f"For more on this, watch <em>{html.escape(name)}</em> just below." if name else "For more on this, watch the video just below."
+        return blocks[:at] + [{"id": _bid("paragraph"), "type": "paragraph", "data": {"html": lead}}, block] + blocks[at:]
     return blocks[:at] + [block] + blocks[at:]
 
 
@@ -939,6 +947,55 @@ def _convert_blocks(raw_blocks: list, links: Optional[set] = None) -> list[dict]
             text = b.get("text") or ""
             if text.strip():
                 out.append({"id": _bid(kind), "type": kind, "data": {"html": _rich(text, links if kind in ("paragraph", "callout") else None)}})
+        elif kind == "ask_agent":
+            out.append(_ask_block(_plain(b.get("text") or "")))
+    return out
+
+
+def _ask_block(topic: str = "") -> dict:
+    """The small "Ask [agent] about ..." line with Call / Text / Email under a sentence that sends the
+    reader to the agent (the page fills in the agent's name and contact)."""
+    topic = re.sub(r"\s+", " ", topic or "").strip(" .:-")[:60]
+    return {"id": _bid("ask_agent"), "type": "ask_agent", "data": {"topic": topic} if topic else {}}
+
+
+# A sentence that sends the reader to the agent - it gets an "Ask [agent]" line under it when the
+# writer didn't place one.
+_ASK_ME = re.compile(r"\b(ask me|I can (?:tell you|walk you|help you|check|confirm|go over|show you|look up|find out|point you)|"
+                     r"I'?ll (?:walk you|go over|check|look up|help you|tell you)|talk (?:it )?(?:over |through )?with me|reach out to me|"
+                     r"call me|text me|email me|send me (?:a|your))\b", re.I)
+
+
+def ask_agent_rows(blocks: list[dict], limit: int = 3) -> list[dict]:
+    """Body blocks (before the closing): keeps the writer's "Ask [agent]" lines (never two in a row,
+    one per section, `limit` in all) and adds one under any other sentence that sends the reader to the
+    agent, within the same caps."""
+    out: list[dict] = []
+    used = 0
+    section_has = False
+    for n, b in enumerate(blocks):
+        t = b.get("type")
+        if t == "heading":
+            section_has = False
+        if t == "ask_agent":
+            if used >= limit or section_has or (out and out[-1].get("type") == "ask_agent"):
+                continue
+            used += 1
+            section_has = True
+            out.append(b)
+            continue
+        out.append(b)
+        if used >= limit or section_has or t not in ("paragraph", "bulleted_list", "numbered_list", "callout"):
+            continue
+        nxt = blocks[n + 1] if n + 1 < len(blocks) else None
+        if nxt and nxt.get("type") == "ask_agent":
+            continue
+        d = b.get("data") or {}
+        text = re.sub(r"<[^>]+>", " ", " ".join([str(d.get("html") or "")] + [str(i) for i in d.get("items") or []]))
+        if _ASK_ME.search(text):
+            out.append(_ask_block())
+            used += 1
+            section_has = True
     return out
 
 
@@ -963,6 +1020,7 @@ def article_to_blocks(article: dict, default_label: str = "Contact Me", form_typ
         if heading:
             blocks.append({"id": _bid("heading"), "type": "heading", "data": {"html": _rich(heading)}})
         blocks.extend(body)
+    blocks = ask_agent_rows(blocks)
     closing = article.get("closing") or {}
     if closing.get("heading"):
         blocks.append({"id": _bid("heading"), "type": "heading", "data": {"html": _rich(closing["heading"])}})

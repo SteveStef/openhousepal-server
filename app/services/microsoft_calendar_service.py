@@ -264,6 +264,31 @@ async def delete_event(access_token: str, calendar_id: str, event_id: str) -> No
         raise
 
 
+async def event_state(access_token: str, calendar_id: str, event_id: str) -> tuple[Optional[bool], Optional[dict]]:
+    """(still there?, its start) in the neutral shape: {"dateTime": "<UTC>Z"} or {"date": "YYYY-MM-DD"}
+    for an all-day one. (False, None) = deleted; (None, None) = couldn't tell."""
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
+            r = await c.get(f"{_GRAPH}/me/calendars/{calendar_id}/events/{event_id}",
+                            headers={"Authorization": f"Bearer {access_token}", "Prefer": 'outlook.timezone="UTC"'},
+                            params={"$select": "id,isCancelled,isAllDay,start"})
+    except httpx.HTTPError:
+        return None, None
+    if r.status_code in (404, 410):
+        return False, None
+    if r.status_code >= 300:
+        return None, None
+    ev = r.json() if r.text else {}
+    if ev.get("isCancelled"):
+        return False, None
+    raw = str((ev.get("start") or {}).get("dateTime") or "")
+    if not raw:
+        return True, None
+    if ev.get("isAllDay"):
+        return True, {"date": raw[:10]}
+    return True, {"dateTime": raw.split(".")[0] + "Z"}
+
+
 async def event_exists(access_token: str, calendar_id: str, event_id: str) -> Optional[bool]:
     """True = still on the calendar, False = the agent deleted it (404/410), None = couldn't tell."""
     try:

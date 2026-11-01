@@ -204,6 +204,13 @@ def public_web_url(value: Optional[str]) -> Optional[str]:
     return v if v.lower().startswith(("http://", "https://")) else f"https://{v}"
 
 
+async def article_contact(db: AsyncSession, user: User) -> dict:
+    """Phone / texting number / email for an article's "Ask me about this" rows - the same contact
+    the agent's site footer and Agent Hub already show publicly."""
+    profile = await get_agent_profile(db, user)
+    return {"phone": profile.get("phone") or None, "text_phone": profile.get("text_phone") or None, "email": profile.get("email") or None}
+
+
 async def get_agent_profile(db: AsyncSession, user: User) -> dict:
     """Merges User (account-level fields) with AgentHub.config (bio/contact/social) - read-only,
     never writes to AgentHub. Agents without an Agent Hub still get a usable profile from just

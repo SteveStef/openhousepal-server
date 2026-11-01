@@ -59,10 +59,12 @@ Open House Kits in depth: building a kit (MLS and No-MLS), every document and it
 - Showcase invite email to guests without an agent goes out 1 hour after sign-in by default; change it in Tools → Email → "Showcase invite after your open house" → **Goes out** (Right away, 15 or 30 minutes after, 1 hour after).
 
 ## Visitors window
-- Counts: **Visitors**, **No agent**, **Has agent**; everyone grouped by day with email and phone.
+- Counts: **Visitors**, **No agent**, **Has agent**; everyone grouped by day with email and phone. Each visitor's name (computer) or **Lead** button (phone) opens their lead page.
 - **Star** (asks **Star Showcase too** or **Just the lead**), **Notes** (shared with their lead), **Activity** ("Everything they did on their Guest Pass" - e.g. Looked through the Similar Homes, Opened the Cheat Sheet, Asked for the seller disclosure, time on it, came back).
 - **Showcase for this visitor** (Premium/IDX, guests without an agent): ON builds their Showcase and schedules the invite; OFF cancels a waiting invite and turns their Showcase off. If the invite email is switched off in Tools → Email, no invite is sent. The same switch is on their Lead page.
 - **Opens list order:** an open house with a sign-in in the last week moves to the top, newest sign-in first.
+
+- From the chat: add a note on one guest (shows on their lead too), and share a hosted open house's guest names with the listing agent, or stop. No email goes out.
 
 ## Disclosure & Second Visits (MLS plans)
 - Requests from the Cheat Sheet QR or Guest Pass sit at the top of My Opens while waiting. Tabs **Upcoming** / **Past**. Each shows the source (Guest Pass or Cheat Sheet QR) and "Also wants disclosure" when asked.
@@ -77,6 +79,9 @@ Open House Kits in depth: building a kit (MLS and No-MLS), every document and it
 - Refusals: the day passed, under contract/off market, coming soon before it goes active ("Hosting once it's active"), that day already booked, you already host another open that day (one per day), or "Not Accepting Host Requests" (team-only or a different brokerage).
 - **My Requests**: Sent Requests, Team Requests (one tap to say yes - first to claim wins), Team Invites, Declined / Cancelled. **Accept New Time**, **Decline**, **Other time**, **Withdraw request** / **Can't host anymore?**. Each side can suggest another time only once; then it's yes or no.
 - Once approved it shows under "You're confirmed to host" on My Opens: **Open kit** ("Kit ready - use the same one") or **Build kit**. Guests who sign in on your kit are your leads.
+
+- From the chat: no Discovery search yet? The chat says so and shows a card to set one up - the center (your listings, your towns, or a place you name), how far (3-25 miles), a price range (from and up to) and bedrooms - and **Save my search** saves it to your Discovery page, the same filter the page uses. "Look around Wayne instead" changes it the same way.
+- From the chat: "what can I host near Malvern this Saturday?" lists homes from your Discovery search area (closest first) and says if that day is open. The chat can also withdraw a request or back out of one you're approved for, offer another time back once after the listing agent suggests one, and answer a team host ask yes or no. Yes as asked books it right away; a different time goes to them to approve; a team-wide ask needs no "no".
 
 ## Your own listings (Manager, MLS plans)
 - Listings where you're the MLS listing agent appear automatically (**Refresh Listings**). Counts: Scheduled, Needs host, Avg guests, Priority.
@@ -95,3 +100,7 @@ Open House Kits in depth: building a kit (MLS and No-MLS), every document and it
 - MLS plans can't type in a home by hand; No-MLS kits never get Similar Homes or a Cheat Sheet.
 - There's no button to type paper (Clipboard) sign-ins into Leads.
 - Can't mark a disclosure request as not done again once marked.
+
+## From the AI helper chat
+- "Make an open house kit for 12 Oak St" sets up a card: a small preview of the flyer's cover, then **Home** (their active listings, or the home they named), **Cover photo**, **In the kit** (QR sign-in sheet and flyer always; Similar Homes sheet and Cheat Sheet to check), **After they sign in** (Build each guest a Showcase, Guest Pass, follow-ups On / Not on my calendar / Off). **Build my kit** opens the Opens page and runs the kit maker with those choices (Similar Homes picked for them, the cover, the Cheat Sheet photos) and stops on **Review your kit** - they look it over and tap Save. At their own listing Similar Homes and guest Showcases start off, like the page.
+- Finding a guest: "a Matt from one of my open houses last week" - the helper searches every sign-in list at once (name, email or phone, how many days back) and shows the open house, the day they signed in and their lead page. Kits aren't dated, so the sign-in day is when they came.

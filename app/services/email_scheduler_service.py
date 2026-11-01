@@ -43,6 +43,12 @@ class EmailSchedulerService:
 
                 for email_record in due_emails:
                     try:
+                        # Re-read it right before sending: the batch was loaded a moment ago, and an
+                        # agent may have cancelled it since (owner, 11/01 - a guest's Showcase switched
+                        # off just as their invite came due must never still get the email).
+                        await db.refresh(email_record, ["status"])
+                        if email_record.status != "PENDING":
+                            continue
                         # Check if recipient is blacklisted
                         if await BlacklistService.is_blacklisted(db, email_record.recipient_email):
                             logger.info(f"Skipping blacklisted email {email_record.id} for {email_record.recipient_email}")

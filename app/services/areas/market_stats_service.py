@@ -481,15 +481,20 @@ async def get_area_sales_snapshot(db: AsyncSession, scope: dict, days: int = 90)
 
     async def window(start: date, stop: date) -> dict:
         rows = (await db.execute(
-            select(Property.raw_mls_data["ClosePrice"].astext, Property.raw_mls_data["ListPrice"].astext, Property.raw_mls_data["DaysOnMarket"].astext)
+            select(Property.raw_mls_data["ClosePrice"].astext, Property.raw_mls_data["ListPrice"].astext, Property.raw_mls_data["DaysOnMarket"].astext,
+                   Property.home_type)
             .where(*base, close_date > start.isoformat(), close_date <= stop.isoformat())
         )).all()
         prices, ratios, doms = [], [], []
-        for cp, lp, dom in rows:
+        by_type: dict[str, list[float]] = {"condo": [], "townhouse": [], "house": []}
+        for cp, lp, dom, home_type in rows:
             cpv = _num(cp)
             if not cpv or cpv < geography.MIN_PLAUSIBLE_SALE_PRICE:
                 continue
             prices.append(cpv)
+            kind = {"CONDO": "condo", "TOWNHOUSE": "townhouse", "SINGLE_FAMILY": "house", "Single Family": "house"}.get(home_type)
+            if kind:
+                by_type[kind].append(cpv)
             lpv = _num(lp)
             if lpv and lpv > 0:
                 ratios.append(cpv / lpv)
@@ -503,6 +508,11 @@ async def get_area_sales_snapshot(db: AsyncSession, scope: dict, days: int = 90)
             out["median_sale_to_list_pct"] = round(_median(ratios) * 100, 1)
         if doms:
             out["median_days_on_market"] = round(_median(doms))
+        # What each kind of home sold for (11/01 Arlington condo article: the only sold median mixed
+        # in $1.5M houses, so the writer reached for a news site's one-month condo average).
+        types = {k: {"count": len(v), "median_close_price": round(_median(v))} for k, v in by_type.items() if len(v) >= 5}
+        if len(types) > 1:
+            out["by_type"] = types
         return out
 
     current = await window(end - timedelta(days=days), end)
@@ -537,6 +547,37 @@ async def get_area_sales_snapshot(db: AsyncSession, scope: dict, days: int = 90)
     }
 
 
+def _one_level(levels) -> bool:
+    """Bright's Levels field (["1"], ["2.5"], "1") - a one-level home or condo unit."""
+    vals = levels if isinstance(levels, list) else [levels]
+    return any(str(v).strip() in ("1", "1.0") for v in vals if v is not None)
+
+
+def _home_mix(homes: list[dict]) -> dict:
+    """What kinds of homes are for sale - what a downsizer or first-time buyer is really shopping
+    for: condos/townhomes vs single-family houses (count + median list price), how much of the
+    lowest-priced quarter is condos/townhomes (11/01: Wayne's quarter-price of $296K next to an
+    $876K median sale read as a typo without it), one-level homes, and 55+ communities."""
+    if len(homes) < 8:
+        return {}
+    out: dict = {"homes": len(homes)}
+    for key in ("attached", "house", "one_level", "manufactured"):
+        group = [h["price"] for h in homes if h[key]]
+        out[key] = {"count": len(group), "median": round(_median(group)) if len(group) >= 5 else None}
+    prices = sorted(h["price"] for h in homes)
+    pos = 0.25 * (len(prices) - 1)  # same interpolation as percentile_cont in the sales snapshot
+    lo = int(pos)
+    p25 = prices[lo] + (prices[min(lo + 1, len(prices) - 1)] - prices[lo]) * (pos - lo)
+    low = [h for h in homes if h["price"] <= p25]
+    out["low_quarter"] = {"count": len(low), "attached": sum(1 for h in low if h["attached"])}
+    recorded = [h for h in homes if h["senior"] is not None]
+    # Only when most listings fill the field in - otherwise "none in a 55+ community" could just be blanks.
+    if len(recorded) >= 0.6 * len(homes):
+        senior = [h["price"] for h in recorded if h["senior"]]
+        out["senior"] = {"count": len(senior), "median": round(_median(senior)) if len(senior) >= 5 else None}
+    return out
+
+
 def _fee_monthly(fee: Optional[float], freq: Optional[str]) -> Optional[float]:
     if not fee or fee <= 0:
         return None
@@ -566,34 +607,69 @@ async def get_area_cost_profile(db: AsyncSession, scope: dict) -> dict:
     rows = (await db.execute(
         select(Property.price, Property.township, Property.home_type, Property.raw_mls_data["TaxAnnualAmount"].astext,
                Property.raw_mls_data["TaxYear"].astext, Property.raw_mls_data["AssociationFee"].astext,
-               Property.raw_mls_data["AssociationFeeFrequency"].astext)
+               Property.raw_mls_data["AssociationFeeFrequency"].astext, Property.raw_mls_data["Levels"],
+               Property.raw_mls_data["SeniorCommunityYN"].astext, Property.raw_mls_data["AssociationFee2"].astext,
+               Property.raw_mls_data["AssociationFee2Frequency"].astext, Property.raw_mls_data["AssociationFeeIncludes"],
+               Property.raw_mls_data["StructureDesignType"].astext)
         .where(location_filter, resid, Property.home_status.in_(FOR_SALE_STATUSES))
     )).all()
-    taxes, ratios, years, hoa = [], [], Counter(), []
+    taxes, ratios, years, homes = [], [], Counter(), []
+    fees: dict[str, list[float]] = {"CONDO": [], "TOWNHOUSE": []}
+    covers: Counter = Counter()
     by_town: dict[str, list[float]] = {}
-    for price, township, home_type, tax, tax_year, fee, freq in rows:
+    for price, township, home_type, tax, tax_year, fee, freq, levels, senior, fee2, freq2, includes, structure in rows:
         tax_v, price_v = _num(tax), _num(price)
         if tax_v and tax_v > 100 and price_v and price_v >= geography.MIN_PLAUSIBLE_SALE_PRICE:
-            taxes.append(tax_v)
+            year = str(tax_year)[:4] if tax_year else None
+            taxes.append((tax_v, year))
             ratios.append(tax_v / price_v)
-            if tax_year:
-                years[str(tax_year)[:4]] += 1
+            if year:
+                years[year] += 1
             if township:
                 by_town.setdefault(str(township).strip().title(), []).append(tax_v / price_v)
         if home_type in ("CONDO", "TOWNHOUSE"):
-            monthly = _fee_monthly(_num(fee), freq)
-            if monthly:
-                hoa.append(monthly)
+            # Bright keeps a condo's fee in AssociationFee2 (11/01 Arlington: 336 of 346 condos) and a
+            # community HOA in AssociationFee - reading only the first left condos out of the median.
+            parts = [m for m in (_fee_monthly(_num(fee), freq), _fee_monthly(_num(fee2), freq2)) if m]
+            if parts:
+                fees[home_type].append(sum(parts))
+                for c in (includes if isinstance(includes, list) else []):
+                    if c and str(c).strip().lower() not in ("none", "other", "see remarks"):
+                        covers[(home_type, str(c).strip())] += 1
+        if price_v and price_v >= geography.MIN_PLAUSIBLE_SALE_PRICE:
+            # 11/01 grader: Rehoboth's "one-level homes" median mixed in manufactured homes (often on
+            # leased land, with lot rent and different financing) - they're counted on their own.
+            manufactured = "manufactured" in str(structure or "").lower()
+            homes.append({"price": price_v, "attached": home_type in ("CONDO", "TOWNHOUSE"), "manufactured": manufactured,
+                          "house": home_type in ("SINGLE_FAMILY", "Single Family") and not manufactured,
+                          "one_level": _one_level(levels) and not manufactured,
+                          "senior": None if senior in (None, "") else str(senior).lower() == "true"})
     out: dict = {"homes_for_sale": len(rows), "as_of": date.today().isoformat()}
     if len(taxes) >= 5:
+        # One tax year per town (11/01: Villanova's median mixed 2025 and 2026 bills next to towns
+        # on 2026): the newest year with 5+ listings and a quarter of the bills (Frederick: 9 bills
+        # marked 2027 out of hundreds), else every bill labeled with the usual year.
+        newest = max((y for y, n in years.items() if n >= max(5, 0.25 * len(taxes))), default=None)
+        bills = [t for t, y in taxes if y == newest] if newest else [t for t, _ in taxes]
         out["tax"] = {
-            "homes": len(taxes), "median_annual": round(_median(taxes)), "median_pct_of_list": round(_median(ratios) * 100, 2),
-            "tax_year": years.most_common(1)[0][0] if years else None,
+            "homes": len(bills), "median_annual": round(_median(bills)), "median_pct_of_list": round(_median(ratios) * 100, 2),
+            "tax_year": newest or (years.most_common(1)[0][0] if years else None),
             "by_township": sorted(({"township": t, "homes": len(v), "median_pct_of_list": round(_median(v) * 100, 2)}
                                    for t, v in by_town.items() if len(v) >= 5), key=lambda r: -r["homes"]),
         }
-    if len(hoa) >= 5:
-        out["hoa"] = {"homes": len(hoa), "median_monthly": round(_median(hoa))}
+    hoa = {}
+    listed = {"CONDO": sum(1 for r in rows if r[2] == "CONDO"), "TOWNHOUSE": sum(1 for r in rows if r[2] == "TOWNHOUSE")}
+    for kind, vals in fees.items():
+        # A fee median needs 10+ listings that show a fee, and says how many of the listings that is.
+        if len(vals) >= 10:
+            top = [(c, round(n * 100 / len(vals))) for (k, c), n in covers.most_common() if k == kind and n * 2 >= len(vals)][:6]
+            hoa[kind.lower()] = {"homes": len(vals), "of": listed[kind], "median_monthly": round(_median(vals)), "covers": top}
+    if hoa:
+        out["hoa"] = hoa
+    mix = _home_mix(homes)
+    if mix:
+        mix["homes"] = len(rows)  # the same count as the snapshot's "homes for sale"
+        out["mix"] = mix
 
     since = (date.today() - timedelta(days=365)).isoformat()
     fin_rows = (await db.execute(

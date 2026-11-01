@@ -2,6 +2,8 @@ IDX website, Agent Hub and Review Hub in depth: website sections, pages, looks, 
 
 # IDX WEBSITE (IDX plan only; top menu **IDX**, "Your site, your brand")
 
+- From the chat: "how many people visited my Agent Hub?" gives visits, QR scans and form responses for the last 7, 30 and 60 days.
+
 ## Status and saving
 - Status chip: **Live**, **Draft** or **Turned off**, with **Copy link** and **Open in new window**.
 - Changes stay private until published. **Save draft** ("Saved - not published yet") vs **Publish changes** ("Your website is live."). Leaving with unsaved changes asks first (**Leave without saving** / **Keep editing**). Publishing can't be undone - there's no version history, so edit and publish again.

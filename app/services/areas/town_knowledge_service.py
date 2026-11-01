@@ -42,6 +42,7 @@ _BANK_TTL_DAYS = {"market": 45, "rates": 10, "taxes": 365, "schools": 365, "tran
 _BANK_TTL_DEFAULT = 270
 _BANK_MAX_ITEMS = 120
 
+_CITE = re.compile(r"</?cite|cite index=", re.I)
 _SUBJECTIVE = re.compile(r"\b(best|top|top-rated|top-ranked|ranked|highly|regarded|acclaimed|excellent|prestigious|desirable|sought-after|award-winning|renowned|outstanding|premier|elite|famil(y|ies)|kids|children|safe|safest|crime)\b", re.I)
 
 # facts[category] -> evidence topic
@@ -106,6 +107,10 @@ def research_items(area: MarketArea) -> list[dict]:
             where = f"in {e.get('city') or area.name}" if e.get("relationship") == "IN_AREA" else (
                 f"about {e['distance_miles']} mi away in {e.get('city')}" if e.get("distance_miles") and e.get("city") else "nearby")
             desc = (e.get("description") or "").strip().rstrip(".")
+            # 11/01 Rehoboth Beach: descriptions that were raw quoted web text with the research's
+            # citation markup ('(cite index="13-1">The Shops at ... is a charming collection...').
+            if _CITE.search(desc):
+                desc = ""
             # Schools get name + place only (no descriptions - they carry rankings / "great for
             # families" language); any other description with subjective or family-status wording is dropped.
             if topic == "schools" or _SUBJECTIVE.search(desc):
@@ -170,7 +175,7 @@ def _places_items(area: MarketArea, facts: dict) -> list[dict]:
         for r in walk["rows"]:
             if r.get("label") and r.get("pct") is not None:
                 out.append({"topic": "transit" if r.get("key") == "transit" else "downtown",
-                            "claim": f"{r['pct']}% of the {walk['homes_checked']} {area.name} homes we checked are within a {mins}-minute walk of {r['label'].lower()} (OpenStreetMap).",
+                            "claim": (f"About {r['pct']}%" if r["pct"] else "Almost no") + f" {'of ' if r['pct'] else ''}{area.name} homes are within a {mins}-minute walk of {r['label'].lower()} (an OpenStreetMap estimate from a sample of {walk['homes_checked']} homes).",
                             "source_name": "OpenStreetMap (OpenHousePal walk check)", "source_url": "https://www.openstreetmap.org", "as_of": _date(walk.get("computed_at")), "confidence": 0.9})
         if walk.get("stations"):
             out.append({"topic": "transit", "claim": f"Rail and trolley stops within a {mins}-minute walk of {area.name} homes: {', '.join(walk['stations'][:6])} (OpenStreetMap).",
@@ -183,7 +188,7 @@ def _places_items(area: MarketArea, facts: dict) -> list[dict]:
                         "source_name": "Google Maps", "source_url": None, "as_of": _date(commute.get("computed_at")), "confidence": 0.85})
     flood = facts.get("flood") or {}
     if flood.get("homes_checked") and flood.get("high_risk_pct") is not None:
-        out.append({"topic": "other", "claim": f"{flood['high_risk_pct']}% of the {flood['homes_checked']} {area.name} homes we checked sit in a FEMA high-risk flood zone (FEMA National Flood Hazard Layer); flood risk is address-specific.",
+        out.append({"topic": "other", "claim": f"About {flood['high_risk_pct']}% of {area.name} homes sit in a FEMA high-risk flood zone (FEMA National Flood Hazard Layer); flood risk is address-specific.",
                     "source_name": "FEMA National Flood Hazard Layer", "source_url": "https://msc.fema.gov/portal/home", "as_of": _date(flood.get("computed_at")), "confidence": 0.9})
     return out
 
@@ -205,6 +210,14 @@ def norm_place(name: Optional[str]) -> str:
     s = _GEO_NOISE.sub(" ", s)
     s = re.sub(r"[^a-z0-9]+", " ", s.lower())
     return " ".join(s.split())
+
+
+_DISTRICT_GENERIC = {"regional", "schools", "school", "public", "district", "unified", "consolidated", "valley", "union", "joint", "city"}
+
+
+def _district_core(norm: str) -> frozenset:
+    """'princeton regional schools' and 'princeton public schools' -> {'princeton'}."""
+    return frozenset(w for w in norm.split() if w not in _DISTRICT_GENERIC)
 
 
 def _county_label(raw: Optional[str]) -> Optional[str]:
@@ -238,6 +251,13 @@ async def geography_profile(db: AsyncSession, area: MarketArea) -> dict:
             towns[norm_place(m["name"])] = {"name": m["name"], "share": m.get("share"), "county": None, "source": "census"}
     for t in mix.get("townships") or []:
         k = norm_place(t["name"])
+        # 11/01 Rehoboth Beach: Bright's township field holds Delaware hundreds ("LEWES REHOBOTH
+        # HUNDRED" - an old land division, not a government) and came out "Lewes Rehoboth Hundred
+        # Township (99%)" next to the census "Unincorporated Sussex County (86%)".
+        # Only PA and NJ have townships: in MD the field is an election district ("Frederick
+        # Township (46%)" next to Frederick City 59%), in DE a hundred, in VA/DC a county.
+        if (area.state or "").upper() not in ("PA", "NJ") or re.search(r"\b(hundred|county)\b", str(t["name"]), re.I):
+            continue
         if k and k not in towns and t["share"] >= 3 and t["homes"] >= 3:
             towns[k] = {"name": _township_label(t["name"]), "share": t["share"], "county": None, "source": "mls"}
     for k, t in towns.items():
@@ -248,6 +268,10 @@ async def geography_profile(db: AsyncSession, area: MarketArea) -> dict:
             districts[norm_place(d["name"])] = {"name": d["name"], "share": d.get("share")}
     for d in mix.get("school_districts") or []:
         k = norm_place(d["name"])
+        # 11/01 Princeton: Bright's "PRINCETON REGIONAL SCHOOLS" is the census "Princeton Public
+        # Schools" - one district, listed twice as 50% and 48%.
+        if any(_district_core(k) and _district_core(k) == _district_core(c) for c in districts):
+            continue
         if k and k not in districts and d["share"] >= 3 and d["homes"] >= 3:
             districts[k] = {"name": f"{d['name'].title()} School District", "share": d["share"]}
     counties = [c for c in (mix.get("counties") or []) if c["share"] >= 3]
@@ -330,7 +354,10 @@ def geography_audit(text: str, profiles: list[dict], known: Optional[dict] = Non
     districts_all = set().union(*(p["norm"]["districts"] for p in profiles))
     town_rx = [(p, _rx(norm_place(p["town"]))) for p in profiles]
     muni_rx = [(m, _rx(m)) for m in sorted(munis, key=len, reverse=True) if m]
-    county_rx = [(c, re.compile(r"\b" + r"[\s\-]+".join(re.escape(w) for w in c.split()) + r"\s+County\b", re.I)) for c in counties if c]
+    # "Middlesex County", and a list that ends in "counties" ("Mercer, Middlesex and Somerset
+    # counties" - 11/01 Princeton: Middlesex was read as the NJ borough of that name).
+    county_rx = [(c, re.compile(r"\b" + r"[\s\-]+".join(re.escape(w) for w in c.split())
+                                + r"(?:\s+County\b|(?=(?:\s*,\s*|\s+and\s+|\s+or\s+)[A-Z][\w\s,\-]{0,60}?\bcounties\b))", re.I)) for c in counties if c]
     # A district named after one township needs "School District" after it to count as a district;
     # a joint one (Tredyffrin-Easttown) is a district wherever it appears, suffix or not.
     district_rx = [(d, re.compile(r"\b" + r"[\s\-]+".join(re.escape(w) for w in d.split())
@@ -383,6 +410,10 @@ def geography_audit(text: str, profiles: list[dict], known: Optional[dict] = Non
                 for _, _, p in group:
                     allowed = p["norm"]["townships" if kind == "township" else "counties" if kind == "county" else "districts"]
                     if (kind == "township" and place == norm_place(p["town"])) or not allowed or place in allowed:
+                        continue
+                    # 11/01 Frederick: "Unincorporated Frederick County" - the MLS's generic
+                    # "UNINCORPORATED" matched on its own once "Frederick County" was taken as the county.
+                    if any(a.startswith(place + " ") for a in allowed):
                         continue
                     truth = "; ".join(t["name"] for t in p["townships"]) or "unknown"
                     key = (sentence.strip(), p["town"], place)
@@ -595,7 +626,7 @@ def market_definition(area: MarketArea, geo: Optional[dict] = None) -> str:
     if area.area_type == "neighborhood":
         return f"{area.name} numbers cover homes inside the {area.name} boundary on our map; {_HOME_TYPES_NOTE}."
     where = ", ".join(t["name"] for t in tw) if len(tw) > 1 else ""
-    return f"{area.name} numbers cover homes with a {area.name} mailing address" + (f", which spans {where}" if where else "") + f"; {_HOME_TYPES_NOTE}."
+    return f"{area.name} numbers cover homes with {_a(area.name)} {area.name} mailing address" + (f", which spans {where}" if where else "") + f"; {_HOME_TYPES_NOTE}."
 
 
 def sales_snapshot_items(area: MarketArea, snap: dict, geo: Optional[dict] = None) -> list[dict]:
@@ -622,6 +653,10 @@ def sales_snapshot_items(area: MarketArea, snap: dict, geo: Optional[dict] = Non
             + (" - a small sample, so one or two sales can move its medians a lot." if small else "."))
     if cur.get("median_close_price"):
         add(f"{area.name}: median closed price {_fmt_money(cur['median_close_price'])} in {win}" + (f" (vs {_fmt_money(prior['median_close_price'])} a year earlier)." if prior.get("median_close_price") and (prior.get("closed_count") or 0) >= 10 else "."))
+    if cur.get("by_type"):
+        names = {"condo": "condos", "townhouse": "townhomes", "house": "single-family houses"}
+        add(f"{area.name}: closed sales by type in {win}: " + "; ".join(
+            f"{names[k]} {_fmt_money(v['median_close_price'])} median ({v['count']} sales)" for k, v in cur["by_type"].items()) + ".")
     if cur.get("median_sale_to_list_pct"):
         add(f"{area.name}: median sale-to-list price ratio {cur['median_sale_to_list_pct']}% in {win} (half of those homes sold above that ratio, half below)"
             + (f"; {prior['median_sale_to_list_pct']}% a year earlier." if prior.get("median_sale_to_list_pct") and (prior.get("closed_count") or 0) >= 10 else "."))
@@ -638,7 +673,7 @@ def sales_snapshot_items(area: MarketArea, snap: dict, geo: Optional[dict] = Non
     return out
 
 
-def cost_items(area: MarketArea, cost: dict) -> list[dict]:
+def cost_items(area: MarketArea, cost: dict, geo: Optional[dict] = None) -> list[dict]:
     """Owning costs read off the listings (taxes per township, HOA fees) and how recent buyers
     paid - local, dated, sourced numbers a first-time-buyer article can lean on."""
     if not cost:
@@ -658,10 +693,37 @@ def cost_items(area: MarketArea, cost: dict) -> list[dict]:
             + f" - a median of {tax['median_pct_of_list']}% of list price per year. A buyer's bill depends on the home's assessment, not its price.")
         for t in tax.get("by_township") or []:
             if len(tax["by_township"]) > 1:
-                add(f"{area.name} homes for sale in {t['township']} Township: median annual tax about {t['median_pct_of_list']}% of list price ({t['homes']} listings) - millage is set by the township, county and school district, so it differs by township.")
-    hoa = cost.get("hoa") or {}
-    if hoa:
-        add(f"{area.name}: condos and townhomes for sale that list a monthly association fee show a median of ${hoa['median_monthly']:,}/month ({hoa['homes']} listings).", "market")
+                # The census name when we have it (11/01: "Princeton Township" - one municipality since 2013).
+                named = {norm_place(x["name"]): x["name"] for x in (geo or {}).get("townships") or []}
+                place = named.get(norm_place(t["township"])) or (f"{t['township']} Township" if (area.state or "").upper() in ("PA", "NJ") else t["township"])
+                add(f"{area.name} homes for sale in {place}: median annual tax about {t['median_pct_of_list']}% of list price ({t['homes']} listings) - tax rates are set locally (municipality, county and school district), so they differ from place to place.")
+    for kind, label in (("condo", "condos"), ("townhouse", "townhomes")):
+        h = (cost.get("hoa") or {}).get(kind)
+        if not h:
+            continue
+        add(f"{area.name}: {label} for sale that list a monthly condo or association fee show a median of ${h['median_monthly']:,}/month, all fees combined "
+            + (f"({h['homes']} of the {h['of']} {label} for sale show a fee)." if h.get("of") else f"({h['homes']} listings).")
+            + (" Most of those fees include: " + ", ".join(f"{_FEE_WORDS.get(c.lower(), c.lower())} ({pct}%)" for c, pct in h["covers"]) + "." if h.get("covers") else ""), "market")
+    mix = cost.get("mix") or {}
+    if mix:
+        def group(g, label):
+            return f"{g['count']} {label}" + (f" (median list price {_fmt_money(g['median'])})" if g.get("median") else "")
+        add(f"{area.name}: of its {mix['homes']} homes for sale on {on}, " + group(mix["attached"], "are condos or townhomes")
+            + " and " + group(mix["house"], "are single-family houses") + ".", "market")
+        low = mix["low_quarter"]
+        if low["count"]:
+            add(f"{area.name}: in the lowest-priced quarter of its homes for sale on {on}, {low['attached']} of {low['count']} are condos or townhomes"
+                + (" - so that quarter price mostly reflects condos and townhomes, not houses." if low["attached"] * 2 > low["count"] else "."), "market")
+        def some(g, what):
+            n = g["count"]
+            head = f"none of its {mix['homes']} homes for sale on {on} is" if not n else f"{n} of its {mix['homes']} homes for sale on {on} {'is' if n == 1 else 'are'}"
+            return f"{head} {what}" + (f" (median list price {_fmt_money(g['median'])})" if g.get("median") else "")
+        add(f"{area.name}: {some(mix['one_level'], 'one-level (one-floor living: a one-level house or condo unit)')}, as entered on the listings.", "market")
+        if mix.get("senior"):
+            add(f"{area.name}: {some(mix['senior'], 'in a 55+ (age-restricted) community')}, as entered on the listings.", "market")
+        if (mix.get("manufactured") or {}).get("count"):
+            add(f"{area.name}: {some(mix['manufactured'], 'a manufactured home')} - counted apart from the one-level homes. A manufactured home may sit "
+                "on land the buyer owns or on leased land with a monthly lot rent, and financing differs; each listing says which.", "market")
     fin = cost.get("financing") or {}
     if fin.get("mix"):
         mix = ", ".join(f"{m['type']} {m['pct']}%" for m in fin["mix"][:5])
@@ -676,7 +738,7 @@ def overlap_items(pairs: list[tuple[MarketArea, MarketArea, int, int]]) -> list[
     for a, b, shared, total in pairs:
         if shared <= 0:
             continue
-        claim = (f"Overlap: {shared} of {a.name}'s {total} homes for sale are also inside {b.name}'s numbers (a {a.name} mailing address within "
+        claim = (f"Overlap: {shared} of {a.name}'s {total} homes for sale are also inside {b.name}'s numbers ({_a(a.name)} {a.name} mailing address within "
                  f"{b.name} Township), so the areas' counts must never be added together.") if (b.municipality_type or "").lower() == "township" else (
                  f"Overlap: {shared} of {a.name}'s {total} homes for sale are also counted in {b.name}'s numbers, so the areas' counts must never be added together.")
         out.append({"topic": "market", "claim": claim, "source_name": "Bright MLS (OpenHousePal data)", "source_url": None,
@@ -782,7 +844,7 @@ async def town_dossier(db: AsyncSession, area: MarketArea, *, include_bank: bool
         except Exception:
             logger.warning("town dossier: cost profile failed for %s", area.slug, exc_info=True)
             cost = {}
-        items += cost_items(area, cost)
+        items += cost_items(area, cost, geo)
     if include_bank:
         items += bank_items(area)
     # Stored research can carry geography that contradicts the records (see scrub_geography).
@@ -800,3 +862,15 @@ async def town_dossier(db: AsyncSession, area: MarketArea, *, include_bank: bool
     return {"town": _town(area), "slug": area.slug, "items": items, "covered": covered, "gaps": gaps, "stale": stale,
             "sales_snapshot": snap, "geo": geo, "cost": cost, "definition": market_definition(area, geo),
             "researched_at": _date(area.last_enriched_at)}
+
+
+def _a(word: str) -> str:
+    """'an Arlington', 'a Wayne'."""
+    return "an" if (word or "").strip()[:1].lower() in "aeiou" else "a"
+
+
+# Bright's AssociationFeeIncludes shorthand, in a reader's words.
+_FEE_WORDS = {"ext bldg maint": "exterior building maintenance", "common area maintenance": "upkeep of shared areas",
+              "lawn maintenance": "lawn care", "hvac maint": "heating and cooling upkeep", "custodial services": "cleaning of shared areas",
+              "reserve funds": "savings for future repairs (reserve funds)", "insurance": "the building's master insurance",
+              "pool(s)": "pool", "health club": "fitness room"}

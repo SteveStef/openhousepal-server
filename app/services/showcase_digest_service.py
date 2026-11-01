@@ -746,14 +746,15 @@ async def _briefing(db: AsyncSession, user: User, now: datetime, showcase_access
     }
 
 
-async def queue_showcase_ready(db: AsyncSession, collection_id: str, from_agent: bool = False) -> bool:
+async def queue_showcase_ready(db: AsyncSession, collection_id: str, from_agent: bool = False, manual: bool = False) -> bool:
     """The buyer's own Showcase link, emailed the moment their Showcase is first built (a form, the
     IDX "Create my free Showcase", the Guest Pass) - so closing the thank-you page doesn't lose it
     until the next 4:30 digest. Its own Mailgun template (showcase_ready): their link, what they can
     do on any home, and the first three homes it picked. Never raises.
 
     from_agent: the agent built it for them by hand ("Email it to them" on) - its own template
-    (showcase_shared): "{Agent} picked homes for you", what the search looks for and how to change it."""
+    (showcase_shared): "{Agent} picked homes for you", what the search looks for and how to change it.
+    manual: the agent pressed Send invite (again) - a same-day repeat still goes (client_email_service)."""
     import os
     from app.models.database import Property, collection_properties
     from app.services.blacklist_service import BlacklistService
@@ -795,6 +796,8 @@ async def queue_showcase_ready(db: AsyncSession, collection_id: str, from_agent:
             "Unsub": f"{frontend_url}/unsubscribe?email={quote(col.visitor_email or '', safe='')}",
             **(await agent_email_vars(db, owner)),   # face, title, brokerage, email, phone
         }
+        if manual:
+            vars_["_manual"] = True
         template = READY_TEMPLATE
         subject = f"{first + ', your' if first else 'Your'} Showcase is ready" + (f" - {total} home{'s' if total != 1 else ''} picked for you" if total else "")
         if from_agent:

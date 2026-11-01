@@ -13,6 +13,8 @@ BlogBlockType = Literal[
     'lead_form', 'area_spotlight', 'property_showcase', 'video_showcase',
     # Added by the AI research pipeline: a worked payment example and the article's sources.
     'payment_example', 'sources',
+    # The small "Ask [agent] about ..." line (Call / Text / Email) under a sentence that sends readers to the agent.
+    'ask_agent',
 ]
 
 
@@ -184,6 +186,10 @@ class PublicBlogDetail(BaseModel):
     agentId: Optional[str] = None
     agentTitle: Optional[str] = None
     agentMarket: Optional[str] = None
+    # The article's small "Ask me about this" rows (Call / Text / Email).
+    agentPhone: Optional[str] = None
+    agentTextPhone: Optional[str] = None
+    agentEmail: Optional[str] = None
     theme: Optional[str] = None
     previewImageUrl: Optional[str] = None
     # True = end the article with the agent's Email Signature card instead of the small contact card.

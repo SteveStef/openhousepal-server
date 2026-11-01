@@ -69,6 +69,7 @@ class DiscoveryPreferencesResponse(BaseModel):
     min_bathrooms: Optional[int] = None
     min_square_feet: Optional[int] = None
     min_price: Optional[float] = None
+    max_price: Optional[float] = None
     brokerages: Optional[List[str]] = None
     cities: Optional[List[str]] = None
     townships: Optional[List[str]] = None
@@ -86,6 +87,7 @@ class UpdateDiscoveryPreferencesRequest(BaseModel):
     min_bathrooms: Optional[int] = None
     min_square_feet: Optional[int] = None
     min_price: Optional[float] = None
+    max_price: Optional[float] = None
     brokerages: Optional[List[str]] = None
     cities: Optional[List[str]] = None
     townships: Optional[List[str]] = None
@@ -267,6 +269,8 @@ async def get_discovery(
             filters.append(Property.living_area >= prefs.min_square_feet)
         if prefs.min_price:
             filters.append(Property.price >= prefs.min_price)
+        if prefs.max_price:
+            filters.append(Property.price <= prefs.max_price)
 
         # Apply city filters
         if prefs.cities and len(prefs.cities) > 0:
@@ -459,6 +463,7 @@ async def get_discovery(
                 min_bathrooms=prefs.min_bathrooms,
                 min_square_feet=prefs.min_square_feet,
                 min_price=prefs.min_price,
+                max_price=prefs.max_price,
                 brokerages=prefs.brokerages,
                 cities=prefs.cities,
                 townships=prefs.townships,

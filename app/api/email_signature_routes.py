@@ -1,5 +1,6 @@
 import hashlib
 import json
+from types import SimpleNamespace
 import re
 import os
 import secrets
@@ -111,7 +112,7 @@ async def update_my_email_signature(
 
 
 # Written only by POST /me/installed - see update_my_email_signature.
-_INSTALL_KEYS = ("installedHtmlHash", "installedAssetsHash", "installedClient")
+_INSTALL_KEYS = ("installedHtmlHash", "installedAssetsHash", "installedClient", "looks")  # looks: each copied look (see _remember_look)
 
 # Mail apps that save their own copy of the pictures when a signature is pasted (classic Outlook
 # for Windows attaches them to every email by default; Apple Mail can too). Their pasted signature
@@ -177,7 +178,14 @@ async def get_my_email_signature_html(
 
     hub_config = await _get_agent_hub_config(db, current_user.id)
 
-    asset_base_url = f"{_api_base(request)}/email-signature/public/{signature.public_token}"
+    # The look the agent is copying (colors, dark, Luxe + its metal) is stamped into every picture
+    # link ("<token>~<look>"): the pictures keep drawing with THIS look until they copy again (owner,
+    # 11/01: after switching bronze -> gold, an installed signature's pictures turned gold while its
+    # pasted text stayed bronze). Listings, sales and stats still update themselves.
+    look_id = _remember_look(signature)
+    if signature.config is not None and (signature.config.get("looks") or {}).get(look_id) is not None:
+        await db.commit()
+    asset_base_url = f"{_api_base(request)}/email-signature/public/{signature.public_token}~{look_id}"
     # The Agent Hub link and any form-linked buttons route through this stable, owner-scoped
     # redirect instead of a resolved domain - see stable_agent_hub_redirect/stable_form_redirect
     # below. That's what lets an install-once signature keep working through a slug rename, a
@@ -190,7 +198,9 @@ async def get_my_email_signature_html(
     # on its own changes - text, colors, which icons/buttons/blocks show. That makes a fingerprint
     # of it an exact "does the agent need to re-copy?" signal (see mark_email_signature_installed).
     html = email_signature_service.build_signature_html(signature.config, hub_config, current_user, redirect_base_url, asset_base_url)
-    html_hash = hashlib.sha256(html.encode("utf-8")).hexdigest()[:20]
+    # (fingerprinted without the look stamp, so signatures installed before it aren't flagged for
+    # nothing - a color change still changes the HTML itself)
+    html_hash = hashlib.sha256(html.replace(f"{signature.public_token}~{look_id}", signature.public_token).encode("utf-8")).hexdigest()[:20]
     stored = signature.config or {}
     installed_hash = stored.get("installedHtmlHash")
     assets_hash = _assets_fingerprint(email_signature_service.resolve_signature_config(signature.config), hub_config, current_user)
@@ -385,11 +395,33 @@ async def stable_form_redirect(owner_id: str, form_type: str, db: AsyncSession =
     return RedirectResponse((await owner_links(db, owner, hub.slug)).form(form.slug))
 
 
-async def _load_public_signature(db: AsyncSession, token: str) -> tuple[EmailSignature, User, dict]:
+_LOOK_KEYS = ("accentColor", "darkMode", "luxe", "luxeMetal")
+
+
+def _remember_look(signature: EmailSignature) -> str:
+    """The current look's short id, saved in the signature's config (the last 12 kept) so a picture
+    link stamped with it can draw that look later. Changes signature.config only when it's new."""
+    cfg = signature.config or {}
+    look = {k: cfg.get(k) for k in _LOOK_KEYS}
+    look_id = hashlib.sha1(json.dumps(look, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:10]
+    looks = dict(cfg.get("looks") or {})
+    if look_id not in looks:
+        looks[look_id] = look
+        looks = dict(list(looks.items())[-12:])
+        signature.config = {**cfg, "looks": looks}
+    return look_id
+
+
+async def _load_public_signature(db: AsyncSession, token: str):
+    # "<token>~<look>": a copy installed with its look stamped in - draw that look, not today's.
+    token, _, look_id = token.partition("~")
     result = await db.execute(select(EmailSignature).where(EmailSignature.public_token == token))
     signature = result.scalar_one_or_none()
     if not signature:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
+    look = ((signature.config or {}).get("looks") or {}).get(look_id) if look_id else None
+    if look:
+        signature = SimpleNamespace(config={**(signature.config or {}), **look}, owner_id=signature.owner_id, public_token=token)
     owner = await db.get(User, signature.owner_id)
     if not owner or not owner_has_access(owner, EMAIL_SIGNATURE_ACCESS_TIERS):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")

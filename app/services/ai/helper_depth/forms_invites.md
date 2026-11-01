@@ -27,7 +27,7 @@ Forms & Invites in depth: every premade form, the custom form builder and its qu
 - **Choose a question type**: **Short answer** (a single line), **Long answer** (a paragraph), **Single choice** (pick one), **Multiple choice** (pick multiple), **Number**, **Currency** (a dollar amount), **Date**, **Time**, **Email** (validated), **Phone**, **Property Address** (address lookup with live Google suggestions), **Statement** (a transition slide, no input).
 - Each question: **Question label**, **Type**, **Required** (not on Statements), **Placeholder**, **Helper text (optional)**, **Choices** (for choice questions), **Unit suffix (optional)** for numbers (e.g. "square feet"). Drag to reorder; delete with the trash.
 - No "if this, then that" branching in the custom builder.
-- Made from the AI helper chat: the card's steps are **Questions** (the helper's suggested ones - tap to take one off; **Add a common one** like move timeline, has an agent, pre-approved, price range, bedrooms, a home to sell, their address, anything else; or type their own), the **Moving background** switch and **About a home?** (No, or one of their own active listings with its photo). Full name, email and phone are always on the form.
+- Made from the AI helper chat: the card's steps are **Questions** (the helper's questions for this form, each with its answer type and choices - the x takes one off; **Ideas for this form** made for what the form is about; **Common ones** for that kind of form (sellers, buyers, events, being featured, renters), **+N more**; or type their own; **Done**), the **Moving background** switch and **About a home?** (No, or one of their own active listings with its photo). Full name, email and phone are always on the form.
 - An invite made from the AI helper chat: the card shows the invite itself, small, redrawn as they tap the steps - **What kind** (Open house, Broker's open, Client event, Other event), **Home** (their listings - its photo becomes the cover; or Not one of my listings), **Day** (the next week as taps, or Another day), **Time** (11-1, 12-2, 1-3, 2-4, 5-7 or exact times), **Design** (Classic, Garden, Midnight, Modern) and **Color** (My brand, Luxe Gold / Silver / Bronze on IDX, or a color). **Make it** saves it to Forms & Invites; nothing is sent until they send it there.
 - The invite's place NAME is for a venue (a club, a restaurant). An invite never shows the street twice - a place name that is just the street, or a title that already says the address, is left off the card's extra lines.
 - Builder sections: **Welcome Screen** (**Intro headline**, **Subtitle**), questions, **Thank You Screen** (**Success heading**, **Success message**), **Settings**, with a **Live preview**.
@@ -94,3 +94,15 @@ Then **Create my invite** -> "Your invite is ready".
 - Luxe form look and Luxe invite metals need IDX.
 - Remind does nothing for people you only texted or shared the link with - it only reaches people you emailed from the invite.
 - More than 7 days or 12 extra questions isn't possible in one invite.
+
+## From the AI helper chat - follow-through (11/01)
+- **Read answers**: "What did the Smiths put on the buyer form?" - every answer, by person and form, newest first. Also who started a form but didn't finish.
+- **Who's coming**: an invite's Coming, Maybe, Can't and No answer yet, with counts and what each person answered.
+- **Mark reviewed** (one, several, or all of a form's new ones) - clears the Inbox and the red number. Can also mark one as new again.
+- **Duplicate a form** - makes an editable copy in Custom Forms (the way to change a premade form's questions).
+- **Tracking link** - makes a Campaign on a premade lead form and gives back its link (QR code in All Campaigns). Not on custom forms.
+- **Add an unfinished one to Leads** - the same as Add to Leads under Unfinished; a follow-up too, unless they said they have an agent or that follow-up is off.
+- **Send an invite to your leads** - the card lists your leads with check boxes (search, Select all shown, a tag like Open house guest or Showcase). People with no email, who unsubscribed or already answered are greyed out. The button says how many get it ("Email 6 people"); it goes from you (your own Gmail or Outlook when connected). Not while RSVPs are closed.
+- **Remind** - the card says how many get the reminder; only people emailed from the invite who haven't answered, at most once every 12 hours.
+- **Close or reopen RSVPs**, and **copy an invite** (same design and details, new link, no guests).
+- Deleting a form, a response, an invite or a campaign stays on the page.

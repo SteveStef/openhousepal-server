@@ -6,10 +6,11 @@ agent opens that chat.
 No new tables: what's being watched and which chats are unread live in users.setup_state
 ("ai_watch" / "ai_unread"), the same JSON the setup steps use.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 import uuid
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -72,6 +73,43 @@ async def finished(owner_id: str, key: str, ok: bool, message: str, link: Option
             await db.commit()
     except Exception:  # noqa: BLE001
         logger.exception("AI helper finished-notice failed", extra={"key": key, "owner_id": owner_id})
+
+
+async def working(db: AsyncSession, user: User) -> list[dict]:
+    """The jobs still running for the chat's progress strip (owner, 11/01: "a nice little loading bar
+    that doesn't go away" while they keep talking): kind (cma | blog), its label, when it started,
+    and for a blog the pipeline stage it's on (gathering, research, write, fact_check, finishing).
+    A watch older than 2 hours is a job that died quietly - not shown."""
+    st = user.setup_state or {}
+    now = datetime.now(timezone.utc)
+    out = []
+    for key, w in (st.get(WATCH_KEY) or {}).items():
+        if not isinstance(w, dict) or ":" not in key:
+            continue
+        try:
+            at = datetime.fromisoformat(w.get("at") or "")
+        except ValueError:
+            continue
+        if now - at > timedelta(hours=2):
+            continue
+        kind, rid = key.split(":", 1)
+        out.append({"key": key, "kind": kind, "id": rid, "label": w.get("label") or "", "at": at.isoformat(), "stage": None})
+    blogs = [j["id"] for j in out if j["kind"] == "blog"]
+    if blogs:
+        from app.models.database import Blog
+        rows = (await db.execute(select(Blog.id, Blog.ai_review).where(Blog.id.in_(blogs)))).all()
+        stages = {r.id: (r.ai_review or {}).get("stage") for r in rows if isinstance(r.ai_review, dict)}
+        for j in out:
+            if j["kind"] == "blog":
+                j["stage"] = stages.get(j["id"])
+    return sorted(out, key=lambda j: j["at"])
+
+
+def busy_conversations(user: User) -> set[str]:
+    """Chats a fresh start must not tidy away yet: one waiting on a background job, one with news."""
+    st = user.setup_state or {}
+    watched = {w.get("conversation_id") for w in (st.get(WATCH_KEY) or {}).values() if isinstance(w, dict)}
+    return {c for c in watched | set(st.get(UNREAD_KEY) or []) if c}
 
 
 def unread(user: User) -> list[str]:

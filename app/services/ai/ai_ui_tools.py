@@ -10,6 +10,14 @@ from urllib.parse import parse_qsl, urlencode
 _PAGES = ("/dash", "/discovery", "/open-houses", "/showcases", "/leads", "/activity", "/studio", "/settings",
           "/agent-hub", "/setup", "/assistant", "/broker-authorization", "/checkout")
 _SAFE = re.compile(r"^/[A-Za-z0-9/_\-?=&%.,+]*$")
+# The real pages one level down (frontend app/ folders) - a guessed "/studio/crm" was let through
+# and opened a dead page (11/01 capability review). Anything deeper under these is the page's own.
+_SUBPAGES = {
+    "/studio": {"blogs", "brand-kit", "calendar", "cma", "design", "domains", "email-signature", "email", "forms", "integrations",
+                "media", "property-sites", "reviews", "site", "tools", "website"},
+    "/settings": {"connected", "help", "subscription"},
+    "/open-houses": {"my-listings", "visitors"},
+}
 
 LINK_HELP = (
     "Handy pages (add the ? options to open them ready to go): /dash, /open-houses (My Opens - kits), "
@@ -19,7 +27,9 @@ LINK_HELP = (
     "/studio/property-sites?new=1 (new Spotlight), /studio/property-sites/<spotlight_id>, /studio/cma?new=1 (new CMA), /studio/cma/<report_id>, "
     "/studio/blogs?new=1 (new blog post), /studio/forms (Forms & Invites), /studio/forms?new=1 (new custom form), /studio/media (Media Lab), /studio/brand-kit (Branding), "
     "/studio/email (Email settings + briefing time), /studio/email-signature, /studio/calendar, /studio/reviews, /studio/website (IDX website), "
-    "/studio/site (Agent Hub editor), /settings, /settings/help (Help), /settings/help?compose=1&category=bug, /settings/subscription (Billing), /setup (Account setup)."
+    "/studio/site (Agent Hub editor), /studio/integrations (CRM - Follow Up Boss, webhooks, lead email address), /studio/domains (Domains), /studio/tools (seller net sheet, buyer cash needed), "
+    "/open-houses/visitors/<open_house_id> (that open house's Visitors), /settings, /settings/connected (Send from your email - Gmail/Outlook), "
+    "/settings/help (Help), /settings/help?compose=1&category=bug, /settings/subscription (Billing), /setup (Account setup)."
 )
 
 UI_TOOL_DEFINITIONS = [
@@ -48,7 +58,12 @@ def safe_page(page: str) -> Optional[str]:
     if not page.startswith("/") or "//" in page or ".." in page or not _SAFE.match(page):
         return None
     path = page.split("?", 1)[0]
-    return page if any(path == p or path.startswith(p + "/") for p in _PAGES) else None
+    if not any(path == p or path.startswith(p + "/") for p in _PAGES):
+        return None
+    for area, subs in _SUBPAGES.items():
+        if path.startswith(area + "/") and path[len(area) + 1:].split("/")[0] not in subs:
+            return None
+    return page
 
 
 def run(name: str, args: dict) -> Tuple[dict, Optional[dict]]:
