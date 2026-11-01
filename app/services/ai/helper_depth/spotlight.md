@@ -14,6 +14,7 @@ Listing Spotlight in depth: making a page, all 9 wizard steps and their options,
 - **Delete** ("Delete this property website?") is permanent.
 
 ## First open: automatic setup
+Made from the AI helper chat: the card shows a small front page of the home to pick the look (**Luxe** or **Editorial**) and the brand color (changing the color changes their Branding color everywhere - the card warns about that). After **Make it**, the same setup runs right in the chat, so the Spotlight is fully written from the listing - the helper never needs to ask about the house.
 "Setting up your site…" runs **Picking the standout amenities**, **Writing the highlights**, **Polishing the property story** and **Writing about the town** ("A few seconds - everything stays editable"). Uses a small amount of your monthly AI. If the AI writer is down: "The AI writer isn't available right now - please try again in a little while."
 
 ## The 9 steps

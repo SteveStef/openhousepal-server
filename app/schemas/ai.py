@@ -263,9 +263,9 @@ class ChatUsageResponse(BaseModel):
     tier: str
     used_usd: float
     limit_usd: Optional[float] = None
-    percent: Optional[int] = None
+    percent: Optional[float] = None
     recent_used_usd: float = 0.0
-    recent_percent: Optional[int] = None
+    recent_percent: Optional[float] = None
     near_limit: bool = False
     exhausted: bool = False
     resets_at: Optional[str] = None

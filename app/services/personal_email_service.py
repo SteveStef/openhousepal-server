@@ -131,6 +131,12 @@ def render(template: str, subject: str, v: dict, *, link: str) -> tuple[str, str
         paras = [
             f"Hi {first},",
             f"Thanks for stopping by the open house{(' at ' + street) if street else ''}. It was great to meet you.",
+            # Re-set to what they're looking for (the agent took off the open house circle, 11/01) -
+            # it isn't "homes like it" any more. Same as the follow-up text (tasks_service).
+            ("I put together a list of homes based on what you told me you're looking for. It keeps itself "
+             "up to date, so new listings and price drops show up there as they happen:") if count and v.get("tailored") else
+            ("I set up a list for you based on what you told me you're looking for. It fills in as homes "
+             "like that come on the market, along with any price drops:") if v.get("tailored") else
             ("I put together a list of homes like it that you might want to look at. It keeps itself up to date, "
              "so new listings and price drops show up there as they happen:") if count else
             ("I set up a list for you that fills in with homes like it as they come on the market, "

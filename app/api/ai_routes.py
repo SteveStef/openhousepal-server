@@ -115,6 +115,24 @@ async def get_ai_helper_status(
     return {"enabled": await can_use_helper(db, current_user), "voice": False}
 
 
+@router.get("/unread")
+async def get_ai_unread(current_user: User = Depends(get_current_active_user)):
+    """Chats where the helper finished something while the agent was away (an AI CMA) - the chat
+    button shows the count on every device until that chat is opened (ai_notify)."""
+    from app.services.ai import ai_notify
+    return {"conversations": ai_notify.unread(current_user)}
+
+
+@router.post("/unread/{conversation_id}/read")
+async def mark_ai_chat_read(
+    conversation_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    from app.services.ai import ai_notify
+    return {"conversations": await ai_notify.mark_read(db, current_user, conversation_id)}
+
+
 @router.post("/actions/{action_id}/confirm")
 async def confirm_ai_action(
     action_id: str,
@@ -289,7 +307,9 @@ async def send_ai_message(
 
         conversation.last_message_at = datetime.now(timezone.utc)
         if not conversation.title:
-            conversation.title = message_text[:80]
+            # whole words only - a title cut mid-word read badly in the chat header (11/01)
+            t = " ".join(message_text.split())
+            conversation.title = t if len(t) <= 80 else t[:79].rsplit(" ", 1)[0].rstrip(",.;:-") + "…"
         db.add(conversation)
 
         await db.commit()

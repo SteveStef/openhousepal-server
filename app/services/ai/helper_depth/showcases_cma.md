@@ -79,6 +79,9 @@ Showcases and CMA in depth: every Showcase search option, match score, compare h
 ## Who gets it
 - Basic, Premium, IDX with broker authorization. Hidden on No-MLS plans.
 
+## From the AI helper chat
+- "Start a CMA for ..." shows a card with two choices: **AI CMA - I do all of it** (picks the comps, runs the AI analysis and writes the report; it shows about how much of the monthly AI it uses) or **Manual** (makes the CMA and they pick the comps on the CMA page - no AI). An AI CMA takes a few minutes; they can close the chat or the site. When it's done, the chat says it's finished with an **Open the CMA** button, and the AI helper button shows a red number until they open that chat - on any device.
+
 ## The list
 - Search "Search by address or client...", tabs All, Draft, Ready, Shared. Each card: Fair Value, **Copy Share Link**, **Download PDF** / **Save the PDF**, theme (light or **Midnight**), **Delete** (permanent).
 

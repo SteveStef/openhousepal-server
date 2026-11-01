@@ -13,7 +13,9 @@ How it works:
 Never here: deletes, billing/plan changes, buying anything, passwords/login email, other agents'
 data, admin data. Anything that messages a client says so on the card.
 """
+import json
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -26,6 +28,9 @@ from app.config.logging import get_logger
 from app.models.database import AIConversation, AIMessage, User
 
 logger = get_logger(__name__)
+
+# The card an action is running for (confirm sets it) - see ai_notify.
+CARD: ContextVar[Optional[dict]] = ContextVar("ai_action_card", default=None)
 
 PENDING_HOURS = 24          # a card left untapped this long can't be confirmed any more
 MAX_ACTIONS_PER_TURN = 3
@@ -80,12 +85,30 @@ def is_action(name: str) -> bool:
     return name in ACTIONS
 
 
+def _coerce(definition: dict, args: dict) -> dict:
+    """The model now and then sends a list or an object as JSON text (questions, tags...) - read it
+    back so the action gets the shape its schema says (a form card crashed on this, 11/01)."""
+    props = ((definition or {}).get("input_schema") or {}).get("properties") or {}
+    out = dict(args)
+    for k, v in args.items():
+        want = (props.get(k) or {}).get("type")
+        if want in ("array", "object") and isinstance(v, str) and v.strip()[:1] in "[{":
+            try:
+                got = json.loads(v)
+            except ValueError:
+                continue
+            if isinstance(got, list if want == "array" else dict):
+                out[k] = got
+    return out
+
+
 async def propose(db: AsyncSession, user: User, name: str, args: dict) -> tuple[dict, Optional[dict]]:
     """Runs `prepare` only. Returns (tool result for the model, card entry or None)."""
     a = ACTIONS.get(name)
     if not a or not _allowed(user, a):
         return {"error": "not_available", "message": "That isn't something I can do on this plan."}, None
     args = {k: v for k, v in (args or {}).items() if k not in {"owner_id", "user_id", "agent_id", "current_user_id"}}
+    args = _coerce(a.definition, args)
     try:
         p = await a.prepare(db, user, args)
     except ActionError as e:
@@ -147,6 +170,9 @@ async def confirm(db: AsyncSession, user: User, message_id: str, action_id: str,
     # Claim it first so a double tap can't run it twice.
     await _save(db, msg, entry, status="running")
     try:
+        # Which card this is - an action that finishes later reports back to it (ai_notify). Kept
+        # out of the payload (some actions send theirs straight on to a route).
+        CARD.set({"message_id": message_id, "action_id": action_id, "conversation_id": msg.conversation_id})
         out = await a.run(db, user, dict(entry.get("payload") or {}))
     except ActionError as e:
         await db.rollback()
@@ -159,9 +185,12 @@ async def confirm(db: AsyncSession, user: User, message_id: str, action_id: str,
         return await _save(db, msg, entry, status="failed", result_message="Something went wrong - nothing was changed.")
     msg, entry = await _owned_entry(db, user, message_id, action_id)
     logger.info("AI action done", extra={"event": "ai_action", "action": entry["tool"], "user_id": user.id})
-    # share: the link a client would get by text ({url, preview}) - the chat shows its Messages-style card
-    return await _save(db, msg, entry, status="done", result_message=out.get("message") or "Done.", result_link=out.get("link"),
-                       share=out.get("share") if isinstance(out.get("share"), dict) else None)
+    # share: the link a client would get by text ({url, preview}) - the chat shows its Messages-style card.
+    # working: started and still going (an AI CMA) - ai_notify turns the card done when it finishes.
+    # made: something the card can show or finish in the browser (a Spotlight's automatic setup).
+    return await _save(db, msg, entry, status="working" if out.get("working") else "done", result_message=out.get("message") or "Done.",
+                       result_link=out.get("link"), share=out.get("share") if isinstance(out.get("share"), dict) else None,
+                       made=out.get("made") if isinstance(out.get("made"), dict) else None)
 
 
 async def client_result(db: AsyncSession, user: User, message_id: str, action_id: str, ok: bool, message: str,

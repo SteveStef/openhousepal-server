@@ -297,6 +297,9 @@ class OpenHouseService:
                     "test_property_address": prop_addr,
                     "showcase_link": showcase_link,
                     "properties_count": count,
+                    # Showcase re-set to what they're looking for (no open house circle) - the email
+                    # says so instead of "homes like it" (personal_email_service, 11/01).
+                    "tailored": await showcase_is_tailored(db, collection_result.get("collection_id")),
                     "agent_name": agent_name,
                     "agent_email": agent_email,
                     "agent_phone": await agent_public_phone(db, hosting_agent),
@@ -653,3 +656,15 @@ class OpenHouseService:
     async def get_property_by_qr_code(db: AsyncSession, qr_code: str) -> Optional[dict]:
         """Get property information by open house event ID"""
         return await OpenHouseService.get_open_house_event_by_id(db, qr_code)
+
+
+async def showcase_is_tailored(db: AsyncSession, collection_id: Optional[str]) -> bool:
+    """An open house Showcase the agent re-set to what the guest is looking for: no distance circle
+    left (Edit Showcase's Remove, or the agent's own towns-only search). Its follow-up text and
+    invite email stop saying "homes like it" (tasks_service.TAILORED_OPEN_HOUSE_PITCH)."""
+    if not collection_id:
+        return False
+    from app.models.database import CollectionPreferences
+    row = (await db.execute(select(CollectionPreferences.address, CollectionPreferences.diameter)
+                            .where(CollectionPreferences.collection_id == collection_id))).first()
+    return bool(row) and (not (row[0] or "").strip() or not row[1])

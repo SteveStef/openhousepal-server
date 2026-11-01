@@ -27,6 +27,7 @@ Forms & Invites in depth: every premade form, the custom form builder and its qu
 - **Choose a question type**: **Short answer** (a single line), **Long answer** (a paragraph), **Single choice** (pick one), **Multiple choice** (pick multiple), **Number**, **Currency** (a dollar amount), **Date**, **Time**, **Email** (validated), **Phone**, **Property Address** (address lookup with live Google suggestions), **Statement** (a transition slide, no input).
 - Each question: **Question label**, **Type**, **Required** (not on Statements), **Placeholder**, **Helper text (optional)**, **Choices** (for choice questions), **Unit suffix (optional)** for numbers (e.g. "square feet"). Drag to reorder; delete with the trash.
 - No "if this, then that" branching in the custom builder.
+- Made from the AI helper chat: the card has a **Moving background** switch and **About a home?** taps (No, or one of their own active listings with its photo) - nothing to type.
 - Builder sections: **Welcome Screen** (**Intro headline**, **Subtitle**), questions, **Thank You Screen** (**Success heading**, **Success message**), **Settings**, with a **Live preview**.
 - Each form has its own link - **Edit URL** to set the ending (letters, numbers, hyphens; it checks the link is free).
 

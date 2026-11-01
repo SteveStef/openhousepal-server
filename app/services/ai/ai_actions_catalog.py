@@ -13,7 +13,7 @@ import re
 from datetime import date as _date, datetime
 from typing import Any, Callable, Dict, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import (
@@ -22,6 +22,9 @@ from app.models.database import (
 )
 from app.services.ai.ai_actions import ActionError, Prepared, register
 from app.services.email_service import tidy_caps
+from app.config.logging import get_logger
+
+logger = get_logger(__name__)
 from app.services.ai.ai_route_bridge import RouteError, call_as_agent
 
 MLS = {"BASIC", "PREMIUM", "IDX"}
@@ -126,8 +129,8 @@ def _sc_name(c: Collection) -> str:
     return f"{c.visitor_name}'s Showcase" if c.visitor_name else (c.name or "this Showcase")
 
 
-def _simple(name: str, description: str, schema: dict, prepare, run, plans=None):
-    register({"name": name, "description": description, "input_schema": schema}, prepare, run, plans)
+def _simple(name: str, description: str, schema: dict, prepare, run, plans=None, adjust=None):
+    register({"name": name, "description": description, "input_schema": schema}, prepare, run, plans, adjust=adjust)
 
 
 # ================================================================ LEADS
@@ -843,19 +846,57 @@ async def _p_cma(db, user, a):
     key = _need_id(a, "listing_key")
     prop = await _one(db, select(Property).where(Property.listing_key == key), "I couldn't find that home.")
     mode = "buyer" if a.get("for_buyer") else "listing"
-    return Prepared(f"Start a CMA for {prop.street_address or key}", [f"{'Buyer / Offer' if mode == 'buyer' else 'Seller / Listing'} CMA"] +
-                    ([f"Client: {_s(a.get('client_name'))}"] if _s(a.get("client_name")) else []) + ["Starts as a draft - you pick comps and run the analysis on the CMA page"],
-                    {"listing_key": key, "mode": mode, "client_name": _s(a.get("client_name")) or None})
+    # AI or manual is asked ON the card (owner, 11/01) - two buttons, not a chat question. What one AI
+    # run usually costs, as a share of their monthly AI allowance, is shown on the AI choice.
+    try:
+        est = await _run_route(user, "GET", "/api/cma/ai-estimate")
+    except ActionError:
+        est = {}
+    addr = tidy_caps(prop.street_address) if prop.street_address else key
+    return Prepared(f"Start a CMA for {addr}", [f"{'Buyer / Offer' if mode == 'buyer' else 'Seller / Listing'} CMA"] +
+                    ([f"Client: {_s(a.get('client_name'))}"] if _s(a.get("client_name")) else []),
+                    {"listing_key": key, "mode": mode, "client_name": _s(a.get("client_name")) or None, "ai": True, "address": addr,
+                     "ai_percent": (est or {}).get("percent"), "photo": (prop.photos or [None])[0] if isinstance(prop.photos, list) and prop.photos else None},
+                    confirm_label="Start", picker="cma")
+
+
+def _adjust_cma(user, payload: dict, picks: dict) -> dict:
+    return {**payload, "ai": bool(picks.get("ai", payload.get("ai")))}
 
 
 async def _r_cma(db, user, p):
     subject = await _run_route(user, "GET", f"/api/cma/subject-from-listing/{p['listing_key']}")
     out = await _run_route(user, "POST", "/api/cma", {"mode": p["mode"], "client_name": p["client_name"], "subject": subject})
     rid = (out or {}).get("id")
-    return {"message": "CMA started.", "link": f"/studio/cma/{rid}" if rid else "/studio/cma"}
+    link = f"/studio/cma/{rid}" if rid else "/studio/cma"
+    if not rid or not p.get("ai"):
+        return {"message": "CMA started - pick your comps on the CMA page.", "link": link}
+    # AI CMA (owner, 11/01): the CMA page's own comp search and picks (cma_backtest_service.wizard_comps
+    # - the wizard's rules, run on the server), saved, then the same background AI analysis as
+    # "Create AI Analysis". It keeps going if they close the site; ai_notify posts here when done.
+    from datetime import date as _date
+    from app.services.cma_backtest_service import _candidate_to_comparable, wizard_comps
+    try:
+        picks, _meta = await wizard_comps(db, (out or {}).get("subject") or subject, _date.today())
+    except Exception:
+        logger.warning("AI CMA comp search failed", exc_info=True)
+        picks = []
+    if not picks:
+        return {"message": "CMA started, but I couldn't find enough similar homes that sold nearby to pick comps on my own - "
+                           "open it to choose them, then run the AI analysis.", "link": link}
+    await _run_route(user, "PATCH", f"/api/cma/{rid}", {"comparables": [_candidate_to_comparable(c, i) for i, c in enumerate(picks)]})
+    from app.services.ai import ai_notify
+    from app.services.ai.ai_actions import CARD
+    await ai_notify.watch(db, user, f"cma:{rid}", CARD.get() or {}, p.get("address") or "this home")   # before it can finish
+    await _run_route(user, "POST", f"/api/cma/{rid}/generate-ai-analysis", {"background": True, "include_map_images": True})
+    return {"working": True, "link": link,
+            "message": f"Making your AI CMA with {len(picks)} comps - usually 2 to 4 minutes. I'll tell you right here when it's "
+                       "done, even if you close the site or open it on another device."}
 
-_simple("start_cma", "Start a CMA draft for a home (listing_key from search_properties), seller/listing or buyer. Doesn't run the paid AI analysis.",
-        _obj({"listing_key": {"type": "string"}, "for_buyer": {"type": "boolean"}, "client_name": {"type": "string"}}, ["listing_key"]), _p_cma, _r_cma, MLS)
+_simple("start_cma", "Start a CMA for a home (listing_key from search_properties), seller/listing or buyer. The card asks AI CMA (it picks the comps and "
+        "runs the AI analysis for them - uses AI allowance) or Manual (they pick comps) - don't ask that in chat.",
+        _obj({"listing_key": {"type": "string"}, "for_buyer": {"type": "boolean"}, "client_name": {"type": "string"}}, ["listing_key"]), _p_cma, _r_cma, MLS,
+        adjust=_adjust_cma)
 
 
 # ================================================================ SPOTLIGHT / STUDIO
@@ -870,18 +911,52 @@ async def _p_spotlight(db, user, a):
         raise ActionError("That listing isn't active any more.")
     have = (await db.execute(select(PropertyWebsite.id).where(PropertyWebsite.owner_id == user.id, PropertyWebsite.listing_key == key))).first()
     style = "editorial_estate" if a.get("style") == "editorial" else "cinematic_luxury"
-    return Prepared(f"Make a Spotlight for {tidy_caps(prop.street_address)}", [f"Look: {'Editorial Estate' if style == 'editorial_estate' else 'Luxe'}",
-                    "Saved as a draft with your listing's photos and details", "When you open it, it writes the highlights, story and town for you - then you review and publish"]
-                    + (["You already have a Spotlight for this home - this makes another"] if have else []), {"listing_key": key, "template_id": style})
+    # The card shows a small front page to pick the look and color on (owner, 11/01) - the home's
+    # cover photo, address and price, in the agent's brand color (a Spotlight wears the Branding color).
+    try:
+        kit = await _run_route(user, "GET", "/studio/brand-kit") or {}
+    except ActionError:
+        kit = {}
+    photos = prop.photos if isinstance(prop.photos, list) else []
+    preview = {"photo": photos[0] if photos else None, "address": tidy_caps(prop.street_address) or "", "city": tidy_caps(prop.city) or "",
+               "price": prop.price, "beds": prop.bedrooms, "baths": prop.bathrooms, "sqft": prop.living_area,
+               "brand_color": kit.get("secondary_color") or "#C9A24D"}
+    return Prepared(f"Make a Spotlight for {tidy_caps(prop.street_address)}",
+                    ["Made from your listing's photos and details - I write the highlights, the story and the town section for you",
+                     "Saved as a draft - nothing goes live until you publish"]
+                    + (["You already have a Spotlight for this home - this makes another"] if have else []),
+                    {"listing_key": key, "template_id": style, "preview": preview}, picker="spotlight")
+
+
+def _adjust_spotlight(user, payload: dict, picks: dict) -> dict:
+    out = dict(payload)
+    if picks.get("template_id") in ("cinematic_luxury", "editorial_estate"):
+        out["template_id"] = picks["template_id"]
+    color = picks.get("brand_color")
+    if color and color != (payload.get("preview") or {}).get("brand_color"):
+        if not _HEX.match(str(color)):
+            raise ActionError("That color isn't one I can use.")
+        out["brand_color"] = str(color)   # a Spotlight wears the Branding color - this changes it
+    return out
 
 
 async def _r_spotlight(db, user, p):
-    out = await _run_route(user, "POST", "/studio/property-sites", p)
+    if p.get("brand_color"):
+        await _run_route(user, "PUT", "/studio/brand-kit", {"secondary_color": p["brand_color"]})
+    out = await _run_route(user, "POST", "/studio/property-sites", {"listing_key": p["listing_key"], "template_id": p["template_id"]})
     sid = (out or {}).get("id")
-    return {"message": "Spotlight made - open it to finish the setup.", "link": f"/studio/property-sites/{sid}?new=1&story=short" if sid else "/studio/property-sites"}
+    # The card then runs the editor's own first-open setup (amenities, highlights, short story,
+    # town) right in the chat - see components/assistant/spotlightSetup.ts. If they close the chat
+    # first, the editor still finishes it the first time it's opened.
+    return {"message": "Spotlight made." + (" Your brand color changed too." if p.get("brand_color") else ""),
+            "link": f"/studio/property-sites/{sid}" if sid else "/studio/property-sites",
+            "made": {"kind": "spotlight", "site_id": sid} if sid else None}
 
-_simple("create_spotlight", "Make a Listing Spotlight (single-listing website) draft for one of the agent's own active listings (listing_key from search_properties). style: luxe (default) or editorial. IDX plan.",
-        _obj({"listing_key": {"type": "string"}, "style": {"type": "string", "enum": ["luxe", "editorial"]}}, ["listing_key"]), _p_spotlight, _r_spotlight, IDX)
+_simple("create_spotlight", "Make a Listing Spotlight (single-listing website) for one of the agent's own active listings (listing_key from search_properties). "
+        "The card shows a small preview with the look (Luxe / Editorial) and color to pick, then writes the highlights, story and town itself - "
+        "don't ask the agent anything about the house. IDX plan.",
+        _obj({"listing_key": {"type": "string"}, "style": {"type": "string", "enum": ["luxe", "editorial"]}}, ["listing_key"]), _p_spotlight, _r_spotlight, IDX,
+        adjust=_adjust_spotlight)
 
 
 async def _p_spotlight_pub(db, user, a):
@@ -985,8 +1060,18 @@ async def _p_form(db, user, a):
     if not title:
         raise ActionError("What should the form be called?")
     qs, lines = [], ["Starts with Full name, Email and Phone"]
-    for i, q in enumerate((a.get("questions") or [])[:15]):
-        q = q or {}
+    raw = a.get("questions") or []
+    if isinstance(raw, str):   # the model sometimes sends the list as JSON text
+        try:
+            import json
+            raw = json.loads(raw)
+        except ValueError:
+            raw = [ln for ln in raw.splitlines() if ln.strip()]
+    if not isinstance(raw, list):
+        raw = []
+    for i, q in enumerate(raw[:15]):
+        # ...or a question as just its words - a short answer
+        q = {"label": q} if isinstance(q, str) else q if isinstance(q, dict) else {}
         label, qt = _s(q.get("label")), _s(q.get("type")) or "short_text"
         if not label:
             continue
@@ -998,25 +1083,41 @@ async def _p_form(db, user, a):
         qs.append({"id": f"ai_q{i + 1}", "type": qt, "label": label[:200], "required": bool(q.get("required")),
                    **({"options": opts} if qt in ("select", "multi_select") else {})})
         lines.append(f"{label} ({Q_TYPES[qt]}{': ' + ', '.join(opts) if opts else ''}){' - required' if q.get('required') else ''}")
-    payload = {"title": title[:120], "questions": qs}
-    # The look choices the editor would ask about (owner, 10/31): moving background on/off, and a home
-    # it's about (one of their own listings, from their listings list).
-    if isinstance(a.get("background_effects"), bool):
-        payload["background_effects"] = a["background_effects"]
-        lines.append(f"Moving background: {'on' if a['background_effects'] else 'off'}")
+    # The two look choices are taps on the card, not chat questions (owner, 11/01: "buttons, much less
+    # words"): moving background on/off, and one of their own active listings to link (or none).
+    from app.utils.plan_ids import listing_owner_key
+    mine = listing_owner_key(user)
+    homes = []
+    if mine:
+        rows = (await db.execute(select(Property).where(
+            or_(Property.list_agent_mls_id == mine, Property.co_list_agent_mls_id == mine),
+            Property.home_status.in_(("ACTIVE-BRIGHT", "COMING SOON-BRIGHT"))).order_by(Property.mls_list_date.desc().nulls_last()).limit(6))).scalars().all()
+        homes = [{"listing_key": r.listing_key, "address": tidy_caps(r.street_address) or "", "city": tidy_caps(r.city) or "",
+                  "photo": (r.photos[0] if isinstance(r.photos, list) and r.photos and isinstance(r.photos[0], str) else None)} for r in rows]
     key = _s(a.get("listing_key"))
-    if key:
-        prop = await _one(db, select(Property).where(Property.listing_key == key), "I couldn't find that home in the listings.")
-        photos = prop.photos if isinstance(getattr(prop, "photos", None), list) else []
-        payload["linked_property"] = {k: v for k, v in {
-            "listing_key": key, "address": prop.street_address, "city": prop.city, "state": prop.state, "zipcode": getattr(prop, "zipcode", None),
-            "price": prop.price, "beds": getattr(prop, "bedrooms", None), "baths": getattr(prop, "bathrooms", None), "sqft": getattr(prop, "living_area", None),
-            "image_url": photos[0] if photos and isinstance(photos[0], str) else None}.items() if v is not None}
-        lines.append(f"About this home: {prop.street_address}, {prop.city}")
-    return Prepared(f"Make a new form: {title}", lines + ["You can change the look and add more in the form editor"], payload)
+    payload = {"title": title[:120], "questions": qs, "homes": homes,
+               "background_effects": a["background_effects"] if isinstance(a.get("background_effects"), bool) else True,
+               "listing_key": key if any(h["listing_key"] == key for h in homes) or not key else key}
+    return Prepared(f"Make a new form: {title}", lines + ["You can change the look and add more in the form editor"], payload, picker="form")
+
+
+def _adjust_form(user, payload: dict, picks: dict) -> dict:
+    out = dict(payload)
+    if isinstance(picks.get("background_effects"), bool):
+        out["background_effects"] = picks["background_effects"]
+    if "listing_key" in picks:
+        out["listing_key"] = _s(picks.get("listing_key")) or None
+    return out
 
 
 async def _r_form(db, user, p):
+    if _s(p.get("listing_key")):
+        prop = await _one(db, select(Property).where(Property.listing_key == p["listing_key"]), "I couldn't find that home in the listings.")
+        photos = prop.photos if isinstance(getattr(prop, "photos", None), list) else []
+        p = {**p, "linked_property": {k: v for k, v in {
+            "listing_key": p["listing_key"], "address": prop.street_address, "city": prop.city, "state": prop.state, "zipcode": getattr(prop, "zipcode", None),
+            "price": prop.price, "beds": getattr(prop, "bedrooms", None), "baths": getattr(prop, "bathrooms", None), "sqft": getattr(prop, "living_area", None),
+            "image_url": photos[0] if photos and isinstance(photos[0], str) else None}.items() if v is not None}}
     out = await _run_route(user, "POST", "/agent-hub/forms", {"title": p["title"]})
     fid = (out or {}).get("id")
     update = {k: p[k] for k in ("background_effects", "linked_property") if k in p}
@@ -1034,11 +1135,11 @@ async def _r_form(db, user, p):
             "link": f"/studio/forms?edit={fid}" if fid else "/studio/forms", "share": share}
 
 _simple("create_form", "Make a new custom form (Forms & Invites) with a title and the agent's own questions (types: " + ", ".join(Q_TYPES) + "; select/multi_select need options). Full name, email and phone are always there already. "
-        "Before setting it up, ask in ONE short message (with offer_choices) whether they want the moving background effect (some people prefer it off) - and if the form is about one home, which of their listings to link (listing_key from their listings list).",
+        "Set it up right away - the card itself has the moving-background switch and their listings to link as taps (don't ask about those in chat). Pass listing_key only if they named the home.",
         _obj({"title": {"type": "string"}, "questions": {"type": "array", "items": {"type": "object", "properties": {
             "label": {"type": "string"}, "type": {"type": "string", "enum": list(Q_TYPES)}, "options": {"type": "array", "items": {"type": "string"}}, "required": {"type": "boolean"}}}},
             "background_effects": {"type": "boolean"}, "listing_key": {"type": "string"}},
-             ["title"]), _p_form, _r_form)
+             ["title"]), _p_form, _r_form, adjust=_adjust_form)
 
 INVITE_TYPES = {"open_house": "Open house", "brokers_open": "Broker's open", "client_event": "Client event", "custom": "Other event"}
 INVITE_DESIGNS = {"classic": "Classic", "garden": "Garden", "midnight": "Midnight", "modern": "Modern"}

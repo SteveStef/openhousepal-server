@@ -324,10 +324,9 @@ async def chat_usage_snapshot(db: AsyncSession, owner_id: str, config: dict, pla
     limit = chat_allowance_usd(config, plan_tier)
     used = await _cost_since_types(db, owner_id, start, CHAT_EVENT_TYPES)
     recent = min(used, await _cost_since_types(db, owner_id, datetime.now(timezone.utc) - timedelta(hours=1), CHAT_EVENT_TYPES))
-    percent = None if not limit else min(100, int(round(used / limit * 100)))
-    recent_percent = None if not limit else min(percent or 0, int(round(recent / limit * 100)))
-    if recent_percent == 0 and recent > 0.0005 and limit:
-        recent_percent = 1 if (percent or 0) >= 1 else 0
+    # One decimal: a single message is a fraction of a percent, so the bar moves after each reply.
+    percent = None if not limit else min(100.0, round(used / limit * 100, 1))
+    recent_percent = None if not limit else min(percent or 0, round(recent / limit * 100, 1))
     return {
         "tier": plan_tier or "",
         "used_usd": round(used, 4),

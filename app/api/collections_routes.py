@@ -1478,19 +1478,22 @@ def _describe_search_change(payload: dict) -> list:
 
 async def _after_search_change(db: AsyncSession, collection_obj: Collection, home_count: int) -> None:
     """After a Showcase's search changes (the agent's edit or the client's own, owner 11/01): an
-    open house invite still waiting to go out gets the new home count, and the client's open
+    open house invite still waiting to go out gets the new home count (and "based on what you told
+    me you're looking for" once the open house circle is gone), and the client's open
     follow-ups re-push their calendar events (they read the Showcase live: count, newest, link).
     Never raises - the search itself is already saved."""
     try:
         if collection_obj.visitor_email:
             from app.models.database import ScheduledEmail
+            from app.services.open_house_service import showcase_is_tailored
+            tailored = await showcase_is_tailored(db, collection_obj.id)
             waiting = (await db.execute(select(ScheduledEmail).where(
                 ScheduledEmail.owner_id == collection_obj.owner_id, ScheduledEmail.status == "PENDING",
                 ScheduledEmail.template_name == "visitor_confirmation",
                 func.lower(ScheduledEmail.recipient_email) == collection_obj.visitor_email.strip().lower(),
             ))).scalars().all()
             for row in waiting:
-                row.template_variables = {**(row.template_variables or {}), "properties_count": home_count}
+                row.template_variables = {**(row.template_variables or {}), "properties_count": home_count, "tailored": tailored}
             if waiting:
                 await db.commit()
         from app.services.leads_service import find_lead_by_contact

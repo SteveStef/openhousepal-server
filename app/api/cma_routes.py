@@ -355,6 +355,14 @@ async def generate_cma_ai_analysis(
                     await service.mark_generation_finished(owner_id, report_id, "complete" if ok else "failed", error=err)
                 finally:
                     await release_cma_generation(report_id)
+                    # Started as an AI CMA from the helper's chat? Its card and chat hear about it
+                    # (no-op otherwise - ai_notify only answers what it was asked to watch).
+                    from app.services.ai import ai_notify
+                    await ai_notify.finished(
+                        owner_id, f"cma:{report_id}", ok,
+                        "Your AI CMA for {label} is finished - comps picked, value estimated and the report written. Take a look before you share it."
+                        if ok else f"The AI CMA for {{label}} didn't finish: {err or 'something went wrong'} Open it to try again or pick the comps yourself.",
+                        link=f"/studio/cma/{report_id}", link_label="Open the CMA")
 
         try:
             task = asyncio.create_task(run())
