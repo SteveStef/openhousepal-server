@@ -102,6 +102,37 @@ def _coerce(definition: dict, args: dict) -> dict:
     return out
 
 
+# The same big job asked for again (owner, 11/01: reloaded while an AI CMA was running, and the
+# helper offered a second CMA card for the same home): the slow, one-per-thing jobs, keyed by what
+# makes them the same thing. A card for it that's working or done in the last 3 hours - in any of
+# their chats - answers instead of a new card.
+_SAME_JOB = {
+    "start_cma": lambda pl: pl.get("listing_key"),
+    "write_blog_post": lambda pl: " ".join(str((pl.get("body") or {}).get("topic") or "").lower().split()) or None,
+    "create_spotlight": lambda pl: pl.get("listing_key"),
+    "create_showcase": lambda pl: str((pl.get("body") or {}).get("visitor_email") or "").lower() or None,
+}
+
+
+async def _recent_same_job(db: AsyncSession, user: User, name: str, payload: dict) -> Optional[dict]:
+    keyfn = _SAME_JOB.get(name)
+    key = keyfn(payload or {}) if keyfn else None
+    if not key:
+        return None
+    since = datetime.now(timezone.utc) - timedelta(hours=3)
+    rows = (await db.execute(
+        select(AIMessage.tool_calls, AIMessage.created_at).join(AIConversation, AIConversation.id == AIMessage.conversation_id)
+        .where(AIConversation.owner_id == user.id, AIMessage.role == "assistant", AIMessage.created_at >= since)
+        .order_by(AIMessage.created_at.desc()).limit(80)
+    )).all()
+    for calls, at in rows:
+        for t in calls or []:
+            if (isinstance(t, dict) and t.get("record_type") == "action" and t.get("tool") == name
+                    and t.get("status") in ("working", "running", "done") and keyfn(t.get("payload") or {}) == key):
+                return {**t, "_at": at}
+    return None
+
+
 async def propose(db: AsyncSession, user: User, name: str, args: dict) -> tuple[dict, Optional[dict]]:
     """Runs `prepare` only. Returns (tool result for the model, card entry or None)."""
     a = ACTIONS.get(name)
@@ -116,6 +147,18 @@ async def propose(db: AsyncSession, user: User, name: str, args: dict) -> tuple[
     except Exception:
         logger.exception("AI action prepare failed", extra={"action": name, "user_id": user.id})
         return {"error": "cannot_prepare", "message": "Something went wrong setting that up."}, None
+    try:
+        same = await _recent_same_job(db, user, name, p.payload)
+    except Exception:  # noqa: BLE001
+        logger.warning("same-job check failed", exc_info=True)
+        same = None
+    if same:
+        mins = max(1, int((datetime.now(timezone.utc) - same["_at"]).total_seconds() // 60))
+        state = ("is still being made - it posts in that chat with a button when it's done (the chat button shows a red number)"
+                 if same.get("status") in ("working", "running") else "is already done")
+        return {"error": "already_started", "card_title": same.get("title"), "link": same.get("result_link"),
+                "message": f"Don't set this up again: \u201c{same.get('title')}\u201d was started {mins} min ago and {state}. "
+                           "Tell them that (with a show_link button to it when there's a link) instead of making a new card."}, None
     entry = {
         "tool": name, "record_type": "action", "record_id": str(uuid.uuid4()),
         "title": p.title, "details": p.details, "warning": p.warning, "confirm_label": p.confirm_label, "picker": p.picker,
@@ -126,11 +169,14 @@ async def propose(db: AsyncSession, user: User, name: str, args: dict) -> tuple[
             "warning": p.warning}, entry
 
 
-async def _owned_entry(db: AsyncSession, user: User, message_id: str, action_id: str):
-    msg = (await db.execute(
-        select(AIMessage).join(AIConversation, AIConversation.id == AIMessage.conversation_id)
-        .where(AIMessage.id == message_id, AIConversation.owner_id == user.id)
-    )).scalar_one_or_none()
+async def _owned_entry(db: AsyncSession, user: User, message_id: str, action_id: str, lock: bool = False):
+    stmt = (select(AIMessage).join(AIConversation, AIConversation.id == AIMessage.conversation_id)
+            .where(AIMessage.id == message_id, AIConversation.owner_id == user.id))
+    if lock:
+        # Confirm reads + claims the card under a row lock: two taps (or a retry) at the same moment
+        # wait for each other, so the second sees "running" - one card can never run twice (11/01).
+        stmt = stmt.with_for_update(of=AIMessage)
+    msg = (await db.execute(stmt)).scalar_one_or_none()
     entry = next((t for t in (msg.tool_calls or []) if t.get("record_type") == "action" and t.get("record_id") == action_id), None) if msg else None
     if not entry:
         raise ActionError("I couldn't find that request any more.")
@@ -145,7 +191,7 @@ async def _save(db: AsyncSession, msg: AIMessage, entry: dict, **changes) -> dic
 
 
 async def confirm(db: AsyncSession, user: User, message_id: str, action_id: str, picks: Optional[dict] = None) -> dict:
-    msg, entry = await _owned_entry(db, user, message_id, action_id)
+    msg, entry = await _owned_entry(db, user, message_id, action_id, lock=True)
     if entry.get("client_action") and entry.get("status") == "running" and entry.get("started_at") and \
             datetime.fromisoformat(entry["started_at"]) < datetime.now(timezone.utc) - timedelta(minutes=10):
         entry["status"] = "pending"   # the browser that was building it went away - let them try again

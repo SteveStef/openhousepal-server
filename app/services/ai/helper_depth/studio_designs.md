@@ -75,6 +75,10 @@ Header: Undo (Ctrl+Z) / Redo (Ctrl+Shift+Z), zoom (50%-250%, tap the % to fit), 
 - **Property** - **Attach a property** / **Change property**; **Refill from the listing** puts back the listing's own address, price, facts and description.
 - **Leads & QR code** - change form or campaign, **QR code on this piece** on/off, **Where the QR code goes** (a campaign form, the open house sign-in, open house registration, My Agent Hub, My forms / Custom forms, or **A web address I type**), **Words beside the code** (e.g. "Scan for details"), **Stop tracking**.
 
+## Made from the AI helper chat
+- "Make me a Just Listed post for my newest listing" sets up a card with a live preview and steps (each folds once picked; tap to change): **Home** (their other active listings - or sales for Just Sold - to switch to, with a photo each), **Layout**, **Colors** (Ivory, Stone, Charcoal, Forest, My brand, and Luxe on IDX), **Luxe finish** (IDX: None, Gold, Silver or Bronze - the metal takes over every accent, same as the Studio's Theme step), and **Photo** (the listing's main photo is picked already; tap another to use it). **Make it** saves it to the Studio and shows it in the chat with **Download** (phone: the Share sheet; computer: a download) and **Print PDF** for print designs.
+- If it set up the wrong home, tap **Home** on the card - or say which one; it won't offer the same home again.
+
 ## Downloading
 - Print pieces: **Print-ready PDF** ("Exact size for your printer" - true size at 300 DPI) or **Image** / High-resolution image ("For email, texts or screens").
 - Social posts: a full-resolution PNG at the exact size above.

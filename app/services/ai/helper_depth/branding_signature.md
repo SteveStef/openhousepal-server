@@ -88,3 +88,6 @@ Spotlight's Listing Agent section ("My email signature card" switch), the end of
 - More than 3 signature buttons (Agent Hub + 2) won't fit.
 - Logos must be JPG or PNG.
 - Pasting into Notes/Word first strips the design - paste directly into the email app.
+
+## From the AI helper chat
+- "Change my colors / show me my options" shows a card with the Branding page's choices as steps: **Look** (Classic or Luxe on IDX), **Color** (Classic) or **Finish** (Luxe Gold / Silver / Bronze), **Pages** (Ivory or Midnight) and, when some tools aren't using the brand, **Every tool?** - **Yes, every tool** does the same as the page's **Use this color for all features**; **Only where it's on now** leaves those tools alone. It saves to the same Branding settings the page uses.

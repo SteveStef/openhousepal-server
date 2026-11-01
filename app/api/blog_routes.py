@@ -425,6 +425,14 @@ async def _run_blog_ai_job(blog_id: str, user_id: str, brief: dict, engine: str)
             link=f"/studio/blogs/{blog.id}", is_read=False, created_at=datetime.now(timezone.utc),
         ))
         await db.commit()
+    # Started from the AI helper's chat? Its card and chat hear about it too (owner, 11/01) - a no-op
+    # otherwise (ai_notify only answers what it was asked to watch).
+    from app.services.ai import ai_notify
+    await ai_notify.finished(
+        user_id, f"blog:{blog_id}", not error,
+        f"Your blog draft \u201c{title}\u201d is ready. Give it a read, pick its look and publish when you're happy - nothing is live until you do."
+        if not error else f"The blog draft about {{label}} didn't finish: {error}",
+        link=f"/studio/blogs/{blog_id}", link_label="Open the draft")
 
 
 async def _mark_ai_alert_seen(db: AsyncSession, blog_id: str, owner_id: str) -> None:

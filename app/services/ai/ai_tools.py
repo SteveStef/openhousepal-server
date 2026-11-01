@@ -26,7 +26,7 @@ place for a tenant-isolation bug to hide.
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from fastapi import HTTPException
-from sqlalchemy import select, func, or_
+from sqlalchemy import Float, select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.logging import get_logger
@@ -86,8 +86,13 @@ async def _search_properties(db: AsyncSession, current_user: User, args: dict, c
     # A town name ("Wayne") is that town - not every address containing it (Waynesboro, Wayne Ave)
     # - and never rentals; prices filter here so the answer can't contradict itself (owner's test, 11/01).
     is_town = not any(ch.isdigit() for ch in query)
+    # An address however it's said ("221 Conestoga Road", "221 Conestoga Rd in Wayne"): the MLS keeps
+    # "221 CONESTOGA RD", so the house number + street name also match on their own (11/01).
+    import re as _re
+    num_street = _re.match(r"\s*(\d+[A-Za-z]?)\s+([A-Za-z0-9']{2,})", query)
+    by_street = [Property.street_address.ilike(f"{num_street.group(1)} {num_street.group(2)}%")] if num_street else []
     where = [or_(func.lower(Property.city) == query.lower(), Property.listing_key == query) if is_town
-             else or_(Property.full_address.ilike(like), Property.street_address.ilike(like), Property.listing_key == query)]
+             else or_(Property.full_address.ilike(like), Property.street_address.ilike(like), Property.listing_key == query, *by_street)]
     lease = Property.raw_mls_data["PropertyType"].astext
     where.append(or_(lease.is_(None), ~lease.ilike("%lease%")))
     if args.get("for_sale_only", True):
@@ -506,11 +511,95 @@ async def _get_priority_summary(db: AsyncSession, current_user: User, args: dict
     return {"priorities": priorities}
 
 
+async def _look_up_agent(db: AsyncSession, current_user: User, args: dict, config: dict) -> dict:
+    """Another agent by name, from the MLS records (owner, 11/01: "how many homes has Lavinia
+    Smerconish sold and what are her listings - I might ask to host an open house around $2M"):
+    each matching agent's office and contact, sales in the last 12 months (listing side and buyer
+    side, with volume) and their listings for sale now - priced in range when one is given."""
+    from datetime import date, timedelta
+    from app.utils.auth import tier_has_mls
+    if not tier_has_mls(current_user.plan_tier):
+        return dict(_NO_MLS_RESULT)
+    name = " ".join(str(args.get("name") or "").split())
+    if len(name) < 3:
+        return {"error": "need_name", "message": "Give the agent's name."}
+    like = f"%{name}%"
+    since = (date.today() - timedelta(days=365)).isoformat()
+    raw = Property.raw_mls_data
+    close_date, close_price = raw["CloseDate"].astext, raw["ClosePrice"].astext
+    closed = Property.home_status == "CLOSED-BRIGHT"
+
+    # who: agents whose name matches (the listing side's name is a column), then everything by their
+    # MLS id - indexed, so it stays quick on the full MLS table (a jsonb name scan took ~4s locally).
+    from sqlalchemy import literal_column
+    names = (await db.execute(
+        select(Property.list_agent_full_name, func.max(Property.list_agent_mls_id), func.max(Property.list_office_name),
+               func.max(Property.list_agent_email), func.max(raw["ListAgentPreferredPhone"].astext), func.count())
+        .where(Property.list_agent_full_name.ilike(like)).group_by(Property.list_agent_full_name)
+        .order_by(func.count().desc()).limit(3))).all()
+    agents = [{"name": full, "mls_id": mid, "office": office, "email": email, "phone": phone} for full, mid, office, email, phone, _n in names if full]
+    if not agents:
+        # only ever a buyer's agent here: the slower name scan, on sold homes only
+        buyer_col = literal_column("properties.raw_mls_data->>'BuyerAgentFullName'")
+        rows = (await db.execute(
+            select(buyer_col, func.max(raw["BuyerAgentMlsId"].astext), func.max(raw["BuyerOfficeName"].astext))
+            .where(closed, buyer_col.ilike(like)).group_by(buyer_col).limit(3))).all()
+        agents = [{"name": full, "mls_id": mid, "office": office} for full, mid, office in rows if full]
+    if not agents:
+        return {"agents": [], "note": f"No agent named like '{name}' in the MLS records here. Check the spelling, or ask for their town or office."}
+
+    lo, hi = args.get("min_price"), args.get("max_price")
+    out = []
+    for a in agents:
+        mid, full = a.pop("mls_id", None), a["name"]
+        mine = Property.list_agent_mls_id == mid if mid else Property.list_agent_full_name == full
+        listing_sold = (await db.execute(
+            select(func.count(), func.coalesce(func.sum(func.cast(close_price, Float)), 0))
+            .where(closed, mine, close_date >= since))).one()
+        buyer_sold = (await db.execute(
+            select(func.count(), func.coalesce(func.sum(func.cast(close_price, Float)), 0))
+            .where(closed, raw["BuyerAgentMlsId"].astext == mid, close_date >= since))).one() if mid else (0, 0)
+        where = [mine, or_(Property.home_status.ilike("%active%"), Property.home_status.ilike("%coming%")),
+                 ~Property.home_status.ilike("%under contract%")]
+        try:
+            if lo not in (None, ""):
+                where.append(Property.price >= float(lo))
+            if hi not in (None, ""):
+                where.append(Property.price <= float(hi))
+        except (TypeError, ValueError):
+            pass
+        rows = (await db.execute(select(Property).where(*where).order_by(Property.price.desc().nullslast()).limit(12))).scalars().all()
+        recent_sales = (await db.execute(
+            select(Property.street_address, Property.city, close_price, close_date)
+            .where(closed, mine, close_date >= since).order_by(close_date.desc()).limit(5))).all()
+        out.append({
+            **a,
+            "sold_last_12_months_as_listing_agent": int(listing_sold[0] or 0), "listing_side_volume": round(float(listing_sold[1] or 0)),
+            "sold_last_12_months_as_buyer_agent": int(buyer_sold[0] or 0), "buyer_side_volume": round(float(buyer_sold[1] or 0)),
+            "listings_for_sale_now": [_property_summary(p) for p in rows],
+            "recent_sales": [{"address": f"{st}, {c}" if c else st, "sold_price": float(pr) if pr else None, "closed": cd} for st, c, pr, cd in recent_sales],
+        })
+    return {"agents": out, "price_range": {"min": lo, "max": hi},
+            "note": "From the MLS records OpenHousePal keeps (about the last 12 months of sales). To host at one of their listings, use request_to_host with its listing_key."}
+
+
 # ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
 TOOL_DEFINITIONS = [
+    {
+        "name": "look_up_agent",
+        "description": "Look up ANOTHER agent by name in the MLS records: their office, email/phone, how many homes they sold in the last 12 months (as listing agent and as buyer's agent, with volume), recent sales, and their listings for sale now (optionally in a price range). Use it for 'how many homes has X sold', 'what is X listing', 'whose listing is this', finding a listing to ask to host an open house at.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "The agent's name as said ('Lavinia Smerconish')."},
+                "min_price": {"type": "number"}, "max_price": {"type": "number"},
+            },
+            "required": ["name"],
+        },
+    },
     {
         "name": "search_properties",
         "description": "Search OpenHousePal's property database by address or city text. Returns compact summaries for multiple properties - use get_property_detail for one specific property's full facts. Property data is shared MLS-sourced listing data, not private to any one agent.",
@@ -631,6 +720,7 @@ TOOL_DEFINITIONS = [
 
 _DISPATCH: Dict[str, Callable] = {
     "search_properties": _search_properties,
+    "look_up_agent": _look_up_agent,
     "get_property_detail": _get_property_detail,
     "search_leads": _search_leads,
     "get_lead_detail": _get_lead_detail,

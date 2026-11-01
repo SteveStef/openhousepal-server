@@ -60,6 +60,7 @@ Order in each line: No-MLS Basic / No-MLS Premium / Basic / Premium / IDX.
 
 ## AI helper chat (the "Chat Usage" meter)
 - The AI helper chat has its own separate allowance, shown as a percent on the "Chat Usage" meter (on the helper's start screen and in Settings). It never uses the Monthly AI Usage allowance.
+- Inside a chat it's always showing, to one decimal, and moves after each reply: on a phone as a slim "CHAT" line on the sheet's top bar (above the X); on a computer as a slim line above the typing box. A typical reply is a small fraction of a percent.
 - Relative size: No-MLS Basic and Basic = 1x. No-MLS Premium and Premium = 2x. IDX = 4x. Each plan has double the chat of the one below it. Never say dollar amounts.
 - It resets on the same billing day as the AI meter. Near the limit the meter appears above the typing box with an upgrade button ("Upgrade to Premium for 2x the chat"). At 100% the chat says it's used up, when it resets, and which plan has double.
 - Things the helper makes for you (designs, Showcases, forms, follow-ups) don't cost extra - only the chat messages count. Starting the Blog AI writer from the chat uses the Monthly AI Usage allowance, same as starting it on the Blogs page.

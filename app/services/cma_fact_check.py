@@ -208,8 +208,29 @@ def subject_list_psf(subject: Optional[dict]) -> Optional[float]:
 
 
 _SUBJECT_PSF_RE = re.compile(
-    r"\bsubject(?:'s|’s)\s+(?:own\s+)?(?:(?:list|asking)(?:[- ]price)?\s+)?(?:\$/sq\.?\s?ft\s+(?:of\s+)?)?"
+    # "the subject's list-price rate of $256/sqft" (11/01 regen, 289 Compass Rd - it is $250): "rate of" too
+    r"\bsubject(?:'s|’s)\s+(?:own\s+)?(?:(?:list|asking)(?:[- ]price)?\s+)?"
+    r"(?:(?:rate|price\s+per\s+(?:square\s+)?(?:foot|sq\.?\s?ft))\s+(?:of\s+)?)?(?:\$/sq\.?\s?ft\s+(?:of\s+)?)?"
     r"\$\s?(?P<n>\d{2,4}(?:\.\d+)?)\s*(?:/\s*sq\.?\s?(?:ft|foot)|per\s+(?:square\s+)?(?:foot|ft))", re.I)
+
+
+def fix_subject_psf_numbers(text: str, subject: Optional[dict]) -> tuple[str, list[str]]:
+    """A wrong $/sq ft attributed to the subject is set to its real above-grade list $/sq ft (instead of
+    dropping the whole sentence)."""
+    s_psf = subject_list_psf(subject)
+    if not text or not s_psf:
+        return text, []
+    flags: list[str] = []
+
+    def _fix(m):
+        n = float(m.group("n"))
+        if abs(n - s_psf) <= max(2.0, 0.01 * s_psf):
+            return m.group(0)
+        flags.append(f"Fact check: the subject's $/sq ft was given as ${n:,.0f} - set to ${s_psf:,.0f}, its list "
+                     "price per above-grade sq ft.")
+        a, b = m.start("n") - m.start(), m.end("n") - m.start()
+        return m.group(0)[:a] + f"{s_psf:,.0f}" + m.group(0)[b:]
+    return _SUBJECT_PSF_RE.sub(_fix, text), flags
 
 
 def subject_psf_claim_problem(sentence: str, subject: Optional[dict]) -> Optional[str]:
@@ -543,6 +564,7 @@ def fix_text(text: str, *, subject: Optional[dict], comp: Optional[dict] = None,
         lambda x: fix_manual_subject_record(x, subject, comp),
         lambda x: fix_subject_lot_words(x, subject, comps) if comp is None and comps else (x, []),
         lambda x: fix_above_grade_psf_wording(x),
+        lambda x: fix_subject_psf_numbers(x, subject),
         lambda x: fix_community_claims(x, subject, comp),
         lambda x: fix_lower_level_claims(x, comp, who) if comp is not None else (x, []),
         lambda x: (lambda t2, f2: (t2, [f"{who}: {m}" for m in f2]))(*fix_size_claims(x, subject, comp)) if comp is not None else (x, []),
@@ -874,10 +896,22 @@ _LL_WORDS = {"measured": "finished below-grade area on record",
              "unfinished": "unfinished basement", "none": "no basement on record", "unknown": None}
 
 
+def lot_acres_text(d: Optional[dict]) -> Optional[str]:
+    """The lot in acres, two decimals - the one figure the report prints everywhere (cover, comp pages,
+    write-ups). The model rounded 1.15 acres to "1.1" in the text while the cover said 1.2 (grader 11/01)."""
+    d = d or {}
+    sqft = _money(d.get("lot_size")) or _money(d.get("lot_size_sqft"))
+    acres = sqft / 43560 if sqft else _money(d.get("lot_size_acres")) or _money(d.get("acres"))
+    if not acres or implausible_lot(acres, _money(d.get("sale_price")) or _money(d.get("list_price")), d.get("home_type")):
+        return None
+    return f"{acres:,.2f} acres - quote exactly this figure for its lot size"
+
+
 def prompt_facts_subject(subject: Optional[dict]) -> dict:
     s = subject or {}
     psf = subject_list_psf(s)
     return {
+        "lot_acres": lot_acres_text(s),
         "subdivision_name": subdivision_of(s) or "not on record",
         "list_price_per_above_grade_sqft": (f"${psf:,.0f} per above-grade sq ft - the ONLY subject $/sq ft to quote"
                                             if psf else None),
@@ -897,6 +931,7 @@ def prompt_facts_comp(subject: Optional[dict], comp: Optional[dict]) -> dict:
         rel = "above" if psf > s_psf * 1.01 else "below" if psf < s_psf * 0.99 else "about the same as"
         vs = f"${psf:,.0f} vs the subject's ${s_psf:,.0f} list price per above-grade sq ft - {rel}"
     return {
+        "lot_acres": lot_acres_text(c),
         "subdivision_name": subdivision_of(c) or "not on record",
         "neighborhood_vs_subject": neighborhood_vs_subject(subject, c),
         "price_per_above_grade_sqft_vs_subject": vs,

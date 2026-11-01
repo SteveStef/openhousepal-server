@@ -39,6 +39,8 @@ Leads and follow-ups in depth: the Leads list and a lead's page, statuses, tags,
 ## Follow-ups page (Leads → Follow-ups, "Never miss a follow-up")
 - Master switch **Follow-ups On/Off**: off = "No automatic follow-ups"; nothing new is made and follow-ups are hidden from Dash, Leads and the daily email. Anything already on your calendar stays. Settings are kept. Good for agents whose CRM already reminds them.
 - **Add** your own: "What needs doing?", **When** (Today, Tomorrow, In 3 days, Next Monday, **Pick a day…**, **Someday**), optional **Add a time** (with a time it buzzes your phone; without, it's all day) → **Add follow-up**.
+- Checked off by mistake: a done card shows **Undo** right next to "Done" (on the Follow-ups page, a lead's page and the Dash) - one tap brings it back. Older done ones sit under the "... completed in the last 2 weeks" bar; open it and tap **Undo**.
+- Phone: the page's top shows the calendar chip (e.g. Google) at the top right, and **Open**, **Inbox**, **+ Add** and the **Follow-ups** on/off switch on one line.
 - Cards: **Mark done** / **Undo - mark not done** (done also marks the person contacted and resolves a linked request), "..." → **Snooze** (Tomorrow, In 3 days, Next week - keeps its time of day) or delete, ready-to-send message (**Text**, **Copy email**, copy). Showing requests add **Book in ShowingTime** with the listing agent's phone, email and MLS#, then **Mark scheduled**. **Suggested from what they just did** → **Add for tomorrow**. **Inbox** = every follow-up added in the last two weeks.
 - One open automatic follow-up per person - no duplicates. Direct requests (disclosure, second visit, showing, search change) always get their own. Missed follow-ups move to today each morning for up to a week.
 
@@ -85,6 +87,7 @@ Each situation has:
 - Tabs: All, Unread, Opens, Forms, Tours, Questions, Showcases, Emails, Follow-ups, Reviews, Hosting, Account. Search, type, date range, Newest/Oldest first, **Clear**. Tap an item to mark it read. **Mark all read**. No mark-unread.
 
 ## The daily briefing
+- The briefing's open house wrap-up lists each guest with "Has an agent" / "No agent" as it is when the email goes out - if the agent changed it on their lead after the sign-in, the email shows the change.
 - Email "Daily briefing" (turn it on/off and pick **Arrives at**, 6:00 AM-9:00 PM Eastern in 15-minute steps, default 4:30 PM, in Tools → Email). On the Dash it's **Today's Rundown**.
 - Contains: follow-ups due today and overdue (top 5, "+ N more"); things waiting on you (agents asking to host your listing, hosting answers needed, leads needing a response, form responses you haven't opened, a support reply); client activity (clients asking for a search change, clients who changed their own search); new matches and price drops across your clients' Showcases; and open house wrap-ups (guests from opens that have ended).
 - Skipped on days with nothing new. If you turn the briefing off, open house wrap-ups still arrive as their own email.

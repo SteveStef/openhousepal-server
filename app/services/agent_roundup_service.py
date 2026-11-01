@@ -168,7 +168,7 @@ def queue_sign_in(db: AsyncSession, agent: User, oh, visitor, note: Optional[str
         return
     has_agent = {"YES": "Has an agent", "NO": "No agent"}.get(str(getattr(visitor, "has_agent", "") or "").upper(), "")
     _queue(db, OH_QUEUED, agent.email, f"oh:{oh.id}", agent.id, OH_TEMPLATE, {
-        "_oh_id": oh.id, "_address": nice_street(oh.address) or "your open house", "_city": (oh.city or "").title(),
+        "_oh_id": oh.id, "_visitor_id": getattr(visitor, "id", None), "_address": nice_street(oh.address) or "your open house", "_city": (oh.city or "").title(),
         "name": _cap_words(visitor.full_name) or "A guest", "email": visitor.email or "", "phone": _phone(visitor.phone),
         "agent_status": has_agent, "no_agent": has_agent == "No agent", "note": note or "", "_lead_link": lead_link or "",
     })
@@ -212,6 +212,24 @@ async def claim_open_house_wrapups(db: AsyncSession, owner_id: str, now: Optiona
     by_oh: "OrderedDict[str, list[dict]]" = OrderedDict()
     for r in rows:
         by_oh.setdefault(str(r.get("_oh_id")), []).append(r)
+    # "Has an agent" as it is NOW, not as they answered at sign-in: the agent may have changed it on
+    # their lead since (owner, 11/01 - Céline still read "Has an agent"). Older queued sign-ins have no
+    # _visitor_id, so they're matched by open house + email.
+    from app.models.database import OpenHouseVisitor
+    now_has: dict = {}
+    vrows = (await db.execute(select(OpenHouseVisitor.id, OpenHouseVisitor.open_house_event_id, OpenHouseVisitor.email, OpenHouseVisitor.has_agent)
+                              .where(OpenHouseVisitor.open_house_event_id.in_(list(by_oh))))).all()
+    for vid, ohid, email, has in vrows:
+        now_has[vid] = has
+        if email:
+            now_has.setdefault((str(ohid), email.strip().lower()), has)
+    for r in rows:
+        has = now_has.get(r.get("_visitor_id")) if r.get("_visitor_id") else None
+        if has is None and r.get("email"):
+            has = now_has.get((str(r.get("_oh_id")), str(r["email"]).strip().lower()))
+        if has is not None:
+            r["agent_status"] = {"YES": "Has an agent", "NO": "No agent"}.get(str(has).upper(), "")
+            r["no_agent"] = r["agent_status"] == "No agent"
     out = []
     for oh_id, guests in by_oh.items():
         seen, people = set(), []

@@ -1263,6 +1263,8 @@ _RAW_PROPERTY_ENRICHMENT_FIELDS = {
     # never reached the report - grader 10/23)
     "condo_fee": "AssociationFee2",
     "condo_fee_frequency": "AssociationFee2Frequency",
+    # Bright SaleType ("Auction", "Bank Owned/REO", "ShortSale"...) - an auction list price is an opening bid (11/01)
+    "sale_type": "SaleType",
 }
 _RAW_PROPERTY_ENRICHMENT_KEYS = tuple(_RAW_PROPERTY_ENRICHMENT_FIELDS)
 
@@ -1287,8 +1289,8 @@ _SUBJECT_FIELDS = [
     "road_context_note", *_PROPERTY_ENRICHMENT_FIELDS, *_RAW_PROPERTY_ENRICHMENT_KEYS,
     "authoritative_property_features", "material_issues",
     # cma_fact_check.prompt_facts_subject (10/24): the facts the grader caught the model guessing at
-    "subdivision_name", "list_price_per_above_grade_sqft", "lower_level_record", "association_fees",
-    "listing_and_sale_history", "interior_condition", "record_source",
+    "subdivision_name", "list_price_per_above_grade_sqft", "lower_level_record", "association_fees", "lot_acres",
+    "listing_and_sale_history", "interior_condition", "record_source", "auction_listing",
 ]
 _COMP_FIELDS = [
     "street_address", "city", "state", "zipcode", "distance_miles", "status",
@@ -1304,7 +1306,7 @@ _COMP_FIELDS = [
     "authoritative_property_features",
     # cma_fact_check.prompt_facts_comp (10/24): "same Uwchlan Hunt community" for a Turnbury subject,
     # "$256/sqft ... in line with the subject's own $256" on a $369-per-above-grade-sq-ft listing
-    "subdivision_name", "neighborhood_vs_subject", "price_per_above_grade_sqft_vs_subject", "lower_level_record",
+    "subdivision_name", "neighborhood_vs_subject", "price_per_above_grade_sqft_vs_subject", "lower_level_record", "lot_acres",
     "association_fees",
     # Included so the AI can echo it back in the listing_key field of its submit_cma_analysis
     # tool call (that's the ONLY thing this value is for - see the system prompt's explicit
@@ -3649,7 +3651,45 @@ def _final_polish_pass(text: str, label: str) -> tuple[str, list[str]]:
     # "statistical outlier", "the analyst notes" (239 Windham Dr) on client pages.
     for pat, rep in _CLIENT_JARGON_SUBS:
         out = pat.sub(rep, out)
+    closed = _close_open_quotes(out)
+    if closed != out:
+        out = closed
+        flags.append(f"{label}: closed a quotation left open.")
     return out, flags
+
+
+def _close_open_quotes(text: str) -> str:
+    """A quote opened and never closed gets its closing mark where the quoted phrase ends - before the next
+    sentence-ending punctuation or the end of the paragraph (grader 11/01: listing describes it as "total
+    rehabilitation needed. Plan for ...")."""
+    paras = []
+    for para in str(text or "").split("\n"):
+        for opener, closer in (("“", "”"), ('"', '"')):
+            if opener == closer:
+                if para.count('"') % 2 == 0:
+                    continue
+                start = para.rfind('"')
+            else:
+                if para.count(opener) <= para.count(closer):
+                    continue
+                start = para.rfind(opener)
+            if start < 0 or start + 1 >= len(para) or not para[start + 1].isalnum():
+                continue
+            m = re.compile(r"[.!?;](?=\s|$)|\)|$").search(para, start + 1)
+            end = m.start() if m else len(para)
+            para = para[:end].rstrip() + closer + para[end:]
+        # single quotes: an opener starts a word after a space, a closer ends one; apostrophes sit inside words
+        # ("'total rehabilitation needed' and 'sold as-is. Buyers ..." - 719 Beechwood Rd regen, 11/01)
+        openers = [m.start() for m in re.finditer(r"(?<![\w'])'(?=\w)", para)]
+        closers = [m.start() for m in re.finditer(r"(?<=[\w.,!?-])'(?![\w'])", para)]
+        if len(openers) > len(closers):
+            start = openers[-1]
+            if not any(c > start for c in closers):
+                m = re.compile(r"[.!?;](?=\s|$)|\)|$").search(para, start + 1)
+                end = m.start() if m else len(para)
+                para = para[:end].rstrip() + "'" + para[end:]
+        paras.append(para)
+    return "\n".join(paras)
 
 
 _CLIENT_JARGON_SUBS = [
@@ -5708,6 +5748,16 @@ _V10_GRID_BG_FRAC = float(os.getenv("CMA_GRID_BG_FRAC", "0.12"))      # each fin
 _V10_FEATURE_BATH_PCT = 0.02      # per full-bath difference (a half bath = 0.5) x the comp's price
 _V10_FEATURE_GARAGE_PCT = float(os.getenv("CMA_GRID_GARAGE_PCT", "0.015"))  # per garage-space difference x the comp's price
 _V10_FEATURE_LOT_PCT = float(os.getenv("CMA_GRID_LOT_PCT", "0"))  # per doubling of lot size x the comp's price (0 = off)
+# Big lot gaps only (grader 11/01, 719 Beechwood Rd: a 1.2-acre subject vs 0.1-0.36-acre comps had no lot
+# line). The all-lots line above stays off (no gain on the 10/21 backtest); this one fires only when one lot
+# is at least _V10_LOT_BIG_RATIO x the other AND _V10_LOT_BIG_MIN_ACRES bigger - extra usable land, not a
+# few thousand square feet.
+_V10_FEATURE_LOT_BIG_PCT = float(os.getenv("CMA_GRID_LOT_BIG_PCT", "0"))   # per doubling x the comp's price
+_V10_LOT_BIG_RATIO = 2.0
+_V10_LOT_BIG_MIN_ACRES = 0.4
+# Septic vs public sewer (grader 11/01). Cesspools have their own line below.
+_V10_FEATURE_SEPTIC_PCT = float(os.getenv("CMA_GRID_SEPTIC_PCT", "0"))
+_V10_FEATURE_SEPTIC_MAX = 20000
 _V10_REL_WEIGHT_POW = float(os.getenv("CMA_REL_WEIGHT_POW", "1"))  # comp weight = Match-% relevance ** this
 # Grader suggestions (10/21), tested on the 120-home free backtest (_cma_engine_lab/engine/edge_*.log):
 # time at 3%/yr was a little better on every buyer measure (grid 10.1% -> 9.8% median miss, with the
@@ -5861,7 +5911,13 @@ def _material_system_issues(d: dict) -> list:
     if "cess" in sewer:
         out.append("cesspool (sewer)")
     remarks = str(_first_present(d or {}, "public_remarks", "remarks", "listing_remarks") or "")
+    # Remarks that also describe a finished full renovation ("once a fixer-upper, now substantially renovated")
+    # aren't a home that needs major work (grader 11/01: comp #4's banner said "needs major work", its
+    # write-up "substantially renovated").
+    renovated = bool(_COND_TEXT_TIERS[-2][1].search(remarks))
     for label, pattern in _RED_FLAG_PATTERNS:
+        if label == "needs major work" and renovated:
+            continue
         for m in re.finditer(pattern, remarks, re.IGNORECASE):
             if not _NEGATION_RE.search(remarks[max(0, m.start() - 20):m.start()]):
                 out.append(f"listing says: {label}")
@@ -5871,6 +5927,57 @@ def _material_system_issues(d: dict) -> list:
 
 def _has_cesspool(d: dict) -> bool:
     return "cess" in _style_text((d or {}).get("sewer"))
+
+
+def _sewer_kind(d: dict) -> Optional[str]:
+    """'septic' (on-site system), 'public' or None (unknown, cesspool, or mixed words like Bright's
+    "Public Septic")."""
+    s = _style_text((d or {}).get("sewer"))
+    if not s or "cess" in s:
+        return None
+    septic = any(w in s for w in ("septic", "on site", "on-site", "onsite", "mound", "sand mound", "holding tank"))
+    public = any(w in s for w in ("public", "city", "municipal", "community sewer"))
+    if septic and not public:
+        return "septic"
+    if public and not septic:
+        return "public"
+    return None
+
+
+# Auction listings (grader 11/01, 719 Beechwood Rd): the list price is an opening bid, not the seller's
+# number. Measured on our Bright mirror (closed sales, sold / final list): SaleType "Auction" median 1.45x
+# (middle half 1.00-1.91x, 1,255 sales; PA single-family 1.13x, 1.00-1.43x) vs 1.00x (0.97-1.01x) for
+# every other sale - so the asking-price check, which assumes a home sells near its asking price, must
+# not run. Bright's SaleType first, else the listing text ("opening bid", "auction date"...).
+_AUCTION_TEXT_RE = re.compile(
+    r"\b(?:(?:opening|starting|minimum|min\.?)\s+bid|bidding\s+(?:starts|opens|begins|ends)|"
+    r"auction\s+(?:date|property|terms|day|ends|starts|closes|will\s+be\s+held|on\s+site)|"
+    r"(?:public|online|absolute|live|real\s+estate|estate)\s+auction|this\s+is\s+an\s+auction|"
+    r"(?:sold|offered|selling|sells)\s+(?:at|by|via|through)\s+(?:public\s+|online\s+)?auction|buyer'?s?\s+premium)\b",
+    re.IGNORECASE)
+
+
+def _auction_listing(d: Optional[dict]) -> Optional[dict]:
+    """{"source": "mls_sale_type" | "listing_text", "phrase": ...} when this listing is sold at auction."""
+    d = d or {}
+    sale_type = d.get("sale_type")
+    vals = sale_type if isinstance(sale_type, (list, tuple)) else [sale_type] if sale_type else []
+    if any("auction" in str(v).lower() for v in vals):
+        return {"source": "mls_sale_type", "phrase": "Auction"}
+    remarks = str(_first_present(d, "public_remarks", "remarks", "listing_remarks") or "")
+    for m in _AUCTION_TEXT_RE.finditer(remarks):
+        if not _NEGATION_RE.search(remarks[max(0, m.start() - 20):m.start()]):
+            return {"source": "listing_text", "phrase": m.group(0)}
+    return None
+
+
+_AUCTION_PROMPT_NOTE = (
+    "This home is being sold at AUCTION. Its list price is an opening (starting) bid set to draw bidders, "
+    "not the seller's expected price and not evidence of value - on our MLS data auction homes have sold "
+    "for a median of about 1.1-1.4x their opening bid, with a very wide spread. Value it from the sales "
+    "only, never pull the value toward the list price, and say in plain words that the list price is an "
+    "opening bid. Auction terms (deposit, buyer's premium, as-is, inspection access, closing date) come "
+    "from the auction company - tell the buyer to read them; never invent them.")
 
 
 def _v10_garage_spaces(d: dict) -> Optional[float]:
@@ -5974,6 +6081,15 @@ def _v10_grid_adjustments(subject: dict, r: dict, s_ag: float, s_bg: float, s_bg
     if _V10_FEATURE_LOT_PCT and s_lot and c_lot and (s_lot / c_lot >= 1.25 or c_lot / s_lot >= 1.25):
         out["lot"] = _clamp(math.log2(s_lot / c_lot), -2.0, 2.0) * price * _V10_FEATURE_LOT_PCT
         out["notes"].append(f"lot {s_lot / 43560:.2f} vs {c_lot / 43560:.2f} acres")
+    elif (_V10_FEATURE_LOT_BIG_PCT and s_lot and c_lot and max(s_lot, c_lot) / min(s_lot, c_lot) >= _V10_LOT_BIG_RATIO
+          and abs(s_lot - c_lot) >= _V10_LOT_BIG_MIN_ACRES * 43560):
+        out["lot"] = _clamp(math.log2(s_lot / c_lot), -2.5, 2.5) * price * _V10_FEATURE_LOT_BIG_PCT
+        out["notes"].append(f"lot {s_lot / 43560:.2f} vs {c_lot / 43560:.2f} acres")
+    s_sep, c_sep = _sewer_kind(subject), _sewer_kind(comp)
+    if _V10_FEATURE_SEPTIC_PCT and {s_sep, c_sep} == {"septic", "public"}:
+        amount = min(_V10_FEATURE_SEPTIC_PCT * price, _V10_FEATURE_SEPTIC_MAX)
+        out["sewer"] = amount if c_sep == "septic" else -amount
+        out["notes"].append("comp is on septic, subject on public sewer" if c_sep == "septic" else "subject is on septic, comp on public sewer")
     s_cess, c_cess = _has_cesspool(subject), _has_cesspool(comp)
     if s_cess != c_cess and subject.get("sewer") and comp.get("sewer"):
         amount = min(_V10_FEATURE_CESSPOOL_PCT * price, _V10_FEATURE_CESSPOOL_MAX)
@@ -6064,6 +6180,37 @@ def _anchor_main_uncertainties(subject: dict, rows: list, closed_count: int) -> 
     for reason in _anchor_loose_fit_reasons(subject, rows):
         if reason not in out and not (reason.startswith("Adjustments exceed") and heavy):
             out.append(reason)
+    out.extend(_lot_and_sewer_uncertainties(subject, rows))
+    return out
+
+
+def _lot_and_sewer_uncertainties(subject: dict, rows: list) -> list:
+    """Say out loud when the land or the sewer differs and there is no dollar line for it (grader 11/01,
+    719 Beechwood Rd: a 1.2-acre septic home next to 0.1-0.36-acre sewer sales, no lot or septic line, and no
+    word about either). Both lines were tested 11/01 on 64 local big-lot sales: a lot line made the adjusted
+    sales LESS accurate (median miss 9.1% -> 9.2-9.7%) and a septic line changed nothing, so they stay off
+    (CMA_GRID_LOT_BIG_PCT / CMA_GRID_SEPTIC_PCT) and the report explains instead."""
+    out = []
+    s_lot = _relevance_lot_sqft(subject)
+    lots = sorted(x for x in (_relevance_lot_sqft(r["_c"]) for r in rows) if x)
+    if s_lot and lots and not _V10_FEATURE_LOT_BIG_PCT:
+        mid = lots[len(lots) // 2]
+        if s_lot >= _V10_LOT_BIG_RATIO * mid and s_lot - mid >= _V10_LOT_BIG_MIN_ACRES * 43560:
+            out.append(f"This home's {s_lot / 43560:.2f}-acre lot is much larger than the sales' (typically {mid / 43560:.2f} acres). "
+                       "On recent local sales, extra land like this didn't add a steady, measurable amount, so the value "
+                       "has no separate dollar step for it - how much a buyer pays for the extra land is a judgment call.")
+        elif mid >= _V10_LOT_BIG_RATIO * s_lot and mid - s_lot >= _V10_LOT_BIG_MIN_ACRES * 43560:
+            out.append(f"This home's {s_lot / 43560:.2f}-acre lot is much smaller than the sales' (typically {mid / 43560:.2f} acres); "
+                       "local sales didn't show a steady dollar difference for land, so there is no separate step for it.")
+    s_sew = _sewer_kind(subject)
+    other = [r for r in rows if _sewer_kind(r["_c"]) and _sewer_kind(r["_c"]) != s_sew]
+    if s_sew and other and not _V10_FEATURE_SEPTIC_PCT:
+        word = {"septic": "a septic system", "public": "public sewer"}
+        out.append(f"This home has {word[s_sew]}, while {len(other)} of the {len(rows)} sales have "
+                   f"{word['public' if s_sew == 'septic' else 'septic']}. Local sales didn't show a steady price difference "
+                   "between the two, so there is no dollar step for it - "
+                   + ("have the septic system inspected and pumped before you commit." if s_sew == "septic"
+                      else "it mainly matters for upkeep."))
     return out
 
 
@@ -6835,14 +6982,16 @@ _COND_TIER_LABEL = {0.0: "needs major rehab", 0.5: "investor / as-is", 1.0: "bel
 _COND_TEXT_TIERS = (
     (0.5, re.compile(r"\b(?:sold\s+as[\s-]?is|as[\s-]?is\s+(?:sale|condition|where[\s-]?is)|investor\s+special|"
                      r"(?:handyman|contractor)\s+special|fixer[\s-]?upper|gut\s+(?:job|rehab)|shell|tear[\s-]?down|"
-                     r"needs?\s+(?:a\s+)?(?:total\s+|full\s+|complete\s+|major\s+)?(?:rehab|gut|renovation|work)|"
+                     r"needs?\s+(?:a\s+)?(?:total\s+|full\s+|complete\s+|major\s+)?(?:rehab(?:ilitation)?|gut|renovation|work)|"
+                     # "total rehabilitation needed" (719 Beechwood Rd, 11/01) read as no tier at all
+                     r"(?:total|full|complete|major|extensive)\s+(?:rehab(?:ilitation)?|renovation|gut(?:\s+rehab)?)\s+(?:is\s+)?(?:needed|required|necessary)|"
                      r"cash\s+(?:only|buyers?\s+only|offers?\s+only)|great\s+investment\s+opportunity|"
                      r"investor\s+(?:opportunity|alert|special|project)|calling\s+all\s+(?:investors|flippers|contractors)|flippers?|"
                      r"(?:online\s+)?auction|ready\s+for\s+(?:a\s+)?(?:full\s+|complete\s+)?(?:gut|rehab|renovation)|"
                      r"in\s+its\s+current\s+condition)\b", re.I)),
     (1.5, re.compile(r"\b(?:needs?\s+(?:some\s+)?(?:tlc|updating|updates|cosmetic)|tlc|bring\s+your\s+(?:ideas|vision|contractor)|"
                      r"sweat\s+equity|original\s+condition|priced\s+to\s+sell|estate\s+sale)\b", re.I)),
-    (4.0, re.compile(r"\b(?:(?:fully|completely|totally|gut|extensively|newly|meticulously|beautifully)\s+"
+    (4.0, re.compile(r"\b(?:(?:fully|completely|totally|gut|extensively|substantially|newly|meticulously|beautifully)\s+"
                      r"(?:renovated|rehabbed|restored|remodeled|redone)|new\s+construction|newly\s+(?:built|constructed)|"
                      r"brand[\s-]new\s+(?:home|construction|build|townhome|townhouse|rowhome)|turn[\s-]?key|"
                      r"top[\s-]to[\s-]bottom\s+(?:renovation|rehab)|renovated\s+(?:from\s+)?top\s+to\s+bottom|tax\s+abatement)\b", re.I)),
@@ -7569,6 +7718,8 @@ def _v10_condition_rating_consistency_check(subject: dict, comps: list) -> list:
     # Age and missing renovation history are not condition evidence. Only an explicit statement in
     # the authoritative property record can establish that the subject is original/dated.
     subj_original = _documented_condition_deficit(subject)
+    _st = _condition_tier(subject)
+    subj_project = _st is not None and _st <= 0.5   # the subject's own listing: needs major work / as-is
     for i, c in enumerate(comps):
         if not c.get("is_included", True):
             continue
@@ -7602,6 +7753,13 @@ def _v10_condition_rating_consistency_check(subject: dict, comps: list) -> list:
                 fixes["interior"] = "above" if strong_reno else "similar"
             elif q.get("interior") in (None, "", "similar") and strong_reno:
                 fixes["interior"] = "above"
+        elif asis and not reno and subj_project:
+            # both sides need work: an as-is sale is no weaker inside than a home needing a total rehab
+            # (11/01 regen of 719 Beechwood Rd: 441 Manchester Ave, sold as-is, was re-rated Inferior)
+            if q.get("finish_quality") == "below":
+                fixes["finish_quality"] = "similar"
+            if q.get("interior") == "below":
+                fixes["interior"] = "similar"
         elif asis and not reno:
             if q.get("finish_quality") in ("above", "similar", None, ""):
                 fixes["finish_quality"] = "below"
@@ -7743,6 +7901,10 @@ def _compute_exposure(subject: dict, status_timeline: dict, comp_median_dom: Opt
 
     if price_reduced and ceiling is not None and cur_list:
         ceiling = cur_list  # the already-reduced list, never the original
+    # An auction list price is an opening bid, never a ceiling (11/01 - see _auction_listing).
+    auction = _auction_listing(subject)
+    if auction and not contract_price:
+        ceiling = hard_upper = pull_target = None
 
     relisted_note = None
     cdom = tl.get("cumulative_dom")
@@ -7772,6 +7934,7 @@ def _compute_exposure(subject: dict, status_timeline: dict, comp_median_dom: Opt
         "dom_thresholds": {"short": round(short_cut), "normal": round(normal_cut), "extended": round(extended_cut)},
         "dom_basis": dom_basis,
         "current_list_price": round(cur_list) if cur_list else None,
+        "auction_listing": bool(auction),
         "original_list_price": round(orig_list) if orig_list else None,
         "previous_list_price": round(prev_list) if prev_list else None,
         "price_cut_pct": round(price_cut_pct, 1),
@@ -8970,6 +9133,11 @@ bidding_war_or_unusual_demand for a sale clearly out of line with the rest of th
 far further over list, or far faster, than the others). Likewise, when most sales closed below
 list after long market times, do not treat the one quick over-list sale as the norm.
 
+When subject.auction_listing is set, the home is being sold at auction: its list price is an opening
+bid set to draw bidders, not market evidence. There is no asking_price_check. Value it from the sales
+alone, never move the value toward the list price, and never describe the value as above or below
+"asking" as if the list price were the seller's expected price - call it the opening bid.
+
 When the packet has asking_price_check, the subject is for sale and its own asking price is market
 evidence. The listing agent priced it from these same sales and has seen inside the home. Homes
 here sell at about comp_median_sold_to_list_ratio of their asking price, so the most likely sale
@@ -9091,6 +9259,8 @@ def _build_reasoning_evidence_packet(
     subject_packet = {
         "address": address or None,
         "current_list_price": _as_float(subject.get("list_price")),
+        # an auction list price is an opening bid - the asking-price check is skipped (see _auction_listing)
+        "auction_listing": (dict(_auction_listing(subject), note=_AUCTION_PROMPT_NOTE) if _auction_listing(subject) else None),
         "original_list_price": _as_float(tl.get("original_list_price")) or _as_float(subject.get("original_list_price")),
         "price_history": exposure.get("price_history") or tl.get("history_events") or [],
         "status": tl.get("current_status") or subject.get("status") or subject.get("mls_status"),
@@ -9109,6 +9279,7 @@ def _build_reasoning_evidence_packet(
         "total_finished_sqft": subject_sqft["total_finished_sqft"],
         "primary_sqft_type": subject_sqft["primary_sqft_type"],
         "lot_size": _first_present(subject, "lot_size", "lot_size_sqft", "acres"),
+        "lot_acres": _fact_check.lot_acres_text(subject),
         "year_built": subject.get("year_built"),
         "school_district": subject.get("school_district"),
         "taxes": _first_present(subject, "taxes", "annual_taxes", "tax_annual_amount"),
@@ -9289,7 +9460,9 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
     None when the subject isn't listed, has already closed, or fewer than 2 comps have a ratio."""
     tl = status_timeline or {}
     state = str((exposure or {}).get("state") or "")
-    if tl.get("not_listed") or state in ("not_listed", "closed"):
+    # An auction list price is an opening bid: auction homes sell far from it (median 1.45x, see
+    # _auction_listing), so it says nothing about where this one sells - no band, no listing step.
+    if tl.get("not_listed") or state in ("not_listed", "closed") or subject_packet.get("auction_listing"):
         return None
     lp = _as_float(subject_packet.get("current_list_price"))
     ratios = [float(c["sold_list_ratio"]) for c in comp_packets
@@ -10801,6 +10974,10 @@ def _size_ratio_claim_errors(text: str, areas_c: dict, areas_s: dict) -> list:
     return out
 
 
+# Plain words for a corrected rating, for the targeted comp-note rewrite (11/01)
+_QUALITY_WORD = {"above": "better than the subject", "below": "weaker than the subject", "similar": "similar to the subject"}
+
+
 def _regenerate_comp_narrative_from_snapshot(comp: dict, label: str, subject: Optional[dict] = None) -> str:
     """Build a corrected comp card from canonical facts plus clearly labelled model judgment.
 
@@ -10941,7 +11118,9 @@ def _regenerate_comp_narrative_from_snapshot(comp: dict, label: str, subject: Op
     updates = _listing_named_updates(remarks)
     if updates:
         sentences.append(f"Its listing mentions {_join_and(updates)}, though " + ("those claims aren't" if len(updates) > 1 else "that isn't") + " independently verified.")
-    elif re.search(r"\b(?:renovat\w+|rebuilt|updated)\b", remarks, re.IGNORECASE):
+    elif re.search(r"\b(?:renovat\w+|rebuilt|updated)\b", remarks, re.IGNORECASE) and not any(
+            f in ("sold as-is", "needs major work") for f in _flags):
+        # not next to "sold as-is" (11/01: "Its listing notes sold as-is ... describes it as updated")
         sentences.append("Its listing describes it as updated, without naming specific systems.")
     return " ".join(sentences)
 
@@ -11065,16 +11244,38 @@ async def _materialize_snapshot_with_comp_narratives(
     flags: list[str] = []
     blocking: list[str] = []
     per_comp_blocking: dict[int, list[str]] = {}
+    # Comps whose ratings were corrected keep the AI's own note and get ONE targeted rewrite of the
+    # rating sentences; the fact template is only the fallback (grader 11/01: comp #3's rebuilt note read
+    # "stiff and templated unlike the other four").
+    template_fallback: dict[int, str] = {}
     for i, comp in enumerate(comps):
         label = _comp_label(i, comp)
         draft = drafts[i] if i < len(drafts) else {}
         ai_draft = str(draft.get("ai_commentary") or "").strip()
         agent_draft = str(draft.get("commentary") or "").strip()
-        corrected = bool(comp.get("_cond_rating_fix") or comp.get("_amenities_fact_reconciled"))
-        _num_errs = [] if corrected or not ai_draft else _comp_note_number_errors(ai_draft, comp, subject)
+        rating_fixed = bool(comp.get("_cond_rating_fix") or comp.get("_amenities_fact_reconciled"))
+        corrected = rating_fixed
+        _num_errs = [] if not ai_draft else _comp_note_number_errors(ai_draft, comp, subject)
         if _num_errs:
             corrected = True
             flags.append(f"{label}: AI note had figures that don't match the MLS record ({'; '.join(_num_errs[:3])}) - rebuilt from verified facts.")
+        # A wrong figure gets the same targeted rewrite (11/01 regen, 289 Compass Rd: one quoted total
+        # sq ft as above grade and the whole note became the fact template); still wrong -> the template.
+        if attempt_rewrite and ai_draft and (rating_fixed or _num_errs):
+            template_fallback[i] = _regenerate_comp_narrative_from_snapshot(comp, label, subject)
+            reasons = []
+            if rating_fixed:
+                _fix = comp.get("_cond_rating_fix") or {}
+                _pairs = ", ".join(f"{k.replace('_', ' ')} now {_QUALITY_WORD.get(v, v)}" for k, v in (_fix.get("after") or {}).items())
+                reasons.append(f"{label}: this comparable's quality ratings were corrected after the note was written"
+                               + (f" ({_pairs})" if _pairs else " (amenities)")
+                               + " - rewrite only the sentences that call it better or worse than the subject on those "
+                               "points so they match; keep every other sentence as written.")
+            if _num_errs:
+                reasons.append(f"{label}: these figures don't match the MLS record - {'; '.join(_num_errs[:3])}. Correct "
+                               "or remove only those figures; keep every other sentence as written.")
+            per_comp_blocking[i] = reasons
+            corrected = False
         generated = _regenerate_comp_narrative_from_snapshot(comp, label, subject) if corrected else ai_draft
         if generated:
             generated, ff = _reconcile_comp_hard_facts(generated, label, subject, comp)
@@ -11094,7 +11295,7 @@ async def _materialize_snapshot_with_comp_narratives(
                     comp[field], label, subject, comp_note=True, comp=comp,
                 ))
         if _comp_blocking:
-            per_comp_blocking[i] = _comp_blocking
+            per_comp_blocking[i] = per_comp_blocking.get(i, []) + _comp_blocking
         if corrected:
             flags.append(f"{label}: regenerated its client narrative from the corrected authoritative evidence snapshot.")
 
@@ -11111,10 +11312,18 @@ async def _materialize_snapshot_with_comp_narratives(
         for i, reasons in per_comp_blocking.items():
             label = _comp_label(i, comps[i])
             new_text = rewritten.get(label)
+            re_blocking = _factual_prose_blocking(new_text, label, subject, comp_note=True, comp=comps[i]) if new_text else reasons
+            if new_text and i in template_fallback:
+                re_blocking = re_blocking + _comp_note_number_errors(new_text, comps[i], subject)
+            if re_blocking and i in template_fallback:
+                # the rewrite failed - fall back to the fact template (always consistent with the ratings)
+                new_text, _ff = _reconcile_comp_hard_facts(template_fallback[i], label, subject, comps[i])
+                flags.extend(_ff)
+                re_blocking = _factual_prose_blocking(new_text, label, subject, comp_note=True, comp=comps[i])
+                flags.append(f"{label}: regenerated its client narrative from the corrected authoritative evidence snapshot.")
             if not new_text:
                 blocking.extend(reasons)
                 continue
-            re_blocking = _factual_prose_blocking(new_text, label, subject, comp_note=True, comp=comps[i])
             if re_blocking:
                 blocking.extend(re_blocking)
                 continue
@@ -13438,12 +13647,15 @@ def _bridge_client_text(bridge: Optional[dict]) -> str:
     if not b.get("steps"):
         return ""
     out = [f"How the value was reached: the adjusted comparable sales point to about ${b['adjusted_sales_value']:,.0f} "
-           "(each sale adjusted toward this home - see the adjustment table)."]
+           "(each sale adjusted for the ways it differs from this home)."]
     for s in b["steps"]:
         amt = s["amount"]
         sign = "adds" if amt > 0 else "takes off"
         if s["key"] == "listing":
-            out.append(f"{s['basis']} That {sign} ${abs(amt):,.0f}.")
+            # the backtest sentence stays on the PDF's value-steps page; in the client's notes it was one
+            # dense sentence too many (grader 11/01: "valuation notes are dense and jargon-heavy for a buyer")
+            basis = re.sub(r"\s*Tested on about \d+ past local sales[^.]*\.", "", s["basis"])
+            out.append(f"{basis} That {sign} ${abs(amt):,.0f}.")
         elif s["key"] == "judgment":
             out.append(f"{s['basis'].rstrip('.')} - it {sign} ${abs(amt):,.0f}.")
         else:
@@ -13529,7 +13741,45 @@ def _v10_reconcile_anchor_direction_prose(methodology: str, *, final: Optional[d
     text, gap_flags = _v10_asking_gap_sentence(text, final=final, trace=trace)
     text, oa_flags = _v10_over_ask_pattern_sentence(text, trace=trace)
     text, pc_flags = _v10_pending_context_sentence(text, final=final, trace=trace)
-    return text, flags + gap_flags + oa_flags + pc_flags
+    text, au_flags = _v10_auction_sentence(text, trace=trace)
+    text, ls_flags = _v10_lot_sewer_sentences(text, trace=trace)
+    return text, flags + gap_flags + oa_flags + pc_flags + au_flags + ls_flags
+
+
+def _v10_lot_sewer_sentences(methodology: str, *, trace: Optional[dict]) -> tuple[str, list[str]]:
+    """The land / sewer differences with no dollar step (_lot_and_sewer_uncertainties), stated once in the
+    client's value notes unless they already talk about it."""
+    unc = ((trace or {}).get("anchor") or {}).get("main_uncertainties") or []
+    add = []
+    for u in unc:
+        if not isinstance(u, str) or not u.startswith("This home's ") and not u.startswith("This home has "):
+            continue
+        topic = r"\bacres?\b|\blot\b" if "lot" in u.split(".")[0] else r"\bseptic\b|\bsewer\b"
+        if methodology and not re.search(topic, methodology, re.IGNORECASE):
+            add.append(u)
+    if not methodology or not add:
+        return methodology, []
+    return methodology.rstrip() + " " + " ".join(add), ["Methodology summary: said why lot size / sewer have no dollar step."]
+
+
+_AUCTION_MARK = "is being sold at auction"
+
+
+def _v10_auction_sentence(methodology: str, *, trace: Optional[dict]) -> tuple[str, list[str]]:
+    """Tell the client the home is an auction and what its list price is (grader 11/01, 719 Beechwood Rd:
+    the notes mentioned an "auction format" but never explained it, and the value was pulled to the
+    opening bid)."""
+    exp = (trace or {}).get("exposure") or {}
+    # the AI often says it already ("The advertised list price is an opening bid") - once is enough
+    if not methodology or not exp.get("auction_listing") or _AUCTION_MARK in methodology \
+            or re.search(r"\bopening bid\b", methodology, re.IGNORECASE):
+        return methodology, []
+    lp = _as_float(exp.get("current_list_price"))
+    sentence = ("This home " + _AUCTION_MARK + (f": its ${lp:,.0f} list price is the opening bid, where bidding starts, "
+                                                if lp else ": its list price is the opening bid, ")
+                + "not the seller's expected price, so it was not used to set the value - the value comes from what "
+                "similar homes sold for.")
+    return methodology.rstrip() + " " + sentence, ["Methodology summary: explained that the home is sold at auction (list price = opening bid)."]
 
 
 _PENDING_CONTEXT_MARK = "market context, not a sale"
@@ -14780,6 +15030,14 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
         opening_low = round(opening_high * 0.98) if (not lp or fmv < lp) else round(lp)
         target = round(fmv)
         comfort_ceiling = round(fmv)
+    # Auction (11/01): the list price is the opening bid, so "X% under list" means nothing - bidding starts
+    # at the opening bid and the buyer's limit is the supported value (bids, not an opening offer).
+    auction = bool(((trace or {}).get("exposure") or {}).get("auction_listing")) and not backup
+    if auction:
+        hot = False
+        opening_low = round(lp) if lp and lp < fmv * 0.97 else round(fmv * 0.9)
+        opening_high = round(fmv * 0.95)
+        target = comfort_ceiling = round(fmv)
 
     target = min(target, ceiling)
     opening_high = min(opening_high, ceiling, target)
@@ -14811,6 +15069,7 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
         "hot_market": hot, "market_over_ask_pct": round((_lts - 1) * 100, 1) if hot else None,
         "outpaced_by_comps": outpaced, "over_ask_passed": over_ask_passed, "over_ask_comp_median_dom": _over_doms[len(_over_doms) // 2] if _over_doms else None,
         "backup": backup, "under_contract_days": int(_uc_days) if (backup and _uc_days is not None) else None,
+        "auction": auction,
     }
 
 
@@ -14866,7 +15125,17 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
         return int(round(float(x) / step) * step) if x else x
     ol, oh, tgt = _r(b["opening_low"]), _r(b["opening_high"]), _r(b["target"])
     comfort_ceiling = _r(b.get("comfort_ceiling") or round(fmv * 1.05))
-    if b.get("backup") and lp:
+    if b.get("auction"):
+        opener = (
+            "This home is being sold at auction, so "
+            + (f"the ${lp:,} list price is the opening bid - where bidding starts, not the seller's expected price. "
+               if lp else "there is no asking price to negotiate from. ")
+            + "On our MLS records, auction homes have usually sold above their opening bid, often well above it, so "
+            f"expect bidding to go past it. Decide your top bid before the auction: the comparable sales support about "
+            f"${fmv:,}, so treat ${fmv:,} as your limit. If the auction terms add a buyer's premium, it is paid on top of "
+            "the winning bid - lower your top bid by that amount."
+        )
+    elif b.get("backup") and lp:
         _d = b.get("under_contract_days")
         _gap = (lp - fmv) / fmv * 100 if fmv else 0
         opener = (
@@ -15009,14 +15278,31 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
         _norm = " ".join(low.split())
         if _norm in " ".join(opener.lower().split()) or any(" ".join(k.lower().split()) == _norm for k in kept):
             continue
+        # An auction has no offer to negotiate and usually no contingencies - the AI's offer-style
+        # sentences ("negotiate", "inspection contingency", "escalation clause") don't apply (11/01).
+        if b.get("auction") and re.search(r"\b(?:contingen\w*|negotiat\w*|escalat\w*|counter\w*|seller concessions?|"
+                                          r"inspection period|due diligence period|appraisal)\b", low):
+            continue
         kept.append(s)
+    # A short / waived inspection next to "keep a strong inspection contingency" contradicts it (grader
+    # 11/01, 719 Beechwood Rd - a total rehab): the thorough inspection wins.
+    _short_insp = re.compile(r"\b(?:short(?:er|ened)?|quick|brief|limited|tight|compressed|abbreviated|reduced)\s+"
+                             r"(?:\w+\s+){0,2}(?:inspection|due[- ]diligence)\s+(?:period|window|timeline|timeframe)\b|"
+                             r"\b(?:waiv\w*|skip\w*|forgo\w*|drop\w*)\s+(?:\w+\s+){0,2}inspection", re.IGNORECASE)
+    # (the same sentence saying both goes too - the standard contingency sentence below replaces it)
+    if any(_short_insp.search(k) for k in kept) and any(re.search(r"\binspection contingency\b", k, re.IGNORECASE) for k in kept):
+        kept = [k for k in kept if not _short_insp.search(k)]
+    if b.get("auction"):
+        kept.append("Auction sales are usually as-is, with a deposit due at the auction that you may not get back and "
+                    "no inspection or financing contingency - read the auction company's terms, and arrange any "
+                    "inspection and your financing before the auction date.")
     # Always tell the buyer to keep an inspection contingency (v10 review, 10/21: when the AI's own
     # strategy sentences fell away, the offer page lost it).
-    if not any(re.search(r"\binspection\b", k, re.IGNORECASE) for k in kept):
+    elif not any(re.search(r"\binspection\b", k, re.IGNORECASE) for k in kept):
         kept.append("Include a standard home inspection contingency so the items on the inspection page can be "
                     "checked before you're committed.")
     # ...and an appraisal contingency (grader, v15: it was there in v12 only when the AI happened to say it).
-    if not any(re.search(r"\bapprais", k, re.IGNORECASE) for k in kept):
+    if not b.get("auction") and not any(re.search(r"\bapprais", k, re.IGNORECASE) for k in kept):
         kept.append("Keep an appraisal contingency as well, so you're protected if the lender's appraisal comes in "
                     "below your price.")
     body = " ".join(kept).strip()
@@ -15912,11 +16198,21 @@ def _fix_subject_condition_words(text: str, subject: dict) -> str:
         return text
     subj_ref = _subject_reference_pattern(subject)
     out = text
+
+    def _claims(t: str, pole: str) -> list:
+        # "what it commands once renovated" / "after renovation" is a what-if, not a claim about the home
+        # today - swapping it gave "commands once condition-unverified" (719 Beechwood Rd regen, 11/01)
+        return [(a, b) for a, b in _condition_claim_spans(t, subj_ref, pole)
+                if not _HYPOTHETICAL_BEFORE_RE.search(t[max(0, a - 24):a])]
     if not _documented_condition_deficit(subject):
-        out = _replace_spans(out, _condition_claim_spans(out, subj_ref, _DEFICIT_POLE_WORDS_RE), _CONDITION_PHRASE_REPLACEMENT)
+        out = _replace_spans(out, _claims(out, _DEFICIT_POLE_WORDS_RE), _CONDITION_PHRASE_REPLACEMENT)
     if not _documented_condition_renovated(subject):
-        out = _replace_spans(out, _condition_claim_spans(out, subj_ref, _RENOVATED_POLE_WORDS_RE), _CONDITION_PHRASE_REPLACEMENT)
+        out = _replace_spans(out, _claims(out, _RENOVATED_POLE_WORDS_RE), _CONDITION_PHRASE_REPLACEMENT)
     return out
+
+
+_HYPOTHETICAL_BEFORE_RE = re.compile(r"\b(?:once|after|when|if|until|unless|before|would\s+be|could\s+be|to\s+be)\s+(?:fully\s+|it\s+is\s+|it's\s+)?$",
+                                     re.IGNORECASE)
 
 
 def _deterministic_text_fixes(text: str, label: str, subject: dict) -> str:
@@ -16486,6 +16782,7 @@ async def _build_content(subject: dict, comps: list[dict], max_photos: int, warn
     subject_for_ai["listing_and_sale_history"] = "; ".join(_hist_lines) if _hist_lines else None
     subject_for_ai["interior_condition"] = None if _subject_interior_documented(subject) else _INTERIOR_UNKNOWN_NOTE
     subject_for_ai["record_source"] = _MANUAL_RECORD_NOTE if subject.get("source") == "manual" else None
+    subject_for_ai["auction_listing"] = _AUCTION_PROMPT_NOTE if _auction_listing(subject) else None
     add_text(_format_block("SUBJECT PROPERTY:", subject_for_ai, _SUBJECT_FIELDS))
     _timeline = subject.get("_status_timeline") if isinstance(subject, dict) else None
     if _timeline and _timeline.get("summary_lines"):
@@ -17145,6 +17442,24 @@ async def _generate_ai_analysis_impl(
                 _q["exterior"] = "similar"
                 qa_flags.append(f"{_comp_lbl}: exterior set to Similar - its listing documents a new "
                                 f"{', '.join(sorted(_ext))}.")
+        # A subject that needs a total rehab can't be the better home inside (grader 11/01, 719 Beechwood Rd:
+        # comps #1-3 rated "Comp Inferior" on interior next to a gut, which ADDED to the value). Unless the
+        # comp's own record says it needed the same work, an Inferior finish / interior becomes Superior.
+        _s_tier = _condition_tier(enriched_subject)
+        if _s_tier is not None and _s_tier <= 0.5:
+            _c_tier = _condition_tier(comp)
+            _flip = {k: ("similar" if _c_tier is not None and _c_tier <= _s_tier else "above")
+                     for k in ("finish_quality", "interior") if str(_q.get(k) or "").lower() == "below"}
+            if _flip:
+                comp["_cond_rating_fix"] = {"before": {k: "below" for k in _flip}, "after": dict(_flip),
+                                            "reason": "the subject's own listing says it needs major work"}
+                _q.update(_flip)
+                qa_flags.append(f"{_comp_lbl}: {' and '.join(k.replace('_', ' ') for k in _flip)} set to "
+                                f"{'Similar' if 'similar' in _flip.values() else 'Comp Superior'} - the subject's own listing "
+                                f"says it needs major work ({_COND_TIER_LABEL[_s_tier]}), so this sale can't be the weaker home inside.")
+        # No lot size on record = no lot rating (grader 11/01: comp #3 showed "-" for lot and "Similar").
+        if _relevance_lot_sqft(comp) is None and str(_q.get("lot") or "") in ("below", "similar", "above"):
+            _q.pop("lot", None)
         # A condo has no lot of its own - its Lot rating reads "N/A", never Inferior/Superior (grader, 10/21).
         if _type_family(enriched_subject.get("property_type")) == "condo":
             _q["lot"] = "n_a"
@@ -17831,6 +18146,8 @@ async def _generate_ai_analysis_impl(
             "current_competition": {"homes": _competition or [], **(_competition_review or {})},
             # Agent-only: buyer CMA on the agent's own listing (10/24)
             "audience_review": await _audience_review(db, owner_id, report.mode, enriched_subject),
+            # the list price is an opening bid (11/01) - the PDF labels it that way
+            "auction_listing": bool(_auction_listing(enriched_subject)),
             # Every step from the adjusted sales to the value (10/24) - shown on the PDF + client notes
             "value_bridge": (valuation_trace or {}).get("value_bridge"),
             # HOA / condo fees and the home's earlier MLS listings + sales (10/24)
@@ -18472,6 +18789,8 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             "current_competition": {"homes": _competition or [], **(_competition_review or {})},
             # Agent-only: buyer CMA on the agent's own listing (10/24)
             "audience_review": await _audience_review(db, owner_id, report.mode, enriched_subject),
+            # the list price is an opening bid (11/01) - the PDF labels it that way
+            "auction_listing": bool(_auction_listing(enriched_subject)),
             # Every step from the adjusted sales to the value (10/24) - shown on the PDF + client notes
             "value_bridge": (valuation_trace or {}).get("value_bridge"),
             # HOA / condo fees and the home's earlier MLS listings + sales (10/24)

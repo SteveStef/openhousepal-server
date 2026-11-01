@@ -10,7 +10,7 @@ from app.schemas.user import UserCreate, User, UserLogin, Token, ForgotPasswordR
 from app.services.user_service import UserService
 from app.services.paypal_service import paypal_service
 from app.services.property_service import property_service
-from app.utils.auth import create_access_token, get_current_active_user, hash_password, verify_password, require_broker_authorization
+from app.utils.auth import SESSION_DAYS, create_access_token, get_current_active_user, hash_password, verify_password, require_broker_authorization
 from app.utils.plan_ids import tier_for_plan_id, plan_id_has_trial
 from app.models.database import User as UserModel, DiscoveryPreferences
 from app.services.verification_service import verification_service
@@ -228,7 +228,7 @@ async def verify_code(
             pass
 
         # 5. Return access token
-        access_token = create_access_token(data={"sub": new_user.id})
+        access_token = create_access_token(data={"sub": new_user.id, "rm": True}, expires_delta=timedelta(days=SESSION_DAYS))
         
         return {
             "success": True,
@@ -583,6 +583,24 @@ async def link_subscription(
 
 
 
+@router.post("/refresh")
+async def refresh_session(request: Request, current_user: UserModel = Depends(get_current_active_user)):
+    """A fresh 30-day sign-in for someone signed in with Remember me (the site calls this once a day
+    while they use it), so an active agent is never signed out. Signed in without Remember me (or
+    the token can't be read): nothing - their 1-day sign-in runs out as before."""
+    from jose import jwt as _jwt
+    from app.utils.auth import JWT_ALGORITHM, JWT_SECRET_KEY
+    raw = (request.headers.get("authorization") or "").removeprefix("Bearer ").strip() or request.cookies.get("auth_token") or ""
+    try:
+        remember = _jwt.decode(raw, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM]).get("rm", True)   # tokens from before this: yes
+    except Exception:  # noqa: BLE001
+        remember = False
+    if not remember:
+        return {"access_token": None}
+    return {"access_token": create_access_token({"sub": current_user.id, "rm": True}, expires_delta=timedelta(days=SESSION_DAYS)),
+            "days": SESSION_DAYS}
+
+
 @router.post("/login", response_model=Token)
 async def login(
     user_credentials: UserLogin,
@@ -628,7 +646,8 @@ async def login(
 
         # Create access token
         access_token = create_access_token(
-            data={"sub": user.id}
+            data={"sub": user.id, "rm": bool(user_credentials.remember)},
+            expires_delta=timedelta(days=SESSION_DAYS) if user_credentials.remember else None,
         )
         
         return {

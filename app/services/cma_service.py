@@ -616,6 +616,7 @@ async def get_public_report(db: AsyncSession, slug: str) -> CmaPublicResponse:
         agent=agent,
         updated_at=report.updated_at,
         signature_hub_slug=signature_hub_slug,
+        map_ref=slug,
     )
 
 
@@ -1224,7 +1225,9 @@ def plan_auto_search(candidates: List[CmaCompCandidate], family: Optional[str], 
 # or the sold charts. Same matching rules as the sold search (type, state, no rentals, same building
 # first for condos); actives are context only, pendings may nudge the value review a little.
 COMPETITION_RADIUS = {"condo": 1.0, "attached": 2.0, "detached": 3.0}
-COMPETITION_MIN_SCORE = 50
+# 65 (11/01): 53-62% "matches" on the client page read as weak (grader, 719 Beechwood Rd). Pendings only move
+# the value at 65%+ anyway (_PENDING_STRONG_MATCH), so nothing below this was ever used.
+COMPETITION_MIN_SCORE = 65
 COMPETITION_MAX_PER_STATUS = 3
 COMPETITION_MAX = 5
 
@@ -1306,6 +1309,20 @@ async def current_competition(db: AsyncSession, subject: dict, *, listing_key: O
     return out
 
 
+_AUTO_AUCTION_PRICE_MAX = 1.9   # auction: sales up to this x the opening bid (about the 85th percentile of auction results)
+
+
+async def _subject_is_auction(db: AsyncSession, req: CmaCompSearchRequest) -> bool:
+    from app.services.cma_ai_service import _auction_listing
+    subj = req.subject.model_dump() if req.subject is not None else {}
+    lk = req.listing_key or subj.get("listing_key")
+    if lk:
+        raw = (await db.execute(select(Property.raw_mls_data).where(Property.listing_key == str(lk)))).scalar_one_or_none() or {}
+        subj["sale_type"] = raw.get("SaleType")
+        subj["public_remarks"] = subj.get("public_remarks") or raw.get("PublicRemarks")
+    return bool(_auction_listing(subj))
+
+
 async def auto_search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, today: Optional[date] = None) -> dict:
     """The comp step's first, automatic search: one query at the widest window this subject could
     need, every candidate scored once, then plan_auto_search picks the radius and sold window. The
@@ -1323,11 +1340,17 @@ async def auto_search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *
     widest = {"condo": AUTO_RADII["urban"][-1], "attached": AUTO_RADII["attached"][-1]}.get(family, AUTO_RADII["detached"][-1])
     lp = (req.subject.list_price if req.subject else None) or None
     date_to = _parse_date(req.sale_date_to) or today
+    # An auction's list price is an opening bid - auction homes sell for a median 1.45x it (see
+    # cma_ai_service._auction_listing). A +/-35% band around it only found cheaper homes 3 miles off
+    # and none of the nearby sales (grader 11/01, 719 Beechwood Rd: every comp 2.7-3.1 mi away).
+    hi_mult = 1 + _AUTO_PRICE_BAND
+    if lp and await _subject_is_auction(db, req):
+        hi_mult = max(hi_mult, _AUTO_AUCTION_PRICE_MAX)
     wide = req.model_copy(update={
         "radius_miles": widest, "statuses": ["sold"],
         "sale_date_from": (date_to - timedelta(days=AUTO_SOLD_DAYS[-1])).isoformat(),
         "sale_date_to": req.sale_date_to,
-        "min_price": round(lp * (1 - _AUTO_PRICE_BAND)) if lp else None, "max_price": round(lp * (1 + _AUTO_PRICE_BAND)) if lp else None,
+        "min_price": round(lp * (1 - _AUTO_PRICE_BAND)) if lp else None, "max_price": round(lp * hi_mult) if lp else None,
     })
     pool = await search_comparables(db, wide, keep_all=True, row_limit=800)
     plan = plan_auto_search(pool, family, today=date_to, subject_year=(req.subject.year_built if req.subject else None))

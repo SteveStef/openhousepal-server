@@ -98,6 +98,34 @@ async def get_public_cma_report(
     return await service.get_public_report(db, slug)
 
 
+@router.get("/map/{ref}.png")
+async def cma_location_map(
+    ref: str,
+    m: str = Query(..., min_length=5, max_length=600),
+    size: str = Query("900x420"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Unauthenticated - the PDF (Studio and the client share link) fetches it without a login. `ref` is the
+    report id or its share slug; every pin in `m` must be that report's subject or one of its comps, so this
+    only ever draws a report's own map (server Google key, cached per pin set)."""
+    from sqlalchemy import or_, select as _select
+    from app.models.database import CmaReport
+    from app.services import cma_manual_subject_service as manual
+    try:
+        pins = manual.parse_map_pins(m)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="Bad map pins.")
+    if size not in manual.CMA_MAP_SIZES:
+        raise HTTPException(status_code=422, detail="Bad map size.")
+    report = (await db.execute(_select(CmaReport).where(or_(CmaReport.id == ref, CmaReport.share_slug == ref)))).scalars().first()
+    if not report or not manual.map_pins_belong(pins, report.subject or {}, report.comparables or []):
+        raise HTTPException(status_code=404, detail="Map not found.")
+    png = await manual.cma_map_png(db, size, pins)
+    if not png:
+        raise HTTPException(status_code=503, detail="Map unavailable.")
+    return Response(content=png, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+
+
 @router.get("/ai-estimate")
 async def cma_ai_estimate(
     db: AsyncSession = Depends(get_db),

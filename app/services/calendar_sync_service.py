@@ -290,6 +290,9 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
         # the agent's Showcases page (signed in).
         parts.append(f"\U0001F4AC THEIR SHOWCASE COMMENT{'S' if len(comments) > 1 else ''}\n" + "\n\n".join(
             f'“{c["text"][:400]}”\n\U0001F3E0 {c["home"]}\n\U0001F449 Open it in your Showcases:\n{clean_url(c["url"])}' for c in comments[:3]))
+    # A note the follow-up already quotes above ("Your note: ...") isn't listed again (owner, 11/01).
+    quoted = " ".join(notes.split()).lower()
+    your_notes = [(label, text) for label, text in (your_notes or []) if " ".join(text[:280].split()).lower() not in quoted]
     if your_notes and task.auto_source != NOTED_GUEST_SOURCE:  # that alert already quotes the note
         parts.append("\U0001F4DD YOUR NOTES\n" + "\n".join(
             f"• {'(' + label + ') ' if label else ''}{text[:280]}" for label, text in your_notes[:3]))

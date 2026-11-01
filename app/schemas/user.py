@@ -99,6 +99,8 @@ class User(UserBase):
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+    # Remember me (on by default): stay signed in 30 days; off = 1 day (a shared computer)
+    remember: bool = True
 
     _email = field_validator("email", mode="before")(_clean_email)
 

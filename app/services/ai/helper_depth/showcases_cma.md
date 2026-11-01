@@ -80,7 +80,8 @@ Showcases and CMA in depth: every Showcase search option, match score, compare h
 - Basic, Premium, IDX with broker authorization. Hidden on No-MLS plans.
 
 ## From the AI helper chat
-- "Start a CMA for ..." shows a card with two choices: **AI CMA - I do all of it** (picks the comps, runs the AI analysis and writes the report; it shows about how much of the monthly AI it uses) or **Manual** (makes the CMA and they pick the comps on the CMA page - no AI). An AI CMA takes a few minutes; they can close the chat or the site. When it's done, the chat says it's finished with an **Open the CMA** button, and the AI helper button shows a red number until they open that chat - on any device.
+- "Start a CMA for ..." shows a card with two steps: **Who it's for** (Seller / Listing or Buyer / Offer), then two choices: **AI CMA - I do all of it** (picks the comps, runs the AI analysis and writes the report; it shows about how much of the monthly AI it uses) or **Manual** (makes the CMA and they pick the comps on the CMA page - no AI). An AI CMA takes a few minutes (it picks the comps, then the analysis and report - all in the background, the card answers right away); they can close the chat or the site. When it's done, the chat says it's finished with an **Open the CMA** button, and the AI helper button shows a red number until they open that chat - on any device.
+- A Showcase made or changed from the chat can use **Built in or after** a year too ("newer builds" with no year = about the last 15 years), along with price, beds, baths, size, towns, townships, school districts and home types. A phone number for the client is optional.
 
 ## The list
 - Search "Search by address or client...", tabs All, Draft, Ready, Shared. Each card: Fair Value, **Copy Share Link**, **Download PDF** / **Save the PDF**, theme (light or **Midnight**), **Delete** (permanent).
@@ -100,5 +101,7 @@ Showcases and CMA in depth: every Showcase search option, match score, compare h
 - The share link always shows the latest saved version - no need to re-share. There's no "unshare".
 - Each CMA has a **Report Code**; if numbers or wording look wrong, **Submit Ticket** with it.
 - A final consistency check runs before export; if a section no longer matches the final value, the report may need checking again before it exports.
+- The per-comp adjustment table ("How we got there") is for the agent only - the client PDF shows the steps from the adjusted sales to the value, not the table.
+- Auction listings (MLS Sale Type "Auction", or "opening bid" in the listing): the list price is treated as the opening bid, not as value evidence; the value comes from the sales, and the buyer advice is a bidding plan (top bid = the value) instead of an offer below list.
 - Out of AI allowance: the analysis won't run until it resets on the 1st; you can still build comps and price by hand.
 - Old Seller Net Sheet / Buyer Cash Needed links open the CMA page.

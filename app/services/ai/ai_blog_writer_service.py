@@ -85,8 +85,9 @@ HARD RULES - never break these:
 1. NO FABRICATED FACTS. Every number (prices, percentages, days on market, inventory, rates, dates, counts, rankings, school ratings, tax figures, HOA fees) must come from the AGENT BRIEF or REAL DATA sections of the request. If a point would benefit from a statistic you were not given, make the point qualitatively or tell the reader what to ask about - never invent or estimate a figure. Do not invent quotes, clients, stories, awards, years of experience, how long the agent has worked an area, sales volume, credentials, or the age/history of homes and neighborhoods. Mortgage rates, market predictions and legal/tax specifics: speak generally and suggest the reader confirm with the right professional.
 2. PLACES. You may mention the towns/areas the agent listed and widely known, long-standing geography you are highly confident about (town names, major roads, rail lines, large public parks). Never invent or name specific businesses, restaurants, events, developments or schools unless the agent named them.
 3. FAIR HOUSING / MLS ADVERTISING. Never reference or imply race, color, religion, sex, familial status, national origin, disability, sexual orientation, or age - of an area, a home, or who would or should live there. Do not use: "family"/"families"/"family-friendly", "perfect for", "ideal for [type of person]", "safe"/"safe neighborhood", "walking distance"/"walk to", "exclusive", "integrated", "traditional neighborhood", "bachelor", "empty nesters", "young professionals", "retirees", "his and hers", "master bedroom" (say "primary bedroom"), "crime", or any phrase steering a type of person toward or away from an area. Describe places, homes, amenities and the process - not the people who belong there. Schools may only be named as neutral, factual proximity if the agent named them.
-4. The agent's personal take / local story, when given, is the heart of the article - weave it in faithfully in their voice (you may lightly polish wording, never add facts to it). A pull-quote should be a faithful line from it.
-5. No hype words ("dream home", "stunning", "nestled", "boasts", "don't miss out"), no clickbait, no emojis, no hashtags. Write like a sharp local expert, not an ad.
+4. PUBLISHED AS-IS, FOR THE PUBLIC. The readers are the agent's clients and everyday buyers, sellers and neighbors - never other agents. Never leave a blank, bracket or placeholder ("$___", "[insert ...]", "(area)", "TBD") or a note to the agent anywhere; every heading needs real content under it - if you have nothing for a section, drop it. Use plain words, and explain any real estate term the first time it appears ("days on market - how long a home took to find a buyer").
+5. The agent's personal take / local story, when given, is the heart of the article - weave it in faithfully in their voice (you may lightly polish wording, never add facts to it). A pull-quote should be a faithful line from it.
+6. No hype words ("dream home", "stunning", "nestled", "boasts", "don't miss out"), no clickbait, no emojis, no hashtags. Write like a sharp local expert, not an ad.
 
 CRAFT:
 - Title: specific and search-friendly (name the place/topic), 45-70 characters, no colon-stacked clickbait.
@@ -94,7 +95,7 @@ CRAFT:
 - H2 section headings that read like a table of contents a reader would scan. Mix short paragraphs (2-4 sentences) with numbered steps or bullet lists where they genuinely help; use at most one pull-quote.
 - Be concrete and actionable: what to do, what to ask, what to watch for, in what order.
 - SEO: use the focus keyword naturally in the title, the first paragraph, and one heading. seo_title <= 60 characters; meta_description 140-158 characters, written to earn the click.
-- Close by summarizing the one thing to remember, then the call to action, in the agent's voice.
+- End the body with a short "bottom line" section (2-4 sentences or 3 bullets: what the reader should do next), then the call to action, in the agent's voice.
 - You may use **double asterisks** for occasional bold emphasis inside paragraphs (sparingly).
 
 Deliver the article ONLY by calling the submit_blog_article tool."""
@@ -867,6 +868,61 @@ def _normalize_article(article: dict) -> dict:
     return article
 
 
+# Fill-in-the-blank text a model can leave for the agent: "$___", "[Median sale price for (area)...]",
+# "[insert ...]", "{{name}}", "TBD". 11/01 a published Main Line article showed a "My current local
+# numbers" list of these to the public. Same pattern as BlogArticleBody.withoutBlanks (frontend).
+PLACEHOLDER = re.compile(r"_{3,}|\[(?:insert|add|enter|your|todo|tbd|placeholder)\b[^\]]*\]|\[[^\]]*\((?:area|date|town|city|price|number|name)\)[^\]]*\]"
+                         r"|\{\{[^}]*\}\}|\bTBD\b", re.I)
+
+
+def strip_placeholders(article: dict) -> list[str]:
+    """Removes placeholder text from a normalized article in place - the line, list item or
+    paragraph that holds it, the subheading that only introduced it, and any section left with
+    nothing in it. Returns what was removed (for the agent's report). The article is public as-is."""
+    removed: list[str] = []
+
+    def keep(text) -> bool:
+        if isinstance(text, str) and PLACEHOLDER.search(text):
+            removed.append(text.strip()[:200])
+            return False
+        return True
+
+    article["intro"] = [p for p in article.get("intro") or [] if keep(p)]
+    article["at_a_glance"] = [g for g in article.get("at_a_glance") or [] if keep(g)]
+    sections = []
+    for section in article.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        out: list[dict] = []
+        for b in _coerce(section.get("blocks"), list):
+            b = _coerce(b, dict)
+            if b.get("type") in ("bulleted_list", "numbered_list"):
+                items = [i for i in _coerce(b.get("items"), list) if keep(i)]
+                dropped = len(items) < len(_coerce(b.get("items"), list))
+                b = dict(b, items=items) if items else None
+            else:
+                dropped = not keep(b.get("text"))
+                b = None if dropped else b
+            if b is None and dropped and out and out[-1].get("type") == "subheading":
+                out.pop()
+            if b is not None:
+                out.append(b)
+        # A trailing subheading has nothing under it.
+        while out and out[-1].get("type") == "subheading":
+            out.pop()
+        if not keep(section.get("heading") or ""):
+            continue
+        if any((b.get("text") or "").strip() or b.get("items") for b in out if b.get("type") != "subheading"):
+            sections.append(dict(section, blocks=out))
+        elif section.get("heading"):
+            removed.append(f"(empty section) {section['heading']}"[:200])
+    article["sections"] = sections
+    closing = article.get("closing") or {}
+    if closing:
+        closing["paragraphs"] = [p for p in closing.get("paragraphs") or [] if keep(p)]
+    return removed
+
+
 def _convert_blocks(raw_blocks: list, links: Optional[set] = None) -> list[dict]:
     out = []
     for b in _coerce(raw_blocks, list):
@@ -899,9 +955,13 @@ def article_to_blocks(article: dict, default_label: str = "Contact Me", form_typ
         if not isinstance(section, dict):
             continue
         heading = (section.get("heading") or "").strip()
+        body = _convert_blocks(section.get("blocks"), links)
+        # A heading with nothing under it never reaches the article.
+        if not any(b["type"] != "subheading" for b in body):
+            continue
         if heading:
             blocks.append({"id": _bid("heading"), "type": "heading", "data": {"html": _rich(heading)}})
-        blocks.extend(_convert_blocks(section.get("blocks"), links))
+        blocks.extend(body)
     closing = article.get("closing") or {}
     if closing.get("heading"):
         blocks.append({"id": _bid("heading"), "type": "heading", "data": {"html": _rich(closing["heading"])}})
@@ -1065,6 +1125,7 @@ async def generate_article(db: AsyncSession, user: User, brief: dict) -> dict:
     article = _normalize_article(article)
     if not article.get("title") or not article.get("sections"):
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The AI writer returned an incomplete draft - please try again.")
+    strip_placeholders(article)
 
     blocks = article_to_blocks(article, *cta_block_args(brief))
     if spotlight:
@@ -1124,7 +1185,9 @@ async def refine_section(db: AsyncSession, user: User, *, title: str, section_bl
     first = section_blocks[0] if section_blocks else None
     if heading and first and isinstance(first, dict) and first.get("type") in ("heading", "subheading"):
         blocks.append({"id": first.get("id") or _bid("heading"), "type": first["type"], "data": {**(first.get("data") or {}), "html": _rich(heading), "text": None}})
-    blocks.extend(_convert_blocks(result.get("blocks")))
+    tmp = {"sections": [{"heading": "", "blocks": _coerce(result.get("blocks"), list)}]}
+    strip_placeholders(tmp)
+    blocks.extend(_convert_blocks(tmp["sections"][0]["blocks"] if tmp["sections"] else []))
     for b in blocks:
         if isinstance(b.get("data"), dict):
             b["data"] = {k: v for k, v in b["data"].items() if v is not None}

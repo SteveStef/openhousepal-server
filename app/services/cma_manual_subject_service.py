@@ -216,3 +216,74 @@ async def save_subject_photo(db: AsyncSession, user: User, jpeg: bytes) -> str:
     url = s3_service.upload_bytes(jpeg, "cma-subject-photos", ".jpg", "image/jpeg")
     await storage_ledger_service.record(db, user.id, "listing_photo", url, len(jpeg))
     return url
+
+
+# ---- Location map for the CMA report (11/01) -----------------------------------------------------------------
+# The report's subject + comps map used to be a Static Maps URL built in the BROWSER with the frontend key -
+# the PDF showed a gray box whenever that key failed (live 11/01: its Google project had no billing; grader:
+# "the map on page 2 is blank"). Now the server draws it with the backend key, once per set of pins.
+CMA_MAP_SIZES = {"900x420", "1200x420", "640x360"}
+_CMA_MAP_MAX_PINS = 12
+_CMA_MAP_LABEL_RE = re.compile(r"^[A-Z0-9]$")
+
+
+def parse_map_pins(raw: str) -> list[tuple[str, float, float]]:
+    """'S:39.91,-75.37|1:39.90,-75.36' -> [(label, lat, lng)]. Raises ValueError on anything else."""
+    pins = []
+    for part in (raw or "").split("|"):
+        label, _, coords = part.partition(":")
+        lat_s, _, lng_s = coords.partition(",")
+        if not _CMA_MAP_LABEL_RE.match(label or ""):
+            raise ValueError("bad pin label")
+        lat, lng = float(lat_s), float(lng_s)
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            raise ValueError("bad pin location")
+        pins.append((label, lat, lng))
+    if not pins or len(pins) > _CMA_MAP_MAX_PINS:
+        raise ValueError("bad pin count")
+    return pins
+
+
+def map_pins_belong(pins: list[tuple[str, float, float]], subject: dict, comparables: list) -> bool:
+    """Every pin sits on the report's own subject or one of its comps - the endpoint draws nothing else."""
+    spots = []
+    for d in [subject or {}, *(comparables or [])]:
+        try:
+            spots.append((float(d.get("latitude")), float(d.get("longitude"))))
+        except (TypeError, ValueError):
+            continue
+    return all(any(abs(lat - a) < 1e-5 and abs(lng - b) < 1e-5 for a, b in spots) for _, lat, lng in pins)
+
+
+async def cma_map_png(db: AsyncSession, size: str, pins: list[tuple[str, float, float]]) -> Optional[bytes]:
+    """PNG of the pins (S = subject, dark; numbers = comps, gold), cached forever by pin set."""
+    import base64
+    import hashlib
+    from app.models.database import ExploreNearbyCache
+    key = _google_key()
+    if not key or size not in CMA_MAP_SIZES:
+        return None
+    sig = size + "|" + "|".join(f"{l}:{lat:.6f},{lng:.6f}" for l, lat, lng in pins)
+    cache_key = "cmamap:v1:" + hashlib.sha1(sig.encode()).hexdigest()
+    row = (await db.execute(select(ExploreNearbyCache).where(ExploreNearbyCache.cache_key == cache_key))).scalar_one_or_none()
+    if row and (row.payload or {}).get("png"):
+        return base64.b64decode(row.payload["png"])
+    params = [("size", size), ("scale", "2"), ("maptype", "roadmap"), ("key", key)]
+    params += [("markers", f"color:{'0x111827' if l == 'S' else '0xC9A24D'}|label:{l}|{lat},{lng}") for l, lat, lng in pins]
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(_STATIC_MAP_URL, params=params)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("CMA map fetch failed", extra={"error": str(exc)})
+        return None
+    if resp.status_code != 200 or not (resp.headers.get("content-type") or "").startswith("image/"):
+        logger.warning("CMA map fetch failed", extra={"status": resp.status_code})
+        return None
+    await charge_google("static_map")
+    png = resp.content
+    try:
+        db.add(ExploreNearbyCache(cache_key=cache_key, payload={"png": base64.b64encode(png).decode()}))
+        await db.commit()
+    except Exception:  # noqa: BLE001 - a lost cache write only costs one more fetch
+        await db.rollback()
+    return png

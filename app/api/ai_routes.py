@@ -56,7 +56,8 @@ async def _get_owned_conversation(
     return conversation
 
 
-_CARD_STATUS = {"pending": "waiting for them to tap Confirm", "running": "running", "done": "the agent tapped Confirm and it went through - it is done",
+_CARD_STATUS = {"pending": "showing in the chat right now, waiting for them to tap its button - you DID set it up", "running": "running",
+                "working": "they tapped it and it is being made in the background now (a blog draft or an AI CMA) - when it finishes, a message with a button posts in this chat by itself and the chat button shows a red number, even if they close the site", "done": "the agent tapped Confirm and it went through - it is done",
                 "failed": "the agent tapped Confirm but it failed - nothing changed", "cancelled": "the agent tapped Cancel - nothing changed", "expired": "expired untapped"}
 
 

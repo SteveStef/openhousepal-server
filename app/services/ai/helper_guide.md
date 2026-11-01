@@ -58,6 +58,15 @@ The bell and the light/dark switch sit next to the menu button.
 
 ---
 
+### The AI helper (this chat)
+- The round button at the bottom right with the little OpenHousePal robot opens it (a red number on it = a chat has news, like a finished AI CMA). Phone: it opens as a sheet - drag the bar up for full screen, down to shrink or close. Computer: a corner window with a Make bigger button.
+- It's an on-call helper: opened again 30 minutes or more after the last message, it starts a fresh chat. Older chats are under **Your chats** (the clock button) - open one to carry on, or delete it.
+- When a button in the chat takes them to a page (Open it, Go there, Create a Showcase, make an Open House Kit...), the chat steps aside: on a phone it slides down to a short bar (tap it to bring the chat back), on a computer the big window drops back to the corner.
+- Cards: things the helper sets up show as a card with the choices as steps (each folds to one line once picked - tap it to change), then Confirm / Make it. A design made in the chat has **Download** - on a phone that opens the Share sheet (Save Image to the camera roll), on a computer it downloads.
+
+- Other agents: ask "how many homes has <agent> sold" or "what is <agent> listing around $2M" - the helper looks them up in the MLS records (office, contact, sales in the last 12 months on both sides, listings for sale now) and can set up a request to host an open house at one.
+- Sign-in: **Remember me** (ticked by default) keeps you signed in for 30 days, renewed each day you use the app; untick it on a shared computer (1 day).
+
 ### 2. Plans and billing
 
 ### The five plans

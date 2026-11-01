@@ -453,3 +453,5 @@ class CmaPublicResponse(BaseModel):
     # Set when the web view should end with the agent's Email Signature card (site version):
     # the report's switch is on, the plan has signatures and one is saved. The PDF ignores it.
     signature_hub_slug: Optional[str] = None
+    # The share slug, for the server-drawn location map (/api/cma/map/{ref}.png, 11/01).
+    map_ref: Optional[str] = None

@@ -255,7 +255,6 @@ async def geography_profile(db: AsyncSession, area: MarketArea) -> dict:
 
     kind = (area.municipality_type or "").lower() or ("neighborhood" if area.area_type == "neighborhood" else "postal town")
     source = "U.S. Census TIGER boundaries + Bright MLS records" if bounds.get("municipalities") else "Bright MLS records"
-    homes = bounds.get("homes_checked") or mix.get("homes")
     when = _date(bounds.get("computed_at")) or datetime.now(timezone.utc).date().isoformat()
     items: list[dict] = []
 
@@ -265,7 +264,7 @@ async def geography_profile(db: AsyncSession, area: MarketArea) -> dict:
 
     tw = sorted(towns.values(), key=lambda t: -(t.get("share") or 0))
     if tw:
-        parts = [f"{t['name']}" + (f", {t['county']}" if t.get("county") else "") + (f" ({t['share']}%)" if t.get("share") is not None else "") for t in tw]
+        parts = [f"{t['name']}" + (f", {t['county']}" if t.get("county") else "") + (f" ({t['share']}% of {area.name}-addressed homes)" if t.get("share") is not None else "") for t in tw]
         if kind == "township" and len(tw) >= 1 and norm_place(tw[0]["name"]) == norm_place(area.name):
             others = [m for m in mailing if norm_place(m["name"]) != norm_place(area.name)][:7]
             add(f"{area.name} here means {tw[0]['name']}" + (f" ({tw[0]['county']})" if tw[0].get("county") else "")
@@ -273,11 +272,14 @@ async def geography_profile(db: AsyncSession, area: MarketArea) -> dict:
                 + (f" Homes in it carry these mailing addresses: {', '.join(m['name'].title() for m in others)} as well as {area.name}." if others else "")
                 + (f" A few {area.name}-addressed homes outside the township (in {', '.join(t['name'] for t in tw[1:])}) are included too." if len(tw) > 1 else ""))
         else:
+            # Each share says whose share it is (11/01 review: "Radnor Township includes homes with Wayne
+            # (46%)..." read as if 46% of Radnor were Wayne) - and no sample counts, which the writer
+            # carried into the article as "homes checked".
             add(f"A {area.name} mailing address is not one municipality: {area.name} homes sit in " + "; ".join(parts)
-                + (f" (shares of {homes} homes checked)" if homes else "") + f". No {area.name} home on record is in any other township or borough.")
+                + f". No {area.name} home on record is in any other township or borough.")
     if districts:
         ds = sorted(districts.values(), key=lambda d: -(d.get("share") or 0))
-        add(f"Public school districts serving {area.name} homes: " + "; ".join(d["name"] + (f" ({d['share']}%)" if d.get("share") is not None else "") for d in ds)
+        add(f"Public school districts serving {area.name} homes: " + "; ".join(d["name"] + (f" ({d['share']}% of {area.name}-addressed homes)" if d.get("share") is not None else "") for d in ds)
             + ". Attendance depends on the specific address - verify with the district.")
     if counties and len(counties) > 1 and not tw:
         add(f"{area.name} homes span " + ", ".join(f"{_county_label(c['name'])} ({c['share']}%)" for c in counties) + ".")

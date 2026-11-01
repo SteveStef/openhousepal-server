@@ -28,6 +28,9 @@ if not JWT_SECRET_KEY:
         )
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24  # 24 hours
+# Signing in with "Remember me" (on by default): 30 days, renewed each day the app is used
+# (POST /auth/refresh) - agents were signed out every 24 hours (owner, 11/01: "logs me out half the time").
+SESSION_DAYS = 30
 
 # Security scheme for Bearer tokens
 security = HTTPBearer()

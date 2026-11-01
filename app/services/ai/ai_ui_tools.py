@@ -61,5 +61,8 @@ def run(name: str, args: dict) -> Tuple[dict, Optional[dict]]:
     page = safe_page(str(args.get("page") or ""))
     if not page:
         return {"error": "not_an_app_page", "message": "Links can only go to a page inside OpenHousePal (starting with /)."}, None
-    label = (str(args.get("label") or "").strip() or "Go there")[:40]
+    # Whole words, up to 60 characters ("Start an Open House Kit for 719 Beechwoo" was cut mid-word, 11/01).
+    label = " ".join(str(args.get("label") or "").split()) or "Go there"
+    if len(label) > 60:
+        label = label[:59].rsplit(" ", 1)[0].rstrip(",.;:-") + "…"
     return {"shown": True}, {"tool": name, "record_type": "link", "record_id": str(uuid.uuid4()), "label": label, "href": page}
