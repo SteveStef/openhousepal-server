@@ -1,11 +1,17 @@
 {
  "2026-10": {
-  "geocoding": 1,
-  "nearby_search_pro": 46,
+  "geocoding": 25,
+  "nearby_search_enterprise": 3,
+  "nearby_search_pro": 55,
   "place_photos": 8,
-  "route_matrix_essentials": 1674,
+  "route_matrix_essentials": 1689,
   "route_matrix_pro": 120,
   "text_search_enterprise": 179,
-  "text_search_pro": 1063
+  "text_search_pro": 1064
+ },
+ "2026-11": {
+  "geocoding": 7,
+  "place_photos": 17,
+  "static_maps": 55
  }
 }
