@@ -870,8 +870,9 @@ def _normalize_article(article: dict) -> dict:
 
 # Fill-in-the-blank text a model can leave for the agent: "$___", "[Median sale price for (area)...]",
 # "[insert ...]", "{{name}}", "TBD". 11/01 a published Main Line article showed a "My current local
-# numbers" list of these to the public. Same pattern as BlogArticleBody.withoutBlanks (frontend).
-PLACEHOLDER = re.compile(r"_{3,}|\[(?:insert|add|enter|your|todo|tbd|placeholder)\b[^\]]*\]|\[[^\]]*\((?:area|date|town|city|price|number|name)\)[^\]]*\]"
+# numbers" list of these to the public, plus a line that was only a bracketed note ("[What these
+# figures cover: township or mailing address]"). Same pattern as BlogArticleBody.withoutBlanks (frontend).
+PLACEHOLDER = re.compile(r"^\s*\[[^\]]{3,}\]\s*$|_{3,}|\[(?:insert|add|enter|your|todo|tbd|placeholder)\b[^\]]*\]|\[[^\]]*\((?:area|date|town|city|price|number|name)\)[^\]]*\]"
                          r"|\{\{[^}]*\}\}|\bTBD\b", re.I)
 
 

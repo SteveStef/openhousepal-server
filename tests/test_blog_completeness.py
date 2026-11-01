@@ -56,3 +56,16 @@ def test_intro_glance_and_closing_placeholders_removed():
     removed = w.strip_placeholders(a)
     assert a["intro"] == ["Real intro."] and a["at_a_glance"] == ["Rates were 6.2% (Freddie Mac)."]
     assert a["closing"]["paragraphs"] == ["Call me."] and len(removed) == 3
+
+
+def test_a_line_that_is_only_a_bracketed_note_is_removed():
+    # Live 11/01: "[What these figures cover: township or mailing address]" stayed on the page.
+    a = _article([{"heading": "Prices now", "blocks": [
+        {"type": "paragraph", "text": "Start with what can be counted."},
+        {"type": "subheading", "text": "My current local numbers"},
+        {"type": "paragraph", "text": "[What these figures cover: township or mailing address]"},
+        {"type": "paragraph", "text": "Rates matter too [see below]."},
+    ]}])
+    removed = w.strip_placeholders(a)
+    assert [b["type"] for b in a["sections"][0]["blocks"]] == ["paragraph", "paragraph"]
+    assert removed == ["[What these figures cover: township or mailing address]"]
