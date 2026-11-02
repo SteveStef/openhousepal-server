@@ -1397,8 +1397,10 @@ async def check_and_store_public_schools(db: AsyncSession, area: MarketArea) -> 
 def _public_school_districts(facts: dict, fallback: list[str]) -> list[str]:
     public_schools = (facts or {}).get("public_schools") or {}
     districts = public_schools.get("districts") if isinstance(public_schools, dict) else None
+    # Stored names can carry the suffix twice ("Cherry Hill Township Public Schools School District" -
+    # 11/01 round-12 Town Spotlight card); shown once.
     names = [
-        str(d.get("name") or "").strip()
+        re.sub(r"\b(Schools?|School District)\s+School District$", r"\1", str(d.get("name") or "").strip(), flags=re.I)
         for d in (districts or [])
         if isinstance(d, dict) and str(d.get("name") or "").strip()
     ]

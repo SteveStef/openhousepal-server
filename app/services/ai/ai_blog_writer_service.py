@@ -85,7 +85,7 @@ HARD RULES - never break these:
 1. NO FABRICATED FACTS. Every number (prices, percentages, days on market, inventory, rates, dates, counts, rankings, school ratings, tax figures, HOA fees) must come from the AGENT BRIEF or REAL DATA sections of the request. If a point would benefit from a statistic you were not given, make the point qualitatively or tell the reader what to ask about - never invent or estimate a figure. Do not invent quotes, clients, stories, awards, years of experience, how long the agent has worked an area, sales volume, credentials, or the age/history of homes and neighborhoods. Mortgage rates, market predictions and legal/tax specifics: speak generally and suggest the reader confirm with the right professional.
 2. PLACES. You may mention the towns/areas the agent listed and widely known, long-standing geography you are highly confident about (town names, major roads, rail lines, large public parks). Never invent or name specific businesses, restaurants, events, developments or schools unless the agent named them.
 3. FAIR HOUSING / MLS ADVERTISING. Never reference or imply race, color, religion, sex, familial status, national origin, disability, sexual orientation, or age - of an area, a home, or who would or should live there. Do not use: "family"/"families"/"family-friendly", "perfect for", "ideal for [type of person]", "safe"/"safe neighborhood", "walking distance"/"walk to", "exclusive", "integrated", "traditional neighborhood", "bachelor", "empty nesters", "young professionals", "retirees", "his and hers", "master bedroom" (say "primary bedroom"), "crime", or any phrase steering a type of person toward or away from an area. Describe places, homes, amenities and the process - not the people who belong there. Schools may only be named as neutral, factual proximity if the agent named them.
-4. PUBLISHED AS-IS, FOR THE PUBLIC. The readers are the agent's clients and everyday buyers, sellers and neighbors - never other agents. Never leave a blank, bracket or placeholder ("$___", "[insert ...]", "(area)", "TBD") or a note to the agent anywhere; every heading needs real content under it - if you have nothing for a section, drop it. Use plain words, and explain any real estate term the first time it appears ("days on market - how long a home took to find a buyer"). Laws, contract deadlines, assistance programs, tax breaks, exemptions and loan limits: name them and say what they do in general words, say conditions apply, and send the reader to the agent - never their amounts, cut-offs, day counts or deadlines - then add an `ask_agent` block naming the topic in 2-6 words (at most 3, never in the closing).
+4. PUBLISHED AS-IS, FOR THE PUBLIC. The readers are the agent's clients and everyday buyers, sellers and neighbors - never other agents. Never leave a blank, bracket or placeholder ("$___", "[insert ...]", "(area)", "TBD") or a note to the agent anywhere; every heading needs real content under it - if you have nothing for a section, drop it. Use plain words, and explain any real estate term the first time it appears ("days on market - how long a home took to find a buyer"). Laws, contract deadlines, assistance programs, tax breaks, exemptions and loan limits: name them and say what they do in general words, say conditions apply, and send the reader to the agent - never their amounts, cut-offs, day counts or deadlines - then add an `ask_agent` block naming the topic in 2-6 words (at most 3, never in the closing). Never state flatly that such a rule does or doesn't apply to the reader when it depends on their situation - give the general idea, say exceptions apply, and point to the right professional. When you send readers to yourself, say it in the first person ("reach out to me") - never your name or "your agent". Leave out any program, tax break or loan rule whose basic requirement doesn't fit the reader (no first-time-buyer or homestead benefits for someone buying a rental). Closing taxes and fees: name them, never their rates - suggest an itemized estimate from the settlement company.
 5. The agent's personal take / local story, when given, is the heart of the article - weave it in faithfully in their voice (you may lightly polish wording, never add facts to it). A pull-quote should be a faithful line from it.
 6. No hype words ("dream home", "stunning", "nestled", "boasts", "don't miss out"), no clickbait, no emojis, no hashtags. Write like a sharp local expert, not an ad.
 
@@ -996,7 +996,36 @@ def ask_agent_rows(blocks: list[dict], limit: int = 3) -> list[dict]:
             out.append(_ask_block())
             used += 1
             section_has = True
-    return out
+    return _name_ask_topics(out)
+
+
+_GENERIC_HEADS = {"the bottom line", "bottom line", "at a glance", "next steps", "the next step", "faq", "faqs"}
+
+
+def _name_ask_topics(blocks: list[dict]) -> list[dict]:
+    """An "Ask me" line with no topic takes its section's (sub)heading - "Ask me about loan options
+    and first-time buyer help", not a bare "Ask me" (11/01 round-11 grader nice-to-have). The first
+    word keeps its capital only if the article never writes it lowercase (place names stay capped)."""
+    plain = lambda b: re.sub(r"<[^>]+>", " ", " ".join([str((b.get("data") or {}).get("html") or (b.get("data") or {}).get("text") or "")]
+                                                      + [str(i) for i in (b.get("data") or {}).get("items") or []]))
+    lower_words = {w for b in blocks for w in re.findall(r"\b[a-z][a-z'-]+\b", plain(b))}
+    head = ""
+    for b in blocks:
+        t = b.get("type")
+        if t in ("heading", "subheading"):
+            head = re.sub(r"\s+", " ", plain(b)).strip()
+            continue
+        if t != "ask_agent" or (b.get("data") or {}).get("topic"):
+            continue
+        topic = re.split(r"[?:]", head)[0].strip(" .-")
+        topic = re.sub(r"\s*\([^)]*\)", "", topic)
+        if not topic or topic.lower() in _GENERIC_HEADS or len(topic) > 60:
+            continue
+        first, _, rest = topic.partition(" ")
+        if first.lower() in lower_words or first.lower() in ("the", "a", "an", "your", "what", "how", "why", "when"):
+            topic = first.lower() + (" " + rest if rest else "")
+        b["data"] = {**(b.get("data") or {}), "topic": topic}
+    return blocks
 
 
 def article_to_blocks(article: dict, default_label: str = "Contact Me", form_type: Optional[str] = None, links: Optional[set] = None) -> list[dict]:

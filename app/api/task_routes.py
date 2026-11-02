@@ -488,16 +488,25 @@ async def public_followup_card(code: str, request: Request, db: AsyncSession = D
 
 
 @public_router.post("/{code}/done")
-async def public_followup_done(code: str, request: Request, db: AsyncSession = Depends(get_db)):
+async def public_followup_done(code: str, request: Request, payload: Optional[dict] = Body(None), db: AsyncSession = Depends(get_db)):
     from app.services.public_rate_limit import check_public_submit
     check_public_submit(request)
     task = await _task_by_code(db, code)
+    via = (payload or {}).get("via")  # "text" / "email" - which button checked it off (11/02)
     if task.completed_at is None:
         task.completed_at = datetime.now(timezone.utc)
-        await tasks_service.mark_lead_contacted(db, task)
+        await tasks_service.mark_lead_contacted(db, task, via)
         await tasks_service.resolve_request_for_followup(db, task)  # a disclosure follow-up = disclosure sent
         await db.commit()
         calendar_sync_service.sync_task_bg(task.owner_id, task.id)  # takes it off the calendar
+    elif via in tasks_service.CONTACT_VIA and task.lead_id:
+        # Already checked off (opening the Mark-as-done link does that) - its Text / Email button
+        # still says how they were reached.
+        from app.models.database import Lead
+        lead = await db.get(Lead, task.lead_id)
+        if lead is not None:
+            tasks_service.log_contact(lead, via, tasks_service.contact_what(task), task.id)
+            await db.commit()
     return _public_view(task, await _others_due(db, task))
 
 
@@ -526,6 +535,7 @@ async def public_followup_undo(code: str, request: Request, db: AsyncSession = D
     task = await _task_by_code(db, code)
     if task.completed_at is not None:
         task.completed_at = None
+        await tasks_service.unmark_lead_contacted(db, task)
         await db.commit()
         calendar_sync_service.sync_task_bg(task.owner_id, task.id)  # puts it back
     return _public_view(task, await _others_due(db, task))
@@ -613,14 +623,16 @@ async def update_task(
             raise HTTPException(status_code=422, detail="Title is required")
         data["title"] = data["title"].strip()
     completed = data.pop("completed", None)
+    completed_via = data.pop("completed_via", None)
     for k, v in data.items():
         setattr(task, k, v)
     if completed is True and task.completed_at is None:
         task.completed_at = datetime.now(timezone.utc)
-        await tasks_service.mark_lead_contacted(db, task)
+        await tasks_service.mark_lead_contacted(db, task, completed_via)
         await tasks_service.resolve_request_for_followup(db, task)  # a disclosure follow-up = disclosure sent
-    elif completed is False:
+    elif completed is False and task.completed_at is not None:
         task.completed_at = None
+        await tasks_service.unmark_lead_contacted(db, task)
     # a moved due date should be able to remind again
     if "due_at" in data or "remind_at" in data:
         task.reminder_sent_at = None

@@ -35,7 +35,7 @@ LINK_HELP = (
 UI_TOOL_DEFINITIONS = [
     {
         "name": "offer_choices",
-        "description": "Show the agent tap-to-answer buttons under your reply when you need them to pick (2-10 short options, each under 40 characters - list every real option, e.g. all 10 design kinds). Tapping one sends it as their answer. Ask the question in your reply text too.",
+        "description": "Show the agent tap-to-answer buttons under your reply when you need them to pick (2-10 short options, each under 40 characters - list every real option, e.g. all 10 design kinds), or ONE do-it-here button after a how-to answer for something you can do in this chat ('Make a Showcase here'). Tapping one sends it as their answer. Ask the question in your reply text too.",
         "input_schema": {"type": "object", "properties": {"options": {"type": "array", "items": {"type": "string"}}}, "required": ["options"]},
     },
     {
@@ -70,8 +70,8 @@ def run(name: str, args: dict) -> Tuple[dict, Optional[dict]]:
     """-> (tool result for the model, entry for the reply)"""
     if name == "offer_choices":
         opts = [str(o).strip()[:60] for o in (args.get("options") or []) if str(o).strip()][:10]
-        if len(opts) < 2:
-            return {"error": "need 2-10 options"}, None
+        if not opts:  # one is fine: the do-it-here button after a how-to answer (owner, 11/01)
+            return {"error": "need 1-10 options"}, None
         return {"shown": True}, {"tool": name, "record_type": "choices", "record_id": str(uuid.uuid4()), "options": opts}
     page = safe_page(str(args.get("page") or ""))
     if not page:

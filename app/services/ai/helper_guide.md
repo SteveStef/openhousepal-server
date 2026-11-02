@@ -557,6 +557,18 @@ A red number on **Opens** means something is waiting on you (a host request, a r
 
 **Where:** Opens > **My Opens**.
 
+### Running an open house, start to finish
+
+When someone asks how to run an open house, walk through all five steps - on Premium and IDX always include step 3, the Showcases. It's the biggest reason guests stay in touch.
+
+1. **Build the kit** (once per home): Opens > My Opens, type the address, **Generate Kit**, pick Similar Homes, the cover and Cheat Sheet photos, choose what happens after sign-in, **Save & Finish**.
+2. **Sign guests in**: the printed QR sign-in sheet, or a tablet in **Kiosk** mode. Each guest lands in Leads.
+3. **Showcases for guests without an agent** (Premium, IDX, when **Guest Showcases** is on): each guest who says they don't have an agent gets their own **Showcase** - a personal home search, like a saved search on a home site, that starts with homes similar to the one they toured. It stays live (new listings, price drops, under contract), and they can favorite homes, comment and ask for a tour, which you see on their lead. Their invite email goes out 1 hour after sign-in by default (Tools > Email). You can also switch one on for a single guest in **Visitors**, or change their search with **Edit Showcase**.
+4. **See who came**: **Visitors** on the kit card - sign-ins by day, No agent / Has agent counts, star, notes, Activity on their Guest Pass.
+5. **Follow up**: Leads > **Follow-ups** has ready-to-send texts for guests without an agent; the text includes their Showcase link when they have one.
+
+On Basic there are no Showcases (a "You're missing out right now" banner may show guests who would have gotten one); No-MLS plans have no Showcases or Similar Homes.
+
 ### Make a kit - MLS plans
 1. Type the address in **Enter property address...** and pick the home from the suggestions.
 2. Tap **Generate Kit**.
@@ -793,6 +805,7 @@ The same switches also appear on the "Mark as done" page that opens from a calen
 - **Why is someone not in "Needs you"?** Only things due today/overdue or unhandled requests put them there. A follow-up set for a later day is planned, not waiting.
 - **Why don't I see follow-up chips on my leads?** Follow-ups may be turned off (see the Follow-ups switch below).
 - **"That email already belongs to another lead."** Two leads can't share one email - open the other lead instead.
+- **How do I see how I already reached someone?** Their lead shows a green chip like **Texted · Showcase pitch** or **Emailed** (the last time), and the lead's **Record** has **How you reached out** with every time. On an open house's **Visitors** list, **Texted** / **Emailed** sits next to their phone / email. It fills in by itself when you tap **Text** or **Email** (on a follow-up, a lead or a visitor) - a follow-up checked off without them shows **Followed up**. Checking off a follow-up also clears that lead's red "new activity" outline on the Dash.
 
 ---
 

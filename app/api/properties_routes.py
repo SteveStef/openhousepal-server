@@ -451,7 +451,7 @@ async def search_properties_by_address(
                 Property.full_address, Property.latitude, Property.longitude, Property.img_src,
                 Property.photos, Property.home_status, Property.raw_mls_data, Property.price,
                 Property.google_rooftop_latitude, Property.google_rooftop_longitude,
-                Property.google_geocode_location_type,
+                Property.google_geocode_location_type, Property.listing_key,
             )
             .where(
                 or_(
@@ -497,6 +497,8 @@ async def search_properties_by_address(
             "results": [
                 {
                     "address": r[0],
+                    # the exact listing, so a pick never comes back as another unit at the same address (11/01)
+                    "listing_key": r[11],
                     "lat": r[8] or r[1],
                     "lng": r[9] or r[2],
                     "brightLat": r[1],

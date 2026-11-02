@@ -111,6 +111,73 @@ def _log_field_changes(db, l_key: str, existing, mapped: Dict[str, Any]) -> int:
         db.add(PropertyFieldChange(listing_key=l_key, field=field, old_value=old, new_value=new))
     return len(changes[:_FIELD_LOG_MAX_ROWS])
 
+
+# Listings asked of Bright per request (was 200; Bright allows 1,000 - owner 11/02: ask for more at once).
+SYNC_PAGE_SIZE = 500
+
+# Each round starts this far before its bookmark (11/02): a change Bright makes visible a little
+# late, stamped just before the bookmark, is still picked up. Versions already held are skipped.
+LOOK_BACK = timedelta(minutes=10)
+
+
+def _look_back(bookmark: str) -> str:
+    try:
+        t = datetime.strptime(bookmark, "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return bookmark  # an unexpected format: start at the bookmark itself, as before
+    return (t - LOOK_BACK).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class _ChangedSince:
+    """Walks Bright's "changed since" feed (oldest change first) by TIME instead of by position.
+
+    It used to ask for rows 0-199, 200-399... of "changed after the bookmark". In a long catch-up a
+    listing that changed again moved to the end of that list and everything behind it shifted up
+    one, so one listing was jumped over - and the bookmark then passed it for good (11/02). Here
+    each page asks for "changed at or after the newest time already seen", leaving out the
+    listings already handled at exactly that time.
+
+    `safe` is the newest time every listing at or before which has been handled - what may be
+    saved as the bookmark (the next run asks for "after" it, so a time that's only part-done is
+    never saved)."""
+
+    def __init__(self, fetch, since: str, page_size: int):
+        self.fetch = fetch
+        self.cursor = since
+        self.safe = since
+        self.page_size = page_size
+        self.op = "gt"
+        self.seen: set = set()  # listings already handled at exactly self.cursor
+        self.extra = 0  # to step past a whole page of listings that share one time
+        self.done = False
+
+    async def next_page(self) -> List[Dict[str, Any]]:
+        while not self.done:
+            rows = await self.fetch(self.cursor, top=self.page_size, skip=self.extra, op=self.op)
+            if len(rows) < self.page_size:
+                self.done = True
+            fresh = [r for r in rows if not (r.get("ModificationTimestamp") == self.cursor and str(r.get("ListingKey")) in self.seen)]
+            if not fresh:
+                if not self.done:
+                    self.extra += self.page_size
+                    continue
+                self.safe = self.cursor
+                return []
+            stamps = [r.get("ModificationTimestamp") for r in fresh if r.get("ModificationTimestamp")]
+            last = max(stamps) if stamps else self.cursor
+            if last != self.cursor:
+                # every listing before `last` is in hand (oldest first); `last` itself may continue
+                # on the next page
+                self.safe = max([self.cursor] + [t for t in stamps if t < last])
+                self.cursor, self.seen, self.extra = last, set(), 0
+            self.seen.update(str(r.get("ListingKey")) for r in fresh if r.get("ModificationTimestamp") == self.cursor)
+            self.op = "ge"
+            if self.done:
+                self.safe = self.cursor
+            return fresh
+        return []
+
+
 class PropertySyncService:
     """
     Global Synchronization Service.
@@ -158,7 +225,38 @@ class PropertySyncService:
 
         await db.commit()
 
-    async def run_global_sync(self, max_pages: Optional[int] = None) -> Dict[str, Any]:
+    async def _save_progress(self, db: AsyncSession, pager: "_ChangedSince", saved: str, key: Optional[str] = None) -> str:
+        """Saves the bookmark after a page (11/02: it was only saved at the end of a run, so a
+        restart mid-catch-up threw away hours of work). Returns what's saved now."""
+        safe = pager.safe
+        if safe and (not saved or safe > saved):  # never backwards (the look-back starts before it)
+            await self.update_last_sync_time(db, safe, key=key)
+            return safe
+        return saved
+
+    async def _not_yet_held(self, db: AsyncSession, rows: List[Dict[str, Any]], bookmark: str, need_close_price: bool = False) -> List[Dict[str, Any]]:
+        """Drops look-back rows (changed at or before the bookmark) that we already hold at that exact
+        Bright version - so re-reading the last few minutes costs nothing. Anything newer than the
+        bookmark is always handled, exactly as before. The sold step also wants the sale price held."""
+        old = [str(r.get("ListingKey")) for r in rows if (r.get("ModificationTimestamp") or "") <= bookmark]
+        if not old:
+            return rows
+        held = (await db.execute(
+            select(Property.listing_key, Property.raw_mls_data["ModificationTimestamp"].astext, Property.raw_mls_data["ClosePrice"].astext)
+            .where(Property.listing_key.in_(old))
+        )).all()
+        have = {k: (t, cp) for k, t, cp in held}
+
+        def held_already(r) -> bool:
+            k, t = str(r.get("ListingKey")), r.get("ModificationTimestamp")
+            if not t or t > bookmark or k not in have:
+                return False
+            ht, cp = have[k]
+            return ht == t and (not need_close_price or cp not in (None, ""))
+
+        return [r for r in rows if not held_already(r)]
+
+    async def run_global_sync(self, max_pages: Optional[int] = None, max_seconds: Optional[float] = None) -> Dict[str, Any]:
         """
         The Main Sync Loop.
         1. Process Hard Deletions (Isolated).
@@ -192,29 +290,35 @@ class PropertySyncService:
                 logger.error(f"Critical error in deletion sync (skipping to modifications): {e}")
                 stats["errors"] += 1
 
-            # --- PART B: PROCESS MODIFICATIONS (Existing Paged Loop) ---
-            skip = 0
-            page_size = 200
-            new_last_sync = last_sync
+            # --- PART B: PROCESS MODIFICATIONS (paged by time, bookmark saved per page) ---
+            pager = _ChangedSince(bright_mls_service.get_properties_modified_since, _look_back(last_sync), SYNC_PAGE_SIZE)
+            saved = last_sync
             had_failure = False
             pages_processed = 0
+            started = time.monotonic()
 
             while True:
                 if max_pages is not None and pages_processed >= max_pages:
                     logger.info(f"Reached max_pages={max_pages} for this run - stopping early, checkpoint saved so far.")
                     break
+                if max_seconds is not None and time.monotonic() - started >= max_seconds:
+                    logger.info(f"Listings sync used its {max_seconds:.0f}s for this cycle - the next cycle carries on from the saved checkpoint.")
+                    break
                 try:
                     # 1. Fetch modified batch from MLS
-                    raw_properties = await bright_mls_service.get_properties_modified_since(last_sync, top=page_size, skip=skip)
+                    raw_properties = await pager.next_page()
                     if not raw_properties:
                         logger.info("No more modified properties found.")
                         break
-                    
-                    logger.info(f"Found {len(raw_properties)} modified properties in this batch (skip={skip})")
+
+                    logger.info(f"Found {len(raw_properties)} modified properties in this batch (from {pager.cursor})")
+
+                    # The look-back minutes: listings we already hold at this exact version are skipped.
+                    raw_properties = await self._not_yet_held(db, raw_properties, last_sync)
 
                     # 2. Batch fetch media
                     listing_keys = [str(p["ListingKey"]) for p in raw_properties]
-                    photo_map = await bright_mls_service.get_media_for_properties(listing_keys)
+                    photo_map = await bright_mls_service.get_media_for_properties(listing_keys) if listing_keys else {}
 
                     # 3. Process each property
                     for raw_prop in raw_properties:
@@ -234,29 +338,25 @@ class PropertySyncService:
                                 # 4. Notify affected collections
                                 notified = await self._propagate_property_change(db, sync_event)
                                 stats["notifications_sent"] += notified
-                            
-                            if not had_failure and mod_ts and (not new_last_sync or mod_ts > new_last_sync):
-                                new_last_sync = mod_ts
-                                
+
                         except Exception as prop_error:
                             logger.error(f"Error syncing property {l_key}: {prop_error}")
                             stats["errors"] += 1
                             had_failure = True
 
                     pages_processed += 1
-                    if len(raw_properties) < page_size:
-                        break
-                    skip += page_size
+                    # A listing that failed is retried next cycle: the bookmark stays before it.
+                    if not had_failure:
+                        saved = await self._save_progress(db, pager, saved)
 
                 except Exception as e:
-                    logger.error(f"Error in sync batch at skip {skip}: {e}")
+                    logger.error(f"Error in sync batch from {pager.cursor}: {e}")
                     stats["errors"] += 1
                     break
 
             # 4. Finalize sync state
-            if new_last_sync != last_sync:
-                await self.update_last_sync_time(db, new_last_sync)
-                logger.info(f"Global Sync Cycle Complete. New Checkpoint: {new_last_sync}")
+            if saved != last_sync:
+                logger.info(f"Global Sync Cycle Complete. New Checkpoint: {saved}")
 
         return stats
 
@@ -444,7 +544,7 @@ class PropertySyncService:
                 plan[r.listing_key] = slots
         return plan
 
-    async def run_closed_sync(self, max_pages: Optional[int] = None) -> Dict[str, Any]:
+    async def run_closed_sync(self, max_pages: Optional[int] = None, max_seconds: Optional[float] = None) -> Dict[str, Any]:
         """Incremental sync of CLOSED-BRIGHT listings, on its own checkpoint.
 
         Why this exists as a separate leg from run_global_sync:
@@ -470,26 +570,30 @@ class PropertySyncService:
             last_sync = await self.get_last_sync_time(db, key=self.CLOSED_SYNC_KEY, fallback_hours=45 * 24)
             logger.info(f"Syncing closed listings from checkpoint: {last_sync}")
 
-            skip = 0
-            page_size = 200
-            new_last_sync = last_sync
+            pager = _ChangedSince(bright_mls_service.get_closed_properties_modified_since, _look_back(last_sync), SYNC_PAGE_SIZE)
+            saved = last_sync
             had_failure = False
             pages_processed = 0
+            started = time.monotonic()
 
             while True:
                 if max_pages is not None and pages_processed >= max_pages:
                     logger.info(f"Reached max_pages={max_pages} for closed sync - stopping early, checkpoint saved so far.")
                     break
+                if max_seconds is not None and time.monotonic() - started >= max_seconds:
+                    logger.info(f"Closed sync used its {max_seconds:.0f}s for this cycle - the next cycle carries on from the saved checkpoint.")
+                    break
                 try:
-                    raw_properties = await bright_mls_service.get_closed_properties_modified_since(last_sync, top=page_size, skip=skip)
+                    raw_properties = await pager.next_page()
                     if not raw_properties:
                         logger.info("No more modified closed listings found.")
                         break
 
-                    logger.info(f"Found {len(raw_properties)} modified closed listings in this batch (skip={skip})")
+                    logger.info(f"Found {len(raw_properties)} modified closed listings in this batch (from {pager.cursor})")
 
+                    raw_properties = await self._not_yet_held(db, raw_properties, last_sync, need_close_price=True)
                     listing_keys = [str(p["ListingKey"]) for p in raw_properties]
-                    photo_map = await bright_mls_service.get_media_for_properties(listing_keys)
+                    photo_map = await bright_mls_service.get_media_for_properties(listing_keys) if listing_keys else {}
 
                     for raw_prop in raw_properties:
                         l_key = str(raw_prop.get("ListingKey"))
@@ -502,29 +606,24 @@ class PropertySyncService:
                                 else:
                                     stats["updated"] += 1
 
-                            if not had_failure and mod_ts and (not new_last_sync or mod_ts > new_last_sync):
-                                new_last_sync = mod_ts
-
                         except Exception as prop_error:
                             logger.error(f"Error syncing closed listing {l_key}: {prop_error}")
                             stats["errors"] += 1
                             had_failure = True
 
                     pages_processed += 1
-                    if len(raw_properties) < page_size:
-                        break
-                    skip += page_size
+                    if not had_failure:
+                        saved = await self._save_progress(db, pager, saved, key=self.CLOSED_SYNC_KEY)
 
                 except Exception as e:
-                    logger.error(f"Error in closed sync batch at skip {skip}: {e}")
+                    logger.error(f"Error in closed sync batch from {pager.cursor}: {e}")
                     stats["errors"] += 1
                     break
 
-            if new_last_sync != last_sync:
-                await self.update_last_sync_time(db, new_last_sync, key=self.CLOSED_SYNC_KEY)
+            if saved != last_sync:
                 logger.info(
                     f"Closed-Listings Sync Cycle Complete. inserted={stats['inserted']} "
-                    f"updated={stats['updated']} errors={stats['errors']} New Checkpoint: {new_last_sync}"
+                    f"updated={stats['updated']} errors={stats['errors']} New Checkpoint: {saved}"
                 )
 
         return stats

@@ -1911,6 +1911,10 @@ async def _p_discovery(db, user, a):
         c = await _address_center(db, want, mine) or await _town_center(db, want)
         if c:
             centers.append(c)
+    # Their center as it is now stays the pick unless they named a new one (owner, 11/01: "keep a
+    # centrepoint ... in the same radius").
+    if prefs.get("landmark_address") and isinstance(prefs.get("latitude"), (int, float)) and isinstance(prefs.get("longitude"), (int, float)):
+        centers.insert(len(centers), {"label": prefs["landmark_address"], "lat": prefs["latitude"], "lng": prefs["longitude"], "kind": "current"})
     if mine:
         for r in (await db.execute(select(Property).where(
                 or_(Property.list_agent_mls_id == mine, Property.co_list_agent_mls_id == mine),
@@ -1937,13 +1941,28 @@ async def _p_discovery(db, user, a):
     if not uniq:
         raise ActionError("Where should your Discovery search be centered? Tell me a town or an address.")
     miles = a.get("miles") if isinstance(a.get("miles"), (int, float)) and 1 <= a["miles"] <= 100 else (prefs.get("miles") or 10)
+    # Listing agents the search hides ("exclude") or shows only ("include") - the Discovery page's
+    # Exclude Agents / Only Agents (owner, 11/01: "take off Lavinia as one of the agents").
+    before = [str(n) for n in (prefs.get("excluded_agents") or []) if str(n).strip()]
+    mode = a.get("agent_mode") if a.get("agent_mode") in ("exclude", "include") else (prefs.get("agent_filter_mode") or "exclude")
+    drop = [_s(x).lower() for x in (a.get("remove_agents") or []) if _s(x)]
+    agents = [n for n in before if not any(d in n.lower() for d in drop)]
+    # A name to take off that isn't in their list: the card says so (never "removed" when nothing was).
+    missing = [_s(x) for x in (a.get("remove_agents") or []) if _s(x) and not any(_s(x).lower() in n.lower() for n in before)]
+    for n in (a.get("add_agents") or []):
+        n = _s(n)
+        if n and not any(n.lower() == x.lower() for x in agents):
+            agents.append(n)
     payload = {"centers": uniq[:8], "center": uniq[0]["label"], "miles": miles,
+               "agents": agents, "agents_known": before + [n for n in agents if n not in before], "agent_mode": mode,
                "min_price": a.get("min_price") if isinstance(a.get("min_price"), (int, float)) else prefs.get("min_price"),
                "max_price": a.get("max_price") if isinstance(a.get("max_price"), (int, float)) else prefs.get("max_price"),
                "min_bedrooms": a.get("min_bedrooms") if isinstance(a.get("min_bedrooms"), int) else prefs.get("min_bedrooms"),
                "had": bool(prefs.get("landmark_address"))}
     title = "Change your Discovery search" if payload["had"] else "Set up your Discovery search"
-    return Prepared(title, [f"Now: {prefs['landmark_address']} · {prefs.get('miles') or 10} mi" if payload["had"] else "Pick where to look - it saves to your Discovery page"],
+    return Prepared(title, [f"Now: {prefs['landmark_address']} · {prefs.get('miles') or 10} mi" if payload["had"] else "Pick where to look - it saves to your Discovery page"]
+                    + ([f"Taken off your {'only-these-agents list' if mode == 'include' else 'hidden agents'}: {', '.join(n for n in before if n not in agents)}" + (" - no agent filter now, every agent's listings show" if not agents else "")] if any(n not in agents for n in before) else [])
+                    + ([f"Not in your agent filter (nothing to remove): {', '.join(missing)}. Your list: {', '.join(before) or 'no agents'}"] if missing else []),
                     payload, confirm_label="Save my search", picker="discovery")
 
 
@@ -1958,6 +1977,11 @@ def _adjust_discovery(user, payload: dict, picks: dict) -> dict:
         if k in picks:
             v = picks.get(k)
             out[k] = v if isinstance(v, (int, float)) and v > 0 else None
+    if isinstance(picks.get("agents"), list):
+        known = {n.lower(): n for n in out.get("agents_known") or []}
+        out["agents"] = [known[str(n).lower()] for n in picks["agents"] if str(n).lower() in known]
+    if picks.get("agent_mode") in ("exclude", "include"):
+        out["agent_mode"] = picks["agent_mode"]
     return out
 
 
@@ -1967,14 +1991,18 @@ async def _r_discovery(db, user, p):
         raise ActionError("Pick where to center the search first.")
     await _run_route(user, "PATCH", "/api/discovery/preferences", {
         "landmark_address": c["label"], "latitude": c["lat"], "longitude": c["lng"], "miles": p.get("miles") or 10,
-        "min_price": p.get("min_price"), "max_price": p.get("max_price"), "min_bedrooms": p.get("min_bedrooms")})
-    return {"message": f"Saved - your Discovery now looks within {p.get('miles') or 10} miles of {c['label']}. Ask me \"what can I host this weekend?\" any time.",
+        "min_price": p.get("min_price"), "max_price": p.get("max_price"), "min_bedrooms": p.get("min_bedrooms"),
+        "excluded_agents": list(p.get("agents") or []), "agent_filter_mode": p.get("agent_mode") or "exclude"})
+    return {"message": f"Saved - your Discovery now looks within {p.get('miles') or 10} miles of {c['label']}. Ask me \"show me homes to host\" to see the new list.",
             "link": "/discovery"}
 
 _simple("set_discovery_search", "Set up or change the agent's Discovery search (where they look for homes to host): the center (one of their listings, a town they serve, or a place they named), "
-        "how many miles, and an optional price range (min and max) / minimum beds - saved to their Discovery page. Use it when find_homes_to_host says their search area isn't set, or 'look around Wayne instead'. "
-        "Set it up right away (pass center if they named a place); the card asks the rest.",
-        _obj({"center": {"type": "string"}, "miles": {"type": "number"}, "min_price": {"type": "number"}, "max_price": {"type": "number"}, "min_bedrooms": {"type": "integer"}}),
+        "how many miles, an optional price range (min and max) / minimum beds, and the listing agents it hides or shows only (Exclude Agents / Only Agents) - saved to their Discovery page. "
+        "Use it for ANY change to their Discovery filter ('look around Wayne instead', '$1.5M to $5M', 'take Lavinia off', 'hide Compass agents' -> add_agents with the names) and when find_homes_to_host says their search area isn't set. "
+        "Their current center and miles stay unless they name new ones - pass only what changes (remove_agents takes part of a name, e.g. 'Lavinia'). Set it up right away; the card shows the rest and they tap Save.",
+        _obj({"center": {"type": "string"}, "miles": {"type": "number"}, "min_price": {"type": "number"}, "max_price": {"type": "number"}, "min_bedrooms": {"type": "integer"},
+              "remove_agents": {"type": "array", "items": {"type": "string"}}, "add_agents": {"type": "array", "items": {"type": "string"}},
+              "agent_mode": {"type": "string", "enum": ["exclude", "include"]}}),
         _p_discovery, _r_discovery, MLS, adjust=_adjust_discovery)
 
 

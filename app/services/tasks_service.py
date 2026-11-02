@@ -3872,15 +3872,78 @@ async def render_ics(db: AsyncSession, user: User) -> str:
     return "\r\n".join(lines) + "\r\n"
 
 
-async def mark_lead_contacted(db: AsyncSession, task: AgentTask) -> None:
+CONTACT_VIA = ("text", "email", "call")
+
+
+def contact_what(task: AgentTask) -> str:
+    """What a checked-off follow-up was, in a few words, for the contact log: "Showcase pitch" when
+    its message pitched their Showcase, else its situation ("Open house sign-in follow-up")."""
+    src = task.auto_source or ""
+    if src in PITCH_RULES and "showcase" in (task.suggested_message or "").lower():
+        return "Showcase pitch"
+    if src == NOTED_GUEST_SOURCE:
+        return "Check-in follow-up"
+    label = next((r["label"] for r in AUTO_FOLLOWUP_RULES if r["key"] == src), None)
+    if src == "form_submission":
+        label = "Form"  # its rule is "Any other form"
+    return f"{label} follow-up" if label else "Follow-up"
+
+
+def log_contact(lead: Lead, via: Optional[str], what: Optional[str] = None, task_id: Optional[str] = None) -> None:
+    """Adds how the agent reached out to lead.contact_log (owner, 11/02: Texted / Emailed on the
+    Visitors list and the Leads page). A second tap of the same button within 10 minutes is the
+    same contact, not a new one. Keeps the last 30. Caller commits."""
+    via = via if via in CONTACT_VIA else None
+    now = datetime.now(timezone.utc)
+    log = list(lead.contact_log or [])
+    if log:
+        last = log[-1]
+        try:
+            recent = now - datetime.fromisoformat(last.get("at")) < timedelta(minutes=10)
+        except (TypeError, ValueError):
+            recent = False
+        if recent and last.get("via") == via and last.get("what") == what:
+            return
+        # The follow-up's own Text / Email tap names how it went - fill in the check-off's entry.
+        if recent and task_id and last.get("task") == task_id and last.get("via") is None:
+            log[-1] = {**last, "via": via}
+            lead.contact_log = log
+            return
+    log.append({"at": now.isoformat(), "via": via, "what": what, "task": task_id})
+    lead.contact_log = log[-30:]
+
+
+def unlog_contact(lead: Lead, task_id: str) -> None:
+    """"Didn't send it - undo" / reopening a follow-up takes its entry back off. Caller commits."""
+    log = list(lead.contact_log or [])
+    for i in range(len(log) - 1, -1, -1):
+        if log[i].get("task") == task_id:
+            del log[i]
+            lead.contact_log = log or None
+            return
+
+
+async def unmark_lead_contacted(db: AsyncSession, task: AgentTask) -> None:
+    if task.lead_id:
+        lead = await db.get(Lead, task.lead_id)
+        if lead is not None:
+            unlog_contact(lead, task.id)
+
+
+async def mark_lead_contacted(db: AsyncSession, task: AgentTask, via: Optional[str] = None) -> None:
     """Checking off a follow-up means the agent reached out: stamp the lead's "last contacted" and
-    move a New lead to Contacted (the Leads page and the follow-up stay in step). Caller commits."""
+    move a New lead to Contacted (the Leads page and the follow-up stay in step). `via` = how
+    ("text" / "email" from the Text / Email buttons; None = just checked off). Caller commits."""
     if not task.lead_id:
         return
     lead = await db.get(Lead, task.lead_id)
     if lead is None:
         return
     lead.last_contacted_at = datetime.now(timezone.utc)
+    # Reaching out counts as having looked at them: the Dash's red "check this lead" outline (and
+    # the AI briefing's "needs attention") clears (owner, 11/02).
+    lead.viewed_at = lead.last_contacted_at
+    log_contact(lead, via, contact_what(task), task.id)
     if lead.status == "new":
         lead.status = "contacted"
     # The request this follow-up was made for is handled too (its to-do leaves the Leads page).

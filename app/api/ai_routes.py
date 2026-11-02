@@ -267,6 +267,11 @@ async def send_ai_message(
 ):
     conversation = await _get_owned_conversation(db, conversation_id, current_user.id)
     config = await ai_config_service.get_config(db)
+    # Read once, up front: after a failed turn the DB session is broken, and reading
+    # current_user.id then reloads it from the DB and crashes - which skipped the release below
+    # and left the agent locked out of the chat ("You already have a request in progress") until
+    # a restart (owner, 11/01).
+    user_id = current_user.id
 
     message_text = (payload.message or "").strip()
     if not message_text:
@@ -308,6 +313,9 @@ async def send_ai_message(
         try:
             text, refs, usage = await run_turn(db, current_user, history, card_note + message_text, voice_mode=payload.voice_mode)
         except AIOrchestratorError as e:
+            # A turn cut off by the time limit can stop mid-query, leaving the session needing a
+            # rollback before it can record anything.
+            await db.rollback()
             # What the partial turn really cost (the orchestrator only prices a finished turn).
             # Logged as blocked, so it never counts on the agent's meter - they got no answer -
             # but the platform counters and admin view see the real spend.
@@ -318,7 +326,7 @@ async def send_ai_message(
                     e.usage.get("cache_write_tokens") or 0, e.usage.get("cache_read_tokens") or 0,
                 )
             await record_usage_event(
-                db, current_user.id, conversation.id, e.usage.get("model", config.get("model")),
+                db, user_id, conversation_id, e.usage.get("model", config.get("model")),
                 e.usage.get("input_tokens"), e.usage.get("output_tokens"), spent,
                 e.usage.get("tool_call_count", 0), True, e.reason,
                 tool_names=e.usage.get("tool_names"),
@@ -355,7 +363,7 @@ async def send_ai_message(
             assistant_message=AIMessageOut.model_validate(assistant_msg),
         )
     finally:
-        await release(current_user.id)
+        await release(user_id)
 
 
 @router.get("/insights", response_model=AIInsightsResponse)

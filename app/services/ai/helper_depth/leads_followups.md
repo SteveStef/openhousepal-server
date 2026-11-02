@@ -28,7 +28,7 @@ Leads and follow-ups in depth: the Leads list and a lead's page, statuses, tags,
 - **Follow-ups** with **Alert settings** and **All follow-ups**; **Their Showcase** (Homes/Liked/Passed, last active, whether their invite email went out and when, Showcase emails on/off, **Open**, **Edit Showcase**, **Their link**, **Send invite** / **Send invite again**); **Emails** (sent, opened, clicked, automatic emails on/weekly/off); **Activity** (Everything, Forms & requests, Showcase); **Open houses they came to**.
 - **Notes**: "Add a note..." - also shows on their open house sign-in and on their follow-ups and calendar events; edit or delete your own notes. A note on a guest who has an agent gives you a "Guest with an agent + your note" heads-up instead of a pitch.
 - **Tags**: "Add a tag..." then +; x removes. Portal leads arrive tagged "Portal Lead".
-- **Record**: Lead since, Last contacted, Last active, **Mark contacted** / **Contacted them again** (checking off a follow-up does this for you).
+- **Record**: Lead since, Last contacted, Last active, **Mark contacted** / **Contacted them again** (checking off a follow-up does this for you), and **How you reached out** (each Text / Email: "Texted · Showcase pitch", "Emailed", "Followed up · Open house sign-in follow-up"). The Leads list shows the latest as a green chip; the Visitors list shows Texted / Emailed next to the phone / email (11/02).
 - **Hide** ("Take them off your lists - nothing is deleted"; also clears their open follow-ups, which don't come back when shown again). **Delete** removes them for good: activity, notes, Activity feed, Email Tracker and their Showcase; automatic emails stop. No undo.
 
 ## Per-lead alert switches (Alert settings, "Just for the client")

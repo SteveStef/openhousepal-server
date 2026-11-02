@@ -1200,9 +1200,13 @@ async def get_open_house_visitors(
         from app.models.database import Collection, GuestPassEvent, Lead
         lead_ids = [v.lead_id for v in visitors if v.lead_id]
         starred_leads = set()
+        contact_logs: dict = {}
         if lead_ids:
             starred_leads = set((await db.execute(select(Lead.id).where(
                 Lead.id.in_(lead_ids), Lead.owner_id == current_user.id, Lead.is_favorite.is_(True)))).scalars())
+            # How the agent already reached each one - "Texted" / "Emailed" on the list (11/02).
+            contact_logs = {lid: log for lid, log in (await db.execute(select(Lead.id, Lead.contact_log).where(
+                Lead.id.in_(lead_ids), Lead.owner_id == current_user.id, Lead.contact_log.isnot(None)))).all()}
         emails = {(v.email or "").strip().lower() for v in visitors if v.email}
         showcases: dict = {}
         if emails:
@@ -1251,6 +1255,7 @@ async def get_open_house_visitors(
                 lead_id=visitor.lead_id,
                 created_at=visitor.created_at,
                 is_favorite=visitor.lead_id in starred_leads,
+                contact_log=[{k: e.get(k) for k in ("at", "via", "what")} for e in (contact_logs.get(visitor.lead_id) or [])],
                 showcase_id=col.id if col else None,
                 showcase_starred=bool(col and col.favorited_at),
                 pass_events=n,

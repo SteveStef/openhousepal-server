@@ -194,6 +194,8 @@ class LeadOut(BaseModel):
     # The agent's star on this person, and whether their Showcase is starred (Showcases page).
     is_favorite: bool = False
     showcase_starred: bool = False
+    # How the agent reached out, oldest first: [{at, via: text|email|call|null, what}] (11/02).
+    contact_log: List[dict] = []
 
     class Config:
         from_attributes = True

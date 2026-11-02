@@ -39,6 +39,7 @@ from .property_website_routes import router as property_website_router
 from .public_property_site_routes import router as public_property_site_router
 from .support_routes import router as support_router
 from .admin_support_routes import router as admin_support_router
+from .admin_grading_routes import router as admin_grading_router
 from .saved_properties_routes import router as saved_properties_router
 from .public_questions_routes import router as public_questions_router
 from .admin_public_questions_routes import router as admin_public_questions_router
@@ -94,6 +95,7 @@ router.include_router(property_website_router)
 router.include_router(public_property_site_router)
 router.include_router(support_router)
 router.include_router(admin_support_router)
+router.include_router(admin_grading_router)
 router.include_router(saved_properties_router)
 router.include_router(public_questions_router)
 router.include_router(admin_public_questions_router)

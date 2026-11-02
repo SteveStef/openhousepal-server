@@ -447,6 +447,26 @@ async def _closed_count_all(db: AsyncSession, start: str, stop: str) -> int:
     return await _global(("closed_all", start, stop), compute)
 
 
+async def covered_days(db: AsyncSession, end, max_days: int, slice_days: int = 30) -> int:
+    """How far back from `end` our closed-sales mirror is complete, in whole `slice_days` steps
+    (at most `max_days`). 11/01 grader: "283 sales since Nov 1, 2025" was really ~2 months -
+    the mirror held almost nothing for Nov 2025-Jun 2026, so every count and mix built on a
+    longer window undercounted while its label promised a year. A slice counts as covered when
+    it holds 60%+ as many closings (across ALL our sales, not one small town) as the fullest
+    slice; the newest slice always counts (recording lag makes it look thin)."""
+    from datetime import timedelta
+
+    slices = []
+    for i in range(max(1, max_days // slice_days)):
+        stop = end - timedelta(days=i * slice_days)
+        slices.append(await _closed_count_all(db, (stop - timedelta(days=slice_days)).isoformat(), stop.isoformat()))
+    top = max(slices) if slices else 0
+    n = 1
+    while n < len(slices) and top and slices[n] >= 0.6 * top:
+        n += 1
+    return n * slice_days
+
+
 async def get_area_sales_snapshot(db: AsyncSession, scope: dict, days: int = 90) -> dict:
     """A DATED closed-sales snapshot for articles (unlike get_area_market_stats, whose sold numbers
     span every sale on record): closed sales in the `days` window ending on the newest CloseDate in
@@ -478,6 +498,9 @@ async def get_area_sales_snapshot(db: AsyncSession, scope: dict, days: int = 90)
     if not latest:
         return {}
     end = date.fromisoformat(str(latest)[:10])
+    # Only as far back as our records are complete (a 60-day window beats a 90-day one that's
+    # missing a month of sales but still says "90 days").
+    days = min(days, await covered_days(db, end, days))
 
     async def window(start: date, stop: date) -> dict:
         rows = (await db.execute(
@@ -506,6 +529,10 @@ async def get_area_sales_snapshot(db: AsyncSession, scope: dict, days: int = 90)
             out["median_close_price"] = round(_median(prices))
         if ratios:
             out["median_sale_to_list_pct"] = round(_median(ratios) * 100, 1)
+            # Real counts - a 100% median doesn't mean half sold above asking (11/01 grader: many
+            # sell at exactly asking).
+            out["vs_asking"] = {"above": sum(1 for r in ratios if r > 1.0005), "at": sum(1 for r in ratios if abs(r - 1) <= 0.0005),
+                                "below": sum(1 for r in ratios if r < 0.9995), "of": len(ratios)}
         if doms:
             out["median_days_on_market"] = round(_median(doms))
         # What each kind of home sold for (11/01 Arlington condo article: the only sold median mixed
@@ -591,21 +618,44 @@ def _fee_monthly(fee: Optional[float], freq: Optional[str]) -> Optional[float]:
     return None  # unknown frequency - not comparable
 
 
-async def get_area_cost_profile(db: AsyncSession, scope: dict) -> dict:
+def parts_fit(total: Optional[int], parts: list[int]) -> bool:
+    """A breakdown is only usable when its parts, counted from the same records as the total, never
+    add up to more than it (11/01 grader: Lancaster's "195 tax bills" next to 49 + 146 + 23 by
+    township - 2026 bills vs every year's bills, and a city filed under the township's name)."""
+    return total is not None and all(p >= 0 for p in parts) and sum(parts) <= total
+
+
+def _place_of(lat, lng, munis: list[dict]) -> Optional[str]:
+    """The census municipality a home's map location falls in (munis = the town's stored TIGER
+    outlines: [{name, rings, box}]), or None when it has no location or sits outside all of them."""
+    from app.services.areas import boundary_service as bs
+    if lat is None or lng is None:
+        return None
+    return next((m["name"] for m in munis if bs.contains(m["rings"], float(lng), float(lat), m["box"])), None)
+
+
+async def get_area_cost_profile(db: AsyncSession, scope: dict, munis: Optional[list[dict]] = None) -> dict:
     """What owning a home here costs, from the listings themselves (Bright MLS fields agents fill
     in): annual property tax on homes for sale (overall, as a share of list price, and per
-    township - the township decides the millage), condo/townhome association fees, and how buyers
-    paid for the homes that closed in the last 12 months (BuyerFinancing). Medians only, and only
-    from groups of 5+ homes, so one odd listing can't make a headline."""
+    municipality - it sets the millage), condo/townhome association fees, and how buyers paid for
+    the homes that closed recently (BuyerFinancing). Medians only, and only from groups of 5+
+    homes, so one odd listing can't make a headline.
+
+    The per-municipality tax split places each home by its MAP LOCATION in the town's census
+    outlines (`munis`, from the town map's TIGER boundaries) - never Bright's township name, which
+    files Lancaster City and Lancaster Township both as "LANCASTER". No outlines, no split; a home
+    with no location (or outside every outline) is left out of the split, never guessed."""
     from collections import Counter
     from datetime import date, timedelta
+    from app.services.areas import boundary_service as bs
 
     location_filter = geography.location_filter(Property, scope)
     if location_filter is None:
         return {}
+    shapes = [{"name": m["name"], "rings": m["rings"], "box": bs.bbox(m["rings"])} for m in (munis or []) if m.get("rings") and m.get("name")]
     resid = geography.residential_for_sale_filter(Property)
     rows = (await db.execute(
-        select(Property.price, Property.township, Property.home_type, Property.raw_mls_data["TaxAnnualAmount"].astext,
+        select(Property.price, Property.latitude, Property.longitude, Property.home_type, Property.raw_mls_data["TaxAnnualAmount"].astext,
                Property.raw_mls_data["TaxYear"].astext, Property.raw_mls_data["AssociationFee"].astext,
                Property.raw_mls_data["AssociationFeeFrequency"].astext, Property.raw_mls_data["Levels"],
                Property.raw_mls_data["SeniorCommunityYN"].astext, Property.raw_mls_data["AssociationFee2"].astext,
@@ -613,24 +663,25 @@ async def get_area_cost_profile(db: AsyncSession, scope: dict) -> dict:
                Property.raw_mls_data["StructureDesignType"].astext)
         .where(location_filter, resid, Property.home_status.in_(FOR_SALE_STATUSES))
     )).all()
-    taxes, ratios, years, homes = [], [], Counter(), []
+    taxes, years, homes = [], Counter(), []
     fees: dict[str, list[float]] = {"CONDO": [], "TOWNHOUSE": []}
     covers: Counter = Counter()
-    by_town: dict[str, list[float]] = {}
-    for price, township, home_type, tax, tax_year, fee, freq, levels, senior, fee2, freq2, includes, structure in rows:
+    town_own: Counter = Counter()
+    for price, lat, lng, home_type, tax, tax_year, fee, freq, levels, senior, fee2, freq2, includes, structure in rows:
         tax_v, price_v = _num(tax), _num(price)
         if tax_v and tax_v > 100 and price_v and price_v >= geography.MIN_PLAUSIBLE_SALE_PRICE:
             year = str(tax_year)[:4] if tax_year else None
-            taxes.append((tax_v, year))
-            ratios.append(tax_v / price_v)
+            taxes.append((tax_v, year, tax_v / price_v, _place_of(lat, lng, shapes) if shapes else None))
             if year:
                 years[year] += 1
-            if township:
-                by_town.setdefault(str(township).strip().title(), []).append(tax_v / price_v)
         if home_type in ("CONDO", "TOWNHOUSE"):
             # Bright keeps a condo's fee in AssociationFee2 (11/01 Arlington: 336 of 346 condos) and a
             # community HOA in AssociationFee - reading only the first left condos out of the median.
             parts = [m for m in (_fee_monthly(_num(fee), freq), _fee_monthly(_num(fee2), freq2)) if m]
+            if home_type == "TOWNHOUSE":
+                # Townhome = a building style, not ownership (11/01 grader): a condo fee (Fee2) marks
+                # one owned as a condo unit; an HOA fee alone, or none, one owned with its land.
+                town_own["condo_fee" if (_num(fee2) or 0) > 0 else "hoa_only" if (_num(fee) or 0) > 0 else "no_fee"] += 1
             if parts:
                 fees[home_type].append(sum(parts))
                 for c in (includes if isinstance(includes, list) else []):
@@ -650,12 +701,21 @@ async def get_area_cost_profile(db: AsyncSession, scope: dict) -> dict:
         # on 2026): the newest year with 5+ listings and a quarter of the bills (Frederick: 9 bills
         # marked 2027 out of hundreds), else every bill labeled with the usual year.
         newest = max((y for y, n in years.items() if n >= max(5, 0.25 * len(taxes))), default=None)
-        bills = [t for t, y in taxes if y == newest] if newest else [t for t, _ in taxes]
+        # One set of bills for the total, the median, the share of list price AND the split.
+        bills = [b for b in taxes if b[1] == newest] if newest else list(taxes)
+        by_town: dict[str, list[float]] = {}
+        for _, _, ratio, place in bills:
+            if place:
+                by_town.setdefault(place, []).append(ratio)
+        split = sorted(({"township": t, "homes": len(v), "median_pct_of_list": round(_median(v) * 100, 2)}
+                        for t, v in by_town.items() if len(v) >= 5), key=lambda r: -r["homes"])
         out["tax"] = {
-            "homes": len(bills), "median_annual": round(_median(bills)), "median_pct_of_list": round(_median(ratios) * 100, 2),
+            "homes": len(bills), "median_annual": round(_median([b[0] for b in bills])),
+            "median_pct_of_list": round(_median([b[2] for b in bills]) * 100, 2),
             "tax_year": newest or (years.most_common(1)[0][0] if years else None),
-            "by_township": sorted(({"township": t, "homes": len(v), "median_pct_of_list": round(_median(v) * 100, 2)}
-                                   for t, v in by_town.items() if len(v) >= 5), key=lambda r: -r["homes"]),
+            "placed": sum(1 for b in bills if b[3]),
+            # Parts that don't fit inside the total are a data error - leave the split out.
+            "by_township": split if parts_fit(len(bills), [r["homes"] for r in split]) else [],
         }
     hoa = {}
     listed = {"CONDO": sum(1 for r in rows if r[2] == "CONDO"), "TOWNHOUSE": sum(1 for r in rows if r[2] == "TOWNHOUSE")}
@@ -666,16 +726,27 @@ async def get_area_cost_profile(db: AsyncSession, scope: dict) -> dict:
             hoa[kind.lower()] = {"homes": len(vals), "of": listed[kind], "median_monthly": round(_median(vals)), "covers": top}
     if hoa:
         out["hoa"] = hoa
+    if sum(town_own.values()) >= 10:
+        out["townhome_fees"] = {"of": sum(town_own.values()), **{k: town_own.get(k, 0) for k in ("condo_fee", "hoa_only", "no_fee")}}
     mix = _home_mix(homes)
     if mix:
         mix["homes"] = len(rows)  # the same count as the snapshot's "homes for sale"
         out["mix"] = mix
 
-    since = (date.today() - timedelta(days=365)).isoformat()
-    fin_rows = (await db.execute(
-        select(Property.raw_mls_data["BuyerFinancing"]).where(
-            location_filter, resid, Property.home_status.in_(_SOLD_STATUSES), Property.raw_mls_data["CloseDate"].astext > since)
-    )).scalars().all()
+    # The same complete-records window as the sales snapshot (up to 12 months), ending on the
+    # newest close date - so "how buyers paid" never claims a year our mirror doesn't hold.
+    close_date = Property.raw_mls_data["CloseDate"].astext
+    latest = (await db.execute(select(func.max(close_date)).where(
+        Property.home_status.in_(_SOLD_STATUSES), resid, close_date <= date.today().isoformat()))).scalar()
+    end = date.fromisoformat(str(latest)[:10]) if latest else date.today()
+    span = await covered_days(db, end, 360)
+    since = (end - timedelta(days=span)).isoformat()
+    # The same sales the snapshot counts - real prices only ($1 transfers and data-entry rows aren't
+    # sales). 11/01 round 13 Baltimore: "1,198 sales" next to "1,205 sales that recorded how the buyer paid".
+    fin_rows = [fin for fin, cp in (await db.execute(
+        select(Property.raw_mls_data["BuyerFinancing"], Property.raw_mls_data["ClosePrice"].astext).where(
+            location_filter, resid, Property.home_status.in_(_SOLD_STATUSES), close_date > since, close_date <= end.isoformat())
+    )).all() if (_num(cp) or 0) >= geography.MIN_PLAUSIBLE_SALE_PRICE]
     kinds: Counter = Counter()
     for raw in fin_rows:
         vals = raw if isinstance(raw, list) else ([raw] if isinstance(raw, str) and raw.strip() else [])
@@ -688,9 +759,10 @@ async def get_area_cost_profile(db: AsyncSession, scope: dict) -> dict:
         kinds[label] += 1
     recorded = sum(kinds.values())
     # Only when most sales recorded it - a mix read off a sliver of the sales would mislead.
-    if recorded >= 20 and recorded >= 0.3 * len(fin_rows):
+    # 11/01 grader: a mix from a minority of sales isn't the market - most sales must record it.
+    if recorded >= 20 and recorded >= 0.6 * len(fin_rows):
         out["financing"] = {
-            "closed_sales": len(fin_rows), "recorded": recorded, "since": since,
+            "closed_sales": len(fin_rows), "recorded": recorded, "since": since, "through": end.isoformat(), "days": span,
             "mix": [{"type": k, "count": v, "pct": round(v * 100 / recorded)} for k, v in kinds.most_common() if v * 100 / recorded >= 1],
         }
     return out
@@ -744,6 +816,19 @@ async def area_geography_mix(db: AsyncSession, scope: dict) -> dict:
     return {"homes": total, "townships": townships, "counties": tally(1), "school_districts": tally(2), "mailing_towns": tally(3)}
 
 
+async def older_homes_share(db: AsyncSession, scopes: list[dict], before: int = 1978) -> Optional[float]:
+    """The share of homes for sale across these areas built before `before` (of those that list a
+    year built) - None under 20 such listings. Triggers the federal lead-paint disclosure item."""
+    filters = [f for f in (geography.location_filter(Property, s) for s in scopes) if f is not None]
+    if not filters:
+        return None
+    years = (await db.execute(
+        select(Property.year_built).where(or_(*filters), geography.residential_for_sale_filter(Property),
+                                          Property.home_status.in_(FOR_SALE_STATUSES), Property.year_built.isnot(None), Property.year_built > 1700)
+    )).scalars().all()
+    return round(sum(1 for y in years if y < before) / len(years), 3) if len(years) >= 20 else None
+
+
 async def entry_price_profile(db: AsyncSession, scopes: list[dict]) -> dict:
     """Homes for sale across several areas at once (each home once, even where the areas
     overlap): the 25th-percentile and median list price, and the median annual tax as a share of
@@ -753,9 +838,21 @@ async def entry_price_profile(db: AsyncSession, scopes: list[dict]) -> dict:
     if not filters:
         return {}
     rows = (await db.execute(
-        select(Property.price, Property.raw_mls_data["TaxAnnualAmount"].astext)
+        select(Property.price, Property.raw_mls_data["TaxAnnualAmount"].astext, Property.home_type, Property.raw_mls_data["StructureDesignType"].astext)
         .where(or_(*filters), geography.residential_for_sale_filter(Property), Property.home_status.in_(FOR_SALE_STATUSES), Property.price.isnot(None))
     )).all()
+    # Manufactured homes aren't counted as single-family houses - the same rule as the article's own
+    # house count (get_area_cost_profile). 11/02 round 14 Lancaster: the card said 134 houses at $485K
+    # while the article said 122 houses at $520K.
+    rows = [(p, t, None if "manufactured" in str(s or "").lower() and ht in ("SINGLE_FAMILY", "Single Family") else ht) for p, t, ht, s in rows]
+    # A move-up or single-family article's example is a typical single-family house, a condo /
+    # townhome article's a typical attached home - never the cheapest quarter of every type (11/01
+    # grader: a Frederick single-family article showed a $390,000 example while houses ran $600,000+).
+    # Each type's tax estimate comes from that same type's listings.
+    typed = {}
+    for kind, types in (("house", ("SINGLE_FAMILY", "Single Family")), ("attached", ("CONDO", "TOWNHOUSE"))):
+        typed[kind] = [(float(p), _num(t)) for p, t, ht in rows if p and ht in types]
+    rows = [(p, t) for p, t, _ in rows]
     prices = sorted(float(p) for p, _ in rows if p)
     if len(prices) < 10:
         return {}
@@ -764,6 +861,16 @@ async def entry_price_profile(db: AsyncSession, scopes: list[dict]) -> dict:
     ratios = [t / p for p, t in near if t and t > 100]
     if len(ratios) < 5:
         ratios = [_num(t) / float(p) for p, t in rows if p and _num(t) and _num(t) > 100]
-    return {"homes": len(prices), "p25": round(p25), "median": round(_median(prices)),
-            "tax_pct_near_p25": round(_median(ratios) * 100, 2) if len(ratios) >= 5 else None,
-            "tax_homes": len(ratios)}
+    out = {"homes": len(prices), "p25": round(p25), "median": round(_median(prices)),
+           "tax_pct_near_p25": round(_median(ratios) * 100, 2) if len(ratios) >= 5 else None,
+           "tax_homes": len(ratios)}
+    for kind, homes in typed.items():
+        if len(homes) < 10:
+            continue
+        km = _median([p for p, _ in homes])
+        near_k = [t / p for p, t in homes if 0.75 * km <= p <= 1.25 * km and t and t > 100]
+        if len(near_k) < 5:
+            near_k = [t / p for p, t in homes if t and t > 100]
+        out.update({("houses" if kind == "house" else "attached"): len(homes), f"{kind}_median": round(km),
+                    f"tax_pct_near_{kind}": round(_median(near_k) * 100, 2) if len(near_k) >= 5 else None})
+    return out

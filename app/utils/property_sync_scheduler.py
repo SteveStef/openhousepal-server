@@ -15,7 +15,7 @@ from app.config.logging import get_logger
 
 logger = get_logger(__name__)
 
-async def run_global_property_sync(max_pages: int | None = None) -> Dict[str, Any]:
+async def run_global_property_sync(max_pages: int | None = None, max_seconds: float | None = None) -> Dict[str, Any]:
     """
     Triggers the high-efficiency global incremental property sync.
     Fetches all changes from Bright MLS and propagates to collections.
@@ -34,7 +34,7 @@ async def run_global_property_sync(max_pages: int | None = None) -> Dict[str, An
         property_sync_service = PropertySyncService()
         
         # Execute the new global sync logic
-        results = await property_sync_service.run_global_sync(max_pages=max_pages)
+        results = await property_sync_service.run_global_sync(max_pages=max_pages, max_seconds=max_seconds)
         
         sync_results['properties_updated'] = results.get('updated', 0)
         sync_results['notifications_sent'] = results.get('notifications_sent', 0)
@@ -133,7 +133,7 @@ async def scheduled_open_house_sync():
         logger.error("Scheduled open house sync failed", exc_info=True, extra={"error": str(e)})
 
 
-async def run_closed_property_sync(max_pages: int | None = None) -> Dict[str, Any]:
+async def run_closed_property_sync(max_pages: int | None = None, max_seconds: float | None = None) -> Dict[str, Any]:
     """
     Triggers the incremental sync of CLOSED-BRIGHT listings into the local mirror, carrying the
     verified ClosePrice / CloseDate the general modified-since feed leaves null. Feeds the CMA
@@ -152,7 +152,7 @@ async def run_closed_property_sync(max_pages: int | None = None) -> Dict[str, An
 
     try:
         property_sync_service = PropertySyncService()
-        results = await property_sync_service.run_closed_sync(max_pages=max_pages)
+        results = await property_sync_service.run_closed_sync(max_pages=max_pages, max_seconds=max_seconds)
 
         sync_results['inserted'] = results.get('inserted', 0)
         sync_results['updated'] = results.get('updated', 0)
@@ -228,6 +228,11 @@ if __name__ == "__main__":
     asyncio.run(run_global_property_sync())
 
 
+# Each 5-minute cycle's share for the two catch-up steps (open houses are small and run in full).
+LISTINGS_SECONDS = 180
+SOLD_SECONDS = 60
+
+
 async def scheduled_bright_sync():
     """The one 5-minute Bright cycle: what changed since last time, in order - listings (and
     deletions), then open house dates, then sold prices. Each step keeps its own checkpoint, so a
@@ -236,8 +241,11 @@ async def scheduled_bright_sync():
     if not os.getenv("PROPERTY_SYNC_ENABLED", "false").lower() == "true":
         logger.info("Property sync is disabled", extra={"event": "property_sync_disabled"})
         return
-    for step, run in (("listings", run_global_property_sync), ("open houses", run_open_house_sync),
-                      ("sold prices", lambda: run_closed_property_sync(max_pages=40))):
+    # Time limits (11/02): a big catch-up used to hold this cycle for 10 hours while open houses and
+    # sold prices waited. Each step now stops after its share and the next cycle carries on from its
+    # saved bookmark.
+    for step, run in (("listings", lambda: run_global_property_sync(max_seconds=LISTINGS_SECONDS)), ("open houses", run_open_house_sync),
+                      ("sold prices", lambda: run_closed_property_sync(max_pages=40, max_seconds=SOLD_SECONDS))):
         try:
             await run()
         except Exception as e:  # one step failing never stops the others

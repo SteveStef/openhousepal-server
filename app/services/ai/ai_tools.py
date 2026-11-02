@@ -39,6 +39,11 @@ from app.services import cma_service, stats_service
 logger = get_logger(__name__)
 
 
+def _esc(s: str) -> str:
+    """Literal text inside a LIKE pattern (Postgres escapes with a backslash by default)."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _clamp_limit(config: dict, tool_name: str, requested: Optional[int]) -> int:
     maximum = config.get("result_limits", {}).get(tool_name, 10)
     if requested is None:
@@ -82,7 +87,6 @@ async def _search_properties(db: AsyncSession, current_user: User, args: dict, c
     if not query:
         return {"results": [], "count": 0, "note": "No search text provided."}
 
-    like = f"%{query}%"
     # A town name ("Wayne") is that town - not every address containing it (Waynesboro, Wayne Ave)
     # - and never rentals; prices filter here so the answer can't contradict itself (owner's test, 11/01).
     is_town = not any(ch.isdigit() for ch in query)
@@ -90,9 +94,13 @@ async def _search_properties(db: AsyncSession, current_user: User, args: dict, c
     # "221 CONESTOGA RD", so the house number + street name also match on their own (11/01).
     import re as _re
     num_street = _re.match(r"\s*(\d+[A-Za-z]?)\s+([A-Za-z0-9']{2,})", query)
-    by_street = [Property.street_address.ilike(f"{num_street.group(1)} {num_street.group(2)}%")] if num_street else []
-    where = [or_(func.lower(Property.city) == query.lower(), Property.listing_key == query) if is_town
-             else or_(Property.full_address.ilike(like), Property.street_address.ilike(like), Property.listing_key == query, *by_street)]
+    # Every match here must use an index (trigram on full_address / city, listing_key): one
+    # unindexed street_address match made Postgres read all ~1.1M live rows per search, so an
+    # address question ran past the chat's 60 s limit (owner, 11/01 - 735 Righters Mill Rd).
+    # full_address starts with the street address, so it covers both.
+    by_street = [Property.full_address.ilike(f"{_esc(num_street.group(1))} {_esc(num_street.group(2))}%")] if num_street else []
+    where = [or_(Property.city.ilike(_esc(query)), Property.listing_key == query) if is_town
+             else or_(Property.full_address.ilike(f"%{_esc(query)}%"), Property.listing_key == query, *by_street)]
     lease = Property.raw_mls_data["PropertyType"].astext
     where.append(or_(lease.is_(None), ~lease.ilike("%lease%")))
     if args.get("for_sale_only", True):

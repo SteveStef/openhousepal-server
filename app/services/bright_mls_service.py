@@ -362,11 +362,12 @@ class BrightMlsService:
         """Centralized list of all 90+ fields from mls_mapper."""
         return ",".join(BRIGHT_PROPERTY_SELECT_FIELDS)
 
-    async def get_properties_modified_since(self, since_timestamp: str, top: int = 200, skip: int = 0) -> List[Dict[str, Any]]:
-        """Fetch all properties modified since a specific timestamp to capture status changes."""
+    async def get_properties_modified_since(self, since_timestamp: str, top: int = 200, skip: int = 0, op: str = "gt") -> List[Dict[str, Any]]:
+        """Fetch all properties modified since a specific timestamp to capture status changes.
+        op "ge" (at or after) is how the sync pages on by time - property_sync_service._ChangedSince."""
         params = {
             # REMOVED MlsStatus filter to capture transitions (e.g., ACTIVE -> PENDING)
-            "$filter": f"ModificationTimestamp gt {since_timestamp}",
+            "$filter": f"ModificationTimestamp {'ge' if op == 'ge' else 'gt'} {since_timestamp}",
             "$top": top,
             "$skip": skip,
             "$select": self._get_full_field_list(),
@@ -375,7 +376,7 @@ class BrightMlsService:
         data = await self._make_request("BrightProperties", params=params)
         return data.get("value", [])
 
-    async def get_closed_properties_modified_since(self, since_timestamp: str, top: int = 200, skip: int = 0) -> List[Dict[str, Any]]:
+    async def get_closed_properties_modified_since(self, since_timestamp: str, top: int = 200, skip: int = 0, op: str = "gt") -> List[Dict[str, Any]]:
         """Incremental pull of CLOSED-BRIGHT listings whose record changed since the checkpoint.
 
         Catches both (a) the active/pending -> closed transition (a listing's
@@ -387,7 +388,7 @@ class BrightMlsService:
         general modified-since feed carries every closed listing with a null sale price. The CMA
         engine needs the verified closed price, so it gets its own leg."""
         params = {
-            "$filter": f"MlsStatus eq 'CLOSED-BRIGHT' and ModificationTimestamp gt {since_timestamp}",
+            "$filter": f"MlsStatus eq 'CLOSED-BRIGHT' and ModificationTimestamp {'ge' if op == 'ge' else 'gt'} {since_timestamp}",
             "$top": top,
             "$skip": skip,
             "$select": self._get_full_field_list(),
@@ -609,13 +610,14 @@ class BrightMlsService:
         })
         return data.get("value", [])
 
-    async def get_listings_by_status(self, mls_status: str, top: int = 200, skip: int = 0) -> List[Dict[str, Any]]:
+    async def get_listings_by_status(self, mls_status: str, top: int = 200, skip: int = 0, select: Optional[str] = None) -> List[Dict[str, Any]]:
         """One page of every listing in one status (e.g. 'ACTIVE-BRIGHT') - the one-time refresh
-        that fills newly-requested fields on listings the 5-minute sync won't touch until they change."""
+        that fills newly-requested fields on listings the 5-minute sync won't touch until they change.
+        `select` narrows the fields (the nightly missing-listings check only needs key + status)."""
         safe = mls_status.replace("'", "''")
         data = await self._make_request("BrightProperties", params={
             "$filter": f"MlsStatus eq '{safe}'", "$top": top, "$skip": skip,
-            "$select": self._get_full_field_list(), "$orderby": "ListingKey",
+            "$select": select or self._get_full_field_list(), "$orderby": "ListingKey",
         })
         return data.get("value", [])
 

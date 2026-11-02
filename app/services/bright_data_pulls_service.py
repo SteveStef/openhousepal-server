@@ -18,11 +18,13 @@ remembering where it stopped (system_settings), until done:
                    up on the next tick (Bright audit, 10/15). New sales after that arrive through
                    the 5-minute sync's closed-listings step.
 
-Three repairs keep running for good (10/21):
+Repairs that keep running for good (10/21, 11/02):
 
   recheck_off_market  weekly: every OFF_MARKET-BRIGHT listing Bright still has comes back.
   stale_recheck       daily: every on-market listing Bright hasn't modified in 14 days is re-read
                       by key; one Bright no longer has goes off-market (its removal notice was lost).
+  missing_check       daily (11/02): every listing Bright has on the market, key + status, against ours;
+                      one we lack or hold with another status is re-read - the 5-minute sync's safety net.
   photo_refill        listings holding fewer photos than Bright's TotalPhotos get their gallery
                       again (after sold_3y finishes), plus any media fetch that failed anywhere.
 
@@ -42,7 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
-PULLS = ("sold_3y", "refresh_current", "price_history", "agent_sales", "recheck_off_market", "stale_recheck", "photo_refill",
+PULLS = ("sold_3y", "refresh_current", "price_history", "agent_sales", "recheck_off_market", "stale_recheck", "missing_check", "photo_refill",
          "town_sales_1y")
 _CURRENT = ("ACTIVE-BRIGHT", "COMING SOON-BRIGHT", "PENDING-BRIGHT", "ACTIVE UNDER CONTRACT-BRIGHT")
 PAGE = 200
@@ -60,7 +62,7 @@ def enabled(name: str) -> bool:
     if name == "recheck_off_market" and "sold_3y" in raw:
         return True
     # Same switch for the daily stale recheck and the photo refill (10/21) - production only.
-    if name in ("stale_recheck", "photo_refill", "town_sales_1y") and "sold_3y" in raw:
+    if name in ("stale_recheck", "missing_check", "photo_refill", "town_sales_1y") and "sold_3y" in raw:
         return True
     return "all" in raw or name in raw
 
@@ -352,6 +354,67 @@ async def stale_recheck(db: AsyncSession, stale_days: int = 14, time_budget: flo
     return st
 
 
+async def missing_check(db: AsyncSession, time_budget: float = 300, pause: float = 0.5) -> dict:
+    """Once a day, the safety net under the 5-minute sync (owner, 11/02): every listing Bright has
+    for sale / coming soon / pending / under contract, 1,000 keys per request (key + status only),
+    compared with ours. One we don't have, or hold with a different status, is read again in full
+    and saved - so a change the sync ever missed, for any reason, is fixed within a day. Listings we
+    hold as on-market that Bright has since changed are stale_recheck's job. A pass that has to fix
+    a lot tells the admin, since it means the 5-minute sync is missing things. No alerts to agents."""
+    from app.services.bright_mls_service import bright_mls_service
+    from app.services.property_sync_service import PropertySyncService
+    key = "data_pull_missing_check"
+    today = date.today().isoformat()
+    st = await _get(db, key)
+    if st.get("day") != today:
+        st = {"day": today, "status_idx": 0, "skip": 0, "bright": 0, "fixed": 0, "new": 0,
+              "last_pass": {k: st.get(k) for k in ("day", "bright", "fixed", "new", "done") if k in st} or None}
+    if st.get("done"):
+        return st
+    syncer = PropertySyncService()
+    deadline = time.monotonic() + time_budget
+    while time.monotonic() < deadline:
+        if st["status_idx"] >= len(_CURRENT):
+            st["done"] = True
+            logger.info("Missing-listings check done", extra={"event": "missing_check", "result": st})
+            if st["fixed"] > 25:
+                from app.services.admin_alerts import alert_admin
+                await alert_admin("bright_missing_check", "Bright sync missed listings",
+                                  f"The nightly check fixed {st['fixed']} of {st['bright']} on-market listings ({st['new']} we didn't have).")
+            break
+        status = _CURRENT[st["status_idx"]]
+        # Raises if Bright can't be asked - nothing is changed, the tick is retried.
+        rows = await bright_mls_service.get_listings_by_status(status, top=1000, skip=st["skip"], select="ListingKey,MlsStatus")
+        keys = [str(r.get("ListingKey")) for r in rows if r.get("ListingKey")]
+        ours = dict((await db.execute(text("SELECT listing_key, home_status FROM properties WHERE listing_key = ANY(:k)"),
+                                      {"k": keys})).all()) if keys else {}
+        wrong = [str(r.get("ListingKey")) for r in rows if r.get("ListingKey") and ours.get(str(r.get("ListingKey"))) != r.get("MlsStatus")]
+        if wrong:
+            full = await bright_mls_service.get_listings_by_keys(wrong)
+            new_keys = [k for k in wrong if k not in ours]
+            photos = await bright_mls_service.get_media_for_properties(new_keys) if new_keys else {}
+            for raw in full:
+                try:
+                    await syncer._sync_single_property(db, raw, photos, allow_inactive_insert=False)
+                except Exception:  # noqa: BLE001 - one bad record never stops the pass
+                    await db.rollback()
+                    logger.warning("missing_check: listing failed", exc_info=True)
+            st["fixed"] += len(full)
+            st["new"] += len(new_keys)
+        st["bright"] += len(rows)
+        # By position within one status: a listing changing status mid-pass can be passed over
+        # tonight - tomorrow's pass (and the 5-minute sync) has it.
+        if len(rows) < 1000:
+            st["status_idx"] += 1
+            st["skip"] = 0
+        else:
+            st["skip"] += 1000
+        await _set(db, key, st)
+        await asyncio.sleep(pause)
+    await _set(db, key, st)
+    return st
+
+
 PHOTO_QUEUE_KEY = "photo_retry_queue"
 
 
@@ -470,7 +533,7 @@ async def photo_refill(db: AsyncSession, time_budget: float = 480, pause: float 
 # media fetches; once sold_3y is done the job's whole 8 minutes go to the photo pass.
 SALES_PULLS = ("town_sales_1y", "refresh_current", "sold_3y", "agent_sales", "photo_refill")
 HISTORY_PULLS = ("price_history",)
-REPAIR_PULLS = ("recheck_off_market", "stale_recheck")
+REPAIR_PULLS = ("recheck_off_market", "stale_recheck", "missing_check")
 
 
 async def run_enabled(db: AsyncSession, names: tuple = PULLS) -> dict:
@@ -486,7 +549,8 @@ async def run_enabled(db: AsyncSession, names: tuple = PULLS) -> dict:
                       ("agent_sales", lambda: pull_agent_sales(db)),
                       ("photo_refill", lambda: photo_refill(db, time_budget=480)),
                       ("recheck_off_market", lambda: recheck_off_market(db)),
-                      ("stale_recheck", lambda: stale_recheck(db, time_budget=300))):
+                      ("stale_recheck", lambda: stale_recheck(db, time_budget=300)),
+                      ("missing_check", lambda: missing_check(db, time_budget=240))):
         if name not in names or not enabled(name):
             continue
         try:

@@ -373,6 +373,10 @@ class Lead(Base):
     tags = Column(JSONB, nullable=False, default=list)
     notes = Column(Text, nullable=True)
     last_contacted_at = Column(DateTime(timezone=True), nullable=True)
+    # How the agent reached out, oldest first (owner, 11/02): [{"at", "via": "text"|"email"|"call"|null,
+    # "what": "Showcase pitch" | "Open house sign-in follow-up" | null, "task": follow-up id|null}].
+    # Shown as Texted / Emailed on the Visitors list and the Leads page - tasks_service.log_contact.
+    contact_log = Column(JSONB, nullable=True)
     hidden_at = Column(DateTime(timezone=True), nullable=True)
 
     # Set when this lead's matched Collection (showcase) is deleted; cleared if a new one is
@@ -2542,6 +2546,26 @@ class CmaReport(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     owner = relationship("User")
+
+
+class AdminGrade(Base):
+    """The admin's own grade for one agent-made blog or CMA (Admin -> Tools -> Grading, owner 11/01):
+    whether it was sent to a grader, the grade it got and any notes - so the admin can look back.
+    Never shown to the agent. One row per item; a deleted blog/CMA just leaves its row unused."""
+    __tablename__ = "admin_grades"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    item_type = Column(String(8), nullable=False)  # blog | cma
+    item_id = Column(String, nullable=False)
+    graded = Column(Boolean, default=False, nullable=False, server_default='false')
+    grade = Column(String(40), nullable=True)  # free text: "11/11", "B+", "92"
+    notes = Column(Text, nullable=True)
+    graded_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('item_type', 'item_id', name='uq_admin_grades_item'),
+    )
 
 
 class CmaBacktestBatch(Base):

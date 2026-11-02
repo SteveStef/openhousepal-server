@@ -170,3 +170,126 @@ def test_rules_are_named_never_spelled_out_in_both_writers():
     assert "NAME THEM, NEVER SPELL THEM OUT" in pipe._ENGINE_RULES and "ask_agent" in pipe._ENGINE_RULES
     assert "never their amounts" in w._SYSTEM
     assert "rule_detail" in str(pipe._REVIEW_TOOL) and "rule_detail (" in pipe._REVIEW_SYSTEM
+
+
+# --- 11/01 grader round 3: applicability, first person, situation exceptions, data coverage ----------------
+def test_engine_never_decides_whether_a_rule_applies_and_speaks_in_first_person():
+    assert "WHETHER A RULE APPLIES TO THE READER" in pipe._ENGINE_RULES and "Never refer to yourself in the third person" in pipe._ENGINE_RULES
+    assert "applicability" in str(pipe._REVIEW_TOOL) and "applicability (" in pipe._REVIEW_SYSTEM and '"ask Peter"' in pipe._REVIEW_SYSTEM
+    assert "exceptions that fit the article's situation" in pipe._RESEARCH_SYSTEM and "last two years" in pipe._RESEARCH_SYSTEM
+
+
+def test_inherited_home_brief_gets_its_checklist():
+    brief = {"topic": "Selling an inherited home in Baltimore: what heirs should know", "audiences": ["Sellers"]}
+    assert "personal representative" in pipe._coverage(brief, 1) and "tax basis" in pipe._coverage(brief, 2)
+    assert "INHERITED" not in pipe._coverage({"topic": "Condos in Arlington"}, 1)
+
+
+def test_sources_about_another_county_are_dropped():
+    prof = [{"town": "Baltimore", "counties": ["Baltimore City"]}]
+    items = [{"claim": "Recording fees in Frederick County are ...", "source_name": "Maryland Courts - Frederick County Clerk"},
+             {"claim": "Baltimore City's property tax rate is ...", "source_name": "Baltimore City"},
+             {"claim": "Maryland's transfer tax is ...", "source_name": "Maryland Comptroller"}]
+    kept = tk.drop_other_county_items(items, prof)
+    assert [i["source_name"] for i in kept] == ["Baltimore City", "Maryland Comptroller"]
+
+
+def test_one_town_geography_is_a_statement_about_our_records(monkeypatch):
+    g = _profile(monkeypatch, "NJ", [("Cherry Hill Township", 100)], [], [], [])
+    claim = g["items"][0]["claim"]
+    assert "in our Bright MLS records" in claim and "confirm both for a specific home" in claim and "No Cherry Hill" not in claim
+
+
+def test_financing_mix_always_says_how_many_sales_recorded_it():
+    area = SimpleNamespace(name="Cherry Hill", slug="cherry-hill-nj", state="NJ")
+    cost = {"as_of": "2026-11-01", "financing": {"closed_sales": 140, "recorded": 124, "since": "2025-11-01",
+                                                 "mix": [{"type": "Conventional", "pct": 66}, {"type": "Cash", "pct": 23}]}}
+    claim = next(i["claim"] for i in tk.cost_items(area, cost) if "how buyers paid" in i["claim"])
+    assert "124 of 140 closed sales" in claim
+
+
+def test_move_up_articles_price_the_example_at_a_typical_house():
+    entry = {"homes": 169, "p25": 350_000, "median": 420_000, "tax_pct_near_p25": 2.0, "houses": 90, "house_median": 552_000, "tax_pct_near_house": 2.2}
+    rate = {"rate_30": 7.24, "as_of": "2026-10-29"}
+    brief = {"topic": "Moving up in Cherry Hill: sell your starter home and buy a bigger one"}
+    assert pipe.payment_basis(brief) == "house" and pipe.payment_basis({"topic": "First-time buyers in Frederick"}) == "entry"
+    ex = pipe.payment_example(entry, rate, ["Cherry Hill"], basis="house")
+    assert ex["price"] >= 540_000 and "single-family houses" in ex["price_basis"]
+    assert pipe.payment_example(entry, rate, ["Cherry Hill"])["price"] == 350_000
+
+
+# Round 9 grader (Frederick single-family article, $390,000 example from mostly condos/townhomes).
+def test_payment_example_matches_the_articles_home_type():
+    entry = {"homes": 400, "p25": 390_000, "median": 480_000, "tax_pct_near_p25": 1.1,
+             "houses": 210, "house_median": 600_000, "tax_pct_near_house": 1.2,
+             "attached": 150, "attached_median": 345_000, "tax_pct_near_attached": 1.0}
+    rate = {"rate_30": 7.24, "as_of": "2026-10-29"}
+    sf = {"topic": "Buying a single-family home in Frederick: city vs. county"}
+    assert pipe.payment_basis(sf) == "house"
+    ex = pipe.payment_example(entry, rate, ["Frederick"], basis=pipe.payment_basis(sf))
+    assert ex["price"] == 600_000 and "single-family" in ex["tax_basis"] and "%" not in ex["tax_basis"]
+    th = {"topic": "Is a townhome right for you in Frederick?"}
+    assert pipe.payment_basis(th) == "attached"
+    assert pipe.payment_example(entry, rate, ["Frederick"], basis="attached")["price"] == 345_000
+    assert pipe.payment_basis({"topic": "House hunting tips for first-time buyers"}) == "entry"
+    assert pipe.payment_basis({"topic": "Townhouse vs. condo"}) == "attached"
+
+
+def test_flagged_bullets_are_cut_and_an_emptied_list_goes():
+    # 11/01 Lancaster: seven "Lancaster City: 41.3186 mills" bullets were flagged but never cut.
+    art = {"title": "T", "intro": [], "at_a_glance": [], "sections": [{"heading": "Taxes", "blocks": [
+        {"type": "paragraph", "text": "Each layer sets its own rate."},
+        {"type": "bulleted_list", "items": ["Lancaster City: 41.3186 mills", "Lancaster Township: 30.5886 mills"]}]}]}
+    hits = __import__("app.services.ai.blog_final_checks", fromlist=["x"]).final_lint(pipe._article_text(art), {})
+    assert [h["sentence"] for h in hits] == ["- Lancaster City: 41.3186 mills", "- Lancaster Township: 30.5886 mills"]
+    assert pipe._cut_target(art, hits[0]["sentence"]) == "Lancaster City: 41.3186 mills"
+    assert pipe._cut_target(art, "Lancaster City") is None  # never part of an item
+    pipe._apply_fixes(art, [{"find": pipe._cut_target(art, h["sentence"]), "replace": ""} for h in hits])
+    assert art["sections"][0]["blocks"] == [{"type": "paragraph", "text": "Each layer sets its own rate."}]
+
+
+def test_text_shares_never_crash_the_research_step():
+    # 11/01 Annapolis: grouped small towns carry share "under 1" - the research step compared it to 5.
+    assert pipe.share_at_least({"name": "other incorporated towns (Highland Beach)", "share": "under 1", "sort": 0.4}, 5) is False
+    assert pipe.share_at_least({"name": "Annapolis City", "share": "42", "sort": 42.3}, 5) is True
+    assert pipe.share_at_least({"name": "Hopewell Township", "share": 12}, 5) is True
+    assert pipe.share_at_least({"name": "x", "share": None}, 5) is False
+
+
+def test_tax_items_carry_no_percent_of_price():
+    from types import SimpleNamespace
+    area = SimpleNamespace(name="Princeton", municipality_type=None, area_type="city", state="NJ", id="a1")
+    cost = {"as_of": "2026-11-01", "tax": {"homes": 120, "median_annual": 16234, "tax_year": 2025, "median_pct_of_list": 1.65, "placed": 110,
+                                            "by_township": [{"township": "Hopewell Township", "homes": 30, "median_pct_of_list": 1.52},
+                                                            {"township": "Princeton", "homes": 50, "median_pct_of_list": 1.54}]}}
+    claims = [i["claim"] for i in tk.cost_items(area, cost)]
+    assert claims and not any("%" in c for c in claims)
+    assert any("$16,234" in c for c in claims) and any("substantially different tax bills" in c for c in claims)
+
+
+# --- 11/01 grader round 4: everything fits this reader; closing taxes named only; places never complete ---
+def test_investment_articles_get_no_payment_card_and_no_occupant_only_programs():
+    rental = {"topic": "Buying your first rental property in Wilmington, DE", "audiences": ["Investors", "Buyers"]}
+    home = {"topic": "Buying a condo in Arlington, VA", "audiences": ["First-time buyers", "Buyers", "Investors"]}
+    assert pipe.investment_article(rental) and not pipe.investment_article(home)
+    assert not pipe.wants_payment_example(rental) and pipe.wants_payment_example(home)
+    items = [{"claim": "Delaware's first-time homebuyer transfer tax reduction requires the buyer to occupy the home as a principal residence.", "origin": "web_research"},
+             {"claim": "Wilmington requires rental properties to be licensed and inspected.", "origin": "web_research"},
+             {"claim": "Owner-occupied share of homes of Wilmington city: 45%", "origin": "idx_research", "topic": "demographics"}]
+    kept = [i["claim"][:20] for i in pipe.fit_to_reader(items, rental)]
+    assert kept == ["Wilmington requires ", "Owner-occupied share"]
+    assert len(pipe.fit_to_reader(items, home)) == 3
+
+
+def test_closing_tax_rates_are_fine_print_and_wrong_reader_is_checked():
+    assert "the usual transfer-tax percentage" not in pipe._ENGINE_RULES and "never their rates or amounts" in pipe._ENGINE_RULES
+    assert "EVERYTHING MUST FIT THIS READER" in pipe._ENGINE_RULES and "wrong_reader" in str(pipe._REVIEW_TOOL) and "wrong_reader (" in pipe._REVIEW_SYSTEM
+
+
+def test_places_are_never_presented_as_a_complete_list(monkeypatch):
+    g = _profile(monkeypatch, "DE", [("Wilmington City", 42), ("Unincorporated New Castle County", 58)],
+                 [("Red Clay Consolidated School District", 40), ("Brandywine School District", 30)], [], [])
+    geo, schools = g["items"][0]["claim"], g["items"][1]["claim"]
+    # Round 8: an unmeasured "Unincorporated ..." row is the leftover - no share, and it says what else it holds.
+    assert "unincorporated areas or other incorporated towns" in geo and "58%" not in geo
+    assert "in our records include" in schools and "Others may serve some addresses" in schools

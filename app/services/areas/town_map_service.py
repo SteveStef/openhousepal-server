@@ -250,6 +250,99 @@ async def refresh_counties(db: AsyncSession, area: MarketArea) -> Optional[list[
     return rows
 
 
+_STRAY_MAX_HOMES = 5   # only a tiny slice can be a handful of bad map points
+_STRAY_KM = 5.0        # ...and only when every one of its homes is this far from the town's other homes
+
+
+def _isolated_rows(pts: list, where: list[int], counts: list[int]) -> set[int]:
+    """Rows whose homes are all bad map points: a tiny slice (<= 5 homes) where every home is more
+    than 5 km from any of the town's other homes (11/01 round 13: one Baltimore-addressed home
+    plotted inside Annapolis, ~25 km away). Every home already sits inside an official Census
+    boundary; this only asks whether its map location is believable. A real sparse place next to
+    the town's other homes (Annapolis' Highland Beach; a lone Baltimore address in Brooklyn Park,
+    Anne Arundel County) stays, however small (round-13 grader: never drop a valid outlier for being
+    rare)."""
+    import math
+    out = set()
+    for i, c in enumerate(counts):
+        if not c or c > _STRAY_MAX_HOMES:
+            continue
+        mine = [p for p, w in zip(pts, where) if w == i]
+        others = [p for p, w in zip(pts, where) if w != i]
+        if not others:
+            continue
+
+        def km(a, b):
+            dx = (a[0] - b[0]) * 111.32 * math.cos(math.radians((a[1] + b[1]) / 2))
+            return math.hypot(dx, (a[1] - b[1]) * 110.57)
+        if all(min(km(p, o) for o in others) > _STRAY_KM for p in mine):
+            out.add(i)
+    return out
+
+
+async def all_municipalities(db: AsyncSession, area: MarketArea) -> Optional[dict]:
+    """Blog engine only (the town page's stored boundaries are untouched): EVERY local government the
+    town's homes sit in, measured by map location - small incorporated towns included - and the
+    county land outside all of them, measured too, never a leftover. 11/01 grader: Wilmington's
+    "unincorporated New Castle County 58%" was 100% minus the city, and hid Bellefonte (a town under
+    the 3% cutoff refresh_boundaries uses for the map). Free Census TIGERweb; cached 180 days.
+
+    {"homes", "placed", "rows": [{name, kind ('place'|'township'|'county'), homes, share, rings}]}
+    shares are % of all the town's mapped homes (one decimal); homes outside every county = unplaced."""
+    pts = await _home_points(db, area)
+    if len(pts) < 20:
+        return None
+    ck = f"geo:allmunis4:{area.id}:{len(pts)}"  # 4: rows carry "isolated" (bad map points)
+    hit = await bs._cache_get(db, ck)
+    if hit and hit.get("result"):
+        return hit["result"]
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    env = bs.envelope(min(xs), min(ys), max(xs), max(ys))
+    try:
+        async with httpx.AsyncClient(headers={"User-Agent": "OpenHousePal/1.0"}) as client:
+            # The same layers and filters as refresh_boundaries: real local governments only.
+            cousubs = [f for f in await bs.tiger(client, bs.COUSUB, **env) if f["attributes"].get("FUNCSTAT") == "A"]
+            names = {(f["attributes"].get("NAME") or "").lower() for f in cousubs}
+            places = [f for f in await bs.tiger(client, bs.PLACE, **env)
+                      if f["attributes"].get("FUNCSTAT") == "A" and (f["attributes"].get("NAME") or "").lower() not in names]
+            counties = await bs.tiger(client, bs.COUNTY, **env)
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        logger.info("Census municipality lookup failed", extra={"area": area.slug, "error": str(exc)})
+        return None
+    # A home in a village/borough/city counts there (the most local government), else its township,
+    # else the county itself (unincorporated) - each home once.
+    st = lambda f: f["attributes"].get("STATE")
+    shapes = ([(bs.nice_place(f["attributes"].get("NAME") or ""), "place", f["geometry"]["rings"], st(f)) for f in places]
+              + [(bs.nice_place(f["attributes"].get("NAME") or ""), "township", f["geometry"]["rings"], st(f)) for f in cousubs]
+              + [(f"Unincorporated {f['attributes'].get('NAME') or 'county'}", "county", f["geometry"]["rings"], st(f)) for f in counties])
+    boxes = [bs.bbox(s[2]) for s in shapes]
+    county_shapes = [(f["attributes"].get("NAME") or "", f["geometry"]["rings"], bs.bbox(f["geometry"]["rings"])) for f in counties]
+    counts = [0] * len(shapes)
+    county_of: list[dict] = [{} for _ in shapes]  # which county each row's homes are in
+    where = [-1] * len(pts)  # the row each home landed in
+    for j, (x, y) in enumerate(pts):
+        for i, s in enumerate(shapes):
+            if bs.contains(s[2], x, y, boxes[i]):
+                counts[i] += 1
+                where[j] = i
+                c = next((n for n, r, b in county_shapes if bs.contains(r, x, y, b)), None)
+                if c:
+                    county_of[i][c] = county_of[i].get(c, 0) + 1
+                break
+    placed = sum(counts)
+    isolated = _isolated_rows(pts, where, counts)
+    # "same_state" / "county": a stray home across a state line, or in a county the town's homes
+    # aren't really in, is a bad map location - the article never names it as a place.
+    home_fips = bs.STATE_FIPS.get((area.state or "").upper())
+    rows = sorted(({"name": n, "kind": k, "homes": c, "share": round(100 * c / len(pts), 1), "rings": r,
+                    "same_state": not home_fips or s == home_fips, "isolated": i in isolated,
+                    "county": max(county_of[i], key=county_of[i].get) if county_of[i] else None}
+                   for i, ((n, k, r, s), c) in enumerate(zip(shapes, counts)) if c), key=lambda row: -row["homes"])
+    result = {"homes": len(pts), "placed": placed, "rows": rows, "computed_at": datetime.now(timezone.utc).isoformat()}
+    await bs._cache_put(db, ck, {"result": result})
+    return result
+
+
 async def refresh_boundaries(db: AsyncSession, area: MarketArea) -> Optional[dict]:
     pts = await _home_points(db, area)
     if len(pts) < 20:

@@ -101,7 +101,9 @@ async def _homes_to_host(db: AsyncSession, user: User, args: dict) -> Any:
     if not ok:
         return data
     prefs = (data or {}).get("preferences")
-    listings = (data or {}).get("data") or []
+    listings = [l for l in ((data or {}).get("data") or []) if isinstance(l, dict)]
+    # Newest listings first (owner, 11/01: "based on the filter the top newest listings").
+    listings.sort(key=lambda l: (not isinstance(l.get("DaysOnMarket"), (int, float)), l.get("DaysOnMarket") or 0))
     if not prefs or not (prefs.get("landmark_address") or prefs.get("cities") or prefs.get("townships") or prefs.get("school_districts")):
         return {"homes": [], "note": "Their Discovery search area isn't set yet. Tell them so in one line and set it up right away with set_discovery_search (its card offers their listings and towns as the center, miles, price and beds - it saves to their Discovery page); say they can tap one or tell you another town. Once it is saved, look again."}
     day = None
@@ -128,6 +130,9 @@ async def _homes_to_host(db: AsyncSession, user: User, args: dict) -> Any:
         f"{prefs['min_bedrooms']}+ beds" if prefs.get("min_bedrooms") else None,
     ] if x) or "their saved Discovery filters"
     res["search_area"] = area
+    # Every matching home, newest first, for the Discovery cards under the reply (the model sees `limit`).
+    res["card_keys"] = [l.get("ListingKey") for l in listings if l.get("ListingKey") and l.get("OnPlatformAgentId") != user.id
+                        and (not want or want in _norm(l.get("City")) or want in _norm(l.get("Street")))][:40]
     if want and not res["homes"]:
         res["note"] = (f"None of the homes in their Discovery search ({area}) are in {town}. They can widen the search on Discovery - "
                        "changing it there changes it for the page too.")

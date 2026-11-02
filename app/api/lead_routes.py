@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Literal, Optional, Tuple
 from pydantic import BaseModel
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import and_, exists, func, select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -398,6 +398,7 @@ def _to_lead_out(lead: Lead, collections: Optional[List[Collection]] = None) -> 
         ),
         created_at=lead.created_at,
         last_contacted_at=lead.last_contacted_at,
+        contact_log=[{k: e.get(k) for k in ("at", "via", "what")} for e in (getattr(lead, "contact_log", None) or [])],
         hidden_at=lead.hidden_at,
         # No activity on record (added by hand, or its history was removed): say when it was added
         # rather than leaving the "came in" / "latest" lines blank.
@@ -1175,6 +1176,30 @@ async def update_lead_alerts(
     if alerts["calendar"] != before:
         tasks_service.apply_lead_alerts_bg(current_user.id, lead.id)
     return LeadAlertsOut(**alerts)
+
+
+@router.post("/{lead_id}/contacted")
+async def lead_contacted(
+    lead_id: str,
+    payload: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """The agent tapped Text / Email for this person outside a follow-up (Visitors list, lead page) -
+    logged as plain "Texted" / "Emailed" (owner, 11/02), marks them contacted and seen."""
+    from app.services.tasks_service import log_contact
+    via = payload.get("via")
+    if via not in ("text", "email", "call"):
+        raise HTTPException(status_code=422, detail="via must be text, email or call")
+    lead = await _load_owned_lead(db, lead_id, current_user.id)
+    now = datetime.now(timezone.utc)
+    log_contact(lead, via, (payload.get("what") or None) and str(payload["what"])[:60])
+    lead.last_contacted_at = now
+    lead.viewed_at = now
+    if lead.status == "new":
+        lead.status = "contacted"
+    await db.commit()
+    return {"contact_log": [{k: e.get(k) for k in ("at", "via", "what")} for e in (lead.contact_log or [])]}
 
 
 @router.patch("/{lead_id}", response_model=LeadDetailOut)

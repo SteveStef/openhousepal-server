@@ -13,6 +13,7 @@ the caller (ai_routes.py) logs an AIUsageEvent either way.
 import asyncio
 import json
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -321,15 +322,20 @@ async def run_turn(
                 all_refs.extend(_extract_record_refs(block.name, args))
                 result = await ai_tools.execute_tool(db, current_user, block.name, args, config)
                 all_refs.extend(_extract_result_refs(block.name, result))
-                # Homes to host come back as home cards under the reply on their own (owner, 11/01:
-                # homes as cards, never a typed list) - the model just sums them up.
-                if block.name == "find_homes_to_host" and isinstance(result, dict) and result.get("homes"):
-                    keys = [h.get("listing_key") for h in result["homes"] if isinstance(h, dict) and h.get("listing_key")][:40]
-                    if keys:
-                        _, entry = await ai_home_cards.run(db, current_user, {"which": "homes", "listing_keys": keys, "title": "Homes to host"})
-                        if entry:
-                            all_refs.append(entry)
-                            result = {**result, "shown_as_cards": True, "note": "These homes already show as cards under your reply - just sum them up in a line or two."}
+                # Homes to host come back under the reply as the Dash's Discovery cards (owner, 11/01:
+                # "just like as if I was on the discovery tab" - newest first, each with its weekend
+                # calendar and Request to host, See more, Browse all of Discovery). The model sums up.
+                if block.name == "find_homes_to_host" and isinstance(result, dict):
+                    keys = result.pop("card_keys", None) or []
+                    if keys and result.get("homes"):
+                        all_refs.append({"tool": block.name, "record_type": "hosting", "record_id": str(uuid.uuid4()),
+                                         "listing_keys": keys, "search_area": result.get("search_area")})
+                        result = {**result, "shown_as_cards": True, "note": (
+                            "These homes already show under your reply as Discovery cards, newest first, each with its weekend calendar "
+                            "and a Request to host button (that opens the calendar to pick a day and time), plus See more and Browse all of "
+                            "Discovery - so never list them in text. Reply in two short lines: what their Discovery filter is (search_area) "
+                            "and how many homes match, then that they can tap Request to host on any of them, or tell you a different "
+                            "area, price or beds to change their Discovery filter and see other homes.")}
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,

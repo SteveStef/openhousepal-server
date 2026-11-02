@@ -110,6 +110,16 @@ class PropertyService:
         # 1. Clean and Split Input
         parts = [p.strip() for p in raw_address.split(',')]
         street_part = parts[0]
+
+        # 1b. The unit ("#605", "Unit 605", "Apt R-505"): a condo building has many listings at one
+        # street address, and ignoring the unit returned whichever was updated last - the owner picked
+        # 191 Presidential Blvd #605 and got #205 (11/01). Taken off the street for the matching below
+        # and matched on its own; a unit that isn't there finds nothing rather than a neighbour.
+        unit = None
+        unit_m = re.search(r'(?:#|\b(?:UNIT|APT|APARTMENT|STE|SUITE)\b\.?)\s*([A-Z]{0,2}-?\d+[A-Z]?(?:\s*-\s*[A-Z]?-?\d+)?)', street_part, re.I)
+        if unit_m:
+            unit = re.sub(r'\s+', '', unit_m.group(1)).upper()
+            street_part = street_part[:unit_m.start()].strip()
         
         # 2. Extract Zip Code (Looks for 5 digits)
         zip_match = re.search(r'\b\d{5}\b', raw_address)
@@ -176,11 +186,23 @@ class PropertyService:
             last_token = re.sub(r'[^a-zA-Z0-9]', '', street_tokens[-1]).upper()
             if last_token in suffix_map:
                 suffix_options = [last_token, suffix_map[last_token]]
-                # Match suffix at the end of the address
-                filters.append(or_(*[Property.street_address.ilike(f"% {opt}") for opt in suffix_options]))
+                # Match suffix at the end of the address - or right before the unit ("...BLVD #826")
+                filters.append(or_(*[Property.street_address.ilike(f"% {opt}") for opt in suffix_options],
+                                   *[Property.street_address.ilike(f"% {opt} #%") for opt in suffix_options]))
         else:
             # Fallback to fuzzy if no house number detected
             filters.append(Property.street_address.ilike(f"%{street_part}%"))
+
+        unit_exact = None
+        if unit:
+            # "605" also finds "#R-605" (Bright puts a building letter in front of some units), but a
+            # unit that names its letter ("R-505") must match it; never a longer number ("1605").
+            digits = re.match(r'^[A-Z]*-?', unit)
+            letters, rest = unit[:digits.end()].rstrip('-'), unit[digits.end():]
+            prefix = f"{re.escape(letters)}-?" if letters else "([A-Z]{1,2}-?)?"
+            filters.append(Property.street_address.op('~*')(rf"#\s*{prefix}{re.escape(rest)}($|[^0-9])"))
+            # ...and the unit exactly as written wins over a lettered neighbour ("#605" before "#R-605")
+            unit_exact = case((Property.street_address.op('~*')(rf"#\s*{re.escape(unit)}($|[^0-9])"), 0), else_=1)
 
         # 4. Geographic Anchor (Zip OR City for resilience)
         geo_filters = []
@@ -214,6 +236,7 @@ class PropertyService:
             select(Property)
             .where(and_(*filters))
             .order_by(
+                *([unit_exact] if unit_exact is not None else []),
                 status_priority,
                 func.coalesce(Property.modification_timestamp, Property.created_at).desc(),
             )

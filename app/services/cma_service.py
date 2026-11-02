@@ -581,6 +581,11 @@ async def get_public_report(db: AsyncSession, slug: str) -> CmaPublicResponse:
     from app.utils.auth import owner_has_access, MLS_ACCESS_TIERS
     if not owner or not owner_has_access(owner, MLS_ACCESS_TIERS):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This CMA link isn't active.")
+    return await build_report_payload(db, report, owner, map_ref=slug)
+
+
+async def build_report_payload(db: AsyncSession, report: CmaReport, owner: Optional[User], map_ref: str) -> CmaPublicResponse:
+    """The client view of a report (share link, PDF) - also what Admin -> Grading builds its PDF from."""
     brand_result = await db.execute(select(StudioBrandKit).where(StudioBrandKit.owner_id == report.owner_id))
     brand = brand_result.scalar_one_or_none()
     hub_result = await db.execute(select(AgentHub).where(AgentHub.owner_id == report.owner_id))
@@ -616,7 +621,7 @@ async def get_public_report(db: AsyncSession, slug: str) -> CmaPublicResponse:
         agent=agent,
         updated_at=report.updated_at,
         signature_hub_slug=signature_hub_slug,
-        map_ref=slug,
+        map_ref=map_ref,
     )
 
 

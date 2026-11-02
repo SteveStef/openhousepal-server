@@ -35,6 +35,8 @@ class TaskUpdate(BaseModel):
     suggested_message: Optional[str] = None
     # true -> mark complete (stamps completed_at now); false -> reopen
     completed: Optional[bool] = None
+    # how it was done, with completed=True: "text" | "email" (the Text / Email buttons, 11/02)
+    completed_via: Optional[str] = None
 
 
 class TaskLeadMini(BaseModel):

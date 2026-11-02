@@ -26,7 +26,7 @@ import hashlib
 import logging
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import select
@@ -212,7 +212,7 @@ def norm_place(name: Optional[str]) -> str:
     return " ".join(s.split())
 
 
-_DISTRICT_GENERIC = {"regional", "schools", "school", "public", "district", "unified", "consolidated", "valley", "union", "joint", "city"}
+_DISTRICT_GENERIC = {"regional", "schools", "school", "public", "district", "unified", "consolidated", "valley", "union", "joint", "city", "of", "the"}
 
 
 def _district_core(norm: str) -> frozenset:
@@ -222,6 +222,10 @@ def _district_core(norm: str) -> frozenset:
 
 def _county_label(raw: Optional[str]) -> Optional[str]:
     n = norm_place(raw)
+    # An independent city (Virginia's Alexandria, Baltimore City) is its own county-level place -
+    # "Alexandria City", never "Alexandria City County".
+    if n.endswith(" city"):
+        return n.title()
     return f"{n.title()} County" if n else None
 
 
@@ -244,12 +248,63 @@ async def geography_profile(db: AsyncSession, area: MarketArea) -> dict:
         mix = {}
     county_of = {norm_place(t["name"]): _county_label(t.get("county")) for t in mix.get("townships") or []}
 
-    # Townships: the stored TIGER shares first; MLS-only names join when they hold 3%+ of homes.
+    # Every local government the homes sit in, MEASURED by map location - small incorporated towns
+    # and unincorporated county land included (11/01 grader: Wilmington's "unincorporated 58%" was
+    # 100% minus the city and hid Bellefonte). Free Census data, cached; blog engine only.
+    measured = None
+    try:
+        from app.services.areas.town_map_service import all_municipalities
+        measured = await all_municipalities(db, area)
+    except Exception:
+        logger.warning("geography profile: municipality measurement failed for %s", area.slug, exc_info=True)
+
     towns: dict[str, dict] = {}
-    for m in bounds.get("municipalities") or []:
+    small: list[dict] = []
+    if measured and measured.get("rows"):
+        def pct(v: float):
+            return round(v) if v >= 1 else "under 1"
+        main = max((m for m in measured["rows"] if m["kind"] == "county"), key=lambda m: m["homes"], default=None)
+        # The counties that really hold the town's homes (1%+ of them, towns and county land together).
+        weight: dict[str, float] = {}
+        for m in measured["rows"]:
+            if m.get("county"):
+                weight[m["county"]] = weight.get(m["county"], 0) + m["share"]
+        for m in measured["rows"]:
+            # Stray homes are bad map locations, not places to name (11/01: a Cherry Hill home "in
+            # Montgomery County", a Wilmington one in a PA township, Frederick homes "in Rockville", a
+            # Baltimore one "in Annapolis City"). Every home is placed inside an official Census
+            # boundary; a slice is a bad map point when it's tiny AND far from all the town's other
+            # homes ("isolated", town_map_service). A small slice next to the others is a real place
+            # and is named however rare (Annapolis' Highland Beach; round-13 grader: Baltimore
+            # addresses in Anne Arundel County are real). A lone home across a state line never is.
+            if m["homes"] < 2 and not m.get("same_state", True):
+                continue
+            if "isolated" in m:
+                if m["isolated"]:
+                    continue
+            # Measurements saved before the distance test: the older rules.
+            elif (m["homes"] < 2 and m["kind"] == "county" and m is not main) or \
+                    (m["share"] < 1 and m.get("county") and weight.get(m["county"], 0) < 1):
+                continue
+            if m["share"] >= 1:
+                towns[m["name"].strip().lower()] = {"name": m["name"], "share": pct(m["share"]), "sort": m["share"],
+                                                "county": None, "source": "census", "kind": m["kind"]}
+            else:
+                small.append(m)
+        if small:
+            names = [m["name"] for m in small]
+            what = "other incorporated towns" if all(m["kind"] == "place" for m in small) else "other municipalities"
+            total = sum(m["share"] for m in small)
+            towns["_small"] = {"name": f"{what} (" + ", ".join(names[:6]) + (" and others" if len(names) > 6 else "") + ")",
+                               "share": pct(total), "sort": total, "county": None, "source": "census", "kind": "small"}
+    # Not measured (no Census answer): the stored TIGER shares - whose "Unincorporated X County" row is
+    # only the remainder (100% minus the towns on the map), so it never gets a share of its own below.
+    for m in [] if towns else (bounds.get("municipalities") or []):
         if m.get("name"):
-            towns[norm_place(m["name"])] = {"name": m["name"], "share": m.get("share"), "county": None, "source": "census"}
-    for t in mix.get("townships") or []:
+            towns[str(m["name"]).strip().lower()] = {"name": m["name"], "share": m.get("share"), "county": None, "source": "census",
+                                            # the town map's leftover row (also when its kind wasn't kept)
+                                            "remainder": m.get("kind") == "county" or str(m["name"]).lower().startswith("unincorporated")}
+    for t in [] if measured and measured.get("rows") else (mix.get("townships") or []):
         k = norm_place(t["name"])
         # 11/01 Rehoboth Beach: Bright's township field holds Delaware hundreds ("LEWES REHOBOTH
         # HUNDRED" - an old land division, not a government) and came out "Lewes Rehoboth Hundred
@@ -258,10 +313,10 @@ async def geography_profile(db: AsyncSession, area: MarketArea) -> dict:
         # Township (46%)" next to Frederick City 59%), in DE a hundred, in VA/DC a county.
         if (area.state or "").upper() not in ("PA", "NJ") or re.search(r"\b(hundred|county)\b", str(t["name"]), re.I):
             continue
-        if k and k not in towns and t["share"] >= 3 and t["homes"] >= 3:
+        if k and k not in {norm_place(x["name"]) for x in towns.values()} and t["share"] >= 3 and t["homes"] >= 3:
             towns[k] = {"name": _township_label(t["name"]), "share": t["share"], "county": None, "source": "mls"}
     for k, t in towns.items():
-        t["county"] = county_of.get(k)
+        t["county"] = county_of.get(norm_place(t["name"])) if k != "_small" else None
     districts: dict[str, dict] = {}
     for d in bounds.get("school_districts") or []:
         if d.get("name"):
@@ -273,7 +328,9 @@ async def geography_profile(db: AsyncSession, area: MarketArea) -> dict:
         if any(_district_core(k) and _district_core(k) == _district_core(c) for c in districts):
             continue
         if k and k not in districts and d["share"] >= 3 and d["homes"] >= 3:
-            districts[k] = {"name": f"{d['name'].title()} School District", "share": d["share"]}
+            # 11/01 grader: "Cherry Hill Township Public Schools School District" - no suffix twice.
+            title = d["name"].title()
+            districts[k] = {"name": title if re.search(r"\b(schools?|district)\b", title, re.I) else f"{title} School District", "share": d["share"]}
     counties = [c for c in (mix.get("counties") or []) if c["share"] >= 3]
     mailing = [m for m in (mix.get("mailing_towns") or []) if m["share"] >= 1]
 
@@ -286,9 +343,18 @@ async def geography_profile(db: AsyncSession, area: MarketArea) -> dict:
         items.append({"topic": "geography", "claim": claim, "source_name": source, "source_url": None, "as_of": when,
                       "confidence": 0.97, "town": _town(area), "origin": "geo_verified", "id": _iid(_town(area), claim)})
 
-    tw = sorted(towns.values(), key=lambda t: -(t.get("share") or 0))
+    tw = sorted(towns.values(), key=lambda t: (bool(t.get("remainder")), -float(t.get("sort", t.get("share") or 0))))
+
+    def part(t: dict) -> str:
+        if t.get("remainder"):
+            # A leftover, not a measurement: no share, and say what else it can hold.
+            county = re.sub(r"^unincorporated\s+", "", t["name"], flags=re.I)
+            return f"the rest of {county} - unincorporated areas or other incorporated towns (not measured separately)"
+        return (f"{t['name']}" + (f", {t['county']}" if t.get("county") else "")
+                + (f" ({t['share']}% of {area.name}-addressed homes)" if t.get("share") is not None else ""))
+
     if tw:
-        parts = [f"{t['name']}" + (f", {t['county']}" if t.get("county") else "") + (f" ({t['share']}% of {area.name}-addressed homes)" if t.get("share") is not None else "") for t in tw]
+        parts = [part(t) for t in tw]
         if kind == "township" and len(tw) >= 1 and norm_place(tw[0]["name"]) == norm_place(area.name):
             others = [m for m in mailing if norm_place(m["name"]) != norm_place(area.name)][:7]
             add(f"{area.name} here means {tw[0]['name']}" + (f" ({tw[0]['county']})" if tw[0].get("county") else "")
@@ -299,18 +365,32 @@ async def geography_profile(db: AsyncSession, area: MarketArea) -> dict:
             # Each share says whose share it is (11/01 review: "Radnor Township includes homes with Wayne
             # (46%)..." read as if 46% of Radnor were Wayne) - and no sample counts, which the writer
             # carried into the article as "homes checked".
-            add(f"A {area.name} mailing address is not one municipality: {area.name} homes sit in " + "; ".join(parts)
-                + f". No {area.name} home on record is in any other township or borough.")
+            # 11/01 grader: "No X home on record is in any other township" became "Every Cherry Hill
+            # mailing address is in Cherry Hill Township" - a claim about records, not every address.
+            placed = f" (placed on the map by each home's location: {measured['placed']:,} of {measured['homes']:,})" if measured and measured.get("rows") else ""
+            lead = (f"{area.name}-addressed homes in our Bright MLS records{placed} sit in " if len(parts) == 1
+                    else f"{_a(area.name).capitalize()} {area.name} mailing address is not one municipality: {area.name}-addressed homes in our Bright MLS records{placed} sit in ")
+            add(lead + "; ".join(parts) + "."
+                + " A mailing address doesn't decide the municipality or school district - confirm both for a specific home.")
     if districts:
         ds = sorted(districts.values(), key=lambda d: -(d.get("share") or 0))
-        add(f"Public school districts serving {area.name} homes: " + "; ".join(d["name"] + (f" ({d['share']}% of {area.name}-addressed homes)" if d.get("share") is not None else "") for d in ds)
-            + ". Attendance depends on the specific address - verify with the district.")
+        if len(ds) == 1 and (area.state or "").upper() in _COUNTY_WIDE_SCHOOLS and len(counties) <= 1:
+            # Maryland, DC, West Virginia and Virginia run one school system per county (11/01 grader: "a few
+            # Annapolis addresses may use other districts" was unsupported - AACPS runs them all).
+            add(f"Public schools for {area.name}-addressed homes are run by {ds[0]['name']}. Which school a home is assigned to "
+                "depends on its exact address - check it with the district.")
+        else:
+            # Never the complete list (11/01 grader: Wilmington's three districts left out Colonial).
+            add(f"Public school districts serving {area.name}-addressed homes in our records include " + "; ".join(d["name"] + (f" ({d['share']}% of {area.name}-addressed homes)" if d.get("share") is not None else "") for d in ds)
+                + ". Others may serve some addresses - the district depends on the specific address; verify with the district.")
     if counties and len(counties) > 1 and not tw:
         add(f"{area.name} homes span " + ", ".join(f"{_county_label(c['name'])} ({c['share']}%)" for c in counties) + ".")
     return {
         "town": area.name, "slug": area.slug, "kind": kind, "townships": tw, "school_districts": list(districts.values()),
         "counties": [_county_label(c["name"]) for c in counties], "mailing_towns": [m["name"].title() for m in mailing],
-        "norm": {"townships": set(towns) | ({norm_place(area.name)} if kind == "township" else set()),
+        # The measured outlines (every town + county land) - the tax split places listings with them.
+        "muni_shapes": [{"name": m["name"], "rings": m["rings"]} for m in (measured or {}).get("rows") or [] if m.get("rings")],
+        "norm": {"townships": {norm_place(t["name"]) for k, t in towns.items() if k != "_small"} | {norm_place(m["name"]) for m in small} | ({norm_place(area.name)} if kind == "township" else set()),
                  "districts": set(districts), "counties": {norm_place(c["name"]) for c in counties},
                  "mailing": {norm_place(m["name"]) for m in mailing}},
         "items": items,
@@ -361,10 +441,16 @@ def geography_audit(text: str, profiles: list[dict], known: Optional[dict] = Non
     # A district named after one township needs "School District" after it to count as a district;
     # a joint one (Tredyffrin-Easttown) is a district wherever it appears, suffix or not.
     district_rx = [(d, re.compile(r"\b" + r"[\s\-]+".join(re.escape(w) for w in d.split())
-                                  + (r"(\s+(area|township))?\s+(school district|sd)\b" if d in munis else r"\b(\s+(area\s+)?(school district|sd)\b)?"), re.I))
+                                  + (r"(\s+(area|township))?\s+(school district|sd)\b" if d in munis else r"\b(\s+(area\s+)?(school district|sd)\b)?"), re.I),
+                    # never "Lower Merion Township" - a township named next to its district stays a township claim
+                    re.compile(r"\b" + r"[\s\-]+".join(re.escape(w) for w in d.split()) + r"\b(?!\s+(?:township|borough|twp)\b)(\s+(area\s+)?(school district|sd)\b)?", re.I))
                    for d in districts_all if d]
     findings, seen = [], set()
     for sentence in _SENT.split(text):
+        # In a sentence about school districts, a verified district's short name IS that district
+        # (11/01 round 13 Wilmington: "districts ... include Red Clay Consolidated, Brandywine and
+        # Christina" was cut as putting Wilmington in a place called Brandywine).
+        school_ctx = bool(re.search(r"\b(?:school\s+)?districts?\b|\bschools?\b", sentence, re.I))
         for clause in _CLAUSE.split(sentence):
             if not clause or not _CUE.search(clause):
                 continue
@@ -379,8 +465,8 @@ def geography_audit(text: str, profiles: list[dict], known: Optional[dict] = Non
                 for m in list(rx.finditer(body)):
                     places.append((m.start(), m.end(), kind, name))
                 body = rx.sub(lambda m: "#" * len(m.group(0)), body)
-            for d, rx in district_rx:
-                take(rx, "school district", d)
+            for d, strict, loose in district_rx:
+                take(loose if school_ctx else strict, "school district", d)
             for c, rx in county_rx:
                 take(rx, "county", c)
             towns = sorted(((m.start(), m.end(), p) for p, rx in town_rx for m in rx.finditer(body)), key=lambda t: t[0])
@@ -423,6 +509,125 @@ def geography_audit(text: str, profiles: list[dict], known: Optional[dict] = Non
                     findings.append({"sentence": sentence.strip(), "town": p["town"], "place": place.title(), "kind": kind,
                                      "truth": f"{p['town']} homes sit in {truth}" + (f"; districts: {', '.join(d['name'] for d in p['school_districts'])}" if p["school_districts"] else "")})
     return findings
+
+
+# One public school system per county (or the whole District; in Virginia per county or independent city -
+# 11/01 round-11 grader: Ashburn is all Loudoun County Public Schools) - a town inside one county has one.
+_COUNTY_WIDE_SCHOOLS = {"MD", "DC", "WV", "VA"}
+
+# Maryland's courts and land records share one statewide site with a page per county
+# (courts.state.md.us/clerks/frederick/...) - the county is only in the address.
+_MD_COUNTIES = {"allegany", "anne arundel", "baltimore", "calvert", "caroline", "carroll", "cecil", "charles", "dorchester",
+                "frederick", "garrett", "harford", "howard", "kent", "montgomery", "prince georges", "queen annes", "somerset",
+                "st marys", "talbot", "washington", "wicomico", "worcester"}
+
+
+def _counties_named(it: dict) -> set[str]:
+    """Counties a fact or source names - in its text ("Frederick County"), or only in its web
+    address ("frederickcountymd.gov", ".../clerks/frederick/...")."""
+    text = f"{it.get('claim') or ''} {it.get('source_name') or it.get('name') or ''}"
+    named = {norm_place(m) for m in re.findall(r"\b([A-Z][a-z]+(?:\s[A-Z][a-z']+)?)\s+County\b", text)}
+    url = str(it.get("source_url") or it.get("url") or "").lower()
+    if url:
+        host = re.sub(r"^https?://(www\.)?", "", url).split("/")[0]
+        # Skips initials ("aacounty.org" is Anne Arundel's) - they can't be matched to a name.
+        named |= {norm_place(m) for m in re.findall(r"([a-z]{4,})county", host)}
+        m = re.search(r"/clerks?/([a-z\-]+)/", url)
+        if m and norm_place(m.group(1)) in _MD_COUNTIES:
+            named.add(norm_place(m.group(1)))
+    return {n for n in named if n}
+
+
+def _munis_named(it: dict) -> set[str]:
+    """Townships and boroughs a fact or source names - in its text ("Ephrata Township") or its web
+    address ("ephratatownship.org")."""
+    text = f"{it.get('claim') or ''} {it.get('source_name') or it.get('name') or ''}"
+    named = {norm_place(m) for m in re.findall(r"\b((?:[A-Z][a-z]+\s){0,2}[A-Z][a-z]+)\s+(?:Township|Borough)\b", text)}
+    # "City of Alexandria" / "Town of Leesburg" (11/01 round 11: an Alexandria recordation-tax page in
+    # an Ashburn article - a Virginia city is its own jurisdiction, not part of Loudoun County).
+    named |= {norm_place(m) for m in re.findall(r"\b(?:City|Town|Village|Borough|Township) of ((?:[A-Z][a-z]+\s)?[A-Z][a-z]+)\b", text)}
+    url = str(it.get("source_url") or it.get("url") or "").lower()
+    if url:
+        host = re.sub(r"^https?://(www\.)?", "", url).split("/")[0]
+        named |= {norm_place(m) for m in re.findall(r"([a-z]{4,})(?:township|borough|twp|boro)\b", host)}
+        # A city's own site with its state code: "alexandriava.gov" (never federal "consumerfinance.gov").
+        m = re.fullmatch(r"([a-z]{4,}?)(?:va|md|pa|nj|de|dc)\.gov", host)
+        if m and not m.group(1).endswith(("county", "state")):
+            named.add(norm_place(m.group(1)))
+    return {n for n in named if n}
+
+
+def place_protections(profiles: list[dict]) -> list[dict]:
+    """Every local government holding 1%+ of a town's homes, as a must-name item (checked like the
+    reader protections - writer list, fact-check, repair, built-in grader). 11/01 round-13 grader:
+    a Baltimore article framed it as "Baltimore City or Baltimore County" while 1% of Baltimore
+    addresses are in Anne Arundel County. Only for towns with two or more such places; the
+    geography item already says smaller verified places exist ("other incorporated towns ...")."""
+    out = []
+    for p in profiles:
+        big = [t for t in p.get("townships") or [] if t.get("kind") not in (None, "small") and not t.get("remainder")
+               and isinstance(t.get("sort", t.get("share")), (int, float)) and t.get("sort", t.get("share")) >= 1]
+        if len(big) < 2:
+            continue
+        town, town_n = p["town"], norm_place(p["town"])
+        for t in big:
+            name = t["name"]
+            core = re.sub(r"^unincorporated\s+|\s+(county|city|town|village|borough|township)$", "", name, flags=re.I).strip()
+            words = r"[\s\-]+".join(re.escape(w) for w in core.split())
+            kind = re.search(r"(county|city|town|village|borough|township)$", name, re.I)
+            if norm_place(core) == town_n and kind:
+                # The mailing town's own name is everywhere - the article must name the government itself.
+                k = kind.group(1)
+                check = rf"\b{words}\s+{k}\b|\b{k}\s+of\s+{words}\b"
+            else:
+                check = rf"\b{words}\b"
+            label = f"unincorporated {core} County" if name.lower().startswith("unincorporated") else name
+            share = t.get("share")
+            out.append({"state": "", "readers": set(), "key": f"place_{norm_place(name).replace(' ', '_')}", "check": check,
+                        "name": label, "source_name": "U.S. Census Bureau boundaries (OpenHousePal map check of each home)", "source_url": None,
+                        "says": f"A {town} mailing address can be in {label} - about {share}% of {town}-addressed homes in our Bright MLS records; "
+                                "confirm the jurisdiction, school district and tax bill for any specific home."})
+    return out
+
+
+def drop_other_county_items(items: list[dict], profiles: list[dict]) -> list[dict]:
+    """Facts and sources about a county none of the article's towns are in - dropped. 11/01: a
+    Frederick County recording-fee page reached a Baltimore article through research, then an
+    Annapolis one through the saved Maryland facts - so this runs on every item and every source,
+    and reads the web address too. An item naming one of the article's counties, or none, stays.
+    The same for townships and boroughs (11/01 round-10 grader: an Ephrata Township tax page in a
+    Lancaster article's sources - same county, but no Lancaster-addressed homes there)."""
+    ours = {norm_place(c) for p in profiles for c in p.get("counties") or []} | {norm_place(p.get("town")) for p in profiles}
+    ours = {o.replace(" ", "") for o in ours if o}
+    if not ours:
+        return items
+    kept = [it for it in items if not (named := {n.replace(" ", "") for n in _counties_named(it)}) or named & ours]
+    # Allowed: the towns' own municipalities, the towns, and their counties (a county's own site).
+    munis = {m.replace(" ", "") for p in profiles for m in (p.get("norm") or {}).get("townships") or set()} | ours
+    return [it for it in kept if not (named := {n.replace(" ", "") for n in _munis_named(it)}) or named & munis]
+
+
+_YEAR_SPAN = re.compile(r"(?<!\d)(20\d\d)\s*[-–_/]\s*(20\d\d|\d\d)(?!\d)")
+
+
+def stale_edition(it: dict, today: Optional[date] = None) -> bool:
+    """A yearly document (school or fiscal year, "2025-2026" / "2025-26" in its title or web
+    address) whose year has already ended - last year's edition. 11/01 round-10 grader: a Lancaster
+    article linked the 2025-2026 school millage table after the 2026-2027 one was out."""
+    today = today or datetime.now(timezone.utc).date()
+    current_end = today.year + 1 if today.month >= 7 else today.year  # school / fiscal years start July 1
+    for m in _YEAR_SPAN.finditer(f"{it.get('source_name') or it.get('name') or ''} {it.get('source_url') or it.get('url') or ''}"):
+        start, end = int(m.group(1)), m.group(2)
+        end = int(end) if len(end) == 4 else (start // 100) * 100 + int(end)
+        if end == start + 1 and end < current_end:
+            return True
+    return False
+
+
+def drop_stale_editions(items: list[dict], today: Optional[date] = None) -> list[dict]:
+    """Facts and sources from last year's edition of a yearly document - dropped, so an article
+    never cites an outdated table (research is told to find the newest edition)."""
+    return [it for it in items if it.get("origin") in ("mls_live", "geo_verified", "calc", "agent") or not stale_edition(it, today)]
 
 
 def scrub_geography(items: list[dict], profiles: list[dict], known: Optional[dict] = None) -> tuple[list[dict], int]:
@@ -507,13 +712,17 @@ async def state_items(db: AsyncSession, state: str) -> list[dict]:
     """State-wide facts already researched (shared_knowledge "state:XX"), minus expired ones."""
     from app.models.database import SharedKnowledge
     row = (await db.execute(select(SharedKnowledge).where(SharedKnowledge.scope == f"state:{(state or '').upper()}"))).scalar_one_or_none()
-    return [{**i, "origin": "state_bank", "town": "general"} for i in _fresh(row.items if row else [], datetime.now(timezone.utc))]
+    return [{**i, "origin": "state_bank", "town": "general"} for i in _fresh(row.items if row else [], datetime.now(timezone.utc))
+            if not _counties_named(i)]
 
 
 async def save_state_items(db: AsyncSession, state: str, items: list[dict]) -> int:
     """Add sourced state-wide facts to the shared store (deduped, capped, expired pruned)."""
     from app.models.database import SharedKnowledge
     items = [i for i in items if i.get("source_url") and i.get("claim") and i.get("topic") != "rates" and "freddie mac" not in i["claim"].lower()]
+    # A county's own fact (its fees, its office) isn't state-wide - banked here it reached every
+    # later article in the state (11/01: Frederick County's recording fees in an Annapolis one).
+    items = [i for i in items if not _counties_named(i)]
     if not items or not state:
         return 0
     scope = f"state:{state.upper()}"
@@ -625,14 +834,18 @@ def market_definition(area: MarketArea, geo: Optional[dict] = None) -> str:
                 + f" plus {area.name}-addressed homes; {_HOME_TYPES_NOTE}.")
     if area.area_type == "neighborhood":
         return f"{area.name} numbers cover homes inside the {area.name} boundary on our map; {_HOME_TYPES_NOTE}."
-    where = ", ".join(t["name"] for t in tw) if len(tw) > 1 else ""
+    # A remainder row (not measured) is "other parts of X County" - never "Unincorporated X County".
+    label = lambda t: f"other parts of {re.sub(r'^unincorporated\s+', '', t['name'], flags=re.I)}" if t.get("remainder") else t["name"]
+    where = ", ".join(label(t) for t in tw) if len(tw) > 1 else ""
     return f"{area.name} numbers cover homes with {_a(area.name)} {area.name} mailing address" + (f", which spans {where}" if where else "") + f"; {_HOME_TYPES_NOTE}."
 
 
 def sales_snapshot_items(area: MarketArea, snap: dict, geo: Optional[dict] = None) -> list[dict]:
     """The dated Bright MLS snapshot as evidence items - each says what it covers, "for sale" is
     active listings only (under contract counted on its own), year-ago figures only when our MLS
-    history for that window is complete, and small samples say so."""
+    history for that window is complete, and small samples say so. Breakdowns must fit inside their
+    total (parts_fit) or they're left out."""
+    from app.services.areas.market_stats_service import parts_fit
     if not snap or not snap.get("current"):
         return []
     town = _town(area)
@@ -653,12 +866,15 @@ def sales_snapshot_items(area: MarketArea, snap: dict, geo: Optional[dict] = Non
             + (" - a small sample, so one or two sales can move its medians a lot." if small else "."))
     if cur.get("median_close_price"):
         add(f"{area.name}: median closed price {_fmt_money(cur['median_close_price'])} in {win}" + (f" (vs {_fmt_money(prior['median_close_price'])} a year earlier)." if prior.get("median_close_price") and (prior.get("closed_count") or 0) >= 10 else "."))
-    if cur.get("by_type"):
+    if cur.get("by_type") and parts_fit(cur.get("closed_count"), [v["count"] for v in cur["by_type"].values()]):
         names = {"condo": "condos", "townhouse": "townhomes", "house": "single-family houses"}
         add(f"{area.name}: closed sales by type in {win}: " + "; ".join(
             f"{names[k]} {_fmt_money(v['median_close_price'])} median ({v['count']} sales)" for k, v in cur["by_type"].items()) + ".")
     if cur.get("median_sale_to_list_pct"):
-        add(f"{area.name}: median sale-to-list price ratio {cur['median_sale_to_list_pct']}% in {win} (half of those homes sold above that ratio, half below)"
+        va = cur.get("vs_asking") or {}
+        split = (f"; of the {va['of']} sales with a list price, {va['above']} sold above asking, {va['at']} at exactly asking and {va['below']} below"
+                 if va.get("of", 0) >= 10 and parts_fit(va["of"], [va["above"], va["at"], va["below"]]) else "")
+        add(f"{area.name}: median sale-to-list price ratio {cur['median_sale_to_list_pct']}% in {win} (the midpoint of those sales, as a share of asking price){split}"
             + (f"; {prior['median_sale_to_list_pct']}% a year earlier." if prior.get("median_sale_to_list_pct") and (prior.get("closed_count") or 0) >= 10 else "."))
     if cur.get("median_days_on_market") is not None:
         add(f"{area.name}: median {cur['median_days_on_market']} days on market for homes that closed in {win}" + (f" (vs {prior['median_days_on_market']} a year earlier)." if prior.get("median_days_on_market") is not None and (prior.get("closed_count") or 0) >= 10 else "."))
@@ -675,7 +891,9 @@ def sales_snapshot_items(area: MarketArea, snap: dict, geo: Optional[dict] = Non
 
 def cost_items(area: MarketArea, cost: dict, geo: Optional[dict] = None) -> list[dict]:
     """Owning costs read off the listings (taxes per township, HOA fees) and how recent buyers
-    paid - local, dated, sourced numbers a first-time-buyer article can lean on."""
+    paid - local, dated, sourced numbers a first-time-buyer article can lean on. Every breakdown
+    must fit inside its total (parts_fit) or it's left out."""
+    from app.services.areas.market_stats_service import parts_fit
     if not cost:
         return []
     town = _town(area)
@@ -690,28 +908,46 @@ def cost_items(area: MarketArea, cost: dict, geo: Optional[dict] = None) -> list
     if tax:
         add(f"{area.name}: the {tax['homes']} homes for sale that list an annual property tax show a median bill of ${tax['median_annual']:,}"
             + (f" (tax year {tax['tax_year']}, as entered on the listings)" if tax.get("tax_year") else " (as entered on the listings)")
-            + f" - a median of {tax['median_pct_of_list']}% of list price per year. A buyer's bill depends on the home's assessment, not its price.")
-        for t in tax.get("by_township") or []:
-            if len(tax["by_township"]) > 1:
-                # The census name when we have it (11/01: "Princeton Township" - one municipality since 2013).
-                named = {norm_place(x["name"]): x["name"] for x in (geo or {}).get("townships") or []}
-                place = named.get(norm_place(t["township"])) or (f"{t['township']} Township" if (area.state or "").upper() in ("PA", "NJ") else t["township"])
-                add(f"{area.name} homes for sale in {place}: median annual tax about {t['median_pct_of_list']}% of list price ({t['homes']} listings) - tax rates are set locally (municipality, county and school district), so they differ from place to place.")
+            + ". A buyer's bill depends on the home's assessment, not its price.")
+        # No tax-as-a-percent-of-price figures, overall or per municipality: readers take them for
+        # official tax rates (11/01 grader, Princeton "1.52% in Hopewell Township"). The comparison
+        # is said in words; the per-municipality split stays internal.
+        if len(tax.get("by_township") or []) > 1:
+            add(f"{area.name}: property taxes vary across the municipalities here - tax rates are set locally (municipality, county and school district), "
+                "so two similarly priced homes can have substantially different tax bills. Check the actual tax bill and assessment for any home before making an offer.")
+    tf = cost.get("townhome_fees") or {}
     for kind, label in (("condo", "condos"), ("townhouse", "townhomes")):
         h = (cost.get("hoa") or {}).get(kind)
-        if not h:
+        if not h or (h.get("of") and not parts_fit(h["of"], [h["homes"]])):
+            continue
+        covers = (" Most of those fees include: " + ", ".join(f"{_FEE_WORDS.get(c.lower(), c.lower())} ({pct}%)" for c, pct in h["covers"]) + "."
+                  if h.get("covers") else "")
+        reported = (tf.get("condo_fee") or 0) + (tf.get("hoa_only") or 0)
+        if kind == "townhouse" and tf and reported and parts_fit(tf["of"], [tf["condo_fee"], tf["hoa_only"], tf["no_fee"]]) and parts_fit(reported, [h["homes"]]):
+            # Round 13 grader (Baltimore): "159 HOA + 44 condo fee" is 203, but "201 show a fee" - the 201
+            # are the ones with a usable dollar amount. Every subset says which set it's from.
+            add(f"{area.name}: of the {tf['of']} townhomes for sale, {reported} report a condo or association fee, and {h['homes']} of those {reported} "
+                f"give a usable dollar amount; those {h['homes']} show a median of ${h['median_monthly']:,}/month, all fees combined." + covers, "market")
             continue
         add(f"{area.name}: {label} for sale that list a monthly condo or association fee show a median of ${h['median_monthly']:,}/month, all fees combined "
-            + (f"({h['homes']} of the {h['of']} {label} for sale show a fee)." if h.get("of") else f"({h['homes']} listings).")
-            + (" Most of those fees include: " + ", ".join(f"{_FEE_WORDS.get(c.lower(), c.lower())} ({pct}%)" for c, pct in h["covers"]) + "." if h.get("covers") else ""), "market")
+            + (f"({h['homes']} of the {h['of']} {label} for sale show a fee)." if h.get("of") else f"({h['homes']} listings).") + covers, "market")
+    if tf and parts_fit(tf["of"], [tf["condo_fee"], tf["hoa_only"], tf["no_fee"]]):
+        # 11/01 grader: "with a condo or townhome, the inspection only covers part of what you're
+        # buying" - true of a condo unit, not of a townhome owned with its land.
+        add(f"{area.name}: \"townhome\" is a building style, not a kind of ownership. Of the {tf['of']} townhomes for sale, {tf['condo_fee']} list a "
+            f"condominium fee (often a sign the townhome is owned as a condo unit), {tf['hoa_only']} list only an HOA fee and {tf['no_fee']} list no fee. "
+            # Round 7 grader: ownership type matters, but the association's governing documents decide
+            # who maintains what (Maryland's condo law lets declarations and bylaws set it).
+            "Whether a townhome is owned as a condo unit or fee simple (with its land) matters, but the association's governing documents "
+            "decide which maintenance belongs to the owner and which to the association - the listing, the association documents and the title show which.", "market")
     mix = cost.get("mix") or {}
-    if mix:
+    if mix and parts_fit(mix["homes"], [mix["attached"]["count"], mix["house"]["count"]]):
         def group(g, label):
             return f"{g['count']} {label}" + (f" (median list price {_fmt_money(g['median'])})" if g.get("median") else "")
         add(f"{area.name}: of its {mix['homes']} homes for sale on {on}, " + group(mix["attached"], "are condos or townhomes")
             + " and " + group(mix["house"], "are single-family houses") + ".", "market")
         low = mix["low_quarter"]
-        if low["count"]:
+        if low["count"] and parts_fit(low["count"], [low["attached"]]):
             add(f"{area.name}: in the lowest-priced quarter of its homes for sale on {on}, {low['attached']} of {low['count']} are condos or townhomes"
                 + (" - so that quarter price mostly reflects condos and townhomes, not houses." if low["attached"] * 2 > low["count"] else "."), "market")
         def some(g, what):
@@ -725,10 +961,11 @@ def cost_items(area: MarketArea, cost: dict, geo: Optional[dict] = None) -> list
             add(f"{area.name}: {some(mix['manufactured'], 'a manufactured home')} - counted apart from the one-level homes. A manufactured home may sit "
                 "on land the buyer owns or on leased land with a monthly lot rent, and financing differs; each listing says which.", "market")
     fin = cost.get("financing") or {}
-    if fin.get("mix"):
+    if fin.get("mix") and parts_fit(fin["closed_sales"], [fin["recorded"]]):
         mix = ", ".join(f"{m['type']} {m['pct']}%" for m in fin["mix"][:5])
-        add(f"{area.name}: how buyers paid on the {fin['recorded']} closed sales since {fin['since']} that recorded financing in Bright MLS: {mix}"
-            + (f" ({fin['closed_sales'] - fin['recorded']} more sales left financing blank)." if fin["closed_sales"] > fin["recorded"] else "."), "market")
+        # The window our records fully cover (11/01: "since Nov 1, 2025" was really two months).
+        span = f"in the {fin['days']} days ending {fin['through']}" if fin.get("days") and fin.get("through") else f"since {fin['since']}"
+        add(f"{area.name}: how buyers paid, from the {fin['recorded']} of {fin['closed_sales']} closed sales {span} that recorded it in Bright MLS: {mix}.", "market")
     return out
 
 
@@ -772,12 +1009,67 @@ _FEDERAL_FACTS = [
      "CFPB: Determine your down payment (closing costs)", "https://www.consumerfinance.gov/owning-a-home/prepare/determine-your-down-payment/", "2026-10", None),
     ("regulation", "Lenders must give the borrower the Closing Disclosure three business days before the scheduled closing.",
      "CFPB: Closing Disclosure", "https://www.consumerfinance.gov/owning-a-home/closing-disclosure/", "2026-10", None),
+    # Round 7 grader: "the lender's appraisal needs to support the price" was too absolute - a financed
+    # purchase can still close after a low appraisal.
+    ("regulation", "A lender may require an appraisal (an independent opinion of the home's value) to help decide how much it will lend. "
+     "If the appraisal comes in below the purchase price, the buyer may be able to negotiate the price with the seller, bring additional cash, "
+     "or review options with the lender; depending on the contract, the buyer may be able to cancel - an attorney can explain the options. "
+     "The lender must give the buyer a copy of the appraisal.",
+     "CFPB: My appraisal is less than the sale price. What does that mean for me?",
+     "https://www.consumerfinance.gov/ask-cfpb/my-appraisal-came-in-lower-than-i-expected-en-2007/", "2026-11", None),
 ]
 
 
 def conforming_limit(today=None) -> Optional[int]:
     """The one-unit baseline conforming loan limit while the item above is current."""
     return 832_750 if (today or datetime.now(timezone.utc).date()).isoformat() <= "2026-12-31" else None
+
+
+_CLL_TABLES: dict[int, Optional[dict]] = {}
+
+
+def _cll_table(year: int) -> Optional[dict]:
+    """FHFA's county one-unit limits for `year` (app/data/fhfa_conforming_limits_<year>.json), indexed
+    by state + normalized county name -> the set of limits under that name (Virginia's Fairfax County
+    and Fairfax City both read "fairfax")."""
+    if year not in _CLL_TABLES:
+        import json
+        from pathlib import Path
+        path = Path(__file__).resolve().parent.parent.parent / "data" / f"fhfa_conforming_limits_{year}.json"
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            idx: dict[tuple[str, str], set[int]] = {}
+            for key, limit in raw["one_unit"].items():
+                st, name = key.split("|", 1)
+                idx.setdefault((st, norm_place(name)), set()).add(int(limit))
+            _CLL_TABLES[year] = {"index": idx, "source_name": raw["source_name"], "source_url": raw["source_url"], "published": raw["published"]}
+        except (OSError, ValueError, KeyError):
+            _CLL_TABLES[year] = None
+    return _CLL_TABLES[year]
+
+
+def county_conforming_limit(state: Optional[str], counties: list[str], today=None) -> Optional[dict]:
+    """The one-unit conforming loan limit that applies to every home in these counties, from FHFA's
+    county list for the current year: {"limit", "counties", "source_name", "source_url", "published"}.
+    None when this year's list isn't on file, a county isn't found, or the counties' limits differ -
+    then whether a loan is jumbo depends on the property's county (11/01 round-11 grader: Ashburn's
+    $1.34M example was called jumbo even at 20% down, against the national $832,750, while Loudoun
+    County's 2026 limit is $1,249,125)."""
+    table = _cll_table((today or datetime.now(timezone.utc).date()).year)
+    names = [c for c in counties if c]
+    if not table or not state or not names:
+        return None
+    limits = set()
+    for c in names:
+        # A Virginia/Maryland independent city may come labeled without "City" (Bright's county field).
+        n = norm_place(c)
+        found = table["index"].get((state.upper(), n)) or table["index"].get((state.upper(), f"{n} city"))
+        if not found or len(found) > 1:
+            return None
+        limits |= found
+    if len(limits) != 1:
+        return None
+    return {"limit": limits.pop(), "counties": names, "source_name": table["source_name"], "source_url": table["source_url"], "published": table["published"]}
 
 
 def federal_items(today=None) -> list[dict]:
@@ -840,7 +1132,9 @@ async def town_dossier(db: AsyncSession, area: MarketArea, *, include_bank: bool
             snap = {}
         items += sales_snapshot_items(area, snap, geo)
         try:
-            cost = await get_area_cost_profile(db, scope)
+            # The town's census outlines (town map, TIGER) place each listing by its map location.
+            munis = (geo or {}).get("muni_shapes") or [m for m in (((area.facts or {}).get("boundaries") or {}).get("municipalities") or []) if m.get("rings")]
+            cost = await get_area_cost_profile(db, scope, munis=munis)
         except Exception:
             logger.warning("town dossier: cost profile failed for %s", area.slug, exc_info=True)
             cost = {}

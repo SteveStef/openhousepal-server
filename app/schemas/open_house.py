@@ -153,6 +153,8 @@ class VisitorResponse(BaseModel):
     created_at: datetime
     # The agent's star on this person's lead (PATCH /leads/{lead_id} {"is_favorite": bool}).
     is_favorite: bool = False
+    # How the agent already reached out (their lead's contact_log) - "Texted" / "Emailed" on the list (11/02).
+    contact_log: List[dict] = []
     # Their Showcase (latest, any status) and whether it's starred (PUT /collections/{id}/favorite).
     showcase_id: Optional[str] = None
     showcase_starred: bool = False
