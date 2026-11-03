@@ -58,7 +58,32 @@ async def _get_owned_conversation(
 
 _CARD_STATUS = {"pending": "showing in the chat right now, waiting for them to tap its button - you DID set it up", "running": "running",
                 "working": "they tapped it and it is being made in the background now (a blog draft or an AI CMA) - when it finishes, a message with a button posts in this chat by itself and the chat button shows a red number, even if they close the site", "done": "the agent tapped Confirm and it went through - it is done",
-                "failed": "the agent tapped Confirm but it failed - nothing changed", "cancelled": "the agent tapped Cancel - nothing changed", "expired": "expired untapped"}
+                "failed": "the agent tapped Confirm but it failed - nothing changed", "cancelled": "the agent tapped Cancel - nothing changed", "expired": "expired untapped",
+                "replaced": "replaced by the newer card you made after it (the agent asked for a change) - only the newer one can be confirmed"}
+
+
+def form_card_questions(c: dict) -> list:
+    """A form card's questions as they stand now - the agent's taps on the card (saved as they go) over
+    what the card first showed."""
+    draft = c.get("draft_picks") if isinstance(c.get("draft_picks"), dict) else {}
+    qs = draft.get("questions") if isinstance(draft.get("questions"), list) else (c.get("payload") or {}).get("questions")
+    return [q for q in (qs or []) if isinstance(q, dict) and q.get("label")]
+
+
+def _form_card_lines(c: dict) -> str:
+    """An open form card's numbered questions, so "change question 3" means the same thing to the
+    helper as the preview the agent is flipping through (owner, 11/02)."""
+    qs = form_card_questions(c)
+    lines = [f"Q{i + 4}. {q['label']} [{q.get('type') or 'short_text'}]" + (f" options: {' | '.join(map(str, q['options']))}" if q.get("options") else "")
+             for i, q in enumerate(qs)]
+    # The model once counted only the agent's own questions ("question 5" = their 5th) and changed the
+    # wrong one - so the mapping is spelled out with this form's own example (11/02).
+    ex = f" - e.g. “question {4 + min(1, len(qs) - 1)}” is “{qs[min(1, len(qs) - 1)]['label']}”" if qs else ""
+    return (" Its questions right now, numbered exactly as the form and the card's preview show them (Q1-Q3 are always Full name, Email, Phone): "
+            + "; ".join(lines) + f". When the agent says “question N” they mean QN here{ex} - never count only their own questions. "
+            "To change, add, remove or reorder any of them, call create_form again with the same title and the FULL updated list of their own questions "
+            "(from Q4 on, in order, all of them - unchanged ones exactly as they are) - that new card replaces this one and its preview opens on the change. "
+            "Change only what they asked.") if lines else ""
 
 
 def _card_note(m: AIMessage) -> str:
@@ -72,7 +97,35 @@ def _card_note(m: AIMessage) -> str:
     return "(App note, not from the agent - the cards your last reply showed: " + "; ".join(
         f"“{c.get('title')}” - {_CARD_STATUS.get(c.get('status'), c.get('status'))}"
         + (f" ({c.get('result_message')})" if c.get("status") == "failed" and c.get("result_message") else "")
+        + (_form_card_lines(c) if c.get("tool") == "create_form" and c.get("status") == "pending" else "")
         + (f" - its link (shown as a preview card): {c['share']['url']}" if isinstance(c.get("share"), dict) and c["share"].get("url") else "") for c in cards) + ")\n\n"
+
+
+async def _replace_open_form_cards(db: AsyncSession, conversation_id: str, refs: list) -> None:
+    """A new form card in this chat replaces the one still waiting (the agent asked for a change) - so
+    only the newest can be confirmed - and its preview opens on the first question that changed."""
+    new = next((r for r in refs or [] if isinstance(r, dict) and r.get("record_type") == "action" and r.get("tool") == "create_form"), None)
+    if not new:
+        return
+    rows = (await db.execute(select(AIMessage).where(AIMessage.conversation_id == conversation_id, AIMessage.role == "assistant")
+                             .order_by(AIMessage.created_at.desc()).limit(20))).scalars().all()
+    from sqlalchemy.orm.attributes import flag_modified
+    title = str((new.get("payload") or {}).get("title") or "").strip().lower()
+    for m in rows:
+        hit = False
+        for c in m.tool_calls or []:
+            # the same form (same title) - a second, different form made in the same chat stays
+            if (isinstance(c, dict) and c.get("record_type") == "action" and c.get("tool") == "create_form" and c.get("status") == "pending"
+                    and str((c.get("payload") or {}).get("title") or "").strip().lower() == title):
+                old, now = form_card_questions(c), (new.get("payload") or {}).get("questions") or []
+                diff = next((i for i in range(max(len(old), len(now)))
+                             if i >= len(old) or i >= len(now) or {k: old[i].get(k) for k in ("label", "type", "options")} != {k: now[i].get(k) for k in ("label", "type", "options")}), None)
+                if diff is not None and "focus_q" not in (new.get("payload") or {}):
+                    new["payload"]["focus_q"] = min(diff, max(len(now) - 1, 0))
+                c.update(status="replaced", result_message="Replaced by the updated card below.")
+                hit = True
+        if hit:
+            flag_modified(m, "tool_calls")
 
 
 async def _build_history(db: AsyncSession, conversation: AIConversation, max_messages: int) -> tuple[List[dict], str]:
@@ -164,6 +217,29 @@ async def confirm_ai_action(
         return await ai_actions.confirm(db, current_user, str(payload.get("message_id") or ""), action_id, picks)
     except ai_actions.ActionError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/actions/{action_id}/draft")
+async def save_ai_action_draft(
+    action_id: str,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_ai_helper_user),
+):
+    """The agent's taps on a card still waiting (a form's questions) - kept on the card so the helper
+    works from what they see when they ask for a change. Nothing runs."""
+    from app.services.ai import ai_actions
+    picks = payload.get("picks") if isinstance(payload.get("picks"), dict) else None
+    if not picks or len(str(picks)) > 20000:
+        raise HTTPException(status_code=400, detail="Nothing to save.")
+    try:
+        msg, entry = await ai_actions._owned_entry(db, current_user, str(payload.get("message_id") or ""), action_id)
+    except ai_actions.ActionError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if entry.get("status") != "pending":
+        return {"saved": False}
+    await ai_actions._save(db, msg, entry, draft_picks=picks)
+    return {"saved": True}
 
 
 @router.post("/actions/{action_id}/client-result")
@@ -337,6 +413,7 @@ async def send_ai_message(
             await reconcile_budget(db, reservation, spent or 0.0)
             raise HTTPException(status_code=503, detail=e.user_message)
 
+        await _replace_open_form_cards(db, conversation.id, refs)
         assistant_msg = AIMessage(conversation_id=conversation.id, role="assistant", content=text, tool_calls=refs or None)
         db.add(assistant_msg)
 

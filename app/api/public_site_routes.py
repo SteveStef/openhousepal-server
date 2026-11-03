@@ -364,8 +364,20 @@ async def get_subdomain_own_domain(slug: str, db: AsyncSession = Depends(get_db)
 async def resolve_site(
     host: str = Query(..., min_length=1),
     path: str = Query("", description="Requested page path, e.g. '' for home or 'about'"),
+    soft: bool = Query(False, description="Answer 'not found' as 200 {not_found: true} instead of a 404"),
     db: AsyncSession = Depends(get_db),
 ):
+    # soft: the site page caches this lookup, and Next.js only caches 200s - a 404 never replaces
+    # the cached live copy, so a site switched off kept showing until the next deploy.
+    try:
+        return await _resolve_site(host, path, db)
+    except HTTPException as e:
+        if soft and e.status_code == status.HTTP_404_NOT_FOUND:
+            return {"not_found": True, "detail": e.detail}
+        raise
+
+
+async def _resolve_site(host: str, path: str, db: AsyncSession):
     """The one hot path for every public site page view - called server-to-server from the
     Next.js (sitepublic) route group, never from the visitor's browser (see frontend
     proxy.ts / (sitepublic) route group), so this never needs CORS handling.

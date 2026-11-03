@@ -64,9 +64,20 @@ def _spotlight_owner_live(user) -> bool:
 async def resolve_property_site(
     host: str = Query(..., min_length=1),
     path: str = Query("", description="Requested path - only used to disambiguate a custom-domain /listings/<slug> hit"),
+    soft: bool = Query(False, description="Answer 'not found' as 200 {not_found: true} instead of a 404"),
     db: AsyncSession = Depends(get_db),
 ):
-    resolved = await domain_resolution_service.resolve_property_site(db, host, path)
+    # soft: see public_site_routes.resolve_site - a cached Spotlight page otherwise outlives its take-down
+    try:
+        return await _resolve_property_site(host, path, db)
+    except HTTPException as e:
+        if soft and e.status_code == status.HTTP_404_NOT_FOUND:
+            return {"not_found": True, "detail": e.detail}
+        raise
+
+
+async def _resolve_property_site(host: str, path: str, db: AsyncSession):
+    resolved =await domain_resolution_service.resolve_property_site(db, host, path)
     if not resolved:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No published property website for that address.")
 

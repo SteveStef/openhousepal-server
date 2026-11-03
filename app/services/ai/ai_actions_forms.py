@@ -456,7 +456,7 @@ async def _p_remind(db, user, a):
     recs = {r.email: r for r in (await db.execute(select(EventInviteRecipient).where(EventInviteRecipient.invite_id == row.id))).scalars().all()}
     if not recs:
         raise ActionError(f"“{inv.get('title')}” hasn't been emailed to anyone from the invite yet, so there's nobody to remind - "
-                          "reminders only reach people emailed from it (send_invite_to_leads sends it).")
+                          "reminders only reach people it was emailed to. I can send it to people first.")
     waiting = await svc.non_responders(db, row)
     if not waiting:
         raise ActionError(f"Nobody to remind - everyone you emailed “{inv.get('title')}” has answered.")

@@ -15,6 +15,7 @@ from app.models.database import (
     OpenHouseVisitor, Property, SupportTicket, User,
 )
 from app.services.ai.ai_actions import ActionError, Prepared
+from app.services.email_service import tidy_caps
 from app.services.ai.ai_actions_catalog import (
     MLS, _agent_name, _date_ok, _need_id, _nice_date, _nice_time, _obj, _oh_name, _one, _run_route, _s, _simple, _time_ok, _yn,
 )
@@ -44,9 +45,12 @@ def _future_day(v: Any) -> str:
     return d
 
 
-async def _address(db, listing_key: str) -> str:
+async def _address(db, listing_key: str, open_house_id: Optional[str] = None) -> str:
     p = (await db.execute(select(Property.street_address).where(Property.listing_key == listing_key))).scalar_one_or_none()
-    return p or "that listing"
+    if not p and open_house_id:   # a listing that left the feed - its open house still has the address
+        p = (await db.execute(select(OpenHouseEvent.address).where(OpenHouseEvent.id == open_house_id))).scalar_one_or_none()
+        p = (p or "").split(",")[0]
+    return tidy_caps(p) if p else "that listing"
 
 
 # ================================================================ HOSTING (Discovery -> My Requests)
@@ -60,8 +64,10 @@ async def _p_withdraw(db, user, a):
     r = await _my_req(db, user, a)
     if r.status not in ("pending", "countered", "approved"):
         raise ActionError("That request is already closed - there's nothing to withdraw.")
+    if r.requested_date and str(r.requested_date)[:10] < _date.today().isoformat():
+        raise ActionError("That open house day has already passed - there's nothing to back out of.")
     who = await _agent_name(db, r.listing_owner_agent_id)
-    addr = await _address(db, r.listing_key)
+    addr = await _address(db, r.listing_key, r.open_house_event_id)
     when = _slot(r.requested_date, r.requested_start_time, r.requested_end_time)
     if r.status == "approved":
         return Prepared(f"Back out of hosting {addr}", [when, "Frees the day so they can find another host", "Takes it off your calendar"],
@@ -525,8 +531,11 @@ async def _p_crm_test(db, user, a):
 
 
 async def _r_crm_test(db, user, p):
-    out = await _run_route(user, "POST", "/integrations/crm/test")
-    return {"message": (out or {}).get("detail") or "Sent.", "link": "/studio/integrations"}
+    out = await _run_route(user, "POST", "/integrations/crm/test") or {}
+    if not any(out.get(k) == "ok" for k in ("webhook", "email", "fub")):
+        # Nothing got through - show it as failed, not a green "done" (11/02 review)
+        raise ActionError(out.get("detail") or "The test lead didn't get through - check Tools → CRM.")
+    return {"message": out.get("detail") or "Sent.", "link": "/studio/integrations"}
 
 _simple("send_crm_test_lead", "Send a test lead to the agent's CRM (Follow Up Boss / webhook / CRM email) to check it's hooked up. Keys and settings stay on Tools → CRM.",
         _obj({}), _p_crm_test, _r_crm_test)

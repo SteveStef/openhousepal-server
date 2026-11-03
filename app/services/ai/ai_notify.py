@@ -79,10 +79,12 @@ async def working(db: AsyncSession, user: User) -> list[dict]:
     """The jobs still running for the chat's progress strip (owner, 11/01: "a nice little loading bar
     that doesn't go away" while they keep talking): kind (cma | blog), its label, when it started,
     and for a blog the pipeline stage it's on (gathering, research, write, fact_check, finishing).
-    A watch older than 2 hours is a job that died quietly - not shown."""
+    A job that died quietly (a restart mid-run) is closed here: its card turns failed and the chat
+    says so with a button (11/02 - the card said "working" forever), and a blog run gives back what
+    it charged, like the Blogs page does."""
     st = user.setup_state or {}
     now = datetime.now(timezone.utc)
-    out = []
+    out, dead = [], []
     for key, w in (st.get(WATCH_KEY) or {}).items():
         if not isinstance(w, dict) or ":" not in key:
             continue
@@ -90,18 +92,40 @@ async def working(db: AsyncSession, user: User) -> list[dict]:
             at = datetime.fromisoformat(w.get("at") or "")
         except ValueError:
             continue
-        if now - at > timedelta(hours=2):
-            continue
         kind, rid = key.split(":", 1)
+        if now - at > timedelta(hours=2):
+            dead.append((key, kind, rid, None))
+            continue
         out.append({"key": key, "kind": kind, "id": rid, "label": w.get("label") or "", "at": at.isoformat(), "stage": None})
     blogs = [j["id"] for j in out if j["kind"] == "blog"]
     if blogs:
         from app.models.database import Blog
         rows = (await db.execute(select(Blog.id, Blog.ai_review).where(Blog.id.in_(blogs)))).all()
-        stages = {r.id: (r.ai_review or {}).get("stage") for r in rows if isinstance(r.ai_review, dict)}
-        for j in out:
-            if j["kind"] == "blog":
-                j["stage"] = stages.get(j["id"])
+        reviews = {r.id: r.ai_review for r in rows if isinstance(r.ai_review, dict)}
+        for j in list(out):
+            if j["kind"] != "blog":
+                continue
+            rv = reviews.get(j["id"]) or {}
+            j["stage"] = rv.get("stage")
+            # The Blogs page's own rule: a run with no new stage for 15 minutes has died
+            try:
+                last = datetime.fromisoformat(rv.get("stage_at") or rv.get("started_at") or "")
+            except ValueError:
+                last = None
+            if rv.get("status") == "failed" or (rv.get("status") == "running" and last and now - last > timedelta(minutes=15)):
+                out.remove(j); dead.append((j["key"], "blog", j["id"], rv.get("started_at")))
+    for key, kind, rid, started in dead:
+        if kind == "blog":
+            if started:
+                from app.services.ai import ai_blog_pipeline_service
+                await ai_blog_pipeline_service.refund_since(db, user.id, started)
+            await finished(user.id, key, False, "The blog draft about {label} didn't finish, so nothing was charged for it. Open it on Blogs to try again.",
+                           f"/studio/blogs/{rid}", "Open it")
+        elif kind == "cma":
+            await finished(user.id, key, False, "The CMA for {label} didn't finish. Open it to pick the comps yourself or run it again.",
+                           f"/studio/cma/{rid}", "Open it")
+        else:
+            await finished(user.id, key, False, "That didn't finish - please try again.")
     return sorted(out, key=lambda j: j["at"])
 
 

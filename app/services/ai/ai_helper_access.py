@@ -1,6 +1,6 @@
 """Who can use the typed AI helper (the bottom-right chat) - owner, 10/30: every paying plan, not
-just the admin account, with one Admin switch. Until the owner flips it on, only the admin and the
-test accounts below see it.
+just the admin account, with one Admin switch. Open to every paying agent since 11/03 (the Admin
+switch turns it off; the admin and the test accounts below always see it).
 
 Voice (Talk to OHP, read-aloud) is off for everyone for now (/ai/helper/status). Which TOOLS a plan
 gets is ai_tools.tools_for(user) - a NO_MLS agent never gets an MLS lookup through the helper, same as
@@ -16,7 +16,7 @@ from app.database import get_db
 from app.models.database import SystemSettings, User
 from app.utils.auth import _assert_active_subscription, get_current_active_user
 
-SETTING_KEY = "ai_helper"   # {"open_to_all": bool}; no row = testers only (owner, 10/30 late)
+SETTING_KEY = "ai_helper"   # {"open_to_all": bool}; no row = open to every paying agent (owner, 11/03: "make it available for everyone")
 
 # While the owner tests it, the helper shows for the admin + these accounts only (the Admin switch
 # opens it to every paying agent). Matched by id or login email so it works on any database copy.
@@ -30,7 +30,8 @@ def is_admin(user: User) -> bool:
 
 async def helper_open_to_all(db: AsyncSession) -> bool:
     row = (await db.execute(select(SystemSettings).where(SystemSettings.key == SETTING_KEY))).scalar_one_or_none()
-    return bool((row.value or {}).get("open_to_all", False)) if row else False
+    # Live has no row - the owner opened it to everyone 11/03; the Admin switch (a row) can still turn it off
+    return bool((row.value or {}).get("open_to_all", True)) if row else True
 
 
 def is_tester(user: User) -> bool:

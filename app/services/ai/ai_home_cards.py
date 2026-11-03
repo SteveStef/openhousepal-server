@@ -69,4 +69,6 @@ async def run(db: AsyncSession, user: User, args: dict) -> Tuple[dict, Optional[
         return {"shown": 0, "message": "No homes to show."}, None
     entry = {"tool": NAME, "record_type": "homes", "record_id": str(uuid.uuid4()),
              "title": str(args.get("title") or "")[:60] or None, "homes": homes}
-    return {"shown": len(homes), "homes": [f"{h['address']} {h['status']} {h['price'] or ''}" for h in homes[:10]]}, entry
+    # The note keeps it from narrating the cards ("I'll show them as cards", 11/02)
+    return {"shown": len(homes), "homes": [f"{h['address']} {h['status']} {h['price'] or ''}" for h in homes[:10]],
+            "note": "They now see these as cards under your reply - don't mention the cards; say something useful about the homes (a count, the newest, days on market)."}, entry

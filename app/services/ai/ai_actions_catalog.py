@@ -202,14 +202,14 @@ async def _p_lead_alerts(db, user, a):
     lead = await _lead(db, user, a)
     body, lines = {}, []
     if isinstance(a.get("calendar"), bool):
-        body["calendar"] = a["calendar"]; lines.append(f"Put {lead.name}'s follow-ups on my calendar: {_yn(a['calendar'])}")
+        body["calendar"] = a["calendar"]; lines.append(f"{lead.name}'s follow-ups on your calendar: {_yn(a['calendar'])}")
         if a["calendar"]:
             body["in_app"] = True
     if isinstance(a.get("keep_followups_in_app"), bool) and not body.get("calendar"):
         body["in_app"] = a["keep_followups_in_app"]
         lines.append("Keep their follow-ups in OpenHousePal" if a["keep_followups_in_app"] else "Stop making follow-ups for them")
     if isinstance(a.get("email_on_likes"), bool):
-        body["emails"] = a["email_on_likes"]; lines.append(f"Email me when they like or comment: {_yn(a['email_on_likes'])}")
+        body["emails"] = a["email_on_likes"]; lines.append(f"Email you when they like or comment: {_yn(a['email_on_likes'])}")
     if not body:
         raise ActionError("Which alert should change?")
     return Prepared(f"{lead.name}'s alerts", lines, {"lead_id": lead.id, "body": body})
@@ -245,6 +245,10 @@ async def _p_handled(db, user, a):
     kind = _s(a.get("kind"))
     if kind not in HANDLED:
         raise ActionError("Which request is done?")
+    # Only when one is actually waiting - the card said "Marked done" for a request that wasn't there (11/02)
+    detail = await _run_route(user, "GET", f"/leads/{lead.id}")
+    if kind not in {t.get("kind") for t in (detail or {}).get("todos") or []}:
+        raise ActionError(f"{lead.name} has no {HANDLED[kind]} waiting on you, so there's nothing to clear.")
     return Prepared(f"Mark {lead.name}'s {HANDLED[kind]} as done", ["Clears it from Waiting on you", "Doesn't message them"], {"lead_id": lead.id, "kind": kind})
 
 
@@ -281,8 +285,10 @@ async def _p_client_emails(db, user, a):
     if "@" not in email:
         raise ActionError("Which client's email address?")
     on = bool(a.get("on"))
-    return Prepared(f"{'Turn back on' if on else 'Turn off'} automatic emails to {email}",
-                    ["Showcase updates and other automatic emails to this client" + (" start again" if on else " stop until you turn them back on")],
+    # Their name when they're one of the agent's leads - the address alone read like a stranger (11/02 review)
+    name = (await db.execute(select(Lead.name).where(Lead.owner_id == user.id, func.lower(Lead.email) == email, Lead.name.isnot(None)).limit(1))).scalar()
+    return Prepared(f"{'Turn back on' if on else 'Turn off'} automatic emails to {name or email}",
+                    ([email] if name else []) + ["Showcase updates and other automatic emails to this client" + (" start again" if on else " stop until you turn them back on")],
                     {"email": email, "on": on})
 
 
@@ -360,7 +366,7 @@ async def _p_edit_task(db, user, a):
         body["notes"] = _s(a["notes"]); lines.append(f"Notes: {body['notes'][:200]}")
     if not body:
         raise ActionError("What should change on that follow-up?")
-    return Prepared(f"Follow-up: {t.title}", lines, {"task_id": t.id, "body": body})
+    return Prepared(f"Change “{t.title}”", lines, {"task_id": t.id, "body": body})
 
 
 async def _r_edit_task(db, user, p):
@@ -424,8 +430,13 @@ _SEARCH_PROPS = {
 def _search_lines(a: dict) -> tuple[dict, list]:
     body = {k: a[k] for k in _SEARCH_PROPS if a.get(k) not in (None, "", [])}
     lines = []
-    if "min_price" in body or "max_price" in body:
-        lines.append(f"Price: {('$' + format(body['min_price'], ',')) if 'min_price' in body else 'any'} - {('$' + format(body['max_price'], ',')) if 'max_price' in body else 'any'}")
+    # One side only = just that side ("any" would read as clearing the other side on a search change)
+    if "min_price" in body and "max_price" in body:
+        lines.append(f"Price: ${body['min_price']:,} - ${body['max_price']:,}")
+    elif "max_price" in body:
+        lines.append(f"Top price: ${body['max_price']:,}")
+    elif "min_price" in body:
+        lines.append(f"Lowest price: ${body['min_price']:,}")
     if "min_beds" in body: lines.append(f"{body['min_beds']}+ beds")
     if "min_baths" in body: lines.append(f"{body['min_baths']}+ baths")
     if "min_year_built" in body: lines.append(f"Built {body['min_year_built']} or newer")
@@ -569,7 +580,7 @@ async def _p_add_home(db, user, a):
     c = await _showcase(db, user, a)
     key = _need_id(a, "listing_key")
     prop = await _one(db, select(Property).where(Property.listing_key == key), "That home isn't in the listings yet.")
-    return Prepared(f"Add a home to {_sc_name(c)}", [prop.street_address or prop.full_address or key, "Marked Recommended, shows as new for them"],
+    return Prepared(f"Add a home to {_sc_name(c)}", [tidy_caps(", ".join(x for x in (prop.street_address, prop.city) if x)) or prop.full_address or key,"Marked Recommended, shows as new for them"],
                     {"collection_id": c.id, "listing_key": key}, warning=f"{c.visitor_name or 'Your client'} sees it in their next Showcase email.")
 
 
@@ -585,10 +596,10 @@ async def _p_tour(db, user, a):
     tid = _need_id(a, "tour_id")
     tour = await _one(db, select(PropertyTour).join(Collection, Collection.id == PropertyTour.collection_id)
                       .where(PropertyTour.id == tid, Collection.owner_id == user.id), "I couldn't find that tour request.")
-    d, t = _date_ok(a.get("date")), _s(a.get("time"))
-    if not t:
+    if not _s(a.get("time")):
         raise ActionError("What time is the tour?")
-    return Prepared(f"Confirm {tour.visitor_name or 'the'} tour", [f"{_nice_date(d)} at {t}", "Only confirm once it's booked and the listing agent accepted"],
+    d, t = _date_ok(a.get("date")), _time_ok(a.get("time"))   # HH:MM - what the Showcase page saves
+    return Prepared(f"Confirm {tour.visitor_name + chr(39) + 's' if tour.visitor_name else 'the'} tour",[f"{_nice_date(d)} at {_nice_time(t)}","Only confirm once it's booked and the listing agent accepted"],
                     {"tour_id": tid, "date": d, "time": t}, warning=f"This emails {tour.visitor_name or 'your client'} that the tour is confirmed.", confirm_label="Confirm tour")
 
 
@@ -637,7 +648,7 @@ async def _p_oh_switches(db, user, a):
         body["guest_pass"] = a["guest_pass"]; lines.append(f"Guest Pass: {_yn(a['guest_pass'])}")
     if a.get("followups") in ("on", "no_calendar", "off"):
         body["followups_mode"] = a["followups"]
-        lines.append({"on": "Guest follow-ups: on (and on my calendar)", "no_calendar": "Guest follow-ups: in OpenHousePal only", "off": "Guest follow-ups: off"}[a["followups"]])
+        lines.append({"on": "Guest follow-ups: on (and on your calendar)", "no_calendar": "Guest follow-ups: in OpenHousePal only", "off": "Guest follow-ups: off"}[a["followups"]])
     if not body:
         raise ActionError("Which switch should change?")
     return Prepared(f"Open house at {_oh_name(oh)}", lines, {"open_house_id": oh.id, "body": body})
@@ -741,6 +752,10 @@ async def _agent_name(db, uid) -> str:
 
 async def _p_answer_host(db, user, a):
     r = await _host_req(db, user, a)
+    if r.status not in ("pending", "countered"):
+        raise ActionError("That request isn't waiting on you any more - it was already answered or withdrawn.")
+    if r.requested_date and str(r.requested_date)[:10] < _date.today().isoformat():
+        raise ActionError("That day has already passed, so there's nothing to answer.")
     who = await _agent_name(db, r.requesting_agent_id)
     when = f"{_nice_date(str(r.requested_date))}, {_nice_time(str(r.requested_start_time))}-{_nice_time(str(r.requested_end_time))}"
     answer = _s(a.get("answer"))
@@ -780,7 +795,7 @@ async def _p_ask_host(db, user, a):
         body.update(requested_start_time=f"{s}:00", requested_end_time=f"{e}:00"); when = f"{_nice_date(d)}, {_nice_time(s)}-{_nice_time(e)}"
     else:
         body["is_anytime"] = True; when = f"{_nice_date(d)}, any time"
-    return Prepared(f"Ask your team to host {prop.street_address}", [when] + ([f"Message: “{body['message']}”"] if body["message"] else []), {"body": body},
+    return Prepared(f"Ask your team to host {tidy_caps(prop.street_address)}",[when] + ([f"Message: “{body['message']}”"] if body["message"] else []), {"body": body},
                     warning="This emails everyone on your team.", confirm_label="Send ask")
 
 
@@ -798,7 +813,19 @@ async def _p_request_host(db, user, a):
     prop = await _one(db, select(Property).where(Property.listing_key == key), "I couldn't find that listing.")
     d, s, e = _date_ok(a.get("date")), _time_ok(a.get("start_time")), _time_ok(a.get("end_time"))
     msg = _s(a.get("message")) or None
-    return Prepared(f"Ask to host {prop.street_address}", [f"{_nice_date(d)}, {_nice_time(s)}-{_nice_time(e)}", f"Listing agent: {prop.list_agent_full_name or 'the listing agent'}"]
+    # The same who-may-ask rule the request route enforces - checked here so the card never offers
+    # "Send request" for an agent who'd refuse it (11/02: the card failed only after the tap)
+    from app.services.open_house_manager_service import _is_eligible_requester
+    owner_mls = prop.list_agent_mls_id or prop.co_list_agent_mls_id
+    owner = None
+    if owner_mls and owner_mls.startswith("user:"):
+        owner = await db.get(User, owner_mls[5:])
+    elif owner_mls:
+        owner = (await db.execute(select(User).where(User.mls_id == owner_mls).order_by(User.test_copy_of_user_id.isnot(None), User.created_at))).scalars().first()
+    if owner and owner.id != user.id and not await _is_eligible_requester(db, owner, user):
+        raise ActionError(f"{prop.list_agent_full_name or 'That listing agent'} only takes host requests from agents at their brokerage or on their team, "
+                          "so I can't send this one.")
+    return Prepared(f"Ask to host {tidy_caps(prop.street_address)}", [f"{_nice_date(d)}, {_nice_time(s)}-{_nice_time(e)}", f"Listing agent: {prop.list_agent_full_name or 'the listing agent'}"]
                     + ([f"Message: “{msg}”"] if msg else []),
                     {"body": {"listing_key": key, "requested_date": d, "requested_start_time": f"{s}:00", "requested_end_time": f"{e}:00", "message": msg}},
                     warning=f"This emails {prop.list_agent_full_name or 'the listing agent'}.", confirm_label="Send request")
@@ -818,9 +845,15 @@ _simple("request_to_host", "Ask a listing agent to let this agent host an open h
 async def _p_counter_reply(db, user, a):
     r = await _one(db, select(OpenHouseHostRequest).where(OpenHouseHostRequest.id == _need_id(a, "request_id"), OpenHouseHostRequest.requesting_agent_id == user.id),
                    "I couldn't find that request.")
+    # Only a request where the listing agent actually suggested another time (11/02 review: a card said
+    # "their suggested time" with no date for an already-approved request)
+    if r.status != "countered" or not r.counter_date:
+        raise ActionError("The listing agent hasn't suggested another time on that request, so there's nothing to accept or decline.")
+    if str(r.counter_date)[:10] < _date.today().isoformat():
+        raise ActionError("The time they suggested has already passed.")
     who = await _agent_name(db, r.listing_owner_agent_id)
     yes = bool(a.get("accept"))
-    when = f"{_nice_date(str(r.counter_date))}, {_nice_time(str(r.counter_start_time))}-{_nice_time(str(r.counter_end_time))}" if r.counter_date else "their suggested time"
+    when = f"{_nice_date(str(r.counter_date))}, {_nice_time(str(r.counter_start_time))}-{_nice_time(str(r.counter_end_time))}"
     return Prepared(f"{'Accept' if yes else 'Decline'} {who}'s suggested time", [when], {"request_id": r.id, "accept": yes}, warning=f"This emails {who}.")
 
 
@@ -996,7 +1029,7 @@ _simple("create_spotlight", "Make a Listing Spotlight (single-listing website) f
 async def _p_spotlight_pub(db, user, a):
     sid = _need_id(a, "spotlight_id")
     site = await _one(db, select(PropertyWebsite).where(PropertyWebsite.id == sid, PropertyWebsite.owner_id == user.id), "I couldn't find that Spotlight.")
-    addr = ((site.property_snapshot or {}).get("street_address") or (site.property_snapshot or {}).get("address") or "this home")
+    addr = tidy_caps((site.property_snapshot or {}).get("street_address") or (site.property_snapshot or {}).get("address") or "") or "this home"
     on = bool(a.get("publish"))
     return Prepared(f"{'Publish' if on else 'Take down'} the Spotlight for {addr}", ["Puts the page live for anyone with the link" if on else "The page goes offline; your work is kept"],
                     {"spotlight_id": sid, "publish": on}, confirm_label="Publish" if on else "Take it down")
@@ -1018,13 +1051,20 @@ _simple("publish_spotlight", "Publish (publish=true) or take down (false) one of
 _HEX = re.compile(r"^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 
 
+# The Branding card's swatches by name (frontend lib/accentSwatches.ts) - the card says "Navy", not "#1E3A5F"
+BRAND_SWATCH_NAMES = {"#9B7659": "Bronze", "#C5C9CA": "Silver", "#D8B86A": "Gold", "#C9A24D": "Original gold", "#F1746B": "Light Red", "#EC4899": "Pink",
+                      "#2563EB": "Blue", "#4A6741": "Green", "#7C3AED": "Purple", "#1E3A5F": "Navy", "#111827": "Charcoal", "#DC2626": "Red",
+                      "#7F1D1D": "Burgundy", "#EA580C": "Orange", "#0F766E": "Teal", "#0284C7": "Sky Blue", "#166534": "Forest", "#7C4A2D": "Brown",
+                      "#475569": "Slate", "#000000": "Black", "#FFFFFF": "White"}
+
+
 async def _p_brand(db, user, a):
     body, lines = {}, []
-    for k, label in (("primary_color", "Main color"), ("secondary_color", "Second color"), ("accent_color", "Accent color")):
+    for k, label in (("primary_color", "Main color"), ("secondary_color", "Brand color"), ("accent_color", "Accent color")):
         if _s(a.get(k)):
             if not _HEX.match(_s(a[k])):
                 raise ActionError("Colors need to be hex codes like #1F3A5F.")
-            body[k] = _s(a[k]); lines.append(f"{label}: {body[k]}")
+            body[k] = _s(a[k]); lines.append(f"{label}: {BRAND_SWATCH_NAMES.get(body[k].upper(), body[k])}")
     if a.get("look") in ("classic", "luxe"):
         if a["look"] == "luxe" and user.plan_tier != "IDX" and not user.is_admin:
             raise ActionError("The Luxe look comes with the IDX plan.")
@@ -1101,9 +1141,13 @@ async def _r_brand(db, user, p):
             "link": "/studio/brand-kit"}
 
 register({"name": "update_branding", "description": (
-    "Change the agent's Branding (brand kit). For 'change my colors / show me my options / change my look / put my colors back / undo' call it WITHOUT colors - "
+    "Change the agent's Branding (brand kit). For 'change my colors / show me my options / change my look / put my colors back / undo' with no color named, call it WITHOUT colors - "
     "the card shows every color, the Classic/Luxe look, the Luxe finish and Ivory/Midnight for them to tap, exactly like the Branding page. "
-    "Only pass hex colors or look when they named exact ones."),
+    "When they NAME a color, even in words ('navy', 'forest green', 'navy and gold'), pass it as a hex code in secondary_color (their brand color - "
+    "the one the card and every tool use). Use the card's own swatches: navy #1E3A5F, gold #C9A24D (Original), light gold #D8B86A, bronze #9B7659, "
+    "silver #C5C9CA, blue #2563EB, sky blue #0284C7, green #4A6741, forest #166534, teal #0F766E, purple #7C3AED, pink #EC4899, red #DC2626, "
+    "light red #F1746B, burgundy #7F1D1D, orange #EA580C, brown #7C4A2D, slate #475569, charcoal #111827, black #000000) "
+    "so the card starts on it; a second named color goes in accent_color. Never tell them to pick a color they already named."),
     "input_schema": _obj({"primary_color": {"type": "string"}, "secondary_color": {"type": "string"}, "accent_color": {"type": "string"}, "look": {"type": "string", "enum": ["classic", "luxe"]}})},
     _p_brand, _r_brand, None, adjust=_adjust_brand)
 
@@ -1232,7 +1276,9 @@ async def _p_form(db, user, a):
         rows = (await db.execute(select(Property).where(
             or_(Property.list_agent_mls_id == mine, Property.co_list_agent_mls_id == mine),
             Property.home_status.in_(("ACTIVE-BRIGHT", "COMING SOON-BRIGHT"))).order_by(Property.mls_list_date.desc().nulls_last()).limit(6))).scalars().all()
-        homes = [{"listing_key": r.listing_key, "address": tidy_caps(r.street_address) or "", "city": tidy_caps(r.city) or "",
+        # price / beds / baths / sq ft too: the card's preview draws the form's home card from these
+        homes = [{"listing_key": r.listing_key, "address": tidy_caps(r.street_address) or "", "city": tidy_caps(r.city) or "", "state": r.state,
+                  "price": r.price, "beds": r.bedrooms, "baths": r.bathrooms, "sqft": r.living_area, "status": r.home_status,
                   "photo": (r.photos[0] if isinstance(r.photos, list) and r.photos and isinstance(r.photos[0], str) else None)} for r in rows]
     key = _s(a.get("listing_key"))
     ideas = [q for q in _safe_form_questions(a.get("ideas") or []) if q["label"].lower() not in {x["label"].lower() for x in qs}][:6]
@@ -1279,7 +1325,10 @@ async def _r_form(db, user, p):
 
 _simple("create_form", "Make a new custom form (Forms & Invites) with a title and the agent's own questions (types: " + ", ".join(Q_TYPES) + "; select/multi_select need options). Full name, email and phone are always there already. "
         "Set it up right away with 3-5 questions that fit exactly what this form is for (pick-one questions with clear answers where it helps), plus `ideas`: 4-6 MORE fitting questions they can tap in - think about the situation (who fills it in and what the agent needs to know next). "
-        "The card itself lets them take questions off, tap ideas and common ones in and type their own, plus the moving-background switch and their listings to link (don't ask about any of those in chat). Send questions and ideas as real lists, never as text. Pass listing_key only if they named the home.",
+        "The card itself lets them take questions off, tap ideas and common ones in and type their own, plus the moving-background switch and their listings to link (don't ask about any of those in chat). Send questions and ideas as real lists, never as text. Pass listing_key only if they named the home. "
+        "The card has a flip-through preview numbered like the real form (Q1-Q3 = name, email, phone; their questions start at Q4). When they ask to change a question or its "
+        "options while the card is still waiting, call create_form again with the same title and the FULL updated list from the app note - that card replaces the old one. "
+        "In chat, never number the questions your own way (no “question 1” for their first one) - say what they're about.",
         _obj({"title": {"type": "string"}, "questions": {"type": "array", "items": {"type": "object", "properties": {
             "label": {"type": "string"}, "type": {"type": "string", "enum": list(Q_TYPES)}, "options": {"type": "array", "items": {"type": "string"}}, "required": {"type": "boolean"}}}},
             "ideas": {"type": "array", "items": {"type": "object", "properties": {
@@ -1403,7 +1452,8 @@ def _adjust_invite(user, payload: dict, picks: dict) -> dict:
 register({"name": "create_invite", "description": (
     "Make an event invite with RSVP (open house, broker's open, client event, other). Set it up as soon as they ask - the card itself asks, as taps with a live preview, "
     "the kind, which of their listings, the date, the times, the design and the color (Luxe on IDX) - so never ask those in chat; pass only what they already said "
-    "(kind, title, date YYYY-MM-DD, times HH:MM, message). place_name is a venue's NAME (a club, a restaurant) - never the street address; "
+    "(kind, title, date YYYY-MM-DD, times HH:MM, message). Keep the title short and catchy - under about 40 characters ('Holiday Cookie Swap', "
+    "not the whole description; details go in message) - a long one is cut off on the invite card. place_name is a venue's NAME (a club, a restaurant) - never the street address; "
     "for a client event away from their listings ask where in one short question. Never sends it."),
     "input_schema": _obj({"kind": {"type": "string", "enum": list(INVITE_TYPES)}, "title": {"type": "string"}, "date": {"type": "string"}, "start_time": {"type": "string"}, "end_time": {"type": "string"},
                           "place_name": {"type": "string"}, "address": {"type": "string"}, "message": {"type": "string"}, "design": {"type": "string", "enum": list(INVITE_DESIGNS)}})},
@@ -1753,7 +1803,8 @@ async def _p_design(db, user, a):
         color = "light"
     # "Open House" + "Open House Flyer" reads "Open House Flyer", not "Open House Open House Flyer" (owner's test, 11/01)
     kind = DESIGN_FORMATS[fmt] if DESIGN_FORMATS[fmt].lower().startswith(label.lower()) else f"{label} {DESIGN_FORMATS[fmt]}"
-    lines = [kind, f"Look: {DESIGN_LAYOUTS.get(layout, 'the recommended layout')}, {DESIGN_COLORS[color]} colors"]
+    cname = DESIGN_COLORS[color]
+    lines = [kind, f"Look: {DESIGN_LAYOUTS.get(layout, 'the recommended layout')}, {cname if cname.endswith('colors') else cname + ' colors'}"]
     payload = {"situation": sit, "format": fmt, "layout": layout, "colors": color}
     if rule:
         key = _need_id(a, "listing_key")
@@ -1799,7 +1850,10 @@ async def _p_design(db, user, a):
                 payload["end_time"] = _time_ok(e_)
             lines.append(f"Open house: {_nice_date(d)}" + (f", {_nice_time(payload['start_time'])}" if payload.get("start_time") else "") + (f"-{_nice_time(payload['end_time'])}" if payload.get("end_time") else ""))
     elif _s(a.get("headline")):
-        payload["headline"] = _s(a["headline"])[:90]; lines.append(f"Headline: “{payload['headline']}”")
+        # whole words only - a cut at 90 characters printed "...no-pressure estim" on the design (11/02)
+        h = _s(a["headline"])
+        payload["headline"] = h if len(h) <= 90 else h[:90].rsplit(" ", 1)[0].rstrip(",.;:-")
+        lines.append(f"Headline: “{payload['headline']}”")
     lines.append("Made in your Studio - you'll see it here with a Download button, and can still edit it")
     return Prepared(f"Make {'an' if kind[:1].lower() in 'aeiou' else 'a'} {kind}", lines, payload, confirm_label="Make it")
 
@@ -1808,7 +1862,7 @@ register({"name": "create_design", "description": (
     "situation: " + ", ".join(DESIGN_SITUATIONS) + ". format must be one the situation offers: "
     + "; ".join(f"{k}: {', '.join(v[2])}" for k, v in DESIGN_SITUATIONS.items())
     + ". just_listed/coming_soon/price_improvement/under_contract need one of the agent's own listings (listing_key); just_sold a sale they had; open_house their listing or one they're approved to host (+ optional date/time). "
-    "The others (home_valuation, make_me_sell, find_your_dream_home, social_ad) need no home - optional headline. layout: keepsake, billboard, slant, postage, filmstrip, luxe (IDX). colors: light (Ivory), stone, dark (Charcoal), forest, brand, luxe (IDX). "
+    "The others (home_valuation, make_me_sell, find_your_dream_home, social_ad) need no home - optional headline (short and punchy, under about 60 characters - it's printed big). layout: keepsake, billboard, slant, postage, filmstrip, luxe (IDX). colors: light (Ivory), stone, dark (Charcoal), forest, brand, luxe (IDX). "
     "The card itself lets the agent pick the layout and colors before tapping Make it - don't ask about the look first; pass layout/colors only when they named one. "
     "The card also lists their other listings (or sales) to switch to. When they say it's a different / another listing, never offer the same home again: use the one they name, or list their listings and ask which. "
     "Use the listing_key from their listings/sales list in your instructions - never a search result for a look-alike address."),

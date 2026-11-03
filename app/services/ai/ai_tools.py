@@ -176,6 +176,7 @@ def _lead_summary(lo) -> dict:
         "last_event_summary": lo.last_event_summary,
         "last_event_at": lo.last_event_at.isoformat() if lo.last_event_at else None,
         "last_contacted_at": lo.last_contacted_at.isoformat() if lo.last_contacted_at else None,
+        "added_at": lo.created_at.isoformat() if lo.created_at else None,
         "needs_attention": lo.needs_attention,
         "showcase_new_matches": lo.showcase_new_matches,
         "has_liked_property": lo.has_liked_property,
@@ -202,6 +203,13 @@ async def _search_leads(db: AsyncSession, current_user: User, args: dict, config
         return (lo.represented == 'yes', not lo.needs_attention, -(last.timestamp() if last else 0))
 
     leads_out.sort(key=sort_key)
+    # "New leads this week" / "how many came in this month": only the ones added lately, newest
+    # first, with the true count (the helper couldn't count them before - 11/02)
+    days = args.get("added_within_days")
+    if isinstance(days, (int, float)) and days > 0:
+        from datetime import datetime, timedelta, timezone
+        since = datetime.now(timezone.utc) - timedelta(days=min(float(days), 366))
+        leads_out = sorted((lo for lo in leads_out if lo.created_at and lo.created_at >= since), key=lambda lo: lo.created_at, reverse=True)
     shown = leads_out[:limit]
     return {"results": [_lead_summary(lo) for lo in shown], "count": len(leads_out), "shown": len(shown)}
 
@@ -681,6 +689,8 @@ TOOL_DEFINITIONS = [
                 "status": {"type": "string", "enum": ["new", "contacted", "in_talks", "signed", "all"]},
                 "represented": {"type": "string", "enum": ["yes", "no", "unknown", "all"]},
                 "search": {"type": "string", "description": "Free-text search over name/email/phone."},
+                "added_within_days": {"type": "integer", "description": "Only leads added in the last N days, newest first, with their true count - "
+                                      "'new leads this week' = 7, 'today' = 1, 'this month' = 30. count is the real total even when fewer are shown."},
                 "limit": {"type": "integer"},
             },
         },

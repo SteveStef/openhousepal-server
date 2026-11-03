@@ -16,6 +16,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import anthropic
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +30,49 @@ from app.services.ai.ai_prompt_service import SYSTEM_PROMPT
 logger = get_logger(__name__)
 
 _client: Optional[anthropic.AsyncAnthropic] = None
+
+
+_ET = ZoneInfo("America/New_York")
+_UTC_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|\+00:00)$")
+
+
+def _now_et() -> datetime:
+    """The agent's wall clock - every Bright MLS agent is on Eastern time."""
+    return datetime.now(_ET)
+
+
+def _ago(then: datetime, now: datetime) -> str:
+    s = (now - then).total_seconds()
+    if s < 0:
+        return "from now" if s < -3600 else "just now"
+    if s < 3600:
+        return f"{max(1, int(s // 60))} min ago"
+    if s < 86400:
+        h = int(s // 3600)
+        return f"{h} hour{'s' if h > 1 else ''} ago"
+    d = int(s // 86400)
+    return f"{d} day{'s' if d > 1 else ''} ago"
+
+
+def _eastern_times(v: Any, now: Optional[datetime] = None) -> Any:
+    """Every UTC timestamp in a lookup result as the agent's own clock, with how long ago - the model
+    did the conversion itself and told an agent a like from 9:50 PM was "2:50 AM UTC, about 15 hours
+    ago" (11/02)."""
+    now = now or _now_et()
+    if isinstance(v, dict):
+        return {k: _eastern_times(x, now) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_eastern_times(x, now) for x in v]
+    if isinstance(v, datetime) and v.tzinfo is not None:
+        t = v.astimezone(_ET)
+    elif isinstance(v, str) and _UTC_STAMP.match(v):
+        try:
+            t = datetime.fromisoformat(v.replace("Z", "+00:00")).astimezone(_ET)
+        except ValueError:
+            return v
+    else:
+        return v
+    return f"{t:%a %b} {t.day} {t.year}, {t:%I:%M %p}".replace(" 0", " ") + f" ({_ago(t, now)})"
 
 
 def _get_client() -> anthropic.AsyncAnthropic:
@@ -203,7 +247,12 @@ async def run_turn(
         # morning or a week ago, and will guess - see ai_prompt_service.py's recency guidance.
         now_block = {
             "type": "text",
-            "text": f"Current date and time: {datetime.now(timezone.utc):%A, %B %d, %Y %I:%M %p} UTC.\n"
+            # Eastern, the agent's own clock (every Bright MLS agent is on it) - in UTC the helper told
+            # an agent at 9:50 PM Monday that it was Tuesday, and read a like from 9:50 PM as "2:50" (11/02).
+            "text": f"Current date and time for the agent: {_now_et():%A, %B %d, %Y %I:%M %p} Eastern time (UTC{_now_et():%z}). "
+                    "Times in lookup results are already on their clock with how long ago (“Mon Nov 2 2026, 9:50 PM (2 hours ago)”) - use them as they are; "
+                    "any left ending in Z or +00:00 are UTC - convert those. Just say the time (“at 9:50 PM”, “earlier tonight”, “yesterday” - today's evening is “tonight”, never “last night”); "
+                    "never write “UTC” or “Eastern”, and never open an answer by stating today's date or what “this week” covers.\n"
                     # Their plan, so how-to answers never offer something it doesn't include (10/30).
                     f"This agent is on the {PLAN_NAMES.get(current_user.plan_tier, current_user.plan_tier)} plan"
                     f"{'' if current_user.broker_authorized else ' and their broker has NOT approved them yet (Broker Authorization in the top menu) - MLS features stay locked until then'}. "
@@ -339,11 +388,14 @@ async def run_turn(
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result, default=str),
+                    "content": json.dumps(_eastern_times(result), default=str),
                 })
 
             if only_ui:
-                return said
+                said = _no_narration(said)
+                if said:
+                    return said
+                # it only narrated the cards ("I'll show them as cards") - one more call writes the real line
             messages.append({"role": "user", "content": tool_results})
 
         return "I wasn't able to finish researching that within my turn budget. Try asking a more specific question, or split it into smaller questions."
@@ -412,5 +464,15 @@ def _no_pretend_cards(text: str, refs: List[dict]) -> str:
     import re
     # (A "the card didn't come through" add-on used to follow any "tap Confirm" with no card - it fired on
     # replies that were only asking a question first, owner 10/31, so it's gone; the prompt rule covers it.)
-    cleaned = re.sub(r"\n?\[Card:[^\]]*\]", "", text or "").strip()
+    cleaned = _no_narration(re.sub(r"\n?\[Card:[^\]]*\]", "", text or "").strip())
     return cleaned or text
+
+
+# A sentence about how the chat works rather than the answer ("The sales list is already in my context,
+# so I'll show those as cards" - 11/02). Agents never need to hear it.
+_NARRATION = re.compile(r"[^.!?\n]*\b(?:in my context|my context|as (?:home |small )?cards|show (?:them|those|these) (?:as|in) cards|"
+                        r"I can show them|I'll show (?:them|those|these)\b)[^.!?\n]*[.!?]?[ \t]*", re.I)
+
+
+def _no_narration(text: str) -> str:
+    return re.sub(r"\n{3,}", "\n\n", _NARRATION.sub("", text or "")).strip()

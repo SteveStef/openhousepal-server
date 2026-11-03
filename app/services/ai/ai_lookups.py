@@ -128,7 +128,13 @@ _route("list_my_spotlights", "The agent's Listing Spotlights (single-listing web
 _route("get_spotlight_stats", "Visitors, views and leads for the agent's Listing Spotlights (totals and per Spotlight).", "/studio/property-sites/analytics", plans=IDX)
 _route("list_my_designs", "The agent's Studio designs (flyers, social posts, postcards...) newest first, with type, situation and status.", "/studio/designs/me", plans=STUDIO, max_list=20)
 _route("list_my_forms", "The agent's forms (Forms & Invites) with ids and response counts.", "/agent-hub/forms/me", max_list=25)
-_route("get_form_stats", "Form totals: views, responses, unread responses.", "/agent-hub/forms/stats/summary")
+_route("get_form_stats", "Form totals across ALL their forms: views, responses, unread responses. For one form use get_one_form_stats.", "/agent-hub/forms/stats/summary")
+# One form's own numbers - "how many people opened my buyer form" (the helper could only give the
+# all-forms total, 11/02). Same per-form stats as the Forms page (views, starts, finished, drop-off).
+_route("get_one_form_stats", "One form's own stats (form_id from list_my_forms): views, starts, finished, completion and where people stopped, "
+       "over days = 7, 30, 90 or 0 (all time, the default here).", "/agent-hub/forms/{form_id}/stats",
+       schema=_obj({"form_id": {"type": "string"}, "days": {"type": "integer", "enum": [7, 30, 90, 0]}}, ["form_id"]),
+       ids=("form_id",), query=lambda a: {"days": a.get("days") if a.get("days") in (7, 30, 90, 0) else 0})
 _route("list_my_invites", "The agent's event invites (open house, broker's open, client events) with RSVP counts.", "/invites", max_list=20)
 _route("list_my_blogs", "The agent's blog posts with status (draft, scheduled, published).", "/studio/blogs/me", plans=STUDIO, max_list=20)
 _route("get_branding", "The agent's Branding (brand kit): colors, fonts, Classic/Luxe look, logos on file.", "/studio/brand-kit")
