@@ -531,7 +531,8 @@ async def _get_cma_summary(db: AsyncSession, current_user: User, args: dict, con
 async def _get_agent_activity_summary(db: AsyncSession, current_user: User, args: dict, config: dict) -> dict:
     limit = _clamp_limit(config, "list_recent_activity", args.get("limit"))
 
-    stats = await stats_service.get_summary(db, current_user.id)
+    # the cards' 30-day trend lines are for the screen, not the model (300 numbers of tokens)
+    stats = {k: {kk: vv for kk, vv in v.items() if kk != "spark"} for k, v in (await stats_service.get_summary(db, current_user.id)).items()}
 
     stmt = (
         select(LeadEvent, Lead.name)

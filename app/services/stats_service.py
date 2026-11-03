@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Literal
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import AgentHubEvent, BlogEvent, FormSubmission, FormViewSession, Lead, OpenHouseEvent, OpenHouseVisitor, OpenHouseSignInView
@@ -27,10 +27,18 @@ def local_day(ts: datetime) -> date:
 _EVENT_TYPES_BY_UNIQUE_METRIC = {"agent_hub_visits": ("visit",), "agent_hub_interactions": ("interaction", "save_contact")}
 
 
+def _hub_visit_filter():
+    # Opening the hub from its QR code logs a "qr_scan" instead of a "visit" - that person is still a
+    # visitor (11/03: they were left out, so "Interacted" could top "Visitors"). Only the hub page's
+    # scans carry a visitor_id; a form page's QR scan has none and isn't a hub visit.
+    return or_(AgentHubEvent.event_type == "visit", and_(AgentHubEvent.event_type == "qr_scan", AgentHubEvent.visitor_id.is_not(None)))
+
+
 async def _visitor_rows_for_metric(db: AsyncSession, owner_id: str, metric: Metric, since: datetime, until: datetime) -> List[tuple]:
     """(created_at, visitor_id) rows backing the unique-visitor metrics."""
+    kind = _hub_visit_filter() if metric == "agent_hub_visits" else AgentHubEvent.event_type.in_(_EVENT_TYPES_BY_UNIQUE_METRIC[metric])
     stmt = select(AgentHubEvent.created_at, AgentHubEvent.visitor_id).where(
-        AgentHubEvent.owner_id == owner_id, AgentHubEvent.event_type.in_(_EVENT_TYPES_BY_UNIQUE_METRIC[metric]),
+        AgentHubEvent.owner_id == owner_id, kind,
         AgentHubEvent.created_at >= since, AgentHubEvent.created_at <= until,
     )
     result = await db.execute(stmt)
@@ -40,7 +48,7 @@ async def _visitor_rows_for_metric(db: AsyncSession, owner_id: str, metric: Metr
 async def _timestamps_for_metric(db: AsyncSession, owner_id: str, metric: Metric, since: datetime, until: datetime) -> List[datetime]:
     if metric == "agent_hub_visits":
         stmt = select(AgentHubEvent.created_at).where(
-            AgentHubEvent.owner_id == owner_id, AgentHubEvent.event_type == "visit",
+            AgentHubEvent.owner_id == owner_id, _hub_visit_filter(),
             AgentHubEvent.created_at >= since, AgentHubEvent.created_at <= until,
         )
     elif metric == "agent_hub_interactions":
@@ -137,21 +145,21 @@ def _percent_change(current: int, previous: int) -> int:
 
 async def get_summary(db: AsyncSession, owner_id: str) -> Dict[str, Dict[str, int]]:
     now = datetime.now(timezone.utc)
-    current_start = now - timedelta(days=30)
-    previous_start = now - timedelta(days=60)
+    # The last 30 Eastern calendar days (today included) vs the 30 before - the same days the stat
+    # pop-up's 30D shows, so the card and the pop-up always agree (11/03: a rolling 30x24h window
+    # pulled part of a 31st day into the card). Daily sums, the way the pop-up's bars add up, so a
+    # hub visitor counts once a day there and here.
+    today = local_day(now)
+    spark_days = [today - timedelta(days=29 - i) for i in range(30)]
+    previous_start, _ = day_bounds(today - timedelta(days=59), today)
 
     summary: Dict[str, Dict[str, int]] = {}
     for metric in METRICS:
-        if metric in UNIQUE_VISITOR_METRICS:
-            rows = await _visitor_rows_for_metric(db, owner_id, metric, previous_start, now)
-            current_visitors = {visitor_id or created_at.isoformat() for created_at, visitor_id in rows if created_at >= current_start}
-            previous_visitors = {visitor_id or created_at.isoformat() for created_at, visitor_id in rows if previous_start <= created_at < current_start}
-            current, previous = len(current_visitors), len(previous_visitors)
-        else:
-            timestamps = await _timestamps_for_metric(db, owner_id, metric, previous_start, now)
-            current = sum(1 for ts in timestamps if ts >= current_start)
-            previous = sum(1 for ts in timestamps if previous_start <= ts < current_start)
-        summary[metric] = {"current": current, "previous": previous, "percent": _percent_change(current, previous)}
+        counts = await get_daily_counts(db, owner_id, metric, previous_start, now)
+        current = sum(n for d, n in counts.items() if d >= spark_days[0])
+        previous = sum(n for d, n in counts.items() if d < spark_days[0])
+        spark = [counts.get(d, 0) for d in spark_days]
+        summary[metric] = {"current": current, "previous": previous, "percent": _percent_change(current, previous), "spark": spark}
 
     views_current = summary["form_views"]["current"]
     views_previous = summary["form_views"]["previous"]
@@ -183,3 +191,97 @@ async def get_summary(db: AsyncSession, owner_id: str) -> Dict[str, Dict[str, in
     }
 
     return summary
+
+
+# ---------------------------------------------------------------- what it was (11/03 stats rework)
+# Under a stat's chart: which form, which post, which open house, where new leads came from - the
+# thing an agent wants to know right after "how many". Agent Hub visits/taps and QR scans aren't
+# recorded with what was tapped, so they have none (their pop-up shows the share of visitors instead).
+_LEAD_ORIGIN_LABELS = {"open_house": "Open houses", "forms": "Forms & invites", "showcase": "Showcases", "listings": "Listing pages",
+                       "website": "Your website", "portal": "Portals", "review": "Reviews", "other": "Other"}
+BREAKDOWN_TITLES = {"form_views": "Forms people opened", "form_fills": "Forms people filled in", "form_completion": "Finish rate by form",
+                    "blog_reads": "Most-read posts", "open_house_signins": "Sign-ins by open house",
+                    "open_house_unrepresented": "Guests without an agent, by open house", "open_house_signin_views": "Sign-in page views by open house",
+                    "open_house_signin_completion": "Sign-in rate by open house", "new_leads": "Where new leads came from"}
+
+
+def day_bounds(start: date, end: date) -> tuple[datetime, datetime]:
+    """Eastern calendar days [start, end] as UTC datetimes."""
+    from datetime import time as _t
+    return (datetime.combine(start, _t.min, EASTERN).astimezone(timezone.utc),
+            datetime.combine(end + timedelta(days=1), _t.min, EASTERN).astimezone(timezone.utc))
+
+
+def _tidy(s) -> str:
+    s = " ".join(str(s or "").split())
+    return s.title() if s.isupper() else s
+
+
+async def get_breakdown(db: AsyncSession, owner_id: str, metric: str, start: date, end: date, limit: int = 6) -> dict:
+    from sqlalchemy import func
+    from app.models.database import AgentForm, Blog, LeadEvent
+    since, until = day_bounds(start, end)
+    rows: List[tuple] = []
+    rate = {}
+    if metric in ("form_views", "form_fills", "form_completion"):
+        views = dict((await db.execute(
+            select(AgentForm.title, func.count()).select_from(FormViewSession).join(AgentForm, AgentForm.id == FormViewSession.form_id)
+            .where(FormViewSession.owner_id == owner_id, FormViewSession.created_at >= since, FormViewSession.created_at < until)
+            .group_by(AgentForm.title))).all())
+        fills = dict((await db.execute(
+            select(AgentForm.title, func.count()).select_from(FormSubmission).join(AgentForm, AgentForm.id == FormSubmission.form_id)
+            .where(FormSubmission.owner_id == owner_id, FormSubmission.created_at >= since, FormSubmission.created_at < until)
+            .group_by(AgentForm.title))).all())
+        if metric == "form_views":
+            rows = list(views.items())
+        elif metric == "form_fills":
+            rows = list(fills.items())
+        else:
+            rows = [(t, min(round(fills.get(t, 0) / v * 100), 100)) for t, v in views.items() if v]
+            rate = {t: (fills.get(t, 0), v) for t, v in views.items() if v}
+    elif metric == "blog_reads":
+        rows = (await db.execute(
+            select(Blog.title, func.count()).select_from(BlogEvent).join(Blog, Blog.id == BlogEvent.blog_id)
+            .where(BlogEvent.owner_id == owner_id, BlogEvent.event_type == "view", BlogEvent.created_at >= since, BlogEvent.created_at < until)
+            .group_by(Blog.title))).all()
+    elif metric in ("open_house_signins", "open_house_unrepresented", "open_house_signin_views", "open_house_signin_completion"):
+        def visitors(unrep: bool = False):
+            q = (select(OpenHouseEvent.address, func.count()).select_from(OpenHouseVisitor).join(OpenHouseEvent, OpenHouseVisitor.open_house_event_id == OpenHouseEvent.id)
+                 .where(OpenHouseEvent.agent_id == owner_id, OpenHouseVisitor.created_at >= since, OpenHouseVisitor.created_at < until))
+            if unrep:
+                q = q.where(OpenHouseVisitor.has_agent == "NO")
+            return q.group_by(OpenHouseEvent.address)
+        page_views = (select(OpenHouseEvent.address, func.count()).select_from(OpenHouseSignInView).join(OpenHouseEvent, OpenHouseSignInView.open_house_event_id == OpenHouseEvent.id)
+                      .where(OpenHouseEvent.agent_id == owner_id, OpenHouseSignInView.created_at >= since, OpenHouseSignInView.created_at < until)
+                      .group_by(OpenHouseEvent.address))
+        if metric == "open_house_signin_views":
+            rows = (await db.execute(page_views)).all()
+        elif metric == "open_house_signin_completion":
+            v, s = dict((await db.execute(page_views)).all()), dict((await db.execute(visitors())).all())
+            rows = [(a, min(round(s.get(a, 0) / n * 100), 100)) for a, n in v.items() if n]
+            rate = {a: (s.get(a, 0), n) for a, n in v.items() if n}
+        else:
+            rows = (await db.execute(visitors(metric == "open_house_unrepresented"))).all()
+    elif metric == "new_leads":
+        from app.api.lead_routes import _origin_group
+        leads = (await db.execute(select(Lead.id).where(Lead.owner_id == owner_id, Lead.created_at >= since, Lead.created_at < until))).scalars().all()
+        groups: Dict[str, int] = defaultdict(int)
+        if leads:
+            evs = (await db.execute(select(LeadEvent).where(LeadEvent.lead_id.in_(leads)).order_by(LeadEvent.lead_id, LeadEvent.occurred_at))).scalars().all()
+            first: Dict[str, LeadEvent] = {}
+            for e in evs:
+                first.setdefault(e.lead_id, e)
+            for lid in leads:
+                groups[_LEAD_ORIGIN_LABELS.get(_origin_group(first[lid]) if lid in first else "other", "Other")] += 1
+        rows = list(groups.items())
+    else:
+        return {"title": None, "items": []}
+    rate = {(_tidy(k) or "Untitled"): v for k, v in rate.items()}
+    merged: Dict[str, int] = defaultdict(int)
+    for label, n in rows:
+        merged[_tidy(label) or "Untitled"] += int(n or 0)
+    items = sorted(({"label": k, "count": v, **({"num": rate[k][0], "den": rate[k][1]} if k in rate else {})} for k, v in merged.items() if v or rate),
+                   key=lambda i: (-(i.get("den") or i["count"]), i["label"]))
+    if metric in ("form_completion", "open_house_signin_completion"):
+        items = [{**i, "num": rate.get(i["label"], (0, 0))[0], "den": rate.get(i["label"], (0, 0))[1]} for i in items]
+    return {"title": BREAKDOWN_TITLES.get(metric), "items": items[:limit], "more": max(0, len(items) - limit)}

@@ -6,7 +6,7 @@ agent sees it on the bell and the Activity page without a second notification pi
 from datetime import datetime, timezone
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -115,6 +115,7 @@ async def get_ticket(
 async def reply_to_ticket(
     ticket_id: str,
     payload: MessageCreate,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     admin: UserModel = Depends(require_admin_user),
 ):
@@ -143,6 +144,9 @@ async def reply_to_ticket(
         ))
 
         await db.commit()
+        # Answered - its "check this ticket" reminder is done and leaves the owner's calendar (11/03)
+        from app.services import support_followup_service
+        background.add_task(support_followup_service.complete_ticket_followup, ticket_id)
         from app.services.agent_email_service import absolute, email_agent
         email_agent(await db.get(UserModel, ticket.agent_id), "SUPPORT_TICKET_REPLY", "support_ticket_reply", f"Re: [{label}] {ticket.subject}",
                     {"ticket_subject": f"{label}: {ticket.subject}", "ticket_category": label, "reply_body": payload.body, "link": absolute(f"/settings/help?ticket={ticket.id}")})
@@ -159,6 +163,7 @@ async def reply_to_ticket(
 async def update_ticket_status(
     ticket_id: str,
     payload: TicketStatusUpdate,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     admin: UserModel = Depends(require_admin_user),
 ):
@@ -168,6 +173,9 @@ async def update_ticket_status(
         ticket = await _get_any_ticket(db, ticket_id)
         ticket.status = payload.status
         await db.commit()
+        if payload.status == 'closed':
+            from app.services import support_followup_service
+            background.add_task(support_followup_service.complete_ticket_followup, ticket_id)
         return await _get_any_ticket(db, ticket_id)
     except HTTPException:
         raise

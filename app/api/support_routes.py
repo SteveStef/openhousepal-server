@@ -15,7 +15,7 @@ message - all shown to the admin beside the thread.
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy import select, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -26,7 +26,7 @@ from app.schemas.support import (
     TicketCreate, MessageCreate, TicketDetail, TicketListItem, TicketUnreadCountResponse,
     TicketStatusUpdate, ScreenshotUploadResponse,
 )
-from app.services import s3_service
+from app.services import s3_service, support_followup_service
 from app.utils.image_validation import photo_to_jpeg
 from app.utils.auth import get_current_active_user
 from app.config.logging import get_logger
@@ -91,10 +91,12 @@ def _is_unread_for_agent(ticket: SupportTicket) -> bool:
 @router.post("/tickets", response_model=TicketDetail, status_code=status.HTTP_201_CREATED)
 async def create_ticket(
     payload: TicketCreate,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: UserModel = Depends(get_current_active_user),
 ):
     subject, body = payload.subject.strip(), payload.message.strip()
+    who = support_followup_service.agent_bits(current_user)
     if not subject or not body:
         raise HTTPException(status_code=422, detail="Please add a title and a message.")
     try:
@@ -113,6 +115,8 @@ async def create_ticket(
         ticket.agent_last_read_at = datetime.now(timezone.utc)
 
         await db.commit()
+        # On the owner's calendar tomorrow, like a follow-up (owner, 11/03)
+        background.add_task(support_followup_service.add_ticket_followup, ticket.id, subject, body, **who, category=payload.category)
 
         result = await db.execute(
             select(SupportTicket).options(selectinload(SupportTicket.messages)).where(SupportTicket.id == ticket.id)
@@ -226,9 +230,11 @@ async def get_ticket(
 async def reply_to_ticket(
     ticket_id: str,
     payload: MessageCreate,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: UserModel = Depends(get_current_active_user),
 ):
+    who = support_followup_service.agent_bits(current_user)
     try:
         ticket = await _get_owned_ticket(db, ticket_id, current_user.id)
 
@@ -239,8 +245,12 @@ async def reply_to_ticket(
         ticket.status = 'open'
         ticket.updated_at = now
         ticket.agent_last_read_at = now
+        subject, category = ticket.subject, ticket.category
 
         await db.commit()
+        # They wrote again - back on the owner's calendar tomorrow unless a reminder is still waiting
+        background.add_task(support_followup_service.add_ticket_followup, ticket_id, subject, payload.body, **who,
+                            category=category, reply_id=message.id)
         return await _get_owned_ticket(db, ticket_id, current_user.id)
     except HTTPException:
         raise
