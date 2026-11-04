@@ -362,18 +362,25 @@ async def _p_edit_task(db, user, a):
         lines.append(f"Move to {_nice_date(due)}" + ("" if body["all_day"] else f" at {_nice_time(due[11:16])}"))
     if _s(a.get("title")):
         body["title"] = _s(a["title"])[:200]; lines.append(f"New title: {body['title']}")
-    if _s(a.get("notes")):
-        body["notes"] = _s(a["notes"]); lines.append(f"Notes: {body['notes'][:200]}")
-    if not body:
+    # A note is added below what's there, as it is when they tap - never a replacement (11/03: it
+    # wiped the follow-up's earlier notes).
+    add_note = _s(a.get("notes"))
+    if add_note:
+        lines.append(f"Add to its notes: {add_note[:200]}" if _s(t.notes) else f"Notes: {add_note[:200]}")
+    if not body and not add_note:
         raise ActionError("What should change on that follow-up?")
-    return Prepared(f"Change “{t.title}”", lines, {"task_id": t.id, "body": body})
+    return Prepared(f"Change “{t.title}”", lines, {"task_id": t.id, "body": body, **({"add_note": add_note} if add_note else {})})
 
 
 async def _r_edit_task(db, user, p):
-    await _run_route(user, "PATCH", f"/tasks/{p['task_id']}", p["body"])
+    body = dict(p["body"])
+    if p.get("add_note"):
+        t = await _task(db, user, p)
+        body["notes"] = f"{t.notes.rstrip()}\n{p['add_note']}" if _s(t.notes) else p["add_note"]
+    await _run_route(user, "PATCH", f"/tasks/{p['task_id']}", body)
     return {"message": "Saved.", "link": f"/leads/tasks?task={p['task_id']}"}
 
-_simple("update_followup", "Check off, reopen, reschedule or rename one follow-up. Use task ids from list_followups.",
+_simple("update_followup", "Check off, reopen, reschedule or rename one follow-up, or add to its notes (`notes` is added below what is there - never send the old notes back). Use task ids from list_followups.",
         _obj({"task_id": {"type": "string"}, "done": {"type": "boolean"}, "due_date": {"type": "string"}, "due_time": {"type": "string"},
               "title": {"type": "string"}, "notes": {"type": "string"}}, ["task_id"]), _p_edit_task, _r_edit_task)
 
@@ -682,12 +689,18 @@ async def _p_oh_note(db, user, a):
     text = _s(a.get("text"))
     if not text:
         raise ActionError("What should the note say?")
-    new = f"{oh.notes.rstrip()}\n{text}" if _s(oh.notes) else text
-    return Prepared(f"Add to your note on {_oh_name(oh)}", [f"“{text[:400]}”", "Added below what's already there"], {"open_house_id": oh.id, "notes": new})
+    # Just the new line - it's added to the note as it is when they tap (11/03: the whole note saved
+    # here wiped anything typed on the Open Houses page while the card waited).
+    return Prepared(f"Add to your note on {_oh_name(oh)}", [f"“{text[:400]}”", "Added below what's already there"], {"open_house_id": oh.id, "text": text})
 
 
 async def _r_oh_note(db, user, p):
-    await _run_route(user, "PUT", f"/api/open-houses/{p['open_house_id']}/note", {"notes": p["notes"]})
+    if "text" in p:
+        oh = await _oh(db, user, p)
+        notes = f"{oh.notes.rstrip()}\n{p['text']}" if _s(oh.notes) else p["text"]
+    else:
+        notes = p["notes"]  # a card made before 11/03
+    await _run_route(user, "PUT", f"/api/open-houses/{p['open_house_id']}/note", {"notes": notes})
     return {"message": "Note saved.", "link": "/open-houses"}
 
 _simple("add_open_house_note", "Add a line to the agent's private note on an open house (lockbox, turnout, feedback). Keeps what's there.",

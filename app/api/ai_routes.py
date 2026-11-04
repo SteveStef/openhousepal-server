@@ -242,6 +242,33 @@ async def save_ai_action_draft(
     return {"saved": True}
 
 
+@router.post("/actions/{action_id}/revise-form")
+async def revise_ai_form_card(
+    action_id: str,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_ai_helper_user),
+):
+    """A form card's own "What should change or be added?" line (owner, 11/03): changes the card's
+    questions right where they are - no new card under it. Saved on the card like its taps."""
+    from app.services.ai import ai_actions, ai_copywrite_service
+    try:
+        msg, entry = await ai_actions._owned_entry(db, current_user, str(payload.get("message_id") or ""), action_id)
+    except ai_actions.ActionError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if entry.get("tool") != "create_form" or entry.get("status") != "pending":
+        raise HTTPException(status_code=400, detail="This card is finished - ask me in the chat instead.")
+    picks = payload.get("picks") if isinstance(payload.get("picks"), dict) else dict(entry.get("draft_picks") or {})
+    questions = [q for q in (picks.get("questions") or (entry.get("payload") or {}).get("questions") or []) if isinstance(q, dict)]
+    at = payload.get("at") if isinstance(payload.get("at"), int) else None
+    out = await ai_copywrite_service.revise_form_questions(
+        db, current_user.id, current_user.plan_tier, title=str((entry.get("payload") or {}).get("title") or "Form"),
+        questions=questions, at=at, instruction=str(payload.get("instruction") or ""))
+    msg, entry = await ai_actions._owned_entry(db, current_user, str(payload.get("message_id") or ""), action_id)
+    await ai_actions._save(db, msg, entry, draft_picks={**picks, "questions": out["questions"]})
+    return out
+
+
 @router.post("/actions/{action_id}/client-result")
 async def client_ai_action_result(
     action_id: str,

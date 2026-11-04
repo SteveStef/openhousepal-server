@@ -165,8 +165,41 @@ async def propose(db: AsyncSession, user: User, name: str, args: dict) -> tuple[
         "payload": p.payload, "status": "pending", "client_action": a.client,
         "expires_at": (datetime.now(timezone.utc) + timedelta(hours=PENDING_HOURS)).isoformat(),
     }
+    try:
+        before = await _field_snapshot(db, user, p.payload or {})
+        if before:
+            entry["before"] = before
+    except Exception:  # noqa: BLE001 - the check is a safety net, never a reason to fail the card
+        logger.warning("card snapshot failed", exc_info=True)
     return {"status": "waiting_for_agent_to_confirm", "card_title": p.title, "card_details": p.details, "card_button": p.confirm_label,
             "warning": p.warning}, entry
+
+
+# A card that changes fields on one of their things notes those fields' values when it's made. If
+# they change one of them somewhere else (its own page) before tapping, the card stops instead of
+# putting back what it planned (owner, 11/03: "don't ruin a finished version" after seeing the
+# chat's older card). Only the fields the card changes are compared - a new guest or a like on the
+# same lead/Showcase doesn't count.
+def _target_models():
+    from app.models.database import AgentForm, AgentTask, Collection, Lead, OpenHouseEvent
+    return {"lead_id": Lead, "task_id": AgentTask, "collection_id": Collection, "open_house_id": OpenHouseEvent, "form_id": AgentForm}
+
+
+async def _field_snapshot(db: AsyncSession, user: User, payload: dict, fields: Optional[List[str]] = None) -> Optional[dict]:
+    body = payload.get("body") if isinstance(payload.get("body"), dict) else None
+    if not body:
+        return None
+    key, model = next(((k, m) for k, m in _target_models().items() if payload.get(k)), (None, None))
+    row = await db.get(model, payload[key]) if model else user
+    if row is None:
+        return None
+    cols = set(row.__table__.columns.keys())
+    names = fields if fields is not None else [f for f in body if f in cols and f not in {"id", "owner_id", "agent_id", "user_id"}]
+    snap = {}
+    for f in names:
+        v = getattr(row, f, None)
+        snap[f] = v if v is None or isinstance(v, (str, int, float, bool, list, dict)) else str(v)
+    return {"key": key, "fields": snap} if snap else None
 
 
 async def _owned_entry(db: AsyncSession, user: User, message_id: str, action_id: str, lock: bool = False):
@@ -203,6 +236,15 @@ async def confirm(db: AsyncSession, user: User, message_id: str, action_id: str,
     a = ACTIONS.get(entry["tool"])
     if not a or not _allowed(user, a):
         return await _save(db, msg, entry, status="failed", result_message="That isn't something I can do on this plan.")
+    before = entry.get("before")
+    if before and isinstance(before.get("fields"), dict):
+        try:
+            now_snap = await _field_snapshot(db, user, dict(entry.get("payload") or {}), list(before["fields"]))
+        except Exception:  # noqa: BLE001
+            now_snap = None
+        if now_snap and now_snap["fields"] != before["fields"]:
+            return await _save(db, msg, entry, status="stale",
+                               result_message="This was changed on its own page after I made this card, so I left it as it is. Ask me again if you still want this change.")
     if picks and a.adjust:
         try:
             entry["payload"] = a.adjust(user, dict(entry.get("payload") or {}), picks)

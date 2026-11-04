@@ -630,3 +630,80 @@ async def sort_listing_photos(db, owner_id: str, plan_tier: str, photos: list, l
         logger.exception("photo sort failed")
         await reconcile_budget(db, reservation, 0.0)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The photo sorter didn't respond - try again in a moment.")
+
+
+# ---------------------------------------------------------------- a form card's "What should change or be added?"
+# One line on the chat's form card changes the card in place (owner, 11/03: a new card under the old
+# one for every change made the chat a mess). Small and metered like the other writing tools.
+FORM_Q_TYPES = ("short_text", "long_text", "select", "multi_select", "number", "currency", "date", "time", "email", "phone")
+_FORM_TOOL = {
+    "name": "save_questions",
+    "description": "The form's full question list after the change.",
+    "input_schema": {"type": "object", "properties": {
+        "questions": {"type": "array", "items": {"type": "object", "properties": {
+            "label": {"type": "string"}, "type": {"type": "string", "enum": list(FORM_Q_TYPES)},
+            "options": {"type": "array", "items": {"type": "string"}}, "required": {"type": "boolean"}}, "required": ["label", "type"]}},
+        "focus": {"type": "integer", "description": "0-based index (in the new list) of the question the agent should see next - the one changed, or the first one added."},
+        "note": {"type": "string", "description": "One short plain sentence saying what changed, e.g. 'Added Pool as a choice.'"},
+    }, "required": ["questions", "focus", "note"]},
+}
+_FORM_SYSTEM = (
+    "You edit the questions on a real estate agent's form (OpenHousePal). Full name, email and phone are always "
+    "asked first by the app - never add them. Apply the agent's request: change the question they're looking at, "
+    "or add new questions (put added ones right after it), or remove one if they ask. Keep every other question "
+    "exactly as it is (same words, type and options, same order). Pick-one/pick-any questions get 2-8 short, "
+    "clear answer choices. Write questions the way an agent would ask a client: short and friendly. "
+    "Return the FULL list with save_questions.")
+
+
+async def revise_form_questions(db, owner_id: str, plan_tier: str, *, title: str, questions: list, at: Optional[int], instruction: str) -> dict:
+    _require_key()
+    instruction = (instruction or "").strip()
+    if not instruction:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Say what should change.")
+    if len(instruction) > 1500 or len(questions) > 40:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "That's a lot at once - try one change at a time.")
+    config = await ai_config_service.get_config(db)
+    model = config["copywrite_model"]
+    lines = []
+    for k, q in enumerate(questions):
+        opts = f" | choices: {', '.join(q.get('options') or [])}" if q.get("options") else ""
+        lines.append(f"{k}. [{q.get('type') or 'short_text'}] {q.get('label')}{opts}{' | required' if q.get('required') else ''}")
+    looking = f"They're looking at question index {at} (“{questions[at].get('label')}”)." if at is not None and 0 <= at < len(questions) else \
+        "They're not on one question - treat it as adding."
+    try:
+        reservation = await reserve_copywrite(db, owner_id, config, plan_tier)
+    except AIRateLimitExceeded as e:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, e.user_message)
+    try:
+        resp = await _client().messages.create(
+            model=model, max_tokens=3000, system=_FORM_SYSTEM, tools=[_FORM_TOOL], tool_choice={"type": "tool", "name": "save_questions"},
+            messages=[{"role": "user", "content": f"Form: {title}\nQuestions (index. [type] words):\n" + "\n".join(lines or ["(none yet)"]) +
+                       f"\n\n{looking}\nThe agent says: {instruction}"}],
+            **ai_config_service.model_options(model),
+        )
+        out = next((b.input for b in resp.content if getattr(b, "type", None) == "tool_use" and b.name == "save_questions"), None) or {}
+        cost = ai_config_service.estimate_cost_usd(config, model, resp.usage.input_tokens, resp.usage.output_tokens)
+        await record_usage_event(db, owner_id, None, model, resp.usage.input_tokens, resp.usage.output_tokens,
+                                 cost, 0, False, None, event_type="copywrite")
+        await reconcile_budget(db, reservation, cost)
+    except HTTPException:
+        await reconcile_budget(db, reservation, 0.0)
+        raise
+    except Exception:
+        logger.exception("revise_form_questions failed")
+        await reconcile_budget(db, reservation, 0.0)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Couldn't make that change - try again in a moment.")
+    clean = []
+    for q in out.get("questions") or []:
+        if not isinstance(q, dict) or not str(q.get("label") or "").strip():
+            continue
+        t = q.get("type") if q.get("type") in FORM_Q_TYPES else "short_text"
+        opts = [str(o).strip()[:80] for o in (q.get("options") or []) if str(o).strip()][:12] if t in ("select", "multi_select") else None
+        if t in ("select", "multi_select") and len(opts or []) < 2:
+            t, opts = "short_text", None
+        clean.append({"label": str(q["label"]).strip()[:300], "type": t, **({"options": opts} if opts else {}), **({"required": True} if q.get("required") else {})})
+    if not clean:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Couldn't make that change - try saying it another way.")
+    focus = out.get("focus") if isinstance(out.get("focus"), int) and 0 <= out["focus"] < len(clean) else (at if at is not None and at < len(clean) else len(clean) - 1)
+    return {"questions": clean, "focus": focus, "note": str(out.get("note") or "Done.").strip()[:200]}
