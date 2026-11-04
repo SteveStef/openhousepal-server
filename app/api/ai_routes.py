@@ -157,6 +157,13 @@ async def _build_history(db: AsyncSession, conversation: AIConversation, max_mes
     return history, note
 
 
+@router.get("/suggestions")
+async def get_ai_suggestions(db: AsyncSession = Depends(get_db), current_user: User = Depends(require_ai_helper_user)):
+    """The chat start screen's "Try asking", from their own account (11/04) - no AI, costs nothing."""
+    from app.services.ai.ai_suggestions import suggestions_for
+    return {"suggestions": await suggestions_for(db, current_user)}
+
+
 @router.get("/helper/status")
 async def get_ai_helper_status(
     db: AsyncSession = Depends(get_db),

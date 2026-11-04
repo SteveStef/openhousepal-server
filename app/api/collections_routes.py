@@ -563,6 +563,32 @@ async def get_showcases_inbox(
     return await CollectionsService.get_inbox(db, str(current_user.id))
 
 
+@router.get("/new-matches")
+async def get_new_matches(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_premium_plan)
+):
+    """The New Matches mailbox: every home the agent hasn't looked at, newest first (11/04). Reading it
+    clears nothing - opening the home or the Showcase does. Ahead of /{collection_id}, like /inbox."""
+    from app.services.new_matches_service import new_matches
+    return await new_matches(db, str(current_user.id))
+
+
+@router.get("/{collection_id}/recent-homes")
+async def get_showcase_recent_homes(
+    collection_id: str,
+    limit: int = 10,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_premium_plan)
+):
+    """One Showcase's newest homes with the basics, for the AI helper (11/04)."""
+    from app.services.new_matches_service import recent_for
+    c = (await db.execute(select(Collection).where(Collection.id == collection_id, Collection.owner_id == str(current_user.id)))).scalar_one_or_none()
+    if not c:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    return {"homes": await recent_for(db, [c], limit=max(1, min(limit, 20)))}
+
+
 @router.post("/inbox/read")
 async def mark_showcases_inbox_read(
     db: AsyncSession = Depends(get_db),

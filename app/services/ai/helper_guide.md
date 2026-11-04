@@ -888,6 +888,7 @@ Every follow-up's calendar event has links:
 
 ### The Showcases page
 - Search: "Search visitor, property, location...".
+- **New** button (the New Matches mailbox): every home you haven't looked at yet from all your Showcases, newest first, with the client's name. Opening a home there marks just that home seen. A lead's page also shows the 3 newest homes in their Showcase with NEW tags and what the client did. NEW only clears when you open that home or the Showcase.
 - **Tours** button: tour requests waiting on you from every Showcase. **Activity** button: likes, comments, tour requests and search changes from your clients.
 - **Budgets** filter and sort: **Activity**, **New matches**, **Newest**, **Fell asleep** (Inactive tab only), **Came from**.
 - **Active** / **Inactive** tabs, and a **New matches** filter.

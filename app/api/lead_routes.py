@@ -1271,6 +1271,19 @@ async def update_lead(
     return await _detail_out(db, await _load_owned_lead(db, lead_id, current_user.id), current_user.id)
 
 
+@router.get("/{lead_id}/recent-matches")
+async def get_lead_recent_matches(
+    lead_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """The 3 newest homes in this lead's Showcase(s), seen or not, with NEW and what the client did
+    (owner, 11/04). Showing them here never clears NEW."""
+    from app.services.new_matches_service import recent_for
+    lead = await _load_owned_lead(db, lead_id, current_user.id)
+    return {"homes": await recent_for(db, _match_collections(lead, await _fetch_owner_collections(db, current_user.id)))}
+
+
 @router.get("/{lead_id}/open-house-showcase")
 async def lead_open_house_showcase(
     lead_id: str,

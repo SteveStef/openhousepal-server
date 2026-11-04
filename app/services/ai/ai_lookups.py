@@ -62,6 +62,13 @@ _route("get_client_email_log", "Emails OpenHousePal sent the agent's clients, wi
 
 # --- Showcases ---
 _route("list_showcases", "All the agent's Showcases with ids, client, status (active or asleep and why), email mode, star, and new-match / activity counts.", "/collections/", plans=SHOWCASE, max_list=40)
+# One Showcase in full (its search) - list_showcases leaves the search out when they have many (11/04).
+_route("get_showcase", "One Showcase in full: its search (price, beds, baths, towns, home types...), status, email mode and counts. Use when list_showcases shows the search as '...'.",
+       "/collections/{collection_id}", schema=_obj({"collection_id": {"type": "string"}}, ["collection_id"]), ids=("collection_id",), plans=SHOWCASE, max_list=10)
+_route("get_showcase_homes", "One Showcase's newest homes with address, price, beds, baths, size, status, whether the agent has seen each one, and what the client did (viewed, liked, passed, commented, asked for a tour).",
+       "/collections/{collection_id}/recent-homes", schema=_obj({"collection_id": {"type": "string"}}, ["collection_id"]), ids=("collection_id",), plans=SHOWCASE, max_list=12)
+_route("get_new_matches", "New matches across ALL their Showcases that the agent hasn't looked at, newest first, with client name, address and price. Use for 'any new matches / what's new for my clients'. Answer short (how many, the top few) and add a show_link button to /showcases?new=1 - their New Matches mailbox. Never a to-do: clients already get these by email.",
+       "/collections/new-matches", plans=SHOWCASE, max_list=15)
 _route("get_showcase_inbox", "Across all Showcases: tour requests and recent likes, comments and search-change requests from clients.", "/collections/inbox", plans=SHOWCASE, max_list=25)
 _route("get_showcase_tours", "Tour requests for one Showcase, with tour ids and status.", "/collections/{collection_id}/tours", schema=_obj({"collection_id": {"type": "string"}}, ["collection_id"]), ids=("collection_id",), plans=SHOWCASE)
 
@@ -128,6 +135,10 @@ _route("list_my_spotlights", "The agent's Listing Spotlights (single-listing web
 _route("get_spotlight_stats", "Visitors, views and leads for the agent's Listing Spotlights (totals and per Spotlight).", "/studio/property-sites/analytics", plans=IDX)
 _route("list_my_designs", "The agent's Studio designs (flyers, social posts, postcards...) newest first, with type, situation and status.", "/studio/designs/me", plans=STUDIO, max_list=20)
 _route("list_my_forms", "The agent's forms (Forms & Invites) with ids and response counts.", "/agent-hub/forms/me", max_list=25)
+_route("get_form_questions", "One form in full (form_id from list_my_forms): its title and every question with answer types and choices.",
+       "/agent-hub/forms/{form_id}", schema=_obj({"form_id": {"type": "string"}}, ["form_id"]), ids=("form_id",), max_list=40)
+_route("get_form_answers", "The answers people gave on one form (form_id from list_my_forms), newest first, with who answered, when and whether it's reviewed - old ones too.",
+       "/agent-hub/forms/{form_id}/submissions", schema=_obj({"form_id": {"type": "string"}}, ["form_id"]), ids=("form_id",), max_list=25)
 _route("get_form_stats", "Form totals across ALL their forms: views, responses, unread responses. For one form use get_one_form_stats.", "/agent-hub/forms/stats/summary")
 # One form's own numbers - "how many people opened my buyer form" (the helper could only give the
 # all-forms total, 11/02). Same per-form stats as the Forms page (views, starts, finished, drop-off).

@@ -216,6 +216,31 @@ async def _my_listings_and_sales(db: AsyncSession, user: User) -> str:
         return ""
 
 
+# Haiku 5.5 bills a whole request at 5x once its prompt passes 100K tokens, and the fixed part (guide +
+# tools) is ~45K. On 11/04 a few turns that piled up big lookups hit 90K-195K and cost 10-15x a normal
+# message (owner: "usage is going faster"). One lookup result is capped, and before each call the
+# turn's older lookup results are cut down until the conversation part fits (~45K tokens).
+_TOOL_RESULT_MAX_CHARS = 40_000
+_CALL_BUDGET_CHARS = 180_000
+
+
+def _fit_messages(messages: List[dict]) -> None:
+    def size() -> int:
+        return len(json.dumps(messages, default=str))
+    total = size()
+    if total <= _CALL_BUDGET_CHARS:
+        return
+    for m in messages[:-1]:  # the newest results are the ones it's answering from
+        if m.get("role") != "user" or not isinstance(m.get("content"), list):
+            continue
+        for b in m["content"]:
+            if isinstance(b, dict) and b.get("type") == "tool_result" and isinstance(b.get("content"), str) and len(b["content"]) > 800:
+                total -= len(b["content"]) - 450
+                b["content"] = b["content"][:400] + " ... (shortened - already used earlier in this answer)"
+                if total <= _CALL_BUDGET_CHARS:
+                    return
+
+
 async def run_turn(
     db: AsyncSession,
     current_user: User,
@@ -241,6 +266,7 @@ async def run_turn(
     mine_text = await _my_listings_and_sales(db, current_user)
 
     async def _call_model():
+        _fit_messages(messages)
         # Second system block is deliberately NOT cached (no cache_control) and rebuilt every
         # call - it's the model's only anchor for "now". Without it, the model has no way to
         # tell whether a tool-returned timestamp like "2026-08-05T09:15:00Z" is from this
@@ -396,6 +422,9 @@ async def run_turn(
                 if said:
                     return said
                 # it only narrated the cards ("I'll show them as cards") - one more call writes the real line
+            for tr in tool_results:
+                if isinstance(tr.get("content"), str) and len(tr["content"]) > _TOOL_RESULT_MAX_CHARS:
+                    tr["content"] = tr["content"][:_TOOL_RESULT_MAX_CHARS] + ' ... (cut to fit - ask about one item for the rest)'
             messages.append({"role": "user", "content": tool_results})
 
         return "I wasn't able to finish researching that within my turn budget. Try asking a more specific question, or split it into smaller questions."
