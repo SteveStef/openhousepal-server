@@ -132,3 +132,9 @@ raw_media_output_default.json
 raw_mls_output.json
 mailgun_templates_export/
 scripts/sync_db_from_s3.sh
+
+# Old local dev dumps - kept on the computer, never in the repo (11/03)
+collections.db
+mls_output.json
+raw_media_output*.json
+raw_mls_output.json
