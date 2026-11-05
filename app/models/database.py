@@ -234,6 +234,8 @@ class AgentForm(Base):
     luxe_metal = Column(String, nullable=True)
     redirect_to_agent_hub = Column(Boolean, default=True, nullable=False)  # After submitting, auto-redirect the visitor to the agent's public Agent Hub
     redirect_to_showcase = Column(Boolean, default=True, server_default='true', nullable=False)  # Showcase-building forms: open the Showcase the answers just built (wins over the Agent Hub)
+    redirect_mode = Column(String(20), nullable=True)  # After the thank-you: NULL = the Agent Hub switch above; agent_hub | sales | website | property | none | custom
+    redirect_url = Column(String(500), nullable=True)  # the custom link
     property_photo_carousel = Column(Boolean, default=False, nullable=False)  # Welcome screen cycles through the linked property's listing photos
     background_effects = Column(Boolean, default=True, nullable=False)  # Subtle animated background graphics across the visitor form flow
     welcome_text_effects = Column(Boolean, default=True, nullable=False)  # Entrance animation for the welcome title, subtitle, and start button

@@ -14,7 +14,7 @@ from sqlalchemy import cast, or_, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.database import AgentHub
+from app.models.database import AgentHub, Site
 
 
 async def hub_by_slug(db: AsyncSession, slug: str) -> Optional[AgentHub]:
@@ -37,7 +37,9 @@ async def slug_held_by_another_agent(db: AsyncSession, slug: str, owner_id: Opti
         or_(AgentHub.slug == name, AgentHub.previous_slugs.op('@>')(cast([name], JSONB))),
         AgentHub.owner_id != owner_id,
     ))).first()
-    return bool(held)
+    # An old website address still forwarding belongs to that agent too, until it's let go.
+    forwarding = (await db.execute(select(Site.id).where(Site.google_search["old_subdomain"].astext == name, Site.owner_id != owner_id))).first()
+    return bool(held or forwarding)
 
 
 def renamed_previous_slugs(current: str, new: str) -> list[str]:

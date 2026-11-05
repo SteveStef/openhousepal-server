@@ -218,8 +218,11 @@ class CollectionsService:
         Needs collection._added_at ({property_id: added_at}) - lead_routes._fetch_owner_collections sets it."""
         added = getattr(collection, '_added_at', None) or {}
         since = card_new_since(collection)
+        # A home they opened on its own isn't new any more - same rule as the card and the mailbox.
+        # (__dict__: only when already loaded, so this never fires a lazy load in async code.)
+        seen = {i.property_id for i in collection.__dict__.get('property_interactions') or [] if i.agent_viewed_at}
         return sum(1 for p in (collection.properties or [])
-                   if (m := matched_in_at(collection, added.get(p.id))) is not None and m > since)
+                   if p.id not in seen and (m := matched_in_at(collection, added.get(p.id))) is not None and m > since)
 
     @staticmethod
     def _calculate_dom(
@@ -1252,12 +1255,17 @@ class CollectionsService:
                 return None
 
             pref_fields = CollectionsService._preferences_from_showcase_form_answers(answers_by_id)
+            # "state" doesn't count: the form starts it on the agent's own state, so it's always there.
             if require_criteria and not any(pref_fields.get(k) for k in (
-                    "cities", "school_districts", "county", "counties", "state", "min_price", "max_price", "min_beds", "search_polygon", "lat")):
+                    "cities", "school_districts", "county", "counties", "min_price", "max_price", "min_beds", "search_polygon", "lat")):
                 return None
+            # Did they actually say what they want? (A note alone isn't a search, and neither is the state.)
+            has_criteria = any(v for k, v in pref_fields.items() if k not in ("state", "special_features"))
 
             # Match on the same contact, so a returning visitor refines their existing Showcase
             # instead of piling up duplicates - email first, phone as a fallback when no email.
+            # Two emails on one phone are two people (a couple sharing a number): a phone match only
+            # counts when this submission has no email or that Showcase has none.
             existing_collection = None
             if submission.contact_email:
                 result = await db.execute(
@@ -1268,12 +1276,13 @@ class CollectionsService:
                 )
                 existing_collection = result.scalars().first()
             if not existing_collection and submission.contact_phone:
-                result = await db.execute(
-                    select(Collection).where(
-                        Collection.owner_id == form.owner_id,
-                        Collection.visitor_phone == submission.contact_phone,
-                    )
+                phone_match = select(Collection).where(
+                    Collection.owner_id == form.owner_id,
+                    Collection.visitor_phone == submission.contact_phone,
                 )
+                if submission.contact_email:
+                    phone_match = phone_match.where(or_(Collection.visitor_email.is_(None), Collection.visitor_email == ""))
+                result = await db.execute(phone_match)
                 existing_collection = result.scalars().first()
 
             if existing_collection:
@@ -1285,10 +1294,12 @@ class CollectionsService:
                 db.add(existing_collection)
                 await db.commit()
 
-                await CollectionPreferencesService.update_preferences(
-                    db, existing_collection.id, CollectionPreferencesUpdate(**pref_fields)
-                )
-                await CollectionsService.repopulate_collection_from_preferences(db, existing_collection.id, commit=True)
+                # A blank search keeps the Showcase they already have - it never wipes it.
+                if has_criteria:
+                    await CollectionPreferencesService.update_preferences(
+                        db, existing_collection.id, CollectionPreferencesUpdate(**pref_fields)
+                    )
+                    await CollectionsService.repopulate_collection_from_preferences(db, existing_collection.id, commit=True)
                 collection = existing_collection
                 # Asked for their Showcase again (Setup My Own Showcase) - their refreshed link goes to their
                 # inbox too, same as a first one (the follow-up text says it was emailed).
@@ -2186,15 +2197,18 @@ class CollectionsService:
             # awaiting the agent's action (not yet confirmed or marked completed), so this
             # badge clears once the agent has actually handled the request instead of
             # staying stuck at 1 forever (a PropertyTour row is never deleted).
+            # A home with any tour at all (waiting, confirmed or done) keeps its Tours button on the
+            # agent's card; a home nobody asked to tour shows none (owner 11/04).
             tours_query = select(
                 PropertyTour.property_id,
-                func.count(PropertyTour.id).label('tour_count')
+                func.count(PropertyTour.id).filter(and_(
+                    PropertyTour.confirmed_date.is_(None),
+                    PropertyTour.is_completed.is_(False),
+                )).label('tour_count')
             ).where(
                 and_(
                     PropertyTour.collection_id == collectionId,
                     PropertyTour.property_id.in_(property_ids),
-                    PropertyTour.confirmed_date.is_(None),
-                    PropertyTour.is_completed.is_(False),
                 )
             ).group_by(PropertyTour.property_id)
 
@@ -2261,6 +2275,7 @@ class CollectionsService:
                     'comments': comments_lookup.get(prop.id, []),
                     'unreadCommentCount': unread_comment_lookup.get(prop.id, 0),
                     'tourCount': tours_lookup.get(prop.id, 0),
+                    'hasTourRequest': prop.id in tours_lookup,
                     'added_at': added_at.isoformat() if added_at else None,
                     'is_new': is_new
                 }

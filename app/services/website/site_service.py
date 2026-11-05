@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import urllib.parse
@@ -7,7 +8,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.database import OpenHouseEvent, Site, SiteDomain, StudioBrandKit, User
+from app.models.database import AgentHub, OpenHouseEvent, Site, SiteDomain, StudioBrandKit, User
 from app.services.website import domain_resolution_service
 from app.services.website.domain_resolution_service import OHP_BASE_DOMAIN
 
@@ -30,14 +31,34 @@ def _slugify(text: str) -> str:
     return normalized or "site"
 
 
+async def subdomain_held(db: AsyncSession, name: str, site_id: str | None = None) -> bool:
+    """Is this <name>.openhousepal.com spoken for by anyone else? Another site's address or the old
+    address it still forwards, or a Spotlight's own address (they share one namespace)."""
+    from app.models.database import PropertyWebsite
+    others = Site.id != site_id if site_id else True
+    return bool(
+        (await db.execute(select(Site.id).where(Site.subdomain_slug == name, others))).first()
+        or (await db.execute(select(Site.id).where(Site.google_search["old_subdomain"].astext == name, others))).first()
+        or (await db.execute(select(PropertyWebsite.id).where(PropertyWebsite.slug == name))).first())
+
+
+async def address_problem(db: AsyncSession, user: User, site: Site, name: str) -> str | None:
+    """Why this website address can't be theirs, or None. Same rules as a hub link (services/hub_slugs)."""
+    from app.services.hub_slugs import slug_held_by_another_agent
+    if len(name) < 3 or len(name) > 63 or name in RESERVED_SLUGS or not SLUG_PATTERN.fullmatch(name):
+        return "Use at least 3 letters or numbers, with dashes between words."
+    if await subdomain_held(db, name, site.id) or await slug_held_by_another_agent(db, name, user.id):
+        return "That address is already being used."
+    return None
+
+
 async def _unique_subdomain_slug(db: AsyncSession, base: str) -> str:
     base = _slugify(base)
     candidate = base
     suffix = 2
     while True:
         if candidate not in RESERVED_SLUGS and SLUG_PATTERN.fullmatch(candidate):
-            existing = await db.execute(select(Site.id).where(Site.subdomain_slug == candidate))
-            if existing.scalar_one_or_none() is None:
+            if not await subdomain_held(db, candidate):
                 return candidate
         candidate = f"{base}-{suffix}"
         suffix += 1
@@ -240,6 +261,40 @@ def build_qr_code_image_url(base_url: str, path: str) -> str:
     """Same qrserver.com-backed QR image every open house QR has always used - centralized so
     creation and post-domain-change regeneration never drift into two different QR styles."""
     return f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={urllib.parse.quote(base_url + path)}"
+
+
+async def change_subdomain(db: AsyncSession, user: User, wanted: str) -> Site:
+    """An agent changes their <slug>.OHP_BASE_DOMAIN address (owner, 11/04), the way a hub link
+    changes: the address they leave forwards here for good, so links, QR codes and Google's listing
+    carry over. Only that ONE - changing again lets the older one go, so nobody holds a pile of names.
+    It's kept in google_search, which Google's restart for a new address leaves in place."""
+    site = await get_or_create_site(db, user)
+    slug = _slugify(wanted or "")
+    if slug == site.subdomain_slug:
+        return site
+    problem = await address_problem(db, user, site, slug)
+    if problem:
+        raise ValueError(problem)
+    left = site.subdomain_slug
+    gs = dict(site.google_search or {})
+    site.google_search = {**{k: gs[k] for k in ("manual_code",) if gs.get(k)}, "old_subdomain": left}   # Google starts over for the new address
+    site.subdomain_slug = slug
+    db.add(site)
+    # The hub keeps its website button as a full address, and the website's page reads it from there.
+    hub = (await db.execute(select(AgentHub).where(AgentHub.owner_id == user.id))).scalar_one_or_none()
+    if hub and isinstance(hub.config, dict):
+        was = json.dumps(hub.config)
+        now = was.replace(f"{left}.{OHP_BASE_DOMAIN}", f"{slug}.{OHP_BASE_DOMAIN}")
+        if now != was:
+            hub.config = json.loads(now)
+            db.add(hub)
+    await db.commit()
+    await db.refresh(site)
+    domain_resolution_service.invalidate_site(site.id)
+    for name in (left, slug):
+        domain_resolution_service.forget_host(f"{name}.{OHP_BASE_DOMAIN}")
+    await regenerate_owner_idx_links(db, user)
+    return site
 
 
 async def regenerate_owner_idx_links(db: AsyncSession, user: User) -> None:

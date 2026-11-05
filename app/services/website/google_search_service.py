@@ -235,7 +235,7 @@ async def register_site(db: AsyncSession, site: Site, *, wait_for_tag: bool = Fa
     gs = dict(site.google_search or {})
     if gs.get("host") != host:
         # New site or a new own domain - start over for it (the old code stays harmless).
-        gs = {k: gs[k] for k in ("manual_code",) if gs.get(k)}
+        gs = {k: gs[k] for k in ("manual_code", "old_subdomain") if gs.get(k)}
         gs["host"] = host
     if gs.get("sitemap_submitted_at") and not force:
         return gs

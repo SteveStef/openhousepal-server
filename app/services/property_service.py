@@ -79,6 +79,13 @@ async def _place_address_center(db, preferences):
         return preferences
 
 
+def bed_filter_exempt_types(preferences) -> list:
+    """Home kinds that skip the beds / baths / size filters because they don't have them. Only the ones
+    asked for: a client wanting 3 beds used to get vacant lots when no home type was picked (owner review, 11/05)."""
+    chosen = {"LAND": preferences.is_lot_land, "FARM": preferences.is_lot_land or preferences.is_farm, "COMMERCIAL": preferences.is_commercial}
+    return ["OTHER"] + [kind for kind, on in chosen.items() if on]
+
+
 class PropertyService:
     """
     Local Search Engine that queries our mirrored 'properties' table.
@@ -295,7 +302,7 @@ class PropertyService:
         filters = []
         
         # Types that typically don't have bathrooms or bedrooms (Exempt from numeric filters)
-        exempt_types = ['LAND', 'FARM', 'COMMERCIAL', 'OTHER']
+        exempt_types = bed_filter_exempt_types(preferences)
 
         # 1. Location Filtering
         # Town/township and county are a geographic hierarchy - picking both narrows (AND) rather
@@ -565,7 +572,7 @@ class PropertyService:
 
         filters = []
         # Same list as get_properties_by_preferences - the count is shown next to those homes.
-        exempt_types = ['LAND', 'FARM', 'COMMERCIAL', 'OTHER']
+        exempt_types = bed_filter_exempt_types(preferences)
 
         # 1. Location Filtering - same town/school-district/county hierarchy (AND across
         # dimensions, OR within each one) as get_properties_by_preferences above; keep both in sync.

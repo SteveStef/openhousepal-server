@@ -25,11 +25,11 @@ LINK_HELP = (
     "/leads, /leads/<lead_id>, /leads/tasks (Follow-ups), /leads/tasks?task=<task_id>, /leads/emails (Email Tracker), /activity, "
     "/studio (Tools), /studio/design?new=1 (new design), /studio/design?address=<street address> (new design for that home), "
     "/studio/property-sites?new=1 (new Spotlight), /studio/property-sites/<spotlight_id>, /studio/cma?new=1 (new CMA), /studio/cma/<report_id>, "
-    "/studio/blogs?new=1 (new blog post), /studio/forms (Forms & Invites), /studio/forms?new=1 (new custom form), /studio/media (Media Lab), /studio/brand-kit (Branding), "
+    "/studio/blogs?new=1 (new blog post), /studio/forms (Forms & Invites), /studio/forms?new=1 (new custom form), /studio/media (Media Lab), /studio/media/new (new AI media), /studio/brand-kit (Branding), "
     "/studio/email (Email settings + briefing time), /studio/email-signature, /studio/calendar, /studio/reviews, /studio/website (IDX website), "
     "/studio/site (Agent Hub editor), /studio/integrations (CRM - Follow Up Boss, webhooks, lead email address), /studio/domains (Domains), /studio/tools (seller net sheet, buyer cash needed), "
     "/open-houses/visitors/<open_house_id> (that open house's Visitors), /settings, /settings/connected (Send from your email - Gmail/Outlook), "
-    "/settings/help (Help), /settings/help?compose=1&category=bug, /settings/subscription (Billing), /setup (Account setup)."
+    "/settings/help (Help), /settings/help?compose=1&category=bug, /settings/subscription (Billing), /setup (Account setup), and the public pages /tools, /pricing, /idx-websites, /faq, /about, /resources, /brokerages."
 )
 
 UI_TOOL_DEFINITIONS = [

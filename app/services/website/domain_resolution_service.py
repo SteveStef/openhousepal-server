@@ -55,6 +55,11 @@ def subdomain_slug_from_hostname(host: str) -> Optional[str]:
     return match.group("slug") if match else None
 
 
+def forget_host(host: str) -> None:
+    """A host that just became a site's address: drop a remembered "no site here"."""
+    _cache.pop(host.strip().lower(), None)
+
+
 def invalidate_site(site_id: str) -> None:
     """Called after publish and after any domain lifecycle change (verified, activated,
     removed, primary changed), so the next request re-fetches instead of serving a stale
@@ -83,6 +88,11 @@ async def resolve_hostname(db: AsyncSession, host: str) -> Optional[ResolvedSite
     return resolved
 
 
+async def site_moved_from(db: AsyncSession, slug: str) -> Optional[Site]:
+    result = await db.execute(select(Site).where(Site.google_search["old_subdomain"].astext == slug, Site.status == "PUBLISHED"))
+    return result.scalars().first()
+
+
 async def canonical_hostname(db: AsyncSession, site: Site) -> str:
     result = await db.execute(
         select(SiteDomain.hostname).where(
@@ -104,7 +114,12 @@ async def _resolve_uncached(db: AsyncSession, host: str) -> Optional[ResolvedSit
         )
         site = result.scalar_one_or_none()
         if not site:
-            return None
+            # The address a site just moved from forwards to where it went (site_service.change_subdomain).
+            moved = await site_moved_from(db, slug)
+            if not moved:
+                return None
+            target = await canonical_hostname(db, moved)
+            return ResolvedSite(site_id=moved.id, owner_id=moved.owner_id, subdomain_slug=moved.subdomain_slug, published_snapshot={}, redirect_to=target, canonical_hostname=target)
         return await _to_resolved(db, site)
 
     # External custom domain: the only path that needs the join.

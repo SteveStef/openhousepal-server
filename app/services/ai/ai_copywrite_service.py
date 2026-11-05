@@ -635,24 +635,39 @@ async def sort_listing_photos(db, owner_id: str, plan_tier: str, photos: list, l
 # ---------------------------------------------------------------- a form card's "What should change or be added?"
 # One line on the chat's form card changes the card in place (owner, 11/03: a new card under the old
 # one for every change made the chat a mess). Small and metered like the other writing tools.
-FORM_Q_TYPES = ("short_text", "long_text", "select", "multi_select", "number", "currency", "date", "time", "email", "phone")
+FORM_Q_TYPES = ("short_text", "long_text", "select", "multi_select", "number", "currency", "date", "time", "email", "phone", "contact_group")
 _FORM_TOOL = {
     "name": "save_questions",
     "description": "The form's full question list after the change.",
     "input_schema": {"type": "object", "properties": {
         "questions": {"type": "array", "items": {"type": "object", "properties": {
             "label": {"type": "string"}, "type": {"type": "string", "enum": list(FORM_Q_TYPES)},
-            "options": {"type": "array", "items": {"type": "string"}}, "required": {"type": "boolean"}}, "required": ["label", "type"]}},
+            "options": {"type": "array", "items": {"type": "string"}}, "required": {"type": "boolean"},
+            "show_if": {"type": "object", "properties": {"question": {"type": "string"}, "answers": {"type": "array", "items": {"type": "string"}}}},
+            "fields": {"type": "array", "items": {"type": "object", "properties": {"label": {"type": "string"}, "type": {"type": "string"}}}}}, "required": ["label", "type"]}},
         "focus": {"type": "integer", "description": "0-based index (in the new list) of the question the agent should see next - the one changed, or the first one added."},
         "note": {"type": "string", "description": "One short plain sentence saying what changed, e.g. 'Added Pool as a choice.'"},
+        "one_contact": {"type": "boolean", "description": "true only when they ask to combine / put the contact details (name, email, phone) on one screen; false only when they ask to split them again. Leave out otherwise."},
+        "first_last": {"type": "boolean", "description": "true only when they ask for first and last name as separate boxes; false for one Full name box. Leave out otherwise."},
+        "look": {"type": "string", "enum": ["classic", "luxe"], "description": "Only when they name the form's style."},
+        "color": {"type": "string", "description": "Only when they name a Classic color for the form: Original, Light Red, Pink, Blue, Green, Purple, Navy, Charcoal, Red, Burgundy, Orange, Teal, Sky Blue, Forest, Brown, Slate or Black."},
+        "metal": {"type": "string", "enum": ["gold", "silver", "bronze"], "description": "Only when they name a Luxe finish."},
+        "dark": {"type": "boolean", "description": "true when they ask for a dark form, false for a light one. Leave out otherwise."},
     }, "required": ["questions", "focus", "note"]},
 }
 _FORM_SYSTEM = (
     "You edit the questions on a real estate agent's form (OpenHousePal). Full name, email and phone are always "
-    "asked first by the app - never add them. Apply the agent's request: change the question they're looking at, "
+    "asked first by the app - never add them. If they ask to combine the contact info or put it on one screen, set one_contact and leave the list alone. If they ask about the form's style, color, finish, dark or light, set look, color, metal or dark and leave the list alone. Apply the agent's request: change the question they're looking at, "
     "or add new questions (put added ones right after it), or remove one if they ask. Keep every other question "
     "exactly as it is (same words, type and options, same order). Pick-one/pick-any questions get 2-8 short, "
     "clear answer choices. Write questions the way an agent would ask a client: short and friendly. "
+    "Forks: when an answer should change what comes next, make that question pick-one, and give each question for one path show_if "
+    "{question: the exact words of that question, answers: [the answers it's for]}. A question with no show_if is asked of everyone, so "
+    "\"if yes, finish\" means the question for No gets show_if and nothing after it is left unforked. "
+    "Only fork when the flow really needs it: they asked for one, or a question makes no sense for people who gave a certain answer. A question added later that fits everyone has no show_if. Keep every fork that's already there. "
+    "Several questions on one page: one question of type contact_group, its label the page's heading, its questions in fields (text, email, "
+    "phone, number, dollar or date only - a pick-one question needs its own page). If the list holds name, email or phone questions, take "
+    "them off: the app asks those. Only say you did what is really in your list. "
     "Return the FULL list with save_questions.")
 
 
@@ -668,7 +683,10 @@ async def revise_form_questions(db, owner_id: str, plan_tier: str, *, title: str
     lines = []
     for k, q in enumerate(questions):
         opts = f" | choices: {', '.join(q.get('options') or [])}" if q.get("options") else ""
-        lines.append(f"{k}. [{q.get('type') or 'short_text'}] {q.get('label')}{opts}{' | required' if q.get('required') else ''}")
+        fork = q.get("show_if") if isinstance(q.get("show_if"), dict) else None
+        lines.append(f"{k}. [{q.get('type') or 'short_text'}] {q.get('label')}{opts}{' | required' if q.get('required') else ''}"
+                     + (f" | show_if {json.dumps(fork)}" if fork else "")
+                     + (f" | fields: {', '.join(str(f.get('label')) for f in q.get('fields') or [])}" if q.get("fields") else ""))
     looking = f"They're looking at question index {at} (“{questions[at].get('label')}”)." if at is not None and 0 <= at < len(questions) else \
         "They're not on one question - treat it as adding."
     try:
@@ -702,8 +720,28 @@ async def revise_form_questions(db, owner_id: str, plan_tier: str, *, title: str
         opts = [str(o).strip()[:80] for o in (q.get("options") or []) if str(o).strip()][:12] if t in ("select", "multi_select") else None
         if t in ("select", "multi_select") and len(opts or []) < 2:
             t, opts = "short_text", None
-        clean.append({"label": str(q["label"]).strip()[:300], "type": t, **({"options": opts} if opts else {}), **({"required": True} if q.get("required") else {})})
-    if not clean:
+        fields = [{"label": str(f.get("label")).strip()[:120], "type": f.get("type") if f.get("type") in ("short_text", "email", "phone", "number", "currency", "date") else "short_text"}
+                  for f in (q.get("fields") or []) if isinstance(f, dict) and str(f.get("label") or "").strip()][:6] if t == "contact_group" else []
+        if t == "contact_group" and len(fields) < 2:
+            t, fields = "short_text", []
+        fork = q.get("show_if") if isinstance(q.get("show_if"), dict) and q["show_if"].get("question") and q["show_if"].get("answers") else None
+        clean.append({"label": str(q["label"]).strip()[:300], "type": t, **({"options": opts} if opts else {}), **({"required": True} if q.get("required") else {}),
+                      **({"fields": fields} if fields else {}),
+                      **({"show_if": {"question": str(fork["question"]).strip(), "answers": [str(a).strip() for a in fork["answers"]][:12]}} if fork else {})})
+    one = out.get("one_contact") if isinstance(out.get("one_contact"), bool) else None
+    split = out.get("first_last") if isinstance(out.get("first_last"), bool) else None
+    # plain words, no need to trust the model with it: they said first and last name
+    if split is None and re.search(r"first.{0,24}last|last.{0,24}first", instruction, re.I) and (one is True or re.search(r"\b(combine|together|one (page|screen|question)|same (page|screen))\b", instruction, re.I)):
+        split = True
+    if split:
+        one = True   # first and last boxes live on the one contact screen
+    # Never claim a change that isn't there (owner, 11/04: it said it combined them and hadn't).
+    same = lambda a, b: [{k: x.get(k) for k in ("label", "type", "options", "fields", "show_if")} for x in a] == [{k: x.get(k) for k in ("label", "type", "options", "fields", "show_if")} for x in b]  # noqa: E731
+    look_said = any(out.get(k) is not None for k in ("look", "color", "metal", "dark"))
+    if one is None and split is None and not look_said and same(clean, questions):
+        return {"questions": questions, "focus": at if at is not None else 0, "changed": False, "note": "I couldn't make that change here. Try saying it another way, or ask me in the chat."}
+    if not clean and one is None and not look_said:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Couldn't make that change - try saying it another way.")
-    focus = out.get("focus") if isinstance(out.get("focus"), int) and 0 <= out["focus"] < len(clean) else (at if at is not None and at < len(clean) else len(clean) - 1)
-    return {"questions": clean, "focus": focus, "note": str(out.get("note") or "Done.").strip()[:200]}
+    focus = out.get("focus") if isinstance(out.get("focus"), int) and 0 <= out["focus"] < len(clean) else (at if at is not None and at < len(clean) else max(len(clean) - 1, 0))
+    return {"questions": clean, "focus": focus, "note": str(out.get("note") or "Done.").strip()[:200], **({"one_contact": one} if one is not None else {}), **({"first_last": split} if split is not None else {}),
+            **{k: out[k] for k in ("look", "color", "metal", "dark") if out.get(k) is not None}}

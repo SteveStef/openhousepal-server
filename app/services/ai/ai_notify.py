@@ -4,7 +4,11 @@ with a button to it, and the chat shows as unread - on the chat button, on any d
 agent opens that chat.
 
 No new tables: what's being watched and which chats are unread live in users.setup_state
-("ai_watch" / "ai_unread"), the same JSON the setup steps use.
+("ai_watch" / "ai_unread"), the same JSON the setup steps use. So does "ai_news": each finished job,
+shown one time at the top of the chat the next time they open it, wherever they left off (11/05).
+
+Several jobs can run at once (a CMA and a blog), and two can finish in the same moment. Every change
+here takes the row lock first, so one job's write can never wipe out the other's.
 """
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -21,6 +25,7 @@ logger = get_logger(__name__)
 
 WATCH_KEY = "ai_watch"
 UNREAD_KEY = "ai_unread"
+NEWS_KEY = "ai_news"
 
 
 def _state(user: User) -> dict:
@@ -31,6 +36,7 @@ async def watch(db: AsyncSession, user: User, key: str, ctx: dict, label: str) -
     """Remember which chat card is waiting on `key` (e.g. "cma:<report id>"). Commits."""
     if not ctx or not ctx.get("message_id"):
         return
+    await db.refresh(user, ["setup_state"], with_for_update=True)
     st = _state(user)
     st[WATCH_KEY] = {**(st.get(WATCH_KEY) or {}), key: {**ctx, "label": label, "at": datetime.now(timezone.utc).isoformat()}}
     user.setup_state = st
@@ -38,14 +44,14 @@ async def watch(db: AsyncSession, user: User, key: str, ctx: dict, label: str) -
     await db.commit()
 
 
-async def finished(owner_id: str, key: str, ok: bool, message: str, link: Optional[str] = None, link_label: str = "Open it") -> None:
+async def finished(owner_id: str, key: str, ok: bool, message: str, link: Optional[str] = None, link_label: str = "Open it", made: Optional[dict] = None) -> None:
     """The watched job is done: update its card, post `message` in its chat ("{label}" = what was
     watched, e.g. the home's street), mark the chat unread.
     Its own session; never raises (the job itself already finished)."""
     from app.database import AsyncSessionLocal
     try:
         async with AsyncSessionLocal() as db:
-            user = await db.get(User, owner_id)
+            user = await db.get(User, owner_id, with_for_update=True, populate_existing=True)
             if user is None:
                 return
             st = _state(user)
@@ -60,6 +66,8 @@ async def finished(owner_id: str, key: str, ok: bool, message: str, link: Option
                 for entry in (msg.tool_calls or []):
                     if entry.get("record_type") == "action" and entry.get("record_id") == w.get("action_id"):
                         entry.update(status="done" if ok else "failed", result_message=message[:300], result_link=link)
+                        if made:
+                            entry["made"] = made
                 flag_modified(msg, "tool_calls")
             conv = await db.get(AIConversation, w.get("conversation_id")) if w.get("conversation_id") else None
             if conv is not None and conv.owner_id == owner_id:
@@ -67,6 +75,8 @@ async def finished(owner_id: str, key: str, ok: bool, message: str, link: Option
                 db.add(AIMessage(conversation_id=conv.id, role="assistant", content=message, tool_calls=calls))
                 conv.last_message_at = now
                 st[UNREAD_KEY] = sorted(set(st.get(UNREAD_KEY) or []) | {conv.id})
+            st[NEWS_KEY] = ([*(st.get(NEWS_KEY) or []), {"id": str(uuid.uuid4()), "text": message[:300], "ok": ok, "link": link, "link_label": link_label,
+                                                         "conversation_id": conv.id if conv is not None else None, "at": now.isoformat()}])[-8:]
             st[WATCH_KEY] = watching
             user.setup_state = st
             flag_modified(user, "setup_state")
@@ -114,6 +124,24 @@ async def working(db: AsyncSession, user: User) -> list[dict]:
                 last = None
             if rv.get("status") == "failed" or (rv.get("status") == "running" and last and now - last > timedelta(minutes=15)):
                 out.remove(j); dead.append((j["key"], "blog", j["id"], rv.get("started_at")))
+    media = [j["id"] for j in out if j["kind"] == "media"]
+    if media:
+        # Backstop for a job whose own finish was lost (a restart): the project row knows.
+        from app.models.database import StudioMediaAsset
+        rows = {r.id: r for r in (await db.execute(select(StudioMediaAsset.id, StudioMediaAsset.status, StudioMediaAsset.kind, StudioMediaAsset.created_at).where(StudioMediaAsset.id.in_(media)))).all()}
+        for j in list(out):
+            if j["kind"] != "media":
+                continue
+            r = rows.get(j["id"])
+            if r is None:
+                out.remove(j); dead.append((j["key"], "media", j["id"], None))
+            elif r.status != "processing":
+                out.remove(j); await finish_media(user.id, j["id"])
+            else:
+                j["media"] = r.kind
+                made_at = r.created_at if r.created_at.tzinfo else r.created_at.replace(tzinfo=timezone.utc)
+                if r.kind == "image" and now - made_at > timedelta(minutes=15):
+                    out.remove(j); dead.append((j["key"], "media", j["id"], None))
     for key, kind, rid, started in dead:
         if kind == "blog":
             if started:
@@ -124,9 +152,35 @@ async def working(db: AsyncSession, user: User) -> list[dict]:
         elif kind == "cma":
             await finished(user.id, key, False, "The CMA for {label} didn't finish. Open it to pick the comps yourself or run it again.",
                            f"/studio/cma/{rid}", "Open it")
+        elif kind == "media":
+            await finished(user.id, key, False, "That didn't finish - please try again. Nothing was charged for a job that failed.", "/studio/media", "Open Media Lab")
+        elif kind == "spotlight":
+            await finished(user.id, key, False, "Your Spotlight for {label} is made, but I couldn't finish writing it. Open it and the editor finishes the rest.",
+                           f"/studio/property-sites/{rid}", "Open the Spotlight")
         else:
             await finished(user.id, key, False, "That didn't finish - please try again.")
     return sorted(out, key=lambda j: j["at"])
+
+
+async def finish_media(owner_id: str, asset_id: str) -> None:
+    """A Media Lab job left "processing" (studio_media_service calls this): its card shows the result.
+    Does nothing unless the chat started it."""
+    from app.database import AsyncSessionLocal
+    from app.models.database import StudioMediaAsset
+    try:
+        async with AsyncSessionLocal() as db:
+            a = await db.get(StudioMediaAsset, asset_id)
+        if a is None or a.status == "processing":
+            return
+        link = f"/studio/media/{asset_id}"
+        if a.status == "succeeded":
+            kind = "video" if a.kind == "video" else "photo"
+            await finished(owner_id, f"media:{asset_id}", True, f"Your {kind} is ready.", link, "Open it in Media Lab",
+                           made={"kind": "media", "media": a.kind, "url": a.result_url, "before": a.source_photo_url})
+        else:
+            await finished(owner_id, f"media:{asset_id}", False, f"That didn't work: {a.error_message or 'please try again.'}", "/studio/media", "Open Media Lab")
+    except Exception:  # noqa: BLE001
+        logger.exception("AI helper media notice failed", extra={"asset_id": asset_id})
 
 
 def busy_conversations(user: User) -> set[str]:
@@ -140,12 +194,29 @@ def unread(user: User) -> list[str]:
     return list((user.setup_state or {}).get(UNREAD_KEY) or [])
 
 
+def news(user: User) -> list[dict]:
+    """Finished jobs they haven't been told about yet."""
+    return list((user.setup_state or {}).get(NEWS_KEY) or [])
+
+
+async def mark_news_seen(db: AsyncSession, user: User, ids: list[str]) -> None:
+    await db.refresh(user, ["setup_state"], with_for_update=True)
+    st = _state(user)
+    left = [n for n in (st.get(NEWS_KEY) or []) if n.get("id") not in set(ids)]
+    if len(left) != len(st.get(NEWS_KEY) or []):
+        st[NEWS_KEY] = left
+        user.setup_state = st
+        flag_modified(user, "setup_state")
+    await db.commit()
+
+
 async def mark_read(db: AsyncSession, user: User, conversation_id: str) -> list[str]:
+    await db.refresh(user, ["setup_state"], with_for_update=True)
     st = _state(user)
     left = [c for c in (st.get(UNREAD_KEY) or []) if c != conversation_id]
     if left != (st.get(UNREAD_KEY) or []):
         st[UNREAD_KEY] = left
         user.setup_state = st
         flag_modified(user, "setup_state")
-        await db.commit()
+    await db.commit()   # also lets go of the row lock when nothing changed
     return left

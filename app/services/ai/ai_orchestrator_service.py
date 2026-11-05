@@ -226,7 +226,9 @@ _CALL_BUDGET_CHARS = 180_000
 
 def _fit_messages(messages: List[dict]) -> None:
     def size() -> int:
-        return len(json.dumps(messages, default=str))
+        # a photo's bytes are priced by the picture, not its text length
+        return len(json.dumps([{**m, "content": [b for b in m["content"] if not (isinstance(b, dict) and b.get("type") == "image")]} if isinstance(m.get("content"), list) else m
+                               for m in messages], default=str))
     total = size()
     if total <= _CALL_BUDGET_CHARS:
         return
@@ -247,13 +249,14 @@ async def run_turn(
     conversation_history: List[Dict[str, Any]],
     user_message: str,
     voice_mode: bool = False,
+    images: Optional[List[dict]] = None,
 ) -> Tuple[str, List[dict], Dict[str, Any]]:
     """Runs one user turn to completion: sends the message, executes any tool calls
     the model makes (bounded by config), and returns (assistant_text, record_refs, usage)."""
     config = await ai_config_service.get_config(db)
     client = _get_client()
 
-    messages: List[dict] = list(conversation_history) + [{"role": "user", "content": user_message}]
+    messages: List[dict] = list(conversation_history) + [{"role": "user", "content": [*images, {"type": "text", "text": user_message}] if images else user_message}]
     all_refs: List[dict] = []
     usage_state = {"model": config["model"], "input_tokens": 0, "output_tokens": 0, "tool_call_count": 0, "tool_names": []}
     # Lookups this plan gets + things it can set up for a Confirm tap (ai_actions.py, 10/30).

@@ -1,7 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
+from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -70,20 +71,29 @@ def form_card_questions(c: dict) -> list:
     return [q for q in (qs or []) if isinstance(q, dict) and q.get("label")]
 
 
+FORM_CARD_TOOLS = ("create_form", "edit_form")
+# What a replaced form card hands on to the new one: the model only re-sends the questions, so without
+# this "add a question" quietly undid the card's other settings (owner, 11/04).
+FORM_CARD_KEEPS = ("one_contact", "first_last", "background_effects", "welcome_text_effects", "dark", "style", "after_mode", "after_url", "listing_key")
+
+
 def _form_card_lines(c: dict) -> str:
     """An open form card's numbered questions, so "change question 3" means the same thing to the
     helper as the preview the agent is flipping through (owner, 11/02)."""
     qs = form_card_questions(c)
-    lines = [f"Q{i + 4}. {q['label']} [{q.get('type') or 'short_text'}]" + (f" options: {' | '.join(map(str, q['options']))}" if q.get("options") else "")
+    draft = c.get("draft_picks") if isinstance(c.get("draft_picks"), dict) else {}
+    one = draft["one_contact"] if isinstance(draft.get("one_contact"), bool) else bool((c.get("payload") or {}).get("one_contact"))
+    first = 2 if one else 4
+    lines = [f"Q{i + first}. {q['label']} [{q.get('type') or 'short_text'}]" + (f" options: {' | '.join(map(str, q['options']))}" if q.get("options") else "")
+             + (f" fields: {' | '.join(str(f.get('label')) for f in q['fields'])}" if q.get("fields") else "")
+             + (f" show_if: {q['show_if']}" if q.get("show_if") else "")
              for i, q in enumerate(qs)]
     # The model once counted only the agent's own questions ("question 5" = their 5th) and changed the
     # wrong one - so the mapping is spelled out with this form's own example (11/02).
-    ex = f" - e.g. “question {4 + min(1, len(qs) - 1)}” is “{qs[min(1, len(qs) - 1)]['label']}”" if qs else ""
-    return (" Its questions right now, numbered exactly as the form and the card's preview show them (Q1-Q3 are always Full name, Email, Phone): "
-            + "; ".join(lines) + f". When the agent says “question N” they mean QN here{ex} - never count only their own questions. "
-            "To change, add, remove or reorder any of them, call create_form again with the same title and the FULL updated list of their own questions "
-            "(from Q4 on, in order, all of them - unchanged ones exactly as they are) - that new card replaces this one and its preview opens on the change. "
-            "Change only what they asked.") if lines else ""
+    ex = f" - e.g. “question {first + min(1, len(qs) - 1)}” is “{qs[min(1, len(qs) - 1)]['label']}”" if qs else ""
+    return (" Its questions right now, numbered exactly as the form and the card's preview show them (" + ("Q1 is their name, Email and Phone together on one screen" if one else "Q1-Q3 are always Full name, Email, Phone") + "): "
+            + "; ".join(lines) + f". “Question N” means QN here{ex}."
+            ) if lines else ""
 
 
 def _card_note(m: AIMessage) -> str:
@@ -97,14 +107,14 @@ def _card_note(m: AIMessage) -> str:
     return "(App note, not from the agent - the cards your last reply showed: " + "; ".join(
         f"“{c.get('title')}” - {_CARD_STATUS.get(c.get('status'), c.get('status'))}"
         + (f" ({c.get('result_message')})" if c.get("status") == "failed" and c.get("result_message") else "")
-        + (_form_card_lines(c) if c.get("tool") == "create_form" and c.get("status") == "pending" else "")
-        + (f" - its link (shown as a preview card): {c['share']['url']}" if isinstance(c.get("share"), dict) and c["share"].get("url") else "") for c in cards) + ")\n\n"
+        + (_form_card_lines(c) if c.get("tool") in FORM_CARD_TOOLS and c.get("status") == "pending" else "")
+        + (f" - its link (shown as a preview card): {c['share']['url']}" if isinstance(c.get("share"), dict) and c["share"].get("url") else "") for c in cards) + ")\n\nThe agent says:\n"
 
 
 async def _replace_open_form_cards(db: AsyncSession, conversation_id: str, refs: list) -> None:
     """A new form card in this chat replaces the one still waiting (the agent asked for a change) - so
     only the newest can be confirmed - and its preview opens on the first question that changed."""
-    new = next((r for r in refs or [] if isinstance(r, dict) and r.get("record_type") == "action" and r.get("tool") == "create_form"), None)
+    new = next((r for r in refs or [] if isinstance(r, dict) and r.get("record_type") == "action" and r.get("tool") in FORM_CARD_TOOLS), None)
     if not new:
         return
     rows = (await db.execute(select(AIMessage).where(AIMessage.conversation_id == conversation_id, AIMessage.role == "assistant")
@@ -115,13 +125,26 @@ async def _replace_open_form_cards(db: AsyncSession, conversation_id: str, refs:
         hit = False
         for c in m.tool_calls or []:
             # the same form (same title) - a second, different form made in the same chat stays
-            if (isinstance(c, dict) and c.get("record_type") == "action" and c.get("tool") == "create_form" and c.get("status") == "pending"
+            if (isinstance(c, dict) and c.get("record_type") == "action" and c.get("tool") in FORM_CARD_TOOLS and c.get("status") == "pending"
                     and str((c.get("payload") or {}).get("title") or "").strip().lower() == title):
                 old, now = form_card_questions(c), (new.get("payload") or {}).get("questions") or []
                 diff = next((i for i in range(max(len(old), len(now)))
                              if i >= len(old) or i >= len(now) or {k: old[i].get(k) for k in ("label", "type", "options")} != {k: now[i].get(k) for k in ("label", "type", "options")}), None)
                 if diff is not None and "focus_q" not in (new.get("payload") or {}):
                     new["payload"]["focus_q"] = min(diff, max(len(now) - 1, 0))
+                draft = c.get("draft_picks") if isinstance(c.get("draft_picks"), dict) else {}
+                # a question it re-sent by the same words keeps its fork and its page
+                was = {str(q.get("label")).strip().lower(): q for q in old}
+                for q in now:
+                    for k in ("show_if", "fields"):
+                        prev = was.get(str(q.get("label")).strip().lower(), {}).get(k)
+                        if prev and not q.get(k):
+                            q[k] = prev
+                told = set((new.get("payload") or {}).get("told") or [])
+                for k in FORM_CARD_KEEPS:
+                    v = draft[k] if k in draft else (c.get("payload") or {}).get(k)
+                    if k not in told and v is not None:
+                        new["payload"][k] = v
                 c.update(status="replaced", result_message="Replaced by the updated card below.")
                 hit = True
         if hit:
@@ -182,7 +205,9 @@ async def get_ai_unread(db: AsyncSession = Depends(get_db), current_user: User =
     button shows the count on every device until that chat is opened (ai_notify) - and the jobs
     still running, for the chat's progress strip."""
     from app.services.ai import ai_notify
-    return {"conversations": ai_notify.unread(current_user), "working": await ai_notify.working(db, current_user)}
+    working = await ai_notify.working(db, current_user)
+    await db.refresh(current_user, ["setup_state"])   # working() may have just closed a dead job
+    return {"conversations": ai_notify.unread(current_user), "working": working, "news": ai_notify.news(current_user)}
 
 
 @router.get("/progress")
@@ -198,6 +223,26 @@ async def get_ai_progress(current_user: User = Depends(get_current_active_user))
     except (TypeError, ValueError):
         fresh = False
     return {"label": v["label"] if fresh else None}
+
+
+@router.post("/attachments")
+async def add_ai_attachment(file: UploadFile = File(...), db: AsyncSession = Depends(get_db), current_user: User = Depends(require_ai_helper_user)):
+    """A photo dropped into the chat or onto a card. Kept like any Media Lab upload (same size and
+    storage limits), so it can be used for anything the chat can make."""
+    from app.services.ai import ai_attachments
+    return await ai_attachments.add(db, current_user, await file.read(), file.content_type or "")
+
+
+class NewsSeenRequest(BaseModel):
+    ids: list[str]
+
+
+@router.post("/news/seen")
+async def mark_ai_news_seen(body: NewsSeenRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    """The chat showed these finished-job notices, so they never show again."""
+    from app.services.ai import ai_notify
+    await ai_notify.mark_news_seen(db, current_user, body.ids[:20])
+    return {"ok": True}
 
 
 @router.post("/unread/{conversation_id}/read")
@@ -263,7 +308,7 @@ async def revise_ai_form_card(
         msg, entry = await ai_actions._owned_entry(db, current_user, str(payload.get("message_id") or ""), action_id)
     except ai_actions.ActionError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    if entry.get("tool") != "create_form" or entry.get("status") != "pending":
+    if entry.get("tool") not in FORM_CARD_TOOLS or entry.get("status") != "pending":
         raise HTTPException(status_code=400, detail="This card is finished - ask me in the chat instead.")
     picks = payload.get("picks") if isinstance(payload.get("picks"), dict) else dict(entry.get("draft_picks") or {})
     questions = [q for q in (picks.get("questions") or (entry.get("payload") or {}).get("questions") or []) if isinstance(q, dict)]
@@ -271,8 +316,16 @@ async def revise_ai_form_card(
     out = await ai_copywrite_service.revise_form_questions(
         db, current_user.id, current_user.plan_tier, title=str((entry.get("payload") or {}).get("title") or "Form"),
         questions=questions, at=at, instruction=str(payload.get("instruction") or ""))
+    from app.services.ai.ai_actions_catalog import ActionError, form_style
+    try:
+        style = form_style(current_user, out.pop("look", None), out.pop("color", None), out.pop("metal", None))
+    except ActionError as e:
+        out.update(note=str(e))
+        style = {}
+    if style:
+        out["style"] = {**(picks.get("style") if isinstance(picks.get("style"), dict) else {}), **style}
     msg, entry = await ai_actions._owned_entry(db, current_user, str(payload.get("message_id") or ""), action_id)
-    await ai_actions._save(db, msg, entry, draft_picks={**picks, "questions": out["questions"]})
+    await ai_actions._save(db, msg, entry, draft_picks={**picks, "questions": out["questions"], **{k: out[k] for k in ("one_contact", "first_last", "dark") if isinstance(out.get(k), bool)}, **({"style": out["style"]} if out.get("style") else {})})
     return out
 
 
@@ -384,8 +437,15 @@ async def send_ai_message(
     user_id = current_user.id
 
     message_text = (payload.message or "").strip()
+    # Photos dropped in: the chat keeps a note with each one's address, and this turn also gets to
+    # see them (a smaller copy), so "stage this" needs no more explaining.
+    from app.services.ai import ai_attachments
+    attached = await ai_attachments.owned(db, user_id, payload.attachments)
+    if attached and not message_text:
+        message_text = "Here's a photo."
     if not message_text:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
+    message_text += ai_attachments.note(attached)
 
     try:
         check_input_length(message_text, config)
@@ -421,7 +481,8 @@ async def send_ai_message(
         await db.refresh(user_msg)
 
         try:
-            text, refs, usage = await run_turn(db, current_user, history, card_note + message_text, voice_mode=payload.voice_mode)
+            text, refs, usage = await run_turn(db, current_user, history, card_note + message_text, voice_mode=payload.voice_mode,
+                                               images=await ai_attachments.image_blocks(attached))
         except AIOrchestratorError as e:
             # A turn cut off by the time limit can stop mid-query, leaving the session needing a
             # rollback before it can record anything.

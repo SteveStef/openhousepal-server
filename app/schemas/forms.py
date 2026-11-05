@@ -101,6 +101,8 @@ class AgentFormResponse(BaseModel):
     # object as a transient attribute in get_my_forms before serialization, since it has no real
     # column. See forms_routes.py CAMPAIGN_ELIGIBLE_FORM_TYPES / get_my_forms.
     additional_campaign_count: int = 0
+    redirect_mode: Optional[str] = None
+    redirect_url: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
 
@@ -157,6 +159,11 @@ class CampaignLookupResponse(BaseModel):
 
 
 class AgentFormUpdate(BaseModel):
+    # The form editor sends the version it loaded (null = a form never saved since it was made). If
+    # the form has moved on since - the chat or another tab - the save stops (409 "form_changed").
+    expected_updated_at: Optional[datetime] = None
+    redirect_mode: Optional[str] = None
+    redirect_url: Optional[str] = None
     title: Optional[str] = None
     headline: Optional[str] = None
     subtitle: Optional[str] = None

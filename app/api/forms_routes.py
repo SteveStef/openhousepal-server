@@ -37,7 +37,7 @@ from app.schemas.forms import (
     SubmissionReviewedUpdate,
 )
 from app.utils.auth import get_current_active_user, get_current_user_optional, require_active_plan
-from app.services.forms_service import record_form_progress, normalize_campaign_redirect, campaign_after_submit, active_campaign_for_token
+from app.services.forms_service import record_form_progress, normalize_campaign_redirect, normalize_form_redirect, form_after_submit, campaign_after_submit, active_campaign_for_token, clean_question_forks
 from app.services.leads_service import upsert_lead
 from app.services.agent_email_service import agent_public_phone
 
@@ -1324,7 +1324,7 @@ async def get_unfinished_responses(
         LeadEvent.source_type == PARTIAL_SOURCE, LeadEvent.source_id.in_([s.id for s in rows] or [""])))).all())
     items = []
     for s in rows:
-        answers = s.partial_answers if isinstance(s.partial_answers, dict) else {}
+        answers = {k: v for k, v in s.partial_answers.items() if v is not None} if isinstance(s.partial_answers, dict) else {}
         if not answers:
             continue
         path = session_path(s, form.questions)
@@ -1925,12 +1925,23 @@ async def update_form(
     form = await get_owned_form(db, form_id, current_user.id)
     aesthetics_only = form.form_type in AESTHETICS_ONLY_FORM_TYPES
 
+    # An editor left open on an older copy must never silently save over newer work (owner, 11/04).
+    # Only the editor sends this; the chat has its own check on its card.
+    if "expected_updated_at" in payload.model_fields_set:
+        seen, now = payload.expected_updated_at, form.updated_at
+        utc = lambda d: d if d is None or d.tzinfo else d.replace(tzinfo=timezone.utc)  # noqa: E731
+        if utc(seen) != utc(now):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="form_changed")
+
     if payload.questions is not None and not aesthetics_only:
         locked_ids = {question["id"] for question in form.questions if question.get("locked")}
-        new_ids = {question.id for question in payload.questions}
+        # a contact screen holding them counts: name, email and phone on one screen, or apart again
+        new_ids = {question.id for question in payload.questions} | {field.id for question in payload.questions for field in (question.fields or [])}
+        if {"email", "phone"} <= new_ids and ("full_name" in new_ids or {"buyer_first_name", "buyer_last_name"} <= new_ids):
+            locked_ids = locked_ids - {"full_name", "email", "phone", "contact_info"}
         if not locked_ids.issubset(new_ids):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Core contact questions cannot be removed.")
-        form.questions = [question.model_dump() for question in payload.questions]
+        form.questions = clean_question_forks([question.model_dump() for question in payload.questions])
 
     if payload.title is not None and not aesthetics_only:
         form.title = payload.title
@@ -1955,6 +1966,8 @@ async def update_form(
     # form included (user, 10/24: its Showcase and Agent Hub redirects are both switchable).
     if payload.redirect_to_agent_hub is not None:
         form.redirect_to_agent_hub = payload.redirect_to_agent_hub
+    if "redirect_mode" in payload.model_fields_set:
+        form.redirect_mode, form.redirect_url = normalize_form_redirect(payload.redirect_mode, payload.redirect_url)
     if payload.redirect_to_showcase is not None:
         form.redirect_to_showcase = payload.redirect_to_showcase
     if payload.property_photo_carousel is not None:
@@ -2060,6 +2073,8 @@ async def get_public_form(
     from app.services import brand_look_service
     look = resolve_form_look(form, hub.config or {}, agent, await brand_look_service.get_look(db, agent))
     campaign_redirect, after_submit_mode, after_submit_url = campaign_after_submit(await active_campaign_for_token(db, form.id, c), hub_live)
+    if campaign_redirect is None:
+        campaign_redirect, after_submit_mode, after_submit_url = await form_after_submit(db, form, agent, hub_live)
 
     return PublicAgentFormResponse(
         form_id=form.id,

@@ -49,6 +49,8 @@ class PropertyWebsiteDraftUpdate(BaseModel):
     # Set once the editor's first-open automatic setup (featured amenities, highlights, story,
     # town) has run, so deleting something later never makes it come back on its own.
     auto_setup_done: Optional[bool] = None
+    # Set up on the server from the chat: the editor ticks the standout amenities once (ai_spotlight_setup).
+    auto_setup_server: Optional[bool] = None
     # The page header: {mode: photo|cycle|video, motion: in|out|both|none, video: {asset_id,
     # style, photo, url, poster}} - see property_website_service._clean_header.
     header: Optional[Dict[str, Any]] = None

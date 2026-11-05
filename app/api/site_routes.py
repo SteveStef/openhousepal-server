@@ -157,6 +157,34 @@ async def set_link_domain(
     return await _link_domain_state(db, current_user)
 
 
+@router.get("/me/address/check")
+async def check_my_address(
+    slug: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """The Check button, like a hub link's."""
+    site = await site_service.get_or_create_site(db, current_user)
+    name = site_service._slugify(slug or "")
+    mine = name == site.subdomain_slug
+    problem = None if mine else await site_service.address_problem(db, current_user, site, name)
+    return {"slug": name, "available": problem is None, "owned_by_current_user": mine, "message": problem}
+
+
+@router.put("/me/address")
+async def change_my_address(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """The agent's own <slug>.openhousepal.com address. The old one forwards here."""
+    try:
+        site = await site_service.change_subdomain(db, current_user, str(body.get("slug") or ""))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {"subdomain_slug": site.subdomain_slug, "old_subdomain": (site.google_search or {}).get("old_subdomain")}
+
+
 @router.put("/me/site-enabled")
 async def set_site_enabled(
     body: SiteEnabledUpdate,

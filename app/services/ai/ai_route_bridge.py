@@ -32,14 +32,14 @@ def _detail(data: Any) -> str:
     return "That didn't work."
 
 
-async def call_as_agent(user: User, method: str, path: str, *, json: Any = None, params: Optional[dict] = None) -> Any:
+async def call_as_agent(user: User, method: str, path: str, *, json: Any = None, params: Optional[dict] = None, files: Optional[dict] = None) -> Any:
     """Calls one of the app's routes as `user`. Returns the JSON body; raises RouteError with the
     route's own plain message on a 4xx/5xx."""
     from app.main import app  # lazy: app.main imports every router, this module is imported by some of them
     token = create_access_token({"sub": user.id}, expires_delta=timedelta(minutes=5))
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://localhost", timeout=60) as client:
-        r = await client.request(method, path, json=json, params=params, headers={"Authorization": f"Bearer {token}"})
+        r = await client.request(method, path, json=json, params=params, files=files, headers={"Authorization": f"Bearer {token}"})
     try:
         data = r.json()
     except ValueError:

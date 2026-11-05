@@ -342,7 +342,16 @@ async def _r_blog_publish(db, user, p):
     if "hub" in p:
         await _run_route(user, "PATCH", f"/studio/blogs/{bid}/agent-hub-visibility", {"agent_hub_visible": p["hub"]})
     st = (p.get("status") or {}).get("status")
-    return {"message": {"PUBLISHED": "It's live.", "SCHEDULED": "Scheduled."}.get(st, "Saved."), "link": f"/studio/blogs/{bid}"}
+    share = None
+    if st == "PUBLISHED":   # a live post gets the same Copy / Share as everything else made here
+        import os
+        from app.services.ai.ai_actions_catalog import _share
+        from app.services.website.site_service import owner_links
+        post, links = await db.get(Blog, bid), await owner_links(db, user)
+        if post and post.slug and links.hub_slug:
+            path = f"/{links.hub_slug}/blogs/{post.slug}"
+            share = await _share(db, user, path, url=os.getenv("FRONTEND_URL", os.getenv("CLIENT_URL", "http://localhost:3000")).rstrip("/") + path)
+    return {"message": {"PUBLISHED": "It's live.", "SCHEDULED": "Scheduled."}.get(st, "Saved."), "link": f"/studio/blogs/{bid}", "share": share}
 
 _simple("publish_blog_post",
         "Publish a blog draft now (when='now'), schedule it (when='schedule', date YYYY-MM-DD + time HH:MM Eastern), and/or show or hide it on the "

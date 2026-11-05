@@ -107,7 +107,7 @@ def _coerce(definition: dict, args: dict) -> dict:
 # makes them the same thing. A card for it that's working or done in the last 3 hours - in any of
 # their chats - answers instead of a new card.
 _SAME_JOB = {
-    "start_cma": lambda pl: pl.get("listing_key"),
+    "start_cma": lambda pl: pl.get("listing_key") or pl.get("address"),
     "write_blog_post": lambda pl: " ".join(str((pl.get("body") or {}).get("topic") or "").lower().split()) or None,
     "create_spotlight": lambda pl: pl.get("listing_key"),
     "create_showcase": lambda pl: str((pl.get("body") or {}).get("visitor_email") or "").lower() or None,

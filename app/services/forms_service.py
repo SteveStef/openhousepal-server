@@ -62,6 +62,44 @@ def campaign_after_submit(campaign: Optional[FormCampaign], hub_live: bool) -> t
     return None, None, None
 
 
+def normalize_form_redirect(mode: Optional[str], url: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """A form's own after-submit choice: the campaign choices plus its website and its linked home."""
+    mode = (mode or "").strip().lower() or None
+    if mode in ("website", "property"):
+        return mode, None
+    return normalize_campaign_redirect(mode, url)
+
+
+async def form_after_submit(db: AsyncSession, form, owner, hub_live: bool) -> tuple[Optional[bool], Optional[str], Optional[str]]:
+    """Where the form itself sends people after the thank-you (owner, 11/04), in the same shape as
+    campaign_after_submit. Its website and its linked home go out as a plain link, so the public
+    pages need nothing new. (None, None, None) = the Agent Hub switch decides."""
+    mode = getattr(form, "redirect_mode", None)
+    if mode == "none":
+        return False, "none", None
+    if mode == "custom" and form.redirect_url:
+        return True, "custom", form.redirect_url
+    if mode in ("agent_hub", "sales"):
+        return (True, mode, None) if hub_live else (None, None, None)
+    if mode == "website":
+        # Their live website, on its free <name>.openhousepal.com address too - owner_links() stays on
+        # openhousepal.com for that one, on purpose, so it can't answer this. No live site: the Agent Hub.
+        from app.models.database import Site
+        from app.services.website.site_service import connected_custom_domain
+        from app.services.website.domain_resolution_service import OHP_BASE_DOMAIN
+        site = (await db.execute(select(Site).where(Site.owner_id == owner.id))).scalar_one_or_none()
+        if site and owner.plan_tier == "IDX" and site.is_enabled is not False and site.status == "PUBLISHED":
+            return True, "custom", f"https://{await connected_custom_domain(db, site) or f'{site.subdomain_slug}.{OHP_BASE_DOMAIN}'}"
+        return (True, "agent_hub", None) if hub_live else (None, None, None)
+    if mode == "property":
+        from app.services.property_website_service import describe_listing_link
+        home = form.linked_property if isinstance(form.linked_property, dict) else {}
+        out = await describe_listing_link(db, owner, home.get("listing_key"), home.get("address"))
+        if out.get("url"):
+            return True, "custom", out["url"]
+    return None, None, None
+
+
 async def active_campaign_for_token(db: AsyncSession, form_id: str, token: Optional[str]) -> Optional[FormCampaign]:
     """The live (non-deleted) campaign a ?c= token belongs to on this form, or None."""
     if not token:
@@ -190,6 +228,61 @@ ANSWER_LIST_CAP = 50         # items kept per multi-select answer
 UNFINISHED_RETENTION_DAYS = 90  # unfinished answers + contact details are cleared after this
 
 
+def _fork_parent_at(questions: list[dict], parent_id) -> Optional[int]:
+    """Where a follow-up's parent sits: a question, or the contact_group holding that field."""
+    for at, q in enumerate(questions):
+        if q.get("id") == parent_id:
+            return at
+    for at, q in enumerate(questions):
+        if any(f.get("id") == parent_id for f in q.get("fields") or []):
+            return at
+    return None
+
+
+def question_is_visible(question: dict, questions: list[dict], answers_by_id: dict, _seen: frozenset = frozenset()) -> bool:
+    """Same rule as FormRunner's isQuestionVisible: a follow-up shows when its parent got one of the
+    right answers AND the parent itself shows - an answer left behind on a path the visitor backed
+    out of opens nothing. A loop of follow-ups never shows."""
+    depends_on = question.get("depends_on")
+    if not depends_on:
+        return True
+    if question.get("id") in _seen:
+        return False
+    at = _fork_parent_at(questions, depends_on["question_id"])
+    if at is not None and not question_is_visible(questions[at], questions, answers_by_id, _seen | {question.get("id")}):
+        return False
+    dep_value = answers_by_id.get(depends_on["question_id"])
+    if dep_value is None:
+        return False
+    values = depends_on.get("values", [])
+    if isinstance(dep_value, list):
+        return any(item in values for item in dep_value)
+    return dep_value in values
+
+
+def clean_question_forks(questions: list[dict]) -> list[dict]:
+    """The safety net when a form is saved (the editor keeps these right as the agent works): a
+    follow-up whose rule can never come true would just vanish from the form with no warning.
+    Drops answers a top-level choice parent no longer offers; clears the rule when no answers are
+    left, or the parent is gone or isn't earlier in the form. A parent that's a field on an earlier
+    contact screen stays as it is. Changes nothing on a premade form (tests/test_form_forks.py)."""
+    out = []
+    for i, question in enumerate(questions):
+        dep = question.get("depends_on")
+        if dep:
+            parent_id = dep.get("question_id")
+            at = _fork_parent_at(questions, parent_id)
+            values = list(dep.get("values") or [])
+            if at is None or at >= i:
+                values = []
+            elif questions[at].get("id") == parent_id and questions[at].get("type") in ("select", "multi_select"):
+                options = questions[at].get("options") or []
+                values = [value for value in values if value in options]
+            question = {**question, "depends_on": {**dep, "values": values} if values else None}
+        out.append(question)
+    return out
+
+
 def _question_ids(form: AgentForm) -> set:
     ids = set()
     for q in form.questions or []:
@@ -201,14 +294,19 @@ def _question_ids(form: AgentForm) -> set:
     return ids
 
 
-def _clean_answers(form: AgentForm, raw: Optional[dict]) -> dict:
-    """Only this form's own questions, blanks dropped, sizes capped - it's public input."""
+def _clean_answers(form: AgentForm, raw: Optional[dict], keep_cleared: bool = False) -> dict:
+    """Only this form's own questions, blanks dropped, sizes capped - it's public input.
+    keep_cleared: a null stays a null - the form saying "that answer is on a path they left"."""
     if not isinstance(raw, dict):
         return {}
     allowed = _question_ids(form)
     out = {}
     for key, value in raw.items():
-        if key not in allowed or value is None:
+        if key not in allowed:
+            continue
+        if value is None:
+            if keep_cleared:
+                out[key] = None
             continue
         if isinstance(value, list):
             items = [str(v)[:200] for v in value if str(v).strip()][:ANSWER_LIST_CAP]
@@ -419,7 +517,7 @@ async def record_form_progress(db: AsyncSession, form: AgentForm, payload: FormP
     campaign_id = await resolve_campaign_id(db, form.id, payload.campaign_token)
     now = datetime.now(timezone.utc)
     completed_at = now if payload.completed else None
-    answers = _clean_answers(form, payload.answers)
+    answers = _clean_answers(form, payload.answers, keep_cleared=True)
     contact = _contact_from_answers(answers)
     # One path entry per question landed on (not for the intro "view" or the completion ping); a
     # repeat of the last entry (answer autosaves while they type) is skipped in SQL below.
@@ -456,10 +554,12 @@ async def record_form_progress(db: AsyncSession, form: AgentForm, payload: FormP
             ),
             "completed_at": func.coalesce(FormViewSession.completed_at, stmt.excluded.completed_at),
             "updated_at": func.now(),
-            # Merge, newest answer wins per question - an answer they change stays current.
+            # Merge, newest answer wins per question - an answer they change stays current. A null
+            # is an answer on a path they left (FormRunner's answersSnapshot): it wins the merge,
+            # then the strip takes it out. Anything not sent stays, so a reload wipes nothing.
             "partial_answers": literal_column(
-                f"coalesce(nullif({t}.partial_answers, 'null'::jsonb), '{{}}'::jsonb)"
-                f" || coalesce(nullif(excluded.partial_answers, 'null'::jsonb), '{{}}'::jsonb)"),
+                f"jsonb_strip_nulls(coalesce(nullif({t}.partial_answers, 'null'::jsonb), '{{}}'::jsonb)"
+                f" || coalesce(nullif(excluded.partial_answers, 'null'::jsonb), '{{}}'::jsonb))"),
             "path": literal_column(
                 f"CASE WHEN jsonb_array_length(coalesce(excluded.path, '[]'::jsonb)) = 0 THEN {t}.path"
                 f" WHEN coalesce({t}.path -> -1 ->> 'q', '') = excluded.path -> 0 ->> 'q' THEN {t}.path"
@@ -497,16 +597,7 @@ async def submit_form(db: AsyncSession, form: AgentForm, payload: FormSubmission
         )
 
     def is_visible(question: dict) -> bool:
-        depends_on = question.get("depends_on")
-        if not depends_on:
-            return True
-        dep_value = answers_by_id.get(depends_on["question_id"])
-        if dep_value is None:
-            return False
-        values = depends_on.get("values", [])
-        if isinstance(dep_value, list):
-            return any(item in values for item in dep_value)
-        return dep_value in values
+        return question_is_visible(question, form.questions, answers_by_id)
 
     def is_blank(value) -> bool:
         if value is None:

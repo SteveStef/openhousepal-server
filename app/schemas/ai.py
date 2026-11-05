@@ -38,6 +38,8 @@ class AIConversationOut(BaseModel):
 
 class AISendMessageRequest(BaseModel):
     message: str
+    # Photos dropped into the chat first (POST /ai/attachments): their ids (11/05).
+    attachments: Optional[List[str]] = None
     # True when this message was spoken (mic dictation) and/or the reply will be read aloud -
     # tells the model to answer in one short, plain-spoken sentence instead of its normal
     # bullet-list style, since a long reply is read out loud rather than scanned. See

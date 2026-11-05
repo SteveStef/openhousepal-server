@@ -107,7 +107,7 @@ async def _unique_property_slug(db: AsyncSession, base: str) -> str:
     suffix = 2
     while True:
         if candidate not in RESERVED_SLUGS and SLUG_PATTERN.fullmatch(candidate):
-            site_hit = (await db.execute(select(Site.id).where(Site.subdomain_slug == candidate))).scalar_one_or_none()
+            site_hit = (await db.execute(select(Site.id).where(or_(Site.subdomain_slug == candidate, Site.google_search["old_subdomain"].astext == candidate)))).first()
             pw_hit = (await db.execute(select(PropertyWebsite.id).where(PropertyWebsite.slug == candidate))).scalar_one_or_none()
             if not site_hit and not pw_hit:
                 return candidate

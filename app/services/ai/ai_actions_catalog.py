@@ -6,7 +6,7 @@ ai_route_bridge - so plan, broker-authorization, ownership and validation rules 
 Rules every action here follows (see ai_actions.py): no deletes, no billing, nothing paid without
 saying so, and anything that emails or notifies a real person says so on the card. Paid AI from
 the chat says so on its card ("This uses your monthly AI allowance") - the AI CMA and the AI blog
-writer (11/01); Media Lab is still left out until the owner decides it should be too. Left out on
+writer (11/01) and AI media (11/05, ai_actions_media.py). Left out on
 purpose: publishing the IDX website draft (no undo), connecting calendars/mailboxes (needs the agent's own
 sign-in), domains, reviews imports (the agent must attest they're real).
 """
@@ -21,6 +21,7 @@ from app.models.database import (
     AgentReview, AgentTask, Collection, CollectionPreferences, Lead, OpenHouseEvent, OpenHouseFormRequest, OpenHouseHostRequest,
     OpenHouseVisitor, Property, PropertyTour, PropertyWebsite, SupportTicket, User,
 )
+from app.models.database import AIConversation, AIMessage
 from app.services.ai.ai_actions import ActionError, Prepared, register
 from app.services.email_service import tidy_caps
 from app.config.logging import get_logger
@@ -891,9 +892,25 @@ _simple("mark_all_activity_read", "Mark all of the agent's activity/notification
 
 # ================================================================ CMA
 
+CMA_SECTIONS = ("subject", "comparison_table", "location", "comparables", "market_context", "charts", "competition", "pricing")
+CMA_TYPES = ("SINGLE_FAMILY", "TWIN", "TOWNHOUSE", "CONDO", "MULTI_FAMILY")
+
+
 async def _p_cma(db, user, a):
-    key = _need_id(a, "listing_key")
-    prop = await _one(db, select(Property).where(Property.listing_key == key), "I couldn't find that home.")
+    key = _s(a.get("listing_key"))
+    typed = _s(a.get("address"))
+    if not key and not typed:
+        raise ActionError("Which home is the CMA for? Tell me the address.")
+    prop = (await _one(db, select(Property).where(Property.listing_key == key), "I couldn't find that home.")) if key else None
+    if prop is None and re.match(r"^\d+\s+\S", typed):
+        # An address they typed may still be in the MLS records (sold homes too): use that record if it is.
+        parts = [x.strip() for x in typed.split(",")]
+        q = select(Property).where(Property.street_address.ilike(f"{parts[0]}%"))
+        if len(parts) > 1 and not re.match(r"^[A-Za-z]{2}(\s+\d{5})?$", parts[1]):
+            q = q.where(func.lower(Property.city) == parts[1].lower())
+        found = (await db.execute(q.order_by(Property.mls_list_date.desc().nulls_last()).limit(2))).scalars().all()
+        if len(found) == 1 or (found and len(parts) > 1):
+            prop, key = found[0], found[0].listing_key
     mode = "buyer" if a.get("for_buyer") else "listing"
     # AI or manual is asked ON the card (owner, 11/01) - two buttons, not a chat question. What one AI
     # run usually costs, as a share of their monthly AI allowance, is shown on the AI choice.
@@ -901,11 +918,15 @@ async def _p_cma(db, user, a):
         est = await _run_route(user, "GET", "/api/cma/ai-estimate")
     except ActionError:
         est = {}
-    addr = tidy_caps(prop.street_address) if prop.street_address else key
+    addr = (tidy_caps(prop.street_address) if prop.street_address else key) if prop else typed
+    photos = [x for x in (prop.photos or []) if isinstance(x, str)] if prop and isinstance(prop.photos, list) else []
+    facts = {"beds": prop.bedrooms, "baths": prop.bathrooms, "sqft": prop.living_area, "price": prop.price, "city": tidy_caps(prop.city)} if prop else {}
     return Prepared(f"Start a CMA for {addr}", [f"{'Buyer / Offer' if mode == 'buyer' else 'Seller / Listing'} CMA"] +
-                    ([f"Client: {_s(a.get('client_name'))}"] if _s(a.get("client_name")) else []),
-                    {"listing_key": key, "mode": mode, "client_name": _s(a.get("client_name")) or None, "ai": True, "address": addr,
-                     "ai_percent": (est or {}).get("percent"), "photo": (prop.photos or [None])[0] if isinstance(prop.photos, list) and prop.photos else None},
+                    ([f"Client: {_s(a.get('client_name'))}"] if _s(a.get("client_name")) else []) +
+                    ([] if prop else ["This home isn't on the MLS - add its address and facts on the card"]),
+                    {"listing_key": key or None, "mode": mode, "client_name": _s(a.get("client_name")) or None, "ai": True, "address": addr, "manual": prop is None,
+                     "ai_percent": (est or {}).get("percent"), "photo": photos[0] if photos else None, "facts": facts,
+                     "condition_photos": [u for u in [_s(a.get("photo_url"))] if u]},
                     confirm_label="Start", picker="cma")
 
 
@@ -913,6 +934,32 @@ def _adjust_cma(user, payload: dict, picks: dict) -> dict:
     out = {**payload, "ai": bool(picks.get("ai", payload.get("ai")))}
     if picks.get("mode") in ("listing", "buyer"):
         out["mode"] = picks["mode"]
+    if "client_name" in picks:
+        out["client_name"] = _s(picks.get("client_name"))[:120] or None
+    # What the AI can't see in the listing, the report's look, and which sections show (owner, 11/05)
+    extra = {k: _s(picks.get(k))[:n] for k, n in (("condition", 120), ("recent_updates", 1000), ("public_remarks", 4000)) if _s(picks.get(k))}
+    if picks.get("theme") in ("light", "dark"):
+        out["theme"] = picks["theme"]
+    if isinstance(picks.get("hidden_sections"), list):
+        out["hidden_sections"] = [x for x in picks["hidden_sections"] if x in CMA_SECTIONS]
+    out["extra"] = extra
+    if payload.get("manual"):
+        m = picks.get("subject") if isinstance(picks.get("subject"), dict) else {}
+        if not _s(m.get("street_address")) or not isinstance(m.get("latitude"), (int, float)) or not isinstance(m.get("longitude"), (int, float)):
+            raise ActionError("Pick the home's address from the list first.")
+        num = lambda k: m.get(k) if isinstance(m.get(k), (int, float)) and m.get(k) >= 0 else None
+        if out["ai"]:
+            need = [label for k, label in (("beds", "bedrooms"), ("full_baths", "full baths"), ("above_grade_finished_area", "finished square feet"), ("year_built", "year built")) if not num(k)]
+            if need or m.get("property_type") not in CMA_TYPES:
+                raise ActionError("An AI CMA needs " + ", ".join((["the home type"] if m.get("property_type") not in CMA_TYPES else []) + need) + " first.")
+        full, half, above, below = num("full_baths") or 0, num("half_baths") or 0, num("above_grade_finished_area") or 0, num("below_grade_finished_area") or 0
+        subject = {k: _s(m.get(k)) or None for k in ("street_address", "city", "state", "zipcode", "county")}
+        subject.update(source="manual", listing_key=None, latitude=m["latitude"], longitude=m["longitude"], property_type=m.get("property_type") if m.get("property_type") in CMA_TYPES else None,
+                       beds=num("beds"), full_baths=full or None, half_baths=half or None, baths=(full + 0.5 * half) or None, above_grade_finished_area=above or None,
+                       below_grade_finished_area=below or None, sqft=(above + below) or None, year_built=num("year_built"))
+        out["subject"] = subject
+        out["address"] = subject["street_address"]
+        out["condition_photos"] = [u for u in (picks.get("condition_photos") or []) if isinstance(u, str) and u.startswith("http")][:10]
     return out
 
 
@@ -952,10 +999,28 @@ async def _ai_cma_in_background(user_id: str, rid: str, subject: dict, address: 
 
 
 async def _r_cma(db, user, p):
-    subject = await _run_route(user, "GET", f"/api/cma/subject-from-listing/{p['listing_key']}")
+    if p.get("manual"):
+        subject = dict(p.get("subject") or {})
+        try:   # the page's own fill-in: school district, township, water and sewer
+            area = await call_as_agent(user, "GET", "/api/cma/subject-area", params={"lat": subject["latitude"], "lng": subject["longitude"]}) or {}
+            subject.update({k: v for k, v in area.items() if v not in (None, "") and not subject.get(k)})
+        except RouteError:
+            pass
+        if p.get("condition_photos"):
+            subject["condition_photos"] = p["condition_photos"]
+    else:
+        subject = await _run_route(user, "GET", f"/api/cma/subject-from-listing/{p['listing_key']}")
+    subject.update(p.get("extra") or {})
     out = await _run_route(user, "POST", "/api/cma", {"mode": p["mode"], "client_name": p["client_name"], "subject": subject})
     rid = (out or {}).get("id")
     link = f"/studio/cma/{rid}" if rid else "/studio/cma"
+    if rid and p.get("manual") and not subject.get("photo_url"):
+        try:   # the same street picture the page fetches for a home that isn't on the MLS
+            await _run_route(user, "POST", f"/api/cma/{rid}/subject-photo/google", {"kind": "street_view"})
+        except ActionError:
+            pass
+    if rid and (p.get("theme") or p.get("hidden_sections")):
+        await _run_route(user, "PATCH", f"/api/cma/{rid}", {"presentation": {"default_theme": p.get("theme") or "light", "hidden_sections": p.get("hidden_sections") or []}})
     if not rid or not p.get("ai"):
         return {"message": "CMA started - pick your comps on the CMA page.", "link": link}
     # AI CMA (owner, 11/01): the CMA page's own comp search and picks (cma_backtest_service.wizard_comps
@@ -973,9 +1038,10 @@ async def _r_cma(db, user, p):
             "message": "Making your AI CMA - picking the comps, then the analysis and report, usually 3 to 5 minutes. I'll tell you right here when "
                        "it's done, even if you close the site or open it on another device."}
 
-_simple("start_cma", "Start a CMA for a home (listing_key from search_properties), seller/listing or buyer. The card asks AI CMA (it picks the comps and "
-        "runs the AI analysis for them - uses AI allowance) or Manual (they pick comps), and Seller or Buyer - don't ask either in chat (pass for_buyer only if they said).",
-        _obj({"listing_key": {"type": "string"}, "for_buyer": {"type": "boolean"}, "client_name": {"type": "string"}}, ["listing_key"]), _p_cma, _r_cma, MLS,
+_simple("start_cma", "Start a CMA for a home, seller/listing or buyer: listing_key from search_properties, or for a home that isn't on the MLS pass address (what they typed) and the card takes its address and facts. "
+        "The card asks Seller or Buyer, AI CMA (it picks the comps and runs the analysis - uses AI allowance) or Manual, the client's name, the home's condition and recent updates, and the report's look and sections - don't ask those in chat. "
+        "A photo they attached goes in photo_url.",
+        _obj({"listing_key": {"type": "string"}, "address": {"type": "string"}, "for_buyer": {"type": "boolean"}, "client_name": {"type": "string"}, "photo_url": {"type": "string"}}), _p_cma, _r_cma, MLS,
         adjust=_adjust_cma)
 
 
@@ -1000,12 +1066,16 @@ async def _p_spotlight(db, user, a):
     photos = prop.photos if isinstance(prop.photos, list) else []
     preview = {"photo": photos[0] if photos else None, "address": tidy_caps(prop.street_address) or "", "city": tidy_caps(prop.city) or "",
                "price": prop.price, "beds": prop.bedrooms, "baths": prop.bathrooms, "sqft": prop.living_area,
-               "brand_color": kit.get("secondary_color") or "#C9A24D"}
+               "brand_color": kit.get("secondary_color") or "#C9A24D", "photos": [x for x in photos if isinstance(x, str)][:16]}
     return Prepared(f"Make a Spotlight for {tidy_caps(prop.street_address)}",
                     ["Made from your listing's photos and details - I write the highlights, the story and the town section for you",
                      "Saved as a draft - nothing goes live until you publish"]
                     + (["You already have a Spotlight for this home - this makes another"] if have else []),
-                    {"listing_key": key, "template_id": style, "preview": preview}, picker="spotlight")
+                    {"listing_key": key, "template_id": style, "preview": preview}, confirm_label="Make it", picker="spotlight")
+
+
+SPOTLIGHT_SECTIONS = {"story", "gallery", "features", "video", "virtual_tour", "floor_plans", "details", "location", "explore_nearby",
+                      "payment", "open_houses", "documents", "agents", "town", "guest_tools"}
 
 
 def _adjust_spotlight(user, payload: dict, picks: dict) -> dict:
@@ -1017,6 +1087,34 @@ def _adjust_spotlight(user, payload: dict, picks: dict) -> dict:
         if not _HEX.match(str(color)):
             raise ActionError("That color isn't one I can use.")
         out["brand_color"] = str(color)   # a Spotlight wears the Branding color - this changes it
+    # The editor's own choices, picked on the card (owner, 11/05) - saved to the draft once it's made.
+    draft: dict = {}
+    hero = picks.get("hero_image")
+    if hero and hero in ((payload.get("preview") or {}).get("photos") or []):
+        draft["hero_image"] = hero
+    head = {}
+    if picks.get("header_mode") in ("photo", "cycle"):
+        head["mode"] = picks["header_mode"]
+    if picks.get("header_motion") in ("out", "in", "both", "none"):
+        head["motion"] = picks["header_motion"]
+    if head:
+        draft["header"] = head
+    hidden = picks.get("hidden_sections")
+    if isinstance(hidden, list):
+        vis = {k: False for k in hidden if k in SPOTLIGHT_SECTIONS}
+        if "open_houses" in vis:
+            vis["open_houses_by_agent"] = True
+        if vis:
+            draft["section_visibility"] = vis
+    tour = _s(picks.get("virtual_tour_url"))
+    if tour:
+        if not re.match(r"^https?://\S+$", tour):
+            raise ActionError("That 3D tour link doesn't look right - it should start with https://")
+        draft["virtual_tour_url"] = tour[:500]
+    out["draft"] = draft
+    out["story_mode"] = "original" if picks.get("story_mode") == "original" else "short"
+    out["publish"] = picks.get("publish") is True
+    out["editor"] = picks.get("editor") is True
     return out
 
 
@@ -1025,16 +1123,28 @@ async def _r_spotlight(db, user, p):
         await _run_route(user, "PUT", "/studio/brand-kit", {"secondary_color": p["brand_color"]})
     out = await _run_route(user, "POST", "/studio/property-sites", {"listing_key": p["listing_key"], "template_id": p["template_id"]})
     sid = (out or {}).get("id")
-    # The card then runs the editor's own first-open setup (amenities, highlights, short story,
-    # town) right in the chat - see components/assistant/spotlightSetup.ts. If they close the chat
-    # first, the editor still finishes it the first time it's opened.
-    return {"message": "Spotlight made." + (" Your brand color changed too." if p.get("brand_color") else ""),
-            "link": f"/studio/property-sites/{sid}" if sid else "/studio/property-sites",
-            "made": {"kind": "spotlight", "site_id": sid} if sid else None}
+    if not sid:
+        return {"message": "Spotlight made.", "link": "/studio/property-sites"}
+    if p.get("draft"):
+        await _run_route(user, "PATCH", f"/studio/property-sites/{sid}", p["draft"])
+    link = f"/studio/property-sites/{sid}"
+    color_note = " Your brand color changed too." if p.get("brand_color") else ""
+    if p.get("editor"):   # "Rather finish it in the full editor?": the editor does the first-open setup, in front of them
+        return {"message": "Spotlight made." + color_note, "link": f"{link}?new=1" + ("&story=short" if p.get("story_mode") != "original" else "")}
+    # The first-time setup runs on the server, so it finishes even if they close the site (11/05).
+    import asyncio
+    from app.services.ai import ai_notify, ai_spotlight_setup
+    from app.services.ai.ai_actions import CARD
+    await ai_notify.watch(db, user, f"spotlight:{sid}", CARD.get() or {}, (p.get("preview") or {}).get("address") or "this home")
+    task = asyncio.create_task(ai_spotlight_setup.run(user.id, sid, p.get("story_mode") or "short", bool(p.get("publish"))))
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+    return {"working": True, "message": "Writing your Spotlight now - the highlights, the story and the town. It takes about a minute, and I'll tell you right here when it's "
+                                        "ready, even if you close the site." + color_note}
 
 _simple("create_spotlight", "Make a Listing Spotlight (single-listing website) for one of the agent's own active listings (listing_key from search_properties). "
-        "The card shows a small preview with the look (Luxe / Editorial) and color to pick, then writes the highlights, story and town itself - "
-        "don't ask the agent anything about the house. IDX plan.",
+        "The card has a live preview and steps for the look (Luxe / Editorial), color, main photo, how the header moves, short or original story, which sections show, a 3D tour link, and draft or publish; "
+        "then it writes the highlights, story and town itself on the server, so it finishes even if they leave. Don't ask the agent any of that or about the house. IDX plan.",
         _obj({"listing_key": {"type": "string"}, "style": {"type": "string", "enum": ["luxe", "editorial"]}}, ["listing_key"]), _p_spotlight, _r_spotlight, IDX,
         adjust=_adjust_spotlight)
 
@@ -1055,8 +1165,15 @@ async def _r_spotlight_pub(db, user, p):
         from app.services.property_website_service import public_url
         site = await db.get(PropertyWebsite, p["spotlight_id"])
         url = await public_url(db, site) if site else None
-        share = {"url": url, "preview": url} if url else None   # its own address - the preview reads it there
+        share = {"url": url, "preview": _spotlight_preview(site, url)} if url else None
     return {"message": "Published." if p["publish"] else "Taken down.", "link": f"/studio/property-sites/{p['spotlight_id']}", "share": share}
+
+def _spotlight_preview(site, url: str) -> str:
+    """Where its preview is read: its own address, or its openhousepal.com one when it's on the
+    agent's own domain (the preview reader only opens our own addresses)."""
+    import os
+    base = os.getenv("OHP_BASE_DOMAIN") or "openhousepal.com"
+    return url if base in url else f"https://{site.slug}.{base}"
 
 _simple("publish_spotlight", "Publish (publish=true) or take down (false) one of the agent's Listing Spotlights (spotlight_id from list_my_spotlights).",
         _obj({"spotlight_id": {"type": "string"}, "publish": {"type": "boolean"}}, ["spotlight_id", "publish"]), _p_spotlight_pub, _r_spotlight_pub, IDX)
@@ -1071,6 +1188,10 @@ BRAND_SWATCH_NAMES = {"#9B7659": "Bronze", "#C5C9CA": "Silver", "#D8B86A": "Gold
                       "#475569": "Slate", "#000000": "Black", "#FFFFFF": "White"}
 
 
+BRAND_LOGOS = ("personal", "team", "brokerage")
+BRAND_FONTS = ("serif", "sans", "mono")
+
+
 async def _p_brand(db, user, a):
     body, lines = {}, []
     for k, label in (("primary_color", "Main color"), ("secondary_color", "Brand color"), ("accent_color", "Accent color")):
@@ -1079,7 +1200,8 @@ async def _p_brand(db, user, a):
                 raise ActionError("Colors need to be hex codes like #1F3A5F.")
             body[k] = _s(a[k]); lines.append(f"{label}: {BRAND_SWATCH_NAMES.get(body[k].upper(), body[k])}")
     if a.get("look") in ("classic", "luxe"):
-        if a["look"] == "luxe" and user.plan_tier != "IDX" and not user.is_admin:
+        from app.utils.auth import luxe_theme_allowed
+        if a["look"] == "luxe" and not luxe_theme_allowed(user):
             raise ActionError("The Luxe look comes with the IDX plan.")
         body["look"] = {"theme": a["look"]}; lines.append(f"Look: {a['look'].title()}")
     # No exact colors named: the card itself shows the Branding page's choices - look, color, Luxe
@@ -1091,7 +1213,18 @@ async def _p_brand(db, user, a):
         kit = {}
     look = kit.get("look") or {}
     current = {"theme": look.get("theme") or "classic", "metal": look.get("metal") or "gold", "dark": bool(look.get("dark")),
-               "secondary_color": kit.get("secondary_color") or "#C9A24D", "idx": user.plan_tier == "IDX" or bool(user.is_admin)}
+               "secondary_color": kit.get("secondary_color") or "#C9A24D", "idx": user.plan_tier == "IDX",
+               "heading_font": kit.get("heading_font") or "serif", "body_font": kit.get("body_font") or "sans", "disclaimer_text": kit.get("disclaimer_text") or "",
+               "logos": {k: kit.get(f"{k}_logo_url") for k in BRAND_LOGOS}, "headshot": user.photo_url}
+    try:
+        current["qr"] = await _run_route(user, "GET", "/me/qr-brand") or {}
+    except ActionError:
+        current["qr"] = {}
+    # A photo dropped in the chat for this: it starts in the right spot on the card.
+    if _s(a.get("logo_url")) and a.get("logo_kind") in BRAND_LOGOS:
+        current["attached_logo"] = {"kind": a["logo_kind"], "url": _s(a["logo_url"])}
+    if _s(a.get("headshot_url")):
+        current["attached_headshot"] = _s(a["headshot_url"])
     # The tools that don't wear the brand right now - the card asks "use it on every tool?" like the
     # Branding page's "Use this color for all features" (owner, 11/01).
     try:
@@ -1108,7 +1241,7 @@ async def _p_brand(db, user, a):
     if (iv.get("total") or 0) > (iv.get("follows") or 0): off.append("Invites")
     current["not_using"] = off
     if not body:
-        return Prepared("Your Branding", ["Pick a look, color and Ivory or Midnight - your hub, forms, signature and website wear it"],
+        return Prepared("Your Branding", ["Pick your look, colors, logos, headshot and fonts - your hub, forms, signature and website wear them"],
                         {"body": {}, "current": current},
                         confirm_label="Save", picker="brand")
     return Prepared("Update your Branding", lines + ["Your hub, forms, signature and website wear it"], {"body": body, "current": current},
@@ -1120,7 +1253,8 @@ def _adjust_brand(user, payload: dict, picks: dict) -> dict:
     body = dict(payload.get("body") or {})
     look = dict(body.get("look") or {})
     if picks.get("theme") in ("classic", "luxe"):
-        if picks["theme"] == "luxe" and user.plan_tier != "IDX" and not user.is_admin:
+        from app.utils.auth import luxe_theme_allowed
+        if picks["theme"] == "luxe" and not luxe_theme_allowed(user):
             raise ActionError("The Luxe look comes with the IDX plan.")
         look["theme"] = picks["theme"]
     if picks.get("metal") in ("gold", "silver", "bronze"):
@@ -1133,25 +1267,39 @@ def _adjust_brand(user, payload: dict, picks: dict) -> dict:
         body["secondary_color"] = str(picks["secondary_color"])
     if look:
         body["look"] = look
+    cur = payload.get("current") or {}
+    for k in ("heading_font", "body_font"):
+        if picks.get(k) in BRAND_FONTS and picks[k] != cur.get(k):
+            body[k] = picks[k]
+    if "disclaimer_text" in picks and _s(picks.get("disclaimer_text")) != _s(cur.get("disclaimer_text")):
+        body["disclaimer_text"] = _s(picks.get("disclaimer_text"))[:2000]
+    logos = {k: u for k, u in (picks.get("logos") or {}).items() if k in BRAND_LOGOS and isinstance(u, str) and u.startswith("http") and u != (cur.get("logos") or {}).get(k)}
+    headshot = picks.get("headshot") if isinstance(picks.get("headshot"), str) and picks["headshot"].startswith("http") and picks["headshot"] != cur.get("headshot") else None
+    qr = picks.get("qr") if picks.get("qr") in ("ohp", "logo", "initials") and picks.get("qr") != (cur.get("qr") or {}).get("choice") else None
     apply_all = bool(picks.get("apply_all"))
-    if not body and not apply_all:
+    if not body and not apply_all and not logos and not headshot and not qr:
         raise ActionError("Pick something to change first.")
-    return {**payload, "body": body, "apply_all": apply_all}
+    return {**payload, "body": body, "apply_all": apply_all, "logos": logos, "headshot": headshot, "qr": qr}
 
 
 async def _r_brand(db, user, p):
-    if not p.get("body") and not p.get("apply_all"):
+    if not p.get("body") and not p.get("apply_all") and not p.get("logos") and not p.get("headshot") and not p.get("qr"):
         raise ActionError("Pick something to change first.")
+    from app.services.ai import ai_attachments
+    for kind, url in (p.get("logos") or {}).items():
+        await ai_attachments.post_file(db, user, url, f"/studio/brand-kit/logo/{kind}", keep_png=True)
+    if p.get("headshot"):
+        await ai_attachments.post_file(db, user, p["headshot"], "/agent-hub/me/photo")
+    if p.get("qr"):
+        await _run_route(user, "PUT", "/me/qr-brand", {"choice": p["qr"]})
     # The same saves as the Branding page: the brand kit, then (if they said so) "Use this color for
     # all features" - so Branding, Settings and every tool show the same thing.
     if p.get("body"):
         await _run_route(user, "PUT", "/studio/brand-kit", p["body"])
     if p.get("apply_all"):
         await _run_route(user, "POST", "/studio/brand-kit/apply-all", {})
-        return {"message": "Branding saved and every tool uses it now - your hub, forms, signature, invites and website. Logos, fonts and your disclaimer are on the Branding page.",
-                "link": "/studio/brand-kit"}
-    return {"message": "Branding saved - every tool set to your brand wears it now. Logos, fonts and your disclaimer are on the Branding page.",
-            "link": "/studio/brand-kit"}
+        return {"message": "Branding saved and every tool uses it now - your hub, forms, signature, invites and website.", "link": "/studio/brand-kit"}
+    return {"message": "Branding saved - every tool set to your brand wears it now.", "link": "/studio/brand-kit"}
 
 register({"name": "update_branding", "description": (
     "Change the agent's Branding (brand kit). For 'change my colors / show me my options / change my look / put my colors back / undo' with no color named, call it WITHOUT colors - "
@@ -1160,13 +1308,16 @@ register({"name": "update_branding", "description": (
     "the one the card and every tool use). Use the card's own swatches: navy #1E3A5F, gold #C9A24D (Original), light gold #D8B86A, bronze #9B7659, "
     "silver #C5C9CA, blue #2563EB, sky blue #0284C7, green #4A6741, forest #166534, teal #0F766E, purple #7C3AED, pink #EC4899, red #DC2626, "
     "light red #F1746B, burgundy #7F1D1D, orange #EA580C, brown #7C4A2D, slate #475569, charcoal #111827, black #000000) "
-    "so the card starts on it; a second named color goes in accent_color. Never tell them to pick a color they already named."),
-    "input_schema": _obj({"primary_color": {"type": "string"}, "secondary_color": {"type": "string"}, "accent_color": {"type": "string"}, "look": {"type": "string", "enum": ["classic", "luxe"]}})},
+    "so the card starts on it; a second named color goes in accent_color. Never tell them to pick a color they already named. "
+    "The card also takes their logos, headshot, fonts, disclaimer and QR center. A logo they attached goes in logo_url with logo_kind (personal, team or brokerage); a headshot in headshot_url."),
+    "input_schema": _obj({"primary_color": {"type": "string"}, "secondary_color": {"type": "string"}, "accent_color": {"type": "string"}, "look": {"type": "string", "enum": ["classic", "luxe"]},
+                          "logo_url": {"type": "string"}, "logo_kind": {"type": "string", "enum": ["personal", "team", "brokerage"]}, "headshot_url": {"type": "string"}})},
     _p_brand, _r_brand, None, adjust=_adjust_brand)
 
 
 Q_TYPES = {"short_text": "Short answer", "long_text": "Long answer", "select": "Pick one", "multi_select": "Pick any",
-           "number": "Number", "currency": "Dollar amount", "date": "Date", "time": "Time", "email": "Email", "phone": "Phone"}
+           "number": "Number", "currency": "Dollar amount", "date": "Date", "time": "Time", "email": "Email", "phone": "Phone", "contact_group": "Several on one page"}
+GROUP_FIELD_TYPES = ("short_text", "email", "phone", "number", "currency", "date")
 
 # Questions an agent's forms usually ask - tap to add them on the card (owner, 11/01: "buttons with
 # steps ... instead of the agent typing everything").
@@ -1245,6 +1396,41 @@ def _safe_form_questions(raw) -> list:
     return out
 
 
+def _q_extras(q: dict, qt: str) -> dict:
+    """What a question can carry beyond its words: its fork, and the questions sharing its page."""
+    out = {}
+    if qt == "contact_group":
+        import uuid
+        fields = [{"id": _s(f.get("id")) or f"f_{uuid.uuid4().hex[:8]}", "type": f.get("type") if f.get("type") in GROUP_FIELD_TYPES else "short_text",
+                   "label": _s(f.get("label"))[:120], "required": bool(f.get("required"))}
+                  for f in (q.get("fields") or []) if isinstance(f, dict) and _s(f.get("label"))][:6]
+        if len(fields) >= 2:
+            out["fields"] = fields
+    s = q.get("show_if")
+    if isinstance(s, dict) and _s(s.get("question")) and isinstance(s.get("answers"), list) and s["answers"]:
+        out["show_if"] = {"question": _s(s["question"]), "answers": [str(a).strip() for a in s["answers"]][:12]}
+    return out
+
+
+def _with_forks(qs: list) -> list:
+    """The card's questions as the form stores them: each show_if becomes depends_on, pointing at the
+    real id of the earlier question and its exact answer words. One it can't place is asked of everyone."""
+    norm = lambda v: str(v or "").strip().lower()  # noqa: E731
+    seen, out = {}, []
+    for q in qs:
+        row = {k: v for k, v in q.items() if k not in ("show_if", "depends_on")}
+        fork = q.get("show_if") or {}
+        target = seen.get(norm(fork.get("question")))
+        if target:
+            opts = {norm(o): o for o in target.get("options") or []}
+            vals = [opts[norm(a)] for a in fork.get("answers") or [] if norm(a) in opts]
+            if vals:
+                row["depends_on"] = {"question_id": target["id"], "values": vals}
+        seen[norm(q.get("label"))] = row
+        out.append(row)
+    return out
+
+
 def _form_questions(raw) -> tuple[list, list]:
     """Questions as the model or the card sends them -> the form's questions + the card's lines."""
     from app.services.form_question_heal import looks_like_blob, parse_blob
@@ -1268,10 +1454,28 @@ def _form_questions(raw) -> tuple[list, list]:
         opts = [str(o).strip()[:80] for o in (q.get("options") or []) if str(o).strip()][:20]
         if qt in ("select", "multi_select") and len(opts) < 2:
             raise ActionError(f"\u201c{label}\u201d needs at least two answers to pick from.")
+        extras = _q_extras(q, qt)
+        if qt == "contact_group" and "fields" not in extras:
+            qt = "short_text"
         qs.append({"id": f"ai_q{i + 1}", "type": qt, "label": label[:200], "required": bool(q.get("required")),
-                   **({"options": opts} if qt in ("select", "multi_select") else {})})
+                   **({"options": opts} if qt in ("select", "multi_select") else {}), **extras})
         lines.append(f"{label} ({Q_TYPES[qt]}{': ' + ', '.join(opts) if opts else ''}){' - required' if q.get('required') else ''}")
     return qs, lines
+
+
+async def _form_homes(db, user) -> list:
+    """Their own active listings a form can link to."""
+    from app.utils.plan_ids import listing_owner_key
+    mine = listing_owner_key(user)
+    if not mine:
+        return []
+    rows = (await db.execute(select(Property).where(
+        or_(Property.list_agent_mls_id == mine, Property.co_list_agent_mls_id == mine),
+        Property.home_status.in_(("ACTIVE-BRIGHT", "COMING SOON-BRIGHT"))).order_by(Property.mls_list_date.desc().nulls_last()).limit(6))).scalars().all()
+    # price / beds / baths / sq ft too: the card's preview draws the form's home card from these
+    return [{"listing_key": r.listing_key, "address": tidy_caps(r.street_address) or "", "city": tidy_caps(r.city) or "", "state": r.state,
+             "price": r.price, "beds": r.bedrooms, "baths": r.bathrooms, "sqft": r.living_area, "status": r.home_status,
+             "photo": (r.photos[0] if isinstance(r.photos, list) and r.photos and isinstance(r.photos[0], str) else None)} for r in rows]
 
 
 async def _p_form(db, user, a):
@@ -1279,24 +1483,21 @@ async def _p_form(db, user, a):
     if not title:
         raise ActionError("What should the form be called?")
     qs, _qlines = _form_questions(a.get("questions") or [])
-    lines = ["Starts with Full name, Email and Phone"]   # the questions themselves are a step on the card
+    one = a.get("one_contact_screen") is not False   # owner, 11/04: one screen, first and last on one line
+    split = one and a.get("first_last_name") is not False
+    lines = [f"Starts with {'First and last name' if split else 'Full name'}, Email and Phone" + (" on one screen" if one else "")]   # the questions themselves are a step on the card
     # The two look choices are taps on the card, not chat questions (owner, 11/01: "buttons, much less
     # words"): moving background on/off, and one of their own active listings to link (or none).
-    from app.utils.plan_ids import listing_owner_key
-    mine = listing_owner_key(user)
-    homes = []
-    if mine:
-        rows = (await db.execute(select(Property).where(
-            or_(Property.list_agent_mls_id == mine, Property.co_list_agent_mls_id == mine),
-            Property.home_status.in_(("ACTIVE-BRIGHT", "COMING SOON-BRIGHT"))).order_by(Property.mls_list_date.desc().nulls_last()).limit(6))).scalars().all()
-        # price / beds / baths / sq ft too: the card's preview draws the form's home card from these
-        homes = [{"listing_key": r.listing_key, "address": tidy_caps(r.street_address) or "", "city": tidy_caps(r.city) or "", "state": r.state,
-                  "price": r.price, "beds": r.bedrooms, "baths": r.bathrooms, "sqft": r.living_area, "status": r.home_status,
-                  "photo": (r.photos[0] if isinstance(r.photos, list) and r.photos and isinstance(r.photos[0], str) else None)} for r in rows]
+    homes = await _form_homes(db, user)
     key = _s(a.get("listing_key"))
+    style_arg = _style_arg(user, a)
     ideas = [q for q in _safe_form_questions(a.get("ideas") or []) if q["label"].lower() not in {x["label"].lower() for x in qs}][:6]
     payload = {"title": title[:120], "questions": qs, "homes": homes, "ideas": ideas, "bank": _form_bank(title),
                "background_effects": a["background_effects"] if isinstance(a.get("background_effects"), bool) else True,
+               "welcome_text_effects": a["welcome_text_effects"] if isinstance(a.get("welcome_text_effects"), bool) else True,
+               "dark": a["dark_mode"] if isinstance(a.get("dark_mode"), bool) else None,
+               "one_contact": one, "first_last": split, **style_arg,
+               **_after_arg(a.get("after_submit")), "told": _told(a),
                "listing_key": key if any(h["listing_key"] == key for h in homes) or not key else key}
     return Prepared(f"Make a new form: {title}", lines + ["You can change the look and add more in the form editor"], payload, picker="form")
 
@@ -1305,26 +1506,126 @@ def _adjust_form(user, payload: dict, picks: dict) -> dict:
     out = dict(payload)
     if isinstance(picks.get("questions"), list):
         out["questions"], _ = _form_questions(picks["questions"])
-    if isinstance(picks.get("background_effects"), bool):
-        out["background_effects"] = picks["background_effects"]
+    for k in ("background_effects", "welcome_text_effects", "one_contact", "first_last"):
+        if isinstance(picks.get(k), bool):
+            out[k] = picks[k]
+    if "after_mode" in picks:
+        out["after_mode"], out["after_url"] = _s(picks.get("after_mode")) or None, _s(picks.get("after_url")) or None
+        if out["after_mode"]:
+            from fastapi import HTTPException
+            from app.services.forms_service import normalize_form_redirect
+            try:
+                normalize_form_redirect(out["after_mode"], out["after_url"])
+            except HTTPException as e:
+                raise ActionError(str(e.detail))
+    if "look" in picks:
+        out["look"] = picks["look"] if isinstance(picks["look"], dict) else None
+    if "style" in picks:
+        out["style"] = picks["style"] if isinstance(picks["style"], dict) else None
+    if "dark" in picks:
+        out["dark"] = picks["dark"] if isinstance(picks["dark"], bool) else None
     if "listing_key" in picks:
         out["listing_key"] = _s(picks.get("listing_key")) or None
     return out
 
 
+# The form look's Classic colors, by the name people use (lib/accentSwatches, minus the metals).
+FORM_COLORS = {"original": "#C9A24D", "light red": "#F1746B", "pink": "#EC4899", "blue": "#2563EB", "green": "#4A6741", "purple": "#7C3AED", "navy": "#1E3A5F",
+               "charcoal": "#111827", "red": "#DC2626", "burgundy": "#7F1D1D", "orange": "#EA580C", "teal": "#0F766E", "sky blue": "#0284C7", "forest": "#166534",
+               "brown": "#7C4A2D", "slate": "#475569", "black": "#000000"}
+
+
+def form_style(user, look=None, color=None, metal=None) -> dict:
+    """What they named of a form's look -> the card's style pick. Luxe is the IDX plan's, like the editor."""
+    style = {}
+    metal, color = _s(metal).lower(), FORM_COLORS.get(_s(color).lower())
+    if metal in ("gold", "silver", "bronze"):
+        style.update(theme="luxe", metal=metal)
+    if color and not metal:
+        style.update(theme="classic", accent=color)
+    if look in ("classic", "luxe"):
+        style["theme"] = look
+    if style.get("theme") == "luxe" and user.plan_tier != "IDX" and not user.is_admin:
+        raise ActionError("The Luxe look comes with the IDX plan.")
+    return style
+
+
+def _style_arg(user, a: dict) -> dict:
+    style = form_style(user, a.get("look"), a.get("color"), a.get("metal"))
+    return {"style": style} if style else {}
+
+
+CONTACT_IDS = ["full_name", "email", "phone"]
+SPLIT_IDS = ["buyer_first_name", "buyer_last_name", "email", "phone"]
+
+
+def _told(a: dict) -> list:
+    """Card settings the helper set on purpose - the rest carry over from the card this one replaces."""
+    return [k for k, arg in (("one_contact", "one_contact_screen"), ("first_last", "first_last_name"), ("background_effects", "background_effects"),
+                             ("welcome_text_effects", "welcome_text_effects"), ("dark", "dark_mode"), ("after_mode", "after_submit"), ("listing_key", "listing_key")) if a.get(arg) is not None] + (
+        ["style"] if a.get("look") or a.get("color") or a.get("metal") else [])
+
+
+def _after_arg(v) -> dict:
+    """The helper's after_submit: a choice, or a web address."""
+    v = _s(v)
+    if not v:
+        return {}
+    return {"after_mode": v, "after_url": None} if v in ("agent_hub", "website", "property", "none") else {"after_mode": "custom", "after_url": v}
+
+
+def _after_update(p: dict) -> dict:
+    """Where the thank-you sends them. A form about a home goes to that home unless they picked."""
+    mode = _s(p.get("after_mode")) or ("property" if _s(p.get("listing_key")) else "")
+    if not mode:
+        return {}
+    return {"redirect_mode": mode, "redirect_url": p.get("after_url") if mode == "custom" else None,
+            **({"redirect_to_agent_hub": mode != "none"})}
+
+
+def _contact_block(locked: list, one: bool, split: bool = False) -> list:
+    """Name, email and phone as three screens or one, the same one-screen question the premade forms
+    use. Field ids stay the same either way, so leads and past answers read the same (owner, 11/04)."""
+    ids = [q.get("id") for q in locked]
+    grouped = ids == ["contact_info"] and [f.get("id") for f in locked[0].get("fields") or []] in (CONTACT_IDS, SPLIT_IDS)
+    if not (ids == CONTACT_IDS or grouped):
+        return locked
+    name = ([{"id": "buyer_first_name", "type": "short_text", "label": "First name", "required": True}, {"id": "buyer_last_name", "type": "short_text", "label": "Last name", "required": True}]
+            if split and one else [{"id": "full_name", "type": "short_text", "label": "Full name", "required": True}])
+    fields = name + [{"id": "email", "type": "email", "label": "Email", "required": True}, {"id": "phone", "type": "phone", "label": "Phone", "required": True}]
+    if one:
+        return [{"id": "contact_info", "type": "contact_group", "label": "Your Contact Information", "required": True, "locked": True, "fields": fields}]
+    return [{**f, "locked": True} for f in fields]
+
+
+def _look_update(p: dict) -> dict:
+    """The card's Light / Dark pick: the form takes its own look, the rest copied from the brand look
+    so only light or dark changes - what the form editor's own picker does."""
+    look = p.get("look")
+    if not isinstance(look, dict) or not isinstance(look.get("dark"), bool):
+        return {}
+    return {"look_mode": "custom", "dark_mode": look["dark"], "look_theme": look.get("theme") if look.get("theme") in ("classic", "luxe") else "classic",
+            **({"accent_color": look["accent"]} if re.fullmatch(r"#[0-9a-fA-F]{6}", str(look.get("accent") or "")) else {}),
+            **({"luxe_metal": look["metal"]} if look.get("metal") in ("gold", "silver", "bronze") else {})}
+
+
+async def _linked_home(db, key: str) -> dict:
+    prop = await _one(db, select(Property).where(Property.listing_key == key), "I couldn't find that home in the listings.")
+    photos = prop.photos if isinstance(getattr(prop, "photos", None), list) else []
+    return {k: v for k, v in {
+        "listing_key": key, "address": prop.street_address, "city": prop.city, "state": prop.state, "zipcode": getattr(prop, "zipcode", None),
+        "price": prop.price, "beds": getattr(prop, "bedrooms", None), "baths": getattr(prop, "bathrooms", None), "sqft": getattr(prop, "living_area", None),
+        "image_url": photos[0] if photos and isinstance(photos[0], str) else None}.items() if v is not None}
+
+
 async def _r_form(db, user, p):
     if _s(p.get("listing_key")):
-        prop = await _one(db, select(Property).where(Property.listing_key == p["listing_key"]), "I couldn't find that home in the listings.")
-        photos = prop.photos if isinstance(getattr(prop, "photos", None), list) else []
-        p = {**p, "linked_property": {k: v for k, v in {
-            "listing_key": p["listing_key"], "address": prop.street_address, "city": prop.city, "state": prop.state, "zipcode": getattr(prop, "zipcode", None),
-            "price": prop.price, "beds": getattr(prop, "bedrooms", None), "baths": getattr(prop, "bathrooms", None), "sqft": getattr(prop, "living_area", None),
-            "image_url": photos[0] if photos and isinstance(photos[0], str) else None}.items() if v is not None}}
+        p = {**p, "linked_property": await _linked_home(db, p["listing_key"])}
     out = await _run_route(user, "POST", "/agent-hub/forms", {"title": p["title"]})
     fid = (out or {}).get("id")
-    update = {k: p[k] for k in ("background_effects", "linked_property") if k in p}
-    if fid and p.get("questions"):
-        update["questions"] = list((out or {}).get("questions") or []) + p["questions"]
+    update = {**{k: p[k] for k in ("background_effects", "welcome_text_effects", "linked_property") if k in p}, **_look_update(p), **_after_update(p)}
+    if fid and (p.get("questions") or p.get("one_contact")):
+        update["questions"] = _contact_block(list((out or {}).get("questions") or []), bool(p.get("one_contact")), bool(p.get("first_last"))) + _with_forks(list(p.get("questions") or []))
     if fid and update:
         await _run_route(user, "PUT", f"/agent-hub/forms/{fid}", update)
     share = None
@@ -1336,18 +1637,210 @@ async def _r_form(db, user, p):
     return {"message": "Form made. In its editor you can also change the look and colors, the welcome text, the thank-you page and where it sends people after.",
             "link": f"/studio/forms?edit={fid}" if fid else "/studio/forms", "share": share}
 
-_simple("create_form", "Make a new custom form (Forms & Invites) with a title and the agent's own questions (types: " + ", ".join(Q_TYPES) + "; select/multi_select need options). Full name, email and phone are always there already. "
-        "Set it up right away with 3-5 questions that fit exactly what this form is for (pick-one questions with clear answers where it helps), plus `ideas`: 4-6 MORE fitting questions they can tap in - think about the situation (who fills it in and what the agent needs to know next). "
-        "The card itself lets them take questions off, tap ideas and common ones in and type their own, plus the moving-background switch and their listings to link (don't ask about any of those in chat). Send questions and ideas as real lists, never as text. Pass listing_key only if they named the home. "
-        "The card has a flip-through preview numbered like the real form (Q1-Q3 = name, email, phone; their questions start at Q4). When they ask to change a question or its "
-        "options while the card is still waiting, call create_form again with the same title and the FULL updated list from the app note - that card replaces the old one. "
-        "In chat, never number the questions your own way (no “question 1” for their first one) - say what they're about.",
-        _obj({"title": {"type": "string"}, "questions": {"type": "array", "items": {"type": "object", "properties": {
-            "label": {"type": "string"}, "type": {"type": "string", "enum": list(Q_TYPES)}, "options": {"type": "array", "items": {"type": "string"}}, "required": {"type": "boolean"}}}},
+_FORM_Q = {"type": "array", "items": {"type": "object", "properties": {
+    "label": {"type": "string"}, "type": {"type": "string", "enum": list(Q_TYPES)}, "options": {"type": "array", "items": {"type": "string"}}, "required": {"type": "boolean"},
+    "show_if": {"type": "object", "description": "A fork: ask this only when that earlier pick-one question got one of these answers", "properties": {"question": {"type": "string"}, "answers": {"type": "array", "items": {"type": "string"}}}},
+    "fields": {"type": "array", "description": "contact_group only: the questions sharing this page (text, email, phone, number, currency, date)", "items": {"type": "object", "properties": {"label": {"type": "string"}, "type": {"type": "string"}}}}}}}
+_FORM_EXTRA = {"first_last_name": {"type": "boolean", "description": "Forms start with first and last name side by side on one line. false only if they ask for one Full name box"},
+               "look": {"type": "string", "enum": ["classic", "luxe"], "description": "Only if they name the style"},
+               "color": {"type": "string", "enum": [n.title() for n in FORM_COLORS], "description": "Only if they name a Classic color"},
+               "metal": {"type": "string", "enum": ["gold", "silver", "bronze"], "description": "Only if they name a Luxe finish"},
+               "after_submit": {"type": "string", "description": "Only if they name where people go after the thank-you: agent_hub, website, property, none, or a web address. \"Finish the form\" is a fork, not this"}}
+
+_simple("create_form", "Make a NEW custom form (to change one that exists use edit_form). A title, 3-5 questions that fit it (types: " + ", ".join(Q_TYPES) + "; select/multi_select need options; name, email and phone are already there) and `ideas`: 4-6 more to tap in. Real lists, never text. listing_key only if they named the home. "
+        "The card handles the look, the linked home, where the thank-you goes and adding or removing questions - don't ask about those in chat. "
+        "Forks only when the flow really needs one (they asked, or a question makes no sense for some answers): make that question pick-one and put show_if on each question for that path; \"if yes, finish\" means the No question gets show_if and no un-forked question follows. Several on one page: type contact_group with fields. "
+        "While the card waits, any change goes through edit_form, never create_form again. In chat never number the questions your own way.",
+        _obj({"title": {"type": "string"}, "questions": _FORM_Q,
             "ideas": {"type": "array", "items": {"type": "object", "properties": {
             "label": {"type": "string"}, "type": {"type": "string", "enum": list(Q_TYPES)}, "options": {"type": "array", "items": {"type": "string"}}}}},
-            "background_effects": {"type": "boolean"}, "listing_key": {"type": "string"}},
+            "background_effects": {"type": "boolean"}, "welcome_text_effects": {"type": "boolean"}, "dark_mode": {"type": "boolean"},
+            "one_contact_screen": {"type": "boolean", "description": "Forms start with name, email and phone on ONE screen. false only if they ask for separate screens"}, **_FORM_EXTRA,
+            "listing_key": {"type": "string"}},
              ["title"]), _p_form, _r_form, adjust=_adjust_form)
+
+
+# Changing a form that already exists, from chat (owner, 11/04: after "Open in Forms" the chat could
+# only make a new one). Same card as making one. The card keeps a copy of the questions it started
+# from, so if the form is changed in its editor before they tap, it stops instead of overwriting
+# (ai_actions._field_snapshot). Each question keeps its own id, so past answers stay attached.
+async def _own_form(db, user, a):
+    from app.models.database import AgentForm
+    rows = (await db.execute(select(AgentForm).where(AgentForm.owner_id == user.id)
+                             .order_by(AgentForm.updated_at.desc().nulls_last(), AgentForm.created_at.desc()))).scalars().all()
+    fid, title = _s(a.get("form_id")), _s(a.get("title")).lower()
+    hit = next((f for f in rows if f.id == fid), None) if fid else None
+    if not hit and title:
+        hit = (next((f for f in rows if (f.title or "").strip().lower() == title), None)
+               or next((f for f in rows if title in (f.title or "").lower()), None))
+    if not hit:
+        # The model's words around the name: "Edit your form: Buyer Check" (a card's title), the name
+        # sent as form_id, or only the change itself. Longest name first, so "Buyer" can't beat "Buyer Check".
+        said = " ".join((title, fid.lower(), _s(a.get("change")).lower()))
+        named = sorted((f for f in rows if (f.title or "").strip()), key=lambda f: -len(f.title))
+        hit = next((f for f in named if f.title.strip().lower() in said), None)
+    if not hit:
+        logger.info("edit_form found no form: id=%r title=%r", fid, title)
+        raise ActionError("I couldn't find that form. Which one do you mean?")
+    return hit
+
+
+def _merge_form_questions(existing: list, new: list) -> list:
+    """The card's questions on top of the form's real ones: same words (or the same spot and kind,
+    for a reworded one) keeps that question's id and everything else about it."""
+    norm = lambda q: str(q.get("label") or "").strip().lower()  # noqa: E731
+    by_label = {norm(q): q for q in existing}
+    wanted = {norm(q) for q in new}
+    used, out = set(), []
+    for i, q in enumerate(new):
+        old = by_label.get(norm(q))
+        if old is None or old.get("id") in used:
+            spot = existing[i] if i < len(existing) else None
+            old = spot if spot and spot.get("id") not in used and spot.get("type") == q.get("type") and norm(spot) not in wanted else None
+        if old:
+            used.add(old.get("id"))
+            kept = {k: v for k, v in old.items() if k not in ("options", "fields", "depends_on")}
+            row = {**kept, **{k: q[k] for k in ("label", "type", "required", "options", "show_if") if k in q}}
+            if q.get("fields"):   # a field keeps its id too, so past answers stay with it
+                ids = {str(f.get("label")).strip().lower(): f.get("id") for f in old.get("fields") or []}
+                row["fields"] = [{**f, "id": ids.get(f["label"].strip().lower()) or f["id"]} for f in q["fields"]]
+            out.append(row)
+        else:
+            import uuid
+            out.append({**q, "id": f"ai_{uuid.uuid4().hex[:8]}"})
+    return out
+
+
+async def _waiting_form_cards(db, user) -> list:
+    rows = (await db.execute(select(AIMessage).join(AIConversation, AIConversation.id == AIMessage.conversation_id)
+                             .where(AIConversation.owner_id == user.id, AIMessage.role == "assistant")
+                             .order_by(AIMessage.created_at.desc()).limit(12))).scalars().all()
+    return [c for m in rows for c in (m.tool_calls or []) if isinstance(c, dict) and c.get("tool") in ("create_form", "edit_form") and c.get("status") == "pending"]
+
+
+async def _revise_card(db, user, title: str, questions: list, change: str) -> dict:
+    """The change applied to the real list by the small editor the card's own change line uses: the
+    chat never retypes a form, so it can't drop a fork or a page, and retyping cost more (owner, 11/04)."""
+    from fastapi import HTTPException
+    from app.services.ai import ai_copywrite_service
+    try:
+        out = await ai_copywrite_service.revise_form_questions(db, user.id, user.plan_tier, title=title or "Form", questions=questions, at=None, instruction=change)
+    except HTTPException as e:
+        raise ActionError(str(e.detail))
+    await db.refresh(user)
+    if out.get("changed") is False:
+        raise ActionError(out["note"])
+    style = form_style(user, out.pop("look", None), out.pop("color", None), out.pop("metal", None))
+    return {**out, **({"style": style} if style else {})}
+
+
+CARD_REVISED = ("one_contact", "first_last", "style", "dark")   # settings the card's change line can set
+
+
+async def _p_edit_waiting(db, user, a, card: dict):
+    """A form not made yet: the change goes on its waiting card, and that stays a card for a new form."""
+    p, draft = dict(card.get("payload") or {}), card.get("draft_picks") if isinstance(card.get("draft_picks"), dict) else {}
+    start = draft.get("questions") or p.get("questions") or []
+    change = _s(a.get("change"))
+    out = await _revise_card(db, user, p.get("title"), start, change) if change else {"questions": start}
+    qs, _ = _form_questions(out["questions"])
+    told = [k for k in CARD_REVISED if k in out] + (["after_mode"] if a.get("after_submit") else [])
+    return Prepared(card.get("title") or f"Make a new form: {p.get('title')}", list(card.get("details") or []),
+                    {**p, "questions": qs, **{k: out[k] for k in CARD_REVISED if k in out}, **_style_arg(user, a), **_after_arg(a.get("after_submit")), "told": told + (["style"] if _style_arg(user, a) else [])}, picker="form")
+
+
+def _card_fits(q: dict, own: list) -> bool:
+    if q.get("type") not in Q_TYPES:
+        return False
+    if q.get("type") == "contact_group" and any(f.get("type") not in GROUP_FIELD_TYPES for f in q.get("fields") or []):
+        return False
+    dep = (q.get("depends_on") or {}).get("question_id")
+    return not dep or any(o.get("id") == dep and _card_fits(o, own) for o in own)
+
+
+async def _p_edit_form(db, user, a):
+    cards = await _waiting_form_cards(db, user)
+    named, fid = _s(a.get("title")).lower(), _s(a.get("form_id"))
+    new_card = next((c for c in cards if not (c.get("payload") or {}).get("form_id") and (not fid) and (not named or str((c.get("payload") or {}).get("title") or "").strip().lower() == named)), None)
+    if new_card:
+        return await _p_edit_waiting(db, user, a, new_card)
+    form = await _own_form(db, user, a)
+    if form.form_type == "showcase_request":
+        raise ActionError("That form's questions are set - only its look can change, in the form editor.")
+    own = [q for q in (form.questions or []) if isinstance(q, dict) and not q.get("locked")]
+    # special = what a card can't hold: a kind it doesn't know, a page with a pick-one in it, or a fork
+    # on a question it doesn't show. Those stay exactly as they are.
+    plain = [q for q in own if _card_fits(q, own)]
+    if len(plain) > 15:
+        raise ActionError("That form has more questions than a chat card can hold - change it in the form editor.")
+    labels = {q.get("id"): q.get("label") for q in plain}
+    start = [{**{k: q.get(k) for k in ("label", "type", "options", "required", "fields") if q.get(k) is not None},
+              **({"show_if": {"question": labels[q["depends_on"]["question_id"]], "answers": q["depends_on"]["values"]}} if q.get("depends_on") else {})} for q in plain]
+    # A card still waiting for this form: this change goes on top of it, not on the saved form.
+    waiting = next((c for c in cards if (c.get("payload") or {}).get("form_id") == form.id), None)
+    if waiting:
+        start = (waiting.get("draft_picks") or {}).get("questions") or (waiting.get("payload") or {}).get("questions") or start
+    revised, change = {}, _s(a.get("change"))
+    if change:
+        revised = await _revise_card(db, user, form.title, start, change)
+        await db.refresh(form)
+        start = revised["questions"]
+    qs, _ = _form_questions(start)
+    title = form.title or "Your form"
+    lines = ["Changes the form that's already live - answers people already sent stay"]
+    if revised.get("note"):
+        lines.insert(0, revised["note"])
+    if len(own) > len(plain):
+        lines.append(f"{len(own) - len(plain)} special question{'s stay' if len(own) - len(plain) != 1 else ' stays'} as is - those change in the form editor")
+    ideas = [q for q in _safe_form_questions(a.get("ideas") or []) if q["label"].lower() not in {x["label"].lower() for x in qs}][:6]
+    linked = form.linked_property if isinstance(form.linked_property, dict) else {}
+    locked = [q for q in (form.questions or []) if isinstance(q, dict) and q.get("locked")]
+    grouped = [q.get("id") for q in locked] == ["contact_info"] and _contact_block(locked, False) != locked      # on one screen, and can come apart
+    fixed = not grouped and [q.get("id") for q in locked] != CONTACT_IDS   # a premade form's own contact questions
+    payload = {"form_id": form.id, "title": title[:120], "questions": qs, "original": plain, "homes": await _form_homes(db, user), "ideas": ideas, "bank": _form_bank(title),
+               "background_effects": form.background_effects is not False, "welcome_text_effects": form.welcome_text_effects is not False,
+               "dark": revised["dark"] if isinstance(revised.get("dark"), bool) else bool(form.dark_mode) if form.look_mode == "custom" else None,
+               "style": revised.get("style") or _style_arg(user, a).get("style") or ({"theme": form.look_theme or "classic", **({"accent": form.accent_color} if form.accent_color else {}), "metal": form.luxe_metal or "gold"} if form.look_mode == "custom" else None),
+               "had_custom": form.look_mode == "custom",
+               "one_contact": revised["one_contact"] if "one_contact" in revised and not fixed else grouped, "contact_fixed": fixed,
+               "first_last": revised["first_last"] if "first_last" in revised and not fixed else any(f.get("id") == "buyer_first_name" for q in locked for f in q.get("fields") or []),
+               "after_mode": form.redirect_mode, "after_url": form.redirect_url, **_after_arg(a.get("after_submit")), "told": _told(a) + [k for k in CARD_REVISED if k in revised],
+               "listing_key": linked.get("listing_key") or None, "had_listing": linked.get("listing_key") or None,
+               "body": {"questions": form.questions or []}}
+    return Prepared(f"Edit your form: {title}", lines, payload, confirm_label="Save changes", picker="form")
+
+
+async def _r_edit_form(db, user, p):
+    if not p.get("form_id"):   # it was a new form's card all along
+        return await _r_form(db, user, p)
+    form = await _own_form(db, user, {"form_id": p.get("form_id")})
+    now = [q for q in (form.questions or []) if isinstance(q, dict)]
+    locked = [q for q in now if q.get("locked")]
+    own = [q for q in now if not q.get("locked")]
+    special = [q for q in own if not _card_fits(q, own)]
+    update = {"questions": _contact_block(locked, bool(p.get("one_contact")), bool(p.get("first_last"))) + _with_forks(_merge_form_questions(p.get("original") or [], p.get("questions") or [])) + special,
+              **(_look_update(p) or ({"look_mode": "brand"} if p.get("had_custom") else {})), **({"redirect_mode": p["after_mode"], "redirect_url": p.get("after_url") if p["after_mode"] == "custom" else None, "redirect_to_agent_hub": p["after_mode"] != "none"} if p.get("after_mode") else {})}
+    for k in ("background_effects", "welcome_text_effects"):
+        if isinstance(p.get(k), bool):
+            update[k] = p[k]
+    key = _s(p.get("listing_key"))
+    if key and key != p.get("had_listing"):
+        update["linked_property"] = await _linked_home(db, key)
+    elif not key and p.get("had_listing"):
+        update["linked_property"] = None
+    await _run_route(user, "PUT", f"/agent-hub/forms/{form.id}", update)
+    share = None
+    from app.services.website.site_service import owner_links
+    links = await owner_links(db, user)
+    if links.hub_slug and form.slug:
+        share = await _share(db, user, f"/{links.hub_slug}/{form.slug}", url=links.form(form.slug))
+    return {"message": "Form updated. If you have its editor open in another tab, it picks up this version when you go back to it.",
+            "link": f"/studio/forms?edit={form.id}", "share": share}
+
+_simple("edit_form", "Change a form: one on a card still waiting, or one that exists (made here, opened in the editor, any of theirs) - never create_form for that. Pass its exact title or form_id (list_my_forms), and `change`: what they asked for in their words, forks, pages and combining the contact info included. Don't retype the questions or ask how to word them - the card's editor writes them. "
+        "No `change` just opens the card. Another change while the card waits: call again with only that change. Past answers are kept.",
+        _obj({"form_id": {"type": "string"}, "title": {"type": "string"}, "change": {"type": "string"}, "after_submit": _FORM_EXTRA["after_submit"]}, []),
+        _p_edit_form, _r_edit_form, adjust=_adjust_form)
 
 INVITE_TYPES = {"open_house": "Open house", "brokers_open": "Broker's open", "client_event": "Client event", "custom": "Other event"}
 INVITE_DESIGNS = {"classic": "Classic", "garden": "Garden", "midnight": "Midnight", "modern": "Modern"}
@@ -1406,7 +1899,9 @@ async def _p_invite(db, user, a):
             "hostBrokerage": prof.get("brokerage") or user.brokerage, "hostPhoto": prof.get("photo_url") or user.photo_url,
             "hostArea": prof.get("market") or getattr(user, "market", None)}
     look = kit.get("look") or {}
-    options = {"homes": homes, "host": host, "luxe_ok": bool(luxe_theme_allowed(user)),
+    from app.services import invites_service
+    options = {"homes": homes, "host": host, "luxe_ok": bool(luxe_theme_allowed(user)), "presets": {k: {x: v[x] for x in ("audience", "design", "message", "questions")} for k, v in invites_service.PRESETS.items()},
+               "attached_cover": _s(a.get("cover_photo_url")) or None,
                "brand_accent": kit.get("secondary_color") or "#C9A24D", "brand_metal": look.get("metal") if look.get("theme") == "luxe" else None,
                "kind_given": bool(kind)}
     return Prepared("Make an event invite", lines + ["It gets its own link - nobody receives it until you send it from Forms & Invites"],
@@ -1414,11 +1909,21 @@ async def _p_invite(db, user, a):
 
 
 async def _r_invite(db, user, p):
-    out = await _run_route(user, "POST", "/invites", p["body"])
+    body = dict(p["body"])
+    home = body.get("linked_property") or {}
+    if home.get("listing_key"):
+        # A home's invite ties to its open house, so the guest page shows the Cheat Sheet (the builder does this)
+        try:
+            slots = await call_as_agent(user, "GET", "/invites/scheduled", params={"listing_key": home["listing_key"]}) or {}
+            if slots.get("open_house_event_id"):
+                body["open_house_event_id"] = slots["open_house_event_id"]
+        except RouteError:
+            pass
+    out = await _run_route(user, "POST", "/invites", body)
     code = (out or {}).get("code")
     share = await _share(db, user, f"/i/{code}", url=(out or {}).get("share_url")) if code else None
     iid = (out or {}).get("id")
-    return {"message": "Invite made - open it to add a cover photo, pick who to send it to and send it.",
+    return {"message": "Invite made - nobody has it yet. Say \"send it\" and I'll pick who it goes to, or share the link.",
             "link": f"/studio/forms?view=invites&invite={iid}" if iid else "/studio/forms?view=invites", "share": share}
 
 def _adjust_invite(user, payload: dict, picks: dict) -> dict:
@@ -1460,20 +1965,59 @@ def _adjust_invite(user, payload: dict, picks: dict) -> dict:
         body["title"] = INVITE_TYPES.get(body.get("invite_type"), "You're invited")
     if not body.get("event_date"):
         raise ActionError("Pick the day on the card first.")
+    # The rest of the builder's choices (owner, 11/05). A card always saves the kind's RSVP questions:
+    # invites made from the chat used to have none, so nobody was asked how many were coming.
+    preset = (opts.get("presets") or {}).get(body.get("invite_type")) or {}
+    body["questions"] = picks["questions"][:12] if isinstance(picks.get("questions"), list) else preset.get("questions") or []
+    body["message"] = _s(picks["message"])[:2000] if "message" in picks else body.get("message") or preset.get("message") or ""
+    if body.get("invite_type") == "brokers_open":
+        body["audience"] = "agents"
+    else:
+        body["audience"] = picks["audience"] if picks.get("audience") in ("clients", "agents") and body.get("invite_type") == "custom" else preset.get("audience") or "clients"
+    if "subtitle" in picks:
+        body["subtitle"] = None if picks["subtitle"] is None else _s(picks["subtitle"])[:60]
+    if not home:
+        for k, n in (("place_name", 140), ("address", 300)):
+            if k in picks:
+                if _s(picks.get(k)):
+                    body[k] = _s(picks[k])[:n]
+                else:
+                    body.pop(k, None)
+        if not _s(body.get("address")) and not _s(body.get("place_name")):
+            raise ActionError("Add where it is on the card first.")
+    cover = picks.get("cover")
+    if isinstance(cover, str) and cover.startswith("http"):
+        body["cover_image_url"] = cover
+    elif cover is None and "cover" in picks and home:
+        body["linked_property"] = {**body["linked_property"], "no_cover": True}
+        body.pop("cover_image_url", None)
+    elif home and home.get("image"):
+        body["cover_image_url"] = home["image"]
+    if picks.get("motion") in ("normal", "luxe"):
+        body["motion"] = picks["motion"]
+    days = []
+    for d in (picks.get("extra_dates") or [])[:6]:
+        if isinstance(d, dict) and d.get("date"):
+            days.append({"date": _date_ok(d["date"]), "start": _time_ok(d.get("start") or body.get("start_time") or ""), "end": _time_ok(d.get("end") or body.get("end_time") or "")})
+    if days:
+        body["extra_dates"] = days
     return {**payload, "body": body}
 
 register({"name": "create_invite", "description": (
     "Make an event invite with RSVP (open house, broker's open, client event, other). Set it up as soon as they ask - the card itself asks, as taps with a live preview, "
-    "the kind, which of their listings, the date, the times, the design and the color (Luxe on IDX) - so never ask those in chat; pass only what they already said "
-    "(kind, title, date YYYY-MM-DD, times HH:MM, message). Keep the title short and catchy - under about 40 characters ('Holiday Cookie Swap', "
+    "the kind, which of their listings, the days and times, the wording, the place, the cover photo, the design, color and animation, and the RSVP questions - so never ask those in chat; pass only what they already said "
+    "(kind, title, date YYYY-MM-DD worked out from today when they say next Friday, times HH:MM, message, and cover_photo_url when they attached a photo). Keep the title short and catchy - under about 40 characters ('Holiday Cookie Swap', "
     "not the whole description; details go in message) - a long one is cut off on the invite card. place_name is a venue's NAME (a club, a restaurant) - never the street address; "
     "for a client event away from their listings ask where in one short question. Never sends it."),
     "input_schema": _obj({"kind": {"type": "string", "enum": list(INVITE_TYPES)}, "title": {"type": "string"}, "date": {"type": "string"}, "start_time": {"type": "string"}, "end_time": {"type": "string"},
-                          "place_name": {"type": "string"}, "address": {"type": "string"}, "message": {"type": "string"}, "design": {"type": "string", "enum": list(INVITE_DESIGNS)}})},
+                          "place_name": {"type": "string"}, "address": {"type": "string"}, "message": {"type": "string"}, "design": {"type": "string", "enum": list(INVITE_DESIGNS)},
+                          "cover_photo_url": {"type": "string"}})},
     _p_invite, _r_invite, None, adjust=_adjust_invite)
 
 
 BLOG_TONES = ("warm", "professional", "luxury", "energetic", "straight")
+BLOG_THEMES = ("luxe", "luxe_plus", "editorial", "modern", "midnight")
+BLOG_CATEGORIES = ("Buyers", "Sellers", "Market Updates", "Neighborhoods", "Homeownership", "Luxury", "Investments", "Open Houses", "Local Guides", "New Construction", "Real Estate News")
 BLOG_LENGTHS = ("short", "standard", "long")
 BLOG_AUDIENCES = ("Buyers", "Sellers", "First-time buyers", "Move-up buyers", "Luxury buyers", "Investors", "Relocating", "Homeowners")
 BLOG_CTAS = ("how_can_i_help", "home_value", "showing", "buying", "selling", "make_me_sell", "question")
@@ -1543,7 +2087,9 @@ async def _p_blog(db, user, a):
         body["key_points"] = _s(a["key_points"])[:2000]
     if _s(a.get("goal")):
         body["goal"] = _s(a["goal"])[:300]
-    options = {"areas": areas, "area_cards": cards, "sales": sales, "listings": listings, "videos": videos,
+    from app.utils.auth import luxe_blog_theme_allowed
+    options = {"areas": areas, "area_cards": cards, "sales": sales, "listings": listings, "videos": videos, "luxe_ok": bool(luxe_blog_theme_allowed(user)),
+               "idx_ok": user.plan_tier == "IDX", "attached_cover": _s(a.get("cover_photo_url")) or None,
                "angles": _strs(a.get("angles"), 5, 200), "goals": _strs(a.get("goals"), 4, 200), "point_ideas": _strs(a.get("point_ideas"), 7, 200)}
     return Prepared("Write a blog post with AI", [f"Topic: {topic[:200]}", "Saved as a draft - never published until you do"],
                     {"body": body, "percents": percents, "options": options},
@@ -1576,6 +2122,23 @@ def _adjust_blog(user, payload: dict, picks: dict) -> dict:
         by = {x["id"]: x for x in (opts.get("listings") or [])}
         body["listings"] = [{"listing_key": by[i]["id"], **{k: by[i][k] for k in ("address", "city", "state", "price", "beds", "baths", "sqft", "status", "image_url") if by[i].get(k) is not None}}
                             for i in picks["listing_ids"] if i in by][:6]
+    # The article's look and where it shows (owner, 11/05): set on the draft as soon as it exists.
+    after, places = {}, {}
+    if picks.get("theme") in BLOG_THEMES and (picks["theme"] != "luxe_plus" or opts.get("luxe_ok")):
+        after["theme"] = picks["theme"]
+        if picks["theme"] == "luxe_plus" and picks.get("luxe_metal") in ("gold", "silver", "bronze"):
+            after["luxe_metal"] = picks["luxe_metal"]
+        if picks["theme"] == "luxe" and picks.get("accent_color") and _HEX.match(str(picks["accent_color"])):
+            after["accent_color"] = str(picks["accent_color"])
+    if picks.get("category") in BLOG_CATEGORIES:
+        after["category"] = picks["category"]
+        body["category_hint"] = picks["category"]
+    if isinstance(picks.get("cover"), str) and picks["cover"].startswith("http"):
+        after["cover_image_url"] = picks["cover"]
+    for k in ("agent_hub_visible", "agent_hub_featured", "use_signature_card") + (("idx_visible",) if opts.get("idx_ok") else ()):
+        if isinstance(picks.get(k), bool):
+            places[k] = picks[k]
+    out["after"], out["places"] = after, places
     if "video" in picks:
         v = picks.get("video") if isinstance(picks.get("video"), dict) else None
         if v and _yt(_s(v.get("url"))):
@@ -1607,6 +2170,10 @@ async def _r_blog(db, user, p):
     bid = (out or {}).get("blog_id") or (out or {}).get("id")
     if not bid:
         return {"message": "Writing it now - it takes a few minutes.", "link": "/studio/blogs"}
+    if p.get("after"):
+        await _run_route(user, "PUT", f"/studio/blogs/{bid}", p["after"])
+    if p.get("places"):
+        await _run_route(user, "PATCH", f"/studio/blogs/{bid}/agent-hub-visibility", p["places"])
     # It writes in the background (research, writing, fact-check): the card keeps working and the
     # chat says when the draft is ready - like an AI CMA (owner, 11/01).
     from app.services.ai import ai_notify
@@ -1617,14 +2184,14 @@ async def _r_blog(db, user, p):
                        "ready, even if you close the site."}
 
 _simple("write_blog_post", "Start the AI blog writer on a topic (draft only; uses the agent's AI allowance). Plans with Blogs. "
-        "You CAN write blog posts - never say otherwise. The card is the Blogs page's own interview as check-box steps (topic angle + what readers walk away with, who it's for, towns + Town Spotlight, key points, their take and numbers, their sales and listings, one of their YouTube videos, tone, length, the ending button) - "
+        "You CAN write blog posts - never say otherwise. The card is the Blogs page's own interview as check-box steps (topic angle + what readers walk away with, who it's for, towns + Town Spotlight, key points, their take and numbers, their sales and listings, one of their YouTube videos, tone, length, the ending button, the article's look and color, its category and cover photo, and where it shows) - "
         "set it up as soon as you have the topic and never ask those in chat (pass them only if they already said). ALWAYS pass angles (4-5 sharper titles on their topic), goals (3-4 one-line things a reader should walk away knowing or doing) and point_ideas (5-7 specific key points worth covering) - they're the check boxes on the card.",
         _obj({"topic": {"type": "string"}, "key_points": {"type": "string"}, "goal": {"type": "string"}, "tone": {"type": "string", "enum": list(BLOG_TONES)},
               "length": {"type": "string", "enum": list(BLOG_LENGTHS)}, "audiences": {"type": "array", "items": {"type": "string", "enum": list(BLOG_AUDIENCES)}},
               "areas": {"type": "array", "items": {"type": "string"}, "description": "Towns the article is about, if they named any (up to 5)."},
               "cta": {"type": "string", "enum": list(BLOG_CTAS)},
               "angles": {"type": "array", "items": {"type": "string"}}, "goals": {"type": "array", "items": {"type": "string"}},
-              "point_ideas": {"type": "array", "items": {"type": "string"}}}, ["topic"]), _p_blog, _r_blog, STUDIO, adjust=_adjust_blog)
+              "point_ideas": {"type": "array", "items": {"type": "string"}}, "cover_photo_url": {"type": "string", "description": "A photo they attached, for the cover."}}, ["topic"]), _p_blog, _r_blog, STUDIO, adjust=_adjust_blog)
 
 
 # ================================================================ SETTINGS / PROFILE / SITE
@@ -1649,7 +2216,7 @@ async def _r_profile(db, user, p):
     await _run_route(user, "PATCH", "/setup/info", p["body"])
     return {"message": "Profile saved.", "link": "/settings"}
 
-_simple("update_profile", "Change the agent's profile: name, title, brokerage, brokerage phone (print ads need it), team, market, bio (<=280 chars), call/text numbers (phone_call is their mobile on designs), contact email. Their headshot can't be added from chat - send them to Settings.",
+_simple("update_profile", "Change the agent's profile: name, title, brokerage, brokerage phone (print ads need it), team, market, bio (<=280 chars), call/text numbers (phone_call is their mobile on designs), contact email. A headshot goes through update_branding (headshot_url, or the card's Headshot step).",
         _obj({"name": {"type": "string"}, "title": {"type": "string"}, "brokerage": {"type": "string"}, "team": {"type": "string"}, "market": {"type": "string"},
               "about": {"type": "string"}, "brokerage_phone": {"type": "string"}, "phone_call": {"type": "string"}, "phone_text": {"type": "string"}, "contact_email": {"type": "string"}}),
         _p_profile, _r_profile)
@@ -1941,8 +2508,13 @@ async def _town_center(db, town: str):
     t = (town or "").split(",")[0].strip()
     if not t:
         return None
-    row = (await db.execute(select(func.avg(Property.latitude), func.avg(Property.longitude), func.count(Property.id), func.max(Property.state))
-                            .where(func.lower(Property.city) == t.lower(), Property.latitude.isnot(None)))).first()
+    # One state only: the same town name in two states must never land between them.
+    want = re.search(r",\s*([A-Za-z]{2})\b", town or "")
+    q = (select(func.avg(Property.latitude), func.avg(Property.longitude), func.count(Property.id), Property.state)
+         .where(func.lower(Property.city) == t.lower(), Property.latitude.isnot(None)).group_by(Property.state).order_by(func.count(Property.id).desc()))
+    if want:
+        q = q.where(func.upper(Property.state) == want.group(1).upper())
+    row = (await db.execute(q.limit(1))).first()
     if not row or not row[2]:
         return None
     return {"label": f"{tidy_caps(t)}, {row[3] or ''}".strip(", "), "lat": round(float(row[0]), 6), "lng": round(float(row[1]), 6), "kind": "town"}
@@ -1956,6 +2528,9 @@ async def _address_center(db, text: str, mine: Optional[str] = None):
     if not re.match(r"^\d+\s+\S", street):
         return None
     q = select(Property).where(Property.street_address.ilike(f"{street}%"), Property.latitude.isnot(None))
+    town = t.split(",")[1].strip() if "," in t else ""
+    if town and not re.match(r"^[A-Za-z]{2}(\s+\d{5})?$", town):   # "12 Oak St, Wayne": this Oak St, not the first one anywhere
+        q = q.where(func.lower(Property.city) == town.lower())
     if mine:
         q = q.order_by((or_(Property.list_agent_mls_id == mine, Property.co_list_agent_mls_id == mine)).desc())
     p = (await db.execute(q.limit(1))).scalars().first()
@@ -1974,10 +2549,13 @@ async def _p_discovery(db, user, a):
     centers = []
     mine = listing_owner_key(user)
     want = _s(a.get("center"))
+    unresolved = None
     if want:
         c = await _address_center(db, want, mine) or await _town_center(db, want)
         if c:
             centers.append(c)
+        else:
+            unresolved = want   # a home address, a landmark: the card's address box finds it (Google, like the page)
     # Their center as it is now stays the pick unless they named a new one (owner, 11/01: "keep a
     # centrepoint ... in the same radius").
     if prefs.get("landmark_address") and isinstance(prefs.get("latitude"), (int, float)) and isinstance(prefs.get("longitude"), (int, float)):
@@ -2005,8 +2583,6 @@ async def _p_discovery(db, user, a):
         if k not in seen:
             seen.add(k)
             uniq.append(c)
-    if not uniq:
-        raise ActionError("Where should your Discovery search be centered? Tell me a town or an address.")
     miles = a.get("miles") if isinstance(a.get("miles"), (int, float)) and 1 <= a["miles"] <= 100 else (prefs.get("miles") or 10)
     # Listing agents the search hides ("exclude") or shows only ("include") - the Discovery page's
     # Exclude Agents / Only Agents (owner, 11/01: "take off Lavinia as one of the agents").
@@ -2020,7 +2596,11 @@ async def _p_discovery(db, user, a):
         n = _s(n)
         if n and not any(n.lower() == x.lower() for x in agents):
             agents.append(n)
-    payload = {"centers": uniq[:8], "center": uniq[0]["label"], "miles": miles,
+    also = [line for line in ((f"Only from: {', '.join(prefs['brokerages'])}" if prefs.get("brokerages") else ""), (f"Only in: {', '.join(prefs['cities'])}" if prefs.get("cities") else ""),
+                              (f"School districts: {', '.join(prefs['school_districts'])}" if prefs.get("school_districts") else "")) if line]
+    payload = {"centers": uniq[:8], "center": "" if unresolved or not uniq else uniq[0]["label"], "miles": miles, "unresolved": unresolved, "also": also,
+               "was": {"center": prefs.get("landmark_address") or "", "miles": prefs.get("miles"), "min_price": prefs.get("min_price"), "max_price": prefs.get("max_price"),
+                       "min_bedrooms": prefs.get("min_bedrooms"), "agents": before, "agent_mode": prefs.get("agent_filter_mode") or "exclude"},
                "agents": agents, "agents_known": before + [n for n in agents if n not in before], "agent_mode": mode,
                "min_price": a.get("min_price") if isinstance(a.get("min_price"), (int, float)) else prefs.get("min_price"),
                "max_price": a.get("max_price") if isinstance(a.get("max_price"), (int, float)) else prefs.get("max_price"),
@@ -2035,9 +2615,14 @@ async def _p_discovery(db, user, a):
 
 def _adjust_discovery(user, payload: dict, picks: dict) -> dict:
     out = dict(payload)
+    typed = picks.get("custom_center") if isinstance(picks.get("custom_center"), dict) else None
+    if typed and _s(typed.get("label")) and isinstance(typed.get("lat"), (int, float)) and isinstance(typed.get("lng"), (int, float)) and -90 <= typed["lat"] <= 90 and -180 <= typed["lng"] <= 180:
+        c = {"label": _s(typed["label"])[:300], "lat": typed["lat"], "lng": typed["lng"], "kind": "home"}
+        out["centers"] = [c, *[x for x in out.get("centers") or [] if x["label"] != c["label"]]]
     labels = {c["label"] for c in out.get("centers") or []}
     if picks.get("center") in labels:
         out["center"] = picks["center"]
+    out["clear_also"] = picks.get("clear_also") is True
     if isinstance(picks.get("miles"), (int, float)) and 1 <= picks["miles"] <= 100:
         out["miles"] = picks["miles"]
     for k in ("min_price", "max_price", "min_bedrooms"):
@@ -2056,14 +2641,24 @@ async def _r_discovery(db, user, p):
     c = next((x for x in p.get("centers") or [] if x["label"] == p.get("center")), None)
     if c is None:
         raise ActionError("Pick where to center the search first.")
-    await _run_route(user, "PATCH", "/api/discovery/preferences", {
-        "landmark_address": c["label"], "latitude": c["lat"], "longitude": c["lng"], "miles": p.get("miles") or 10,
-        "min_price": p.get("min_price"), "max_price": p.get("max_price"), "min_bedrooms": p.get("min_bedrooms"),
-        "excluded_agents": list(p.get("agents") or []), "agent_filter_mode": p.get("agent_mode") or "exclude"})
+    # Only what changed on this card: a change made on the Discovery page after the card opened stays.
+    was = p.get("was") or {}
+    new = {"miles": p.get("miles") or 10, "min_price": p.get("min_price"), "max_price": p.get("max_price"), "min_bedrooms": p.get("min_bedrooms")}
+    patch = {k: v for k, v in new.items() if k not in was or v != was.get(k)}
+    if not was or c["label"] != was.get("center"):
+        patch.update(landmark_address=c["label"], latitude=c["lat"], longitude=c["lng"])
+    if list(p.get("agents") or []) != list(was.get("agents") or []):
+        patch["excluded_agents"] = list(p.get("agents") or [])
+    if (p.get("agent_mode") or "exclude") != was.get("agent_mode"):
+        patch["agent_filter_mode"] = p.get("agent_mode") or "exclude"
+    if p.get("clear_also"):
+        patch.update(brokerages=[], cities=[], school_districts=[])
+    if patch:
+        await _run_route(user, "PATCH", "/api/discovery/preferences", patch)
     return {"message": f"Saved - your Discovery now looks within {p.get('miles') or 10} miles of {c['label']}. Ask me \"show me homes to host\" to see the new list.",
             "link": "/discovery"}
 
-_simple("set_discovery_search", "Set up or change the agent's Discovery search (where they look for homes to host): the center (one of their listings, a town they serve, or a place they named), "
+_simple("set_discovery_search", "Set up or change the agent's Discovery search (where they look for homes to host): the center (one of their listings, a town, or ANY address such as their own home, so they can search by commute; pass what they typed in center and the card finds it), "
         "how many miles, an optional price range (min and max) / minimum beds, and the listing agents it hides or shows only (Exclude Agents / Only Agents) - saved to their Discovery page. "
         "Use it for ANY change to their Discovery filter ('look around Wayne instead', '$1.5M to $5M', 'take Lavinia off', 'hide Compass agents' -> add_agents with the names) and when find_homes_to_host says their search area isn't set. "
         "Their current center and miles stay unless they name new ones - pass only what changes (remove_agents takes part of a name, e.g. 'Lavinia'). Set it up right away; the card shows the rest and they tap Save.",
@@ -2074,4 +2669,4 @@ _simple("set_discovery_search", "Set up or change the agent's Discovery search (
 
 
 # 11/01 additions (capability review): forms/invites follow-through, hosting, blogs, account items.
-from app.services.ai import ai_actions_forms, ai_actions_more  # noqa: E402,F401
+from app.services.ai import ai_actions_forms, ai_actions_media, ai_actions_more  # noqa: E402,F401

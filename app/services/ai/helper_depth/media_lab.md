@@ -72,3 +72,5 @@ Media Lab in depth: every photo effect and option, AI video and its title/brandi
 - There's no "re-generate" for videos on the result page - make a new one from Create New. Changing the video's shape or layers never re-generates.
 - Staging should be disclosed - use the "Virtually Staged" label where your MLS requires it.
 - Deleting can't be undone.
+
+**From the chat.** Everything here except circling areas to remove and the video's title cards can be started in the chat: drop a photo in (or name a listing), and the card asks the tool, the photo and its choices. It uses the same monthly AI allowance, keeps going if they leave, and the finished photo or video shows on the card and in Media Lab.

@@ -530,6 +530,8 @@ async def _run_image_job(asset_id, owner_id, payload, effects, action_label, opt
             config = await ai_config_service.get_config(s)
             await _run_image(s, user, payload, effects, action_label, options, config, prompt,
                              group_id, parent_asset_id, linked_property, placeholder_id=asset_id)
+            from app.services.ai import ai_notify
+            await ai_notify.finish_media(owner_id, asset_id)
             return
         except HTTPException as exc:
             error = str(exc.detail)
@@ -2110,6 +2112,8 @@ async def poll_asset(db: AsyncSession, user: User, asset: StudioMediaAsset) -> S
     asset = await _poll_asset_body(db, user, asset)
     if was_processing and asset.status in ("succeeded", "failed"):
         await _notify_video_done(db, asset)
+        from app.services.ai import ai_notify
+        await ai_notify.finish_media(asset.owner_id, asset.id)
     return asset
 
 

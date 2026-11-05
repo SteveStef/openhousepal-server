@@ -47,6 +47,9 @@ Tap the menu button at the top right. Every section is a card. Tap a section to 
 
 The bell and the light/dark switch sit next to the menu button.
 
+### Public pages (anyone can read these, and they're linked in the site's footer)
+**Tools** (/tools, plus a page for each tool), **Pricing** (/pricing), **IDX Websites** (/idx-websites), **FAQ** (/faq), **About** (/about), **Resources** (/resources, with articles), **Brokerages** (/brokerages).
+
 ### Why some menu items look different
 
 - **A lock icon, greyed out**: your plan doesn't include it. Tap it to see which plan unlocks it.
@@ -62,20 +65,23 @@ The bell and the light/dark switch sit next to the menu button.
 - The round gold button at the bottom right with Chat Pal (a little speech bubble with a roof and a face) opens it (a red number on it = a chat has news, like a finished AI CMA). Phone: it opens as a sheet - drag the bar up for full screen, down to shrink or close. Computer: a corner window with a Make bigger button.
 - It's an on-call helper: opened again 30 minutes or more after the last message, it starts a fresh chat, and old chats are cleared away - there is no chat history (it also keeps each chat's usage small). **New chat** (the speech-bubble button) starts over any time. A chat that is still making something (an AI CMA, a blog) stays until its finished message is read.
 - The chat's top line always says **AI Assistant** with its usage bar beside it. Phones: drag the pull tab up for full screen, down to shrink, further down to close.
-- Something still being made (an AI CMA, a blog post) shows as a progress bar right under the top line until it's done - they can keep chatting about anything meanwhile.
+- Several things can be made at once (AI CMAs, blog posts, Spotlights, AI media): each shows its own progress bar under the top line, and they can keep chatting about anything. All of them finish on our servers, so they can close the site or switch devices. Next time the chat opens, a green note at the top says what finished - one time only - and the message stays in the chat that started it.
+- **Photos in the chat:** drag a photo onto the chat, paste it, or tap the picture button beside the message box (a phone opens the camera roll). JPG, PNG or WebP, up to 12MB, up to 6 at a time. The helper can see it and use it: AI media, an invite or blog cover, a logo, a headshot, CMA condition photos. Cards with a photo step also take a drop right on the step, and a dropped photo joins their Media Lab uploads.
+- On a computer in the big window, each card shows its preview on the left and its choices on the right, with finished steps side by side.
 - Their listings and sales show in the chat as small home cards - the little photo with Active / Pending / Sold on it and the street: the newest five, then **+N more**. Photo choices on any card are one row to swipe; picking one folds the step.
 - While a reply is coming, the chat shows what it's doing right now ("Searching your open house guests...") and the seconds going by.
 - When a button in the chat takes them to a page (Open it, Go there, Create a Showcase, make an Open House Kit...), the chat steps aside: on a phone it slides down to a short bar (tap it to bring the chat back), on a computer the big window drops back to the corner.
 - Cards: things the helper sets up show as a card with the choices as steps (each folds to one line once picked - tap it to change), then Confirm / Make it. A design made in the chat has **Download** - on a phone that opens the Share sheet (Save Image to the camera roll), on a computer it downloads.
-- A form card goes **one screen at a time** with a phone **preview** above it: **Back / Next** (or the dots) move through the welcome screen, every question and the thank-you screen (**Hide preview** folds the preview). Questions 1-3 are always name, email and phone (greyed - nothing to change), so their own questions start at 4 - the same numbers the form shows. Under each screen is a **"What should change or be added?"** line: they type a change or a new question there and the card updates right where it is (no new card). They can still ask in the chat too ("make question 5 a pick-one with Under $500K, $500K-$1M and Over $1M") - then a new card replaces the old one. **Open in Forms** at the top makes the form as it is on the card and opens it in the Forms page's editor.
+- A form card goes **one screen at a time** with a **preview**: **Back / Next** and the numbers between them move through it (**Hide preview** folds it). Their own questions start after name, email and phone, the same numbers the form shows. The **"What should change or be added?"** line changes the card right where it is; asking in chat works too. **Open in Forms** makes the form and opens its editor.
+- Forms can put the contact info on one screen, fork ("if they say No, ask what they're looking for") and hold several questions on one page; forks are **Only ask this when** in the form editor. Renaming or deleting a choice carries over to its follow-ups; a follow-up moved above its question gets a warning and an **Ask everyone** button. **After the thank-you** picks where people go: that home, Agent Hub, website, the thank-you screen or a link. An existing form edits from chat too ("edit my Open House Feedback form"): **Save changes** updates it and past answers stay. A card stops if the form changed in its editor first, and the editor's Save asks **Load the newest** or **Replace it with mine** if the chat or another tab saved a newer version.
 
 - **What the helper can do for you in the chat** (each one shows a card; nothing happens until you tap its button - deleting, billing, sign-ins and passwords always stay on the page):
   - Leads & follow-ups: find a lead or an open house guest, add or change follow-ups and their rules, star, move or mark leads.
   - Open houses: build an Open House Kit, switch a kit's guest Showcases / Similar Homes / Guest Pass / follow-ups, refresh Similar Homes, add a private note, a note on a guest, share the guest list with the listing agent, mark a disclosure sent or a second visit scheduled.
-  - Hosting: find homes to host on Discovery, ask to host, withdraw, offer another time, answer a team ask or a listing agent's request.
+  - Hosting: set the Discovery search (any address as the center, like their home), find homes to host, ask to host, withdraw, offer another time, answer a team ask or a listing agent's request.
   - Showcases: make one, change its search, add a home, re-send the invite, confirm a tour, reply to a comment.
-  - Studio: designs (with Download), Listing Spotlights (make, publish), CMAs (AI or manual), blog posts (write, publish, schedule, stats), forms (make, copy, tracking links, read answers, mark reviewed), invites (make, send to leads, remind, who's coming, close RSVPs, copy).
-  - Your brand & account: Branding, email signature switches, email settings and the daily briefing, profile, towns, review settings, website on/off, calendar status and resync, CRM status and a test lead, Help tickets (open, read the reply, answer), account setup steps.
+  - Studio: designs (with Download), Listing Spotlights (look, color, main photo, header, story, sections, 3D tour, publish), CMAs (AI or manual, MLS homes or any address, condition, report look and sections), blog posts (write with look, color, category, cover and where it shows; publish, schedule, stats), AI media (twilight, lights on, virtual staging, enhance, AI video), forms (make, copy, tracking links, read answers, mark reviewed), invites (wording, days, place, cover, design, color, animation, RSVP questions; send to leads, remind, who's coming, close RSVPs, copy).
+  - Your brand & account: Branding (look, colors, logos, headshot, fonts, disclaimer, QR center), email signature switches, email settings and the daily briefing, profile, towns, review settings, website on/off, calendar status and resync, CRM status and a test lead, Help tickets (open, read the reply, answer), account setup steps.
   - Look-ups: your listings and sales as home cards, other agents' sales and listings, MLS homes, stats for your forms, blog and Agent Hub, your plan and AI usage.
 - Other agents: ask "how many homes has <agent> sold" or "what is <agent> listing around $2M" - the helper looks them up in the MLS records (office, contact, sales in the last 12 months on both sides, listings for sale now) and can set up a request to host an open house at one.
 - Sign-in: **Remember me** (ticked by default) keeps you signed in for 30 days, renewed each day you use the app; untick it on a shared computer (1 day).
@@ -370,7 +376,8 @@ The same Settings tab also shows:
 
 ### Your web address and your own domain
 
-- Every IDX website gets a free address, **yourname.openhousepal.com**, set up automatically.
+- Every IDX website gets a free address, **yourname.openhousepal.com**, set up automatically. To change it: **Settings → IDX Website**, **Change my link** (it opens the website's Domain tab): type the new name, tap **Check**, confirm the warning. The old address keeps forwarding and stays held for you. Done on the page, not in the chat. The first-time setup has the same step.
+- With the IDX website off, an Agent Hub can stand alone on a connected domain.
 - In the **Domain** tab you can:
   - Choose **I already have one** to connect a domain you own.
   - Choose **Get a new one** to buy one inside OpenHousePal. It's registered in your name, with your home address kept private, and set up for you. You'll see the price per year before you pay.
@@ -655,7 +662,7 @@ MLS plans. Opens another agent approved you to host appear here. Tap **Open kit*
 **Where:** Opens > **Discovery** (or **Find Open Houses** on My Opens).
 
 **Set your search (saved automatically):**
-- **Enter address or landmark** and pick a distance in **miles**.
+- **Enter address or landmark** and pick a distance in **miles**. Many agents use their home address, so the search matches how far they'd drive. The chat can set this too, and it saves to the same search.
 - Filters: **Brokerages**, **Exclude Agents / Only Agents**, **Cities**, **Districts**, **Min Bedrooms**, **Min Bathrooms**, **Min Sqft**, **Min Price**. **Reset All** clears them.
 - Sort: Newest Listed, Oldest Listed, Price: Low to High, Price: High to Low, Closest to Address, Farthest from Address.
 

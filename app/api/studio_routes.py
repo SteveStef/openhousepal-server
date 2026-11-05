@@ -75,6 +75,7 @@ async def update_brand_kit(
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Luxe is included with the IDX plan.")
         from app.services.setup_flow_service import lock_setup_state
         await lock_setup_state(db, current_user)
+        await db.refresh(current_user, ["setup_state"], with_for_update=True)   # never put back what a finishing chat job just wrote
         brand_look_service.save_look(current_user, {k: v for k, v in look.items() if v is not None})
     await db.flush()
     # Every feature still on "My Brand Kit" picks the change up (the signature is written here;

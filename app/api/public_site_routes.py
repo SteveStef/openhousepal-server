@@ -224,13 +224,15 @@ async def _get_site_default_form(db: AsyncSession, site_id: str, form_type: str)
 
 async def _public_form_response(db: AsyncSession, user: User, form: AgentForm, campaign_token: Optional[str] = None) -> PublicAgentFormResponse:
     from app.api.forms_routes import _agent_hub_is_live
-    from app.services.forms_service import active_campaign_for_token, campaign_after_submit
+    from app.services.forms_service import active_campaign_for_token, campaign_after_submit, form_after_submit
     hub_result = await db.execute(select(AgentHub).where(AgentHub.owner_id == user.id))
     hub = hub_result.scalar_one_or_none()
     # A campaign link (?c=) can send its visitors somewhere after submitting; the website's own
     # default is no Agent Hub redirect (the site page handles where to go).
     campaign_redirect, after_submit_mode, after_submit_url = campaign_after_submit(
         await active_campaign_for_token(db, form.id, campaign_token), bool(hub and _agent_hub_is_live(user, hub)))
+    if campaign_redirect is None:
+        campaign_redirect, after_submit_mode, after_submit_url = await form_after_submit(db, form, user, bool(hub and _agent_hub_is_live(user, hub)))
     example_properties = _showcase_example_properties(hub.config or {}) if hub and form.form_type == "showcase_request" else None
     return PublicAgentFormResponse(
         form_id=form.id,
@@ -334,6 +336,25 @@ async def list_warm_hosts(db: AsyncSession = Depends(get_db)):
     )).scalars().all()
     hosts = [default_hostname(s) for s in rows if s.subdomain_slug]
     return {"hosts": hosts[:500]}
+
+
+@router.get("/hub-domain")
+async def get_hub_only_domain(host: str, db: AsyncSession = Depends(get_db)):
+    """An agent on the IDX plan switched the website off but has their own domain: that domain shows
+    their Agent Hub by itself, as if they never had a website (owner, 11/04). {"hub_slug": null} = no."""
+    from app.models.database import AgentHub
+    try:
+        row = (await db.execute(
+            select(Site, User).join(SiteDomain, SiteDomain.site_id == Site.id).join(User, User.id == Site.owner_id)
+            .where(SiteDomain.hostname == host.strip().lower(), SiteDomain.status == "ACTIVE", Site.is_enabled.is_(False))
+        )).first()
+        if not row or not _idx_owner_live(row[1]):
+            return {"hub_slug": None}
+        slug = (await db.execute(select(AgentHub.slug).where(AgentHub.owner_id == row[1].id))).scalar_one_or_none()
+        return {"hub_slug": slug}
+    except Exception:  # noqa: BLE001 - fail open: the domain answers the way it always did
+        logger.exception("hub-domain lookup failed for %s", host)
+        return {"hub_slug": None}
 
 
 @router.get("/subdomain/{slug}/own-domain")
@@ -1364,6 +1385,9 @@ async def domain_allowed(
 
     slug = domain_resolution_service.subdomain_slug_from_hostname(hostname)
     if slug:
+        result = await db.execute(select(Site.id).where(Site.subdomain_slug == slug, Site.status == "PUBLISHED"))
+        if result.scalar_one_or_none() is None and await domain_resolution_service.site_moved_from(db, slug):
+            return {"ok": True}
         result = await db.execute(select(Site.id).where(Site.subdomain_slug == slug, Site.status == "PUBLISHED"))
     else:
         result = await db.execute(

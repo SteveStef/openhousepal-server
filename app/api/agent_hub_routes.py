@@ -84,6 +84,7 @@ HUB_RESERVED_SLUGS = {
     "checkout", "cma", "dash", "discovery", "leads", "net-sheet", "open-houses", "privacy", "property",
     "settings", "setup", "showcase", "showcases", "studio", "terms", "unsubscribe", "upgrade-required",
     "forgot-password", "login", "register", "reset-password", "open-house", "spotlight-preview", "ohp-site-render",
+    "tools", "pricing", "idx-websites", "faq", "about", "resources", "brokerages",
 }
 
 
@@ -642,7 +643,8 @@ async def _ensure_hub(db: AsyncSession, user: User) -> AgentHub:
                 AgentHub.previous_slugs.op('@>')(cast([candidate], JSONB)),
             ))
         )).first()
-        if taken:
+        from app.services.hub_slugs import slug_held_by_another_agent
+        if taken or await slug_held_by_another_agent(db, candidate, user.id):
             continue
         hub = AgentHub(owner_id=user.id, slug=candidate)
         from app.services.setup_flow_service import seed_hub_from_user

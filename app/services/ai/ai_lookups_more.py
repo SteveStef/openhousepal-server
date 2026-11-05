@@ -336,3 +336,28 @@ LOOKUPS["get_crm_status"] = (
     "Whether the agent's CRM is hooked up: Follow Up Boss key, webhook or CRM email set, whether new leads are being sent, the last send "
     "and how it went, and their portal lead forwarding address. Use for 'is my CRM connected?' / 'are my leads going to Follow Up Boss?'.",
     _obj(), None, _crm)
+
+
+# ================================================================ DISCOVERY FILTER, AI MEDIA (11/05)
+
+async def _discovery_search(db: AsyncSession, user: User, args: dict) -> Any:
+    ok, data = await _get(user, "/api/discovery")
+    if not ok:
+        return data
+    p = (data or {}).get("preferences") or {}
+    return {k: p.get(k) for k in ("landmark_address", "miles", "min_price", "max_price", "min_bedrooms", "min_bathrooms", "min_square_feet", "brokerages", "cities",
+                                  "school_districts", "excluded_agents", "agent_filter_mode")}
+
+LOOKUPS["get_discovery_search"] = (
+    "The agent's saved Discovery search as it is right now: the center address, miles, price range, beds and every other filter. The same search the Discovery page shows.",
+    _obj(), MLS, _discovery_search)
+
+
+async def _my_media(db: AsyncSession, user: User, args: dict) -> Any:
+    ok, data = await _get(user, "/studio/media-lab/assets", {"limit": 12})
+    if not ok:
+        return data
+    rows = (data or {}).get("assets") or (data or {}).get("items") or []
+    return [{k: a.get(k) for k in ("id", "kind", "action", "status", "created_at", "custom_name")} for a in rows]
+
+LOOKUPS["list_my_media"] = ("The agent's newest AI Media projects (photos and videos) and whether each is finished.", _obj(), {"IDX", "PRO_NO_MLS"}, _my_media)
