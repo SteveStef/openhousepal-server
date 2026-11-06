@@ -272,6 +272,9 @@ async def fetch_bright_agent_sales(identifier: str, identifier_type: str, limit:
 # marketing sitemap for a while gets them recrawled sooner, so the noindex is seen and they drop
 # (owner, 10/30). Paths only - every one of these pages is already public.
 RECHECK_UNTIL = datetime(2026, 12, 15, tzinfo=timezone.utc)
+# Our own test accounts: their public pages showed a real brokerage's name, so they don't exist to the
+# public (owner, 11/06). The accounts still work when signed in.
+HIDDEN_TEST_HUBS = {"admin-user", "dan-twinn", "danny-twinn", "test-testing", "testing-now"}
 _recheck_cache: Dict[str, Any] = {}
 
 
@@ -296,7 +299,7 @@ async def public_recheck_paths(db: AsyncSession = Depends(get_db)):
             paths.append(f"/{s}")
         paths += [f"/{slug}/{x}" for x in ("sales", "listings", "blogs", "review")]
         paths += [f"/{slug}/{f}" for f in by_owner.get(owner_id, [])]
-    paths = sorted({p for p in paths if re.fullmatch(r"/[A-Za-z0-9/_-]+", p)})[:5000]
+    paths = sorted({p for p in paths if re.fullmatch(r"/[A-Za-z0-9/_-]+", p) and p.split("/")[1].lower() not in HIDDEN_TEST_HUBS})[:5000]
     _recheck_cache["v"] = (time.time(), paths)
     return {"paths": paths}
 
@@ -359,6 +362,8 @@ async def check_slug(
 
 
 async def _resolve_public_hub(slug: str, db: AsyncSession) -> tuple[AgentHub, User]:
+    if slug.lower() in HIDDEN_TEST_HUBS:
+        raise HTTPException(status_code=404, detail="Agent Hub not found")
     normalized = normalize_slug(slug)
     result = await db.execute(select(AgentHub).where(AgentHub.slug == normalized))
     hub = result.scalar_one_or_none()
