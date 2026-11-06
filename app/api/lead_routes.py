@@ -1110,6 +1110,32 @@ async def delete_lead(
     return {"success": True, **done, "message": lead_cleanup_service.deleted_message(done["name"], done)}
 
 
+@router.get("/starred")
+async def starred_people(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Who the agent has starred, so every screen can show it (owner, 11/06). A person's star and their
+    Showcase's star are one star (services/star_sync.py)."""
+    leads = (await db.execute(select(Lead.id, Lead.email, Lead.name).where(
+        Lead.owner_id == current_user.id, Lead.is_favorite.is_(True)))).all()
+    cols = (await db.execute(select(Collection.id, Collection.visitor_email, Collection.visitor_name).where(
+        Collection.owner_id == current_user.id, Collection.favorited_at.isnot(None)))).all()
+    # A star on either side counts for both, even one from before the two were joined.
+    emails = {e for e in (normalize_email(x) for x in [*(r.email for r in leads), *(r.visitor_email for r in cols)]) if e}
+    if emails:
+        leads = list(leads) + list((await db.execute(select(Lead.id, Lead.email, Lead.name).where(
+            Lead.owner_id == current_user.id, Lead.email.in_(emails)))).all())
+        cols = list(cols) + list((await db.execute(select(Collection.id, Collection.visitor_email, Collection.visitor_name).where(
+            Collection.owner_id == current_user.id, func.lower(func.trim(Collection.visitor_email)).in_(emails)))).all())
+    return {
+        "lead_ids": sorted({str(r.id) for r in leads}),
+        "showcase_ids": sorted({str(r.id) for r in cols}),
+        "emails": sorted(emails),
+        "names": sorted({n for n in [*(r.name for r in leads), *(r.visitor_name for r in cols)] if n}),
+    }
+
+
 @router.get("/{lead_id}", response_model=LeadDetailOut)
 async def get_lead(
     lead_id: str,

@@ -26,7 +26,7 @@ From left to right, after the OpenHousePal logo:
 
 On the right, after a thin divider, there are small icons with no words. Hover over one to see its name:
 
-- **Account setup** (clipboard icon): reopens the step-by-step setup.
+- **Account setup** (clipboard icon, until setup is finished): reopens the step-by-step setup. Once it's finished it lives in **Settings**.
 - **Help** (question mark): your support tickets. A red dot means support has replied.
 - **Settings** (gear): your profile, notifications, billing and account. A red "!" means something required is still missing.
 - The **bell**: your notifications.
@@ -43,7 +43,7 @@ Tap the menu button at the top right. Every section is a card. Tap a section to 
 - **Leads**: Leads, Email Tracker, Follow-ups, Activity (Action Plans shows "Coming soon")
 - **Tools**: **Branding**, plus the same tools as on a computer (Agent Hub, Forms & Invites, CMA, Blogs, Studio, Media Lab, Listing Spotlight, Signature, CRM, Email, Calendar, Reviews). Deadlines shows "Coming soon".
 - **IDX Website**
-- **Account**: **Account setup**, **Settings**, **Help**
+- **Account**: **Account setup** (until it's finished), **Settings**, **Help**
 
 The bell and the light/dark switch sit next to the menu button.
 
@@ -624,7 +624,7 @@ What happens after a guest signs in. Each switch only shows if your plan has it.
 
 ### Visitors
 Tap **Visitors** on a card. You'll see **Visitors**, **No agent** and **Has agent** counts, then everyone grouped by day with email and phone (tap to copy, email or call).
-- **Star** a visitor to star their lead. If they have a Showcase you're asked whether to **Star Showcase too** or **Just the lead**.
+- **Star** a visitor to star that person. It's one star: their lead and Showcase are starred too.
 - **Showcase** switch (Premium, IDX; guests without an agent): turn on to give this one guest a Showcase - their invite email goes out after the delay you set in Studio > Email. Turn off to cancel a waiting invite and turn their Showcase off.
 - **Notes** - a note on this visitor, shared with their lead profile.
 - **Activity** - everything they did on their Guest Pass (only shows once they've used it).
@@ -777,7 +777,7 @@ Every action earns points. Asking to see a home counts most, then questions, sig
 
 ### Quick actions on each row
 - **Call**, **Text**, **Copy email**.
-- **Star** (gold star) - stars the lead *and* their Showcase together.
+- **Star** (gold star, on the list and on the lead's page) - stars the lead *and* their Showcase together. The gold star then shows beside them on the Dash, Activity, the bell, Follow-ups, the Email Tracker and the New Matches mailbox.
 - **Mark that you reached out** button - stamps "last contacted" and moves a New lead to Contacted.
 - **"..." (More)** menu: **Move to** New / Contacted / In talks / Signed, **Mark contacted**, **Mark as seen**, **Hide** (or **Show again** on a hidden lead), **Delete**.
 - **Mark all seen** (appears when leads have red "new" dots): clears every red dot at once. Follow-ups and requests stay in "Needs you". This can't be undone.
@@ -895,7 +895,7 @@ Every follow-up's calendar event has links:
 
 ### The Showcases page
 - Search: "Search visitor, property, location...".
-- **New** button (the New Matches mailbox): every home you haven't looked at yet from all your Showcases, newest first, with the client's name. Opening a home there marks just that home seen. A lead's page also shows the 3 newest homes in their Showcase with NEW tags and what the client did. NEW only clears when you open that home or the Showcase.
+- **New** button (the New Matches mailbox): every home you haven't looked at yet from all your Showcases, newest first, with the client's name. Tap a home to open it right there: flip through its photos and see all its stats. **Dismiss** (or the small X) clears it from the mailbox only, with an Undo; it stays in the client's Showcase. **Open in their Showcase** goes to that home's page there. A lead's page also shows the 3 newest homes in their Showcase with NEW tags and what the client did. NEW only clears when you open that home or the Showcase.
 - **Tours** button: tour requests waiting on you from every Showcase. **Activity** button: likes, comments, tour requests and search changes from your clients.
 - **Budgets** filter and sort: **Activity**, **New matches**, **Newest**, **Fell asleep** (Inactive tab only), **Came from**.
 - **Active** / **Inactive** tabs, and a **New matches** filter.

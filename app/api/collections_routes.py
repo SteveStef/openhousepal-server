@@ -26,7 +26,7 @@ from app.services.property_tour_service import PropertyTourService
 from app.services.blacklist_service import BlacklistService
 from app.services.leads_service import upsert_lead
 from app.utils.auth import get_current_active_user, get_current_user_optional, require_premium_plan, require_broker_authorization
-from app.models.database import User, Collection, Notification
+from app.models.database import User, Collection, Notification, PropertyInteraction
 from sqlalchemy import select, update, and_, func
 from app.services.showcase_links import share_match
 from sqlalchemy.orm import joinedload
@@ -1192,6 +1192,36 @@ async def move_to_sold_folder(
     if not coll or coll.owner_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
     return _sold_folder_result(await CollectionsService.set_sold_filed(db, collection_id, property_id, body.filed))
+
+
+class AgentSeenBody(BaseModel):
+    seen: bool
+
+
+@router.post("/{collection_id}/properties/{property_id}/agent-seen")
+async def set_agent_seen(
+    collection_id: str,
+    property_id: str,
+    body: AgentSeenBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_premium_plan)
+):
+    """New Matches mailbox: dismiss a home, or put it back with Undo (owner, 11/06). This is only the
+    agent's own "looked at it" mark; the home stays in the client's Showcase."""
+    coll = (await db.execute(select(Collection).where(Collection.id == collection_id))).scalar_one_or_none()
+    if not coll or coll.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    row = (await db.execute(select(PropertyInteraction).where(
+        PropertyInteraction.collection_id == collection_id, PropertyInteraction.property_id == property_id))).scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    if row is None:
+        if not body.seen:
+            return {"success": True}
+        row = PropertyInteraction(collection_id=collection_id, property_id=property_id, liked=False, disliked=False, view_count=0, created_at=now)
+        db.add(row)
+    row.agent_viewed_at = now if body.seen else None
+    await db.commit()
+    return {"success": True}
 
 
 @router.post("/{collection_id}/properties/{property_id}/view")

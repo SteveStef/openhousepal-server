@@ -21,7 +21,7 @@ _SUBPAGES = {
 
 LINK_HELP = (
     "Handy pages (add the ? options to open them ready to go): /dash, /open-houses (My Opens - kits), "
-    "/open-houses?kit=<street address, town> (start an Open House Kit for that home), /open-houses/my-listings (Manager), /discovery, /showcases, /showcases?new=1 (new Showcase), /showcases?showcase=<collection_id>, "
+    "/open-houses?kit=<street address, town> (start an Open House Kit for that home), /open-houses/my-listings (Manager), /discovery, /showcases, /showcases?new=1 (ONLY to create a new Showcase), /showcases?matches=1 (the New Matches mailbox), /showcases?showcase=<collection_id>, "
     "/leads, /leads/<lead_id>, /leads/tasks (Follow-ups), /leads/tasks?task=<task_id>, /leads/emails (Email Tracker), /activity, "
     "/studio (Tools), /studio/design?new=1 (new design), /studio/design?address=<street address> (new design for that home), "
     "/studio/property-sites?new=1 (new Spotlight), /studio/property-sites/<spotlight_id>, /studio/cma?new=1 (new CMA), /studio/cma/<report_id>, "
