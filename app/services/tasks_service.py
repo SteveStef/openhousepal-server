@@ -861,7 +861,7 @@ ALERT_SAMPLES: dict[str, str] = {
                          "The comment, the home and a link to it are on the alert, with her contact card."),
     "showcase_search_request": ('Jane asked you to change her Showcase search:\n"Look closer to downtown. Raise my max price."\n'
                                 "To do: open her Showcase, update the search, then let her know - new matches show up for her right away."),
-    "private_feedback": ("Jane left a 2-star review through your review link. It stayed private - it isn't posted anywhere.\n"
+    "private_feedback": ("Jane left a 2-star review through your review link. It came to you first and isn't on your Agent Hub. Like every client, they were also offered Google and Zillow.\n"
                          'Their feedback: "Took a while to hear back after the showing."\n'
                          "To do: reach out in your own words - every review is different, so there's no set message. "
                          "A quick call usually goes further than a text."),
@@ -2812,8 +2812,8 @@ def _alert_notes(rule: str, lead: Lead, event) -> str:
     if rule == "private_feedback":
         stars = getattr(event, "rating", None)
         feedback = str(getattr(event, "body", None) or "").strip()
-        lines = [f"{first} left a {stars}-star review through your review link. It stayed private - it isn't posted anywhere."
-                 if stars else f"{first} left a low review through your review link. It stayed private - it isn't posted anywhere."]
+        lines = [f"{first} left a {stars}-star review through your review link. It came to you first and isn't on your Agent Hub. Like every client, they were also offered Google and Zillow."
+                 if stars else f"{first} left a low review through your review link. It came to you first and isn't on your Agent Hub. Like every client, they were also offered Google and Zillow."]
         if feedback:
             lines.append(f'Their feedback: "{feedback[:1000]}"')
         lines.append("To do: reach out in your own words - every review is different, so there's no set message. "
@@ -3560,7 +3560,7 @@ def _sample_cases() -> dict:
         "listing_inquiry": ("Follow up with Jane Buyer", "Asked a question about 12 Oak St on its Spotlight site",
                             ["Their question: Is the roof new?"], listing),
         "showcase_search_request": ("Update Jane Buyer's Showcase search", "Asked you to change their Showcase search", [], None),
-        "private_feedback": ("Follow up with Jane Buyer", "Left a 2-star review through your review link - it stayed private, not posted anywhere", [], None),
+        "private_feedback": ("Follow up with Jane Buyer", "Left a 2-star review through your review link - it came to you first and isn't on your Agent Hub", [], None),
     }
 
 

@@ -12,7 +12,7 @@ Media Lab in depth: every photo effect and option, AI video and its title/brandi
 - Card buttons: **Download** and **Delete**. Click **Create New** to start.
 
 ## Making something: 4 steps (Property -> What to make -> Pick photos -> Generate)
-1. **Property** - "Pick a property, or upload your own photos". Uploads: JPG, PNG or WebP, up to 12MB each. "Your library stays across sessions, separate from any listing's photos." You can drag and drop.
+1. **Property** - "Pick a property, or upload your own photos". Uploads: JPG, PNG, WebP or iPhone photos; very large ones are shrunk to fit. "Your library stays across sessions, separate from any listing's photos." You can drag and drop.
 2. **What do you want to make?**
    - **Photo edit** - "Stack twilight, lights-on, virtual staging & enhancement onto one photo - all applied as a single combined edit."
    - **AI Video** - up to 7 photos -> about a 35-second marketing video, about 5 seconds per photo with a gentle camera move on each.

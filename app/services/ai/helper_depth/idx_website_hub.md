@@ -56,7 +56,7 @@ IDX website, Agent Hub and Review Hub in depth: website sections, pages, looks, 
 # AGENT HUB (Premium, IDX, No-MLS Premium; Tools → Agent Hub, "One link, all of you")
 
 ## Tabs (with a live preview; **Views** and **Interacted** counts on top)
-- **Profile**: photo (drag the circle to reposition; JPG under 5MB), Agent name, Professional title, Brokerage name, Team name ("Only if you are on a team"), Market or service area, About me, RE License number (private; locked once saved - support changes it). Shared with Settings → Profile.
+- **Profile**: photo (drag the circle to reposition; any JPG, PNG, WebP or iPhone photo, shrunk to fit), Agent name, Professional title, Brokerage name, Team name ("Only if you are on a team"), Market or service area, About me, RE License number (private; locked once saved - support changes it). Shared with Settings → Profile.
 - **Contact**: Call, Text and Email buttons; Social Links (Instagram, Facebook, YouTube, TikTok, Website); **Contact Card** - what people save with **Save Contact**: name always, plus Mobile Phone, Email, Brokerage, Photo, Website, Agent Hub link, Job Title, Office Phone, Office Address, Team, Instagram, Facebook, YouTube, Custom Link and a short note. Turning one off only leaves it off the saved card.
 - **Listings & Sales**:
   - My Listings: Bright plans pull active, pending and coming-soon listings (**Refresh Listings**); choose which show. **Manually Add** → **Add Listing** (Street Address, City, State, ZIP, Price, Status Active / Coming Soon / Under Contract, photo). Sort, **Carousel view**, **Auto scroll**.
@@ -78,9 +78,9 @@ IDX website, Agent Hub and Review Hub in depth: website sections, pages, looks, 
 # REVIEW HUB (Premium, IDX, No-MLS Premium; Tools → Reviews, "Five stars, on repeat")
 - Needs your Agent Hub set up first.
 - **Your review link** (yourname/review): **Copy link**, **Text it**, **Email it**, **See what clients see**. "Send it after every closing."
-- How it works: clients pick stars and write a few words. 4-5 stars go public and their text copies automatically, then **Post on Google** / **Post on Zillow** - one paste and done. 1-3 stars come to you as **Private feedback**, never posted, and create an Unhappy review follow-up right away (switchable on the Follow-ups page).
+- How it works: clients pick stars and write a few words. Every client then gets **Post on Google** / **Post on Zillow**, whatever they rated you, with their text copied - one paste and done. 4-5 stars also show on your Agent Hub. 1-3 stars come to you as **Private feedback** with a follow-up so you can make it right, and stay off your hub.
 - Settings: **Show on my Agent Hub**, **Show on my IDX website** (IDX plan), **Only show 4 and 5 stars** (lower ones stay saved privately).
-- **Where happy clients post**: paste your Google link (Business Profile → Ask for reviews → copy the short link) and Zillow link (the link behind **Write a review** on your Zillow profile - not the profile link) → **Save links**.
+- **Where clients post**: paste your Google link (Business Profile → Ask for reviews → copy the short link) and Zillow link (the link behind **Write a review** on your Zillow profile - not the profile link) → **Save links**.
 - **Bring in your Google reviews**: paste your Google Place ID (starts with ChIJ…) - Google shares up to 5.
 - **Bring in reviews from other sites**: **Paste a bunch** (Zillow, Google, Realtor.com, Homes.com, Facebook, somewhere else → **Find the reviews**; uses a little AI allowance; copied word for word with a "via" label and original date; you confirm they're real) or **Add one by hand**.
 - Received list: Average rating, Shown publicly, Posted to Google / Zillow; each review **Hide** / **Show** or **Delete permanently**.

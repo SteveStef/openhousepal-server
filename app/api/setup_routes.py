@@ -14,7 +14,7 @@ from app.database import get_db
 from app.models.database import User
 from app.services import s3_service, setup_flow_service as flow
 from app.utils.auth import get_current_active_user
-from app.utils.image_validation import assert_valid_jpeg
+from app.utils.image_validation import headshot_jpeg
 
 router = APIRouter(prefix="/setup", tags=["setup"])
 
@@ -211,19 +211,16 @@ async def put_form_defaults(payload: FormDefaultsPatch, db: AsyncSession = Depen
 async def upload_photo(file: UploadFile = File(...), db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
     """Same rules as the Agent Hub photo upload, but open before a plan is active, and it writes
     the hub copy too so every feature shows the new photo at once."""
-    from app.api.agent_hub_routes import PHOTO_CONTENT_TYPES, PHOTO_MAX_BYTES
-    extension = PHOTO_CONTENT_TYPES.get(file.content_type)
-    if not extension:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Please choose a JPG photo.")
+    from app.api.agent_hub_routes import HEADSHOT_MAX_BYTES
     contents = await file.read()
-    if len(contents) > PHOTO_MAX_BYTES:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "That photo is too big - please pick one under 5MB.")
+    if len(contents) > HEADSHOT_MAX_BYTES:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "That photo is too big - please try a smaller one.")
     try:
-        assert_valid_jpeg(contents)
+        contents = headshot_jpeg(contents)
     except ValueError as e:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
     old = current_user.photo_url
-    url = s3_service.upload_bytes(contents, "agent-photos", extension, file.content_type)
+    url = s3_service.upload_bytes(contents, "agent-photos", ".jpg", "image/jpeg")
     current_user.photo_url = url
     hub = await _hub(db, current_user)
     cfg = dict(hub.config or {})

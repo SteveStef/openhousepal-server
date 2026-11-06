@@ -107,4 +107,4 @@ Then **Create my invite** -> "Your invite is ready".
 - **Close or reopen RSVPs**, and **copy an invite** (same design and details, new link, no guests).
 - Deleting a form, a response, an invite or a campaign stays on the page.
 
-**Looks and animation.** A form in the Classic look has the moving street scene. A form in the Luxe look has a grander one: a fine metal drawing of an estate that sketches itself in, windows that light up room by room, slow beams of light and rising gold dust, in the agent's gold, silver or bronze. **Background effects** off turns either one off. Invites made in the chat get the same RSVP questions as the builder, and a home's invite ties to its open house.
+**Looks and animation.** A form in the Classic look has the moving street scene. A form in the Luxe look has a quieter one: stars around the form, a soft glow along the bottom and small real estate icons that drift by now and then, in the agent's gold, silver or bronze. **Background effects** off turns either one off. Invites made in the chat get the same RSVP questions as the builder, and a home's invite ties to its open house.

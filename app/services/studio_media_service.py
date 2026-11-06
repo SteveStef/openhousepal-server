@@ -1876,14 +1876,16 @@ async def _render_branding_png(
     av_x, av_y = x0 + pad * 0.35, cy - avatar_d / 2
     if avatar_img is not None:
         try:
-            flat = avatar_img
-            if flat.mode in ("RGBA", "LA", "P"):
-                # A see-through PNG logo goes on white - converting straight to RGB turned its
-                # transparent background black.
-                rgba = flat.convert("RGBA")
-                flat = Image.new("RGB", rgba.size, (255, 255, 255))
-                flat.paste(rgba, mask=rgba.split()[3])
-            av = ImageOps.fit(flat.convert("RGB"), (avatar_d, avatar_d), method=Image.LANCZOS)
+            if user.photo_url:
+                av = ImageOps.fit(avatar_img.convert("RGB"), (avatar_d, avatar_d), method=Image.LANCZOS)
+            else:
+                # A logo shows whole inside the circle (cropping cut a wide one to fragments), on
+                # white, or dark if it's a white logo.
+                from app.utils.logo_fit import DARK_BACKING, is_light_logo
+                rgba = avatar_img.convert("RGBA")
+                av = Image.new("RGB", (avatar_d, avatar_d), DARK_BACKING if is_light_logo(rgba) else (255, 255, 255))
+                inner = ImageOps.contain(rgba, (round(avatar_d * 0.8), round(avatar_d * 0.8)), method=Image.LANCZOS)
+                av.paste(inner, ((avatar_d - inner.width) // 2, (avatar_d - inner.height) // 2), inner)
             mask = Image.new("L", (avatar_d, avatar_d), 0)
             ImageDraw.Draw(mask).ellipse((0, 0, avatar_d, avatar_d), fill=255)
             circle = Image.new("RGBA", (avatar_d, avatar_d))
@@ -2839,7 +2841,7 @@ async def upload_photo(db: AsyncSession, user: User, data: bytes, content_type: 
         from app.utils.image_validation import photo_to_jpeg
         data = photo_to_jpeg(data)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Please upload a JPG, PNG or WebP photo.") from exc
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Please upload a JPG, PNG, WebP or iPhone photo.") from exc
     if len(data) > _SOURCE_MAX_BYTES:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "That photo is over 12MB once converted - try a smaller one.")
     try:

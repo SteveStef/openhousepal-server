@@ -47,9 +47,10 @@ async def _logo_data_url(url: Optional[str]) -> Optional[str]:
     try:
         from PIL import Image
         from app.services.email_signature_service import _fetch_image
-        img = await _fetch_image(url)
+        img = await _fetch_image(url, keep_clear=True)
         if img is not None:
-            img = img.convert("RGBA")
+            from app.utils.logo_fit import is_light_logo, on_dark_backing
+            img = (on_dark_backing(img) if is_light_logo(img) else img).convert("RGBA")   # the centre of a QR code is white
             img.thumbnail((256, 256))
             buf = io.BytesIO()
             img.save(buf, "PNG", optimize=True)

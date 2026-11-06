@@ -24,7 +24,7 @@ Each feature shows a status: **Uses your brand**, **Its own look**, **Not set up
 - **See it everywhere** - a preview of every feature in your color.
 
 ### Logos, fonts & print
-- **Logos**: three slots - **Personal**, **Team**, **Brokerage**. "JPG or PNG. Used on your designs, Spotlight and signature." Up to 10MB. **Upload** / **Replace** / remove. In a Studio design you pick which one shows (or none) and its size.
+- **Logos**: three slots - **Personal**, **Team**, **Brokerage**. "PNG with a clear background looks best. Used on your designs, Spotlight and signature." Up to 10MB. **Upload** / **Replace** / remove. In a Studio design you pick which one shows (or none) and its size.
 - **The middle of your QR codes** (under Logos): **Our house logo** (every plan); **Your logo** (your Personal logo) or **Your initials** (IDX only). Used on every kit, design, form and sign-in screen; codes you already printed keep working.
 - **Fonts**: **Heading font** and **Body font** - **Editorial Serif**, **Modern Sans**, **Structured Mono**.
 - **Default Disclaimer**: "Shown on print materials where required. Leave blank to omit." (e.g. "Equal Housing Opportunity. Information deemed reliable but not guaranteed."). Studio designs use it as their fine print unless you type a per-design one.
@@ -86,7 +86,7 @@ Spotlight's Listing Agent section ("My email signature card" switch), the end of
 - Luxe (Branding, signature, Studio, forms, invites) needs IDX; others see it as a preview.
 - Can't add LinkedIn or custom-URL buttons to the signature - buttons must be your forms.
 - More than 3 signature buttons (Agent Hub + 2) won't fit.
-- Logos must be JPG or PNG.
+- Logos can be PNG, JPG, WebP or SVG. A logo is never recolored: one that would vanish on its background sits on a small white or dark backing.
 - Pasting into Notes/Word first strips the design - paste directly into the email app.
 
 ## From the AI helper chat

@@ -86,7 +86,7 @@ CATEGORIES: Dict[str, dict] = {
     },
     "reviews": {
         "label": "New reviews",
-        "help": "A client left you a review (or private feedback) through your review link.",
+        "help": "A client left you a review through your review link.",
         "types": ["NEW_REVIEW", "REVIEW"],
     },
     "account": {

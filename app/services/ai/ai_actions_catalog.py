@@ -389,7 +389,7 @@ RULES = {"open_house_signin": "Open house sign-in", "similar_homes_qr": "Similar
          "disclosure_request": "Disclosure request", "showcase_setup": "Showcase set up", "buyer_form": "Buyer form", "how_can_we_help": "How can we help form",
          "form_submission": "Form submission", "invite_rsvp": "Invite RSVP", "showing_request": "Showing request", "showcase_comment": "Showcase comment",
          "showcase_likes": "Showcase likes", "showcase_search_request": "Search change request", "listing_inquiry": "Listing inquiry",
-         "website_signin": "Website sign-in", "private_feedback": "Private feedback"}
+         "website_signin": "Website sign-in", "private_feedback": "Review off your hub"}
 WHEN = {"same_day": "Soon", "later_today": "In 2 hrs", "next_day": "Next day"}
 
 
@@ -2386,6 +2386,9 @@ async def _p_design(db, user, a):
     cname = DESIGN_COLORS[color]
     lines = [kind, f"Look: {DESIGN_LAYOUTS.get(layout, 'the recommended layout')}, {cname if cname.endswith('colors') else cname + ' colors'}"]
     payload = {"situation": sit, "format": fmt, "layout": layout, "colors": color}
+    logo = _s(a.get("logo"))
+    if logo in ("personal", "team", "brokerage", "none"):
+        payload["branding_mode"] = logo   # (the card's Logo step shows and changes it)
     if rule:
         key = _need_id(a, "listing_key")
         prop = await _one(db, select(Property).where(Property.listing_key == key), "I couldn't find that home in the listings.")
@@ -2443,12 +2446,13 @@ register({"name": "create_design", "description": (
     + "; ".join(f"{k}: {', '.join(v[2])}" for k, v in DESIGN_SITUATIONS.items())
     + ". just_listed/coming_soon/price_improvement/under_contract need one of the agent's own listings (listing_key); just_sold a sale they had; open_house their listing or one they're approved to host (+ optional date/time). "
     "The others (home_valuation, make_me_sell, find_your_dream_home, social_ad) need no home - optional headline (short and punchy, under about 60 characters - it's printed big). layout: keepsake, billboard, slant, postage, filmstrip, luxe (IDX). colors: light (Ivory), stone, dark (Charcoal), forest, brand, luxe (IDX). "
-    "The card itself lets the agent pick the layout and colors before tapping Make it - don't ask about the look first; pass layout/colors only when they named one. "
+    "The card itself lets the agent pick the layout, colors and logo before tapping Make it - don't ask about the look first; pass layout/colors only when they named one. "
+    "logo: pass none when they say no logo, or personal, team or brokerage when they name which one; leave it out otherwise. "
     "The card also lists their other listings (or sales) to switch to. When they say it's a different / another listing, never offer the same home again: use the one they name, or list their listings and ask which. "
     "Use the listing_key from their listings/sales list in your instructions - never a search result for a look-alike address."),
     "input_schema": _obj({"situation": {"type": "string", "enum": list(DESIGN_SITUATIONS)}, "format": {"type": "string", "enum": list(DESIGN_FORMATS)},
                           "listing_key": {"type": "string"}, "layout": {"type": "string", "enum": list(DESIGN_LAYOUTS)}, "colors": {"type": "string", "enum": list(DESIGN_COLORS)},
-                          "headline": {"type": "string"}, "open_house_date": {"type": "string"}, "start_time": {"type": "string"}, "end_time": {"type": "string"}},
+                          "logo": {"type": "string", "enum": ["personal", "team", "brokerage", "none"], "description": "Only when they ask for it in this request. Never carry it over from an earlier design."}, "headline": {"type": "string"}, "open_house_date": {"type": "string"}, "start_time": {"type": "string"}, "end_time": {"type": "string"}},
                          ["situation", "format"])},
          _p_design, None, STUDIO, client="create_design")
 

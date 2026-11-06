@@ -438,6 +438,38 @@ class CrashToJsonMiddleware:
 
 app.add_middleware(CrashToJsonMiddleware)
 
+
+class BodySizeLimitMiddleware:
+    """The biggest thing anyone uploads is a 25MB PDF. Without this, a huge upload was read in full
+    before its route could say it's too big. Inside CORS, so the browser can read the refusal."""
+    LIMIT = 30 * 1024 * 1024
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        length = next((v for k, v in scope["headers"] if k == b"content-length"), b"")
+        if length.isdigit() and int(length) > self.LIMIT:
+            return await JSONResponse({"detail": "That file is too big."}, status_code=413)(scope, receive, send)
+        from fastapi import HTTPException
+        seen = 0
+
+        async def counted():
+            nonlocal seen
+            message = await receive()
+            if message["type"] == "http.request":
+                seen += len(message.get("body", b""))
+                if seen > self.LIMIT:
+                    raise HTTPException(status_code=413, detail="That file is too big.")
+            return message
+
+        await self.app(scope, counted, send)
+
+
+app.add_middleware(BodySizeLimitMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     # Local dev browsers may load the app via either "localhost" or "127.0.0.1" -

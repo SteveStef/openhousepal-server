@@ -66,7 +66,7 @@ The bell and the light/dark switch sit next to the menu button.
 - It's an on-call helper: opened again 30 minutes or more after the last message, it starts a fresh chat, and old chats are cleared away - there is no chat history (it also keeps each chat's usage small). **New chat** (the speech-bubble button) starts over any time. A chat that is still making something (an AI CMA, a blog) stays until its finished message is read.
 - The chat's top line always says **AI Assistant** with its usage bar beside it. Phones: drag the pull tab up for full screen, down to shrink, further down to close.
 - Several things can be made at once (AI CMAs, blog posts, Spotlights, AI media): each shows its own progress bar under the top line, and they can keep chatting about anything. All of them finish on our servers, so they can close the site or switch devices. Next time the chat opens, a green note at the top says what finished - one time only - and the message stays in the chat that started it.
-- **Photos in the chat:** drag a photo onto the chat, paste it, or tap the picture button beside the message box (a phone opens the camera roll). JPG, PNG or WebP, up to 12MB, up to 6 at a time. The helper can see it and use it: AI media, an invite or blog cover, a logo, a headshot, CMA condition photos. Cards with a photo step also take a drop right on the step, and a dropped photo joins their Media Lab uploads.
+- **Photos in the chat:** drag a photo onto the chat, paste it, or tap the picture button beside the message box (a phone opens the camera roll). JPG, PNG, WebP or iPhone photos, shrunk to fit if large, up to 12MB, up to 6 at a time. The helper can see it and use it: AI media, an invite or blog cover, a logo, a headshot, CMA condition photos. Cards with a photo step also take a drop right on the step, and a dropped photo joins their Media Lab uploads.
 - On a computer in the big window, each card shows its preview on the left and its choices on the right, with finished steps side by side.
 - Their listings and sales show in the chat as small home cards - the little photo with Active / Pending / Sold on it and the street: the newest five, then **+N more**. Photo choices on any card are one row to swipe; picking one folds the step.
 - While a reply is coming, the chat shows what it's doing right now ("Searching your open house guests...") and the seconds going by.
@@ -974,7 +974,7 @@ Search ("Search by address or client..."), tabs **All**, **Draft**, **Ready**, *
 
 ### 6. Client Reviews (Review Hub)
 
-**What it is:** One review link. 4-5 star reviews go public and clients can post them to Google and Zillow in one tap; 1-3 stars come to you privately and are never posted.
+**What it is:** One review link. Every client can post to Google and Zillow in one tap, whatever they rated you (Google's rules ban steering only happy clients there). 4-5 stars also show on your Agent Hub; 1-3 stars alert you right away so you can make it right, and stay off your hub.
 
 **Where:** Top menu **Tools** > **Reviews** (heading "Five stars, on repeat").
 
@@ -988,7 +988,7 @@ Under **Your review link** ("Send it after every closing"): **Copy link**, **Tex
 - **Show on my IDX website** - adds a Reviews page and menu link (IDX plan only).
 - **Only show 4 and 5 stars** - lower ones stay saved here, just not shown publicly.
 
-### Where happy clients post (Google & Zillow)
+### Where clients post (Google & Zillow)
 Paste each review link once, then **Save links**. Google: open your Google Business Profile > Ask for reviews > copy the short link. Zillow: use the link behind the **Write a review** button on your Zillow profile.
 
 ### Bring in existing reviews
@@ -996,8 +996,8 @@ Paste each review link once, then **Save links**. Google: open your Google Busin
 - **Bring in reviews from other sites:** **Paste a bunch** (copy reviews from Zillow, Google, Realtor.com, Homes.com, Facebook or somewhere else, paste, tap **Find the reviews** - uses a little of your monthly AI allowance and copies each review word for word) or **Add one by hand**. You confirm they're real reviews from your clients.
 
 ### Your reviews
-The **Received** list shows each review, "Private feedback" for 1-3 stars, and whether the client posted it **On Google** / **On Zillow**. **Hide** / **Show** controls whether it appears publicly; delete removes it permanently.
-An unhappy (1-3 star) review also creates a follow-up for you right away (you can switch that situation off on the Follow-ups page).
+The **Received** list shows each review, "Off your hub" for 1-3 stars, and whether the client posted it **On Google** / **On Zillow**. **Hide** / **Show** controls whether it appears publicly; delete removes it permanently.
+An unhappy (1-3 star) review also creates a follow-up for you right away, so you can reach out and make it right (you can switch that situation off on the Follow-ups page).
 
 
 ## Tools (Studio, Spotlight, Media Lab, Branding, Email & more) - How-To Guide
@@ -1113,7 +1113,7 @@ Each page shows a **Live**, **Offline** or **Draft** badge, its listing status, 
 6. **Choose a color theme** - Ivory, Stone, Charcoal, Forest, Brand (your Branding colors), or Luxe (IDX only).
 7. **Frame your photo** - drag/zoom the photo, or show the whole photo.
 8. **Track the leads this brings in** - pick a form for the QR code. You can make a new campaign (its own link and QR, counted separately) or use an existing one.
-9. **Name it & create** - click **Create**.
+9. **Name it & create** - **Your headshot** and **Your logo** switches (with **My logo**, **Team** or **Brokerage** when you have more than one), then click **Create**. In the chat, the design card has the same **Logo** step, with **No logo**.
 
 If your profile is missing something ads must show (like your brokerage or phone), Studio asks "A few details first".
 
@@ -1137,7 +1137,7 @@ If your profile is missing something ads must show (like your brokerage or phone
 **Where:** **Tools > Media Lab**. Your projects are listed with filters (**All**, **Twilight**, **Staging**, **Lights On**, **AI Video**, **Videos**). Click **Create New**.
 
 ### Make an edit or a video
-1. **Property** - "Pick a property, or upload your own photos" (JPG, PNG or WebP, up to 12MB each). On No-MLS Premium you use your own uploads.
+1. **Property** - "Pick a property, or upload your own photos" (JPG, PNG, WebP or iPhone photos; very large ones are shrunk to fit). On No-MLS Premium you use your own uploads.
 2. **What do you want to make?**
    - **Photo edit** - stack any of: **Twilight** (daytime exterior to dusk, lights on), **Lights On**, **Virtual Stage** (pick a room type and a style: Modern, Transitional, Luxury, Traditional), **Enhance** (Improve grass / lawn, Improve / replace sky, Brighten exterior, Improve lighting, General photo polish, Clean up leaves, sticks & debris, Remove cars, bins & clutter, Remove furniture). With Virtual Stage you can add a **"Virtually Staged" label** (**Off**, **Bottom middle**, **Bottom right**).
    - **AI Video** - up to 7 photos, about 5 seconds each with a gentle camera move. Optional **Day → Twilight timelapse**.
@@ -1159,7 +1159,7 @@ If your profile is missing something ads must show (like your brokerage or phone
 
 - **Your look**: **Classic** or **Luxe** (Luxe is IDX only), Ivory (bright pages) or Midnight (deep pages), and for Luxe the metal (gold, silver or bronze).
 - **Your brand color**: pick a swatch or **Custom color**. **Where it shows** lists every feature and whether it uses your brand ("Uses your brand", "Its own look", "Not set up yet"). **Use this color for all features** switches every feature back to your Brand Kit ("You can still give any one of them its own look later, in that feature").
-- **Logos, fonts & print**: **Logos** (personal, team and brokerage - "JPG or PNG. Used on your designs, Spotlight and signature."), **Fonts** (**Heading font**, **Body font**: Editorial Serif, Modern Sans, Structured Mono), **The middle of your QR codes** (**Our house logo** on every plan; **Your logo** or **Your initials** on IDX - the logo is your Personal logo; printed codes keep working), and **Default Disclaimer** ("Shown on print materials where required. Leave blank to omit.").
+- **Logos, fonts & print**: **Logos** (personal, team and brokerage - "PNG with a clear background looks best. Used on your designs, Spotlight and signature."), **Fonts** (**Heading font**, **Body font**: Editorial Serif, Modern Sans, Structured Mono), **The middle of your QR codes** (**Our house logo** on every plan; **Your logo** or **Your initials** on IDX - the logo is your Personal logo; printed codes keep working), and **Default Disclaimer** ("Shown on print materials where required. Leave blank to omit.").
 
 *Why didn't my Agent Hub change color?* It only follows your brand while its "Look comes from" is set to **My Brand Kit**.
 

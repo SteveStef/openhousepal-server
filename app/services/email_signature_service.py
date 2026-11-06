@@ -806,7 +806,7 @@ def _frames_to_looping_gif(frames: list, durations: list[int], colors: int = 200
     return buffer.getvalue()
 
 
-async def _fetch_image(url: str):
+async def _fetch_image(url: str, keep_clear: bool = False):
     from PIL import Image
     import httpx
 
@@ -831,7 +831,8 @@ async def _fetch_image(url: str):
     if response.status_code != 200:
         return None
     try:
-        return Image.open(BytesIO(response.content)).convert("RGB")
+        # RGB turns a logo's see-through background solid black, so logos ask to keep it.
+        return Image.open(BytesIO(response.content)).convert("RGBA" if keep_clear else "RGB")
     except Exception:  # noqa: BLE001 - a corrupt/unsupported fetch just falls back to the initial
         return None
 

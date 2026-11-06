@@ -26,7 +26,7 @@ from app.services.bright_mls_service import bright_mls_service
 from app.services import property_website_service, s3_service, vcard_service
 from app.services.website.site_service import owner_links, resolve_owner_public_base_url
 from app.utils.auth import luxe_theme_allowed, AGENT_HUB_ACCESS_TIERS, REVIEWS_ACCESS_TIERS, get_current_active_user, get_current_user_optional, require_active_plan, require_agent_hub_access, require_reviews_access, owner_has_access, tier_has_mls
-from app.utils.image_validation import assert_valid_jpeg, photo_to_jpeg
+from app.utils.image_validation import assert_valid_jpeg, headshot_jpeg
 
 router = APIRouter(prefix="/agent-hub", tags=["agent-hub"])
 logger = logging.getLogger(__name__)
@@ -41,9 +41,10 @@ PHOTO_CONTENT_TYPES = {
     "image/jpeg": ".jpg",
 }
 PHOTO_MAX_BYTES = 5 * 1024 * 1024
-# The agent's own headshot also takes PNG/WebP (what phones and photo apps often save) - it's
-# converted to a real JPEG before it's stored, so everything downstream still only ever sees JPG.
-HEADSHOT_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
+# The agent's own headshot takes any real photo, checked by what the file is rather than what the
+# browser calls it (an iPhone HEIC on a computer often has no type). It's stored as a sized JPG, so
+# everything downstream still only ever sees JPG. Browsers shrink first; this is the HEIC case.
+HEADSHOT_MAX_BYTES = 25 * 1024 * 1024
 
 
 class AgentHubSlugUpdate(BaseModel):
@@ -1409,20 +1410,14 @@ async def upload_my_photo(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
-    if file.content_type not in HEADSHOT_CONTENT_TYPES:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Please upload a JPG, PNG or WebP photo.",
-        )
-
     contents = await file.read()
-    if len(contents) > PHOTO_MAX_BYTES:
+    if len(contents) > HEADSHOT_MAX_BYTES:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Photo must be 5MB or smaller.",
+            detail="That photo is too big - please try a smaller one.",
         )
     try:
-        contents = photo_to_jpeg(contents)
+        contents = headshot_jpeg(contents)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
 
@@ -1626,10 +1621,10 @@ async def public_submit_review(slug: str, payload: ReviewSubmit, request: Reques
     if not name or not body:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Please add your name and a few words.")
     rating = max(1, min(5, int(payload.rating or 0)))
-    # Review-funnel gate (same idea the paid reputation tools use): 4-5 stars are published and
-    # nudged onward to Google / Zillow; 1-3 stars come in as private feedback (status "hidden")
-    # so a bad day doesn't auto-post to the agent's public hub. The agent can still publish it by
-    # hand from Settings -> Reviews.
+    # 4-5 stars show on the agent's own hub; 1-3 stars come to them as private feedback (status
+    # "hidden") with a same-day follow-up, so they can make it right. The agent can still publish it
+    # by hand from Settings -> Reviews. Google and Zillow are offered to everyone below, whatever the
+    # rating: Google's rules ban selectively asking for positive reviews (owner, 11/05).
     is_public = rating >= 4
     review = AgentReview(
         owner_id=owner.id,
@@ -1647,7 +1642,7 @@ async def public_submit_review(slug: str, payload: ReviewSubmit, request: Reques
         type="NEW_REVIEW",
         reference_type="REVIEW",
         reference_id=review.id,
-        title=f"New {rating}-star review" if is_public else f"Private feedback ({rating}-star)",
+        title=f"New {rating}-star review" if is_public else f"New {rating}-star review (off your hub)",
         message=f"{name}: {body[:80]}" + ("…" if len(body) > 80 else ""),
         link="/settings#reviews",
         is_read=False,
@@ -1656,7 +1651,7 @@ async def public_submit_review(slug: str, payload: ReviewSubmit, request: Reques
     await db.refresh(review)
     from app.services.agent_email_service import absolute, email_agent
     email_agent(owner, "NEW_REVIEW", "new_review_received",
-                f"New {rating}-star review from {name}" if is_public else f"Private feedback from {name} ({rating}-star)",
+                f"New {rating}-star review from {name}" if is_public else f"New {rating}-star review from {name} (off your hub)",
                 {"reviewer_name": name, "rating": rating, "stars": "\u2605" * rating + "\u2606" * (5 - rating), "review_body": body[:1500],
                  "is_public": is_public, "link": absolute("/studio/reviews")})
 
@@ -1665,7 +1660,7 @@ async def public_submit_review(slug: str, payload: ReviewSubmit, request: Reques
     await log_activity(
         db, owner_id=owner.id, email=review.reviewer_email, source_type="review_left", source_id=review.id,
         summary=(f"Left you a {rating}-star review" if is_public
-                 else f"Left you a {rating}-star review (kept private - not posted anywhere)"),
+                 else f"Left you a {rating}-star review (came to you first, not shown on your Agent Hub)"),
         raw_snapshot={"rating": rating, "message": body[:1500], "is_public": is_public},
     )
     await db.refresh(review)  # the log commits - reload before reading it again below
@@ -1683,7 +1678,7 @@ async def public_submit_review(slug: str, payload: ReviewSubmit, request: Reques
             rule="private_feedback",
             source_id=review.id,
             title=f"Follow up with {name[:80]}",
-            context=f"Left a {rating}-star review through your review link - it stayed private, not posted anywhere",
+            context=f"Left a {rating}-star review through your review link - it came to you first and isn't on your Agent Hub",
             # An alert, not a text: what happened, their words, and what to do.
             notes=tasks_service._alert_notes("private_feedback", who, SimpleNamespace(rating=rating, body=body, property_address=None)),
             message=None,
@@ -1692,9 +1687,8 @@ async def public_submit_review(slug: str, payload: ReviewSubmit, request: Reques
         )
 
     dests = _review_dests(hub)
-    # Only nudge onward for a genuinely positive review AND only to a destination the agent set up.
-    onward = dests if is_public else {"google_review_url": None, "zillow_review_url": None, "google_place_id": None}
-    return {"id": review.id, "rating": rating, "is_public": is_public, "destinations": onward}
+    # The same offer for every rating, to wherever the agent set up.
+    return {"id": review.id, "rating": rating, "is_public": is_public, "destinations": dests}
 
 
 @router.post("/public/{slug}/reviews/{review_id}/posted", status_code=status.HTTP_204_NO_CONTENT)

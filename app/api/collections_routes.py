@@ -423,6 +423,27 @@ async def get_send_home_state(
     return {**_send_prefs(current_user), "intro_texted_at": coll.home_intro_texted_at, "sends": coll.home_sends or []}
 
 
+@router.get("/{collection_id}/lead")
+async def get_showcase_lead(
+    collection_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_premium_plan),
+):
+    """The client's lead card, so it can open over the Showcases page: matched by their email or phone
+    like everywhere else, then by the lead activity this Showcase logged (a client with neither)."""
+    from app.models.database import LeadEvent
+    from app.services.leads_service import find_lead_by_contact
+    coll = (await db.execute(select(Collection).where(Collection.id == collection_id))).scalar_one_or_none()
+    if not coll or coll.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    lead = await find_lead_by_contact(db, current_user.id, coll.visitor_email, coll.visitor_phone)
+    if lead:
+        return {"lead_id": lead.id}
+    lead_id = (await db.execute(select(LeadEvent.lead_id).where(LeadEvent.collection_id == collection_id, LeadEvent.lead_id.isnot(None))
+                                .order_by(LeadEvent.created_at.desc()).limit(1))).scalar_one_or_none()
+    return {"lead_id": lead_id}
+
+
 SEND_LOG_MAX = 300  # entries kept per Showcase (oldest dropped)
 
 
