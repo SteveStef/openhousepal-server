@@ -34,7 +34,7 @@ from app.schemas.blogs import (
 )
 from app.services import email_signature_service
 from app.services import blog_neighborhoods
-from app.utils.auth import get_current_active_user, get_current_user_optional, require_studio_design_access, luxe_blog_theme_allowed
+from app.utils.auth import get_current_active_user, get_current_user_optional, require_studio_design_access, luxe_blog_theme_allowed, luxe_upgrade_label
 
 router = APIRouter(prefix="/studio/blogs", tags=["blogs"])
 logger = logging.getLogger(__name__)
@@ -635,7 +635,7 @@ async def update_blog(
     blog = await get_owned_blog(db, blog_id, current_user.id)
     data = payload.model_dump(exclude_unset=True)
     if data.get("theme") == "luxe_plus" and not luxe_blog_theme_allowed(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="The Luxe article theme is part of the IDX plan.")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"The Luxe article theme is part of the {luxe_upgrade_label(current_user)} plan.")
 
     old_cover_url = blog.cover_image_url
     for field, value in data.items():

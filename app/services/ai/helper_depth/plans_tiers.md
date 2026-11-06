@@ -40,9 +40,10 @@ Order in each line: No-MLS Basic / No-MLS Premium / Basic / Premium / IDX.
 - IDX Website and Listing Spotlight: hidden / hidden / locked / locked / yes.
 
 **Looks**
-- Luxe Agent Hub look, Luxe Studio layout and color theme, Luxe brand look: IDX only. Every other plan can preview Luxe, but visitors see Classic. The saved choice is kept, so upgrading brings it straight back.
+- Luxe Agent Hub look, Luxe Studio layout and color theme, Luxe brand look, Luxe forms, invites and signature: IDX and No-MLS Premium. Every other plan can preview Luxe, but visitors see Classic. The saved choice is kept, so upgrading brings it straight back.
 - Luxe blog theme: IDX and No-MLS Premium.
-- Your own logo or initials in the middle of your QR codes: IDX only (everyone can use the house logo).
+- Your own logo or initials in the middle of your QR codes: IDX and No-MLS Premium (everyone can use the house logo).
+- On No-MLS Basic, the upgrade for Luxe and the QR center is No-MLS Premium, never IDX. Basic and Premium upgrade to IDX for them.
 
 **Account setup steps by plan**
 - Every plan: About you, How to reach you, License number, Your photo, Your brand, Open house defaults, Alerts & follow-ups, Calendar, Your email, Your CRM, Towns you serve.

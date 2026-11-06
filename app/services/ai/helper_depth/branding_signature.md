@@ -1,11 +1,11 @@
 Branding and the Email Signature in depth: your look (Classic/Luxe, Ivory/Midnight, metals), brand color and "use it everywhere", logos, the middle of your QR codes, fonts and disclaimer; then every signature section, the banner and stats, buttons, looks, smart links, installing in each email app and when to re-copy.
 
 ## Branding (Brand Kit)
-**Who**: every plan. The **Luxe** look is IDX only ("Included with the IDX plan") - others can preview it.
+**Who**: every plan. The **Luxe** look is on IDX and No-MLS Premium - others can preview it. Basic and Premium see "Included with the IDX plan"; No-MLS Basic sees "Included with the No-MLS Premium plan" and is never pointed at IDX.
 **Where**: the Branding banner at the bottom of the Tools page (phone menu: **Branding**). Page title "Your brand, everywhere". "Tap to choose - everything saves on its own, no Save button needed."
 
 ### Your look
-- **Look**: **Classic** ("Clean and bright, in your color") or **Luxe** ("Metal shine, serif type, cinematic light" - IDX).
+- **Look**: **Classic** ("Clean and bright, in your color") or **Luxe** ("Metal shine, serif type, cinematic light" - IDX and No-MLS Premium).
 - **Finish** (Luxe): **Gold**, **Silver** or **Bronze**.
 - **Color** (Classic): pick a swatch, **Custom color** / **Any color**.
 - **Ivory or Midnight**: bright pages or deep, dark pages.
@@ -25,12 +25,12 @@ Each feature shows a status: **Uses your brand**, **Its own look**, **Not set up
 
 ### Logos, fonts & print
 - **Logos**: three slots - **Personal**, **Team**, **Brokerage**. "PNG with a clear background looks best. Used on your designs, Spotlight and signature." Up to 10MB. **Upload** / **Replace** / remove. In a Studio design you pick which one shows (or none) and its size.
-- **The middle of your QR codes** (under Logos): **Our house logo** (every plan); **Your logo** (your Personal logo) or **Your initials** (IDX only). Used on every kit, design, form and sign-in screen; codes you already printed keep working.
+- **The middle of your QR codes** (under Logos): **Our house logo** (every plan); **Your logo** (your Personal logo) or **Your initials** (IDX and No-MLS Premium; No-MLS Basic's upgrade for these is No-MLS Premium). Used on every kit, design, form and sign-in screen; codes you already printed keep working.
 - **Fonts**: **Heading font** and **Body font** - **Editorial Serif**, **Modern Sans**, **Structured Mono**.
 - **Default Disclaimer**: "Shown on print materials where required. Leave blank to omit." (e.g. "Equal Housing Opportunity. Information deemed reliable but not guaranteed."). Studio designs use it as their fine print unless you type a per-design one.
 
 ## Email Signature
-**Who**: IDX and No-MLS Premium. Locked on Basic, Premium and No-MLS Basic. No-MLS Premium shows the listings and sales you enter by hand; IDX syncs them from the MLS. The Luxe signature theme is IDX only.
+**Who**: IDX and No-MLS Premium. Locked on Basic, Premium and No-MLS Basic. No-MLS Premium shows the listings and sales you enter by hand; IDX syncs them from the MLS. The Luxe signature theme comes with both.
 **Where**: Tools > Signature. Autosaves ("Saving..." / "Saved"). Five sections: **Identity**, **Social**, **Buttons**, **Banner**, **Customize**.
 
 ### Identity
@@ -51,7 +51,7 @@ Toggle which links show: **Website**, **Instagram**, **Facebook**, **YouTube**, 
 
 ### Customize
 - **Look** - "Where the look comes from": **My Brand Kit** (follows Branding) or **Choose my own** ("Pick a color, Luxe and Ivory or Midnight below").
-- **Premade theme - Luxe**: gold, serif and the Spotlight's light, in Ivory or Midnight; **Luxe finish** (Gold, Silver, Bronze). With Luxe on, the color and font pickers step aside. IDX only.
+- **Premade theme - Luxe**: gold, serif and the Spotlight's light, in Ivory or Midnight; **Luxe finish** (Gold, Silver, Bronze). With Luxe on, the color and font pickers step aside.
 - **Photo & Theme**: **Ivory** / **Midnight** - "Applies everywhere instantly, nothing to re-paste."
 - Accent color picker.
 - **Font** (email-safe only): **System**, **Classic**, **Editorial Serif**, **Friendly**.
@@ -83,14 +83,14 @@ Spotlight's Listing Agent section ("My email signature card" switch), the end of
 
 ## Can't do / common mistakes
 - Hub didn't change color? Its "Look comes from" isn't on My Brand Kit.
-- Luxe (Branding, signature, Studio, forms, invites) needs IDX; others see it as a preview.
+- Luxe (Branding, signature, Studio, forms, invites) needs IDX or No-MLS Premium; others see it as a preview.
 - Can't add LinkedIn or custom-URL buttons to the signature - buttons must be your forms.
 - More than 3 signature buttons (Agent Hub + 2) won't fit.
 - Logos can be PNG, JPG, WebP or SVG. A logo is never recolored: one that would vanish on its background sits on a small white or dark backing.
 - Pasting into Notes/Word first strips the design - paste directly into the email app.
 
 ## From the AI helper chat
-- "Change my colors / show me my options" shows a card with the Branding page's choices as steps: **Look** (Classic or Luxe on IDX), **Color** (Classic) or **Finish** (Luxe Gold / Silver / Bronze), **Pages** (Ivory or Midnight) and, when some tools aren't using the brand, **Every tool?** - **Yes, every tool** does the same as the page's **Use this color for all features**; **Only where it's on now** leaves those tools alone. It saves to the same Branding settings the page uses.
+- "Change my colors / show me my options" shows a card with the Branding page's choices as steps: **Look** (Classic, or Luxe on IDX and No-MLS Premium), **Color** (Classic) or **Finish** (Luxe Gold / Silver / Bronze), **Pages** (Ivory or Midnight) and, when some tools aren't using the brand, **Every tool?** - **Yes, every tool** does the same as the page's **Use this color for all features**; **Only where it's on now** leaves those tools alone. It saves to the same Branding settings the page uses.
 - "What's on my signature / did I install it?" lists its buttons, banner, socials and look, and whether it needs copying again. The chat can turn the listings banner (or its featured listing / recent sales / stats), a button, or a social icon on or off - afterward, copy it again into Gmail/Outlook. Colors and fonts stay on the Signature page.
 - An installed signature keeps the look it was copied with - its pictures (photo frame, listings/sales banner, stats strip, social icons) stay in those colors even after the colors change, so it never ends up half old, half new. Listings, sales and stats still update themselves. After changing colors (or the Branding look it follows), the Signature page says to copy it again; the new copy carries the new look everywhere. Signatures copied before 11/01 update their pictures live until they're copied once more.
 - On websites (blogs, Spotlights, Guest Pass, CMA) the signature card's top matches the Agent Hub's side header: the framed photo on the left, then brokerage, name, title and the area they serve.

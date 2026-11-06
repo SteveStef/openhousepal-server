@@ -2,7 +2,7 @@ Forms & Invites in depth: every premade form, the custom form builder and its qu
 
 ## Who gets it
 - Every plan. The **Setup My Own Showcase** form ("Showcase Request") needs a Showcase plan - Premium or IDX ("Upgrade to Premium to turn it on").
-- The **Luxe** form look and Luxe invite metals are IDX only.
+- The **Luxe** form look and Luxe invite metals are on IDX and No-MLS Premium. On No-MLS Basic the upgrade for them is No-MLS Premium.
 - **Open House Requests** and **Similar Listings QR** come from your open house Cheat Sheets (MLS plans).
 
 ## The page (Tools > Forms & Invites)
@@ -27,8 +27,8 @@ Forms & Invites in depth: every premade form, the custom form builder and its qu
 - **Choose a question type**: **Short answer** (a single line), **Long answer** (a paragraph), **Single choice** (pick one), **Multiple choice** (pick multiple), **Number**, **Currency** (a dollar amount), **Date**, **Time**, **Email** (validated), **Phone**, **Property Address** (address lookup with live Google suggestions), **Statement** (a transition slide, no input).
 - Each question: **Question label**, **Type**, **Required** (not on Statements), **Placeholder**, **Helper text (optional)**, **Choices** (for choice questions; a locked premade question shows its choices but they can't be changed), **Unit suffix (optional)** for numbers (e.g. "square feet"). Drag to reorder; delete with the trash.
 - No "if this, then that" branching in the custom builder.
-- Made from the AI helper chat: the card's steps are **Questions** (the helper's questions for this form, each with its answer type and choices - the x takes one off; **Ideas for this form** made for what the form is about; **Common ones** for that kind of form (sellers, buyers, events, being featured, renters), **+N more**; or type their own; **Done**), **Look** (**Classic** with a color or **Luxe** with Gold, Silver or Bronze (IDX plan), **Light** or **Dark**, **Background effects** and **Welcome text effects**, with the preview beside them, and **Use my Brand Kit look** to go back) and **About a home?** (No, or one of their own active listings with its photo). First and last name (side by side on one line), email and phone start on one screen; the switches on that step change it to one Full name box or separate screens.
-- An invite made from the AI helper chat: the card shows the invite itself, small, redrawn as they tap the steps - **What kind** (Open house, Broker's open, Client event, Other event), **Home** (their listings - its photo becomes the cover; or Not one of my listings), **Day** (the next week as taps, or Another day), **Time** (11-1, 12-2, 1-3, 2-4, 5-7 or exact times), **Design** (Classic, Garden, Midnight, Modern) and **Color** (My brand, Luxe Gold / Silver / Bronze on IDX, or a color). **Make it** saves it to Forms & Invites; nothing is sent until they send it there.
+- Made from the AI helper chat: the card's steps are **Questions** (the helper's questions for this form, each with its answer type and choices - the x takes one off; **Ideas for this form** made for what the form is about; **Common ones** for that kind of form (sellers, buyers, events, being featured, renters), **+N more**; or type their own; **Done**), **Look** (**Classic** with a color or **Luxe** with Gold, Silver or Bronze (IDX and No-MLS Premium), **Light** or **Dark**, **Background effects** and **Welcome text effects**, with the preview beside them, and **Use my Brand Kit look** to go back) and **About a home?** (No, or one of their own active listings with its photo). First and last name (side by side on one line), email and phone start on one screen; the switches on that step change it to one Full name box or separate screens.
+- An invite made from the AI helper chat: the card shows the invite itself, small, redrawn as they tap the steps - **What kind** (Open house, Broker's open, Client event, Other event), **Home** (their listings - its photo becomes the cover; or Not one of my listings), **Day** (the next week as taps, or Another day), **Time** (11-1, 12-2, 1-3, 2-4, 5-7 or exact times), **Design** (Classic, Garden, Midnight, Modern) and **Color** (My brand, Luxe Gold / Silver / Bronze on IDX and No-MLS Premium, or a color). **Make it** saves it to Forms & Invites; nothing is sent until they send it there.
 - The invite's place NAME is for a venue (a club, a restaurant). An invite never shows the street twice - a place name that is just the street, or a title that already says the address, is left off the card's extra lines.
 - Builder sections: **Welcome Screen** (**Intro headline**, **Subtitle**), questions, **Thank You Screen** (**Success heading**, **Success message**), **Settings**, with a **Live preview**.
 - Each form has its own link - **Edit URL** to set the ending (letters, numbers, hyphens; it checks the link is free).
@@ -40,7 +40,7 @@ Forms & Invites in depth: every premade form, the custom form builder and its qu
 - **Agent & property placement**: **Property top, agent bottom** (default), **Agent top, property bottom**, or **Integrated card** ("One cohesive card, like Open House sign-in").
 - **After they submit**: **Go to my Agent Hub** (a few seconds after the thank-you), or stay on the thank-you. Showcase forms: **Open their new Showcase**.
 - **Background effects** (a quiet street of homes under a soft sky, in the form's color, behind the form) and **Welcome text effects** (title, words and Start button glide in).
-- **Look**: where it comes from - **My Brand Kit** (default), **Match my Agent Hub**, or **Choose my own** ("Its own look": a style, color and Ivory or Midnight). Styles: **Classic** ("Clean, in your color") or **Luxe** ("Metal shine and a serif title" - IDX only), with a metal finish. **Ivory** (light & airy) or **Midnight** (dark & dramatic). **Use this look on all my forms** applies it everywhere.
+- **Look**: where it comes from - **My Brand Kit** (default), **Match my Agent Hub**, or **Choose my own** ("Its own look": a style, color and Ivory or Midnight). Styles: **Classic** ("Clean, in your color") or **Luxe** ("Metal shine and a serif title" - IDX and No-MLS Premium), with a metal finish. **Ivory** (light & airy) or **Midnight** (dark & dramatic). **Use this look on all my forms** applies it everywhere.
 
 ## Campaigns (tracking links)
 - "Same form, new tracking link - track a mailer, ad, or flyer separately." Identical questions and design, its own link, QR code and stats.
@@ -74,7 +74,7 @@ Forms & Invites in depth: every premade form, the custom form builder and its qu
 5. **The place** - **Address** and optional **Name of the place** (e.g. "Our office"). Guests get a **Get directions** button.
 6. **The look** - "Make it yours":
    - **Design**: **Classic** (ivory card, fine border), **Garden** (soft botanicals), **Midnight** (dark, metallic accents), **Modern** (big photo, bold type).
-   - **Color**: your Brand Kit color, a palette, any color, or **Luxe** metals (IDX plan).
+   - **Color**: your Brand Kit color, a palette, any color, or **Luxe** metals (IDX and No-MLS Premium).
    - **Animation**: **Normal** ("A paper envelope that opens to the card") or **Luxe** ("Lacquer, foil and light - a cinematic reveal").
    - **Cover photo**: from the home's photos or your own upload (JPG under 10 MB); drag up/down to position. No photo = your initials.
    - **Words on the invitation**: **Line 1 - the big title**, **Line 2 - under the title** (leave empty for none; defaults to the address).
@@ -91,7 +91,7 @@ Then **Create my invite** -> "Your invite is ready".
 - Can't remove Full name, Email or Phone from a custom form.
 - Premade questions can't be edited in place - Duplicate first.
 - Changing a campaign's after-submit page changes it for QR codes already printed.
-- Luxe form look and Luxe invite metals need IDX.
+- Luxe form look and Luxe invite metals need IDX or No-MLS Premium.
 - Remind does nothing for people you only texted or shared the link with - it only reaches people you emailed from the invite.
 - More than 7 days or 12 extra questions isn't possible in one invite.
 

@@ -1861,7 +1861,7 @@ def resolve_form_look(form: AgentForm, hub_config: dict, owner, brand_look: Opti
     """What a visitor sees: 'brand' (the default) = the agent's Brand Kit look; 'custom' = the
     form's own; 'hub' (legacy, before the Brand Kit became the one source) = the Agent Hub's look as
     visitors see it (which is itself the Brand Kit while the hub follows it).
-    Luxe is IDX only (same rule as the hub) - otherwise it shows as Classic."""
+    Luxe is IDX and No-MLS Premium (same rule as the hub) - otherwise it shows as Classic."""
     from app.utils.auth import luxe_theme_allowed
     from app.services import brand_look_service
     cfg = hub_config or {}

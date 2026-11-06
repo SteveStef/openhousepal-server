@@ -62,7 +62,7 @@ IDX website, Agent Hub and Review Hub in depth: website sections, pages, looks, 
   - My Listings: Bright plans pull active, pending and coming-soon listings (**Refresh Listings**); choose which show. **Manually Add** → **Add Listing** (Street Address, City, State, ZIP, Price, Status Active / Coming Soon / Under Contract, photo). Sort, **Carousel view**, **Auto scroll**.
   - Recent Sales: found by your RE License number (**Refresh Sales**); choose which show - they also rotate through your email signature. **Manually Add** → **Add Sold Property** (address, Price, Date Closed, photo). Sort Newest / Price High / Price Low, **Min price to display**, **Sold-price stats**, **Carousel view**, **Auto scroll** (Luxe only). No-MLS Premium adds every listing and sale by hand; sales also print on the Brag Sheet.
 - **Media**: Videos (YouTube channel link with **Auto-update from channel** / **Load Recent Videos**, or individual links; favorite = always first), House Tours (playlist link or individual links), Blogs (Studio articles auto-synced, plus manual links).
-- **Layout**: **Agent Hub theme** (My Brand Kit or Choose my own: **Classic color** or **Luxe finish** - Luxe is visible to visitors on IDX only; others see "IDX · Preview"); **Ivory or Midnight** (also your Sales page); **Profile header** (Centered - "Photo on top, everything centered" / Side by side - "Photo beside your name and details, stats below"); **Reviews** (Show reviews on my Agent Hub, Only show 4 and 5 star reviews, One big card / Two cards, Move on their own (phones)); **Agent Hub Layout** (drag My Listings, Recent Sales, Videos, House Tours, Blogs, Reviews into order; switch each on/off - empty sections stay off); **Star Rating** (rating and review button on your profile card). Changes go live right away.
+- **Layout**: **Agent Hub theme** (My Brand Kit or Choose my own: **Classic color** or **Luxe finish** - Luxe is visible to visitors on IDX and No-MLS Premium; Premium sees "IDX · Preview"); **Ivory or Midnight** (also your Sales page); **Profile header** (Centered - "Photo on top, everything centered" / Side by side - "Photo beside your name and details, stats below"); **Reviews** (Show reviews on my Agent Hub, Only show 4 and 5 star reviews, One big card / Two cards, Move on their own (phones)); **Agent Hub Layout** (drag My Listings, Recent Sales, Videos, House Tours, Blogs, Reviews into order; switch each on/off - empty sections stay off); **Star Rating** (rating and review button on your profile card). Changes go live right away.
 - **Link**: **Public URL** → **Custom URL ending** (letters, numbers, hyphens) → **Save URL**; **Copy URL**, **Open Public Page**, **Share URL**.
 
 ## Changing your hub address
@@ -73,7 +73,7 @@ IDX website, Agent Hub and Review Hub in depth: website sections, pages, looks, 
 - Settings → Profile → **Where Your Listings Link To**: each listing on your hub and signature opens its Spotlight (if published) or the simple Listing Page ("Presented by" you, with showing and question forms). You can send one back to the plain page.
 
 ## Can't do
-- Basic and No-MLS Basic don't have a hub. Luxe isn't public below IDX. The hub shows "This link isn't active" when the plan lapses or no longer includes it.
+- Basic and No-MLS Basic don't have a hub. Luxe isn't public on Premium (it needs IDX). The hub shows "This link isn't active" when the plan lapses or no longer includes it.
 
 # REVIEW HUB (Premium, IDX, No-MLS Premium; Tools → Reviews, "Five stars, on repeat")
 - Needs your Agent Hub set up first.

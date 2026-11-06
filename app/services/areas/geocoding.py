@@ -56,6 +56,19 @@ async def geocode_place(name: str, state: str) -> tuple[float, float] | None:
 
 _NAMED_AREA_FIELD_MASK = FIELD_MASK + ",places.addressComponents,places.types,places.viewport"
 _AREA_PLACE_TYPES = {"neighborhood", "sublocality", "sublocality_level_1", "locality", "political"}
+# What a served area can be. A search for "Main Line" returned Main Line Pizza & Catering: a business
+# is never a place someone serves (owner, 11/06).
+_REAL_PLACE_TYPES = _AREA_PLACE_TYPES | {"colloquial_area", "natural_feature", "park", "tourist_attraction", "historical_landmark",
+                                         "administrative_area_level_2", "administrative_area_level_3"}
+# Well known regions Google has no entry for. Key = (lowercased name, state).
+_KNOWN_REGIONS: dict[tuple[str, str], dict[str, Any]] = {
+    ("main line", "PA"): {
+        "name": "Main Line", "state": "PA", "lat": 40.0237, "lng": -75.3966, "parent_city": None,
+        "formatted_address": "Main Line, PA, USA",
+        "geography": {"type": "bounds", "source": "known_region",
+                      "bounds": {"min_lat": 39.975, "max_lat": 40.075, "min_lng": -75.56, "max_lng": -75.25}},
+    },
+}
 _POINT_PLACE_TYPES = {"park", "point_of_interest", "establishment", "tourist_attraction"}
 _POINT_LIKE_VIEWPORT_MAX_SPAN_MILES = 0.35
 
@@ -129,6 +142,10 @@ async def resolve_named_place(name: str, state: str) -> dict | None:
     was present (e.g. an unincorporated area), which the caller should treat as "resolved, but
     couldn't determine a parent" rather than a hard failure.
     """
+    known = _KNOWN_REGIONS.get((name.strip().lower(), state.strip().upper()))
+    if known:
+        return {**known, "geography": dict(known["geography"])}
+
     api_key = os.getenv("GOOGLE_PLACES_API_KEY")
     if not api_key:
         logger.info("Named place resolution skipped: no GOOGLE_PLACES_API_KEY configured")
@@ -149,7 +166,7 @@ async def resolve_named_place(name: str, state: str) -> dict | None:
         logger.warning("Named place resolution request failed", extra={"place": text_query, "error": str(exc)})
         return None
 
-    places = payload.get("places") or []
+    places = [p for p in (payload.get("places") or []) if set(p.get("types") or []) & _REAL_PLACE_TYPES]
     if not places:
         return None
     place = _choose_named_area_place(places, name)
@@ -178,4 +195,6 @@ async def resolve_named_place(name: str, state: str) -> dict | None:
         "parent_city": parent_city,
         "formatted_address": place.get("formattedAddress"),
         "geography": _geography_definition(place, float(lat), float(lng)),
+        # "Philly" comes back as the city itself, so it's added as the town.
+        "is_city": "locality" in (place.get("types") or []),
     }

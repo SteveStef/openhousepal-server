@@ -144,8 +144,8 @@ There are two families of plans. Bright MLS agents can choose any plan. Agents o
 | Media Lab | IDX, No-MLS Premium |
 | IDX Website, Listing Spotlight | IDX only |
 | Showcases | Premium, IDX |
-| Luxe look on your Agent Hub | IDX only (other plans can preview it, but visitors see Classic) |
-| Your own logo or initials in the middle of your QR codes | IDX only |
+| Luxe look on your Agent Hub | IDX, No-MLS Premium (other plans can preview it, but visitors see Classic) |
+| Your own logo or initials in the middle of your QR codes | IDX, No-MLS Premium |
 
 ### Starting your plan (checkout)
 
@@ -254,7 +254,7 @@ Add YouTube **Videos**, **House Tours** and **Blogs** to your hub.
 ### Layout
 
 - **Agent Hub theme**: choose **My Brand Kit** to follow your Branding, so your hub changes when your Branding changes. Or choose **Choose my own** and pick a **Classic color** or a **Luxe finish**.
-  - Luxe only shows to visitors on the IDX plan. On other plans you can preview it, but visitors see Classic.
+  - Luxe only shows to visitors on the IDX and No-MLS Premium plans. On other plans you can preview it, but visitors see Classic.
   - Changes go live right away.
 - **Ivory or Midnight**: a light or dark page for visitors. This also applies to your Sales page.
 - **Profile header**: how the top of your hub looks on phones and computers.
@@ -283,7 +283,7 @@ It shows "Presented by" you, with a schedule-a-showing form and a message form. 
 ### Common questions
 
 - **My hub says "This link isn't active."** The hub only shows while your plan includes it and your subscription is active.
-- **Why don't I see Luxe on my live hub?** Luxe is an IDX-plan look.
+- **Why don't I see Luxe on my live hub?** Luxe is a look for the IDX and No-MLS Premium plans.
 - **My sales aren't showing.** Add your license number. If it's already saved, tap **Refresh Sales**. You can always use **Manually Add**.
 
 ---
@@ -1035,7 +1035,7 @@ A grey item with a lock means your plan doesn't include it - clicking it shows t
 | Media Lab | IDX and No-MLS Premium (locked for everyone else). No-MLS Premium works from your own uploaded photos. |
 | Signature | IDX and No-MLS Premium (locked for Basic, Premium, No-MLS Basic) |
 | Listing Spotlight | IDX only (locked for Basic and Premium; not shown on No-MLS plans) |
-| "Luxe" looks (Studio Luxe layout and color theme, Luxe brand look) | IDX only - other plans can preview it |
+| "Luxe" looks (Studio Luxe layout and color theme, Luxe brand look, forms, invites, signature) | IDX and No-MLS Premium - other plans can preview it. On No-MLS Basic the upgrade for Luxe is No-MLS Premium, never IDX. |
 | Luxe blog theme | IDX and No-MLS Premium |
 
 ---
@@ -1108,9 +1108,9 @@ Each page shows a **Live**, **Offline** or **Draft** badge, its listing status, 
 1. **What are you marketing?** - pick one: Just Listed, Coming Soon, Open House, Price Improvement, Under Contract, Just Sold, Home Valuation, Make Me Sell, Find Your Dream Home, Social Media Ad.
 2. **Where will it be posted?** - the choices depend on the situation, e.g. Just Listed Flyer, Open House Flyer, Postcard, Jumbo Postcard, Letter Mailer, Door Hanger, square/feed posts and Instagram Story.
 3. **Which property is this for?** - address, price, facts and photos fill in automatically; pick the lead photo. (Home Valuation, Make Me Sell and similar "get leads" pieces ask for **Your message & photo** instead.)
-4. **Choose a layout** - Keepsake, Billboard, Slant, Postage, Filmstrip, or Luxe (IDX only). Others show "Coming soon".
+4. **Choose a layout** - Keepsake, Billboard, Slant, Postage, Filmstrip, or Luxe (IDX and No-MLS Premium). Others show "Coming soon".
 5. **Choose a style** - Modern Luxury (other styles show "Coming soon").
-6. **Choose a color theme** - Ivory, Stone, Charcoal, Forest, Brand (your Branding colors), or Luxe (IDX only).
+6. **Choose a color theme** - Ivory, Stone, Charcoal, Forest, Brand (your Branding colors), or Luxe (IDX and No-MLS Premium).
 7. **Frame your photo** - drag/zoom the photo, or show the whole photo.
 8. **Track the leads this brings in** - pick a form for the QR code. You can make a new campaign (its own link and QR, counted separately) or use an existing one.
 9. **Name it & create** - **Your headshot** and **Your logo** switches (with **My logo**, **Team** or **Brokerage** when you have more than one), then click **Create**. In the chat, the design card has the same **Logo** step, with **No logo**.
@@ -1124,7 +1124,7 @@ If your profile is missing something ads must show (like your brokerage or phone
 - Reminder shown on the page: "Before it goes out: if your brokerage reviews marketing, get their OK first."
 
 ### Common questions
-- *Why is Luxe locked?* Luxe layouts and the Luxe theme are part of IDX.
+- *Why is Luxe locked?* Luxe layouts and the Luxe theme are part of IDX and No-MLS Premium.
 - *Why can't I pick most layouts?* Only the reviewed layouts are available; the rest say "Coming soon". Designs you already made in another layout still open.
 - *How do I undo?* The undo arrow at the top of the editor, or Ctrl+Z.
 
@@ -1157,9 +1157,9 @@ If your profile is missing something ads must show (like your brokerage or phone
 
 **Where:** the Branding banner at the bottom of the Tools page (phone menu: **Branding**).
 
-- **Your look**: **Classic** or **Luxe** (Luxe is IDX only), Ivory (bright pages) or Midnight (deep pages), and for Luxe the metal (gold, silver or bronze).
+- **Your look**: **Classic** or **Luxe** (Luxe is on IDX and No-MLS Premium), Ivory (bright pages) or Midnight (deep pages), and for Luxe the metal (gold, silver or bronze).
 - **Your brand color**: pick a swatch or **Custom color**. **Where it shows** lists every feature and whether it uses your brand ("Uses your brand", "Its own look", "Not set up yet"). **Use this color for all features** switches every feature back to your Brand Kit ("You can still give any one of them its own look later, in that feature").
-- **Logos, fonts & print**: **Logos** (personal, team and brokerage - "PNG with a clear background looks best. Used on your designs, Spotlight and signature."), **Fonts** (**Heading font**, **Body font**: Editorial Serif, Modern Sans, Structured Mono), **The middle of your QR codes** (**Our house logo** on every plan; **Your logo** or **Your initials** on IDX - the logo is your Personal logo; printed codes keep working), and **Default Disclaimer** ("Shown on print materials where required. Leave blank to omit.").
+- **Logos, fonts & print**: **Logos** (personal, team and brokerage - "PNG with a clear background looks best. Used on your designs, Spotlight and signature."), **Fonts** (**Heading font**, **Body font**: Editorial Serif, Modern Sans, Structured Mono), **The middle of your QR codes** (**Our house logo** on every plan; **Your logo** or **Your initials** on IDX and No-MLS Premium - the logo is your Personal logo; printed codes keep working), and **Default Disclaimer** ("Shown on print materials where required. Leave blank to omit.").
 
 *Why didn't my Agent Hub change color?* It only follows your brand while its "Look comes from" is set to **My Brand Kit**.
 

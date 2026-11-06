@@ -1,7 +1,7 @@
 """The Brand Kit's LOOK - the one central look an agent sets once in Studio -> Brand Kit (or the
 setup flow's Brand step) that every feature wears by default:
 
-    theme   'classic' | 'luxe'          (Luxe is IDX only - other plans fall back to Classic)
+    theme   'classic' | 'luxe'          (Luxe is IDX and No-MLS Premium - other plans fall back to Classic)
     accent  the Brand Kit's secondary_color (the Classic color - same palette as Hub / IDX)
     metal   'gold' | 'silver' | 'bronze'  (Luxe's finish)
     dark    False = Ivory, True = Midnight
@@ -78,7 +78,7 @@ def look_of(user: User, kit: Optional[StudioBrandKit]) -> dict:
     theme = "luxe" if raw.get("theme") == "luxe" else "classic"
     return {
         "theme": theme,
-        # what features actually show - Luxe is IDX only
+        # what features actually show - Luxe is IDX and No-MLS Premium
         "shown_theme": theme if theme != "luxe" or luxe_theme_allowed(user) else "classic",
         "metal": raw.get("metal") if raw.get("metal") in METALS else "gold",
         "dark": raw.get("dark") is True,

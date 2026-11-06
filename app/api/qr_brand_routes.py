@@ -1,6 +1,6 @@
 """What goes in the middle of an agent's QR codes (user, 10/17).
 
-Default for everyone: the OpenHousePal house logo. IDX agents can swap it for their own Brand Kit
+Default for everyone: the OpenHousePal house logo. IDX and No-MLS Premium agents can swap it for their own Brand Kit
 logo or their initials (Settings -> Profile, or the setup flow's brand step). Old printed codes keep
 working either way - the centre is only decoration over the code's error-correction margin, the link
 inside never changes - and every QR drawn from then on (kits, designs, forms, blogs, kiosk) uses the
@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config.logging import get_logger
 from app.database import get_db
 from app.models.database import StudioBrandKit, User
-from app.utils.auth import get_current_active_user, owner_has_access
+from app.utils.auth import QR_BRAND_ACCESS_TIERS, get_current_active_user, luxe_upgrade_label, owner_has_access
 
 logger = get_logger(__name__)
 router = APIRouter(tags=["qr-brand"])
@@ -67,7 +67,7 @@ async def qr_brand_for(db: AsyncSession, user: Optional[User]) -> dict:
     """{"kind": "ohp" | "logo" | "initials", "initials"?, "logo"?, "choice", "allowed"}."""
     if user is None:
         return {"kind": "ohp", "choice": "ohp", "allowed": False}
-    allowed = owner_has_access(user, {"IDX"})
+    allowed = owner_has_access(user, QR_BRAND_ACCESS_TIERS)
     choice = (user.qr_logo or "ohp") if allowed else "ohp"
     out = {"kind": "ohp", "choice": user.qr_logo or "ohp", "allowed": allowed, "initials": _initials(user)}
     if choice == "initials":
@@ -102,8 +102,8 @@ async def my_qr_brand(db: AsyncSession = Depends(get_db), current_user: User = D
 @router.put("/me/qr-brand")
 async def set_my_qr_brand(payload: QrBrandUpdate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
     user = await db.get(User, current_user.id)
-    if payload.choice != "ohp" and not owner_has_access(user, {"IDX"}):
-        raise HTTPException(status_code=403, detail="Your own logo or initials in your QR codes comes with the IDX plan.")
+    if payload.choice != "ohp" and not owner_has_access(user, QR_BRAND_ACCESS_TIERS):
+        raise HTTPException(status_code=403, detail=f"Your own logo or initials in your QR codes comes with the {luxe_upgrade_label(user)} plan.")
     user.qr_logo = payload.choice
     await db.commit()
     kit = (await db.execute(select(StudioBrandKit).where(StudioBrandKit.owner_id == user.id))).scalar_one_or_none()

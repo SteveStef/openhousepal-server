@@ -59,7 +59,7 @@ async def update_brand_kit(
     current_user: User = Depends(require_active_plan),
 ):
     from app.services import brand_look_service
-    from app.utils.auth import luxe_theme_allowed
+    from app.utils.auth import luxe_theme_allowed, luxe_upgrade_label
     kit = await get_or_create_brand_kit(db, current_user.id)
     data = payload.model_dump(exclude_unset=True)
     look = data.pop("look", None)
@@ -70,9 +70,9 @@ async def update_brand_kit(
         # live invitations made in the old brand color follow the new one (Branding center)
         await brand_look_service.follow_brand_color_change(db, current_user, old_secondary, kit.secondary_color)
     if look:
-        # Luxe is IDX only (same rule as the Hub / Signature / Studio Luxe).
+        # Luxe is IDX and No-MLS Premium (same rule as the Hub / Signature / Studio Luxe).
         if look.get("theme") == "luxe" and not luxe_theme_allowed(current_user):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Luxe is included with the IDX plan.")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Luxe is included with the {luxe_upgrade_label(current_user)} plan.")
         from app.services.setup_flow_service import lock_setup_state
         await lock_setup_state(db, current_user)
         await db.refresh(current_user, ["setup_state"], with_for_update=True)   # never put back what a finishing chat job just wrote

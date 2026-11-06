@@ -228,23 +228,36 @@ REVIEWS_ACCESS_TIERS = {
 # (no Bright data to match homes against). Membership set, same reasoning as the ones above.
 SHOWCASE_ACCESS_TIERS = {PlanTier.PREMIUM.value, PlanTier.IDX.value}
 
-# OpenHousePal Luxe - the elevated Agent Hub theme and the Luxe article theme. IDX only; every
-# other plan can preview it in the editor (an upgrade pitch) but the public page falls back to
-# the standard look. The saved choice is kept, so upgrading brings it straight back.
-LUXE_THEME_ACCESS_TIERS = {PlanTier.IDX.value}
+# OpenHousePal Luxe - the Brand Kit look, Agent Hub theme, forms, invites, Studio Luxe and the
+# signature. IDX on the Bright ladder plus the top of the No-MLS track (PRO_NO_MLS, "No-MLS
+# Premium" - a No-MLS plan can never buy IDX). Every other plan can preview it in the editor (an
+# upgrade pitch) but the public page falls back to the standard look. The saved choice is kept, so
+# upgrading brings it straight back. Mirrors luxeAllowed in frontend navAccess.ts.
+LUXE_THEME_ACCESS_TIERS = {PlanTier.IDX.value, PlanTier.PRO_NO_MLS.value}
 
 
 def luxe_theme_allowed(user) -> bool:
     return getattr(user, "plan_tier", None) in LUXE_THEME_ACCESS_TIERS
 
 
-# The Luxe ARTICLE theme is wider than the rest of Luxe: IDX on the Bright ladder plus the top of
-# the No-MLS track (PRO_NO_MLS, "No-MLS Premium"). Mirrors luxeBlogAllowed in frontend navAccess.ts.
-LUXE_BLOG_THEME_ACCESS_TIERS = {PlanTier.IDX.value, PlanTier.PRO_NO_MLS.value}
+# The Luxe ARTICLE theme: same plans as the rest of Luxe.
+LUXE_BLOG_THEME_ACCESS_TIERS = LUXE_THEME_ACCESS_TIERS
 
 
 def luxe_blog_theme_allowed(user) -> bool:
     return getattr(user, "plan_tier", None) in LUXE_BLOG_THEME_ACCESS_TIERS
+
+
+# Their own logo or initials in the middle of their QR codes: same plans as Luxe.
+QR_BRAND_ACCESS_TIERS = LUXE_THEME_ACCESS_TIERS
+
+
+def luxe_upgrade_label(user) -> str:
+    """The plan that unlocks Luxe and the QR center from this agent's track, for lock messages:
+    a No-MLS plan is only ever pointed at No-MLS Premium, never IDX. Mirrors luxeUpgrade in
+    frontend navAccess.ts."""
+    no_mls = (PlanTier.NO_MLS.value, PlanTier.PRO_NO_MLS.value)
+    return "No-MLS Premium" if getattr(user, "plan_tier", None) in no_mls else "IDX"
 
 
 def tier_has_mls(plan_tier) -> bool:

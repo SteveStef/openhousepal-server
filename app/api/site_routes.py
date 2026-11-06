@@ -961,15 +961,21 @@ async def add_my_served_area(
                 detail="Couldn't find that market area or neighborhood - check the spelling, or try including the nearest city (e.g. \"Rittenhouse Square, Philadelphia\").",
             )
         name, state = resolved["name"], resolved["state"]
-        parent_area_name = resolved.get("parent_city")
-        centroid = (resolved["lat"], resolved["lng"])
-        geography_definition = (
-            await boundary_sources.resolve_named_area_boundary(name, parent_area_name, state)
-            or resolved.get("geography")
-        )
-        if (geography_definition or {}).get("center"):
-            # The shape's own middle, not the geocoder's point (Roxborough's sat 2.3 mi off, in Manayunk).
-            centroid = tuple(geography_definition["center"])
+        if resolved.get("is_city"):
+            area_type = "city"   # they typed a town ("Philly"): it shares the town's page and research
+        else:
+            parent_area_name = resolved.get("parent_city")
+            centroid = (resolved["lat"], resolved["lng"])
+            geography_definition = (
+                await boundary_sources.resolve_named_area_boundary(name, parent_area_name, state)
+                or resolved.get("geography")
+            )
+            center = (geography_definition or {}).get("center")
+            if isinstance(center, dict):   # a radius area keeps {"lat", "lng"}; this crashed the save
+                centroid = (center["lat"], center["lng"])
+            elif center:
+                # The shape's own middle, not the geocoder's point (Roxborough's sat 2.3 mi off, in Manayunk).
+                centroid = tuple(center)
 
     area = await area_enrichment_service.get_or_create_market_area(
         db,

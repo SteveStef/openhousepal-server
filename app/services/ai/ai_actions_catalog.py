@@ -35,6 +35,13 @@ IDX = {"IDX"}
 REVIEWS = {"PREMIUM", "IDX", "PRO_NO_MLS"}
 STUDIO = {"PREMIUM", "IDX", "PRO_NO_MLS"}
 
+
+def _luxe_locked(user) -> str:
+    """Luxe's lock message, naming the plan that unlocks it from their track (never IDX to a No-MLS plan)."""
+    from app.utils.auth import luxe_upgrade_label
+    return f"The Luxe look comes with the {luxe_upgrade_label(user)} plan."
+
+
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _TIME = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
@@ -1202,7 +1209,7 @@ async def _p_brand(db, user, a):
     if a.get("look") in ("classic", "luxe"):
         from app.utils.auth import luxe_theme_allowed
         if a["look"] == "luxe" and not luxe_theme_allowed(user):
-            raise ActionError("The Luxe look comes with the IDX plan.")
+            raise ActionError(_luxe_locked(user))
         body["look"] = {"theme": a["look"]}; lines.append(f"Look: {a['look'].title()}")
     # No exact colors named: the card itself shows the Branding page's choices - look, color, Luxe
     # finish, Ivory/Midnight - starting from what they have now (owner, 10/31: "show me my options").
@@ -1255,7 +1262,7 @@ def _adjust_brand(user, payload: dict, picks: dict) -> dict:
     if picks.get("theme") in ("classic", "luxe"):
         from app.utils.auth import luxe_theme_allowed
         if picks["theme"] == "luxe" and not luxe_theme_allowed(user):
-            raise ActionError("The Luxe look comes with the IDX plan.")
+            raise ActionError(_luxe_locked(user))
         look["theme"] = picks["theme"]
     if picks.get("metal") in ("gold", "silver", "bronze"):
         look["metal"] = picks["metal"]
@@ -1536,7 +1543,8 @@ FORM_COLORS = {"original": "#C9A24D", "light red": "#F1746B", "pink": "#EC4899",
 
 
 def form_style(user, look=None, color=None, metal=None) -> dict:
-    """What they named of a form's look -> the card's style pick. Luxe is the IDX plan's, like the editor."""
+    """What they named of a form's look -> the card's style pick. Luxe follows the plan, like the editor."""
+    from app.utils.auth import luxe_theme_allowed
     style = {}
     metal, color = _s(metal).lower(), FORM_COLORS.get(_s(color).lower())
     if metal in ("gold", "silver", "bronze"):
@@ -1545,8 +1553,8 @@ def form_style(user, look=None, color=None, metal=None) -> dict:
         style.update(theme="classic", accent=color)
     if look in ("classic", "luxe"):
         style["theme"] = look
-    if style.get("theme") == "luxe" and user.plan_tier != "IDX" and not user.is_admin:
-        raise ActionError("The Luxe look comes with the IDX plan.")
+    if style.get("theme") == "luxe" and not luxe_theme_allowed(user) and not user.is_admin:
+        raise ActionError(_luxe_locked(user))
     return style
 
 
@@ -2374,11 +2382,12 @@ async def _p_design(db, user, a):
         raise ActionError(f"A {label} design comes as: " + ", ".join(DESIGN_FORMATS[f] for f in formats) + ".")
     layout = _s(a.get("layout")) or None
     color = _s(a.get("colors")) or "light"
-    idx = user.plan_tier == "IDX" or user.is_admin
+    from app.utils.auth import luxe_theme_allowed
+    luxe_ok = luxe_theme_allowed(user) or user.is_admin
     if layout and layout not in DESIGN_LAYOUTS:
         raise ActionError("Layouts are Keepsake, Billboard, Slant, Postage, Filmstrip and Luxe.")
-    if (layout == "luxe" or color == "luxe") and not idx:
-        raise ActionError("The Luxe look comes with the IDX plan.")
+    if (layout == "luxe" or color == "luxe") and not luxe_ok:
+        raise ActionError(_luxe_locked(user))
     if color not in DESIGN_COLORS:
         color = "light"
     # "Open House" + "Open House Flyer" reads "Open House Flyer", not "Open House Open House Flyer" (owner's test, 11/01)
@@ -2445,7 +2454,7 @@ register({"name": "create_design", "description": (
     "situation: " + ", ".join(DESIGN_SITUATIONS) + ". format must be one the situation offers: "
     + "; ".join(f"{k}: {', '.join(v[2])}" for k, v in DESIGN_SITUATIONS.items())
     + ". just_listed/coming_soon/price_improvement/under_contract need one of the agent's own listings (listing_key); just_sold a sale they had; open_house their listing or one they're approved to host (+ optional date/time). "
-    "The others (home_valuation, make_me_sell, find_your_dream_home, social_ad) need no home - optional headline (short and punchy, under about 60 characters - it's printed big). layout: keepsake, billboard, slant, postage, filmstrip, luxe (IDX). colors: light (Ivory), stone, dark (Charcoal), forest, brand, luxe (IDX). "
+    "The others (home_valuation, make_me_sell, find_your_dream_home, social_ad) need no home - optional headline (short and punchy, under about 60 characters - it's printed big). layout: keepsake, billboard, slant, postage, filmstrip, luxe (plans with Luxe only). colors: light (Ivory), stone, dark (Charcoal), forest, brand, luxe (plans with Luxe only). "
     "The card itself lets the agent pick the layout, colors and logo before tapping Make it - don't ask about the look first; pass layout/colors only when they named one. "
     "logo: pass none when they say no logo, or personal, team or brokerage when they name which one; leave it out otherwise. "
     "The card also lists their other listings (or sales) to switch to. When they say it's a different / another listing, never offer the same home again: use the one they name, or list their listings and ask which. "

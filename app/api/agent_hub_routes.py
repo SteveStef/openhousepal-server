@@ -447,7 +447,7 @@ async def get_public_agent_hub(
     # Brand Kit change shows here on the next visit (services/brand_look_service).
     from app.services import brand_look_service
     config = brand_look_service.hub_config_with_brand(config, await brand_look_service.get_look(db, owner))
-    # The Luxe hub theme is IDX only - after a downgrade the page shows the Classic look (the
+    # The Luxe hub theme is IDX and No-MLS Premium - after a downgrade the page shows the Classic look (the
     # saved choice stays, so an upgrade brings it straight back).
     if config.get("hubTheme") == "luxe" and not luxe_theme_allowed(owner):
         config = {**config, "hubTheme": "classic"}

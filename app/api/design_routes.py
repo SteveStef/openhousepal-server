@@ -14,7 +14,7 @@ from app.schemas.design import (
     DesignProjectUpdate,
     DesignStatusUpdate,
 )
-from app.utils.auth import create_access_token, get_current_active_user, require_studio_design_access, luxe_theme_allowed
+from app.utils.auth import create_access_token, get_current_active_user, require_studio_design_access, luxe_theme_allowed, luxe_upgrade_label
 from app.services.design_export_service import PNG_DIMENSIONS_PX, PRINT_DIMENSIONS_IN, render_design_pdf, render_design_png
 
 router = APIRouter(prefix="/studio/designs", tags=["design"])
@@ -67,10 +67,10 @@ def _uses_luxe(template_id: Optional[str], color_mode: Optional[str]) -> bool:
 
 
 def _guard_luxe(user: User, template_id: Optional[str], color_mode: Optional[str]) -> None:
-    """The Luxe layout and Luxe color theme are IDX only (other plans can preview them in the
+    """The Luxe layout and Luxe color theme are IDX and No-MLS Premium (other plans can preview them in the
     wizard but not make them)."""
     if _uses_luxe(template_id, color_mode) and not luxe_theme_allowed(user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Studio Luxe is part of the IDX plan.")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Studio Luxe is part of the {luxe_upgrade_label(user)} plan.")
 
 
 @router.post("", response_model=DesignProjectResponse, status_code=status.HTTP_201_CREATED)
