@@ -78,7 +78,7 @@ Each situation has:
 - **Text the client from your phone** opens a page where **Text** opens your own Messages app with their number and the suggested text filled in (sent from your real cell). **Email** opens your mail app instead. Either one checks the follow-up off. On a computer you get **Copy text** and a QR code to scan with your phone.
 
 ## Email Tracker (Leads → Email Tracker, "Every email, tracked")
-- Last 30 days: **Sent**, **Opened**, **Clicked**, **Slowed**. Tabs **People** / **Sent emails**. Filters All, On, Weekly, Off, Not in your leads; sort Latest email, Most engaged, Least engaged, Name A-Z.
+- Last 30 days: **Sent**, **Opened**, **Clicked**, **Slowed**. Filters All, On, Weekly, Off, Not in your leads; sort Latest email, Most engaged, Least engaged, Name A-Z.
 - Rules: unopened on 3 different days → **Weekly only**; then 3 skipped weekly emails → **Emails off** (their Showcase may fall asleep). Opening any email or using their Showcase turns daily back on by itself.
 - Personal emails (sign-in thank-you, tour confirmation, your comment reply, a Showcase you send) always go.
 - **Turn off** / **Turn back on** per person (a manual off sticks). Unsubscribed, bounced or spam-marked people can't be switched back on by you.

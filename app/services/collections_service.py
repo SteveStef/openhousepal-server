@@ -741,7 +741,9 @@ class CollectionsService:
 
     # What the Showcases page's Activity inbox lists - everything clients do in their Showcases.
     INBOX_ACTIVITY_TYPES = ('PROPERTY_INTERACTION', 'PROPERTY_COMMENT', 'TOUR_REQUEST',
-                            'REFINE_SEARCH_REQUEST', 'SHOWCASE_SEARCH_CHANGED')
+                            'REFINE_SEARCH_REQUEST', 'SHOWCASE_SEARCH_CHANGED', 'GUEST_PASS_ACTIVITY')
+    # A guest needs no Showcase for their Guest Pass activity to reach the mailbox.
+    INBOX_ROW = or_(Notification.collection_id.isnot(None), Notification.type == 'GUEST_PASS_ACTIVITY')
 
     @staticmethod
     async def get_inbox(db: AsyncSession, user_id: str) -> Dict[str, Any]:
@@ -780,7 +782,7 @@ class CollectionsService:
             select(Notification)
             .where(
                 Notification.agent_id == user_id,
-                Notification.collection_id.isnot(None),
+                CollectionsService.INBOX_ROW,
                 Notification.type.in_(CollectionsService.INBOX_ACTIVITY_TYPES),
                 Notification.created_at >= since,
             )
@@ -800,7 +802,12 @@ class CollectionsService:
             "photo": photos.get(n.property_id), "link": n.link, "is_read": n.is_read,
             "created_at": n.created_at.isoformat(),
         } for n in notes]
-        return {"tours": tours, "activity": activity, "unread_activity": sum(1 for a in activity if not a["is_read"])}
+        unread = sum(1 for a in activity if not a["is_read"])
+        # Plus the quiet signals: opening the Showcase, a home's details, a Showcase email (owner, 11/07).
+        from app.services import showcase_mailbox_service as mailbox
+        cols = list((await db.execute(select(Collection).where(Collection.owner_id == user_id))).scalars().all())
+        activity = mailbox.merged(activity, await mailbox.quiet_activity(db, user_id, cols, since))
+        return {"tours": tours, "activity": activity, "unread_activity": unread}
 
     @staticmethod
     async def mark_inbox_read(db: AsyncSession, user_id: str) -> None:
@@ -808,7 +815,7 @@ class CollectionsService:
             update(Notification)
             .where(
                 Notification.agent_id == user_id,
-                Notification.collection_id.isnot(None),
+                CollectionsService.INBOX_ROW,
                 Notification.type.in_(CollectionsService.INBOX_ACTIVITY_TYPES),
                 Notification.is_read.is_(False),
             )

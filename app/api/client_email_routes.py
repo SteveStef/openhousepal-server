@@ -199,7 +199,9 @@ async def email_people(db: AsyncSession = Depends(get_db), user: User = Depends(
     out.sort(key=lambda p: p.get("last_sent_at") or "", reverse=True)
     totals = {
         "people": len(out), "daily": sum(1 for p in out if p["mode"] == "daily"),
-        "weekly": sum(1 for p in out if p["mode"] == "weekly"), "off": sum(1 for p in out if p["mode"] == "off"),
+        "weekly": sum(1 for p in out if p["mode"] in ("weekly", "biweekly")), "off": sum(1 for p in out if p["mode"] == "off"),
+        # The rules slowed them down, not a choice anyone made.
+        "slowed": sum(1 for p in out if p.get("code") in ("unopened_days", "weekly_unopened")),
     }
     return {"people": out, "totals": totals, "rules": {"strike_days": ce.STRIKE_DAYS, "weekly_strikes": ce.WEEKLY_STRIKES, "max_auto_per_day": ce.MAX_AUTO_PER_DAY}}
 
@@ -214,8 +216,7 @@ async def email_log(email: Optional[str] = None, q: Optional[str] = None, limit:
         ClientEmailPref.owner_id == user.id, ClientEmailPref.manual == ce.LEAD_DELETED)))
     # ...nor anyone who isn't one of their leads any more (deleted before 10/24, or never a lead).
     from app.models.database import Lead
-    stmt = stmt.where(or_(ClientEmail.recipient_email.in_(select(Lead.email).where(Lead.owner_id == user.id)),
-                          ClientEmail.recipient_email == ce._norm(user.email)))
+    stmt = stmt.where(ClientEmail.recipient_email.in_(select(Lead.email).where(Lead.owner_id == user.id)))
     if email:
         stmt = stmt.where(ClientEmail.recipient_email == ce._norm(email))
     if q:
@@ -242,13 +243,34 @@ class PersonSwitch(BaseModel):
     on: bool
 
 
-@router.put("/client-emails/people")
-async def switch_person(body: PersonSwitch, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_active_user)):
-    email = ce._norm(body.email)
+class PersonFrequency(BaseModel):
+    email: str
+    frequency: str
+
+
+async def _known_contact(db: AsyncSession, user: User, email: str) -> str:
+    email = ce._norm(email)
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Email address needed")
     known = (await db.execute(select(func.count()).select_from(ClientEmail).where(ClientEmail.owner_id == user.id, ClientEmail.recipient_email == email))).scalar() \
         or (await db.execute(select(func.count()).select_from(Lead).where(Lead.owner_id == user.id, Lead.email == email))).scalar()
     if not known:
         raise HTTPException(status_code=404, detail="Not one of your contacts")
-    return await ce.set_manual(db, user.id, email, body.on)
+    return email
+
+
+@router.get("/client-emails/status")
+async def person_status(email: str, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_active_user)):
+    return await ce.status_for(db, user.id, await _known_contact(db, user, email))
+
+
+@router.put("/client-emails/frequency")
+async def person_frequency(body: PersonFrequency, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_active_user)):
+    if body.frequency not in ce.FREQUENCIES:
+        raise HTTPException(status_code=400, detail="Pick daily, weekly or every two weeks")
+    return await ce.set_frequency(db, user.id, await _known_contact(db, user, body.email), body.frequency, by="agent")
+
+
+@router.put("/client-emails/people")
+async def switch_person(body: PersonSwitch, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_active_user)):
+    return await ce.set_manual(db, user.id, await _known_contact(db, user, body.email), body.on)

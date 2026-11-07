@@ -60,7 +60,7 @@ Open House Kits in depth: building a kit (MLS and No-MLS), every document and it
 
 ## Visitors window
 - Counts: **Visitors**, **No agent**, **Has agent**; everyone grouped by day with email and phone. Each visitor's name (computer) or **Lead** button (phone) opens their lead page.
-- **Star** (asks **Star Showcase too** or **Just the lead**), **Notes** (shared with their lead), **Activity** ("Everything they did on their Guest Pass" - e.g. Looked through the Similar Homes, Opened the Cheat Sheet, Asked for the seller disclosure, time on it, came back).
+- **Star** (asks **Star Showcase too** or **Just the lead**), **Notes** (shared with their lead), **Guest Activity** (everything they did on their Guest Pass - e.g. Looked at 12 Oak St for 2 min, Looked through the Similar Homes, Opened the Cheat Sheet, Looked up nearby coffee shops, Tapped to call you, Asked for the seller disclosure, time on it, came back). The button looks like Notes when they only opened the pass; it turns dark with a number when they did something on it. Five seconds on a home sends an alert to the Activity mailbox and the bell any time. Anything else they tap sends one once an hour has passed since they signed in. It all goes on their lead too.
 - **Showcase for this visitor** (Premium/IDX, guests without an agent): ON builds their Showcase and schedules the invite; OFF cancels a waiting invite and turns their Showcase off. If the invite email is switched off in Tools → Email, no invite is sent. The same switch is on their Lead page.
 - **Opens list order:** an open house with a sign-in in the last week moves to the top, newest sign-in first.
 

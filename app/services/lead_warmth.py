@@ -31,16 +31,16 @@ WEIGHTS: dict[str, float] = {
     'form_submission': 4, 'open_house_visitor': 4, 'property_comment': 3, 'invite_rsvp': 4,
     'showcase_like': 2, 'showcase_refine': 2, 'showcase_search_changed': 2, 'email_clicked': 2,
     'showcase_view': 1, 'collection_visitor': 1, 'showcase_dislike': 1, 'email_opened': 1, 'form_partial': 1,
-    'review_left': 1,
+    'review_left': 1, 'guest_pass_home': 1,
 }
 
 # Per-day caps on the cheap signals (points per calendar day, UTC).
-DAILY_CAP: dict[str, float] = {'showcase_view': 5, 'collection_visitor': 2, 'email_opened': 1, 'showcase_dislike': 3}
+DAILY_CAP: dict[str, float] = {'showcase_view': 5, 'guest_pass_home': 5, 'collection_visitor': 2, 'email_opened': 1, 'showcase_dislike': 3}
 
 # "Just looking" signals. However many, they top out at Warm (BROWSE_CAP x5 = 30): scrolling lots of
 # homes, passing on homes or opening emails isn't the same as wanting one. Hot takes a real signal
 # (a like, comment, click, question, form, sign-in, showing ask) or interest in one home (below).
-BROWSE_TYPES = {'showcase_view', 'collection_visitor', 'showcase_dislike', 'email_opened', 'form_partial',
+BROWSE_TYPES = {'showcase_view', 'guest_pass_home', 'collection_visitor', 'showcase_dislike', 'email_opened', 'form_partial',
                 'showcase_refine', 'showcase_search_changed'}
 BROWSE_CAP = 6
 # Email opens alone stay Cool at most (Apple Mail opens emails by itself): 2 points = 10.
@@ -72,7 +72,7 @@ _NOUN: dict[str, tuple[str, str]] = {
     'blog_inquiry': ('blog question', 'blog questions'), 'website_google_signin': ('website sign-in', 'website sign-ins'), 'portal_lead': ('portal inquiry', 'portal inquiries'),
     'showcase_refine': ('search change', 'search changes'), 'showcase_search_changed': ('search change', 'search changes'),
     'showcase_dislike': ('home passed on', 'homes passed on'), 'form_partial': ('form started', 'forms started'),
-    'review_left': ('review', 'reviews'),
+    'review_left': ('review', 'reviews'), 'guest_pass_home': ('Guest Pass home view', 'Guest Pass home views'),
 }
 _ASKS = {'property_tour', 'property_website_tour_request', 'property_page_tour_request', 'open_house_second_visit'}
 

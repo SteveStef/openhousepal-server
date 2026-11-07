@@ -1,6 +1,6 @@
 """Showcases that go to sleep (user, 10/22).
 
-A client who ignored 3 weekly emails in a row (client_email_service.decide -> "off") stops getting
+A client who ignored 5 weekly emails in a row (client_email_service.decide -> "off") stops getting
 automatic emails, and - unless the agent is still minding them (starred the Showcase, or in the last
 2 weeks opened it, opened the lead, marked them contacted, wrote a note or checked off a follow-up;
 the agent still gets that Showcase's updates in their briefing) - their Showcases go to sleep: status INACTIVE with

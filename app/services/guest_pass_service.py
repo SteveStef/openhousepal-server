@@ -403,32 +403,197 @@ GUEST_PASS_SEEN = "On their Guest Pass: "
 # A visit = heartbeats with no gap longer than this; a later ping starts a new visit row.
 _VISIT_GAP = timedelta(minutes=30)
 
+# What reaches the agent (owner, 11/07). Landing on the pass never does: every guest lands there.
+ALERT_TYPE = "GUEST_PASS_ACTIVITY"
+# A home they stayed on this long is an alert any time, even during the open house.
+WATCH_SECONDS = 5
+# Everything else they tap is an alert once this long has passed since they signed in - before that
+# they are standing in the house with the pass in their hand.
+QUIET_AFTER_SIGN_IN = timedelta(hours=1)
+ALERTS_PER_DAY = 15   # per guest: a fast scroller never floods the mailbox
+ROWS_PER_DAY = 300    # per guest: the public /seen route can't fill the table
+MAX_SECONDS = 4 * 3600
+# One line per thing per visit. Requests and questions are never folded: each one is its own.
+_ONCE_PER_VISIT = ("similar", "similar_list", "cheat", "showcase", "map", "nearby", "spotlight", "directions", "photos", "contact")
+_NEARBY = {"coffee": "coffee shops", "grocery": "grocery stores", "schools": "schools", "medical": "hospitals and doctors",
+           "restaurants": "restaurants", "parks": "parks"}
+_CONTACT = {"call": "Tapped to call you", "text": "Tapped to text you", "email": "Tapped to email you",
+            "hub": "Opened your Agent Hub", "website": "Opened your website"}
+
+
+def describe(kind: str, key: Optional[str] = None, label: Optional[str] = None) -> str:
+    """What the guest did, in the plain words the agent reads everywhere it shows up."""
+    if kind == "similar":
+        return f"Looked at {label or 'a similar home'}"
+    if kind == "nearby":
+        return f"Looked up nearby {_NEARBY.get(key or '', 'places')}"
+    if kind == "contact":
+        return _CONTACT.get(key or "", "Tapped to reach you")
+    if kind == "request":
+        return "Asked for the seller disclosure" if key == "disclosure" else "Asked for a second tour" + (f" - {label}" if label else "")
+    if kind == "question":
+        return f'Asked you: "{label or ""}"'
+    if kind == "home_tour":
+        return f"Asked to tour {label or 'a similar home'}"
+    if kind == "home_question":
+        return f"Asked you about {label or 'a similar home'}"
+    return {"similar_list": "Looked through the Similar Homes", "cheat": "Opened the Cheat Sheet", "showcase": "Opened their Showcase",
+            "map": "Moved around the neighborhood map", "spotlight": "Opened the full home tour", "directions": "Opened the home in Maps",
+            "photos": "Looked through the home's photos"}.get(kind, "Used their Guest Pass")
+
+
+async def _home(db: AsyncSession, oh: OpenHouseEvent, key: str) -> tuple:
+    """(label, property id) for a home they opened: "12 Oak St, Wayne". A home that isn't in our MLS
+    table is still named, from the Similar Homes sheet saved on the open house."""
+    from app.services.email_service import tidy_caps
+    row = (await db.execute(select(Property.id, Property.street_address, Property.city).where(Property.listing_key == key[:64]).limit(1))).first()
+    if row and row[1]:
+        return tidy_caps(str(row[1]).split(",")[0].strip()) + (f", {tidy_caps(row[2])}" if row[2] else ""), row[0]
+    for item in oh.similar_properties_snapshot or []:
+        if isinstance(item, dict) and str(item.get("ListingKey")) == key:
+            street = str(item.get("FullStreetAddress") or item.get("address") or "").split(",")[0].strip()
+            city = item.get("City") or item.get("city")
+            if street:
+                return tidy_caps(street) + (f", {tidy_caps(str(city))}" if city else ""), row[0] if row else None
+    return None, row[0] if row else None
+
 
 async def log_event(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEvent, kind: str,
-                    key: Optional[str] = None, label: Optional[str] = None, session: Optional[str] = None) -> None:
-    """One line in the guest's Guest Pass activity log (agent's Visitors window). Never raises."""
+                    key: Optional[str] = None, label: Optional[str] = None, session: Optional[str] = None,
+                    seconds: Optional[int] = None) -> tuple:
+    """One line in the guest's Guest Pass activity log (agent's Visitors window), or more time on
+    the line it already has. Returns (row, is it new, the seconds it had before). Never raises."""
     try:
         from app.models.database import GuestPassEvent
-        if kind in ("similar", "map", "similar_list") and session:
+        seconds = min(max(int(seconds), 0), MAX_SECONDS) if seconds else None
+        if kind in _ONCE_PER_VISIT and session:
             # The same thing twice in one visit is one line.
-            dup = (await db.execute(select(GuestPassEvent.id).where(
+            row = (await db.execute(select(GuestPassEvent).where(
                 GuestPassEvent.visitor_id == visitor.id, GuestPassEvent.session == session[:40],
                 GuestPassEvent.kind == kind, GuestPassEvent.key.is_(None) if key is None else GuestPassEvent.key == key[:64],
-            ).limit(1))).first()
-            if dup:
-                return
-        if kind == "similar" and key and not label:
-            row = (await db.execute(select(Property.street_address, Property.city).where(Property.listing_key == key[:64]).limit(1))).first()
-            if row and row[0]:
-                from app.services.email_service import tidy_caps
-                label = tidy_caps(str(row[0]).split(",")[0].strip()) + (f", {tidy_caps(row[1])}" if row[1] else "")
-        db.add(GuestPassEvent(visitor_id=visitor.id, open_house_event_id=oh.id if oh else None, kind=kind[:20],
-                              key=(key or None) and key[:64], label=(label or None) and label[:200],
-                              session=(session or None) and session[:40]))
+            ).order_by(GuestPassEvent.created_at.asc()).limit(1))).scalars().first()
+            if row is not None:
+                was = row.seconds or 0
+                if seconds and seconds > was:
+                    row.seconds = seconds
+                    await db.commit()
+                return row, False, was
+        today = (await db.execute(select(func.count(GuestPassEvent.id)).where(
+            GuestPassEvent.visitor_id == visitor.id, GuestPassEvent.kind != "session",
+            GuestPassEvent.created_at >= datetime.now(timezone.utc) - timedelta(days=1)))).scalar_one()
+        if today >= ROWS_PER_DAY:
+            return None, False, 0
+        row = GuestPassEvent(visitor_id=visitor.id, open_house_event_id=oh.id if oh else None, kind=kind[:20],
+                             key=(key or None) and key[:64], label=(label or None) and label[:200],
+                             session=(session or None) and session[:40], seconds=seconds)
+        db.add(row)
         await db.commit()
+        return row, True, 0
     except Exception:  # noqa: BLE001 - tracking never breaks the pass
         await db.rollback()
         logger.warning("guest pass event log failed", exc_info=True)
+        return None, False, 0
+
+
+def _past_quiet_hour(visitor: OpenHouseVisitor, now: datetime) -> bool:
+    signed = visitor.created_at
+    if signed is None:
+        return True
+    if signed.tzinfo is None:
+        signed = signed.replace(tzinfo=timezone.utc)
+    return now - signed >= QUIET_AFTER_SIGN_IN
+
+
+async def _their_lead(db: AsyncSession, visitor: OpenHouseVisitor, host: User):
+    from app.models.database import Lead
+    from app.services.leads_service import find_lead_by_contact
+    lead = await db.get(Lead, visitor.lead_id) if visitor.lead_id else None
+    if lead is not None and lead.owner_id == host.id:
+        return lead
+    return await find_lead_by_contact(db, host.id, visitor.email, None)
+
+
+async def _alert(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEvent, host: User, lead, kind: str,
+                 key: Optional[str], label: Optional[str], property_id: Optional[str], text: str) -> None:
+    """A new line in the Activity mailbox and the bell. Once per thing per guest per day - the same
+    home on another day is news again. Tied to their Showcase when they have one, so it's in that
+    client's own mailbox too. Never raises."""
+    try:
+        from app.models.database import Notification
+        now = datetime.now(timezone.utc)
+        day = now.date().isoformat()
+        ref = f"{visitor.id}:{kind}:{key or ''}:{day}"
+        same_day = (await db.execute(select(Notification.reference_id).where(
+            Notification.agent_id == host.id, Notification.type == ALERT_TYPE,
+            Notification.reference_id.like(f"{visitor.id}:%:{day}")))).scalars().all()
+        if ref in same_day or len(same_day) >= ALERTS_PER_DAY:
+            return
+        col = await _showcase(db, host, visitor)
+        if property_id is None and oh.listing_key:
+            property_id = (await db.execute(select(Property.id).where(Property.listing_key == oh.listing_key).limit(1))).scalar_one_or_none()
+        db.add(Notification(
+            agent_id=host.id, type=ALERT_TYPE, reference_type="GUEST_PASS", reference_id=ref,
+            title=f"{visitor.full_name or 'A guest'} on their Guest Pass", message=text,
+            collection_id=col.id if col else None, collection_name=col.name if col else None,
+            property_id=property_id, property_address=label if kind == "similar" else oh.address,
+            visitor_name=visitor.full_name, link=f"/leads?lead={lead.id}",
+            is_read=False, created_at=now))
+        await db.commit()
+    except Exception:  # noqa: BLE001 - tracking never breaks the pass
+        await db.rollback()
+        logger.warning("guest pass alert failed", exc_info=True)
+
+
+async def _surface(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEvent, host: User, kind: str,
+                   key: Optional[str], label: Optional[str], property_id: Optional[str], alert: bool) -> None:
+    """Puts one thing they did under their lead, and into the mailbox when `alert` says so."""
+    from app.services.leads_service import log_activity
+    text = describe(kind, key, label)
+    lead = await _their_lead(db, visitor, host)
+    if lead is None:
+        return   # the agent deleted this lead: their Guest Pass still works, but it's no longer news
+    await log_activity(
+        db, owner_id=host.id, email=visitor.email, lead=lead,
+        source_type="guest_pass_home" if kind == "similar" else "guest_pass_activity",
+        summary=f"{text} on their Guest Pass", source_id=f"{visitor.id}:{kind}:{key or ''}",
+        property_address=label if kind == "similar" else oh.address,
+        raw_snapshot={"kind": kind, "key": key, "visitor_id": visitor.id, "open_house_event_id": oh.id}, dedupe_hours=6)
+    if alert:
+        await _alert(db, visitor, oh, host, lead, kind, key, label, property_id, text)
+
+
+async def track(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEvent, host: User, view: str,
+                key: Optional[str] = None, session: Optional[str] = None, seconds: Optional[int] = None) -> dict:
+    """Something the guest did on their pass (owner, 11/07). Every tap is a line in Guest Activity.
+    It also goes under their lead, and reaches the mailbox: a home the moment they've stayed on it
+    for WATCH_SECONDS, anything else once QUIET_AFTER_SIGN_IN has passed. A tap on a home and straight
+    back out stays a line in Guest Activity only."""
+    kind = "similar_list" if view == "similar" and not key else view
+    label, property_id = await _home(db, oh, key) if kind in ("similar", "home_tour", "home_question") and key else (None, None)
+    row, fresh, was = await log_event(db, visitor, oh, kind, key=key, label=label, session=session, seconds=seconds)
+    # A tour request or question from a home's page already made its own lead activity and alert.
+    if row is None or kind in ("home_tour", "home_question"):
+        return {"noted": False}
+    if kind == "similar":
+        if (seconds or 0) >= WATCH_SECONDS > was and key != oh.listing_key:
+            await _surface(db, visitor, oh, host, kind, key, label, property_id, alert=True)
+    elif fresh:
+        await _surface(db, visitor, oh, host, kind, key, None, None, alert=_past_quiet_hour(visitor, datetime.now(timezone.utc)))
+    if fresh and view in ("similar", "cheat", "showcase"):
+        return {"noted": await note_activity(db, visitor, oh, host, view, key)}
+    return {"noted": False}
+
+
+async def mark_seen(db: AsyncSession, visitor: OpenHouseVisitor, host: User) -> None:
+    """The agent opened this guest's Guest Activity: it stops showing as new, here and in the mailbox."""
+    from sqlalchemy import update
+    from app.models.database import Notification
+    now = datetime.now(timezone.utc)
+    visitor.pass_seen_at = now
+    await db.execute(update(Notification).where(
+        Notification.agent_id == host.id, Notification.type == ALERT_TYPE, Notification.is_read.is_(False),
+        Notification.reference_id.like(f"{visitor.id}:%")).values(is_read=True, read_at=now))
+    await db.commit()
 
 
 async def ping(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEvent, session: str) -> None:
@@ -481,7 +646,8 @@ async def activity(db: AsyncSession, visitor: OpenHouseVisitor) -> dict:
     for r in rows:
         if r.kind == "session":
             continue
-        ev = {"kind": r.kind, "key": r.key, "label": r.label, "at": iso(r.created_at)}
+        ev = {"kind": r.kind, "key": r.key, "label": r.label, "at": iso(r.created_at), "seconds": r.seconds,
+              "text": describe(r.kind, r.key, r.label)}
         # Into the visit (same session) that was open at that moment, else listed on its own.
         cands = by_session.get(r.session or "", []) if r.session else []
         target = None

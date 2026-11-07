@@ -1216,12 +1216,26 @@ async def get_open_house_visitors(
                 showcases[(col.visitor_email or "").strip().lower()] = col  # newest wins
         pass_stats: dict = {}
         if visitors:
-            for vid, n, last in (await db.execute(select(
-                    GuestPassEvent.visitor_id, func.count(GuestPassEvent.id),
-                    func.max(func.coalesce(GuestPassEvent.last_seen_at, GuestPassEvent.created_at)))
-                    .where(GuestPassEvent.visitor_id.in_([v.id for v in visitors]))
-                    .group_by(GuestPassEvent.visitor_id))).all():
-                pass_stats[vid] = (n, last)
+            # n: anything at all, visits included. actions: what they actually did on it (just
+            # landing on the page is not one). fresh: actions since the agent last looked.
+            seen_at = {v.id: v.pass_seen_at for v in visitors}
+            for vid, kind, at, seen in (await db.execute(select(
+                    GuestPassEvent.visitor_id, GuestPassEvent.kind, GuestPassEvent.created_at, GuestPassEvent.last_seen_at)
+                    .where(GuestPassEvent.visitor_id.in_(list(seen_at))))).all():
+                s = pass_stats.setdefault(vid, {"n": 0, "actions": 0, "fresh": 0, "last": None})
+                s["n"] += 1
+                moment = seen or at
+                s["last"] = moment if s["last"] is None or moment > s["last"] else s["last"]
+                if kind != "session":
+                    s["actions"] += 1
+                    if seen_at[vid] is None or at > seen_at[vid]:
+                        s["fresh"] += 1
+        # How many notes each guest has - the same lead notes the Notes window shows.
+        note_counts: dict = {}
+        if lead_ids:
+            from app.models.database import LeadNote
+            note_counts = dict((await db.execute(select(LeadNote.lead_id, func.count(LeadNote.id))
+                                                 .where(LeadNote.lead_id.in_(lead_ids)).group_by(LeadNote.lead_id))).all())
 
         # Per-visitor Showcase switch: on Showcase plans, for guests without an agent.
         from app.models.database import ScheduledEmail
@@ -1242,7 +1256,7 @@ async def get_open_house_visitors(
         out = []
         for visitor in visitors:
             col = showcases.get((visitor.email or "").strip().lower())
-            n, last = pass_stats.get(visitor.id, (0, None))
+            ps = pass_stats.get(visitor.id, {})
             switchable = showcase_plan and not vss.has_agent(visitor)
             out.append(VisitorResponse(
                 id=visitor.id,
@@ -1258,8 +1272,11 @@ async def get_open_house_visitors(
                 contact_log=[{k: e.get(k) for k in ("at", "via", "what")} for e in (contact_logs.get(visitor.lead_id) or [])],
                 showcase_id=col.id if col else None,
                 showcase_starred=bool(col and col.favorited_at),
-                pass_events=n,
-                pass_last_at=last,
+                pass_events=ps.get("n", 0),
+                pass_actions=ps.get("actions", 0),
+                pass_new=ps.get("fresh", 0),
+                pass_last_at=ps.get("last"),
+                note_count=note_counts.get(visitor.lead_id, 0) if visitor.lead_id else (1 if (visitor.notes or "").strip() else 0),
                 showcase_on=switchable and vss.effective_on(open_house, visitor),
                 showcase_switchable=switchable,
                 showcase_invite_at=invite_at.get((visitor.email or "").strip().lower()) if switchable else None,
@@ -1518,6 +1535,19 @@ async def visitor_pass_activity(
     from app.services import guest_pass_service
     visitor = await _load_owned_visitor(db, visitor_id, current_user.id)
     return await guest_pass_service.activity(db, visitor)
+
+
+@router.post("/api/visitors/{visitor_id}/pass-seen")
+async def visitor_pass_seen(
+    visitor_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
+):
+    """The agent opened this guest's Guest Activity: it stops showing as new."""
+    from app.services import guest_pass_service
+    visitor = await _load_owned_visitor(db, visitor_id, current_user.id)
+    await guest_pass_service.mark_seen(db, visitor, current_user)
+    return {"ok": True}
 
 
 @router.get("/api/visitors/{visitor_id}/notes")

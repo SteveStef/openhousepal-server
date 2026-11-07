@@ -699,12 +699,15 @@ class ClientEmailPref(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     owner_id = Column(String, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     email = Column(String, nullable=False)
-    mode = Column(String, nullable=False, default='daily', server_default='daily')  # daily | weekly | off
+    mode = Column(String, nullable=False, default='daily', server_default='daily')  # daily | weekly | biweekly | off
     reason = Column(Text, nullable=True)
     manual = Column(String, nullable=True)             # None | off
     reset_at = Column(DateTime(timezone=True), nullable=True)   # count unopened emails only after this
     changed_at = Column(DateTime(timezone=True), nullable=True)
     last_weekly_at = Column(DateTime(timezone=True), nullable=True)
+    # Picked on purpose (client_email_service.set_frequency): weekly | biweekly stay put. None = the normal rules.
+    frequency = Column(String, nullable=True)
+    frequency_by = Column(String, nullable=True)       # agent | client
 
     __table_args__ = (UniqueConstraint('owner_id', 'email', name='uq_client_email_prefs_owner_email'),)
 
@@ -816,7 +819,7 @@ class Collection(Base):
     short_code = Column(String, unique=True, nullable=True, index=True)  # short personal link /s/<code> (services/showcase_links.py)
     is_public = Column(Boolean, default=True)
     status = Column(String, default="ACTIVE", nullable=False)  # ACTIVE, INACTIVE
-    # INACTIVE = asleep: no matching, no emails. 'no_response' (the client ignored 3 weekly emails -
+    # INACTIVE = asleep: no matching, no emails. 'no_response' (the client ignored 5 weekly emails -
     # wakes by itself when they open their Showcase, services/showcase_sleep.py) | 'agent' | NULL (older rows).
     inactive_reason = Column(String(24), nullable=True)
     inactive_at = Column(DateTime(timezone=True), nullable=True)
@@ -1236,6 +1239,8 @@ class OpenHouseVisitor(Base):
     # a Showcase even though the kit's Showcases are off, False = not even though they're on,
     # NULL = follow the kit (open_house_events.auto_showcase). See visitor_showcase_service.
     showcase_override = Column(Boolean, nullable=True)
+    # When the agent last opened this guest's Guest Activity: anything newer is shown as new.
+    pass_seen_at = Column(DateTime(timezone=True), nullable=True)
 
     # How the sign-in went (admin Insights, migration c7e9a1b3d5f8): seconds from first tapping the
     # form to pressing Sign in (NULL = not measured), phone | kiosk, and mobile | tablet | desktop.
@@ -1253,7 +1258,10 @@ class GuestPassEvent(Base):
     window (user, 10/24). kind: 'session' (one row per visit: created_at = opened, last_seen_at =
     last heartbeat, so last_seen_at - created_at = time spent), 'similar' (key = listing key of a
     home they opened), 'similar_list', 'cheat', 'showcase', 'map', 'request' (key = disclosure |
-    second_visit), 'question'. `session` ties events to the visit they happened in."""
+    second_visit), 'question', 'nearby' (key = category), 'spotlight', 'directions', 'photos',
+    'contact' (key = call | text | email | hub | website), 'home_tour' and 'home_question' (from a
+    home's page; key = its listing key). `session` ties events to the visit they
+    happened in. `seconds`: how long they stayed on a home they opened (owner, 11/07)."""
     __tablename__ = "guest_pass_events"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -1265,6 +1273,7 @@ class GuestPassEvent(Base):
     session = Column(String(40), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     last_seen_at = Column(DateTime(timezone=True), nullable=True)
+    seconds = Column(Integer, nullable=True)
 
 
 class OpenHouseSignInView(Base):

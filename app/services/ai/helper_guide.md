@@ -572,7 +572,7 @@ When someone asks how to run an open house, walk through all five steps - on Pre
 1. **Build the kit** (once per home): Opens > My Opens, type the address, **Generate Kit**, pick Similar Homes, the cover and Cheat Sheet photos, choose what happens after sign-in, **Save & Finish**.
 2. **Sign guests in**: the printed QR sign-in sheet, or a tablet in **Kiosk** mode. Each guest lands in Leads.
 3. **Showcases for guests without an agent** (Premium, IDX, when **Guest Showcases** is on): each guest who says they don't have an agent gets their own **Showcase** - a personal home search, like a saved search on a home site, that starts with homes similar to the one they toured. It stays live (new listings, price drops, under contract), and they can favorite homes, comment and ask for a tour, which you see on their lead. Their invite email goes out 1 hour after sign-in by default (Tools > Email). You can also switch one on for a single guest in **Visitors**, or change their search with **Edit Showcase**.
-4. **See who came**: **Visitors** on the kit card - sign-ins by day, No agent / Has agent counts, star, notes, Activity on their Guest Pass.
+4. **See who came**: **Visitors** on the kit card - sign-ins by day, No agent / Has agent counts, star, notes (the button shows how many), **Guest Activity** for what they did on their Guest Pass (dark with a number when they did more than open it).
 5. **Follow up**: Leads > **Follow-ups** has ready-to-send texts for guests without an agent; the text includes their Showcase link when they have one.
 
 On Basic there are no Showcases (a "You're missing out right now" banner may show guests who would have gotten one); No-MLS plans have no Showcases or Similar Homes.
@@ -626,8 +626,11 @@ What happens after a guest signs in. Each switch only shows if your plan has it.
 Tap **Visitors** on a card. You'll see **Visitors**, **No agent** and **Has agent** counts, then everyone grouped by day with email and phone (tap to copy, email or call).
 - **Star** a visitor to star that person. It's one star: their lead and Showcase are starred too.
 - **Showcase** switch (Premium, IDX; guests without an agent): turn on to give this one guest a Showcase - their invite email goes out after the delay you set in Studio > Email. Turn off to cancel a waiting invite and turn their Showcase off.
-- **Notes** - a note on this visitor, shared with their lead profile.
-- **Activity** - everything they did on their Guest Pass (only shows once they've used it).
+- **Open** (beside the Showcase switch, or beside **Edit Showcase**) - their Showcase in a new tab.
+- **Notes** - notes on this visitor, shared with their lead profile. The button shows how many there are.
+- **Guest Activity** - everything they did on their Guest Pass (only shows once they've opened it). It looks like Notes if they only opened it, and turns dark with a number when they did something on it, like opening a home or the Cheat Sheet.
+
+Guest Pass activity also reaches you on its own, in the **Activity** mailbox on Showcases and in the bell: a home they stayed on for 5 seconds or more, any time, and anything else they tap once an hour has passed since they signed in. Just opening the pass never alerts you. It all shows on their lead too.
 
 ### Disclosure & Second Visits
 MLS plans. When a guest asks for the seller's disclosure or a second visit (from the Cheat Sheet QR or their Guest Pass), it shows on My Opens - at the very top while it's waiting on you. Tabs **Upcoming** and **Past**. When you've handled one, tap **Mark sent** (disclosure) or **Mark scheduled** (second visit); it moves to Past and its follow-up is checked off.
@@ -788,12 +791,13 @@ Click a lead to open it. You'll see:
 - **Call / Text / Email** buttons and copy buttons for phone and email.
 - **Where they stand** menu: New ("Haven't talked yet"), Contacted, In talks ("Actively working together"), Signed ("Your client").
 - **Do they have an agent?** menu: No agent, Not sure, Has an agent (moves them to the "Has agent" tab).
-- **How they found you:** Came from, First touch, Latest, and "What they told you". **See it in Activity** jumps to the full entry.
+- **How they found you:** Came from, First touch, Latest, and "What they told you". **See it in Activity** jumps to the full entry. If they came from an open house and did more on their Guest Pass than land on it, a **Guest Pass** button opens what they did.
 - **Waiting on you:** each open request with **Open** and **Done** (Done = "I've handled this - clear it").
 - **Follow-ups** section (see section 2), with **Alert settings** and **All follow-ups**.
-- **Their Showcase** card: Homes / Liked / Passed counts, last active, whether they get Showcase emails, **Open** and **Their link** (copies their Showcase link).
-- **Emails** card: what they were sent, opened, clicked, and whether automatic emails are on, weekly or off.
-- **Activity:** everything they've done, filter by **Everything**, **Forms & requests**, **Showcase**.
+- **Their Showcase** card: an on / off switch, **(#) Matches** beside the name (opens their Showcase mailbox), Viewed (homes they opened over the Showcase's life) / Liked / Passed counts, last active, whether they get Showcase emails, **Open** and **Their link** (copies their Showcase link). **Open mailbox** by Newest matches opens the same mailbox.
+- **Showcase mailbox:** one client's newest homes and everything they did, with **Everything**, **Matches** and **Activity** tabs. It's also the **Mailbox** button on their Showcase.
+- **Emails** card: what they were sent, opened, clicked, whether automatic emails are on, weekly or off, a **How often** menu, and **All emails** (a pop-up).
+- **Activity:** everything they've done, by **Last week**, **Last month**, **Last 3 months**, **Last year**, **YTD** or **All time**, and by **Everything**, **Forms & requests**, **Showcase**. Over 20 things turns into pages.
 - **Open houses they came to.**
 - **Notes:** type in "Add a note..." and add it. Notes also show on their open house sign-in and on their follow-ups. You can edit or delete your notes.
 - **Tags:** type in "Add a tag..." and press the + button; click the x on a tag to remove it.
@@ -871,15 +875,17 @@ Every follow-up's calendar event has links:
 
 **Plans:** Every plan.
 
-- Numbers at the top (last 30 days): **Sent**, **Opened**, **Clicked**, **Slowed** (people on weekly or no automatic emails).
-- Tabs: **People** and **Sent emails**.
-- People filters: **All**, **On**, **Weekly**, **Off**, **Not in your leads**. Sort: Latest email, Most engaged, Least engaged, Name A-Z.
-- Each person: **Turn off** / **Turn back on** their automatic emails, and **Their emails** to see what they were sent. A **Why:** line explains a slowdown.
+- Numbers at the top (last 30 days): **Sent**, **Opened**, **Clicked**, **Slowed** (people who stopped opening, so they get fewer).
+- The tracker lists your leads only. Delete a lead and they leave it.
+- People filters: **All**, **On**, **Weekly**, **Off**, **Slowed**. Sort: Latest email, Most engaged, Least engaged, Name A-Z.
+- Each person: **Turn off** / **Turn back on** their automatic emails, a **How often** menu, and **Their emails**, which opens what they were sent in a pop-up. A **Why:** line explains a slowdown.
+- The amber number on the **Email Tracker** button on Leads ("2 slowed") counts people the rules just slowed. It clears once you've looked.
 
 **The automatic rules:**
 - **Emails on** - normal.
 - **Weekly only** - they left emails unopened on 3 different days; daily Showcase updates become one weekly email. Back to daily as soon as they open one.
-- **Emails off** - they also ignored 3 weekly emails; automatic emails stop. They restart by themselves when the person opens an email or uses their Showcase.
+- **Emails off** - they also ignored 5 weekly emails; automatic emails stop. They restart by themselves when the person opens an email or uses their Showcase.
+- **How often (Daily, Weekly, Every 2 weeks)** - on the lead, their Showcase and the tracker. **Daily** runs the rules above, counting from that moment. **Weekly** and **Every 2 weeks** stay put whether they open or not, because someone chose them on purpose. The client can pick the same three at the top right of their Showcase, and you get told.
 - Personal emails (tour confirmation, reply to their comment, the thank-you after signing in) always send.
 - **Unsubscribed**, bounced ("Fix their email address to send again") or marked-as-spam people can't be switched back on by you.
 
@@ -896,7 +902,7 @@ Every follow-up's calendar event has links:
 ### The Showcases page
 - Search: "Search visitor, property, location...".
 - **New** button (the New Matches mailbox): every home you haven't looked at yet from all your Showcases, newest first, with the client's name. Tap a home to open it right there: flip through its photos and see all its stats. **Dismiss** (or the small X) clears it from the mailbox only, with an Undo; it stays in the client's Showcase. **Open in their Showcase** goes to that home's page there. A lead's page also shows the 3 newest homes in their Showcase with NEW tags and what the client did. NEW only clears when you open that home or the Showcase.
-- **Tours** button: tour requests waiting on you from every Showcase. **Activity** button: likes, comments, tour requests and search changes from your clients.
+- **Tours** button: tour requests waiting on you from every Showcase. **Activity** button: everything your clients did in the last 30 days: opening their Showcase, a home's details, likes, comments, tour requests, search changes and opening a Showcase email. Its number counts likes, comments and requests only.
 - **Budgets** filter and sort: **Activity**, **New matches**, **Newest**, **Fell asleep** (Inactive tab only), **Came from**.
 - **Active** / **Inactive** tabs, and a **New matches** filter.
 - Each Showcase card: star, client email/phone copy, new-match count (**Dismiss new matches**), activity badges, **Edit**, **Share**, **Delete**, and an **On / Off** switch.
@@ -925,7 +931,7 @@ Tap **Tours**. For each request: **Confirm**, then pick the time and **Yes, Conf
 
 ### Star, sleep and wake
 - **Star** a Showcase (or star the lead - they're linked): it sorts first and never falls asleep. Starring an asleep Showcase wakes it and moves it to Active.
-- **Asleep (Inactive):** if a client ignores 3 weekly emails in a row and you haven't touched them in 2 weeks (opened the Showcase or lead, marked contacted, wrote a note, checked off a follow-up), their Showcase goes to sleep: no new matches, no emails, no alerts. Nothing is deleted and the link still works. A client who keeps using their Showcase stays awake even if they ignore emails.
+- **Asleep (Inactive):** if a client ignores 5 weekly emails in a row and you haven't touched them in 2 weeks (opened the Showcase or lead, marked contacted, wrote a note, checked off a follow-up), their Showcase goes to sleep: no new matches, no emails, no alerts. Nothing is deleted and the link still works. A client who keeps using their Showcase stays awake even if they ignore emails.
 - It **wakes by itself** when the client opens their Showcase or an old email, and catches up on homes that came on the market while it slept. You can wake it with **Turn On** / the **On** switch, or by starring it.
 - **Turn Off** ("Put to sleep: no new matches, no emails") does the same by hand.
 

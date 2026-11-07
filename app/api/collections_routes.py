@@ -610,6 +610,20 @@ async def get_showcase_recent_homes(
     return {"homes": await recent_for(db, [c], limit=max(1, min(limit, 20)))}
 
 
+@router.get("/{collection_id}/mailbox")
+async def get_showcase_mailbox(
+    collection_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_premium_plan)
+):
+    """One client's mailbox (owner, 11/07): their newest homes and everything they did, all in one."""
+    from app.services import showcase_mailbox_service as mailbox
+    c = (await db.execute(select(Collection).where(Collection.id == collection_id, Collection.owner_id == str(current_user.id)))).scalar_one_or_none()
+    if not c:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    return await mailbox.mailbox(db, c, CollectionsService.INBOX_ACTIVITY_TYPES)
+
+
 @router.post("/inbox/read")
 async def mark_showcases_inbox_read(
     db: AsyncSession = Depends(get_db),
@@ -1754,6 +1768,69 @@ async def preview_shared_collection_matches(
     except Exception as e:
         logger.error("previewing shared showcase matches failed", extra={"error": str(e)})
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to preview matches")
+
+
+class SharedEmailFrequency(BaseModel):
+    frequency: str
+
+
+async def _shared_collection(db: AsyncSession, share_token: str) -> Collection:
+    from app.services.showcase_links import share_match
+    c = (await db.execute(select(Collection).where(share_match(share_token)))).scalar_one_or_none()
+    if c is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found")
+    return c
+
+
+def _client_frequency(st: dict, c: Collection) -> dict:
+    return {"frequency": st.get("frequency") or (st["mode"] if st["mode"] in ("daily", "weekly", "biweekly") else "daily"),
+            "emails_on": bool(c.notify_visitor) and st["mode"] != "off", "blocked": st.get("code") in ("unsubscribed", "bounced", "spam")}
+
+
+@router.get("/shared/{share_token}/email-frequency")
+async def get_shared_email_frequency(share_token: str, db: AsyncSession = Depends(get_db)):
+    """How often this client's Showcase emails go out, for the picker on their Showcase."""
+    from app.services import client_email_service as ce
+    c = await _shared_collection(db, share_token)
+    if not c.visitor_email:
+        return {"frequency": "daily", "emails_on": False, "blocked": True}
+    return _client_frequency(await ce.status_for(db, c.owner_id, c.visitor_email), c)
+
+
+@router.put("/shared/{share_token}/email-frequency")
+async def set_shared_email_frequency(share_token: str, body: SharedEmailFrequency, http_request: Request, db: AsyncSession = Depends(get_db)):
+    """The client picks daily, weekly or every two weeks (owner, 11/07). Picking one turns their
+    emails on. The agent hears about it."""
+    from app.services import client_email_service as ce
+    from app.services.public_rate_limit import check_public_submit
+    check_public_submit(http_request)
+    if body.frequency not in ce.FREQUENCIES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick daily, weekly or every two weeks")
+    c = await _shared_collection(db, share_token)
+    if not c.visitor_email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This Showcase has no email address")
+    c.notify_visitor = True
+    await db.flush()
+    return _client_frequency(await ce.set_frequency(db, c.owner_id, c.visitor_email, body.frequency, by="client"), c)
+
+
+@router.post("/shared/{share_token}/opened")
+async def shared_showcase_opened(
+    share_token: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional)
+):
+    """The client opened their Showcase - at most once per half hour on their lead (owner, 11/07). The
+    page calls this itself, so mail scanners and link previews don't count. The agent's own look doesn't."""
+    from sqlalchemy import update
+    from app.services.leads_service import log_showcase_activity
+    c = await _shared_collection(db, share_token)
+    if await _owner_id_if_owner(db, c.id, current_user):
+        return {"success": True}
+    await db.execute(update(Collection).where(Collection.id == c.id).values(last_visitor_activity_at=datetime.now(timezone.utc)))
+    await db.commit()
+    await log_showcase_activity(db, c.id, "showcase_opened", "Opened their Showcase", dedupe_hours=0.5)
+    return {"success": True}
 
 
 @router.patch("/shared/{share_token}/notifications")

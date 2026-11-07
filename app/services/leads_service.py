@@ -177,15 +177,15 @@ async def upsert_lead(
 # (the person is already one), never push to the agent's CRM and never make a follow-up (except a
 # search change request - collections_service schedules that one itself).
 SHOWCASE_ACTIVITY_TYPES = {
-    "showcase_like", "showcase_dislike", "showcase_view", "showcase_refine", "showcase_search_changed",
+    "showcase_like", "showcase_dislike", "showcase_view", "showcase_opened", "showcase_refine", "showcase_search_changed",
     "showcase_emails_off", "showcase_emails_on",
 }
-OTHER_ACTIVITY_TYPES = {"email_unsubscribed", "review_left"}
+OTHER_ACTIVITY_TYPES = {"email_unsubscribed", "review_left", "guest_pass_home", "guest_pass_activity"}
 # Seen-it signals: shown on the timeline and as "latest", but they don't flag the lead as needing
 # the agent (a client browsing homes isn't something to act on - a like or a question is).
 # Email tracking + the engagement rules (client_email_service) are history only - an open never
 # makes a lead "need you".
-QUIET_ACTIVITY_TYPES = {"showcase_view", "showcase_emails_on", "email_opened", "email_clicked",
+QUIET_ACTIVITY_TYPES = {"showcase_view", "showcase_opened", "showcase_emails_on", "email_opened", "email_clicked", "guest_pass_activity",
                         "email_weekly", "email_paused", "email_resumed"}
 
 

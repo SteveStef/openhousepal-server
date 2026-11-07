@@ -304,6 +304,15 @@ async def agent_busy_times(agent_id: str, db: AsyncSession = Depends(get_db)):
     return {"busy": await calendar_sync_service.public_busy(db, agent_id)}
 
 
+@router.get("/open-house/{event_id}/busy")
+async def open_house_busy_times(event_id: str, db: AsyncSession = Depends(get_db)):
+    """The agent's busy blocks for an open house's second-visit window - see public_busy."""
+    from app.models.database import OpenHouseEvent
+    from app.services import calendar_sync_service
+    agent_id = (await db.execute(select(OpenHouseEvent.agent_id).where(OpenHouseEvent.id == event_id))).scalar_one_or_none()
+    return {"busy": await calendar_sync_service.public_busy(db, agent_id) if agent_id else []}
+
+
 @router.post("/schedule-tour")
 async def schedule_tour_route(
     request: ScheduleTourRequest,

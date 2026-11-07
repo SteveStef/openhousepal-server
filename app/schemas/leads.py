@@ -17,8 +17,10 @@ LeadSourceType = Literal[
     # Google One Tap on the agent's IDX website (google_visitor_service).
     'website_google_signin',
     # Done inside their Showcase / elsewhere - logged by leads_service.log_activity.
-    'showcase_like', 'showcase_dislike', 'showcase_view', 'showcase_refine', 'showcase_search_changed',
+    'showcase_like', 'showcase_dislike', 'showcase_view', 'showcase_opened', 'showcase_refine', 'showcase_search_changed',
     'showcase_emails_off', 'showcase_emails_on', 'email_unsubscribed', 'review_left',
+    # Done on their Guest Pass after signing in - guest_pass_service.track.
+    'guest_pass_home', 'guest_pass_activity',
     # Email tracking + engagement rules - client_email_service.
     'email_opened', 'email_clicked', 'email_weekly', 'email_paused', 'email_resumed',
 ]
@@ -60,6 +62,8 @@ class LeadShowcaseOut(BaseModel):
     share_token: Optional[str] = None
     short_code: Optional[str] = None
     home_count: int = 0
+    viewed: int = 0     # homes the client opened over this Showcase's whole life
+    status: Optional[str] = None
     liked: int = 0
     disliked: int = 0
     new_matches: int = 0

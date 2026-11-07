@@ -334,7 +334,7 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
 
     today = datetime.now(EASTERN).strftime("%m/%d/%Y")
     buyers = weekly_sent = held_weekly = held_off = 0
-    from app.services.client_email_service import WEEKLY_GAP, WEEKLY_TEMPLATE, last_auto_sent, refresh_status
+    from app.services.client_email_service import BIWEEKLY_GAP, WEEKLY_GAP, WEEKLY_TEMPLATE, last_auto_sent, refresh_status
     hold_ids: list[str] = []          # weekly people whose week isn't up: their changes wait for next week's email
     per_owner: dict[str, int] = {}    # spread each agent's emails out (a burst of identical emails looks like spam)
     run_at = datetime.now(timezone.utc)
@@ -371,10 +371,10 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
         if st["mode"] == "off":
             held_off += 1
             continue
-        weekly = st["mode"] == "weekly"
+        weekly = st["mode"] in ("weekly", "biweekly")
         if weekly:
             last_sent = await last_auto_sent(db, col.owner_id, email)
-            if last_sent and run_at - last_sent < WEEKLY_GAP:
+            if last_sent and run_at - last_sent < (BIWEEKLY_GAP if st["mode"] == "biweekly" else WEEKLY_GAP):
                 hold_ids.extend(buyer_ids.get((email, cid), []))
                 held_weekly += 1
                 continue

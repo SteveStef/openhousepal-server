@@ -161,6 +161,12 @@ class VisitorResponse(BaseModel):
     # Guest Pass activity: logged things + visits, and the last time (None = never opened it).
     pass_events: int = 0
     pass_last_at: Optional[datetime] = None
+    # What they actually did on it (landing on the page doesn't count), and how much of it the agent
+    # hasn't seen yet.
+    pass_actions: int = 0
+    pass_new: int = 0
+    # How many notes this guest has (their lead's notes - what the Notes window shows).
+    note_count: int = 0
     # The per-visitor Showcase switch (PUT /api/visitors/{id}/showcase {"on": bool}): its state
     # (their own setting, else the kit's), whether it can be used (plan has Showcases, guest has no
     # agent) and when a not-yet-sent invite goes out.

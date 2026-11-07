@@ -37,6 +37,8 @@ def _categorize_source(source_type: str, raw_snapshot: Optional[dict]) -> LeadSo
         if form_type == 'showcase_request':
             return 'showcase'
         return 'form'
+    if source_type in ('guest_pass_home', 'guest_pass_activity'):
+        return 'open_house'
     if source_type in ('open_house_disclosure', 'form_partial', 'invite_rsvp'):
         return 'form'
     if source_type in ('open_house_second_visit', 'property_tour', 'property_website_tour_request', 'property_page_tour_request'):
@@ -51,7 +53,7 @@ def _origin_group(e: LeadEvent) -> str:
     """Where the person first came in, for the Leads page's "Came in from" filter."""
     st, snap = e.source_type, e.raw_snapshot or {}
     came = snap.get('came_from') if isinstance(snap.get('came_from'), dict) else {}
-    if st in ('open_house_visitor', 'open_house_second_visit', 'open_house_disclosure'):
+    if st in ('open_house_visitor', 'open_house_second_visit', 'open_house_disclosure', 'guest_pass_home', 'guest_pass_activity'):
         return 'open_house'
     if st == 'invite_rsvp':  # Forms & Invites -> Invites
         return 'forms'
@@ -188,7 +190,7 @@ def _lead_places(events: List[LeadEvent]) -> List[str]:
     out: List[str] = []
     for e in events:
         st = e.source_type or ''
-        if st.startswith(('showcase', 'collection', 'email')) or st in _NOT_HOW_THEY_FOUND_YOU:
+        if st.startswith(('showcase', 'collection', 'email', 'guest_pass')) or st in _NOT_HOW_THEY_FOUND_YOU:
             continue
         oh = getattr(e, 'open_house_event', None)
         for a in (e.property_address, oh and ', '.join(x for x in (oh.address, oh.city) if x)):
@@ -262,7 +264,7 @@ _ENGAGEMENT_EVENT_TYPES = {'property_comment', 'property_tour', 'property_websit
                            'property_page_inquiry', 'property_page_tour_request',
                            # inside their Showcase (leads_service.log_activity)
                            'showcase_like', 'showcase_dislike', 'showcase_view', 'showcase_refine', 'showcase_search_changed',
-                           'review_left',
+                           'review_left', 'guest_pass_home', 'guest_pass_activity',
                            # a question or request they sent, like the Spotlight inquiry above
                            'blog_inquiry', 'open_house_second_visit', 'open_house_disclosure', 'invite_rsvp',
                            # clicked a link in your email (an open alone isn't reliable proof)
@@ -415,7 +417,7 @@ def _first_touch(events: List[LeadEvent]) -> Optional[LeadEvent]:
     """How they came in: the earliest touch point (events are newest-first). Showcase browsing
     can't be first - it needs a lead already - but skip it anyway in case of clock ties."""
     for e in reversed(events):
-        if not (e.source_type.startswith('showcase_') or e.source_type == 'email_unsubscribed'):
+        if not (e.source_type.startswith(('showcase_', 'guest_pass_')) or e.source_type == 'email_unsubscribed'):
             return e
     return events[-1] if events else None
 
@@ -544,6 +546,7 @@ async def _showcases_out(lead: Lead, collections: List[Collection]) -> List[Lead
         out.append(LeadShowcaseOut(
             id=c.id, name=c.name, share_token=c.share_token if c.is_public else None,
             short_code=c.short_code if c.is_public else None, home_count=len(in_it),
+            viewed=sum(1 for pi in (c.property_interactions or []) if (pi.view_count or 0) > 0), status=c.status,
             liked=sum(1 for pi in pis if pi.liked), disliked=sum(1 for pi in pis if pi.disliked),
             new_matches=CollectionsService.count_new_properties(c), last_active_at=c.last_visitor_activity_at,
             emails_on=bool(c.notify_visitor), refine_message=c.refine_request_message,
@@ -605,7 +608,7 @@ async def _fetch_leads(db: AsyncSession, current_user: User, status: Optional[st
         conds.append(exists().where(
             LeadEvent.lead_id == Lead.id,
             ~LeadEvent.source_type.like('showcase%'), ~LeadEvent.source_type.like('collection%'),
-            ~LeadEvent.source_type.like('email%'),
+            ~LeadEvent.source_type.like('email%'), ~LeadEvent.source_type.like('guest_pass%'),
             LeadEvent.source_type.notin_(('property_comment', 'property_tour', 'review_left')),
             LeadEvent.property_address.ilike(like),
         ))

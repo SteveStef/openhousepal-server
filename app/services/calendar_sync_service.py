@@ -1355,9 +1355,9 @@ async def get_busy(db: AsyncSession, owner_id: str, start: datetime, end: dateti
 _public_busy_cache: dict[str, tuple[datetime, list[dict]]] = {}
 
 
-async def public_busy(db: AsyncSession, owner_id: str, days: int = 8) -> list[dict]:
+async def public_busy(db: AsyncSession, owner_id: str, days: int = 8, cap: int = 14) -> list[dict]:
     now = datetime.now(timezone.utc)
-    days = max(1, min(int(days or 8), 14))
+    days = max(1, min(int(days or 8), cap))
     key = owner_id if days == 8 else f"{owner_id}:{days}"
     hit = _public_busy_cache.get(key)
     if hit and (now - hit[0]).total_seconds() < 60:

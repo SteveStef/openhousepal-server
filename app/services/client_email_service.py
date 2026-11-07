@@ -49,9 +49,14 @@ TRACKED_TEMPLATES = AUTO_TEMPLATES | {
 LINK_VARS = ("showcase_link", "collection_link", "site_url")
 
 STRIKE_DAYS = 3
-WEEKLY_STRIKES = 3
+WEEKLY_STRIKES = 5
 GRACE = timedelta(hours=12)
 WEEKLY_GAP = timedelta(days=6, hours=12)
+BIWEEKLY_GAP = timedelta(days=13, hours=12)
+# How often someone gets automatic emails when it was picked on purpose (owner, 11/07). Daily is the
+# normal rules with the count starting over; weekly and every two weeks stay put, opened or not.
+FREQUENCIES = ("daily", "weekly", "biweekly")
+FREQUENCY_WORDS = {"daily": "daily", "weekly": "weekly", "biweekly": "every two weeks"}
 MAX_AUTO_PER_DAY = 2
 # Mail scanners (Outlook Safe Links, corporate filters) fetch images and follow links the moment a
 # message arrives - that isn't the person.
@@ -99,7 +104,8 @@ def _first(name: Optional[str], email: str) -> str:
 # ---------------------------------------------------------------- the decision (pure, testable)
 
 def decide(emails: list[dict], *, manual: Optional[str], reset_at: Optional[datetime],
-           last_engaged: Optional[datetime], unsubscribed: bool = False, now: Optional[datetime] = None) -> dict:
+           last_engaged: Optional[datetime], unsubscribed: bool = False, now: Optional[datetime] = None,
+           frequency: Optional[str] = None, frequency_by: Optional[str] = None) -> dict:
     """emails: this person's sent emails [{sent_at, opened_at, clicked_at, template}].
     -> {mode, reason, unopened, unopened_days, weekly_unopened}"""
     now = now or _now()
@@ -110,6 +116,10 @@ def decide(emails: list[dict], *, manual: Optional[str], reset_at: Optional[date
     if manual == LEAD_DELETED:
         return {"mode": "off", "reason": "You deleted their lead, so automatic emails to them stopped", "unopened": 0, "unopened_days": 0,
                 "weekly_unopened": 0, "code": "lead_deleted"}
+    if frequency in ("weekly", "biweekly"):
+        who = "They chose" if frequency_by == "client" else "You chose"
+        return {"mode": frequency, "code": "chosen", "reason": f"{who} {FREQUENCY_WORDS[frequency]} emails, so it stays that way whether they open them or not.",
+                "unopened": 0, "unopened_days": 0, "weekly_unopened": 0}
     start = max([d for d in (reset_at, last_engaged) if d] or [None]) if (reset_at or last_engaged) else None
     unopened = [e for e in emails
                 if e.get("sent_at") and (start is None or e["sent_at"] > start) and e["sent_at"] <= now - GRACE
@@ -201,11 +211,17 @@ async def refresh_status(db, owner_id: str, email: str, *, announce: bool = True
     pref = await _pref(db, owner_id, email)
     unsub = await _is_unsubscribed(db, email)
     d = decide(await _emails_for(db, owner_id, email), manual=pref.manual, reset_at=pref.reset_at,
-               last_engaged=await _last_engaged(db, owner_id, email), unsubscribed=unsub)
+               last_engaged=await _last_engaged(db, owner_id, email), unsubscribed=unsub,
+               frequency=pref.frequency, frequency_by=pref.frequency_by)
     d = await _why_blocked(db, owner_id, email, d)
     old = pref.mode or "daily"
     woke: list[str] = []
-    if d["mode"] != old and not unsub and pref.manual not in MANUAL_OFF:
+    if d.get("code") == "chosen":
+        # Picked on purpose: nothing to announce, and nothing steps it down.
+        if old != d["mode"]:
+            pref.mode, pref.changed_at = d["mode"], _now()
+        pref.reason = d["reason"]
+    elif d["mode"] != old and not unsub and pref.manual not in MANUAL_OFF:
         pref.mode, pref.changed_at = d["mode"], _now()
         pref.reason = d["reason"] or (f"Back on - {trigger}" if trigger else "Back on")
         # Ignored 3 weekly emails -> their Showcases go to sleep; any sign of life wakes them (showcase_sleep).
@@ -231,7 +247,7 @@ async def refresh_status(db, owner_id: str, email: str, *, announce: bool = True
     if woke:
         from app.services.showcase_sleep import catch_up
         await catch_up(db, woke)
-    return {**d, "since": pref.changed_at, "manual": pref.manual}
+    return {**d, "since": pref.changed_at, "manual": pref.manual, "frequency": pref.frequency, "frequency_by": pref.frequency_by}
 
 
 async def _announce(db, owner_id: str, email: str, old: str, new: str, reason: str, trigger: Optional[str], slept: int = 0,
@@ -245,11 +261,11 @@ async def _announce(db, owner_id: str, email: str, old: str, new: str, reason: s
             msg += f" {who} keeps using their Showcase, so it stays open."
     elif new == "off":
         if still_using and not slept:
-            source, title, msg = "email_paused", f"{who}: automatic emails stopped", f"{who} didn't open 3 weekly emails in a row, so automatic emails stopped - but {who} keeps using their Showcase, so it stays open and keeps updating."
+            source, title, msg = "email_paused", f"{who}: automatic emails stopped", f"{who} didn't open {WEEKLY_STRIKES} weekly emails in a row, so automatic emails stopped - but {who} keeps using their Showcase, so it stays open and keeps updating."
         elif slept:
-            source, title, msg = "email_paused", f"{who}: Showcase asleep", f"{who} didn't open 3 weekly emails in a row, so automatic emails stopped and their Showcase went to sleep (Showcases -> Inactive). It wakes up by itself if {who} opens it or an old email."
+            source, title, msg = "email_paused", f"{who}: Showcase asleep", f"{who} didn't open {WEEKLY_STRIKES} weekly emails in a row, so automatic emails stopped and their Showcase went to sleep (Showcases -> Inactive). It wakes up by itself if {who} opens it or an old email."
         else:
-            source, title, msg = "email_paused", f"{who}: automatic emails stopped", f"{who} didn't open 3 weekly emails in a row, so automatic emails stopped. They restart by themselves if {who} opens one or visits their Showcase."
+            source, title, msg = "email_paused", f"{who}: automatic emails stopped", f"{who} didn't open {WEEKLY_STRIKES} weekly emails in a row, so automatic emails stopped. They restart by themselves if {who} opens one or visits their Showcase."
     else:
         source, title, msg = "email_resumed", f"{who}: emails back to daily", f"{who} {trigger or 'is active again'}, so their updates are back to normal."
     if lead is not None:
@@ -272,9 +288,11 @@ async def status_for(db, owner_id: str, email: str) -> dict:
     email = _norm(email)
     pref = await _pref(db, owner_id, email, create=False)
     d = decide(await _emails_for(db, owner_id, email), manual=pref.manual if pref else None, reset_at=pref.reset_at if pref else None,
-               last_engaged=await _last_engaged(db, owner_id, email), unsubscribed=await _is_unsubscribed(db, email))
+               last_engaged=await _last_engaged(db, owner_id, email), unsubscribed=await _is_unsubscribed(db, email),
+               frequency=pref.frequency if pref else None, frequency_by=pref.frequency_by if pref else None)
     d = await _why_blocked(db, owner_id, email, d)
-    return {**d, "since": pref.changed_at if pref else None, "manual": pref.manual if pref else None}
+    return {**d, "since": pref.changed_at if pref else None, "manual": pref.manual if pref else None,
+            "frequency": pref.frequency if pref else None, "frequency_by": pref.frequency_by if pref else None}
 
 
 # ---------------------------------------------------------------- the send path
@@ -326,11 +344,12 @@ async def before_send(owner_id: Optional[str], to: Optional[str], template: str,
                     logger.info("client email held (daily limit)", extra={"template": template, "owner_id": owner_id})
                     dd.forget(dkey)
                     return None
-                if st["mode"] == "weekly" and template != WEEKLY_TEMPLATE:
+                if st["mode"] in ("weekly", "biweekly") and template != WEEKLY_TEMPLATE:
+                    gap = BIWEEKLY_GAP if st["mode"] == "biweekly" else WEEKLY_GAP
                     last_auto = (await db.execute(select(func.max(ClientEmail.sent_at)).where(
                         ClientEmail.owner_id == owner_id, ClientEmail.recipient_email == email, ClientEmail.kind == "auto",
                         ClientEmail.status == "sent"))).scalar()
-                    if template == "showcase_daily_digest" or (last_auto and _now() - last_auto < WEEKLY_GAP):
+                    if template == "showcase_daily_digest" or (last_auto and _now() - last_auto < gap):
                         logger.info("client email held (weekly)", extra={"template": template, "owner_id": owner_id})
                         dd.forget(dkey)
                         return None
@@ -694,6 +713,43 @@ async def set_manual(db, owner_id: str, email: str, on: bool) -> dict:
     return await status_for(db, owner_id, email)
 
 
+async def set_frequency(db, owner_id: str, email: str, value: str, by: str = "agent") -> dict:
+    """Daily, weekly or every two weeks, picked on purpose by the agent or the client. Daily is the
+    normal rules with the unopened count starting from now; the other two stay as picked. Picking
+    one means they want emails, so an agent's own "off" lifts and a sleeping Showcase wakes.
+    A deleted lead's hold and an unsubscribe still win. Commits."""
+    if value not in FREQUENCIES:
+        raise ValueError("Unknown email frequency")
+    email = _norm(email)
+    pref = await _pref(db, owner_id, email)
+    if pref.manual == LEAD_DELETED:
+        return await status_for(db, owner_id, email)
+    lead = await _lead(db, owner_id, email)
+    pref.frequency = None if value == "daily" else value
+    pref.frequency_by = by
+    pref.manual = None
+    pref.reset_at = pref.changed_at = _now()
+    pref.mode = value
+    words = FREQUENCY_WORDS[value]
+    pref.reason = f"{'They' if by == 'client' else 'You'} chose {words} emails"
+    from app.services.leads_service import log_activity
+    from app.services.showcase_sleep import catch_up, wake_no_response
+    if lead is not None:
+        await log_activity(db, owner_id=owner_id, email=email, lead=lead, source_type="showcase_emails_on" if by == "client" else "email_resumed",
+                           summary=f"Chose {words} Showcase emails" if by == "client" else f"You set their emails to {words}", raw_snapshot={"to": value, "by": by})
+    if by == "client":
+        name = await _person_name(db, owner_id, email)
+        who = _first(name, email)
+        db.add(Notification(agent_id=owner_id, type="EMAIL_STATUS", reference_type="CLIENT_EMAIL_PREF", reference_id=email,
+                            title=f"{who}: picked {words} emails", message=f"{who} changed their Showcase emails to {words}.", visitor_name=name or None,
+                            link=f"/leads?lead={lead.id}" if lead else "/leads/emails", is_read=False, created_at=_now()))
+    woke = await wake_no_response(db, owner_id, email)
+    await db.commit()
+    if woke:
+        await catch_up(db, woke)
+    return await status_for(db, owner_id, email)
+
+
 async def stop_for_deleted_lead(db, owner_id: str, email: Optional[str]) -> bool:
     """Their lead was deleted: no more automatic emails to them (shown as off, with why, on the
     Emails page). An agent's own "off" stays as it is. Doesn't commit."""
@@ -720,16 +776,11 @@ async def lift_lead_deleted(db, owner_id: str, email: Optional[str]) -> None:
 
 
 async def listed_emails(db, owner_id: str, emails) -> set[str]:
-    """The addresses the Email Tracker shows: the agent's current leads, and the agent's own."""
+    """The addresses the Email Tracker shows: the agent's current leads, nobody else (owner, 11/07)."""
     emails = {_norm(e) for e in emails if e}
     if not emails:
         return set()
-    keep = set((await db.execute(select(Lead.email).where(Lead.owner_id == owner_id, Lead.email.in_(emails)))).scalars().all())
-    from app.models.database import User
-    owner = await db.get(User, owner_id)
-    if owner is not None and _norm(owner.email) in emails:
-        keep.add(_norm(owner.email))
-    return keep
+    return set((await db.execute(select(Lead.email).where(Lead.owner_id == owner_id, Lead.email.in_(emails)))).scalars().all())
 
 
 def _rate(sent: int, opened: int) -> Optional[int]:
@@ -755,8 +806,7 @@ async def people(db, owner_id: str) -> dict[str, dict]:
     # A deleted lead disappears from the Email Tracker (user, 10/24) - the hold on their automatic
     # emails stays (prefs keep LEAD_DELETED), they're just not listed until they're a lead again.
     emails -= {e for e, p in prefs.items() if p.manual == LEAD_DELETED}
-    # ...and so does anyone who isn't one of their leads at all (deleted before 10/24, or never a
-    # lead) - except the agent themself, for the copies they send to their own address.
+    # ...and so does anyone who isn't one of their leads at all (deleted before 10/24, or never a lead).
     emails &= await listed_emails(db, owner_id, emails)
     if not emails:
         return {}
@@ -771,7 +821,8 @@ async def people(db, owner_id: str) -> dict[str, dict]:
         opens = [r.opened_at for r in rs if r.opened_at] + [r.clicked_at for r in rs if r.clicked_at]
         last_engaged = max([d for d in (max(opens) if opens else None, eng.get(email)) if d] or [None]) if (opens or eng.get(email)) else None
         d = decide([{"sent_at": r.sent_at, "opened_at": r.opened_at, "clicked_at": r.clicked_at, "template": r.template} for r in rs],
-                   manual=p.manual if p else None, reset_at=p.reset_at if p else None, last_engaged=last_engaged, unsubscribed=email in unsub)
+                   manual=p.manual if p else None, reset_at=p.reset_at if p else None, last_engaged=last_engaged, unsubscribed=email in unsub,
+                   frequency=p.frequency if p else None, frequency_by=p.frequency_by if p else None)
         pr = problems.get(email)
         if pr is not None and d["code"] == "unsubscribed" and pr.delivery_note:
             d = {**d, "reason": pr.delivery_note, "code": "bounced" if pr.delivery in ("bounced", "blocked") else "spam"}
@@ -780,6 +831,7 @@ async def people(db, owner_id: str) -> dict[str, dict]:
         latest = rs[0] if rs else None
         out[email] = {
             "email": email, "mode": d["mode"], "reason": d["reason"], "code": d["code"], "manual": p.manual if p else None,
+            "frequency": p.frequency if p else None, "frequency_by": p.frequency_by if p else None,
             "since": p.changed_at.isoformat() if p and p.changed_at and d["mode"] != "daily" else None,
             "sent": len(rs), "opened": sum(1 for r in rs if r.opened_at or r.clicked_at), "clicked": sum(1 for r in rs if r.clicked_at),
             "rate": _rate(len(sent90), opened90), "unopened_in_a_row": d["unopened"],

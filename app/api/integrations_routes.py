@@ -187,6 +187,19 @@ async def _calendar_statuses(db: AsyncSession, owner_id: str) -> tuple[Optional[
 
 
 # --------------------------------------------------------------------------- routes
+@router.get("/my-busy")
+async def my_busy_times(
+    days: int = 45,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """The agent's own busy blocks, for every time they pick for themselves (owner, 11/07), and whether
+    a calendar is connected, so the picker can say so when it isn't."""
+    g, m = await _calendar_statuses(db, current_user.id)
+    connected = any(s and s.get("connected") and not s.get("needs_reconnect") for s in (g, m))
+    return {"connected": connected, "busy": await calendar_sync_service.public_busy(db, current_user.id, days, cap=45) if connected else []}
+
+
 @router.get("", response_model=IntegrationsOut)
 async def get_integrations(
     db: AsyncSession = Depends(get_db),

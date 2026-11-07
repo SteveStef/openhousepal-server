@@ -56,24 +56,20 @@ async def guest_pass_showcase(token: str, request: Request, db: AsyncSession = D
 
 
 class GuestPassSeen(BaseModel):
-    view: Literal["similar", "cheat", "showcase", "map"]
+    view: Literal["similar", "cheat", "showcase", "map", "nearby", "spotlight", "directions", "photos", "contact", "home_tour", "home_question"]
     key: Optional[str] = Field(default=None, max_length=64)
     # The visit it happened in (the page's own random id) - groups the agent's activity log.
     session: Optional[str] = Field(default=None, max_length=40)
+    # How long they've been on this home so far (only for a home they opened).
+    seconds: Optional[int] = Field(default=None, ge=0, le=86400)
 
 
 @router.post("/guest-pass/{token}/seen")
 async def guest_pass_seen(token: str, body: GuestPassSeen, db: AsyncSession = Depends(get_db)):
-    """What they opened on their pass (a similar home, the Cheat Sheet, their Showcase, the map) -
-    logged with its time for the agent's activity log (Visitors window), and noted on their open
-    follow-up so the agent's alert and suggested text can mention it. Fire-and-forget; each thing
-    is noted once, so it needs no rate limit of its own."""
+    """What they did on their pass - see guest_pass_service.track. Fire-and-forget; each thing is one
+    line per visit and the rows per guest are capped, so it needs no rate limit of its own."""
     visitor, oh, host = await gp.resolve(db, token)
-    kind = "similar_list" if body.view == "similar" and not body.key else body.view
-    await gp.log_event(db, visitor, oh, kind, key=body.key, session=body.session)
-    if body.view == "map":
-        return {"noted": False}
-    return {"noted": await gp.note_activity(db, visitor, oh, host, body.view, body.key)}
+    return await gp.track(db, visitor, oh, host, body.view, body.key, body.session, body.seconds)
 
 
 class GuestPassPing(BaseModel):
