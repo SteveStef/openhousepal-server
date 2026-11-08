@@ -574,12 +574,16 @@ async def track(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEvent,
     # A tour request or question from a home's page already made its own lead activity and alert.
     if row is None or kind in ("home_tour", "home_question"):
         return {"noted": False}
+    watched = False
     if kind == "similar":
         if (seconds or 0) >= WATCH_SECONDS > was and key != oh.listing_key:
+            watched = True
             await _surface(db, visitor, oh, host, kind, key, label, property_id, alert=True)
     elif fresh:
         await _surface(db, visitor, oh, host, kind, key, None, None, alert=_past_quiet_hour(visitor, datetime.now(timezone.utc)))
-    if fresh and view in ("similar", "cheat", "showcase"):
+    # Their follow-up gets a line too: a home only once they stayed on it (11/07 - a tap and straight
+    # back out was landing on the follow-up as "opened 12 Oak St").
+    if (watched or (fresh and kind != "similar")) and view in ("similar", "cheat", "showcase"):
         return {"noted": await note_activity(db, visitor, oh, host, view, key)}
     return {"noted": False}
 

@@ -137,3 +137,23 @@ async def test_a_full_log_stops_quietly(monkeypatch):
     calls = _patch(monkeypatch, None, False, 0)
     assert await gp.track(Db(), VISITOR_OLD, OH, None, "cheat", None, "s") == {"noted": False}
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_tap_on_a_home_does_not_go_on_the_follow_up(monkeypatch):
+    _patch(monkeypatch, object(), True, 0)
+    assert await gp.track(Db(), VISITOR_NEW, OH, None, "similar", "K1", "s") == {"noted": False}
+
+
+@pytest.mark.asyncio
+async def test_five_seconds_on_a_home_goes_on_the_follow_up(monkeypatch):
+    _patch(monkeypatch, object(), False, 0)
+    assert await gp.track(Db(), VISITOR_NEW, OH, None, "similar", "K1", "s", 5) == {"noted": True}
+
+
+@pytest.mark.asyncio
+async def test_the_cheat_sheet_goes_on_the_follow_up_once(monkeypatch):
+    _patch(monkeypatch, object(), True, 0)
+    assert await gp.track(Db(), VISITOR_NEW, OH, None, "cheat", None, "s") == {"noted": True}
+    _patch(monkeypatch, object(), False, 0)
+    assert await gp.track(Db(), VISITOR_NEW, OH, None, "cheat", None, "s") == {"noted": False}

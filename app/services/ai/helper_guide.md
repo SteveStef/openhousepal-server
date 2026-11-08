@@ -624,6 +624,7 @@ What happens after a guest signs in. Each switch only shows if your plan has it.
 
 ### Visitors
 Tap **Visitors** on a card. You'll see **Visitors**, **No agent** and **Has agent** counts, then everyone grouped by day with email and phone (tap to copy, email or call).
+- Lots of sign-ins (more than 10)? Use **Search guests**, the sort (Newest first, Oldest first, Name A-Z) and the filters (All, No agent, Starred, Guest Activity) at the top. The list shows 10 at a time on a phone and 20 on a computer - tap **Show more** for the rest.
 - **Star** a visitor to star that person. It's one star: their lead and Showcase are starred too.
 - **Showcase** switch (Premium, IDX; guests without an agent): turn on to give this one guest a Showcase - their invite email goes out after the delay you set in Studio > Email. Turn off to cancel a waiting invite and turn their Showcase off.
 - **Open** (beside the Showcase switch, or beside **Edit Showcase**) - their Showcase in a new tab.
