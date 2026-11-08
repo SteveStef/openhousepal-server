@@ -54,6 +54,9 @@ BRIGHT_PROPERTY_SELECT_FIELDS = [
     "SaleType", "Concessions", "ConcessionInPriceYN", "SellerPaidClosingCostsTotal", "BuyerFinancing",
     "PropertyCondition", "YearBuiltEffective", "StoriesTotal", "BasementFinishedPercent",
     "UpperLevelsTotalBedrooms", "UpperLevelsTotalBaths", "LowerLevelsTotalBedrooms", "LowerLevelsTotalBaths",
+    # Bedrooms / full baths on the main level (owner, 11/08: "first-floor bedroom" questions in the AI
+    # chat - ai_tools._floor_facts reads it). In our feed: seen in raw_mls_output.json's full records.
+    "MainLevelBedrooms", "MainLevelFullBaths",
     "BuyerOfficeName",
     # Structured facts used by the newer CMA/property-detail tooling. These remain in
     # raw_mls_data even when there is no dedicated Property column, so downstream features can

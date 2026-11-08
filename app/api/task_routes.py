@@ -273,6 +273,25 @@ def _public_view(task: AgentTask, others: Optional[list] = None) -> dict:
     return out
 
 
+async def _view(db: AsyncSession, task: AgentTask, others: Optional[list] = None) -> dict:
+    """_public_view + whether this person has a Showcase: the "Email me when they like or
+    comment" switch only shows when they do (owner, 11/08 - a guest with an agent has none)."""
+    out = _public_view(task, others)
+    out["has_showcase"] = await _lead_has_showcase(db, task)
+    return out
+
+
+async def _lead_has_showcase(db: AsyncSession, task: AgentTask) -> bool:
+    lead = task.lead
+    email = (lead.email or "").strip().lower() if lead else ""
+    if not email:
+        return False
+    from app.models.database import Collection
+    row = (await db.execute(select(Collection.id).where(Collection.owner_id == task.owner_id,
+                                                        func.lower(func.trim(Collection.visitor_email)) == email).limit(1))).first()
+    return row is not None
+
+
 async def _others_due(db: AsyncSession, task: AgentTask) -> list[dict]:
     """"Did you also do these?" - the agent's OTHER follow-ups that are due today or overdue, each
     with its own done code, so one tap from the calendar can clear several at once."""
@@ -305,7 +324,7 @@ async def _others_due(db: AsyncSession, task: AgentTask) -> list[dict]:
 @public_router.get("/{code}")
 async def public_followup(code: str, db: AsyncSession = Depends(get_db)):
     task = await _task_by_code(db, code)
-    return _public_view(task, await _others_due(db, task))
+    return await _view(db, task, await _others_due(db, task))
 
 
 @public_router.get("/{code}/contact.vcf")
@@ -406,7 +425,7 @@ async def public_followup_text(code: str, request: Request, db: AsyncSession = D
         if conn is not None and conn.enabled:
             mail_provider = {"google": "gmail", "microsoft": "outlook"}.get(conn.provider)
     return {
-        **_public_view(task),
+        **(await _view(db, task)),
         "first_name": (lead.name or "").split(" ")[0] or None,
         "phone": lead.phone if has_phone else None,
         "sms_to": (f"+{digits}" if digits else lead.phone) if has_phone else None,
@@ -475,7 +494,7 @@ async def public_followup_card(code: str, request: Request, db: AsyncSession = D
         logger.warning("calendar link lookup failed for follow-up card %s", task.id, exc_info=True)
     bucket = tasks_service.compute_bucket(task)
     return {
-        **_public_view(task),
+        **(await _view(db, task)),
         "code": code,
         "due_at": task.due_at.isoformat() if task.due_at else None,
         "all_day": task.all_day,
@@ -507,7 +526,7 @@ async def public_followup_done(code: str, request: Request, payload: Optional[di
         if lead is not None:
             tasks_service.log_contact(lead, via, tasks_service.contact_what(task), task.id)
             await db.commit()
-    return _public_view(task, await _others_due(db, task))
+    return await _view(db, task, await _others_due(db, task))
 
 
 @public_router.post("/{code}/alerts")
@@ -538,7 +557,7 @@ async def public_followup_undo(code: str, request: Request, db: AsyncSession = D
         await tasks_service.unmark_lead_contacted(db, task)
         await db.commit()
         calendar_sync_service.sync_task_bg(task.owner_id, task.id)  # puts it back
-    return _public_view(task, await _others_due(db, task))
+    return await _view(db, task, await _others_due(db, task))
 
 
 @router.get("/counts", response_model=TaskCounts)

@@ -33,7 +33,7 @@ Leads and follow-ups in depth: the Leads list and a lead's page, statuses, tags,
 
 ## Per-lead alert switches (Alert settings, "Just for the client")
 - **Put the client's follow-ups on my calendar**: off asks "Still want the client's follow-ups in OpenHousePal?" → **Yes, keep them here** (Follow-ups page and Dash only) or **No, stop them** (no new follow-ups for this person).
-- **Email me when the client likes or comments**: off = still in their activity, no email.
+- **Email me when the client likes or comments**: off = still in their activity, no email. Only shown when they have a Showcase.
 - The same switches show on the "Mark as done" page opened from a calendar alert.
 
 ## Follow-ups page (Leads → Follow-ups, "Never miss a follow-up")

@@ -23,6 +23,7 @@ imported and reused rather than re-derived - a second, subtly different
 implementation of "does this lead belong to this collection" would be a real
 place for a tenant-isolation bug to hide.
 """
+import re
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from fastapi import HTTPException
@@ -472,6 +473,234 @@ async def _get_showcase_info(db: AsyncSession, current_user: User, args: dict, c
     }
 
 
+# "Check the description of every home in Nicole's Showcase for a first-floor bedroom" (owner,
+# 11/08): opening homes one by one ran past the chat's 60-second limit and the agent got "isn't
+# available right now". This reads every home in the Showcase in one go - the listing description,
+# the MLS feature list and (for floor questions) the MLS room counts - and sends back only the hits.
+_FLOOR_WORDS = re.compile(r"\b(first|1st|main|entry|ground|one)\b", re.I)
+_BED_WORDS = re.compile(r"\b(bed|bedroom|bedrooms|suite|primary|owner|owners|master|sleep)", re.I)
+_SENTENCE = re.compile(r"[^.!?;\n]+")
+_WORD = re.compile(r"[a-z0-9]+", re.I)
+_STOP = {"a", "an", "the", "on", "in", "of", "with", "and", "or", "for", "to", "at", "has", "have", "is"}
+_NEAR = 8   # every word of a wording within 8 words of each other, in one sentence
+
+
+def _phrase_words(phrase: str) -> list:
+    return [w for w in _WORD.findall((phrase or "").lower()) if w not in _STOP][:6]
+
+
+def _phrase_span(text: str, words: list) -> Optional[Tuple[int, int]]:
+    """Where all the words sit close together in one sentence, in any order ("first floor
+    bedroom" finds "first-floor primary bedroom" and "bedroom on the main level"; "bedroom" finds
+    "bedrooms"). Never across sentences: "The first floor has a den. Three bedrooms upstairs." is
+    no match."""
+    if not words or not text:
+        return None
+    for s in _SENTENCE.finditer(text):
+        toks = [(m.group(0).lower(), s.start() + m.start(), s.start() + m.end()) for m in _WORD.finditer(s.group(0))]
+        hits = [[i for i, t in enumerate(toks) if t[0].startswith(w)] for w in words]
+        if not all(hits):
+            continue
+        for i in hits[0]:
+            picks = [min(h, key=lambda j: abs(j - i)) for h in hits]
+            if max(picks) - min(picks) < _NEAR:
+                return toks[min(picks)][1], toks[max(picks)][2]
+    return None
+
+
+def _snippet(text: str, start: int, end: int) -> str:
+    left = max(text.rfind(".", 0, start), text.rfind("!", 0, start), text.rfind("?", 0, start), text.rfind("\n", 0, start))
+    right = [i for i in (text.find(".", end), text.find("!", end), text.find("?", end), text.find("\n", end)) if i != -1]
+    s = text[left + 1:(min(right) + 1) if right else len(text)].strip()
+    if len(s) > 240:
+        mid = max(0, start - left - 1 - 100)
+        s = ("…" if mid else "") + s[mid:mid + 230].strip() + "…"
+    return s
+
+
+def _floor_facts(p: Property) -> Tuple[Optional[str], bool]:
+    """(what the MLS says about a main-floor bedroom, is it a one-level home)."""
+    raw = p.raw_mls_data if isinstance(p.raw_mls_data, dict) else {}
+    feats = [str(f) for f in (p.interior_features or raw.get("InteriorFeatures") or []) if f]
+    if any("entry level bedroom" in f.lower() for f in feats):
+        return "MLS feature list: Entry Level Bedroom", False
+    levels = [str(x) for x in (raw.get("Levels") or p.levels or []) if x]
+    one_level = levels in (["1"], ["One"], ["1.0"])
+    total, up, main = raw.get("BedroomsTotal"), raw.get("UpperLevelsTotalBedrooms"), raw.get("MainLevelBedrooms")
+    if isinstance(main, (int, float)) and main >= 1 and not one_level:
+        return f"MLS: {int(main)} bedroom{'s' if main != 1 else ''} on the main level" + (f" (of {int(total)})" if isinstance(total, (int, float)) else ""), False
+    if not one_level and isinstance(total, (int, float)) and isinstance(up, (int, float)):
+        main = int(total - up - (raw.get("LowerLevelsTotalBedrooms") or 0))
+        if main >= 1:
+            return f"MLS room counts: {main} of {int(total)} bedrooms on the main floor", False
+    return None, one_level
+
+
+# Every MLS list of features worth reading ("Pool", "Garage", "Basement - Finished", "Ramp"...).
+_FEATURE_FIELDS = ("InteriorFeatures", "ExteriorFeatures", "PoolFeatures", "ParkingFeatures", "AccessibilityFeatures",
+                   "LotFeatures", "WaterfrontFeatures", "PatioAndPorchFeatures", "FireplaceFeatures", "Basement",
+                   "Flooring", "Appliances", "Heating", "Cooling", "View", "CommunityFeatures", "AssociationAmenities")
+
+
+def _feature_strings(p: Property) -> list:
+    raw = p.raw_mls_data if isinstance(p.raw_mls_data, dict) else {}
+    out = [str(f) for f in (p.interior_features or []) if f]
+    for k in _FEATURE_FIELDS:
+        v = raw.get(k)
+        for f in (v if isinstance(v, list) else [v] if isinstance(v, str) else []):
+            if f and str(f) not in out:
+                out.append(str(f))
+    return out
+
+
+def _num(v) -> Optional[float]:
+    try:
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _scan_args(args: dict) -> Tuple[list, dict]:
+    look_for = args.get("look_for") or []
+    if isinstance(look_for, str):
+        look_for = [look_for]
+    phrases = [str(x).strip() for x in look_for if str(x).strip()][:12]
+    limits = {k: _num(args.get(k)) for k in ("min_price", "max_price", "min_beds", "min_baths")}
+    return phrases, limits
+
+
+def _scan_homes(homes: list, phrases: list, limits: dict) -> dict:
+    """Read every home - its listing description and every MLS feature list (plus, for a
+    first-floor bedroom, the MLS bedroom counts and one-level homes) - and keep only the ones
+    that mention what was asked. No AI runs here: a few thousand homes take well under a second,
+    and only the hits (at most 50, each a quoted line) go back to the chat, so a big question
+    can't run up a big AI bill or run past the chat's time limit."""
+    wordings = [w for ph in phrases if (w := _phrase_words(ph))]
+    floor_question = any(_FLOOR_WORDS.search(ph) and _BED_WORDS.search(ph) for ph in phrases)
+    matches, one_level, no_text, checked = [], [], 0, 0
+    for p in homes:
+        if limits.get("min_price") and (p.price or 0) < limits["min_price"]:
+            continue
+        if limits.get("max_price") and (p.price is None or p.price > limits["max_price"]):
+            continue
+        if limits.get("min_beds") and (p.bedrooms or 0) < limits["min_beds"]:
+            continue
+        if limits.get("min_baths") and (p.bathrooms or 0) < limits["min_baths"]:
+            continue
+        checked += 1
+        found = []
+        desc = p.description or ""
+        if not desc.strip():
+            no_text += 1
+        feats = _feature_strings(p)
+        for words in wordings:
+            span = _phrase_span(desc, words)
+            if span:
+                quote = _snippet(desc, *span)
+                if quote and all(quote not in f for f in found):
+                    found.append(f"Description: \"{quote}\"")
+            else:
+                hit = next((f for f in feats if _phrase_span(f, words)), None)
+                if hit and f"MLS feature list: {hit}" not in found:
+                    found.append(f"MLS feature list: {hit}")
+            if len(found) >= 2:
+                break
+        is_one_level = False
+        if floor_question:
+            fact, is_one_level = _floor_facts(p)
+            if fact and fact not in found:
+                found.append(fact)
+        if found:
+            matches.append({**_property_summary(p), "found": found})
+        elif is_one_level:
+            one_level.append({**_property_summary(p), "found": ["MLS: one-level home (every bedroom is on its one floor - for a condo, check which floor the unit is on)"]})
+    # Quoted in the description first - the clearest proof - then the MLS-only matches.
+    matches.sort(key=lambda m: 0 if any(f.startswith("Description") for f in m["found"]) else 1)
+    out = {
+        "homes_checked": checked,
+        "looked_for": phrases,
+        "match_count": len(matches),
+        "matches": matches[:50],
+        "homes_with_no_description": no_text,
+        "note": ("Checked: each home's listing description and every MLS feature list" + (" plus the MLS bedroom counts" if floor_question else "")
+                 + ". Reply in this shape so nothing is cut off: (1) the strongest matches - the description says it - one short line each "
+                 "(address, town, price, beds, and the words from 'found' inside quote marks EXACTLY as written - never reworded inside quote marks), at most 10; (2) every other match as ONE line of addresses only, grouped by "
+                 "why (MLS feature list / MLS bedroom counts)" + ("; (3) one-level homes as a count plus up to 5 addresses" if floor_question else "")
+                 + "; then one line: a home that isn't listed only didn't mention it. Never write a line and take it back; any count you give must match the homes you list. Use judgment on each "
+                 "quote: 'could add a bedroom', 'no pool', a lower-level in-law suite or a builder's other floor plans aren't a real match - leave them out."),
+    }
+    if floor_question:
+        out["one_level_homes"] = one_level[:30]
+        out["one_level_count"] = len(one_level)
+    if len(matches) > 50:
+        out["more_matches_not_shown"] = len(matches) - 50
+    return out
+
+
+async def _search_showcase_homes(db: AsyncSession, current_user: User, args: dict, config: dict) -> dict:
+    lead_id = (args.get("lead_id") or "").strip()
+    phrases, limits = _scan_args(args)
+    if not lead_id:
+        return {"error": "not_found", "message": "No lead_id provided."}
+    if not phrases:
+        return {"error": "missing", "message": "Say what to look for, in a few different wordings."}
+    lead, collection = await _find_lead_collection(db, current_user, lead_id)
+    if not lead:
+        return {"error": "not_found", "message": "No lead found with that id."}
+    if not collection:
+        return {"has_showcase": False, "message": "This lead doesn't have a Showcase yet."}
+    homes = list(collection.properties or [])
+    out = _scan_homes(homes, phrases, limits)
+    return {"has_showcase": True, "collection_id": collection.id, "showcase_home_count": len(homes), **out}
+
+
+# "Find homes for sale in Exton with a first-floor primary bedroom" (owner, 11/08). Same reader as
+# above over the homes for sale in one town or zip. At most _TOWN_SCAN homes are read (newest
+# first) - a town bigger than that (Philadelphia has ~15,000 for sale) says so and asks for a price,
+# beds or a zip code to narrow it.
+_TOWN_SCAN = 2000
+_FOR_SALE = ("ACTIVE-BRIGHT", "COMING SOON-BRIGHT", "ACTIVE", "COMING SOON")
+
+
+async def _search_homes_for_sale(db: AsyncSession, current_user: User, args: dict, config: dict) -> dict:
+    from app.utils.auth import tier_has_mls
+    if not tier_has_mls(current_user.plan_tier):
+        return dict(_NO_MLS_RESULT)
+    # "Exton PA", "Exton, Pennsylvania" -> Exton; a township ("West Whiteland") counts too.
+    place = re.sub(r",?\s+(pa|pennsylvania|nj|new jersey|de|delaware|md|maryland|va|virginia|dc|wv|ny)\.?$", "",
+                   (args.get("town") or "").strip(), flags=re.I).strip(" ,")
+    phrases, limits = _scan_args(args)
+    if not place:
+        return {"error": "missing", "message": "Say which town or zip code."}
+    if not phrases:
+        return {"error": "missing", "message": "Say what to look for, in a few different wordings."}
+    is_zip = bool(re.fullmatch(r"\d{5}", place))
+    where = [Property.home_status.in_(_FOR_SALE),
+             Property.zipcode.like(f"{place}%") if is_zip else or_(Property.city.ilike(_esc(place)), Property.township.ilike(_esc(place)))]
+    lease = Property.raw_mls_data["PropertyType"].astext
+    where.append(or_(lease.is_(None), ~lease.ilike("%lease%")))
+    if limits.get("min_price"):
+        where.append(Property.price >= limits["min_price"])
+    if limits.get("max_price"):
+        where.append(Property.price <= limits["max_price"])
+    if limits.get("min_beds"):
+        where.append(Property.bedrooms >= limits["min_beds"])
+    if limits.get("min_baths"):
+        where.append(Property.bathrooms >= limits["min_baths"])
+    total = (await db.execute(select(func.count()).select_from(Property).where(*where))).scalar() or 0
+    if not total:
+        return {"town": place, "homes_for_sale": 0, "matches": [], "match_count": 0,
+                "note": "No homes for sale found under that town name or zip in the MLS data - check the spelling, or try the zip code "
+                        "or the post-office town name the MLS uses (Exton, not West Whiteland)."}
+    homes = list((await db.execute(select(Property).where(*where).order_by(Property.mls_list_date.desc().nullslast()).limit(_TOWN_SCAN))).scalars())
+    out = _scan_homes(homes, phrases, {})
+    out = {"town": place, "homes_for_sale": total, **out}
+    if total > _TOWN_SCAN:
+        out["only_newest_checked"] = (f"{place} has {total:,} homes for sale that fit; the {_TOWN_SCAN:,} newest were checked. Say so, and offer "
+                                      "to check them all if they add a price range, beds or a zip code.")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # CMAs
 # ---------------------------------------------------------------------------
@@ -648,7 +877,9 @@ async def _look_up_agent(db: AsyncSession, current_user: User, args: dict, confi
 TOOL_DEFINITIONS = [
     {
         "name": "look_up_agent",
-        "description": "Look up ANOTHER agent by name in the MLS records: their office, email/phone, how many homes they sold in the last 12 months (as listing agent and as buyer's agent, with volume), recent sales, and their listings for sale now (optionally in a price range). Use it for 'how many homes has X sold', 'what is X listing', 'whose listing is this', finding a listing to ask to host an open house at.",
+        "description": "Look up ANOTHER agent by name in the MLS records: their office, email/phone, how many homes they sold in the last 12 months (as listing agent and as buyer's agent, with volume), recent sales, and their listings for sale now (optionally in a price range). Use it for 'how many homes has X sold', 'what is X listing', 'whose listing is this', finding a listing to ask to host an open house at. "
+                       "A name that could be one of the agent's own leads or clients ('Stella's homes', 'homes for Nicole') is NOT another agent - "
+                       "check search_leads first; their homes are their Showcase (search_showcase_homes / get_property_matches).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -754,6 +985,44 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "search_showcase_homes",
+        "description": "Check EVERY home in one of the agent's leads' Showcase at once for something - a first-floor bedroom, a pool, a "
+                       "finished basement, a garage, 'needs work' - by searching each home's listing description and MLS feature list (and, "
+                       "for a first-floor / main-level bedroom, the MLS room counts and one-level homes). Use this for any 'which homes in "
+                       "<lead>'s Showcase / <lead>'s homes / <lead>'s matches have / mention ...' question - never open the homes one by one with get_property_detail. "
+                       "Pass several wordings in look_for, the way a listing might say it.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "lead_id": {"type": "string"},
+                "look_for": {"type": "array", "items": {"type": "string"}, "description": "3-8 wordings, e.g. for a first-floor bedroom: "
+                             "['first floor bedroom', '1st floor bedroom', 'main level bedroom', 'main floor primary', 'first floor suite', "
+                             "'entry level bedroom', 'in-law suite']."},
+                "min_price": {"type": "number"}, "max_price": {"type": "number"},
+                "min_beds": {"type": "number"}, "min_baths": {"type": "number"},
+            },
+            "required": ["lead_id", "look_for"],
+        },
+    },
+    {
+        "name": "search_homes_for_sale",
+        "description": "Find homes FOR SALE in one town or zip code whose listing mentions something - a first-floor primary bedroom, a pool, "
+                       "a finished basement, a 3-car garage, an in-law suite, 'needs work', a view - by reading every home's listing "
+                       "description and MLS feature lists (and, for a first-floor / main-level bedroom, the MLS bedroom counts and "
+                       "one-level homes). One call checks the whole town; never open homes one by one with get_property_detail for this. "
+                       "Pass several wordings in look_for. Price / beds / baths narrow it. For several towns, call it once per town (at most 3).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "town": {"type": "string", "description": "ONE town as the MLS names it ('Exton', 'Wayne') or a 5-digit zip code."},
+                "look_for": {"type": "array", "items": {"type": "string"}, "description": "3-8 wordings, the way a listing might say it."},
+                "min_price": {"type": "number"}, "max_price": {"type": "number"},
+                "min_beds": {"type": "number"}, "min_baths": {"type": "number"},
+            },
+            "required": ["town", "look_for"],
+        },
+    },
+    {
         "name": "get_similar_properties",
         "description": "Get the Similar Properties saved for one of the agent's own open houses.",
         "input_schema": {
@@ -799,6 +1068,8 @@ _DISPATCH: Dict[str, Callable] = {
     "find_open_house_guests": _find_open_house_guests,
     "get_property_matches": _get_property_matches,
     "get_showcase_info": _get_showcase_info,
+    "search_showcase_homes": _search_showcase_homes,
+    "search_homes_for_sale": _search_homes_for_sale,
     "get_similar_properties": _get_similar_properties,
     "get_cma_summary": _get_cma_summary,
     "get_agent_activity_summary": _get_agent_activity_summary,
@@ -815,7 +1086,7 @@ _FORBIDDEN_ARG_KEYS = {"owner_id", "user_id", "agent_id", "current_user_id"}
 
 # MLS listing lookups follow the app's own require_mls_access: a No-MLS plan never gets Bright
 # data through the helper either (owner, 10/30 - the helper opened to every plan).
-_MLS_TOOLS = {"search_properties", "get_property_detail", "get_similar_properties"}
+_MLS_TOOLS = {"search_properties", "get_property_detail", "get_similar_properties", "search_homes_for_sale"}
 
 
 def _allowed(current_user: User, tool_name: str) -> bool:

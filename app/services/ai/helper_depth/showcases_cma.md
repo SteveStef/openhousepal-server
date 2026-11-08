@@ -42,6 +42,8 @@ Showcases and CMA in depth: every Showcase search option, match score, compare h
 - **Share** (copies the link; asks to "Turn on the link and share it" if it's off), **Edit Search**, **View tours**, **Turn Off / Turn On**.
 - Email switches: **Emails to the client** and **Emails to me** (shown as Visitor / Agent on a computer). "This visitor unsubscribed from update emails" if they did.
 - **Select** mode: **Recommend** ("I recommend this home for you" tag; brings a passed home back), **Love** / **Pass** (recorded as if the client did it), **To Sold/Removed** (off-market homes only), **Remove** (the search won't add it back), **Send**.
+- A home's details window (tap the card) has the same tools as its card, so you never close it to act: **Recommend** with a small **Love** / **Pass** beside it, **Send** (the Send window opens over it; green **Sent** once sent), **Tours** when someone asked to tour it, and **Directions**. On a phone, once you scroll, the bottom bar has Recommend, Love, Pass, Send and Messages.
+- **Tidy up** (beside the Showcase's name, only when homes sold or came off the market): moves every sold / under contract / off-market home into Sold/Removed in one go - except ones the client loved, commented on or asked to tour, which stay for you to move by hand with the card's **Move to Sold/Removed**. It shows how many move and how many stay before anything happens.
 - **Send**: by Text (opens Messages) or Email (pick Gmail, Outlook or your default mail app), with the home links into their Showcase. **Attach a short message?** - **Save as my message** saves it for every Showcase. The Showcase link must be on first.
 - Add one home from any home's page: **Add to a Showcase** → pick the client. It's marked Recommended, stays even if it doesn't match, and counts as new for them.
 
@@ -67,6 +69,11 @@ Showcases and CMA in depth: every Showcase search option, match score, compare h
 - **Comments**: clients comment on homes; you get an alert follow-up. **Reply to Comment** - your reply is emailed to the client.
 - **Likes** (the client's favorites): show in the Liked tab; you get one "Liked homes" email per hour of activity and a next-morning follow-up naming the homes.
 - What the client sees: Matches / Liked / Disliked / Sold/Removed, a heart, pass, comments, tour requests, **Change your search**, an **Emails** switch, and "Your Upcoming Tours". When you open their link: "Your clicks here don't count as theirs."
+
+## Checking every home for one thing (in the helper chat)
+- Ask "which homes in <lead>'s Showcase have a first-floor bedroom" (or a pool, a finished basement, a garage...) and the chat reads every home in the Showcase at once - the listing description and the MLS feature list - and lists the ones that mention it, quoting the line.
+- For a first-floor / main-level bedroom it also uses the MLS "Entry Level Bedroom" feature and the MLS room counts (bedrooms upstairs vs in total), and lists one-level homes separately (for a condo, check which floor the unit is on).
+- A home that isn't listed only didn't mention it - it may still have it. Nothing in the Showcase changes.
 
 ## Can't do
 - **Delete Showcase** is permanent (homes, likes, comments, search; the client stays in Leads; open follow-ups about it may be removed - the window lists them). Use **Turn Off** to pause.

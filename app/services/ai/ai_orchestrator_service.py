@@ -128,7 +128,7 @@ def _extract_result_refs(tool_name: str, result: Any) -> List[dict]:
     collection_id = result.get("collection_id")
     if collection_id:
         refs.append({"tool": tool_name, "record_type": "showcase", "record_id": collection_id})
-    for item in (result.get("results") or [])[:3]:
+    for item in ((result.get("results") or result.get("matches")) or [])[:3]:
         if isinstance(item, dict) and item.get("listing_key"):
             refs.append({"tool": tool_name, "record_type": "property", "record_id": item["listing_key"]})
     if tool_name == "get_priority_summary":
@@ -172,7 +172,7 @@ _STEP_WORDS = {
     "find_open_house_guests": "Searching your open house guests", "get_open_house_guests": "Reading the sign-in list",
     "search_open_houses": "Looking through your open houses", "search_leads": "Searching your leads", "get_lead_detail": "Opening their lead",
     "search_properties": "Searching the MLS", "get_property_detail": "Reading the listing", "look_up_agent": "Looking up that agent",
-    "get_property_matches": "Matching homes", "get_showcase_info": "Opening the Showcase", "get_similar_properties": "Finding similar homes",
+    "get_property_matches": "Matching homes", "get_showcase_info": "Opening the Showcase", "search_showcase_homes": "Reading every home in the Showcase", "search_homes_for_sale": "Reading every listing in town", "get_similar_properties": "Finding similar homes",
     "get_cma_summary": "Reading the CMA", "get_agent_activity_summary": "Reading your activity", "get_priority_summary": "Checking what needs you",
     "show_homes": "Pulling up the homes",
 }
@@ -302,9 +302,12 @@ async def run_turn(
         ]
         if voice_mode:
             system_blocks.append(VOICE_MODE_BLOCK)
+        # A whole-Showcase check answers with a list of homes - room for it, or the reply stopped
+        # mid-address (11/08, 100 homes). Only after that tool ran, and only in voice-free replies.
+        long_list = not voice_mode and any(n in usage_state["tool_names"] for n in ("search_showcase_homes", "search_homes_for_sale"))
         return await client.messages.create(
             model=config["model"],
-            max_tokens=config["max_output_tokens"],
+            max_tokens=config["max_output_tokens"] * (2 if long_list else 1),
             system=system_blocks,
             tools=tools,
             messages=messages,
@@ -436,7 +439,7 @@ async def run_turn(
         text = await asyncio.wait_for(_run(), timeout=config["request_timeout_seconds"])
     except asyncio.TimeoutError:
         raise AIOrchestratorError(
-            "timeout", "That request took too long to process. Please try a simpler question.", usage=usage_state
+            "timeout", "That took longer than one answer is allowed. Try asking about fewer things at once, or one lead or home at a time.", usage=usage_state
         ) from None
     except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:
         logger.error("Anthropic API error: %s", e)

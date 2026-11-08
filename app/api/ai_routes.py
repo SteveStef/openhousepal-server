@@ -170,8 +170,13 @@ async def _build_history(db: AsyncSession, conversation: AIConversation, max_mes
     # Each reply's card note goes at the start of the message after it (the newest one's comes back
     # as `trailing`, for the message being sent now).
     history, note = [], ""
-    for m in messages:
+    for i, m in enumerate(messages):
         if m.role == "user":
+            # A question that never got an answer (that turn failed - ran out of time, the AI was
+            # down) is left out: replayed, the chat tried that same big job again on every later
+            # message and failed again, so the whole chat seemed broken (owner, 11/08).
+            if i + 1 >= len(messages) or messages[i + 1].role == "user":
+                continue
             history.append({"role": "user", "content": note + m.content}); note = ""
         else:
             history.append({"role": m.role, "content": m.content}); note = _card_note(m)
@@ -479,6 +484,7 @@ async def send_ai_message(
         db.add(user_msg)
         await db.commit()
         await db.refresh(user_msg)
+        user_msg_id = user_msg.id
 
         try:
             text, refs, usage = await run_turn(db, current_user, history, card_note + message_text, voice_mode=payload.voice_mode,
@@ -506,7 +512,20 @@ async def send_ai_message(
             # erroring out - true up the reservation with whatever it actually cost, never a
             # blind full refund, so the global/emergency counters stay accurate either way.
             await reconcile_budget(db, reservation, spent or 0.0)
-            raise HTTPException(status_code=503, detail=e.user_message)
+            # The question goes back in their typing box (the chat takes it off the screen), so it
+            # isn't kept either - an unanswered question left in the chat was replayed into every
+            # later message, and they failed too (owner, 11/08). _build_history skips any older ones.
+            try:
+                from sqlalchemy import delete as _delete
+                await db.execute(_delete(AIMessage).where(AIMessage.id == user_msg_id))
+                await db.commit()
+            except Exception:  # noqa: BLE001
+                await db.rollback()
+            # Ran out of time = the question was too big for one turn, not something broken on our
+            # side: 504 keeps its own words. A 503 is swapped for "isn't available right now - we've
+            # been notified" (main.provider_failure_handler), which told the owner (11/08) the
+            # assistant was down when it had only run long.
+            raise HTTPException(status_code=504 if e.reason == "timeout" else 503, detail=e.user_message)
 
         await _replace_open_form_cards(db, conversation.id, refs)
         assistant_msg = AIMessage(conversation_id=conversation.id, role="assistant", content=text, tool_calls=refs or None)

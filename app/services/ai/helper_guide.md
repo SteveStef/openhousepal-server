@@ -79,10 +79,11 @@ The bell and the light/dark switch sit next to the menu button.
   - Leads & follow-ups: find a lead or an open house guest, add or change follow-ups and their rules, star, move or mark leads.
   - Open houses: build an Open House Kit, switch a kit's guest Showcases / Similar Homes / Guest Pass / follow-ups, refresh Similar Homes, add a private note, a note on a guest, share the guest list with the listing agent, mark a disclosure sent or a second visit scheduled.
   - Hosting: set the Discovery search (any address as the center, like their home), find homes to host, ask to host, withdraw, offer another time, answer a team ask or a listing agent's request.
-  - Showcases: make one, change its search, add a home, re-send the invite, confirm a tour, reply to a comment.
+  - Showcases: make one, change its search, add a home, re-send the invite, confirm a tour, reply to a comment. It can also read every home in a lead's Showcase at once and say which ones mention something ("which homes in Nicole's Showcase have a first-floor bedroom / a pool / a finished basement"), quoting the listing - plus, for a first-floor bedroom, the MLS "Entry Level Bedroom" feature, the MLS room counts and one-level homes.
   - Studio: designs (with Download), Listing Spotlights (look, color, main photo, header, story, sections, 3D tour, publish), CMAs (AI or manual, MLS homes or any address, condition, report look and sections), blog posts (write with look, color, category, cover and where it shows; publish, schedule, stats), AI media (twilight, lights on, virtual staging, enhance, AI video), forms (make, copy, tracking links, read answers, mark reviewed), invites (wording, days, place, cover, design, color, animation, RSVP questions; send to leads, remind, who's coming, close RSVPs, copy).
   - Your brand & account: Branding (look, colors, logos, headshot, fonts, disclaimer, QR center), email signature switches, email settings and the daily briefing, profile, towns, review settings, website on/off, calendar status and resync, CRM status and a test lead, Help tickets (open, read the reply, answer), account setup steps.
   - Look-ups: your listings and sales as home cards, other agents' sales and listings, MLS homes, stats for your forms, blog and Agent Hub, your plan and AI usage.
+  - Homes for sale with a feature (MLS plans): "find homes for sale in Exton with a first-floor primary bedroom / a pool / a finished basement" reads every listing for sale in that town, township or zip code (price and beds narrow it) and lists the ones whose description or MLS features mention it. A very big town (Philadelphia) checks the newest 2,000 and asks for a price, beds or zip code to check the rest.
 - Other agents: ask "how many homes has <agent> sold" or "what is <agent> listing around $2M" - the helper looks them up in the MLS records (office, contact, sales in the last 12 months on both sides, listings for sale now) and can set up a request to host an open house at one.
 - Sign-in: **Remember me** (ticked by default) keeps you signed in for 30 days, renewed each day you use the app; untick it on a shared computer (1 day).
 
@@ -808,7 +809,7 @@ Click a lead to open it. You'll see:
 ### Per-lead alert switches
 In a lead's Follow-ups section tap **Alert settings** ("Just for the client"). Only this person changes - other leads aren't affected.
 - **Put the client's follow-ups on my calendar** - on: each follow-up shows on your calendar with an alert. Turning it off asks **"Still want the client's follow-ups in OpenHousePal?"**: **Yes, keep them here** (they stay on the Follow-ups page and Dash, just not your calendar) or **No, stop them** (no new follow-ups for this person).
-- **Email me when the client likes or comments** - off means you'll still see it in their activity, you just won't get the email.
+- **Email me when the client likes or comments** - off means you'll still see it in their activity, you just won't get the email. It only shows for someone who has a Showcase (a guest with their own agent has none).
 
 The same switches also appear on the "Mark as done" page that opens from a calendar alert.
 
