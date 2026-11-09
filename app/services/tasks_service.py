@@ -1437,7 +1437,14 @@ def _pick_standout(payload: dict) -> tuple[int, Optional[dict], Optional[int], O
     # Only a home that's actually new gets pitched by name - "the one I'd look at first ... it's
     # been on the market 200 days" sells nothing. Nothing listed in the last 3 weeks -> no home is
     # named at all; the message just gives the count and the link.
-    candidates = [p for p in candidates if dom(p) is not None and dom(p) <= PITCH_FRESH_DAYS]
+    smart_only = bool(candidates) and all(_is_smart(p) for p in candidates)
+    fresh = [p for p in candidates if dom(p) is not None and dom(p) <= PITCH_FRESH_DAYS]
+    if not fresh and smart_only:
+        # Must-haves on (owner, 11/09): a home that has them is worth naming even if it isn't new - the
+        # one listed most recently, with no "hit the market" line (days = None).
+        best = min(candidates, key=lambda p: dom(p) if dom(p) is not None else 10**6)
+        return len(shown), best, None, None
+    candidates = fresh
     if not candidates:
         return len(shown), None, None, None
 
@@ -1499,13 +1506,28 @@ def _must_parts(count: int, best: Optional[dict], smart: Optional[dict]) -> dict
     if not smart or not count or not smart.get("n") or not smart.get("wants"):
         return {}
     n = min(int(smart["n"]), count)
-    what = _and_words([w[:1].lower() + w[1:] for w in smart["wants"]])
-    if n == count:
-        line = f"It has the {what} you wanted." if count == 1 else f"All {n} have the {what} you wanted."
-    elif n == 1:
-        line = f"One of them has the {what} you wanted."
+    wants = [str(w) for w in smart["wants"]]
+    phrases = smart.get("phrases") or {}
+    one = [(phrases.get(w) or {}).get("one") for w in wants]
+    many = [(phrases.get(w) or {}).get("many") for w in wants]
+    from app.services.showcase_smart_filter import join_clauses
+    if all(one) and all(many):
+        # The tidied words (showcase_smart_filter.tidy_wants): "2 of them are on a cul-de-sac and have a pool."
+        if n == count:
+            line = f"It {join_clauses(one)}." if count == 1 else f"All {n} {join_clauses(many)}."
+        elif n == 1:
+            line = f"One of them {join_clauses(one)}."
+        else:
+            line = f"{n} of them {join_clauses(many)}."
     else:
-        line = f"{n} of them have the {what} you wanted."
+        # No tidy words (older must-haves, or the tidy-up failed): a form that reads right whatever was typed.
+        what = _and_words([w[:1].lower() + w[1:] for w in wants])
+        if n == count:
+            line = f"It matches what you asked for: {what}." if count == 1 else f"All {n} match what you asked for: {what}."
+        elif n == 1:
+            line = f"One of them matches what you asked for: {what}."
+        else:
+            line = f"{n} of them match what you asked for: {what}."
     tail = ""
     if best is not None and _is_smart(best) and n < count:
         tail = ", the one that has it" if n == 1 else ", one of those"
@@ -1549,6 +1571,10 @@ def pick_for_followup(candidates: list, created_at: Optional[datetime], now: Opt
         return best["home"], best["dom"]
     # Otherwise the pick as it was that day: fresh THEN (<= 3 weeks on market), best match, newest on a tie.
     fresh = [c for c in candidates if c["dom"] - age <= PITCH_FRESH_DAYS]
+    if not fresh and all(c.get("smart") for c in candidates):
+        # a must-have home is named even when none is new - the most recent of them, no day count
+        best = min(candidates, key=lambda c: c["dom"])
+        return best["home"], None
     if not fresh:
         return None, None
     if any(c["score"] is not None for c in fresh):
@@ -1620,6 +1646,8 @@ async def lead_showcase_info(db: AsyncSession, owner: User, leads: list) -> dict
     from app.services.collections_service import CollectionsService
     from app.utils.auth import SHOWCASE_ACCESS_TIERS, owner_has_access
     by_id = {l.id: l for l in leads if l is not None and getattr(l, "represented", None) != "yes"}
+    # read up front: a short link made on the way (showcase_path) commits, which can expire these objects
+    first_of = {lid: _first(l.name) for lid, l in by_id.items()}
     if not by_id or not owner_has_access(owner, SHOWCASE_ACCESS_TIERS):
         return {}
     rows = (await db.execute(
@@ -1664,6 +1692,11 @@ async def lead_showcase_info(db: AsyncSession, owner: User, leads: list) -> dict
                 cands = None
             try:
                 smart = smart_summary(payload)
+                if smart:
+                    # the tidied sentence words for its must-haves (showcase_smart_filter.tidy_wants)
+                    ph = (await db.execute(select(CollectionPreferences.ai_wants).where(
+                        CollectionPreferences.collection_id == col_of.get(token)))).scalar()
+                    smart["phrases"] = (ph or {}).get("phrases") or {} if isinstance(ph, dict) else {}
             except Exception:  # noqa: BLE001
                 smart = None
             cache[token] = (*_pick_standout(payload), cands, smart)
@@ -1671,7 +1704,7 @@ async def lead_showcase_info(db: AsyncSession, owner: User, leads: list) -> dict
         from app.services.showcase_links import showcase_path
         url = clean_url(f"{base}{await showcase_path(share_token=token, db=db) or f'/showcase/{token}'}")
         out[lead_id] = {"url": url, "count": count, "parts": _pitch_parts(count, best, days, url, smart), "smart": smart,
-                        "first_name": _first(by_id[lead_id].name), "candidates": cands,
+                        "first_name": first_of.get(lead_id, ""), "candidates": cands,
                         "tailored": col_of.get(token) in tailored}
     return out
 
@@ -1697,6 +1730,52 @@ def checkin_message(lead_name: Optional[str], owner: Optional[User], showcase_ur
     return f"{text}\n\n{clean_url(showcase_url)}" if showcase_url else text
 
 
+# ---- time words that stay right (owner, 11/09): a written message says WHEN the open house was as a
+# slot - {oh_when:2026-10-19} - filled in the day the message is shown, so a follow-up that rolls over
+# as overdue never says "yesterday" about last week. (followup_writer writes these.)
+_WHEN_SLOT = re.compile(r"\{oh_when:(\d{4}-\d{2}-\d{2})\}")
+_DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+
+def when_words(day, today) -> str:
+    """'today' / 'yesterday' / 'this past Sunday' / 'last weekend' / 'a couple of weeks ago' / 'a few weeks
+    ago' / 'about a month ago' / 'a couple of months ago' / 'a while back' - fits after "my open house at X"."""
+    n = (today - day).days
+    if n <= 0:
+        return "today"
+    if n == 1:
+        return "yesterday"
+    if n <= 6:
+        return f"this past {_DAY_NAMES[day.weekday()]}"
+    # never "last weekend" past this point: 12 days after a Sunday, "last weekend" means the one in between
+    if n <= 9:
+        return "about a week ago"
+    if n <= 20:
+        return "a couple of weeks ago"
+    if n <= 34:
+        return "a few weeks ago"
+    if n <= 59:
+        return "about a month ago"
+    if n <= 120:
+        return "a couple of months ago"
+    return "a while back"
+
+
+def fill_when(text: Optional[str], now: Optional[datetime] = None) -> Optional[str]:
+    """Every {oh_when:YYYY-MM-DD} slot -> its words for today (Eastern)."""
+    if not text or "{oh_when:" not in text:
+        return text
+    from datetime import date as _date
+    today = (now or datetime.now(timezone.utc)).astimezone(EASTERN).date()
+
+    def repl(m):
+        try:
+            return when_words(_date.fromisoformat(m.group(1)), today)
+        except ValueError:
+            return "recently"
+    return _WHEN_SLOT.sub(repl, text)
+
+
 def full_message(task: AgentTask, showcase: Optional[dict], owner: Optional[User] = None,
                  lead_name: Optional[str] = None) -> Optional[str]:
     """The suggested message, with this situation's Showcase pitch (link last) wherever the agent's
@@ -1704,7 +1783,7 @@ def full_message(task: AgentTask, showcase: Optional[dict], owner: Optional[User
     situation isn't one that makes a Showcase. Older follow-ups made before templates had no
     marker: the pitch is appended at the end for those. A text follow-up with no message gets
     checkin_message when the caller passes the person's name."""
-    msg = task.suggested_message or ""
+    msg = fill_when(task.suggested_message) or ""   # "this past Sunday" -> whatever is right today
     if not msg and lead_name is not None and task.kind == "text" and task.completed_at is None:
         return checkin_message(lead_name, owner, (showcase or {}).get("url"))
     if not msg:

@@ -909,7 +909,7 @@ async def create_collection_with_preferences(
                 from app.utils.auth import tier_has_mls
                 if tier_has_mls(current_user.plan_tier) or current_user.is_admin:
                     from app.services.showcase_smart_filter import save_wants
-                    await save_wants(db, collection.id, request.ai_wants)
+                    await save_wants(db, collection.id, request.ai_wants, user=current_user)
 
             if request.email_client:
                 from app.services.showcase_digest_service import queue_showcase_ready
@@ -1991,7 +1991,7 @@ async def save_smart_filter(collection_id: str, body: SmartFilterUpdate, db: Asy
         if n > READ_CAP and not same:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                                 detail=f"This Showcase has {n} homes - the AI reads every one, so narrow the search to {READ_CAP} or fewer before adding must-haves.")
-    st = await save_wants(db, collection_id, wants)
+    st = await save_wants(db, collection_id, wants, user=current_user)
     return {"success": True, "smart_filter": st}
 
 

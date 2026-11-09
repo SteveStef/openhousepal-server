@@ -61,6 +61,8 @@ class TaskOut(BaseModel):
     completed_at: Optional[datetime] = None
     auto_source: Optional[str] = None
     suggested_message: Optional[str] = None
+    # a message of its own is saved (vs the default check-in written on the fly) - "Write it for me" offers on the rest
+    has_message: Optional[bool] = None
     # One line on why this follow-up exists ("Signed in at your open house - 12 Oak St")
     context: Optional[str] = None
     lead_id: Optional[str] = None

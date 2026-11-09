@@ -211,9 +211,26 @@ def card_new_since(collection: Collection) -> datetime:
     return _utc(collection.last_agent_dismissed_at or collection.created_at)
 
 
-async def _ai_starred_ids(db, collection_id: str) -> set:
-    """Homes the Showcase's must-haves reader starred (not the agent by hand) - showcase_smart_filter."""
-    v = (await db.execute(text("select ai_wants->'ai_starred' from collection_preferences where collection_id = :c"), {"c": collection_id})).scalar()
+async def _ai_starred_ids(db, collection_id: str, smart_lookup: dict | None = None) -> set:
+    """Homes the Showcase's must-haves reader starred (not the agent by hand) - showcase_smart_filter. Also gives
+    each home's gold line its sentence words ("say": "be on a cul-de-sac and have a pool") from the tidied
+    must-haves - none when a must-have has no tidy words (the card then lists them plainly)."""
+    from app.services.showcase_smart_filter import join_clauses
+    st = (await db.execute(text("select ai_wants from collection_preferences where collection_id = :c"), {"c": collection_id})).scalar()
+    st = st if isinstance(st, dict) else {}
+    phrases = st.get("phrases") if isinstance(st.get("phrases"), dict) else {}
+    for line in (smart_lookup or {}).values():
+        if line and line.get("wants"):
+            its = [(phrases.get(w) or {}).get("it") for w in line["wants"]]
+            if all(its):
+                line["say"] = join_clauses(its)
+            # the Send sheet's "Mention the must-haves" line: "This one is on a cul-de-sac." / "All 3 are ..."
+            ones = [(phrases.get(w) or {}).get("one") for w in line["wants"]]
+            manys = [(phrases.get(w) or {}).get("many") for w in line["wants"]]
+            if all(ones) and all(manys):
+                line["one"] = join_clauses(ones)
+                line["many"] = join_clauses(manys)
+    v = st.get("ai_starred")
     return set(v) if isinstance(v, dict) else set()
 
 
@@ -1652,7 +1669,7 @@ class CollectionsService:
                     filed_at_lookup[row.property_id] = row.sold_filed_at
                     smart_lookup[row.property_id] = smart_line(row.ai_match)
             sold_folder, back_on_market = sold_folder_split(collection.properties, filed_at_lookup)
-            ai_starred_ids = await _ai_starred_ids(db, collection.id)
+            ai_starred_ids = await _ai_starred_ids(db, collection.id, smart_lookup)
 
             # Calculate "new" threshold (properties added in last 7 days)
             now = datetime.now(timezone.utc)
@@ -2172,7 +2189,7 @@ class CollectionsService:
                 filed_at_lookup[row.property_id] = row.sold_filed_at
                 smart_lookup[row.property_id] = smart_line(row.ai_match)
             sold_folder, back_on_market = sold_folder_split(collection.properties, filed_at_lookup)
-            ai_starred_ids = await _ai_starred_ids(db, collection.id)
+            ai_starred_ids = await _ai_starred_ids(db, collection.id, smart_lookup)
 
             # Calculate "new" threshold (properties added in last 7 days)
             now = datetime.now(timezone.utc)

@@ -120,6 +120,7 @@ async def list_tasks(
                 t.showcase_url = sc["url"]
             # The copy button sends the whole thing: the reply with the Showcase pitch (link last)
             # where the agent's template puts it - or the {showcase} marker removed if there's none.
+            t.has_message = bool((by_id[t.id].suggested_message or "").strip())
             t.suggested_message = tasks_service.full_message(by_id[t.id], sc, current_user, lead_name=by_id[t.id].lead.name if by_id[t.id].lead is not None else None)
             if not t.completed_at and by_id[t.id].auto_source:
                 try:
@@ -558,6 +559,58 @@ async def public_followup_undo(code: str, request: Request, db: AsyncSession = D
         await db.commit()
         calendar_sync_service.sync_task_bg(task.owner_id, task.id)  # puts it back
     return await _view(db, task, await _others_due(db, task))
+
+
+# ---- Write it for me (owner, 11/09): an AI-written check-in for one lead, on the agent's tap only ----
+from pydantic import BaseModel as _BM  # noqa: E402
+
+
+class WriteBody(_BM):
+    lead_id: str
+    goal: Optional[str] = None      # what the agent typed as the follow-up ("Check in about homes")
+    task_id: Optional[str] = None   # an existing follow-up: the message is saved onto it
+
+
+async def _ai_user(db: AsyncSession, user: User) -> User:
+    from app.services.ai.ai_helper_access import can_use_helper
+    if not await can_use_helper(db, user):
+        raise HTTPException(status_code=403, detail="Writing messages uses the AI helper, which isn't on for your account.")
+    return user
+
+
+@router.get("/checkins")
+async def list_checkins(lead_id: Optional[str] = Query(None), db: AsyncSession = Depends(get_db),
+                        current_user: User = Depends(get_current_active_user)):
+    """Leads with a check-in waiting (no AI - just who and why), and what one written message takes."""
+    from app.services import followup_writer
+    items = await followup_writer.checkins(db, current_user, lead_id=lead_id)
+    est = await followup_writer.estimate(db, current_user)
+    return {"items": items, "estimate": est}
+
+
+@router.post("/write")
+async def write_message(body: WriteBody, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    """The text this agent would send this lead, written from their open house, notes, Showcase and history.
+    With task_id it's saved onto that follow-up (signed like the automatic ones) and its calendar event redone."""
+    from app.services import followup_writer
+    await _ai_user(db, current_user)
+    lead = await db.get(Lead, body.lead_id)
+    if lead is None or lead.owner_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    task = None
+    if body.task_id:
+        task = await db.get(AgentTask, body.task_id)
+        if task is None or task.owner_id != current_user.id or task.lead_id != lead.id:
+            raise HTTPException(status_code=404, detail="Follow-up not found")
+    out = await followup_writer.write(db, current_user, lead, goal=body.goal or (task.title if task is not None else None))
+    if "error" in out:
+        raise HTTPException(status_code=409, detail=out["error"])
+    if task is not None:
+        task.suggested_message = tasks_service.with_footer(out["message"], current_user) or out["message"]
+        await db.commit()
+        calendar_sync_service.sync_task_bg(current_user.id, task.id)
+        out["saved"] = True
+    return out
 
 
 @router.get("/counts", response_model=TaskCounts)

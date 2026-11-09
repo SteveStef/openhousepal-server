@@ -48,6 +48,140 @@ def clean_wants(raw: Any) -> List[str]:
     return out[:MAX_WANTS]
 
 
+_TIDY_SYSTEM = (
+    "A real-estate agent typed things a buyer must have in a home (they may be misspelled or rough). For each one, in order, "
+    "return: label = the same thing, spelled right, short, first letter capital (e.g. 'col de sack' -> 'Cul-de-sac', "
+    "'no hoa' -> 'No HOA', 'near train' -> 'Near a train station'); many = words finishing '2 of them ...' (e.g. 'are on a "
+    "cul-de-sac', 'have a pool', 'have no HOA', 'are near a train station', 'have 9 ft+ ceilings', 'are on lots under 1 acre'); "
+    "one = the same for one home ('is on a cul-de-sac', 'has a pool', 'has no HOA', 'is on a lot under 1 acre'); it = words "
+    "finishing 'This home appears to ...' ('be on a cul-de-sac', 'have a pool', 'have no HOA', 'be on a lot under 1 acre'). "
+    "Each must read as natural, correct English in its sentence. Keep the meaning exactly - never add, soften or exaggerate. "
+    "Lowercase start for many/one/it, no ending period, no lead-in words. Answer with JSON only: "
+    "{\"items\":[{\"label\":\"...\",\"many\":\"...\",\"one\":\"...\",\"it\":\"...\"}]}"
+)
+
+
+def join_clauses(clauses: List[str]) -> str:
+    """'have no HOA', 'have a pool' -> 'have no HOA and a pool'; a verb said again right after itself is dropped."""
+    out = []
+    for i, c in enumerate(clauses):
+        prev = clauses[i - 1].split(" ", 1)[0] if i else None
+        first, _, rest = c.partition(" ")
+        out.append(rest if prev and first == prev and rest else c)
+    return out[0] if len(out) == 1 else ", ".join(out[:-1]) + " and " + out[-1]
+
+
+async def tidy_wants(db, user, wants: List[str], known: Optional[Dict[str, Any]] = None) -> tuple:
+    """(wants with the spelling fixed, {label: {many, one, it}}) - the words a follow-up text and a home card put
+    them in (owner, 11/09: "col de sack" must never reach a client like that). One small AI call for the ones it
+    hasn't seen; known = phrases already worked out. Any failure keeps the agent's words and no phrases - the
+    sentences then fall back to "match what you asked for: ..." (tasks_service._must_parts)."""
+    known = {k.lower(): (k, v) for k, v in (known or {}).items() if isinstance(v, dict)}
+    out_wants, phrases, todo = [], {}, []
+    for w in wants:
+        hit = known.get(w.lower())
+        if hit:
+            out_wants.append(hit[0]); phrases[hit[0]] = hit[1]
+        else:
+            out_wants.append(w); todo.append(w)
+    if not todo:
+        return out_wants, phrases
+    try:
+        from app.services.ai import ai_home_reader as reader
+        from app.services.ai.ai_config_service import ai_config_service
+        config = await ai_config_service.get_config(db)
+        resp = await asyncio.wait_for(reader._get_client().messages.create(
+            model=config["model"], max_tokens=600, system=_TIDY_SYSTEM,
+            messages=[{"role": "user", "content": "\n".join(f"{i + 1}. {w}" for i, w in enumerate(todo))}],
+            **ai_config_service.model_options(config["model"], "low")), timeout=12)
+        text_out = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+        m = re.search(r"\{.*\}", text_out, re.S)
+        items = (json.loads(m.group(0)).get("items") if m else None) or []
+        try:
+            from app.services.ai.ai_rate_limit_service import record_usage_event
+            usd = ai_config_service.estimate_cost_usd(config, config["model"], resp.usage.input_tokens, resp.usage.output_tokens)
+            await record_usage_event(db, user.id, None, config["model"], resp.usage.input_tokens, resp.usage.output_tokens, usd, 0, False, None,
+                                     tool_names=["showcase_smart_filter_tidy"])
+        except Exception:  # noqa: BLE001 - the words still count; the usage note is best-effort
+            logger.warning("smart filter tidy usage not recorded", exc_info=True)
+    except Exception:  # noqa: BLE001
+        logger.warning("smart filter tidy failed - keeping the agent's words", exc_info=True)
+        return out_wants, phrases
+
+    def ok_phrase(s) -> Optional[str]:
+        s = " ".join(str(s or "").split()).rstrip(".")
+        # it sometimes repeats the lead-in ("This home appears to have a pool") or starts with a capital
+        s = re.sub(r"^(this home appears to|this appears to|it appears to|2 of them|one of them|the home|they|it)\s+", "", s, flags=re.I)
+        first = s.split(" ", 1)[0] if s else ""
+        if first and not first.isupper():
+            s = s[:1].lower() + s[1:]
+        return s if 2 <= len(s) <= 80 and s[0].islower() and not re.search(r"[{}<>\[\]]", s) else None
+
+    for w, it in zip(todo, items if isinstance(items, list) else []):
+        if not isinstance(it, dict):
+            continue
+        label = " ".join(str(it.get("label") or "").split()).strip(" .")[:MAX_WANT_CHARS]
+        p = {k: ok_phrase(it.get(k)) for k in ("many", "one", "it")}
+        if not label or re.search(r"[{}<>\[\]]", label):
+            label = w
+        label = label[:1].upper() + label[1:]
+        i = out_wants.index(w)
+        if any(x.lower() == label.lower() for j, x in enumerate(out_wants) if j != i):
+            continue   # two wants turned into the same thing - keep the agent's words
+        out_wants[i] = label
+        if all(p.values()):
+            phrases[label] = p
+    return out_wants, phrases
+
+
+async def fill_phrases(db, collection_id: str, user, st: Dict[str, Any]) -> Dict[str, Any]:
+    """Catch-up for must-haves saved before tidy_wants existed (owner, 11/09 - Nicole's): give them their sentence
+    words once, keyed by the words as saved. The must-haves themselves are NOT respelled here - that would
+    change the read key and make every home be read again. Writes only the phrases (never clobbers the rest)."""
+    wants = clean_wants(st.get("wants"))
+    have = st.get("phrases") if isinstance(st.get("phrases"), dict) else {}
+    if not wants or all(w in have for w in wants) or user is None:
+        return have
+    new_wants, ph = await tidy_wants(db, user, wants, have)
+    mapped = {**have}
+    for orig, new in zip(wants, new_wants):
+        if new in ph and orig not in mapped:
+            mapped[orig] = ph[new]
+    mapped = {w: p for w, p in mapped.items() if w in wants}
+    if mapped != have:
+        await db.execute(text("update collection_preferences set ai_wants = jsonb_set(ai_wants, '{phrases}', cast(:p as jsonb)) "
+                              "where collection_id = :c and ai_wants is not null"), {"p": json.dumps(mapped), "c": collection_id})
+        await db.commit()
+    return mapped
+
+
+async def catch_up_phrases() -> int:
+    """Once after a deploy: every Showcase with must-haves but no sentence words gets them (a fraction of a cent each)."""
+    from app.database import AsyncSessionLocal
+    from app.models.database import Collection, User
+    done = 0
+    try:
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(text(
+                "select cp.collection_id, cp.ai_wants, c.owner_id from collection_preferences cp join collections c on c.id = cp.collection_id "
+                "where jsonb_typeof(cp.ai_wants->'wants') = 'array' and jsonb_array_length(cp.ai_wants->'wants') > 0 "
+                "and coalesce(cp.ai_wants->>'state', '') not in ('off', 'too_many')"))).all()
+            for cid, st, owner_id in rows:
+                st = st if isinstance(st, dict) else {}
+                have = st.get("phrases") if isinstance(st.get("phrases"), dict) else {}
+                if all(w in have for w in clean_wants(st.get("wants"))):
+                    continue
+                user = await db.get(User, owner_id)
+                if user is not None:
+                    await fill_phrases(db, cid, user, st)
+                    done += 1
+    except Exception:  # noqa: BLE001 - the plain wording still reads right; next deploy tries again
+        logger.warning("smart filter phrase catch-up failed", exc_info=True)
+    if done:
+        logger.info("smart filter: sentence words added for %s Showcase(s)", done)
+    return done
+
+
 def wants_key(wants: List[str]) -> str:
     return "|".join(sorted(w.lower() for w in wants))
 
@@ -112,6 +246,11 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
                    "at": datetime.now(timezone.utc).isoformat()}
             await _set_state(db, prefs.id, out)
             return out
+        # older must-haves: sentence words, once (after the 300 check - a paused Showcase uses no AI)
+        try:
+            st["phrases"] = await fill_phrases(db, collection_id, user, st)
+        except Exception:  # noqa: BLE001
+            logger.warning("smart filter phrases catch-up failed for %s", collection_id, exc_info=True)
         if not todo:
             done = {**st, "wants": wants, "state": "done", "left": 0, "at": datetime.now(timezone.utc).isoformat(),
                     "matched": await _count_matched(db, collection_id, k)}
@@ -330,18 +469,26 @@ def match_line(m: Any) -> Optional[Dict[str, Any]]:
             "marks": marks[:MAX_WANTS]}
 
 
-async def save_wants(db, collection_id: str, raw: Any) -> Dict[str, Any]:
+async def save_wants(db, collection_id: str, raw: Any, user=None) -> Dict[str, Any]:
     """The agent saved its must-haves: new ones clear every home's read (the stars stay - the agent's to
-    take off) and reading starts in the background. Empty turns it off. Caller commits nothing."""
+    take off) and reading starts in the background. Empty turns it off. Caller commits nothing.
+    With the agent (user), new wording is tidied first (tidy_wants): spelling fixed, sentence words kept."""
     from app.models.database import CollectionPreferences
     prefs = (await db.execute(select(CollectionPreferences).where(CollectionPreferences.collection_id == collection_id))).scalar_one_or_none()
     if prefs is None:
         return {}
     wants = clean_wants(raw)
     old = state_of(prefs)
+    phrases = {}
+    if wants and user is not None:
+        wants, phrases = await tidy_wants(db, user, wants, old.get("phrases"))
+        wants = clean_wants(wants)
     changed = wants_key(wants) != wants_key(clean_wants(old.get("wants")))
     st = {**old, "wants": wants, "state": ("reading" if changed or old.get("state") != "done" else "done") if wants else "off",
           "at": datetime.now(timezone.utc).isoformat()}
+    if user is not None or not wants:
+        # only the words for the current must-haves (a follow-up / card can never use stale ones)
+        st["phrases"] = {w: p for w, p in {**(old.get("phrases") or {}), **phrases}.items() if w in wants}
     if changed:
         st.pop("matched", None); st.pop("read", None)
         await db.execute(text("update collection_properties set ai_match = null where collection_id = :c"), {"c": collection_id})

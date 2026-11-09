@@ -85,6 +85,19 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
+    # Must-haves saved before their sentence words existed get them once, shortly after a deploy
+    # (showcase_smart_filter.catch_up_phrases - only Showcases still missing them; a fraction of a cent each).
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from app.services.showcase_smart_filter import catch_up_phrases
+    scheduler.add_job(
+        catch_up_phrases,
+        "date",
+        run_date=_dt.now(_tz.utc) + _td(seconds=90),
+        id="smart_filter_phrases_catchup",
+        name="Must-haves: sentence words for older Showcases",
+        replace_existing=True,
+    )
+
     # The Bright sync - every 5 minutes, one cycle: changed listings + deletions, open house dates,
     # sold prices (each asks Bright only for what changed since its own checkpoint).
     scheduler.add_job(

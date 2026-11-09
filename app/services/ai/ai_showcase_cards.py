@@ -25,16 +25,20 @@ CARD_TOOLS = ("search_showcase_homes", "get_property_matches", "get_showcase_hom
 
 async def showcase_rows(db: AsyncSession, c: Collection) -> List[Dict[str, Any]]:
     """Every home in the Showcase right now (a removed one is gone), newest-added first."""
-    from app.services.collections_service import _is_property_available
+    from app.services.collections_service import _is_property_available, _ai_starred_ids
+    from app.services.showcase_smart_filter import match_line
     rows = (await db.execute(
-        select(Property, collection_properties.c.sold_filed_at, collection_properties.c.added_at)
+        select(Property, collection_properties.c.sold_filed_at, collection_properties.c.added_at, collection_properties.c.ai_match)
         .join(collection_properties, collection_properties.c.property_id == Property.id)
         .where(collection_properties.c.collection_id == c.id))).all()
     ix = {i.property_id: i for i in (await db.execute(select(PropertyInteraction).where(PropertyInteraction.collection_id == c.id))).scalars()}
     talk = {pid for (pid,) in (await db.execute(select(PropertyComment.property_id).where(PropertyComment.collection_id == c.id).distinct())).all()}
     toured = {pid for (pid,) in (await db.execute(select(PropertyTour.property_id).where(PropertyTour.collection_id == c.id).distinct())).all()}
+    # the must-haves line per home (+ its sentence words) - the Send sheet's "Mention the must-haves" uses it
+    smart = {p.id: match_line(m) for p, _f, _a, m in rows}
+    await _ai_starred_ids(db, c.id, smart)
     out = []
-    for p, filed, added in rows:
+    for p, filed, added, _m in rows:
         i = ix.get(p.id)
         tags = []
         if i and i.liked:
@@ -51,6 +55,7 @@ async def showcase_rows(db: AsyncSession, c: Collection) -> List[Dict[str, Any]]
             "state": p.state, "price": p.price, "beds": p.bedrooms, "baths": p.bathrooms, "sqft": p.living_area, "photo": p.img_src,
             "status": None if _is_property_available(p.home_status) else ("Sold/Removed folder" if filed else status), "tags": tags,
             "recommended": bool(i and i.agent_recommended_at and not i.disliked), "_added": added.isoformat() if added else "",
+            "smart": smart.get(p.id),
         })
     out.sort(key=lambda h: h.pop("_added"), reverse=True)
     return out[:ROWS_MAX]
