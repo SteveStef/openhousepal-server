@@ -128,6 +128,8 @@ class ShowcaseSelfServePreferencesUpdate(BaseModel):
 class CollectionPreferences(CollectionPreferencesBase):
     id: str
     collection_id: str
+    # The smart filter (services/showcase_smart_filter.py): {wants, state, matched, left, at}
+    ai_wants: Optional[dict] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
     

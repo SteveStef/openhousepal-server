@@ -85,6 +85,8 @@ class CreateCollectionWithPreferencesRequest(BaseModel):
     min_acres: Optional[float] = None
     max_acres: Optional[float] = None
     special_features: Optional[str] = None
+    # Smart filter: up to 3 things the AI looks for in every home (services/showcase_smart_filter.py)
+    ai_wants: Optional[list[str]] = None
     compare_property_listing_key: Optional[str] = None
     show_match_score: bool = True
     # "Email it to them" in the agent's create flow: their link + a few homes, right away.
@@ -203,6 +205,45 @@ class PreviewMatchesResponse(BaseModel):
     count: int
     # More match than a Showcase holds (services/showcase_limit) - the screens say "100+".
     at_limit: bool = False
+
+
+class CirclePlace(BaseModel):
+    name: str
+    kind: Optional[str] = "city"   # "city" (Towns) | "township"
+
+
+class CircleCoverageRequest(BaseModel):
+    places: List[CirclePlace]
+    lat: float
+    long: float
+    diameter: float                # the circle's radius in miles, as stored on a Showcase
+    # The rest of the search (price, beds, types...) - the counts then are the homes that would
+    # really show ("24 of Malvern's 88"), not every home for sale in the town.
+    preferences: Optional[CollectionPreferencesBase] = None
+
+
+@router.post("/circle-coverage", dependencies=[Depends(require_broker_authorization), Depends(require_premium_plan)])
+async def circle_coverage(req: CircleCoverageRequest, db: AsyncSession = Depends(get_db)):
+    """A town added to a Showcase that has a search circle (owner, 11/09): how much of it the circle
+    covers, so the editors can take the circle off (all outside) or ask remove / grow / move (part)."""
+    if not (-90 <= req.lat <= 90 and -180 <= req.long <= 180) or not (0 < req.diameter <= 100):
+        raise HTTPException(status_code=400, detail="Bad circle")
+    places = await property_service.circle_coverage(db, [p.model_dump() for p in req.places], req.lat, req.long, req.diameter)
+    if req.preferences is not None:
+        # Same search Save runs, one town at a time: whole town / inside the circle / circle moved to the town.
+        base = req.preferences.model_copy(update={"search_polygon": None, "cities": [], "townships": [], "address": None})
+        for pl in places:
+            if not pl["total"]:
+                continue
+            town = {"townships": [pl["name"]]} if pl["kind"] == "township" else {"cities": [pl["name"]]}
+            whole = base.model_copy(update={**town, "lat": None, "long": None, "diameter": None})
+            pl["total"] = await property_service.get_properties_count_by_preferences(db, whole)
+            pl["inside"] = await property_service.get_properties_count_by_preferences(
+                db, base.model_copy(update={**town, "lat": req.lat, "long": req.long, "diameter": req.diameter}))
+            if pl.get("center"):
+                pl["center_inside"] = await property_service.get_properties_count_by_preferences(
+                    db, base.model_copy(update={**town, "lat": pl["center"]["lat"], "long": pl["center"]["lng"], "diameter": req.diameter}))
+    return {"places": places}
 
 
 @router.post("/preview-matches", response_model=PreviewMatchesResponse, dependencies=[Depends(require_broker_authorization), Depends(require_premium_plan)])
@@ -859,6 +900,12 @@ async def create_collection_with_preferences(
                     "Showcase %s population raised - collection kept but may be empty: %s",
                     collection.id, e, exc_info=True,
                 )
+
+            if request.ai_wants:
+                from app.utils.auth import tier_has_mls
+                if tier_has_mls(current_user.plan_tier) or current_user.is_admin:
+                    from app.services.showcase_smart_filter import save_wants
+                    await save_wants(db, collection.id, request.ai_wants)
 
             if request.email_client:
                 from app.services.showcase_digest_service import queue_showcase_ready
@@ -1541,7 +1588,11 @@ async def _notify_search_changed(db: AsyncSession, collection_obj: Collection, c
         await db.rollback()
 
 
-def _self_serve_payload(payload: dict) -> dict:
+def _same_list(a, b) -> bool:
+    return sorted(str(x).strip().lower() for x in (a or [])) == sorted(str(x).strip().lower() for x in (b or []))
+
+
+def _self_serve_payload(payload: dict, saved=None) -> dict:
     """The rules for a Showcase visitor's own search change (save and live preview alike):
     - building it around a home makes that home the one the match % is measured against;
     - remove_home: no home at all any more - just their filters, no match %;
@@ -1557,12 +1608,19 @@ def _self_serve_payload(payload: dict) -> dict:
     elif remove_home:
         payload['show_match_score'] = False
         payload['compare_property_listing_key'] = None
-    if payload.get('address') or payload.get('cities'):
+    # Only a NEW address or NEW towns count (11/09 audit: the window sends the whole form, so a client
+    # who only changed bedrooms wiped the area their agent drew - 100 homes down to 45).
+    def _get(k):
+        return saved.get(k) if isinstance(saved, dict) else getattr(saved, k, None) if saved is not None else None
+    new_address = bool(payload.get('address')) and (
+        saved is None or str(payload.get('address') or '').strip().lower() != str(_get('address') or '').strip().lower())
+    new_towns = bool(payload.get('cities')) and (saved is None or not _same_list(payload.get('cities'), _get('cities')))
+    if new_address or new_towns:
         payload['search_polygon'] = None
     # Areas add up (a circle OR a township OR a county), so a buyer who picks "within N miles"
     # would otherwise still get every home in a township / county their agent had set - far
     # outside the circle they see. Their distance search replaces those.
-    if payload.get('address'):
+    if new_address:
         payload.update(townships=[], counties=[], county=None)
     return payload
 
@@ -1675,7 +1733,7 @@ async def update_shared_collection_preferences(
         # (EditPreferencesModal.validateLocationPreferences): a radius is only required
         # alongside an address that's actually present, and SOME location method (address
         # or area filters) must exist - never let an edit leave the showcase with neither.
-        payload = _self_serve_payload(preferences_update.dict(exclude_unset=True))
+        payload = _self_serve_payload(preferences_update.dict(exclude_unset=True), collection_obj.preferences)
         effective_diameter = payload.get('diameter', collection_obj.preferences.diameter)
         effective_address = payload.get('address', collection_obj.preferences.address)
         # The resulting areas (what they're sending, else what's saved) - switching from "near the
@@ -1715,6 +1773,9 @@ async def update_shared_collection_preferences(
         # Same as when the agent edits it: a waiting invite and their follow-up show the new search.
         from app.services.showcase_digest_service import showcase_home_ids
         await _after_search_change(db, collection_obj, len(await showcase_home_ids(db, collection_obj.id)))
+        # The agent's smart filter reads the homes their new search brought in (it can't be changed here).
+        from app.services.showcase_smart_filter import schedule_if_on
+        await schedule_if_on(db, [collection_obj.id])
 
         collection_data = await CollectionsService.get_shared_collection(db, share_token)
         if not collection_data:
@@ -1753,7 +1814,7 @@ async def preview_shared_collection_matches(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found or not available")
     try:
         saved = CollectionPreferencesBase.model_validate(collection_obj.preferences, from_attributes=True).model_dump()
-        merged = CollectionPreferencesBase(**{**saved, **_self_serve_payload(preferences_update.model_dump(exclude_unset=True))})
+        merged = CollectionPreferencesBase(**{**saved, **_self_serve_payload(preferences_update.model_dump(exclude_unset=True), saved)})
         from app.services.showcase_limit import SHOWCASE_FETCH, SHOWCASE_MAX_HOMES, cap_matches
         properties, more = cap_matches(await property_service.get_properties_by_preferences(db, merged, max_properties=SHOWCASE_FETCH))
         count = await property_service.get_properties_count_by_preferences(db, merged)
@@ -1892,6 +1953,39 @@ async def get_properties_from_collection(
             detail="Failed to get properties from collection"
         )
 
+class SmartFilterUpdate(BaseModel):
+    wants: list[str] = []
+
+
+@router.put("/{collection_id}/smart-filter")
+async def save_smart_filter(collection_id: str, body: SmartFilterUpdate, db: AsyncSession = Depends(get_db),
+                            current_user: User = Depends(require_premium_plan)):
+    """The agent's smart filter (owner, 11/09): up to 3 things the AI looks for in every home of this
+    Showcase - the homes that have them all are starred with a line saying so. Agent only: it spends the
+    agent's chat usage. An empty list turns it off (the stars it gave stay)."""
+    from app.utils.auth import tier_has_mls
+    from app.services.showcase_smart_filter import save_wants
+    coll = (await db.execute(select(Collection).where(Collection.id == collection_id))).scalar_one_or_none()
+    if not coll or coll.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    if not (tier_has_mls(current_user.plan_tier) or current_user.is_admin):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="The smart filter reads MLS listings - it's on the MLS plans.")
+    st = await save_wants(db, collection_id, body.wants)
+    return {"success": True, "smart_filter": st}
+
+
+@router.get("/{collection_id}/smart-filter")
+async def get_smart_filter(collection_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(require_premium_plan)):
+    """Where the smart filter is (reading / done / no usage left) - the Showcase page asks while it reads."""
+    from app.models.database import CollectionPreferences
+    from app.services.showcase_smart_filter import state_of
+    coll = (await db.execute(select(Collection).where(Collection.id == collection_id))).scalar_one_or_none()
+    if not coll or coll.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    prefs = (await db.execute(select(CollectionPreferences).where(CollectionPreferences.collection_id == collection_id))).scalar_one_or_none()
+    return {"smart_filter": state_of(prefs) if prefs else {}}
+
+
 @router.put("/{collection_id}/update-preferences-and-refresh")
 async def update_preferences_and_refresh(
     collection_id: str,
@@ -1937,6 +2031,9 @@ async def update_preferences_and_refresh(
             await db.commit()
             after_ids = await showcase_home_ids(db, collection_id)
             await _after_search_change(db, collection_obj, len(after_ids))
+            # Homes the new search brought in get the smart filter's read too.
+            from app.services.showcase_smart_filter import schedule_if_on
+            await schedule_if_on(db, [collection_id])
             return {
                 "success": True,
                 "added": len(set(after_ids) - set(before_ids)),

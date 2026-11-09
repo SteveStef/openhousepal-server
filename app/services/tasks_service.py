@@ -3913,21 +3913,44 @@ def log_contact(lead: Lead, via: Optional[str], what: Optional[str] = None, task
     lead.contact_log = log[-30:]
 
 
-def unlog_contact(lead: Lead, task_id: str) -> None:
-    """"Didn't send it - undo" / reopening a follow-up takes its entry back off. Caller commits."""
+def unlog_contact(lead: Lead, task_id: str) -> Optional[dict]:
+    """"Didn't send it - undo" / reopening a follow-up takes its entry back off (and returns it).
+    Caller commits."""
     log = list(lead.contact_log or [])
     for i in range(len(log) - 1, -1, -1):
         if log[i].get("task") == task_id:
-            del log[i]
+            entry = log.pop(i)
             lead.contact_log = log or None
-            return
+            return entry
+    return None
 
 
 async def unmark_lead_contacted(db: AsyncSession, task: AgentTask) -> None:
-    if task.lead_id:
-        lead = await db.get(Lead, task.lead_id)
-        if lead is not None:
-            unlog_contact(lead, task.id)
+    """Undoing / reopening a follow-up puts the lead back the way that check-off found it (owner,
+    11/09: Nicole stayed "Contacted" after the follow-up was undone) - the status it moved (New ->
+    Contacted) and the "last contacted" time - unless something else changed them since."""
+    if not task.lead_id:
+        return
+    lead = await db.get(Lead, task.lead_id)
+    if lead is None:
+        return
+    entry = unlog_contact(lead, task.id)
+    if not entry:
+        return
+    if entry.get("was_status") == "new" and lead.status == "contacted":
+        lead.status = "new"
+    if "was_at" in entry and lead.last_contacted_at is not None:
+        try:
+            stamped = datetime.fromisoformat(entry.get("at"))
+        except (TypeError, ValueError):
+            stamped = None
+        # only when no later contact moved it on (a Text tap tops up the same entry within seconds)
+        if stamped is not None and abs((lead.last_contacted_at - stamped).total_seconds()) < 600:
+            was = entry.get("was_at")
+            try:
+                lead.last_contacted_at = datetime.fromisoformat(was) if was else None
+            except (TypeError, ValueError):
+                pass
 
 
 async def mark_lead_contacted(db: AsyncSession, task: AgentTask, via: Optional[str] = None) -> None:
@@ -3939,6 +3962,8 @@ async def mark_lead_contacted(db: AsyncSession, task: AgentTask, via: Optional[s
     lead = await db.get(Lead, task.lead_id)
     if lead is None:
         return
+    was_at = lead.last_contacted_at
+    was_status = lead.status
     lead.last_contacted_at = datetime.now(timezone.utc)
     # Reaching out counts as having looked at them: the Dash's red "check this lead" outline (and
     # the AI briefing's "needs attention") clears (owner, 11/02).
@@ -3946,6 +3971,15 @@ async def mark_lead_contacted(db: AsyncSession, task: AgentTask, via: Optional[s
     log_contact(lead, via, contact_what(task), task.id)
     if lead.status == "new":
         lead.status = "contacted"
+    # Remember what this check-off changed, so undoing it can put it back (unmark_lead_contacted).
+    log = list(lead.contact_log or [])
+    for i in range(len(log) - 1, -1, -1):
+        if log[i].get("task") == task.id:
+            if "was_at" not in log[i]:
+                log[i] = {**log[i], "was_at": was_at.isoformat() if was_at else None,
+                          "was_status": was_status if lead.status != was_status else None}
+                lead.contact_log = log
+            break
     # The request this follow-up was made for is handled too (its to-do leaves the Leads page).
     if task.auto_source_id:
         from app.models.database import LeadEvent

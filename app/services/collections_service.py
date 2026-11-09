@@ -4,6 +4,7 @@ from app.services.showcase_links import share_match
 from sqlalchemy.orm import selectinload, joinedload, load_only
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
+from app.services.showcase_smart_filter import match_line as smart_line
 import uuid
 import secrets
 import string
@@ -407,6 +408,7 @@ class CollectionsService:
                         "school_districts": collection.preferences.school_districts,
                         "diameter": collection.preferences.diameter,
                         "special_features": collection.preferences.special_features,
+                        "ai_wants": collection.preferences.ai_wants,
                         "visiting_reason": collection.preferences.visiting_reason,
                         "has_agent": collection.preferences.has_agent,
                         "compare_property_listing_key": collection.preferences.compare_property_listing_key,
@@ -978,6 +980,7 @@ class CollectionsService:
                     "school_districts": collection.preferences.school_districts,
                     "diameter": collection.preferences.diameter,
                     "special_features": collection.preferences.special_features,
+                    "ai_wants": collection.preferences.ai_wants,
                     "visiting_reason": collection.preferences.visiting_reason,
                     "has_agent": collection.preferences.has_agent,
                     "compare_property_listing_key": collection.preferences.compare_property_listing_key,
@@ -1618,6 +1621,7 @@ class CollectionsService:
             tours_lookup = {}
             added_at_lookup = {}
             filed_at_lookup = {}
+            smart_lookup: Dict[str, Any] = {}  # the smart filter's line per home (showcase_smart_filter)
 
             # Only query if we have properties
             if property_ids:
@@ -1626,6 +1630,7 @@ class CollectionsService:
                     collection_properties.c.property_id,
                     collection_properties.c.added_at,
                     collection_properties.c.sold_filed_at,
+                    collection_properties.c.ai_match,
                 ).where(
                     and_(
                         collection_properties.c.collection_id == collection.id,
@@ -1639,6 +1644,7 @@ class CollectionsService:
                 for row in added_at_data:
                     added_at_lookup[row.property_id] = row.added_at
                     filed_at_lookup[row.property_id] = row.sold_filed_at
+                    smart_lookup[row.property_id] = smart_line(row.ai_match)
             sold_folder, back_on_market = sold_folder_split(collection.properties, filed_at_lookup)
 
             # Calculate "new" threshold (properties added in last 7 days)
@@ -1758,6 +1764,8 @@ class CollectionsService:
                     'liked':interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
                     'agentRecommended': bool(prop.id in interactions_lookup and interactions_lookup[prop.id].agent_recommended_at),
+                    # "Appears to have: ..." - the smart filter found every must-have (owner, 11/09)
+                    'smartMatch': smart_lookup.get(prop.id),
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
                     'viewCount': interactions_lookup[prop.id].view_count if prop.id in interactions_lookup else 0,
                     # NEW for the buyer: in their Showcase less than NEW_PROPERTY_DAYS (the first fill
@@ -1842,6 +1850,7 @@ class CollectionsService:
                     'school_districts': collection.preferences.school_districts,
                     'diameter': collection.preferences.diameter,
                     'special_features': collection.preferences.special_features,
+                    'ai_wants': collection.preferences.ai_wants,
                     'visiting_reason': collection.preferences.visiting_reason,
                     'has_agent': collection.preferences.has_agent,
                     'compare_property_listing_key': collection.preferences.compare_property_listing_key,
@@ -1906,9 +1915,19 @@ class CollectionsService:
             # 2. Fetch new matching properties from the local database
             # A Showcase holds at most SHOWCASE_MAX_HOMES matches (services/showcase_limit) - the
             # closest for a distance search, else the newest. Asked for a few more to know if it's "100+".
-            from app.services.showcase_limit import SHOWCASE_FETCH, cap_matches
-            matching_properties, at_limit = cap_matches(
-                await property_service.get_properties_by_preferences(db, preferences, max_properties=SHOWCASE_FETCH))
+            from app.services.showcase_limit import SHOWCASE_FETCH, SHOWCASE_MAX_HOMES, cap_matches
+            # A town / area search over the limit keeps the homes already in the Showcase that still
+            # match first, then the newest (11/09 audit: widening Malvern+Berwyn to add Exton removed 16
+            # homes the client already had, just because newer Exton listings outranked them).
+            radius_only = (preferences.lat is not None and preferences.long is not None and preferences.diameter
+                           and not (preferences.cities or preferences.townships or getattr(preferences, 'counties', None)
+                                    or getattr(preferences, 'county', None) or getattr(preferences, 'search_polygon', None)))
+            fetched = await property_service.get_properties_by_preferences(db, preferences, max_properties=SHOWCASE_FETCH if radius_only else 1000)
+            if not radius_only and len(fetched) > SHOWCASE_MAX_HOMES:
+                linked_now = {r[0] for r in (await db.execute(select(collection_properties.c.property_id).where(
+                    collection_properties.c.collection_id == collection_id))).all()}
+                fetched = [p for p in fetched if p.id in linked_now] + [p for p in fetched if p.id not in linked_now]
+            matching_properties, at_limit = cap_matches(fetched)
             new_match_ids = {p.id for p in matching_properties}
             # Homes the agent took out of this Showcase never come back from the search.
             removed_ids = {r[0] for r in (await db.execute(select(PropertyInteraction.property_id).where(and_(
@@ -2119,6 +2138,7 @@ class CollectionsService:
                 collection_properties.c.property_id,
                 collection_properties.c.added_at,
                 collection_properties.c.sold_filed_at,
+                collection_properties.c.ai_match,
             ).where(
                 and_(
                     collection_properties.c.collection_id == collectionId,
@@ -2131,9 +2151,11 @@ class CollectionsService:
             # Create lookup dictionary for added_at timestamps
             added_at_lookup = {}
             filed_at_lookup = {}
+            smart_lookup: Dict[str, Any] = {}  # the smart filter's line per home (showcase_smart_filter)
             for row in added_at_data:
                 added_at_lookup[row.property_id] = row.added_at
                 filed_at_lookup[row.property_id] = row.sold_filed_at
+                smart_lookup[row.property_id] = smart_line(row.ai_match)
             sold_folder, back_on_market = sold_folder_split(collection.properties, filed_at_lookup)
 
             # Calculate "new" threshold (properties added in last 7 days)
@@ -2276,6 +2298,8 @@ class CollectionsService:
                     'liked': interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
                     'agentRecommended': bool(prop.id in interactions_lookup and interactions_lookup[prop.id].agent_recommended_at),
+                    # "Appears to have: ..." - the smart filter found every must-have (owner, 11/09)
+                    'smartMatch': smart_lookup.get(prop.id),
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
                     'viewCount': interactions_lookup[prop.id].view_count if prop.id in interactions_lookup else 0,
                     'lastViewedAt': interactions_lookup[prop.id].last_viewed_at.isoformat() if prop.id in interactions_lookup and interactions_lookup[prop.id].last_viewed_at else None,

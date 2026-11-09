@@ -111,6 +111,38 @@ def _card_note(m: AIMessage) -> str:
         + (f" - its link (shown as a preview card): {c['share']['url']}" if isinstance(c.get("share"), dict) and c["share"].get("url") else "") for c in cards) + ")\n\nThe agent says:\n"
 
 
+def _ids_note(m: AIMessage) -> str:
+    """The ids the last reply worked with (a lead, a Showcase). Only the words of a past reply are
+    replayed, so "now remove the ones that don't have it" came in with no lead id - the model guessed
+    one, got "not found" and asked the agent for the client's name (owner's test, 11/08)."""
+    seen, parts = set(), []
+    for t in m.tool_calls or []:
+        if not isinstance(t, dict) or t.get("record_type") not in ("lead", "showcase") or not t.get("record_id"):
+            continue
+        key = (t["record_type"], str(t["record_id"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        parts.append(f"{'lead_id' if key[0] == 'lead' else 'Showcase collection_id'} {key[1]}")
+    # The Home search card under that reply, if the agent ran it - which homes it found.
+    for t in m.tool_calls or []:
+        if isinstance(t, dict) and t.get("record_type") == "home_search":
+            r, f = t.get("result"), t.get("filters") or {}
+            where = f.get("town") or f.get("district") or "?"
+            if not r:
+                parts.append(f"a Home search card for {where} the agent hasn't run yet")
+            else:
+                homes = r.get("homes") or []
+                yes = [f"{h.get('street')} ({h['key']})" for h in homes if h.get("v") == "yes"][:30]
+                maybe = [f"{h.get('street')} ({h['key']})" for h in homes if h.get("v") == "maybe"][:15]
+                parts.append(f"RESULTS of the Home search card under your last reply - the agent ran it, and you know these results, so answer from "
+                             f"them: {where}, '{f.get('question')}', {r.get('read')} listings read by AI, {r.get('yes', len(yes))} match(es): {'; '.join(yes) or 'none'}"
+                             + (f"; {r.get('maybe', len(maybe))} maybe: {'; '.join(maybe)}" if maybe else ""))
+    if not parts:
+        return ""
+    return "(App note, not from the agent - what your last reply used: " + "; ".join(parts[:8]) + ". Use these ids - never guess one.)\n\n"
+
+
 async def _replace_open_form_cards(db: AsyncSession, conversation_id: str, refs: list) -> None:
     """A new form card in this chat replaces the one still waiting (the agent asked for a change) - so
     only the newest can be confirmed - and its preview opens on the first question that changed."""
@@ -179,10 +211,114 @@ async def _build_history(db: AsyncSession, conversation: AIConversation, max_mes
                 continue
             history.append({"role": "user", "content": note + m.content}); note = ""
         else:
-            history.append({"role": m.role, "content": m.content}); note = _card_note(m)
+            history.append({"role": m.role, "content": m.content})
+            card, ids = _card_note(m), _ids_note(m)
+            note = ids + (card or ("The agent says:\n" if ids else ""))
     if conversation.summary:
         history.insert(0, {"role": "user", "content": f"[Summary of earlier conversation: {conversation.summary}]"})
     return history, note
+
+
+@router.get("/showcase-card/{collection_id}")
+async def get_showcase_card_rows(collection_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(require_ai_helper_user)):
+    """The chat's Showcase card, as it is now (11/08): opened later, a home removed or recommended
+    since then shows that way. Owner-only; no AI."""
+    from app.models.database import Collection
+    from app.services.ai import ai_showcase_cards
+    c = (await db.execute(select(Collection).where(Collection.id == collection_id, Collection.owner_id == current_user.id))).scalar_one_or_none()
+    if c is None:
+        raise HTTPException(status_code=404, detail="That Showcase isn't there any more.")
+    return {"collection": ai_showcase_cards.collection_info(c), "homes": await ai_showcase_cards.showcase_rows(db, c)}
+
+
+class HomeSearchFilters(BaseModel):
+    town: Optional[str] = None
+    district: Optional[str] = None
+    min_beds: Optional[float] = None
+    min_sqft: Optional[float] = None
+    min_price: Optional[float] = None
+    max_price: Optional[float] = None
+    question: Optional[str] = None
+
+
+def _home_search_mls(user: User) -> None:
+    from app.utils.auth import tier_has_mls
+    if not tier_has_mls(user.plan_tier):
+        raise HTTPException(status_code=403, detail="Home search reads MLS listings, which aren't part of this plan.")
+
+
+@router.get("/home-search/places")
+async def home_search_places(q: str = "", db: AsyncSession = Depends(get_db), current_user: User = Depends(require_ai_helper_user)):
+    """The Home search card's place box: towns, zips and school districts with homes for sale. No AI."""
+    from app.services.ai import ai_home_search
+    _home_search_mls(current_user)
+    return {"places": await ai_home_search.places(db, q)}
+
+
+@router.post("/home-search/count")
+async def home_search_count(body: HomeSearchFilters, db: AsyncSession = Depends(get_db), current_user: User = Depends(require_ai_helper_user)):
+    """How many homes fit the card's boxes and how much chat usage reading them takes - a database
+    count, no AI, free (owner, 11/08)."""
+    from app.services.ai import ai_home_search
+    _home_search_mls(current_user)
+    config = await ai_config_service.get_config(db)
+    return await ai_home_search.count(db, current_user, config, body.model_dump())
+
+
+async def _home_search_card(db: AsyncSession, user: User, message_id: str, search_id: str):
+    m = (await db.execute(select(AIMessage).join(AIConversation, AIConversation.id == AIMessage.conversation_id)
+                          .where(AIMessage.id == message_id, AIConversation.owner_id == user.id))).scalar_one_or_none()
+    ref = next((t for t in (m.tool_calls or []) if isinstance(t, dict) and t.get("record_type") == "home_search" and t.get("record_id") == search_id), None) if m else None
+    if ref is None:
+        raise HTTPException(status_code=404, detail="That search isn't there any more - ask the chat again.")
+    return m, ref
+
+
+@router.post("/home-search/{message_id}/{search_id}/run")
+async def home_search_run(message_id: str, search_id: str, body: HomeSearchFilters, db: AsyncSession = Depends(get_db),
+                          current_user: User = Depends(require_ai_helper_user)):
+    """The agent tapped Search on the Home search card: the AI reads every home that fits (at most
+    READ_CAP). Re-checks the boxes, the count and their chat usage first - nothing runs unless it all
+    fits - then counts the real cost on their Chat usage bar and saves the results on the card."""
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.services.ai import ai_home_reader, ai_home_search
+    _home_search_mls(current_user)
+    m, ref = await _home_search_card(db, current_user, message_id, search_id)
+    config = await ai_config_service.get_config(db)
+    info = await ai_home_search.count(db, current_user, config, body.model_dump())
+    if info["missing"]:
+        raise HTTPException(status_code=400, detail="Fill in the place, the least bedrooms, the least size and what to look for first.")
+    if not info["count"]:
+        raise HTTPException(status_code=400, detail="No homes for sale fit those boxes - widen them a little.")
+    if info["count"] > info["cap"]:
+        raise HTTPException(status_code=400, detail=f"{info['count']:,} homes fit - narrow it to {info['cap']} or fewer first.")
+    if not info["enough"]:
+        raise HTTPException(status_code=429, detail="There isn't enough chat usage left this month to read these listings. Narrow the search, or get more with your next billing day or a bigger plan.")
+    try:
+        reservation = await check_and_reserve(db, current_user.id, config, current_user.plan_tier)
+    except AIRateLimitExceeded as e:
+        raise HTTPException(status_code=429, detail=e.user_message)
+    spent = 0.0
+    try:
+        out = await ai_home_search.run(db, current_user, config, info["filters"])
+        cost = out.pop("_cost")
+        spent = float(cost.get("usd") or 0)
+        _, limit = await ai_home_reader.room(db, current_user, config)
+        out["used_percent"] = ai_home_reader.percent(spent, limit)
+        out["ran_at"] = datetime.now(timezone.utc).isoformat()
+        # Saved on the card BEFORE the usage row: that commit expires the message, and a change made
+        # after it was lost (11/08 test: results gone on reload).
+        m, ref = await _home_search_card(db, current_user, message_id, search_id)
+        ref["filters"], ref["count"], ref["result"] = info["filters"], info["count"], out
+        conv_id = m.conversation_id
+        flag_modified(m, "tool_calls")
+        await db.commit()
+        await record_usage_event(db, current_user.id, conv_id, config["model"], cost.get("in"), cost.get("out"), spent, 0, False, None,
+                                 tool_names=["home_search"])
+        return out
+    finally:
+        await reconcile_budget(db, reservation, spent)
+        await release(current_user.id)
 
 
 @router.get("/suggestions")

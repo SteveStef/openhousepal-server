@@ -45,6 +45,8 @@ collection_properties = Table(
     # under contract / sold / off the market stays in the list with a notice until someone moves
     # it; a home back on the market drops this (collections_service._sold_folder_ids).
     Column('sold_filed_at', DateTime(timezone=True), nullable=True),
+    # The smart filter's read of this home (services/showcase_smart_filter.py): {k, v, found, starred, at}
+    Column('ai_match', JSONB, nullable=True),
 )
 
 class User(Base):
@@ -1484,6 +1486,9 @@ class CollectionPreferences(Base):
 
     # Additional features
     special_features = Column(Text, default="")
+    # Smart filter (owner, 11/09): up to 3 things the AI looks for in every home that fits - the homes that
+    # have them all are starred with a line saying so (services/showcase_smart_filter.py). Agent only.
+    ai_wants = Column(JSONB, nullable=True)
 
     # Home type preferences
     is_town_house = Column(Boolean, nullable=True, default=False)

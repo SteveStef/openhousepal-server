@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.logging import get_logger
 from app.models.database import User
-from app.services.ai import ai_actions, ai_tools, ai_ui_tools
+from app.services.ai import ai_actions, ai_showcase_cards, ai_tools, ai_ui_tools
 from app.services.ai.ai_config_service import ai_config_service
 from app.services.ai.ai_prompt_service import SYSTEM_PROMPT
 
@@ -172,7 +172,7 @@ _STEP_WORDS = {
     "find_open_house_guests": "Searching your open house guests", "get_open_house_guests": "Reading the sign-in list",
     "search_open_houses": "Looking through your open houses", "search_leads": "Searching your leads", "get_lead_detail": "Opening their lead",
     "search_properties": "Searching the MLS", "get_property_detail": "Reading the listing", "look_up_agent": "Looking up that agent",
-    "get_property_matches": "Matching homes", "get_showcase_info": "Opening the Showcase", "search_showcase_homes": "Reading every home in the Showcase", "search_homes_for_sale": "Reading every listing in town", "get_similar_properties": "Finding similar homes",
+    "get_property_matches": "Matching homes", "get_showcase_info": "Opening the Showcase", "search_showcase_homes": "Reading every listing in the Showcase", "search_homes_for_sale": "Setting up a home search", "get_similar_properties": "Finding similar homes",
     "get_cma_summary": "Reading the CMA", "get_agent_activity_summary": "Reading your activity", "get_priority_summary": "Checking what needs you",
     "show_homes": "Pulling up the homes",
 }
@@ -258,10 +258,12 @@ async def run_turn(
 
     messages: List[dict] = list(conversation_history) + [{"role": "user", "content": [*images, {"type": "text", "text": user_message}] if images else user_message}]
     all_refs: List[dict] = []
+    # One Showcase card per Showcase the reply read (ai_showcase_cards) - added under the reply at the end.
+    showcase_cards: Dict[str, dict] = {}
     usage_state = {"model": config["model"], "input_tokens": 0, "output_tokens": 0, "tool_call_count": 0, "tool_names": []}
     # Lookups this plan gets + things it can set up for a Confirm tap (ai_actions.py, 10/30).
     from app.services.ai import ai_home_cards
-    tools = ai_tools.tools_for(current_user) + ai_actions.action_tools_for(current_user) + ai_ui_tools.UI_TOOL_DEFINITIONS + [ai_home_cards.TOOL]
+    tools = ai_tools.tools_for(current_user) + ai_actions.action_tools_for(current_user) + ai_ui_tools.UI_TOOL_DEFINITIONS + [ai_home_cards.TOOL, ai_showcase_cards.MARK_TOOL]
 
     # The agent's own listings and sales, known up front (owner, 10/30: it guessed "your newest listing"
     # from days on market, then lost it on a follow-up) - newest first, with each one's listing key so
@@ -316,10 +318,13 @@ async def run_turn(
 
     nudged = False
     promised = False
+    listed = False
+    homes_nudged = False
+    seen_homes: dict = {}  # listing_key -> "602 holywell" for every home a lookup returned this turn
     _progress(current_user.id, "Thinking")
 
     async def _run() -> str:
-        nonlocal nudged, promised
+        nonlocal nudged, promised, listed, homes_nudged
         for _ in range(config["max_iterations"]):
             response = await _call_model()
             usage_state["input_tokens"] += response.usage.input_tokens
@@ -338,6 +343,14 @@ async def run_turn(
 
             if response.stop_reason != "tool_use":
                 text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
+                # The homes are on the Showcase card - a reply that lists them anyway gets one nudge to
+                # mark the not-real ones on the card and say it short (owner, 11/08: never a text list).
+                if showcase_cards and not listed and ai_showcase_cards.lists_homes(text) and usage_state["tool_call_count"] < config["max_tool_calls_per_turn"] - 1:
+                    listed = True
+                    messages.append({"role": "assistant", "content": response.content})
+                    messages.append({"role": "user", "content": ai_showcase_cards.LIST_NUDGE})
+                    _progress(current_user.id, "Tidying the answer")
+                    continue
                 if not promised and _PROMISE.search((text or "").strip()[-220:]) and usage_state["tool_call_count"] < config["max_tool_calls_per_turn"] - 1:
                     promised = True
                     messages.append({"role": "assistant", "content": response.content})
@@ -346,11 +359,33 @@ async def run_turn(
                     continue
                 # In a long chat it sometimes says "tap Confirm on the card" without making one
                 # (owner's test, 11/01) - one nudge to make the real card, then whatever it says.
-                if not nudged and _CLAIMS_CARD.search(text or "") and not any(r.get("record_type") == "action" for r in all_refs):
+                # ("...on the card" about the Home search card the last reply showed is true - no nudge.)
+                if not nudged and _CLAIMS_CARD.search(text or "") and not showcase_cards and "Home search card" not in user_message and not any(r.get("record_type") in ("action", "homes", "hosting", "home_search", "showcase_homes") for r in all_refs):
+                    # (11/09: a fresh chat's Home search card wasn't counted, so the reminder made it say
+                    # "the search card is already on your reply from my last message")
                     nudged = True
                     messages.append({"role": "assistant", "content": response.content})
                     messages.append({"role": "user", "content": "(App note: no card was made this turn - nothing shows for them to tap. Call the action tool now to set it up, then reply in one short line. If you still need an answer from them first, ask only that.)"})
                     continue
+                # Homes it names show as property cards, never a text list (owner, 11/09). Two or more
+                # written out -> one nudge to pick them with show_homes and say it short; one home named
+                # -> its card is added under the reply.
+                # (11/09 test: it made the cards AND wrote all 9 out above them - a reply with cards that
+                # still lists 3+ homes gets one nudge to say it in a line or two.)
+                other_cards = ("showcase_homes", "home_search", "hosting")
+                has_cards = any(r.get("record_type") == "homes" for r in all_refs)
+                if seen_homes and text and not showcase_cards and not any(r.get("record_type") in other_cards for r in all_refs):
+                    named = ai_home_cards.mentioned(text, seen_homes)
+                    if len(named) >= (3 if has_cards else 2) and not homes_nudged and usage_state["tool_call_count"] < config["max_tool_calls_per_turn"] - 1:
+                        homes_nudged = True
+                        messages.append({"role": "assistant", "content": response.content})
+                        messages.append({"role": "user", "content": ai_home_cards.SHORTEN if has_cards else ai_home_cards.NUDGE})
+                        _progress(current_user.id, "Tidying the answer")
+                        continue
+                    if named and not has_cards:
+                        _, entry = await ai_home_cards.run(db, current_user, {"which": "homes", "listing_keys": named[:40]})
+                        if entry:
+                            all_refs.append(entry)
                 return text or "I wasn't able to come up with a response. Please try rephrasing your question."
 
             tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
@@ -375,10 +410,17 @@ async def run_turn(
                 args = block.input if isinstance(block.input, dict) else {}
                 usage_state["tool_names"].append(block.name)
                 _progress(current_user.id, _STEP_WORDS.get(block.name) or ("Setting up the card" if ai_actions.is_action(block.name) else "Looking that up"))
+                if block.name == ai_showcase_cards.MARK_TOOL["name"]:
+                    # Matches that aren't real ("a pool table") - shown apart on this reply's card instead of listed in text.
+                    result = ai_showcase_cards.mark_doubtful(showcase_cards, args)
+                    tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(result, default=str)})
+                    continue
                 if block.name == ai_home_cards.NAME:
                     # Their listings / sales as small home cards under the reply (owner, 11/01).
                     result, entry = await ai_home_cards.run(db, current_user, args)
                     if entry:
+                        # one card per kind of list a reply (asked again after a nudge -> it replaces the first)
+                        all_refs[:] = [r for r in all_refs if not (r.get("record_type") == "homes" and r.get("which") == entry.get("which"))]
                         all_refs.append(entry)
                     tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(result, default=str)})
                     continue
@@ -400,9 +442,27 @@ async def run_turn(
                         all_refs.append(entry)
                     tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(result, default=str)})
                     continue
-                all_refs.extend(_extract_record_refs(block.name, args))
                 result = await ai_tools.execute_tool(db, current_user, block.name, args, config)
+                if isinstance(result, (dict, list)) and block.name not in ai_showcase_cards.CARD_TOOLS:
+                    ai_home_cards.collect(result, seen_homes)
+                # The AI reading of listings a tool did (ai_home_reader) counts on this answer's usage.
+                if isinstance(result, dict) and isinstance(result.get("_ai_cost"), dict):
+                    spent = result.pop("_ai_cost")
+                    usage_state["estimated_cost_usd"] = usage_state.get("estimated_cost_usd", 0.0) + float(spent.get("usd") or 0)
+                    usage_state["input_tokens"] += int(spent.get("in") or 0)
+                    usage_state["output_tokens"] += int(spent.get("out") or 0)
+                # "Homes for sale in <town> with ..." shows the Home search card (ai_home_search).
+                # One card per reply: a second call (it asked again with a change) replaces the first.
+                if block.name == "search_homes_for_sale" and isinstance(result, dict) and isinstance(result.get("card"), dict):
+                    all_refs[:] = [r for r in all_refs if r.get("record_type") != "home_search"]
+                    all_refs.append(result.pop("card"))
+                # An id it guessed wrong (the tool said not found) isn't kept - the next message is told
+                # the ids this reply used (ai_routes._ids_note), so a wrong one would be repeated.
+                if not (isinstance(result, dict) and result.get("error")):
+                    all_refs.extend(_extract_record_refs(block.name, args))
                 all_refs.extend(_extract_result_refs(block.name, result))
+                if block.name in ai_showcase_cards.CARD_TOOLS and isinstance(result, dict) and not result.get("error"):
+                    result = await _showcase_card(db, current_user, block.name, args, result, showcase_cards)
                 # Homes to host come back under the reply as the Dash's Discovery cards (owner, 11/01:
                 # "just like as if I was on the discovery tab" - newest first, each with its weekend
                 # calendar and Request to host, See more, Browse all of Discovery). The model sums up.
@@ -456,8 +516,67 @@ async def run_turn(
         ) from e
 
     usage_state.setdefault("estimated_cost_usd", 0.0)  # summed per call in _run
+    for cid, card in showcase_cards.items():
+        # A "Remove homes" card for the same Showcase already lists every home - one list, not two.
+        if not any(r.get("tool") == "remove_showcase_homes" and (r.get("payload") or {}).get("collection_id") == cid for r in all_refs):
+            all_refs.append(card)
     _howto_button(user_message, all_refs)
+    # Word matches only (not enough chat usage left for AI reading): always said, never left to the model.
+    if any(c.get("words_only") for c in showcase_cards.values()) and not re.search(r"chat usage|allowance", text or "", re.I):
+        text = ("You're almost out of chat usage this month, so this was a quick word search instead of AI reading every listing - "
+                "some homes may be missed.\n\n" + (text or ""))
     return _no_pretend_cards(text, all_refs), all_refs, usage_state
+
+
+async def _showcase_card(db, user, tool: str, args: dict, result: dict, cards: Dict[str, dict]) -> dict:
+    """A tool read a client's Showcase: its homes show as the Showcase card under the reply (owner,
+    11/08: never a text list), and the model is told so. Several reads of the same Showcase in one
+    reply ("a pool or a finished basement") make one card with every match."""
+    cid = result.get("collection_id") or args.get("collection_id")
+    if not cid:
+        return result
+    searched = tool == "search_showcase_homes"
+    matched = ai_showcase_cards.matched_from(result) if searched else None
+    try:
+        card = cards.get(cid)
+        if card is None:
+            card = await ai_showcase_cards.card_ref(db, user, cid, matched, result.get("looked_for") if searched else None)
+            if card is None:
+                return result
+            cards[cid] = card
+        elif searched:
+            card["searched"] = True
+            for pid, why in (matched or {}).items():
+                card["matched"].setdefault(pid, why)
+            card["looked_for"] = list(dict.fromkeys((card.get("looked_for") or []) + (result.get("looked_for") or [])))[:12]
+        # The AI's "maybe" homes (only a hint) show greyed, last, with why.
+        if result.get("ai_read") is False:
+            card["words_only"] = True   # not enough chat usage left for AI reading - the card says so
+        for m in result.get("matches") or []:
+            if m.get("maybe") and m.get("property_id"):
+                card.setdefault("doubtful", {})[m["property_id"]] = m["maybe"]
+    except Exception:  # noqa: BLE001 - the answer still works without its card
+        logger.warning("showcase card failed", exc_info=True)
+        return result
+    name = card["collection"]["client"] or "their"
+    note = ai_showcase_cards.CARD_NOTE.format(name=name, what="the matches first with why each matched" if searched else "newest first",
+                                              count_word="matched" if searched else "homes are in it")
+    if searched:
+        note += (" Use judgment on each match's quote: 'could add a bedroom', 'no pool', a lower-level in-law suite or a builder's other "
+                 "floor plans aren't real matches - say so in a few words. A home that isn't a match only didn't mention it. If they "
+                 "then want the others taken out, use remove_showcase_homes with these matches' listing_keys as keep_listing_keys.")
+    total = len(card["homes"])
+    note += (f" The Showcase has {total} home{'s' if total != 1 else ''} in all right now (the card shows every one) - when you say how "
+             "many are in it, use that number, never the length of a list above.")
+    # The card has every match - the model only needs a few to name, not all of them (saves chat usage).
+    trimmed = {**result}
+    if searched and len(result.get("matches") or []) > 8:
+        trimmed["matches"] = [m for m in result["matches"] if not m.get("maybe")][:6] + [m for m in result["matches"] if m.get("maybe")][:2]
+        trimmed["more_on_the_card"] = len(result["matches"]) - len(trimmed["matches"])
+    if trimmed.get("matches"):   # the highlight marks are for the card only
+        from app.services.ai.ai_home_reader import plain
+        trimmed["matches"] = [{**m, "found": [plain(f) for f in m.get("found") or []]} if m.get("found") else m for m in trimmed["matches"]]
+    return {**trimmed, "shown_as_card": True, "showcase_home_count": total, "note": note}
 
 
 # "How do I make / create / start X?" always ends with a button into X's create screen (owner,

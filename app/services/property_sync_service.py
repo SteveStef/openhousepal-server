@@ -998,6 +998,7 @@ class PropertySyncService:
         # this before downgrading/cancelling (Settings > Billing).
         from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
 
+        smart_ids: list = []   # Showcases this new listing joined - their smart filter reads it (owner, 11/09)
         if event["type"] == "NEW_GLOBAL" or event.get("rematch"):
             discovered_collections = [
                 col for col in await self._discover_matching_collections(db, event["data"])
@@ -1013,6 +1014,7 @@ class PropertySyncService:
                 changes = {"new_properties": [event["data"]], "price_drops": []}
                 await self._schedule_combined_notification(db, col, changes)
                 count += 1
+                smart_ids.append(col.id)
 
             # My Team: if this brand-new listing belongs to an on-platform agent, let their
             # accepted team members know there's a new opportunity to host. NEW_GLOBAL only ever
@@ -1022,6 +1024,12 @@ class PropertySyncService:
             # explicit guard against ever double-notifying for the same listing.
             if event["type"] == "NEW_GLOBAL":  # not on a re-match - the team already heard about it
                 await self._notify_team_of_new_listing(db, l_key, event["data"])
+            if smart_ids:
+                try:
+                    from app.services.showcase_smart_filter import schedule_if_on
+                    await schedule_if_on(db, smart_ids, delay=30)
+                except Exception:  # noqa: BLE001 - never stops the sync
+                    logger.warning("smart filter schedule failed", exc_info=True)
 
         # 2. UPDATES: Find collections that already HAVE this property (Price Drops)
         query = (
@@ -1586,19 +1594,24 @@ def _in_shape(lat: float, lng: float, geometry: dict) -> bool:
 def _area_ok(p, city, township, county, lat, lng) -> bool:
     """Is a new listing really inside this Showcase's area? The query already matched towns,
     townships, counties and school districts exactly; this settles the parts it can only box:
-    the radius circle (only when no town/township/county is picked) and a drawn area."""
+    the radius circle and a drawn area. The circle narrows picked towns/townships/counties (owner,
+    11/09: homes in the town AND inside the radius) - with none picked it's its own area, same as the
+    search (property_service._circle_filter)."""
     if p is None:
         return True
     cities = {_place_name(c) for c in (p.cities or []) if isinstance(c, str)}
     towns = {_place_name(t) for t in (p.townships or []) if isinstance(t, str)}
     counties = {_place_name(c) for c in (p.counties or []) if isinstance(c, str)}
+    has_circle = p.lat is not None and p.long is not None and bool(p.diameter)
+    in_circle = has_circle and bool(lat and lng and is_within_distance(p.lat, p.long, lat, lng, p.diameter))
     if (city and _place_name(city) in cities | towns) or (township and _place_name(township) in towns | cities) \
             or (county and _place_name(county) in counties and not (cities or towns)):
-        return True
+        if not has_circle or in_circle:
+            return True
     shape = p.search_polygon if isinstance(p.search_polygon, dict) else None
     if shape and lat and lng and _in_shape(float(lat), float(lng), shape):
         return True
-    if not (cities or towns or counties) and p.lat and p.long and p.diameter:
-        return bool(lat and lng and is_within_distance(p.lat, p.long, lat, lng, p.diameter))
+    if not (cities or towns or counties) and has_circle:
+        return in_circle
     # No circle / shape / place to check here: district-only (the query checked it)
     return not (cities or towns or counties or shape)

@@ -1,3 +1,4 @@
+import math
 import re
 import logging
 from typing import Any, List, Optional
@@ -77,6 +78,26 @@ async def _place_address_center(db, preferences):
     except AttributeError:   # a saved row (the caller commits)
         preferences.lat, preferences.long = coords
         return preferences
+
+
+def _circle_filter(preferences):
+    """The search center's circle as one exact SQL condition (box first so it can use the index), or None.
+    How it stacks (owner, 11/09): with towns / townships / counties picked it NARROWS them - only homes
+    in those places AND inside the circle; with none picked it's its own area. (11/01 it was ignored
+    when a town was picked; the owner changed that.)"""
+    if preferences.lat is None or preferences.long is None or not preferences.diameter:
+        return None
+    lat_offset, long_offset = get_lat_long_offsets(preferences.lat, preferences.diameter)
+    return and_(
+        Property.latitude.isnot(None), Property.longitude.isnot(None),
+        Property.latitude >= float(preferences.lat) - lat_offset,
+        Property.latitude <= float(preferences.lat) + lat_offset,
+        Property.longitude >= float(preferences.long) - long_offset,
+        Property.longitude <= float(preferences.long) + long_offset,
+        # the exact circle, not the square around it (11/09 audit: the corners let in homes up to
+        # 2 mi out of a 1.5 mi radius)
+        distance_miles_sql(Property.latitude, Property.longitude, float(preferences.lat), float(preferences.long)) <= float(preferences.diameter),
+    )
 
 
 def bed_filter_exempt_types(preferences) -> list:
@@ -376,21 +397,16 @@ class PropertyService:
         if hierarchy_groups:
             location_filters.append(and_(*[or_(*group) for group in hierarchy_groups]))
 
-        # Geography areas add up: the town/county hierarchy above, a radius and drawn shapes are
-        # independent areas (OR). School districts then narrow the result (AND) - see below.
+        # Geography areas: the town/county hierarchy above and drawn shapes add up (OR). The search
+        # center's circle narrows the towns/counties when any are picked (owner, 11/09: "inside the
+        # radius in that selected town"), otherwise it's its own area. School districts then narrow
+        # the result (AND) - see below. Same rule as the new-listing matcher (property_sync_service).
+        circle = _circle_filter(preferences)
+        if location_filters and circle is not None:
+            location_filters = [and_(location_filters[0], circle)]
         geo_filters = list(location_filters)
-
-        # The radius is its own area only when no town / township / county is picked (owner, 11/01:
-        # a Showcase set to Exton kept the open house's 1.5 mi circle and showed Downingtown homes).
-        # Same rule as the new-listing matcher (property_sync_service) and the AI helper.
-        if not location_filters and preferences.lat is not None and preferences.long is not None and preferences.diameter:
-            lat_offset, long_offset = get_lat_long_offsets(preferences.lat, preferences.diameter)
-            geo_filters.append(and_(
-                Property.latitude >= float(preferences.lat) - lat_offset,
-                Property.latitude <= float(preferences.lat) + lat_offset,
-                Property.longitude >= float(preferences.long) - long_offset,
-                Property.longitude <= float(preferences.long) + long_offset
-            ))
+        if not location_filters and circle is not None:
+            geo_filters.append(circle)
 
         if getattr(preferences, 'search_polygon', None):
             # Agent-drawn "Draw on Map" search area(s). Bbox prefilter first (indexable), then the
@@ -548,6 +564,46 @@ class PropertyService:
         return [PropertySummaryResponse.model_validate(p) for p in properties]
 
     @staticmethod
+    async def circle_coverage(db: AsyncSession, places: list, lat: float, lng: float, miles: float) -> list:
+        """How much of each town / township a search circle covers (owner, 11/09: a town added to a
+        Showcase that has a circle - all outside -> the circle comes off; partly inside -> the agent
+        picks remove / grow / move it). Measured with the town's homes for sale - the same homes the
+        search can show. Per place: total, inside, cover_miles (the circle size from this center that
+        takes in the whole town), center (the town's middle) and center_inside (how many a circle this
+        size would cover from there)."""
+        from app.utils.geo import haversine_distance
+        out = []
+        for pl in (places or [])[:6]:
+            name = str((pl or {}).get("name") or "").strip()
+            if not name:
+                continue
+            kind = "township" if (pl or {}).get("kind") == "township" else "city"
+            parts = [s.strip() for s in name.split(",")]
+            cond = (Property.township.in_(PropertyService.get_township_search_values(parts[0])) if kind == "township"
+                    else Property.city.ilike(parts[0]))
+            if len(parts) >= 2 and parts[1]:
+                cond = and_(cond, Property.state.ilike(parts[1]))
+            rows = (await db.execute(select(Property.latitude, Property.longitude).where(
+                cond, Property.home_status.in_(('ACTIVE-BRIGHT', 'COMING SOON-BRIGHT')), Property.is_manual.is_(False),
+                Property.latitude.isnot(None), Property.longitude.isnot(None),
+            ))).all()
+            pts = [(float(a), float(b)) for a, b in rows]
+            if not pts:
+                out.append({"name": name, "kind": kind, "total": 0, "inside": 0, "cover_miles": None, "center": None, "center_inside": 0})
+                continue
+            dists = sorted(haversine_distance(lat, lng, a, b) for a, b in pts)
+            inside = sum(1 for d in dists if d <= miles)
+            # the town's middle: the median spot of its homes (one mis-mapped listing can't drag it)
+            mid = (sorted(a for a, _ in pts)[len(pts) // 2], sorted(b for _, b in pts)[len(pts) // 2])
+            center_inside = sum(1 for a, b in pts if haversine_distance(mid[0], mid[1], a, b) <= miles)
+            # big enough for (almost) every home - the far 3% are often mis-mapped listings
+            far = dists[min(len(dists) - 1, int(math.ceil(len(dists) * 0.97)) - 1)]
+            cover = min(50.0, math.ceil(far * 2) / 2)
+            out.append({"name": name, "kind": kind, "total": len(pts), "inside": inside, "cover_miles": max(cover, miles),
+                        "center": {"lat": mid[0], "lng": mid[1]}, "center_inside": center_inside})
+        return out
+
+    @staticmethod
     async def get_properties_count_by_preferences(db: AsyncSession, preferences: CollectionPreferencesSchema) -> int:
         """Fetch only the count of matching properties without downloading records."""
         preferences = await _place_address_center(db, preferences)
@@ -565,10 +621,10 @@ class PropertyService:
             preferences.diameter
         )
 
-        if use_circular_filter:
-            query = select(Property.latitude, Property.longitude)
-        else:
-            query = select(func.count(Property.id))
+        # Light rows, not a bare count: one house listed twice counts once, like the homes the
+        # Showcase gets (11/09: the editor said 91 Malvern homes, the Showcase got 88).
+        query = select(Property.latitude, Property.longitude, Property.street_address, Property.living_area,
+                       Property.bedrooms, Property.bathrooms)
 
         filters = []
         # Same list as get_properties_by_preferences - the count is shown next to those homes.
@@ -639,8 +695,14 @@ class PropertyService:
         if hierarchy_groups:
             location_filters.append(and_(*[or_(*group) for group in hierarchy_groups]))
 
-        # Same stacking as get_properties_by_preferences above - keep both in sync.
+        # Same stacking as get_properties_by_preferences above - keep both in sync: the circle narrows
+        # picked towns/counties, otherwise it's its own area.
+        circle = _circle_filter(preferences)
+        if location_filters and circle is not None:
+            location_filters = [and_(location_filters[0], circle)]
         geo_filters = list(location_filters)
+        if not location_filters and circle is not None:
+            geo_filters.append(circle)
 
         if getattr(preferences, 'search_polygon', None):
             bbox = _polygon_bbox(preferences.search_polygon)
@@ -654,18 +716,6 @@ class PropertyService:
                     Property.longitude <= bbox["max_lng"],
                     _polygon_filter(Property, preferences.search_polygon),
                 ))
-
-        # The radius is its own area only when no town / township / county is picked (owner, 11/01:
-        # a Showcase set to Exton kept the open house's 1.5 mi circle and showed Downingtown homes).
-        # Same rule as the new-listing matcher (property_sync_service) and the AI helper.
-        if not location_filters and preferences.lat is not None and preferences.long is not None and preferences.diameter:
-            lat_offset, long_offset = get_lat_long_offsets(preferences.lat, preferences.diameter)
-            geo_filters.append(and_(
-                Property.latitude >= float(preferences.lat) - lat_offset,
-                Property.latitude <= float(preferences.lat) + lat_offset,
-                Property.longitude >= float(preferences.long) - long_offset,
-                Property.longitude <= float(preferences.long) + long_offset
-            ))
 
         if geo_filters:
             filters.append(or_(*geo_filters))
@@ -757,20 +807,14 @@ class PropertyService:
 
         result = await db.execute(query)
         
+        rows = [r._asdict() for r in result.all()]
         if use_circular_filter:
             # Perform precise circular filter on the bounding box results
-            rows = result.all()
             center_lat = float(preferences.lat)
             center_long = float(preferences.long)
             radius_miles = float(preferences.diameter)
-            
-            count = 0
-            for p_lat, p_lon in rows:
-                if is_within_distance(center_lat, center_long, p_lat, p_lon, radius_miles):
-                    count += 1
-            return count
-        else:
-            return result.scalar() or 0
+            rows = [r for r in rows if is_within_distance(center_lat, center_long, r["latitude"], r["longitude"], radius_miles)]
+        return len(dedupe_same_homes(rows))
 
     @staticmethod
     async def bright_mls_id_exists(db: AsyncSession, mls_id: str) -> bool:

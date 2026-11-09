@@ -3,7 +3,8 @@ data and writes the Confirm card; changes nothing) and a `run` (only after the a
 Confirm). Every run calls the SAME route the page's own button calls, as the agent, through
 ai_route_bridge - so plan, broker-authorization, ownership and validation rules are the app's own.
 
-Rules every action here follows (see ai_actions.py): no deletes, no billing, nothing paid without
+Rules every action here follows (see ai_actions.py): no deletes (one exception the owner asked for, 11/08:
+remove_showcase_homes - the agent checks each home on the card), no billing, nothing paid without
 saying so, and anything that emails or notifies a real person says so on the card. Paid AI from
 the chat says so on its card ("This uses your monthly AI allowance") - the AI CMA and the AI blog
 writer (11/01) and AI media (11/05, ai_actions_media.py). Left out on
@@ -346,7 +347,36 @@ async def _p_new_task(db, user, a):
         body["notes"] = _s(a["notes"]); lines.append(f"Notes: {body['notes'][:200]}")
     if _s(a.get("suggested_message")):
         body["suggested_message"] = _s(a["suggested_message"]); lines.append(f"Message to send: “{body['suggested_message'][:300]}”")
-    return Prepared("Add a follow-up", lines, {"body": body})
+    # Everything on it can be changed right on the card (owner, 11/09: "should have the options changeable
+    # there in the ui") - the card starts from these and sends its picks back on Confirm (_adjust_followup).
+    from zoneinfo import ZoneInfo
+    local = datetime.fromisoformat(due).astimezone(ZoneInfo("America/New_York")) if due else None
+    lead_name = lines[1][5:] if len(lines) > 1 and lines[1].startswith("For: ") else ""
+    form = {"title": body["title"], "kind": body["kind"], "lead_id": body.get("lead_id"), "lead_name": lead_name,
+            "due_date": local.date().isoformat() if local else "", "due_time": "" if not local or body.get("all_day") else local.strftime("%H:%M"),
+            "notes": body.get("notes", ""), "suggested_message": body.get("suggested_message", "")}
+    return Prepared("Add a follow-up", lines, {"body": body, "form": form}, picker="followup")
+
+
+def _adjust_followup(user, payload: dict, picks: dict) -> dict:
+    """The card's own fields, checked like the chat's: a title, a known kind, a real date / time (Eastern).
+    The lead is checked again by the tasks route (it must be theirs)."""
+    if not isinstance(picks, dict) or not picks.get("title") and "due_date" not in picks:
+        return payload
+    title = _s(picks.get("title"))
+    if not title:
+        raise ActionError("Give the follow-up a title.")
+    body = {"title": title[:200], "kind": picks.get("kind") if picks.get("kind") in ("call", "text", "email", "showing", "general") else "general"}
+    if _s(picks.get("lead_id")):
+        body["lead_id"] = _s(picks["lead_id"])
+    due = _when({"due_date": picks.get("due_date"), "due_time": picks.get("due_time")})
+    if due:
+        body["due_at"] = due; body["all_day"] = not _s(picks.get("due_time"))
+    if _s(picks.get("notes")):
+        body["notes"] = _s(picks["notes"])[:4000]
+    if _s(picks.get("suggested_message")):
+        body["suggested_message"] = _s(picks["suggested_message"])[:2000]
+    return {**payload, "body": body}
 
 
 async def _r_new_task(db, user, p):
@@ -356,7 +386,7 @@ async def _r_new_task(db, user, p):
 _simple("create_followup", "Add a follow-up (to-do) for the agent, optionally for one lead, with a due date/time (Eastern) and a message to send. Dates YYYY-MM-DD, times HH:MM 24h. When it's about a person, pass lead_id, or lead_name and it finds them. notes only when there's more than the title says.",
         _obj({"title": {"type": "string"}, "lead_id": {"type": "string"}, "lead_name": {"type": "string"}, "kind": {"type": "string", "enum": ["call", "text", "email", "showing", "general"]},
               "due_date": {"type": "string"}, "due_time": {"type": "string"}, "notes": {"type": "string"}, "suggested_message": {"type": "string"}}, ["title"]),
-        _p_new_task, _r_new_task)
+        _p_new_task, _r_new_task, adjust=_adjust_followup)
 
 
 async def _p_edit_task(db, user, a):
@@ -605,6 +635,125 @@ async def _r_add_home(db, user, p):
 
 _simple("add_home_to_showcase", "Add a specific home (listing_key from search_properties) to a client's Showcase as Recommended.",
         _obj({"collection_id": {"type": "string"}, "listing_key": {"type": "string"}}, ["collection_id", "listing_key"]), _p_add_home, _r_add_home, SHOWCASE)
+
+
+# Take homes out of a client's Showcase (owner, 11/08: "it needs to be able to remove homes from a
+# Showcase - a nice card where the agent does the clicking"). The one remove the chat sets up: the
+# card lists EVERY home in the Showcase, the ones to go start checked, and nothing leaves until the
+# agent taps Remove - the same "Remove" as Select mode on the Showcase page (the search won't add
+# them back). Homes the client loved, commented on or asked to tour never start checked when the
+# chat picks by "keep these"; the agent can still check them.
+_REMOVE_MAX = 100
+
+
+async def _p_remove_homes(db, user, a):
+    from app.models.database import PropertyComment, PropertyInteraction, collection_properties
+    from app.services.collections_service import _is_property_available
+    # Either id works - a lead's id given as collection_id (or the other way round) is still found.
+    from app.services.ai.ai_tools import _find_lead_collection
+    c = None
+    for cand in dict.fromkeys(x for x in (_s(a.get("collection_id")), _s(a.get("lead_id"))) if _ID.match(x)):
+        c = (await db.execute(select(Collection).where(Collection.id == cand, Collection.owner_id == user.id))).scalar_one_or_none()
+        if c is None:
+            lead, c = await _find_lead_collection(db, user, cand)
+            if lead is not None and c is None:
+                raise ActionError(f"{lead.name or 'That lead'} doesn't have a Showcase.")
+        if c is not None:
+            break
+    if c is None:
+        raise ActionError("I couldn't find that Showcase - look the lead up with search_leads and pass its lead_id.")
+    rows = (await db.execute(
+        select(Property, collection_properties.c.sold_filed_at)
+        .join(collection_properties, collection_properties.c.property_id == Property.id)
+        .where(collection_properties.c.collection_id == c.id))).all()
+    if not rows:
+        raise ActionError(f"{_sc_name(c)} has no homes in it right now.")
+    ix = {i.property_id: i for i in (await db.execute(select(PropertyInteraction).where(PropertyInteraction.collection_id == c.id))).scalars()}
+    talk = {pid for (pid,) in (await db.execute(select(PropertyComment.property_id).where(PropertyComment.collection_id == c.id).distinct())).all()}
+    toured = {pid for (pid,) in (await db.execute(select(PropertyTour.property_id).where(PropertyTour.collection_id == c.id).distinct())).all()}
+    first = (c.visitor_name or "").split(" ")[0] or "They"
+
+    def keys(name):
+        v = a.get(name)
+        return {str(x).strip() for x in (v if isinstance(v, list) else [v] if v else []) if str(x).strip()}
+    drop, keep = keys("remove_listing_keys"), keys("keep_listing_keys")
+    # "Remove the sold / under contract ones" (owner's test, 11/08): every home off the market starts checked.
+    off_market = a.get("off_market") is True
+    if not drop and not keep and not off_market:
+        raise ActionError("Which homes should go? Give me the ones to remove (or the ones to keep, or off_market).")
+
+    homes, chosen = [], []
+    for p, filed in rows:
+        i = ix.get(p.id)
+        tags = []
+        if i and i.liked:
+            tags.append("Loved")
+        if p.id in talk:
+            tags.append("Commented")
+        if p.id in toured:
+            tags.append("Tour ask")
+        if i and i.agent_recommended_at:
+            tags.append("You recommended")
+        status = (p.home_status or "").replace("-BRIGHT", "").strip().title() or "Listed"
+        homes.append({
+            "id": p.id, "key": p.listing_key, "street": tidy_caps(p.street_address or p.full_address or ""), "city": tidy_caps(p.city or ""),
+            "price": p.price, "beds": p.bedrooms, "baths": p.bathrooms, "photo": p.img_src,
+            "status": None if _is_property_available(p.home_status) else ("Sold/Removed folder" if filed else status), "tags": tags,
+        })
+        touched = any(t in tags for t in ("Loved", "Commented", "Tour ask"))
+        if p.listing_key in drop or (keep and p.listing_key not in keep and not touched) or (off_market and not _is_property_available(p.home_status) and not touched):
+            chosen.append(p.id)
+    unknown = [k for k in drop if k not in {h["key"] for h in homes}]
+    homes.sort(key=lambda h: (h["id"] not in chosen, (h["street"] or "").lower()))
+    held = [h for h in homes if h["id"] not in chosen and any(t in h["tags"] for t in ("Loved", "Commented", "Tour ask"))
+            and ((keep and h["key"] not in keep) or (off_market and h["status"]))]
+    n = len(chosen)
+    lines = [f"{_sc_name(c)} has {len(homes)} home{'s' if len(homes) != 1 else ''}",
+             f"{n} checked to remove - check or uncheck homes on the card" if n else "Check the homes to remove on the card"]
+    if held:
+        lines.append(f"{len(held)} {first} loved, commented on or asked to tour {'is' if len(held) == 1 else 'are'} left unchecked - check {'it' if len(held) == 1 else 'them'} to remove too")
+    if unknown:
+        lines.append(f"{len(unknown)} of the homes you named aren't in this Showcase")
+    payload = {"collection_id": c.id, "client": first if first != "They" else "", "name": _sc_name(c), "homes": homes[:_REMOVE_MAX * 2], "selected": chosen}
+    return Prepared(f"Remove homes from {_sc_name(c)}", lines, payload,
+                    warning=f"Removed homes leave {(first + chr(39) + 's') if first != 'They' else 'their'} Showcase for good - the search won't add them back.",
+                    confirm_label=f"Remove {n} home{'s' if n != 1 else ''}" if n else "Remove homes", picker="showcase_remove")
+
+
+def _adjust_remove(user, payload: dict, picks: dict) -> dict:
+    ids = picks.get("property_ids")
+    if not isinstance(ids, list):
+        return payload
+    want = {str(i) for i in ids}
+    ok = [h["id"] for h in payload.get("homes") or [] if h["id"] in want]
+    if not ok:
+        raise ActionError("Check at least one home on the card first.")
+    return {**payload, "selected": ok[:_REMOVE_MAX]}
+
+
+async def _r_remove_homes(db, user, p):
+    ids = [str(i) for i in (p.get("selected") or [])][:_REMOVE_MAX]
+    if not ids:
+        raise ActionError("No homes were checked - nothing was removed.")
+    out = await _run_route(user, "POST", f"/collections/{p['collection_id']}/properties/bulk", {"action": "remove", "property_ids": ids})
+    done = len((out or {}).get("done") or [])
+    left = len(p.get("homes") or []) - done
+    return {"message": f"Removed {done} home{'s' if done != 1 else ''} - {left} left in {p.get('name') or 'the Showcase'}.",
+            "link": f"/showcases?showcase={p['collection_id']}"}
+
+register({"name": "remove_showcase_homes",
+          "description": "Set up taking homes OUT of a client's Showcase. The card lists every home in it with the ones to go already checked; "
+                         "the agent checks / unchecks and taps Remove (nothing leaves before that; the search won't add removed homes back). "
+                         "Give collection_id (or lead_id) and EITHER remove_listing_keys (the homes to go) OR keep_listing_keys (the homes to keep - "
+                         "every other home starts checked, except ones the client loved, commented on or asked to tour), OR off_market true (every sold / under contract / off-market home). For 'remove the ones "
+                         "without X', call search_showcase_homes first and pass its matches as keep_listing_keys. Always make the card in the same turn - never "
+                         "ask which homes to keep first: the card is where they pick. Put borderline matches in keep_listing_keys (they start "
+                         "unchecked) and name them in one line so the agent can check them on the card.",
+          "input_schema": _obj({"collection_id": {"type": "string"}, "lead_id": {"type": "string"},
+                                "remove_listing_keys": {"type": "array", "items": {"type": "string"}},
+                                "keep_listing_keys": {"type": "array", "items": {"type": "string"}},
+                                "off_market": {"type": "boolean", "description": "true = every home that sold, is pending / under contract or came off the market starts checked (for 'remove the sold ones'). Never decide that from a short list - this checks every home."}})},
+         _p_remove_homes, _r_remove_homes, SHOWCASE, adjust=_adjust_remove)
 
 
 async def _p_tour(db, user, a):
