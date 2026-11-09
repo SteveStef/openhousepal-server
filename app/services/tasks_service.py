@@ -1424,6 +1424,8 @@ def _pick_standout(payload: dict) -> tuple[int, Optional[dict], Optional[int], O
     subject = payload.get("originalProperty") or None
     toured = (subject or {}).get("listingKey")
     candidates = [p for p in shown if not toured or p.get("ListingKey") != toured] or shown
+    # The Showcase's must-haves (smart filter): the home named first is one that has them, when any does.
+    candidates = [p for p in candidates if _is_smart(p)] or candidates
     show_match = (payload.get("preferences") or {}).get("show_match_score") is not False
 
     def dom(p):
@@ -1465,9 +1467,68 @@ def _standout_candidates(payload: dict) -> list[dict]:
             dom = int(p.get("DaysOnMarket"))
         except (TypeError, ValueError):
             continue
-        out.append({"home": p, "dom": dom,
+        out.append({"home": p, "dom": dom, "smart": _is_smart(p),
                     "score": compute_match_score(p, subject, shown) if subject and show_match else None})
     return out
+
+
+def _is_smart(p: dict) -> bool:
+    """Has every must-have of its Showcase (the gold "This appears to have" line)."""
+    return bool(((p or {}).get("smartMatch") or {}).get("wants"))
+
+
+def smart_summary(payload: dict) -> Optional[dict]:
+    """{n, wants} - how many homes on the guest's Showcase have every must-have, and what they are -
+    or None when the Showcase has no must-haves or none of its homes has them."""
+    shown = [p for p in (payload.get("matchedProperties") or []) if _visible_on_showcase(p)]
+    hits = [p for p in shown if _is_smart(p)]
+    if not hits:
+        return None
+    return {"n": len(hits), "wants": [str(w) for w in hits[0]["smartMatch"]["wants"] if w]}
+
+
+def _and_words(items: list) -> str:
+    items = [w for w in items if w]
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1] if items else ""
+
+
+def _must_parts(count: int, best: Optional[dict], smart: Optional[dict]) -> dict:
+    """The must-have sentence that follows the home count ("4 of them have the first-floor primary
+    bedroom you wanted.") and the few words after the named home when it's one of them (owner, 11/09:
+    what matters most to this client belongs in the text)."""
+    if not smart or not count or not smart.get("n") or not smart.get("wants"):
+        return {}
+    n = min(int(smart["n"]), count)
+    what = _and_words([w[:1].lower() + w[1:] for w in smart["wants"]])
+    if n == count:
+        line = f"It has the {what} you wanted." if count == 1 else f"All {n} have the {what} you wanted."
+    elif n == 1:
+        line = f"One of them has the {what} you wanted."
+    else:
+        line = f"{n} of them have the {what} you wanted."
+    tail = ""
+    if best is not None and _is_smart(best) and n < count:
+        tail = ", the one that has it" if n == 1 else ", one of those"
+    return {"must_line": line, "must_tail": tail}
+
+
+def _with_must(template: str, parts: dict) -> str:
+    """The must-have sentence goes right after the sentence holding {home_count}; nothing when the
+    agent's version has no count in it."""
+    line = parts.get("must_line")
+    if not line or "{home_count}" not in (template or ""):
+        return template
+    paras = template.split("\n\n")
+    for i, para in enumerate(paras):
+        sents = re.split(r"(?<=[.!?])\s+", para)
+        for j, sent in enumerate(sents):
+            if "{home_count}" in sent:
+                sents.insert(j + 1, line)
+                paras[i] = " ".join(sents)
+                if parts.get("must_tail"):
+                    paras = [x.replace("{best_home}", "{best_home}" + parts["must_tail"], 1) for x in paras]
+                return "\n\n".join(paras)
+    return template
 
 
 def pick_for_followup(candidates: list, created_at: Optional[datetime], now: Optional[datetime] = None):
@@ -1477,6 +1538,7 @@ def pick_for_followup(candidates: list, created_at: Optional[datetime], now: Opt
     which then takes over ("It just hit the market 1 day ago"). (None, None) = name no home."""
     if not candidates:
         return None, None
+    candidates = [c for c in candidates if c.get("smart")] or candidates   # a must-have home first
     today = (now or datetime.now(timezone.utc)).astimezone(EASTERN).date()
     made = (created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)).astimezone(EASTERN).date() if created_at else today
     age = max(0, (today - made).days)
@@ -1496,13 +1558,14 @@ def pick_for_followup(candidates: list, created_at: Optional[datetime], now: Opt
     return best["home"], best["dom"]
 
 
-def _pitch_parts(count: int, best: Optional[dict], days: Optional[int], url: str) -> dict:
+def _pitch_parts(count: int, best: Optional[dict], days: Optional[int], url: str, smart: Optional[dict] = None) -> dict:
     """The pieces a pitch template is filled with (see PITCH_TOKENS) - how many homes fit, the one
     to open first, why it's worth a click today, and the link."""
     parts = {"home_count": "", "best_home": "", "why_now": "", "showcase_link": url, "count": count}
     if not count:
         return parts
     parts["home_count"] = f"{count} {'home' if count == 1 else 'homes'}"
+    parts.update(_must_parts(count, best, smart))
     if not best:
         return parts  # nothing new enough to name (see _pick_standout) - count + link only
     street = str(best.get("FullStreetAddress") or "").strip()
@@ -1541,11 +1604,11 @@ def pitch_for(rule: Optional[str], owner: Optional[User], showcase: Optional[dic
     parts["first_name"] = showcase.get("first_name") or ""
     parts["my_name"] = _my_name(owner)
     if rule == "open_house_signin" and showcase.get("tailored"):
-        return render_pitch(TAILORED_OPEN_HOUSE_PITCH if parts.get("home_count") else TAILORED_OPEN_HOUSE_EMPTY, parts)
+        return render_pitch(_with_must(TAILORED_OPEN_HOUSE_PITCH, parts) if parts.get("home_count") else TAILORED_OPEN_HOUSE_EMPTY, parts)
     if not parts.get("home_count"):
         return render_pitch(EMPTY_PITCHES.get(rule, EMPTY_PITCH), parts)
     template = rule_settings(owner, rule)["pitch"] if owner is not None else DEFAULT_PITCHES[rule]
-    return render_pitch(template, parts)
+    return render_pitch(_with_must(template, parts), parts)
 
 
 async def lead_showcase_info(db: AsyncSession, owner: User, leads: list) -> dict[str, dict]:
@@ -1599,11 +1662,15 @@ async def lead_showcase_info(db: AsyncSession, owner: User, leads: list) -> dict
             except Exception:  # noqa: BLE001 - the per-follow-up pick is a refinement, never fatal
                 logger.warning("showcase candidates failed for %s", token, exc_info=True)
                 cands = None
-            cache[token] = (*_pick_standout(payload), cands)
-        count, best, _match, days, cands = cache[token]
+            try:
+                smart = smart_summary(payload)
+            except Exception:  # noqa: BLE001
+                smart = None
+            cache[token] = (*_pick_standout(payload), cands, smart)
+        count, best, _match, days, cands, smart = cache[token]
         from app.services.showcase_links import showcase_path
         url = clean_url(f"{base}{await showcase_path(share_token=token, db=db) or f'/showcase/{token}'}")
-        out[lead_id] = {"url": url, "count": count, "parts": _pitch_parts(count, best, days, url),
+        out[lead_id] = {"url": url, "count": count, "parts": _pitch_parts(count, best, days, url, smart), "smart": smart,
                         "first_name": _first(by_id[lead_id].name), "candidates": cands,
                         "tailored": col_of.get(token) in tailored}
     return out
@@ -1650,7 +1717,7 @@ def full_message(task: AgentTask, showcase: Optional[dict], owner: Optional[User
             # This follow-up's own home: the same one each day it rolls over (day count moving on),
             # or a newer match that arrived since - see pick_for_followup.
             best, days = pick_for_followup(showcase["candidates"], getattr(task, "created_at", None))
-            parts = {**_pitch_parts(showcase["count"], best, days, url), "showcase_link": url}
+            parts = {**_pitch_parts(showcase["count"], best, days, url, showcase.get("smart")), "showcase_link": url}
         showcase = {**showcase, "url": url, "parts": parts}
     seen = guest_pass_line(task)
     if seen:

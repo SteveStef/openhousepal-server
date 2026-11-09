@@ -24,4 +24,6 @@ def test_card_line_only_for_yes():
     assert sf.match_line(None) is None
     assert sf.match_line({"v": "maybe", "found": []}) is None
     line = sf.match_line({"v": "yes", "found": [{"w": "Pool", "q": "an in-ground ⟦pool⟧"}, {"w": "9 ft+ ceilings", "q": ""}]})
-    assert line == {"wants": ["Pool", "9 ft+ ceilings"], "quotes": ["an in-ground ⟦pool⟧"]}
+    # marks = the listing's own words to highlight in the description (only where the quote marked some)
+    assert line == {"wants": ["Pool", "9 ft+ ceilings"], "quotes": ["an in-ground ⟦pool⟧"],
+                    "marks": [{"want": "Pool", "words": "pool"}]}

@@ -104,7 +104,14 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
         )).all()
         removed = {r[0] for r in (await db.execute(select(PropertyInteraction.property_id).where(and_(
             PropertyInteraction.collection_id == collection_id, PropertyInteraction.agent_removed_at.is_not(None))))).all()}
-        todo = [(p, old) for p, old in rows if p.id not in removed and not (isinstance(old, dict) and old.get("k") == k)][:reader.READ_CAP]
+        todo = [(p, old) for p, old in rows if p.id not in removed and not (isinstance(old, dict) and old.get("k") == k)]
+        if len(todo) > reader.READ_CAP:
+            # Same ceiling as the chat's own listing reads (owner, 11/09): more than 300 homes to read never
+            # starts - the agent narrows the search first. New listings arriving one by one never hit this.
+            out = {**st, "wants": wants, "state": "too_many", "left": len(todo), "cap": reader.READ_CAP,
+                   "at": datetime.now(timezone.utc).isoformat()}
+            await _set_state(db, prefs.id, out)
+            return out
         if not todo:
             done = {**st, "wants": wants, "state": "done", "left": 0, "at": datetime.now(timezone.utc).isoformat(),
                     "matched": await _count_matched(db, collection_id, k)}
@@ -114,7 +121,7 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
         config = await ai_config_service.get_config(db)
         homes = [p for p, _ in todo]
         est = reader.estimate_for(config, homes) * len(wants)
-        left, _limit = await reader.room(db, user, config)
+        left, limit = await reader.room(db, user, config)
         if left is not None and est > left:
             out = {**st, "wants": wants, "state": "no_room", "left": len(todo), "at": datetime.now(timezone.utc).isoformat()}
             await _set_state(db, prefs.id, out)
@@ -128,6 +135,7 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
             await _set_state(db, prefs.id, out)
             return out
         spent, tin, tout = 0.0, 0, 0
+        ai_starred: Dict[str, str] = {}
         try:
             got = await asyncio.gather(*(reader.read(config, w, homes) for w in wants))
             for g in got:
@@ -151,12 +159,19 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
                     if row.agent_recommended_at is None:
                         row.agent_recommended_at = now
                         row.disliked = False
+                        ai_starred[p.id] = now.isoformat()   # the AI's star, not the agent's (ai_only_star_ids)
                     m["starred"] = True
                 await db.execute(text("update collection_properties set ai_match = cast(:m as jsonb) where collection_id = :c and property_id = :p"),
                                  {"m": json.dumps(m), "c": collection_id, "p": p.id})
             await db.commit()
+            # What this read took of the agent's chat usage - shown on the Showcase like the chat shows it.
+            used = reader.percent(spent, limit) if limit else None
             out = {**st, "wants": wants, "state": "done", "left": len(failed), "read": len(todo) - len(failed),
-                   "matched": await _count_matched(db, collection_id, k), "at": datetime.now(timezone.utc).isoformat()}
+                   "matched": await _count_matched(db, collection_id, k), "at": datetime.now(timezone.utc).isoformat(),
+                   "used_percent": used, "used_total_percent": round(float(st.get("used_total_percent") or 0) + (used or 0), 1) if used is not None else st.get("used_total_percent")}
+            # The AI's stars, read fresh (the agent may have tapped a star while this read ran - forget_ai_star).
+            now_list = (await db.execute(text("select ai_wants->'ai_starred' from collection_preferences where id = :i"), {"i": prefs.id})).scalar()
+            out["ai_starred"] = {**(now_list if isinstance(now_list, dict) else {}), **ai_starred}
             await _set_state(db, prefs.id, out)
         except Exception:  # noqa: BLE001 - a failed read leaves the homes unread; the next save or listing tries again
             logger.warning("showcase smart filter failed for %s", collection_id, exc_info=True)
@@ -168,6 +183,75 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
         if spent:
             await record_usage_event(db, user.id, None, config["model"], tin, tout, spent, 0, False, None, tool_names=["showcase_smart_filter"])
         return out
+
+
+FOR_SALE = ("ACTIVE-BRIGHT", "COMING SOON-BRIGHT", "ACTIVE", "COMING SOON")
+_avg_chars: Dict[str, Any] = {}
+
+
+async def _avg_desc_chars(db) -> float:
+    """The average description length (capped like the reader caps it) of homes for sale - an hour's cache."""
+    now = datetime.now(timezone.utc).timestamp()
+    if _avg_chars and now - _avg_chars["at"] < 3600:
+        return _avg_chars["v"]
+    v = (await db.execute(text(
+        "select coalesce(avg(least(length(coalesce(description, '')), 1800)), 900) from properties where home_status = any(:s)"),
+        {"s": list(FOR_SALE)})).scalar()
+    _avg_chars.update(v=float(v or 900), at=now)
+    return _avg_chars["v"]
+
+
+async def estimate(db, user, homes: int, n_wants: int) -> Dict[str, Any]:
+    """What reading `homes` homes for `n_wants` must-haves takes - the chat's own Home search math (owner,
+    11/09): a percent of the agent's chat usage, what's left, and whether it can run at all (300 homes at
+    most, and only when the usage has room). No AI - a plain estimate."""
+    from app.services.ai import ai_home_reader as reader
+    from app.services.ai.ai_config_service import ai_config_service
+    config = await ai_config_service.get_config(db)
+    n = max(0, int(homes or 0))
+    w = max(1, min(MAX_WANTS, int(n_wants or 1)))
+    # Each home's facts + MLS features ride along with its description (~1,300 characters) - as the chat counts it.
+    chars = int(n * (await _avg_desc_chars(db) + 1300))
+    est = reader.estimate_usd(config, chars, min(n, reader.READ_CAP)) * w if n else 0.0
+    left, limit = await reader.room(db, user, config)
+    enough = left is None or est <= left
+    return {"count": n, "cap": reader.READ_CAP, "usage_percent": reader.percent(est, limit) if limit else 0.0,
+            "left_percent": None if left is None else reader.percent(left, limit), "enough": enough,
+            "ready": 0 < n <= reader.READ_CAP and enough}
+
+
+async def showcase_home_count(db, collection_id: str) -> int:
+    """Homes for sale in the Showcase the must-haves would read (the agent's removed ones left out)."""
+    return int((await db.execute(text(
+        "select count(*) from collection_properties cp join properties p on p.id = cp.property_id "
+        "where cp.collection_id = :c and cp.sold_filed_at is null and p.home_status = any(:s) "
+        "and not exists (select 1 from property_interactions i where i.collection_id = cp.collection_id "
+        "and i.property_id = cp.property_id and i.agent_removed_at is not null)"),
+        {"c": collection_id, "s": list(FOR_SALE)})).scalar() or 0)
+
+
+async def ai_only_star_ids(db, collection_id: str, ids) -> set:
+    """Of `ids`, the homes whose only reason to stay is a star the must-haves gave (ai_wants.ai_starred - the
+    agent touching a home's star takes it off that list, see forget_ai_star) and that the client hasn't
+    liked, commented on or toured."""
+    ids = [i for i in ids if i]
+    if not ids:
+        return set()
+    rows = (await db.execute(text(
+        "select i.property_id from property_interactions i join collection_preferences cpf on cpf.collection_id = i.collection_id "
+        "where i.collection_id = :c and i.property_id = any(:ids) and i.agent_recommended_at is not null "
+        "and (cpf.ai_wants->'ai_starred') ? i.property_id "
+        "and coalesce(i.liked, false) = false "
+        "and not exists (select 1 from property_comments c where c.collection_id = i.collection_id and c.property_id = i.property_id) "
+        "and not exists (select 1 from property_tours t where t.collection_id = i.collection_id and t.property_id = i.property_id)"),
+        {"c": collection_id, "ids": ids})).all()
+    return {r[0] for r in rows}
+
+
+async def forget_ai_star(db, collection_id: str, property_id: str) -> None:
+    """The agent starred or unstarred this home by hand - from now on its star is the agent's own."""
+    await db.execute(text("update collection_preferences set ai_wants = ai_wants #- array['ai_starred', cast(:p as text)] "
+                          "where collection_id = :c and ai_wants ? 'ai_starred'"), {"c": collection_id, "p": property_id})
 
 
 async def _count_matched(db, collection_id: str, k: str) -> int:
@@ -225,13 +309,25 @@ async def schedule_if_on(db, collection_ids, delay: float = 0) -> None:
             schedule(cid, delay)
 
 
+_MARKED = re.compile(r"⟦(.+?)⟧")
+
+
 def match_line(m: Any) -> Optional[Dict[str, Any]]:
-    """What a home card shows: only a 'yes' (changing the must-haves clears every home's read - save_wants)."""
+    """What a home card shows: only a 'yes' (changing the must-haves clears every home's read - save_wants).
+    marks = the listing's own words the AI pointed at, one per must-have (the ⟦key words⟧ of its quote) - the
+    home's details window highlights them in the description (owner, 11/09). A must-have taken off clears
+    the read, so its highlight goes with it."""
     if not isinstance(m, dict) or m.get("v") != "yes":
         return None
     found = m.get("found") or []
+    marks = []
+    for f in found:
+        hit = _MARKED.search(f.get("q") or "")
+        if f.get("w") and hit and hit.group(1).strip():
+            marks.append({"want": f["w"], "words": hit.group(1).strip()})
     return {"wants": [f.get("w") for f in found if f.get("w")],
-            "quotes": [f.get("q") for f in found if f.get("q")][:3]}
+            "quotes": [f.get("q") for f in found if f.get("q")][:3],
+            "marks": marks[:MAX_WANTS]}
 
 
 async def save_wants(db, collection_id: str, raw: Any) -> Dict[str, Any]:

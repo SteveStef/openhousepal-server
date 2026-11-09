@@ -398,6 +398,8 @@ async def add_home_to_showcase(
     row.disliked = False
     row.agent_recommended_at = row.agent_recommended_at or now
     row.agent_removed_at = None  # an agent who took it out earlier can always put it back
+    from app.services.showcase_smart_filter import forget_ai_star
+    await forget_ai_star(db, collection_id, home_id)   # added by hand = the agent's own pick
     coll.updated_at = now
     await db.commit()
     return {"success": True, "added": not already, "property_id": home_id}
@@ -580,6 +582,8 @@ async def bulk_homes_action(
             else:
                 row.agent_recommended_at = None
             row.updated_at = now
+            from app.services.showcase_smart_filter import forget_ai_star
+            await forget_ai_star(db, collection_id, pid)   # the agent's own choice now
             done.append(pid)
         elif a in ("sold", "unsold"):
             res = await CollectionsService.set_sold_filed(db, collection_id, pid, a == "sold")
@@ -1222,6 +1226,9 @@ async def recommend_property(
     if body.recommended and row.disliked:
         row.disliked = False
     row.agent_recommended_at = now if body.recommended else None
+    # The agent's own choice now - not a must-haves star any more (it keeps the home on a search change).
+    from app.services.showcase_smart_filter import forget_ai_star
+    await forget_ai_star(db, collection_id, property_id)
     await db.commit()
     return {"success": True, "recommended": body.recommended}
 
@@ -1970,8 +1977,36 @@ async def save_smart_filter(collection_id: str, body: SmartFilterUpdate, db: Asy
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
     if not (tier_has_mls(current_user.plan_tier) or current_user.is_admin):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="The smart filter reads MLS listings - it's on the MLS plans.")
-    st = await save_wants(db, collection_id, body.wants)
+    from app.services.showcase_smart_filter import clean_wants, showcase_home_count, state_of
+    from app.services.ai.ai_home_reader import READ_CAP
+    from app.models.database import CollectionPreferences
+    wants = clean_wants(body.wants)
+    if wants:
+        # Same ceiling as the chat's listing reads (owner, 11/09): the AI reads every home, so a Showcase
+        # over 300 homes is narrowed first. A Showcase whose must-haves are already on and unchanged
+        # isn't refused (new listings keep being read one by one).
+        prefs = (await db.execute(select(CollectionPreferences).where(CollectionPreferences.collection_id == collection_id))).scalar_one_or_none()
+        same = prefs is not None and [w.lower() for w in clean_wants(state_of(prefs).get("wants"))] == [w.lower() for w in wants]
+        n = await showcase_home_count(db, collection_id)
+        if n > READ_CAP and not same:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"This Showcase has {n} homes - the AI reads every one, so narrow the search to {READ_CAP} or fewer before adding must-haves.")
+    st = await save_wants(db, collection_id, wants)
     return {"success": True, "smart_filter": st}
+
+
+class SmartFilterEstimate(BaseModel):
+    count: int = 0      # homes the search finds right now (the editor's live count)
+    wants: int = 1      # how many must-haves
+
+
+@router.post("/smart-filter/estimate")
+async def smart_filter_estimate(body: SmartFilterEstimate, db: AsyncSession = Depends(get_db),
+                                current_user: User = Depends(require_premium_plan)):
+    """What reading the search's homes for the must-haves would take of the agent's chat usage - the same
+    numbers the chat's Home search card shows. Free: no AI."""
+    from app.services.showcase_smart_filter import estimate
+    return await estimate(db, current_user, body.count, body.wants)
 
 
 @router.get("/{collection_id}/smart-filter")

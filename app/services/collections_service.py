@@ -211,6 +211,12 @@ def card_new_since(collection: Collection) -> datetime:
     return _utc(collection.last_agent_dismissed_at or collection.created_at)
 
 
+async def _ai_starred_ids(db, collection_id: str) -> set:
+    """Homes the Showcase's must-haves reader starred (not the agent by hand) - showcase_smart_filter."""
+    v = (await db.execute(text("select ai_wants->'ai_starred' from collection_preferences where collection_id = :c"), {"c": collection_id})).scalar()
+    return set(v) if isinstance(v, dict) else set()
+
+
 class CollectionsService:
 
     @staticmethod
@@ -1646,6 +1652,7 @@ class CollectionsService:
                     filed_at_lookup[row.property_id] = row.sold_filed_at
                     smart_lookup[row.property_id] = smart_line(row.ai_match)
             sold_folder, back_on_market = sold_folder_split(collection.properties, filed_at_lookup)
+            ai_starred_ids = await _ai_starred_ids(db, collection.id)
 
             # Calculate "new" threshold (properties added in last 7 days)
             now = datetime.now(timezone.utc)
@@ -1764,6 +1771,8 @@ class CollectionsService:
                     'liked':interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
                     'agentRecommended': bool(prop.id in interactions_lookup and interactions_lookup[prop.id].agent_recommended_at),
+                    # starred by the must-haves reader, not by hand - it doesn't keep the home on a search change
+                    'aiStarred': prop.id in ai_starred_ids,
                     # "Appears to have: ..." - the smart filter found every must-have (owner, 11/09)
                     'smartMatch': smart_lookup.get(prop.id),
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
@@ -1959,6 +1968,12 @@ class CollectionsService:
             )
             keep_ids_res = await db.execute(keep_query)
             protected_ids = {r[0] for r in keep_ids_res.fetchall()}
+            # A star the must-haves reader gave (showcase_smart_filter) isn't the agent's own pick: it never
+            # keeps a home the new search leaves out (owner, 11/09 - a client's "4+ beds" kept the AI's
+            # starred 3-bed homes). The agent's own stars still do; liked / commented / toured still do.
+            if protected_ids:
+                from app.services.showcase_smart_filter import ai_only_star_ids
+                protected_ids -= await ai_only_star_ids(db, collection_id, protected_ids)
 
             # The same house under two MLS numbers: matches are already one per house (newest
             # listing) - but if they acted on the other copy, keep that one instead.
@@ -2157,6 +2172,7 @@ class CollectionsService:
                 filed_at_lookup[row.property_id] = row.sold_filed_at
                 smart_lookup[row.property_id] = smart_line(row.ai_match)
             sold_folder, back_on_market = sold_folder_split(collection.properties, filed_at_lookup)
+            ai_starred_ids = await _ai_starred_ids(db, collection.id)
 
             # Calculate "new" threshold (properties added in last 7 days)
             now = datetime.now(timezone.utc)
@@ -2298,6 +2314,8 @@ class CollectionsService:
                     'liked': interactions_lookup[prop.id].liked if prop.id in interactions_lookup else False,
                     'disliked': interactions_lookup[prop.id].disliked if prop.id in interactions_lookup else False,
                     'agentRecommended': bool(prop.id in interactions_lookup and interactions_lookup[prop.id].agent_recommended_at),
+                    # starred by the must-haves reader, not by hand - it doesn't keep the home on a search change
+                    'aiStarred': prop.id in ai_starred_ids,
                     # "Appears to have: ..." - the smart filter found every must-have (owner, 11/09)
                     'smartMatch': smart_lookup.get(prop.id),
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
