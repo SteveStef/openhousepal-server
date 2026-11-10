@@ -1905,6 +1905,14 @@ class CollectionsService:
                 'shortCode': collection.short_code,
                 'isPublic': collection.is_public
             }
+            # The homes its link preview leads with - the one the follow-up text names first, then the
+            # rest that have every must-have (tasks_service.preview_lead_ids; owner, 11/09).
+            try:
+                from app.services.tasks_service import preview_lead_ids
+                collection_data['previewLead'] = preview_lead_ids(collection_data)
+            except Exception:  # noqa: BLE001 - the preview falls back to newest-first
+                logger.warning("showcase preview order failed", exc_info=True)
+                collection_data['previewLead'] = []
 
             await _unfile_back_on_market(db, collection.id, back_on_market)
             return collection_data

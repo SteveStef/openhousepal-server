@@ -34,6 +34,14 @@ async def ensure_google_rooftop_geocode(db: AsyncSession, property_record: Prope
     """
     if property_record.google_rooftop_latitude is not None and property_record.google_rooftop_longitude is not None:
         return property_record
+    # Asked before and Google had no rooftop point: don't ask again on every view (11/09 money audit - a
+    # home Google only places approximately was re-geocoded, and billed, each time its page opened).
+    # Retried after 180 days in case Google's map improved.
+    tried = property_record.google_geocoded_at
+    if tried is not None:
+        tried = tried if tried.tzinfo else tried.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - tried).days < 180:
+            return property_record
 
     api_key = os.getenv("GOOGLE_GEOCODING_API_KEY") or os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("GOOGLE_PLACES_API_KEY")
     if not api_key:
@@ -42,6 +50,20 @@ async def ensure_google_rooftop_geocode(db: AsyncSession, property_record: Prope
 
     address = _property_address(property_record)
     if not address:
+        return property_record
+
+    # Home pages on agents' websites call this for VISITORS (and search-engine robots) - a day/month count
+    # cap under Google's monthly free geocoding allowance (owner rule: Google free tier only). Over it the
+    # home just keeps the MLS's own map point.
+    try:
+        from app.services import usage_budget_service
+        from app.services.ai.ai_config_service import ai_config_service
+        config = await ai_config_service.get_config(db)
+        await usage_budget_service.reserve(db, {
+            "google_geocode": (config.get("google_geocode_daily_limit", 400), config.get("google_geocode_monthly_limit", 8000), None, None),
+            "platform_emergency": (None, None, config["platform_emergency_daily_cost_ceiling_usd"], config["platform_emergency_monthly_cost_ceiling_usd"]),
+        }, config.get("google_geocode_estimated_cost_usd", 0.005), count_delta=1)
+    except Exception:  # noqa: BLE001 - over the cap (BudgetExceeded) or the counter failed: no Google call
         return property_record
 
     try:

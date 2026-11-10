@@ -46,7 +46,7 @@ from app.services.open_house_manager_service import INACTIVE_STATUSES
 logger = logging.getLogger(__name__)
 from app.services.mls_open_houses import open_houses_payload
 from app.services.property_service import PropertyService
-from app.services.website import search_query_parser
+from app.services.website import search_features, search_query_parser
 from app.services.email_service import tidy_caps  # MLS ALL-CAPS -> "583 Lakeside Rd #205"
 from app.utils.listing_dom import property_days_on_market
 
@@ -1519,7 +1519,50 @@ async def served_area_names(db: AsyncSession, user: User, limit: int = 50) -> li
         .order_by(MarketArea.name)
         .limit(limit)
     )
-    return [n for n in result.scalars().all() if n]
+    names = [n for n in result.scalars().all() if n]
+    if names or not getattr(user, "mls_id", None):
+        return names
+    # No towns (a site published before towns were required, owner 11/09): the towns of the agent's own
+    # listings and sales - never the newest homes anywhere in the MLS (DC, Virginia...).
+    rows = (await db.execute(
+        select(Property.city, Property.state).where(
+            or_(Property.list_agent_mls_id == user.mls_id, Property.co_list_agent_mls_id == user.mls_id),
+            Property.city.isnot(None), Property.state.isnot(None),
+        ).group_by(Property.city, Property.state).order_by(func.count().desc()).limit(min(limit, 12))
+    )).all()
+    return [f"{c.strip().title()}, {s.strip().upper()}" for c, s in rows if c and s and c.strip()]
+
+
+_MLS_TOWNS_CACHE: dict[tuple, tuple[float, list[str]]] = {}
+_MLS_TOWNS_TTL_S = 6 * 3600
+
+
+async def _served_states(db: AsyncSession, user: User) -> list[str]:
+    result = await db.execute(
+        select(MarketArea.state).join(AgentMarketArea, AgentMarketArea.area_id == MarketArea.id)
+        .where(AgentMarketArea.owner_id == user.id).distinct()
+    )
+    return sorted({(s or "").strip().upper() for s in result.scalars().all() if s and s.strip()})
+
+
+async def mls_town_names(db: AsyncSession, states: list[str]) -> list[str]:
+    """Every real town with homes for sale in the agent's state(s), as "Town, ST" - the search box
+    recognizes any of them, not only the agent's own towns (11/09: "Malvern" was silently ignored
+    and the agent's towns shown instead). No served towns yet = every state in the MLS. Cached."""
+    key = tuple(states)
+    hit = _MLS_TOWNS_CACHE.get(key)
+    if hit and time.monotonic() - hit[0] < _MLS_TOWNS_TTL_S:
+        return hit[1]
+    q = (select(Property.city, Property.state)
+         .where(Property.city.isnot(None), Property.state.isnot(None), Property.home_status.notin_(INACTIVE_STATUSES))
+         .group_by(Property.city, Property.state).having(func.count() >= 2))
+    if states:
+        q = q.where(func.upper(Property.state).in_(states))
+    rows = (await db.execute(q)).all()
+    names = sorted({f"{(c or '').strip().title()}, {(st or '').strip().upper()}" for c, st in rows
+                    if c and st and re.fullmatch(r"[A-Za-z][A-Za-z .'-]{1,40}", c.strip())})
+    _MLS_TOWNS_CACHE[key] = (time.monotonic(), names)
+    return names
 
 
 async def get_served_areas_summary(db: AsyncSession, user: User, limit: int = 15, with_stats: bool = False) -> list[dict]:
@@ -1721,10 +1764,13 @@ async def get_header_listings(db: AsyncSession, user: User, served_cities: list[
     exception as get_hero_photos. Block fields: header_towns, photo_price_min/max,
     photo_property_type, header_mine_first."""
     picked = [t for t in (data.get("header_towns") or []) if isinstance(t, str) and t.strip()]
-    towns = picked or served_cities
+    towns = picked or served_cities or await served_area_names(db, user, 12)
+    if not towns:
+        # No towns at all (owner, 11/09): no homes rather than the newest homes anywhere in the MLS.
+        return []
     flag = _HERO_PROPERTY_TYPE_FLAGS.get(data.get("photo_property_type"))
     min_price, max_price = _as_int(data.get("photo_price_min")), _as_int(data.get("photo_price_max"))
-    prefs = _build_property_preferences(cities=towns or None, min_price=min_price, max_price=max_price, property_type_flag=flag)
+    prefs = _build_property_preferences(cities=towns, min_price=min_price, max_price=max_price, property_type_flag=flag)
     results = await PropertyService.get_properties_by_preferences(db, prefs, max_properties=40)
     results = [p for p in results if getattr(p, "img_src", None) and geography.is_residential_for_sale(getattr(p, "home_type", None), getattr(p, "price", None))]
     cards = await apply_idx_rules(db, [_listing_card(p) for p in results])
@@ -1806,7 +1852,7 @@ async def get_search_suggestions(db: AsyncSession, user: User, limit: int = 3) -
 async def _build_search_suggestions(db: AsyncSession, user: User, limit: int) -> list[str]:
     cities = await _sold_cities(db, user, limit * 2)
     if not cities:
-        cities = await served_area_names(db, user, limit * 2)
+        cities = [c.split(",")[0].strip() for c in await served_area_names(db, user, limit * 2)]
     if not cities:
         return ["4 bed homes under $1M", "homes with 1+ acre", "new listings this week"]
 
@@ -1851,7 +1897,12 @@ def _search_result_card(p) -> dict:
     }
 
 
-_ADDRESS_LIKE_RE = re.compile(r'^\s*\d+\s+\S')
+_ADDRESS_LIKE_RE = re.compile(
+    r"^\s*\d+[a-z]?\s+(?!(?:\+|-|to|or|and|plus|beds?|bedrooms?|br|brs|bd|bds|bdrms?|baths?|bathrooms?|ba|bth|full|acres?|k|m|mil|million|thousand|"
+    r"sq|sqft|sf|square|homes?|houses?|condos?|townhomes?|townhouses?|car|story|stories|units?|family|year|years|min|minutes?)(?![a-z]))[a-z]", re.IGNORECASE)
+_STREET_SUFFIX_RE = re.compile(
+    r"\s+(road|rd|street|st|avenue|ave|av|lane|ln|drive|dr|court|ct|circle|cir|boulevard|blvd|place|pl|way|terrace|ter|pike|parkway|pkwy|highway|hwy|trail|trl)\.?\s*$",
+    re.IGNORECASE)
 
 
 async def _address_search(db: AsyncSession, query_text: str, limit: int) -> list:
@@ -1864,10 +1915,14 @@ async def _address_search(db: AsyncSession, query_text: str, limit: int) -> list
     branch instead of the normal filtered search below."""
     if not _ADDRESS_LIKE_RE.match(query_text or ''):
         return []
+    street = (query_text or '').split(',')[0].strip()
+    street = re.sub(r"\s+", " ", _STREET_SUFFIX_RE.sub("", street)).replace("%", "").replace("_", " ")
+    if len(street) < 4:
+        return []
     result = await db.execute(
         select(Property)
         .where(
-            Property.full_address.ilike(f"%{query_text.strip()}%"),
+            Property.full_address.ilike(f"{street}%") | Property.full_address.ilike(f"{street} %") | Property.street_address.ilike(f"{street}%"),
             Property.home_status.notin_(INACTIVE_STATUSES),
             internet_display_ok(),
             # a seller who hid the address must not be findable by typing it
@@ -1919,13 +1974,41 @@ async def get_search_results(
         return {"results": cards[:limit], "applied_filters": {}}
 
     known_cities = await served_area_names(db, user, 50)
-    parsed = search_query_parser.parse_search_query(query_text, known_cities)
+    parsed = search_query_parser.parse_search_query(query_text, known_cities, await mls_town_names(db, await _served_states(db, user)) if query_text.strip() else [])
+    # A zip code is its town(s), then only that zip's homes (filtered below).
+    zip_code = parsed.get("zip")
+    if zip_code and not parsed.get("cities"):
+        zip_rows = (await db.execute(
+            select(Property.city, Property.state).where(Property.zipcode.like(f"{zip_code}%"), Property.home_status.notin_(INACTIVE_STATUSES))
+            .group_by(Property.city, Property.state)
+        )).all()
+        parsed["cities"] = sorted({f"{c.strip().title()}, {st.strip().upper()}" for c, st in zip_rows if c and st})
+
+    # Just a street name ("Sandringham", "Mount Moro Rd") - nothing else understood: the homes on
+    # that street, anywhere in the agent's area.
+    only_words = parsed.get("unmatched") and not (set(parsed) - {"unmatched"})
+    if only_words and not search_polygon and 3 <= len(query_text.strip()) <= 40:
+        street = re.sub(r"\s+", " ", _STREET_SUFFIX_RE.sub("", query_text.strip())).replace("%", "").replace("_", " ")
+        rows = (await db.execute(
+            select(Property).where(
+                Property.street_address.ilike(f"% {street}%"),
+                Property.home_status.notin_(INACTIVE_STATUSES), internet_display_ok(),
+                func.coalesce(Property.raw_mls_data["InternetAddressDisplayYN"].astext, "true") != "false",
+            ).order_by(Property.mls_list_date.desc().nullslast()).limit(limit * 2)
+        )).scalars().all()
+        states = await _served_states(db, user)
+        rows = [r for r in rows if not states or (r.state or "").upper() in states]
+        if rows:
+            cards = await apply_idx_rules(db, [_search_result_card(p) for p in rows
+                                               if geography.is_residential_for_sale(p.home_type, p.price) or (include_rentals and p.home_type == "RESIDENTIAL_LEASE")])
+            if cards:
+                return {"results": await _attach_spotlight_urls(db, user, cards[:limit]), "applied_filters": {"street": street}}
 
     # No city recognized in the query (including a blank query, e.g. landing on /search directly
     # instead of typing something on the home page first) - default to the agent's own served
     # areas rather than an unscoped search across the entire regional MLS mirror, same "known
     # vocabulary only" principle as the rest of this function.
-    cities = None if search_polygon else ([parsed["city"]] if parsed.get("city") else (known_cities or None))
+    cities = None if search_polygon else (parsed.get("cities") or (["__no_such_town__"] if zip_code else None) or known_cities or None)
     # Home type can be several at once ("single_family,town_house") - same as a Showcase.
     type_flags = [f for f in (_HERO_PROPERTY_TYPE_FLAGS.get(t.strip()) for t in (property_type or "").split(",")) if f]
     flag = (type_flags[0] if type_flags else None) or parsed.get("property_type_flag")
@@ -1962,6 +2045,8 @@ async def get_search_results(
         prefs.min_sqft = min_sqft
     if max_sqft:
         prefs.max_sqft = max_sqft
+    if not min_year_built and parsed.get("new_construction"):
+        min_year_built = datetime.now(timezone.utc).year - 1
     if min_year_built:
         prefs.min_year_built = min_year_built
 
@@ -1973,11 +2058,27 @@ async def get_search_results(
     # "Rentals" toggle, but get_properties_by_preferences includes every type when no is_XXX flag
     # is set, since that's also its correct behavior for callers that DO want every type mixed.
     min_acres = min_acres if min_acres else parsed.get("min_lot_size_acres")
-    needs_post_filter = min_acres is not None or not include_rentals
+    address_like = bool(_ADDRESS_LIKE_RE.match(query_text or ''))
+    needs_post_filter = min_acres is not None or not include_rentals or bool(zip_code)
     fetch_cap = max(limit * 3, 60) if needs_post_filter else limit
-    results = await PropertyService.get_properties_by_preferences(db, prefs, max_properties=fetch_cap)
+    # Home features typed in ("pool", "finished basement") and any other leftover words ("sunroom")
+    # looked for in the listing's own checkboxes / description - no AI (search_features.py, owner 11/09).
+    # Leftover words no home mentions are dropped again and named on the page as not searchable.
+    feature_keys = parsed.get("features") or []
+    extra = search_features.feature_filters(feature_keys)
+    unmatched = list(parsed.get("unmatched") or [])
+    keywords = search_features.keyword_words(unmatched) if not address_like else []
+    kw_filter = search_features.keyword_filter(keywords)
+    results = await PropertyService.get_properties_by_preferences(
+        db, prefs, max_properties=fetch_cap, extra_filters=extra + ([kw_filter] if kw_filter is not None else []))
+    if keywords and not results:
+        keywords = []
+        results = await PropertyService.get_properties_by_preferences(db, prefs, max_properties=fetch_cap, extra_filters=extra)
+    unmatched = [w for w in unmatched if w not in keywords]
     if min_acres is not None:
         results = [r for r in results if (r.lot_size_acres or 0) >= min_acres]
+    if zip_code:
+        results = [r for r in results if (r.zipcode or "").startswith(zip_code)]
     if include_rentals:
         # Rentals in, but never commercial space / land / data-entry junk.
         results = [r for r in results if r.home_type == "RESIDENTIAL_LEASE" or geography.is_residential_for_sale(r.home_type, r.price)]
@@ -1985,7 +2086,7 @@ async def get_search_results(
         results = [r for r in results if r.home_type != "RESIDENTIAL_LEASE" and geography.is_residential_for_sale(r.home_type, r.price)]
 
     cards = await apply_idx_rules(db, [_search_result_card(p) for p in results])
-    if _ADDRESS_LIKE_RE.match(query_text or ''):
+    if address_like:
         # an address typed in fell through to the general search - a home whose seller withheld
         # its address must not answer "is it this house?"
         cards = [c for c in cards if not c.get("address_withheld")]
@@ -2011,7 +2112,14 @@ async def get_search_results(
         "area": bool(search_polygon),
         # The towns this search actually covered (typed town, else the agent's served towns) -
         # "Save this search" hands them to the Showcase so its alerts cover the same ground.
-        "cities": [] if search_polygon else (cities or []),
+        "cities": [] if search_polygon else [c for c in (cities or []) if c != "__no_such_town__"],
+        "zip": zip_code,
+        # Words the box couldn't search on ("pool") - the Search page says so instead of
+        # silently dropping them.
+        "unmatched": unmatched,
+        # What the features / description words narrowed it to ("a pool", "sunroom") - shown on the page.
+        "features": [search_features.label(k) for k in feature_keys],
+        "keywords": keywords,
     }
     return {"results": await _attach_spotlight_urls(db, user, cards[:limit]), "applied_filters": applied_filters}
 

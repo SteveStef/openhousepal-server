@@ -339,6 +339,11 @@ async def publish_my_site(
     current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
 ):
     site = await _load_owned_site(db, current_user.id)
+    # A website needs at least one town (owner, 11/09) - its homes, search and town pages come from
+    # them; with none it showed the newest homes anywhere in the MLS (DC, Virginia...).
+    if not (await db.execute(select(func.count(AgentMarketArea.id)).where(AgentMarketArea.owner_id == current_user.id))).scalar():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Add at least one town you work in before publishing - your website shows homes from your towns.")
     published = await site_service.publish_site(db, site)
     # Tell Bing (IndexNow) the site changed, and make sure Google has it - no agent steps.
     background_tasks.add_task(google_search_service.after_publish, published.id)
@@ -1095,5 +1100,9 @@ async def remove_my_served_area(
     )).scalar_one_or_none()
     if not link:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Area not found")
+    # A live website keeps at least one town (owner, 11/09) - see publish_my_site.
+    count = (await db.execute(select(func.count(AgentMarketArea.id)).where(AgentMarketArea.owner_id == current_user.id))).scalar() or 0
+    if count <= 1 and (await db.execute(select(Site.id).where(Site.owner_id == current_user.id, Site.status == "PUBLISHED").limit(1))).scalar():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Your website needs at least one town - add another before removing this one.")
     await db.delete(link)
     await db.commit()

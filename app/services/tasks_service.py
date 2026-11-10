@@ -946,6 +946,26 @@ DEFAULT_PITCHES: dict[str, str] = {
                    "text me here."),
 }
 DEFAULT_PITCHES["how_can_we_help"] = DEFAULT_PITCHES["buyer_form"]
+# The open house pitch when the guest's Showcase has must-haves (owner, 11/09): the homes are picked for
+# what they want now, not "similar to the one you toured" - and the must-have count comes right before
+# the home named first (that home has the must-have - see _pick_standout).
+SMART_OPEN_HOUSE_PITCH = (
+    "I also set up a personal home search for you, called a Showcase. It already has {home_count} that might "
+    "interest you. It updates the moment something new hits the market. {must_line} The one I'd look at first is "
+    "{best_home}. {why_now} Here's your link: {showcase_link}" + "\n\n" + "Inside it, you can like, comment on or "
+    "request a tour of any home - or just text me here.")
+# An agent's own pitch that still says the homes are like the toured one - wrong once there are must-haves.
+_SIMILAR_TO_TOURED = re.compile(r"\b(?:similar to|just like|like) the (?:one|home|house) (?:you|they) "
+                                r"(?:toured|saw|visited|came to see|looked at)\b", re.I)
+SMART_INSTEAD_OF_SIMILAR = "that might interest you"
+_MATCHING_WHAT = re.compile(r"\b(?:matching|that fit) what (?:you're|you are|they're) looking for|\b(?:matching|that fit) what you asked for"
+                            r"|(?<=\{home_count\} )that fit(?=[,.])", re.I)
+# The Showcase-request pitch with must-haves: the must-have sentence sits right after the count, before
+# "I also sent it to your email" (it read as if "them" were the emails - 11/09 review).
+SMART_SHOWCASE_SETUP_PITCH = ("Your Showcase is ready - it already has {home_count} matching what you asked for. {must_line} "
+                              "I also sent it to your email. Here's your link: {showcase_link}")
+# Default pitches swapped out when the guest's Showcase has must-haves (never an agent's own version).
+SMART_PITCHES = {"open_house_signin": SMART_OPEN_HOUSE_PITCH, "showcase_setup": SMART_SHOWCASE_SETUP_PITCH}
 # A Showcase with no homes in it yet can't be sold on its homes - this goes out instead.
 EMPTY_PITCH = ("I also set up a personal home search for you - you'll get an alert the moment a home that fits "
                "what you're looking for hits the market. Take a look here: {showcase_link}")
@@ -1494,6 +1514,25 @@ def smart_summary(payload: dict) -> Optional[dict]:
     return {"n": len(hits), "wants": [str(w) for w in hits[0]["smartMatch"]["wants"] if w]}
 
 
+def preview_lead_ids(payload: dict) -> list[str]:
+    """The homes a Showcase's link preview (the iMessage card, lib/og/cards renderShowcaseCard) leads with, in
+    order (owner, 11/09): the home its follow-up text names first, then the other homes that have every
+    must-have (newest on the market first). Same pick as the text (_pick_standout) so they never disagree."""
+    _count, best, _match, _days = _pick_standout(payload)
+    toured = ((payload.get("originalProperty") or {}).get("listingKey"))
+    shown = [p for p in (payload.get("matchedProperties") or []) if _visible_on_showcase(p)
+             and not (toured and p.get("ListingKey") == toured)]
+
+    def dom(p):
+        try:
+            return int(p.get("DaysOnMarket"))
+        except (TypeError, ValueError):
+            return 10**6
+    lead = [best] if best is not None else []
+    lead += sorted((p for p in shown if _is_smart(p) and p is not best), key=dom)
+    return [str(p["id"]) for p in lead if p.get("id") is not None]
+
+
 def _and_words(items: list) -> str:
     items = [w for w in items if w]
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1] if items else ""
@@ -1503,18 +1542,27 @@ def _must_parts(count: int, best: Optional[dict], smart: Optional[dict]) -> dict
     """The must-have sentence that follows the home count ("4 of them have the first-floor primary
     bedroom you wanted.") and the few words after the named home when it's one of them (owner, 11/09:
     what matters most to this client belongs in the text)."""
-    if not smart or not count or not smart.get("n") or not smart.get("wants"):
+    if not smart or not count or not smart.get("wants"):
         return {}
-    n = min(int(smart["n"]), count)
+    n = min(int(smart.get("n") or 0), count)
     wants = [str(w) for w in smart["wants"]]
     phrases = smart.get("phrases") or {}
     one = [(phrases.get(w) or {}).get("one") for w in wants]
     many = [(phrases.get(w) or {}).get("many") for w in wants]
     from app.services.showcase_smart_filter import join_clauses
+    if n == 0:
+        # Must-haves known, none of the homes has them yet (the listings were all read - see lead_showcase_info):
+        # still never "similar to the one you toured" (owner, 11/09), and say so plainly.
+        if all(one):
+            line = f"None of them {join_clauses(one)} yet, but you'll hear the moment one does."
+        else:
+            line = f"None of them matches what you asked for yet ({_and_words([w[:1].lower() + w[1:] for w in wants])}), but you'll hear the moment one does."
+        return {"must_line": line, "must_tail": "", "must_all": False}
     if all(one) and all(many):
         # The tidied words (showcase_smart_filter.tidy_wants): "2 of them are on a cul-de-sac and have a pool."
+        # One home: "That home ..." - "It ..." right after "It updates the moment ..." read as the Showcase.
         if n == count:
-            line = f"It {join_clauses(one)}." if count == 1 else f"All {n} {join_clauses(many)}."
+            line = f"That home {join_clauses(one)}." if count == 1 else f"All {n} {join_clauses(many)}."
         elif n == 1:
             line = f"One of them {join_clauses(one)}."
         else:
@@ -1523,21 +1571,28 @@ def _must_parts(count: int, best: Optional[dict], smart: Optional[dict]) -> dict
         # No tidy words (older must-haves, or the tidy-up failed): a form that reads right whatever was typed.
         what = _and_words([w[:1].lower() + w[1:] for w in wants])
         if n == count:
-            line = f"It matches what you asked for: {what}." if count == 1 else f"All {n} match what you asked for: {what}."
+            line = f"That home matches what you asked for: {what}." if count == 1 else f"All {n} match what you asked for: {what}."
         elif n == 1:
             line = f"One of them matches what you asked for: {what}."
         else:
             line = f"{n} of them match what you asked for: {what}."
+    # "2 of them have X. The one I'd look at first is Y." already says Y is one of them (owner's wording,
+    # 11/09); only a single must-have home gets named as "the one that has it".
     tail = ""
-    if best is not None and _is_smart(best) and n < count:
-        tail = ", the one that has it" if n == 1 else ", one of those"
-    return {"must_line": line, "must_tail": tail}
+    if best is not None and _is_smart(best) and n == 1 and n < count:
+        tail = ", the one that has it"
+    return {"must_line": line, "must_tail": tail, "must_all": n == count}
 
 
 def _with_must(template: str, parts: dict) -> str:
-    """The must-have sentence goes right after the sentence holding {home_count}; nothing when the
-    agent's version has no count in it."""
+    """The must-have sentence goes where the template has {must_line}, else right after the sentence
+    holding {home_count}; nothing when the agent's version has no count in it."""
     line = parts.get("must_line")
+    if "{must_line}" in (template or ""):
+        out = template.replace("{must_line}", line or "")
+        if line and parts.get("must_tail"):
+            out = out.replace("{best_home}", "{best_home}" + parts["must_tail"], 1)
+        return out
     if not line or "{home_count}" not in (template or ""):
         return template
     paras = template.split("\n\n")
@@ -1630,11 +1685,33 @@ def pitch_for(rule: Optional[str], owner: Optional[User], showcase: Optional[dic
     parts["first_name"] = showcase.get("first_name") or ""
     parts["my_name"] = _my_name(owner)
     if rule == "open_house_signin" and showcase.get("tailored"):
-        return render_pitch(_with_must(TAILORED_OPEN_HOUSE_PITCH, parts) if parts.get("home_count") else TAILORED_OPEN_HOUSE_EMPTY, parts)
+        if not parts.get("home_count"):
+            return render_pitch(TAILORED_OPEN_HOUSE_EMPTY, parts)
+        return render_pitch(_with_must(_count_words(TAILORED_OPEN_HOUSE_PITCH, parts), parts), parts)
     if not parts.get("home_count"):
         return render_pitch(EMPTY_PITCHES.get(rule, EMPTY_PITCH), parts)
-    template = rule_settings(owner, rule)["pitch"] if owner is not None else DEFAULT_PITCHES[rule]
-    return render_pitch(_with_must(template, parts), parts)
+    settings = rule_settings(owner, rule) if owner is not None else {"pitch": DEFAULT_PITCHES[rule], "custom_pitch": False}
+    template = settings["pitch"]
+    if parts.get("must_line") and not settings.get("custom_pitch"):
+        template = SMART_PITCHES.get(rule, template)
+    return render_pitch(_with_must(_count_words(template, parts), parts), parts)
+
+
+def _count_words(template: str, parts: dict) -> str:
+    """The words around the home count, made true for this Showcase (owner, 11/09 review):
+    - must-haves known: never "similar to the one you toured"; and unless EVERY home has them, the homes
+      "might interest you" rather than "match what you're looking for" (only some do);
+    - just 1 home: "1 home that fits", and no "The one I'd look at first is" when there's only the one."""
+    tpl = template or ""
+    if parts.get("must_line"):
+        tpl = _SIMILAR_TO_TOURED.sub(SMART_INSTEAD_OF_SIMILAR, tpl)
+        if not parts.get("must_all"):
+            tpl = _MATCHING_WHAT.sub(SMART_INSTEAD_OF_SIMILAR, tpl)
+    if parts.get("count") == 1:
+        tpl = tpl.replace("{home_count} that fit,", "{home_count} that fits,")
+        tpl = tpl.replace("The one I'd look at first is {best_home}",
+                          ("It's {best_home}" if parts.get("must_line") else "That home is {best_home}"))
+    return tpl
 
 
 async def lead_showcase_info(db: AsyncSession, owner: User, leads: list) -> dict[str, dict]:
@@ -1692,11 +1769,18 @@ async def lead_showcase_info(db: AsyncSession, owner: User, leads: list) -> dict
                 cands = None
             try:
                 smart = smart_summary(payload)
+                ph = (await db.execute(select(CollectionPreferences.ai_wants).where(
+                    CollectionPreferences.collection_id == col_of.get(token)))).scalar()
+                ph = ph if isinstance(ph, dict) else {}
+                if not smart and ph.get("state") == "done":
+                    from app.services.showcase_smart_filter import clean_wants
+                    if clean_wants(ph):
+                        # Must-haves set and every listing read, none has them yet: the text still speaks to
+                        # what they want (_must_parts n=0) - never "similar to the one you toured" (owner, 11/09).
+                        smart = {"n": 0, "wants": clean_wants(ph)}
                 if smart:
                     # the tidied sentence words for its must-haves (showcase_smart_filter.tidy_wants)
-                    ph = (await db.execute(select(CollectionPreferences.ai_wants).where(
-                        CollectionPreferences.collection_id == col_of.get(token)))).scalar()
-                    smart["phrases"] = (ph or {}).get("phrases") or {} if isinstance(ph, dict) else {}
+                    smart["phrases"] = ph.get("phrases") or {}
             except Exception:  # noqa: BLE001
                 smart = None
             cache[token] = (*_pick_standout(payload), cands, smart)
@@ -1734,21 +1818,29 @@ def checkin_message(lead_name: Optional[str], owner: Optional[User], showcase_ur
 # slot - {oh_when:2026-10-19} - filled in the day the message is shown, so a follow-up that rolls over
 # as overdue never says "yesterday" about last week. (followup_writer writes these.)
 _WHEN_SLOT = re.compile(r"\{oh_when:(\d{4}-\d{2}-\d{2})\}")
-_DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 
 
 def when_words(day, today) -> str:
-    """'today' / 'yesterday' / 'this past Sunday' / 'last weekend' / 'a couple of weeks ago' / 'a few weeks
-    ago' / 'about a month ago' / 'a couple of months ago' / 'a while back' - fits after "my open house at X"."""
+    """When the open house was, in words that fit after "my open house at X" (owner, 11/09). Weeks run
+    Monday-Sunday, so "last weekend" only ever means the weekend right before this week:
+      today / yesterday
+      earlier this week       - another day of this week
+      last weekend            - the Saturday/Sunday just before this week (a Sunday open house, read on any
+                                day Tuesday through the next Sunday; a Saturday one, Monday through Sunday)
+      last week               - a weekday of last week
+      about a week ago / a couple of weeks ago / a few weeks ago / about a month ago /
+      a couple of months ago / a while back - anything older, by days."""
     n = (today - day).days
     if n <= 0:
         return "today"
     if n == 1:
         return "yesterday"
-    if n <= 6:
-        return f"this past {_DAY_NAMES[day.weekday()]}"
-    # never "last weekend" past this point: 12 days after a Sunday, "last weekend" means the one in between
-    if n <= 9:
+    this_monday = today.toordinal() - today.weekday()
+    if day.toordinal() >= this_monday:
+        return "earlier this week"
+    if day.toordinal() >= this_monday - 7:
+        return "last weekend" if day.weekday() >= 5 else "last week"
+    if n <= 10:
         return "about a week ago"
     if n <= 20:
         return "a couple of weeks ago"
@@ -1776,6 +1868,73 @@ def fill_when(text: Optional[str], now: Optional[datetime] = None) -> Optional[s
     return _WHEN_SLOT.sub(repl, text)
 
 
+# Where an open house follow-up says it was at the open house - the time words go at the end of that
+# clause: "thanks for stopping by my open house at 239 Windham Dr, Exton {oh_when:..}!".
+_WHEN_ANCHOR = re.compile(r"\b(?:open house (?:at|for) |great to see you again at |coming back to see |"
+                          r"stopping by (?:the open house )?(?:at )?)", re.I)
+# Words that already say when - never add a second "when".
+_HAS_WHEN = re.compile(r"\{oh_when:|\b(?:today|tonight|yesterday|weekend|monday|tuesday|wednesday|thursday|friday|"
+                       r"saturday|sunday|last week|this week|ago|recently|earlier|while back|last night)\b", re.I)
+# A period that ends an abbreviation in an address ("123 N. Main St.") rather than the sentence.
+_ABBR_BEFORE = re.compile(r"(?:\b(?:St|Dr|Rd|Ave|Ln|Ct|Blvd|Pl|Mt|Ft|Hwy|Pkwy|Cir|Ter|Sq|Apt|No|Jr|Sr)|\b[A-Z])$")
+# Follow-ups whose message is about the open house visit itself.
+OH_WHEN_SOURCES = {"open_house_signin"}
+
+
+def with_when_slot(message: Optional[str], day) -> Optional[str]:
+    """The message with a {oh_when:YYYY-MM-DD} slot after where it says the guest came to the open house
+    (owner, 11/09: a follow-up sent days later read as if it was yesterday - it never said when). Left
+    as is when it already says when, has no such clause, or there's no date."""
+    if not message or day is None or "{oh_when:" in message:
+        return message
+    m = _WHEN_ANCHOR.search(message)
+    if not m:
+        return message
+    end, abbr, i = None, None, m.end()
+    while i < len(message):
+        ch = message[i]
+        if ch in "!?\n":
+            end = i
+            break
+        if ch == "." and (i + 1 == len(message) or message[i + 1] in " \n"):
+            if not _ABBR_BEFORE.search(message[:i]):
+                end = i
+                break
+            abbr = abbr if abbr is not None else i
+        i += 1
+    if end is None:
+        end = len(message)
+    if abbr is not None and end - m.end() > 70:
+        end = abbr   # "at 239 Windham Dr. If you have ..." - the period after "Dr" did end the sentence
+    if _HAS_WHEN.search(message[m.start():end]):
+        return message
+    return f"{message[:end].rstrip()} {{oh_when:{day.isoformat()}}}{message[end:]}"
+
+
+def _eastern_day(dt: Optional[datetime]):
+    if dt is None:
+        return None
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).astimezone(EASTERN).date()
+
+
+async def visit_day(db: AsyncSession, signin_id: Optional[str], fallback: Optional[datetime]):
+    """The day (Eastern) the guest was at the open house: when they signed in - or, for a Clipboard (paper)
+    sign-in typed in a day or so later, the open house's own date."""
+    day = _eastern_day(fallback)
+    try:
+        from app.models.database import OpenHouseEvent, OpenHouseVisitor
+        v = await db.get(OpenHouseVisitor, signin_id) if signin_id else None
+        if v is not None and v.created_at is not None:
+            day = _eastern_day(v.created_at)
+        oh = await db.get(OpenHouseEvent, v.open_house_event_id) if v is not None and v.open_house_event_id else None
+        sd = getattr(oh, "scheduled_date", None)
+        if sd is not None and day is not None and sd <= day and (day - sd).days <= 3:
+            day = sd
+    except Exception:  # noqa: BLE001 - the sign-in time is good enough
+        logger.warning("visit day lookup failed for %s", signin_id, exc_info=True)
+    return day
+
+
 def full_message(task: AgentTask, showcase: Optional[dict], owner: Optional[User] = None,
                  lead_name: Optional[str] = None) -> Optional[str]:
     """The suggested message, with this situation's Showcase pitch (link last) wherever the agent's
@@ -1783,7 +1942,11 @@ def full_message(task: AgentTask, showcase: Optional[dict], owner: Optional[User
     situation isn't one that makes a Showcase. Older follow-ups made before templates had no
     marker: the pitch is appended at the end for those. A text follow-up with no message gets
     checkin_message when the caller passes the person's name."""
-    msg = fill_when(task.suggested_message) or ""   # "this past Sunday" -> whatever is right today
+    raw = task.suggested_message
+    if raw and getattr(task, "auto_source", None) in OH_WHEN_SOURCES and "{oh_when:" not in raw:
+        # Made before the message carried its open house date: the follow-up was made at sign-in.
+        raw = with_when_slot(raw, _eastern_day(getattr(task, "created_at", None)))
+    msg = fill_when(raw) or ""   # "last weekend" / "yesterday" - whatever is right today
     if not msg and lead_name is not None and task.kind == "text" and task.completed_at is None:
         return checkin_message(lead_name, owner, (showcase or {}).get("url"))
     if not msg:
@@ -3133,7 +3296,8 @@ async def create_open_house_followup(
                 open_task.context = _tidy_subject(repeat["context"] if repeat else f"Signed in at your open house - {property_address}")[:240]
                 if repeat:
                     open_task.title = f"Follow up with {repeat_name} - {repeat['label']}"
-                    open_task.suggested_message = repeat["message"].replace("{first_name}", _guest_first(lead.name))
+                    open_task.suggested_message = with_when_slot(repeat["message"].replace("{first_name}", _guest_first(lead.name)),
+                                                                 await visit_day(db, signin_id, occurred_at))
                 if property_address not in (open_task.notes or ""):
                     open_task.notes = ((open_task.notes or "") + f"\nAlso signed in at: {property_address}").strip()
                 elif repeat:
@@ -3177,8 +3341,11 @@ async def create_open_house_followup(
             done_code=new_done_code(),
             auto_source=rule,
             auto_source_id=dedup_key,
-            suggested_message=(repeat["message"].replace("{first_name}", _guest_first(lead.name)) if repeat else
-                               render_rule_message(owner, rule, name=lead.name, address=await _open_house_short(db, signin_id, property_address))),
+            suggested_message=with_when_slot(
+                repeat["message"].replace("{first_name}", _guest_first(lead.name)) if repeat else
+                render_rule_message(owner, rule, name=lead.name, address=await _open_house_short(db, signin_id, property_address)),
+                # when they came, as a slot filled the day it's shown ("yesterday" -> "last weekend")
+                await visit_day(db, signin_id, occurred_at) if rule in OH_WHEN_SOURCES else None),
             # The sheet's bottom "Want to see more homes like these?" QR (-> sign-in -> Showcase), not
             # one of the per-home QRs (those open that home's listing page - tracked separately).
             # MLS capitals tidied like every other follow-up ("26 OLD GULPH RD" read as shouting).
@@ -3429,8 +3596,10 @@ async def on_represented_change(db: AsyncSession, owner_id: str, lead: Lead, old
             task.priority = "high"
             task.context = context
             task.notes = body
-            task.suggested_message = render_rule_message(owner, "open_house_signin", name=name,
-                                                         address=await _open_house_short(db, heads_up.auto_source_id, address))
+            task.suggested_message = with_when_slot(
+                render_rule_message(owner, "open_house_signin", name=name,
+                                    address=await _open_house_short(db, heads_up.auto_source_id, address)),
+                await visit_day(db, heads_up.auto_source_id, visitor.created_at))
             if task.due_at is not None and task.due_at < now:
                 task.due_at, task.remind_at, task.all_day = await plan_followup(db, owner, "open_house_signin", now)
         else:

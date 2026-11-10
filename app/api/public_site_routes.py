@@ -35,15 +35,65 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/public/sites", tags=["website-builder-public"])
 
 
+# Town photos we keep a copy of (owner, 11/09: "let's store that"): photo name -> when the copy was made.
+_AREA_PHOTO_STORED: dict[str, datetime] = {}
+# Google's terms only allow keeping their content for a limited time, so a copy is used for 30 days,
+# then fetched fresh once (one billed call per photo per month, however many people look at it).
+_AREA_PHOTO_KEEP_DAYS = 30
+
+
+def _area_photo_key(photo_name: str) -> str:
+    import hashlib
+    return "area-photos/" + hashlib.sha1(photo_name.encode()).hexdigest() + ".jpg"
+
+
 @router.get("/photo/{photo_name:path}")
-async def get_area_photo(photo_name: str):
-    """Server-side proxy for Area photos (see area_enrichment_service._places_photos) - the
+async def get_area_photo(photo_name: str, db: AsyncSession = Depends(get_db)):
+    """Area (town) photos from Google Places (see area_enrichment_service._places_photos) - the
     Google API key is attached here, never sent to the browser. `photo_name` is a Places API
-    resource path like 'places/XXX/photos/YYY', not user input used for anything but this."""
+    resource path like 'places/XXX/photos/YYY', not user input used for anything but this.
+
+    Each photo is fetched from Google ONCE and kept in our image store (S3 + CDN); every later visitor
+    is sent to that copy - no Google call, no cost. The copy is refreshed after 30 days (Google's terms
+    limit how long their content may be kept). If the image store can't be reached, it falls back to
+    fetching from Google each time, still under the day/month cap below."""
+    import asyncio
+    from datetime import timedelta
+    from fastapi.responses import RedirectResponse
+    from app.services import s3_service
     api_key = os.getenv("GOOGLE_PLACES_API_KEY")
     # Only a real Places photo name - anything else (../, other APIs) would spend our key on
     # whatever Google endpoint it pointed at.
-    if not api_key or not re.fullmatch(r"places/[A-Za-z0-9_-]+/photos/[A-Za-z0-9_-]+", photo_name or ""):
+    if not re.fullmatch(r"places/[A-Za-z0-9_-]+/photos/[A-Za-z0-9_-]+", photo_name or ""):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Photo unavailable.")
+    key = _area_photo_key(photo_name)
+    now = datetime.now(timezone.utc)
+    fresh_after = now - timedelta(days=_AREA_PHOTO_KEEP_DAYS)
+    made = _AREA_PHOTO_STORED.get(photo_name)
+    if made is None:
+        try:
+            made = await asyncio.to_thread(s3_service.stored_at, key)
+        except Exception:  # noqa: BLE001 - no image store here (e.g. no AWS keys): fetch from Google below
+            made = None
+        if made is not None:
+            _AREA_PHOTO_STORED[photo_name] = made
+    if made is not None and made > fresh_after:
+        # a day of browser caching (the CDN copy itself is what's kept for the month)
+        return RedirectResponse(s3_service.public_url(key), status_code=302, headers={"Cache-Control": "public, max-age=86400"})
+    if not api_key:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Photo unavailable.")
+    # Every Google fetch is billed (Place Details Photos) - it gets its own day/month count cap, set
+    # just under Google's monthly free allowance (owner rule: Google free tier only), same pattern as
+    # the Explore Nearby caps. Over the cap the photo is just "unavailable"; pages fall back to homes.
+    # With the stored copies above, the cap is only reached by new towns, never by busy ones.
+    from app.services import usage_budget_service
+    config = await ai_config_service.get_config(db)
+    try:
+        await usage_budget_service.reserve(db, {
+            "places_photo": (config.get("places_photo_daily_limit", 100), config.get("places_photo_monthly_limit", 999), None, None),
+            "platform_emergency": (None, None, config["platform_emergency_daily_cost_ceiling_usd"], config["platform_emergency_monthly_cost_ceiling_usd"]),
+        }, config.get("places_photo_estimated_cost_usd", 0.007), count_delta=1)
+    except usage_budget_service.BudgetExceeded:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Photo unavailable.")
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -55,7 +105,67 @@ async def get_area_photo(photo_name: str):
             resp.raise_for_status()
     except httpx.HTTPError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Photo unavailable.")
-    return Response(content=resp.content, media_type=resp.headers.get("content-type", "image/jpeg"), headers={"Cache-Control": "public, max-age=604800"})
+    ctype = resp.headers.get("content-type", "image/jpeg")
+    if ctype.startswith("image/") and resp.content:
+        try:
+            await asyncio.to_thread(s3_service.put_bytes_at, key, resp.content, ctype, "public, max-age=2592000")
+            if len(_AREA_PHOTO_STORED) > 5000:
+                _AREA_PHOTO_STORED.clear()
+            _AREA_PHOTO_STORED[photo_name] = now
+        except Exception:  # noqa: BLE001 - the visitor still gets the photo; the next one tries storing again
+            logger.warning("town photo not stored", exc_info=True)
+    return Response(content=resp.content, media_type=ctype, headers={"Cache-Control": "public, max-age=86400"})
+
+
+_MAP_HITS: dict[str, list] = {}
+
+
+@router.get("/maps/home/{key}.png")
+async def home_area_map(key: str, size: str = Query("640x210"), db: AsyncSession = Depends(get_db)):
+    """The Cheat Sheet's small area map of one home (owner, 11/09: no money leaks). It used to load
+    from Google in the browser every time a Cheat Sheet was made; now the server draws it once per
+    home (our key, counted by google_free_tier) and keeps it. `key` is the home's id or MLS listing
+    key, so this only ever draws homes we have."""
+    from app.services import cma_manual_subject_service as manual
+    if size not in manual.CMA_MAP_SIZES or len(key) > 80:
+        raise HTTPException(status_code=422, detail="Bad map.")
+    prop = (await db.execute(select(Property).where(or_(Property.id == key, Property.listing_key == key)).limit(1))).scalar_one_or_none()
+    lat = prop and (prop.google_rooftop_latitude if prop.google_rooftop_latitude is not None else prop.latitude)
+    lng = prop and (prop.google_rooftop_longitude if prop.google_rooftop_longitude is not None else prop.longitude)
+    if lat is None or lng is None:
+        raise HTTPException(status_code=404, detail="Map not found.")
+    png = await manual.cma_map_png(db, size, [("H", float(lat), float(lng))], zoom=15)
+    if not png:
+        raise HTTPException(status_code=503, detail="Map unavailable.")
+    return Response(content=png, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+
+
+@router.post("/maps/allow", status_code=status.HTTP_204_NO_CONTENT)
+async def allow_map_load(request: Request, db: AsyncSession = Depends(get_db)):
+    """Asked by the browser right before it shows a Google map (lib/googleMapsLoader.ts) - every map
+    shown is a billed Google "map load" that happens in the visitor's browser, out of the server's
+    sight. Counted here under a day/month cap below Google's monthly free allowance (owner rule:
+    Google free tier only); over it, 429 and the page shows its homes without the map.
+    Per address, at most 60 map loads an hour - a script hammering this can't use up everyone's maps."""
+    import time
+    from app.services import usage_budget_service
+    ip = _client_ip(request) or "unknown"
+    now = time.time()
+    hits = [t for t in _MAP_HITS.get(ip, []) if now - t < 3600]
+    if len(hits) >= 60:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Map unavailable.")
+    hits.append(now)
+    if len(_MAP_HITS) > 50_000:
+        _MAP_HITS.clear()
+    _MAP_HITS[ip] = hits
+    config = await ai_config_service.get_config(db)
+    try:
+        await usage_budget_service.reserve(db, {
+            "google_map_load": (config.get("google_map_load_daily_limit", 1500), config.get("google_map_load_monthly_limit", 9000), None, None),
+        }, config.get("google_map_load_estimated_cost_usd", 0.007), count_delta=1)
+    except usage_budget_service.BudgetExceeded:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Map unavailable.")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 _BLOG_COVER_CACHE: dict[str, tuple[str, bytes]] = {}

@@ -64,6 +64,9 @@ _BUDGET_BUCKETS = [
     ("area_research_global", "Area research (platform-wide)", "area_research_global_daily_cost_ceiling_usd", "area_research_global_monthly_cost_ceiling_usd", None, None),
     ("places_search", "Google Places - Explore Nearby search", None, None, "places_explore_search_daily_limit", "places_explore_search_monthly_limit"),
     ("places_details", "Google Places - Explore Nearby details", None, None, "places_explore_details_daily_limit", "places_explore_details_monthly_limit"),
+    ("places_photo", "Google Places - town photos", None, None, "places_photo_daily_limit", "places_photo_monthly_limit"),
+    ("google_geocode", "Google Geocoding - exact home map points", None, None, "google_geocode_daily_limit", "google_geocode_monthly_limit"),
+    ("google_map_load", "Google Maps - maps shown in browsers", None, None, "google_map_load_daily_limit", "google_map_load_monthly_limit"),
     ("platform_emergency", "OpenHousePal emergency brake (all features combined)", "platform_emergency_daily_cost_ceiling_usd", "platform_emergency_monthly_cost_ceiling_usd", None, None),
 ]
 
@@ -75,6 +78,9 @@ _BUDGET_BUCKETS = [
 _PLACES_FREE_TIER_NOTE = {
     "places_search": "Google's free tier: 5,000 calls/mo. Capped at 4,999/mo so real billing stays $0.",
     "places_details": "Google's free tier: 1,000 calls/mo. Capped at 999/mo so real billing stays $0.",
+    "google_map_load": "Google's free tier: 10,000 map loads/mo. Capped at 9,000/mo (1,500 a day) so real billing stays $0 - over it, pages show homes without the map.",
+    "google_geocode": "Google's free tier: 10,000 calls/mo. Capped at 8,000/mo (asked once per home) so real billing stays $0.",
+    "places_photo": "Google's free tier: 1,000 photos/mo. Capped at 999/mo so real billing stays $0. Each photo is fetched once and kept 30 days in our image store, so only new towns count here.",
 }
 
 # Which AIUsageEvent.event_type a cost-ceiling bucket's calls actually show up under, so
@@ -162,13 +168,13 @@ def _a_real_block():
 
 
 async def _places_spend(db: AsyncSession) -> dict:
-    """Explore Nearby (Google Places for visitors on agents' pages) - not on any agent's bar, so it
+    """Explore Nearby + town photos (Google Places for visitors on agents' pages) - not on any agent's bar, so it
     has no ai_usage_events row; its cost lives only in the places_* budget counters (UTC days)."""
     day_key, month_key = datetime.now(timezone.utc).date().isoformat(), datetime.now(timezone.utc).strftime("%Y-%m")
     out = {"day": 0.0, "month": 0.0, "all": 0.0}
     rows = (await db.execute(
         select(UsageBudgetCounter.period_type, UsageBudgetCounter.period_key, UsageBudgetCounter.cost_micros)
-        .where(UsageBudgetCounter.bucket.in_(("places_search", "places_details")))
+        .where(UsageBudgetCounter.bucket.in_(("places_search", "places_details", "places_photo", "google_geocode", "google_map_load")))
     )).all()
     for period_type, period_key, micros in rows:
         usd = micros_to_usd(micros or 0)

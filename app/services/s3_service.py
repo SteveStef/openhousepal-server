@@ -60,3 +60,23 @@ def delete_by_url(url: Optional[str]) -> None:
         _client().delete_object(Bucket=AWS_S3_BUCKET, Key=key)
     except ClientError as e:
         logger.warning("s3 delete_object failed", extra={"key": key, "error": str(e)})
+
+
+def put_bytes_at(key: str, data: bytes, content_type: str, cache_control: str | None = None) -> str:
+    """Like upload_bytes, but at a key the caller chooses (the same thing always lands at the same
+    key - e.g. one town photo, see public_site_routes.get_area_photo). Returns its public URL."""
+    extra = {"CacheControl": cache_control} if cache_control else {}
+    _client().put_object(Bucket=AWS_S3_BUCKET, Key=key.strip("/"), Body=data, ContentType=content_type, **extra)
+    return f"https://{PUBLIC_URL_HOST}/{key.strip('/')}"
+
+
+def stored_at(key: str):
+    """When the object at `key` was last written (a datetime), or None if it isn't there."""
+    try:
+        return _client().head_object(Bucket=AWS_S3_BUCKET, Key=key.strip("/"))["LastModified"]
+    except ClientError:
+        return None
+
+
+def public_url(key: str) -> str:
+    return f"https://{PUBLIC_URL_HOST}/{key.strip('/')}"

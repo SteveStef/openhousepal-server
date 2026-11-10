@@ -269,6 +269,23 @@ DEFAULT_CONFIG = {
     # when this fires (selectPlace's catch just stores null - see ExploreNearby.tsx), so a visitor
     # just sees a place with no rating shown, not an error.
     "places_explore_details_monthly_limit": 999,
+    # Town photos (public_site_routes.get_area_photo): each one a visitor's browser loads is a
+    # billed Place Details Photos call. Capped one under the 1,000/month free allowance, with a
+    # daily slice so one busy day can't use up the month.
+    "places_photo_estimated_cost_usd": 0.007,
+    "places_photo_daily_limit": 100,
+    "places_photo_monthly_limit": 999,
+    # Exact (rooftop) map points for homes, asked once per home (google_geocoding_service) - Google's free
+    # Geocoding allowance is 10,000/mo; this path is capped under it, leaving room for the agent tools.
+    "google_geocode_estimated_cost_usd": 0.005,
+    "google_geocode_daily_limit": 400,
+    "google_geocode_monthly_limit": 8000,
+    # Google maps shown in browsers (Search page, town pages, home pages, agent pages) - counted by
+    # public_site_routes.allow_map_load. Google's free allowance is 10,000 map loads a month; the day cap
+    # keeps one busy day from using up the whole month.
+    "google_map_load_estimated_cost_usd": 0.007,
+    "google_map_load_daily_limit": 1500,
+    "google_map_load_monthly_limit": 9000,
     # How long a cached Explore Nearby result (a search or one place's rating/review count) stays
     # valid before it's asked of Google again - see ExploreNearbyCache in database.py. This is the
     # real lever on total spend, not just the limits above: without it, every visitor to the same

@@ -44,7 +44,11 @@ _SYSTEM = (
     "- Start like a text from the agent: 'Hi {first}, it's {agent}!' (use the names given). No sign-off - it is added.\n"
     "- Timing of the open house: never write day or date words yourself (no 'yesterday', 'this weekend', 'Sunday'). "
     "Where you mention when the open house was, write the token {when} at the end of that clause, e.g. "
-    "'thanks again for coming to my open house at 239 Windham Dr {when}'. Only use {when} if an open house is given.\n"
+    "'thanks again for coming to my open house at 239 Windham Dr {when}'. Only use {when} if an open house is given; "
+    "when one is given and you mention it, always add {when}.\n"
+    "- If showcase.must_haves is given: never call their homes 'similar to the home you toured' or 'like it' - they "
+    "are 'homes that might interest you'. If you talk about the homes, say how many have the must-haves in plain "
+    "words (showcase.must_have_sentence), and if you name a home, name only showcase.home_to_name_first.\n"
     "- If the Showcase pitch was already sent, do NOT explain or pitch the Showcase again. If they never opened it, "
     "a natural move is asking if they're still looking and offering to send homes now and then.\n"
     "- If they liked or passed on homes, you may refer to that in general words (no addresses unless given as liked).\n"
@@ -141,6 +145,13 @@ async def facts(db: AsyncSession, owner: User, lead: Lead) -> Dict[str, Any]:
         showcase = {"homes": info.get("count") or 0, "opened": any(e.source_type in _SHOWCASE_SEEN for e in events),
                     "liked": likes, "passed": passes, "pitch_already_sent": pitch_sent,
                     "must_haves_matching": (info.get("smart") or {}).get("n") or 0}
+        smart, parts = info.get("smart") or {}, info.get("parts") or {}
+        if smart.get("wants") and parts.get("must_line"):
+            # What they want now (the Showcase's must-haves) - the same words and home the template text uses.
+            showcase["must_haves"] = [str(w) for w in smart["wants"]]
+            showcase["must_have_sentence"] = parts["must_line"]
+            if parts.get("best_home"):
+                showcase["home_to_name_first"] = parts["best_home"] + (f" - {parts['why_now']}" if parts.get("why_now") else "")
     last = lead.last_contacted_at
     return {
         "today": f"{_eastern_date(now)} ({_eastern_date(now).strftime('%A')})",
@@ -174,12 +185,23 @@ async def estimate(db: AsyncSession, owner: User) -> Dict[str, Any]:
             "enough": left is None or est <= left}
 
 
-def _clean_message(msg: str, oh_date: Optional[str]) -> str:
+def _clean_message(msg: str, oh_date: Optional[str], smart: bool = False) -> str:
+    from app.services import tasks_service as ts
     msg = " ".join(str(msg or "").replace("\r", "").split(" "))
     msg = re.sub(r"https?://\S+", "", msg)                      # links are the app's job
     msg = msg.replace("{when}", "{oh_when:%s}" % oh_date if oh_date else "recently")
     msg = re.sub(r"\{(?!oh_when:\d{4}-\d{2}-\d{2}\})[^{}]*\}", "", msg)   # any other stray {token}
     msg = re.sub(r"[ \t]{2,}", " ", msg).strip()
+    if oh_date:
+        # Mentioned the open house but left out when: the slot goes in anyway (owner, 11/09).
+        try:
+            from datetime import date as _date
+            msg = ts.with_when_slot(msg, _date.fromisoformat(oh_date)) or msg
+        except ValueError:
+            pass
+    if smart:
+        # Must-haves known: never "homes similar to the one you toured".
+        msg = ts._SIMILAR_TO_TOURED.sub(ts.SMART_INSTEAD_OF_SIMILAR, msg)
     return msg[:700]
 
 
@@ -221,7 +243,7 @@ async def write(db: AsyncSession, owner: User, lead: Lead, goal: Optional[str] =
         return {"error": "Couldn't write it just now - try again."}
     finally:
         await reconcile_budget(db, reservation, spent)
-    message = _clean_message(out.get("message") or "", f["_oh_date"])
+    message = _clean_message(out.get("message") or "", f["_oh_date"], smart=bool((f.get("showcase") or {}).get("must_haves")))
     if len(message) < 12:
         return {"error": "Couldn't write it just now - try again."}
     if out.get("link") and f["_showcase_url"]:

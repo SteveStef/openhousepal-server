@@ -322,11 +322,14 @@ async def compute(db: AsyncSession, user: User, hub: AgentHub) -> dict:
 
     skipped = set(st["skipped"])
     not_using = set(st["not_using"]) & NOT_USING_STEPS
+    # A website needs at least one town (owner, 11/09): without one its homes came from the whole MLS
+    # (DC, Virginia...). Required for IDX - no Skip; one town is enough.
+    required = REQUIRED | ({"areas"} if str(plan or "").upper() == "IDX" else set())
     items = []
     for step in steps:
         status = ("done" if done[step] else "not_using" if step in not_using
-                  else "skipped" if step in skipped and step not in REQUIRED else "todo")
-        items.append({"id": step, "status": status, "required": step in REQUIRED})
+                  else "skipped" if step in skipped and step not in required else "todo")
+        items.append({"id": step, "status": status, "required": step in required})
     remaining = [i for i in items if i["status"] not in ("done", "not_using")]
     return {
         "plan": plan,

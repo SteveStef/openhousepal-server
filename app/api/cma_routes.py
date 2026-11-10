@@ -103,6 +103,7 @@ async def cma_location_map(
     ref: str,
     m: str = Query(..., min_length=5, max_length=600),
     size: str = Query("900x420"),
+    z: Optional[int] = Query(None, ge=14, le=18),
     db: AsyncSession = Depends(get_db),
 ):
     """Unauthenticated - the PDF (Studio and the client share link) fetches it without a login. `ref` is the
@@ -117,10 +118,12 @@ async def cma_location_map(
         raise HTTPException(status_code=422, detail="Bad map pins.")
     if size not in manual.CMA_MAP_SIZES:
         raise HTTPException(status_code=422, detail="Bad map size.")
+    if z is not None and len(pins) != 1:
+        raise HTTPException(status_code=422, detail="Bad map pins.")
     report = (await db.execute(_select(CmaReport).where(or_(CmaReport.id == ref, CmaReport.share_slug == ref)))).scalars().first()
     if not report or not manual.map_pins_belong(pins, report.subject or {}, report.comparables or []):
         raise HTTPException(status_code=404, detail="Map not found.")
-    png = await manual.cma_map_png(db, size, pins)
+    png = await manual.cma_map_png(db, size, pins, zoom=z)
     if not png:
         raise HTTPException(status_code=503, detail="Map unavailable.")
     return Response(content=png, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})

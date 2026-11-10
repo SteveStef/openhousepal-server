@@ -303,6 +303,7 @@ class PropertyService:
         preferences: CollectionPreferencesSchema,
         max_properties: int = 500,
         nearest_first: bool = True,
+        extra_filters: Optional[list] = None,
     ) -> List[PropertySummaryResponse]:
         """
         Performs a local SQLAlchemy search against the mirrored 'properties' table.
@@ -514,6 +515,9 @@ class PropertyService:
             # Rentals mis-tagged as homes for sale, timeshare weeks, parking spaces: nothing but land
             # lists for sale under $10k, so those never reach a buyer unless they asked for rentals.
             filters.append(or_(Property.price.is_(None), Property.price >= MIN_FOR_SALE_HOME_PRICE, Property.home_type.in_(('LAND', 'FARM'))))
+
+        # The IDX search box's feature words ("pool", "finished basement" - search_features.py), no AI.
+        filters.extend(extra_filters or [])
 
         # Apply all filters
         if filters:
