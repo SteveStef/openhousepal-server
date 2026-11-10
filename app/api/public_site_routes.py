@@ -145,7 +145,8 @@ async def allow_map_load(request: Request, db: AsyncSession = Depends(get_db)):
     """Asked by the browser right before it shows a Google map (lib/googleMapsLoader.ts) - every map
     shown is a billed Google "map load" that happens in the visitor's browser, out of the server's
     sight. Counted here under a day/month cap below Google's monthly free allowance (owner rule:
-    Google free tier only); over it, 429 and the page shows its homes without the map.
+    Google free tier only); over it, 429 and that page draws the same map on the free OpenFreeMap
+    street map instead (frontend lib/freeMap - same pins, shapes and buttons, never billed).
     Per address, at most 60 map loads an hour - a script hammering this can't use up everyone's maps."""
     import time
     from app.services import usage_budget_service
