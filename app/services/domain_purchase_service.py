@@ -16,8 +16,8 @@ The whole life of a bought domain:
                    (cancels PayPal; the domain stays until it expires) or move the domain away
                    (we unlock it and show the transfer code).
 
-Config (env): NAMECOM_* (namecom_service), PAYPAL_DOMAIN_PLAN_ID (the shared yearly "Domain
-name" plan - scripts/create_domain_paypal_plan.py makes it), DOMAIN_MARKUP_USD (default 6),
+Config (env): NAMECOM_* (namecom_service), PayPal keys (a plan per price pair is made
+automatically - see plan_id), DOMAIN_MARKUP_USD (default 6),
 DOMAIN_MAX_PRICE_USD (default 75), DOMAIN_TLDS (endings we sell).
 """
 from __future__ import annotations
@@ -55,30 +55,47 @@ _plan_ids: dict[str, str] = {}
 
 
 def _paypal_ready() -> bool:
-    return bool(os.getenv("PAYPAL_DOMAIN_PLAN_ID") or (os.getenv("PAYPAL_CLIENT_ID") and os.getenv("PAYPAL_SECRET_ID")))
+    return bool(os.getenv("PAYPAL_CLIENT_ID") and os.getenv("PAYPAL_SECRET_ID"))
 
 
-async def plan_id(db: AsyncSession) -> str:
-    """The shared yearly "Domain name" PayPal plan. PAYPAL_DOMAIN_PLAN_ID if set; otherwise made
-    automatically the first time anyone buys and remembered in app_cache (one per PayPal mode),
-    so nobody has to run anything by hand."""
-    env = os.getenv("PAYPAL_DOMAIN_PLAN_ID")
-    if env:
-        return env
+async def _cached(db: AsyncSession, key: str) -> Optional[str]:
     from sqlalchemy import text
-    from app.services import app_cache
-    from app.services.paypal_service import paypal_service
-    key = f"paypal_domain_plan_id:{os.getenv('PAYPAL_MODE', 'sandbox')}"
     if key in _plan_ids:
         return _plan_ids[key]
     row = (await db.execute(text("SELECT value FROM app_cache WHERE key = :k"), {"k": key})).scalar_one_or_none()
     if isinstance(row, str) and row:
         _plan_ids[key] = row
         return row
-    pid = await paypal_service.create_domain_plan()
+    return None
+
+
+async def plan_id(db: AsyncSession, price: float, renewal: float) -> str:
+    """A plain PayPal plan for one price pair: year one at `price`, charged the moment the agent
+    approves, then `renewal` every year - the yearly charge lands RENEW_LEAD_DAYS before the domain
+    would expire. Made automatically the first time a price pair is sold and remembered in
+    app_cache (per PayPal mode), so nobody has to run anything by hand.
+
+    Why not one shared plan with each subscription's price overridden + a setup fee + a start date
+    a year out (the first version): PayPal's live checkout refused that shape for every buyer
+    ("PayPal isn't available at this time", 11/10) while the sandbox accepted it. A plan whose
+    first cycle is billed at once is the same shape as every OpenHousePal sign-up plan."""
+    from app.services import app_cache
+    from app.services.paypal_service import paypal_service
+    mode = os.getenv("PAYPAL_MODE", "sandbox")
+    key = f"paypal_domain_plan:v2:{mode}:{price:.2f}:{renewal:.2f}"
+    pid = await _cached(db, key)
+    if pid:
+        return pid
+    product_key = f"paypal_domain_product:{mode}"
+    product = await _cached(db, product_key)
+    if not product:
+        product = await paypal_service.create_domain_product()
+        await app_cache.save(product_key, product)
+        _plan_ids[product_key] = product
+    pid = await paypal_service.create_domain_plan(product, price, renewal, 365 - RENEW_LEAD_DAYS)
     await app_cache.save(key, pid)
     _plan_ids[key] = pid
-    _ping(f":credit_card: Made the PayPal 'Domain name' plan automatically ({os.getenv('PAYPAL_MODE', 'sandbox')}): {pid}")
+    _ping(f":credit_card: Made a PayPal domain plan ({mode}): ${price:.2f} then ${renewal:.2f}/yr - {pid}")
     return pid
 
 
@@ -238,11 +255,9 @@ async def start(db: AsyncSession, user: User, domain: str, contact_in: dict, bac
     await db.flush()
     back = back if back in ("setup", "settings", "website") else "website"
     ret = f"{app_url()}/studio/domains/return?purchase={purchase.id}&back={back}"
-    first_renewal = datetime.now(timezone.utc) + timedelta(days=365 - RENEW_LEAD_DAYS)
     try:
         sub = await paypal_service.create_domain_subscription(
-            await plan_id(db), price, renewal, first_renewal.strftime("%Y-%m-%dT%H:%M:%SZ"), purchase.id,
-            f"{domain} (yearly)", ret, f"{ret}&cancelled=1",
+            await plan_id(db, price, renewal), purchase.id, ret, f"{ret}&cancelled=1",
         )
     except Exception:
         logger.exception("PayPal domain subscription create failed", extra={"domain": domain})
@@ -587,7 +602,17 @@ async def sweep(db: AsyncSession) -> None:
             created = p.created_at if p.created_at.tzinfo else p.created_at.replace(tzinfo=timezone.utc)
             if p.status == "CHECKOUT":
                 if now - created > timedelta(days=2):
-                    p.status = "ABANDONED"   # never approved at PayPal
+                    # Never approved - or approved but year one never got paid (card declined). Stop
+                    # the subscription too, so PayPal doesn't keep retrying a domain we never bought.
+                    if p.paypal_subscription_id:
+                        try:
+                            from app.services.paypal_service import paypal_service
+                            sub = await paypal_service.get_subscription(p.paypal_subscription_id)
+                            if (sub.get("status") or "").upper() in ("ACTIVE", "SUSPENDED"):
+                                await paypal_service.cancel_subscription(p.paypal_subscription_id, "Domain checkout never paid")
+                        except Exception:
+                            logger.warning("Couldn't cancel an unpaid domain subscription", exc_info=True, extra={"purchase": p.id})
+                    p.status = "ABANDONED"
                     await db.commit()
                 else:
                     await complete(db, p)

@@ -450,48 +450,45 @@ class PayPalService:
             return await client.post(f"{self._base_url}{path}", json=data, timeout=30.0,
                                      headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
 
-    async def create_domain_plan(self) -> str:
-        """The one shared yearly "Domain name" plan (product + plan) - its $20 prices are
-        placeholders; every domain's subscription overrides them. Returns the plan id."""
+    async def create_domain_product(self) -> str:
+        """The one PayPal catalog product every domain plan hangs off. Returns the product id."""
         prod = await self._post("/v1/catalogs/products", {
             "name": "OpenHousePal domain name", "type": "SERVICE", "category": "SOFTWARE",
             "description": "A website domain registered for an agent's OpenHousePal IDX website, renewed yearly.",
         })
         if prod.status_code not in (200, 201):
             raise Exception(f"Failed to create domain product: {prod.status_code} - {prod.text}")
+        return prod.json()["id"]
+
+    async def create_domain_plan(self, product_id: str, first_year: float, renewal: float, first_days: int) -> str:
+        """A plain plan for one domain price pair - no setup fee, no override, no future start:
+        cycle 1 = year one, billed the moment the agent approves and lasting `first_days` (so the
+        next charge lands just before the domain would expire); then `renewal` every year.
+        Returns the plan id."""
         plan = await self._post("/v1/billing/plans", {
-            "product_id": prod.json()["id"], "name": "Domain name (yearly)", "status": "ACTIVE",
-            "description": "Yearly domain renewal - first year charged at sign-up",
-            "billing_cycles": [{
-                "frequency": {"interval_unit": "YEAR", "interval_count": 1}, "tenure_type": "REGULAR",
-                "sequence": 1, "total_cycles": 0,
-                "pricing_scheme": {"fixed_price": {"value": "20.00", "currency_code": "USD"}},
-            }],
-            "payment_preferences": {
-                "auto_bill_outstanding": True, "setup_fee_failure_action": "CANCEL", "payment_failure_threshold": 2,
-                "setup_fee": {"value": "20.00", "currency_code": "USD"},
-            },
+            "product_id": product_id, "status": "ACTIVE",
+            "name": f"Domain name - ${first_year:.2f} first year, then ${renewal:.2f}/yr",
+            "description": "Website domain - first year charged now, then yearly",
+            "billing_cycles": [
+                {"frequency": {"interval_unit": "DAY", "interval_count": first_days}, "tenure_type": "TRIAL",
+                 "sequence": 1, "total_cycles": 1,
+                 "pricing_scheme": {"fixed_price": {"value": f"{first_year:.2f}", "currency_code": "USD"}}},
+                {"frequency": {"interval_unit": "YEAR", "interval_count": 1}, "tenure_type": "REGULAR",
+                 "sequence": 2, "total_cycles": 0,
+                 "pricing_scheme": {"fixed_price": {"value": f"{renewal:.2f}", "currency_code": "USD"}}},
+            ],
+            "payment_preferences": {"auto_bill_outstanding": True, "payment_failure_threshold": 2},
         })
         if plan.status_code not in (200, 201):
             raise Exception(f"Failed to create domain plan: {plan.status_code} - {plan.text}")
         return plan.json()["id"]
 
-    async def create_domain_subscription(self, plan_id: str, first_year: float, renewal: float, start_time: str,
-                                         custom_id: str, description: str, return_url: str, cancel_url: str) -> dict:
-        """One yearly subscription per domain on the shared "Domain name" plan, priced for this
-        domain: year one is the setup fee (charged at approval - CANCEL if it fails, so ACTIVE means
-        paid), the yearly cycle starts at `start_time` (just before it would expire)."""
+    async def create_domain_subscription(self, plan_id: str, custom_id: str, return_url: str, cancel_url: str) -> dict:
+        """One subscription per domain on its price pair's plan, starting now: PayPal bills year
+        one as soon as the agent approves."""
         resp = await self._post("/v1/billing/subscriptions", {
             "plan_id": plan_id,
-            "start_time": start_time,
             "custom_id": custom_id,
-            "plan": {
-                "billing_cycles": [{"sequence": 1, "total_cycles": 0,
-                                    "pricing_scheme": {"fixed_price": {"value": f"{renewal:.2f}", "currency_code": "USD"}}}],
-                "payment_preferences": {"auto_bill_outstanding": True, "setup_fee_failure_action": "CANCEL",
-                                        "payment_failure_threshold": 2,
-                                        "setup_fee": {"value": f"{first_year:.2f}", "currency_code": "USD"}},
-            },
             "application_context": {
                 "brand_name": "OpenHousePal", "shipping_preference": "NO_SHIPPING", "user_action": "SUBSCRIBE_NOW",
                 "return_url": return_url, "cancel_url": cancel_url,
