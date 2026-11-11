@@ -446,7 +446,8 @@ async def _gate(db: AsyncSession, user: User, config: dict, engine: str) -> None
     allowance is the only limit (no article count), and a run can't push them past it."""
     if user.id in _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS:
         return
-    limit = (config.get("agent_monthly_ai_budget_usd_by_tier") or {}).get(user.plan_tier)
+    from app.services.ai.ai_rate_limit_service import monthly_limit_usd
+    limit = await monthly_limit_usd(db, user.id, config, user.plan_tier)
     if not limit:
         return
     need = float((config.get("blog_pipeline_gate_usd") or {}).get(engine, 1.0))

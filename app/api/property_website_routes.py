@@ -225,7 +225,8 @@ async def header_video_estimate(
     from app.services.ai.ai_rate_limit_service import monthly_ai_budget_snapshot
     await _load_owned(db, site_id, current_user.id)
     config = await ai_config_service.get_config(db)
-    out = spotlight_header_service.estimate(config, current_user.plan_tier)
+    from app.services.ai.ai_rate_limit_service import monthly_limit_usd
+    out = spotlight_header_service.estimate(config, current_user.plan_tier, await monthly_limit_usd(db, current_user.id, config, current_user.plan_tier))
     snap = await monthly_ai_budget_snapshot(db, current_user.id, config, current_user.plan_tier)
     out["used_percent"] = snap.get("percent")
     # The Room by room photo sorter's price for this listing, same "% of monthly AI" language.

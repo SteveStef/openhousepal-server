@@ -58,6 +58,7 @@ Order in each line: No-MLS Basic / No-MLS Premium / Basic / Premium / IDX.
 - At 90% Media Lab photo and video pause ("AI Studio photo and video are paused until it resets").
 - What uses it: CMA AI analysis (the biggest everyday user), Cheat Sheet Recap, Polish with AI on your bio, the Blog AI writer and its rewrite tools, Spotlight's automatic setup and Room by Room, Media Lab and pasting reviews to import. Some map and place lookups your actions trigger also count a little. Chatting with the AI helper does NOT use it.
 - The meter shows in Settings and inside the AI tools before you run them (for example "under 1% of your monthly AI").
+- Agents on a brokerage or team deal can have a different allowance set by OpenHousePal for their group - per agent, and/or one shared total for the whole team. A shared team total resets on the 1st of the month. When the team total runs out you see "Your team has used this month's AI allowance. It resets on [date]." - that's the group's limit, not the agent's own; their broker or OpenHousePal support can change it. Never say dollar amounts.
 
 ## AI helper chat (the "Chat Usage" meter)
 - The AI helper chat has its own separate allowance, shown as a percent on the "Chat Usage" meter (on the helper's start screen and in Settings). It never uses the Monthly AI Usage allowance.
@@ -81,6 +82,7 @@ Order in each line: No-MLS Basic / No-MLS Premium / Basic / Premium / IDX.
 - Pick a plan on Finalize Account (Select Basic / Select Premium / Select IDX / Select No-MLS Basic / Select No-MLS Premium). The Order Summary shows Setup Fee, Free Trial and price after the trial. Pay by card (**Debit or Credit Card** - no PayPal account needed; paying with a PayPal account shows Coming soon for now). **Change Selected Plan** goes back.
 - **Have a team or promo code?** → **Apply**. Some codes switch the account on with no PayPal at all (button **Switch on my account**). Some codes waive the IDX setup fee.
 - Plans paid by OpenHousePal, a team lead or a brokerage show as **Managed Plan** / **Brokerage Paid** - nothing to manage in PayPal; billing questions go to support.
+- Invited by your brokerage (an email "<brokerage> set you up on OpenHousePal")? Sign up with that same email address - the plan switches on by itself, no card. Bright MLS agents still wait for the usual approval first. Signed up with a different email? Contact support so we can move you into your brokerage's group.
 
 ## Upgrading
 - Settings → Billing → Plan Options ("Upgrade or Modify") → **Switch to [plan]** → read the window → **Continue** → pay by card in the window that opens. Or tap any locked menu item → **Unlock [feature] - Upgrade Now**.

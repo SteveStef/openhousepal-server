@@ -111,6 +111,9 @@ class User(Base):
     # Paid for by their brokerage on a custom deal (admin "Brokerage groups"). The plan itself is
     # still plan_tier/subscription_status (set by the admin, no PayPal subscription on the agent).
     billing_group_id = Column(String, ForeignKey('billing_groups.id', ondelete='SET NULL'), nullable=True, index=True)
+    # Admin-set monthly AI allowance for this one person inside their brokerage group (beats the
+    # group's per-agent amount and their plan's). Cleared when they leave the group.
+    ai_budget_override_usd = Column(Float, nullable=True)
     # The admin-made sign-up code this agent used at checkout (admin "Codes"), if any.
     promo_code_id = Column(String, ForeignKey('promo_codes.id', ondelete='SET NULL'), nullable=True, index=True)
     # When they ticked "I agree" at sign-up, and which Terms ("Last updated" date). NULL = signed up
@@ -481,8 +484,64 @@ class BillingGroup(Base):
     started_on = Column(Date, nullable=True)
     next_invoice_on = Column(Date, nullable=True)
     notes = Column(Text, nullable=True)
+    # AI usage for the deal (admin, 11/11). None = the plan's normal monthly allowance per agent and
+    # no shared cap. Per agent replaces each member's own allowance; total caps the whole group
+    # together for the calendar month (ai_rate_limit_service.monthly_limit_usd / group_pool).
+    ai_budget_per_agent_usd = Column(Float, nullable=True)
+    ai_budget_total_usd = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class PaymentRequest(Base):
+    """A custom payment request the admin sends (11/11): a pay link that takes any debit or credit
+    card once and then charges by itself - one time, monthly, every 3 months or yearly. Each one is
+    its own PayPal plan + subscription (custom_id "payreq:<id>"); payment_request_service keeps it
+    in step through the PayPal webhook. Optional: a brokerage group or agent it pays for, the plan
+    they get once it's paid, and how many people it covers."""
+    __tablename__ = "payment_requests"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    token = Column(String, nullable=False, unique=True, index=True)   # the public /pay/<token> link
+    title = Column(String, nullable=False)                            # what it's for
+    note = Column(Text, nullable=True)                                # message shown to the payer
+    amount = Column(Float, nullable=False)
+    cycle = Column(String, nullable=False, server_default='monthly', default='monthly')  # once | monthly | quarterly | yearly
+    total_payments = Column(Integer, nullable=True)                   # recurring: stop after N (None = until cancelled)
+    billing_group_id = Column(String, ForeignKey('billing_groups.id', ondelete='SET NULL'), nullable=True, index=True)
+    user_id = Column(String, ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    payer_name = Column(String, nullable=True)
+    payer_email = Column(String, nullable=True)
+    plan_tier = Column(String, nullable=True)                         # plan they get once it's paid
+    seats = Column(Integer, nullable=True)                            # people the deal covers
+    # open (waiting) | active (recurring, paid) | paid (one time, done) | past_due | cancelled | ended
+    status = Column(String, nullable=False, server_default='open', default='open')
+    paypal_plan_id = Column(String, nullable=True)
+    paypal_subscription_id = Column(String, nullable=True, index=True)
+    payments_count = Column(Integer, nullable=False, server_default='0', default=0)
+    amount_paid_total = Column(Float, nullable=False, server_default='0', default=0.0)
+    last_paid_at = Column(DateTime(timezone=True), nullable=True)
+    next_charge_at = Column(DateTime(timezone=True), nullable=True)
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    sent_count = Column(Integer, nullable=False, server_default='0', default=0)
+    cancelled_at = Column(DateTime(timezone=True), nullable=True)
+    # A new deal for the same people: once this one is paid, the old one stops charging.
+    replaces_request_id = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class BillingGroupEmail(Base):
+    """An email the admin put on a brokerage group before that person has an account: when they
+    sign up with it they join the group (and get its plan, brokerage-paid) - no checkout."""
+    __tablename__ = "billing_group_emails"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    group_id = Column(String, ForeignKey('billing_groups.id', ondelete='CASCADE'), nullable=False, index=True)
+    email = Column(String, nullable=False, unique=True)   # lower-case
+    apply_plan = Column(Boolean, nullable=False, server_default=text('true'), default=True)
+    invited_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class PromoCode(Base):

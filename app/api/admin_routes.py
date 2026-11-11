@@ -126,6 +126,8 @@ async def update_user_plan(
         else:
             # For BASIC or PREMIUM, set to ACTIVE and clear subscription_id 
             # and plan_id to make it "injected" (it won't be synced from PayPal)
+            from app.services.website.site_service import reset_idx_site_question_on_upgrade
+            reset_idx_site_question_on_upgrade(user, user.plan_tier, plan_tier)  # moving onto IDX asks "use your IDX website?"
             user.plan_tier = plan_tier
             if plan_tier == "IDX" and not user.idx_setup_settled_at:
                 from datetime import datetime, timezone

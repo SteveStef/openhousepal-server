@@ -46,7 +46,8 @@ async def estimate(db: AsyncSession, user: User) -> dict:
     # What a cover really costs (measured 10/17: $0.04 for a 1536x1024 picture) - the AI Media
     # reservation estimate ($0.25) is a deliberately high hold, not the price.
     usd = float(config.get("blog_cover_typical_usd", 0.05) or 0.05)
-    limit = (config.get("agent_monthly_ai_budget_usd_by_tier") or {}).get(user.plan_tier)
+    from app.services.ai.ai_rate_limit_service import monthly_limit_usd
+    limit = await monthly_limit_usd(db, user.id, config, user.plan_tier)
     return {"usd": round(usd, 4), "percent": round(usd / float(limit) * 100, 2) if limit else None,
             "allowed": allowed(user, config), "max_revisions": MAX_REVISIONS}
 

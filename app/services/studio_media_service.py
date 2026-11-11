@@ -996,7 +996,8 @@ async def _run_video(db, user, payload, photos, options, config, group_id, paren
     # enforce_agent_monthly_budget (inside reserve_studio_media_video below) only blocks once
     # the agent is ALREADY at/over their monthly budget - it can't see that THIS video's own
     # worst-case cost would tip them over. Check that here, before committing to anything.
-    budget_limit = config.get("agent_monthly_ai_budget_usd_by_tier", {}).get(user.plan_tier)
+    from app.services.ai.ai_rate_limit_service import monthly_limit_usd
+    budget_limit = await monthly_limit_usd(db, user.id, config, user.plan_tier)
     if budget_limit and user.id not in _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS:
         spent = await total_monthly_ai_cost(db, user.id)
         if spent + generation_ceiling > float(budget_limit) + 0.01:

@@ -759,7 +759,8 @@ async def estimate_ai_copywrite(
     input_tokens = 700 + max(0, min(int(chars), 20000)) // 4
     output_tokens = min(int(config.get("copywrite_max_output_tokens") or 400), 160)
     usd = float(ai_config_service.estimate_cost_usd(config, model, input_tokens, output_tokens))
-    limit = config.get("agent_monthly_ai_budget_usd_by_tier", {}).get(current_user.plan_tier)
+    from app.services.ai.ai_rate_limit_service import monthly_limit_usd
+    limit = await monthly_limit_usd(db, current_user.id, config, current_user.plan_tier)
     return {"purpose": purpose, "usd": round(usd, 5), "percent": round(usd / float(limit) * 100, 3) if limit else None}
 
 

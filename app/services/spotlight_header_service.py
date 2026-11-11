@@ -16,6 +16,7 @@ reused by any other Spotlight site for the same home. This module only adds:
 from __future__ import annotations
 
 import os
+from typing import Optional
 import shutil
 import subprocess
 import tempfile
@@ -150,11 +151,11 @@ async def make_loop(clip_url: str) -> dict:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def estimate(config: dict, plan_tier: str) -> dict:
+def estimate(config: dict, plan_tier: str, limit: Optional[float] = None) -> dict:
     """Up-front cost of the header clip, in dollars and as a share of the agent's monthly AI
     allowance (the only number agents ever see). Same projection as any 1-photo Media Lab video."""
     from app.services.studio_media_service import estimate_video_generation_cost_usd
-    limit = config.get("agent_monthly_ai_budget_usd_by_tier", {}).get(plan_tier)
+    limit = limit if limit is not None else config.get("agent_monthly_ai_budget_usd_by_tier", {}).get(plan_tier)
     out = {}
     for style in HEADER_STYLES:
         usd = float(estimate_video_generation_cost_usd(config, photo_count=1)["total_usd"])

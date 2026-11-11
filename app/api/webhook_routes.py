@@ -180,6 +180,30 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
             )
             return {"received": True, "warning": "No subscription_id"}
 
+        # A custom payment request the admin sent (payment_request_service) - its own subscription.
+        from app.models.database import PaymentRequest
+        from app.services import payment_request_service
+        pay_req = (await db.execute(
+            select(PaymentRequest).where(PaymentRequest.paypal_subscription_id == subscription_id)
+        )).scalar_one_or_none()
+        pay_ref = str(resource.get("custom_id") or resource.get("custom") or "")
+        if pay_req is None and pay_ref.startswith(payment_request_service.CUSTOM_PREFIX) and event_type in ("BILLING.SUBSCRIPTION.ACTIVATED", "PAYMENT.SALE.COMPLETED"):
+            # Paid, but the pay page closed before it reported back - attach it here.
+            waiting = await db.get(PaymentRequest, pay_ref[len(payment_request_service.CUSTOM_PREFIX):])
+            if waiting is not None and waiting.status in ("open", "past_due"):
+                db.add(WebhookEvent(id=event_id, event_type=event_type))
+                await db.commit()
+                try:
+                    await payment_request_service.attach(db, waiting, subscription_id)
+                except payment_request_service.PaymentRequestError as e:
+                    logger.warning("Payment request webhook attach refused", extra={"request": waiting.id, "reason": str(e)})
+                return {"received": True, "event_type": event_type, "payment_request": waiting.id}
+        if pay_req is not None:
+            db.add(WebhookEvent(id=event_id, event_type=event_type))
+            await db.commit()
+            await payment_request_service.on_paypal_event(db, pay_req, event_type, resource)
+            return {"received": True, "event_type": event_type, "payment_request": pay_req.id}
+
         # A domain bought in OpenHousePal has its own yearly subscription - not the agent's plan.
         from app.models.database import PurchasedDomain
         purchase = (await db.execute(

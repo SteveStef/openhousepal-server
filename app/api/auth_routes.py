@@ -201,6 +201,13 @@ async def verify_code(
         await db.flush()
         await db.refresh(new_user)
 
+        # An email the admin put on a brokerage group's list: they join it now and get its plan,
+        # brokerage-paid - no checkout (admin_groups_routes.join_from_list).
+        joined_group = None
+        if not test_source:
+            from app.api.admin_groups_routes import join_from_list
+            joined_group = await join_from_list(db, new_user)
+
         # 4. Create Discovery Preferences
         discovery_prefs = DiscoveryPreferences(
             user_id=new_user.id,
@@ -215,7 +222,11 @@ async def verify_code(
 
         # Tell the team someone is waiting - they can't pay until an admin authorizes them.
         try:
-            if test_source:
+            if joined_group is not None:
+                plan_txt = f" on {new_user.plan_tier}" if new_user.subscription_status == "ACTIVE" else " (their group's plan needs an MLS ID - pick a plan for them on the Agents tab)"
+                notifier.send(f"{new_user.first_name} {new_user.last_name} ({new_user.email}) signed up from {joined_group.name}'s list - "
+                              f"joined the group{plan_txt}." + (" Authorize them in Admin once Bright approves their feed." if not new_user.broker_authorized else ""))
+            elif test_source:
                 notifier.send(f"TEST account signed up: {new_user.first_name} {new_user.last_name} - test copy of "
                               f"{test_source.first_name} {test_source.last_name} (code {test_promo.code}). Authorize them in Admin to continue the test.")
             elif new_user.mls_id:

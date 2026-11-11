@@ -242,16 +242,96 @@ _USAGE_LABELS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Brokerage group AI usage (admin, 11/11): a group can set each member's monthly allowance
+# (replaces the plan's normal one) and/or one total for the whole group together. Blank = the
+# plan's normal allowance and no shared cap - exactly what everyone had before.
+# ---------------------------------------------------------------------------
+
+async def _user_and_group(db: AsyncSession, owner_id: str):
+    from app.models.database import BillingGroup
+    u = await db.get(User, owner_id)
+    if u is None or not u.billing_group_id:
+        return u, None
+    return u, await db.get(BillingGroup, u.billing_group_id)
+
+
+async def _group_of(db: AsyncSession, owner_id: str):
+    return (await _user_and_group(db, owner_id))[1]
+
+
+async def _custom_allowance(db: AsyncSession, owner_id: str) -> Optional[float]:
+    """The admin's own number for this agent, if any: their personal one inside the group first,
+    then the group's per-agent amount. None = their plan's normal allowance."""
+    u, g = await _user_and_group(db, owner_id)
+    if u is not None and g is not None and u.ai_budget_override_usd:
+        return float(u.ai_budget_override_usd)
+    if g is not None and g.ai_budget_per_agent_usd:
+        return float(g.ai_budget_per_agent_usd)
+    return None
+
+
+async def monthly_limit_usd(db: AsyncSession, owner_id: str, config: dict, plan_tier: Optional[str]) -> Optional[float]:
+    """This agent's monthly AI allowance in dollars: a personal amount the admin set for them in
+    their group, else the group's per-agent amount, else their plan's. None = not gated.
+    The platform-wide safety ceilings (reserve_global_and_emergency) still apply on top - this
+    only changes the agent's own allowance."""
+    custom = await _custom_allowance(db, owner_id)
+    if custom:
+        return custom
+    limit = (config.get("agent_monthly_ai_budget_usd_by_tier") or {}).get(plan_tier)
+    return float(limit) if limit else None
+
+
+async def media_cap_usd(db: AsyncSession, owner_id: str, config: dict, plan_tier: Optional[str]) -> Optional[float]:
+    """The silent AI Media slice, scaled with a custom allowance (same share of it)."""
+    cap = (config.get("studio_media_monthly_spend_cap_usd_by_tier") or {}).get(plan_tier)
+    custom = await _custom_allowance(db, owner_id)
+    if custom:
+        default = (config.get("agent_monthly_ai_budget_usd_by_tier") or {}).get(plan_tier)
+        share = float(cap) / float(default) if cap and default else 0.5
+        return round(custom * share, 2)
+    return float(cap) if cap else None
+
+
+async def group_month_spend(db: AsyncSession, group_id: str) -> dict:
+    """{owner_id: dollars} this calendar month for one group's members (what the group cap counts)."""
+    members = select(User.id).where(User.billing_group_id == group_id)
+    rows = (await db.execute(
+        select(AIUsageEvent.owner_id, func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0.0))
+        .where(AIUsageEvent.owner_id.in_(members), AIUsageEvent.blocked.is_(False),
+               AIUsageEvent.created_at >= _start_of_month(), _counts_on_agent_bar())
+        .group_by(AIUsageEvent.owner_id)
+    )).all()
+    return {oid: float(c or 0.0) for oid, c in rows}
+
+
+async def group_pool(db: AsyncSession, owner_id: str) -> Optional[dict]:
+    """The group's shared monthly total, when it has one: {used, total, resets} (calendar month)."""
+    g = await _group_of(db, owner_id)
+    if g is None or not g.ai_budget_total_usd:
+        return None
+    used = sum((await group_month_spend(db, g.id)).values())
+    return {"used": used, "total": float(g.ai_budget_total_usd), "resets": _add_months(_start_of_month(), 1)}
+
+
 async def monthly_ai_budget_snapshot(db: AsyncSession, owner_id: str, config: dict, plan_tier: str) -> dict:
     """Powers GET /ai/usage/monthly. `percent` is None for a tier with no configured budget
     (the frontend renders no meter in that case). `used_usd` is returned for the temporary
     exact-dollar readout while testing - the permanent UI is the percentage only."""
-    limit = config.get("agent_monthly_ai_budget_usd_by_tier", {}).get(plan_tier)
-    media_cap = config.get("studio_media_monthly_spend_cap_usd_by_tier", {}).get(plan_tier)
+    limit = await monthly_limit_usd(db, owner_id, config, plan_tier)
+    media_cap = await media_cap_usd(db, owner_id, config, plan_tier)
+    pool = await group_pool(db, owner_id)
     period_start, period_end = await usage_period(db, owner_id)
     used = await total_monthly_ai_cost(db, owner_id)
     media_used = await studio_media_monthly_cost(db, owner_id)
     percent = None if not limit else min(100, int(round(used / limit * 100)))
+    if pool:
+        # The bar shows whichever runs out first - their own allowance or the group's total.
+        pool_pct = min(100, int(round(pool["used"] / pool["total"] * 100)))
+        if percent is None or pool_pct > percent:
+            percent = pool_pct
+            period_end = pool["resets"]
     # What the last hour added - the meter shows it as its own coloured slice, so an agent can see
     # what the thing they just made actually cost them.
     recent = min(used, await _cost_since(db, owner_id, datetime.now(timezone.utc) - timedelta(hours=1), event_type=None))
@@ -283,7 +363,7 @@ async def monthly_ai_budget_snapshot(db: AsyncSession, owner_id: str, config: di
         "limit_usd": limit,
         "percent": percent,
         "near_limit": bool(percent is not None and percent >= 80),
-        "exhausted": bool(limit and used >= limit),
+        "exhausted": bool((limit and used >= limit) or (pool and pool["used"] >= pool["total"])),
         "studio_media_used_usd": round(media_used, 4),
         "studio_media_cap_usd": media_cap,
         "resets_at": period_end.isoformat(),
@@ -347,13 +427,17 @@ async def enforce_agent_monthly_budget(db: AsyncSession, owner_id: str, config: 
     no configured budget. Call before reserving spend on any metered AI feature."""
     if owner_id in _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS:
         return
-    limit = config.get("agent_monthly_ai_budget_usd_by_tier", {}).get(plan_tier)
-    if not limit:
-        return
-    if await total_monthly_ai_cost(db, owner_id) >= limit:
+    limit = await monthly_limit_usd(db, owner_id, config, plan_tier)
+    if limit and await total_monthly_ai_cost(db, owner_id) >= limit:
         raise AIRateLimitExceeded(
             "agent_monthly_budget",
             f"You've reached your AI usage limit for this month. {resets_text((await usage_period(db, owner_id))[1])}",
+        )
+    pool = await group_pool(db, owner_id)
+    if pool and pool["used"] >= pool["total"]:
+        raise AIRateLimitExceeded(
+            "group_monthly_budget",
+            f"Your team has used this month's AI allowance. {resets_text(pool['resets'])}",
         )
 
 
@@ -364,13 +448,14 @@ async def studio_soft_capped(db: AsyncSession, owner_id: str, config: dict, plan
     out proactively. Never true for an exempt owner or a tier with no configured budget."""
     if owner_id in _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS:
         return False
-    limit = config.get("agent_monthly_ai_budget_usd_by_tier", {}).get(plan_tier)
-    if not limit:
-        return False
     pct = config.get("studio_soft_cap_percent", 90)
     if pct >= 100:
         return False
-    return await total_monthly_ai_cost(db, owner_id) >= limit * (pct / 100.0)
+    limit = await monthly_limit_usd(db, owner_id, config, plan_tier)
+    if limit and await total_monthly_ai_cost(db, owner_id) >= limit * (pct / 100.0):
+        return True
+    pool = await group_pool(db, owner_id)
+    return bool(pool and pool["used"] >= pool["total"] * (pct / 100.0))
 
 
 async def enforce_studio_soft_cap(db: AsyncSession, owner_id: str, config: dict, plan_tier: str) -> None:
@@ -392,7 +477,7 @@ async def enforce_studio_media_monthly_cap(db: AsyncSession, owner_id: str, conf
     sees a media-specific figure."""
     if owner_id in _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS:
         return
-    cap = config.get("studio_media_monthly_spend_cap_usd_by_tier", {}).get(plan_tier)
+    cap = await media_cap_usd(db, owner_id, config, plan_tier)
     if not cap:
         return
     if await studio_media_monthly_cost(db, owner_id) >= cap:

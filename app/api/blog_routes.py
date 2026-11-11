@@ -212,7 +212,8 @@ async def estimate_blog_ai(
     engine = config.get("blog_pipeline_default_engine", "max")
     typical = float((config.get("blog_pipeline_typical_usd") or {}).get(engine, 0.65))
     usd = typical * {"short": 0.8, "standard": 1.0, "long": 1.3}.get(length, 1.0)
-    limit = config.get("agent_monthly_ai_budget_usd_by_tier", {}).get(current_user.plan_tier)
+    from app.services.ai.ai_rate_limit_service import monthly_limit_usd
+    limit = await monthly_limit_usd(db, current_user.id, config, current_user.plan_tier)
     return {"usd": round(usd, 5), "percent": round(usd / float(limit) * 100, 2) if limit else None}
 
 

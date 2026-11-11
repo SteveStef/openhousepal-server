@@ -517,6 +517,38 @@ class PayPalService:
             raise Exception(f"Failed to create domain subscription: {resp.status_code} - {resp.text}")
         return resp.json()
 
+    # ---- Custom payment requests (payment_request_service) ----
+
+    async def create_custom_product(self) -> str:
+        """The one PayPal catalog product every custom payment request's plan hangs off."""
+        prod = await self._post("/v1/catalogs/products", {
+            "name": "OpenHousePal custom plan", "type": "SERVICE", "category": "SOFTWARE",
+            "description": "A custom OpenHousePal deal - a team, brokerage or special plan.",
+        })
+        if prod.status_code not in (200, 201):
+            raise Exception(f"Failed to create custom product: {prod.status_code} - {prod.text}")
+        return prod.json()["id"]
+
+    async def create_custom_plan(self, product_id: str, name: str, amount: float, cycle: str, total_payments: Optional[int]) -> str:
+        """One plan per payment request: `amount` charged the moment the payer approves, then again
+        every cycle (once = a single payment). total_payments stops it after N (0 = until cancelled)."""
+        unit, count = {"once": ("MONTH", 1), "monthly": ("MONTH", 1), "quarterly": ("MONTH", 3), "yearly": ("YEAR", 1)}[cycle]
+        total = 1 if cycle == "once" else int(total_payments or 0)
+        plan = await self._post("/v1/billing/plans", {
+            "product_id": product_id, "status": "ACTIVE",
+            "name": name[:127],
+            "description": ("One-time payment" if cycle == "once" else f"${amount:.2f} {cycle}")[:127],
+            "billing_cycles": [
+                {"frequency": {"interval_unit": unit, "interval_count": count}, "tenure_type": "REGULAR",
+                 "sequence": 1, "total_cycles": total,
+                 "pricing_scheme": {"fixed_price": {"value": f"{amount:.2f}", "currency_code": "USD"}}},
+            ],
+            "payment_preferences": {"auto_bill_outstanding": True, "payment_failure_threshold": 2},
+        })
+        if plan.status_code not in (200, 201):
+            raise Exception(f"Failed to create custom plan: {plan.status_code} - {plan.text}")
+        return plan.json()["id"]
+
     async def list_subscription_transactions(self, subscription_id: str, days: int = 400) -> list:
         token = await self.get_token()
         end = datetime.now(timezone.utc)

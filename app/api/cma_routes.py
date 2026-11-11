@@ -141,7 +141,8 @@ async def cma_ai_estimate(
     from app.models.database import AIUsageEvent
     from app.services.ai.ai_config_service import ai_config_service
     config = await ai_config_service.get_config(db)
-    limit = (config.get("agent_monthly_ai_budget_usd_by_tier") or {}).get(current_user.plan_tier)
+    from app.services.ai.ai_rate_limit_service import monthly_limit_usd
+    limit = await monthly_limit_usd(db, current_user.id, config, current_user.plan_tier)
     cap = float(config.get("cma_ai_max_cost_per_generation_usd") or 0.75)
 
     async def avg(kind: str) -> float:
