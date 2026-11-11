@@ -468,6 +468,23 @@ async def get_hub_only_domain(host: str, db: AsyncSession = Depends(get_db)):
         return {"hub_slug": None}
 
 
+@router.get("/apex-check")
+async def apex_check(domain: str = Query("", max_length=253), db: AsyncSession = Depends(get_db)):
+    """Asked by the bare-domain redirect server (Caddy on WEBSITE_APEX_IP, user 11/10) before it gets a
+    padlock certificate for a domain: 200 only when it's an agent's connected/bought domain (the
+    bare name or its www pair), anything else 404 - so strangers can't make it fetch certificates.
+    That server then sends <domain>/<page> to https://www.<domain>/<page>."""
+    host = (domain or "").strip().lower().rstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    if not host or "." not in host or host.endswith("openhousepal.com"):
+        raise HTTPException(status_code=404, detail="no")
+    found = (await db.execute(select(SiteDomain.id).where(SiteDomain.hostname.in_([host, f"www.{host}"])).limit(1))).first()
+    if not found:
+        raise HTTPException(status_code=404, detail="no")
+    return {"ok": True}
+
+
 @router.get("/subdomain/{slug}/own-domain")
 async def get_subdomain_own_domain(slug: str, db: AsyncSession = Depends(get_db)):
     """Where <slug>.openhousepal.com forwards to (frontend proxy.ts) - {"own_domain": null} = stay.

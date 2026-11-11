@@ -473,23 +473,28 @@ def _parse(v: Optional[str]) -> Optional[datetime]:
 
 
 async def set_dns(domain: str) -> None:
-    """www -> CNAME, bare domain -> ANAME (Name.com's root alias), both at sites.openhousepal.com.
-    Clears Name.com's parking records on those two names first."""
+    """www -> CNAME at sites.openhousepal.com. Bare domain -> A record at the bare-domain redirect
+    server (WEBSITE_APEX_IP, user 11/10: every page without www goes to the same page on www), or an
+    ANAME at sites.openhousepal.com when that server isn't set. Clears Name.com's parking records first."""
+    from app.services.website.domain_verification_service import WEBSITE_APEX_IP
+    want_root = ("A", WEBSITE_APEX_IP) if WEBSITE_APEX_IP else ("ANAME", CNAME_TARGET)
     records = await namecom_service.list_records(domain)
     for r in records:
         host = (r.get("host") or "").lower()
-        if host in ("", "@", "www") and (r.get("type") or "").upper() in ("A", "AAAA", "CNAME", "ANAME"):
-            if host == "www" and r.get("type") == "CNAME" and (r.get("answer") or "").rstrip(".").lower() == CNAME_TARGET:
+        rtype = (r.get("type") or "").upper()
+        if host in ("", "@", "www") and rtype in ("A", "AAAA", "CNAME", "ANAME"):
+            answer = (r.get("answer") or "").rstrip(".").lower()
+            if host == "www" and rtype == "CNAME" and answer == CNAME_TARGET:
                 continue
-            if host in ("", "@") and r.get("type") == "ANAME" and (r.get("answer") or "").rstrip(".").lower() == CNAME_TARGET:
+            if host in ("", "@") and (rtype, answer) == (want_root[0], want_root[1].lower()):
                 continue
             if r.get("id") is not None:
                 await namecom_service.delete_record(domain, r["id"])
     have = {((r.get("host") or "").lower(), (r.get("type") or "").upper()) for r in await namecom_service.list_records(domain)}
     if ("www", "CNAME") not in have:
         await namecom_service.create_record(domain, "www", "CNAME", CNAME_TARGET)
-    if ("", "ANAME") not in have and ("@", "ANAME") not in have:
-        await namecom_service.create_record(domain, "", "ANAME", CNAME_TARGET)
+    if ("", want_root[0]) not in have and ("@", want_root[0]) not in have:
+        await namecom_service.create_record(domain, "", want_root[0], want_root[1])
 
 
 async def hook_up(db: AsyncSession, purchase: PurchasedDomain) -> None:
@@ -498,6 +503,9 @@ async def hook_up(db: AsyncSession, purchase: PurchasedDomain) -> None:
     domain = purchase.domain_name
     try:
         await set_dns(domain)
+        from app.services.website.domain_verification_service import WEBSITE_APEX_IP
+        if WEBSITE_APEX_IP:
+            purchase.registrant = {**(purchase.registrant or {}), "_apex_ip": WEBSITE_APEX_IP}
         if purchase.last_error == "dns_setup":
             purchase.last_error = None
     except NamecomError:
@@ -819,6 +827,16 @@ async def sweep(db: AsyncSession) -> None:
             elif p.status == "ACTIVE":
                 if p.last_error == "dns_setup":
                     await hook_up(db, p)
+                # Bare-domain redirect server set (or changed): point this domain's root at it once.
+                from app.services.website.domain_verification_service import WEBSITE_APEX_IP
+                if WEBSITE_APEX_IP and (p.registrant or {}).get("_apex_ip") != WEBSITE_APEX_IP:
+                    try:
+                        await set_dns(p.domain_name)
+                        p.registrant = {**(p.registrant or {}), "_apex_ip": WEBSITE_APEX_IP}
+                        await db.commit()
+                    except NamecomError:
+                        logger.warning("Couldn't point the bare domain at the redirect server - next sweep retries",
+                                       extra={"domain": p.domain_name})
                 await make_primary_when_live(db, p)
                 exp = p.expires_at if not p.expires_at or p.expires_at.tzinfo else p.expires_at.replace(tzinfo=timezone.utc)
                 if exp and exp < now:
