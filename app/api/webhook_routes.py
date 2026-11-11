@@ -196,6 +196,20 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
         # Only approved/paid events (a CREATED one isn't paid yet - tying it on blocked the real payment
         # 11/10); attach() also checks PayPal says ACTIVE/APPROVED and may replace an unpaid earlier try.
         domain_ref = resource.get("custom_id") or resource.get("custom")
+        if domain_ref and str(domain_ref).startswith("renew:") and event_type in ("BILLING.SUBSCRIPTION.ACTIVATED", "PAYMENT.SALE.COMPLETED"):
+            # "Renew with card" whose page closed before it reported back
+            owned = (await db.execute(select(PurchasedDomain).where(
+                PurchasedDomain.id == str(domain_ref)[len("renew:"):], PurchasedDomain.status == "ACTIVE",
+            ))).scalar_one_or_none()
+            if owned:
+                from app.services import domain_purchase_service
+                db.add(WebhookEvent(id=event_id, event_type=event_type))
+                await db.commit()
+                try:
+                    await domain_purchase_service.attach_renewal(db, owned, subscription_id)
+                except domain_purchase_service.PurchaseError as e:
+                    logger.warning("Domain renewal webhook attach refused", extra={"purchase": owned.id, "reason": str(e)})
+                return {"received": True, "event_type": event_type, "domain": owned.domain_name}
         if domain_ref and event_type in ("BILLING.SUBSCRIPTION.ACTIVATED", "PAYMENT.SALE.COMPLETED"):
             pending = (await db.execute(select(PurchasedDomain).where(
                 PurchasedDomain.id == str(domain_ref), PurchasedDomain.status == "CHECKOUT",

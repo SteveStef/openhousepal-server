@@ -99,6 +99,28 @@ async def plan_id(db: AsyncSession, price: float, renewal: float) -> str:
     return pid
 
 
+async def renew_plan_id(db: AsyncSession, renewal: float) -> str:
+    """The yearly-only plan used by "Renew with card" (a domain they already own), per price."""
+    from app.services import app_cache
+    from app.services.paypal_service import paypal_service
+    mode = os.getenv("PAYPAL_MODE", "sandbox")
+    key = f"paypal_domain_renew_plan:v1:{mode}:{renewal:.2f}"
+    pid = await _cached(db, key)
+    if pid:
+        return pid
+    product_key = f"paypal_domain_product:{mode}"
+    product = await _cached(db, product_key)
+    if not product:
+        product = await paypal_service.create_domain_product()
+        await app_cache.save(product_key, product)
+        _plan_ids[product_key] = product
+    pid = await paypal_service.create_domain_renew_plan(product, renewal)
+    await app_cache.save(key, pid)
+    _plan_ids[key] = pid
+    _ping(f":credit_card: Made a PayPal domain RENEW plan ({mode}): ${renewal:.2f}/yr - {pid}")
+    return pid
+
+
 def available() -> dict:
     """Can agents buy right now? (the screen says "opens soon" otherwise)"""
     return {"buy": namecom_service.configured() and _paypal_ready(), "test_mode": namecom_service.is_test()}
@@ -529,6 +551,8 @@ async def on_paypal_event(db: AsyncSession, purchase: PurchasedDomain, event_typ
     elif event_type in ("BILLING.SUBSCRIPTION.CANCELLED", "BILLING.SUBSCRIPTION.SUSPENDED", "BILLING.SUBSCRIPTION.EXPIRED"):
         if purchase.auto_renew:
             purchase.auto_renew = False
+            if event_type != "BILLING.SUBSCRIPTION.CANCELLED":
+                purchase.last_error = "payment_failed"  # the domain card says so + offers Renew with card
             await db.commit()
             if event_type != "BILLING.SUBSCRIPTION.CANCELLED":
                 await _email(db, purchase, "payment_failed")
@@ -554,6 +578,117 @@ async def renew_if_due(db: AsyncSession, purchase: PurchasedDomain, paid: bool) 
         purchase.last_error = "renew_failed"
         _ping(f":rotating_light: Domain RENEWAL failed for {purchase.domain_name} ({e.message}) - the agent paid; renew it at Name.com by hand.")
     await db.commit()
+
+
+def _renew_start(purchase: PurchasedDomain) -> Optional[str]:
+    """When the first "Renew with card" charge lands: RENEW_LEAD_DAYS before expiry (when the
+    yearly charge would have come anyway); None = now, when that's already past/close."""
+    exp = purchase.expires_at if not purchase.expires_at or purchase.expires_at.tzinfo else purchase.expires_at.replace(tzinfo=timezone.utc)
+    if not exp:
+        return None
+    when = exp - timedelta(days=RENEW_LEAD_DAYS)
+    if when <= datetime.now(timezone.utc) + timedelta(hours=1):
+        return None
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def renew_checkout(db: AsyncSession, purchase: PurchasedDomain) -> dict:
+    """"Renew with card": renewing was stopped or the yearly card payment failed - start a new
+    yearly card subscription for a domain they still own (before it ends)."""
+    if purchase.status != "ACTIVE":
+        raise PurchaseError("This domain can't be renewed here - contact support.")
+    if purchase.auto_renew:
+        raise PurchaseError("This domain already renews automatically.")
+    exp = purchase.expires_at if not purchase.expires_at or purchase.expires_at.tzinfo else purchase.expires_at.replace(tzinfo=timezone.utc)
+    if exp and exp < datetime.now(timezone.utc):
+        raise PurchaseError("This domain has already ended - contact support to get it back.")
+    try:
+        plan = await renew_plan_id(db, purchase.renewal_price_usd)
+    except Exception:
+        logger.exception("PayPal domain renew plan failed", extra={"purchase": purchase.id})
+        raise PurchaseError("PayPal didn't answer - try again in a minute.")
+    return {"plan_id": plan, "custom_id": f"renew:{purchase.id}", "start_time": _renew_start(purchase)}
+
+
+async def attach_renewal(db: AsyncSession, purchase: PurchasedDomain, subscription_id: str) -> PurchasedDomain:
+    """The card button approved a "Renew with card" subscription - it becomes this domain's yearly
+    payment (the PAYMENT.SALE.COMPLETED webhook then renews at Name.com via renew_if_due)."""
+    from app.services.paypal_service import paypal_service
+    sid = (subscription_id or "").strip()
+    if not sid:
+        raise PurchaseError("PayPal didn't send the payment back - try again.")
+    if purchase.paypal_subscription_id == sid and purchase.auto_renew:
+        return purchase
+    if purchase.status != "ACTIVE":
+        raise PurchaseError("This domain can't be renewed here - contact support.")
+    used = (await db.execute(select(PurchasedDomain.id).where(PurchasedDomain.paypal_subscription_id == sid))).first()
+    if used:
+        raise PurchaseError("That payment is already used for another domain.")
+    try:
+        sub = await paypal_service.get_subscription(sid)
+        want = await renew_plan_id(db, purchase.renewal_price_usd)
+    except Exception:
+        logger.warning("PayPal lookup failed attaching a domain renewal", exc_info=True, extra={"purchase": purchase.id})
+        raise PurchaseError("PayPal didn't answer - tap Finish to try again.")
+    if sub.get("custom_id") != f"renew:{purchase.id}" or sub.get("plan_id") != want:
+        logger.error("Domain renewal payment mismatch", extra={"purchase": purchase.id, "subscription": sid})
+        raise PurchaseError("That payment doesn't match this domain.")
+    if (sub.get("status") or "").upper() not in ("ACTIVE", "APPROVED"):
+        raise PurchaseError("PayPal hasn't confirmed this payment yet.")
+    old = purchase.paypal_subscription_id
+    if old and old != sid:
+        # the stopped / failed one must never charge alongside the new one
+        try:
+            if ((await paypal_service.get_subscription(old)).get("status") or "").upper() in ("ACTIVE", "SUSPENDED", "APPROVED"):
+                await paypal_service.cancel_subscription(old, "Replaced by Renew with card")
+        except Exception:
+            logger.error("Couldn't cancel the old domain subscription", exc_info=True, extra={"purchase": purchase.id, "old": old})
+            _ping(f":warning: Domain {purchase.domain_name}: couldn't cancel old PayPal subscription {old} after Renew with card - cancel it by hand.")
+    purchase.paypal_subscription_id = sid
+    purchase.auto_renew = True
+    if purchase.last_error == "payment_failed":
+        purchase.last_error = None
+    flags = {k: v for k, v in (purchase.registrant or {}).items() if not str(k).startswith("_warned")}
+    purchase.registrant = flags
+    await db.commit()
+    await db.refresh(purchase)
+    _ping(f":repeat: Domain renewing again: {purchase.domain_name} (${purchase.renewal_price_usd:.2f}/yr, card).")
+    # Charged now (expiry is close)? PayPal's sale webhook renews it; this covers a fast/missed one.
+    try:
+        last = ((sub.get("billing_info") or {}).get("last_payment") or {})
+        if _money(last.get("amount")) >= purchase.renewal_price_usd - 0.01:
+            await renew_if_due(db, purchase, paid=True)
+    except Exception:
+        logger.warning("Immediate renew check failed", exc_info=True, extra={"purchase": purchase.id})
+    return purchase
+
+
+async def release_ended(db: AsyncSession, purchase: PurchasedDomain) -> None:
+    """A bought domain ended (renewing off / card failed): the website and every new link go back
+    to the free OpenHousePal address - never forward visitors or print QR codes onto a dead domain."""
+    from app.services.website import cloudflare_saas_service, domain_resolution_service, site_service
+    rows = (await db.execute(select(SiteDomain).where(
+        SiteDomain.hostname.in_([purchase.domain_name, f"www.{purchase.domain_name}"]),
+        SiteDomain.owner_id == purchase.owner_id,
+    ))).scalars().all()
+    if not rows:
+        return
+    was_primary = any(r.is_primary for r in rows)
+    site_ids = {r.site_id for r in rows}
+    for r in sorted(rows, key=lambda r: r.redirect_target_domain_id is None):  # partners first
+        try:
+            await cloudflare_saas_service.remove(r.hostname)
+        except Exception:
+            logger.warning("Cloudflare remove failed for an ended domain", exc_info=True, extra={"host": r.hostname})
+        await db.delete(r)
+    await db.commit()
+    for sid_ in site_ids:
+        domain_resolution_service.invalidate_site(sid_)
+    if was_primary:
+        owner = await db.get(User, purchase.owner_id)
+        if owner:
+            await site_service.regenerate_owner_idx_links(db, owner)
+    _ping(f":hourglass_flowing_sand: Domain ended: {purchase.domain_name} - website back on its OpenHousePal address.")
 
 
 async def stop_renewing(db: AsyncSession, purchase: PurchasedDomain) -> None:
@@ -689,6 +824,8 @@ async def sweep(db: AsyncSession) -> None:
                 if exp and exp < now:
                     p.status = "EXPIRED"
                     await db.commit()
+                    await release_ended(db, p)
+                    await _email(db, p, "ended")
                 elif exp and p.auto_renew and exp - now < timedelta(days=10) and p.paypal_subscription_id:
                     # the yearly-payment webhook never arrived? ask PayPal directly before it lapses
                     from app.services.paypal_service import paypal_service
@@ -752,14 +889,21 @@ async def _email(db: AsyncSession, p: PurchasedDomain, kind: str) -> None:
                 subject=f"{d} won't renew - PayPal payment didn't go through", eyebrow="Renewal", heading=f"{d} won't renew",
                 button="See my domain", preheader=f"PayPal couldn't take the renewal for {d}.",
                 p1=f"PayPal couldn't take this year's payment for {d}, so it won't renew. It keeps working until {exp}.",
-                note="", p2="To keep it, check the card on your PayPal account, then reply to this email or contact "
-                             "OpenHousePal support and we'll sort it out with you."),
+                note="", p2=f"To keep it, open your Domain screen and tap Renew with card before {exp} - it only takes "
+                             "a minute, and you won't be charged twice."),
             "expiring": dict(
                 subject=f"{d} ends on {exp}", eyebrow="Reminder", heading=f"{d} ends on {exp}", button="See my domain",
                 preheader=f"{d} ends on {exp}.",
                 p1=f"renewing is switched off for {d}, so it ends on {exp}. After that your website goes back to its free "
                    f"OpenHousePal address, and links that used {d} stop opening.",
-                note="", p2="Moving it to another company? Get its transfer code from the Domain screen before it ends."),
+                note="", p2="Want to keep it? Tap Renew with card on your Domain screen. Moving it to another company? "
+                            "Get its transfer code from the Domain screen before it ends."),
+            "ended": dict(
+                subject=f"{d} has ended", eyebrow="Domain ended", heading=f"{d} has ended", button="See my domain",
+                preheader=f"Your website is back on its OpenHousePal address.",
+                p1=f"{d} wasn't renewed, so it has ended. Your website is back on its free OpenHousePal address, and every "
+                   "new QR code and link you share uses that address now.",
+                note="", p2="Want the name back? Contact OpenHousePal support - it can often be recovered for a short time."),
         }
         m = msgs[kind]
         subject = m.pop("subject")

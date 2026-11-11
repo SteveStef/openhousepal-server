@@ -817,6 +817,37 @@ async def get_domain_purchase(
     return out
 
 
+@router.post("/me/domain-shop/purchases/{purchase_id}/renew-checkout")
+async def domain_renew_checkout(
+    purchase_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """"Renew with card" - the plan + start date for the page's card button."""
+    from app.services import domain_purchase_service as shop
+    p = await _load_owned_purchase(db, purchase_id, current_user.id)
+    try:
+        return await shop.renew_checkout(db, p)
+    except shop.PurchaseError as e:
+        raise _purchase_error(e)
+
+
+@router.post("/me/domain-shop/purchases/{purchase_id}/attach-renewal")
+async def domain_attach_renewal(
+    purchase_id: str,
+    body: DomainAttachBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    from app.services import domain_purchase_service as shop
+    p = await _load_owned_purchase(db, purchase_id, current_user.id)
+    try:
+        p = await shop.attach_renewal(db, p, body.subscription_id)
+    except shop.PurchaseError as e:
+        raise _purchase_error(e)
+    return shop.as_dict(p)
+
+
 @router.post("/me/domain-shop/purchases/{purchase_id}/cancel-checkout")
 async def cancel_domain_checkout(
     purchase_id: str,

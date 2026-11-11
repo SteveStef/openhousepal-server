@@ -483,6 +483,25 @@ class PayPalService:
             raise Exception(f"Failed to create domain plan: {plan.status_code} - {plan.text}")
         return plan.json()["id"]
 
+    async def create_domain_renew_plan(self, product_id: str, renewal: float) -> str:
+        """Turning renewing back on (or fixing a failed renewal) for a domain already owned: just
+        `renewal` once a year - the subscription's start_time puts the first charge right before
+        the domain would expire. Returns the plan id."""
+        plan = await self._post("/v1/billing/plans", {
+            "product_id": product_id, "status": "ACTIVE",
+            "name": f"Domain renewal - ${renewal:.2f}/yr",
+            "description": "Website domain - renews yearly",
+            "billing_cycles": [
+                {"frequency": {"interval_unit": "YEAR", "interval_count": 1}, "tenure_type": "REGULAR",
+                 "sequence": 1, "total_cycles": 0,
+                 "pricing_scheme": {"fixed_price": {"value": f"{renewal:.2f}", "currency_code": "USD"}}},
+            ],
+            "payment_preferences": {"auto_bill_outstanding": True, "payment_failure_threshold": 2},
+        })
+        if plan.status_code not in (200, 201):
+            raise Exception(f"Failed to create domain renew plan: {plan.status_code} - {plan.text}")
+        return plan.json()["id"]
+
     async def create_domain_subscription(self, plan_id: str, custom_id: str, return_url: str, cancel_url: str) -> dict:
         """One subscription per domain on its price pair's plan, starting now: PayPal bills year
         one as soon as the agent approves."""
