@@ -155,7 +155,7 @@ There are two families of plans. Bright MLS agents can choose any plan. Agents o
 1. After your broker approves you, the **Finalize Account** page shows the plan cards. Bright agents can switch between **Bright MLS Agent** and **Non-Bright MLS**.
 2. Tap **Select Basic**, **Select Premium**, **Select IDX**, **Select No-MLS Basic** or **Select No-MLS Premium**.
 3. The **Order Summary** shows the Setup Fee, the Free Trial and your price after the trial.
-4. Pay securely with PayPal. When it's done, you land on your Dash.
+4. Pay by card: tap **Debit or Credit Card**, enter your card and billing address (no PayPal account needed - if PayPal offers to create an account, turn that switch off or tap **Continue as Guest**), then **Agree & Subscribe**. Paying by logging into a PayPal account shows **Coming soon** for now. A free trial charges nothing today; your bank may ask you to confirm the card (a text or app prompt) - that's normal. When it's done, you land on your Dash.
 5. Have a code? Use the **Have a team or promo code?** box, type it in, and tap **Apply**. Some codes switch your account on with no PayPal at all. In that case the button is **Switch on my account**, and you're billed directly.
 6. Picked the wrong plan? Tap **Change Selected Plan**.
 
@@ -175,14 +175,14 @@ If your plan is paid by OpenHousePal directly, or by your team lead or brokerage
 1. Go to **Settings → Billing** and find **Plan Options** ("Upgrade or Modify").
 2. Tap **Switch to [plan name]**.
 3. Read the confirmation. If you're moving to a smaller plan, it lists exactly what stops working. For example, your Agent Hub going offline or your Showcases pausing.
-4. Tap **Continue to PayPal** and approve the change there.
+4. Tap **Continue**, then pay by card in the window that opens (**Debit or Credit Card**; paying with a PayPal account shows Coming soon for now).
 
 What to expect:
 
-- The new plan switches on as soon as PayPal approves it.
+- The new plan switches on right away, and your old plan stops, so you never pay for both. Nothing is charged today - the new price starts on the date you're already paid up to.
 - If you're still in your free trial, you keep the trial. The new price starts when the trial ends.
 - Otherwise, the new price starts with your next bill.
-- **Moving to IDX** shows a **one-time IDX setup fee**. PayPal charges it once when you approve. If you have a code, enter it in the **Have a code?** box to waive the fee.
+- **Moving to IDX** shows a **one-time IDX setup fee**. It's charged once, by card, when you switch. If you have a code, enter it in the **Have a code?** box to waive the fee.
 
 You can also upgrade from any locked menu item. It opens an **Unlock More** page that compares your current plan with the plan you need. Tap **Unlock [feature] — Upgrade Now**.
 
@@ -197,8 +197,8 @@ You keep full access until the end of the period you already paid for. Billing t
 ### Payment failed or plan ended
 
 - **Payment Failed**:
-  - Tap **Update payment method on PayPal** to fix your card.
-  - Or tap **Start Fresh** to cancel the failed agreement and pick a plan with a different card.
+  - Tap **Start Fresh** to cancel the failed agreement and pick a plan again with a different card (this is the way for anyone who paid by card without a PayPal account).
+  - If you pay through a PayPal account, **Update payment method on PayPal** also works.
 - **Expired** or **Cancelled**: tap **Resubscribe**.
 
 ---
@@ -313,7 +313,7 @@ It shows "Presented by" you, with a schedule-a-showing form and a message form. 
   - About Me
   - Client Reviews
   - Lead Form
-  - Contact Band
+  - (Not a section: every home page ends with the automatic "Let's talk" closing band - home value, home search and consultation buttons plus your agent card, using your Agent Hub info.)
   - Latest Articles
   - Text, Photo, Divider and Heading
 - **Design** ("Look & Feel"): choose between:
@@ -385,6 +385,25 @@ The same Settings tab also shows:
   - Choose **I already have one** to connect a domain you own.
   - Choose **Get a new one** to buy one inside OpenHousePal. It's registered in your name, with your home address kept private, and set up for you. You'll see the price per year before you pay.
 - Some agents may see "Connecting your own domain opens soon" or "Buying a domain here opens soon". That means the option isn't switched on for your account yet. Your free address works in the meantime.
+- **Connecting a domain you own** (Domain tab → **I already have one** → type it → **Connect** → pick your domain company - GoDaddy, Squarespace, Namecheap, Wix, IONOS, Cloudflare, Network Solutions, Porkbun, Hostinger or Somewhere else). The guide shows that company's exact clicks with **Copy** buttons. Two records at the domain company:
+  1. **www** - a CNAME pointing to **sites.openhousepal.com**.
+  2. **@** (the address without www) - ONE **A record** with the number shown in the guide. **First delete any old forwarding/redirect** for the domain (the guide's highlighted "First" step - on GoDaddy it's the **Forwarding** tab next to DNS Records), and at the end only ONE line with @ may be left: delete any other A or AAAA line with @ (often marked "Parked").
+  - Then every page works with or without www (for example yourdomain.com/listings goes to www.yourdomain.com/listings), and http:// switches to https:// by itself. Usually live within an hour, sometimes up to a day.
+- **Domain warnings** (on the Domain tab and the Dash) and what to do:
+  - **Old forwarding is still on for yourdomain.com** - delete the forwarding/redirect at the domain company (GoDaddy: Forwarding tab → trash can). Keep the A record. It clears itself once the forward is gone.
+  - **Only your home page opens from yourdomain.com (without the www)** - the domain company's forwarding only passes the home page: delete it and add the A record @ → the number in the guide.
+  - **yourdomain.com forwards to http://** - switch the forward to https://, or better, replace it with the A record.
+  - **yourdomain.com (without the www) doesn't open your website yet** - add the A record @ → the number in the guide (and delete old forwarding).
+  - **The www record points somewhere else** - edit the existing www line so it points to sites.openhousepal.com (edit it, don't add a second one).
+  - **still isn't connected** - the www record isn't showing yet; check it was saved exactly as shown. **The secure (https) part is still being set up** - nothing to do; if it's still there tomorrow, contact support.
+  - **isn't opening your website right now** - check the www record still points to sites.openhousepal.com; if it does, contact support.
+  - **no longer shows your website** (plan ended) / **isn't showing anything** (IDX website switched off) - renew IDX in Settings → Billing, or switch the website back on.
+- **How the Domain tab looks:** your free OpenHousePal address on top, then ONE card per domain you own. A domain bought here shows its renewal on that same card ("Bought here · renews [date] for $X", or "not renewing - yours until [date], then it ends", or "The yearly payment didn't go through"), with **Renew with card** when renewing is off and **Domain options** for Resend confirm email, Move to another company and Stop renewing. With the IDX website switched off, the domain shows **Website off · shows your Agent Hub** (it opens your Agent Hub instead) and the free address shows **Website off** (a "not available" page) - turn the IDX website back on at the top of the tab to show the website again. Once you have a domain, adding another is behind **Connect or buy another domain**.
+- **Domains bought here** need nothing from you - both records are set up for you. They renew automatically each year by card about 2 weeks before the end date. On the domain card:
+  - **Stop renewing** - it keeps working until the end date; reminders come 30 and 7 days before; then it ends.
+  - **Renew with card** - shows when renewing is off (you tapped Stop renewing, or "The yearly payment didn't go through"). Opens the card window; the charge comes about 2 weeks before the end date, then yearly, and the old stopped/failed payment is cancelled so you never pay twice.
+  - When a bought domain ends, your website and every new link and QR code go back to your free OpenHousePal address automatically. Contact support to try to get the name back.
+  - Name.com emails the owner once to confirm the email address - click it within 15 days or the domain pauses (**Resend confirm email** on the card).
 - Once your own domain is connected and live, the **Use my own domain for my links** switch turns on. New sign-in QR codes, Guest Passes, Showcases, forms and copied links then use your domain.
 - Links you already handed out keep working.
 

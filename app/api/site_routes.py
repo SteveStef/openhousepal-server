@@ -928,6 +928,14 @@ async def _enrich_area(area_id: str, triggering_user_id: str):
             await area_enrichment_service.enrich_area(db, area, user)
         except Exception:
             logger.exception("Area enrichment failed", extra={"area_id": area_id})
+        # The town's card/page just filled in (or failed) - every agent serving it sees it now,
+        # not after the town-card cache runs out.
+        try:
+            owners = (await db.execute(select(AgentMarketArea.owner_id).where(AgentMarketArea.area_id == area_id))).scalars().all()
+            for owner_id in set(owners):
+                content_adapters.forget_served_areas(owner_id)
+        except Exception:
+            pass
 
 
 @router.get("/me/areas", response_model=List[AgentMarketAreaResponse])
@@ -1094,6 +1102,33 @@ async def add_my_served_area(
         await db.refresh(link, attribute_names=["area"])  # so the response reflects RESEARCHING, not the stale pre-claim status
 
     await _show_in_site_neighborhoods(db, current_user.id, area.slug)
+    content_adapters.forget_served_areas(current_user.id)  # preview + live site show it now (audit 11/11)
+    return link
+
+
+@router.post("/me/areas/{link_id}/retry", response_model=AgentMarketAreaResponse)
+async def retry_my_served_area(
+    link_id: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
+):
+    """Try again on a town whose page couldn't be built (FAILED) - before this the only way was
+    remove + add again (adding it again said "You already serve this area")."""
+    link = (await db.execute(
+        select(AgentMarketArea).where(AgentMarketArea.id == link_id, AgentMarketArea.owner_id == current_user.id)
+    )).scalar_one_or_none()
+    if not link:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Area not found")
+    claim = await db.execute(
+        update(MarketArea).where(MarketArea.id == link.area_id, MarketArea.enrichment_status == "FAILED")
+        .values(enrichment_status="RESEARCHING")
+    )
+    await db.commit()
+    if claim.rowcount:
+        background_tasks.add_task(_enrich_area_background, link.area_id, current_user.id)
+    await db.refresh(link, attribute_names=["area"])
+    content_adapters.forget_served_areas(current_user.id)
     return link
 
 
@@ -1159,3 +1194,4 @@ async def remove_my_served_area(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Your website needs at least one town - add another before removing this one.")
     await db.delete(link)
     await db.commit()
+    content_adapters.forget_served_areas(current_user.id)  # its card and page link leave the site now

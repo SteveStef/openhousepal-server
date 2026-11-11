@@ -92,6 +92,23 @@ async def _doh_lookup(client: httpx.AsyncClient, hostname: str, record_type: str
     return [a.get("data", "").rstrip(".").lower() for a in data.get("Answer", []) if a.get("data")]
 
 
+async def apex_extra_ips(apex: str) -> List[str]:
+    """The bare domain points at our redirect server AND other addresses (owner's mainlinerealty.co,
+    11/11: GoDaddy forwarding left on adds its own A records next to ours, so visitors land on
+    GoDaddy at random and pages without www dead-end). Returns the other addresses; [] = fine or
+    unknown (no redirect server configured, not pointed at us yet, or the lookup failed)."""
+    if not WEBSITE_APEX_IP:
+        return []
+    try:
+        async with httpx.AsyncClient() as client:
+            ips = await _doh_lookup(client, apex, "A")
+    except httpx.HTTPError:
+        return []
+    if WEBSITE_APEX_IP not in ips:
+        return []
+    return [ip for ip in ips if ip != WEBSITE_APEX_IP]
+
+
 async def check_dns(hostname: str) -> DnsCheckResult:
     target = WEBSITE_CNAME_TARGET.rstrip(".").lower()
     try:
@@ -195,7 +212,9 @@ async def verify_domain(db: AsyncSession, domain: SiteDomain) -> SiteDomain:
     # (or, on a company that offers ALIAS at the root, once its DNS points at us like the www
     # record). Re-checked while connected too: a forward to http:// isn't connected - it goes back
     # to waiting with "forward_http", so the panel says exactly what to change.
-    if domain.redirect_target_domain_id and not is_www(domain.hostname):
+    bare = bool(domain.redirect_target_domain_id) and not is_www(domain.hostname)
+    extra = await apex_extra_ips(domain.hostname) if bare else []
+    if bare:
         fwd = await check_forwarding(domain.hostname)
         if fwd in ("ok", "no_paths") or (fwd == "none" and domain.status == "ACTIVE"):
             # (one failed look at an already-working forward isn't enough to undo it)
@@ -205,6 +224,12 @@ async def verify_domain(db: AsyncSession, domain: SiteDomain) -> SiteDomain:
                 domain.status = "ACTIVE"
                 domain.verified_at = domain.verified_at or datetime.now(timezone.utc)
                 domain.last_error = "forward_no_paths" if fwd == "no_paths" else None
+            # Old forwarding left on next to our A record: visits land on it at random, so the
+            # forward check above passes or fails by luck - name the real problem instead.
+            if extra and domain.status == "ACTIVE":
+                domain.last_error = "apex_extra_records"
+            elif not extra and domain.last_error == "apex_extra_records":
+                domain.last_error = None
             db.add(domain)
             await db.commit()
             await db.refresh(domain)
@@ -242,6 +267,8 @@ async def verify_domain(db: AsyncSession, domain: SiteDomain) -> SiteDomain:
         if await check_https_reachable(domain.hostname):
             domain.status = "ACTIVE"
             domain.last_error = None
+    if bare and extra and domain.status == "ACTIVE":
+        domain.last_error = "apex_extra_records"
 
     db.add(domain)
     await db.commit()

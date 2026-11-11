@@ -114,12 +114,18 @@ def issues_for(rows: list[SiteDomain], tier: Optional[str] = "IDX", enabled: Opt
         bare = bool(d.redirect_target_domain_id) and not is_www(d.hostname)
         issue = None
         if bare:
-            if d.last_error == "forward_http":
+            from app.services.website.domain_verification_service import WEBSITE_APEX_IP
+            if d.last_error == "apex_extra_records":
+                issue = ("apex_extra_records", f"Old forwarding is still on for {apex}",
+                         f"At your domain company, delete the forwarding (or redirect) for {apex} - on GoDaddy it's "
+                         f"the Forwarding tab next to DNS Records. It's fighting your new record, so most pages "
+                         f"without the www still show \"page not found\". Keep the A record: name @, value "
+                         f"{WEBSITE_APEX_IP}.")
+            elif d.last_error == "forward_http":
                 issue = ("forward_http", f"{apex} forwards to http:// - visitors who type it get \"page not found\"",
                          f"At your domain company, open the forwarding for {apex} and switch http:// to https:// "
                          f"(on GoDaddy it's the small dropdown on the left of the address box). Forward to https://www.{apex}.")
             elif d.last_error == "forward_no_paths":
-                from app.services.website.domain_verification_service import WEBSITE_APEX_IP
                 issue = ("forward_no_paths", f"Only your home page opens from {apex} (without the www)",
                          (f"At your domain company, delete the forwarding on {apex} and add an A record instead: "
                           f"name @, value {WEBSITE_APEX_IP}. Then every page works without the www too."
@@ -129,8 +135,11 @@ def issues_for(rows: list[SiteDomain], tier: Optional[str] = "IDX", enabled: Opt
                           f"www.{apex}."))
             elif d.status != "ACTIVE" and old and d.hostname not in (no_forward or set()):
                 issue = ("forward_none", f"{apex} (without the www) doesn't open your website yet",
-                         f"Add a forward from {apex} to https://www.{apex} at your domain company - the exact steps "
-                         f"for your company are on the IDX Domain screen.")
+                         (f"At your domain company, add an A record: name @, value {WEBSITE_APEX_IP} (and delete any "
+                          f"old forwarding for {apex}). The exact steps for your company are on the IDX Domain screen."
+                          if WEBSITE_APEX_IP else
+                          f"Add a forward from {apex} to https://www.{apex} at your domain company - the exact steps "
+                          f"for your company are on the IDX Domain screen."))
         elif d.status == "ACTIVE" and d.last_error == "site_down":
             issue = ("site_down", f"{d.hostname} isn't opening your website right now",
                      f"Check the www record at your domain company still points to the address on the Domain screen. "

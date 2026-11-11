@@ -16,7 +16,7 @@ Tabs: **Profile**, **Notifications**, **Tools**, **IDX Website** (IDX only), **B
 
 **IDX Website** (IDX) - the website on/off switch, Your Website status, **View My Website** / **Edit My Website**, **IDX Domain** (free address, your own domain, **Use my own domain for my links**), **More website settings**.
 
-**Billing** - Current Plan, status (Free Trial, Active, Cancelled, Payment Failed, Expired; or Managed / Brokerage Paid), dates (Trial Ends, Active Since, Last Billing, First Payment / Next Renewal, Access Ends), **View full plan details**, **Plan Options** ("Upgrade or Modify"), **Manage Subscription** → **Cancel Plan**, **Restore Access**, **Update payment method on PayPal**, **Start Fresh**, **Resubscribe**. The Monthly AI Usage and storage meters also show in Settings.
+**Billing** - Current Plan, status (Free Trial, Active, Cancelled, Payment Failed, Expired; or Managed / Brokerage Paid), dates (Trial Ends, Active Since, Last Billing, First Payment / Next Renewal, Access Ends), **View full plan details**, **Plan Options** ("Upgrade or Modify"), **Manage Subscription** → **Cancel Plan**, **Restore Access**, **Update payment method on PayPal** (PayPal-account payers), **Start Fresh** (new card), **Resubscribe**. Restart and plan changes open a card window (**Debit or Credit Card**; PayPal account shows Coming soon). The Monthly AI Usage and storage meters also show in Settings.
 
 **Account** - **Password** (Current, New - at least 8 characters, Confirm; or **Reset it by email**). Account details: Sign-in email, MLS ID (or License number), State, Plan, Status, Member since. Changing sign-in email, MLS ID or license = **Contact support**. Shortcuts: Your team →, Agent Hub → (IDX: Website & domain →), Billing →.
 

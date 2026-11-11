@@ -485,7 +485,8 @@ async def get_featured_page_listings(db: AsyncSession, user: User, settings: dic
     if show_areas:
         served = await served_area_names(db, user, 50)
         picked = {t.strip().lower() for t in (settings.get("area_towns") or []) if isinstance(t, str)}
-        towns = [t for t in served if t.lower() in picked] if picked else served
+        # Picked towns since removed on the Areas tab fall back to all served towns (audit 11/11).
+        towns = ([t for t in served if t.lower() in picked] if picked else served) or served
         if towns:
             searches.append((towns, []))
     if show_custom:
@@ -1665,6 +1666,10 @@ async def area_summary_card(db: AsyncSession, a: MarketArea, with_stats: bool = 
         "state": a.state,
         "county": a.county,
         "photo": photo,
+        # The editor's Google tab builds a neighborhood's title from these, like the live page
+        # ("Bella Vista, Philadelphia, PA") - audit 11/11.
+        "area_type": getattr(a, "area_type", None),
+        "parent_area_name": getattr(a, "parent_area_name", None),
     }
     # The card says what the town page says (fair_housing_service.town_display).
     from app.services.areas.fair_housing_service import town_display
@@ -1763,8 +1768,11 @@ async def get_header_listings(db: AsyncSession, user: User, served_cities: list[
     agent's own matching listings lead when `header_mine_first` (default on). Same full-MLS
     exception as get_hero_photos. Block fields: header_towns, photo_price_min/max,
     photo_property_type, header_mine_first."""
-    picked = [t for t in (data.get("header_towns") or []) if isinstance(t, str) and t.strip()]
-    towns = picked or served_cities or await served_area_names(db, user, 12)
+    served = served_cities or await served_area_names(db, user, 12)
+    # Towns picked here but since removed on the Areas tab don't count (audit 11/11).
+    served_lc = {s.lower() for s in served}
+    picked = [t for t in (data.get("header_towns") or []) if isinstance(t, str) and t.strip() and t.strip().lower() in served_lc]
+    towns = picked or served
     if not towns:
         # No towns at all (owner, 11/09): no homes rather than the newest homes anywhere in the MLS.
         return []
@@ -1780,6 +1788,11 @@ async def get_header_listings(db: AsyncSession, user: User, served_cities: list[
         own = [c for c in await get_active_listings(db, user, 12) if c.get("photo")]
         own = [c for c in own if (not towns or (c.get("city") or "").lower() in {t.lower() for t in towns})
                and (min_price is None or (c.get("price") or 0) >= min_price) and (max_price is None or (c.get("price") or 0) <= max_price)]
+        if flag:
+            # Home type too (a Condo-only header led with their single-family listing - audit
+            # 11/11): the typed search above already covers their own listings in these towns.
+            typed = {getattr(p, "listing_key", None) for p in results}
+            own = [c for c in own if c["listing_key"] in typed]
         seen = {c["listing_key"] for c in own}
         cards = own + [c for c in cards if c["listing_key"] not in seen]
     cards = cards[:limit]
@@ -2454,7 +2467,9 @@ async def hydrate_page_blocks(db: AsyncSession, user: User, page: dict, featured
                 data["resolved_market"] = profile["market"]
             # Anything but "manual" is the newest homes - same as the editor and HeroBlock read a
             # header saved before this setting existed (it showed no homes at all - 10/27 audit).
-            if data.get("photo_source_mode") != "manual":
+            # "One photo I upload" with no photo uploaded yet would leave the header blank - keep
+            # the newest homes until a photo is there (audit 11/11).
+            if data.get("photo_source_mode") != "manual" or not data.get("image_url"):
                 criteria = {
                     "price_min": data.get("photo_price_min"),
                     "price_max": data.get("photo_price_max"),

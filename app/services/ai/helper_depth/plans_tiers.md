@@ -78,13 +78,13 @@ Order in each line: No-MLS Basic / No-MLS Premium / Basic / Premium / IDX.
 - Showcase, CMA, Discovery and Manager actions refuse with "Broker authorization required" until it's approved.
 
 ## Checkout, codes and managed plans
-- Pick a plan on Finalize Account (Select Basic / Select Premium / Select IDX / Select No-MLS Basic / Select No-MLS Premium). The Order Summary shows Setup Fee, Free Trial and price after the trial. Pay with PayPal. **Change Selected Plan** goes back.
+- Pick a plan on Finalize Account (Select Basic / Select Premium / Select IDX / Select No-MLS Basic / Select No-MLS Premium). The Order Summary shows Setup Fee, Free Trial and price after the trial. Pay by card (**Debit or Credit Card** - no PayPal account needed; paying with a PayPal account shows Coming soon for now). **Change Selected Plan** goes back.
 - **Have a team or promo code?** → **Apply**. Some codes switch the account on with no PayPal at all (button **Switch on my account**). Some codes waive the IDX setup fee.
 - Plans paid by OpenHousePal, a team lead or a brokerage show as **Managed Plan** / **Brokerage Paid** - nothing to manage in PayPal; billing questions go to support.
 
 ## Upgrading
-- Settings → Billing → Plan Options ("Upgrade or Modify") → **Switch to [plan]** → read the window → **Continue to PayPal**. Or tap any locked menu item → **Unlock [feature] - Upgrade Now**.
-- New features switch on as soon as PayPal approves (it can take a minute to show).
+- Settings → Billing → Plan Options ("Upgrade or Modify") → **Switch to [plan]** → read the window → **Continue** → pay by card in the window that opens. Or tap any locked menu item → **Unlock [feature] - Upgrade Now**.
+- New features switch on right away; the old plan stops (never pay for both) and the new price starts on the date you're already paid up to (trial kept).
 - Still in the free trial? You keep the trial; the new price starts when it ends. Otherwise the new price starts with your next bill.
 - Moving to IDX the first time adds the one-time setup fee, charged once on approval; the monthly IDX price starts on the date you're already paid up to. Enter a code in **Have a code?** to waive it. The fee is only ever paid once - coming back to IDX later doesn't charge it again.
 - Moving from Basic up to Premium or IDX: guests without an agent who signed in at your open houses in the last 90 days, and never got a Showcase, now get one built automatically, and their Showcase invite emails go out.
@@ -104,7 +104,7 @@ Order in each line: No-MLS Basic / No-MLS Premium / Basic / Premium / IDX.
 - Settings → Billing → Manage Subscription → Need to pause? → **Cancel Plan** → **Yes, Cancel Plan**. Full access continues until the paid period ends; Billing shows **Subscription Ending Soon**.
 - On cancel the list also includes: open house sign-in QR codes and kiosks stop accepting guests (even printed ones), forms stop taking responses, calendar and CRM sync stop, and you lose your dashboard and leads.
 - After access ends, data may be permanently deleted unless you renew. Before the end date, **Restore Access** reactivates.
-- Payment Failed: **Update payment method on PayPal**, or **Start Fresh** (cancels the failed agreement so you can pick a plan with a different card). Expired or Cancelled: **Resubscribe**.
+- Payment Failed: **Start Fresh** (works for card payers), or **Update payment method on PayPal** for PayPal-account payers. **Start Fresh** (cancels the failed agreement so you can pick a plan with a different card). Expired or Cancelled: **Resubscribe**.
 - When a plan lapses, public pages (Agent Hub, forms, Showcases, signature links, reviews, website) stop serving.
 
 ## Can't do / common mistakes

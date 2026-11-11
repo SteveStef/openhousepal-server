@@ -77,7 +77,7 @@ async def compose_starter_pages(db: AsyncSession, user: User) -> list[dict]:
     if has_spotlights:
         home_blocks.append(_block("b-spotlights", "spotlights", {"headline": "Listing Spotlights"}))
     if has_areas:
-        home_blocks.append(_block("b-communities", "communities", {"headline": "Communities We Serve"}))
+        home_blocks.append(_block("b-communities", "communities", {"headline": "Explore Neighborhoods"}))
     home_blocks.append(_block("b-about-agent", "about_agent"))
     if has_sales:
         home_blocks.append(_block("b-recent-sales", "recent_sales", {"headline": "Recently Sold"}))
