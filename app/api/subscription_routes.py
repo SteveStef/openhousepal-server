@@ -35,6 +35,10 @@ CLIENT_URL = os.getenv("CLIENT_URL", "http://localhost:3000")
 class ChangePlanRequest(BaseModel):
     target_tier: str  # NO_MLS | BASIC | PREMIUM | IDX
     code: Optional[str] = None  # waives the one-time IDX setup fee
+    # Card checkout (user, 11/10): don't revise / redirect to PayPal's page (PayPal login only on our
+    # live account) - return the plan + start date so the page's card button makes a NEW subscription
+    # that replaces this one (complete-new cancels the old one).
+    buttons: bool = False
 
 
 IDX_SETUP_FEE_PLAN_ID = os.getenv("PAYPAL_IDX_PLAN_ID")  # IDX with the one-time setup fee
@@ -194,6 +198,24 @@ async def change_plan(
         # PayPal never charges a setup fee on a plan change, so the fee path starts a new IDX
         # subscription (fee charged on approval, first month on the date they're already paid up
         # to) and the old one is cancelled when they come back (complete-new).
+        if payload.buttons:
+            # New subscription by card, starting the day they're already paid up to (or their trial
+            # ends) - so nobody pays twice and a trial is kept. The setup fee (IDX) is charged now.
+            plan = new_plan_id
+            if _owes_idx_setup_fee(current_user, target_tier):
+                plan = (await _apply_idx_waiver(db, current_user.id, payload.code)) if payload.code else IDX_SETUP_FEE_PLAN_ID
+            if not plan:
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                    detail="That plan isn't configured yet. Contact support.")
+            start = None
+            nb = current_user.next_billing_date or current_user.trial_ends_at
+            if nb and nb.tzinfo is None:
+                nb = nb.replace(tzinfo=timezone.utc)
+            if nb and nb > datetime.now(timezone.utc) + timedelta(minutes=30):
+                start = nb.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            return {"success": True, "immediate": False, "checkout": {"plan_id": plan, "start_time": start},
+                    "message": "Add your card to switch plans"}
+
         if _owes_idx_setup_fee(current_user, target_tier):
             if payload.code:
                 new_plan_id = await _apply_idx_waiver(db, current_user.id, payload.code)
@@ -456,6 +478,7 @@ async def reactivate_subscription(
 class CreateSubscriptionRequest(BaseModel):
     plan_tier: str
     code: Optional[str] = None  # waives the one-time IDX setup fee
+    buttons: bool = False  # card checkout: return the plan for the page's card button (no PayPal redirect)
 
 
 class CompleteSubscriptionRequest(BaseModel):
@@ -512,12 +535,9 @@ async def complete_new_subscription(
         # A brand-new subscription is only for someone whose old one has ended or failed -
         # otherwise they'd be paying for two at once. The one exception is the IDX upgrade with its
         # setup fee: that new subscription replaces the live one (cancelled below).
+        # Card checkout (11/10) also changes plans this way: a new subscription on a DIFFERENT tier
+        # replaces the live one (checked once PayPal says which plan it is, below).
         live = current_user.subscription_status not in ("CANCELLED", "EXPIRED", "SUSPENDED", "PENDING_PAYMENT", None)
-        if live and not (current_user.plan_tier != "IDX" and IDX_SETUP_FEE_PLAN_ID):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="You already have an active subscription. Change plans from Settings > Billing instead."
-            )
 
         # Step 2: Validate subscription with PayPal API
         try:
@@ -544,12 +564,6 @@ async def complete_new_subscription(
                 detail="PayPal hasn't confirmed this subscription yet. Please finish approving it on PayPal."
             )
 
-        if live and paypal_plan_id != IDX_SETUP_FEE_PLAN_ID:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="You already have an active subscription. Change plans from Settings > Billing instead."
-            )
-
         # Step 4: Determine plan tier from plan_id (legacy or current, any of the 4 tiers, or a code's plan)
         plan_tier = tier_for_plan_id(paypal_plan_id)
         if plan_tier is None:
@@ -559,6 +573,14 @@ async def complete_new_subscription(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid plan ID from PayPal"
+            )
+
+        # A live plan may only be replaced by a plan change (another tier) - never a second copy of
+        # the same plan.
+        if live and plan_tier == current_user.plan_tier and paypal_plan_id != IDX_SETUP_FEE_PLAN_ID:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You already have an active subscription. Change plans from Settings > Billing instead."
             )
         if not tier_allowed_for(current_user, plan_tier):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=NOT_IN_BRIGHT_MESSAGE)
@@ -572,6 +594,13 @@ async def complete_new_subscription(
         # Determine if this plan has a trial period
         has_trial = plan_id_has_trial(paypal_plan_id)
         trial_days = int(os.getenv("TRIAL_PERIOD_DAYS", "14"))
+        # Switching plans during a free trial: the new subscription starts billing when the trial
+        # ends (change-plan start_time), so they stay on their trial.
+        kept_trial_end = None
+        if live and not has_trial and user.subscription_status == "TRIAL" and user.trial_ends_at:
+            te = user.trial_ends_at if user.trial_ends_at.tzinfo else user.trial_ends_at.replace(tzinfo=timezone.utc)
+            if te > datetime.now(timezone.utc):
+                kept_trial_end = te
 
         # The old subscription they're replacing (e.g. a suspended one after a failed card)
         # must stop, or PayPal could retry/charge it alongside the new one.
@@ -617,6 +646,11 @@ async def complete_new_subscription(
             user.trial_ends_at = trial_end
             trial_end_iso = trial_end.isoformat()
             user.next_billing_date = trial_end
+        elif kept_trial_end:
+            # Plan change mid-trial - still on the free trial until it ends
+            user.subscription_status = "TRIAL"
+            user.trial_ends_at = kept_trial_end
+            trial_end_iso = kept_trial_end.isoformat()
         else:
             # Returning customer without trial
             user.subscription_status = "ACTIVE"
@@ -658,7 +692,7 @@ async def complete_new_subscription(
             "subscription": {
                 "subscription_id": subscription_id,
                 "plan_tier": plan_tier,
-                "status": "TRIAL" if has_trial else "ACTIVE",
+                "status": user.subscription_status,
                 "trial_ends_at": trial_end_iso
             }
         }
@@ -723,6 +757,10 @@ async def create_new_subscription(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="No-trial plan ID not configured. Please contact support."
             )
+
+        if request.buttons:
+            return {"success": True, "plan_id": plan_id, "plan_tier": plan_tier,
+                    "message": f"Add your card to restart {display_name_for_tier(plan_tier)}"}
 
         # Build return URLs
         return_url = f"{CLIENT_URL}/settings/subscription?resubscribed=true"

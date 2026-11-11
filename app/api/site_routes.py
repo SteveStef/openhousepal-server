@@ -704,6 +704,11 @@ class DomainBuyBody(BaseModel):
     domain: str
     contact: dict
     back: str = "website"
+    buttons: bool = False
+
+
+class DomainAttachBody(BaseModel):
+    subscription_id: str
 
 
 def _purchase_error(e: Exception) -> HTTPException:
@@ -769,11 +774,28 @@ async def buy_domain(
     from app.services import domain_purchase_service as shop
     from app.services.website.namecom_service import NamecomError
     try:
-        return await shop.start(db, current_user, body.domain, body.contact, body.back)
+        return await shop.start(db, current_user, body.domain, body.contact, body.back, buttons=body.buttons)
     except shop.PurchaseError as e:
         raise _purchase_error(e)
     except NamecomError:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="The domain company didn't answer - try again in a moment.")
+
+
+@router.post("/me/domain-shop/purchases/{purchase_id}/attach")
+async def attach_domain_payment(
+    purchase_id: str,
+    body: DomainAttachBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """PayPal's on-page buttons approved - tie that subscription to this purchase and finish."""
+    from app.services import domain_purchase_service as shop
+    p = await _load_owned_purchase(db, purchase_id, current_user.id)
+    try:
+        p = await shop.attach(db, p, body.subscription_id)
+    except shop.PurchaseError as e:
+        raise _purchase_error(e)
+    return shop.as_dict(p)
 
 
 @router.get("/me/domain-shop/purchases/{purchase_id}")

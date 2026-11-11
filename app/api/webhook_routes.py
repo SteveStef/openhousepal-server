@@ -191,6 +191,23 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
             await db.commit()
             await domain_purchase_service.on_paypal_event(db, purchase, event_type, resource)
             return {"received": True, "event_type": event_type, "domain": purchase.domain_name}
+        # A domain paid through PayPal's on-page buttons whose page closed before it reported back:
+        # PayPal carries our purchase id as custom_id ("custom" on sale events) - attach it here.
+        domain_ref = resource.get("custom_id") or resource.get("custom")
+        if domain_ref and event_type.startswith(("BILLING.SUBSCRIPTION.", "PAYMENT.SALE.")):
+            pending = (await db.execute(select(PurchasedDomain).where(
+                PurchasedDomain.id == str(domain_ref), PurchasedDomain.status == "CHECKOUT",
+                PurchasedDomain.paypal_subscription_id.is_(None),
+            ))).scalar_one_or_none()
+            if pending:
+                from app.services import domain_purchase_service
+                db.add(WebhookEvent(id=event_id, event_type=event_type))
+                await db.commit()
+                try:
+                    await domain_purchase_service.attach(db, pending, subscription_id)
+                except domain_purchase_service.PurchaseError as e:
+                    logger.warning("Domain webhook attach refused", extra={"purchase": pending.id, "reason": str(e)})
+                return {"received": True, "event_type": event_type, "domain": pending.domain_name}
 
         # Find user by subscription_id
         result = await db.execute(

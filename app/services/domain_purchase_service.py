@@ -206,7 +206,10 @@ class PurchaseError(Exception):
     """Agent-safe message."""
 
 
-async def start(db: AsyncSession, user: User, domain: str, contact_in: dict, back: str) -> dict:
+async def start(db: AsyncSession, user: User, domain: str, contact_in: dict, back: str, buttons: bool = False) -> dict:
+    """buttons=True: PayPal's own on-page buttons make the subscription in the browser (they offer
+    'Debit or Credit Card' without a PayPal login - the redirect page on our live account only
+    offers PayPal login, user 11/10), so return the plan for them and wait for attach()."""
     from app.services.agent_email_service import app_url
     from app.services.paypal_service import paypal_service
     if not available()["buy"]:
@@ -253,6 +256,16 @@ async def start(db: AsyncSession, user: User, domain: str, contact_in: dict, bac
                                renewal_price_usd=renewal, cost_usd=cost, registrant=contact)
     db.add(purchase)
     await db.flush()
+    if buttons:
+        try:
+            plan = await plan_id(db, price, renewal)
+        except Exception:
+            logger.exception("PayPal domain plan failed", extra={"domain": domain})
+            await db.rollback()
+            raise PurchaseError("PayPal didn't answer - try again in a minute.")
+        purchase_id = purchase.id
+        await db.commit()
+        return {"purchase_id": purchase_id, "plan_id": plan, "approve_url": None}
     back = back if back in ("setup", "settings", "website") else "website"
     ret = f"{app_url()}/studio/domains/return?purchase={purchase.id}&back={back}"
     try:
@@ -325,6 +338,41 @@ async def complete(db: AsyncSession, purchase: PurchasedDomain) -> PurchasedDoma
         return purchase
     await db.refresh(purchase)
     return await _register(db, purchase, sale_id)
+
+
+async def attach(db: AsyncSession, purchase: PurchasedDomain, subscription_id: str) -> PurchasedDomain:
+    """Buttons checkout: tie the subscription PayPal's buttons made to this purchase - only when
+    PayPal says it's ours (our custom_id + this price pair's plan) - then finish as usual.
+    Called by the page right after approval, and by the webhook if the page never got to."""
+    from app.services.paypal_service import paypal_service
+    sid = (subscription_id or "").strip()
+    if not sid:
+        raise PurchaseError("PayPal didn't send the payment back - try again.")
+    if purchase.paypal_subscription_id:
+        if purchase.paypal_subscription_id != sid:
+            raise PurchaseError("That payment doesn't match this domain.")
+        return await complete(db, purchase)
+    if purchase.status != "CHECKOUT":
+        raise PurchaseError("This checkout has closed - start again.")
+    used = (await db.execute(select(PurchasedDomain.id).where(PurchasedDomain.paypal_subscription_id == sid))).first()
+    if used:
+        raise PurchaseError("That payment is already used for another domain.")
+    try:
+        sub = await paypal_service.get_subscription(sid)
+        want = await plan_id(db, purchase.price_usd, purchase.renewal_price_usd)
+    except Exception:
+        logger.warning("PayPal lookup failed attaching a domain payment", exc_info=True, extra={"purchase": purchase.id})
+        raise PurchaseError("PayPal didn't answer - tap Finish to try again.")
+    if sub.get("custom_id") != purchase.id or sub.get("plan_id") != want:
+        logger.error("Domain payment mismatch", extra={"purchase": purchase.id, "subscription": sid})
+        raise PurchaseError("That payment doesn't match this domain.")
+    claimed = await db.execute(update(PurchasedDomain).where(PurchasedDomain.id == purchase.id, PurchasedDomain.paypal_subscription_id.is_(None))
+                               .values(paypal_subscription_id=sid))
+    await db.commit()
+    await db.refresh(purchase)
+    if claimed.rowcount != 1 and purchase.paypal_subscription_id != sid:
+        raise PurchaseError("That payment doesn't match this domain.")
+    return await complete(db, purchase)
 
 
 async def _register(db: AsyncSession, purchase: PurchasedDomain, sale_id: str) -> PurchasedDomain:
