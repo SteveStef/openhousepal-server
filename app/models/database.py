@@ -116,6 +116,8 @@ class User(Base):
     ai_budget_override_usd = Column(Float, nullable=True)
     # The admin-made sign-up code this agent used at checkout (admin "Codes"), if any.
     promo_code_id = Column(String, ForeignKey('promo_codes.id', ondelete='SET NULL'), nullable=True, index=True)
+    # The sign-up offer this person claimed (offer_service): their spot is held; checkout shows its prices.
+    offer_id = Column(String, ForeignKey('offers.id', ondelete='SET NULL', use_alter=True, name='fk_users_offer_id'), nullable=True, index=True)
     # When they ticked "I agree" at sign-up, and which Terms ("Last updated" date). NULL = signed up
     # before this was recorded.
     terms_accepted_at = Column(DateTime(timezone=True), nullable=True)
@@ -541,6 +543,47 @@ class BillingGroupEmail(Base):
     email = Column(String, nullable=False, unique=True)   # lower-case
     apply_plan = Column(Boolean, nullable=False, server_default=text('true'), default=True)
     invited_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class Offer(Base):
+    """A private sign-up offer (admin, 11/11): its own unguessable page /offer/<token> + QR code,
+    showing chosen plans at a percent off (first payment / first N months / forever), the IDX setup
+    fee waived or not, the free trial on or off, a number of spots and an end date. Each plan is its
+    own PayPal plan (OfferPlan) so checkout charges exactly what the page says."""
+    __tablename__ = "offers"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    token = Column(String, nullable=False, unique=True, index=True)
+    name = Column(String, nullable=False)                # for the admin
+    headline = Column(String, nullable=True)             # shown at the top of the offer page
+    duration = Column(String, nullable=False, server_default='forever', default='forever')  # first | months | forever
+    months = Column(Integer, nullable=True)              # with duration "months"
+    trial = Column(Boolean, nullable=False, server_default=text('true'), default=True)
+    waive_idx_fee = Column(Boolean, nullable=False, server_default=text('false'), default=False)
+    max_uses = Column(Integer, nullable=False, server_default='50', default=50)
+    uses = Column(Integer, nullable=False, server_default='0', default=0)   # spots taken (held at sign-up)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    is_active = Column(Boolean, nullable=False, server_default=text('true'), default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class OfferPlan(Base):
+    """One plan inside an offer and the PayPal plan that charges it. An edited offer gets new rows
+    (is_current) - old rows stay so people already on them keep their plan."""
+    __tablename__ = "offer_plans"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    offer_id = Column(String, ForeignKey('offers.id', ondelete='CASCADE'), nullable=False, index=True)
+    tier = Column(String, nullable=False)
+    percent_off = Column(Integer, nullable=False, server_default='0', default=0)
+    base_price = Column(Float, nullable=False)
+    offer_price = Column(Float, nullable=False)
+    setup_fee = Column(Float, nullable=False, server_default='0', default=0.0)
+    trial_days = Column(Integer, nullable=False, server_default='0', default=0)
+    paypal_plan_id = Column(String, nullable=False, unique=True, index=True)
+    is_current = Column(Boolean, nullable=False, server_default=text('true'), default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 

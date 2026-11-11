@@ -15,6 +15,7 @@ cancelled payment never takes anyone's plan away by itself - the admin gets a Di
 request shows it, so they decide."""
 from __future__ import annotations
 
+import asyncio
 import os
 import secrets
 from datetime import datetime, timezone
@@ -28,8 +29,8 @@ from app.models.database import BillingGroup, PaymentRequest, User
 
 logger = get_logger(__name__)
 
-CYCLES = ("once", "monthly", "quarterly", "yearly")
-CYCLE_WORDS = {"once": "one time", "monthly": "every month", "quarterly": "every 3 months", "yearly": "every year"}
+CYCLES = ("once", "monthly", "quarterly", "semiannual", "yearly")
+CYCLE_WORDS = {"once": "one time", "monthly": "every month", "quarterly": "every 3 months", "semiannual": "every 6 months", "yearly": "every year"}
 PLAN_NAMES = {"NO_MLS": "No-MLS Basic", "PRO_NO_MLS": "No-MLS Premium", "BASIC": "Basic", "PREMIUM": "Premium", "IDX": "IDX"}
 CUSTOM_PREFIX = "payreq:"
 
@@ -196,7 +197,7 @@ async def apply_benefits(db: AsyncSession, req: PaymentRequest, *, give_plan: bo
             g.status = "active"
             g.paypal_reference = req.paypal_subscription_id
             g.amount = req.amount
-            if req.cycle in ("monthly", "quarterly", "yearly"):
+            if req.cycle in ("monthly", "quarterly", "semiannual", "yearly"):
                 g.billing_cycle = req.cycle
             if req.seats:
                 g.seats = req.seats
@@ -232,7 +233,7 @@ async def apply_benefits(db: AsyncSession, req: PaymentRequest, *, give_plan: bo
     return had_paypal
 
 
-async def attach(db: AsyncSession, req: PaymentRequest, subscription_id: str) -> PaymentRequest:
+async def attach(db: AsyncSession, req: PaymentRequest, subscription_id: str, sale_id: Optional[str] = None) -> PaymentRequest:
     """The card form approved: check PayPal says it's this request's payment, then it's paid."""
     from app.services.paypal_service import paypal_service
     sid = (subscription_id or "").strip()
@@ -241,6 +242,10 @@ async def attach(db: AsyncSession, req: PaymentRequest, subscription_id: str) ->
     if req.paypal_subscription_id == sid and req.status in ("active", "paid"):
         return req
     if req.status not in ("open", "past_due"):
+        # Paid twice (two tabs / two phones), or paid after it was cancelled: PayPal already
+        # charged this second card - stop it and give the money back so nobody pays twice.
+        if await undo_duplicate(req, sid, sale_id):
+            raise PaymentRequestError("This was already paid, so that second payment was cancelled and refunded - you won't be charged twice.")
         raise PaymentRequestError("This payment request is closed.")
     used = (await db.execute(select(PaymentRequest.id).where(PaymentRequest.paypal_subscription_id == sid, PaymentRequest.id != req.id))).first()
     if used:
@@ -250,6 +255,13 @@ async def attach(db: AsyncSession, req: PaymentRequest, subscription_id: str) ->
     except Exception:
         logger.warning("PayPal lookup failed attaching a payment request", exc_info=True, extra={"request": req.id})
         raise PaymentRequestError("PayPal didn't answer - tap Finish to try again.")
+    if sub.get("custom_id") == f"{CUSTOM_PREFIX}{req.id}" and sub.get("plan_id") != req.paypal_plan_id:
+        # Their page was open while the request was edited: they paid the OLD price. Never keep a
+        # charge at a price the request no longer says - undo it, they pay again at the new one.
+        logger.warning("Payment on an edited request's old plan - undoing", extra={"request": req.id, "subscription": sid})
+        await cancel_and_refund(sid, f"{CUSTOM_PREFIX}{req.id}", f"'{req.title}' was paid at its old price (page open while you edited it)", sale_id)
+        raise PaymentRequestError("This payment request was just updated, so that payment was cancelled and refunded. "
+                                  "Reload the page to see the new details, then pay again.")
     if sub.get("custom_id") != f"{CUSTOM_PREFIX}{req.id}" or sub.get("plan_id") != req.paypal_plan_id:
         logger.error("Payment request mismatch", extra={"request": req.id, "subscription": sid})
         raise PaymentRequestError("That payment doesn't match this request.")
@@ -287,6 +299,84 @@ async def attach(db: AsyncSession, req: PaymentRequest, subscription_id: str) ->
     return req
 
 
+_REFUND_TASKS: set = set()
+
+
+async def _refund_completed(sid: str, sale_id: Optional[str] = None) -> tuple[int, bool]:
+    """Refund every completed charge on `sid` (and `sale_id`, from PayPal's notice). Returns
+    (charges refunded, all ok). PayPal's list of a brand-new subscription's charges lags a minute
+    or more behind the charge itself - 0 found right after paying is normal."""
+    from app.services.paypal_service import paypal_service
+    ids = [sale_id] if sale_id else []
+    txs = await paypal_service.list_subscription_transactions(sid, days=30)
+    ids += [t.get("id") for t in txs if (t.get("status") or "").upper() == "COMPLETED" and t.get("id")]
+    ids = list(dict.fromkeys(i for i in ids if i))
+    ok = all([await paypal_service.refund_sale(x) for x in ids]) if ids else True
+    return len(ids), ok
+
+
+async def _refund_when_listed(sid: str, why: str) -> None:
+    """Keep checking for the charge (every 15 s, up to 15 min) and refund it the moment it shows."""
+    for _ in range(60):
+        await asyncio.sleep(15)
+        try:
+            n, ok = await _refund_completed(sid)
+        except Exception:
+            logger.warning("Refund retry failed", exc_info=True, extra={"subscription": sid})
+            continue
+        if n:
+            _ping(f":leftwards_arrow_with_hook: {why} ({sid}) - refunded." if ok else
+                  f":rotating_light: {why} ({sid}) - the refund FAILED. Refund it in PayPal now.")
+            return
+    _ping(f":rotating_light: {why} ({sid}) - stopped, but no charge showed up to refund after 15 minutes. Check it in PayPal and refund it if it was charged.")
+
+
+async def cancel_and_refund(sid: str, custom_id: str, why: str, sale_id: Optional[str] = None) -> bool:
+    """Cancel subscription `sid` and refund everything it charged - only if PayPal says it carries
+    `custom_id` (ours, for that request). Pings the admin. True when it was ours."""
+    from app.services.paypal_service import paypal_service
+    try:
+        sub = await paypal_service.get_subscription(sid)
+    except Exception:
+        logger.warning("Undo lookup failed", exc_info=True, extra={"subscription": sid})
+        _ping(f":warning: {why} - PayPal subscription {sid} couldn't be checked. Look at it in PayPal and refund it.")
+        return False
+    if sub.get("custom_id") != custom_id:
+        return False
+    cancelled = False
+    n, ok = 0, False
+    try:
+        if (sub.get("status") or "").upper() in ("ACTIVE", "APPROVED", "APPROVAL_PENDING", "SUSPENDED"):
+            cancelled = await paypal_service.cancel_subscription(sid, "Not kept - " + why[:100])
+        else:
+            cancelled = True
+        n, ok = await _refund_completed(sid, sale_id)
+    except Exception:
+        logger.error("Cancel + refund failed", exc_info=True, extra={"subscription": sid})
+    if not cancelled:
+        _ping(f":rotating_light: {why} ({sid}) - it could NOT be stopped. Cancel and refund it in PayPal now.")
+    elif n and ok:
+        _ping(f":leftwards_arrow_with_hook: {why} ({sid}) - stopped and refunded.")
+    elif n and not ok:
+        _ping(f":rotating_light: {why} ({sid}) - stopped, but the refund FAILED. Refund it in PayPal now.")
+    else:
+        # Charged a moment ago and not listed yet - refund it as soon as PayPal shows it.
+        _ping(f":hourglass_flowing_sand: {why} ({sid}) - stopped; the refund goes out as soon as PayPal lists the charge.")
+        task = asyncio.get_running_loop().create_task(_refund_when_listed(sid, why))
+        _REFUND_TASKS.add(task)
+        task.add_done_callback(_REFUND_TASKS.discard)
+    return True
+
+
+async def undo_duplicate(req: PaymentRequest, sid: str, sale_id: Optional[str] = None) -> bool:
+    """A second subscription for a request that's already paid / closed: cancel it and refund what
+    it charged. Only ever touches a subscription PayPal says belongs to THIS request (custom_id),
+    never the request's own one. True when it was ours to undo."""
+    if not sid or sid == req.paypal_subscription_id:
+        return False
+    return await cancel_and_refund(sid, f"{CUSTOM_PREFIX}{req.id}", f"'{req.title}' was paid a second time", sale_id)
+
+
 async def on_paypal_event(db: AsyncSession, req: PaymentRequest, event_type: str, resource: dict) -> None:
     """Every later PayPal event for this request's subscription."""
     before = req.status
@@ -315,6 +405,83 @@ async def on_paypal_event(db: AsyncSession, req: PaymentRequest, event_type: str
         _ping(f":x: Payment request cancelled in PayPal: '{req.title}' ({who}). No more charges - plans are unchanged; switch them on the Agents tab if the deal ended.")
     elif req.status == "ended" and before != "ended":
         _ping(f":checkered_flag: Payment request finished its {req.total_payments or ''} payments: '{req.title}' ({who}).")
+
+
+CYCLE_MONTHS = {"monthly": 1, "quarterly": 3, "semiannual": 6, "yearly": 12}
+
+
+def price_change_from(req: PaymentRequest) -> Optional[datetime]:
+    """The first charge a new price reaches: PayPal keeps the old price for payments within 10 days."""
+    from datetime import timedelta
+    nxt = req.next_charge_at
+    if nxt is None:
+        return None
+    if nxt.tzinfo is None:
+        nxt = nxt.replace(tzinfo=timezone.utc)
+    if nxt - datetime.now(timezone.utc) >= timedelta(days=10):
+        return nxt
+    from app.services.ai.ai_rate_limit_service import _add_months
+    return _add_months(nxt, CYCLE_MONTHS.get(req.cycle, 1))
+
+
+async def change_deal(db: AsyncSession, req: PaymentRequest, *, amount: Optional[float] = None,
+                      plan_tier: Optional[str] = None, seats: Optional[int] = None, title: Optional[str] = None) -> dict:
+    """Change a running deal in place - no cancelling, no new link, no proration.
+    Price: the request's own PayPal plan gets the new price; PayPal emails the payer and charges it
+    from the next payment at least 10 days away. Plan / people: switched right now."""
+    from app.api.admin_groups_routes import _give_managed_plan
+    from app.services.open_house_service import schedule_showcase_backfill
+    from app.services.paypal_service import paypal_service
+    notes = []
+    if amount is not None and abs(float(amount) - float(req.amount)) > 0.004:
+        if req.cycle == "once":
+            raise PaymentRequestError("A one-time payment can't change price after it's paid - send a new request for the difference.")
+        if not req.paypal_plan_id:
+            raise PaymentRequestError("This request has no PayPal plan to change.")
+        try:
+            await paypal_service.update_plan_price(req.paypal_plan_id, float(amount))
+        except Exception:
+            logger.exception("PayPal price change failed", extra={"request": req.id})
+            raise PaymentRequestError("PayPal didn't take the new price - nothing was changed. Try again in a minute.")
+        old = req.amount
+        req.amount = round(float(amount), 2)
+        when = price_change_from(req)
+        notes.append(f"New price {money(req.amount)} (was {money(old)})" + (f" from the {when:%b} {when.day} charge" if when else " from the next charge")
+                     + " - PayPal emails them about it.")
+    if title:
+        req.title = title.strip()[:200] or req.title
+    g = await db.get(BillingGroup, req.billing_group_id) if req.billing_group_id else None
+    if seats is not None and seats != req.seats:
+        req.seats = seats
+        if g is not None:
+            g.seats = seats
+        notes.append(f"Covers {seats} {'person' if seats == 1 else 'people'}.")
+    if g is not None and amount is not None:
+        g.amount = req.amount
+    changed_people: list = []
+    if plan_tier and plan_tier != req.plan_tier:
+        req.plan_tier = plan_tier
+        people: list = []
+        if g is not None:
+            g.plan_tier = plan_tier
+            people = list((await db.execute(select(User).where(User.billing_group_id == g.id))).scalars().all())
+        if req.user_id:
+            u = await db.get(User, req.user_id)
+            if u is not None and u not in people:
+                people.append(u)
+        for u in people:
+            if u.is_admin:
+                continue
+            _give_managed_plan(u, plan_tier)
+            changed_people.append(u.id)
+        notes.append(f"Plan is now {PLAN_NAMES.get(plan_tier, plan_tier)}" + (f" for {len(changed_people)} {'agent' if len(changed_people) == 1 else 'agents'} right now." if changed_people else "."))
+    await db.commit()
+    await db.refresh(req)
+    for uid in changed_people:
+        schedule_showcase_backfill(uid)
+    if notes:
+        _ping(f":pencil2: Deal changed: '{req.title}' - " + " ".join(notes))
+    return {"notes": notes}
 
 
 async def cancel(db: AsyncSession, req: PaymentRequest) -> PaymentRequest:

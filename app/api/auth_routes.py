@@ -432,7 +432,7 @@ async def redeem_billed_by_us_code(
     await db.commit()
     await db.refresh(current_user)
 
-    cycle = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}.get(promo.billing_cycle or "monthly", "month")
+    cycle = {"monthly": "month", "quarterly": "quarter", "semiannual": "6 months", "yearly": "year"}.get(promo.billing_cycle or "monthly", "month")
     price = f"${promo.custom_price:,.2f}/{cycle}" if promo.custom_price is not None else "no price set"
     if promo.test_copy_of_user_id:
         notifier.send(f"TEST account {current_user.first_name} {current_user.last_name} switched on "
@@ -489,6 +489,14 @@ async def link_subscription(
         BUNDLE_PLAN_ID = os.getenv("PAYPAL_BUNDLE_PLAN_ID")
         resolved_tier = tier_for_plan_id(plan_id)
         promo = None
+        # A sign-up offer this person holds a spot in (offer_service): its own PayPal plan, started
+        # with custom_id "offer:<their id>" so nobody else's offer plan can be linked here.
+        from app.services.offer_service import plan_for_checkout
+        offer_plan = await plan_for_checkout(db, current_user, plan_id)
+        if offer_plan is not None:
+            if subscription_details.get("custom_id") != f"offer:{current_user.id}":
+                raise HTTPException(status_code=400, detail="That payment doesn't match your offer. Please try again.")
+            resolved_tier = offer_plan.tier
         if bundle_code and not (BUNDLE_PLAN_ID and plan_id == BUNDLE_PLAN_ID):
             # An admin-made code with its own PayPal plan (e.g. IDX with no setup fee).
             from app.services.promo_code_service import find_usable
@@ -498,7 +506,7 @@ async def link_subscription(
             if promo.kind != "paypal_plan" or promo.paypal_plan_id != plan_id:
                 raise HTTPException(status_code=400, detail="This code doesn't go with that plan.")
             resolved_tier = promo.plan_tier
-        if resolved_tier is not None and promo is None:
+        if resolved_tier is not None and promo is None and offer_plan is None:
             from app.utils.plan_ids import SIGNUP_PLAN_IDS
             if plan_id not in SIGNUP_PLAN_IDS:
                 # A plan-change / no-fee plan picked without the code that unlocks it.
@@ -560,7 +568,7 @@ async def link_subscription(
         reset_idx_site_question_on_upgrade(current_user, current_user.plan_tier, plan_tier)
         current_user.plan_tier = plan_tier
         # Trial only when the PayPal plan really has one (the promo plan's free period counts).
-        has_trial = plan_id_has_trial(plan_id) or is_bundle_plan or bool(promo and promo.trial_days)
+        has_trial = plan_id_has_trial(plan_id) or is_bundle_plan or bool(promo and promo.trial_days) or bool(offer_plan and offer_plan.trial_days)
         current_user.subscription_status = "TRIAL" if has_trial else "ACTIVE"
         current_user.subscription_started_at = now
         current_user.trial_ends_at = trial_end if has_trial else None

@@ -24,7 +24,7 @@ router = APIRouter(prefix="/admin/promo-codes", tags=["admin"])
 
 PLAN_TIERS = {"NO_MLS", "PRO_NO_MLS", "BASIC", "PREMIUM", "IDX"}
 KINDS = {"paypal_plan", "billed_by_us"}
-CYCLES = {"monthly", "quarterly", "yearly"}
+CYCLES = {"monthly", "quarterly", "semiannual", "yearly"}
 
 # The plans already set up on this server, offered as quick picks for a "special PayPal plan" code.
 _KNOWN_PLANS = [
@@ -109,7 +109,7 @@ async def _apply(db: AsyncSession, c: PromoCode, body: CodeIn) -> None:
         c.plan_tier = data["plan_tier"]
     if "billing_cycle" in data:
         if data["billing_cycle"] is not None and data["billing_cycle"] not in CYCLES:
-            raise HTTPException(status_code=400, detail="Billing cycle must be monthly, quarterly or yearly.")
+            raise HTTPException(status_code=400, detail="Billing cycle must be monthly, every 3 months, every 6 months or yearly.")
         c.billing_cycle = data["billing_cycle"]
     if "custom_price" in data:
         if data["custom_price"] is not None and data["custom_price"] < 0:

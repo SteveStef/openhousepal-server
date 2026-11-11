@@ -532,7 +532,7 @@ class PayPalService:
     async def create_custom_plan(self, product_id: str, name: str, amount: float, cycle: str, total_payments: Optional[int]) -> str:
         """One plan per payment request: `amount` charged the moment the payer approves, then again
         every cycle (once = a single payment). total_payments stops it after N (0 = until cancelled)."""
-        unit, count = {"once": ("MONTH", 1), "monthly": ("MONTH", 1), "quarterly": ("MONTH", 3), "yearly": ("YEAR", 1)}[cycle]
+        unit, count = {"once": ("MONTH", 1), "monthly": ("MONTH", 1), "quarterly": ("MONTH", 3), "semiannual": ("MONTH", 6), "yearly": ("YEAR", 1)}[cycle]
         total = 1 if cycle == "once" else int(total_payments or 0)
         plan = await self._post("/v1/billing/plans", {
             "product_id": product_id, "status": "ACTIVE",
@@ -548,6 +548,47 @@ class PayPalService:
         if plan.status_code not in (200, 201):
             raise Exception(f"Failed to create custom plan: {plan.status_code} - {plan.text}")
         return plan.json()["id"]
+
+    async def create_offer_plan(self, product_id: str, name: str, *, full_price: float, offer_price: float,
+                                discount_months: Optional[int], trial_days: int, setup_fee: float) -> str:
+        """A sign-up offer's monthly plan: optional free trial, then `offer_price` for `discount_months`
+        payments (None = forever), then `full_price`. setup_fee is charged at sign-up (0 = none)."""
+        cycles, seq = [], 1
+        if trial_days > 0:
+            cycles.append({"frequency": {"interval_unit": "DAY", "interval_count": trial_days}, "tenure_type": "TRIAL",
+                           "sequence": seq, "total_cycles": 1})
+            seq += 1
+        discounted = offer_price < full_price - 0.004
+        if discounted and discount_months:
+            cycles.append({"frequency": {"interval_unit": "MONTH", "interval_count": 1}, "tenure_type": "TRIAL",
+                           "sequence": seq, "total_cycles": int(discount_months),
+                           "pricing_scheme": {"fixed_price": {"value": f"{offer_price:.2f}", "currency_code": "USD"}}})
+            seq += 1
+        regular = offer_price if (discounted and not discount_months) else full_price
+        cycles.append({"frequency": {"interval_unit": "MONTH", "interval_count": 1}, "tenure_type": "REGULAR",
+                       "sequence": seq, "total_cycles": 0,
+                       "pricing_scheme": {"fixed_price": {"value": f"{regular:.2f}", "currency_code": "USD"}}})
+        prefs = {"auto_bill_outstanding": True, "payment_failure_threshold": 2}
+        if setup_fee > 0:
+            prefs["setup_fee"] = {"value": f"{setup_fee:.2f}", "currency_code": "USD"}
+            prefs["setup_fee_failure_action"] = "CANCEL"
+        plan = await self._post("/v1/billing/plans", {
+            "product_id": product_id, "status": "ACTIVE", "name": name[:127],
+            "description": "OpenHousePal sign-up offer"[:127], "billing_cycles": cycles, "payment_preferences": prefs,
+        })
+        if plan.status_code not in (200, 201):
+            raise Exception(f"Failed to create offer plan: {plan.status_code} - {plan.text}")
+        return plan.json()["id"]
+
+    async def update_plan_price(self, plan_id: str, amount: float) -> None:
+        """New price on a payment request's own plan. PayPal applies it to the running subscription
+        too (it emails the payer; payments within the next 10 days keep the old price)."""
+        resp = await self._post(f"/v1/billing/plans/{plan_id}/update-pricing-schemes", {
+            "pricing_schemes": [{"billing_cycle_sequence": 1,
+                                 "pricing_scheme": {"fixed_price": {"value": f"{amount:.2f}", "currency_code": "USD"}}}],
+        })
+        if resp.status_code not in (200, 204):
+            raise Exception(f"Failed to update plan price: {resp.status_code} - {resp.text}")
 
     async def list_subscription_transactions(self, subscription_id: str, days: int = 400) -> list:
         token = await self.get_token()
@@ -566,7 +607,10 @@ class PayPalService:
     async def refund_sale(self, sale_id: str) -> bool:
         """Full refund of one subscription payment (a domain we couldn't register)."""
         resp = await self._post(f"/v1/payments/sale/{sale_id}/refund", {})
-        return resp.status_code in (200, 201)
+        if resp.status_code in (200, 201):
+            return True
+        # Asking twice (our retry + PayPal's notice) is fine: already refunded means it's done.
+        return resp.status_code == 400 and "TRANSACTION_ALREADY_REFUNDED" in (resp.text or "")
 
 
 paypal_service = PayPalService()

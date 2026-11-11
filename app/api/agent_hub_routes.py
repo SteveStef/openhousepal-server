@@ -83,7 +83,7 @@ def normalize_slug(slug: str) -> str:
 HUB_RESERVED_SLUGS = {
     "activity", "agenthub", "admin", "agent-hub", "api", "assistant", "broker-authorization", "cash-needed",
     "checkout", "cma", "dash", "discovery", "leads", "net-sheet", "open-houses", "privacy", "property",
-    "settings", "setup", "showcase", "showcases", "studio", "terms", "unsubscribe", "upgrade-required", "pay",
+    "settings", "setup", "showcase", "showcases", "studio", "terms", "unsubscribe", "upgrade-required", "pay", "offer",
     "forgot-password", "login", "register", "reset-password", "open-house", "spotlight-preview", "ohp-site-render",
     "tools", "pricing", "idx-websites", "faq", "about", "resources", "brokerages",
 }

@@ -58,7 +58,9 @@ async def tier_for_promo_plan(db: AsyncSession, plan_id: Optional[str]) -> Tuple
         select(PromoCode.plan_tier, PromoCode.trial_days).where(PromoCode.paypal_plan_id == plan_id).limit(1)
     )).first()
     if row is None:
-        return None, False
+        # A sign-up offer's plan (offer_service) - same answer shape.
+        from app.services.offer_service import tier_for_offer_plan
+        return await tier_for_offer_plan(db, plan_id)
     return row[0], bool(row[1])
 
 

@@ -40,6 +40,13 @@ class RequestIn(BaseModel):
     send_email: bool = False
 
 
+class ChangeIn(BaseModel):
+    amount: Optional[float] = None
+    plan_tier: Optional[str] = None
+    seats: Optional[int] = None
+    title: Optional[str] = None
+
+
 class ConfirmIn(BaseModel):
     subscription_id: str
 
@@ -59,7 +66,7 @@ def _clean(body: RequestIn, req: Optional[PaymentRequest]) -> dict:
             raise HTTPException(400, "The amount must be between $1 and $100,000.")
         data["amount"] = round(float(a), 2)
     if "cycle" in data and data["cycle"] not in prs.CYCLES:
-        raise HTTPException(400, "Pick one time, monthly, every 3 months or yearly.")
+        raise HTTPException(400, "Pick one time, monthly, every 3 months, every 6 months or yearly.")
     if data.get("total_payments") is not None and not (1 <= data["total_payments"] <= 120):
         raise HTTPException(400, "Number of payments must be 1 to 120 (or blank for until cancelled).")
     if data.get("seats") is not None and not (1 <= data["seats"] <= 10000):
@@ -175,6 +182,25 @@ async def update_request(request_id: str, body: RequestIn, db: AsyncSession = De
     await db.commit()
     await db.refresh(req)
     return await prs.admin_view(db, req)
+
+
+@admin_router.post("/{request_id}/change")
+async def change_request(request_id: str, body: ChangeIn, db: AsyncSession = Depends(get_db), _admin=Depends(require_admin_user)):
+    """Change a deal that's already paying: price (from the next charge), plan and people (now)."""
+    req = await _get(db, request_id)
+    if req.status not in ("active", "past_due", "paid"):
+        raise HTTPException(400, "Only a deal that's paying can be changed - edit or make a new request instead.")
+    if body.amount is not None and (body.amount < 1 or body.amount > 100000):
+        raise HTTPException(400, "The amount must be between $1 and $100,000.")
+    if body.plan_tier and body.plan_tier not in PLAN_TIERS:
+        raise HTTPException(400, "Unknown plan")
+    if body.seats is not None and not (1 <= body.seats <= 10000):
+        raise HTTPException(400, "People covered must be at least 1.")
+    try:
+        out = await prs.change_deal(db, req, amount=body.amount, plan_tier=body.plan_tier, seats=body.seats, title=body.title)
+    except prs.PaymentRequestError as e:
+        raise HTTPException(400, str(e))
+    return {**await prs.admin_view(db, req), "change_notes": out["notes"]}
 
 
 @admin_router.post("/{request_id}/send")

@@ -190,11 +190,26 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
         if pay_req is None and pay_ref.startswith(payment_request_service.CUSTOM_PREFIX) and event_type in ("BILLING.SUBSCRIPTION.ACTIVATED", "PAYMENT.SALE.COMPLETED"):
             # Paid, but the pay page closed before it reported back - attach it here.
             waiting = await db.get(PaymentRequest, pay_ref[len(payment_request_service.CUSTOM_PREFIX):])
+            if waiting is None:
+                # Paid a request that was deleted while their page was open: nothing to attach to - undo it.
+                db.add(WebhookEvent(id=event_id, event_type=event_type))
+                await db.commit()
+                await payment_request_service.cancel_and_refund(subscription_id, pay_ref, "A deleted payment request was paid (their page was still open)",
+                                                                sale_id=resource.get("id") if event_type == "PAYMENT.SALE.COMPLETED" else None)
+                return {"received": True, "event_type": event_type, "payment_request": None, "undone": True}
+            if waiting is not None and waiting.status not in ("open", "past_due"):
+                # Already paid (or cancelled) and this is a second payment: undo it.
+                db.add(WebhookEvent(id=event_id, event_type=event_type))
+                await db.commit()
+                await payment_request_service.undo_duplicate(waiting, subscription_id,
+                                                             sale_id=resource.get("id") if event_type == "PAYMENT.SALE.COMPLETED" else None)
+                return {"received": True, "event_type": event_type, "payment_request": waiting.id, "duplicate": True}
             if waiting is not None and waiting.status in ("open", "past_due"):
                 db.add(WebhookEvent(id=event_id, event_type=event_type))
                 await db.commit()
                 try:
-                    await payment_request_service.attach(db, waiting, subscription_id)
+                    await payment_request_service.attach(db, waiting, subscription_id,
+                                                         sale_id=resource.get("id") if event_type == "PAYMENT.SALE.COMPLETED" else None)
                 except payment_request_service.PaymentRequestError as e:
                     logger.warning("Payment request webhook attach refused", extra={"request": waiting.id, "reason": str(e)})
                 return {"received": True, "event_type": event_type, "payment_request": waiting.id}

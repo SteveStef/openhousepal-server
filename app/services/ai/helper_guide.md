@@ -158,6 +158,7 @@ There are two families of plans. Bright MLS agents can choose any plan. Agents o
 4. Pay by card: tap **Debit or Credit Card**, enter your card and billing address (no PayPal account needed - if PayPal offers to create an account, turn that switch off or tap **Continue as Guest**), then **Agree & Subscribe**. Paying by logging into a PayPal account shows **Coming soon** for now. A free trial charges nothing today; your bank may ask you to confirm the card (a text or app prompt) - that's normal. When it's done, you land on your Dash.
 5. Have a code? Use the **Have a team or promo code?** box, type it in, and tap **Apply**. Some codes switch your account on with no PayPal at all. In that case the button is **Switch on my account**, and you're billed directly.
 6. Picked the wrong plan? Tap **Change Selected Plan**.
+7. Came from an offer link someone shared with you (the "Get this offer" page)? Checkout opens on **Your offer** with that offer's plans and prices; the Order Summary shows the offer price, what's due today and when the price goes back to normal. **See our regular plans instead** shows the usual plans. Only talk about an offer when the agent says they have one - never suggest offers or discounts exist.
 
 ### Seeing your plan
 
@@ -167,6 +168,8 @@ Go to **Settings → Billing**. You can also tap the plan name button at the top
 - A status: **Free Trial**, **Active**, **Cancelled**, **Payment Failed** or **Expired**.
 - Dates: **Trial Ends**, **Active Since**, **Last Billing**, **First Payment** / **Next Renewal**, or **Access Ends** if you've cancelled.
 - **View full plan details** opens the full card for your plan.
+
+Signed up through an offer? **Current Plan** shows the price you actually pay, with a line underneath saying how long the discount lasts and the regular price after it.
 
 If your plan is paid by OpenHousePal directly, or by your team lead or brokerage, it shows as **Managed** or **Brokerage Paid**. There's nothing to manage in PayPal. Message support with any billing questions.
 

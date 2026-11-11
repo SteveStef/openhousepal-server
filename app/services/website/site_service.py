@@ -22,7 +22,7 @@ RESERVED_SLUGS = {
     "www", "app", "api", "admin", "mail", "ftp", "assets", "static", "cdn",
     "ohp-site-render", "dash", "leads", "studio", "assistant", "login", "register",
     "settings", "showcase", "showcases", "open-house", "open-houses", "discovery",
-    "checkout", "terms", "privacy", "unsubscribe", "agent-hub", "setup", "pay",
+    "checkout", "terms", "privacy", "unsubscribe", "agent-hub", "setup", "pay", "offer",
 }
 
 

@@ -97,8 +97,8 @@ def _apply(g: BillingGroup, data: GroupIn) -> None:
                 raise HTTPException(status_code=400, detail="Give the group a name.")
         if k == "plan_tier" and v not in PLAN_TIERS and v is not None:
             raise HTTPException(status_code=400, detail="Unknown plan")
-        if k == "billing_cycle" and v not in ("monthly", "quarterly", "yearly"):
-            raise HTTPException(status_code=400, detail="Billing cycle must be monthly, quarterly or yearly")
+        if k == "billing_cycle" and v not in ("monthly", "quarterly", "semiannual", "yearly"):
+            raise HTTPException(status_code=400, detail="Billing cycle must be monthly, every 3 months, every 6 months or yearly")
         if k in ("ai_budget_per_agent_usd", "ai_budget_total_usd") and v is not None:
             if v < 1 or v > 10000:
                 raise HTTPException(status_code=400, detail="AI usage must be between $1 and $10,000 a month (blank = normal).")
