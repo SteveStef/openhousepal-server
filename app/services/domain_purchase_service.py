@@ -348,9 +348,7 @@ async def attach(db: AsyncSession, purchase: PurchasedDomain, subscription_id: s
     sid = (subscription_id or "").strip()
     if not sid:
         raise PurchaseError("PayPal didn't send the payment back - try again.")
-    if purchase.paypal_subscription_id:
-        if purchase.paypal_subscription_id != sid:
-            raise PurchaseError("That payment doesn't match this domain.")
+    if purchase.paypal_subscription_id == sid:
         return await complete(db, purchase)
     if purchase.status != "CHECKOUT":
         raise PurchaseError("This checkout has closed - start again.")
@@ -366,8 +364,25 @@ async def attach(db: AsyncSession, purchase: PurchasedDomain, subscription_id: s
     if sub.get("custom_id") != purchase.id or sub.get("plan_id") != want:
         logger.error("Domain payment mismatch", extra={"purchase": purchase.id, "subscription": sid})
         raise PurchaseError("That payment doesn't match this domain.")
-    claimed = await db.execute(update(PurchasedDomain).where(PurchasedDomain.id == purchase.id, PurchasedDomain.paypal_subscription_id.is_(None))
-                               .values(paypal_subscription_id=sid))
+    # Only an APPROVED payment is tied on (11/10: a first try PayPal only CREATED got tied on by its
+    # webhook, then the real paid second try was refused).
+    if (sub.get("status") or "").upper() not in ("ACTIVE", "APPROVED"):
+        raise PurchaseError("PayPal hasn't confirmed this payment yet.")
+    old = purchase.paypal_subscription_id
+    if old:
+        # An earlier try is tied on: replace it only if that one was never paid/approved.
+        try:
+            old_status = ((await paypal_service.get_subscription(old)).get("status") or "").upper()
+        except Exception:
+            raise PurchaseError("PayPal didn't answer - tap Finish to try again.")
+        if old_status in ("ACTIVE", "APPROVED", "SUSPENDED"):
+            logger.error("Second approved payment for one domain", extra={"purchase": purchase.id, "subscription": sid, "kept": old})
+            _ping(f":warning: Domain {purchase.domain_name}: a 2nd approved PayPal subscription {sid} came in for one checkout (kept {old}) - refund/cancel {sid} by hand.")
+            raise PurchaseError("This domain is already paid for.")
+    claimed = await db.execute(update(PurchasedDomain).where(
+        PurchasedDomain.id == purchase.id, PurchasedDomain.status == "CHECKOUT",
+        (PurchasedDomain.paypal_subscription_id.is_(None) if not old else PurchasedDomain.paypal_subscription_id == old),
+    ).values(paypal_subscription_id=sid))
     await db.commit()
     await db.refresh(purchase)
     if claimed.rowcount != 1 and purchase.paypal_subscription_id != sid:

@@ -193,11 +193,12 @@ async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get
             return {"received": True, "event_type": event_type, "domain": purchase.domain_name}
         # A domain paid through PayPal's on-page buttons whose page closed before it reported back:
         # PayPal carries our purchase id as custom_id ("custom" on sale events) - attach it here.
+        # Only approved/paid events (a CREATED one isn't paid yet - tying it on blocked the real payment
+        # 11/10); attach() also checks PayPal says ACTIVE/APPROVED and may replace an unpaid earlier try.
         domain_ref = resource.get("custom_id") or resource.get("custom")
-        if domain_ref and event_type.startswith(("BILLING.SUBSCRIPTION.", "PAYMENT.SALE.")):
+        if domain_ref and event_type in ("BILLING.SUBSCRIPTION.ACTIVATED", "PAYMENT.SALE.COMPLETED"):
             pending = (await db.execute(select(PurchasedDomain).where(
                 PurchasedDomain.id == str(domain_ref), PurchasedDomain.status == "CHECKOUT",
-                PurchasedDomain.paypal_subscription_id.is_(None),
             ))).scalar_one_or_none()
             if pending:
                 from app.services import domain_purchase_service
