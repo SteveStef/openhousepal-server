@@ -20,6 +20,7 @@ from app.utils.auth import get_current_active_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["client-emails"])
+_SUPPRESSED = ("suppress-bounce", "suppress-complaint", "suppress-unsubscribe")
 
 _GIF = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
 _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate, private", "Pragma": "no-cache"}
@@ -120,13 +121,21 @@ async def mailgun_events(request: Request, db: AsyncSession = Depends(get_db)):
         rec.delivery, rec.delivery_note, rec.delivery_at = delivery, note[:300], datetime.now(timezone.utc)
         if delivery in ("bounced", "blocked"):
             rec.status, rec.error = "failed", note[:300]
-    if delivery not in ("bounced", "spam"):
+    # Mailgun refused it because the address is on ITS list (bounced / spam / unsubscribed before -
+    # often from before our own list existed). Put it on ours too, or the daily digest keeps trying
+    # it every day and the Admin Failures page fills with the same row (owner, 11/12).
+    suppressed = kind == "failed" and str(ev.get("reason") or "") in _SUPPRESSED
+    if delivery not in ("bounced", "spam") and not suppressed:
         await db.commit()
         return {"ok": True, "delivery": delivery}
     from app.services.blacklist_service import BlacklistService
-    await BlacklistService.blacklist_email(db, recipient)
+    newly = await BlacklistService.blacklist_email(db, recipient)
     await db.commit()
     owner_id = rec.owner_id if rec is not None else None
+    if suppressed:
+        delivery = "spam" if ev.get("reason") == "suppress-complaint" else "bounced"
+        if not newly or ev.get("reason") == "suppress-unsubscribe":  # told the first time / their own choice
+            owner_id = None
     if owner_id:
         lead = await ce._lead(db, owner_id, recipient)
         who = ce._first(await ce._person_name(db, owner_id, recipient), recipient)

@@ -57,9 +57,44 @@ _LIMIT_REASONS = {"burst_limit", "daily_limit", "monthly_limit", "cost_ceiling",
 
 
 def _row(at, source: str, feature: str, owner_id: Optional[str], code: Optional[str], message: Optional[str],
-         kind: str = "error", ref: Optional[str] = None) -> dict:
+         kind: str = "error", ref: Optional[str] = None, audience: Optional[str] = None, what: Optional[str] = None) -> dict:
     return {"at": at.isoformat() if at else None, "source": source, "feature": feature, "owner_id": owner_id,
-            "code": code, "message": (message or "")[:600] or None, "kind": kind, "ref": ref}
+            "code": code, "message": (message or "")[:600] or None, "kind": kind, "ref": ref,
+            "audience": audience, "what": what}
+
+
+# Emails: who it was going to decides the label (owner, 11/12: a client's bounced Showcase email
+# listed under the agent's name read like the AGENT wasn't getting emails).
+EMAIL_TO_AGENT = "Email to an agent"
+EMAIL_TO_CLIENT = "Email to an agent's client"
+_TEMPLATE = {
+    "showcase_daily_digest": "Showcase daily update", "showcase_weekly_digest": "Showcase weekly update",
+    "showcase_daily_digest_agent": "Daily briefing", "agent_weekly_summary": "Weekly summary",
+}
+
+
+def _template_label(name: Optional[str]) -> str:
+    n = (name or "").strip()
+    base = n[:-3] if n.endswith("_v2") else n
+    return _TEMPLATE.get(base) or base.replace("_", " ").strip().capitalize() or "Email"
+
+
+def _group(rows: list[dict]) -> list[dict]:
+    """The same failure again and again (one bad address tried every day) -> one row with a count
+    and when it started. rows are newest first, so the kept row is the latest."""
+    out: list[dict] = []
+    seen: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r["source"], r["feature"], r["owner_id"], r["ref"], r["code"], r["message"], r["what"])
+        g = seen.get(key)
+        if g is None:
+            g = {**r, "count": 1, "first_at": r["at"]}
+            seen[key] = g
+            out.append(g)
+        else:
+            g["count"] += 1
+            g["first_at"] = r["at"] or g["first_at"]
+    return out
 
 
 async def recent_failures(db: AsyncSession, days: int = 14, limit: int = 200, include_limits: bool = False) -> dict:
@@ -95,15 +130,24 @@ async def recent_failures(db: AsyncSession, days: int = 14, limit: int = 200, in
         select(ClientEmail).where(ClientEmail.status == "failed", ClientEmail.created_at >= since)
         .order_by(ClientEmail.created_at.desc()).limit(limit)
     )).scalars():
-        rows.append(_row(m.created_at, "email", f"Email to a client ({m.template})", m.owner_id, m.via or "send_failed", m.error,
-                         ref=m.recipient_email))
+        rows.append(_row(m.created_at, "email", EMAIL_TO_CLIENT, m.owner_id,
+                         "blocked" if "Not sent" in (m.error or "") else "bounced" if "Bounced" in (m.error or "") else "send_failed", m.error,
+                         ref=m.recipient_email, audience="client", what=_template_label(m.template)))
 
-    for s in (await db.execute(
+    scheduled = (await db.execute(
         select(ScheduledEmail).where(func.upper(ScheduledEmail.status) == "FAILED", ScheduledEmail.created_at >= since)
         .order_by(ScheduledEmail.created_at.desc()).limit(limit)
-    )).scalars():
-        rows.append(_row(s.sent_at or s.scheduled_for or s.created_at, "email", f"Scheduled email ({s.template_name})", s.owner_id,
-                         "send_failed", s.error_message))
+    )).scalars().all()
+    own = {}
+    ids = {s.owner_id for s in scheduled if s.owner_id}
+    if ids:
+        own = {i: (e or "").strip().lower() for i, e in (await db.execute(select(User.id, User.email).where(User.id.in_(ids)))).all()}
+    for s in scheduled:
+        to = (s.recipient_email or "").strip().lower()
+        to_agent = not s.owner_id or to == own.get(s.owner_id) or (s.template_name or "").endswith("_agent")             or (s.template_name or "").startswith("agent_")
+        rows.append(_row(s.sent_at or s.scheduled_for or s.created_at, "email", EMAIL_TO_AGENT if to_agent else EMAIL_TO_CLIENT,
+                         s.owner_id, "send_failed", s.error_message, ref=s.recipient_email,
+                         audience="agent" if to_agent else "client", what=_template_label(s.template_name)))
 
     for model, label in ((MailConnection, "Send as me (mailbox)"), (CalendarConnection, "Calendar sync")):
         for c in (await db.execute(
@@ -114,7 +158,7 @@ async def recent_failures(db: AsyncSession, days: int = 14, limit: int = 200, in
                              "connection_error", c.last_error))
 
     rows.sort(key=lambda x: x["at"] or "", reverse=True)
-    rows = rows[:limit]
+    rows = _group(rows)[:limit]
 
     owner_ids = {r["owner_id"] for r in rows if r["owner_id"]}
     people = {}
@@ -129,6 +173,6 @@ async def recent_failures(db: AsyncSession, days: int = 14, limit: int = 200, in
     by_feature: dict[str, int] = {}
     for r in rows:
         if r["kind"] == "error":
-            by_feature[r["feature"]] = by_feature.get(r["feature"], 0) + 1
+            by_feature[r["feature"]] = by_feature.get(r["feature"], 0) + 1   # one per grouped row, not per repeat
     return {"days": days, "count": len(rows), "errors": sum(1 for r in rows if r["kind"] == "error"),
             "by_feature": by_feature, "failures": rows}
