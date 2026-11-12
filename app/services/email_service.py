@@ -57,6 +57,11 @@ def with_open_pixel(html: str, url: Optional[str]) -> str:
     return html[:i] + img + html[i:] if i >= 0 else html + img
 
 
+def _top_line(template: str, variables: dict):
+    from app.services.email_top_line import render
+    return render(template, variables)
+
+
 def mailgun_template_name(template: str) -> str:
     """The name to ask Mailgun for (the app always uses the plain name everywhere else)."""
     return f"{template}{TEMPLATE_VERSION_SUFFIX}" if template in REDESIGNED_TEMPLATES else template
@@ -303,6 +308,9 @@ class EmailService:
                 # The weekly summary / test email of agent_email_health_service - rendered here too.
                 from app.services.agent_email_health_service import render as render_health
                 data["subject"], data["html"], data["text"] = render_health(template, subject, template_variables)
+            elif (top := _top_line(template, template_variables)) is not None:
+                # The agent's daily digest with its "how often / when" line on top (email_top_line).
+                data["html"], data["text"] = top
             else:
                 data.update({
                     "template": mailgun_template_name(template),

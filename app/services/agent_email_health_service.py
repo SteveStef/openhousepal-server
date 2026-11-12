@@ -8,11 +8,13 @@ down for everyone. So, for emails TO agents (email_agent: briefings, alerts, rou
             button (`link`) goes through /e/a/<id>/go, which counts as an open too (images blocked).
             The EmailLog row id is the token.
   normal    the usual state.
-  warned    FIRST_STRIKE tracked emails in a row unopened (each given GRACE to be opened): in-app
-            banner + a bell alert "they may be landing in junk", with a Send-me-a-test-email button.
-  weekly    SECOND_STRIKE more unopened after the warning: non-critical emails (DIGESTIBLE) wait
-            for one weekly summary. CRITICAL emails - a new lead, a tour / showing request, an RSVP,
-            account and billing notices - always go out at once, whatever the state.
+  weekly    FIRST_STRIKE tracked emails in a row unopened (each given GRACE to be opened): non-critical
+            emails (DIGESTIBLE - the daily digest, round-ups) wait for one weekly summary; Dash notice
+            "Your daily digest emails went to weekly" (That's fine / Make daily again) + a bell alert.
+  off       SECOND_STRIKE weekly summaries unopened: routine emails stop altogether ("asleep") until
+            they open any of our emails or tap Turn back on. CRITICAL emails - a new lead, a tour /
+            showing request, an RSVP, account and billing notices - always go out at once, whatever the state.
+  (warned)  an older state (10/24-11/11) - read as normal now.
 
 Any open or click puts the agent straight back on normal (the count starts again); the agent can
 also tap "Turn daily emails back on".
@@ -40,8 +42,10 @@ from app.models.database import AgentEmailHealth, EmailLog, Notification, User
 
 logger = logging.getLogger(__name__)
 
-FIRST_STRIKE = 5            # unopened in a row -> warning
-SECOND_STRIKE = 5           # more unopened after the warning -> weekly
+# Owner, 11/11: 4 unopened in a row -> weekly (one summary a week); then 3 weekly summaries unopened
+# -> asleep (routine emails stop) until they open any of our emails or tap "Turn back on".
+FIRST_STRIKE = 4            # unopened in a row -> weekly
+SECOND_STRIKE = 3           # weekly summaries unopened -> asleep
 GRACE = timedelta(hours=24)  # an email only counts as unopened a day after it was sent
 SCANNER_WINDOW = timedelta(seconds=20)
 SUMMARY_GAP = timedelta(days=7)
@@ -154,15 +158,14 @@ def decide(emails: list[dict], *, mode: str = "normal", warned_at: Optional[date
                 and not e.get("opened_at") and not e.get("clicked_at")]
     n = len(unopened)
     engaged_since = lambda t: bool(t and start and start > t)  # noqa: E731
-    after = [e for e in unopened if warned_at and e["sent_at"] > warned_at]
-    if mode == "weekly" and weekly_at and not engaged_since(weekly_at):
-        return {"mode": "weekly", "unopened": n, "after_warning": len(after), "code": "weekly"}
-    if mode in ("warned", "weekly") and warned_at and not engaged_since(warned_at):
-        if len(after) >= SECOND_STRIKE:
-            return {"mode": "weekly", "unopened": n, "after_warning": len(after), "code": "weekly"}
-        return {"mode": "warned", "unopened": n, "after_warning": len(after), "code": "warned"}
+    # Weekly summaries left unopened since the switch to weekly (the summary is the only routine email then).
+    summaries = [e for e in unopened if weekly_at and e["sent_at"] > weekly_at and e.get("template") == SUMMARY_TEMPLATE]
+    if mode in ("weekly", "off") and weekly_at and not engaged_since(weekly_at):
+        if mode == "off" or len(summaries) >= SECOND_STRIKE:
+            return {"mode": "off", "unopened": n, "after_warning": len(summaries), "code": "off"}
+        return {"mode": "weekly", "unopened": n, "after_warning": len(summaries), "code": "weekly"}
     if n >= FIRST_STRIKE:
-        return {"mode": "warned", "unopened": n, "after_warning": 0, "code": "warned"}
+        return {"mode": "weekly", "unopened": n, "after_warning": 0, "code": "weekly"}
     return {"mode": "normal", "unopened": n, "after_warning": 0, "code": "ok"}
 
 
@@ -226,10 +229,17 @@ async def refresh(db, user_id: str, *, announce: bool = True) -> dict:
         elif d["mode"] == "weekly":
             h.weekly_at = now
             if announce:
-                _bell(db, user_id, "Your OpenHousePal emails are now weekly",
-                      "You haven't opened our recent emails, so routine ones (briefings, round-ups) now come as one weekly summary. "
-                      "New leads, tour requests and account emails still arrive right away. Tap to turn daily emails back on.",
+                _bell(db, user_id, "Your daily digest emails went to weekly",
+                      f"You haven't opened our last {FIRST_STRIKE} emails, so routine ones (your daily digest, round-ups) now come as one weekly summary. "
+                      "New leads, tour requests and account emails still arrive right away. If they're landing in junk or spam, move one to your inbox.",
                       f"weekly|{now.date().isoformat()}")
+        elif d["mode"] == "off":
+            h.weekly_at = h.weekly_at or now
+            if announce:
+                _bell(db, user_id, "Your digest emails are paused",
+                      f"You didn't open our last {SECOND_STRIKE} weekly summaries, so routine emails are paused until you open one of our emails "
+                      "or turn them back on. New leads, tour requests and account emails still arrive right away.",
+                      f"off|{now.date().isoformat()}")
         else:
             h.warned_at = h.weekly_at = None
         await db.commit()
@@ -252,7 +262,7 @@ async def _back_to_normal(db, user_id: str, why: str) -> None:
         # the warning / weekly alerts are answered now
         await db.execute(update(Notification).where(Notification.agent_id == user_id, Notification.type == NOTIFY_TYPE,
                                                     Notification.is_read.is_(False)).values(is_read=True, read_at=now))
-        if was == "weekly":
+        if was in ("weekly", "off"):
             _bell(db, user_id, "Daily emails are back on", f"{why} - your OpenHousePal emails are back to normal.", f"resumed|{now.isoformat()}")
     await db.commit()
 
@@ -292,8 +302,12 @@ async def should_hold(user_id: str, template: str, subject: str, variables: dict
     try:
         async with AsyncSessionLocal() as db:
             st = await refresh(db, user_id)
-            if st["mode"] != "weekly" or is_critical(template, always):
+            if st["mode"] not in ("weekly", "off") or is_critical(template, always):
                 return False
+            if st["mode"] == "off":
+                # Asleep: routine emails stop (each is still in the bell); nothing piles up for a summary.
+                logger.info("agent email skipped - routine emails asleep", extra={"template": template, "user_id": user_id})
+                return True
             h = await _row(db, user_id, create=True)
             item = {"t": template, "s": (subject or "")[:200], "l": variables.get("_orig_link") or variables.get("link"), "at": _now().isoformat()}
             h.held = ([item] + list(h.held or []))[:HELD_CAP]

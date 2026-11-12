@@ -30,7 +30,7 @@ Tabs: **Profile**, **Notifications**, **Tools**, **IDX Website** (IDX only), **B
   - Automatic updates: **New homes & price drops in their Showcase** (**How often**: Up to daily - one 4:30 PM email on days something changed - or Once a week), **Listing Spotlight alerts**.
   - Off = never goes out. No-MLS plans only see **Tour confirmations** (from the Schedule a Showing form).
 - **What lands in your inbox**: grouped "Most important" (New leads & sign-ins, Client requests in Showcases, Open house host requests), "Good to know" (Daily briefing, Liked homes, Showcase activity, New reviews, Spotlight weekly report, Team & broadcasts), "Extras" (My listing updates, AI media ready). No-MLS plans don't see the Showcase, hosting, briefing, liked-homes, Spotlight, listing and team rows.
-- **Daily briefing → Arrives at**: every 15 minutes from 6:00 AM to 9:00 PM Eastern; default 4:30 PM. Only shows while Daily briefing is on.
+- **Daily briefing → How often**: **Every day** or **Once a week (Mondays)**. **Arrives at**: every 15 minutes from 6:00 AM to 9:00 PM Eastern; default 4:30 PM. Only shows while Daily briefing is on.
 - Can't be turned off: sign-in codes and password resets, billing and plan notices, support replies and connection problems.
 
 ## Calendar (Tools → Calendar, "Your follow-ups, on your calendar"; every plan)

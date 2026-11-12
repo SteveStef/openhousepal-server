@@ -250,6 +250,82 @@ async def plan_for_checkout(db: AsyncSession, user: User, plan_id: str) -> Optio
     return row
 
 
+# ------------------------------------------------------------------ coming back after cancelling
+
+def _paid_at(t: dict, price: float) -> bool:
+    """A PayPal subscription payment that went through, for this amount."""
+    if str(t.get("status") or "").upper() not in ("COMPLETED", "PARTIALLY_REFUNDED"):
+        return False
+    try:
+        gross = float(((t.get("amount_with_breakdown") or {}).get("gross_amount") or {}).get("value"))
+    except (TypeError, ValueError):
+        return False
+    return abs(gross - price) < 0.005
+
+
+async def comeback_offer(db: AsyncSession, user: User, tier: str, now: Optional[datetime] = None) -> Optional[OfferPlan]:
+    """Owner, 11/11: someone on a sign-up offer who cancels can restart at the offer price while their
+    paid time hasn't run out - for whatever discount they had left. Once it runs out (status EXPIRED,
+    or the end date passed), it's normal prices. Same plan only; never a second free trial or setup
+    fee. None = no offer price applies. Raises OfferError if PayPal can't be checked (never guess)."""
+    now = now or datetime.now(timezone.utc)
+    end = user.next_billing_date
+    if user.subscription_status != "CANCELLED" or not user.plan_id or not user.offer_id or not end:
+        return None
+    if (end if end.tzinfo else end.replace(tzinfo=timezone.utc)) <= now:
+        return None
+    row = (await db.execute(select(OfferPlan).where(OfferPlan.paypal_plan_id == user.plan_id))).scalar_one_or_none()
+    if row is None or row.tier != tier or row.offer_id != user.offer_id or row.percent_off <= 0:
+        return None
+    offer = await db.get(Offer, row.offer_id)
+    if offer is None or not offer.is_active:
+        return None
+    # A restart plan carries only the discount that was left when it was made (never the offer's full count again).
+    from app.services import app_cache
+    months = discount_months(offer)
+    if not row.is_current:
+        saved = await app_cache.load(f"offer_plan_months:{row.paypal_plan_id}")
+        months = None if saved in (None, "forever") else int(saved)
+        if saved is None and discount_months(offer) is not None:
+            return None   # unknown leftover on a limited deal: normal price rather than a guess
+    left: Optional[int] = None
+    if months is not None:
+        from app.services.paypal_service import paypal_service
+        try:
+            txns = await paypal_service.list_subscription_transactions(user.subscription_id) if user.subscription_id else []
+        except Exception as e:  # noqa: BLE001
+            raise OfferError("We couldn't check your offer price with PayPal just now. Please try again in a minute.") from e
+        used = sum(1 for t in txns if _paid_at(t, row.offer_price))
+        left = months - used
+        if left <= 0:
+            return None
+    return await _comeback_plan(db, offer, row, left)
+
+
+async def _comeback_plan(db: AsyncSession, offer: Offer, row: OfferPlan, left: Optional[int]) -> OfferPlan:
+    """The PayPal plan for a comeback: no trial, no setup fee, the offer price for `left` more
+    payments (None = forever), then the full price. Made once per offer + plan + months left."""
+    from app.services import app_cache
+    from app.services.paypal_service import paypal_service
+    key = f"offer_comeback:{os.getenv('PAYPAL_MODE', 'sandbox')}:{offer.id}:{row.tier}:{left if left is not None else 'forever'}:{row.offer_price:.2f}"
+    pid = await app_cache.load(key)
+    if pid:
+        hit = (await db.execute(select(OfferPlan).where(OfferPlan.paypal_plan_id == str(pid)))).scalar_one_or_none()
+        if hit is not None:
+            return hit
+    product = await _product(db)
+    pid = await paypal_service.create_offer_plan(
+        product, f"OpenHousePal {PLAN_NAMES[row.tier]} - offer {offer.name} (restart)", full_price=row.base_price,
+        offer_price=row.offer_price, discount_months=left, trial_days=0, setup_fee=0.0)
+    new = OfferPlan(offer_id=offer.id, tier=row.tier, percent_off=row.percent_off, base_price=row.base_price,
+                    offer_price=row.offer_price, setup_fee=0.0, trial_days=0, paypal_plan_id=pid, is_current=False)
+    db.add(new)
+    await db.commit()
+    await app_cache.save(key, pid)
+    await app_cache.save(f"offer_plan_months:{pid}", left if left is not None else "forever")
+    return new
+
+
 async def tier_for_offer_plan(db: AsyncSession, plan_id: Optional[str]) -> tuple[Optional[str], bool]:
     """(tier, has free trial) for any offer plan, current or old - PayPal notices and syncs use it."""
     if not plan_id:

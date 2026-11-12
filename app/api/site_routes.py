@@ -896,6 +896,29 @@ async def get_domain_transfer_code(
         raise _purchase_error(e)
 
 
+@router.get("/me/domain-shop/confirm-reminders")
+async def domain_confirm_reminders(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Bought domains still waiting on the Name.com "verify your email" click (Dash + Domains)."""
+    from app.services import domain_purchase_service as shop
+    return {"domains": await shop.confirm_reminders(db, current_user.id)}
+
+
+@router.post("/me/domain-shop/purchases/{purchase_id}/confirm-reminder/dismiss")
+async def dismiss_domain_confirm_reminder(
+    purchase_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    from app.services import domain_purchase_service as shop
+    p = await _load_owned_purchase(db, purchase_id, current_user.id)
+    if not await shop.dismiss_confirm_reminder(db, p):
+        raise HTTPException(status_code=400, detail="Name.com still shows this email as not confirmed - open their email and tap Verify.")
+    return {"ok": True}
+
+
 @router.post("/me/domain-shop/purchases/{purchase_id}/resend-email")
 async def resend_domain_email(
     purchase_id: str,

@@ -89,7 +89,7 @@ Each situation has:
 
 ## The daily briefing
 - The briefing's open house wrap-up lists each guest with "Has an agent" / "No agent" as it is when the email goes out - if the agent changed it on their lead after the sign-in, the email shows the change.
-- Email "Daily briefing" (turn it on/off and pick **Arrives at**, 6:00 AM-9:00 PM Eastern in 15-minute steps, default 4:30 PM, in Tools → Email). On the Dash it's **Today's Rundown**.
+- Email "Daily briefing" (turn it on/off, pick **How often** - Every day or Once a week (Mondays) - and **Arrives at**, 6:00 AM-9:00 PM Eastern in 15-minute steps, default 4:30 PM, in Tools → Email). On the Dash it's **Today's Rundown**. Left unopened, it slows to a weekly summary and then pauses (see "If you stop opening our emails").
 - Contains: follow-ups due today and overdue (top 5, "+ N more"); things waiting on you (agents asking to host your listing, hosting answers needed, leads needing a response, form responses you haven't opened, a support reply); client activity (clients asking for a search change, clients who changed their own search); new matches and price drops across your clients' Showcases; and open house wrap-ups (guests from opens that have ended).
 - Skipped on days with nothing new. If you turn the briefing off, open house wrap-ups still arrive as their own email.
 - On No-MLS plans the Showcase and hosting parts never appear, and the Daily briefing row isn't listed among the inbox switches.

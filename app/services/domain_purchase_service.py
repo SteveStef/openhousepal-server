@@ -756,6 +756,47 @@ async def email_confirmed(purchase: PurchasedDomain) -> Optional[bool]:
     return reg.get("isVerified") if isinstance(reg.get("isVerified"), bool) else None
 
 
+CONFIRM_DAYS = 15   # ICANN: the registrant's email must be confirmed within 15 days or the domain pauses
+
+
+async def confirm_reminders(db: AsyncSession, owner_id: str) -> list[dict]:
+    """Owner, 11/11: every domain this agent bought whose Name.com "verify your email" link hasn't
+    been clicked yet - shown on the Dash and the Domains screen until it's done. Once Name.com says
+    confirmed we remember it and stop asking. confirmed None = Name.com couldn't tell us (then the
+    agent may dismiss it)."""
+    rows = (await db.execute(select(PurchasedDomain).where(
+        PurchasedDomain.owner_id == owner_id, PurchasedDomain.status == "ACTIVE"))).scalars().all()
+    out, changed = [], False
+    now = datetime.now(timezone.utc)
+    for p in rows:
+        flags = dict(p.registrant or {})
+        if flags.get("_email_ok") or flags.get("_confirm_dismissed"):
+            continue
+        ok = await email_confirmed(p)
+        if ok is True:
+            p.registrant = {**flags, "_email_ok": True}
+            changed = True
+            continue
+        start = p.registered_at or p.created_at
+        left = None
+        if start is not None:
+            start = start if start.tzinfo else start.replace(tzinfo=timezone.utc)
+            left = max(0, CONFIRM_DAYS - (now - start).days)
+        out.append({"id": p.id, "domain": p.domain_name, "email": flags.get("email"), "confirmed": ok, "days_left": left})
+    if changed:
+        await db.commit()
+    return out
+
+
+async def dismiss_confirm_reminder(db: AsyncSession, p: PurchasedDomain) -> bool:
+    """Only when we can't check with Name.com - a domain we know isn't confirmed keeps its reminder."""
+    if await email_confirmed(p) is False:
+        return False
+    p.registrant = {**(p.registrant or {}), "_confirm_dismissed": True}
+    await db.commit()
+    return True
+
+
 def as_dict(p: PurchasedDomain) -> dict:
     return {
         "id": p.id, "domain": p.domain_name, "status": p.status, "price": p.price_usd, "renewal_price": p.renewal_price_usd,

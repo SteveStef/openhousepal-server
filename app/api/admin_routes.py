@@ -25,6 +25,20 @@ async def list_domain_issues(
     return {"issues": await all_domain_issues(db)}
 
 
+@router.post("/domain-issues/dismiss")
+async def dismiss_domain_issue(
+    body: Dict[str, Any],
+    admin: UserModel = Depends(require_admin_user),
+):
+    """Hide one domain alert (e.g. a test account) - it stays hidden until a different problem shows."""
+    from app.services.website.domain_health_service import dismiss_domain_issue as _dismiss
+    key = str(body.get("key") or "").strip()
+    if not key or key.count("|") != 2:
+        raise HTTPException(status_code=400, detail="Missing alert")
+    await _dismiss(key)
+    return {"ok": True}
+
+
 @router.get("/users", response_model=List[UserSchema])
 async def list_users(
     db: AsyncSession = Depends(get_db),

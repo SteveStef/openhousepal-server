@@ -95,7 +95,8 @@ async def recent_failures(db: AsyncSession, days: int = 14, limit: int = 200, in
         select(ClientEmail).where(ClientEmail.status == "failed", ClientEmail.created_at >= since)
         .order_by(ClientEmail.created_at.desc()).limit(limit)
     )).scalars():
-        rows.append(_row(m.created_at, "email", f"Email to a client ({m.template})", m.owner_id, m.via or "send_failed", m.error))
+        rows.append(_row(m.created_at, "email", f"Email to a client ({m.template})", m.owner_id, m.via or "send_failed", m.error,
+                         ref=m.recipient_email))
 
     for s in (await db.execute(
         select(ScheduledEmail).where(func.upper(ScheduledEmail.status) == "FAILED", ScheduledEmail.created_at >= since)

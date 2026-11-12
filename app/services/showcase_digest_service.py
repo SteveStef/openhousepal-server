@@ -469,6 +469,11 @@ async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) ->
         h, m = briefing_hm(user)
         if (local.hour, local.minute) < (h, m) or not owner_has_access(user):
             continue
+        # Once a week (their Studio -> Email choice): only on Mondays - the week's news waits for it.
+        from app.services.email_settings_service import BRIEFING_WEEKDAY, briefing_weekly
+        if briefing_weekly(user) and local.weekday() != BRIEFING_WEEKDAY:
+            _BRIEFED.add((user.id, local_day))
+            continue
         _BRIEFED.add((user.id, local_day))
         claimed_day = (await db.execute(text(
             "INSERT INTO system_settings (key, value) VALUES (:k, to_jsonb(CAST(:d AS text))) "
@@ -527,6 +532,11 @@ async def send_agent_briefings(db: AsyncSession, now: datetime | None = None) ->
             continue  # only things they were already told about yesterday - no email
         v = {"recipient_name": user.first_name or "there", "today_date": today,
              "dashboard_link": absolute("/dash"), **brief}
+        # A small line above the header: how often + when, and where to change it (owner, 11/11).
+        from app.services.email_settings_service import briefing_label, briefing_weekly
+        v["top_line"] = f"Your digest: {'every Monday' if briefing_weekly(user) else 'every day'} at {briefing_label(user)}"
+        v["top_line_link_text"] = "Change how often or when"
+        v["top_line_link"] = absolute("/studio/email#digest")
         if sc:
             # Counted per HOME, not per Showcase ("4 new homes", not "132 new matches" for 4 houses x 33 clients).
             new_part = _plural(sc["new"], "new home", "new homes") if sc["new"] else ""

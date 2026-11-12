@@ -283,6 +283,7 @@ async def _email_settings_payload(db: AsyncSession, user: User) -> dict:
         "client": [{k: v for k, v in {**c, **s["client"][c["key"]]}.items() if k != "templates"} for c in client_rows],
         "invite_delay": s["invite_delay"], "invite_delays": list(es.INVITE_DELAYS),
         "briefing_time": s["briefing_time"], "briefing_times": list(es.BRIEFING_TIMES),
+        "briefing_frequency": s["briefing_frequency"],
         "mailbox": {"connected": connected, "account_email": conn.account_email if conn else None,
                     "provider": conn.provider if conn else None, "status": conn.status if conn else None},
         "receive": [t for t in receive if t["categories"]],

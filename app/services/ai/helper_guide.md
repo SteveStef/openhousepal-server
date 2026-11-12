@@ -197,6 +197,8 @@ You can also upgrade from any locked menu item. It opens an **Unlock More** page
 
 You keep full access until the end of the period you already paid for. Billing then shows **Subscription Ending Soon** and the number of days left. After access ends, your data may be permanently deleted unless you renew.
 
+Signed up through an offer? The confirmation warns first that you'll lose your offer price. Change your mind before **Access Ends** and **Resubscribe** on the same plan: you keep the offer price (if the discount was only for some months, you get the discounted months you had left). Once access ends, coming back is the regular price.
+
 ### Payment failed or plan ended
 
 - **Payment Failed**:
@@ -406,7 +408,7 @@ The same Settings tab also shows:
   - **Stop renewing** - it keeps working until the end date; reminders come 30 and 7 days before; then it ends.
   - **Renew with card** - shows when renewing is off (you tapped Stop renewing, or "The yearly payment didn't go through"). Opens the card window; the charge comes about 2 weeks before the end date, then yearly, and the old stopped/failed payment is cancelled so you never pay twice.
   - When a bought domain ends, your website and every new link and QR code go back to your free OpenHousePal address automatically. Contact support to try to get the name back.
-  - Name.com emails the owner once to confirm the email address - click it within 15 days or the domain pauses (**Resend confirm email** on the card).
+  - Name.com emails the owner once to confirm the email address - click it within 15 days or the domain pauses (**Resend confirm email** on the card). The email is titled "Verify Your Contact Information" and goes to the email typed when buying - tap **Verify Email Address Now** in it. Until it's confirmed, a reminder with the days left stays on the Dash and the Domain tab, with **I did it - check again** and **Send the email again**.
 - Once your own domain is connected and live, the **Use my own domain for my links** switch turns on. New sign-in QR codes, Guest Passes, Showcases, forms and copied links then use your domain.
 - Links you already handed out keep working.
 
@@ -458,7 +460,10 @@ The bell in the app always shows everything. This tab only controls which notifi
 
 1. Go to **Tools → Email** → "What lands in your inbox".
 2. Turn on **Daily briefing**.
-3. Pick a time from **Arrives at**. Times run from 6:00 AM to 9:00 PM.
+3. Pick **How often**: **Every day** or **Once a week (Mondays)**.
+4. Pick a time from **Arrives at**. Times run from 6:00 AM to 9:00 PM.
+
+The top of every daily briefing email says how often and when it comes, with a **Change how often or when** link that opens this setting.
 
 **Tools → Email** is also where you:
 
@@ -1227,9 +1232,15 @@ When connected: **Sync now** pushes everything again; **Disconnect** removes the
 3. **Emails to you - What lands in your inbox**: on/off for New leads & sign-ins, Client requests in Showcases, Open house host requests, **Daily briefing**, Liked homes, Showcase activity, New reviews, Spotlight weekly report (Mondays), Team & broadcasts, My listing updates, AI media ready. Your in-app bell always shows everything.
 
 ### Change your daily briefing time
-In **Emails to you**, make sure **Daily briefing** is on, then use **Arrives at** to pick a time (every 15 minutes from 6:00 AM to 9:00 PM, **Eastern time**). It saves instantly (you'll see "Saved"). The default is 4:30 PM.
+In **Emails to you**, make sure **Daily briefing** is on, then pick **How often** (**Every day** or **Once a week (Mondays)**) and use **Arrives at** to pick a time (every 15 minutes from 6:00 AM to 9:00 PM, **Eastern time**). It saves instantly (you'll see "Saved"). The default is 4:30 PM.
 
 Some emails can't be turned off: sign-in codes and password resets, billing and plan notices, and support replies.
+
+### If you stop opening our emails
+- After **4** of our emails in a row go unopened, routine ones (your daily briefing, round-ups) come as **one weekly summary** instead. Your Dash says **"Your daily digest emails went to weekly"** with **That's fine** (keep weekly) or **Make daily again**.
+- If **3** weekly summaries then go unopened, routine emails **pause**. The Dash says **"Your digest emails are paused"** with **Turn back on**. Closed, a small "Your digest emails are paused · Turn back on" line stays at the top of the Dash.
+- New leads, tour and showing requests, RSVPs and account or billing emails **always** arrive right away.
+- Opening any of our emails puts everything back to normal. Not seeing them? Check your junk or spam folder and move ours to your inbox (**Send me a test email** on the Dash helps find it).
 
 ---
 

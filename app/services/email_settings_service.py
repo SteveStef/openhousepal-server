@@ -50,6 +50,9 @@ VIA = ("mine", "openhousepal")
 INVITE_DELAYS = (0, 15, 30, 60)          # minutes; 60 = the default
 DEFAULT_INVITE_DELAY = 60
 DEFAULT_BRIEFING = "16:30"               # Eastern
+# The agent's own daily digest: every day, or once a week (Mondays) - owner, 11/11.
+BRIEFING_FREQUENCIES = ("daily", "weekly")
+BRIEFING_WEEKDAY = 0                     # Monday
 # Every quarter hour from 6 AM to 9 PM - the briefing job runs every few minutes.
 BRIEFING_TIMES = tuple(f"{h:02d}:{m:02d}" for h in range(6, 21) for m in (0, 15, 30, 45)) + ("21:00",)
 
@@ -70,6 +73,7 @@ def defaults() -> dict:
         "client": {c["key"]: {"on": True, "via": "mine", **({"mode": "daily"} if c.get("modes") else {})} for c in CLIENT_EMAILS},
         "invite_delay": DEFAULT_INVITE_DELAY,
         "briefing_time": DEFAULT_BRIEFING,
+        "briefing_frequency": "daily",
     }
 
 
@@ -91,6 +95,8 @@ def resolve(stored: Optional[dict]) -> dict:
         out["invite_delay"] = stored["invite_delay"]
     if stored.get("briefing_time") in BRIEFING_TIMES:
         out["briefing_time"] = stored["briefing_time"]
+    if stored.get("briefing_frequency") in BRIEFING_FREQUENCIES:
+        out["briefing_frequency"] = stored["briefing_frequency"]
     return out
 
 
@@ -111,6 +117,8 @@ def sanitize(incoming: dict, current: Optional[dict]) -> dict:
         merged["invite_delay"] = patch["invite_delay"]
     if patch.get("briefing_time") in BRIEFING_TIMES:
         merged["briefing_time"] = patch["briefing_time"]
+    if patch.get("briefing_frequency") in BRIEFING_FREQUENCIES:
+        merged["briefing_frequency"] = patch["briefing_frequency"]
     return merged
 
 
@@ -131,6 +139,10 @@ def briefing_hm(user) -> tuple[int, int]:
     t = resolve(getattr(user, "email_settings", None) if user is not None else None)["briefing_time"]
     h, m = t.split(":")
     return int(h), int(m)
+
+
+def briefing_weekly(user) -> bool:
+    return resolve(getattr(user, "email_settings", None) if user is not None else None)["briefing_frequency"] == "weekly"
 
 
 def briefing_label(user) -> str:

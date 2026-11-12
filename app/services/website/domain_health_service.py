@@ -182,6 +182,18 @@ async def _no_forward_hosts(rows) -> set:
     return out
 
 
+DISMISSED_KEY = "admin_domain_issues_dismissed"  # app_cache: ["agent|host|code", ...] the admin hid
+
+
+async def dismiss_domain_issue(key: str) -> None:
+    """Admin hides one alert. A different problem on the same domain (another code) shows again."""
+    from app.services import app_cache
+    keys = list(await app_cache.load(DISMISSED_KEY) or [])
+    if key not in keys:
+        keys = (keys + [key[:300]])[-500:]
+        await app_cache.save(DISMISSED_KEY, keys)
+
+
 async def all_domain_issues(db: AsyncSession) -> list[dict]:
     """Every agent with a domain problem right now (admin) - newest first."""
     from app.models.database import Site, User
@@ -190,9 +202,18 @@ async def all_domain_issues(db: AsyncSession) -> list[dict]:
     by_owner: dict[str, tuple] = {}
     for d, u, s in rows:
         by_owner.setdefault(u.id, (u, s, []))[2].append(d)
+    from app.services import app_cache
+    from app.utils.auth import owner_has_access
+    hidden = set(await app_cache.load(DISMISSED_KEY) or [])
     out = []
     for u, s, ds in by_owner.values():
+        # A cancelled or ended plan: the site is going away anyway - nothing to chase.
+        if u.subscription_status == "CANCELLED" or not owner_has_access(u):
+            continue
         for i in issues_for(ds, u.plan_tier, s.is_enabled, s.status, await _no_forward_hosts(ds)):
-            out.append({**i, "agent_id": u.id, "agent_name": f"{u.first_name or ''} {u.last_name or ''}".strip() or u.email,
+            key = f"{u.id}|{i.get('hostname')}|{i.get('code')}"
+            if key in hidden:
+                continue
+            out.append({**i, "key": key, "agent_id": u.id, "agent_name": f"{u.first_name or ''} {u.last_name or ''}".strip() or u.email,
                         "agent_email": u.email, "brokerage": u.brokerage})
     return sorted(out, key=lambda x: x["since"], reverse=True)

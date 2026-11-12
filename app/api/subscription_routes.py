@@ -574,6 +574,11 @@ async def complete_new_subscription(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid plan ID from PayPal"
             )
+        # An offer price only for the person who holds that offer.
+        from app.models.database import OfferPlan as _OfferPlan
+        _offer_of_plan = (await db.execute(select(_OfferPlan.offer_id).where(_OfferPlan.paypal_plan_id == paypal_plan_id).limit(1))).scalar()
+        if _offer_of_plan is not None and _offer_of_plan != current_user.offer_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That offer price isn't on your account.")
 
         # A live plan may only be replaced by a plan change (another tier) - never a second copy of
         # the same plan.
@@ -748,8 +753,17 @@ async def create_new_subscription(
         # cancellation is not covered by grandfathering (that only protects staying on your
         # existing tier without ever lapsing).
         plan_id = CURRENT_NO_TRIAL_PLAN_ID_BY_TIER.get(plan_tier)
+        # On a sign-up offer and back before their paid time ran out: same plan, offer price, for the
+        # discount they had left (owner, 11/11). After it runs out - normal prices.
+        from app.services import offer_service
+        try:
+            comeback = await offer_service.comeback_offer(db, current_user, plan_tier)
+        except offer_service.OfferError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+        if comeback is not None:
+            plan_id = comeback.paypal_plan_id
         # Coming back on IDX without ever having paid the setup fee: it applies, unless a code waives it.
-        if _owes_idx_setup_fee(current_user, plan_tier):
+        elif _owes_idx_setup_fee(current_user, plan_tier):
             plan_id = (await _apply_idx_waiver(db, current_user.id, request.code)) if request.code else IDX_SETUP_FEE_PLAN_ID
 
         if not plan_id:
@@ -759,8 +773,12 @@ async def create_new_subscription(
             )
 
         if request.buttons:
-            return {"success": True, "plan_id": plan_id, "plan_tier": plan_tier,
-                    "message": f"Add your card to restart {display_name_for_tier(plan_tier)}"}
+            out = {"success": True, "plan_id": plan_id, "plan_tier": plan_tier,
+                   "message": f"Add your card to restart {display_name_for_tier(plan_tier)}"}
+            if comeback is not None:
+                out["offer_price"] = comeback.offer_price
+                out["full_price"] = comeback.base_price
+            return out
 
         # Build return URLs
         return_url = f"{CLIENT_URL}/settings/subscription?resubscribed=true"

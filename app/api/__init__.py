@@ -33,6 +33,7 @@ from .admin_insights_routes import router as admin_insights_router
 from .admin_groups_routes import router as admin_groups_router
 from .admin_promo_routes import router as admin_promo_router
 from .payment_request_routes import admin_router as payment_request_admin_router, public_router as payment_request_public_router
+from .admin_email_tools_routes import router as admin_email_tools_router
 from .offer_routes import admin_router as offer_admin_router, public_router as offer_public_router
 from .admin_area_routes import router as admin_area_router
 from .site_routes import router as site_router
@@ -91,6 +92,7 @@ router.include_router(admin_insights_router)
 router.include_router(admin_groups_router)
 router.include_router(admin_promo_router)
 router.include_router(payment_request_admin_router)
+router.include_router(admin_email_tools_router)
 router.include_router(payment_request_public_router)
 router.include_router(offer_admin_router)
 router.include_router(offer_public_router)

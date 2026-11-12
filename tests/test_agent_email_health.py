@@ -1,4 +1,4 @@
-"""Agent email health (agent_email_health_service): the unopened counter, the 5 / 5 thresholds, the
+"""Agent email health (agent_email_health_service): the unopened counter, the 4 -> weekly / 3 summaries -> paused thresholds, the
 critical-email allowlist and the tracking links. Pure - no database, never sends an email."""
 import asyncio
 import os
@@ -26,13 +26,13 @@ def mails(n, *, start_days_ago=20, step_hours=24, template="showcase_daily_diges
     return out
 
 
-def test_four_unopened_is_still_normal():
-    assert h.decide(mails(4), proven=P, now=NOW)["mode"] == "normal"
+def test_three_unopened_is_still_normal():
+    assert h.decide(mails(3), proven=P, now=NOW)["mode"] == "normal"
 
 
-def test_five_unopened_in_a_row_warns():
-    d = h.decide(mails(5), proven=P, now=NOW)
-    assert d["mode"] == "warned" and d["unopened"] == 5
+def test_four_unopened_in_a_row_goes_weekly():
+    d = h.decide(mails(4), proven=P, now=NOW)
+    assert d["mode"] == "weekly" and d["unopened"] == 4
 
 
 def test_any_open_restarts_the_count():
@@ -42,7 +42,7 @@ def test_any_open_restarts_the_count():
 
 
 def test_grace_period_newest_email_not_counted_yet():
-    ms = mails(5, start_days_ago=4)  # the 5th was sent "now" - inside the 24h grace
+    ms = mails(4, start_days_ago=3)  # the 4th was sent "now" - inside the 24h grace
     assert h.decide(ms, proven=P, now=NOW)["mode"] == "normal"
 
 
@@ -50,21 +50,40 @@ def test_untracked_and_unproven_templates_never_count():
     assert h.decide(mails(8, tracked=False), proven=P, now=NOW)["mode"] == "normal"
     assert h.decide(mails(8, template="spotlight_weekly_report"), proven=P, now=NOW)["mode"] == "normal"
     # proven=None (tests / admin preview) counts everything tracked
-    assert h.decide(mails(8, template="spotlight_weekly_report"), proven=None, now=NOW)["mode"] == "warned"
+    assert h.decide(mails(8, template="spotlight_weekly_report"), proven=None, now=NOW)["mode"] == "weekly"
 
 
-def test_weekly_needs_five_more_after_the_warning():
-    ms = mails(14, start_days_ago=20)
-    warned_at = ms[4]["sent_at"] + timedelta(minutes=5)
-    # 9 unopened after the warning but only on the stored "warned" state: -> weekly
-    assert h.decide(ms, mode="warned", warned_at=warned_at, proven=P, now=NOW)["mode"] == "weekly"
-    # only 4 after the warning -> still warned
-    assert h.decide(ms[:9], mode="warned", warned_at=warned_at, proven=P, now=NOW)["mode"] == "warned"
+def summaries(n, after):
+    return [{"sent_at": after + timedelta(days=7 * (i + 1)), "opened_at": None, "clicked_at": None,
+             "template": h.SUMMARY_TEMPLATE, "tracked": True} for i in range(n)]
 
 
-def test_first_evaluation_with_a_long_backlog_only_warns():
-    # an agent with 12 old unopened emails the day this ships gets the warning first, never straight to weekly
-    assert h.decide(mails(12), proven=P, now=NOW)["mode"] == "warned"
+def test_three_unopened_weekly_summaries_pause_them():
+    weekly_at = NOW - timedelta(days=30)
+    PS = P | {h.SUMMARY_TEMPLATE}
+    ms = mails(4, start_days_ago=34) + summaries(3, weekly_at)
+    assert h.decide(ms, mode="weekly", weekly_at=weekly_at, proven=PS, now=NOW)["mode"] == "off"
+    # only 2 summaries so far -> still weekly
+    ms2 = mails(4, start_days_ago=34) + summaries(2, weekly_at)
+    assert h.decide(ms2, mode="weekly", weekly_at=weekly_at, proven=PS, now=NOW)["mode"] == "weekly"
+    # the summary's open pixel never seen working yet -> never paused on it
+    assert h.decide(ms, mode="weekly", weekly_at=weekly_at, proven=P, now=NOW)["mode"] == "weekly"
+
+
+def test_paused_stays_paused_until_an_open():
+    weekly_at = NOW - timedelta(days=30)
+    ms = mails(4, start_days_ago=34)
+    assert h.decide(ms, mode="off", weekly_at=weekly_at, proven=P, now=NOW)["mode"] == "off"
+    ms[3]["opened_at"] = NOW - timedelta(hours=2)
+    assert h.decide(ms, mode="off", weekly_at=weekly_at, proven=P, now=NOW)["mode"] == "normal"
+    # "Turn back on" = reset_at
+    assert h.decide(mails(4, start_days_ago=34), mode="off", weekly_at=weekly_at, reset_at=NOW - timedelta(hours=1),
+                    proven=P, now=NOW)["mode"] == "normal"
+
+
+def test_old_warned_state_reads_as_normal_rules():
+    assert h.decide(mails(3), mode="warned", proven=P, now=NOW)["mode"] == "normal"
+    assert h.decide(mails(4), mode="warned", proven=P, now=NOW)["mode"] == "weekly"
 
 
 def test_open_after_warning_or_weekly_goes_back_to_normal():
