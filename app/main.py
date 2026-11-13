@@ -299,6 +299,12 @@ async def lifespan(app: FastAPI):
         name="Claude AI health check",
         replace_existing=True,
     )
+    # Bare-domain redirect server (WEBSITE_APEX_IP) still answering? Bell + email to the admin if not
+    # (owner 11/13 - it was switched off on 11/12 and nobody knew). apex_redirect_monitor.py.
+    from app.services.apex_redirect_monitor import scheduled_apex_redirect_check
+    scheduler.add_job(scheduled_apex_redirect_check, _Interval(minutes=3, start_date=_dt.now() + _td(seconds=60)),
+                      id="apex_redirect_check", name="Bare-domain redirect server up?", replace_existing=True,
+                      max_instances=1, coalesce=True)
     # Town pages: recompute every published site's market numbers right after start (the saved copy
     # above serves visitors meanwhile) - public_site_routes.warm_area_caches.
     from apscheduler.triggers.date import DateTrigger as _Once
