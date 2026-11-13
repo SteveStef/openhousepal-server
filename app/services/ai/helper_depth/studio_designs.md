@@ -54,7 +54,7 @@ Bar at the top shows each step; tap a finished step to go back. On a computer, E
 7. **Photo crop - "Frame your photo"**: drag and zoom, use **Quick framing**, or **Show the whole photo** ("Nothing cut off - the edges fill with a soft blur of it."). Your photo file is never cut.
 8. **Leads - "Track the leads this brings in"** (see below).
 9. **Finish - "Name it & create"**: **Design name**, a summary with **Change** links for every step, and **Your headshot** on/off ("On the design, beside your name" / "Off - just your name and contact"). Click **Create design**.
-After creating: "Happy with this design?" - download right away (print: PDF "Exact size, 300 DPI - send to your printer" or PNG; social: **Save image** full resolution), **Open the editor**, or **Edit this design**. Social posts get "Your link" to paste in your caption, bio or Story.
+After creating: "Happy with this design?" - download right away (print: PDF "Exact size, 300 DPI - send to your printer" or PNG; social: **Save image** full resolution), **Open the editor**, or **Edit this design**. Social posts get "Your link" to paste in your caption, bio or Story. If you skipped the property, it first says **Add the address and photo first** (the design still shows sample words and an empty photo frame) - tap it to open the editor, or download it as it is.
 
 ## "A few details first" (the profile gate)
 Real-estate ads must show who they're from, so Studio won't create or download a design until your profile has: **Your name**, **Your brokerage**, **Your headshot** (JPG), **Your mobile number** (10 digits), and for print pieces **Your brokerage's phone** (printed under your number). Fill them right there and tap **Save and continue**, or **Or edit everything in Settings**.

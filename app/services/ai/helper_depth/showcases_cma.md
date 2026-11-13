@@ -57,7 +57,7 @@ Showcases and CMA in depth: every Showcase search option, match score, compare h
 ## Client emails and digests
 - Showcase invite after your open house: 1 hour after sign-in by default (Right away, 15, 30 minutes or 1 hour in Tools → Email).
 - Did a client get their invite? The lead's page (Their Showcase card) says **Invite emailed** + date, or **Invite never sent** / **Invite not sent - held back by your email settings** / **Invite didn't go through**, with **Send invite** or **Send invite again**. When it was opened is in that lead's **Emails** card.
-- **New homes & price drops**: at most one email a day at 4:30 PM Eastern, only on days something changed. Or **Once a week** for everyone (Tools → Email → How often: Up to daily / Once a week). Each person can also be slowed automatically.
+- **New homes & price drops**: at most one email a day at 4:30 PM Eastern, only on days something changed. Or **Once a week** for everyone (Tools → Email → How often: Up to daily / Once a week). Each person can also be slowed automatically. The weekly email says why it's weekly ("Once a week, as you picked" with a **Change how often** link, "Once a week, with everything new in one email", or "We now send these once a week").
 - Every row in Tools → Email can be switched off and sent **From your email** (connected Gmail) or **OpenHousePal**.
 - Automatic slowing: unopened on 3 different days → weekly; 3 ignored weekly emails → automatic emails stop. Opening one or using the Showcase turns daily back on.
 
@@ -68,10 +68,10 @@ Showcases and CMA in depth: every Showcase search option, match score, compare h
 - **Turn Off** = "Put to sleep: no new matches, no emails" by hand.
 
 ## Tours, comments and likes
-- **Tours**: **Confirm** → pick the time → **Yes, Confirm Tour**. Only confirm once it's booked in ShowingTime and the listing agent accepted - the client gets a confirmation email and it's added to your connected calendar. **Unconfirm** reverses. **Mark Done** clears a request without telling the client; **Reopen** undoes.
+- **Tours**: each request shows the day and time the client picked. **Confirm** → pick the time → **Yes, Confirm Tour**. Only confirm once it's booked in ShowingTime and the listing agent accepted - the client gets a confirmation email and it's added to your connected calendar. **Unconfirm** reverses. **Mark Done** clears a request without telling the client; **Reopen** undoes.
 - **Comments**: clients comment on homes; you get an alert follow-up. **Reply to Comment** - your reply is emailed to the client.
 - **Likes** (the client's favorites): show in the Liked tab; you get one "Liked homes" email per hour of activity and a next-morning follow-up naming the homes.
-- What the client sees: Matches / Liked / Disliked / Sold/Removed, a heart, pass, comments, tour requests, **Change your search**, an **Emails** switch, and "Your Upcoming Tours". When you open their link: "Your clicks here don't count as theirs."
+- What the client sees: a **Your agent** card at the top (your photo or initials, name, brokerage, **Call** / **Text** / **Email**), Matches / Liked / Disliked / Sold/Removed, a heart, pass, comments, tour requests (that home's button says **Requested** until you confirm), **Change your search**, an **Emails** switch, and "Your Upcoming Tours". When you open their link: "Your clicks here don't count as theirs."
 
 ## The Showcase card in the chat
 - Whenever the chat reads a client's Showcase, its homes show as a card under the reply instead of a text list: each home's photo, street, price, beds/baths, Sold / Under Contract, what the client did (Loved, Passed, Commented, Tour ask, Sent) and, after a search, a short piece of the listing's words with the key part highlighted. **Recommend** (star), **Send** (paper plane) and **Remove** (trash can, asks first) are round buttons in each home's top right corner; a long street name ends in "...". Matches the chat thinks aren't real (a pool table, a community pool) sit last in Matches, greyed, marked "Maybe not" with why.

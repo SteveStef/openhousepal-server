@@ -22,6 +22,12 @@ from app.services.website.site_service import resolve_owner_public_base_url
 from app.config.logging import get_logger
 from app.services.agent_email_service import agent_public_phone
 
+
+def _nice_street(street, city=None):
+    """Bell notes read "Liked 317 Greene Rd", not the MLS capitals (audit 11/13)."""
+    from app.services.agent_roundup_service import nice_street
+    return nice_street(street, city) or (street or "")
+
 logger = get_logger(__name__)
 
 
@@ -163,7 +169,7 @@ class PropertyInteractionsService:
                             reference_type="INTERACTION",
                             reference_id=interaction.id,
                             title=title,
-                            message=f"{interaction_type.capitalize()} {property_obj.street_address}",
+                            message=f"{interaction_type.capitalize()} {_nice_street(property_obj.street_address, property_obj.city)}",
                             collection_id=collection_id,
                             collection_name=collection.name,
                             property_id=property_id,
@@ -423,8 +429,8 @@ class PropertyInteractionsService:
                         type="PROPERTY_COMMENT",
                         reference_type="COMMENT",
                         reference_id=comment.id,
-                        title=f"New Comment: {comment.visitor_name or 'Anonymous'}",
-                        message=f"Commented on {property_obj.street_address}: \"{comment_preview}\"",
+                        title=f"New Comment: {collection.visitor_name or comment.visitor_name or 'Your client'}",
+                        message=f"Commented on {_nice_street(property_obj.street_address, property_obj.city)}: \"{comment_preview}\"",
                         collection_id=collection.id,
                         collection_name=collection.name,
                         property_id=property_obj.id,

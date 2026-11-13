@@ -288,10 +288,17 @@ def hosting_window(home_status: Optional[str], raw_mls_data: Optional[dict]) -> 
     return None, None
 
 
+# Sold, expired, withdrawn or cancelled listings (launch audit 11/13: a host request for a sold home
+# used to go through when sent straight to the server).
+GONE_STATUS_WORDS = ("CLOSED", "SOLD", "EXPIRED", "WITHDRAWN", "CANCEL")
+
+
 def hosting_date_problem(home_status: Optional[str], raw_mls_data: Optional[dict], day: Optional[date]) -> Optional[str]:
     """A plain-English reason this listing can't have an open house on `day` (None = fine)."""
     if day and day < datetime.now(EASTERN_TZ).date():
         return "That day has already passed - pick an upcoming day."
+    if home_status and any(w in home_status.upper() for w in GONE_STATUS_WORDS):
+        return "This home is no longer for sale, so it can't have an open house."
     blocked, hosts_from = hosting_window(home_status, raw_mls_data)
     if blocked == "pending":
         return "This home is under contract, so it can't have an open house."
@@ -302,6 +309,26 @@ def hosting_date_problem(home_status: Optional[str], raw_mls_data: Optional[dict
     if hosts_from and day and day < hosts_from:
         return f"This home is Coming Soon - open houses can start {hosts_from:%a, %b} {hosts_from.day}, when it goes active."
     return None
+
+
+def _time_problem(start, end) -> Optional[str]:
+    """An open house has to end after it starts (checked on every ask, suggestion and team ask)."""
+    if start and end and end <= start:
+        return "The end time has to be after the start time."
+    return None
+
+
+async def _lock_listing_day(db: AsyncSession, listing_key: str, day: Optional[date]) -> None:
+    """Two yeses for one home's day landing at the same moment (two taps, two tabs) wait in line:
+    the second then sees the day is booked and gets the plain "already has a host" answer instead of
+    a database error (launch audit 11/13). Held until this request's save; no-op off Postgres."""
+    if not day:
+        return
+    try:
+        from sqlalchemy import text
+        await db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": f"host-day:{listing_key}:{day}"})
+    except Exception:
+        pass
 
 
 async def _ensure_hostable(db: AsyncSession, listing_key: str, day: Optional[date]) -> None:
@@ -1100,19 +1127,23 @@ async def get_action_counts(db: AsyncSession, current_user: User) -> ActionCount
     # the badge (and Dash's "2 to respond to") lit with nothing there to respond to.
     incoming_unseen = incoming_broadcast_unseen_result.scalar() or 0
     incoming_waiting = 0
-    if incoming_unseen:
-        try:
-            still_open = len(await list_incoming_broadcasts(db, current_user)) + len(await list_incoming_team_invites(db, current_user))
-            incoming_waiting = min(incoming_unseen, still_open)
-        except Exception:  # noqa: BLE001 - a badge is never worth breaking the counts
-            logger.warning("incoming broadcast recount failed", exc_info=True)
-            incoming_waiting = incoming_unseen
+    # Every ask still waiting on this agent's answer, seen or not - Dash keeps saying "a listing
+    # agent asked you to host" until they answer (launch audit 11/13: opening the alert used to
+    # make an unanswered ask vanish from Dash).
+    still_open = 0
+    try:
+        still_open = len(await list_incoming_broadcasts(db, current_user)) + len(await list_incoming_team_invites(db, current_user))
+        incoming_waiting = min(incoming_unseen, still_open)
+    except Exception:  # noqa: BLE001 - a badge is never worth breaking the counts
+        logger.warning("incoming broadcast recount failed", exc_info=True)
+        incoming_waiting = incoming_unseen
     return ActionCountsResponse(
         pending_as_listing_agent=pending_result.scalar() or 0,
         countered_as_host=countered_result.scalar() or 0,
         listing_agent_unseen_updates=listing_agent_unseen_result.scalar() or 0,
         host_unseen_updates=host_unseen_result.scalar() or 0,
         pending_incoming_broadcasts=incoming_waiting,
+        open_incoming_asks=still_open,
     )
 
 
@@ -1278,8 +1309,11 @@ async def create_host_request(db: AsyncSession, current_user: User, payload: Cre
     prop = prop_result.scalar_one_or_none()
     if not prop:
         raise ValueError("This listing could not be found.")
-    if problem := hosting_date_problem(prop.home_status, prop.raw_mls_data, payload.requested_date):
+    if problem := (hosting_date_problem(prop.home_status, prop.raw_mls_data, payload.requested_date)
+                   or _time_problem(payload.requested_start_time, payload.requested_end_time)):
         raise ValueError(problem)
+    if _owns_listing(current_user, prop):
+        raise ValueError("This is your own listing - you can schedule its open houses yourself.")
     # Before the on-platform check: a day that's already covered (an approved host, or an open house
     # posted in Bright) is taken whoever the listing agent is.
     if await _date_already_booked(db, payload.listing_key, payload.requested_date):
@@ -1300,6 +1334,24 @@ async def create_host_request(db: AsyncSession, current_user: User, payload: Cre
 
     if await _agent_already_hosting_that_day(db, current_user.id, payload.requested_date):
         raise ValueError(f"You're already confirmed to host another open house on {_format_date(payload.requested_date)}. One open per day.")
+
+    # The same ask sent twice (a double tap, or sent again later) is the SAME request - no second
+    # card, alert or email for the listing agent (launch audit 11/13). The lock makes two taps that
+    # land at the same moment wait for each other, so the second one finds the first.
+    try:
+        from sqlalchemy import text
+        await db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+                         {"k": f"host-ask:{current_user.id}:{payload.listing_key}:{payload.requested_date}"})
+    except Exception:
+        pass
+    same = (await db.execute(select(OpenHouseHostRequest).where(
+        OpenHouseHostRequest.listing_key == payload.listing_key, OpenHouseHostRequest.requesting_agent_id == current_user.id,
+        OpenHouseHostRequest.requested_date == payload.requested_date, OpenHouseHostRequest.requested_start_time == payload.requested_start_time,
+        OpenHouseHostRequest.requested_end_time == payload.requested_end_time,
+        OpenHouseHostRequest.status.in_(("pending", "countered"))).limit(1))).scalar_one_or_none()
+    if same is not None:
+        hydrated = await _hydrate_host_request(db, same, {prop.listing_key: prop}, {current_user.id: current_user})
+        return CreateHostRequestResult(on_platform=True, request=hydrated)
 
     request_id = str(uuid.uuid4())
     request = OpenHouseHostRequest(
@@ -1471,6 +1523,8 @@ async def create_host_requests_batch(db: AsyncSession, current_user: User, paylo
     listing_owner = next(iter(owners.values()))
     if listing_owner is None:
         return CreateHostRequestBatchResult(on_platform=False)
+    if listing_owner.id == current_user.id:
+        raise ValueError("These are your own listings - you can schedule their open houses yourself.")
     if not await _is_eligible_requester(db, listing_owner, current_user):
         raise ValueError("This agent isn't accepting host requests for these listings.")
 
@@ -1675,6 +1729,7 @@ async def approve_host_request(db: AsyncSession, current_user: User, request_id:
     request = result.scalar_one_or_none()
     if not request or request.listing_owner_agent_id != current_user.id:
         raise ValueError("Host request not found.")
+    await _lock_listing_day(db, request.listing_key, request.requested_date)
     await _ensure_hostable(db, request.listing_key, request.requested_date)
 
     if await _date_already_booked(db, request.listing_key, request.requested_date, exclude_request_id=request_id):
@@ -1871,9 +1926,13 @@ async def cancel_approved_open(db: AsyncSession, current_user: User, listing_key
     requester_result = await db.execute(select(User).where(User.id == request.requesting_agent_id))
     requester = requester_result.scalar_one_or_none()
     if requester:
-        _send_email_safely(
-            requester, "An open house you were hosting was cancelled", "host_request_declined",
-            {"agent_name": requester.first_name, "property_address": prop.street_address if prop else "the listing"}, notification_type="HOST_REQUEST_DECLINED")
+        # Says WHICH open (day + time): a host with two opens at one home couldn't tell (launch audit 11/13).
+        street = prop.street_address if prop else "the listing"
+        when = _format_slot(request.requested_date, request.requested_start_time, request.requested_end_time)
+        _send_update_email(requester, f"Your {_format_date(request.requested_date)} open house at {street} was cancelled",
+                           "Open house cancelled", "Cancelled", street, "the listing agent cancelled the open house you were set to host at",
+                           f" on {when}. Nothing else is needed from you - other homes near you may still need a host.",
+                           "Find another home", "/discovery", "HOST_REQUEST_DECLINED")
 
     await db.commit()
 
@@ -1935,6 +1994,8 @@ async def counter_host_request(db: AsyncSession, current_user: User, request_id:
         raise ValueError("Host request not found.")
     if (await _suggestions_used(db, request))[0]:
         raise ValueError("You already suggested another time once - approve or decline this one.")
+    if problem := _time_problem(payload.counter_start_time, payload.counter_end_time):
+        raise ValueError(problem)
     await _ensure_hostable(db, request.listing_key, payload.counter_date)
 
     claimed = await _atomic_status_update(
@@ -1997,6 +2058,8 @@ async def counter_back_host_request(db: AsyncSession, current_user: User, reques
         raise ValueError("Host request not found.")
     if (await _suggestions_used(db, request))[1]:
         raise ValueError("You already suggested another time once - accept or decline this one.")
+    if problem := _time_problem(payload.proposed_start_time, payload.proposed_end_time):
+        raise ValueError(problem)
     await _ensure_hostable(db, request.listing_key, payload.proposed_date)
 
     claimed = await _atomic_status_update(
@@ -2058,6 +2121,7 @@ async def respond_to_counter(db: AsyncSession, current_user: User, request_id: s
 
     if accept:
         new_date, new_start, new_end = (request.counter_date, request.counter_start_time, request.counter_end_time)
+        await _lock_listing_day(db, request.listing_key, new_date)
         if await _date_already_booked(db, request.listing_key, new_date, exclude_request_id=request_id):
             raise ValueError("Someone else was already confirmed for that date while you were negotiating. Ask the listing agent to propose a different time.")
         if await _agent_already_hosting_that_day(db, request.requesting_agent_id, new_date, exclude_request_id=request_id):
@@ -2096,7 +2160,7 @@ async def respond_to_counter(db: AsyncSession, current_user: User, request_id: s
         )
     else:
         notif_title = "Proposed time declined"
-        notif_message = f"{_agent_name(current_user)} declined the proposed time for {prop.street_address if prop else 'this listing'}"
+        notif_message = f"{_agent_name(current_user)} declined the proposed time for {prop.street_address if prop else 'this listing'} on {_format_date(request.counter_date or request.requested_date)}"
 
     try:
         db.add(Notification(
@@ -2121,7 +2185,7 @@ async def respond_to_counter(db: AsyncSession, current_user: User, request_id: s
         address = prop.street_address if prop else "your listing"
         _send_update_email(owner, f"{_agent_name(current_user)} can't do the time you suggested", "Suggested time turned down", "Not this time", address,
                            f"{_agent_name(current_user)} can’t make the time you suggested for",
-                           ", so that request is closed. The day is still open for another host.",
+                           f" on {_format_slot(request.counter_date, request.counter_start_time, request.counter_end_time) if request.counter_date else _format_date(request.requested_date)}, so that request is closed. The day is still open for another host.",
                            "Open your listings", f"/open-houses/my-listings?listingKey={request.listing_key}", "HOST_REQUEST_COUNTER_RESPONSE")
     if accept:
         # Their open house now has a confirmed host - same email as a claimed team broadcast.
@@ -2391,6 +2455,8 @@ async def create_broadcast(db: AsyncSession, current_user: User, payload: Create
 
     if not payload.is_anytime and (not payload.requested_start_time or not payload.requested_end_time):
         raise ValueError("Please choose a start and end time, or mark this as Anytime.")
+    if not payload.is_anytime and (problem := _time_problem(payload.requested_start_time, payload.requested_end_time)):
+        raise ValueError(problem)
 
     # Idempotency guard: a double-click / duplicate submit of the exact same ask (same listing,
     # date, time window, and recipient) while an identical one is still open would otherwise create
@@ -2647,6 +2713,8 @@ async def respond_to_broadcast(db: AsyncSession, current_user: User, broadcast_i
     is_direct_target = broadcast.target_agent_id == current_user.id
     if broadcast.target_agent_id and not is_direct_target:
         raise ValueError("This open house was offered to another agent.")
+    if problem := _time_problem(payload.proposed_start_time, payload.proposed_end_time):
+        raise ValueError(problem)
     await _ensure_hostable(db, broadcast.listing_key, payload.proposed_date or broadcast.requested_date)
     if not is_direct_target and not await _is_accepted_team_member(db, broadcast.owner_id, current_user.id):
         raise ValueError("You're not on this agent's Open House Team.")
@@ -2794,7 +2862,30 @@ async def cancel_broadcast(db: AsyncSession, current_user: User, broadcast_id: s
     broadcast = result.scalar_one_or_none()
     if not broadcast:
         raise ValueError("Broadcast not found.")
+    was_open = broadcast.status == "open"
     broadcast.status = "cancelled"
+    if was_open:
+        # Tell everyone who got the "needs a host" alert that it's no longer needed (owner, 11/13),
+        # and clear that old alert so it stops asking them.
+        sent = (await db.execute(select(Notification).where(
+            Notification.reference_id == broadcast.id,
+            Notification.type.in_(["TEAM_BROADCAST_RECEIVED", "DIRECT_HOST_REQUEST_RECEIVED"]),
+        ))).scalars().all()
+        prop = (await db.execute(select(Property).where(Property.listing_key == broadcast.listing_key))).scalar_one_or_none()
+        address = prop.street_address if prop else "that home"
+        day = _format_date(broadcast.requested_date)
+        told = set()
+        for n in sent:
+            n.is_read = True
+            if n.agent_id in told:
+                continue
+            told.add(n.agent_id)
+            db.add(Notification(
+                agent_id=n.agent_id, type="HOST_REQUEST_WITHDRAWN", reference_type="TEAM_BROADCAST", reference_id=broadcast.id,
+                title="Host no longer needed", message=f"{_agent_name(current_user)} no longer needs a host for {address} on {day}.",
+                property_id=prop.id if prop else None, property_address=address,
+                link="/discovery?myRequests=1", is_read=False,
+            ))
     await db.commit()
 
 

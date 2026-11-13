@@ -399,6 +399,9 @@ async def redeem_billed_by_us_code(
     from app.services.promo_code_service import claim, find_usable
     from app.utils.plan_ids import tier_allowed_for, NOT_IN_BRIGHT_MESSAGE, display_name_for_tier
 
+    # Lock this account's row first: two taps at once both passed the check below, so the code was
+    # used twice and two welcome emails went out (signup audit 11/13). The second now waits, then sees the plan.
+    await db.refresh(current_user, with_for_update=True)
     if current_user.subscription_id or (current_user.subscription_status not in (None, "PENDING_PAYMENT")):
         raise HTTPException(status_code=400, detail="You already have a plan on this account. Manage it in Settings > Billing.")
     promo, why = await find_usable(db, request.get("code") or "")
@@ -852,7 +855,7 @@ async def reset_password(
         if not reset_token:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid or expired reset token"
+                detail="This reset link isn't valid any more. Ask for a new one."
             )
 
         # Check if token has been used

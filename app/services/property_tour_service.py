@@ -17,6 +17,12 @@ from app.services import calendar_sync_service
 from app.config.logging import get_logger
 from app.services.agent_email_service import agent_public_phone
 
+
+def _tidy_street(street, city=None):
+    """Bell notes read "Liked 317 Greene Rd", not the MLS capitals (audit 11/13)."""
+    from app.services.agent_roundup_service import nice_street
+    return nice_street(street, city) or (street or "")
+
 logger = get_logger(__name__)
 
 
@@ -261,7 +267,7 @@ class PropertyTourService:
                     reference_type="TOUR",
                     reference_id=tour.id,
                     title=f"New Tour Request: {visitor_name}",
-                    message=f"Requested tour at {property_obj.street_address}{preferred_date_str}",
+                    message=f"Requested tour at {_tidy_street(property_obj.street_address, property_obj.city)}{preferred_date_str}",
                     collection_id=collection.id,
                     collection_name=collection.name,
                     property_id=property_id,

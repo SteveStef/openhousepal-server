@@ -155,7 +155,8 @@ class OpenHouseService:
             # Create collection (always ACTIVE, no limit)
             collection = Collection(
                 owner_id=visited_open_house.get('agent_id'),  # Use agent_id from the open house event
-                name=visited_open_house.get('address', 'Unknown Property'),
+                # "2074 Fox Creek Rd", not the MLS capitals - the name shows on the agent's lists (audit 11/13).
+                name=_nice_name(visited_open_house.get('address')) or 'Unknown Property',
                 description=f"Properties similar to {visited_open_house.get('address', 'the visited property')} based on {visitor.full_name}'s preferences",
                 visitor_email=visitor.email,
                 visitor_name=visitor.full_name,
@@ -668,3 +669,8 @@ async def showcase_is_tailored(db: AsyncSession, collection_id: Optional[str]) -
     row = (await db.execute(select(CollectionPreferences.address, CollectionPreferences.diameter)
                             .where(CollectionPreferences.collection_id == collection_id))).first()
     return bool(row) and (not (row[0] or "").strip() or not row[1])
+
+
+def _nice_name(address):
+    from app.services.agent_roundup_service import nice_street
+    return nice_street(address) if address else None

@@ -49,6 +49,7 @@ from app.services.property_service import PropertyService
 from app.services.website import search_features, search_query_parser
 from app.services.email_service import tidy_caps  # MLS ALL-CAPS -> "583 Lakeside Rd #205"
 from app.utils.listing_dom import property_days_on_market
+from app.utils.mls_mapper import card_photo, display_street, real_photos
 
 _HERO_PROPERTY_TYPE_FLAGS = {
     "single_family": "is_single_family",
@@ -118,12 +119,9 @@ async def apply_idx_rules(db: AsyncSession, cards: list[dict]) -> list[dict]:
 
 
 def _property_photo(p) -> Optional[str]:
-    if getattr(p, "img_src", None):
-        return p.img_src
+    # Never a PDF Bright filed as a "Photo" (11/13) - the first real photo instead.
     photos = getattr(p, "photos", None)
-    if isinstance(photos, list) and photos:
-        return photos[0]
-    return None
+    return card_photo(getattr(p, "img_src", None), photos if isinstance(photos, list) else None)
 
 
 def _feature_list(*jsonb_fields, limit: int = 12) -> list[str]:
@@ -135,6 +133,15 @@ def _feature_list(*jsonb_fields, limit: int = 12) -> list[str]:
         if isinstance(field, list):
             seen.extend(str(v) for v in field if v)
     return seen[:limit]
+
+
+def card_acres(value):
+    """A lot size worth showing on a card - condos and units often carry 0 (cards read "0.00 ac")."""
+    try:
+        acres = float(value)
+    except (TypeError, ValueError):
+        return None
+    return acres if acres >= 0.005 else None
 
 
 def _listing_card(p) -> dict:
@@ -150,7 +157,7 @@ def _listing_card(p) -> dict:
         "listing_key": p.listing_key,
         # Street only - full_address embeds city/state/zip inline ("637 Heather Ln, Bryn Mawr,
         # PA 19010"), which duplicated the city already shown in its own CityPill on every card.
-        "address": tidy_caps(p.street_address or p.full_address),
+        "address": tidy_caps(display_street(p.street_address, getattr(p, "unparsed_address", None)) or p.full_address),
         "city": tidy_caps(p.city),
         "state": p.state,
         "zipcode": p.zipcode,
@@ -158,7 +165,7 @@ def _listing_card(p) -> dict:
         "bedrooms": p.bedrooms,
         "bathrooms": p.bathrooms,
         "living_area": p.living_area,
-        "lot_size_acres": getattr(p, "lot_size_acres", None),
+        "lot_size_acres": card_acres(getattr(p, "lot_size_acres", None)),
         "status": p.home_status,
         "days_on_market": property_days_on_market(p),
         "year_built": getattr(p, "year_built", None),
@@ -400,7 +407,7 @@ async def get_published_spotlights(db: AsyncSession, user: User, limit: int = 12
             continue
         seen.add(dedupe_key)
         p = site.property_snapshot or {}
-        photos = p.get("photos") if isinstance(p.get("photos"), list) else []
+        photos = real_photos(p.get("photos")) if isinstance(p.get("photos"), list) else []
         status, price = live.get(site.listing_key, (p.get("status"), p.get("price")))
         out.append({
             "id": site.id,
@@ -604,7 +611,7 @@ async def get_property_detail(db: AsyncSession, user: User, listing_key: str) ->
     card = _listing_card(p)
     card.update({
         "description": _fix_mojibake(p.description),
-        "photos": p.photos if isinstance(p.photos, list) else ([card["photo"]] if card["photo"] else []),
+        "photos": real_photos(p.photos) if isinstance(p.photos, list) else ([card["photo"]] if card["photo"] else []),
         "lot_size": p.lot_size,
         "year_built": p.year_built,
         "home_type": p.home_type,
@@ -1892,7 +1899,7 @@ def _search_result_card(p) -> dict:
     return {
         "listing_key": p.listing_key,
         # Street only - see matching comment in _listing_card.
-        "address": tidy_caps(p.street_address or p.full_address),
+        "address": tidy_caps(display_street(p.street_address, getattr(p, "unparsed_address", None)) or p.full_address),
         "city": tidy_caps(p.city),
         "state": p.state,
         "zipcode": p.zipcode,
@@ -1900,7 +1907,7 @@ def _search_result_card(p) -> dict:
         "bedrooms": p.bedrooms,
         "bathrooms": p.bathrooms,
         "living_area": p.living_area,
-        "lot_size_acres": p.lot_size_acres,
+        "lot_size_acres": card_acres(p.lot_size_acres),
         "status": p.home_status,
         "photo": p.img_src,
         "latitude": p.latitude,
@@ -2276,7 +2283,7 @@ async def get_public_mls_property_detail(db: AsyncSession, listing_key: str) -> 
     )).scalar()
     card.update({
         "description": _fix_mojibake(p.description),
-        "photos": p.photos if isinstance(p.photos, list) else ([card["photo"]] if card["photo"] else []),
+        "photos": real_photos(p.photos) if isinstance(p.photos, list) else ([card["photo"]] if card["photo"] else []),
         "lot_size": p.lot_size,
         "year_built": p.year_built,
         "price_per_sqft": p.price_per_square_feet,

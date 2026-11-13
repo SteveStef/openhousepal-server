@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.logging import get_logger
@@ -290,6 +290,11 @@ async def public_rsvp(code: str, payload: RsvpSubmit, request: Request, db: Asyn
     else:
         snapshot = [a for a in snapshot if any(q["id"] == a["questionId"] and q.get("role") == "brokerage" for q in questions)]
 
+    # One answer per guest at a time: a double tap sends two or three at once, and each one used to
+    # miss the others below and save its own RSVP (three bells, three emails, a tripled head count).
+    # This waits for the first to finish; the next ones then find it and update it (launch audit 11/13).
+    guest_key = payload.token or email or phone or name.lower()
+    await db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": f"invite-rsvp:{inv.id}:{guest_key}"})
     rsvp: Optional[EventInviteRsvp] = None
     if payload.token:
         rsvp = (await db.execute(select(EventInviteRsvp).where(EventInviteRsvp.token == payload.token, EventInviteRsvp.invite_id == inv.id))).scalar_one_or_none()

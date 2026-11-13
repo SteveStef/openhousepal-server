@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from app.models.database import HomeType
-from app.utils.mls_mapper import BRIGHT_PROPERTY_SELECT_FIELDS, map_reso_to_internal, parse_dt, clean_address, get_best_photo_url
+from app.utils.mls_mapper import BRIGHT_PROPERTY_SELECT_FIELDS, map_reso_to_internal, parse_dt, clean_address, get_best_photo_url, is_photo_url
 
 load_dotenv()
 
@@ -516,7 +516,7 @@ class BrightMlsService:
                 for m in rows:
                     key = str(m["ResourceRecordKey"])
                     photo_url = get_best_photo_url(m)
-                    if not photo_url:
+                    if not photo_url or not is_photo_url(photo_url):   # a PDF filed as a "Photo" (11/13)
                         continue
                     bucket = photo_map.setdefault(key, [])
                     seen_for_key = seen.setdefault(key, set())

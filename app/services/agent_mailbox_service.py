@@ -331,6 +331,9 @@ async def send_guest(owner_id: Optional[str], to_email: str, subject: str, templ
                 headers = {}
             else:
                 html, text = await render(template, variables)
+                from app.services.email_top_line import _text, fix_weekly_line
+                if (fixed := fix_weekly_line(html, variables)) is not None:   # picked weekly: say so (11/13)
+                    html, text = fixed, _text(fixed)
                 headers = unsubscribe_headers(template, to_email, variables)
             try:
                 token = await _access_token(db, conn)

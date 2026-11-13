@@ -1,3 +1,4 @@
+from app.utils.mls_mapper import card_photo
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func, case
@@ -916,7 +917,7 @@ async def search_listing_addresses_public(
                 "address": full,
                 "price": p.price,
                 "status": p.home_status,
-                "photo": p.img_src or (photos[0] if photos else None),
+                "photo": card_photo(p.img_src, photos),
                 "mine": bool(mls_id) and mls_id in (p.list_agent_mls_id, p.co_list_agent_mls_id),
                 "listing_key": p.listing_key,
                 # For the showing flow's home card (street on top, town + facts below).

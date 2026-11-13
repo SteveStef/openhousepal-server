@@ -438,3 +438,39 @@ async def test_flyer_line_two(no_send):
         await _settle()
         mail = [m for m in no_send if m["template"] == "invite_rsvp_agent"]
         assert mail and mail[-1]["vars"]["invite_subtitle"] == "Wine & cheese on the porch"
+
+
+@pytest.mark.asyncio
+async def test_double_tapped_rsvp_saves_once(no_send, monkeypatch):
+    """Three identical RSVPs at the same moment (a double tap on a slow phone) -> one RSVP, one bell
+    (launch audit 11/13: it used to save three)."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+    real_execute = AsyncSession.execute
+
+    async def slow_lookup(self, statement, *a, **kw):
+        # a slow server: a gap between "is there an RSVP for this email?" and saving one
+        out = await real_execute(self, statement, *a, **kw)
+        sql = str(statement)
+        if "event_invite_rsvps" in sql and "event_invite_rsvps.email" in sql:
+            await asyncio.sleep(0.4)
+        return out
+
+    monkeypatch.setattr(AsyncSession, "execute", slow_lookup)
+    async with AsyncSessionLocal() as db:
+        agent = await _agent(db, "dbl")
+        created = await routes.create_invite(_save("client_event"), db=db, current_user=agent)
+    guest = _email("tap")
+
+    async def tap():
+        async with AsyncSessionLocal() as s:
+            return await routes.public_rsvp(created["code"], RsvpSubmit(
+                response="yes", name="Tap Guest", email=guest, answers=[{"questionId": "party", "value": "2"}]), request=None, db=s)
+
+    results = await asyncio.gather(tap(), tap(), tap())
+    assert sorted(r["updated"] for r in results) == [False, True, True]
+    await _settle()
+    async with AsyncSessionLocal() as db:
+        rs = (await db.execute(select(EventInviteRsvp).where(EventInviteRsvp.invite_id == created["id"]))).scalars().all()
+        assert len(rs) == 1 and rs[0].guest_count == 2
+        bell = (await db.execute(select(Notification).where(Notification.agent_id == agent.id))).scalars().all()
+        assert len(bell) == 1

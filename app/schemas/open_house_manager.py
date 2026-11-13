@@ -29,6 +29,7 @@ class ActionCountsResponse(BaseModel):
     listing_agent_unseen_updates: int  # unseen "host responded to your proposed time" notifications
     host_unseen_updates: int  # unseen "listing agent approved/declined your request" notifications
     pending_incoming_broadcasts: int  # open Team broadcasts ("X needs a host") I haven't responded to yet
+    open_incoming_asks: int = 0  # every team ask / direct ask / team invite still waiting on my answer, seen or not (Dash)
 
 
 class ScheduledOpenResponse(BaseModel):

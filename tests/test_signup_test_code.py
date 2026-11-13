@@ -27,7 +27,7 @@ class Db:
     async def commit(self):
         self.commits += 1
 
-    async def refresh(self, _obj):
+    async def refresh(self, _obj, **_kw):   # with_for_update= (the double-tap lock, 11/13)
         pass
 
     async def rollback(self):

@@ -1,7 +1,21 @@
-from pydantic import BaseModel, Field
+import re
+from typing import Annotated
+
+from pydantic import BaseModel, BeforeValidator, Field
 from typing import Optional, List, Literal, Dict, Any, Union
 from datetime import datetime
 import uuid
+
+# Bright sends an empty unit as a bare "#" ("601 ARGYLE CIR #"); it showed on the client report,
+# the PDF and the cards (launch audit 11/13). Dropped wherever a CMA address is read or saved.
+_EMPTY_UNIT = re.compile(r"\s+#(?=\s*(,|$))")
+
+
+def _drop_empty_unit(v):
+    return _EMPTY_UNIT.sub("", v).strip() if isinstance(v, str) else v
+
+
+Street = Annotated[Optional[str], BeforeValidator(_drop_empty_unit)]
 
 CmaMode = Literal['listing', 'buyer']
 CmaStatus = Literal['DRAFT', 'READY', 'SHARED']
@@ -24,7 +38,7 @@ class CmaSubjectProperty(BaseModel):
     source: CompSource = 'mls'
     photo_url: Optional[str] = None
     photos: List[str] = []
-    street_address: Optional[str] = None
+    street_address: Street = None
     city: Optional[str] = None
     state: Optional[str] = None
     zipcode: Optional[str] = None
@@ -107,7 +121,7 @@ class CmaComparable(BaseModel):
 
     photo_url: Optional[str] = None
     photos: List[str] = []
-    street_address: Optional[str] = None
+    street_address: Street = None
     city: Optional[str] = None
     state: Optional[str] = None
     zipcode: Optional[str] = None
@@ -295,7 +309,7 @@ class CmaReportListItem(BaseModel):
     mode: CmaMode
     status: CmaStatus
     share_slug: Optional[str] = None
-    subject_address: Optional[str] = None
+    subject_address: Street = None
     subject_photo_url: Optional[str] = None
     comparable_count: int = 0
     fair_value: Optional[float] = None
@@ -376,7 +390,7 @@ class CmaCompCandidate(BaseModel):
     status: CompStatus
     photo_url: Optional[str] = None
     photos: List[str] = []
-    street_address: Optional[str] = None
+    street_address: Street = None
     city: Optional[str] = None
     state: Optional[str] = None
     zipcode: Optional[str] = None

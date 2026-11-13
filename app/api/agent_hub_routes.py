@@ -1,3 +1,4 @@
+from app.utils.mls_mapper import card_photo
 import asyncio
 import html
 import json
@@ -1094,7 +1095,7 @@ async def get_my_recent_sales(
             "state": property.state,
             "price": property.price,
             "status": property.home_status,
-            "image": property.img_src or (property.photos[0] if isinstance(property.photos, list) and property.photos else None),
+            "image": card_photo(property.img_src, property.photos if isinstance(property.photos, list) else None),
             "sold_date": property.modification_timestamp or property.mls_list_date,
         }
         if is_eligible_recent_sale(sale):
@@ -1625,7 +1626,11 @@ async def public_submit_review(slug: str, payload: ReviewSubmit, request: Reques
     body = (payload.body or "").strip()
     if not name or not body:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Please add your name and a few words.")
-    rating = max(1, min(5, int(payload.rating or 0)))
+    # Launch audit 11/13: no stars (0) used to be filed as a 1-star complaint - alert, private
+    # follow-up and all. Only a real 1-5 rating is taken.
+    if not 1 <= int(payload.rating or 0) <= 5:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Pick a star rating first.")
+    rating = int(payload.rating)
     # 4-5 stars show on the agent's own hub; 1-3 stars come to them as private feedback (status
     # "hidden") with a same-day follow-up, so they can make it right. The agent can still publish it
     # by hand from Settings -> Reviews. Google and Zillow are offered to everyone below, whatever the
@@ -1642,13 +1647,20 @@ async def public_submit_review(slug: str, payload: ReviewSubmit, request: Reques
     )
     db.add(review)
     await db.flush()  # populate review.id before the Notification references it
+    # A good review the agent can't see on their hub yet: their "Show reviews on my Agent Hub" switch is
+    # off (it starts off). Say so in the alert, or they wonder where it went (owner, 11/13).
+    from app.services.review_display import review_prefs
+    hub_reviews_off = is_public and not review_prefs((hub.config if hub else {}) or {})["show_on_hub"]
+    message = f"{name}: {body[:80]}" + ("…" if len(body) > 80 else "")
+    if hub_reviews_off:
+        message += " · Turn on “Show reviews on my Agent Hub” (Agent Hub → Layout) to show it there."
     db.add(Notification(
         agent_id=owner.id,
         type="NEW_REVIEW",
         reference_type="REVIEW",
         reference_id=review.id,
         title=f"New {rating}-star review" if is_public else f"New {rating}-star review (off your hub)",
-        message=f"{name}: {body[:80]}" + ("…" if len(body) > 80 else ""),
+        message=message,
         link="/settings#reviews",
         is_read=False,
     ))

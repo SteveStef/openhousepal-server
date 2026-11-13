@@ -80,7 +80,7 @@ class PropertyWebsiteOut(BaseModel):
 class PropertyWebsiteViewStats(BaseModel):
     unique_visitors: int = 0
     total_views: int = 0
-    # Totals only: distinct people who asked for a tour / sent a question from a Spotlight page.
+    # Distinct people who asked for a tour / sent a question from a Spotlight page (overall + per page).
     leads: int | None = None
 
 

@@ -37,7 +37,8 @@ Tabs: **Profile**, **Notifications**, **Tools**, **IDX Website** (IDX only), **B
 - **Google Calendar** → **Connect Google** → sign in ("If Google says 'unverified app': Advanced → Go to OpenHousePal → Allow") → you land back synced.
 - Creates one calendar called "OpenHousePal" - it never touches your other calendars. Shows follow-ups (with your buzz settings), scheduled open houses and approved hosting dates, and confirmed Showcase tours. Two-way for follow-ups: move one to another day or time in your calendar and the follow-up moves with it in OpenHousePal (Follow-ups, the Dash, the daily briefing) - next time Follow-ups opens or within a few minutes - and the app never moves it back; delete it in your calendar and it's marked done. New follow-ups skip times you're already booked.
 - **Sync now** pushes everything again. **Disconnect** removes the OpenHousePal calendar and its events from Google. **Sign-in expired** → **Reconnect**.
-- **Outlook Calendar**: "Coming soon".
+- **Outlook Calendar**: "Coming soon" - not fully connected yet.
+- **Use Outlook, Apple Calendar or something else?** (marked **For now**): copy your private calendar link and add it as a "subscribed" / "internet" calendar. Shows follow-ups and open houses, view only (changes made there don't come back), updates by itself. Keep the link private.
 - Times use Eastern time.
 
 - From the chat: "is my calendar connected?" and "resync my calendar" (Sync now). Connecting stays on the page.

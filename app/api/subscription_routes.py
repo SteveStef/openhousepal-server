@@ -332,8 +332,10 @@ async def cancel_subscription(
                 detail="Failed to verify subscription with PayPal. Please try again."
             )
 
-        # Validate subscription status is cancellable
-        if paypal_status not in ["ACTIVE", "SUSPENDED"]:
+        # Validate subscription status is cancellable. APPROVED = approved by card but not started yet
+        # (a plan switch or restart made during a trial / paid month starts on the next bill date) -
+        # it must be cancellable too, or the agent gets charged when it starts (signup audit 11/13).
+        if paypal_status not in ["ACTIVE", "SUSPENDED", "APPROVED"]:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Cannot cancel subscription with status '{paypal_status}'. Only active or suspended subscriptions can be cancelled."

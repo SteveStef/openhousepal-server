@@ -93,6 +93,10 @@ class PropertySummaryResponse(BaseModel):
         if self.close_date is None and raw.get("CloseDate"):
             self.close_date = str(raw["CloseDate"])[:10]
         self.mls_raw = None
+        # A PDF Bright filed as the main "Photo" (11/13) - no picture beats a broken one.
+        from app.utils.mls_mapper import is_photo_url
+        if self.img_src and not is_photo_url(self.img_src):
+            self.img_src = None
         return self
 
 class PropertyDetailResponse(PropertySummaryResponse):
@@ -102,6 +106,16 @@ class PropertyDetailResponse(PropertySummaryResponse):
     """
     description: Optional[str] = Field(None, alias="PublicRemarks")
     photos: Optional[List[str]] = None
+
+    @model_validator(mode='after')
+    def photos_only(self) -> 'PropertyDetailResponse':
+        # Bright files some PDFs (floor plans, disclosures) as photos - keep pictures only (11/13).
+        from app.utils.mls_mapper import real_photos
+        if self.photos is not None:
+            self.photos = real_photos(self.photos)
+        if not self.img_src and self.photos:
+            self.img_src = self.photos[0]
+        return self
     
     # Listing Agent & Office
     list_agent_full_name: Optional[str] = Field(None, alias="ListAgentFullName")

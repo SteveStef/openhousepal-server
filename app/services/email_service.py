@@ -59,8 +59,8 @@ def with_open_pixel(html: str, url: Optional[str]) -> str:
 
 
 def _top_line(template: str, variables: dict):
-    from app.services.email_top_line import render
-    return render(template, variables)
+    from app.services.email_top_line import render, render_weekly
+    return render(template, variables) or render_weekly(template, variables)
 
 
 def mailgun_template_name(template: str) -> str:
@@ -143,8 +143,9 @@ def _tidy_values(value, key: str = ""):
 def _tidy_subject(subject: str) -> str:
     # an all-caps street address inside a sentence ("... wants to host 1650 SKINNERS TURN RD"),
     # with the town/state after it ("..., WAYNE, PA 19087") and numbered streets ("N 5TH ST")
-    word = r"(?:\d+(?:ST|ND|RD|TH)\b|[A-Z][A-Z0-9'.#-]*|#?\d+[A-Z]?)"
-    pattern = rf"\b\d+[A-Z]{{0,2}}(?:\s+{word})+(?:,\s*[A-Z][A-Z'.-]*(?:\s+[A-Z][A-Z'.-]*)*)*(?:\s+\d{{5}})?"
+    # A time is not an address: "12:00 PM" used to come out "12:00 Pm" (audit 11/13).
+    word = r"(?:\d+(?:ST|ND|RD|TH)\b|(?!(?:AM|PM|ET|EST|EDT)\b)[A-Z][A-Z0-9'.#-]*|#?\d+[A-Z]?)"
+    pattern = rf"(?<![:\d])\b\d+[A-Z]{{0,2}}(?:\s+{word})+(?:,\s*[A-Z][A-Z'.-]*(?:\s+[A-Z][A-Z'.-]*)*)*(?:\s+\d{{5}})?"
     out = re.sub(pattern, lambda m: tidy_caps(m.group(0)), subject or "")
     # an empty unit number from the MLS: "1330 N Avignon Dr #, Gladwyne" -> "1330 N Avignon Dr, Gladwyne"
     return re.sub(r"\s+#(?=\s*(?:,|$|\s-\s|\)))", "", out)

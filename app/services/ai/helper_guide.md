@@ -53,7 +53,7 @@ The bell and the light/dark switch sit next to the menu button.
 ### Why some menu items look different
 
 - **A lock icon, greyed out**: your plan doesn't include it. Tap it to see which plan unlocks it.
-- **Missing entirely**: the feature needs Bright MLS data, and your plan is one of the No-MLS plans. For example, No-MLS plans have no Discovery, Manager, CMA, Showcases or IDX.
+- **Missing entirely**: the feature needs Bright MLS data, and your plan is one of the No-MLS plans. For example, No-MLS plans have no Discovery, Manager, CMA, Showcases or IDX. Opening one of those pages from a link shows **This needs Bright MLS** with **Send us your MLS ID** (for agents who have joined Bright MLS: support adds the MLS ID and moves you to a Bright plan).
 - **Only "Broker Authorization" shows**: your broker hasn't approved your account yet.
 - **Everything is faded and can't be tapped**: your subscription has ended. Go to **Settings → Billing** to come back.
 - **Menu items take you to checkout**: you haven't picked a plan yet.
@@ -200,7 +200,7 @@ You keep full access until the end of the period you already paid for. Billing t
 Signed up through an offer? The confirmation warns first that you'll lose your offer price. Change your mind before **Access Ends** and **Resubscribe** on the same plan: you keep the offer price (if the discount was only for some months, you get the discounted months you had left). Once access ends, coming back is the regular price.
 
 ### Payment failed or plan ended
-
+ If it says **The video maker is restarting**, give it a minute - the button turns back on by itself (no need to reload).
 - **Payment Failed**:
   - Tap **Start Fresh** to cancel the failed agreement and pick a plan again with a different card (this is the way for anyone who paid by card without a PayPal account).
   - If you pay through a PayPal account, **Update payment method on PayPal** also works.
@@ -267,7 +267,7 @@ Add YouTube **Videos**, **House Tours** and **Blogs** to your hub.
 - **Ivory or Midnight**: a light or dark page for visitors. This also applies to your Sales page.
 - **Profile header**: how the top of your hub looks on phones and computers.
 - **Reviews**: three switches:
-  - **Show reviews on my Agent Hub**
+  - **Show reviews on my Agent Hub** (starts off - while it's off, the bell alert for a new 4-5 star review reminds you to turn it on here)
   - **Only show 4 and 5 star reviews** (this also applies to your IDX website)
   - **Move on their own (phones)**
 - **Agent Hub Layout**: drag the sections (My Listings, Recent Sales, Videos, House Tours, Blogs, Reviews) into the order visitors see them. Switch each section on or off.
@@ -353,10 +353,14 @@ Tips:
 - Use the arrows to put your main town first. Your website lists towns in that order.
 - Removing a town asks "Stop serving this area?". Its page will no longer appear on your site.
 - Every plan can set "Towns you serve" in Account setup. Only IDX turns them into website pages.
+- A town's page lives at yoursite/town-name-state (for example /wayne-pa). Older-style links such as /neighborhoods/wayne-pa or /communities/wayne-pa forward to it.
 
 ### Pop-up forms
 
 Every lead button on your website opens one of your real forms in a window over the page, so visitors never leave your site. Examples are "What's my home worth?", "Start my home search" and a home's tour request. Every answer lands in your Leads. To change the forms themselves, go to **Tools → Forms & Invites**.
+
+- The forms follow your site's look: when a visitor has your site in dark mode, the form window and the form on your Contact page are dark too.
+- On a home's page, a visitor can tap a day under **Book a showing** - the showing window opens with that day already picked, so they only choose morning/afternoon/evening and a time.
 
 ### Blog on your site
 
@@ -691,7 +695,7 @@ MLS plans. Opens another agent approved you to host appear here. Tap **Open kit*
 
 ### 3. Discovery (find homes to host)
 
-**What it is:** brokerage listings near you that you may be able to host, with a one-tap request to the listing agent. MLS plans only.
+**What it is:** brokerage listings near you that you may be able to host, with a one-tap request to the listing agent. MLS plans only. Your own listings never show here (you schedule their opens yourself in **Manager**), and sold or under-contract homes can't be asked about.
 
 **Where:** Opens > **Discovery** (or **Find Open Houses** on My Opens).
 
@@ -920,6 +924,7 @@ Every follow-up's calendar event has links:
 - **Emails on** - normal.
 - **Weekly only** - they left emails unopened on 3 different days; daily Showcase updates become one weekly email. Back to daily as soon as they open one.
 - **Emails off** - they also ignored 5 weekly emails; automatic emails stop. They restart by themselves when the person opens an email or uses their Showcase.
+- The weekly email says why it's weekly: if they picked it, "Once a week, as you picked" with a **Change how often** link; if you set it, "Once a week, with everything new in one email"; if the rules slowed it, "We now send these once a week".
 - **How often (Daily, Weekly, Every 2 weeks)** - on the lead, their Showcase and the tracker. **Daily** runs the rules above, counting from that moment. **Weekly** and **Every 2 weeks** stay put whether they open or not, because someone chose them on purpose. The client can pick the same three at the top right of their Showcase, and you get told. In the same place they can pick what time the emails arrive: **8 AM**, **Noon**, **4:30 PM** (the usual) or **7 PM** Eastern.
 - When the rules slow a client to weekly or stop their emails, their Showcase tells them once at the top - with a tip to check their junk or spam folder, and buttons to keep daily or go weekly (or turn emails back on). Opening their Showcase already counts as being active, so their emails go back to normal.
 - Personal emails (tour confirmation, reply to their comment, the thank-you after signing in) always send.
@@ -936,9 +941,9 @@ Every follow-up's calendar event has links:
 **Plans:** Premium and IDX. On Basic it shows locked with an upgrade prompt. The No-MLS plans don't have Showcases.
 
 ### The Showcases page
-- Search: "Search visitor, property, location...".
+- Search: "Search clients or homes".
 - **New** button (the New Matches mailbox): every home you haven't looked at yet from all your Showcases, newest first, with the client's name. Tap a home to open it right there: flip through its photos and see all its stats. **Dismiss** (or the small X) clears it from the mailbox only, with an Undo; it stays in the client's Showcase. **Open in their Showcase** goes to that home's page there. A lead's page also shows the 3 newest homes in their Showcase with NEW tags and what the client did. NEW only clears when you open that home or the Showcase.
-- **Tours** button: tour requests waiting on you from every Showcase. **Activity** button: everything your clients did in the last 30 days: opening their Showcase, a home's details, likes, comments, tour requests, search changes and opening a Showcase email. Its number counts likes, comments and requests only.
+- **Tours** button: tour requests waiting on you from every Showcase, each with the day and time the client picked (for example "Sat, Nov 14 · 12:00 PM") and **Confirm**. **Activity** button: everything your clients did in the last 30 days: opening their Showcase, a home's details, likes, comments, tour requests, search changes and opening a Showcase email. Its number counts likes, comments and requests only.
 - **Budgets** filter and sort: **Activity**, **New matches**, **Newest**, **Fell asleep** (Inactive tab only), **Came from**.
 - **Active** / **Inactive** tabs, and a **New matches** filter.
 - Each Showcase card: star, client email/phone copy, new-match count (**Dismiss new matches**), activity badges, **Edit**, **Share**, **Delete**, and an **On / Off** switch.
@@ -975,7 +980,7 @@ Tap **Tours**. For each request: **Confirm**, then pick the time and **Yes, Conf
 On a home's page, use **Add to a Showcase** and pick the client. It's marked as your pick (Recommended), stays even if it doesn't match their search, and counts as new for them.
 
 ### What the buyer sees
-Their own Showcase link with **Matches / Liked / Disliked / Sold/Removed**, a heart to like, pass, comments, tour requests, **Change your search** (they can change it themselves or send you a message), an **Emails** switch for update emails, and "Your Upcoming Tours" once you confirm. When you open their link yourself you'll see "Your clicks here don't count as theirs."
+Their own Showcase link, with a **Your agent** card at the top (your photo or initials, name, brokerage and **Call** / **Text** / **Email** buttons), **Matches / Liked / Disliked / Sold/Removed**, a heart to like, pass, comments, tour requests (after they ask, that home's button says **Requested** until you confirm), **Change your search** (they can change it themselves or send you a message), an **Emails** switch for update emails, and "Your Upcoming Tours" once you confirm. When you open their link yourself you'll see "Your clicks here don't count as theirs."
 
 ### Showcases and open houses
 Each open house has its own Showcases switch on the Open Houses page. Turning it off asks **Turn off Showcases?** and lets you choose what the guest's Guest Pass still offers: **Similar homes** and/or a **"Get my Showcase"** button (one is made only if they tap it).
@@ -996,7 +1001,7 @@ Each open house has its own Showcases switch on the Open Houses page. Turning it
 **Plans:** Basic, Premium and IDX. Not on the No-MLS plans. Broker authorization is required.
 
 ### Your CMA list
-Search ("Search by address or client..."), tabs **All**, **Draft**, **Ready**, **Shared**. Each CMA card shows the Fair Value and has **Copy Share Link**, **Download PDF** / **Save the PDF**, a theme switch (light or **Midnight**), and **Delete** (permanent).
+Search ("Search by address or client..."), tabs **All**, **Draft**, **Ready**, **Shared**. Each CMA card shows the Fair Value and has **Copy Share Link**, **Download PDF** / **Save the PDF**, a theme switch (light or **Midnight**), and **Delete** (permanent). A deleted or wrong CMA link opens "This CMA isn't here" with **Back to your CMAs**; a client opening a dead share link sees "This link isn't active - Ask your agent for an updated link."
 
 ### Build a CMA
 1. Tap **Create New CMA**.
@@ -1232,7 +1237,9 @@ Afterwards: **Save** to download, **Make it** for another shape, and **Sections*
 
 When connected: **Sync now** pushes everything again; **Disconnect** removes the "OpenHousePal" calendar and its events from your Google account. If it says **Sign-in expired**, click **Reconnect**.
 
-**Outlook Calendar** shows "Coming soon" - use Google for now.
+**Outlook Calendar** shows "Coming soon" - use Google for now, or the calendar link below.
+
+**Use Outlook, Apple Calendar or something else?** (marked **For now** - Outlook isn't fully connected yet, which is why its card says Coming soon) (below the Google card): tap **Show my calendar link**, then **Copy my calendar link**, and add it in your calendar app as a "subscribed" or "internet" calendar. It shows your follow-ups and open houses, read-only, and updates by itself. Keep the link private.
 
 ---
 
@@ -1284,7 +1291,7 @@ Some emails can't be turned off: sign-in codes and password resets, billing and 
 
 ### Forms
 - **Premade forms** - ready to share: I'm Buying, I'm Selling, What's My Home Worth?, Schedule a Showing, How Can We Help, Seller Onboarding, Buyer Onboarding, Make Me Sell, Setup My Own Showcase (Premium/IDX).
-- **Custom forms** - click **New custom form** ("Start from scratch - any questions you like"). Every custom form starts with Full name, Email and Phone (these can't be removed). Add questions: Short answer, Long answer, Single choice, Multiple choice, Number, Currency, Date, Time, Email, Phone, Property Address, Statement.
+- **Custom forms** - click **New custom form** ("Start from scratch - any questions you like"). Every custom form starts with Full name, Email and Phone (these can't be removed). Give it a name in the Welcome Screen **Title** - the big heading visitors see and the form's link follow that name until it's been shared (once anyone has opened the link, it never changes). Add questions: Short answer, Long answer, Single choice, Multiple choice, Number, Currency, Date, Time, Email, Phone, Property Address, Statement.
 - **Share** a form with its link or QR code.
 - **Campaigns** - "Same form, new tracking link - track a mailer, ad, or flyer separately." Click **New Campaign**, give it a **Campaign Name** (e.g. "September Postcard"), and choose **After they submit, send them to**: **My Agent Hub**, **My Sales & Listings**, **Stay on the thank-you screen**, or **My own link**. Changing this later affects already-printed QR codes right away.
 - Want different questions on a premade form? Use **Duplicate** to make your own editable copy. A form can be reverted ("Revert this form to default?").

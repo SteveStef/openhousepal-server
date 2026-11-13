@@ -23,6 +23,7 @@ from app.services.ai.ai_config_service import ai_config_service
 from app.services.mls_open_houses import upcoming_mls_open_houses
 from app.services.website import domain_resolution_service
 from app.services.website.site_service import RESERVED_SLUGS, SLUG_PATTERN, _slugify
+from app.utils.mls_mapper import real_photos
 
 TEMPLATE_IDS = {"cinematic_luxury", "editorial_estate"}
 DEFAULT_TEMPLATE_ID = "cinematic_luxury"
@@ -181,7 +182,7 @@ def _build_property_snapshot(p: Property) -> dict:
         "property_type": p.mls_property_type,
         "architectural_style": p.architectural_style if isinstance(p.architectural_style, list) else [],
         "description": p.description,
-        "photos": p.photos if isinstance(p.photos, list) else [],
+        "photos": real_photos(p.photos) if isinstance(p.photos, list) else [],   # no PDFs (11/13)
         "county": p.county,
         "township": p.township,
         "subdivision_name": p.subdivision_name,
@@ -905,6 +906,24 @@ async def analytics_for_owner(db: AsyncSession, owner_id: str) -> dict:
             LeadEvent.source_type.in_(("property_website_inquiry", "property_website_tour_request")),
         )
     )).scalar_one()
+    # Launch audit 11/13: each page card shows its own Leads count, but only the overall total
+    # was sent, so every card said 0.
+    per_site_leads = dict((await db.execute(
+        select(LeadEvent.source_id, func.count(distinct(LeadEvent.lead_id)))
+        .join(PropertyWebsite, PropertyWebsite.id == LeadEvent.source_id)
+        .where(
+            PropertyWebsite.owner_id == owner_id,
+            LeadEvent.source_type.in_(("property_website_inquiry", "property_website_tour_request")),
+        )
+        .group_by(LeadEvent.source_id)
+    )).all())
+
+    sites = {
+        site_id: {"unique_visitors": int(uniques or 0), "total_views": int(views or 0), "leads": int(per_site_leads.get(site_id) or 0)}
+        for site_id, uniques, views in per_site_rows
+    }
+    for site_id, n in per_site_leads.items():
+        sites.setdefault(site_id, {"unique_visitors": 0, "total_views": 0, "leads": int(n or 0)})
 
     return {
         "totals": {
@@ -912,10 +931,7 @@ async def analytics_for_owner(db: AsyncSession, owner_id: str) -> dict:
             "total_views": int(totals_row[1] or 0),
             "leads": int(leads or 0),
         },
-        "sites": {
-            site_id: {"unique_visitors": int(uniques or 0), "total_views": int(views or 0)}
-            for site_id, uniques, views in per_site_rows
-        },
+        "sites": sites,
     }
 
 

@@ -81,8 +81,17 @@ def clean_address(address: str) -> str:
     """Extracts the primary street address from a full address string."""
     if not address: return ""
     parts = [p.strip() for p in address.split(',')]
-    for part in parts:
+    only_number = re.compile(r'^\d+[A-Za-z]?(-\d+[A-Za-z]?)?$')
+    for i, part in enumerate(parts):
         if re.match(r'^\d+', part):
+            # One listing for several house numbers: "170, 200, 220 OLD STATE RD" used to come out
+            # as just "170" (audit 11/13). Keep the numbers with the street they belong to.
+            if only_number.match(part):
+                j = i
+                while j < len(parts) and only_number.match(parts[j]):
+                    j += 1
+                if j < len(parts) and re.match(r'^\d+\S*\s+\S', parts[j]):
+                    return "/".join(parts[i:j]) + "/" + parts[j]  # "170/200/220 OLD STATE RD" - no commas (cards split on them)
             return part
     return parts[0]
 
@@ -146,12 +155,12 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]] =
     # 4. Photo processing (Simplified list of strings)
     fetched_photos = []
     if photo_map and listing_key in photo_map:
-        fetched_photos = photo_map[listing_key]
+        fetched_photos = real_photos(photo_map[listing_key])
     else:
         # Fallback to the primary photo field if no photo_map provided
         # Use HD/HiRes versions if they happen to be in the main item
         primary = get_best_photo_url(item) or item.get("ListPicture3URL") or item.get("ListPictureURL")
-        if primary:
+        if is_photo_url(primary):
             fetched_photos = [primary]
     
     # 5. Township Logic: IncorporatedCityName (cleaner) -> MLSAreaMajor (fallback)
@@ -201,7 +210,7 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]] =
         "mls_structure_design_type": m_design,
         "latitude": item.get("Latitude"),
         "longitude": item.get("Longitude"),
-        "img_src": item.get("ListPicture3URL") or item.get("ListPictureURL"),
+        "img_src": card_photo(item.get("ListPicture3URL") or item.get("ListPictureURL"), fetched_photos),
         "description": item.get("PublicRemarks"),
         "photos": fetched_photos,
         "list_agent_full_name": item.get("ListAgentFullName"),
@@ -295,3 +304,36 @@ def map_reso_to_internal(item: Dict[str, Any], photo_map: Dict[str, List[str]] =
         "modification_timestamp": parse_dt(item.get("ModificationTimestamp")),
         "raw_mls_data": item
     }
+
+
+_NUMBER_ONLY = re.compile(r'^\d+[A-Za-z]?$')
+
+
+def display_street(street: str | None, unparsed: str | None = None) -> str | None:
+    """The street line to show. Rows saved before the 11/13 clean_address fix hold just "170" for a
+    listing at "170, 200, 220 OLD STATE RD" - rebuild it from the unparsed address when we can."""
+    if street and unparsed and _NUMBER_ONLY.match(street.strip()):
+        better = clean_address(unparsed)
+        if better and better.startswith(street.strip()) and " " in better:
+            return better
+    return street
+
+
+# Bright files some PDFs (floor plans, disclosures) as "Photo" media - 445 for-sale listings on 11/13,
+# 103 with the PDF as the FIRST photo, so their cards showed a broken picture. Photos only.
+_NOT_A_PHOTO = re.compile(r"/documents/|\.pdf(?:$|\?)", re.I)
+
+
+def is_photo_url(url) -> bool:
+    return isinstance(url, str) and bool(url.strip()) and not _NOT_A_PHOTO.search(url)
+
+
+def real_photos(photos) -> list:
+    return [u for u in (photos or []) if is_photo_url(u)]
+
+
+def card_photo(img_src, photos=None):
+    """The listing's picture for a card: its own main photo unless that's a document, else the first real one."""
+    if is_photo_url(img_src):
+        return img_src
+    return next(iter(real_photos(photos)), None)

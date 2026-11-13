@@ -73,6 +73,7 @@ IDX website, Agent Hub and Review Hub in depth: website sections, pages, looks, 
 
 ## Changing your hub address
 - Confirmation **Change your Agent Hub link?**: "Pick a name you'll keep." Your current link keeps working after the change (cards, signature, social bios, printed QR codes - your hub, forms and blog all still open), and no other agent can take it. But only your most recent old link keeps working: change it again later and the one before stops working and is freed up. The new link becomes your main one.
+- New 4-5 star reviews: while **Show reviews on my Agent Hub** (Layout) is off - it starts off - the bell alert for the review reminds you to turn it on.
 - Hub pages: openhousepal.com/your-name, /sales (Past Sales and Current Listings), listings, blogs, and /review. On IDX with your own domain connected, the hub also opens on your domain.
 
 ## Where listings link to

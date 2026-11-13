@@ -21,7 +21,7 @@ _TTL = 600
 _ANCHOR = re.compile(r'<table[^>]*class="container"', re.I)
 
 
-def _compiled(name: str):
+def _compiled(name: str, need_anchor: bool = True):
     hit = _CACHE.get(name)
     if hit and time.monotonic() - hit[0] < _TTL:
         return hit[1]
@@ -36,7 +36,7 @@ def _compiled(name: str):
     if r.status_code >= 300:
         return None
     source = ((r.json().get("template") or {}).get("version") or {}).get("template") or ""
-    if not source or not _ANCHOR.search(source):
+    if not source or (need_anchor and not _ANCHOR.search(source)):
         return None
     from pybars import Compiler
     compiled = Compiler().compile(source)
@@ -82,4 +82,49 @@ def render(template: str, variables: dict) -> Optional[tuple[str, str]]:
         return (out, _text(out)) if out else None
     except Exception:  # noqa: BLE001 - never stop an email over this
         logger.warning("top line render failed - sending the normal way", exc_info=True, extra={"template": template})
+        return None
+
+
+# ---------------------------------------------------------------- the client's weekly email
+# The live weekly design always says "We now send these once a week. Want daily updates again? Just
+# open your Showcase." - right for someone the rules slowed down (they stopped opening), wrong for a
+# client who PICKED weekly (11/12 time picker) or whose agent set weekly (owner, 11/13: "fix it so it
+# works as we say"). Same trick as the top line: render the live design here and swap that sentence.
+WEEKLY_TEMPLATE = "showcase_weekly_digest"
+_WEEKLY_SENTENCE = re.compile(r"We now send these once a week\.\s*Want daily updates again\?\s*Just open your Showcase\.?")
+
+
+def weekly_words(variables: dict) -> Optional[str]:
+    """The sentence's replacement (HTML), or None to keep the design's own words."""
+    why, freq, link = variables.get("weekly_why"), variables.get("weekly_frequency") or "weekly", variables.get("manage_link")
+    if why not in ("client", "agent"):
+        return None
+    every = "Every two weeks" if freq == "biweekly" else "Once a week"
+    words = f"{every}, as you picked." if why == "client" else f"{every}, with everything new in one email."
+    if link:
+        return (f'{_h.escape(words)} <a href="{_h.escape(str(link), quote=True)}" style="color:#8b6d2f;font-weight:700;'
+                f'text-decoration:underline;">Change how often</a>')
+    return _h.escape(words)
+
+
+def fix_weekly_line(html: str, variables: dict) -> Optional[str]:
+    """html with the weekly sentence swapped, or None (nothing to change / not found)."""
+    new = weekly_words(variables)
+    if not new or not _WEEKLY_SENTENCE.search(html or ""):
+        return None
+    return _WEEKLY_SENTENCE.sub(lambda _m: new, html, count=1)
+
+
+def render_weekly(template: str, variables: dict) -> Optional[tuple[str, str]]:
+    """(html, text) for the Mailgun path when the sentence needs changing, else None (normal send)."""
+    if template != WEEKLY_TEMPLATE or weekly_words(variables) is None:
+        return None
+    try:
+        compiled = _compiled(template, need_anchor=False)
+        if compiled is None:
+            return None
+        out = fix_weekly_line(str(compiled(variables)), variables)
+        return (out, _text(out)) if out else None
+    except Exception:  # noqa: BLE001 - never stop an email over this
+        logger.warning("weekly line render failed - sending the normal way", exc_info=True)
         return None

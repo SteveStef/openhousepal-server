@@ -26,6 +26,7 @@ from app.services.blacklist_service import BlacklistService
 from app.services.leads_service import upsert_lead
 from app.services.website.content_adapters import get_agent_profile
 from app.utils.listing_dom import dom_fetched_at, resolve_days_on_market
+from app.utils.mls_mapper import card_photo, display_street, real_photos
 from app.services import showcase_sleep as _sleep_rules
 from app.services.showcase_limit import at_limit_from_active
 
@@ -471,7 +472,7 @@ class CollectionsService:
                         'id': prop.id,
                         'ListingKey': prop.listing_key,
                         'open_houses': open_houses_payload(prop),
-                        'FullStreetAddress': prop.street_address or 'Unknown Address',
+                        'FullStreetAddress': display_street(prop.street_address, prop.unparsed_address) or 'Unknown Address',
                         'City': prop.city,
                         'StateOrProvince': prop.state,
                         'PostalCode': prop.zipcode,
@@ -490,9 +491,9 @@ class CollectionsService:
                             prop.mls_list_date, prop.days_on_market, prop.home_status, dom_fetched_at(prop),
                         ),
                         'AssociationYN': prop.has_association,
-                        'ListPictureURL': prop.img_src,
+                        'ListPictureURL': card_photo(prop.img_src, prop.photos),
                         # Up to 10 more photos so a card can be flipped through on a phone (user, 10/27).
-                        'Photos': [u for u in (prop.photos or [])[:10] if u],
+                        'Photos': real_photos(prop.photos)[:10],
                         'PublicRemarks': '',
                         'ModificationTimestamp': prop.modification_timestamp.isoformat() if prop.modification_timestamp else (prop.updated_at.isoformat() if prop.updated_at else None),
                         'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,
@@ -739,7 +740,7 @@ class CollectionsService:
             return {"success": False, "error": str(e)}
 
     @staticmethod
-    async def count_pending_refine_requests(db: AsyncSession, user_id: str) -> int:
+    async def count_pending_refine_requests(db: AsyncSession, user_id: str, split: bool = False):
         """How many of the agent's showcases currently have an undismissed refine-search message -
         drives the Showcases nav badge. Deliberately keyed off Collection.refine_request_message
         (the same field the DetailView banner checks), not Notification.is_read - those two are
@@ -762,6 +763,10 @@ class CollectionsService:
                 PropertyTour.is_completed.is_(False),
             )
         )
+        # split=True: (search-change requests, showing requests) - the daily briefing words them apart
+        # (audit 11/13: a waiting showing request read "1 client wants their search changed").
+        if split:
+            return (result.scalar() or 0), (tours.scalar() or 0)
         return (result.scalar() or 0) + (tours.scalar() or 0)
 
     # What the Showcases page's Activity inbox lists - everything clients do in their Showcases.
@@ -955,7 +960,7 @@ class CollectionsService:
                     'id': prop.id,
                     'ListingKey': prop.listing_key,
                     'open_houses': open_houses_payload(prop),
-                    'FullStreetAddress': prop.street_address or 'Unknown Address',
+                    'FullStreetAddress': display_street(prop.street_address, prop.unparsed_address) or 'Unknown Address',
                     'City': prop.city,
                     'StateOrProvince': prop.state,
                     'PostalCode': prop.zipcode,
@@ -974,9 +979,9 @@ class CollectionsService:
                         prop.mls_list_date, prop.days_on_market, prop.home_status, dom_fetched_at(prop),
                     ),
                     'AssociationYN': prop.has_association,
-                    'ListPictureURL': prop.img_src,
+                    'ListPictureURL': card_photo(prop.img_src, prop.photos),
                     # Up to 10 more photos so a card can be flipped through on a phone (user, 10/27).
-                    'Photos': [u for u in (prop.photos or [])[:10] if u],
+                    'Photos': real_photos(prop.photos)[:10],
                     'PublicRemarks': '',
                     'ModificationTimestamp': prop.modification_timestamp.isoformat() if prop.modification_timestamp else (prop.updated_at.isoformat() if prop.updated_at else None),
                     'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,
@@ -1757,7 +1762,7 @@ class CollectionsService:
                     'id': prop.id,
                     'ListingKey': prop.listing_key,
                     'open_houses': open_houses_payload(prop),
-                    'FullStreetAddress': prop.street_address or 'Unknown Address',
+                    'FullStreetAddress': display_street(prop.street_address, prop.unparsed_address) or 'Unknown Address',
                     'City': prop.city,
                     'StateOrProvince': prop.state,
                     'PostalCode': prop.zipcode,
@@ -1774,9 +1779,9 @@ class CollectionsService:
                         prop.mls_list_date, prop.days_on_market, prop.home_status, dom_fetched_at(prop),
                     ),
                     'AssociationYN': prop.has_association,
-                    'ListPictureURL': prop.img_src,
+                    'ListPictureURL': card_photo(prop.img_src, prop.photos),
                     # Up to 10 more photos so a card can be flipped through on a phone (user, 10/27).
-                    'Photos': [u for u in (prop.photos or [])[:10] if u],
+                    'Photos': real_photos(prop.photos)[:10],
                     'PublicRemarks': '',
                     'ModificationTimestamp': prop.modification_timestamp.isoformat() if prop.modification_timestamp else (prop.updated_at.isoformat() if prop.updated_at else None),
                     'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,
@@ -1845,6 +1850,9 @@ class CollectionsService:
                 'agentEmail': agent_profile.get('email') if agent_profile else None,
                 'agentPhone': agent_profile.get('phone') or None if agent_profile else None,
                 'agentPhotoUrl': agent_profile.get('photo_url') if agent_profile else None,
+                # The "your agent" card on the client's Showcase page (owner yes 11/13).
+                'agentBrokerage': (agent_profile.get('brokerage') or None) if agent_profile else None,
+                'agentTextPhone': (agent_profile.get('text_phone') or None) if agent_profile else None,
                 'originalProperty': original_property_data,
                 'customer': {
                     'firstName': collection.visitor_name.split(' ')[0] if collection.visitor_name else 'Anonymous',
@@ -2308,7 +2316,7 @@ class CollectionsService:
                     'id': prop.id,
                     'ListingKey': prop.listing_key,
                     'open_houses': open_houses_payload(prop),
-                    'FullStreetAddress': prop.street_address or 'Unknown Address',
+                    'FullStreetAddress': display_street(prop.street_address, prop.unparsed_address) or 'Unknown Address',
                     'City': prop.city,
                     'StateOrProvince': prop.state,
                     'PostalCode': prop.zipcode,
@@ -2327,9 +2335,9 @@ class CollectionsService:
                         prop.mls_list_date, prop.days_on_market, prop.home_status, dom_fetched_at(prop),
                     ),
                     'AssociationYN': prop.has_association,
-                    'ListPictureURL': prop.img_src,
+                    'ListPictureURL': card_photo(prop.img_src, prop.photos),
                     # Up to 10 more photos so a card can be flipped through on a phone (user, 10/27).
-                    'Photos': [u for u in (prop.photos or [])[:10] if u],
+                    'Photos': real_photos(prop.photos)[:10],
                     'PublicRemarks': '',
                     'ModificationTimestamp': prop.modification_timestamp.isoformat() if prop.modification_timestamp else (prop.updated_at.isoformat() if prop.updated_at else None),
                     'PriceChangeTimestamp': prop.price_change_timestamp.isoformat() if prop.price_change_timestamp else None,

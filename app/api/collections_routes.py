@@ -130,6 +130,30 @@ async def _owner_id_if_owner(db: AsyncSession, collection_id: str, user: Optiona
     return user.id if owner_id == user.id else None
 
 
+async def _assert_visitor_can_act(db: AsyncSession, collection_id: str, property_id: Optional[str] = None) -> None:
+    """A visitor's like / pass / comment needs a live Showcase (the same rules as opening its link)
+    and, when a home is named, a home that's in it (or one they already acted on). A wrong or old
+    link used to crash with a 500 and still wrote likes onto a Showcase the agent had turned off
+    (audit 11/13). The agent's own actions skip this."""
+    from app.models.database import collection_properties
+    from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
+    row = (await db.execute(select(Collection, User).join(User, User.id == Collection.owner_id)
+                            .where(Collection.id == collection_id))).first()
+    if row is None or not row[0].is_public or row[0].status != "ACTIVE":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This Showcase isn't available.")
+    if not owner_has_access(row[1], SHOWCASE_ACCESS_TIERS):
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail=SHOWCASE_PAUSED_DETAIL)
+    if property_id is None:
+        return
+    in_it = (await db.execute(select(collection_properties.c.property_id).where(
+        collection_properties.c.collection_id == collection_id, collection_properties.c.property_id == property_id).limit(1))).first()
+    if in_it is None:
+        acted = (await db.execute(select(PropertyInteraction.id).where(
+            PropertyInteraction.collection_id == collection_id, PropertyInteraction.property_id == property_id).limit(1))).first()
+        if acted is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="That home isn't in this Showcase.")
+
+
 @router.post("/unsubscribe")
 async def unsubscribe_visitor(
     request: Optional[UnsubscribeRequest] = None,
@@ -1169,6 +1193,9 @@ async def update_property_interaction(
     Update user interaction with a property within a collection (like, dislike)
     For both authenticated users (agents) and anonymous visitors (shared collections)
     """
+    owner_id = await _owner_id_if_owner(db, collection_id, current_user)
+    if owner_id is None:
+        await _assert_visitor_can_act(db, collection_id, property_id)
     try:
         if interaction_data.interaction_type and interaction_data.value is not None:
             if interaction_data.interaction_type == 'like':
@@ -1178,7 +1205,7 @@ async def update_property_interaction(
 
         interaction = await PropertyInteractionsService.create_property_interaction(
             db, collection_id, property_id, interaction_data,
-            user_id=await _owner_id_if_owner(db, collection_id, current_user)
+            user_id=owner_id
         )
         
         return {
@@ -1303,10 +1330,13 @@ async def track_property_view(
     Track a property view by incrementing view_count and updating last_viewed_at.
     For both authenticated users (agents) and anonymous visitors (shared collections)
     """
+    owner_id = await _owner_id_if_owner(db, collection_id, current_user)
+    if owner_id is None:
+        await _assert_visitor_can_act(db, collection_id)
     try:
         interaction = await PropertyInteractionsService.track_property_view(
             db, collection_id, property_id,
-            user_id=await _owner_id_if_owner(db, collection_id, current_user)
+            user_id=owner_id
         )
 
         return {
@@ -1337,6 +1367,7 @@ async def add_property_comment(
     if owner_id is None:
         from app.services.public_rate_limit import check_public_submit
         check_public_submit(request)  # bots can't flood the agent's leads/inbox
+        await _assert_visitor_can_act(db, collection_id, property_id)
 
     """
     Add a comment to a property within a collection
@@ -1385,6 +1416,8 @@ async def get_property_comments(
     Public endpoint for shared collections - also used by the agent's own showcase view,
     which is how we tell the two apart below.
     """
+    if await _owner_id_if_owner(db, collection_id, current_user) is None:
+        await _assert_visitor_can_act(db, collection_id)
     try:
         comments = await PropertyInteractionsService.get_property_comments(
             db, collection_id, property_id
@@ -1632,8 +1665,45 @@ def _self_serve_payload(payload: dict, saved=None) -> dict:
     return payload
 
 
+_PAIRS = (("min_price", "max_price"), ("min_beds", "max_beds"), ("min_baths", "max_baths"))
+
+
+def _same_value(a, b) -> bool:
+    if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+        return _same_list(a, b)
+    if a in (None, "", 0) and b in (None, "", 0):
+        return True
+    try:
+        return float(a) == float(b)
+    except (TypeError, ValueError):
+        return str(a).strip().lower() == str(b).strip().lower()
+
+
+def _only_changed(payload: dict, saved) -> dict:
+    """The fields of a client's search save that really differ from what was saved (the window sends
+    the whole form). A changed min or max brings its partner along so "3+" never reads as "Up to"."""
+    if saved is None:
+        return dict(payload)
+    out = {k: v for k, v in payload.items() if not _same_value(v, getattr(saved, k, None))}
+    for lo, hi in _PAIRS:
+        if lo in out or hi in out:
+            out.setdefault(lo, payload.get(lo, getattr(saved, lo, None)))
+            out.setdefault(hi, payload.get(hi, getattr(saved, hi, None)))
+    return out
+
+
+def _place(v) -> str:
+    """ "BERWYN, PA" -> "Berwyn, PA" (MLS capitals); anything with lower case is left alone."""
+    t = str(v or "").strip()
+    if not t or any(c.islower() for c in t):
+        return t
+    head, _, tail = t.partition(",")
+    return head.strip().title() + (f",{tail}" if tail else "")
+
+
 def _describe_search_change(payload: dict) -> list:
-    """A client's own Showcase search edit -> [{"label", "value"}] rows for their lead's activity."""
+    """A client's own Showcase search edit -> [{"label", "value"}] rows for their lead's activity.
+    Pass only what changed (_only_changed) - the window sends every field."""
     def money(v):
         return f"${v:,.0f}" if isinstance(v, (int, float)) else None
 
@@ -1657,13 +1727,13 @@ def _describe_search_change(payload: dict) -> list:
     if "min_baths" in payload or "max_baths" in payload:
         rows.append({"label": "Bathrooms", "value": span(payload.get("min_baths"), payload.get("max_baths"))})
     if payload.get("address"):
-        rows.append({"label": "Near", "value": str(payload["address"])})
+        rows.append({"label": "Near", "value": _place(payload["address"])})
     if payload.get("diameter"):
         rows.append({"label": "Within", "value": f"{payload['diameter']:g} miles"})
     if "cities" in payload:
-        rows.append({"label": "Towns", "value": ", ".join(payload.get("cities") or []) or "Any"})
+        rows.append({"label": "Towns", "value": ", ".join(_place(c).split(",")[0] for c in (payload.get("cities") or [])) or "Any"})
     if "school_districts" in payload:
-        rows.append({"label": "School districts", "value": ", ".join(payload.get("school_districts") or []) or "Any"})
+        rows.append({"label": "School districts", "value": ", ".join(_place(d) for d in (payload.get("school_districts") or [])) or "Any"})
     return rows
 
 
@@ -1761,6 +1831,8 @@ async def update_shared_collection_preferences(
                 detail="This showcase needs either a search address or an area to search"
             )
 
+        # What they actually changed (read before the save overwrites it) - the window sends every field.
+        really_changed = _only_changed(payload, collection_obj.preferences)
         update_result = await CollectionPreferencesService.update_preferences_and_refresh_properties(
             db, collection_obj.id, CollectionPreferencesUpdate(**payload)
         )
@@ -1773,7 +1845,7 @@ async def update_shared_collection_preferences(
 
         # On their lead's activity: what they changed it to, in words.
         from app.services.leads_service import log_showcase_activity
-        changed = _describe_search_change(payload)
+        changed = _describe_search_change(really_changed)
         await log_showcase_activity(db, collection_obj.id, "showcase_search_changed", "Changed their Showcase search",
                                     raw_snapshot={"answers": changed} if changed else None)
         await _notify_search_changed(db, collection_obj, changed)

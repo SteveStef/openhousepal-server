@@ -34,7 +34,7 @@ Each feature shows a status: **Uses your brand**, **Its own look**, **Not set up
 **Where**: Tools > Signature. Autosaves ("Saving..." / "Saved"). Five sections: **Identity**, **Social**, **Buttons**, **Banner**, **Customize**.
 
 ### Identity
-"Headshot, name, title, brokerage, team, phone & email come from your Profile in Settings." Switch each on/off: **Headshot**, **Name**, **Job Title**, **Brokerage**, **Team** (needs a team name in Settings), **Phone**, **Email**, **Agent Hub link**. **Verified badge**: "Small blue checkmark next to your name - a design accent, not a real verification." Drag your photo to fix a tight crop.
+"Headshot, name, title, brokerage, team, phone & email come from your Profile in Settings." Switch each on/off: **Headshot**, **Name**, **Job Title**, **Brokerage**, **Team** (needs a team name in Settings), **Phone**, **Email**, **Agent Hub link**. **Verified badge**: "Small blue checkmark next to your name - shows clients you're a licensed agent, checked with the license or MLS ID you gave us." (Owner 11/13: the badge stands for a real agent - their license number or Bright MLS ID is on file.) Drag your photo to fix a tight crop.
 
 ### Social
 Toggle which links show: **Website**, **Instagram**, **Facebook**, **YouTube**, **TikTok**. Links come from Social Links in Settings - "A link with nothing filled in can't be turned on." No LinkedIn. Icons pop in gently, then hold.

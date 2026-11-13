@@ -1,3 +1,4 @@
+from app.utils.mls_mapper import card_photo
 import logging
 import re
 import uuid
@@ -1758,7 +1759,7 @@ async def _showing_home(db: AsyncSession, submission: FormSubmission) -> dict:
         "address": submission.property_address or prop.street_address or "",
         "street": nice_street(prop.street_address, prop.city) or (submission.property_address or "").split(",")[0],
         "city": (prop.city or "").title(), "state": prop.state or "", "zipcode": prop.zipcode or "",
-        "photo": prop.img_src or (photos[0] if photos else None),
+        "photo": card_photo(prop.img_src, photos),
         "price": prop.price, "beds": prop.bedrooms, "baths": prop.bathrooms, "sqft": prop.living_area,
     }
 
@@ -1943,10 +1944,14 @@ async def update_form(
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Core contact questions cannot be removed.")
         form.questions = clean_question_forks([question.model_dump() for question in payload.questions])
 
+    old_title, old_headline = form.title or "", form.headline or ""
     if payload.title is not None and not aesthetics_only:
         form.title = payload.title
     if payload.headline is not None and not aesthetics_only:
         form.headline = payload.headline
+    renamed = payload.title is not None and not aesthetics_only and payload.title.strip() and payload.title != old_title
+    if renamed:
+        await _follow_new_title(db, form, old_title, old_headline, payload.headline)
     if payload.subtitle is not None and not aesthetics_only:
         form.subtitle = payload.subtitle
     if payload.description is not None and not aesthetics_only:
@@ -1984,6 +1989,35 @@ async def update_form(
     await db.commit()
     await db.refresh(form)
     return form
+
+
+_UNTITLED_SLUG = re.compile(r"untitled-form(-\d+)?")
+
+
+async def _follow_new_title(db: AsyncSession, form: AgentForm, old_title: str, old_headline: str, sent_headline: Optional[str]) -> None:
+    """A new custom form starts as "Untitled Form" (title, big heading and link). When the agent
+    names it, the parts they never touched follow the name - before, visitors still saw "Untitled
+    Form" as the heading and the link stayed /untitled-form (launch audit 11/13).
+    - Heading: follows when it still equals the old title and the agent didn't change it here.
+    - Link: only an untitled-form link nobody has used yet (no visit, answer or campaign), so a
+      link or QR code already handed out never breaks."""
+    if old_headline.strip() == old_title.strip() and (sent_headline is None or sent_headline == old_headline):
+        form.headline = form.title
+    if not _UNTITLED_SLUG.fullmatch(form.slug or ""):
+        return
+    for model in (FormViewSession, FormSubmission, FormCampaign):
+        if (await db.execute(select(model.id).where(model.form_id == form.id).limit(1))).first():
+            return
+    base = re.sub(r"[^a-z0-9]+", "-", form.title.lower()).strip("-")[:60].strip("-")
+    if not base or base in RESERVED_FORM_SLUGS or not SLUG_PATTERN.fullmatch(base):
+        return
+    taken = set((await db.execute(
+        select(AgentForm.slug).where(AgentForm.owner_id == form.owner_id, AgentForm.id != form.id)
+    )).scalars().all())
+    slug, n = base, 2
+    while slug in taken:
+        slug, n = f"{base}-{n}", n + 1
+    form.slug = slug
 
 
 def _agent_hub_is_live(agent: User, hub: AgentHub) -> bool:

@@ -4021,7 +4021,10 @@ async def fire_due_reminders(db: AsyncSession) -> int:
 # --------------------------------------------------------------------------- iCalendar feed
 
 def _ics_escape(text: str) -> str:
-    return (text or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+    # Line breaks typed on Windows / pasted from email arrive as \r\n or a lone \r - a raw \r inside
+    # an .ics line breaks some calendar apps' import (signup-settings audit 11/13).
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
 
 
 def _fold(line: str) -> str:

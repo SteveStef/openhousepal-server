@@ -382,8 +382,11 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
         if rule is not None and not rule["on"]:
             held_off += 1
             continue
+        weekly_why = "client" if st.get("code") == "chosen" and st.get("frequency_by") == "client" else (
+            "agent" if st.get("code") == "chosen" else "")
         if rule is not None and rule.get("mode") == "weekly" and st["mode"] == "daily":
             st = {**st, "mode": "weekly"}
+            weekly_why = "agent"   # their agent's Studio -> Email setting
         if st["mode"] == "off":
             held_off += 1
             continue
@@ -441,6 +444,8 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
         # "How often & when" link at the top of the email - opens their Showcase's email settings.
         link = vars_.get("collection_link") or ""
         vars_["manage_link"] = f"{link}{'&' if '?' in link else '?'}emails=1" if link else ""
+        if weekly and weekly_why:
+            vars_["weekly_why"], vars_["weekly_frequency"] = weekly_why, st["mode"]
         n = per_owner.get(col.owner_id, 0)
         per_owner[col.owner_id] = n + 1
         db.add(ScheduledEmail(
@@ -761,7 +766,10 @@ async def _briefing(db: AsyncSession, user: User, now: datetime, showcase_access
     # Showcase clients asking to change their search (the Showcases menu's red badge).
     if showcase_access:
         from app.services.collections_service import CollectionsService
-        refine = await CollectionsService.count_pending_refine_requests(db, str(user.id))
+        refine, showings = await CollectionsService.count_pending_refine_requests(db, str(user.id), split=True)
+        if showings:
+            activity.append({"badge": str(showings), "title": _plural(showings, "showing request", "showing requests") + " waiting on you",
+                             "detail": "", "link": absolute("/showcases")})
         if refine:
             activity.append({"badge": str(refine), "title": _plural(refine, "client wants", "clients want") + " their search changed",
                              "detail": "", "link": absolute("/showcases")})

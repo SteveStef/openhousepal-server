@@ -245,6 +245,12 @@ async def get_discovery(
         # the Discovery marketplace as an open house another agent could request to host.
         filters.append(Property.is_manual.is_(False))
 
+        # Never your own listings - you can't ask yourself to host them (launch audit 11/13: they
+        # showed with a "Request to Host" button).
+        if current_user.mls_id:
+            filters.append(or_(Property.list_agent_mls_id.is_(None), Property.list_agent_mls_id != current_user.mls_id))
+            filters.append(or_(Property.co_list_agent_mls_id.is_(None), Property.co_list_agent_mls_id != current_user.mls_id))
+
         # Exclude LAND
         filters.append(Property.home_type != 'LAND')
 
