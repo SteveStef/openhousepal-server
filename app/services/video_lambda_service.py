@@ -62,16 +62,42 @@ def _split(job_id: str) -> tuple[str, str]:
     return bucket, render_id
 
 
+_ACCOUNT: dict[str, Any] = {"at": 0.0, "limit": None}
+
+
+def account_limit() -> int:
+    """How many Lambdas this AWS account may run at once - read from AWS itself (checked at most once
+    an hour), so when AWS raises it (requested 11/13: 10 -> 1,000) videos speed up by themselves with no
+    settings change. REMOTION_ACCOUNT_CONCURRENCY overrides; 10 if AWS can't be asked."""
+    if os.environ.get("REMOTION_ACCOUNT_CONCURRENCY"):
+        return max(2, int(os.environ["REMOTION_ACCOUNT_CONCURRENCY"]))
+    if _ACCOUNT["limit"] and time.time() - _ACCOUNT["at"] < 3600:
+        return _ACCOUNT["limit"]
+    try:
+        import boto3
+        s = boto3.client("lambda", region_name=_region()).get_account_settings()
+        lim = int(((s.get("AccountLimit") or {}).get("ConcurrentExecutions")) or 10)
+    except Exception:  # noqa: BLE001
+        lim = _ACCOUNT["limit"] or 10
+    _ACCOUNT.update(at=time.time(), limit=max(2, lim))
+    return _ACCOUNT["limit"]
+
+
+def lambdas_per_video() -> int:
+    """How many Lambdas one video is split across: REMOTION_MAX_LAMBDAS (7 - sized for a 10-at-once
+    account) while the account is small; once AWS allows 100+ at once, 40 (about 1-2 minutes a video,
+    same cost) unless REMOTION_MAX_LAMBDAS is set higher."""
+    env = max(1, int(os.environ.get("REMOTION_MAX_LAMBDAS") or 7))
+    return env if account_limit() < 100 else max(env, 40)
+
+
 def max_videos() -> int:
-    """How many videos may be on Lambda at once. Each takes REMOTION_MAX_LAMBDAS renderers + 1 main
-    function, and progress checks need a little room too, out of the account's concurrency
-    (REMOTION_ACCOUNT_CONCURRENCY, 10 on a new account -> 1 video at a time; the rest wait in line).
-    REMOTION_MAX_VIDEOS overrides."""
+    """How many videos may be on Lambda at once: each takes lambdas_per_video() renderers + 1 main
+    function, and progress checks need a little room, out of the account's limit (10 now -> 1 video at a
+    time; the rest wait in line). REMOTION_MAX_VIDEOS overrides."""
     if os.environ.get("REMOTION_MAX_VIDEOS"):
         return max(1, int(os.environ["REMOTION_MAX_VIDEOS"]))
-    lambdas = max(1, int(os.environ.get("REMOTION_MAX_LAMBDAS") or 7))
-    account = max(2, int(os.environ.get("REMOTION_ACCOUNT_CONCURRENCY") or 10))
-    return max(1, (account - 2) // (lambdas + 1))
+    return max(1, (account_limit() - 2) // (lambdas_per_video() + 1))
 
 
 def video_seconds(frames: int) -> float:
@@ -91,7 +117,7 @@ def health() -> dict:
 
 async def start(props: dict) -> str:
     from remotion_lambda import Privacy, RenderMediaParams
-    lambdas = max(1, int(os.environ.get("REMOTION_MAX_LAMBDAS") or 7))
+    lambdas = lambdas_per_video()
     fpl = max(20, math.ceil(frames_estimate(props) / lambdas))
     params = RenderMediaParams(
         composition="CinematicVideo", input_props=props, codec="h264", crf=21, audio_codec="aac",
