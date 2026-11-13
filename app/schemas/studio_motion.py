@@ -43,3 +43,8 @@ class MotionEstimateResponse(BaseModel):
     month_percent: Optional[float] = None
     soft_capped: bool = False
     sharpen_paused: bool = False
+    # making the video itself (AWS Lambda, owner 11/13) - 0 / False on the old self-hosted worker
+    render_usd: float = 0.0
+    render_percent: Optional[float] = None
+    render_paid: bool = False
+    render_paused: bool = False

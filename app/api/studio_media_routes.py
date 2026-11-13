@@ -420,10 +420,11 @@ async def export_asset(
 async def motion_estimate(
     photos: int = Query(7, ge=1, le=30),
     sharpen: bool = Query(True),
+    seconds: float = Query(30, ge=5, le=120),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_studio_media_access),
 ):
-    return await studio_motion_service.estimate(db, current_user, photos, sharpen)
+    return await studio_motion_service.estimate(db, current_user, photos, sharpen, seconds)
 
 
 @router.get("/motion/health")

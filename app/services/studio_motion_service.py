@@ -36,6 +36,7 @@ from app.config.logging import get_logger
 from app.database import AsyncSessionLocal
 from app.models.database import Property, StudioMediaAsset, User
 from app.services import s3_service, storage_ledger_service
+from app.services import video_lambda_service as vl
 from app.services.ai.ai_config_service import ai_config_service
 from app.utils.auth import tier_has_mls
 from app.services.ai.ai_rate_limit_service import (
@@ -577,7 +578,7 @@ async def _owned_motion(db, owner_id: str, asset_id: str, lock: bool = False) ->
 
 # ------------------------------------------------------------------ costs
 
-async def estimate(db, user: User, photos: int, sharpen: bool) -> dict:
+async def estimate(db, user: User, photos: int, sharpen: bool, seconds: float = 30) -> dict:
     config = await ai_config_service.get_config(db)
     n = max(1, min(int(photos or 1), int(config.get("studio_motion_max_photos", 15))))
     from app.services.ai.ai_copywrite_service import estimate_photo_sort_usd
@@ -587,12 +588,17 @@ async def estimate(db, user: User, photos: int, sharpen: bool) -> dict:
     snap = await monthly_ai_budget_snapshot(db, user.id, config, user.plan_tier)
     limit = snap.get("limit_usd")
     pct = (lambda v: round(v / float(limit) * 100, 2) if limit else None)
+    paid = vl.enabled()
+    render = vl.estimate_usd(seconds, config) if paid else 0.0
+    would_refuse = await studio_motion_would_refuse(db, user.id, config, user.plan_tier)
     return {
+        "render_usd": render, "render_percent": pct(render) if paid else None, "render_paid": paid,
+        "render_paused": bool(paid and would_refuse),
         "photos": n, "analyze_usd": round(analyze, 4), "sharpen_usd": round(sharp, 4),
         "analyze_percent": pct(analyze), "sharpen_percent": pct(sharp), "month_percent": snap.get("percent"),
         "soft_capped": await studio_soft_capped(db, user.id, config, user.plan_tier),
         # sharpening will be skipped at Make (any AI limit, not just the soft cap) - the page says so
-        "sharpen_paused": await studio_motion_would_refuse(db, user.id, config, user.plan_tier),
+        "sharpen_paused": would_refuse,
     }
 
 
@@ -1180,6 +1186,16 @@ async def worker_alive() -> bool:
 async def worker_status() -> dict:
     """Is the video maker up, and how long would a video take right now (its measured speed + the
     line ahead) - the Make step's "To make" figure (QA 11/12: it was a fixed guess)."""
+    if vl.enabled():  # AWS Lambda (owner 11/13): always up; a short line only while every slot is busy
+        h = vl.health()
+        try:
+            making, waiting = await _lambda_line()
+            wait = await _line_wait_seconds(making, len(waiting))
+        except Exception:  # noqa: BLE001
+            making, waiting, wait = [], [], 0
+        return {"worker": True, "wait_seconds": round(wait), "sec_per_frame": h["sec_per_frame"], "start_seconds": h["start_seconds"],
+                "save_seconds": round(_SAVE_SECS["v"]), "queued": len(waiting),
+                "busy": len(making) >= vl.max_videos()}
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             r = await client.get(f"{_worker_url()}/health")
@@ -1215,7 +1231,14 @@ async def start_render(db, user: User, asset_id: str, sharpen: Optional[bool], f
     need_sharp = [p for p in visible if not p.get("sharp")]
     reservation = None
     skip_sharp = False
-    if need_sharp:
+    if vl.enabled():
+        # Making the video now costs real money (AWS Lambda, owner 11/13) and counts on the agent's
+        # monthly AI usage - so it needs AI left this month, like every other AI Media tool.
+        try:
+            reservation = await reserve_studio_motion(db, user.id, config, user.plan_tier)
+        except AIRateLimitExceeded as exc:
+            raise _rate_http(exc)
+    elif need_sharp:
         if await studio_soft_capped(db, user.id, config, user.plan_tier):
             skip_sharp = True
         else:
@@ -1301,25 +1324,51 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
                     a.cost_usd = round(float(a.cost_usd or 0) + spent, 4)
                 a2 = await _patch(asset_id, keep_sharp)
                 motion = dict((a2.options or {}).get("motion") or {})
-            if reservation is not None:
+            if reservation is not None and not vl.enabled():
                 async with AsyncSessionLocal() as db:
                     await reconcile_budget(db, reservation, spent)
                 reservation = None
-            # 2) hand it to the worker
+            # 2) hand it to the video maker (AWS Lambda when set up, else the self-hosted worker)
             props = worker_props(motion, target)
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(f"{_worker_url()}/jobs", json={"props": props}, headers=_worker_headers())
-                r.raise_for_status()
-                job_id = r.json()["id"]
+            if vl.enabled():
+                job_id = await _lambda_take_turn(asset_id, props)
+            else:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    r = await client.post(f"{_worker_url()}/jobs", json={"props": props}, headers=_worker_headers())
+                    r.raise_for_status()
+                    job_id = r.json()["id"]
             await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "job_id": job_id, "state": "queued",
                                                                           "stage": "Waiting for the video maker", "progress": max(0.12, (o.get("render") or {}).get("progress") or 0)}))
         # 3) follow the worker. Runs on the server, so the agent can close the page, log out or turn
         # their computer off - the bell (and their next daily briefing) tells them when it's ready.
         last = None
         resent = 0
+        lam = vl.is_lambda_job(job_id)
         async with httpx.AsyncClient(timeout=30) as client:
             while True:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(5.0 if lam else 2.0)
+                if lam:
+                    j = await vl.status(job_id)
+                    if j.get("busy_check"):
+                        continue
+                    if j.get("status") == "failed":
+                        raise RuntimeError("worker: " + str(j.get("error") or "render failed"))
+                    if j.get("status") == "done":
+                        break
+                    state = "rendering" if j.get("status") == "rendering" else "queued"
+                    prog = 0.12 + 0.8 * float(j.get("progress") or 0)
+                    eta = j.get("eta_seconds")
+                    eta = int(eta) + int(_SAVE_SECS["v"]) if eta is not None else None
+                    eta_at = (datetime.now(timezone.utc) + timedelta(seconds=eta)).isoformat() if eta is not None else None
+                    prev = (last or {}).get("eta_at")
+                    if prev and eta_at and abs((datetime.fromisoformat(prev) - datetime.fromisoformat(eta_at)).total_seconds()) < max(5, 0.04 * int(eta)):
+                        eta_at = prev
+                    cur = {"state": state, "progress": round(prog, 2), "stage": "Filming your video" if state == "rendering" else "Starting the cameras",
+                           "ahead": 0, "eta_at": eta_at, "wait_seconds": 0, "eta_learned": True}
+                    if cur != last:
+                        last = cur
+                        await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), **cur, "progress": prog}))
+                    continue
                 try:
                     r = await client.get(f"{_worker_url()}/jobs/{job_id}", headers=_worker_headers())
                 except httpx.HTTPError:
@@ -1368,16 +1417,43 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
             await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "state": "finishing", "progress": 0.94, "stage": "Saving your video",
                                                                           "eta_at": (datetime.now(timezone.utc) + timedelta(seconds=_SAVE_SECS["v"])).isoformat()}))
             save_t0 = time.time()
-            fr = await client.get(f"{_worker_url()}/jobs/{job_id}/file", headers=_worker_headers(), timeout=300)
-            fr.raise_for_status()
-            video = fr.content
             poster = None
-            try:
-                pr = await client.get(f"{_worker_url()}/jobs/{job_id}/poster", headers=_worker_headers(), timeout=60)
-                if pr.status_code == 200 and pr.content:
-                    poster = pr.content
-            except httpx.HTTPError:
-                poster = None
+            if lam and not await _first_to_finish(job_id):
+                # another server process (the every-2-minutes pick-up, or a second copy of the app)
+                # is already saving and charging this exact video - leave it to that one (QA 11/13:
+                # a local test saved and charged one video three times)
+                if reservation is not None:
+                    async with AsyncSessionLocal() as db:
+                        await reconcile_budget(db, reservation, spent)
+                return
+            if lam:
+                video = await vl.fetch(job_id, j.get("out_key"))  # the cover is taken from the video itself below
+            else:
+                fr = await client.get(f"{_worker_url()}/jobs/{job_id}/file", headers=_worker_headers(), timeout=300)
+                fr.raise_for_status()
+                video = fr.content
+                try:
+                    pr = await client.get(f"{_worker_url()}/jobs/{job_id}/poster", headers=_worker_headers(), timeout=60)
+                    if pr.status_code == 200 and pr.content:
+                        poster = pr.content
+                except httpx.HTTPError:
+                    poster = None
+        if lam:
+            # What AWS charged for this video goes on the agent's monthly AI usage (owner 11/13).
+            async with AsyncSessionLocal() as db:
+                aws = vl.charge_usd(j.get("remotion_cost_usd") or 0, await ai_config_service.get_config(db))
+                if aws:
+                    await record_usage_event(db, owner_id, None, "aws:lambda", None, None, aws, 0, False, None, event_type=EVENT_TYPE)
+            spent += aws
+            if reservation is not None:
+                async with AsyncSessionLocal() as db:
+                    await reconcile_budget(db, reservation, spent)
+                reservation = None
+            render_cost = aws
+
+            def add_cost(a, o):
+                a.cost_usd = round(float(a.cost_usd or 0) + render_cost, 4)
+            await _patch(asset_id, add_cost)
         frames, width = j.get("frames"), j.get("width")
         url = await asyncio.to_thread(s3_service.upload_bytes, video, f"{_S3_PREFIX}/videos", ".mp4", "video/mp4")
         from app.services.studio_media_service import _store_preview_frame
@@ -1447,11 +1523,14 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
                 s3_service.delete_by_url(old_prev)
         # Only now (the video is safely stored) let the worker drop its copy - a restart before this
         # point resumes and downloads it again instead of losing the finished render.
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                await client.delete(f"{_worker_url()}/jobs/{job_id}", headers=_worker_headers())
-        except httpx.HTTPError:
-            pass  # the worker clears old files by itself after 3 hours
+        if lam:
+            await vl.cleanup(job_id)
+        else:
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    await client.delete(f"{_worker_url()}/jobs/{job_id}", headers=_worker_headers())
+            except httpx.HTTPError:
+                pass  # the worker clears old files by itself after 3 hours
         if newly_done["v"] and asset:
             async with AsyncSessionLocal() as db:
                 fresh = await db.get(StudioMediaAsset, asset_id)
@@ -1494,6 +1573,16 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
 async def _next_remake(asset_id: str, owner_id: str) -> None:
     """After an updated main video: re-make the next out-of-date extra shape (render only - the
     photos are already prepared, so sharpening is never re-run here)."""
+    if vl.enabled():
+        # each remake is a paid AWS render now - not once the agent's AI for the month is used up
+        # (the out-of-date shapes stay listed; Make it re-makes them when there's AI again)
+        try:
+            async with AsyncSessionLocal() as db:
+                u = await db.get(User, owner_id)
+                if not u or await studio_motion_would_refuse(db, owner_id, await ai_config_service.get_config(db), u.plan_tier):
+                    return
+        except Exception:  # noqa: BLE001
+            return
     nxt = {"t": None}
 
     def take(a, o):
@@ -1515,7 +1604,130 @@ async def _next_remake(asset_id: str, owner_id: str) -> None:
         _TASKS[asset_id] = asyncio.create_task(_run_render(asset_id, owner_id, None, resume_job=None))
 
 
+async def _first_to_finish(job_id: str) -> bool:
+    """True for exactly one caller per AWS render (an atomic database counter), so a finished video is
+    saved and charged once even when two server processes follow the same render."""
+    from app.services.usage_budget_service import _period_keys, reserve_bucket
+    try:
+        async with AsyncSessionLocal() as db:
+            first = await reserve_bucket(db, f"motion_finish:{job_id.rsplit(':', 1)[-1]}", "month", _period_keys()[1], 1, 0, 1, None)
+            await db.commit()
+            return bool(first)
+    except Exception:  # noqa: BLE001 - never block a finished video on this check
+        logger.warning("motion finish claim failed", exc_info=True)
+        return True
+
+
 _ACTIVE = ("preparing", "queued", "rendering", "finishing")
+
+# ---- the line for AWS Lambda videos (owner 11/13). The account runs only so many Lambdas at once
+# (vl.max_videos() videos), so extra videos wait their turn here: first come, first served (render
+# "line_at"), each one's page shows how many are ahead and a countdown that moves as the line does.
+# Kept in the database (each video's render state), so a restart keeps everyone's place, and it all
+# runs on the server - the agent can close the page or log out.
+_LINE_LOCK = asyncio.Lock()
+
+
+async def _lambda_line() -> tuple[list[dict], list[dict]]:
+    """(being made on Lambda now, waiting in line - oldest first)."""
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(select(StudioMediaAsset.id, StudioMediaAsset.options).where(
+            StudioMediaAsset.action == "motion",
+            StudioMediaAsset.options["render"]["state"].astext.in_(_ACTIVE),
+        ))).all()
+    making, waiting = [], []
+    for aid, opts in rows:
+        r = (opts or {}).get("render") or {}
+        job = r.get("job_id") or ""
+        if vl.is_lambda_job(job):
+            if r.get("state") in ("queued", "rendering"):  # "finishing" = saving, AWS is already free
+                making.append({"id": aid, "eta_at": r.get("eta_at"), "frames": r.get("frames")})
+        elif r.get("line_at") and not job:
+            waiting.append({"id": aid, "line_at": r["line_at"], "frames": r.get("frames")})
+    waiting.sort(key=lambda w: (w["line_at"], w["id"]))
+    return making, waiting
+
+
+async def _line_wait_seconds(making: list[dict], ahead_waiting: int) -> float:
+    """Seconds until a slot is free for a video with `ahead_waiting` videos in line before it."""
+    slots = vl.max_videos()
+    now = datetime.now(timezone.utc)
+    left = []
+    for m in making:
+        try:
+            left.append(max(0.0, (datetime.fromisoformat(m["eta_at"]) - now).total_seconds()) if m.get("eta_at") else vl.video_seconds(m.get("frames") or 900))
+        except ValueError:
+            left.append(vl.video_seconds(900))
+    left.sort()
+    free_now = max(0, slots - len(left))
+    queue = [0.0] * free_now + left  # when each slot frees up
+    for _ in range(ahead_waiting):  # each video ahead takes the next free slot
+        queue.sort()
+        t = queue.pop(0)
+        queue.append(t + vl.video_seconds(900))
+    queue.sort()
+    return queue[0] if queue else 0.0
+
+
+async def _lambda_take_turn(asset_id: str, props: dict) -> str:
+    """Wait for a free Lambda slot (first come, first served), then start this video on AWS."""
+    frames = vl.frames_estimate(props)
+
+    def join(a, o):
+        r = dict(o.get("render") or {})
+        r.setdefault("line_at", _now())
+        r["frames"] = frames
+        o["render"] = r
+    a0 = await _patch(asset_id, join)
+    run_key = ((a0.options or {}).get("render") or {}).get("started_at") or "" if a0 else ""
+    last = None
+
+    async def started_elsewhere() -> Optional[str]:
+        # another server process (deploy overlap, a leftover process) already started this video
+        async with AsyncSessionLocal() as db:
+            a = await db.get(StudioMediaAsset, asset_id)
+            job = (((a.options or {}).get("render") or {}).get("job_id") if a else None) or ""
+        return job if vl.is_lambda_job(job) else None
+
+    while True:
+        other = await started_elsewhere()
+        if other:
+            return other
+        async with _LINE_LOCK:
+            making, waiting = await _lambda_line()
+            ids = [w["id"] for w in waiting]
+            pos = ids.index(asset_id) if asset_id in ids else 0
+            if len(making) + pos < vl.max_videos():
+                # exactly one process may start this run of this video (atomic database claim)
+                from app.services.usage_budget_service import _period_keys, reserve_bucket
+                async with AsyncSessionLocal() as db:
+                    mine = await reserve_bucket(db, f"motion_start:{asset_id}:{run_key}", "month", _period_keys()[1], 1, 0, 1, None)
+                    await db.commit()
+                if not mine:
+                    await asyncio.sleep(3.0)
+                    continue
+                job_id = await vl.start(props)
+                await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "job_id": job_id, "state": "queued",
+                                                                              "stage": "Starting the cameras", "ahead": 0}))
+                return job_id
+            wait = await _line_wait_seconds(making, pos)
+        ahead = len(making) + pos
+        eta = wait + vl.video_seconds(frames) + _SAVE_SECS["v"]
+        eta_at = (datetime.now(timezone.utc) + timedelta(seconds=eta)).isoformat()
+        if last and last["ahead"] == ahead and abs((datetime.fromisoformat(last["eta_at"]) - datetime.fromisoformat(eta_at)).total_seconds()) < max(8, 0.05 * eta):
+            eta_at = last["eta_at"]  # keep the countdown steady unless the line really moved
+        cur = {"state": "queued", "ahead": ahead, "eta_at": eta_at, "wait_seconds": round(wait),
+               "stage": f"In line - {ahead} {'video' if ahead == 1 else 'videos'} ahead of yours", "eta_learned": True}
+        if cur != last:
+            last = cur
+
+            def wait_patch(a, o):
+                r = o.get("render") or {}
+                if vl.is_lambda_job(r.get("job_id")):
+                    return  # already on AWS (started by another process) - never put it back in line
+                o["render"] = {**r, **cur}
+            await _patch(asset_id, wait_patch)
+        await asyncio.sleep(4.0)
 # Seconds to copy a finished video to storage - added to the countdown; learned from each save.
 _SAVE_SECS = {"v": 20.0}
 _RESUMING: set[str] = set()

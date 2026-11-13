@@ -322,6 +322,14 @@ async def get_ai_helper_switch(db: AsyncSession = Depends(get_db), admin: UserMo
     return {"open_to_all": await helper_open_to_all(db)}
 
 
+@router.get("/provider-limits")
+async def get_provider_limits(db: AsyncSession = Depends(get_db), admin: UserModel = Depends(require_admin_user)):
+    """Every paid provider's month so far against its free allowance / our cap (owner 11/13) -
+    the Costs > Provider billing page. provider_limits_service.snapshot."""
+    from app.services.provider_limits_service import snapshot
+    return await snapshot(db)
+
+
 @router.put("/helper-switch")
 async def set_ai_helper_switch(payload: dict, db: AsyncSession = Depends(get_db), admin: UserModel = Depends(require_admin_user)):
     from app.services.ai.ai_helper_access import helper_open_to_all, set_helper_open_to_all

@@ -80,7 +80,7 @@ _limiter = _InProcessLimiter()
 
 
 async def _count_since(db: AsyncSession, owner_id: str, since: datetime, event_type: Optional[str] = None,
-                       skip_model_prefix: Optional[str] = None) -> int:
+                       skip_model_prefix: Optional[str | tuple[str, ...]] = None) -> int:
     stmt = select(func.count(AIUsageEvent.id)).where(
         AIUsageEvent.owner_id == owner_id,
         AIUsageEvent.blocked.is_(False),
@@ -88,8 +88,8 @@ async def _count_since(db: AsyncSession, owner_id: str, since: datetime, event_t
     )
     if event_type:
         stmt = stmt.where(AIUsageEvent.event_type == event_type)
-    if skip_model_prefix:
-        stmt = stmt.where(~func.coalesce(AIUsageEvent.model, "").startswith(skip_model_prefix))
+    for pre in ((skip_model_prefix,) if isinstance(skip_model_prefix, str) else (skip_model_prefix or ())):
+        stmt = stmt.where(~func.coalesce(AIUsageEvent.model, "").startswith(pre))
     result = await db.execute(stmt)
     return result.scalar_one() or 0
 
@@ -749,7 +749,7 @@ async def _reserve_studio_media(
     db: AsyncSession, owner_id: str, config: dict, plan_tier: str,
     *, event_type: str, daily_key: str, monthly_key: str,
     bucket: str, estimate_key: str, daily_ceiling_key: str, monthly_ceiling_key: str,
-    count_skip_model_prefix: Optional[str] = None,
+    count_skip_model_prefix: Optional[str | tuple[str, ...]] = None,
 ) -> Reservation:
     """Shared body for the image and video variants below - same shape as reserve_cma_analysis:
     per-user daily/monthly generation-count ceilings scoped to this feature's own event_type,
@@ -839,7 +839,7 @@ async def reserve_studio_motion(db: AsyncSession, owner_id: str, config: dict, p
         # Count VIDEOS, not steps (QA 11/12): each video also logs its photo prep (fal:depth,
         # fal:erase, fal:esrgan) under this event_type for spend tracking, which made "40 a day"
         # really ~10. Only the room-sorting run (one per project) counts toward the limits.
-        count_skip_model_prefix="fal:",
+        count_skip_model_prefix=("fal:", "aws:"),  # AWS Lambda render cost too (owner 11/13) - money, not a video
     )
 
 
@@ -855,8 +855,8 @@ async def studio_motion_would_refuse(db: AsyncSession, owner_id: str, config: di
         await enforce_studio_media_monthly_cap(db, owner_id, config, plan_tier)
     except AIRateLimitExceeded:
         return True
-    day = await _count_since(db, owner_id, now.replace(hour=0, minute=0, second=0, microsecond=0), event_type="studio_motion", skip_model_prefix="fal:")
-    month = await _count_since(db, owner_id, now.replace(day=1, hour=0, minute=0, second=0, microsecond=0), event_type="studio_motion", skip_model_prefix="fal:")
+    day = await _count_since(db, owner_id, now.replace(hour=0, minute=0, second=0, microsecond=0), event_type="studio_motion", skip_model_prefix=("fal:", "aws:"))
+    month = await _count_since(db, owner_id, now.replace(day=1, hour=0, minute=0, second=0, microsecond=0), event_type="studio_motion", skip_model_prefix=("fal:", "aws:"))
     return day >= config["studio_motion_daily_generation_limit_by_tier"][plan_tier] or month >= config["studio_motion_monthly_generation_limit_by_tier"].get(plan_tier, 0)
 
 

@@ -718,7 +718,13 @@ DEFAULT_CONFIG = {
     "studio_motion_erase_badge": True,
     "studio_motion_erase_price_per_photo_usd": 0.004,
     "studio_motion_sharpen_price_per_photo_usd": 0.006,
-    "studio_motion_reservation_estimate_usd": 0.15,
+    # Making the video on AWS Lambda (owner 11/13). Charged to the agent's AI usage after each video
+    # from Remotion's own cost figure x this factor: measured 11/13 against AWS's billed time, Remotion
+    # under-counted: 11.1c said / 12.8c billed (x1.15), then 8.6c / 10.5c (x1.22) - two 30 s videos 11/13.
+    "studio_motion_lambda_cost_factor": 1.2,
+    # Up-front guess for the Make step: dollars per second of finished video (12.8c / 30 s, rounded up).
+    "studio_motion_render_usd_per_second": 0.0045,
+    "studio_motion_reservation_estimate_usd": 0.45,
     "studio_motion_daily_generation_limit_by_tier": {"IDX": 40, "PRO_NO_MLS": 40},
     "studio_motion_monthly_generation_limit_by_tier": {"IDX": 400, "PRO_NO_MLS": 400},
     "studio_motion_global_daily_cost_ceiling_usd": 25.0,

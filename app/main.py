@@ -299,6 +299,12 @@ async def lifespan(app: FastAPI):
         name="Claude AI health check",
         replace_existing=True,
     )
+    # Every paid provider against its free monthly allowance / our monthly cap - one admin bell at
+    # 80% and again at 95% per month (owner 11/13: AWS, Google and every provider). provider_limits_service.
+    from app.services.provider_limits_service import check_and_alert as _limits_check
+    scheduler.add_job(_limits_check, _Interval(minutes=30, start_date=_dt.now() + _td(minutes=2)),
+                      id="provider_limits_check", name="Provider limits close?", replace_existing=True,
+                      max_instances=1, coalesce=True)
     # Bare-domain redirect server (WEBSITE_APEX_IP) still answering? Bell + email to the admin if not
     # (owner 11/13 - it was switched off on 11/12 and nobody knew). apex_redirect_monitor.py.
     from app.services.apex_redirect_monitor import scheduled_apex_redirect_check
