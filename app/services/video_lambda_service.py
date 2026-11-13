@@ -29,7 +29,9 @@ logger = logging.getLogger(__name__)
 PREFIX = "lambda:"
 # measured 11/13 (845 Dale Rd, 900 frames, 9 Lambdas): 445 s -> ~0.49 s a frame at 9 wide. Learned
 # from each finished render after that (the Make step's "To make" figure).
-_SPEED = {"sec_per_frame": 0.5, "start_seconds": 25.0}
+# Seconds ONE Lambda needs per frame (+ a fixed start). Measured 11/13: 900 frames on 7 Lambdas ~510 s
+# (live), on 9 ~445 s -> ~3.8 s a frame per Lambda. Learned from each finished render after that.
+_SPEED = {"lambda_sec_per_frame": 3.8, "start_seconds": 25.0}
 _STARTED: dict[str, float] = {}
 
 
@@ -100,9 +102,13 @@ def max_videos() -> int:
     return max(1, (account_limit() - 2) // (lambdas_per_video() + 1))
 
 
-def video_seconds(frames: int) -> float:
+def sec_per_frame(lambdas: Optional[int] = None) -> float:
+    return _SPEED["lambda_sec_per_frame"] / max(1, int(lambdas or lambdas_per_video()))
+
+
+def video_seconds(frames: int, lambdas: Optional[int] = None) -> float:
     """About how long one video takes on Lambda (learned speed), start to finish."""
-    return _SPEED["start_seconds"] + max(1, int(frames or 900)) * _SPEED["sec_per_frame"]
+    return _SPEED["start_seconds"] + max(1, int(frames or 900)) * sec_per_frame(lambdas)
 
 
 def frames_estimate(props: dict) -> int:
@@ -111,7 +117,7 @@ def frames_estimate(props: dict) -> int:
 
 
 def health() -> dict:
-    return {"worker": True, "wait_seconds": 0, "sec_per_frame": round(_SPEED["sec_per_frame"], 3),
+    return {"worker": True, "wait_seconds": 0, "sec_per_frame": round(sec_per_frame(), 3),
             "start_seconds": round(_SPEED["start_seconds"]), "queued": 0, "running": None, "learned": True}
 
 
@@ -162,20 +168,37 @@ async def status(job_id: str) -> dict:
     remotion_cost = float((costs.get("accruedSoFar") if isinstance(costs, dict) else 0) or 0)
     out: dict[str, Any] = {"progress": prog, "frames": frames, "width": vc.get("width"), "fps": vc.get("fps") or 30,
                            "remotion_cost_usd": remotion_cost, "lambdas": getattr(p, "lambdasInvoked", None)}
+    # Time on AWS so far, from AWS's own start time (survives a server restart; _STARTED doesn't).
+    n_lambdas = int(meta.get("estimatedRenderLambdaInvokations") or 0) or None  # this render's own split
+    started_ms = meta.get("startedDate")
+    t0 = (float(started_ms) / 1000.0) if started_ms else _STARTED.get(job_id)
+    el = max(0.0, time.time() - t0) if t0 else None
     if getattr(p, "done", False):
         out.update(status="done", progress=1.0, out_key=getattr(p, "outKey", None), out_bucket=bucket)
-        t0 = _STARTED.pop(job_id, None)
-        if t0 and frames:
-            spf = (time.time() - t0) / float(frames)
-            _SPEED["sec_per_frame"] = _SPEED["sec_per_frame"] * 0.6 + spf * 0.4
+        _STARTED.pop(job_id, None)
+        if el and frames and el > _SPEED["start_seconds"]:
+            one = (el - _SPEED["start_seconds"]) / float(frames) * (n_lambdas or lambdas_per_video())
+            _SPEED["lambda_sec_per_frame"] = _SPEED["lambda_sec_per_frame"] * 0.6 + one * 0.4
         return out
-    out["status"] = "rendering" if prog > 0.02 else "queued"
-    t0 = _STARTED.get(job_id)
-    if t0 and prog > 0.05:
-        el = time.time() - t0
-        out["eta_seconds"] = int(el / prog * (1 - prog))
-    elif frames:
-        out["eta_seconds"] = int(_SPEED["start_seconds"] + frames * _SPEED["sec_per_frame"])
+    # How long is left. Remotion's overallProgress jumps to ~0.2 before a single frame is made (live
+    # 11/13: "about a minute left" for 5 minutes while ~9 remained), so it isn't used for time. Early on:
+    # the learned speed (start + frames x seconds a frame). As frames really get made: blend toward
+    # "time per frame so far x frames still to make". The percent shown follows the same figure.
+    total = frames or 900
+    learned_left = max(15.0, video_seconds(total, n_lambdas) - (el or 0.0))
+    made = getattr(p, "framesRendered", None)
+    left = learned_left
+    if el and made and total:
+        frac = min(1.0, float(made) / float(total))
+        if frac > 0.02:
+            render_el = max(1.0, el - _SPEED["start_seconds"])
+            live_left = render_el / frac * (1.0 - frac) + 20.0  # + stitching the pieces together
+            w = min(1.0, max(0.0, (frac - 0.1) / 0.5))
+            left = (1.0 - w) * learned_left + w * live_left
+    out["status"] = "rendering" if (made or prog > 0.02) else "queued"
+    out["eta_seconds"] = int(left)
+    if el is not None:
+        out["progress"] = min(0.97, max(0.02, el / (el + left)))
     return out
 
 

@@ -1361,8 +1361,13 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
                     eta = int(eta) + int(_SAVE_SECS["v"]) if eta is not None else None
                     eta_at = (datetime.now(timezone.utc) + timedelta(seconds=eta)).isoformat() if eta is not None else None
                     prev = (last or {}).get("eta_at")
-                    if prev and eta_at and abs((datetime.fromisoformat(prev) - datetime.fromisoformat(eta_at)).total_seconds()) < max(5, 0.04 * int(eta)):
-                        eta_at = prev
+                    if prev and eta_at:
+                        shift = (datetime.fromisoformat(eta_at) - datetime.fromisoformat(prev)).total_seconds()
+                        if abs(shift) < max(5, 0.04 * int(eta)):
+                            eta_at = prev  # steady countdown
+                        elif shift < -20:
+                            # never suddenly earlier: come down at most 20 s a check (owner 11/13)
+                            eta_at = (datetime.fromisoformat(prev) - timedelta(seconds=20)).isoformat()
                     cur = {"state": state, "progress": round(prog, 2), "stage": "Filming your video" if state == "rendering" else "Starting the cameras",
                            "ahead": 0, "eta_at": eta_at, "wait_seconds": 0, "eta_learned": True}
                     if cur != last:
