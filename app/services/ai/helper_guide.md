@@ -920,7 +920,8 @@ Every follow-up's calendar event has links:
 - **Emails on** - normal.
 - **Weekly only** - they left emails unopened on 3 different days; daily Showcase updates become one weekly email. Back to daily as soon as they open one.
 - **Emails off** - they also ignored 5 weekly emails; automatic emails stop. They restart by themselves when the person opens an email or uses their Showcase.
-- **How often (Daily, Weekly, Every 2 weeks)** - on the lead, their Showcase and the tracker. **Daily** runs the rules above, counting from that moment. **Weekly** and **Every 2 weeks** stay put whether they open or not, because someone chose them on purpose. The client can pick the same three at the top right of their Showcase, and you get told.
+- **How often (Daily, Weekly, Every 2 weeks)** - on the lead, their Showcase and the tracker. **Daily** runs the rules above, counting from that moment. **Weekly** and **Every 2 weeks** stay put whether they open or not, because someone chose them on purpose. The client can pick the same three at the top right of their Showcase, and you get told. In the same place they can pick what time the emails arrive: **8 AM**, **Noon**, **4:30 PM** (the usual) or **7 PM** Eastern.
+- When the rules slow a client to weekly or stop their emails, their Showcase tells them once at the top - with a tip to check their junk or spam folder, and buttons to keep daily or go weekly (or turn emails back on). Opening their Showcase already counts as being active, so their emails go back to normal.
 - Personal emails (tour confirmation, reply to their comment, the thank-you after signing in) always send.
 - **Unsubscribed**, bounced ("Fix their email address to send again") or marked-as-spam people can't be switched back on by you.
 

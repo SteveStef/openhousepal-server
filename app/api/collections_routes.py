@@ -1851,8 +1851,12 @@ async def _shared_collection(db: AsyncSession, share_token: str) -> Collection:
 
 
 def _client_frequency(st: dict, c: Collection) -> dict:
+    since = st.get("since")
     return {"frequency": st.get("frequency") or (st["mode"] if st["mode"] in ("daily", "weekly", "biweekly") else "daily"),
-            "emails_on": bool(c.notify_visitor) and st["mode"] != "off", "blocked": st.get("code") in ("unsubscribed", "bounced", "spam")}
+            "emails_on": bool(c.notify_visitor) and st["mode"] != "off", "blocked": st.get("code") in ("unsubscribed", "bounced", "spam"),
+            # For the notice on their Showcase: slowed to weekly / stopped because the emails weren't opened.
+            "mode": st.get("mode"), "code": st.get("code"), "since": since.isoformat() if hasattr(since, "isoformat") else since,
+            "send_time": st.get("send_time") or "16:30", "notice": st.get("notice")}
 
 
 @router.get("/shared/{share_token}/email-frequency")
@@ -1880,6 +1884,36 @@ async def set_shared_email_frequency(share_token: str, body: SharedEmailFrequenc
     c.notify_visitor = True
     await db.flush()
     return _client_frequency(await ce.set_frequency(db, c.owner_id, c.visitor_email, body.frequency, by="client"), c)
+
+
+@router.post("/shared/{share_token}/email-notice/dismiss")
+async def dismiss_shared_email_notice(share_token: str, http_request: Request, db: AsyncSession = Depends(get_db)):
+    """The client closed the "your emails went to weekly / paused" note on their Showcase."""
+    from app.services import client_email_service as ce
+    from app.services.public_rate_limit import check_public_submit
+    check_public_submit(http_request)
+    c = await _shared_collection(db, share_token)
+    if not c.visitor_email:
+        return {"ok": True}
+    return _client_frequency(await ce.dismiss_client_notice(db, c.owner_id, c.visitor_email), c)
+
+
+class SharedSendTime(BaseModel):
+    send_time: str
+
+
+@router.put("/shared/{share_token}/email-time")
+async def set_shared_email_time(share_token: str, body: SharedSendTime, http_request: Request, db: AsyncSession = Depends(get_db)):
+    """The client picks when their Showcase emails arrive (owner, 11/11)."""
+    from app.services import client_email_service as ce
+    from app.services.public_rate_limit import check_public_submit
+    check_public_submit(http_request)
+    if body.send_time not in ce.SEND_TIMES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick one of the times shown")
+    c = await _shared_collection(db, share_token)
+    if not c.visitor_email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This Showcase has no email address")
+    return _client_frequency(await ce.set_send_time(db, c.owner_id, c.visitor_email, body.send_time), c)
 
 
 @router.post("/shared/{share_token}/opened")

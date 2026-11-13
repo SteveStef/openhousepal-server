@@ -812,6 +812,12 @@ class ClientEmailPref(Base):
     # Picked on purpose (client_email_service.set_frequency): weekly | biweekly stay put. None = the normal rules.
     frequency = Column(String, nullable=True)
     frequency_by = Column(String, nullable=True)       # agent | client
+    # When the client wants them (Eastern, "HH:MM" from client_email_service.SEND_TIMES). None = 4:30 PM.
+    send_time = Column(String(5), nullable=True)
+    # Shown once on their Showcase: the rules slowed their emails to weekly ('weekly') or stopped them
+    # ('off') because they weren't opened. Cleared when they pick, turn back on or dismiss it.
+    client_notice = Column(String(10), nullable=True)
+    client_notice_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (UniqueConstraint('owner_id', 'email', name='uq_client_email_prefs_owner_email'),)
 

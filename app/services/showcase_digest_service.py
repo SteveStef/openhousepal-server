@@ -69,6 +69,20 @@ def digest_cutoff(now: datetime | None = None) -> datetime:
     return datetime.combine(local.date(), time(DIGEST_HOUR, DIGEST_MINUTE), EASTERN).astimezone(timezone.utc)
 
 
+def client_send_at(run_at: datetime, hm: str | None) -> tuple[datetime, bool]:
+    """When a client's email goes out: the time they picked (Eastern), the first one at/after the
+    4:30 PM gathering - 7 PM the same evening, 8 AM / noon the next day. -> (when, next_day)."""
+    if not hm or hm == f"{DIGEST_HOUR:02d}:{DIGEST_MINUTE:02d}":   # the usual 4:30 - right now, even if the run is a minute late
+        return run_at, False
+    h, m = (int(x) for x in hm.split(":"))
+    local = run_at.astimezone(EASTERN)
+    at = datetime.combine(local.date(), time(h, m), EASTERN)
+    nxt = False
+    if at <= local:
+        at, nxt = at + timedelta(days=1), True
+    return at.astimezone(timezone.utc), nxt
+
+
 def is_digest_time(now: datetime | None = None) -> bool:
     return (now or datetime.now(timezone.utc)) >= digest_cutoff(now)
 
@@ -338,6 +352,8 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
     hold_ids: list[str] = []          # weekly people whose week isn't up: their changes wait for next week's email
     per_owner: dict[str, int] = {}    # spread each agent's emails out (a burst of identical emails looks like spam)
     run_at = datetime.now(timezone.utc)
+    from app.services.client_email_service import send_times_for
+    picked_times = await send_times_for(db, [(cols[cid].owner_id, email) for (email, cid) in buyer_rows if cols.get(cid)])
     for (email, cid), rows in buyer_rows.items():
         col = cols.get(cid)
         if not live(col) or not getattr(col, "notify_visitor", True) or not col.visitor_email:
@@ -418,11 +434,18 @@ async def send_showcase_digests(db: AsyncSession, now: datetime | None = None) -
             # Leads with the search change; the homes (if any) follow under it.
             vars_["headline"] = f"{agent_first} updated your search" + (f", plus {both}" if both else "")
             subject = f"{agent_first} updated your Showcase search{fits}" if not homes else f"Your search was updated + {both}"
+        # Their own time (picked on their Showcase): tonight or tomorrow morning instead of 4:30.
+        send_at, next_day = client_send_at(run_at, picked_times.get((col.owner_id, (email or "").strip().lower())))
+        if next_day:
+            subject = subject.replace(" today", "")
+        # "How often & when" link at the top of the email - opens their Showcase's email settings.
+        link = vars_.get("collection_link") or ""
+        vars_["manage_link"] = f"{link}{'&' if '?' in link else '?'}emails=1" if link else ""
         n = per_owner.get(col.owner_id, 0)
         per_owner[col.owner_id] = n + 1
         db.add(ScheduledEmail(
             recipient_email=col.visitor_email, template_name=WEEKLY_TEMPLATE if weekly else BUYER_TEMPLATE, template_variables=vars_,
-            subject=subject, status="PENDING", scheduled_for=run_at + timedelta(seconds=SPREAD_SECONDS * n), owner_id=col.owner_id,
+            subject=subject, status="PENDING", scheduled_for=send_at + timedelta(seconds=SPREAD_SECONDS * n), owner_id=col.owner_id,
         ))
         buyers += 1
         weekly_sent += 1 if weekly else 0

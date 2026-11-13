@@ -57,6 +57,10 @@ BIWEEKLY_GAP = timedelta(days=13, hours=12)
 # normal rules with the count starting over; weekly and every two weeks stay put, opened or not.
 FREQUENCIES = ("daily", "weekly", "biweekly")
 FREQUENCY_WORDS = {"daily": "daily", "weekly": "weekly", "biweekly": "every two weeks"}
+# When the client wants their Showcase emails (Eastern). The day's updates are gathered at 4:30 PM;
+# a later time sends them that evening, an earlier one the next morning (owner, 11/11).
+SEND_TIMES = ("08:00", "12:00", "16:30", "19:00")
+DEFAULT_SEND_TIME = "16:30"
 MAX_AUTO_PER_DAY = 2
 # Mail scanners (Outlook Safe Links, corporate filters) fetch images and follow links the moment a
 # message arrives - that isn't the person.
@@ -230,6 +234,9 @@ async def refresh_status(db, owner_id: str, email: str, *, announce: bool = True
         pref.reason = d["reason"]
     elif d["mode"] != old and not unsub and pref.manual not in MANUAL_OFF:
         pref.mode, pref.changed_at = d["mode"], _now()
+        # Tell the client on their Showcase next time they're there (they may never see the agent's note).
+        if (d["mode"], d.get("code")) in (("weekly", "unopened_days"), ("off", "weekly_unopened")):
+            pref.client_notice, pref.client_notice_at = d["mode"], _now()
         pref.reason = d["reason"] or (f"Back on - {trigger}" if trigger else "Back on")
         # Ignored 3 weekly emails -> their Showcases go to sleep; any sign of life wakes them (showcase_sleep).
         from app.services import showcase_sleep
@@ -301,7 +308,9 @@ async def status_for(db, owner_id: str, email: str) -> dict:
     if d.get("code") == "email_changed" and pref is not None and pref.reason:
         d = {**d, "reason": pref.reason}
     return {**d, "since": pref.changed_at if pref else None, "manual": pref.manual if pref else None,
-            "frequency": pref.frequency if pref else None, "frequency_by": pref.frequency_by if pref else None}
+            "frequency": pref.frequency if pref else None, "frequency_by": pref.frequency_by if pref else None,
+            "send_time": (pref.send_time if pref else None) or DEFAULT_SEND_TIME,
+            "notice": pref.client_notice if pref else None, "notice_at": pref.client_notice_at if pref else None}
 
 
 # ---------------------------------------------------------------- the send path
@@ -703,6 +712,7 @@ async def set_manual(db, owner_id: str, email: str, on: bool) -> dict:
     woke: list[str] = []
     if on:
         pref.manual, pref.reset_at, pref.mode, pref.changed_at = None, _now(), "daily", _now()
+        pref.client_notice = None
         pref.reason = "Turned back on by you"
         if lead:
             await log_activity(db, owner_id=owner_id, email=email, lead=lead, source_type="email_resumed",
@@ -736,6 +746,7 @@ async def set_frequency(db, owner_id: str, email: str, value: str, by: str = "ag
     lead = await _lead(db, owner_id, email)
     pref.frequency = None if value == "daily" else value
     pref.frequency_by = by
+    pref.client_notice = None
     pref.manual = None
     pref.reset_at = pref.changed_at = _now()
     pref.mode = value
@@ -757,6 +768,35 @@ async def set_frequency(db, owner_id: str, email: str, value: str, by: str = "ag
     if woke:
         await catch_up(db, woke)
     return await status_for(db, owner_id, email)
+
+
+async def dismiss_client_notice(db, owner_id: str, email: str) -> dict:
+    pref = await _pref(db, owner_id, _norm(email), create=False)
+    if pref is not None and pref.client_notice:
+        pref.client_notice = None
+        await db.commit()
+    return await status_for(db, owner_id, email)
+
+
+async def set_send_time(db, owner_id: str, email: str, value: str) -> dict:
+    """The client picks when their emails arrive (one of SEND_TIMES). Commits."""
+    if value not in SEND_TIMES:
+        raise ValueError("Unknown send time")
+    pref = await _pref(db, owner_id, _norm(email))
+    pref.send_time = None if value == DEFAULT_SEND_TIME else value
+    await db.commit()
+    return await status_for(db, owner_id, email)
+
+
+async def send_times_for(db, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], str]:
+    """{(owner_id, email): "HH:MM"} for the ones that picked a time other than 4:30 PM."""
+    if not pairs:
+        return {}
+    owners = {o for o, _ in pairs}
+    rows = (await db.execute(select(ClientEmailPref.owner_id, ClientEmailPref.email, ClientEmailPref.send_time).where(
+        ClientEmailPref.owner_id.in_(owners), ClientEmailPref.send_time.isnot(None)))).all()
+    want = {(o, _norm(e)) for o, e in pairs}
+    return {(o, e): t for o, e, t in rows if (o, e) in want and t in SEND_TIMES}
 
 
 async def stop_for_deleted_lead(db, owner_id: str, email: Optional[str]) -> bool:
@@ -810,6 +850,7 @@ async def hold_for_new_address(db, owner_id: str, new_email: str, old_state: dic
         return False
     why = _HOLD_WHY[old_state["code"]]
     pref.manual, pref.mode, pref.changed_at = EMAIL_CHANGED, "off", _now()
+    pref.client_notice = None
     pref.reason = f"{why}. Paused at the new address until you turn them back on."
     if lead is not None:
         from app.services.leads_service import log_activity
