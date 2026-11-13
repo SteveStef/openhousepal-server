@@ -192,7 +192,7 @@ async def status(job_id: str) -> dict:
         frac = min(1.0, float(made) / float(total))
         if frac > 0.02:
             render_el = max(1.0, el - _SPEED["start_seconds"])
-            live_left = render_el / frac * (1.0 - frac) + 20.0  # + stitching the pieces together
+            live_left = render_el / frac * (1.0 - frac) + 45.0  # + stitching the pieces together (~40-60 s measured)
             w = min(1.0, max(0.0, (frac - 0.1) / 0.5))
             left = (1.0 - w) * learned_left + w * live_left
     out["status"] = "rendering" if (made or prog > 0.02) else "queued"
