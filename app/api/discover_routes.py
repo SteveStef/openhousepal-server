@@ -58,6 +58,9 @@ class DiscoveryPropertyResponse(BaseModel):
     # HostsFrom = the first day an open house is allowed (open_house_manager_service.hosting_window).
     HostingBlocked: Optional[str] = None
     HostsFrom: Optional[str] = None
+    # How many of this listing agent's homes could use a host (this one included) - more than one
+    # opens "I'd host any of these" (owner, 11/12).
+    AgentHostableCount: int = 1
 
 class DiscoveryPreferencesResponse(BaseModel):
     landmark_address: Optional[str] = None
@@ -389,6 +392,18 @@ async def get_discovery(
                 return False
             return bool(owner.brokerage) and bool(current_user.brokerage) and owner.brokerage.strip().lower() == current_user.brokerage.strip().lower()
 
+        # Each listing agent's homes that could use a host - one grouped count for the whole page.
+        hostable_by_agent: dict = {}
+        agent_ids = {p.list_agent_mls_id for p in properties if p.list_agent_mls_id}
+        if agent_ids:
+            hostable_by_agent = dict((await db.execute(
+                select(Property.list_agent_mls_id, func.count()).where(
+                    Property.list_agent_mls_id.in_(agent_ids),
+                    or_(Property.home_status == 'ACTIVE-BRIGHT', Property.home_status == 'COMING SOON-BRIGHT'),
+                    Property.is_manual.is_(False),
+                    or_(Property.home_type.is_(None), Property.home_type.notin_(('LAND', 'RESIDENTIAL_LEASE'))),
+                ).group_by(Property.list_agent_mls_id))).all())
+
         # Map to response format
         response_data = []
 
@@ -438,6 +453,7 @@ async def get_discovery(
                 OnPlatformAgentId=on_platform_owner.id if on_platform_owner else None,
                 HostingBlocked=hosting_blocked,
                 HostsFrom=hosts_from.isoformat() if hosts_from else None,
+                AgentHostableCount=max(1, int(hostable_by_agent.get(p.list_agent_mls_id) or 1)),
             ))
 
         # Sort by distance if applicable

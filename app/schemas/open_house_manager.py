@@ -134,6 +134,14 @@ class HostRequestResponse(BaseModel):
     counter_end_time: Optional[time] = None
     counter_message: Optional[str] = None
     broadcast_id: Optional[str] = None
+    # Asked together with other homes / days ("I'd host any of these") - the Host Requests list
+    # shows the whole ask as one card.
+    group_id: Optional[str] = None
+    # How many different homes that ask covered (0 = not asked together).
+    group_homes: int = 0
+    # Why a declined one closed when it wasn't a plain "no" ("Closed - you're hosting 11 Zinnia
+    # Way that day.", "Another agent was already confirmed for this date.").
+    closed_note: Optional[str] = None
     # The listing agent's Host Notes for this property (access instructions, lockbox code, parking,
     # etc.) - live, not a snapshot: always reflects whatever the listing agent has saved most
     # recently, so an edit made after approval still reaches the host on their next fetch.
@@ -158,6 +166,34 @@ class CreateHostRequestResult(BaseModel):
     # the frontend should fall back to the email template instead.
     on_platform: bool
     request: Optional[HostRequestResponse] = None
+
+
+class HostAskItem(BaseModel):
+    listing_key: str
+    requested_date: date
+    requested_start_time: time
+    requested_end_time: time
+
+
+class CreateHostRequestBatch(BaseModel):
+    """"I'd host any of these" (owner, 11/12): several of one listing agent's homes, each with a
+    day + time (the same one for all, or one each), sent as ONE ask - one alert, one email. Each
+    home/day is still its own request row the listing agent can approve on its own."""
+    items: List[HostAskItem]
+    message: Optional[str] = None
+
+
+class HostAskSkipped(BaseModel):
+    listing_key: str
+    requested_date: date
+    reason: str
+
+
+class CreateHostRequestBatchResult(BaseModel):
+    on_platform: bool
+    group_id: Optional[str] = None
+    created: List[HostRequestResponse] = []
+    skipped: List[HostAskSkipped] = []
 
 
 class CancelApprovedOpenRequest(BaseModel):

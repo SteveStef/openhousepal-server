@@ -2120,7 +2120,7 @@ async def poll_asset(db: AsyncSession, user: User, asset: StudioMediaAsset) -> S
     return asset
 
 
-async def _notify_video_done(db: AsyncSession, asset: StudioMediaAsset) -> None:
+async def _notify_video_done(db: AsyncSession, asset: StudioMediaAsset, email_ready: bool = True) -> None:
     """Fires the Activity-bell notification once a video leaves "processing". Guarded by a DB
     existence check (not just the caller's own state) so a rare concurrent poll from two tabs
     can't double-notify."""
@@ -2154,7 +2154,9 @@ async def _notify_video_done(db: AsyncSession, asset: StudioMediaAsset) -> None:
         await db.commit()
         from app.services.agent_email_service import absolute, email_agent
         owner = await db.get(User, asset.owner_id)
-        if succeeded:
+        if succeeded and not email_ready:
+            pass  # Cinematic Video: in the daily briefing instead (owner 11/12)
+        elif succeeded:
             email_agent(owner, "STUDIO_MEDIA_VIDEO_READY", "studio_media_ready", "Your AI property video is ready",
                         {"media_type": "AI property video", "property_address": address, "link": absolute(f"/studio/media/{asset.id}")})
         else:

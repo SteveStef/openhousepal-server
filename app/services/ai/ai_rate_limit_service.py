@@ -79,7 +79,8 @@ class _InProcessLimiter:
 _limiter = _InProcessLimiter()
 
 
-async def _count_since(db: AsyncSession, owner_id: str, since: datetime, event_type: Optional[str] = None) -> int:
+async def _count_since(db: AsyncSession, owner_id: str, since: datetime, event_type: Optional[str] = None,
+                       skip_model_prefix: Optional[str] = None) -> int:
     stmt = select(func.count(AIUsageEvent.id)).where(
         AIUsageEvent.owner_id == owner_id,
         AIUsageEvent.blocked.is_(False),
@@ -87,6 +88,8 @@ async def _count_since(db: AsyncSession, owner_id: str, since: datetime, event_t
     )
     if event_type:
         stmt = stmt.where(AIUsageEvent.event_type == event_type)
+    if skip_model_prefix:
+        stmt = stmt.where(~func.coalesce(AIUsageEvent.model, "").startswith(skip_model_prefix))
     result = await db.execute(stmt)
     return result.scalar_one() or 0
 
@@ -235,7 +238,7 @@ _USAGE_LABELS = {
     "blog_writer": "Blog articles",
     "cma_ai": "CMA reports", "cma_reasoning": "CMA reports", "cma_ai_recompute": "CMA reports",
     "copywrite": "Copywriter & wording checks",
-    "studio_media_image": "AI Media pictures", "studio_media_video": "AI Media videos",
+    "studio_media_image": "AI Media pictures", "studio_media_video": "AI Media videos", "studio_motion": "AI Media cinematic videos",
     "external_api": "Maps & place lookups",
     "school_lookup": "Cheat sheet schools",
     "cheat_sheet_downtown": "Cheat sheet nearby places", "cheat_sheet_proofread": "Cheat sheet nearby places",
@@ -746,6 +749,7 @@ async def _reserve_studio_media(
     db: AsyncSession, owner_id: str, config: dict, plan_tier: str,
     *, event_type: str, daily_key: str, monthly_key: str,
     bucket: str, estimate_key: str, daily_ceiling_key: str, monthly_ceiling_key: str,
+    count_skip_model_prefix: Optional[str] = None,
 ) -> Reservation:
     """Shared body for the image and video variants below - same shape as reserve_cma_analysis:
     per-user daily/monthly generation-count ceilings scoped to this feature's own event_type,
@@ -769,13 +773,14 @@ async def _reserve_studio_media(
     await enforce_agent_monthly_budget(db, owner_id, config, plan_tier)
     await enforce_studio_media_monthly_cap(db, owner_id, config, plan_tier)
 
-    daily_count = await _count_since(db, owner_id, start_of_day, event_type=event_type)
+    skip = count_skip_model_prefix
+    daily_count = await _count_since(db, owner_id, start_of_day, event_type=event_type, skip_model_prefix=skip)
     if daily_count >= daily_limit:
         raise AIRateLimitExceeded(
             "daily_limit", "You've reached your AI Media generation limit for today. It resets tomorrow."
         )
 
-    monthly_count = await _count_since(db, owner_id, start_of_month, event_type=event_type)
+    monthly_count = await _count_since(db, owner_id, start_of_month, event_type=event_type, skip_model_prefix=skip)
     if monthly_count >= monthly_limit:
         raise AIRateLimitExceeded(
             "monthly_limit", "You've reached your AI Media generation limit for this month."
@@ -815,6 +820,44 @@ async def reserve_studio_media_video(db: AsyncSession, owner_id: str, config: di
         daily_ceiling_key="studio_media_video_global_daily_cost_ceiling_usd",
         monthly_ceiling_key="studio_media_video_global_monthly_cost_ceiling_usd",
     )
+
+
+async def reserve_studio_motion(db: AsyncSession, owner_id: str, config: dict, plan_tier: str) -> Reservation:
+    """Per-user + global layer for an AI Media Cinematic Video's AI steps (room labels, depth,
+    optional sharpening - a few cents a video). Same spend gates as the rest of AI Media (soft
+    cap, monthly budget) but its own event_type and generous counts, so these near-free videos
+    never use up the AI video quota."""
+    return await _reserve_studio_media(
+        db, owner_id, config, plan_tier,
+        event_type="studio_motion",
+        daily_key="studio_motion_daily_generation_limit_by_tier",
+        monthly_key="studio_motion_monthly_generation_limit_by_tier",
+        bucket="studio_motion_global",
+        estimate_key="studio_motion_reservation_estimate_usd",
+        daily_ceiling_key="studio_motion_global_daily_cost_ceiling_usd",
+        monthly_ceiling_key="studio_motion_global_monthly_cost_ceiling_usd",
+        # Count VIDEOS, not steps (QA 11/12): each video also logs its photo prep (fal:depth,
+        # fal:erase, fal:esrgan) under this event_type for spend tracking, which made "40 a day"
+        # really ~10. Only the room-sorting run (one per project) counts toward the limits.
+        count_skip_model_prefix="fal:",
+    )
+
+
+async def studio_motion_would_refuse(db: AsyncSession, owner_id: str, config: dict, plan_tier: str) -> bool:
+    """reserve_studio_motion's per-agent checks without reserving anything - the Make step uses it
+    to say up front that sharpening will be skipped (the video is still made)."""
+    now = datetime.now(timezone.utc)
+    try:
+        if config["studio_motion_daily_generation_limit_by_tier"].get(plan_tier) is None:
+            return True
+        await enforce_studio_soft_cap(db, owner_id, config, plan_tier)
+        await enforce_agent_monthly_budget(db, owner_id, config, plan_tier)
+        await enforce_studio_media_monthly_cap(db, owner_id, config, plan_tier)
+    except AIRateLimitExceeded:
+        return True
+    day = await _count_since(db, owner_id, now.replace(hour=0, minute=0, second=0, microsecond=0), event_type="studio_motion", skip_model_prefix="fal:")
+    month = await _count_since(db, owner_id, now.replace(day=1, hour=0, minute=0, second=0, microsecond=0), event_type="studio_motion", skip_model_prefix="fal:")
+    return day >= config["studio_motion_daily_generation_limit_by_tier"][plan_tier] or month >= config["studio_motion_monthly_generation_limit_by_tier"].get(plan_tier, 0)
 
 
 async def release(owner_id: str):

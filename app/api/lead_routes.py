@@ -1241,6 +1241,11 @@ async def update_lead(
     lead = await _load_owned_lead(db, lead_id, current_user.id)
     old_email, old_phone, old_name = lead.email, lead.phone, lead.name
     old_represented = lead.represented
+    # Emails to the old address, read before the change: off there = ask before restarting (11/12).
+    old_state = None
+    if body.email is not None and old_email and normalize_email(body.email) not in (None, "", old_email):
+        from app.services import client_email_service as ce
+        old_state = await ce.status_for(db, current_user.id, old_email)
 
     if body.name is not None:
         lead.name = body.name.strip() or None
@@ -1280,7 +1285,8 @@ async def update_lead(
     # A new email / phone / name goes everywhere they're written down (their Showcase's recipient,
     # sign-ins, waiting emails...) and a new address starts its email rules fresh (user, 10/24).
     from app.services import lead_contact_service
-    contact = await lead_contact_service.propagate(db, current_user.id, lead, old_email=old_email, old_phone=old_phone, old_name=old_name)
+    contact = await lead_contact_service.propagate(db, current_user.id, lead, old_email=old_email, old_phone=old_phone, old_name=old_name,
+                                                     old_state=old_state)
 
     db.add(lead)
     await db.commit()

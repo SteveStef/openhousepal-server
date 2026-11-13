@@ -67,7 +67,7 @@ CRITICAL_TEMPLATES = frozenset({
     "tour_request", "similar_property_visitor_tour_request", "similar_property_visitor_message",
     "property_comment", "refine_search_request", "invite_rsvp_agent", "invite_day_before_agent",
     # hosting requests between agents (time-sensitive: the open house is days away)
-    "direct_host_request", "host_request_received", "host_request_approved", "host_request_countered",
+    "direct_host_request", "host_request_received", "host_request_group_received", "host_request_approved", "host_request_countered",
     "host_request_declined", "host_request_update", "team_broadcast_received", "team_invite_received",
     # account, billing, security, things that broke
     "password_reset", "verify_code", "account_approved", "agent_welcome", "payment_failed",

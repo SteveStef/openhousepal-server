@@ -9,7 +9,7 @@ ImageEffect = Literal["twilight", "lights_on", "virtual_staging", "enhance"]
 # "stack" = a photo edit driven by `effects`; "animate" = the multi-photo AI video.
 StudioMediaAction = Literal["twilight", "lights_on", "virtual_staging", "enhance", "stack", "animate"]
 StudioMediaKind = Literal["image", "video", "upload"]
-StudioMediaStatus = Literal["processing", "succeeded", "failed"]
+StudioMediaStatus = Literal["draft", "processing", "succeeded", "failed"]
 StudioMediaSourceKind = Literal["listing", "upload"]
 
 RoomType = Literal[

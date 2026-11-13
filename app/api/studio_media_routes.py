@@ -25,7 +25,10 @@ from app.schemas.studio_media import (
     VideoExportRequest,
     VideoOverlayUpdateRequest,
 )
-from app.services import studio_media_service
+from app.schemas.studio_motion import (
+    MotionAddPhotosRequest, MotionCreateRequest, MotionEstimateResponse, MotionRenderRequest, MotionUpdateRequest,
+)
+from app.services import s3_service, storage_ledger_service, studio_media_service, studio_motion_service
 from app.services.ai import ai_rate_limit_service
 from app.services.ai.ai_config_service import ai_config_service
 from app.utils.auth import require_admin_user, require_studio_media_access
@@ -216,6 +219,8 @@ async def get_asset(
     current_user: User = Depends(require_studio_media_access),
 ):
     asset = await studio_media_service.get_owned(db, current_user.id, asset_id)
+    if asset.action == "motion":
+        return await studio_motion_service.check(db, asset)
     # A video still processing gets polled here so the client only ever calls this one endpoint.
     if asset.kind == "video" and asset.status == "processing":
         asset = await studio_media_service.poll_asset(db, current_user, asset)
@@ -283,7 +288,12 @@ async def delete_asset(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_studio_media_access),
 ):
+    asset = await studio_media_service.get_owned(db, current_user.id, asset_id)
+    extra = studio_motion_service.files_of(asset) if asset.action == "motion" else []
     await studio_media_service.delete_asset(db, current_user.id, asset_id)
+    for url in extra:
+        s3_service.delete_by_url(url)
+        await storage_ledger_service.release(db, url)
 
 
 @router.get("/assets/{asset_id}/download")
@@ -300,6 +310,25 @@ async def download_asset(
     asset = await studio_media_service.get_owned(db, current_user.id, asset_id)
     if not asset.result_url or asset.status != "succeeded":
         return Response(status_code=status.HTTP_409_CONFLICT, content=b"Not ready")
+    if asset.action == "motion":
+        # Cinematic Video: every shape is its own real render (never a crop) - the main one, or
+        # one made with "Make this size" and kept in options.formats.
+        main_fmt = ((asset.options or {}).get("motion") or {}).get("format", "16:9")
+        src = asset.result_url
+        if ratio and ratio != main_fmt:
+            f = ((asset.options or {}).get("formats") or {}).get(ratio)
+            src = f.get("url") if isinstance(f, dict) else f
+            if not src:
+                return Response(status_code=status.HTTP_409_CONFLICT, content=b"Make this size first")
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0), follow_redirects=True) as client:
+                r = await client.get(src)
+                r.raise_for_status()
+        except httpx.HTTPError:
+            return Response(status_code=status.HTTP_502_BAD_GATEWAY, content=b"Couldn't fetch the file")
+        tag = f"-{(ratio or main_fmt).replace(':', 'x')}"
+        return Response(content=r.content, media_type="video/mp4",
+                        headers={"Content-Disposition": f'attachment; filename="cinematic-video-{asset.id[:8]}{tag}.mp4"'})
     lower = asset.result_url.lower()
     if asset.kind == "video":
         ext = "webm" if lower.endswith(".webm") else "mp4"
@@ -381,3 +410,88 @@ async def export_asset(
         media_type="video/mp4",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ------------------------------------------------------------------ Cinematic Video (photo motion)
+# A draft project from the first tap, autosaved settings, one AI look at the photos (labels +
+# depth), then renders on the video worker. See app/services/studio_motion_service.py.
+
+@router.get("/motion/estimate", response_model=MotionEstimateResponse)
+async def motion_estimate(
+    photos: int = Query(7, ge=1, le=30),
+    sharpen: bool = Query(True),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_media_access),
+):
+    return await studio_motion_service.estimate(db, current_user, photos, sharpen)
+
+
+@router.get("/motion/health")
+async def motion_health(current_user: User = Depends(require_studio_media_access)):
+    return await studio_motion_service.worker_status()
+
+
+@router.post("/motion", response_model=StudioMediaAssetResponse, status_code=status.HTTP_201_CREATED)
+async def motion_create(
+    payload: MotionCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_media_access),
+):
+    return await studio_motion_service.create_draft(
+        db, current_user, payload.photos, payload.source_kind,
+        payload.linked_property.model_dump() if payload.linked_property else None,
+        payload.agent, payload.client_request_id,
+    )
+
+
+@router.patch("/motion/{asset_id}", response_model=StudioMediaAssetResponse)
+async def motion_update(
+    asset_id: str,
+    payload: MotionUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_media_access),
+):
+    """Autosave - no AI, no cost."""
+    return await studio_motion_service.update_settings(db, current_user.id, asset_id, payload.settings)
+
+
+@router.post("/motion/{asset_id}/photos", response_model=StudioMediaAssetResponse)
+async def motion_add_photos(
+    asset_id: str,
+    payload: MotionAddPhotosRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_media_access),
+):
+    return await studio_motion_service.add_photos(db, current_user, asset_id, payload.photos)
+
+
+@router.delete("/motion/{asset_id}/photos/{photo_id}", response_model=StudioMediaAssetResponse)
+async def motion_remove_photo(
+    asset_id: str,
+    photo_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_media_access),
+):
+    return await studio_motion_service.remove_photo(db, current_user.id, asset_id, photo_id)
+
+
+@router.post("/motion/{asset_id}/analyze", response_model=StudioMediaAssetResponse)
+async def motion_analyze(
+    asset_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_media_access),
+):
+    """Room labels + depth for any photo that doesn't have them yet (runs in the background;
+    the page polls GET /assets/{id})."""
+    return await studio_motion_service.start_analysis(db, current_user, asset_id)
+
+
+@router.post("/motion/{asset_id}/render", response_model=StudioMediaAssetResponse)
+async def motion_render(
+    asset_id: str,
+    payload: MotionRenderRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_media_access),
+):
+    """Make (or remake) the video, or another size of it. Only new photo sharpening costs AI."""
+    return await studio_motion_service.start_render(db, current_user, asset_id, payload.sharpen, payload.format)

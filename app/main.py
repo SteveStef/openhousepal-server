@@ -110,6 +110,15 @@ async def lifespan(app: FastAPI):
         coalesce=True,
     )
 
+    # Cinematic Videos still being made when the server restarted (a deploy) pick back up by
+    # themselves - the agent may have logged out and never open the page (owner, 11/12).
+    from app.services.studio_motion_service import resume_stalled as _motion_resume
+    scheduler.add_job(
+        _motion_resume, "interval", minutes=2, id="motion_video_resume",
+        name="Cinematic Video: pick up videos cut off by a restart", replace_existing=True,
+        max_instances=1, coalesce=True, next_run_time=_dt.now(_tz.utc) + _td(seconds=45),
+    )
+
     # Schedule email processing every minute
     scheduler.add_job(
         EmailSchedulerService.process_due_emails,

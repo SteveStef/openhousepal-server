@@ -493,6 +493,13 @@ async def run_turn(
                     tr["content"] = tr["content"][:_TOOL_RESULT_MAX_CHARS] + ' ... (cut to fit - ask about one item for the rest)'
             messages.append({"role": "user", "content": tool_results})
 
+        # Out of rounds AFTER the work is done (QA 11/12: a "host any of these" ask made its request card,
+        # then the reply was this error next to a working card) - point at what's there instead.
+        kinds = {r.get("record_type") for r in all_refs}
+        if "action" in kinds:
+            return "Here it is - check the details on the card below, then tap the button to send it."
+        if kinds & {"homes", "hosting", "home_search", "showcase_homes"}:
+            return "Here's what I found - it's on the cards below."
         return "I wasn't able to finish researching that within my turn budget. Try asking a more specific question, or split it into smaller questions."
 
     try:

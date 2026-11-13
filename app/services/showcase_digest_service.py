@@ -709,6 +709,32 @@ async def _briefing(db: AsyncSession, user: User, now: datetime, showcase_access
             actions.append({"badge": "1", "title": "Support replied to you", "detail": "", "link": absolute("/settings/help")})
     except Exception:  # noqa: BLE001
         logger.warning("briefing support check failed", exc_info=True)
+    # Cinematic Videos finished since the last briefing (owner, 11/12: they're told here, not in a
+    # separate email - the bell still says so the moment one is done).
+    try:
+        from app.models.database import StudioMediaAsset
+        from app.services.email_settings_service import briefing_weekly
+        since = now - timedelta(days=7 if briefing_weekly(user) else 1)
+        vids = []
+        for a in (await db.execute(select(StudioMediaAsset).where(
+            StudioMediaAsset.owner_id == user.id, StudioMediaAsset.action == "motion",
+            StudioMediaAsset.status == "succeeded", StudioMediaAsset.updated_at >= since,
+        ))).scalars().all():
+            try:
+                done_at = datetime.fromisoformat(str((a.options or {}).get("rendered_at")))
+            except ValueError:
+                continue
+            if (done_at if done_at.tzinfo else done_at.replace(tzinfo=timezone.utc)) >= since:
+                vids.append(a)
+        if vids:
+            streets = [nice_street((v.linked_property or {}).get("address")) or "your listing" for v in vids]
+            one = len(vids) == 1
+            # first, so a busy day's "+ N more" never hides it
+            actions.insert(0, {"badge": "▶", "title": f"Your video for {streets[0]} is ready" if one else f"{len(vids)} of your videos are ready",
+                            "detail": "" if one else ", ".join(streets[:4]) + (f" + {len(streets) - 4} more" if len(streets) > 4 else ""),
+                            "link": absolute(f"/studio/media/{vids[0].id}" if one else "/studio/media")})
+    except Exception:  # noqa: BLE001
+        logger.warning("briefing videos check failed", exc_info=True)
     # Showcase clients asking to change their search (the Showcases menu's red badge).
     if showcase_access:
         from app.services.collections_service import CollectionsService

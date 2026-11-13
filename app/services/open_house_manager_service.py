@@ -37,8 +37,11 @@ from app.schemas.open_house_manager import (
     CounterBackRequest,
     CounterHostRequestRequest,
     CreateBroadcastRequest,
+    CreateHostRequestBatch,
+    CreateHostRequestBatchResult,
     CreateHostRequestRequest,
     CreateHostRequestResult,
+    HostAskSkipped,
     HostRequestEventResponse,
     HostRequestResponse,
     IncomingBroadcastResponse,
@@ -972,7 +975,18 @@ async def _hydrate_host_request(
     # The host's own cards are about the listing agent they're dealing with, not themselves.
     owner = await db.get(User, req.listing_owner_agent_id) if req.listing_owner_agent_id else None
     la_suggested, host_suggested = await _suggestions_used(db, req) if req.status in ("pending", "countered") else (True, True)
+    group_homes = 0
+    if req.group_id:
+        group_homes = (await db.execute(select(func.count(func.distinct(OpenHouseHostRequest.listing_key))).where(
+            OpenHouseHostRequest.group_id == req.group_id))).scalar() or 0
+    closed_note = None
+    if req.status == "declined":
+        closed_note = (await db.execute(select(OpenHouseHostRequestEvent.note).where(
+            OpenHouseHostRequestEvent.request_id == req.id, OpenHouseHostRequestEvent.action == "declined",
+            OpenHouseHostRequestEvent.note.isnot(None)).order_by(OpenHouseHostRequestEvent.created_at.desc()).limit(1))).scalar()
     return HostRequestResponse(
+        group_homes=group_homes,
+        closed_note=closed_note,
         listing_agent_suggested_time=la_suggested,
         host_suggested_time=host_suggested,
         id=req.id,
@@ -998,6 +1012,7 @@ async def _hydrate_host_request(
         counter_end_time=req.counter_end_time,
         counter_message=req.counter_message,
         broadcast_id=req.broadcast_id,
+        group_id=req.group_id,
         listing_host_notes=note.notes if note else None,
     )
 
@@ -1247,6 +1262,17 @@ async def _decline_same_date_conflicts(db: AsyncSession, request: OpenHouseHostR
                            "Find another home", "/discovery", "HOST_REQUEST_DECLINED")
 
 
+async def _listing_owner_for(db: AsyncSession, prop: Property) -> Optional[User]:
+    """The listing agent's OpenHousePal account, or None when they aren't on OpenHousePal."""
+    owner_mls_id = prop.list_agent_mls_id or prop.co_list_agent_mls_id
+    if owner_mls_id and owner_mls_id.startswith("user:"):  # hand-entered by an agent outside Bright
+        return (await db.execute(select(User).where(User.id == owner_mls_id[5:]))).scalar_one_or_none()
+    if owner_mls_id:
+        owner_result = await db.execute(select(User).where(User.mls_id == owner_mls_id).order_by(User.test_copy_of_user_id.isnot(None), User.created_at))
+        return owner_result.scalars().first()  # the real agent, not a test copy sharing the ID
+    return None
+
+
 async def create_host_request(db: AsyncSession, current_user: User, payload: CreateHostRequestRequest) -> CreateHostRequestResult:
     prop_result = await db.execute(select(Property).where(Property.listing_key == payload.listing_key))
     prop = prop_result.scalar_one_or_none()
@@ -1259,13 +1285,7 @@ async def create_host_request(db: AsyncSession, current_user: User, payload: Cre
     if await _date_already_booked(db, payload.listing_key, payload.requested_date):
         raise ValueError(f"{prop.street_address} already has an open house on {_format_date(payload.requested_date)}. Pick a different date.")
 
-    owner_mls_id = prop.list_agent_mls_id or prop.co_list_agent_mls_id
-    listing_owner = None
-    if owner_mls_id and owner_mls_id.startswith("user:"):  # hand-entered by an agent outside Bright
-        listing_owner = (await db.execute(select(User).where(User.id == owner_mls_id[5:]))).scalar_one_or_none()
-    elif owner_mls_id:
-        owner_result = await db.execute(select(User).where(User.mls_id == owner_mls_id).order_by(User.test_copy_of_user_id.isnot(None), User.created_at))
-        listing_owner = owner_result.scalars().first()  # the real agent, not a test copy sharing the ID
+    listing_owner = await _listing_owner_for(db, prop)
     if not listing_owner:
         # The listing's MLS agent has no OpenHousePal account - nothing to persist or notify.
         # The frontend falls back to the email template for this case.
@@ -1359,6 +1379,261 @@ async def create_host_request(db: AsyncSession, current_user: User, payload: Cre
     return CreateHostRequestResult(on_platform=True, request=hydrated)
 
 
+# ---------------------------------------------------------------- "I'd host any of these" (owner, 11/12)
+# One ask covering several of one listing agent's homes, each with its own day + time (or one day +
+# time for all of them). On OpenHousePal it arrives as ONE alert / email / card; the listing agent
+# says yes to whichever home(s) suit them - yes to one closes the host's other asks for that same
+# day. Off OpenHousePal the host gets the same ask as a ready text or email instead.
+
+HOSTABLE_STATUSES = ("ACTIVE-BRIGHT", COMING_SOON_STATUS)
+ASK_MAX_HOMES = 8
+ASK_MAX_ITEMS = 16
+
+
+def _phone_or_blank(v: Optional[str]) -> str:
+    v = (v or "").strip()
+    return "" if v.upper() in ("", "N/A", "NONE") else v
+
+
+async def listing_agent_homes(db: AsyncSession, current_user: User, listing_key: str) -> dict:
+    """The listing agent of `listing_key` and their homes that could use a host - this one first,
+    then their other active / coming-soon listings - with the days already taken and the days this
+    agent already asked about, plus whether the listing agent is on OpenHousePal (in-app request)
+    or not (text / email)."""
+    prop = (await db.execute(select(Property).where(Property.listing_key == listing_key))).scalar_one_or_none()
+    if prop is None:
+        raise ValueError("This listing could not be found.")
+    homes = [prop]
+    agent_ids = [m for m in (prop.list_agent_mls_id,) if m]
+    if agent_ids:
+        others = (await db.execute(
+            select(Property).where(
+                or_(Property.list_agent_mls_id.in_(agent_ids), Property.co_list_agent_mls_id.in_(agent_ids)),
+                Property.listing_key != listing_key,
+                Property.home_status.in_(HOSTABLE_STATUSES),
+                Property.is_manual.is_(False),
+                or_(Property.home_type.is_(None), Property.home_type.notin_(("LAND", "RESIDENTIAL_LEASE"))),
+            ).order_by(Property.mls_list_date.desc().nullslast()).limit(ASK_MAX_HOMES * 2)
+        )).scalars().all()
+        homes += [p for p in others if hosting_window(p.home_status, p.raw_mls_data)[0] is None][:ASK_MAX_HOMES - 1]
+    keys = [p.listing_key for p in homes]
+    statuses = await get_listing_open_house_statuses(db, keys)
+    asked: Dict[str, List[str]] = {}
+    for k, d in (await db.execute(select(OpenHouseHostRequest.listing_key, OpenHouseHostRequest.requested_date).where(
+            OpenHouseHostRequest.listing_key.in_(keys), OpenHouseHostRequest.requesting_agent_id == current_user.id,
+            OpenHouseHostRequest.status.in_(("pending", "countered"))))).all():
+        asked.setdefault(k, []).append(d.isoformat())
+    owner = await _listing_owner_for(db, prop)
+    eligible = True if owner is None else await _is_eligible_requester(db, owner, current_user)
+
+    def _home(p: Property) -> dict:
+        blocked, hosts_from = hosting_window(p.home_status, p.raw_mls_data)
+        taken = sorted({o["scheduled_date"].isoformat() for o in (statuses.get(p.listing_key) or {}).get("scheduled_opens", []) if o.get("scheduled_date")})
+        return {
+            "ListingKey": p.listing_key, "Street": p.street_address or "", "City": p.city or "", "State": p.state or "",
+            "Zipcode": p.zipcode or "", "Price": f"${int(p.price):,}" if p.price is not None else "", "Image": p.img_src or "",
+            "Beds": int(p.bedrooms or 0), "Baths": int(p.bathrooms or 0), "SquareFeet": int(p.living_area or 0),
+            "HostingBlocked": blocked, "HostsFrom": hosts_from.isoformat() if hosts_from else None,
+            "taken": taken, "asked": sorted(asked.get(p.listing_key, [])),
+        }
+
+    return {
+        "agent": {
+            "name": prop.list_agent_full_name or "", "email": (prop.list_agent_email or "").strip(),
+            "phone": _phone_or_blank(prop.list_agent_preferred_phone), "office": prop.list_office_name or "",
+            "on_platform": owner is not None, "eligible": eligible, "photo_url": owner.photo_url if owner else None,
+        },
+        "homes": [_home(p) for p in homes],
+    }
+
+
+def _join_words(parts: List[str]) -> str:
+    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " or " + parts[-1]
+
+
+async def create_host_requests_batch(db: AsyncSession, current_user: User, payload: CreateHostRequestBatch) -> CreateHostRequestBatchResult:
+    """Send one "I'd host any of these" ask. Each home/day is checked on its own: one that can't be
+    asked about (already hosted that day, already asked, you're hosting elsewhere that day...) is
+    skipped and listed back, the rest go out together. Nothing goes out if none can."""
+    items = payload.items
+    if not items:
+        raise ValueError("Pick at least one home.")
+    if len(items) > ASK_MAX_ITEMS or len({i.listing_key for i in items}) > ASK_MAX_HOMES:
+        raise ValueError(f"Ask about up to {ASK_MAX_HOMES} homes at a time.")
+    keys = list(dict.fromkeys(i.listing_key for i in items))
+    props = {p.listing_key: p for p in (await db.execute(select(Property).where(Property.listing_key.in_(keys)))).scalars().all()}
+    if len(props) != len(keys):
+        raise ValueError("One of these listings could not be found.")
+    owners = {k: await _listing_owner_for(db, props[k]) for k in keys}
+    owner_ids = {o.id if o else None for o in owners.values()}
+    if len(owner_ids) > 1:
+        raise ValueError("These homes have different listing agents - ask one listing agent at a time.")
+    listing_owner = next(iter(owners.values()))
+    if listing_owner is None:
+        return CreateHostRequestBatchResult(on_platform=False)
+    if not await _is_eligible_requester(db, listing_owner, current_user):
+        raise ValueError("This agent isn't accepting host requests for these listings.")
+
+    group_id = str(uuid.uuid4())
+    made: List[OpenHouseHostRequest] = []
+    skipped: List[HostAskSkipped] = []
+    seen = set()
+    for it in sorted(items, key=lambda i: (i.requested_date, i.requested_start_time, keys.index(i.listing_key))):
+        p = props[it.listing_key]
+        if (it.listing_key, it.requested_date) in seen:
+            continue
+        seen.add((it.listing_key, it.requested_date))
+        problem = hosting_date_problem(p.home_status, p.raw_mls_data, it.requested_date)
+        if not problem and it.requested_end_time <= it.requested_start_time:
+            problem = "The end time has to be after the start time."
+        if not problem and await _date_already_booked(db, it.listing_key, it.requested_date):
+            problem = f"{p.street_address} already has an open house on {_format_date(it.requested_date)}."
+        if not problem and await _agent_already_hosting_that_day(db, current_user.id, it.requested_date):
+            problem = f"You're already hosting another open house on {_format_date(it.requested_date)}."
+        if not problem and (await db.execute(select(OpenHouseHostRequest.id).where(
+                OpenHouseHostRequest.listing_key == it.listing_key, OpenHouseHostRequest.requesting_agent_id == current_user.id,
+                OpenHouseHostRequest.requested_date == it.requested_date, OpenHouseHostRequest.status.in_(("pending", "countered"))).limit(1))).first():
+            problem = f"You already asked to host {p.street_address} on {_format_date(it.requested_date)}."
+        if problem:
+            skipped.append(HostAskSkipped(listing_key=it.listing_key, requested_date=it.requested_date, reason=problem))
+            continue
+        req = OpenHouseHostRequest(
+            id=str(uuid.uuid4()), listing_key=it.listing_key, listing_owner_agent_id=listing_owner.id,
+            requesting_agent_id=current_user.id, group_id=group_id, requested_date=it.requested_date,
+            requested_start_time=it.requested_start_time, requested_end_time=it.requested_end_time,
+            message=(payload.message or "").strip() or None, status="pending",
+        )
+        db.add(req)
+        made.append(req)
+    if not made:
+        raise ValueError(skipped[0].reason if skipped else "Nothing to send.")
+    await db.flush()
+    for req in made:
+        await _log_request_event(db, req.id, current_user.id, "requested", req.requested_date, req.requested_start_time,
+                                 req.requested_end_time, req.message)
+
+    streets = list(dict.fromkeys(props[r.listing_key].street_address for r in made))
+    days = list(dict.fromkeys(_format_date(r.requested_date) for r in made))
+    times = list(dict.fromkeys(_format_times(r.requested_start_time, r.requested_end_time) for r in made))
+    who = _agent_name(current_user)
+    many = len(streets) > 1
+    lines = [f"{props[r.listing_key].street_address}: {_format_slot(r.requested_date, r.requested_start_time, r.requested_end_time)}" for r in made]
+    first = props[made[0].listing_key]
+    # Say plainly what kind of ask it is: one day for all (pick ONE home), or a day for each (any).
+    one_day = len(days) == 1
+    offered = {(r.listing_key, r.requested_date) for r in made}
+    same_set = many and not one_day and all((k, d) in offered for k in {r.listing_key for r in made} for d in {r.requested_date for r in made})
+    if many and one_day:
+        title = f"{who} would host one of {len(streets)} of your listings"
+        message = (f"{days[0]}, {times[0]} - pick one: {_join_words(streets)}" if len(times) == 1
+                   else f"{days[0]} - pick one: " + "; ".join(lines))
+    elif same_set:
+        title = f"{who} would host any of {len(streets)} of your listings"
+        message = f"{_join_words(days)}{', ' + times[0] if len(times) == 1 else ''} - pick one home per day: {_join_words(streets)}"
+    elif many:
+        title = f"{who} would host any of {len(streets)} of your listings"
+        message = "A day for each - say yes to any: " + "; ".join(lines)
+    else:
+        title, message = f"{who} wants to host an open house", "Requested " + "; ".join(lines)
+    try:
+        db.add(Notification(
+            agent_id=listing_owner.id, type="HOST_REQUEST_RECEIVED", reference_type="HOST_REQUEST_GROUP", reference_id=group_id,
+            title=title,
+            message=message,
+            property_id=None if many else first.id, property_address=None if many else first.street_address,
+            link="/open-houses/my-listings?panel=host-requests", is_read=False,
+        ))
+    except Exception:
+        pass
+    if many:
+        # Several homes: one line per requested open (host_ask_email_service), not a paragraph.
+        _send_email_safely(
+            listing_owner, title, "host_request_group_received",
+            {"agent_name": listing_owner.first_name, "requester_name": who, "requester_brokerage": current_user.brokerage or "",
+             "kind": "one_day" if one_day else "same_set" if same_set else "each", "homes": len(streets),
+             "opens": [{"street": props[r.listing_key].street_address, "image": props[r.listing_key].img_src or "",
+                        "when": _format_slot(r.requested_date, r.requested_start_time, r.requested_end_time)} for r in made][:16],
+             "note": (payload.message or "").strip()},
+            notification_type="HOST_REQUEST_RECEIVED")
+    else:
+        _send_email_safely(
+            listing_owner, f"{who} wants to host {first.street_address}", "host_request_received",
+            {"agent_name": listing_owner.first_name, "requester_name": who, **_ask_email_words(many, one_day, same_set, streets, days, times, lines, first)},
+            notification_type="HOST_REQUEST_RECEIVED")
+    await db.commit()
+    for req in made:
+        await db.refresh(req)
+    created = [await _hydrate_host_request(db, r, props, {current_user.id: current_user}) for r in made]
+    return CreateHostRequestBatchResult(on_platform=True, group_id=group_id, created=created, skipped=skipped)
+
+
+def _ask_email_words(many: bool, one_day: bool, same_set: bool, streets: List[str], days: List[str], times: List[str],
+                     lines: List[str], first: Property) -> dict:
+    """The host_request_received email reads "<who> asked to host an open house at {property_address}.
+    Requested time {requested_date} · {requested_time}" - fill it so each kind of ask is plain."""
+    if not many:
+        return {"property_address": first.street_address, "requested_date": _join_words(days),
+                "requested_time": times[0] if len(times) == 1 else "a few times - see the request"}
+    if one_day:
+        return {"property_address": f"one of these - you pick which: {_join_words(streets)}", "requested_date": days[0],
+                "requested_time": times[0] if len(times) == 1 else "times for each home in the request"}
+    if same_set:
+        return {"property_address": f"any of these - one home per day: {_join_words(streets)}", "requested_date": _join_words(days),
+                "requested_time": times[0] if len(times) == 1 else "times for each home in the request"}
+    shown = lines[:4] + ([f"+{len(lines) - 4} more"] if len(lines) > 4 else [])
+    return {"property_address": f"any of these - a day for each: {_join_words(streets)}", "requested_date": "; ".join(shown),
+            "requested_time": "say yes to as many as you like"}
+
+
+async def _close_group_same_day(db: AsyncSession, request: OpenHouseHostRequest) -> None:
+    """Yes to one home in an "any of these" ask: the host's other homes in that ask on the same day
+    close (they can only host one open a day). Other days stay open for the listing agent."""
+    if not request.group_id:
+        return
+    rows = (await db.execute(select(OpenHouseHostRequest).where(
+        OpenHouseHostRequest.group_id == request.group_id, OpenHouseHostRequest.id != request.id,
+        OpenHouseHostRequest.requesting_agent_id == request.requesting_agent_id,
+        OpenHouseHostRequest.requested_date == request.requested_date,
+        OpenHouseHostRequest.status.in_(("pending", "countered"))))).scalars().all()
+    if not rows:
+        return
+    street = (await db.execute(select(Property.street_address).where(Property.listing_key == request.listing_key))).scalar() or "another home"
+    for r in rows:
+        r.status, r.responded_at = "declined", datetime.now(timezone.utc)
+        await _log_request_event(db, r.id, request.listing_owner_agent_id, "declined", note=f"Closed - you're hosting {street} that day.")
+
+
+async def decline_host_request_group(db: AsyncSession, current_user: User, group_id: str) -> int:
+    """"None of these work": every still-waiting home/day in one ask is declined at once, and the
+    host hears it once (one alert, one email) instead of once per home."""
+    rows = (await db.execute(select(OpenHouseHostRequest).where(
+        OpenHouseHostRequest.group_id == group_id, OpenHouseHostRequest.listing_owner_agent_id == current_user.id,
+        OpenHouseHostRequest.status == "pending"))).scalars().all()
+    if not rows:
+        raise ValueError("There's nothing left to answer in this request.")
+    now = datetime.now(timezone.utc)
+    for r in rows:
+        r.status, r.responded_at = "declined", now
+        await _log_request_event(db, r.id, current_user.id, "declined")
+    keys = list(dict.fromkeys(r.listing_key for r in rows))
+    streets = [s for (s,) in (await db.execute(select(Property.street_address).where(Property.listing_key.in_(keys)))).all() if s]
+    address = _join_words(streets) if streets else "those homes"
+    requester = await db.get(User, rows[0].requesting_agent_id)
+    try:
+        db.add(Notification(
+            agent_id=rows[0].requesting_agent_id, type="HOST_REQUEST_DECLINED", reference_type="HOST_REQUEST_GROUP", reference_id=group_id,
+            title="Not this time", message=f"{_agent_name(current_user)} doesn't need a host at {address} on those days.",
+            link="/discovery?myRequests=1", is_read=False,
+        ))
+    except Exception:
+        pass
+    await db.commit()
+    _send_update_email(requester, f"Your request to host {address} wasn't approved", "Not this time", "Not approved", address,
+                       f"{_agent_name(current_user) or 'the listing agent'} doesn't need a host at", " on the days you offered. Other homes near you may still need a host.",
+                       "Find another home", "/discovery", "HOST_REQUEST_DECLINED")
+    return len(rows)
+
+
 async def _fill_broadcast_and_decline_siblings(db: AsyncSession, request: OpenHouseHostRequest) -> None:
     """Once one team-broadcast response is approved, close out the rest so the owner doesn't have
     to manually decline every other agent who said they were interested in the same slot."""
@@ -1424,6 +1699,7 @@ async def approve_host_request(db: AsyncSession, current_user: User, request_id:
     # date/time and notifies them; it doesn't generate a kit on their behalf.
     await _fill_broadcast_and_decline_siblings(db, request)
     await _decline_same_date_conflicts(db, request)
+    await _close_group_same_day(db, request)
     await _log_request_event(db, request.id, current_user.id, "approved", request.requested_date, request.requested_start_time, request.requested_end_time)
     _calendar_host_open(request.requesting_agent_id, request.id)
 
@@ -1802,6 +2078,7 @@ async def respond_to_counter(db: AsyncSession, current_user: User, request_id: s
     await db.refresh(request)
     if accept:
         await _decline_same_date_conflicts(db, request)
+        await _close_group_same_day(db, request)
     await _log_request_event(
         db, request.id, current_user.id, "counter_accepted" if accept else "counter_declined",
         request.requested_date if accept else None, request.requested_start_time if accept else None, request.requested_end_time if accept else None,

@@ -175,7 +175,14 @@ async def _p_update_lead(db, user, a):
             body[k] = _s(a[k]); lines.append(f"{label}: {body[k]}")
     if not body:
         raise ActionError("Tell me what to change about them.")
-    warn = "Changing their email restarts their automatic emails at the new address." if "email" in body else None
+    warn = None
+    if "email" in body and _s(body["email"]).lower() != (lead.email or "").lower():
+        # Emails to the old address were off: the new one starts paused until the agent says (11/12).
+        from app.services import client_email_service as ce
+        old = await ce.status_for(db, user.id, lead.email) if lead.email else None
+        warn = ("Automatic emails to their old address were off, so they stay paused at the new address - "
+                "ask me to turn them back on (they start fresh) if you want them going again."
+                if ce.needs_hold(old) else "Changing their email restarts their automatic emails at the new address.")
     return Prepared(f"Update {lead.name or 'this lead'}", lines, {"lead_id": lead.id, "body": body}, warning=warn)
 
 
@@ -992,6 +999,13 @@ async def _p_request_host(db, user, a):
         owner = await db.get(User, owner_mls[5:])
     elif owner_mls:
         owner = (await db.execute(select(User).where(User.mls_id == owner_mls).order_by(User.test_copy_of_user_id.isnot(None), User.created_at))).scalars().first()
+    if not owner:
+        # Not on OpenHousePal: no in-app request to send - the text/email is written on the home's
+        # card, right in the chat (QA 11/12: the card offered "Send request" and then sent nothing)
+        raise ActionError(f"{prop.list_agent_full_name or 'That listing agent'} isn't on OpenHousePal, so there's no in-app request to send. "
+                          f"Call find_homes_to_host with town set to \"{tidy_caps(prop.street_address)}\" so the home's card shows here, and tell them to tap "
+                          "Request to host on it - it writes the text or email for them (and lets them tick the agent's other homes). "
+                          "Never write the text or email yourself.")
     if owner and owner.id != user.id and not await _is_eligible_requester(db, owner, user):
         raise ActionError(f"{prop.list_agent_full_name or 'That listing agent'} only takes host requests from agents at their brokerage or on their team, "
                           "so I can't send this one.")
@@ -1010,6 +1024,54 @@ async def _r_request_host(db, user, p):
 _simple("request_to_host", "Ask a listing agent to let this agent host an open house at their listing (listing_key from search_properties), with date and start/end times.",
         _obj({"listing_key": {"type": "string"}, "date": {"type": "string"}, "start_time": {"type": "string"}, "end_time": {"type": "string"}, "message": {"type": "string"}},
              ["listing_key", "date", "start_time", "end_time"]), _p_request_host, _r_request_host, MLS)
+
+
+async def _p_request_host_several(db, user, a):
+    """"I'd host any of these" (11/12): several of ONE listing agent's homes, one day + time for all
+    of them, sent as one OpenHousePal request (the listing agent picks a home)."""
+    from app.services.open_house_manager_service import listing_agent_homes
+    key = _need_id(a, "listing_key")
+    d, s, e = _date_ok(a.get("date")), _time_ok(a.get("start_time")), _time_ok(a.get("end_time"))
+    try:
+        found = await listing_agent_homes(db, user, key)
+    except ValueError:
+        raise ActionError("I couldn't find that listing.")
+    agent = found["agent"]
+    if not agent["on_platform"]:
+        raise ActionError(f"{agent['name'] or 'That listing agent'} isn't on OpenHousePal, so there's no in-app request to send. "
+                          f"Call find_homes_to_host with listing_agent \"{agent['name'] or ''}\" so their homes show here as cards, and tell them to tap "
+                          "Request to host on one - they tick the agent's other homes, pick the day and time, and it writes ONE text or email for all "
+                          "of them. Stay in the chat (never send them to the Discovery page for this) and never write the text or email yourself.")
+    if not agent["eligible"]:
+        raise ActionError(f"{agent['name'] or 'That listing agent'} only takes host requests from agents at their brokerage or on their team, so I can't send this one.")
+    want = {k for k in (a.get("other_listing_keys") or []) if isinstance(k, str)} | {key}
+    homes = [h for h in found["homes"] if a.get("all_homes") or h["ListingKey"] in want]
+    homes = [h for h in homes if d not in h["taken"] and d not in h["asked"]]
+    if not homes:
+        raise ActionError(f"None of those homes can be asked about on {_nice_date(d)} - they're already hosted or you already asked.")
+    msg = _s(a.get("message")) or None
+    first = (agent["name"] or "the listing agent").split(" ")[0]
+    return Prepared(f"Ask {first} to host any of {len(homes)} homes" if len(homes) > 1 else f"Ask to host {tidy_caps(homes[0]['Street'])}",
+                    [f"{_nice_date(d)}, {_nice_time(s)}-{_nice_time(e)}"] + [f"• {tidy_caps(h['Street'])}" for h in homes]
+                    + [f"{agent['name']} picks one" if len(homes) > 1 else f"Listing agent: {agent['name']}"] + ([f"Message: “{msg}”"] if msg else []),
+                    {"body": {"items": [{"listing_key": h["ListingKey"], "requested_date": d, "requested_start_time": f"{s}:00", "requested_end_time": f"{e}:00"} for h in homes],
+                              "message": msg}},
+                    warning=f"This sends {agent['name'] or 'the listing agent'} one request (and one email).", confirm_label="Send request")
+
+
+async def _r_request_host_several(db, user, p):
+    out = await _run_route(user, "POST", "/api/open-house-manager/requests/batch", p["body"])
+    if isinstance(out, dict) and out.get("on_platform") is False:
+        return {"message": "That listing agent isn't on OpenHousePal yet, so nothing was sent - tap Request to host in Discovery to text or email them.", "link": "/discovery"}
+    skipped = (out or {}).get("skipped") or [] if isinstance(out, dict) else []
+    return {"message": "Request sent." + (f" Skipped {len(skipped)}: {skipped[0]['reason']}" if skipped else ""), "link": "/discovery?myRequests=1"}
+
+_simple("request_to_host_several", "Ask ONE listing agent to let this agent host an open house at any of several of their listings, in one request (\"I'd host any of these\"): "
+        "listing_key (one of their homes), other_listing_keys (more of the SAME agent's homes) or all_homes=true, plus one date and start/end times. "
+        "The listing agent picks a home. Only when the agent gave the day and times.",
+        _obj({"listing_key": {"type": "string"}, "other_listing_keys": {"type": "array", "items": {"type": "string"}}, "all_homes": {"type": "boolean"},
+              "date": {"type": "string"}, "start_time": {"type": "string"}, "end_time": {"type": "string"}, "message": {"type": "string"}},
+             ["listing_key", "date", "start_time", "end_time"]), _p_request_host_several, _r_request_host_several, MLS)
 
 
 async def _p_counter_reply(db, user, a):

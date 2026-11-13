@@ -698,6 +698,32 @@ DEFAULT_CONFIG = {
     "studio_media_video_global_daily_cost_ceiling_usd": 150.0,
     "studio_media_video_global_monthly_cost_ceiling_usd": 1500.0,
 
+    # ---- AI Media "Cinematic Video" (photo motion, 11/11) ----
+    # Real listing photos moved like a camera through their own 3D depth, rendered by the video
+    # worker (frontend/video-worker, Remotion) - no AI video model. The only AI spend per video:
+    # one vision call that names each room + depth maps + the optional photo sharpening (fal ESRGAN
+    # $0.000575/compute second, ~3-6s a photo). Its own event_type ("studio_motion") so it never
+    # uses up the AI video quota above.
+    # Depth (11/12): fal depth-anything v2 ($0.00125/compute s, ~1-2 s) for the overall near/far
+    # spread + fal Marigold ($0.000575/compute s, ~7 s) for crisp edges, combined - crisp edges let
+    # the camera move ~60% further without close furniture warping. Prices from fal's pricing API.
+    "studio_motion_enabled": True,
+    "studio_motion_min_photos": 2,
+    "studio_motion_max_photos": 15,
+    "studio_motion_label_model": None,  # None = photo_sort_model (Sonnet: Haiku mislabels rooms)
+    "studio_motion_sharp_depth": True,  # False = depth-anything only (softer edges, gentler moves)
+    "studio_motion_depth_price_per_photo_usd": 0.007,
+    # MLS badge painted out with fal LaMa ($0.000575/compute s, ~2-7 s) instead of cutting a strip
+    # off the bottom (owner 11/12: keep the whole photo). False = the old strip cut.
+    "studio_motion_erase_badge": True,
+    "studio_motion_erase_price_per_photo_usd": 0.004,
+    "studio_motion_sharpen_price_per_photo_usd": 0.006,
+    "studio_motion_reservation_estimate_usd": 0.15,
+    "studio_motion_daily_generation_limit_by_tier": {"IDX": 40, "PRO_NO_MLS": 40},
+    "studio_motion_monthly_generation_limit_by_tier": {"IDX": 400, "PRO_NO_MLS": 400},
+    "studio_motion_global_daily_cost_ceiling_usd": 25.0,
+    "studio_motion_global_monthly_cost_ceiling_usd": 200.0,
+
     # ---- Per-agent monthly spend budget (across EVERY AI tool combined) ----
     # The sum of every AIUsageEvent.estimated_cost_usd for one owner since the 1st of the
     # month, across all event_types (chat + tts + realtime + cma_ai + studio_media_image +

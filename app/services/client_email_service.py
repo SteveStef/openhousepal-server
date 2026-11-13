@@ -75,7 +75,11 @@ WEEKLY_TEMPLATE = "showcase_weekly_digest"
 # ClientEmailPref.manual when the agent deleted this person's lead (lead_cleanup_service): off like
 # "off", but lifted by itself when they become a lead again or the agent turns their Showcase back on.
 LEAD_DELETED = "lead_deleted"
-MANUAL_OFF = ("off", LEAD_DELETED)
+# ClientEmailPref.manual on a client's NEW address when the agent changed their email while emails to
+# the old one were off (bounced, unsubscribed, ignored, turned off): held until the agent says to turn
+# them back on, which starts the unopened count over (user, 11/12).
+EMAIL_CHANGED = "email_changed"
+MANUAL_OFF = ("off", LEAD_DELETED, EMAIL_CHANGED)
 
 
 def _norm(email: Optional[str]) -> str:
@@ -116,6 +120,9 @@ def decide(emails: list[dict], *, manual: Optional[str], reset_at: Optional[date
     if manual == LEAD_DELETED:
         return {"mode": "off", "reason": "You deleted their lead, so automatic emails to them stopped", "unopened": 0, "unopened_days": 0,
                 "weekly_unopened": 0, "code": "lead_deleted"}
+    if manual == EMAIL_CHANGED:
+        return {"mode": "off", "reason": "Paused when you changed their email. Turn them back on to restart.", "unopened": 0,
+                "unopened_days": 0, "weekly_unopened": 0, "code": "email_changed"}
     if frequency in ("weekly", "biweekly"):
         who = "They chose" if frequency_by == "client" else "You chose"
         return {"mode": frequency, "code": "chosen", "reason": f"{who} {FREQUENCY_WORDS[frequency]} emails, so it stays that way whether they open them or not.",
@@ -291,6 +298,8 @@ async def status_for(db, owner_id: str, email: str) -> dict:
                last_engaged=await _last_engaged(db, owner_id, email), unsubscribed=await _is_unsubscribed(db, email),
                frequency=pref.frequency if pref else None, frequency_by=pref.frequency_by if pref else None)
     d = await _why_blocked(db, owner_id, email, d)
+    if d.get("code") == "email_changed" and pref is not None and pref.reason:
+        d = {**d, "reason": pref.reason}
     return {**d, "since": pref.changed_at if pref else None, "manual": pref.manual if pref else None,
             "frequency": pref.frequency if pref else None, "frequency_by": pref.frequency_by if pref else None}
 
@@ -775,6 +784,40 @@ async def lift_lead_deleted(db, owner_id: str, email: Optional[str]) -> None:
         pref.reason = "Back on - they're one of your leads again"
 
 
+_HOLD_WHY = {
+    "bounced": "Emails to their old address bounced",
+    "spam": "They marked an email to their old address as spam - only turn emails back on if they asked you to",
+    "unsubscribed": "They unsubscribed at their old address - only turn emails back on if they asked you to",
+    "manual_off": "You had turned their emails off",
+    "weekly_unopened": "Their old address stopped opening emails",
+}
+
+
+def needs_hold(old_state: Optional[dict]) -> bool:
+    """Emails to the old address were off for a reason the agent should decide about again."""
+    return bool(old_state) and old_state.get("mode") == "off" and old_state.get("code") in _HOLD_WHY
+
+
+async def hold_for_new_address(db, owner_id: str, new_email: str, old_state: dict, lead: Optional[Lead] = None) -> bool:
+    """The agent changed a client's email while emails to the old address were off: the new address
+    starts paused (not silently back on) and the agent is asked whether to turn them back on. An
+    off the agent already set on the new address stays as it is. Doesn't commit. -> True when held."""
+    new_email = _norm(new_email)
+    if not new_email or not needs_hold(old_state):
+        return False
+    pref = await _pref(db, owner_id, new_email)
+    if pref.manual == "off":
+        return False
+    why = _HOLD_WHY[old_state["code"]]
+    pref.manual, pref.mode, pref.changed_at = EMAIL_CHANGED, "off", _now()
+    pref.reason = f"{why}. Paused at the new address until you turn them back on."
+    if lead is not None:
+        from app.services.leads_service import log_activity
+        await log_activity(db, owner_id=owner_id, email=new_email, lead=lead, source_type="email_paused",
+                           summary="Automatic emails paused - new email address", raw_snapshot={"to": "off", "was": old_state["code"]})
+    return True
+
+
 async def listed_emails(db, owner_id: str, emails) -> set[str]:
     """The addresses the Email Tracker shows: the agent's current leads, nobody else (owner, 11/07)."""
     emails = {_norm(e) for e in emails if e}
@@ -803,6 +846,11 @@ async def people(db, owner_id: str) -> dict[str, dict]:
         problems.setdefault(r.recipient_email, r)
     # Someone whose only email bounced is still listed - that's who the agent most needs to see.
     emails = set(by) | set(prefs) | set(problems)
+    # A lead whose address is on the do-not-email list but was never emailed shows as blocked, not
+    # "Emails on" (11/12).
+    from app.models.database import BlacklistedEmail
+    emails |= {e for (e,) in (await db.execute(select(Lead.email).join(
+        BlacklistedEmail, func.lower(BlacklistedEmail.email) == Lead.email).where(Lead.owner_id == owner_id))).all() if e}
     # A deleted lead disappears from the Email Tracker (user, 10/24) - the hold on their automatic
     # emails stays (prefs keep LEAD_DELETED), they're just not listed until they're a lead again.
     emails -= {e for e, p in prefs.items() if p.manual == LEAD_DELETED}
@@ -812,7 +860,6 @@ async def people(db, owner_id: str) -> dict[str, dict]:
         return {}
     eng = dict((await db.execute(select(Lead.email, func.max(LeadEvent.occurred_at)).join(LeadEvent, LeadEvent.lead_id == Lead.id).where(
         Lead.owner_id == owner_id, Lead.email.in_(emails), LeadEvent.source_type.notin_(_NOT_ENGAGEMENT)).group_by(Lead.email))).all())
-    from app.models.database import BlacklistedEmail
     unsub = {e for (e,) in (await db.execute(select(func.lower(BlacklistedEmail.email)).where(func.lower(BlacklistedEmail.email).in_(emails)))).all()}
     out = {}
     for email in emails:
@@ -826,6 +873,8 @@ async def people(db, owner_id: str) -> dict[str, dict]:
         pr = problems.get(email)
         if pr is not None and d["code"] == "unsubscribed" and pr.delivery_note:
             d = {**d, "reason": pr.delivery_note, "code": "bounced" if pr.delivery in ("bounced", "blocked") else "spam"}
+        if d["code"] == "email_changed" and p is not None and p.reason:
+            d = {**d, "reason": p.reason}
         sent90 = [r for r in rs if r.sent_at >= _now() - timedelta(days=90)]
         opened90 = sum(1 for r in sent90 if r.opened_at or r.clicked_at)
         latest = rs[0] if rs else None

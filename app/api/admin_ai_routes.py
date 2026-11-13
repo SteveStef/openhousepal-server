@@ -92,7 +92,7 @@ _BUCKET_EVENT_TYPE = {
     "chat_global": "chat", "tts_global": "tts", "realtime_global": "realtime",
     "area_narrative_global": "area_narrative", "area_research_global": "area_research",
     "copywrite_global": "copywrite", "blog_writer_global": "blog_writer", "studio_media_image_global": "studio_media_image",
-    "studio_media_video_global": "studio_media_video",
+    "studio_media_video_global": "studio_media_video", "studio_motion_global": "studio_motion",
 }
 
 # ai_rate_limit_service.classify_provider_error's possible return values that mean "an upstream
@@ -110,7 +110,7 @@ _ET = ZoneInfo("America/New_York")
 # The rest of event_type -> vendor (the dict above predates these features).
 _EVENT_TYPE_PROVIDER.update({
     "area_fair_housing": "anthropic", "cma_ai_recompute": "anthropic",
-    "studio_media_image": "openai", "studio_media_video": "fal",
+    "studio_media_image": "openai", "studio_media_video": "fal", "studio_motion": "anthropic",
     "external_api": "google", "explore_nearby": "google_places",
 })
 

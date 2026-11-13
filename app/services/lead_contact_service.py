@@ -9,6 +9,9 @@ person is written down, and a new email address starts fresh.
 - Spotlight price / open house alerts they signed up for - moved to the new address.
 - Email rules start over for the new address (nothing ignored yet, so no 3-not-opened sleep), and a
   Showcase that fell asleep because the OLD address never opened anything wakes up.
+- Except when emails to the old address were OFF (bounced, unsubscribed, ignored, turned off by the
+  agent): then the new address starts paused and the agent is asked "Turn their emails back on?"
+  (user, 11/12) - yes is the normal switch (fresh unopened count, sleeping Showcase wakes).
 
 The "Send them a new invitation?" choice afterwards is send_invite() - the Showcase-from-an-open-
 house invite (visitor_confirmation) or the normal Showcase invite (showcase_ready)."""
@@ -36,9 +39,11 @@ def _norm(v: Optional[str]) -> str:
 
 
 async def propagate(db, owner_id: str, lead: Lead, *, old_email: Optional[str], old_phone: Optional[str],
-                    old_name: Optional[str]) -> dict:
+                    old_name: Optional[str], old_state: Optional[dict] = None) -> dict:
     """Push the lead's (already edited) contact details out. Call before the commit; doesn't commit.
-    -> {"showcases": n, "woken": [collection ids to catch up after the commit], "email_changed": bool}."""
+    old_state: client_email_service.status_for() of the OLD address, read before the edit.
+    -> {"showcases": n, "woken": [collection ids to catch up after the commit], "email_changed": bool,
+        "emails_held": bool}."""
     from app.services import client_email_service as ce
     from app.services import showcase_sleep
     from app.services.lead_cleanup_service import lead_showcases
@@ -49,7 +54,10 @@ async def propagate(db, owner_id: str, lead: Lead, *, old_email: Optional[str], 
     phone_changed = (new_phone or None) != (old_phone or None)
     name_changed = (new_name or None) != (old_name or None)
     if not (email_changed or phone_changed or name_changed):
-        return {"showcases": 0, "woken": [], "email_changed": False}
+        return {"showcases": 0, "woken": [], "email_changed": False, "emails_held": False}
+    # Emails to the old address were off: the new one waits for the agent's say-so (and so do
+    # Showcases asleep because of it - turning emails back on wakes them).
+    held = email_changed and ce.needs_hold(old_state)
 
     # Their Showcases, found the way the lead page finds them - by the OLD address.
     cols = await lead_showcases(db, owner_id, SimpleNamespace(id=lead.id, email=old_email or new_email))
@@ -57,7 +65,7 @@ async def propagate(db, owner_id: str, lead: Lead, *, old_email: Optional[str], 
     for col in cols:
         if email_changed:
             col.visitor_email = new_email
-            if col.status == "INACTIVE" and col.inactive_reason == showcase_sleep.NO_RESPONSE:
+            if not held and col.status == "INACTIVE" and col.inactive_reason == showcase_sleep.NO_RESPONSE:
                 # Asleep because the wrong address never opened anything - the right one starts fresh.
                 col.status, col.inactive_reason, col.inactive_at = "ACTIVE", None, None
                 woken.append(col.id)
@@ -94,7 +102,9 @@ async def propagate(db, owner_id: str, lead: Lead, *, old_email: Optional[str], 
         ).values(email=new_email).execution_options(synchronize_session=False))
         # The new address: a clean slate (a "you deleted their lead" hold on it, if any, is lifted).
         await ce.lift_lead_deleted(db, owner_id, new_email)
-    return {"showcases": len(cols), "woken": woken, "email_changed": email_changed}
+    if held:
+        held = await ce.hold_for_new_address(db, owner_id, new_email, old_state, lead)
+    return {"showcases": len(cols), "woken": woken, "email_changed": email_changed, "emails_held": bool(held)}
 
 
 async def after_commit(owner_id: str, lead_id: str, result: dict) -> None:

@@ -114,6 +114,15 @@ async def _homes_to_host(db: AsyncSession, user: User, args: dict) -> Any:
             raise ValueError("date must be YYYY-MM-DD")
     town = str(args.get("town") or "").strip()
     want = _norm(town)
+    # One listing agent's homes ("I'd host any of Karen's homes" - QA 11/12): the hosting cards' Request
+    # to host lets them tick the agent's other homes and send ONE text, email or OpenHousePal request.
+    agent_want = _norm(args.get("listing_agent"))
+    if agent_want:
+        listings = [l for l in listings if isinstance(l, dict) and all(w in _norm(l.get("ListAgentFullName")) for w in agent_want.split())]
+        if not listings:
+            return {"homes": [], "note": (f"None of {args.get('listing_agent')}'s homes are in their Discovery search, so there are no cards to show. "
+                                          "Say so in one line: they can widen their Discovery search (set_discovery_search), and if the listing agent "
+                                          "isn't on OpenHousePal they can still text or email them from Discovery's Request to host.")}
     keys = [l.get("ListingKey") for l in listings if isinstance(l, dict) and l.get("OnPlatformAgentId") != user.id and (not want or want in _norm(l.get("City")) or want in _norm(l.get("Street")))][:25]
     statuses: dict = {}
     if keys:
@@ -137,15 +146,19 @@ async def _homes_to_host(db: AsyncSession, user: User, args: dict) -> Any:
         res["note"] = (f"None of the homes in their Discovery search ({area}) are in {town}. They can widen the search on Discovery - "
                        "changing it there changes it for the page too.")
     res["how_to_ask"] = ("To ask to host one: request_to_host with its listing_key, a date and times (only when can_ask_in_app). "
-                         "If the listing agent isn't on OpenHousePal, Discovery has a text/email they send themselves.")
+                         "Several of one agent's homes: request_to_host_several (only when can_ask_in_app). If the listing agent isn't on "
+                         "OpenHousePal, these cards' Request to host writes the text or email for them (it can tick the agent's other homes too) - "
+                         "tell them to open a home on the cards BELOW your reply and tap Request to host, then pick the day and time there "
+                         "(it is NOT filled in from the chat - never say it is); never write the text yourself.")
     return res
 
 LOOKUPS["find_homes_to_host"] = (
     "Homes the agent could host an open house at - the Discovery page's own list (their saved search area, closest first) with "
-    "address, price, listing agent, miles away, open houses already set, and their own requests. Optional town (keeps only that town) "
-    "and date YYYY-MM-DD (says per home if that day is open to host). Use for 'what can I host near Malvern this Saturday?' or "
-    "'any homes that need a host this weekend?'.",
-    _obj({"town": {"type": "string"}, "date": {"type": "string"}, "limit": {"type": "integer"}}), MLS, _homes_to_host)
+    "address, price, listing agent, miles away, open houses already set, and their own requests. They show under the reply as "
+    "Discovery cards with Request to host. Optional town (keeps only that town or street), listing_agent (keeps only that listing "
+    "agent's homes - use it for 'I'd host any of Karen's homes'), and date YYYY-MM-DD (says per home if that day is open to host). "
+    "Use for 'what can I host near Malvern this Saturday?', 'any homes that need a host this weekend?' or one agent's homes.",
+    _obj({"town": {"type": "string"}, "listing_agent": {"type": "string"}, "date": {"type": "string"}, "limit": {"type": "integer"}}), MLS, _homes_to_host)
 
 
 # ================================================================ BLOG + AGENT HUB STATS

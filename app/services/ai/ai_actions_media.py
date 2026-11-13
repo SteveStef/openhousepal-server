@@ -18,7 +18,8 @@ from app.services.ai.ai_actions_catalog import _BACKGROUND, _obj, _run_route, _s
 from app.services.email_service import tidy_caps
 
 MEDIA_PLANS = {"IDX", "PRO_NO_MLS"}
-TOOLS = ("twilight", "lights_on", "virtual_staging", "enhance", "video")
+TOOLS = ("twilight", "lights_on", "virtual_staging", "enhance", "video", "cinematic")
+CINEMATIC_MAX = 40  # photos it may choose from (the editor picks the video's own by room and length)
 ROOMS = ("living_room", "family_room", "primary_bedroom", "bedroom", "nursery", "kitchen", "dining_room", "office", "basement",
          "bonus_room", "home_gym", "sunroom", "entryway", "patio")
 STYLES = ("modern", "transitional", "luxury", "traditional")
@@ -36,7 +37,7 @@ async def _p_media(db, user, a):
     if key and has_mls:
         p = (await db.execute(select(Property).where(Property.listing_key == key))).scalars().first()
         if p is not None:
-            photos = [x for x in (p.photos or []) if isinstance(x, str)][:24] if isinstance(p.photos, list) else []
+            photos = [x for x in (p.photos or []) if isinstance(x, str)][:40] if isinstance(p.photos, list) else []
             listing = {"listing_key": key, "address": tidy_caps(p.street_address) or "", "city": tidy_caps(p.city) or "", "state": p.state, "zipcode": p.zipcode,
                        "price": p.price, "beds": p.bedrooms, "baths": p.bathrooms, "sqft": p.living_area, "photos": photos}
     ups = (await db.execute(select(StudioMediaAsset.result_url).where(StudioMediaAsset.owner_id == user.id, StudioMediaAsset.kind == "upload", StudioMediaAsset.result_url.isnot(None))
@@ -64,6 +65,18 @@ def _adjust_media(user, payload: dict, picks: dict) -> dict:
     listing = payload.get("listing") or {}
     listed = set(listing.get("photos") or [])
     allowed = listed | set(payload.get("uploads") or []) | {u for u in (picks.get("added") or []) if isinstance(u, str)}
+    if tool == "cinematic":
+        # Cinematic Video: a listing hands over all its photos; uploads are picked on the card. The
+        # length, the rooms, the look and making it happen in its editor (right in the chat).
+        listing_photos = [u for u in (listing.get("photos") or []) if isinstance(u, str)]
+        if len(listing_photos) >= 2:
+            photos = listing_photos[:CINEMATIC_MAX]
+        else:
+            photos = [u for u in (picks.get("photos") or []) if u in allowed][:CINEMATIC_MAX]
+        if len(photos) < 2:
+            raise ActionError("Pick at least 2 photos first.")
+        out.update(tool=tool, photos=photos)
+        return out
     if tool == "video":
         photos = [u for u in (picks.get("photos") or []) if u in allowed][:7]
         if not photos:
@@ -102,11 +115,39 @@ def _linked(p: dict) -> Optional[dict]:
     return {k: home[k] for k in ("listing_key", "address", "city", "state", "zipcode", "price", "beds", "baths", "sqft") if home.get(k) is not None}
 
 
+async def _r_cinematic(user, p: dict, linked: Optional[dict]) -> dict:
+    """Cinematic Video from the chat: makes the project (a draft, same as the page's Continue) with the
+    picked photos, starts the AI looking at them, and hands over to its editor - checking each room's
+    label, the look, transitions and making the video happen there (too much for a card)."""
+    listed = set((p.get("listing") or {}).get("photos") or [])
+    photos = p.get("photos") or []
+    from_listing = bool(linked) and bool(photos) and photos[0] in listed
+    agent = {"name": f"{user.first_name or ''} {user.last_name or ''}".strip(), "brokerage": user.brokerage or "",
+             "photo": user.photo_url if (user.photo_url or "").startswith(("http://", "https://")) else None}
+    body = {"photos": photos, "source_kind": "listing" if from_listing else "upload", "agent": agent,
+            "client_request_id": str(uuid.uuid4())}
+    if from_listing:
+        body["linked_property"] = linked
+    out = await _run_route(user, "POST", "/studio/media-lab/motion", body)
+    aid = (out or {}).get("id")
+    if not aid:
+        return {"message": "Your Cinematic Video is waiting in Media Lab.", "link": "/studio/media"}
+    try:
+        await _run_route(user, "POST", f"/studio/media-lab/motion/{aid}/analyze")
+    except ActionError:
+        pass  # the editor starts it itself when it opens
+    return {"message": "Your Cinematic Video is started - I'm sorting the photos into rooms now. Pick the length and shape "
+                       "below, tap the rooms to show, check each photo and make it - right here. It's saved as you go.",
+            "link": f"/studio/media/motion/{aid}"}
+
+
 async def _r_media(db, user, p):
     from app.services.ai import ai_notify
     from app.services.ai.ai_actions import CARD
     video = p.get("tool") == "video"
     linked = _linked(p)
+    if p.get("tool") == "cinematic":
+        return await _r_cinematic(user, p, linked)
     if video:
         first = (p.get("photos") or [None])[0]
         listed = set((p.get("listing") or {}).get("photos") or [])
@@ -133,7 +174,7 @@ async def _r_media(db, user, p):
 
 
 _simple("make_ai_media", "Make AI media from a photo, the Media Lab's tools: twilight (day to dusk), lights_on, virtual_staging (needs a room and a style), enhance (grass, sky, brighten_exterior, lighting, polish, yard_cleanup, "
-        "declutter, remove_furniture) or an AI video (1 to 7 landscape photos, standard or day_to_twilight). Set it up right away: the card asks the tool, the photo and that tool's choices with a preview. "
+        "declutter, remove_furniture), an AI video (1 to 7 landscape photos, standard or day_to_twilight) or a Cinematic Video (tool=cinematic: uses every photo of the named listing, or 2+ uploads picked on the card; then its editor opens right in the chat to pick the length and shape, tap the rooms to show, check each photo, the look and make it - no AI video model, well under 1% of their AI). Set it up right away: the card asks the tool, the photo and that tool's choices with a preview. "
         "Pass photo_url when they attached a photo (from the [Photo attached: url] note), listing_key when they named one of their homes, and room_type or style if you can see or were told them. Runs in the background; never ask them to wait. IDX and Pro plans.",
         _obj({"tool": {"type": "string", "enum": list(TOOLS)}, "photo_url": {"type": "string"}, "listing_key": {"type": "string"},
               "room_type": {"type": "string", "enum": list(ROOMS)}, "style": {"type": "string", "enum": list(STYLES)},

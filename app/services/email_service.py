@@ -42,6 +42,7 @@ TEMPLATE_VERSION_SUFFIX = "_v2"
 
 
 AGENT_HEALTH_TEMPLATES = {"agent_weekly_summary", "agent_email_test"}
+HOST_ASK_TEMPLATES = {"host_request_group_received"}  # host_ask_email_service.render
 PAYMENT_REQUEST_TEMPLATES = {"payment_request", "payment_request_failed", "group_invite"}  # payment_request_service.render
 
 
@@ -300,6 +301,10 @@ class EmailService:
                 # (the prod Mailgun domain is at its template cap).
                 from app.services.invite_email_service import render as render_invite
                 data["subject"], data["html"], data["text"] = render_invite(template, subject, template_variables)
+            elif template in HOST_ASK_TEMPLATES:
+                # "I'd host any of these" (11/12) - one line per requested open, rendered here.
+                from app.services.host_ask_email_service import render as render_host_ask
+                data["subject"], data["html"], data["text"] = render_host_ask(template, subject, template_variables)
             elif template in PAYMENT_REQUEST_TEMPLATES:
                 # Admin payment requests (payment_request_service) - designed v2 look, rendered here.
                 from app.services.payment_request_service import render as render_payment

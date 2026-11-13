@@ -15,6 +15,8 @@ from app.schemas.open_house_manager import (
     CounterBackRequest,
     CounterHostRequestRequest,
     CreateBroadcastRequest,
+    CreateHostRequestBatch,
+    CreateHostRequestBatchResult,
     CreateHostRequestRequest,
     CreateHostRequestResult,
     HostRequestEventResponse,
@@ -132,6 +134,46 @@ async def create_request(
     except Exception as e:
         logger.error(f"Failed to create host request: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Unable to submit this request right now.")
+
+
+@router.get("/listing-agent-homes")
+async def listing_agent_homes(
+    listing_key: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.BASIC)),
+):
+    """This listing's agent and their other homes that could use a host ("I'd host any of these")."""
+    try:
+        return await service.listing_agent_homes(db, current_user, listing_key)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+@router.post("/requests/batch", response_model=CreateHostRequestBatchResult, status_code=status.HTTP_201_CREATED)
+async def create_requests_batch(
+    payload: CreateHostRequestBatch,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.BASIC)),
+):
+    try:
+        return await service.create_host_requests_batch(db, current_user, payload)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to create host requests: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Unable to send this request right now.")
+
+
+@router.post("/host-requests/group/{group_id}/decline")
+async def decline_request_group(
+    group_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.BASIC)),
+):
+    try:
+        return {"declined": await service.decline_host_request_group(db, current_user, group_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
 @router.post("/host-requests/{request_id}/approve", response_model=HostRequestResponse)
