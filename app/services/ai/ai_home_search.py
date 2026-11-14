@@ -18,6 +18,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import Property, User
+from app.services import mls_mirror
 from app.services.ai import ai_home_reader as reader
 from app.services.email_service import tidy_caps
 
@@ -69,7 +70,7 @@ def missing(f: Dict[str, Any]) -> List[str]:
 
 
 def _where(f: Dict[str, Any]) -> list:
-    lease = Property.raw_mls_data["PropertyType"].astext
+    lease = mls_mirror.col(Property.mls_property_type, "PropertyType")
     w = [Property.home_status.in_(FOR_SALE), or_(lease.is_(None), ~lease.ilike("%lease%"))]
     town = f.get("town")
     if town:

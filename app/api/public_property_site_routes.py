@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import email_signature_service
+from app.services import mls_mirror
 from app.api.public_nearby_shared import explore_nearby_response, explore_place_details_response, visitor_device_id
 from app.database import get_db
 from app.models.database import AgentHub, PropertyWebsite, StudioBrandKit, StudioMediaAsset, User
@@ -43,7 +44,7 @@ async def _listing_not_showable(db: AsyncSession, site: PropertyWebsite) -> bool
     from app.models.database import Property
     from app.services.website.content_adapters import _IDX_NOT_SHOWN_STATUSES
     row = (await db.execute(
-        select(Property.home_status, Property.raw_mls_data["InternetEntireListingDisplayYN"].astext)
+        select(Property.home_status, mls_mirror.text_field("InternetEntireListingDisplayYN"))
         .where(Property.listing_key == str(site.listing_key))
     )).first()
     if not row:

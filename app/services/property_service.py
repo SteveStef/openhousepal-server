@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, case
 from app.schemas.collection_preferences import CollectionPreferencesBase as CollectionPreferencesSchema
 from app.models.database import Property
+from app.services import mls_mirror
 from app.models.property import PropertySummaryResponse, PropertyDetailResponse
 from app.services.google_geocoding_service import ensure_google_rooftop_geocode
 from app.utils.same_home import dedupe_same_homes
@@ -94,6 +95,8 @@ def _circle_filter(preferences):
         Property.latitude <= float(preferences.lat) + lat_offset,
         Property.longitude >= float(preferences.long) - long_offset,
         Property.longitude <= float(preferences.long) + long_offset,
+        mls_mirror.in_box(float(preferences.lat) - lat_offset, float(preferences.lat) + lat_offset,
+                          float(preferences.long) - long_offset, float(preferences.long) + long_offset),
         # the exact circle, not the square around it (11/09 audit: the corners let in homes up to
         # 2 mi out of a 1.5 mi radius)
         distance_miles_sql(Property.latitude, Property.longitude, float(preferences.lat), float(preferences.long)) <= float(preferences.diameter),
@@ -320,7 +323,8 @@ class PropertyService:
         preferences = await _place_address_center(db, preferences)
         if preferences is None:
             return []
-        query = select(Property)
+        # Results become PropertySummaryResponse, which reads sold fields from the mirror: skip the payload.
+        query = select(Property).options(*mls_mirror.defer_raw())
         filters = []
         
         # Types that typically don't have bathrooms or bedrooms (Exempt from numeric filters)
@@ -422,6 +426,7 @@ class PropertyService:
                     Property.latitude <= bbox["max_lat"],
                     Property.longitude >= bbox["min_lng"],
                     Property.longitude <= bbox["max_lng"],
+                    mls_mirror.in_box(bbox["min_lat"], bbox["max_lat"], bbox["min_lng"], bbox["max_lng"]),
                     _polygon_filter(Property, preferences.search_polygon),
                 ))
 
@@ -718,6 +723,7 @@ class PropertyService:
                     Property.latitude <= bbox["max_lat"],
                     Property.longitude >= bbox["min_lng"],
                     Property.longitude <= bbox["max_lng"],
+                    mls_mirror.in_box(bbox["min_lat"], bbox["max_lat"], bbox["min_lng"], bbox["max_lng"]),
                     _polygon_filter(Property, preferences.search_polygon),
                 ))
 

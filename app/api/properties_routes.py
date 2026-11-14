@@ -1,7 +1,7 @@
 from app.utils.mls_mapper import card_photo
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, func, case
+from sqlalchemy import select, or_, and_, func, case
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
@@ -21,6 +21,7 @@ from app.models.property import (
     NearbyAmenitiesResponse,
 )
 from app.services import nearby_amenities_service
+from app.services import mls_mirror
 from app.services.nces_school_assignment_service import resolve_school_assignment
 from app.config.logging import get_logger
 
@@ -456,10 +457,18 @@ async def search_properties_by_address(
             (Property.full_address.ilike(f"{query}%"), 0),
             else_=1,
         )
+        # The payload is only a fallback for an empty photo / status / price column: open it just
+        # for those rows (it was loaded whole for every one of the 15 candidates, every keystroke).
+        raw_fallbacks = func.jsonb_build_object(
+            "ListPictureURL", case((and_(func.coalesce(Property.img_src, "") == "", func.coalesce(Property.photos.op("->>")(0), "") == ""),
+                                    Property.raw_mls_data["ListPictureURL"]), else_=None),
+            "MlsStatus", case((func.coalesce(Property.home_status, "") == "", Property.raw_mls_data["MlsStatus"]), else_=None),
+            "ListPrice", case((or_(Property.price.is_(None), Property.price == 0), Property.raw_mls_data["ListPrice"]), else_=None),
+        ) if mls_mirror.ready() else Property.raw_mls_data
         stmt = (
             select(
                 Property.full_address, Property.latitude, Property.longitude, Property.img_src,
-                Property.photos, Property.home_status, Property.raw_mls_data, Property.price,
+                Property.photos, Property.home_status, raw_fallbacks, Property.price,
                 Property.google_rooftop_latitude, Property.google_rooftop_longitude,
                 Property.google_geocode_location_type, Property.listing_key,
             )
@@ -1328,7 +1337,7 @@ async def get_listing_price_history(listing_key: str, db: AsyncSession = Depends
     a withdrawn/expired/off-market or internet-opted-out listing has none to show."""
     from app.services.website.content_adapters import _IDX_NOT_SHOWN_STATUSES
     row = (await db.execute(
-        select(Property.home_status, Property.raw_mls_data["InternetEntireListingDisplayYN"].astext).where(Property.listing_key == str(listing_key))
+        select(Property.home_status, mls_mirror.text_field("InternetEntireListingDisplayYN")).where(Property.listing_key == str(listing_key))
     )).first()
     if not row or row[0] in _IDX_NOT_SHOWN_STATUSES or row[1] == "false":
         raise HTTPException(status_code=404, detail="No price history for this home.")
@@ -1371,7 +1380,7 @@ async def get_property_for_agent(
             # public page. Sold and under-contract homes still are.
             from app.services.website.content_adapters import _IDX_NOT_SHOWN_STATUSES
             opted_out, expected_on = (await db.execute(
-                select(Property.raw_mls_data["InternetEntireListingDisplayYN"].astext, Property.raw_mls_data["ExpectedOnMarketDate"].astext)
+                select(mls_mirror.text_field("InternetEntireListingDisplayYN"), mls_mirror.text_field("ExpectedOnMarketDate"))
                 .where(Property.listing_key == str(listing_key))
             )).first() or (None, None)
             if getattr(property_data, "home_status", None) in _IDX_NOT_SHOWN_STATUSES or opted_out == "false":

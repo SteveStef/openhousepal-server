@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.logging import get_logger
 from app.models.database import User, Lead, LeadEvent, Collection, Property, OpenHouseEvent, OpenHouseVisitor
+from app.services import mls_mirror
 from app.api.lead_routes import _fetch_leads, _to_lead_out, _fetch_owner_collections, _match_collections, _load_owned_lead
 from app.services.collections_service import CollectionsService
 from app.utils.listing_dom import property_days_on_market
@@ -102,7 +103,7 @@ async def _search_properties(db: AsyncSession, current_user: User, args: dict, c
     by_street = [Property.full_address.ilike(f"{_esc(num_street.group(1))} {_esc(num_street.group(2))}%")] if num_street else []
     where = [or_(Property.city.ilike(_esc(query)), Property.listing_key == query) if is_town
              else or_(Property.full_address.ilike(f"%{_esc(query)}%"), Property.listing_key == query, *by_street)]
-    lease = Property.raw_mls_data["PropertyType"].astext
+    lease = mls_mirror.col(Property.mls_property_type, "PropertyType")
     where.append(or_(lease.is_(None), ~lease.ilike("%lease%")))
     if args.get("for_sale_only", True):
         where.append(or_(Property.home_status.ilike("%active%"), Property.home_status.ilike("%coming%")))
@@ -855,7 +856,7 @@ async def _look_up_agent(db: AsyncSession, current_user: User, args: dict, confi
     like = f"%{name}%"
     since = (date.today() - timedelta(days=365)).isoformat()
     raw = Property.raw_mls_data
-    close_date, close_price = raw["CloseDate"].astext, raw["ClosePrice"].astext
+    close_date, close_price = mls_mirror.close_date(), mls_mirror.text_field("ClosePrice")
     closed = Property.home_status == "CLOSED-BRIGHT"
 
     # who: agents whose name matches (the listing side's name is a column), then everything by their
@@ -906,7 +907,7 @@ async def _look_up_agent(db: AsyncSession, current_user: User, args: dict, confi
             "sold_last_12_months_as_listing_agent": int(listing_sold[0] or 0), "listing_side_volume": round(float(listing_sold[1] or 0)),
             "sold_last_12_months_as_buyer_agent": int(buyer_sold[0] or 0), "buyer_side_volume": round(float(buyer_sold[1] or 0)),
             "listings_for_sale_now": [_property_summary(p) for p in rows],
-            "recent_sales": [{"address": f"{st}, {c}" if c else st, "sold_price": float(pr) if pr else None, "closed": cd} for st, c, pr, cd in recent_sales],
+            "recent_sales": [{"address": f"{st}, {c}" if c else st, "sold_price": float(pr) if pr not in (None, "") else None, "closed": cd} for st, c, pr, cd in recent_sales],
         })
     return {"agents": out, "price_range": {"min": lo, "max": hi},
             "note": "From the MLS records OpenHousePal keeps (about the last 12 months of sales). To host at one of their listings, use request_to_host with its listing_key."}

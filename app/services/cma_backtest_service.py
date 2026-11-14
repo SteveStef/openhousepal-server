@@ -28,6 +28,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.config.logging import get_logger
 from app.database import AsyncSessionLocal
 from app.models.database import AIUsageEvent, CmaBacktestBatch, CmaReport, Property, PropertyPriceEvent, User
+from app.services import mls_mirror
 from app.schemas.cma import CmaCompSearchRequest, CmaComparable, CmaSubjectProperty
 from app.services import cma_ai_service, cma_service, cma_time_machine
 from app.services.cma_backtest_stubs import StubAnthropic, stub_reasoning
@@ -73,10 +74,12 @@ def _d(v) -> Optional[date]:
 # ---- sampling -----------------------------------------------------------------------------------
 
 async def _median_contract_to_close_days(db: AsyncSession) -> int:
+    cd, pc = ("mls_close_date", "mls_purchase_contract_date") if mls_mirror.ready() else (
+        "raw_mls_data->>'CloseDate'", "raw_mls_data->>'PurchaseContractDate'")
     r = await db.execute(text(
-        "select percentile_cont(0.5) within group (order by ((raw_mls_data->>'CloseDate')::date - "
-        "(raw_mls_data->>'PurchaseContractDate')::date)) from properties where home_status ilike 'closed%' "
-        "and raw_mls_data->>'PurchaseContractDate' is not null and raw_mls_data->>'CloseDate' >= :since"),
+        f"select percentile_cont(0.5) within group (order by (({cd})::date - "
+        f"({pc})::date)) from properties where home_status ilike 'closed%' "
+        f"and {pc} is not null and {cd} >= :since"),
         {"since": (date.today() - timedelta(days=SALES_WINDOW_DAYS)).isoformat()})
     v = r.scalar()
     return int(round(v)) if v else 35
@@ -146,13 +149,13 @@ async def sample_homes(db: AsyncSession, *, towns: list[str], random_spread: boo
                        price_max: Optional[float], property_type: str, count: int) -> list[dict]:
     types = PROPERTY_TYPES.get(property_type, PROPERTY_TYPES["single_family"])[1]
     since = (date.today() - timedelta(days=SALES_WINDOW_DAYS)).isoformat()
-    close_price = func.nullif(Property.raw_mls_data["ClosePrice"].astext, "").cast(Float)
+    close_price = mls_mirror.close_price() if mls_mirror.ready() else func.nullif(Property.raw_mls_data["ClosePrice"].astext, "").cast(Float)
     q = select(Property).where(
         Property.is_manual.is_(False),
         func.upper(Property.home_status).like("CLOSED%"),
         Property.home_type.in_(types),
-        Property.raw_mls_data["CloseDate"].astext >= since,
-        Property.raw_mls_data["CloseDate"].astext <= date.today().isoformat(),
+        mls_mirror.close_date() >= since,
+        mls_mirror.close_date() <= date.today().isoformat(),
         close_price > 0,
         Property.living_area > 0,
         Property.latitude.isnot(None), Property.longitude.isnot(None),
@@ -206,9 +209,11 @@ async def sample_homes(db: AsyncSession, *, towns: list[str], random_spread: boo
 
 async def town_options(db: AsyncSession) -> list[dict]:
     since = (date.today() - timedelta(days=SALES_WINDOW_DAYS)).isoformat()
+    cd, cp = ("mls_close_date", "mls_close_price") if mls_mirror.ready() else (
+        "raw_mls_data->>'CloseDate'", "nullif(raw_mls_data->>'ClosePrice','')::float")
     r = await db.execute(text(
         "select initcap(lower(city)) c, upper(state) st, count(*) n from properties where home_status ilike 'closed%' "
-        "and raw_mls_data->>'CloseDate' >= :since and nullif(raw_mls_data->>'ClosePrice','')::float > 0 "
+        f"and {cd} >= :since and {cp} > 0 "
         "and living_area > 0 and latitude is not null and is_manual is false "
         "group by 1, 2 having count(*) >= 5 order by 3 desc limit 400"), {"since": since})
     # "Springfield, PA" - Bright covers several states and town names repeat (accuracy test 10/19

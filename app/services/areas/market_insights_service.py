@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import Property
+from app.services import mls_mirror
 from app.services.areas import geography
 from app.services.areas.market_stats_service import FOR_SALE_STATUSES, sales_window
 
@@ -85,13 +86,13 @@ async def get_area_insights(db: AsyncSession, scope: dict, district_names: Optio
     if location_filter is None:
         return {}
     resid = geography.residential_for_sale_filter(Property)
-    close_date = Property.raw_mls_data["CloseDate"].astext
+    close_date = mls_mirror.close_date()
     today = date.today()
     since_24 = (today - timedelta(days=730)).isoformat()
 
     sold = (await db.execute(
-        select(close_date, Property.raw_mls_data["ClosePrice"].astext, Property.raw_mls_data["ListPrice"].astext,
-               Property.raw_mls_data["DaysOnMarket"].astext, Property.bedrooms, Property.bathrooms, Property.living_area,
+        select(close_date, mls_mirror.text_field("ClosePrice"), mls_mirror.col(Property.price, "ListPrice"),
+               mls_mirror.col(Property.days_on_market, "DaysOnMarket"), Property.bedrooms, Property.bathrooms, Property.living_area,
                Property.lot_size_acres, Property.year_built, Property.tax_annual_amount, Property.school_district_name)
         .where(location_filter, resid, Property.home_status.in_(_SOLD), close_date >= since_24)
     )).all()

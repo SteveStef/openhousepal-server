@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, Text, ForeignKey, Table, Index, DateTime, Date, Time, UniqueConstraint
+from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, Text, ForeignKey, Table, Index, DateTime, Date, Time, UniqueConstraint, Numeric, FetchedValue
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func, text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -1024,6 +1024,20 @@ class PropertyFieldChange(Base):
 
 class Property(Base):
     __tablename__ = "properties"
+    # The mirror columns below are filled by the database (trigger): fetch them back with each
+    # write instead of leaving them stale on the object.
+    __mapper_args__ = {"eager_defaults": True}
+    # Built CONCURRENTLY at runtime by app/services/mls_mirror.py (never in a migration - a plain
+    # CREATE INDEX on this table blocks the MLS sync for minutes on the live server).
+    __table_args__ = (
+        Index("ix_properties_mls_unmirrored", "id", postgresql_where=text("mls_mirrored_at IS NULL")),
+        Index("ix_properties_mls_close_date", "mls_close_date"),
+        Index("ix_properties_school_district_trgm", "school_district_name", postgresql_using="gin",
+              postgresql_ops={"school_district_name": "gin_trgm_ops"}),
+        Index("ix_properties_zipcode_pattern", "zipcode", postgresql_ops={"zipcode": "varchar_pattern_ops"}),
+        Index("ix_properties_geo_point", text("point(longitude, latitude)"), postgresql_using="gist"),
+        Index("ix_properties_status_state_city", "home_status", "state", "city"),
+    )
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     listing_key = Column(String, unique=True, index=True, nullable=False)
@@ -1055,6 +1069,26 @@ class Property(Base):
     price_per_square_feet = Column(Float, nullable=True)
     mls_incorporated_city_name = Column(String, nullable=True)
     raw_mls_data = Column(JSONB, nullable=True)
+
+    # Bright fields read by searches, counts and sorts, mirrored out of raw_mls_data into real
+    # columns (owner 11/13: sold-home lookups read the whole 10 GB raw-payload store just to find
+    # a sold date). The DATABASE fills them - trigger properties_mls_mirror (migration
+    # 05333178db78) recomputes them from raw_mls_data on every insert and every update that writes
+    # raw_mls_data, from any code path - so they can never drift from the payload. Same values as
+    # `raw_mls_data->>'Key'` (text stays text, numbers become numeric). Existing rows are filled in
+    # the background by app/services/mls_mirror.py; until that's finished, readers use the payload
+    # (mls_mirror.ready()). Never write these from Python.
+    mls_close_date = Column(String, nullable=True, server_default=FetchedValue(), server_onupdate=FetchedValue())            # CloseDate 'YYYY-MM-DD'
+    mls_close_price = Column(Numeric(asdecimal=False), nullable=True, server_default=FetchedValue(), server_onupdate=FetchedValue())  # ClosePrice
+    mls_purchase_contract_date = Column(String, nullable=True, server_default=FetchedValue(), server_onupdate=FetchedValue())  # PurchaseContractDate
+    mls_expected_on_market_date = Column(String, nullable=True, server_default=FetchedValue(), server_onupdate=FetchedValue())  # ExpectedOnMarketDate (Coming Soon)
+    mls_internet_display = Column(String, nullable=True, server_default=FetchedValue(), server_onupdate=FetchedValue())      # InternetEntireListingDisplayYN 'true'/'false'
+    mls_internet_address_display = Column(String, nullable=True, server_default=FetchedValue(), server_onupdate=FetchedValue())  # InternetAddressDisplayYN
+    mls_association_fee2 = Column(Numeric(asdecimal=False), nullable=True, server_default=FetchedValue(), server_onupdate=FetchedValue())
+    mls_association_fee2_frequency = Column(String, nullable=True, server_default=FetchedValue(), server_onupdate=FetchedValue())
+    mls_buyer_financing = Column(JSONB, nullable=True, server_default=FetchedValue(), server_onupdate=FetchedValue())        # BuyerFinancing (list)
+    mls_property_condition = Column(JSONB, nullable=True, server_default=FetchedValue(), server_onupdate=FetchedValue())     # PropertyCondition (list)
+    mls_mirrored_at = Column(DateTime(timezone=True), nullable=True, server_default=FetchedValue(), server_onupdate=FetchedValue())
 
     # Cached nearby-amenities lookup (Google Places) for the Open House Cheat Sheet PDF -
     # persisted rather than in-memory so repeat kit downloads don't re-bill Google.

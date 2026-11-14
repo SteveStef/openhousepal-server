@@ -15,6 +15,7 @@ from app.models.database import (
     PropertyComment, PropertyTour, collection_properties,
     Notification, ScheduledEmail, CollectionPreferences, AgentForm, FormSubmission, LeadEvent
 )
+from app.services import mls_mirror
 from app.schemas.collection import CollectionCreate
 from app.services.areas import geography
 from app.services.mls_open_houses import open_houses_payload
@@ -82,12 +83,12 @@ def _sale_fields(prop: Property) -> Dict[str, Any]:
     """Sold price + date for a closed home's notice (Bright fills these only once it's closed)."""
     if 'closed' not in str(prop.home_status or '').lower():
         return {'ClosePrice': None, 'CloseDate': None}
-    raw = prop.raw_mls_data or {}
+    cp = mls_mirror.value(prop, 'ClosePrice')
     try:
-        close_price = float(raw.get('ClosePrice')) if raw.get('ClosePrice') not in (None, '') else None
+        close_price = float(cp) if cp not in (None, '') else None
     except (TypeError, ValueError):
         close_price = None
-    return {'ClosePrice': close_price, 'CloseDate': raw.get('CloseDate') or None}
+    return {'ClosePrice': close_price, 'CloseDate': mls_mirror.value(prop, 'CloseDate') or None}
 
 
 async def _resolve_original_property_data(db: AsyncSession, collection: Collection) -> Optional[Dict[str, Any]]:
@@ -293,7 +294,7 @@ class CollectionsService:
                 select(Collection)
                 .options(
                     selectinload(Collection.preferences),
-                    selectinload(Collection.properties),
+                    mls_mirror.selectin_without_raw(Collection.properties),
                     selectinload(Collection.original_open_house_event),
                     selectinload(Collection.property_interactions),
                 )
@@ -912,7 +913,7 @@ class CollectionsService:
         try:
             query = select(Collection).options(
                 selectinload(Collection.preferences),
-                selectinload(Collection.properties),
+                mls_mirror.selectin_without_raw(Collection.properties),
                 selectinload(Collection.property_interactions),
                 selectinload(Collection.original_open_house_event)
             ).where(
@@ -1597,7 +1598,7 @@ class CollectionsService:
             query = (
                 select(Collection)
                 .options(
-                    selectinload(Collection.properties),
+                    mls_mirror.selectin_without_raw(Collection.properties),
                     joinedload(Collection.preferences),
                     selectinload(Collection.original_open_house_event)
                 )
@@ -2078,7 +2079,7 @@ class CollectionsService:
         try:
             # First, get the collection with its properties
             query = select(Collection).options(
-                selectinload(Collection.properties)
+                mls_mirror.selectin_without_raw(Collection.properties)
             ).where(
                 Collection.id == collection_id,
                 Collection.owner_id == user_id
@@ -2151,7 +2152,7 @@ class CollectionsService:
             # Get all the properties that have a relation to the collectionId
             query = (
                 select(Collection)
-                .options(selectinload(Collection.properties))
+                .options(mls_mirror.selectin_without_raw(Collection.properties))
                 .where(Collection.id == collectionId)
             )
             result = await db.execute(query)

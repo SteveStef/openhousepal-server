@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
 from app.models.database import CmaReport, HomeType, Property, User, StudioBrandKit, AgentHub, Site, SiteDomain
+from app.services import mls_mirror
 from app.schemas.cma import (
     CmaReportCreate, CmaReportUpdate, CmaCompSearchRequest, CmaCompCandidate,
     CmaShareResponse, CmaPublicResponse, CmaPublicAgent, CmaReportListItem,
@@ -769,6 +770,7 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
     query = select(Property).where(
         Property.latitude.between(req.latitude - lat_offset, req.latitude + lat_offset),
         Property.longitude.between(req.longitude - lng_offset, req.longitude + lng_offset),
+        mls_mirror.in_box(req.latitude - lat_offset, req.latitude + lat_offset, req.longitude - lng_offset, req.longitude + lng_offset),
         # Agent-entered "My Listings" rows are not real MLS records - never offer them as CMA
         # comparable candidates.
         Property.is_manual.is_(False),
@@ -783,7 +785,7 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
         or_(Property.home_type.is_(None), Property.home_type.notin_([HomeType.LAND.value, HomeType.COMMERCIAL.value])),
         # Bright files some rentals as 'Multi-Family' with a monthly rent as the "close price" - the
         # lease is only in PropertyType (1420 Locust St #23H got two of them as comps, 10/21).
-        ~func.coalesce(Property.raw_mls_data["PropertyType"].astext, "").ilike("%lease%"),
+        ~func.coalesce(mls_mirror.col(Property.mls_property_type, "PropertyType"), "").ilike("%lease%"),
     )
     # Same state only - no New Jersey comps for a Philadelphia home (grader 10/21).
     _subj_state = ((req.subject.state if req.subject else None) or "").strip().upper()
@@ -869,7 +871,7 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
         query = query.where(or_(*status_terms))
     if date_from or date_to:
         sale_day = func.coalesce(
-            Property.raw_mls_data["CloseDate"].astext,
+            mls_mirror.close_date(),
             func.to_char(Property.updated_at, "YYYY-MM-DD"),
         )
         date_terms = []

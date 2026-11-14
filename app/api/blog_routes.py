@@ -374,35 +374,99 @@ def _job_is_stale(review: dict) -> bool:
     return (datetime.now(timezone.utc) - started).total_seconds() > _AI_JOB_STALE_SECONDS
 
 
+# Every run ends on its own, with a clear answer, well before the progress poll would give up on it
+# (owner 11/13: a live article sat on "Gathering" for 15 minutes while the database was overloaded,
+# then failed - and the stuck run kept going in the background). Gathering is free database
+# look-ups that take seconds; minutes there means the database is struggling, so the run stops
+# early instead of making the agent wait. Nothing is charged for a run that is stopped.
+_AI_JOB_TIME_LIMIT_SECONDS = 14 * 60
+_AI_JOB_STAGE_LIMITS = {"gathering": 3 * 60}
+_AI_JOB_POLL_SECONDS = 5
+_AI_JOB_BUSY_ERROR = ("Our servers were too busy to look up your towns just now, so the AI never started writing. "
+                      "Nothing was charged and your answers are saved - please try again in a few minutes.")
+_AI_JOB_SLOW_ERROR = "The AI writer took too long - please try again. Nothing was charged for this try."
+
+
+def _same_run(review: Optional[dict], job: dict) -> bool:
+    """The article still belongs to this run - not given up by the progress poll, not replaced by a
+    newer run, not reopened as a draft. A run never writes over anything else."""
+    return bool(job.get("started_at")) and (review or {}).get("started_at") == job.get("started_at")
+
+
 async def _run_blog_ai_job(blog_id: str, user_id: str, brief: dict, engine: str) -> None:
+    import asyncio
+    import time
     from sqlalchemy import update
     from app.database import AsyncSessionLocal
     from app.services.ai import ai_blog_pipeline_service
 
+    error = None
+    result = None
     async with AsyncSessionLocal() as db:
         user = await db.get(User, user_id)
         blog = await db.get(Blog, blog_id)
         if not user or not blog:
             return
         job = dict(blog.ai_review or {})
+        stage_clock = {"name": job.get("stage") or "gathering", "at": time.monotonic()}
 
         async def on_stage(name: str) -> None:
+            stage_clock.update(name=name, at=time.monotonic())
             job.update(stage=name, stage_at=datetime.now(timezone.utc).isoformat())
-            await db.execute(update(Blog).where(Blog.id == blog_id).values(ai_review=dict(job)))
+            await db.execute(update(Blog).where(Blog.id == blog_id, Blog.ai_review["started_at"].astext == str(job.get("started_at")))
+                             .values(ai_review=dict(job)))
             await db.commit()
 
-        error = None
-        try:
-            result = await ai_blog_pipeline_service.run_pipeline(db, user, brief, engine=engine, on_stage=on_stage)
-        except HTTPException as exc:
-            error = str(exc.detail)
-        except Exception:
-            logger.exception("AI blog job failed", extra={"blog_id": blog_id})
-            error = "The AI writer hit a problem - please try again. Nothing was charged for this try."
+        run = asyncio.create_task(ai_blog_pipeline_service.run_pipeline(db, user, brief, engine=engine, on_stage=on_stage))
+        began = time.monotonic()
+        stopped = None
+        while not run.done():
+            await asyncio.wait({run}, timeout=_AI_JOB_POLL_SECONDS)
+            if run.done():
+                break
+            now = time.monotonic()
+            limit = _AI_JOB_STAGE_LIMITS.get(stage_clock["name"])
+            if limit and now - stage_clock["at"] > limit:
+                stopped = _AI_JOB_BUSY_ERROR
+            elif now - began > _AI_JOB_TIME_LIMIT_SECONDS:
+                stopped = _AI_JOB_SLOW_ERROR
+            if stopped:
+                logger.warning("AI blog job stopped", extra={"blog_id": blog_id, "stage": stage_clock["name"], "seconds": round(now - began)})
+                run.cancel()
+                try:
+                    await run
+                except BaseException:
+                    pass
+                break
+        if stopped:
+            error = stopped
+        else:
+            try:
+                result = run.result()
+            except HTTPException as exc:
+                error = str(exc.detail)
+            except Exception:
+                logger.exception("AI blog job failed", extra={"blog_id": blog_id})
+                error = "The AI writer hit a problem - please try again. Nothing was charged for this try."
+        if stopped:
+            # The cancelled look-up may have left this connection mid-query - drop it, not reuse it.
+            try:
+                await db.invalidate()
+            except Exception:
+                pass
+
+    # The ending is written on a fresh connection, so the run's long transaction is over either way.
+    async with AsyncSessionLocal() as db:
+        if stopped:
+            await ai_blog_pipeline_service.refund_since(db, user_id, job.get("started_at"))
         blog = await db.get(Blog, blog_id)
         if not blog:
             return
-        await db.refresh(blog)
+        if not _same_run(blog.ai_review, job):
+            logger.warning("AI blog job finished after it was given up - not written", extra={"blog_id": blog_id, "failed": bool(error)})
+            if not error:
+                await ai_blog_pipeline_service.refund_since(db, user_id, job.get("started_at"))
+            return
         if error:
             blog.ai_review = {**job, "status": "failed", "error": error}
         else:
@@ -536,6 +600,97 @@ async def start_blog_ai_job(
     _AI_JOBS.add(task)
     task.add_done_callback(_AI_JOBS.discard)
     return {"blog_id": blog.id, "status": "running", "stage": "gathering", "engine": engine}
+
+
+async def _writer_probe(user: User, names: list[str], slugs: list[str]) -> dict:
+    """The run's first, free step on a short leash: find the towns and pull the first one's numbers,
+    each database look-up allowed 20 seconds (the slowest, a whole-table count, takes ~10 s when it
+    isn't cached yet). Slower than that means the database is overloaded and a real run would sit on
+    "Gathering" - better to say so before the agent presses Write. It also warms the caches the
+    real run reads (in this server process)."""
+    import asyncio
+    import time
+    from sqlalchemy import text
+    from app.database import AsyncSessionLocal
+    from app.services.areas import town_knowledge_service as tk
+    from app.utils.auth import tier_has_mls
+
+    out = {"busy": False, "unknown": [], "seconds": 0.0}
+    t0 = time.monotonic()
+
+    async def probe() -> None:
+        async with AsyncSessionLocal() as db:
+            try:
+                await db.execute(text("SET LOCAL statement_timeout = 20000"))
+                state = (getattr(user, "state", None) or "PA").strip().upper()[:2]
+                areas = list(await tk.find_areas(db, slugs=slugs[:5])) if slugs else []
+                for raw in names[:5]:
+                    # the same town lookup the article run itself uses (ai_blog_pipeline_service -> find_areas)
+                    found = await tk.find_areas(db, names=[str(raw)], state=state)
+                    a = found[0] if found else None
+                    if a:
+                        areas.append(a)
+                    # Typing a town makes an empty record for it right away (the Spotlight look-up),
+                    # so "on file" means researched - anything else gets the "new to us" note.
+                    if not a or a.enrichment_status not in ("ENRICHED", "PARTIAL"):
+                        out["unknown"].append(str(raw).split(",")[0].strip())
+                known = [a for a in areas if a.enrichment_status in ("ENRICHED", "PARTIAL")] or areas
+                if known:
+                    await tk.town_dossier(db, known[0], include_bank=False, mls=tier_has_mls(user.plan_tier))
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "statement timeout" in msg or "canceling statement" in msg:
+                    out["busy"] = True
+                else:  # our own bug must never block writing - log it and let the run go ahead
+                    logger.warning("blog writer preflight probe failed", exc_info=True)
+            finally:
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+
+    try:
+        await asyncio.wait_for(probe(), timeout=45)
+    except asyncio.TimeoutError:
+        out["busy"] = True
+    out["seconds"] = round(time.monotonic() - t0, 1)
+    return out
+
+
+@router.post("/ai/preflight")
+async def blog_ai_preflight(
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_design_access),
+):
+    """"Ready to write?" - checked on the writer's last step and again on Write (owner 11/13: "the
+    flow catches possible issues before they send it and have to wait forever"). Free and quick:
+    the AI allowance and MLS data (the same check Write does), the towns, and whether the database
+    is answering fast enough for the run's first step. `ready` is false only for something that
+    would stop the run; towns we've never covered are a note, not a stop."""
+    from app.services.ai import ai_blog_pipeline_service
+    checks: list[dict] = []
+    try:
+        await ai_blog_pipeline_service.precheck(db, current_user, payload.get("engine"))
+        checks.append({"key": "allowance", "level": "ok", "title": "Enough AI usage left this month"})
+    except HTTPException as exc:
+        checks.append({"key": "allowance", "level": "block", "title": "Can't write this one right now", "detail": str(exc.detail)})
+    names = [str(a)[:80] for a in (payload.get("areas") or []) if str(a).strip()][:5]
+    slugs = [str(s)[:120] for s in (payload.get("area_slugs") or []) if str(s).strip()][:5]
+    probe = await _writer_probe(current_user, names, slugs)
+    if probe["busy"]:
+        checks.append({"key": "servers", "level": "block", "title": "Our servers are very busy right now",
+                       "detail": "Writing would stall on its first step. Your answers are saved - check again in a few minutes."})
+    else:
+        checks.append({"key": "servers", "level": "ok", "title": "Ready to write - usually 2-4 minutes"})
+    if probe["unknown"]:
+        towns = ", ".join(probe["unknown"])
+        checks.append({"key": "towns", "level": "warn", "title": f"New to us: {towns}",
+                       "detail": "The AI researches it from scratch - a little slower, with fewer local numbers. Check the spelling if that's a typo."})
+    elif names or slugs:
+        checks.append({"key": "towns", "level": "ok", "title": "Your towns are on file"})
+    logger.info("blog writer preflight", extra={"owner_id": current_user.id, "busy": probe["busy"], "seconds": probe["seconds"]})
+    return {"ready": not any(c["level"] == "block" for c in checks), "checks": checks, "seconds": probe["seconds"]}
 
 
 @router.get("/ai/jobs/{blog_id}")

@@ -74,6 +74,27 @@ async def lifespan(app: FastAPI):
 
     logger.info("Initializing APScheduler for scheduled tasks")
 
+    # MLS mirror columns (owner 11/13 - sold-home lookups read the whole raw payload store): old
+    # rows are filled in small batches in the background (one worker, quiet around the nightly
+    # backup), then the indexes are built and every reader switches to the columns by itself.
+    from app.services import mls_mirror
+    try:
+        await mls_mirror.refresh_ready(force=True)
+    except Exception:
+        logger.warning("mls mirror readiness check failed at boot", exc_info=True)
+    from datetime import datetime as _mm_dt, timedelta as _mm_td
+    scheduler.add_job(
+        mls_mirror.scheduled_mls_mirror_fill,
+        "interval",
+        minutes=10,
+        next_run_time=_mm_dt.now() + _mm_td(minutes=2),
+        id="mls_mirror_fill",
+        name="Fill the MLS mirror columns, then switch readers to them",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
     cache_hour = int(os.getenv("CACHE_CLEANUP_HOUR", 2))
     cache_mins = int(os.getenv("CACHE_CLEANUP_MINUTE", 0))
 

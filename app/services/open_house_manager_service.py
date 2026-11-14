@@ -9,6 +9,7 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import s3_service, storage_ledger_service
+from app.services import mls_mirror
 from app.services.mls_open_houses import upcoming_mls_open_houses
 from app.utils.listing_dom import property_days_on_market
 
@@ -334,8 +335,9 @@ async def _lock_listing_day(db: AsyncSession, listing_key: str, day: Optional[da
 async def _ensure_hostable(db: AsyncSession, listing_key: str, day: Optional[date]) -> None:
     """Refuse an open house on a day the listing can't be shown (checked again at every step -
     the home can go under contract between the ask and the yes)."""
-    prop = (await db.execute(select(Property.home_status, Property.raw_mls_data).where(Property.listing_key == listing_key))).first()
-    if prop and (problem := hosting_date_problem(prop.home_status, prop.raw_mls_data, day)):
+    prop = (await db.execute(select(Property.home_status, Property.raw_mls_data, Property.mls_mirrored_at, Property.mls_expected_on_market_date)
+                             .where(Property.listing_key == listing_key))).first()
+    if prop and (problem := hosting_date_problem(prop.home_status, mls_mirror.hosting_fields(prop), day)):
         raise ValueError(problem)
 
 
@@ -868,7 +870,7 @@ async def get_my_listings(db: AsyncSession, current_user: User) -> MyListingsRes
         manual_priority = bool(note and note.is_priority_override)
         # High priority = this listing has proven it draws guests (a past open had at least one
         # guest sign in) and still needs a host lined up - worth prioritizing over an unproven listing.
-        hosting_blocked, hosts_from = hosting_window(prop.home_status, prop.raw_mls_data)
+        hosting_blocked, hosts_from = hosting_window(prop.home_status, mls_mirror.hosting_fields(prop))
         computed_priority = open_house_status == "needs_host" and listing_guest_count > 0 and not hosting_blocked
         # Nothing to find a host for while it can't be shown (under contract / Coming Soon before
         # its go-live weekend).
@@ -1309,7 +1311,7 @@ async def create_host_request(db: AsyncSession, current_user: User, payload: Cre
     prop = prop_result.scalar_one_or_none()
     if not prop:
         raise ValueError("This listing could not be found.")
-    if problem := (hosting_date_problem(prop.home_status, prop.raw_mls_data, payload.requested_date)
+    if problem := (hosting_date_problem(prop.home_status, mls_mirror.hosting_fields(prop), payload.requested_date)
                    or _time_problem(payload.requested_start_time, payload.requested_end_time)):
         raise ValueError(problem)
     if _owns_listing(current_user, prop):
@@ -1467,7 +1469,7 @@ async def listing_agent_homes(db: AsyncSession, current_user: User, listing_key:
                 or_(Property.home_type.is_(None), Property.home_type.notin_(("LAND", "RESIDENTIAL_LEASE"))),
             ).order_by(Property.mls_list_date.desc().nullslast()).limit(ASK_MAX_HOMES * 2)
         )).scalars().all()
-        homes += [p for p in others if hosting_window(p.home_status, p.raw_mls_data)[0] is None][:ASK_MAX_HOMES - 1]
+        homes += [p for p in others if hosting_window(p.home_status, mls_mirror.hosting_fields(p))[0] is None][:ASK_MAX_HOMES - 1]
     keys = [p.listing_key for p in homes]
     statuses = await get_listing_open_house_statuses(db, keys)
     asked: Dict[str, List[str]] = {}
@@ -1479,7 +1481,7 @@ async def listing_agent_homes(db: AsyncSession, current_user: User, listing_key:
     eligible = True if owner is None else await _is_eligible_requester(db, owner, current_user)
 
     def _home(p: Property) -> dict:
-        blocked, hosts_from = hosting_window(p.home_status, p.raw_mls_data)
+        blocked, hosts_from = hosting_window(p.home_status, mls_mirror.hosting_fields(p))
         taken = sorted({o["scheduled_date"].isoformat() for o in (statuses.get(p.listing_key) or {}).get("scheduled_opens", []) if o.get("scheduled_date")})
         return {
             "ListingKey": p.listing_key, "Street": p.street_address or "", "City": p.city or "", "State": p.state or "",
@@ -1537,7 +1539,7 @@ async def create_host_requests_batch(db: AsyncSession, current_user: User, paylo
         if (it.listing_key, it.requested_date) in seen:
             continue
         seen.add((it.listing_key, it.requested_date))
-        problem = hosting_date_problem(p.home_status, p.raw_mls_data, it.requested_date)
+        problem = hosting_date_problem(p.home_status, mls_mirror.hosting_fields(p), it.requested_date)
         if not problem and it.requested_end_time <= it.requested_start_time:
             problem = "The end time has to be after the start time."
         if not problem and await _date_already_booked(db, it.listing_key, it.requested_date):
@@ -2450,7 +2452,7 @@ async def create_broadcast(db: AsyncSession, current_user: User, payload: Create
     same OpenHouseTeamBroadcast row either way, same open/filled/cancelled lifecycle and the same
     atomic-claim-or-counter response path (respond_to_broadcast), just a different recipient set."""
     prop = await _get_owned_property(db, current_user, payload.listing_key)
-    if problem := hosting_date_problem(prop.home_status, prop.raw_mls_data, payload.requested_date):
+    if problem := hosting_date_problem(prop.home_status, mls_mirror.hosting_fields(prop), payload.requested_date):
         raise ValueError(problem)
 
     if not payload.is_anytime and (not payload.requested_start_time or not payload.requested_end_time):

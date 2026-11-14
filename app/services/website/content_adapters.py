@@ -20,6 +20,7 @@ import logging
 import math
 import re
 import time
+from app.services import mls_mirror
 from datetime import date, datetime, timezone
 from typing import Optional
 
@@ -75,7 +76,7 @@ _ADDRESS_REPORT_KEY_RE = re.compile(r"address|street|latitude|longitude|directio
 
 def internet_display_ok():
     """SQL condition: the seller did not opt this listing out of internet display."""
-    return func.coalesce(Property.raw_mls_data["InternetEntireListingDisplayYN"].astext, "true") != "false"
+    return mls_mirror.internet_display_ok()
 
 
 def _withhold_address(card: dict) -> dict:
@@ -97,8 +98,8 @@ async def apply_idx_rules(db: AsyncSession, cards: list[dict]) -> list[dict]:
         return cards
     rows = (await db.execute(
         select(Property.listing_key,
-               Property.raw_mls_data["InternetEntireListingDisplayYN"].astext,
-               Property.raw_mls_data["InternetAddressDisplayYN"].astext,
+               mls_mirror.text_field("InternetEntireListingDisplayYN"),
+               mls_mirror.text_field("InternetAddressDisplayYN"),
                Property.list_office_name)
         .where(Property.listing_key.in_(keys))
     )).all()
@@ -313,7 +314,7 @@ async def get_active_listings(
     "My Listings" rows (`is_manual=True`, never touched by the Bright sync)."""
     if not user.mls_id:
         return []
-    query = select(Property).where(
+    query = select(Property).options(*mls_mirror.defer_raw()).where(
         or_(Property.list_agent_mls_id == user.mls_id, Property.co_list_agent_mls_id == user.mls_id),
         Property.home_status.notin_(INACTIVE_STATUSES),
         internet_display_ok(),
@@ -599,7 +600,7 @@ async def get_property_detail(db: AsyncSession, user: User, listing_key: str) ->
     if not user.mls_id:
         return None
     result = await db.execute(
-        select(Property).where(
+        select(Property).options(*mls_mirror.defer_raw()).where(
             Property.listing_key == listing_key,
             or_(Property.list_agent_mls_id == user.mls_id, Property.co_list_agent_mls_id == user.mls_id),
         )
@@ -619,7 +620,7 @@ async def get_property_detail(db: AsyncSession, user: User, listing_key: str) ->
         "township": p.township,
         "days_on_market": property_days_on_market(p),
         "mls_number": p.listing_id,
-        "expected_on_market_date": (p.raw_mls_data or {}).get("ExpectedOnMarketDate"),
+        "expected_on_market_date": mls_mirror.value(p, "ExpectedOnMarketDate"),
         "list_office_name": p.list_office_name,
         "list_office_phone": p.list_office_phone,
         "list_agent_full_name": p.list_agent_full_name,
@@ -648,7 +649,7 @@ async def get_similar_listings(db: AsyncSession, user: User, exclude_listing_key
     if not user.mls_id or not city:
         return []
     result = await db.execute(
-        select(Property)
+        select(Property).options(*mls_mirror.defer_raw())
         .where(
             or_(Property.list_agent_mls_id == user.mls_id, Property.co_list_agent_mls_id == user.mls_id),
             Property.home_status.notin_(INACTIVE_STATUSES),
@@ -674,23 +675,21 @@ def _agent_sale_identifier_filters(mls_id: str) -> list:
 
 def _not_a_lease():
     """A rental isn't a sale - leases closed by an agent never fill their Recent Sales."""
-    t = Property.raw_mls_data["PropertyType"].astext
+    t = mls_mirror.col(Property.mls_property_type, "PropertyType")
     return or_(t.is_(None), ~t.ilike("%lease%"))
 
 
 def _sold_price(p) -> Optional[float]:
     """What it sold for (ClosePrice), the list price only when Bright never sent one."""
-    raw = p.raw_mls_data if isinstance(p.raw_mls_data, dict) else {}
     try:
-        close = float(raw.get("ClosePrice") or 0)
+        close = float(mls_mirror.value(p, "ClosePrice") or 0)
     except (TypeError, ValueError):
         close = 0
     return close or p.price
 
 
 def _sold_date(p) -> Optional[str]:
-    raw = p.raw_mls_data if isinstance(p.raw_mls_data, dict) else {}
-    return str(raw.get("CloseDate") or "")[:10] or None
+    return str(mls_mirror.value(p, "CloseDate") or "")[:10] or None
 
 
 async def get_recent_sales(
@@ -707,7 +706,7 @@ async def get_recent_sales(
     # most recently MODIFIED rows of any status, so a busy agent's listings crowded their real
     # sales out, and it showed the list price + the last-edited date instead of what it sold for
     # and when.
-    query = select(Property).where(
+    query = select(Property).options(*mls_mirror.defer_raw()).where(
         or_(*_agent_sale_identifier_filters(mls_id)),
         or_(Property.home_status.ilike("%closed%"), Property.home_status.ilike("%sold%")),
         _not_a_lease(),
@@ -716,7 +715,7 @@ async def get_recent_sales(
     if location_filter is not None:
         query = query.where(location_filter)
     result = await db.execute(
-        query.order_by(Property.raw_mls_data["CloseDate"].astext.desc().nullslast(),
+        query.order_by(mls_mirror.close_date().desc().nullslast(),
                        Property.modification_timestamp.desc().nullslast())
         .limit(limit * 3)  # over-fetch before the price floor below, still bounded
     )
@@ -855,7 +854,7 @@ async def get_agent_stats(db: AsyncSession, user: User) -> dict:
         return {"active_listings": active_count, "sold_count": len(hub_sales), "sold_volume": round(sum(s.get("price") or 0 for s in hub_sales))}
 
     result = await db.execute(
-        select(Property)
+        select(Property).options(*mls_mirror.defer_raw())
         .where(or_(*_agent_sale_identifier_filters(mls_id)),
                or_(Property.home_status.ilike("%closed%"), Property.home_status.ilike("%sold%")), _not_a_lease())
         .limit(1000)
@@ -1879,7 +1878,7 @@ async def _build_search_suggestions(db: AsyncSession, user: User, limit: int) ->
     suggestions: list[str] = []
     for city in cities[:limit]:
         result = await db.execute(
-            select(Property)
+            select(Property).options(*mls_mirror.defer_raw())
             .where(Property.city.ilike(city), Property.price.isnot(None))
             .order_by(Property.mls_list_date.desc().nullslast())
             .limit(1)
@@ -1940,13 +1939,13 @@ async def _address_search(db: AsyncSession, query_text: str, limit: int) -> list
     if len(street) < 4:
         return []
     result = await db.execute(
-        select(Property)
+        select(Property).options(*mls_mirror.defer_raw())
         .where(
             Property.full_address.ilike(f"{street}%") | Property.full_address.ilike(f"{street} %") | Property.street_address.ilike(f"{street}%"),
             Property.home_status.notin_(INACTIVE_STATUSES),
             internet_display_ok(),
             # a seller who hid the address must not be findable by typing it
-            func.coalesce(Property.raw_mls_data["InternetAddressDisplayYN"].astext, "true") != "false",
+            mls_mirror.internet_address_ok(),
         )
         .order_by(Property.mls_list_date.desc().nullslast())
         .limit(limit)
@@ -1999,7 +1998,7 @@ async def get_search_results(
     zip_code = parsed.get("zip")
     if zip_code and not parsed.get("cities"):
         zip_rows = (await db.execute(
-            select(Property.city, Property.state).where(Property.zipcode.like(f"{zip_code}%"), Property.home_status.notin_(INACTIVE_STATUSES))
+            select(Property.city, Property.state).where(mls_mirror.zip_prefix(Property.zipcode, zip_code), Property.home_status.notin_(INACTIVE_STATUSES))
             .group_by(Property.city, Property.state)
         )).all()
         parsed["cities"] = sorted({f"{c.strip().title()}, {st.strip().upper()}" for c, st in zip_rows if c and st})
@@ -2010,10 +2009,10 @@ async def get_search_results(
     if only_words and not search_polygon and 3 <= len(query_text.strip()) <= 40:
         street = re.sub(r"\s+", " ", _STREET_SUFFIX_RE.sub("", query_text.strip())).replace("%", "").replace("_", " ")
         rows = (await db.execute(
-            select(Property).where(
+            select(Property).options(*mls_mirror.defer_raw()).where(
                 Property.street_address.ilike(f"% {street}%"),
                 Property.home_status.notin_(INACTIVE_STATUSES), internet_display_ok(),
-                func.coalesce(Property.raw_mls_data["InternetAddressDisplayYN"].astext, "true") != "false",
+                mls_mirror.internet_address_ok(),
             ).order_by(Property.mls_list_date.desc().nullslast()).limit(limit * 2)
         )).scalars().all()
         states = await _served_states(db, user)
@@ -2189,7 +2188,7 @@ async def get_area_inventory(
     total = (await db.execute(select(func.count(Property.id)).where(*filters))).scalar_one()
 
     order = _AREA_SORTS.get(sort, _AREA_SORTS["newest"])
-    result = await db.execute(select(Property).where(*filters).order_by(order).offset(offset).limit(limit))
+    result = await db.execute(select(Property).options(*mls_mirror.defer_raw()).where(*filters).order_by(order).offset(offset).limit(limit))
     return await apply_idx_rules(db, [_listing_card(p) for p in result.scalars().all()]), total
 
 
@@ -2202,9 +2201,9 @@ async def get_area_recent_market_sales(db: AsyncSession, area_scope: dict | list
     location_filter = geography.location_filter(Property, area_scope)
     if location_filter is None:
         return []
-    close_date = Property.raw_mls_data["CloseDate"].astext
+    close_date = mls_mirror.close_date()
     result = await db.execute(
-        select(Property)
+        select(Property).options(*mls_mirror.defer_raw())
         .where(location_filter, Property.home_status.in_(_AREA_SOLD_STATUSES), geography.residential_for_sale_filter(Property), close_date.isnot(None), internet_display_ok())
         .order_by(close_date.desc())
         .limit(limit)
@@ -2212,13 +2211,13 @@ async def get_area_recent_market_sales(db: AsyncSession, area_scope: dict | list
     out = []
     for p in result.scalars().all():
         card = _listing_card(p)
-        raw = p.raw_mls_data or {}
+        cp = mls_mirror.value(p, "ClosePrice")
         try:
-            close_price = float(raw.get("ClosePrice")) if raw.get("ClosePrice") else None
+            close_price = float(cp) if cp else None
         except (TypeError, ValueError):
             close_price = None
         card["sold_price"] = close_price or p.price
-        card["sold_date"] = raw.get("CloseDate")
+        card["sold_date"] = mls_mirror.value(p, "CloseDate")
         out.append(card)
     return await apply_idx_rules(db, out)
 
@@ -2279,7 +2278,7 @@ async def get_public_mls_property_detail(db: AsyncSession, listing_key: str) -> 
     )).first()
     card["open_houses"] = open_houses_payload(oh_row) if oh_row else []
     card["expected_on_market_date"] = (await db.execute(
-        select(Property.raw_mls_data["ExpectedOnMarketDate"].astext).where(Property.listing_key == str(listing_key))
+        select(mls_mirror.text_field("ExpectedOnMarketDate")).where(Property.listing_key == str(listing_key))
     )).scalar()
     card.update({
         "description": _fix_mojibake(p.description),

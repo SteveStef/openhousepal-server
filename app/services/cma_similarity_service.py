@@ -14,6 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import Property
+from app.services import mls_mirror
 from app.utils.geo import distance_miles_sql, get_lat_long_offsets, haversine_distance
 
 
@@ -341,10 +342,11 @@ async def _load_local_proximity_context(db: AsyncSession, subject: dict) -> dict
         Property.lot_size,
         Property.year_built,
         Property.home_status,
-        Property.raw_mls_data,
+        mls_mirror.close_date().label("close_date_v"),  # only CloseDate was read - not the whole payload
     ).where(
         Property.latitude.between(lat - lat_offset, lat + lat_offset),
         Property.longitude.between(lng - lng_offset, lng + lng_offset),
+        mls_mirror.in_box(lat - lat_offset, lat + lat_offset, lng - lng_offset, lng + lng_offset),
         Property.is_manual.is_(False),
         distance_expr <= MAX_DENSITY_SEARCH_MILES,
     )
@@ -380,8 +382,8 @@ async def _load_local_proximity_context(db: AsyncSession, subject: dict) -> dict
             "lot_size": row["lot_size"],
             "year_built": row["year_built"],
             "status": row["home_status"],
-            "close_date": (row["raw_mls_data"] or {}).get("CloseDate"),
-            "sale_date": (row["raw_mls_data"] or {}).get("CloseDate"),
+            "close_date": row["close_date_v"],
+            "sale_date": row["close_date_v"],
         }
         for row in rows
     ]
@@ -409,15 +411,15 @@ async def _load_price_surface(db: AsyncSession, subject: dict, lat: float, lng: 
     family = property_type_family(subject.get("property_type") or subject.get("home_type"))
     as_of = cma_time_machine.today()
     since = (as_of - timedelta(days=PRICE_SURFACE_DAYS)).isoformat()
-    close_price = func.nullif(Property.raw_mls_data["ClosePrice"].astext, "")
-    close_date = Property.raw_mls_data["CloseDate"].astext
+    close_price = Property.mls_close_price if mls_mirror.ready() else func.nullif(Property.raw_mls_data["ClosePrice"].astext, "")
+    close_date = mls_mirror.close_date()
     lat_offset, lng_offset = get_lat_long_offsets(lat, PRICE_SURFACE_MILES)
     distance_expr = distance_miles_sql(Property.latitude, Property.longitude, lat, lng)
     # Each sale's condition tier rides along (5th field) so the price level can be read condition-neutral
     # (cma_ai_service CMA_AREA_PRICE_COND - a block of unrenovated rentals is not a cheap location).
     with_cond = os.getenv("CMA_AREA_PRICE_COND", "1") == "1"
-    cond_cols = (Property.raw_mls_data["PropertyCondition"].label("cond"),
-                 Property.raw_mls_data["PublicRemarks"].astext.label("remarks")) if with_cond else ()
+    cond_cols = (mls_mirror.json_field("PropertyCondition").label("cond"),
+                 mls_mirror.col(Property.description, "PublicRemarks").label("remarks")) if with_cond else ()
     query = select(
         Property.listing_key, Property.latitude, Property.longitude, Property.home_type,
         close_price.label("close_price"),
@@ -426,6 +428,7 @@ async def _load_price_surface(db: AsyncSession, subject: dict, lat: float, lng: 
     ).where(
         Property.latitude.between(lat - lat_offset, lat + lat_offset),
         Property.longitude.between(lng - lng_offset, lng + lng_offset),
+        mls_mirror.in_box(lat - lat_offset, lat + lat_offset, lng - lng_offset, lng + lng_offset),
         Property.is_manual.is_(False),
         func.upper(Property.home_status).like("CLOSED%"),
         close_date >= since, close_date <= as_of.isoformat(),

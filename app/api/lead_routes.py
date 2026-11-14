@@ -14,6 +14,7 @@ from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.models.database import AgentTask, Collection, Lead, LeadEvent, LeadNote, OpenHouseEvent, OpenHouseVisitor, Property, User
+from app.services import mls_mirror
 from app.schemas.leads import (
     LeadAlertsOut, LeadAlertsUpdate, LeadDetailOut, LeadEventOut, LeadHandleRequest, LeadHideRequest, LeadMomentOut, LeadNoteCreate, LeadNoteOut, LeadNoteUpdate,
     LeadOpenHouseOut, LeadOut, LeadPropertyOut, LeadShowcaseOut, LeadSort, LeadSourceFilter, LeadStatus, LeadRepresented,
@@ -229,7 +230,7 @@ async def _fetch_owner_collections(db: AsyncSession, owner_id: str) -> List[Coll
     """
     result = await db.execute(
         select(Collection)
-        .options(selectinload(Collection.properties), selectinload(Collection.property_interactions))
+        .options(mls_mirror.selectin_without_raw(Collection.properties), selectinload(Collection.property_interactions))
         .where(Collection.owner_id == owner_id, or_(Collection.visitor_email.isnot(None), Collection.visitor_phone.isnot(None)))
     )
     cols = list(result.scalars().unique().all())

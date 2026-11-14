@@ -9,6 +9,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import Collection, Property, PropertyComment, PropertyInteraction, PropertyTour, collection_properties
+from app.services import mls_mirror
 from app.services.collections_service import card_new_since, matched_in_at
 
 
@@ -52,6 +53,7 @@ async def _matches(db: AsyncSession, collections: List[Collection], limit_per: O
         .where(collection_properties.c.collection_id.in_(list(by_id)))
         # newest first; the homes a Showcase started with (no date) last, by when they were listed
         .order_by(case((collection_properties.c.added_at.is_(None), 1), else_=0), collection_properties.c.added_at.desc(), Property.mls_list_date.desc().nullslast())
+        .options(*mls_mirror.defer_raw())  # cards use columns only
     )).all()
     acts = await _activity(db, list(by_id))
     out, seen = [], {}

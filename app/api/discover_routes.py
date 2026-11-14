@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func
 from app.models.database import DiscoveryPreferences, User, Property, Brokerage
+from app.services import mls_mirror
 from dotenv import load_dotenv
 from typing import Literal, Optional, List
 from pydantic import BaseModel
@@ -144,6 +145,8 @@ async def suggest_discovery_agents(
         area.append(and_(
             Property.latitude.between(float(prefs.latitude) - lat_off, float(prefs.latitude) + lat_off),
             Property.longitude.between(float(prefs.longitude) - lon_off, float(prefs.longitude) + lon_off),
+            mls_mirror.in_box(float(prefs.latitude) - lat_off, float(prefs.latitude) + lat_off,
+                              float(prefs.longitude) - lon_off, float(prefs.longitude) + lon_off),
             distance_miles_sql(Property.latitude, Property.longitude, float(prefs.latitude), float(prefs.longitude)) <= float(prefs.miles),
         ))
     if prefs and prefs.cities:
@@ -210,7 +213,7 @@ async def get_discovery(
             return {"success": True, "data": [], "preferences": None}
 
         # Build the property query
-        prop_stmt = select(Property)
+        prop_stmt = select(Property).options(*mls_mirror.defer_raw())  # cards use columns + the mirror only
         filters = []
 
         # 1. Location Precedence: Radius
@@ -227,7 +230,9 @@ async def get_discovery(
                 Property.latitude >= float(prefs.latitude) - lat_off,
                 Property.latitude <= float(prefs.latitude) + lat_off,
                 Property.longitude >= float(prefs.longitude) - lon_off,
-                Property.longitude <= float(prefs.longitude) + lon_off
+                Property.longitude <= float(prefs.longitude) + lon_off,
+                mls_mirror.in_box(float(prefs.latitude) - lat_off, float(prefs.latitude) + lat_off,
+                                  float(prefs.longitude) - lon_off, float(prefs.longitude) + lon_off),
             ))
             radius_distance_expr = distance_miles_sql(
                 Property.latitude, Property.longitude, float(prefs.latitude), float(prefs.longitude)
@@ -427,7 +432,7 @@ async def get_discovery(
                 dist = haversine_distance(prefs.latitude, prefs.longitude, p.latitude, p.longitude)
 
             on_platform_owner = owner_by_mls_id.get(p.list_agent_mls_id) or owner_by_mls_id.get(p.co_list_agent_mls_id)
-            hosting_blocked, hosts_from = hosting_window(p.home_status, p.raw_mls_data)
+            hosting_blocked, hosts_from = hosting_window(p.home_status, mls_mirror.hosting_fields(p))
 
             response_data.append(DiscoveryPropertyResponse(
                 ListingKey=str(p.listing_key),

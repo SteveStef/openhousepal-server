@@ -6,6 +6,7 @@ rollup) - it's a new, small, aggregate query, the kind of thing that genuinely d
 anywhere in this codebase yet (confirmed during Phase 3 planning research).
 """
 import re
+from app.services import mls_mirror
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -46,8 +47,8 @@ def closed_sales_filter(model, start, end):
     listings carry future close dates), at a real price (geography.MIN_PLAUSIBLE_SALE_PRICE -
     $1 transfers and data-entry rows are not sales). Combine with a location filter."""
     from sqlalchemy import and_
-    close_date = model.raw_mls_data["CloseDate"].astext
-    close_price = cast(func.nullif(model.raw_mls_data["ClosePrice"].astext, ""), Numeric)
+    close_date = mls_mirror.close_date(model)
+    close_price = mls_mirror.close_price(model)
     return and_(
         geography.residential_for_sale_filter(model),
         model.home_status.in_(SOLD_STATUSES),
@@ -107,7 +108,7 @@ async def get_area_market_stats(db: AsyncSession, zip_codes: list[str] | dict, c
     # for in the last two years, the middle 90% of them, leaving out units under 800 sq ft (studio
     # condos, parking spaces) - not the min/max of whatever happens to be listed today.
     from datetime import date, timedelta
-    close_price = cast(func.nullif(Property.raw_mls_data["ClosePrice"].astext, ""), Numeric)
+    close_price = mls_mirror.close_price()
     range_row = (await db.execute(
         select(
             func.count(close_price),
@@ -115,7 +116,7 @@ async def get_area_market_stats(db: AsyncSession, zip_codes: list[str] | dict, c
             func.percentile_cont(0.95).within_group(close_price.asc()),
         ).where(
             location_filter, for_sale, Property.home_status.in_(_SOLD_STATUSES),
-            Property.raw_mls_data["CloseDate"].astext >= (date.today() - timedelta(days=730)).isoformat(),
+            mls_mirror.close_date() >= (date.today() - timedelta(days=730)).isoformat(),
             or_(Property.living_area.is_(None), Property.living_area >= 800),
         )
     )).first()
@@ -125,10 +126,12 @@ async def get_area_market_stats(db: AsyncSession, zip_codes: list[str] | dict, c
     # sat so far - Malvern's FAQ called that 63 "days on the market" while its sold homes took 12.
     win_start, win_end = sales_window()
     sold_doms = [float(v) for v in (await db.execute(
-        select(Property.raw_mls_data["DaysOnMarket"].astext).where(
+        select(mls_mirror.col(Property.days_on_market, "DaysOnMarket")).where(
             location_filter, closed_sales_filter(Property, win_start, win_end),
         )
-    )).scalars().all() if v and re.fullmatch(r"\d+(?:\.\d+)?", str(v).strip())]
+    # (`v not in (None, "")`, not `if v`: a home that sold in 0 days counts - the column reads 0 where
+    # the payload read "0")
+    )).scalars().all() if v not in (None, "") and re.fullmatch(r"\d+(?:\.\d+)?", str(v).strip())]
 
     # Real MLS field per listing (School District Name), not the NCES attendance-boundary lookup
     # baked into MarketArea.facts.schools - reuses data already ingested for every property, so
@@ -193,7 +196,7 @@ async def get_area_market_trends(db: AsyncSession, scope: dict, months: int = 12
     if location_filter is None:
         return {}
     resid = geography.residential_for_sale_filter(Property)
-    close_date = Property.raw_mls_data["CloseDate"].astext
+    close_date = mls_mirror.close_date()
     # The shared window (sales_window): the 1st of the month `months-1` months ago through today;
     # the year-earlier comparison is the same stretch of days one year back.
     window_start, today = sales_window(months=months)
@@ -204,8 +207,8 @@ async def get_area_market_trends(db: AsyncSession, scope: dict, months: int = 12
         prior_end = today.replace(year=today.year - 1, day=28)
 
     rows = (await db.execute(
-        select(close_date, Property.raw_mls_data["ClosePrice"].astext, Property.raw_mls_data["ListPrice"].astext,
-               Property.raw_mls_data["DaysOnMarket"].astext, Property.living_area)
+        select(close_date, mls_mirror.text_field("ClosePrice"), mls_mirror.col(Property.price, "ListPrice"),
+               mls_mirror.col(Property.days_on_market, "DaysOnMarket"), Property.living_area)
         .where(location_filter, closed_sales_filter(Property, prior_start, today))
     )).all()
 
@@ -422,8 +425,10 @@ def _num(v) -> Optional[float]:
 
 
 # Whole-table figures (the newest close date, all closings in a window) take ~5 s each and don't
-# depend on the town - computed once per 10 minutes, not once per town per article.
-_GLOBAL_TTL_S = 600
+# depend on the town - computed once per hour, not once per town per article. They only move when the
+# MLS sync adds closings; 10 minutes made nearly every article pay for them again (owner 11/13: an
+# article sat on "Gathering" until it timed out while these crawled on a busy database).
+_GLOBAL_TTL_S = 3600
 _global_cache: dict = {}
 
 
@@ -438,13 +443,34 @@ async def _global(key, compute):
 
 
 async def _closed_count_all(db: AsyncSession, start: str, stop: str) -> int:
-    close_date = Property.raw_mls_data["CloseDate"].astext
+    close_date = mls_mirror.close_date()
 
     async def compute():
         return (await db.execute(select(func.count(Property.id)).where(
             geography.residential_for_sale_filter(Property), Property.home_status.in_(_SOLD_STATUSES), close_date > start, close_date <= stop,
         ))).scalar() or 0
     return await _global(("closed_all", start, stop), compute)
+
+
+async def _closed_counts_by_slice(db: AsyncSession, end, slice_days: int, n_slices: int) -> list[int]:
+    """All closings in each `slice_days` step back from `end`, newest first - ONE pass over the
+    table for every slice (at least a year's worth, so the 90-day snapshot and the 12-month cost
+    profile share it). It was one full pass per slice: ~15 passes, two minutes on a cold cache."""
+    from datetime import timedelta
+    from sqlalchemy import and_
+    close_date = mls_mirror.close_date()
+    n = max(n_slices, 12)
+    bounds = [((end - timedelta(days=(i + 1) * slice_days)).isoformat(), (end - timedelta(days=i * slice_days)).isoformat()) for i in range(n)]
+
+    async def compute():
+        row = (await db.execute(select(*[
+            func.count(Property.id).filter(and_(close_date > start, close_date <= stop)) for start, stop in bounds
+        ]).where(
+            geography.residential_for_sale_filter(Property), Property.home_status.in_(_SOLD_STATUSES),
+            close_date > bounds[-1][0], close_date <= bounds[0][1],
+        ))).one()
+        return [int(v or 0) for v in row]
+    return await _global(("closed_slices", end.isoformat(), slice_days, n), compute)
 
 
 async def covered_days(db: AsyncSession, end, max_days: int, slice_days: int = 30) -> int:
@@ -456,10 +482,8 @@ async def covered_days(db: AsyncSession, end, max_days: int, slice_days: int = 3
     slice; the newest slice always counts (recording lag makes it look thin)."""
     from datetime import timedelta
 
-    slices = []
-    for i in range(max(1, max_days // slice_days)):
-        stop = end - timedelta(days=i * slice_days)
-        slices.append(await _closed_count_all(db, (stop - timedelta(days=slice_days)).isoformat(), stop.isoformat()))
+    n_slices = max(1, max_days // slice_days)
+    slices = (await _closed_counts_by_slice(db, end, slice_days, n_slices))[:n_slices]
     top = max(slices) if slices else 0
     n = 1
     while n < len(slices) and top and slices[n] >= 0.6 * top:
@@ -486,7 +510,7 @@ async def get_area_sales_snapshot(db: AsyncSession, scope: dict, days: int = 90)
     if location_filter is None:
         return {}
     resid = geography.residential_for_sale_filter(Property)
-    close_date = Property.raw_mls_data["CloseDate"].astext
+    close_date = mls_mirror.close_date()
     base = (location_filter, resid, Property.home_status.in_(_SOLD_STATUSES))
     today = date.today()
     # One window end for every town (the newest close date in our data), so several towns in one
@@ -504,8 +528,8 @@ async def get_area_sales_snapshot(db: AsyncSession, scope: dict, days: int = 90)
 
     async def window(start: date, stop: date) -> dict:
         rows = (await db.execute(
-            select(Property.raw_mls_data["ClosePrice"].astext, Property.raw_mls_data["ListPrice"].astext, Property.raw_mls_data["DaysOnMarket"].astext,
-                   Property.home_type)
+            select(mls_mirror.text_field("ClosePrice"), mls_mirror.col(Property.price, "ListPrice"),
+                   mls_mirror.col(Property.days_on_market, "DaysOnMarket"), Property.home_type)
             .where(*base, close_date > start.isoformat(), close_date <= stop.isoformat())
         )).all()
         prices, ratios, doms = [], [], []
@@ -547,7 +571,10 @@ async def get_area_sales_snapshot(db: AsyncSession, scope: dict, days: int = 90)
     prior = await window(prior_end - timedelta(days=days), prior_end)
     # Coverage check across ALL our closed sales (not just this town, which can be tiny): if the
     # mirror holds under 60% as many closings a year back, last year's numbers are a data gap.
-    now_all = await _closed_count_all(db, (end - timedelta(days=days)).isoformat(), end.isoformat())
+    # (this window is whole 30-day steps back from `end` - covered_days - so the one-pass slice counts
+    # already hold it; only last year's window needs a pass of its own)
+    now_all = sum((await _closed_counts_by_slice(db, end, 30, days // 30))[:days // 30]) if days % 30 == 0 \
+        else await _closed_count_all(db, (end - timedelta(days=days)).isoformat(), end.isoformat())
     then_all = await _closed_count_all(db, (prior_end - timedelta(days=days)).isoformat(), prior_end.isoformat())
     prior_ok = bool(now_all) and then_all >= 0.6 * now_all
 
@@ -655,12 +682,15 @@ async def get_area_cost_profile(db: AsyncSession, scope: dict, munis: Optional[l
     shapes = [{"name": m["name"], "rings": m["rings"], "box": bs.bbox(m["rings"])} for m in (munis or []) if m.get("rings") and m.get("name")]
     resid = geography.residential_for_sale_filter(Property)
     rows = (await db.execute(
-        select(Property.price, Property.latitude, Property.longitude, Property.home_type, Property.raw_mls_data["TaxAnnualAmount"].astext,
-               Property.raw_mls_data["TaxYear"].astext, Property.raw_mls_data["AssociationFee"].astext,
-               Property.raw_mls_data["AssociationFeeFrequency"].astext, Property.raw_mls_data["Levels"],
-               Property.raw_mls_data["SeniorCommunityYN"].astext, Property.raw_mls_data["AssociationFee2"].astext,
-               Property.raw_mls_data["AssociationFee2Frequency"].astext, Property.raw_mls_data["AssociationFeeIncludes"],
-               Property.raw_mls_data["StructureDesignType"].astext)
+        select(Property.price, Property.latitude, Property.longitude, Property.home_type,
+               mls_mirror.col(Property.tax_annual_amount, "TaxAnnualAmount"), mls_mirror.col(Property.tax_year, "TaxYear"),
+               mls_mirror.col(Property.association_fee, "AssociationFee"),
+               mls_mirror.col(Property.association_fee_frequency, "AssociationFeeFrequency"),
+               mls_mirror.col(Property.levels, "Levels", as_json=True),
+               mls_mirror.col(Property.senior_community_yn, "SeniorCommunityYN"), mls_mirror.text_field("AssociationFee2"),
+               mls_mirror.text_field("AssociationFee2Frequency"),
+               mls_mirror.col(Property.association_fee_includes, "AssociationFeeIncludes", as_json=True),
+               mls_mirror.col(Property.mls_structure_design_type, "StructureDesignType"))
         .where(location_filter, resid, Property.home_status.in_(FOR_SALE_STATUSES))
     )).all()
     taxes, years, homes = [], Counter(), []
@@ -735,16 +765,20 @@ async def get_area_cost_profile(db: AsyncSession, scope: dict, munis: Optional[l
 
     # The same complete-records window as the sales snapshot (up to 12 months), ending on the
     # newest close date - so "how buyers paid" never claims a year our mirror doesn't hold.
-    close_date = Property.raw_mls_data["CloseDate"].astext
-    latest = (await db.execute(select(func.max(close_date)).where(
-        Property.home_status.in_(_SOLD_STATUSES), resid, close_date <= date.today().isoformat()))).scalar()
+    close_date = mls_mirror.close_date()
+    today_iso = date.today().isoformat()
+
+    async def newest():  # the same whole-table figure (and cache entry) as the sales snapshot's window end
+        return (await db.execute(select(func.max(close_date)).where(
+            Property.home_status.in_(_SOLD_STATUSES), resid, close_date <= today_iso))).scalar()
+    latest = await _global(("latest_close", today_iso), newest)
     end = date.fromisoformat(str(latest)[:10]) if latest else date.today()
     span = await covered_days(db, end, 360)
     since = (end - timedelta(days=span)).isoformat()
     # The same sales the snapshot counts - real prices only ($1 transfers and data-entry rows aren't
     # sales). 11/01 round 13 Baltimore: "1,198 sales" next to "1,205 sales that recorded how the buyer paid".
     fin_rows = [fin for fin, cp in (await db.execute(
-        select(Property.raw_mls_data["BuyerFinancing"], Property.raw_mls_data["ClosePrice"].astext).where(
+        select(mls_mirror.json_field("BuyerFinancing"), mls_mirror.text_field("ClosePrice")).where(
             location_filter, resid, Property.home_status.in_(_SOLD_STATUSES), close_date > since, close_date <= end.isoformat())
     )).all() if (_num(cp) or 0) >= geography.MIN_PLAUSIBLE_SALE_PRICE]
     kinds: Counter = Counter()
@@ -838,7 +872,8 @@ async def entry_price_profile(db: AsyncSession, scopes: list[dict]) -> dict:
     if not filters:
         return {}
     rows = (await db.execute(
-        select(Property.price, Property.raw_mls_data["TaxAnnualAmount"].astext, Property.home_type, Property.raw_mls_data["StructureDesignType"].astext)
+        select(Property.price, mls_mirror.col(Property.tax_annual_amount, "TaxAnnualAmount"), Property.home_type,
+               mls_mirror.col(Property.mls_structure_design_type, "StructureDesignType"))
         .where(or_(*filters), geography.residential_for_sale_filter(Property), Property.home_status.in_(FOR_SALE_STATUSES), Property.price.isnot(None))
     )).all()
     # Manufactured homes aren't counted as single-family houses - the same rule as the article's own

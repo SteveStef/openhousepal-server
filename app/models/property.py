@@ -6,6 +6,21 @@ from datetime import datetime
 
 from app.utils.listing_dom import dom_fetched_at, resolve_days_on_market
 
+class _RowView:
+    """A Property row with a few attributes overridden - what the response models read instead of
+    the row itself (see PropertySummaryResponse._sold_from_mirror)."""
+    __slots__ = ("_row", "_over")
+
+    def __init__(self, row, over: dict):
+        self._row, self._over = row, over
+
+    def __getattr__(self, name):
+        over = object.__getattribute__(self, "_over")
+        if name in over:
+            return over[name]
+        return getattr(object.__getattribute__(self, "_row"), name)
+
+
 class PropertySummaryResponse(BaseModel):
     """
     SHALLOW model for lists and showcases.
@@ -74,6 +89,25 @@ class PropertySummaryResponse(BaseModel):
     close_price: Optional[float] = Field(None, alias="ClosePrice")
     close_date: Optional[str] = Field(None, alias="CloseDate")
     mls_raw: Optional[dict] = Field(None, exclude=True, validation_alias="raw_mls_data")
+
+    @model_validator(mode='before')
+    @classmethod
+    def _sold_from_mirror(cls, data):
+        """A home row whose sold price/date are already in the mirror columns (app/services/
+        mls_mirror.py) is read from them - the heavy payload isn't opened, and when a list query
+        skipped loading it (mls_mirror.defer_raw) it's never touched. Same values either way."""
+        from app.models.database import Property
+        if not isinstance(data, Property) or getattr(data, "mls_mirrored_at", None) is None:
+            return data
+        from app.services import mls_mirror
+        price = mls_mirror.value(data, "ClosePrice")
+        date = mls_mirror.value(data, "CloseDate")
+        return _RowView(data, {
+            # exactly what calculate_dom would have taken from the payload
+            "close_price": (float(price) or None) if price not in (None, "") else None,
+            "close_date": str(date)[:10] if date else None,
+            "raw_mls_data": None,
+        })
 
     @model_validator(mode='after')
     def calculate_dom(self) -> 'PropertySummaryResponse':

@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.logging import get_logger
 from app.models.database import Property, User
+from app.services import mls_mirror
 from app.services import s3_service
 from app.services.usage_owner import charge_google
 from app.utils.geo import distance_miles_sql, get_lat_long_offsets
@@ -69,6 +70,7 @@ async def area_suggestions(db: AsyncSession, lat: float, lng: float) -> dict:
                dist.label("d"))
         .where(Property.latitude.between(lat - lat_off, lat + lat_off),
                Property.longitude.between(lng - lng_off, lng + lng_off),
+               mls_mirror.in_box(lat - lat_off, lat + lat_off, lng - lng_off, lng + lng_off),
                Property.is_manual.is_(False),
                dist <= _NEARBY_RADIUS_MILES)
         .order_by(dist.asc())
