@@ -17,6 +17,7 @@ theme, transitions, removing sections) re-renders at no AI cost.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import base64
 import hashlib
 import io
@@ -29,7 +30,7 @@ from typing import Any, Optional
 
 import httpx
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.config.logging import get_logger
@@ -1657,6 +1658,30 @@ _ACTIVE = ("preparing", "queued", "rendering", "finishing")
 # Kept in the database (each video's render state), so a restart keeps everyone's place, and it all
 # runs on the server - the agent can close the page or log out.
 _LINE_LOCK = asyncio.Lock()
+_LINE_DB_LOCK = 740_511_15   # the same line lock across every copy of the API (WEB_WORKERS > 1, 11/14)
+
+
+@asynccontextmanager
+async def _line_db_lock():
+    """Only one copy of the API at a time looks at the line and starts the next video, so two copies can
+    never both start 'the last free slot'. A Postgres advisory lock on one connection held just for this
+    short step (Postgres frees it by itself if the connection drops); the connection is thrown away
+    rather than reused if the unlock fails, so a lock can never leak back into the pool."""
+    from app.database import engine
+    conn = await engine.connect()
+    try:
+        await conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": _LINE_DB_LOCK})
+        await conn.commit()
+        try:
+            yield
+        finally:
+            try:
+                await conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _LINE_DB_LOCK})
+                await conn.commit()
+            except Exception:  # noqa: BLE001
+                await conn.invalidate()
+    finally:
+        await conn.close()
 
 
 async def _lambda_line() -> tuple[list[dict], list[dict]]:
@@ -1724,7 +1749,7 @@ async def _lambda_take_turn(asset_id: str, props: dict) -> str:
         other = await started_elsewhere()
         if other:
             return other
-        async with _LINE_LOCK:
+        async with _LINE_LOCK, _line_db_lock():
             making, waiting = await _lambda_line()
             ids = [w["id"] for w in waiting]
             pos = ids.index(asset_id) if asset_id in ids else 0
