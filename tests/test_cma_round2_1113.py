@@ -77,7 +77,9 @@ def test_land_mismatch_needs_both_the_ratio_and_a_real_gap():
     assert svc._pending_land_mismatch({"lot_size": 7.5 * 43560}, {"lot_size": 1.4 * 43560})
     assert not svc._pending_land_mismatch({"lot_size": 6000}, {"lot_size": 20000})       # 3x, but a third of an acre apart
     assert not svc._pending_land_mismatch({"lot_size": 2 * 43560}, {"lot_size": 4 * 43560})  # 2x only
-    assert not svc._pending_land_mismatch({"lot_size": 7.5 * 43560}, {})                   # unknown is not a mismatch
+    # a home with no lot on record: not a match for an acreage subject (11/14), no call for an ordinary one
+    assert svc._pending_land_mismatch({"lot_size": 7.5 * 43560}, {})
+    assert not svc._pending_land_mismatch({"lot_size": 0.3 * 43560}, {})
 
 
 def test_review_note_shows_whole_thousands(monkeypatch):
@@ -187,7 +189,7 @@ def test_seller_report_states_an_unsold_last_listing():
     text = svc._seller_pricing_position(value=690000, range_min=640000, range_max=745000, subject_asking=None,
                                         status_timeline=tl, comps=[])
     assert "We recommend listing at about $690,000" in text
-    assert "last listing, at $835,750, ended" in text and "without a sale" in text and "about 21% above" in text
+    assert "last listing, at $835,750, came off the market" in text and "with no sale recorded" in text and "about 21% above" in text
 
 
 def test_no_unsold_listing_line_for_a_sold_old_or_hand_entered_home():
@@ -220,7 +222,7 @@ def test_competition_list_leaves_out_homes_on_a_fraction_of_the_land(monkeypatch
                 {"street_address": "NO LOT ON RECORD", "status": "pending"}]
     monkeypatch.setattr(svc.cma_service, "current_competition", fake)
     homes = asyncio.run(svc._load_current_competition(None, None, {"listing_key": "1", "lot_size": 7.5 * 43560}))
-    assert [h["street_address"] for h in homes] == ["9 ACRE LN", "NO LOT ON RECORD"]
+    assert [h["street_address"] for h in homes] == ["9 ACRE LN"]      # (no lot on record: not shown for an acreage subject)
 
 
 # ---- 6. the value steps explain every dollar ---------------------------------------------------------------
@@ -321,7 +323,7 @@ def test_no_dollar_step_sentence_only_when_land_was_not_priced():
     # ...and the report says the land WAS adjusted for, and that the rate is an estimate
     line = next(x for x in said if "acres" in x)
     assert "lot is 7.50 acres" in line and "Three of the three sales are on far less land and were adjusted up" in line
-    assert "estimate" in line
+    assert "estimate" in line and "each doubling of land" in line      # the rate is stated (grader audit 11/14)
     # it reaches the client's notes even when they already mention the acreage - unless they already say it was adjusted for
     notes = "This home has 7.50 acres, a pond and a workshop."
     out, flags = svc._v10_lot_sewer_sentences(notes, trace={"anchor": {"main_uncertainties": said}})
@@ -371,7 +373,7 @@ def test_off_market_buyer_report_states_the_last_listing():
     assert any("$499,500" in x and "ended without a sale" in x for x in new_tl["summary_lines"])
     band = {**_OFF_MARKET_BAND, "last_listing": new_tl["last_listing"]}
     out, _ = svc._v10_rebuild_buyer_offer_prose("Keep inspection and appraisal contingencies.", band, 7.0)
-    assert "The owner last listed this home at $499,500" in out and "without a sale" in out and "about 11% more" in out
+    assert "The owner last listed this home at $499,500" in out and "with no sale recorded" in out and "about 11% more" in out
     # nothing on record, or an old price at or under the value: the note says nothing about it
     out2, _ = svc._v10_rebuild_buyer_offer_prose("Keep inspection and appraisal contingencies.", dict(_OFF_MARKET_BAND), 7.0)
     assert "last listed" not in out2
@@ -445,3 +447,25 @@ def test_saved_note_with_the_old_mailing_wording_is_repaired():
     assert out == "It has a Villanova mailing address, with the same Radnor school district." and flags
     assert fc.fix_mailing_address_grammar("A colonial with a Villanova mailing address.") == ("A colonial with a Villanova mailing address.", [])
     assert "has a West Chester mailing address" in fc.fix_text("It sits with a West Chester mailing address.", subject={}, comp={})[0]
+
+
+# ---- 11. the comp search never filters on the MLS payload in SQL (live slowdown, 11/14) -------------------------
+
+def test_comp_search_sql_never_filters_on_the_mls_payload():
+    """An hour after the 11/14 push the live comp step took 65 seconds: three WHERE filters read raw_mls_data
+    (design type, closing price, MLS status), so the database opened the full payload of every home in the
+    search box. Those checks now use mirrored columns or run on the rows already read."""
+    import inspect
+    from app.services import cma_service
+    src = inspect.getsource(cma_service.search_comparables)
+    sql_part = src.split("rows = result.scalars().all()")[0]
+    # the one payload read left is the subject's own design type: a single row looked up by its key
+    assert sql_part.count("raw_mls_data[") == 1 and "Property.listing_key == req.listing_key" in sql_part
+    assert "mls_mirror.close_price()" in sql_part
+
+
+def test_parking_and_manufactured_records_are_still_left_out():
+    import inspect
+    from app.services import cma_service
+    loop_part = inspect.getsource(cma_service.search_comparables).split("rows = result.scalars().all()")[1]
+    assert '"parking" in _design' in loop_part and "_subject_manufactured" in loop_part

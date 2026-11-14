@@ -642,6 +642,14 @@ def _clean_status(home_status: Optional[str]) -> str:
     return (home_status or "").upper().replace("-BRIGHT", "")
 
 
+def _whole(v) -> Optional[int]:
+    """A count from the MLS payload ('2', 2.0, '') as an int, None when missing."""
+    try:
+        return int(float(v)) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _sold_then_removed(home_status: Optional[str], raw: Optional[dict]) -> bool:
     """A real sale whose status column no longer says so. When Bright later drops a CLOSED listing, the sync marks
     the row OFF_MARKET-BRIGHT (property_sync_service.mark_off_market) - but the MLS record itself still says
@@ -831,17 +839,15 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
     # Manufactured / mobile homes and deeded parking spaces are filed as single-family houses in our copy (788
     # closed sales since 2025). A double-wide is not a comp for a house, and a parking space is not a home (deep
     # dive 11/13). They stay in only when the subject itself is a manufactured home.
-    _design = func.coalesce(Property.raw_mls_data["StructureDesignType"].astext, "")
+    # Checked in the Python loop below, on the rows already read - NOT in SQL: as a WHERE on the MLS payload it
+    # made the database open the full payload of every home in the search box, and the live comp step went from
+    # a few seconds to 65 (11/14, an hour after it shipped).
     _subject_design = ""
     if req.listing_key:
         _subject_design = str((await db.execute(
             select(Property.raw_mls_data["StructureDesignType"].astext).where(Property.listing_key == req.listing_key)
         )).scalar_one_or_none() or "").lower()
-    query = query.where(~_design.ilike("%parking%"), ~_design.ilike("%garage%"))
-    if "manufactured" in _subject_design or "mobile" in _subject_design:
-        query = query.where(or_(_design.ilike("%manufactured%"), _design.ilike("%mobile%")))
-    else:
-        query = query.where(~_design.ilike("%manufactured%"), ~_design.ilike("%mobile%"))
+    _subject_manufactured = "manufactured" in _subject_design or "mobile" in _subject_design
     # The subject's OWN earlier sales are separate MLS listings (different listing_key) of the same
     # house - they used to come back as a "98% match" comp and anchor the value to itself. Same
     # street address + ZIP, or the same tax parcel, is never a comparable.
@@ -862,8 +868,8 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
     # A sold home is judged by what it SOLD for, the same basis the "outside the price range" list uses (deep
     # dive 11/13: listed $700K / sold $650K failed a $325-675K band on its list price, yet wasn't "outside" by its
     # sale price either - it appeared in neither list). List price when there is no closing price.
-    from sqlalchemy import Numeric, cast
-    _band_price = func.coalesce(cast(func.nullif(Property.raw_mls_data["ClosePrice"].astext, ""), Numeric), Property.price)
+    # (the mirrored closing-price column - see mls_mirror - never the payload, for the same reason as above)
+    _band_price = func.coalesce(mls_mirror.close_price(), Property.price)
     if req.min_price is not None:
         query = query.where(_band_price >= req.min_price)
     if req.max_price is not None:
@@ -907,10 +913,9 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
     # other statuses and a wider radius never reaches the in-window sales it was widened for.
     status_u = func.upper(func.coalesce(Property.home_status, ""))
     is_closed = or_(status_u.like("CLOSED%"), status_u.like("SOLD%"),
-                    # sold, then dropped by Bright (see _sold_then_removed) - the Python loop makes the exact call
-                    and_(status_u == "OFF_MARKET-BRIGHT",
-                         func.upper(func.coalesce(Property.raw_mls_data["MlsStatus"].astext, "")).like("CLOSED%"),
-                         func.coalesce(Property.raw_mls_data["ClosePrice"].astext, "") != ""))
+                    # sold, then dropped by Bright (see _sold_then_removed) - the Python loop makes the exact call.
+                    # Mirrored columns only (closing price + date on record), never the payload.
+                    and_(status_u == "OFF_MARKET-BRIGHT", mls_mirror.close_price() > 0, mls_mirror.close_date().isnot(None)))
     status_terms = []
     if "sold" in req.statuses:
         status_terms.append(is_closed)
@@ -945,6 +950,12 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
             continue
 
         raw = p.raw_mls_data or {}
+        # not a home, or not this kind of home (see the note above the query)
+        _design = str(raw.get("StructureDesignType") or "").lower()
+        if "parking" in _design or "garage" in _design:
+            continue
+        if ("manufactured" in _design or "mobile" in _design) != _subject_manufactured:
+            continue
 
         # ---- Verified closed-sale price (never a list / pending / current-price fallback) ----
         # A comp counts as a CLOSED valuation comp only if the mirror says it's closed AND a real
@@ -1068,6 +1079,7 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
             lot_size=_sane_lot_size(p, sale_price or list_price),
             beds=p.bedrooms,
             baths=_mls_baths(p),
+            full_baths=_whole(raw.get("BathroomsFull")), half_baths=_whole(raw.get("BathroomsHalf")),
             year_built=p.year_built,
             architectural_style=p.architectural_style,
             levels=p.levels,
@@ -1328,6 +1340,31 @@ async def _price_cuts(db: AsyncSession, listing_keys: List[str]) -> Dict[str, di
     return out
 
 
+# "Under contract" is evidence of demand only while it is recent (grader audit 11/14). Most contracts close in
+# 30-60 days; a record still marked under contract whose contract date and last MLS change are both this old is a
+# long new-construction contract or a record that went stale (on the live copy 1,035 of 28,152 pendings, 3.7%,
+# had not changed in 120+ days). Such a home is not shown as "recently went under contract" and never moves a value.
+COMPETITION_PENDING_MAX_AGE_DAYS = 120
+
+
+def pending_is_stale(contract_date, modified, today: date) -> bool:
+    """True when the newest of the contract date and the last MLS change is older than the limit. Unknown both = not stale."""
+    seen = []
+    for v in (contract_date, modified):
+        d = v.date() if isinstance(v, datetime) else _parse_date(str(v)[:10]) if v else None
+        if d:
+            seen.append(d)
+    return bool(seen) and (today - max(seen)).days > COMPETITION_PENDING_MAX_AGE_DAYS
+
+
+async def _stale_pending_keys(db: AsyncSession, keys: List[str], today: date) -> set:
+    if not keys:
+        return set()
+    rows = (await db.execute(select(Property.listing_key, mls_mirror.text_field("PurchaseContractDate"),
+                                    Property.modification_timestamp).where(Property.listing_key.in_(keys)))).all()
+    return {k for k, contract, modified in rows if pending_is_stale(contract, modified, today)}
+
+
 async def current_competition(db: AsyncSession, subject: dict, *, listing_key: Optional[str] = None,
                               today: Optional[date] = None) -> List[dict]:
     """Up to 5 similar ACTIVE and PENDING / under-contract homes (at most 3 of each), best Match first.
@@ -1352,6 +1389,9 @@ async def current_competition(db: AsyncSession, subject: dict, *, listing_key: O
         return []
     pool = await search_comparables(db, req, keep_all=True, row_limit=600)
     pool = [c for c in pool if _auto_pickable(c) and (c.match_score or 0) >= COMPETITION_MIN_SCORE and c.list_price]
+    stale = await _stale_pending_keys(db, [c.listing_key for c in pool if c.status in ("pending", "active_under_contract")],
+                                      today or date.today())
+    pool = [c for c in pool if c.listing_key not in stale]
     pool.sort(key=lambda c: -(c.match_score or 0))
     pend = [c for c in pool if c.status in ("pending", "active_under_contract")][:COMPETITION_MAX_PER_STATUS]
     act = [c for c in pool if c.status == "active"][:COMPETITION_MAX_PER_STATUS]

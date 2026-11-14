@@ -381,6 +381,20 @@ def _parallel(sentence: str, w: list[str], prev: list[str]) -> bool:
     return bool(caps & diff)
 
 
+def _contained(w: list[str], prev: list[str]) -> bool:
+    """True when (nearly) every word of `w` appears, in the same order, inside the longer earlier sentence `prev`."""
+    if len(prev) <= len(w):
+        return False
+    hit, j = 0, 0
+    for word in w:
+        try:
+            j = prev.index(word, j) + 1
+            hit += 1
+        except ValueError:
+            continue
+    return hit >= 0.9 * len(w)
+
+
 def drop_repeated_sentences(text: str, threshold: float = 0.72) -> tuple[str, list[str]]:
     """Drop a sentence that says what an earlier sentence in the same section already said (word overlap,
     so 'The range tops out at...' and 'The range stops at...' count as the same). Paragraph breaks kept."""
@@ -396,6 +410,12 @@ def drop_repeated_sentences(text: str, threshold: float = 0.72) -> tuple[str, li
         kept = []
         for s in sentences(para):
             w = _norm_words(s)
+            # ...or is a piece of a longer earlier sentence, word for word (owner's live report 11/14: "This home has
+            # now been on the market longer than that without an accepted offer, so it isn't drawing the same
+            # competition" appeared as the second half of one sentence and again as a sentence of its own)
+            if len(w) >= 10 and any(_contained(w, p) for p in seen):
+                flags.append(f"Fact check: removed a repeated sentence (\"{s[:80]}\").")
+                continue
             if len(w) >= 7 and any(_similar(w, p) >= threshold and not _parallel(s, w, p) for p in seen):
                 flags.append(f"Fact check: removed a repeated sentence (\"{s[:80]}\").")
                 continue
@@ -816,6 +836,29 @@ _DEN_LAYOUT_RE = re.compile(r"\b(one|two|three|four|1|2|3|4)[- ]bed(?:room)?s?[-
 _WORD_NUM = {"one": 1, "two": 2, "three": 3, "four": 4}
 
 
+def bath_words(row: Optional[dict]) -> Optional[str]:
+    """'2 full and 2 half baths' when the record has both counts and at least one half bath; None otherwise."""
+    r = row or {}
+    try:
+        full = int(float(r.get("full_baths"))) if r.get("full_baths") not in (None, "") else None
+        half = int(float(r.get("half_baths"))) if r.get("half_baths") not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+    if full is None or not half:
+        return None
+    return f"{full} full and {half} half bath{'s' if half != 1 else ''}"
+
+
+def bath_record_note(subject: Optional[dict]) -> Optional[str]:
+    """524 Wales Rd (grader audit 11/14): the MLS has 2 full and 2 half baths; the total of 3 was written "three
+    bathrooms". The total is a count of full-bath equivalents, not rooms - the report says what the home has."""
+    words = bath_words(subject)
+    if not words:
+        return None
+    return (f"{words} - say it exactly this way; never write the total as that many bathrooms "
+            "(the total counts each half bath as half)")
+
+
 def bedroom_record_note(subject: Optional[dict]) -> Optional[str]:
     """The MLS says N bedrooms and the listing describes N-1 plus a den: one wording for the whole report."""
     s = subject or {}
@@ -970,6 +1013,28 @@ def fix_mailing_address_grammar(text: str) -> tuple[str, list[str]]:
     return out, ([] if out == text else ["Fact check: 'is with a ... mailing address' reworded."])
 
 
+# "The seller may be holding out for more than the sales support" about a home that is already under contract
+# (524 Wales Rd, test rounds 11/13-11/14): that seller has accepted an offer.
+_HOLDING_OUT_RE = re.compile(r"\bseller\b[^.]{0,30}\b(?:hold(?:ing)? out|holds out|not (?:yet )?(?:ready|willing) to (?:negotiate|come down))\b", re.I)
+
+
+def fix_under_contract_holdout(text: str, subject: Optional[dict]) -> tuple[str, list[str]]:
+    status = str((subject or {}).get("mls_status") or (subject or {}).get("status") or "").lower()
+    if not text or not re.search(r"pending|under contract|contingent", status):
+        return text, []
+    kept, dropped = [], 0
+    for para in re.split(r"(\n\s*\n)", text):
+        if re.fullmatch(r"\n\s*\n", para or ""):
+            kept.append(para)
+            continue
+        ss = [x for x in sentences(para) if not _HOLDING_OUT_RE.search(x)]
+        dropped += len(sentences(para)) - len(ss)
+        kept.append(" ".join(ss))
+    if not dropped:
+        return text, []
+    return "".join(kept).strip(), ["Fact check: removed 'the seller may be holding out' - this home is already under contract."]
+
+
 def fix_text(text: str, *, subject: Optional[dict], comp: Optional[dict] = None, who: str = "Text",
              comps: Optional[list] = None) -> tuple[str, list[str]]:
     """Every deterministic rewrite above, in order. `comp` = the home a comp write-up is about; `comps` =
@@ -994,6 +1059,7 @@ def fix_text(text: str, *, subject: Optional[dict], comp: Optional[dict] = None,
         lambda x: fix_ratio_of_list(x),
         lambda x: fix_acres_lot_grammar(x),
         lambda x: fix_mailing_address_grammar(x),
+        lambda x: fix_under_contract_holdout(x, subject) if comp is None else (x, []),
         lambda x: fix_field_name_leaks(x),
         lambda x: drop_repeated_sentences(x),
     ):
@@ -1354,6 +1420,7 @@ def prompt_facts_subject(subject: Optional[dict]) -> dict:
         "lower_level_record": _LL_WORDS[lower_level_state(s)],
         "association_fees": fee_line(s),
         "bedroom_record": bedroom_record_note(s),
+        "bath_record": bath_record_note(s),
         "building_type": ({"high": "high-rise building", "mid": "mid-rise building", "low": "low-rise building"}[building_height_class(s)]
                           + " - use exactly this term" if building_height_class(s) else None),
     }

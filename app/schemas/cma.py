@@ -11,8 +11,14 @@ import uuid
 _EMPTY_UNIT = re.compile(r"\s+#(?=\s*(,|$))")
 
 
+# ...and some records carry the house number twice: "523-523 SHERBROOK DR" (owner's live report, 11/14).
+_DOUBLED_NUMBER = re.compile(r"^\s*(\d+[A-Za-z]?)-\1(?=\s)")
+
+
 def _drop_empty_unit(v):
-    return _EMPTY_UNIT.sub("", v).strip() if isinstance(v, str) else v
+    if not isinstance(v, str):
+        return v
+    return _DOUBLED_NUMBER.sub(r"\1", _EMPTY_UNIT.sub("", v)).strip()
 
 
 Street = Annotated[Optional[str], BeforeValidator(_drop_empty_unit)]
@@ -150,6 +156,9 @@ class CmaComparable(BaseModel):
     lot_size: Optional[float] = None
     beds: Optional[float] = None
     baths: Optional[float] = None
+    # how `baths` is made up (grader audit 11/14: "3 baths" for a home with 2 full and 2 half read as three bathrooms)
+    full_baths: Optional[int] = None
+    half_baths: Optional[int] = None
     year_built: Optional[int] = None
     architectural_style: Optional[Union[List[str], str]] = None
     levels: Optional[Union[List[str], str]] = None
@@ -415,6 +424,9 @@ class CmaCompCandidate(BaseModel):
     lot_size: Optional[float] = None
     beds: Optional[float] = None
     baths: Optional[float] = None
+    # how `baths` is made up (grader audit 11/14: "3 baths" for a home with 2 full and 2 half read as three bathrooms)
+    full_baths: Optional[int] = None
+    half_baths: Optional[int] = None
     year_built: Optional[int] = None
     architectural_style: Optional[Union[List[str], str]] = None
     levels: Optional[Union[List[str], str]] = None
