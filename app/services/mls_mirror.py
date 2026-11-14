@@ -253,9 +253,12 @@ def hosting_fields(p) -> dict:
 # The background fill
 
 _LOCK_KEY = 718_204_117
-_BATCH = int(os.getenv("OHP_MLS_MIRROR_BATCH", "500"))
-_RUN_SECONDS = int(os.getenv("OHP_MLS_MIRROR_RUN_SECONDS", "240"))
-_PAUSE_S = float(os.getenv("OHP_MLS_MIRROR_PAUSE", "1.0"))
+# One-time fill at full speed (owner 11/13: "nobody is using the website right now - do it all now"):
+# 2,000 rows a batch, almost no pause, ~9 of every 10 minutes until done. Afterwards the job only
+# re-checks readiness, so these never matter again.
+_BATCH = int(os.getenv("OHP_MLS_MIRROR_BATCH", "2000"))
+_RUN_SECONDS = int(os.getenv("OHP_MLS_MIRROR_RUN_SECONDS", "540"))
+_PAUSE_S = float(os.getenv("OHP_MLS_MIRROR_PAUSE", "0.1"))
 
 
 def fill_sql(batch_limit: bool = True) -> str:
