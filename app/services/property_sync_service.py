@@ -46,6 +46,50 @@ _FIELD_LOG_MAX = 500  # characters kept of one value
 _FIELD_LOG_MAX_ROWS = 40  # fields logged for one listing in one read
 
 
+_MISSING = object()
+
+
+def _same_value(old, new) -> bool:
+    """True only when the stored value and the new one are exactly equal - so the column can be left
+    as it is. Strict on purpose (unlike _field_text, which rounds and trims for the change log): any
+    doubt (a value we can't compare, naive vs aware times, a column the model doesn't have) counts as
+    changed, and the new value is written as before."""
+    import enum
+    if old is _MISSING:
+        return False
+    if isinstance(old, enum.Enum):
+        old = old.value
+    if isinstance(new, enum.Enum):
+        new = new.value
+    if old is None or new is None:
+        return old is None and new is None
+    if isinstance(old, bool) != isinstance(new, bool):
+        return False
+    if isinstance(old, datetime) and isinstance(new, datetime) and (old.tzinfo is None) != (new.tzinfo is None):
+        # A date-only Bright value ("2026-06-29") parses without a timezone; the database (UTC session)
+        # stores it as that moment in UTC - so compare it the way it would be stored.
+        old = old if old.tzinfo else old.replace(tzinfo=timezone.utc)
+        new = new if new.tzinfo else new.replace(tzinfo=timezone.utc)
+    try:
+        return bool(old == new)
+    except Exception:  # noqa: BLE001 - e.g. naive vs aware datetimes
+        return False
+
+
+def _changed_columns(existing, mapped: Dict[str, Any]) -> List[str]:
+    """The mapped columns whose new value differs from the stored one - the only ones a re-read writes.
+
+    dom_read_at is "the day count was read now", stamped on every read, so on its own it would make
+    every re-read a write. It still moves whenever the count is (re)written, and on every read of an
+    Active listing, whose shown count = stored count + days since it was read (listing_dom)."""
+    from app.utils.listing_dom import _counts_daily
+    changed = [key for key, value in mapped.items()
+               if key != "dom_read_at" and not _same_value(getattr(existing, key, _MISSING), value)]
+    if "dom_read_at" in mapped and ("days_on_market" in changed or _counts_daily(mapped.get("home_status"))):
+        changed.append("dom_read_at")
+    return changed
+
+
 def _int_or_none(v) -> Optional[int]:
     try:
         return int(v) if v not in (None, "") else None
@@ -927,11 +971,17 @@ class PropertySyncService:
             except Exception:  # noqa: BLE001 - the change log never breaks the sync
                 logger.warning("field change log not recorded", exc_info=True)
 
-            # Update all columns
-            for key, value in mapped.items():
-                setattr(existing, key, value)
-            existing.updated_at = datetime.now(timezone.utc)
-            logger.debug(f"Updated existing property: {l_key} | {mapped['street_address']} | Status: {mapped['home_status']}")
+            # Update only the columns that really changed. A re-read of a listing Bright hasn't
+            # changed (the daily / weekly re-checks, history pulls) used to rewrite the whole row -
+            # raw bundle included - about 60,000 times a day for nothing (owner, 11/13). Nothing is
+            # lost: an unchanged value is already stored, and any difference (or a value we can't
+            # compare) is still written.
+            changed = _changed_columns(existing, mapped)
+            for key in changed:
+                setattr(existing, key, mapped[key])
+            if changed:
+                existing.updated_at = datetime.now(timezone.utc)
+            logger.debug(f"Updated existing property: {l_key} | {mapped['street_address']} | Status: {mapped['home_status']} | changed: {len(changed)}")
         else:
             # For NEW properties, only add them if they are ACTIVE or COMING SOON
             # This prevents our DB from filling up with old CLOSED listings we never tracked

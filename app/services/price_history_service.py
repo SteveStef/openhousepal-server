@@ -253,7 +253,8 @@ async def _insert_parcel_listings(db: AsyncSession, syncer, found: dict[str, lis
 
 
 async def backfill_batch(db: AsyncSession, max_parcels: int = 300, pause_seconds: float = 0.6,
-                         per_request: int = 100, time_budget: Optional[float] = None) -> dict:
+                         per_request: int = 100, time_budget: Optional[float] = None,
+                         tax_ids: Optional[list] = None) -> dict:
     """Pull every 2012+ listing Bright has for up to `max_parcels` parcels that have a listing on
     the market now and haven't been pulled yet. Inserts them into the mirror (no client alerts, no
     Showcase matching - history only), marks each parcel done.
@@ -261,11 +262,16 @@ async def backfill_batch(db: AsyncSession, max_parcels: int = 300, pause_seconds
     `per_request` parcels per Bright request (one parcel per request took ~24 s each - ~44 days for
     the whole backlog; 100 at once take about the same time, 10/21). Stops starting new groups after
     `time_budget` seconds so a batch ends inside its 10-minute slot; parcels not reached are simply
-    picked up by the next batch."""
+    picked up by the next batch.
+
+    tax_ids: the parcels to pull, chosen by the caller (the 10-minute job looks only at listings that
+    changed since its bookmark - bright_data_pulls_service.price_history_tick). Without it, the old
+    search over every listing on the market is used (scripts / tests). The result's `not_reached`
+    lists the parcels a time limit or a Bright outage stopped before they were asked for."""
     from app.services.bright_mls_service import bright_mls_service
     from app.services.property_sync_service import PropertySyncService
 
-    rows = (await db.execute(text("""
+    rows = list(tax_ids) if tax_ids is not None else (await db.execute(text("""
         SELECT DISTINCT p.listing_tax_id FROM properties p
         LEFT JOIN price_history_parcels h ON h.tax_id = p.listing_tax_id
         WHERE p.home_status = ANY(:current) AND h.tax_id IS NULL
@@ -273,11 +279,13 @@ async def backfill_batch(db: AsyncSession, max_parcels: int = 300, pause_seconds
         ORDER BY p.listing_tax_id
         LIMIT :n"""), {"current": list(_CURRENT_STATUSES), "n": max_parcels})).scalars().all()
     syncer = PropertySyncService()
+    stopped_at = len(rows)
     done = added = failed = 0
     deadline = time.monotonic() + time_budget if time_budget else None
     blips = 0
     for i in range(0, len(rows), per_request):
         if deadline is not None and time.monotonic() >= deadline:
+            stopped_at = i
             break
         group = list(rows[i:i + per_request])
         try:
@@ -289,6 +297,7 @@ async def backfill_batch(db: AsyncSession, max_parcels: int = 300, pause_seconds
                 blips += 1
                 logger.warning("price history backfill: group lookup failed", extra={"parcels": len(group)})
                 if blips >= 3:
+                    stopped_at = i + per_request
                     break
                 await asyncio.sleep(pause_seconds * 4)
                 continue
@@ -315,4 +324,4 @@ async def backfill_batch(db: AsyncSession, max_parcels: int = 300, pause_seconds
         await asyncio.sleep(pause_seconds)
     result = {"parcels": done, "listings_added": added, "failed": failed, "remaining_in_batch": len(rows) - done - failed}
     logger.info("price history backfill batch", extra={"event": "price_history_backfill", **result})
-    return result
+    return {**result, "not_reached": list(rows[stopped_at:])}

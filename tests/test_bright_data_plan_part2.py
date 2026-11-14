@@ -200,11 +200,25 @@ def _fake_state(monkeypatch, initial=None):
     return store
 
 
+def _bright_on_market(monkeypatch, keys):
+    """Bright's on-market key list (1,000 a page), for the nightly stale recheck."""
+    async def fake_status(status, top=1000, skip=0, select=None):
+        if status != pulls._CURRENT[0]:
+            return []
+        return [{"ListingKey": k} for k in keys[skip:skip + top]]
+    monkeypatch.setattr(bright_mls_service, "get_listings_by_status", fake_status)
+    monkeypatch.setattr(pulls, "_night_now", lambda: True)
+    pulls._STALE_SEEN.clear()
+
+
 def test_stale_recheck_rereads_and_takes_missing_off_market(monkeypatch):
+    # 11/13: only listings we hold as on the market that aren't on Bright's on-market list are read.
     store = _fake_state(monkeypatch)
-    reread, marked = [], []
+    reread, marked, asked = [], [], []
+    _bright_on_market(monkeypatch, [str(100000 + i) for i in range(1500)] + ["500"])
 
     async def fake_lookup(keys):
+        asked.append(list(keys))
         return [{"ListingKey": 11, "MlsStatus": "CLOSED-BRIGHT"}]  # 12 is gone from Bright
 
     async def fake_sync(self, _db, raw, photos, allow_inactive_insert=False):
@@ -217,14 +231,17 @@ def test_stale_recheck_rereads_and_takes_missing_off_market(monkeypatch):
     monkeypatch.setattr(bright_mls_service, "get_listings_by_keys", fake_lookup)
     monkeypatch.setattr(pss.PropertySyncService, "_sync_single_property", fake_sync)
     monkeypatch.setattr(pss.PropertySyncService, "mark_off_market", fake_mark)
-    out = _run(pulls.stale_recheck(_StaleDB([["11", "12"]]), pause=0))
+    out = _run(pulls.stale_recheck(_StaleDB([["11", "12", "500"]]), pause=0))  # 500 is still on Bright's list
+    assert asked == [["11", "12"]]
     assert reread == ["11"] and marked == [{"12": None}]
     assert out["done"] and (out["checked"], out["updated"], out["off_market"]) == (2, 1, 1)
+    assert out["candidates"] == 2 and "todo" not in out
     assert store["data_pull_stale_recheck"]["day"] == date.today().isoformat()
 
 
 def test_stale_recheck_marks_nothing_when_bright_cannot_be_asked(monkeypatch):
     _fake_state(monkeypatch)
+    _bright_on_market(monkeypatch, [str(100000 + i) for i in range(1500)])
     marked = []
 
     async def failing(keys):
@@ -239,6 +256,27 @@ def test_stale_recheck_marks_nothing_when_bright_cannot_be_asked(monkeypatch):
     with pytest.raises(RuntimeError):
         _run(pulls.stale_recheck(_StaleDB([["11", "12"]]), pause=0))
     assert marked == []
+
+
+def test_stale_recheck_never_trusts_an_empty_bright_list(monkeypatch):
+    _fake_state(monkeypatch)
+    _bright_on_market(monkeypatch, [])
+    marked = []
+
+    async def fake_mark(self, _db, removed_at):
+        marked.append(removed_at)
+        return 0
+
+    monkeypatch.setattr(pss.PropertySyncService, "mark_off_market", fake_mark)
+    out = _run(pulls.stale_recheck(_StaleDB([["11", "12"]]), pause=0))
+    assert out["done"] and out.get("skipped") and marked == []
+
+
+def test_stale_recheck_waits_for_the_night(monkeypatch):
+    _fake_state(monkeypatch, {"data_pull_stale_recheck": {"day": "2000-01-01", "done": True}})
+    monkeypatch.setattr(pulls, "_night_now", lambda: False)
+    out = _run(pulls.stale_recheck(_StaleDB([]), pause=0))
+    assert out.get("waiting_for") == "night"
 
 
 def test_off_market_recheck_restarts_weekly(monkeypatch):
