@@ -41,6 +41,8 @@ from app.services import road_context_service
 # the backtest runner switches it on around a single generation.
 from app.services import cma_time_machine as _tmach
 from app.services import cma_fact_check as _fact_check
+from app.services import cma_claude as _cma_claude
+from app.services import mls_freshness
 from app.utils.listing_dom import dom_fetched_at, resolve_days_on_market
 import contextvars as _contextvars
 
@@ -83,7 +85,7 @@ from app.services.ai.ai_rate_limit_service import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "v11"  # v11 (10/20): feature grid in the anchor, asking-price honesty
+PROMPT_VERSION = "v12"  # v12 (11/13): buyer value never lifted by asking; builder base-price sales; per-report value lock. v11 (10/20): feature grid in the anchor, asking-price honesty
 # v10 (hybrid) - see the "v10 HYBRID VALUATION ENGINE" section lower in this file for the full
 # pipeline. Short version: v5 dropped the old computed comp-anchor + bounded +-15% adjustment
 # model and let the AI return a fair-value dollar figure verbatim with no ceiling. That made the
@@ -1290,12 +1292,13 @@ _SUBJECT_FIELDS = [
     "authoritative_property_features", "material_issues",
     # cma_fact_check.prompt_facts_subject (10/24): the facts the grader caught the model guessing at
     "subdivision_name", "list_price_per_above_grade_sqft", "lower_level_record", "association_fees", "lot_acres",
+    "bedroom_record", "building_type",
     "listing_and_sale_history", "interior_condition", "record_source", "auction_listing",
 ]
 _COMP_FIELDS = [
     "street_address", "city", "state", "zipcode", "distance_miles", "status",
     "verified_close_price", "original_list_price", "list_price", "close_date", "sale_date",
-    "days_on_market", "cdom", "data_note", "assigned_role", "share_of_value_pct",
+    "days_on_market", "cdom", "data_note", "builder_price_note", "assigned_role", "share_of_value_pct",
     "sqft", "lot_size", "beds", "baths", "year_built",
     "property_age_years", "garage", "basement", "price_per_sqft", "annual_taxes", "school_district", "water_source", "sewer", "match_score", "road_context_note", "township",
     # Computed by _comp_evidence_score (see below), not raw MLS data - grounds the AI's own
@@ -1970,6 +1973,23 @@ def _derive_amenities_gap(subject: dict, comp: dict) -> Optional[str]:
     return "similar"  # identical sets (or both empty) and both readable
 
 
+def _same_building_amenities(subject: dict, comp: dict, amenities_before: str, label: str) -> list[str]:
+    """A condo comp in the subject's own building shares its amenities: its rating is Similar, whatever
+    the feature-record check made of it (above / below / cleared). And a rating that ends where the AI
+    put it was never corrected, so the AI's written note stays (CMA test 11/13, 50 S 16th St: #4504 was
+    flipped to Superior and back, #5203 cleared - both lost their notes to the stiff fact template).
+    Updates comp["quality"] / comp["_amenities_fact_reconciled"]; returns QA flags."""
+    flags: list[str] = []
+    q = comp.get("quality") if isinstance(comp.get("quality"), dict) else None
+    if (q is not None and _type_family(subject.get("property_type")) == "condo" and _building_key(comp)
+            and _building_key(comp) == _building_key(subject) and q.get("amenities") != "similar"):
+        comp["quality"] = {**q, "amenities": "similar"}
+        flags.append(f"{label}: amenities set to Similar - it shares the subject's building amenities.")
+    if comp.get("_amenities_fact_reconciled") and str((comp.get("quality") or {}).get("amenities") or "") == (amenities_before or ""):
+        comp.pop("_amenities_fact_reconciled", None)
+    return flags
+
+
 def _reconcile_amenities_quality(
     subject: dict, comp: dict, quality: Optional[dict], label: str,
 ) -> tuple[dict, list[str]]:
@@ -2119,6 +2139,18 @@ def _build_evidence_by_key(subject: dict, comps: list[dict]) -> dict[str, dict]:
     return {c["listing_key"]: _comp_evidence_score(subject, c) for c in comps if c.get("listing_key")}
 
 
+_V10_PSF_OUTLIER_MIN_GAP = 0.0    # no minimum gap (a 15% one was tried 11/13 and made past-sale accuracy worse)
+_CONF_OUTLIER_MIN_GAP = 0.15      # ...but a flagged comp within 15% of the set's middle doesn't lower CONFIDENCE
+
+
+def _outlier_psf(c: dict) -> Optional[float]:
+    """The $/sq ft the outlier check reads: the stored figure (sale price / total living area)."""
+    # Tried on above-grade $/sq ft with a 15% minimum gap (deep dive 11/13) - on 60 past sales that was LESS
+    # accurate (420 Williamson Rd: 3.4% miss -> 12.6%). Halving the weight of the comp furthest from the pack
+    # works as a trim, even in a tight set, so the check stays as it was.
+    return _as_float(c.get("price_per_sqft"))
+
+
 def _flag_psf_outliers(comps: list[dict]) -> dict[str, str]:
     """B2 - $/sqft outlier detection across comps with a verified price, returning
     {listing_key: note} for the caller to surface as a qa_flag, factor softly into confidence
@@ -2134,9 +2166,9 @@ def _flag_psf_outliers(comps: list[dict]) -> dict[str, str]:
         near the z>3.5 cutoff. The ratio check catches that case directly, independent of how
         noisy MAD is at this sample size."""
     psf_by_key = {
-        c["listing_key"]: _as_float(c.get("price_per_sqft"))
+        c["listing_key"]: _outlier_psf(c)
         for c in comps
-        if c.get("listing_key") and c.get("price_verified", True) and _as_float(c.get("price_per_sqft"))
+        if c.get("listing_key") and c.get("price_verified", True) and _outlier_psf(c)
     }
     if len(psf_by_key) < 4:  # too few points for either check to mean anything
         return {}
@@ -2148,12 +2180,14 @@ def _flag_psf_outliers(comps: list[dict]) -> dict[str, str]:
     out: dict[str, str] = {}
     for key, psf in psf_by_key.items():
         if median > 0 and not (1 / _V10_PSF_OUTLIER_RATIO <= psf / median <= _V10_PSF_OUTLIER_RATIO):
-            out[key] = (f"${int(psf)}/sq ft is {'more than' if psf > median else 'less than'} "
-                        f"{_V10_PSF_OUTLIER_RATIO}x the comp set's median (${int(median)}/sq ft) - review before relying on it.")
+            out[key] = (f"${int(psf)}/sq ft is {'more than ' + str(_V10_PSF_OUTLIER_RATIO) + 'x' if psf > median else 'less than ' + str(round(100 / _V10_PSF_OUTLIER_RATIO)) + '% of'} "
+                        f"the comp set's median (${int(median)}/sq ft) - review before relying on it.")
             continue
         if mad > 0:
             z = 0.6745 * (psf - median) / mad
-            if abs(z) > 3.5:
+            # ... and a real gap: when the comps agree closely the spread is tiny, so $215 against $200 / $201 /
+            # $202 scored as "a statistical outlier" and lost half its weight (deep dive 11/13)
+            if abs(z) > 3.5 and abs(psf / median - 1) >= _V10_PSF_OUTLIER_MIN_GAP:
                 out[key] = f"${int(psf)}/sq ft is a statistical outlier vs. the comp set's median (${int(median)}/sq ft) - review before relying on it."
     return out
 
@@ -2175,7 +2209,16 @@ def _redundancy_adjusted_count(comps: list[dict]) -> float:
             rep_psf = _as_float(rep.get("price_per_sqft"))
             rep_dist = _as_float(rep.get("distance_miles"))
             psf_close = psf is not None and rep_psf is not None and rep_psf > 0 and abs(psf - rep_psf) <= 0.05 * rep_psf
-            dist_close = dist is not None and rep_dist is not None and abs(dist - rep_dist) <= 0.5
+            # NEAR EACH OTHER - the distance between the two comps, not how far each is from the subject (two comps
+            # a mile out on opposite sides counted as neighbours) - and sold close together in time. Three good
+            # comps that simply AGREE on price are strong evidence, not one comp counted three times (deep dive
+            # 11/13: $200 / $204 / $207 per sq ft read "near-duplicate evidence" and lowered confidence, while
+            # $200 / $230 / $260 read "high").
+            _apart = _miles_between(c, rep)
+            dist_close = _apart is not None and _apart <= 0.15
+            _d1 = _parse_iso_date(_first_present(c, "sale_date", "close_date"))
+            _d2 = _parse_iso_date(_first_present(rep, "sale_date", "close_date"))
+            dist_close = dist_close and bool(_d1 and _d2 and abs((_d1 - _d2).days) <= 45)
             if psf_close and dist_close:
                 cluster.append(c)
                 placed = True
@@ -2229,7 +2272,13 @@ def _compute_confidence(
         avg_components["condition_agreement"] = condition_agreement
     evidence_quality = (sum(avg_components.values()) / len(avg_components)) if avg_components else 0.5
 
-    outlier_ct = sum(1 for c in valuation if c.get("listing_key") in outliers)
+    # Only an outlier that is really apart from the pack lowers confidence (524 Wales Rd, test round 11/13: five
+    # sales within 8% of each other - $290 to $330 a sq ft - and the $290 one read "a statistical outlier", so a
+    # tight, agreeing set LOWERED confidence). Its weight trim is unchanged; this is the confidence label only.
+    _psfs = sorted(p for p in (_outlier_psf(c) for c in valuation) if p)
+    _psf_mid = _v10_median(_psfs) if _psfs else None
+    outlier_ct = sum(1 for c in valuation if c.get("listing_key") in outliers
+                     and not (_psf_mid and _outlier_psf(c) and abs(_outlier_psf(c) / _psf_mid - 1) < _CONF_OUTLIER_MIN_GAP))
     if outlier_ct:
         evidence_quality *= (1 - 0.15 * min(outlier_ct, 2))
         flags.append(f"Confidence reduced - {outlier_ct} valuation comp(s) carry a statistical $/sqft outlier flag.")
@@ -2422,6 +2471,10 @@ def _fix_pct_below_list(text: str, list_price: Optional[float], fallback_low: Op
 
     def repl(match: re.Match) -> str:
         preceding = text[max(0, match.start() - 100):match.start()]
+        # ... in the SAME clause only: figures from an earlier sentence or clause are about something else ("Comp #1
+        # closed at $655,000 and Comp #2 at $690,000; the concluded value is about 5% below list" became "2.2-3.0%
+        # below list" from the two comp prices - deep dive 11/13)
+        preceding = re.split(r"(?<=[.!?])\s+|;\s*", preceding)[-1]
         # the list price quoted in the sentence is the base, not the figure being compared ("$3.05M vs
         # the $3.199M list, 4.7% below" became "0.0-4.7% below list" - rule audit 10/24)
         dollars = [d for d in _DOLLAR_RE.finditer(preceding)
@@ -2430,6 +2483,12 @@ def _fix_pct_below_list(text: str, list_price: Optional[float], fallback_low: Op
             recent = dollars[-2:] if len(dollars) >= 2 else dollars[-1:]
             values = [_parse_dollar(d.group(1), d.group(2)) for d in recent]
             low, high = min(values), max(values)
+            # one figure above the list price and one below is not one "X% below list" claim - use the report's own
+            # numbers, or leave the sentence alone
+            if low < list_price < high:
+                if fallback_low is None or fallback_high is None:
+                    return match.group(0)
+                low, high = min(fallback_low, fallback_high), max(fallback_low, fallback_high)
         elif fallback_low is not None and fallback_high is not None:
             low, high = min(fallback_low, fallback_high), max(fallback_low, fallback_high)
         else:
@@ -2714,6 +2773,34 @@ def _final_strongest_first(report) -> list[str]:
             "every 'Comp #N' in the report was renumbered to match."]
 
 
+def _persist_comp_note_fixes(report, comps: list) -> None:
+    """The final fact gate (_auto_repair_export_blocks) edits comp notes IN PLACE, after the report's
+    comparables were assigned and a commit had already flushed them - so its fixes were never saved
+    (CMA test 11/13: the flags said "dropped a 8.8-acre lot size" and "trafficked road" while the saved
+    notes kept both). Re-assign AND flag the column changed - the saved snapshot is the very list that was
+    edited in place, so a plain re-assign compares equal and writes nothing."""
+    if getattr(report, "comparables", None) is comps or not getattr(report, "comparables", None):
+        report.comparables = [dict(c) for c in comps]
+        _flag_changed(report, "comparables")
+        return
+    # A different list on the report (re-ordered copies): carry the gate's note edits over by listing key.
+    fixed = {c.get("listing_key") or c.get("id"): c for c in comps if isinstance(c, dict)}
+    out = []
+    for c in report.comparables:
+        src = fixed.get((c or {}).get("listing_key") or (c or {}).get("id")) if isinstance(c, dict) else None
+        out.append({**c, **{k: src[k] for k in ("commentary", "ai_commentary") if src and k in src}} if src else c)
+    report.comparables = out
+    _flag_changed(report, "comparables")
+
+
+def _flag_changed(obj, attr: str) -> None:
+    try:
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(obj, attr)
+    except Exception:  # noqa: BLE001 - a plain object (tests) has no ORM state
+        pass
+
+
 def _apply_final_order(report) -> None:
     """Best-effort - a re-order problem must never fail a finished, paid report."""
     try:
@@ -2982,6 +3069,18 @@ async def _enrich_with_property_data(db: AsyncSession, subject: dict, comps: lis
     except Exception:  # noqa: BLE001
         logger.debug("CMA road-context enrichment failed", exc_info=True)
 
+    # Builder base-price sales (see _builder_base_price_sale): flagged once here - the flag is stored on
+    # the comp, so a re-run and the report pages read the same thing.
+    # A home on public sewer isn't on septic, whatever a listing agent ticked (grader audit 11/13, finding 26)
+    for _row in (subject_out, *comps_out):
+        if _row.get("sewer") is not None:
+            _row["sewer"] = _fact_check.clean_sewer(_row["sewer"])
+    for _c in comps_out:
+        if _builder_base_price_sale(_c, trust_flag=False):   # from today's MLS record, not an old flag
+            _c["builder_base_price"] = True
+        else:
+            _c.pop("builder_base_price", None)
+
     return subject_out, comps_out
 
 
@@ -3087,9 +3186,11 @@ def _seller_not_listed(mode: str, subject: dict, timeline: dict) -> tuple[dict, 
     past tense about that old sale (seen live 2026-10-05). Returns (subject, timeline) rewritten so
     the home is "not currently listed", with its last sale kept as history only."""
     tl = timeline or {}
-    if mode == "buyer" or tl.get("is_under_contract"):
+    if tl.get("is_under_contract"):
         return subject, timeline
     status = str(tl.get("current_status") or "").lower()
+    if mode == "buyer":
+        return _buyer_off_market(subject, tl, status)
     listed_now = bool(tl.get("is_active", False)) and not tl.get("is_closed") and not any(
         w in status for w in ("expired", "withdrawn", "cancel", "off market", "off-market", "closed", "sold"))
     if listed_now:
@@ -3097,12 +3198,16 @@ def _seller_not_listed(mode: str, subject: dict, timeline: dict) -> tuple[dict, 
     subj = dict(subject or {})
     last_price = _as_float(subj.get("last_sale_price")) or _as_float(subj.get("close_price"))
     close_date = tl.get("close_date") or subj.get("last_sale_date")
-    if tl.get("is_closed") and not last_price:
-        last_price = _as_float(subj.get("list_price"))
+    # (no closing price on the record: say when it sold, never print its old LIST price as the sale price -
+    # deep dive 11/13)
     lines = ["Not currently on the market - this is the homeowner's own home, which they are getting ready to list now."]
     if tl.get("is_closed") and (close_date or last_price):
         lines.append("Last sold" + (f" {close_date}" if close_date else "") + (f" for ${last_price:,.0f}" if last_price else "") +
                      " (its most recent recorded sale). That is history, not a current asking price.")
+    last_listing = _unsold_last_listing(subj, tl)
+    if last_listing:
+        lines.append(last_listing["line"] + " Buyers did not pay that price: treat it as a ceiling on what the home is worth "
+                     "today, never as an asking price or a starting point, and say so plainly when recommending a list price.")
     if subj.get("source") == "manual" and not subj.get("listing_key"):
         # Entered by hand in the CMA builder (the home has no MLS record) - there is no past listing.
         lines.append("This home has no MLS record - its facts, description and photo were entered by the agent. Treat them as the "
@@ -3116,6 +3221,7 @@ def _seller_not_listed(mode: str, subject: dict, timeline: dict) -> tuple[dict, 
         "current_status": "Not currently listed", "is_active": False, "is_under_contract": False, "is_closed": False,
         "not_listed": True, "current_list_price": None, "active_market_days": None, "cumulative_dom": None,
         "list_date": None, "under_contract_date": None, "close_date": None, "dom_source": None,
+        "last_listing": ({k: v for k, v in last_listing.items() if k != "line"} if last_listing else None),
         "summary_lines": lines, "live_status_note": tl.get("live_status_note"),
     }
     for _k in ("list_price", "original_list_price", "days_on_market", "cumulative_days_on_market", "close_price"):
@@ -3125,6 +3231,86 @@ def _seller_not_listed(mode: str, subject: dict, timeline: dict) -> tuple[dict, 
         subj["last_sale_price"] = last_price
     if close_date:
         subj["last_sale_date"] = str(close_date)
+    subj["_status_timeline"] = new_tl
+    return subj, new_tl
+
+
+_OFF_MARKET_WORDS = ("off market", "off-market", "withdrawn", "expired", "cancel")
+_UNSOLD_LISTING_MAX_AGE_DAYS = 730   # an unsold listing older than this says little about today's market
+
+
+def _unsold_last_listing(subject: dict, tl: dict) -> Optional[dict]:
+    """The home's last MLS listing, when it ended WITHOUT a sale (expired / withdrawn / taken off the market).
+
+    418 Reedville Rd (test round 11/13): on the market from May 15 at $849,900, cut to $835,750, and taken off on
+    Nov 13 after about six months with no sale - one day before a seller report recommended $675,000 without a
+    word about it. A price the market passed on for months is the plainest evidence there is for a seller, and
+    the agent sitting across from that owner needs it in front of them. Facts only: the price, the days, the dates.
+    Returns {price, original_price, list_date, ended, days, line} or None."""
+    tl = tl or {}
+    if tl.get("is_closed") or tl.get("is_active") or tl.get("is_under_contract"):
+        return None
+    if (subject or {}).get("source") == "manual" and not (subject or {}).get("listing_key"):
+        return None
+    price = _as_float(tl.get("current_list_price")) or _as_float((subject or {}).get("list_price"))
+    if not price:
+        return None
+    list_date, ended = _parse_iso_date(tl.get("list_date")), _parse_iso_date(tl.get("off_market_date"))
+    last_seen = ended or list_date
+    if not last_seen or (_tmach.today() - last_seen).days > _UNSOLD_LISTING_MAX_AGE_DAYS:
+        return None
+    # Days only when the record says when it ENDED. Without an end date the timeline's count runs to today
+    # (735 Concord Ave, 11/14: 21 days on the market read "after about 158 days").
+    days = float((ended - list_date).days) if (ended and list_date and ended >= list_date) else None
+    orig = _as_float(tl.get("original_list_price")) or _as_float(tl.get("previous_list_price"))
+    orig = orig if orig and orig > price * 1.005 else None
+    line = "Its last MLS listing"
+    if list_date:
+        line += f", listed {_fact_check._nice_date(list_date.isoformat())}"
+    line += f", asked ${price:,.0f}" + (f" (reduced from ${orig:,.0f})" if orig else "")
+    line += " and ended" + (f" {_fact_check._nice_date(ended.isoformat())}" if ended else "")
+    line += (f", about {int(round(days))} days after it was listed," if days and days >= 1 else "") + " without a recorded sale."
+    return {"price": round(price), "original_price": round(orig) if orig else None,
+            "list_date": list_date.isoformat() if list_date else None, "ended": ended.isoformat() if ended else None,
+            "days": int(round(days)) if days else None, "line": line}
+
+
+def _buyer_off_market(subject: dict, tl: dict, status: str) -> tuple[dict, dict]:
+    """Buyer CMA on a home that isn't for sale (an off-market approach to the owner). Its last MLS
+    listing ended without a sale, so that old price is history - not an asking price to discount
+    from - and its old days on market say nothing about demand today (CMA test 11/13, 735 Concord
+    Ave). A closed, active or under-contract subject is left alone."""
+    if tl.get("is_active") or tl.get("is_closed") or not any(w in status for w in _OFF_MARKET_WORDS):
+        return subject, tl
+    subj = dict(subject or {})
+    # (the first run saved the subject with no list price - the old asking price lives on as last_list_price)
+    old_ask = _as_float(subj.get("list_price")) or _as_float(subj.get("last_list_price"))
+    # ...and the MLS record still holds it (735 Concord Ave, test round 11/14: last listed at $499,500, off the
+    # market after 21 days - the buyer's report never said so, and it is the best clue to the owner's own number)
+    last_listing = _unsold_last_listing(subj, tl)
+    old_ask = old_ask or _as_float((last_listing or {}).get("price"))
+    label = str(tl.get("current_status") or "Off Market")
+    lines = ["Not currently on the market - the buyer is considering an offer to the owner of a home that isn't for sale "
+             "(an off-market offer)."]
+    if old_ask:
+        lines.append(f"Its last MLS listing, at ${old_ask:,.0f}, ended without a sale (now {label}). That old price is "
+                     "history, not a current asking price, and is not evidence of what the home is worth.")
+    lines.append("The listing remarks and photos are from that past listing - describe features as documented there, and never "
+                 "claim the home's CURRENT condition goes beyond (or falls short of) what they and the MLS fields say.")
+    lines.append("There is NO current list price and no current days on market. Base every offer figure on the value from the "
+                 "comparable sales - never on a discount from an asking price.")
+    new_tl = {
+        "current_status": "Not currently listed", "is_active": False, "is_under_contract": False, "is_closed": False,
+        "not_listed": True, "not_listed_buyer": True, "last_list_price": round(old_ask) if old_ask else None,
+        "last_listing": ({k: v for k, v in last_listing.items() if k != "line"} if last_listing else None),
+        "current_list_price": None, "active_market_days": None, "cumulative_dom": None,
+        "list_date": None, "under_contract_date": None, "close_date": None, "dom_source": None,
+        "summary_lines": lines, "live_status_note": tl.get("live_status_note"),
+    }
+    for _k in ("list_price", "original_list_price", "days_on_market", "cumulative_days_on_market"):
+        subj[_k] = None
+    subj["status"] = "Not currently listed"
+    subj["mls_status"] = "Not currently listed"
     subj["_status_timeline"] = new_tl
     return subj, new_tl
 
@@ -3170,6 +3356,15 @@ def _subject_status_timeline(
         or (getattr(prop, "home_status", None) if prop is not None else None)
         or subject.get("mls_status")
     )
+    # A listing Bright stopped sending is marked OFF_MARKET-BRIGHT by the sync (property_sync_service)
+    # without touching raw_mls_data, so its raw status stays "Active" forever (75k+ homes 11/13).
+    # Unless a fresh live re-pull says otherwise, the sync's newer word wins - a sale stays a sale.
+    # CMA test 11/13 (735 Concord Ave, withdrawn at $499,500): the report said "this home is listed at
+    # $499,500", "on the market longer than its comps" and opened 13-16% "below the asking price".
+    _home_status = str(getattr(prop, "home_status", "") or "") if prop is not None else ""
+    if (_home_status.upper().startswith("OFF_MARKET") and not (live_overlay or {}).get("StandardStatus")
+            and not (live_overlay or {}).get("MlsStatus") and _normalize_status_label(status_src) != "Closed"):
+        status_src = "Off Market"
     current_status = _normalize_status_label(status_src)
     low = current_status.lower()
     is_closed = low == "closed"
@@ -3185,7 +3380,9 @@ def _subject_status_timeline(
     )
     under_contract_date = (
         _parse_iso_date(raw.get("PurchaseContractDate"))
-        or _parse_iso_date(raw.get("ContractStatusChangeDate"))
+        # (only when the home is under contract or sold - an ACTIVE listing carrying this field read "Went under
+        # contract" - deep dive 11/13)
+        or (_parse_iso_date(raw.get("ContractStatusChangeDate")) if (is_under_contract or is_closed) else None)
         # StatusChangeTimestamp is only a reliable "went under contract" proxy when the CURRENT
         # status is itself the under-contract one (a later price change wouldn't move it, but a
         # bounce back to Active would) - so only trust it in that case.
@@ -3414,6 +3611,9 @@ def _subject_status_timeline(
         "previous_status": prev_status if prev_status not in ("Unknown", current_status) else None,
         "major_change_type": major_type or None,
         "history_events": history_events or None,
+        # when the listing ended without a sale: Bright's own date, else the day the sync saw it removed
+        "off_market_date": (lambda d: d.isoformat() if d else None)(
+            (off_market_date or _parse_iso_date(raw.get("OhpOffMarketTimestamp"))) if not (is_active or is_closed or is_under_contract) else None),
         "summary_lines": lines,
         "live_status_note": live_status_note,
     }
@@ -3421,6 +3621,14 @@ def _subject_status_timeline(
 
 def _format_status_block(timeline: dict) -> str:
     body = "\n".join(f"  {ln}" for ln in timeline.get("summary_lines", []))
+    if timeline.get("not_listed_buyer"):
+        return (
+            f"SUBJECT LISTING STATUS (authoritative):\n{body}\n  The home is NOT for sale; the buyer is weighing an "
+            "off-market offer to its owner. offer_strategy_considerations must base every figure on the fair market value "
+            "from the comparable sales, say plainly there is no asking price to negotiate from, and keep the buyer's "
+            "inspection and appraisal protections. Never call the old list price an asking/list price, never describe "
+            "days on market, competing offers or the seller \"taking offers\", and never write as if the home is listed now."
+        )
     if timeline.get("not_listed"):
         return (
             f"SUBJECT LISTING STATUS (authoritative):\n{body}\n  The homeowner is deciding what to list for NOW. "
@@ -4064,6 +4272,30 @@ def _process_seller_guidance(
 # just above the supported value range"). The Pricing Position section is now written here from the
 # authoritative numbers; the AI's other sections (competition, risk, launch) are kept.
 
+_BUILDER_BASE_MIN_RATIO = 1.05
+_BUILDER_PRICE_NOTE = (
+    "NEW CONSTRUCTION THAT CLOSED ABOVE ITS LIST PRICE: the list price was most likely the builder's BASE price, and the "
+    "higher closing price most likely reflects the options, upgrades and lot premium this buyer chose - a well-optioned new "
+    "home. A bidding war is possible but much less likely. Do NOT describe this sale as 'over asking', a bidding war, "
+    "competing offers or strong demand, and do not quote its sold-to-list ratio as market evidence; if you mention the gap, "
+    "say it was most likely upgrades over the builder's base price."
+)
+
+
+def _builder_base_price_sale(comp: dict, *, trust_flag: bool = True) -> bool:
+    """New construction that closed well above its list price (owner, 11/13). 370 Wickmere St closed at
+    $867,620 against a $554,900 list and read "156% of asking", "sold/list over 1.5", "strong demand":
+    a builder lists the base price and the close includes the buyer's options. Its sold-to-list ratio is
+    not market evidence - kept out of every over-asking / bidding-war read."""
+    if trust_flag and comp.get("builder_base_price"):
+        return True
+    if str(comp.get("new_construction_yn")).strip().lower() not in ("true", "1", "y", "yes"):
+        return False
+    sp = _as_float(comp.get("sale_price")) or _as_float(comp.get("close_price")) or _as_float(comp.get("verified_close_price"))
+    lp = _as_float(comp.get("original_list_price")) or _as_float(comp.get("list_price"))
+    return bool(sp and lp and sp / lp >= _BUILDER_BASE_MIN_RATIO)
+
+
 def _seller_comp_market_read(comps: list) -> dict:
     ratios, doms = [], []
     for c in comps or []:
@@ -4071,7 +4303,7 @@ def _seller_comp_market_read(comps: list) -> dict:
             continue
         sp = _as_float(c.get("sale_price")) if c.get("price_verified", True) else None
         lp = _as_float(c.get("list_price"))
-        if sp and lp:
+        if sp and lp and not _builder_base_price_sale(c):
             ratios.append(sp / lp)
         d = _as_float(c.get("days_on_market"))
         if d is not None:
@@ -4121,18 +4353,21 @@ def _seller_pricing_position(*, value: float, range_min: Optional[float], range_
     ask = _as_float(subject_asking)
     listed = bool(ask) and not tl.get("not_listed") and not tl.get("is_closed")
     days = _as_float(tl.get("active_market_days"))
+    recommends_price = False
     if tl.get("is_under_contract"):
         text = (f"The home is under contract. This analysis documents its supported market value of about ${v:,.0f}"
                 f"{rng}, which is useful for the buyer's appraisal and for any renegotiation after inspection.")
     elif listed and ask > v * 1.02:
-        gap = round((ask - v) / ask * 100)
+        # share of the VALUE it is compared with (deep dive 11/13: $600K against $500K read "about 17% above")
+        gap = round((ask - v) / v * 100)
+        recommends_price = True
         stale = (f" After {int(days)} days on the market without an accepted offer, buyers have answered that price."
                  if days is not None and days >= 30 else "")
         text = (f"The current ${ask:,.0f} asking price is about {gap}% above the supported value of ${v:,.0f}{rng}.{stale} "
                 f"We recommend repositioning to about ${rlp:,.0f}, where the home competes directly with the sales "
                 f"buyers are comparing it to.")
     elif listed and ask < v * 0.98:
-        gap = round((v - ask) / ask * 100)
+        gap = round((v - ask) / v * 100)
         text = (f"The current ${ask:,.0f} asking price sits about {gap}% below the supported value of ${v:,.0f}{rng}. "
                 f"There is no reason to reduce it; expect strong early interest, and weigh any offers against that value.")
     elif listed:
@@ -4143,7 +4378,18 @@ def _seller_pricing_position(*, value: float, range_min: Optional[float], range_
                 f"price itself is defensible.{stale}")
     else:
         text = (f"We recommend listing at about ${rlp:,.0f}, the home's supported market value{rng}.")
-    note = _search_bracket_note(rlp) if not tl.get("is_under_contract") else None
+        recommends_price = True
+        # its last listing ended without a sale: say so, with the facts (see _unsold_last_listing)
+        _ll = tl.get("last_listing") or {}
+        if _as_float(_ll.get("price")) and _ll["price"] > v * 1.02:
+            _when = f" in {_parse_iso_date(_ll['ended']).strftime('%B %Y')}" if _parse_iso_date(_ll.get("ended")) else ""
+            _dd = f", about {_ll['days']} days after it was listed," if _ll.get("days") else ""
+            text += (f" The home's last listing, at ${_ll['price']:,.0f}, ended{_when}{_dd} without a sale - about "
+                     f"{round((_ll['price'] - v) / v * 100)}% above what the comparable sales support. Pricing it where "
+                     "similar homes have actually sold is what gives it a real chance this time.")
+    # The search-limit note is about the price we RECOMMEND - only where one is recommended (it told the owner of
+    # a home listed at $460,000 that "listing at $499,900 instead would..." - deep dive 11/13)
+    note = _search_bracket_note(rlp) if recommends_price else None
     return "**Pricing Position:** " + text + market + (" " + note if note else "")
 
 
@@ -5216,6 +5462,11 @@ async def _fetch_image_block(http: httpx.AsyncClient, url: str) -> Optional[tupl
         if not content_type.startswith("image/"):
             return None
         image_bytes, content_type, width, height = _resize_if_needed(resp.content, content_type)
+        if content_type not in _AI_IMAGE_TYPES.values():
+            # one photo the AI can't take must never cost the agent the whole report (735 Concord Ave,
+            # 11/13: Bright served two photos labelled "image/jpg" and the provider refused the request)
+            logger.info("Skipping CMA photo in a format the AI can't read", extra={"url": url, "content_type": content_type})
+            return None
         block = {
             "type": "image",
             "source": {"type": "base64", "media_type": content_type, "data": base64.b64encode(image_bytes).decode()},
@@ -5224,6 +5475,13 @@ async def _fetch_image_block(http: httpx.AsyncClient, url: str) -> Optional[tupl
     except Exception as exc:
         logger.info("Skipping unreachable CMA comp photo", extra={"url": url, "error": str(exc)})
         return None
+
+
+# The only photo formats the AI accepts, keyed by the name the image library gives the file's REAL
+# format. The type is read from the file itself, never trusted from the download's label: Bright's
+# photo servers label some JPEGs "image/jpg", which is not a real type, and one such photo made the
+# provider refuse the whole request - the report failed with "Couldn't generate the AI analysis".
+_AI_IMAGE_TYPES = {"JPEG": "image/jpeg", "MPO": "image/jpeg", "PNG": "image/png", "GIF": "image/gif", "WEBP": "image/webp"}
 
 
 def _resize_if_needed(image_bytes: bytes, content_type: str) -> tuple[bytes, str, int, int]:
@@ -5239,8 +5497,10 @@ def _resize_if_needed(image_bytes: bytes, content_type: str) -> tuple[bytes, str
         from PIL import Image
         with Image.open(BytesIO(image_bytes)) as img:
             width, height = img.size
-            if max(width, height) <= _MAX_IMAGE_EDGE_PX:
-                return image_bytes, content_type, width, height
+            real_type = _AI_IMAGE_TYPES.get((img.format or "").upper())
+            if max(width, height) <= _MAX_IMAGE_EDGE_PX and real_type:
+                return image_bytes, real_type, width, height
+            # too big, or a format the AI doesn't take (AVIF, BMP, TIFF...): re-save as a JPEG
             img = img.convert("RGB")
             img.thumbnail((_MAX_IMAGE_EDGE_PX, _MAX_IMAGE_EDGE_PX), Image.LANCZOS)
             out = BytesIO()
@@ -5424,8 +5684,17 @@ def _v10_median(values: list) -> Optional[float]:
 
 
 def _v10_sqft(row: dict) -> Optional[float]:
-    """Above-grade finished area, falling back to a blended total only when that's all there is."""
-    return _as_float(row.get("above_grade_finished_area")) or _as_float(row.get("sqft"))
+    """Above-grade finished area, falling back to a blended total only when that's all there is. With no
+    above-grade figure but a finished lower level on record, the total minus that lower level (deep dive
+    11/13: the total was used as above-grade and the basement counted twice - rare in our data: 38 of
+    69,445 closed sales since 2025)."""
+    above = _as_float(row.get("above_grade_finished_area"))
+    if above:
+        return above
+    total, below = _as_float(row.get("sqft")), _as_float(row.get("below_grade_finished_area"))
+    if total and below and 0 < below < total:
+        return total - below
+    return total
 
 
 _CLAIM_PSF_RE = re.compile(r"/\s?sq\.?\s?ft|per[- ](?:square[- ])?(?:foot|ft)|\bpsf\b|per-foot|price per", re.I)
@@ -5567,7 +5836,10 @@ def _v10_redundancy_penalties(rows: list) -> dict:
                                and _apart is not None and _apart <= 0.25)
             d1, d2 = _parse_iso_date(r.get("sale_date")), _parse_iso_date(rep.get("sale_date"))
             period_close = bool(d1 and d2 and abs((d1 - d2).days) <= 30)
-            if same_street or (psf_tight and size_tight and period_close):
+            # Same street alone is not duplicate evidence (deep dive 11/13): two sales a few doors from the subject -
+            # the comps Match % had just given its same-street bonus - were each cut to 71% weight. It now also
+            # needs a tight $/sq ft and a close sale date (the docstring's "AND").
+            if (same_street and psf_tight and period_close) or (psf_tight and size_tight and period_close):
                 cl.append(r)
                 placed = True
                 break
@@ -5755,6 +6027,15 @@ _V10_FEATURE_LOT_PCT = float(os.getenv("CMA_GRID_LOT_PCT", "0"))  # per doubling
 _V10_FEATURE_LOT_BIG_PCT = float(os.getenv("CMA_GRID_LOT_BIG_PCT", "0"))   # per doubling x the comp's price
 _V10_LOT_BIG_RATIO = 2.0
 _V10_LOT_BIG_MIN_ACRES = 0.4
+# Acreage (test round 11/13, 418 Reedville Rd: 7.5 acres and a pond valued off one-acre subdivision sales). The
+# big-lot line above was tested on suburban lots (1.2 acres against a third of an acre) and did not help. Real
+# acreage is different: on 60 past sales of homes on 2+ acres (free paired check, scratch bt\r2check.py) the
+# adjusted sales ran a median 12% LOW - about even at 2-3 acres, 18% low at 3-10, 38% low past 10 - and all of it
+# came from comps with under half the land. This line fires only when the two lots are at least
+# _V10_LOT_BIG_RATIO apart AND differ by _V10_ACREAGE_MIN_GAP_ACRES or more: each doubling of land moves the
+# comp's price by this share. 0 = off.
+_V10_ACREAGE_LOT_PCT = float(os.getenv("CMA_GRID_ACREAGE_PCT", "0.08"))
+_V10_ACREAGE_MIN_GAP_ACRES = 2.0
 # Septic vs public sewer (grader 11/01). Cesspools have their own line below.
 _V10_FEATURE_SEPTIC_PCT = float(os.getenv("CMA_GRID_SEPTIC_PCT", "0"))
 _V10_FEATURE_SEPTIC_MAX = 20000
@@ -6001,7 +6282,33 @@ def _v10_bg_for_grid(d: dict, above_grade: float) -> tuple:
     if known is not None:
         return float(known), False
     partial = "partial" in _style_text((d or {}).get("basement")) or _remarks_finished_basement(d) == "partial"
-    return round((0.25 if partial else 0.5) * (above_grade or 0.0)), True
+    # Half the FOOTPRINT: a basement sits under one floor. Half the whole above-grade area gave a 3-story
+    # rowhome a "finished basement" 1.5x the size of its footprint (deep dive 11/13: +6% on the value).
+    footprint = (above_grade or 0.0) / _story_count(d)
+    return round((0.25 if partial else 0.5) * footprint), True
+
+
+_STORY_WORDS = {"one": 1.0, "two": 2.0, "three": 3.0, "four": 4.0}
+
+
+def _story_count(d: Optional[dict]) -> float:
+    """Above-grade floors, 1-4. From the record's levels / stories; when the record has none, an attached
+    home (row, twin, townhouse) is taken as 2 floors and a detached one as 1 (the old behaviour)."""
+    d = d or {}
+    for key in ("stories", "stories_total", "levels"):
+        raw = d.get(key)
+        vals = raw if isinstance(raw, (list, tuple)) else [raw]
+        nums = []
+        for v in vals:
+            t = str(v or "").strip().lower()
+            m = re.search(r"\d+(?:\.\d+)?", t)
+            n = float(m.group(0)) if m else next((n for w, n in _STORY_WORDS.items() if w in t), None)
+            if n:
+                nums.append(n)
+        if nums:
+            return min(4.0, max(1.0, max(nums)))
+    kind = " ".join(str(d.get(k) or "") for k in ("property_type", "home_type", "structure_type")).lower()
+    return 2.0 if any(w in kind for w in ("town", "row", "twin", "attached", "semi")) else 1.0
 
 
 def _v10_weighted_median(pairs: list) -> Optional[float]:
@@ -6085,6 +6392,10 @@ def _v10_grid_adjustments(subject: dict, r: dict, s_ag: float, s_bg: float, s_bg
           and abs(s_lot - c_lot) >= _V10_LOT_BIG_MIN_ACRES * 43560):
         out["lot"] = _clamp(math.log2(s_lot / c_lot), -2.5, 2.5) * price * _V10_FEATURE_LOT_BIG_PCT
         out["notes"].append(f"lot {s_lot / 43560:.2f} vs {c_lot / 43560:.2f} acres")
+    elif (_V10_ACREAGE_LOT_PCT and s_lot and c_lot and max(s_lot, c_lot) / min(s_lot, c_lot) >= _V10_LOT_BIG_RATIO
+          and abs(s_lot - c_lot) >= _V10_ACREAGE_MIN_GAP_ACRES * 43560):
+        out["lot"] = _clamp(math.log2(s_lot / c_lot), -2.5, 2.5) * price * _V10_ACREAGE_LOT_PCT
+        out["notes"].append(f"land {s_lot / 43560:.2f} vs {c_lot / 43560:.2f} acres")
     s_sep, c_sep = _sewer_kind(subject), _sewer_kind(comp)
     if _V10_FEATURE_SEPTIC_PCT and {s_sep, c_sep} == {"septic", "public"}:
         amount = min(_V10_FEATURE_SEPTIC_PCT * price, _V10_FEATURE_SEPTIC_MAX)
@@ -6193,7 +6504,16 @@ def _lot_and_sewer_uncertainties(subject: dict, rows: list) -> list:
     out = []
     s_lot = _relevance_lot_sqft(subject)
     lots = sorted(x for x in (_relevance_lot_sqft(r["_c"]) for r in rows) if x)
-    if s_lot and lots and not _V10_FEATURE_LOT_BIG_PCT:
+    _land_rows = [r for r in rows if (r.get("feat") or {}).get("lot")]
+    if s_lot and _land_rows:
+        # land WAS priced (the acreage line): say so, and that it is an estimate
+        _up = sum(1 for r in _land_rows if r["feat"]["lot"] > 0)
+        _dir = "up" if _up * 2 >= len(_land_rows) else "down"
+        out.append(f"This home's lot is {s_lot / 43560:.2f} acres. {_num_word(len(_land_rows)).capitalize()} of the {_num_word(len(rows))} "
+                   f"sales {'is' if len(_land_rows) == 1 else 'are'} on far {'less' if _dir == 'up' else 'more'} land and "
+                   f"{'was' if len(_land_rows) == 1 else 'were'} adjusted {_dir} for it, at the rate past local acreage sales "
+                   "support. That rate is an estimate, so how much buyers pay for the land is the main uncertainty in this value.")
+    elif s_lot and lots:
         mid = lots[len(lots) // 2]
         if s_lot >= _V10_LOT_BIG_RATIO * mid and s_lot - mid >= _V10_LOT_BIG_MIN_ACRES * 43560:
             out.append(f"This home's {s_lot / 43560:.2f}-acre lot is much larger than the sales' (typically {mid / 43560:.2f} acres). "
@@ -6285,6 +6605,20 @@ def _anchor_integrity_errors(anchor: Optional[dict], subject: Optional[dict] = N
     return errs
 
 
+def _grid_condition_delivered(anchor: Optional[dict]) -> float:
+    """Weighted condition dollars the comp adjustment grid already took off the comps (positive = the comps
+    were moved DOWN because they are in better condition than the subject). Deep dive 11/13: the valuation
+    zeroed the AI's own condition item as "already priced in the grid" and then charged the whole condition
+    gap again, as if nothing had been delivered - four ~$500K sales all rated above came out $434K, about
+    $18K of it deducted twice."""
+    total = 0.0
+    for c in (anchor or {}).get("comps") or []:
+        w = _as_float(c.get("normalized_weight")) or 0.0
+        v = _as_float((c.get("feature_adjustments") or {}).get("condition")) or 0.0
+        total += w * v
+    return -total
+
+
 def _anchor_priced_features(anchor: Optional[dict]) -> set:
     """Which grid features ("below_grade", "baths", "garage") the anchor adjusted on any comp."""
     out = set()
@@ -6358,7 +6692,9 @@ def _compute_comp_anchor(
             # Against the ORIGINAL asking price when known (10/20): 2702 E Kings Hwy sold "6.5% over" a
             # reduced $385K ask but only 2.5% over its original $399,900 - the market read was too hot.
             "sale_to_list": (price / (_as_float(c.get("original_list_price")) or _as_float(c.get("list_price"))))
-                            if (price_basis == "closed_verified" and (_as_float(c.get("original_list_price")) or _as_float(c.get("list_price")))) else None,
+                            if (price_basis == "closed_verified" and (_as_float(c.get("original_list_price")) or _as_float(c.get("list_price")))
+                                and not _builder_base_price_sale(c)) else None,   # a builder's base price isn't an asking price
+            "builder_base_price": _builder_base_price_sale(c),
         }
         # round 13: a verified closed sale that went well over asking, fast = a "competitive sale".
         _lts = row["sale_to_list"]
@@ -6637,6 +6973,13 @@ def _compute_comp_anchor(
             f"sale-vs-$/sqft divergence {round(divergence*100,1)}%"
             + (", size model was sanity-clamped" if "sanity_clamped" in size_model else "")
         )
+    # "Mixed" means fewer than two SOLD comps carry weight, so asking prices of homes still for sale are in the
+    # value at face value. That is never an "ok" anchor, however many listings agree (deep dive 11/13: one $400K
+    # sale plus four homes asking $470K gave $450K and called it valid - more listings made it look MORE valid).
+    if anchor_mode == "mixed" and anchor_validity == "ok":
+        anchor_validity = "weak"
+        validity_reason = (f"only {len(closed_rows)} sold comp(s) carry weight, so the asking prices of homes still "
+                           "for sale make up most of the value")
 
     # authoritative descriptive stats over the weighted comp set - so any "average"/"median"
     # figure in the narrative (or a frontend rollup) can be cross-checked against ONE source.
@@ -6757,6 +7100,17 @@ _REL_UNKNOWN_CREDIT = None if os.getenv("CMA_REL_UNKNOWN") == "off" else float(o
 # v4: city mode (dense_urban density) - tighter distance, and the market area uses neighborhood + ZIP,
 # since school district / township / city are the same for every comp in Philadelphia.
 _REL_URBAN_MODE = os.getenv("CMA_REL_URBAN", "1") == "1"
+# Acreage (test round 11/13, 418 Reedville Rd - 7.5 acres valued off one-acre subdivision homes). On 60 past sales
+# of homes on 2+ acres the engine ran a median 12% LOW, and all of it came from the homes whose comps had under
+# half their land (-15%); with similar-land comps it was level (+1%). Land is 6 points of about 130 in the match
+# score, so an 8.5-acre home's "best" comps were quarter-acre ones a mile away. For a subject on this much land
+# the land match counts this many times more. 1 = off.
+_REL_ACREAGE_MIN_ACRES = float(os.getenv("CMA_REL_ACREAGE_MIN", "3"))
+# A "subdivision" that is only the town's name is not a community (cma_fact_check.CITY_NAME_IS_NOT_A_COMMUNITY) - but
+# in the MATCH SCORE those points had been working as a small "same town" preference. Whether they stay is decided
+# by the free past-sales check, like every scoring change. True = scored as before 11/13.
+_REL_TOWN_NAME_SCORES = os.getenv("CMA_REL_TOWN_NAME_SCORES", "0") == "1"
+_REL_ACREAGE_LOT_MULT = float(os.getenv("CMA_REL_ACREAGE_LOT_MULT", "4"))
 # Neighborhood price level: median $/sqft of the price-map sales within the first of these radii that
 # has enough of them; scored by how far the comp's level is from the subject's (half-life on the log
 # ratio: 0.12 = a 12% gap scores 0.5).
@@ -6998,6 +7352,63 @@ _COND_TEXT_TIERS = (
     (3.0, re.compile(r"\b(?:renovated|rehabbed|remodeled|updated|move[\s-]in\s+ready)\b", re.I)),
 )
 
+# What the description SAYS about the home's physical state, read as a whole (deep dive 11/13). The table above
+# was tried lowest tier first and the first hit won, so boilerplate beat the description: "Completely renovated
+# top to bottom in 2025. Property is being sold as-is." read as an investor fixer-upper, and that flipped every
+# comp the AI had rated worse on finishes to "better". Now:
+#   - words that describe WORK NEEDED are evidence of a low tier;
+#   - sale-terms boilerplate (sold as-is, cash only, an auction listing) counts only when nothing describes a
+#     renovation;
+#   - marketing or sale-type words (priced to sell, estate sale, great investment opportunity, a bare
+#     "shell" - "near the Shell station") say nothing about condition and are not read at all;
+#   - a description that says both "fully renovated" and "needs work" is unclear -> no tier, rather than a guess.
+_COND_NEEDS_WORK_RE = re.compile(
+    r"\b(?:investor\s+special|(?:handyman|contractor)\s+special|fixer[\s-]?upper|gut\s+(?:job|rehab)|tear[\s-]?down|"
+    r"(?:just\s+a|is\s+a|sold\s+as\s+a|down\s+to\s+(?:the\s+)?)\s*shell|shell\s+(?:condition|only)|"
+    r"needs?\s+(?:a\s+)?(?:total\s+|full\s+|complete\s+|major\s+)?(?:rehab(?:ilitation)?|gut|renovation|work)|"
+    r"(?:total|full|complete|major|extensive)\s+(?:rehab(?:ilitation)?|renovation|gut(?:\s+rehab)?)\s+(?:is\s+)?(?:needed|required|necessary)|"
+    r"investor\s+(?:alert|special|project)|calling\s+all\s+(?:investors|flippers|contractors)|"
+    r"ready\s+for\s+(?:a\s+)?(?:full\s+|complete\s+)?(?:gut|rehab|renovation))\b", re.I)
+_COND_SALE_TERMS_RE = re.compile(
+    r"\b(?:sold\s+as[\s-]?is|as[\s-]?is\s+(?:sale|condition|where[\s-]?is)|cash\s+(?:only|buyers?\s+only|offers?\s+only)|"
+    # an auction listing with nothing describing a renovation is usually a distressed sale (10/23 city round)
+    r"in\s+its\s+current\s+condition|(?:online\s+)?auction)\b", re.I)
+_COND_NEEDS_UPDATING_RE = re.compile(
+    r"\b(?:needs?\s+(?:some\s+)?(?:tlc|updating|updates|cosmetic)|tlc|bring\s+your\s+(?:ideas|vision|contractor)|"
+    r"sweat\s+equity|original\s+condition)\b", re.I)
+_COND_MARKETING_LOW_RE = re.compile(r"\b(?:great\s+investment\s+opportunity|investor\s+opportunity|flippers?)\b", re.I)
+_COND_MARKETING_DATED_RE = re.compile(r"\b(?:priced\s+to\s+sell|estate\s+sale)\b", re.I)
+_COND_RENOVATED_RE = _COND_TEXT_TIERS[2][1]
+_COND_UPDATED_RE = _COND_TEXT_TIERS[3][1]
+
+
+def _condition_tier_from_text(text: str) -> Optional[float]:
+    def hit(rx):
+        m = rx.search(text)
+        return bool(m and not _NEGATION_RE.search(text[max(0, m.start() - 20):m.start()]))
+    needs_work, sale_terms = hit(_COND_NEEDS_WORK_RE), hit(_COND_SALE_TERMS_RE)
+    needs_updating, renovated, updated = hit(_COND_NEEDS_UPDATING_RE), hit(_COND_RENOVATED_RE), hit(_COND_UPDATED_RE)
+    if renovated and (needs_work or needs_updating):
+        return None                      # says both - unclear, never a guess
+    if needs_work:
+        return 0.5
+    if needs_updating:
+        return 1.5
+    if renovated:
+        return 4.0
+    if updated:
+        return 3.0
+    if sale_terms:
+        return 0.5                       # "sold as-is" with nothing describing a renovation
+    # Sale-type and marketing words, when nothing at all describes a renovation or update. They read like
+    # boilerplate, but on 60 past sales (free paired check, 11/13) ignoring them made the engine less accurate:
+    # homes sold as an estate or "priced to sell" really do sell lower. A renovation phrase still beats them.
+    if hit(_COND_MARKETING_LOW_RE):
+        return 0.5
+    if hit(_COND_MARKETING_DATED_RE):
+        return 1.5
+    return None
+
 
 def _condition_tier(d: Optional[dict]) -> Optional[float]:
     d = d or {}
@@ -7007,12 +7418,7 @@ def _condition_tier(d: Optional[dict]) -> Optional[float]:
     if tiers:
         return max(tiers)
     text = str(_first_present(d, "public_remarks", "remarks", "listing_remarks") or "")
-    if text:
-        for tier, pattern in _COND_TEXT_TIERS:
-            m = pattern.search(text)
-            if m and not _NEGATION_RE.search(text[max(0, m.start() - 20):m.start()]):
-                return tier
-    return None
+    return _condition_tier_from_text(text) if text else None
 
 
 def _area_price_level(surface: list, lat, lng, exclude_key: Optional[str] = None, *,
@@ -7088,6 +7494,9 @@ def _relevance_market_area_score(subject: dict, comp: dict, *, urban: bool = Fal
             sv, cv = _first_present(subject, *keys), _first_present(comp, *keys)
             same = (_same_district if label == "school_district" else _same_place)(sv, cv)
             detail[label] = None if same is None else (1.0 if same else 0.0)
+            # (11/13: letting a different mailing city through when the township matches was tried and reverted -
+            # on 60 past sales it was less accurate. On the Main Line the mailing town carries a real price
+            # difference inside one township: 223 Upper Gulph Rd went from a 4.8% miss to 31.5%.)
             if same is False:
                 return 0.0, detail
         pieces = []
@@ -7194,7 +7603,7 @@ def _continuous_relevance(
                 and _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["same_street"] > 0:
             components["same_street"] = 1.0
         elif not urban and subject_type != "condo" and _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["same_subdivision"] > 0 \
-                and _fact_check.same_subdivision(subject, comp) is True:
+                and _fact_check.same_subdivision(subject, comp, town_name_counts=_REL_TOWN_NAME_SCORES) is True:
             components["same_subdivision"] = 1.0
         if subject_level and _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS["area_price"] > 0:
             s_level, s_radius, s_n = subject_level, subject_radius, subject_n
@@ -7230,6 +7639,11 @@ def _continuous_relevance(
         comp_type = _type_family(comp.get("property_type") or comp.get("home_type"))
         if subject_type and comp_type:
             components["property_type"] = 1.0 if subject_type == comp_type else 0.0
+        elif _REL_UNKNOWN_CREDIT is not None:
+            # A type missing on either side is UNKNOWN, like a missing lot or year - not a free pass (deep dive
+            # 11/13: with no type on the subject, a condo and a multi-family both scored 0.92 "strong").
+            components["property_type"] = _REL_UNKNOWN_CREDIT
+        property_type_unknown = not (subject_type and comp_type)
         # Eligibility-only, NOT a score input: condo/attached/detached are structurally different
         # housing products (condo vs single-family, townhouse vs detached single-family, etc.) - a
         # comp across that line can't become a Strong/primary comp no matter how high its Match %
@@ -7264,11 +7678,14 @@ def _continuous_relevance(
         elif str(comp.get("status") or "").lower() in ("sold", "closed"):
             if _REL_UNKNOWN_CREDIT is not None: components["recency"] = _REL_UNKNOWN_CREDIT   # a sale with no sale date on record
         components["data_reliability"] = _relevance_data_reliability(comp)
-        available = [(name, score, _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS[name]) for name, score in components.items()]
+        _lot_mult = (_REL_ACREAGE_LOT_MULT if (subject_lot and subject_type != "condo"
+                                                and subject_lot >= _REL_ACREAGE_MIN_ACRES * 43560) else 1.0)
+        _weight = lambda name: _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS[name] * (_lot_mult if name == "lot" else 1.0)  # noqa: E731
+        available = [(name, score, _weight(name)) for name, score in components.items()]
         denominator = sum(weight for _, _, weight in available)
         base_score = sum(score * weight for _, score, weight in available) / denominator if denominator else 0.0
         component_points = {
-            name: round(score * _CONTINUOUS_RELEVANCE_COMPONENT_WEIGHTS[name], 4)
+            name: round(score * _weight(name), 4)
             for name, score in components.items()
         }
         # Match %/ranking/weighting is the 8 core components only - no post-score product or
@@ -7299,6 +7716,7 @@ def _continuous_relevance(
             "adjusted_relevance_score": round(adjusted_score, 4),
             "mechanically_eligible": mechanically_eligible,
             "structurally_incompatible_property_type": structurally_incompatible_property_type,
+            "property_type_unknown": property_type_unknown,
         })
     best = max((row["adjusted_relevance_score"] for row in rows if row["mechanically_eligible"]), default=0.0)
     for row in rows:
@@ -7309,8 +7727,8 @@ def _continuous_relevance(
             or score < 0.45
         ):
             role = "weak"
-        elif score >= 0.72 and score >= best - 0.06:
-            role = "strong"
+        elif score >= 0.72 and score >= best - 0.06 and not row.get("property_type_unknown"):
+            role = "strong"      # never on an unknown home type: it can't be confirmed as the same kind of home
         else:
             role = "supporting"
         row["proposed_role"] = role
@@ -7583,8 +8001,15 @@ def _v10_location_class_review(subject: dict, comps: list, evidence_by_key: dict
             # order the AI writes against - is the same before and after the AI and on every run
             # (v9, 10/21: the AI rated set-back 2702 E Kings Hwy "below", the map "neutral").
             "street_weight_penalty": round(1.0 - _V10_LOC_NEG_STEP - _V10_LOC_STREET_STEP, 3)
-                                     if (rc_verdict == "through" and subj_street_tier in ("quiet", "neutral", None)
-                                         and not override_valid) else 1.0,
+                                     # ... and only when the subject's own road is KNOWN to be quieter - with no road
+                                     # answer for the subject, a comp on its own road was losing 20% of its weight
+                                     # (deep dive 11/13; the 10/25 guard above was never applied here)
+                                     # A subject with no road answer still counts as quieter when its own street is a
+                                     # Lane / Drive / Court (417 Dogwood Ln), never when it is a Road / Avenue / Pike.
+                                     if (rc_verdict == "through" and not override_valid
+                                         and (_subj_quieter or (not _subj_road_known
+                                                                and not _fact_check._subject_road_may_be_busy(subject))))
+                                     else 1.0,
         }
     return flags
 
@@ -7825,6 +8250,9 @@ def _v10_exposure_meaning(state: str, price_cut_pct: float, has_contract_price: 
     return m
 
 
+_V10_CLOSED_PRICE_FRESH_DAYS = 90   # a closing this recent is evidence of today's value; older is history
+
+
 def _compute_exposure(subject: dict, status_timeline: dict, comp_median_dom: Optional[float], anchor: Optional[dict]) -> dict:
     """Stage 2. The subject's own market behaviour -> a structured constraint. Never RAISES a
     value; only caps or pulls down an above-anchor / above-list conclusion (or, when the listing
@@ -7843,8 +8271,17 @@ def _compute_exposure(subject: dict, status_timeline: dict, comp_median_dom: Opt
     # A VERIFIED accepted price (closed price, or an explicitly-stored under-contract price) is the
     # single strongest anchor-level evidence point. Bright rarely exposes an AUC/pending accepted
     # price, so this is usually only set once the deal closes.
+    # ... but only a RECENT closing. A buyer CMA on a home whose latest MLS record closed in 2023 at $340K was
+    # clamped to $340K against $500K of adjusted sales (deep dive 11/13): an old sale is history.
+    _recent_close = False
+    if is_closed:
+        try:
+            _closed_on = datetime.fromisoformat(str(tl.get("close_date"))[:10]).date()
+            _recent_close = (_tmach.today() - _closed_on).days <= _V10_CLOSED_PRICE_FRESH_DAYS
+        except (TypeError, ValueError):
+            _recent_close = False
     contract_price = _as_float(tl.get("contract_price")) or _as_float(subject.get("contract_price")) or \
-        (_as_float(subject.get("last_sale_price")) if is_closed else None)
+        (_as_float(subject.get("last_sale_price")) if (is_closed and _recent_close) else None)
 
     price_cut_pct = ((orig_list - cur_list) / orig_list * 100) if (orig_list and cur_list and orig_list > cur_list) else 0.0
     price_increase = bool(orig_list and cur_list and cur_list > orig_list * 1.01)
@@ -7869,7 +8306,7 @@ def _compute_exposure(subject: dict, status_timeline: dict, comp_median_dom: Opt
         state = "not_listed"
     elif is_closed:
         state = "closed"
-        ceiling = contract_price or cur_list
+        ceiling = (contract_price or cur_list) if _recent_close else None   # an old sale / old list price caps nothing
     elif is_uc:
         if active_dom is not None and active_dom <= max(21.0, short_cut):
             state = "quick_contract"
@@ -7953,7 +8390,8 @@ def _compute_exposure(subject: dict, status_timeline: dict, comp_median_dom: Opt
         "hard_upper": round(hard_upper) if hard_upper else None,
         "pull_target": round(pull_target) if pull_target else None,
         "relisted_note": relisted_note,
-        "meaning": _v10_exposure_meaning(state, price_cut_pct, bool(contract_price)),
+        "meaning": ("Not for sale - the buyer is weighing an off-market offer to the owner, so the comps alone decide value."
+                    if tl.get("not_listed_buyer") else _v10_exposure_meaning(state, price_cut_pct, bool(contract_price))),
     }
 
 
@@ -8379,7 +8817,9 @@ def _apply_v10_valuation(anchor: Optional[dict], exposure: dict, ai_estimate: Op
         # pseudo-appraisal precision.
         _isolated = btype == "paired_market_evidence" and val_note is None
         _soft = None
-        if not _isolated and hi > lo:
+        # (also when the AI gave one figure: $20,000-$20,000 applied in full while $20,000-$20,001 applied $12,000 -
+        # deep dive 11/13)
+        if not _isolated and hi >= lo and hi > 0:
             mid = lo
             if direction == "up":
                 mid *= _V10_SOFT_OFFSET_FACTOR
@@ -8388,7 +8828,11 @@ def _apply_v10_valuation(anchor: Optional[dict], exposure: dict, ai_estimate: Op
                 _soft = "conservative_end"
         # Step 5: an adjustment about raw size / lot area is already the anchor's job - shrink it.
         fam = _v10_adj_family(factor, basis)
-        if fam == "lot_land" and any(k in f"{factor} {basis}".lower() for k in ("acre", "lot size", "square foot", "sqft", "sq ft")):
+        # ... only when the grid really priced the lot. Its lot line is off by default (11/01 backtest), so on a
+        # 7-acre home against 1-acre sales the AI's +$100-120K land item was cut to $18K as "already handled"
+        # by an anchor that had added $0 for land (deep dive 11/13; 418 Reedville Rd).
+        if (fam == "lot_land" and "lot" in _anchor_priced_features(anchor)
+                and any(k in f"{factor} {basis}".lower() for k in ("acre", "lot size", "square foot", "sqft", "sq ft"))):
             if mid > 0.02 * anchor_value:
                 flags.append(f"Adjustment '{factor}': raw lot/size difference is already handled by the deterministic anchor - reduced.")
                 mid = min(mid, 0.02 * anchor_value)
@@ -8618,6 +9062,17 @@ def _apply_v10_valuation(anchor: Optional[dict], exposure: dict, ai_estimate: Op
                     f"({', '.join(p['factor'] for p in supported)}) ~${supported_sum:,.0f} vs an implied "
                     f"~${implied_gap:,.0f} {b.replace('_', ' ')} gap - confirm.")
                 flags.append(qual_recon["offsets_accepted"][-1])
+            elif (b == "condition" and "condition" in _anchor_priced_features(anchor)
+                  and (_grid_condition_delivered(anchor) > 0) == subj_inferior and _grid_condition_delivered(anchor) != 0):
+                # The grid already moved the comps for condition, in the right direction. Its dollars are credited
+                # against the gap below; asking for an itemised condition adjustment here was a dead end (the
+                # duplicate rule zeroes any the AI files).
+                _gc = abs(_grid_condition_delivered(anchor))
+                _bucket_resolution[b] = {"captured": False, "offset_credit": 0.0}
+                qual_recon["captured_mechanically"].append(
+                    f"{_bucket_label}: itemised net {_net_description}; the comp adjustment grid already moved the "
+                    f"comps about ${_gc:,.0f} (weighted) for condition - credited, not charged again.")
+                flags.append(qual_recon["captured_mechanically"][-1])
             elif captured:
                 _bucket_resolution[b] = {"captured": True, "offset_credit": 0.0}
                 qual_recon["captured_mechanically"].append(
@@ -8707,7 +9162,10 @@ def _apply_v10_valuation(anchor: Optional[dict], exposure: dict, ai_estimate: Op
         # the per-bucket reconciliation ACCEPTED as explaining this bucket's near-zero net.
         _itemised_down = -sum(min(0.0, _bucket_net.get(b, 0.0)) for b, _s in _inf_buckets)
         _offset_credit = sum((_bucket_resolution.get(b) or {}).get("offset_credit", 0.0) for b, _s in _inf_buckets)
-        _shortfall = max(0.0, _implied_total - _itemised_down - _offset_credit) * _V10_BROAD_INFERIORITY_APPLY_FRAC
+        # ... and what the comp adjustment grid already took off for condition (see _grid_condition_delivered)
+        _grid_credit = (max(0.0, _grid_condition_delivered(anchor))
+                        if any(b == "condition" for b, _s in _inf_buckets) else 0.0)
+        _shortfall = max(0.0, _implied_total - _itemised_down - _offset_credit - _grid_credit) * _V10_BROAD_INFERIORITY_APPLY_FRAC
         if _shortfall > _V10_BROAD_INFERIORITY_MIN_FRAC * anchor_value:
             _agg = -round(_shortfall)
             _names = " + ".join(b.replace("_", " ") for b, _s in _inf_buckets)
@@ -8729,7 +9187,8 @@ def _apply_v10_valuation(anchor: Optional[dict], exposure: dict, ai_estimate: Op
             })
             qual_recon["aggregate_inferiority"] = {
                 "buckets": [b for b, _s in _inf_buckets], "implied_total": round(_implied_total),
-                "itemised_down": round(_itemised_down), "offset_credit": round(_offset_credit), "applied": _agg,
+                "itemised_down": round(_itemised_down), "offset_credit": round(_offset_credit),
+                "grid_condition_credit": round(_grid_credit), "applied": _agg,
             }
             bound_hit = True  # widen the range (existing bound_hit -> range_pct += 1 path)
             flags.append(
@@ -8800,6 +9259,7 @@ def _apply_v10_valuation(anchor: Optional[dict], exposure: dict, ai_estimate: Op
             flags.append(f"Extended exposure: FMV compressed from ${fmv:,.0f} toward the ${exposure['pull_target']:,.0f} "
                          f"anchor/list floor (paired evidence lifts it back by half, to ${target:,.0f}).")
             gate["extended_pull_to"] = round(target)
+            gate.setdefault("from", round(fmv))   # so a 3%+ pull lowers the confidence seed like the other pulls
             gate.setdefault("action", "extended_pull")
             gate["applied"] = True
             fmv = target
@@ -8820,12 +9280,14 @@ def _apply_v10_valuation(anchor: Optional[dict], exposure: dict, ai_estimate: Op
     # Fix 1 (round 10): when the $/sqft leg leaned on the FALLBACK below-grade HEURISTIC for one or
     # more comps (no paired/local evidence for the below-grade rate), that leg is less reliable -
     # widen the range floor and, if it touched most of the weighted comps, step confidence down.
-    _psf_heuristic_ct = anchor.get("psf_leg_heuristic_comp_count", 0) or 0
+    # (deep dive 11/13: the $/sq ft leg was retired to a trace-only diagnostic, but its counts still widened the
+    # range floor and stepped confidence down, and its divergence figure - which leaves out the grid's age, time,
+    # condition and location lines - still added range. Both are out of the range / confidence logic now.)
+    _psf_heuristic_ct = 0
     _psf_heuristic_heavy = _psf_heuristic_ct >= max(2, (anchor.get("weighted_comp_count", 0) + 1) // 2)
     _excellent = (
         anchor.get("mode") == "closed_only"
         and anchor.get("weighted_comp_count", 0) >= 3
-        and anchor["sale_psf_divergence_pct"] <= 5
         and not any(c.get("outlier") for c in anchor_comps)
         and "sanity_clamped" not in anchor.get("size_model", "")
         and _psf_heuristic_ct == 0
@@ -8840,8 +9302,6 @@ def _apply_v10_valuation(anchor: Optional[dict], exposure: dict, ai_estimate: Op
         min_range = max(min_range, 8.0)  # a weak anchor must not imply tight precision
     range_pct = _as_float((ai_estimate or {}).get("range_pct")) or 5.0
     range_pct = max(range_pct, float(anchor["spread_pct"]), min_range)
-    if anchor["sale_psf_divergence_pct"] > 8:
-        range_pct += 1
     if disputed:
         range_pct += 1
     _pull_actions = ("pulled_down", "extended_pull", "capped_by_exposure", "clamped_to_contract_price")
@@ -9131,7 +9591,10 @@ that sold over list is direct evidence of what buyers here pay, not unusual dema
 the subject should be valued as a home that will meet the same buyer competition. Reserve
 bidding_war_or_unusual_demand for a sale clearly out of line with the rest of the set (for example
 far further over list, or far faster, than the others). Likewise, when most sales closed below
-list after long market times, do not treat the one quick over-list sale as the norm.
+list after long market times, do not treat the one quick over-list sale as the norm. When a
+comparable carries builder_price_note it is new construction whose list price was the builder's
+base price: it has no sold_list_ratio on purpose. Follow the note - its closing price is real
+evidence of what a finished, optioned home costs, but never over-asking, bidding-war or demand evidence.
 
 When subject.auction_listing is set, the home is being sold at auction: its list price is an opening
 bid set to draw bidders, not market evidence. There is no asking_price_check. Value it from the sales
@@ -9173,6 +9636,14 @@ what buyers did or thought ("buyers have passed on it"), which the data can't sh
 factor that governs the value. When naming the strongest comparables, name them by address -
 never describe them as a group by a trait not all of them share (e.g. "the quiet-street sales"
 when one of them is on a highway).
+When asking_price_check.buyer_report is true, this report is for a BUYER: the asking price is the
+seller's number, not evidence of value for them. It may hold final_fmv down (a home that has sat, or
+one priced below its sales), but it must never lift final_fmv above what the adjusted sales support -
+there is no allowed_low floor, and the application caps a buyer's value at the top of the adjusted
+sales when the asking price sits above them. Do not explain a value as moving "toward the asking
+price"; where the asking price is well above the sales, say plainly that the seller may hold out for
+more than the sales support - unless the home is already under contract: that seller has accepted an
+offer, so say instead that the accepted price is not known and may sit above what the sales support.
 
 Range: derive range_low and range_high from the spread of the adjusted comparable evidence and
 your uncertainty. The asking price is never a ceiling or a floor on the range - do not set
@@ -9245,7 +9716,7 @@ def _build_reasoning_evidence_packet(
     *, subject: dict, comps: list, status_timeline: dict, anchor: Optional[dict],
     exposure: dict, v10_result: dict, subject_estimate: Optional[dict],
     evidence_by_key: dict, outliers: dict, data_quality_flags: Optional[list] = None,
-    deterministic_confidence: Optional[str] = None,
+    deterministic_confidence: Optional[str] = None, mode: Optional[str] = None,
 ) -> dict:
     """Build the bounded, JSON-only packet for the final reasoning pass."""
     tl = status_timeline or {}
@@ -9313,14 +9784,21 @@ def _build_reasoning_evidence_packet(
     trace_by_label = {str(c.get("label")): c for c in (a.get("comps") or [])}
     comp_packets = []
     for i, comp in enumerate(comps):
+        # A comp the agent switched off is not evidence (deep dive 11/13: excluded comps still set the comps'
+        # median sold-to-list ratio, the expected sale price and the market tempo). Labels keep their numbers.
+        if not comp.get("is_included", True):
+            continue
         label = _comp_label(i, comp)
         key = str(comp.get("listing_key") or f"comp-{i + 1}")
         ct = trace_by_label.get(label) or {}
         price = _as_float(comp.get("sale_price")) or _as_float(comp.get("close_price"))
         list_price = _as_float(comp.get("list_price")) or _as_float(comp.get("original_list_price"))
         sold_list = _as_float(ct.get("sale_to_list"))
-        if sold_list is None and price and list_price:
+        _builder = _builder_base_price_sale(comp)
+        if sold_list is None and price and list_price and not _builder:
             sold_list = price / list_price
+        if _builder:
+            sold_list = None   # not an asking-price result: out of the tempo / asking-price / over-ask reads
         comp_features = _authoritative_property_features(comp)
         comp_sqft = _exact_sqft_semantics(comp)
         comp_packets.append({
@@ -9332,6 +9810,7 @@ def _build_reasoning_evidence_packet(
             "sale_price": price,
             "list_price": list_price,
             "sold_list_ratio": sold_list,
+            "builder_price_note": _BUILDER_PRICE_NOTE if _builder else None,
             "dom": ct.get("dom") if ct.get("dom") is not None else comp.get("days_on_market"),
             "sale_date": _first_present(comp, "sale_date", "close_date"),
             "distance_miles": ct.get("distance_miles") if ct.get("distance_miles") is not None else comp.get("distance_miles"),
@@ -9421,7 +9900,9 @@ def _build_reasoning_evidence_packet(
     packet = {"subject": subject_packet, "comparables": comp_packets, "market_tempo": _reasoning_market_tempo(comp_packets),
               "deterministic_evidence": deterministic}
     check = _asking_price_market_check(subject_packet, tl, exposure, comp_packets, anchor_value=a.get("anchor_value"),
-                                       sales_loose_fit=bool(a.get("loose_fit")))
+                                       sales_loose_fit=bool(a.get("loose_fit")), buyer_report=(mode == "buyer"))
+    if mode:
+        packet["report_mode"] = mode
     if check:
         packet["asking_price_check"] = check
     return packet
@@ -9454,7 +9935,7 @@ _PRICED_ABOVE_SALES_TOL = 0.02   # asking more than 2% above the adjusted sales 
 
 def _asking_price_market_check(subject_packet: dict, status_timeline: dict, exposure: dict,
                                comp_packets: list, *, anchor_value: Optional[float] = None,
-                               sales_loose_fit: bool = False) -> Optional[dict]:
+                               sales_loose_fit: bool = False, buyer_report: bool = False) -> Optional[dict]:
     """Expected sale price of a listed subject = asking x the comps' median sold/list ratio (no
     premium once it has sat longer than its comps), and the band the final value must stay in.
     None when the subject isn't listed, has already closed, or fewer than 2 comps have a ratio."""
@@ -9468,7 +9949,9 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
     ratios = [float(c["sold_list_ratio"]) for c in comp_packets
               if _as_float(c.get("sale_price")) and _as_float(c.get("sold_list_ratio"))
               and 0.75 <= float(c["sold_list_ratio"]) <= 1.5]
-    if not lp or len(ratios) < 2:
+    # ... or just two that disagree (0.97 and 1.21 "median" 1.09 - their mean - set a seller floor $40K above the
+    # adjusted sales; deep dive 11/13)
+    if not lp or len(ratios) < 2 or (len(ratios) == 2 and abs(ratios[0] - ratios[1]) > 0.08):
         return None
     median = _v10_median(sorted(ratios))
     ratio = _clamp(median, *_ASKING_CHECK_RATIO_BOUNDS)
@@ -9489,7 +9972,12 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
     if _total and (dom is None or _total > dom):
         dom = _total
     comp_dom = _as_float((exposure or {}).get("comp_median_dom"))
-    passed_over = dom is not None and dom >= _ASKING_CHECK_PASSED_OVER_DAYS and (not comp_dom or dom >= 2 * comp_dom)
+    # Needs the comps' real days on market: missing data used to count as "sat twice as long", so "passed over"
+    # fired at day 14 with nothing behind it and the report said the home "has been on the market longer than they
+    # took to sell" (deep dive 11/13). And a home UNDER CONTRACT has a buyer - it is not passed over or unsold.
+    under_contract = state in ("quick_contract", "under_contract_normal") or bool(tl.get("is_under_contract"))
+    passed_over = bool(dom is not None and dom >= _ASKING_CHECK_PASSED_OVER_DAYS and comp_dom and dom >= 2 * comp_dom
+                       and not under_contract)
     high_mult = _ASKING_CHECK_BAND[1]
     # Outpaced: the over-asking sales went under contract fast and this home is still on the market
     # well past that - don't assume it will sell over asking too (10/20: 417 Dogwood Ln at 14 days vs
@@ -9517,7 +10005,7 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
     long_unsold = False
     # Letting the sales win only makes sense when they are real matches - not for a home no sale
     # fits well (an estate, much bigger than every sale; see _anchor_loose_fit_reasons).
-    if stale and dom is not None and not sales_loose_fit:
+    if stale and dom is not None and not sales_loose_fit and not under_contract:
         for days, floor in _ASKING_CHECK_LONG_UNSOLD_FLOORS:
             if dom >= days:
                 low_mult, long_unsold = min(low_mult, floor), True
@@ -9548,12 +10036,17 @@ def _asking_price_market_check(subject_packet: dict, status_timeline: dict, expo
             over_ask_pattern = None   # past two weeks: the report doesn't promise competition
     else:
         over_ask_pattern = None
+    # Buyer reports (owner, 11/13): the asking price is the seller's number - it may hold a buyer's
+    # value DOWN (a home that sells under asking), never lift it toward the asking price. No floor;
+    # the likely sale price goes to the offer advice instead ("the seller may hold out for more").
+    allowed_low = 0 if buyer_report else round(expected * low_mult)
     return {
         "asking_price": round(lp),
         "comp_median_sold_to_list_ratio": round(median, 3),
         "ratio_used": round(ratio, 3),
         "expected_sale_price": round(expected),
-        "allowed_low": round(expected * low_mult),
+        "allowed_low": allowed_low,
+        "buyer_report": bool(buyer_report),
         "allowed_high": round(allowed_high),
         "comp_ratios_counted": len(ratios),
         "exposure_state": state or None,
@@ -9582,7 +10075,11 @@ async def _load_current_competition(db: AsyncSession, report, subject: dict) -> 
     if _tmach.current():
         return []
     try:
-        return await cma_service.current_competition(db, subject, listing_key=subject.get("listing_key"))
+        homes = await cma_service.current_competition(db, subject, listing_key=subject.get("listing_key"))
+        # A home on a fraction of the land is not this home's competition (418 Reedville Rd, 7.5 acres with a pond,
+        # test round 11/13: quarter-acre new-construction lots were shown as its competition, under the line
+        # "Priced above all current competition - expect longer market time").
+        return [h for h in homes or [] if not _pending_land_mismatch(subject, h)]
     except Exception:   # never let the side section fail a paid run
         logger.warning("CMA current competition lookup failed", exc_info=True)
         return []
@@ -9608,6 +10105,7 @@ def _pending_implied_value(subject: dict, home: dict, market_psf: Optional[float
 _MISSED_SALE_DAYS = 120          # a same-community sale this recent should be in the report, or looked at
 _MISSED_SALE_DAYS_FEW = 730      # ...this far back when the report has fewer than 2 same-community comps
 _MISSED_SALE_MILES = 1.0
+_MISSED_SALE_MIN_PRICE = 20000   # a closed LEASE carries its monthly rent as the "close price" - not a sale
 _MISSED_SALE_SIZE = (0.65, 1.45)  # x the subject's total finished area
 
 
@@ -9638,8 +10136,15 @@ async def _missed_same_community_sales(db: AsyncSession, subject: dict, comps: l
                    Property.home_type, Property.living_area, Property.bedrooms, Property.bathrooms,
                    Property.raw_mls_data["SubdivisionName"].astext.label("sub"),
                    Property.raw_mls_data["ClosePrice"].astext.label("close_price"), close_date.label("close_date"))
+            # Only what could be a missed comp, newest first (deep dive 11/13: an unordered LIMIT 400 over every
+            # closed record in the ZIP - leases and all home types included - often left out the one sale this
+            # check exists to catch): within the search box around the subject, closed on or before today.
             .where(Property.zipcode == zipcode, func.upper(Property.home_status).like("CLOSED%"),
-                   close_date >= since, Property.is_manual.is_(False))
+                   close_date >= since, close_date <= _tmach.today().isoformat(), Property.is_manual.is_(False),
+                   Property.latitude.between(lat - _MISSED_SALE_MILES / 69.0, lat + _MISSED_SALE_MILES / 69.0),
+                   Property.longitude.between(lng - _MISSED_SALE_MILES / (69.0 * math.cos(math.radians(lat))),
+                                              lng + _MISSED_SALE_MILES / (69.0 * math.cos(math.radians(lat)))))
+            .order_by(close_date.desc())
             .limit(400)
         )).mappings().all()
     except Exception:  # noqa: BLE001 - a side check never fails a paid run
@@ -9647,10 +10152,11 @@ async def _missed_same_community_sales(db: AsyncSession, subject: dict, comps: l
         return None
     kx = 69.0 * math.cos(math.radians(lat))
     found = []
+    _sub_key = _fact_check._subdivision_key(subject)   # (with the subject's town: a town's own name is no community)
     for r in rows:
         if str(r["listing_key"]) in have or str(r["listing_key"]) == str(subject.get("listing_key") or ""):
             continue
-        if _fact_check._subdivision_key({"subdivision_name": r["sub"]}) != _fact_check._subdivision_key({"subdivision_name": sub}):
+        if _fact_check._subdivision_key({"subdivision_name": r["sub"]}) != _sub_key:
             continue
         if family and _type_family(r["home_type"]) != family:
             continue
@@ -9658,7 +10164,8 @@ async def _missed_same_community_sales(db: AsyncSession, subject: dict, comps: l
                 math.hypot((float(r["latitude"]) - lat) * 69.0, (float(r["longitude"]) - lng) * kx) > _MISSED_SALE_MILES:
             continue
         sq, price = _as_float(r["living_area"]), _as_float(r["close_price"])
-        if not price or (total and sq and not (_MISSED_SALE_SIZE[0] <= sq / total <= _MISSED_SALE_SIZE[1])):
+        if not price or price < _MISSED_SALE_MIN_PRICE \
+                or (total and sq and not (_MISSED_SALE_SIZE[0] <= sq / total <= _MISSED_SALE_SIZE[1])):
             continue
         found.append({"listing_key": r["listing_key"], "street_address": r["street_address"], "close_price": price,
                       "close_date": str(r["close_date"])[:10], "sqft": sq, "beds": r["bedrooms"], "baths": r["bathrooms"]})
@@ -9668,16 +10175,43 @@ async def _missed_same_community_sales(db: AsyncSession, subject: dict, comps: l
     found = found[:3]
     names = "; ".join(f"{_title_address(h['street_address'])} sold {_fact_check._nice_date(h['close_date'])} for ${h['close_price']:,.0f}"
                       + (f" ({round(h['sqft']):,} sq ft)" if h.get("sqft") else "") for h in found)
-    return {"homes": found, "message": (f"Review before sending: recent {_title_address(sub)} sales not in this report - {names}. "
-                                        "Same community as the subject - consider adding or say why it was left out.")}
+    # "recent" only when they are (701 Sturbridge Dr, test round 11/13: an April 2025 sale was a "recent" one
+    # in November 2026 - the two-year look-back for a report with fewer than 2 same-community comps)
+    _recent_cut = (_tmach.today() - timedelta(days=_MISSED_SALE_DAYS)).isoformat()
+    _kind = "Recent" if all(h["close_date"] >= _recent_cut for h in found) else "Earlier"
+    return {"homes": found, "message": (f"Review before sending: {_kind} {_title_address(sub)} sales not in this report - {names}. "
+                                        "Same community as the subject - consider adding "
+                                        + ("them" if len(found) > 1 else "it") + " or say why "
+                                        + ("they were" if len(found) > 1 else "it was") + " left out.")}
 
 
-def _pending_competition_review(subject: dict, homes: list, value, low, high, trace: Optional[dict]):
+_PENDING_LOT_RATIO = 3.0        # a pending on a third (or three times) the land, and at least...
+_PENDING_LOT_MIN_ACRES = 1.0    # ...an acre different, is not a close match: it informs nothing about this home
+
+
+def _pending_land_mismatch(subject: dict, home: dict) -> bool:
+    """A 1.4-acre subdivision home is not a "close match" for a 7.5-acre property with a pond (418 Reedville Rd,
+    test round 11/13: two such pendings took 2.5% off its value). Land has no dollar line in the grid, so a
+    pending this different on land can't be adjusted to the subject - it is left out of the value review."""
+    s_lot, h_lot = _relevance_lot_sqft(subject), _relevance_lot_sqft(home)
+    if not s_lot or not h_lot:
+        return False
+    return max(s_lot, h_lot) / min(s_lot, h_lot) >= _PENDING_LOT_RATIO and abs(s_lot - h_lot) >= _PENDING_LOT_MIN_ACRES * 43560
+
+
+def _pending_competition_review(subject: dict, homes: list, value, low, high, trace: Optional[dict],
+                                buyer_report: bool = False, subject_under_contract: bool = False):
     """Pendings may nudge the final value a little (2+ strong pendings agree, capped at 2.5%, kept
     inside the asking-price band); actives never count. Returns (value, low, high, review_info)."""
     info = {"pendings_used": [], "nudge_pct": 0.0, "nudged_from": None, "review": None}
     v = _as_float(value)
     if not homes or not v:
+        return value, low, high, info
+    # The subject has its own accepted contract (524 Wales Rd, test round 11/13: under contract at a $479,000
+    # asking price, and two OTHER homes' asking prices took 2% off its value). A buyer has already agreed a price
+    # for this home; what other sellers are asking says less about it than that does - no review, no nudge.
+    if subject_under_contract:
+        info["skipped"] = "subject_under_contract"
         return value, low, high, info
     t = trace or {}
     anchor = t.get("anchor") or {}
@@ -9688,11 +10222,13 @@ def _pending_competition_review(subject: dict, homes: list, value, low, high, tr
     for h in homes:
         if h.get("status") != "pending" or (h.get("match_score") or 0) < _PENDING_STRONG_MATCH or h.get("new_construction"):
             continue
+        if _pending_land_mismatch(subject, h):
+            continue
         iv = _pending_implied_value(subject, h, market_psf)
         if iv:
             strong.append((h, iv))
     info["pendings_used"] = [{"listing_key": h.get("listing_key"), "street_address": h.get("street_address"),
-                              "list_price": h.get("list_price"), "implied_value": round(iv),
+                              "list_price": h.get("list_price"), "implied_value": round(iv / 1000) * 1000,
                               "match_score": h.get("match_score"), "distance_miles": h.get("distance_miles"),
                               "days_on_market": h.get("days_on_market"), "sqft": h.get("sqft")} for h, iv in strong]
     new_v = v
@@ -9712,6 +10248,13 @@ def _pending_competition_review(subject: dict, homes: list, value, low, high, tr
     if agree:
         med = _v10_median([iv for _, iv in pool])
         nudge = max(-_PENDING_NUDGE_CAP, min(_PENDING_NUDGE_CAP, _PENDING_NUDGE_SHARE * (med - v) / v))
+        # Buyer report (deep dive 11/13): a pending is known only by its LIST price - another seller's asking
+        # price. It may pull a buyer's value down, never lift it (it was undoing the buyer cap one step later:
+        # capped at $520,000, then nudged to $533,000).
+        if buyer_report and nudge > 0:
+            nudge = 0.0
+            for row in info["pendings_used"]:
+                row["moved_value"] = False
         if abs(nudge) >= 0.003:
             apc = t.get("asking_price_check") or {}
             lo_b, hi_b = _as_float(apc.get("allowed_low_price")), _as_float(apc.get("allowed_high_price"))
@@ -9732,8 +10275,9 @@ def _pending_competition_review(subject: dict, homes: list, value, low, high, tr
     for h, iv in strong:
         if (h.get("match_score") or 0) >= _PENDING_REVIEW_MATCH and abs(iv - new_v) / new_v > _PENDING_REVIEW_GAP:
             side = "above" if iv > new_v else "below"
+            # (whole thousands: "about $2,152,925 adjusted" read as a precision the estimate doesn't have)
             info["review"] = (f"Review before sending: {h.get('street_address')} is under contract and closely matches this home "
-                              f"(list ${h.get('list_price'):,.0f}, about ${iv:,.0f} adjusted to this home) - "
+                              f"(list ${h.get('list_price'):,.0f}, about ${round(iv / 1000) * 1000:,.0f} adjusted to this home) - "
                               f"{abs(iv - new_v) / new_v * 100:.0f}% {side} this report's value of ${new_v:,.0f}. "
                               "Its contract price isn't known yet; check it before sending.")
             break
@@ -9784,6 +10328,13 @@ def _apply_asking_price_check(reasoning: dict, evidence_packet: dict) -> tuple[d
         return reasoning, []
     fmv = float(reasoning["final_fmv"])
     lo, hi = float(check["allowed_low"]), float(check["allowed_high"])
+    # Buyer report, asking price above what the sales support: the value can't be carried past the top
+    # of the adjusted sales toward the asking price (owner, 11/13 - "whose side is the report on?").
+    _det = (evidence_packet or {}).get("deterministic_evidence") or {}
+    _anchor, _top = _as_float(_det.get("deterministic_anchor")), _as_float(_det.get("anchor_high"))
+    if (check.get("buyer_report") and _anchor and _top and _top >= _anchor
+            and float(check["asking_price"]) > _anchor and fmv > _top):
+        hi = min(hi, _top)
     if lo <= fmv <= hi:
         return reasoning, []
     # whole $1,000 inside the band - the raw edge printed as "$1,081,795" (10/24 dry run)
@@ -9801,6 +10352,13 @@ def _apply_asking_price_check(reasoning: dict, evidence_packet: dict) -> tuple[d
     if abs(scale - 1) > 0.08:
         out["confidence"] = "low"
     out["asking_price_check_applied"] = {**check, "from": round(fmv), "to": round(new)}
+    if check.get("buyer_report") and hi < float(check["allowed_high"]) and fmv > hi:
+        out["asking_price_check_applied"]["buyer_sales_cap"] = round(hi)
+        return out, [
+            f"Buyer report: the final value (${fmv:,.0f}) was above the top of what the adjusted sales support "
+            f"(${hi:,.0f}) while the ${check['asking_price']:,.0f} asking price is higher still - capped at ${new:,.0f}, "
+            "so the seller's asking price never carries a buyer's value past the sales."
+        ]
     return out, [
         f"Asking-price check: the comps' value (${fmv:,.0f}) was {'above' if fmv > hi else 'below'} what homes "
         f"here sell for relative to asking (${check['asking_price']:,.0f} x {check['ratio_used']:.3f} = "
@@ -9887,10 +10445,106 @@ def _add_usage(total: dict, usage: Optional[dict]) -> dict:
     return total
 
 
+def _reasoning_is_claude(config: Optional[dict] = None) -> bool:
+    from app.services.ai.ai_config_service import DEFAULT_CONFIG
+    return str((config or {}).get("cma_reasoning_model") or DEFAULT_CONFIG.get("cma_reasoning_model") or "").startswith("claude-")
+
+
+def _reasoning_key_missing(config: Optional[dict] = None) -> bool:
+    """The final-valuation step can't run: no key for the provider its model belongs to."""
+    if _reasoning_is_claude(config):
+        return not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"))
+    return not os.getenv("OPENAI_API_KEY")
+
+
+_REASONING_CLAUDE_FALLBACK_MODEL = "claude-opus-5-5"   # when the first model declines the request
+_REASONING_CLAUDE_THINKING_HEADROOM = 8000              # thinking counts toward max_tokens on these models
+
+
+def _reasoning_json_from_text(text: str) -> Optional[dict]:
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except (TypeError, ValueError):
+        m = re.search(r"\{.*\}", text or "", re.DOTALL)
+        try:
+            obj = json.loads(m.group(0)) if m else None
+        except ValueError:
+            obj = None
+        return obj if isinstance(obj, dict) else None
+
+
+async def _call_cma_reasoning_claude(config: dict, evidence_packet: dict) -> tuple[dict, dict]:
+    """The final-valuation pass on a Claude model (owner, 11/13: one provider for the whole CMA). Same
+    instructions, same evidence packet, same answer schema as the OpenAI path, so nothing downstream changes.
+
+    - Structured output (output_config.format) holds the answer to the schema; if the API rejects the schema
+      itself, the call is repeated once asking for the same JSON in plain text.
+    - Streamed, because a top model can think for minutes and a silent connection would time out.
+    - A policy decline (stop_reason "refusal") is retried once on _REASONING_CLAUDE_FALLBACK_MODEL."""
+    client = _provider_client()
+    model = config["cma_reasoning_model"]
+    effort = config.get("cma_reasoning_effort", "medium")
+    max_tokens = int(_as_float(config.get("cma_reasoning_max_output_tokens")) or 12000) + _REASONING_CLAUDE_THINKING_HEADROOM
+    timeout_s = max(300.0, float(_as_float(config.get("cma_reasoning_request_timeout_seconds")) or 180))
+    packet_text = json.dumps(evidence_packet, separators=(",", ":"), default=str)
+    usage_total: dict = {}
+    last_error = "unknown"
+    use_format = True
+    for attempt in range(_REASONING_MAX_RETRIES + 1):
+        if attempt:
+            await asyncio.sleep(_REASONING_RETRY_BACKOFF_S[min(attempt - 1, len(_REASONING_RETRY_BACKOFF_S) - 1)])
+        kwargs = dict(model=model, max_tokens=max_tokens, system=_CMA_REASONING_SYSTEM_PROMPT,
+                      messages=[{"role": "user", "content": packet_text}])
+        if use_format:
+            kwargs["output_config"] = {"effort": effort, "format": {"type": "json_schema", "schema": _CMA_REASONING_SCHEMA}}
+        else:
+            kwargs["output_config"] = {"effort": effort}
+            kwargs["messages"] = [{"role": "user", "content": packet_text + "\n\nReturn ONLY one JSON object (no prose, no code "
+                                   "fence) that matches this JSON schema exactly:\n" + json.dumps(_CMA_REASONING_SCHEMA, separators=(",", ":"))}]
+        try:
+            async with client.with_options(timeout=timeout_s).messages.stream(**kwargs) as stream:
+                msg = await stream.get_final_message()
+        except Exception as exc:  # noqa: BLE001 - classified below; never let a provider error escape unbooked
+            code = getattr(exc, "status_code", None)
+            last_error = f"{type(exc).__name__}" + (f" HTTP {code}" if code else "")
+            if code == 400 and use_format:
+                # the schema itself was refused (a keyword structured outputs doesn't take): ask in plain text
+                logger.warning("CMA reasoning (Claude): structured output rejected - retrying as plain JSON",
+                               extra={"model": model, "error": str(exc)[:300]})
+                use_format = False
+                continue
+            if code in (401, 403, 404) or (code == 400 and not use_format):
+                raise _ReasoningCallError(f"reasoning request failed ({last_error})", usage_total) from exc
+            logger.warning("CMA reasoning (Claude) call failed - retrying", extra={"model": model, "error": last_error, "attempt": attempt + 1})
+            continue
+        _add_usage(usage_total, {"input_tokens": getattr(msg.usage, "input_tokens", 0), "output_tokens": getattr(msg.usage, "output_tokens", 0)})
+        if msg.stop_reason == "refusal":
+            last_error = "model declined the request"
+            if model != _REASONING_CLAUDE_FALLBACK_MODEL:
+                logger.warning("CMA reasoning (Claude): declined - retrying on the fallback model",
+                               extra={"model": model, "fallback": _REASONING_CLAUDE_FALLBACK_MODEL})
+                model = _REASONING_CLAUDE_FALLBACK_MODEL
+            continue
+        if msg.stop_reason == "max_tokens":
+            last_error = "ran out of room before finishing"
+            max_tokens = min(max_tokens + 8000, 48000)
+            continue
+        text = "".join(getattr(b, "text", "") for b in (msg.content or []) if getattr(b, "type", None) == "text")
+        raw = _reasoning_json_from_text(text)
+        if raw is None:
+            last_error = "answer was not a JSON object"
+            continue
+        return raw, usage_total
+    raise _ReasoningCallError(f"reasoning request failed ({last_error})", usage_total)
+
+
 async def _call_cma_reasoning_model(config: dict, evidence_packet: dict) -> tuple[dict, dict]:
     _tm = _tmach.current()
     if _tm is not None and getattr(_tm, "fake_reasoning", None) is not None:
         return _tm.fake_reasoning(evidence_packet), {}   # accuracy-test dry run: no provider call
+    if _reasoning_is_claude(config):
+        return await _call_cma_reasoning_claude(config, evidence_packet)
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not configured")
@@ -10283,6 +10937,8 @@ def _validate_reasoning_valuation(result: dict, evidence_packet: dict) -> tuple[
         round(_as_float(v)) for v in (
             (evidence_packet.get("subject") or {}).get("dom"),
             (evidence_packet.get("subject") or {}).get("cdom"),
+            # the packet gives the model this figure for a relisted home - citing it is not an error (deep dive 11/13)
+            (evidence_packet.get("subject") or {}).get("marketing_days_total"),
             (evidence_packet.get("deterministic_evidence") or {}).get("comp_set_median_dom"),
             (evidence_packet.get("market_tempo") or {}).get("median_days_on_market"),
             *(comp.get("dom") for comp in comp_rows),
@@ -10611,8 +11267,13 @@ def _reconcile_comp_hard_facts(
     _ccity = str(comp.get("city") or "").strip()
     if _ccity and _same_municipality(subject, comp) and _norm_token(_ccity) != _norm_token(subject.get("city")):
         _town = _ccity.title()
-        _new = re.sub(rf"\bin {re.escape(_town)}\b(?!\s+(?:Area|School|Township|Borough|schools?)\b)",
-                      f"with a {_town} mailing address", out, flags=re.IGNORECASE)
+        _not_place = r"(?!\s+(?:Area|School|Township|Borough|schools?)\b)"
+        # "It is in Villanova, with the same..." became "It is with a Villanova mailing address, with the
+        # same..." (701 Sturbridge Dr, test round 11/13) - after "is / sits / is located" the home HAS the address
+        _new = re.sub(rf"\b(?:is|sits|lies)(?:\s+located)?\s+in {re.escape(_town)}\b{_not_place}",
+                      f"has a {_town} mailing address", out, flags=re.IGNORECASE)
+        _new = re.sub(rf"\bin {re.escape(_town)}\b{_not_place}",
+                      f"with a {_town} mailing address", _new, flags=re.IGNORECASE)
         if _new != out:
             out = _new
             flags.append(f"{label}: '{_town}' is only its mailing town - it is in the subject's township.")
@@ -10672,6 +11333,10 @@ def _reconcile_comp_hard_facts(
             return f"${round(n):,}{m.group(2)}"   # someone else's figure: just drop the cents
         _new = re.sub(r"\$(\d[\d,]*(?:\.\d{1,2})?)(\s*/\s*sq\.?\s*ft\.?|/sf\b| per sq(?:uare)? f(?:oo)?t)", _psf_fix, out, flags=re.IGNORECASE)
         _new = _new.replace("/sqft above grade above grade", "/sqft above grade")
+        # the AI's own "on total area" after a figure now on the above-grade basis ("$208/sqft above grade on total
+        # area", 418 Reedville Rd, 11/14)
+        _new = re.sub(r"(/sqft above grade),?\s+(?:on|based on|using|across)\s+(?:its\s+|the\s+)?total\s+"
+                      r"(?:finished\s+)?(?:area|size|sq(?:uare)?\.?\s*f(?:oo|ee)?t|sqft|living area)", r"\1", _new, flags=re.IGNORECASE)
         if _new != out:
             out = _new
             flags.append(f"{label}: $/sqft figures put on the card's above-grade basis.")
@@ -11209,7 +11874,7 @@ async def _targeted_comp_narrative_rewrite(
         # 1000-1200+ "thinking" tokens on this same 3-note batch across back-to-back calls) with
         # no way here to turn that off, so the budget must comfortably absorb worst-case thinking
         # AND the visible JSON, not just the JSON alone.
-        resp = await client.messages.create(
+        resp = await _cma_claude.create(client, effort="low",
             model=model, max_tokens=min(8000, 2500 + 700 * len(flagged)), system=sys,
             messages=[{"role": "user", "content": user}],
         )
@@ -11927,8 +12592,10 @@ def _authoritative_range(value: float, range_pct: float, trace: Optional[dict] =
     high = _as_float(source.get("range_max"))
     if low is None or high is None:
         t = trace or {}
-        low = _as_float(t.get("reasoning_model_range_low")) or _as_float(t.get("range_min"))
-        high = _as_float(t.get("reasoning_model_range_high")) or _as_float(t.get("range_max"))
+        # the report's final range first (_sync_trace_final); the model's own endpoints only as a fallback -
+        # they are from before the under-contract step and the value bridge
+        low = _as_float(t.get("range_min")) or _as_float(t.get("reasoning_model_range_low"))
+        high = _as_float(t.get("range_max")) or _as_float(t.get("reasoning_model_range_high"))
     if low is not None and high is not None:
         return round(low), round(high)
     if not value:
@@ -12075,6 +12742,98 @@ async def _reasoning_cache_put(db: AsyncSession, key: str, raw) -> None:
         logger.warning("CMA reasoning cache write failed", exc_info=True)
 
 
+# ---- Same report, same number (owner, 11/13) ----------------------------------------------------
+# The prompt-keyed caches above miss on anything: a corrected comp note, road data that arrived late,
+# a dollar figure crossing a $2,500 rounding step, any prompt edit - and a re-run's estimate pass had
+# no cache at all, so 701 Sturbridge Dr went $1.80M -> $1.75M -> $1.725M with no edits. Each report
+# also keeps its own AI answers, keyed only on the FACTS an agent would call a change: the subject's
+# price/status/size, which comps are in it and their sale facts and ratings, the mode, the model and
+# PROMPT_VERSION (bump it to refresh every report on purpose). Same facts -> the stored answer, for
+# _REASONING_CACHE_DAYS; the deterministic steps still run on today's data.
+def _lock_sqft(d: dict) -> list:
+    s = _exact_sqft_semantics(d)
+    return [s["above_grade_sqft"], s["below_grade_sqft"], s["total_finished_sqft"]]
+
+
+def _value_lock_identity(subject: dict, comps: list, *, with_ratings: bool) -> dict:
+    """The facts of a report (raw subject/comp dicts), for the estimate and comp passes."""
+    remarks = str(_first_present(subject, "public_remarks", "remarks", "listing_remarks") or "")
+    subj = {
+        "addr": [str(subject.get(k) or "").strip().lower() for k in ("street_address", "city", "state")],
+        "list": _as_float(subject.get("list_price")),
+        "status": str(subject.get("home_status") or subject.get("status") or subject.get("mls_status") or "").strip().lower(),
+        "beds": _first_present(subject, "beds", "bedrooms", "bedrooms_total"),
+        "baths": _first_present(subject, "baths", "bathrooms", "bathrooms_total"),
+        "sqft": _lock_sqft(subject), "lot": _first_present(subject, "lot_size", "lot_size_sqft", "acres"),
+        "year": subject.get("year_built"),
+        "cond": _first_present(subject, "renovation_level", "condition", "property_condition"),
+        "remarks": hashlib.sha256(remarks.encode("utf-8")).hexdigest()[:16],
+    }
+    rows = []
+    for i, c in enumerate(comps or []):
+        row = {
+            "k": str(c.get("listing_key") or f"comp-{i + 1}"),
+            "price": _as_float(c.get("sale_price")) or _as_float(c.get("close_price")),
+            "list": _as_float(c.get("list_price")) or _as_float(c.get("original_list_price")),
+            "date": str(_first_present(c, "sale_date", "close_date") or "")[:10],
+            "beds": _first_present(c, "beds", "bedrooms", "bedrooms_total"),
+            "baths": _first_present(c, "baths", "bathrooms", "bathrooms_total"),
+            "sqft": _lock_sqft(c), "lot": _first_present(c, "lot_size", "lot_size_sqft", "acres"),
+            "year": c.get("year_built"), "in": bool(c.get("is_included", True)),
+        }
+        if with_ratings:
+            row["q"] = c.get("quality") or {}
+        rows.append(row)
+    return {"subject": subj, "comps": sorted(rows, key=lambda r: r["k"])}
+
+
+def _packet_lock_identity(evidence_packet: dict) -> dict:
+    """The same facts, read from the final-valuation evidence packet."""
+    s = evidence_packet.get("subject") or {}
+    remarks = str(s.get("listing_remarks") or "")
+    subj = {k: s.get(k) for k in ("address", "current_list_price", "beds", "baths", "above_grade_sqft", "below_grade_sqft",
+                                  "total_finished_sqft", "lot_size", "year_built", "renovation_level",
+                                  # every subject fact the adjustment grid prices (deep dive 11/13: a garage count
+                                  # going 0 -> 3 returned the old value)
+                                  "garage", "pool", "school_district", "primary_sqft_type", "guest_house_or_accessory_space")}
+    subj["status"] = str(s.get("status") or "").strip().lower()
+    subj["auction"] = bool(s.get("auction_listing"))
+    subj["remarks"] = hashlib.sha256(remarks.encode("utf-8")).hexdigest()[:16]
+    rows = [{k: c.get(k) for k in ("comp_id", "sale_price", "list_price", "beds", "baths", "above_grade_sqft",
+                                   "below_grade_sqft", "total_finished_sqft", "lot_size", "year_built",
+                                   "garage", "school_district", "renovation_condition")}
+            | {"date": str(c.get("sale_date") or "")[:10], "q": c.get("better_worse_ratings") or {}}
+            for c in (evidence_packet.get("comparables") or [])]
+    return {"subject": subj, "comps": sorted(rows, key=lambda r: str(r.get("comp_id"))),
+            "mode": evidence_packet.get("report_mode")}
+
+
+def _value_lock_fingerprint(identity: dict, *, model: str, mode: Optional[str] = None, extra=None) -> str:
+    payload = json.dumps({"id": identity, "m": model, "mode": mode, "v": PROMPT_VERSION, "x": extra},
+                         sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:48]
+
+
+def _value_lock_key(report_id, kind: str) -> str:
+    return f"cma_value_lock:{kind}:{report_id}"
+
+
+async def _value_lock_get(db: AsyncSession, report_id, kind: str, fingerprint: str) -> Optional[dict]:
+    """This report's stored AI answer for `kind`, when its facts (fingerprint) haven't changed."""
+    if not report_id or _tmach.current():   # accuracy-test runs never reuse (each is its own experiment)
+        return None
+    got = await _reasoning_cache_get(db, _value_lock_key(report_id, kind))
+    if isinstance(got, dict) and got.get("fp") == fingerprint and got.get("raw") is not None:
+        return got
+    return None
+
+
+async def _value_lock_put(db: AsyncSession, report_id, kind: str, fingerprint: str, raw, **more) -> None:
+    if not report_id or _tmach.current():
+        return
+    await _reasoning_cache_put(db, _value_lock_key(report_id, kind), {"fp": fingerprint, "raw": raw, **more})
+
+
 async def _run_cma_reasoning_stage(
     db: AsyncSession, owner_id: str, plan_tier: str, config: dict, evidence_packet: dict,
     report_id: str, *, fallback: Optional[dict] = None, reservation=None,
@@ -12095,7 +12854,12 @@ async def _run_cma_reasoning_stage(
         if _fallback_ok:
             logger.warning("CMA reasoning pass over its cost limit - V10 fallback",
                            extra={"report_id": report_id, "projected_cost": projected_cost, "max_cost": max_cost})
-            return _v10_fallback_reasoning(fallback, evidence_packet, f"over its ${max_cost:.2f} cost limit"), [], 0.0, {}
+            # ... through the same asking-price band, buyer cap and agent note as the failure fallback below (deep
+            # dive 11/13: this one returned the benchmark value unbanded and its note never reached the agent)
+            reasoning = _v10_fallback_reasoning(fallback, evidence_packet, f"over its ${max_cost:.2f} cost limit")
+            reasoning, guard_flags = _apply_asking_price_check(reasoning, evidence_packet)
+            reasoning["_guard_flags"] = list(reasoning.pop("_repair_flags", None) or []) + list(guard_flags)
+            return reasoning, [], 0.0, {}
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             f"The final valuation reasoning pass would exceed its ${max_cost:.2f} per-CMA limit.",
@@ -12107,13 +12871,23 @@ async def _run_cma_reasoning_stage(
         # setting, so the same home with the same comps and data gave $500K / $480K / $510K-style
         # swings. Its answer for an identical evidence packet is reused (no charge) for 14 days.
         _cache_key = _reasoning_cache_key(evidence_packet, model)
-        cached = await _reasoning_cache_get(db, _cache_key)
+        # this report's own earlier answer first (same facts -> same number, see _value_lock_identity)
+        _lock_fp = _value_lock_fingerprint(_packet_lock_identity(evidence_packet), model=model)
+        _locked = await _value_lock_get(db, report_id, "reasoning", _lock_fp)
+        cached = _locked or await _reasoning_cache_get(db, _cache_key)
         _now_dom = _as_float((evidence_packet.get("subject") or {}).get("dom"))
+        _now_cdom = _as_float((evidence_packet.get("subject") or {}).get("cdom"))
+        _now_total = _as_float((evidence_packet.get("subject") or {}).get("marketing_days_total"))
+        _days_now = {"subject_dom": _now_dom, "subject_cdom": _now_cdom, "subject_total": _now_total}
         reasoning = blockers = None
         if isinstance(cached, dict) and "raw" in cached:
             # possibly stored on an earlier day: refresh its day count, and re-ask if it no longer checks out
             _comp_doms = {round(d) for d in (_as_float(c.get("dom")) for c in evidence_packet.get("comparables") or []) if d is not None}
             raw, _ = _refresh_cached_subject_days(cached["raw"], _as_float(cached.get("subject_dom")), _now_dom, _comp_doms)
+            # ... and its cumulative / total marketing days: a stored "marketed for 72 days" failed the day-count
+            # check on day 73, the answer was thrown away and the value changed with no fact change (deep dive 11/13)
+            for _k, _now in (("subject_cdom", _now_cdom), ("subject_total", _now_total)):
+                raw, _ = _refresh_cached_subject_days(raw, _as_float(cached.get(_k)), _now, _comp_doms)
             reasoning, blockers = _validate_reasoning_valuation(raw, evidence_packet)
             if blockers:
                 reasoning = blockers = None
@@ -12130,7 +12904,9 @@ async def _run_cma_reasoning_stage(
         if reasoning is None:
             reasoning, blockers = _validate_reasoning_valuation(raw, evidence_packet)
         if cached is None and not blockers:
-            await _reasoning_cache_put(db, _cache_key, {"raw": raw, "subject_dom": _now_dom})
+            await _reasoning_cache_put(db, _cache_key, {"raw": raw, **_days_now})
+        if not blockers and (cached is None or cached is not _locked):
+            await _value_lock_put(db, report_id, "reasoning", _lock_fp, raw, **_days_now)
         reasoning, guard_flags = _apply_asking_price_check(reasoning, evidence_packet)
         # the callers move these into qa_flags; the validator's own repairs go first
         reasoning["_guard_flags"] = list(reasoning.pop("_repair_flags", None) or []) + list(guard_flags)
@@ -13451,6 +14227,8 @@ def _bridge_driver_text(items: list, grid_families: set) -> tuple[str, bool, boo
         if not f:
             continue
         name = f[:1].lower() + f[1:] if not f[:2].isupper() else f
+        # a bare price reads as a typo to a client ("prior listing at 835,750", 418 Reedville Rd, 11/14)
+        name = re.sub(r"(?<![$\d,.])\b(\d{1,3}(?:,\d{3})+)\b(?!\s*(?:sq|square|acres?|days?|feet|ft)\b)", r"$\1", name)
         names.append(name)
         supported = supported or d.get("evidence_strength") == "clearly_market_supported"
         hit = any(re.search(rx, f, re.I) and fam in grid_families for fam, rx in _GRID_PRICED_WORDS)
@@ -13511,13 +14289,25 @@ def _v10_value_bridge(trace: Optional[dict], *, value, range_min=None, range_max
         if toward and (toward > 0) == (move > 0):
             listing = math.copysign(min(abs(move), abs(toward)), move)
         edge = lo if move > 0 else hi
-        if edge and abs(m0 - edge) <= 0.01 * edge and ((move > 0 and edge > a) or (move < 0 and edge < a)):
+        # "Held at the edge" only when the value really sits on it - the same sliver the rounding rule below allows.
+        # 701 Sturbridge Dr (test round 11/13): the edge was $1,838,000 and the value $1,820,000, and the whole
+        # $35,000 was explained as "the value is not set above about $1,838,000. That takes off $35,000. Together:
+        # $1,820,000" - $18,000 of it was the valuation pass's own judgment and had no line.
+        if edge and abs(m0 - edge) <= min(15000.0, 0.01 * edge) and ((move > 0 and edge > a) or (move < 0 and edge < a)):
             listing, held_at_edge = move, edge
+    # Buyer report (11/13): the asking price never lifts a buyer's value, so an upward move is the
+    # reasoning pass's judgment, and the buyer cap is its own step - not "asking-price evidence".
+    _buyer = bool(apc.get("buyer_report"))
+    if _buyer and move > 0:
+        listing, held_at_edge = 0.0, None
     judgment = move - listing
     # a sliver past the asking-price figure is rounding in the reasoning pass, not a judgment worth a line
     if listing and abs(judgment) < min(15000.0, 0.01 * a):
         listing, judgment = move, 0.0
     clamp = (v_pass - m0) if applied else 0.0
+    buyer_cap = 0.0
+    if _buyer and applied and (applied or {}).get("buyer_sales_cap") and clamp < 0:
+        buyer_cap, clamp = clamp, 0.0
     nudge = v - v_pass
 
     steps: list[dict] = []
@@ -13525,16 +14315,25 @@ def _v10_value_bridge(trace: Optional[dict], *, value, range_min=None, range_max
         amt = listing + clamp
         edge = _as_float((applied or {}).get("to")) or held_at_edge
         up = amt > 0
-        basis = (f"This home is listed at ${ask:,.0f}. The comparable sales closed at about {round(ratio * 100)}% of their "
-                 f"final asking prices" if ratio else f"This home is listed at ${ask:,.0f}")
+        # The comps' real median, not the figure after the stale-listing caps (deep dive 11/13: comps that sold at
+        # 105-107% of asking were described as "closed at about 98% of their final asking prices").
+        _real = _as_float(apc.get("comp_median_sold_to_list_ratio")) or ratio
+        basis = (f"This home is listed at ${ask:,.0f}. The comparable sales closed at about {round(_real * 100)}% of their "
+                 f"final asking prices" if _real else f"This home is listed at ${ask:,.0f}")
         if apc.get("passed_over"):
             basis += (", and this home has been on the market longer than they took to sell, so it is valued as a home that "
                       "sells at or a little under its asking price")
+        elif _real and ratio and abs(_real - ratio) >= 0.01:
+            basis += (f", but this home has been on the market longer than the fastest of them, so it is valued at about "
+                      f"{round(ratio * 100)}% of its asking price")
         basis += f" - which points to a sale near ${round(exp, -3):,.0f}." if exp else "."
-        if edge and up:
+        # Floor or ceiling by WHICH edge held, not by the sign of the net step (deep dive 11/13: a value pulled
+        # DOWN to the top of the band was explained as "rarely sell for less than ... not set below ... That adds").
+        _is_floor = (clamp > 0) if (applied and abs(clamp) >= 500) else (move > 0)
+        if edge and _is_floor:
             basis += (f" Homes at this stage rarely sell for less than about {round(edge / ask * 100)}% of their asking "
                       f"price, so the value is not set below about ${round(edge, -3):,.0f}.")
-        elif edge and not up:
+        elif edge and not _is_floor:
             basis += (f" Homes at this stage rarely sell for more than about {round(edge / ask * 100)}% of their asking "
                       f"price, so the value is not set above about ${round(edge, -3):,.0f}.")
         elif exp and abs(exp - a) > 0:
@@ -13547,8 +14346,8 @@ def _v10_value_bridge(trace: Optional[dict], *, value, range_min=None, range_max
                       "way toward it.")
         # the empirical support for this step (grader 10/25: "the 46% weighting needs empirical support") -
         # the free backtest on ~220 past local sales, see _cma_engine_lab/engine (edge_*_LOCCOND / AUD1024)
-        basis += (" Tested on about 220 past local sales of listed homes, weighing the asking-price evidence this way "
-                  "cut the typical miss from about 9% (adjusted sales alone) to about 6%.")
+        # (The ~220-sale backtest behind this step - typical miss about 9% -> 6% - stays an internal note: a
+        # client can't check it, so the report doesn't cite it. Grader audit 11/13, finding 25.)
         steps.append({"key": "listing", "label": "Asking-price evidence (how homes here sell against their asking price)",
                       "amount": round(amt), "basis": basis, "measured": False})
     jdg_text, jdg_supported, jdg_gridded = "", False, False
@@ -13559,9 +14358,16 @@ def _v10_value_bridge(trace: Optional[dict], *, value, range_min=None, range_max
         basis = ("A judgment, not a measured adjustment" + (f": {jdg_text}." if jdg_text else
                  ": the reasoning pass weighed the comparable evidence as a whole."))
         if jdg_gridded:
-            basis += " These features are already partly priced in the adjusted sales, so this step is held to review."
+            basis += " These features are already partly counted in the adjusted sales."
         steps.append({"key": "judgment", "label": "Judgment beyond the measured adjustments", "amount": round(judgment),
                       "basis": basis, "measured": False, "market_supported": jdg_supported, "already_in_grid": jdg_gridded})
+    if abs(buyer_cap) >= 500:
+        steps.append({"key": "buyer_cap", "label": "Held to the top of the adjusted sales", "amount": round(buyer_cap),
+                      "basis": ((f"This report is for a buyer. The ${ask:,.0f} asking price is above what the comparable "
+                                 "sales support, and a seller's asking price isn't evidence of value for a buyer, so the "
+                                 "value is held to the top of the adjusted sales.") if ask else
+                                "This report is for a buyer, so the value is held to the top of the adjusted sales."),
+                      "measured": False})
     if abs(nudge) >= 500:
         # only the pendings that moved it, with what each implies - "are listed lower" named a home that
         # implied MORE than the value (4913 Chancellor St, 10/24)
@@ -13639,6 +14445,28 @@ def _apply_value_bridge(valuation_trace: Optional[dict], value, low, high, confi
         confidence = cap
     qa_flags.extend(bridge.get("checks") or [])
     return low, high, round(((high - low) / (2 * value)) * 100, 2), confidence
+
+
+def _sync_trace_final(valuation_trace: Optional[dict], value, low, high, range_pct) -> None:
+    """The audit trail's final value and range must be the ones the report shows.
+
+    The under-contract step and the value bridge run AFTER the final valuation pass wrote its numbers
+    to the trail, and nothing wrote the changed numbers back. Every report they touched then failed its
+    own final check - "valuation_trace.final_fmv ($690,000) != the headline FMV ($673,000)", "range ...
+    doesn't match the authoritative final range" - so the written summary was thrown away for the plain
+    rebuilt one and the agent got three false "Review before sending" warnings (418 Reedville Rd,
+    735 Concord Ave and 524 Wales Rd, test round 11/13: three of five reports). The model's own numbers
+    stay on the trail as reasoning_model_fmv / reasoning_model_range_low / _high."""
+    if not isinstance(valuation_trace, dict):
+        return
+    v = _as_float(value)
+    if v:
+        valuation_trace["final_fmv"] = round(v)
+    lo, hi = _as_float(low), _as_float(high)
+    if lo and hi:
+        valuation_trace["range_min"], valuation_trace["range_max"] = round(lo), round(hi)
+    if range_pct is not None:
+        valuation_trace["range_pct"] = range_pct
 
 
 def _bridge_client_text(bridge: Optional[dict]) -> str:
@@ -13755,6 +14583,12 @@ def _v10_lot_sewer_sentences(methodology: str, *, trace: Optional[dict]) -> tupl
         if not isinstance(u, str) or not u.startswith("This home's ") and not u.startswith("This home has "):
             continue
         topic = r"\bacres?\b|\blot\b" if "lot" in u.split(".")[0] else r"\bseptic\b|\bsewer\b"
+        if methodology and u.split(". ")[0] in methodology:
+            continue    # already said (a repair round re-runs this - it was appended three times, 11/14)
+        if "adjusted" in u and "land" in u:
+            # the sales WERE adjusted for land (the acreage line): a mention of the acreage isn't enough - the notes
+            # must say the adjustment was made and that its rate is an estimate
+            topic = r"adjust\w*[^.]{0,80}\b(?:land|acre\w*|lot)\b|\b(?:land|acre\w*|lot)\b[^.]{0,80}adjust"
         if methodology and not re.search(topic, methodology, re.IGNORECASE):
             add.append(u)
     if not methodology or not add:
@@ -14171,7 +15005,7 @@ async def _targeted_gate_rewrite(methodology: str, offer: str, *, value: float, 
         # variable, uncontrollable number of tokens on internal reasoning before any visible
         # text, so the budget must absorb worst-case thinking AND both rewritten sections, not
         # just the JSON alone.
-        resp = await client.messages.create(
+        resp = await _cma_claude.create(client, effort="low",
             model=model, max_tokens=4000, system=sys,
             messages=[{"role": "user", "content": user}],
         )
@@ -14257,7 +15091,7 @@ async def _v10_final_language_polish(fields: dict, *, model: str) -> dict:
         user = "Fields to polish (keep every number and direction identical):\n\n" + "\n\n".join(
             f"### {k}\n{v}" for k, v in src.items()
         )
-        resp = await client.messages.create(model=model, max_tokens=3000, system=sys,
+        resp = await _cma_claude.create(client, effort="low", model=model, max_tokens=3000, system=sys,
                                             messages=[{"role": "user", "content": user}])
         _note_extra_usage(resp, model, "language_polish")
         raw = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", None) == "text")
@@ -14707,6 +15541,17 @@ def _v10_directional_adjustment_backing_check(fields: dict, trace: dict) -> list
     nonzero structured adjustment exists anywhere in the final adjustment trace."""
     blocking: list = []
     records = _v10_structured_adjustment_records(trace or {})
+    # ...and the adjustment GRID's own lines (418 Reedville Rd, 11/14: four sales adjusted up $107,000-$128,000
+    # each for land, and "the sales were adjusted up for the land" was cut as having "no matching adjustment")
+    _grid_words = {"lot": ("lot_land", "lot land acreage acres grounds"), "garage": ("garage_parking", "garage parking"),
+                   "condition": ("renovation_condition", "condition finish renovation kitchen bath"),
+                   "baths": ("bathrooms", "bath baths bathroom"), "below_grade": ("lower_level", "lower level basement"),
+                   "sewer": ("systems_mechanical", "sewer septic"), "age": ("age", "age newer older year built")}
+    for _c in ((trace or {}).get("anchor") or {}).get("comps") or []:
+        for _k, (_fam, _words) in _grid_words.items():
+            _v = _as_float((_c.get("feature_adjustments") or {}).get(_k))
+            if _v and abs(_v) > 1:
+                records.append({"family": _fam, "direction": "up" if _v > 0 else "down", "text": _words})
 
     def backed(families: set[str], feat_re: re.Pattern, direction: str) -> bool:
         for r in records:
@@ -15049,7 +15894,9 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
     target = min(_rd(target), int(ceiling // _step * _step) if ceiling else _rd(target))
     opening_high = min(_rd(opening_high), target)
     opening_low = min(_rd(opening_low), opening_high - _step)
-    comfort_ceiling = _rd(comfort_ceiling)
+    # Rounded DOWN unless it is a real stretch above the value: $648,000 rounded to $650,000 turned the walk-away
+    # line into "you could stretch to about $650,000" on a passed-over home (deep dive 11/13)
+    comfort_ceiling = _rd(comfort_ceiling) if comfort_ceiling > fmv * 1.005 else int(math.floor(float(comfort_ceiling) / _step) * _step)
     pct_low = ((opening_low - lp) / lp * 100) if lp else None
     pct_high = ((opening_high - lp) / lp * 100) if lp else None
     return {
@@ -15061,6 +15908,7 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
         "strong_offer": target,
         "valuation_range_low": round(range_min) if _as_float(range_min) else None,
         "valuation_range_high": round(range_max) if _as_float(range_max) else None,
+        "confidence": (str(confidence).lower() if confidence else None),
         "opening_pct_low_vs_list": round(pct_low, 4) if pct_low is not None else None,
         "opening_pct_high_vs_list": round(pct_high, 4) if pct_high is not None else None,
         "opening_pct_phrase": _v10_pct_range_phrase(opening_low, opening_high, lp) if lp else None,
@@ -15070,6 +15918,8 @@ def _v10_build_buyer_offer_band(fmv: float, list_price: Optional[float], *, trac
         "outpaced_by_comps": outpaced, "over_ask_passed": over_ask_passed, "over_ask_comp_median_dom": _over_doms[len(_over_doms) // 2] if _over_doms else None,
         "backup": backup, "under_contract_days": int(_uc_days) if (backup and _uc_days is not None) else None,
         "auction": auction,
+        "off_market": bool((status_timeline or {}).get("not_listed_buyer")) and not lp,
+        "last_listing": (status_timeline or {}).get("last_listing") if (status_timeline or {}).get("not_listed_buyer") else None,
     }
 
 
@@ -15087,13 +15937,13 @@ def _v10_pct_range_phrase(low: float, high: float, ref: float) -> str:
         if lo_rounded == hi_rounded:
             return f"about {hi_rounded}% above"
         if lo_rounded == 0:
-            return f"at to about {hi_rounded}% above"   # not "about 0%-1% above"
+            return f"at or up to about {hi_rounded}% above"   # not "about 0%-1% above" (was "at to about", 11/13)
         return f"about {lo_rounded}%-{hi_rounded}% above"
     if lo_pct <= 0 and hi_pct <= 0:
         if lo_rounded == hi_rounded:
             return f"about {hi_rounded}% below"
         if hi_rounded == 0:
-            return f"at to about {lo_rounded}% below"   # not "about 0%-3% below"
+            return f"at or up to about {lo_rounded}% below"   # not "about 0%-3% below"
         return f"about {hi_rounded}%-{lo_rounded}% below"
     return "straddling"
 
@@ -15135,18 +15985,42 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
             f"${fmv:,}, so treat ${fmv:,} as your limit. If the auction terms add a buyer's premium, it is paid on top of "
             "the winning bid - lower your top bid by that amount."
         )
+    elif b.get("off_market"):
+        # Not for sale (CMA test 11/13): no asking price to open "below", no competition to read.
+        opener = (
+            f"This home isn't for sale, so there is no asking price to negotiate from - your offer is an invitation "
+            f"for the owner to sell. The comparable sales support about ${fmv:,}. An opening offer of roughly ${ol:,} "
+            f"to ${oh:,} gives the owner a serious number to consider while leaving room to settle toward ${tgt:,}. "
+            f"Treat the ${fmv:,} fair market value as your walk-away price; an owner who wasn't planning to sell may "
+            f"ask for more, and paying past it needs a clear reason, such as this home's specific features mattering "
+            f"enough to you."
+        )
+        # The owner's own number, when the record shows one (see _unsold_last_listing): a fact for the
+        # negotiation, never a value.
+        _ll = b.get("last_listing") or {}
+        if _as_float(_ll.get("price")) and _ll["price"] > fmv * 1.02:
+            _when = f" in {_parse_iso_date(_ll['ended']).strftime('%B %Y')}" if _parse_iso_date(_ll.get("ended")) else ""
+            _dd = f", about {_ll['days']} days after it was listed," if _ll.get("days") else ""
+            opener += (f" The owner last listed this home at ${_ll['price']:,}; that listing ended{_when}{_dd} without a "
+                       f"sale. Expect the owner to have a number near that in mind - about "
+                       f"{round((_ll['price'] - fmv) / fmv * 100)}% more than the comparable sales support - so be ready "
+                       "to show the sales behind your offer.")
     elif b.get("backup") and lp:
         _d = b.get("under_contract_days")
         _gap = (lp - fmv) / fmv * 100 if fmv else 0
         opener = (
             f"The seller has already accepted an offer" + (f" after {_d} days on the market" if _d is not None else "")
-            + ", so a backup offer only comes into play if that contract falls through - and a quick contract usually "
-            f"means a price near the ${lp:,} asking price. A backup offer of roughly ${ol:,} to ${oh:,} reflects the "
-            f"${fmv:,} fair market value"
+            + ", so a backup offer only comes into play if that contract falls through"
+            # "quick contract" only when it was one (deep dive 11/13: said after 150 days on the market)
+            + (f" - and a quick contract usually means a price near the ${lp:,} asking price" if (_d is not None and _d <= 14) else "")
+            + f". A backup offer of roughly ${ol:,} to ${oh:,} reflects the ${fmv:,} fair market value"
             + (f"; one well below that is unlikely to be considered while the current contract stands. Paying the full "
                f"asking price would mean about {round(_gap)}% more than the comparable sales support - reasonable only if "
                "this home's specific features matter enough to you." if _gap >= 1 else
-               f"; the comparable sales support paying up to ${fmv:,}, above the asking price, if it comes back on the market.")
+               # "above the asking price" only when the value IS above it ($497,000 "above" a $500,000 asking price)
+               (f"; the comparable sales support paying up to ${fmv:,}, above the asking price, if it comes back on the market."
+                if fmv > lp else
+                f"; the comparable sales support paying up to ${fmv:,}, about the asking price, if it comes back on the market."))
         )
     elif b.get("underpriced") and b.get("hot_market"):
         rel_open = b.get("opening_pct_phrase") or _v10_pct_range_phrase(ol, oh, lp)
@@ -15165,8 +16039,10 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
             f"This home looks underpriced: the ${fmv:,} fair market value sits above the ${lp:,} list "
             f"price. A reasonable opening offer is roughly ${ol:,} to ${oh:,} ({rel_open} the list price), "
             f"a {position} opening with room to move toward ${tgt:,} if the property draws competition. "
-            f"Opening near the asking price keeps your negotiating room; if other buyers compete, the comparable "
-            f"sales support going up to the ${fmv:,} fair market value - treat that as your walk-away "
+            + ("Opening near the asking price keeps your negotiating room; if other buyers compete, the comparable "
+               if position in ("near-list", "modestly below-list", "meaningfully below-list") else
+               "If other buyers compete, the comparable ")
+            + f"sales support going up to the ${fmv:,} fair market value - treat that as your walk-away "
             f"price unless new property-specific information supports more." + (
                 f" It has been on the market longer than the nearby sales that went over asking, so a "
                 f"bidding war is unlikely." if b.get("outpaced_by_comps") else "")
@@ -15204,6 +16080,14 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
             f"to ${oh:,} ({rel_open} the ${_ref:,} {_ref_name}), leaving room to settle "
             f"toward ${tgt:,}. " + _why_under + _walk
         )
+    # Wording matches confidence (grader audit 11/13, finding 28): a report that calls its own confidence
+    # moderate or low and shows a wide range can't also hand the buyer a hard "walk-away price" point.
+    _vlo, _vhi = b.get("valuation_range_low"), b.get("valuation_range_high")
+    if str(b.get("confidence") or "").lower() in ("low", "medium") and _vlo and _vhi and not b.get("auction"):
+        _soft = (f"The value is an estimate, not a precise figure - the comparable sales support roughly ${_vlo:,} to ${_vhi:,} - "
+                 f"so use about ${fmv:,} as a sensible limit rather than a hard line")
+        opener = re.sub(r"Treat the \$[\d,]+ fair market value as your walk-away price", _soft, opener)
+        opener = opener.replace("treat that as your walk-away price", "treat that as a sensible limit, not a hard line")
     kept: list = []
     source_offer = _strip_under_contract_offer_frame(offer_text or "")
     for sm in re.finditer(r"(?:[^.!?]|\.(?=\d))*[.!?]", source_offer):   # 417 Dogwood Ln: "(median 1." cut at the decimal
@@ -15268,9 +16152,19 @@ def _v10_rebuild_buyer_offer_prose(offer_text: str, band: dict, range_pct: float
             # v12: "Given the short market exposure so far, there's no strong signal yet of pricing pressure"
             r"|\b(?:short|limited|brief|little)\s+(?:market\s+)?(?:exposure|time on (?:the )?market|listing period)"
             r"|\bno (?:strong |clear |real )?signal (?:yet )?of\b", low))
+        # The opener (and, under contract, the note above it) already says the home isn't for sale / the seller
+        # has accepted an offer; the AI's own sentence saying it again read as a stutter (735 Concord Ave: "This
+        # home isn't for sale, so there is no asking price to negotiate from" twice; 524 Wales Rd: "The seller is
+        # not actively negotiating new offers" twice - test round 11/13).
+        _repeats_frame = bool(
+            (b.get("off_market") and re.search(
+                r"\b(?:isn'?t|is not|not)\s+(?:currently\s+)?(?:for sale|on the market|listed)\b|\bno asking price\b"
+                r"|\b(?:wasn'?t|was not|isn'?t|is not|not)\s+planning to sell\b", low))
+            or (b.get("backup") and re.search(
+                r"\bnot actively negotiating\b|\balready accepted an offer\b", low)))
         if (_has_open_num or _has_indicated_num or _repeats_opening_advice
                 or _mentions_internal_anchor or _has_strategy_number or _contradicts_hot
-                or _contradicts_below_ask or _contradicts_passed_over or _contradicts_ceiling):
+                or _contradicts_below_ask or _contradicts_passed_over or _contradicts_ceiling or _repeats_frame):
             continue  # its numbers are re-stated by the deterministic opener
         # This rebuild runs again on its own output during repair rounds - a sentence the opener
         # already says (or one kept twice) must not pile up (10/20: "It has been on the market
@@ -15469,6 +16363,10 @@ def _v10_offer_sanity_check(offer_text: str, band: Optional[dict], range_min: Op
                 stated = {int(pct_match.group(1))}
                 if pct_match.group(2):
                     stated.add(int(pct_match.group(2)))
+                # "at or up to about 1% above the list price" is a 0%-1% band - the engine's own phrase was being
+                # rejected and the agent got a false "Review before sending" (deep dive 11/13)
+                if re.search(r"\bat\s+(?:or\s+up\s+)?to\s*$", pct_window[:pct_match.start()], re.IGNORECASE):
+                    stated.add(0)
                 actual = {
                     round(abs((lo - lp) / lp * 100)),
                     round(abs((hi - lp) / lp * 100)),
@@ -15764,7 +16662,8 @@ async def _finalize_gate_reconciled_prose(
     flags += _adf
     # The home's own record: relisted / recently sold (4913 Chancellor St, grader 10/24)
     _hist = (enriched_subject or {}).get("_listing_history") or {}
-    _hm = _fact_check.history_sentence(methodology, _hist, today=_tmach.today())
+    _hm = _fact_check.history_sentence(methodology, _hist, today=_tmach.today(),
+                                       listed=not (status_timeline or {}).get("not_listed"))
     if _hm != methodology:
         methodology = _hm
         # the quoted last-sale price is a record figure - the stray-$ sweep must know it
@@ -16799,6 +17698,7 @@ async def _build_content(subject: dict, comps: list[dict], max_photos: int, warn
         comp_for_ai = _with_age(_prep_comp_for_ai(comp))
         comp_for_ai["authoritative_property_features"] = _authoritative_property_features(comp)
         comp_for_ai.update(_fact_check.prompt_facts_comp(subject, comp))
+        comp_for_ai["builder_price_note"] = _BUILDER_PRICE_NOTE if _builder_base_price_sale(comp) else None
         add_text(_format_block(f"{_comp_label(i, comp)}:", comp_for_ai, _COMP_FIELDS))
 
     images_sent: dict = {}
@@ -16856,6 +17756,47 @@ async def _build_content(subject: dict, comps: list[dict], max_photos: int, warn
     return content, images_sent, projected_tokens
 
 
+def _subject_status_flags(subject: dict, status_timeline: dict, value, subject_asking) -> list[str]:
+    """The subject's own status notes for the final valuation and the agent: listed long with a value above its
+    asking price, a market window that ENDED at a contract (not weak demand), or simply its status. One helper for
+    the full run and the re-run (deep dive 11/13: only the full run added them, so after a comp change a re-run's
+    final valuation never saw "went pending - not evidence of weak demand")."""
+    status_timeline = status_timeline or {}
+    flags: list[str] = []
+    # Authoritative status + active-market DOM from the deterministic timeline (never today - list
+    # date once the listing went contingent/pending/closed). Falls back to the subject's own
+    # days_on_market field only when the timeline couldn't compute one.
+    _subject_on_market = bool(status_timeline.get("is_active", True)) and not status_timeline.get("is_under_contract") and not status_timeline.get("is_closed")
+    active_dom = status_timeline.get("active_market_days")
+    if active_dom is None and not status_timeline.get("not_listed"):
+        active_dom = _as_float((subject or {}).get("days_on_market"))
+    # B5: NO hard clamp to list price. Extended active-market exposure is real, meaningful
+    # evidence - flagged for the agent to weigh - but list price is not an absolute ceiling the
+    # value can never cross; a comp-supported estimate above a stale asking price can be correct
+    # (the seller may simply be over/under-priced relative to the market).
+    if value and active_dom is not None and active_dom > 14 and subject_asking and value > subject_asking and _subject_on_market:
+        flags.append(
+            f"Subject has been active {int(active_dom)} days without an accepted offer - the "
+            f"estimated value (${value:,.0f}) exceeds list price (${subject_asking:,.0f}); confirm "
+            "this is justified by the comp evidence, not just the AI's own read."
+        )
+    if active_dom is not None and active_dom > 14 and not _subject_on_market:
+        _stat = (status_timeline.get("current_status") or "under contract").lower()
+        flags.append(
+            f"Subject's active-market window ({int(active_dom)} days) ended when it went {_stat}"
+            + (f" on {status_timeline['under_contract_date']}" if status_timeline.get("under_contract_date") else "")
+            + " - it is not evidence of weak demand, and offer guidance must not treat it as an active listing."
+        )
+    elif status_timeline.get("current_status") and status_timeline.get("current_status") != "Unknown":
+        flags.append(
+            f"Subject listing status: {status_timeline['current_status']}"
+            + (f"; active-market days {int(active_dom)}" if active_dom is not None else "")
+            + (f" ({status_timeline['dom_source']})" if status_timeline.get("dom_source") else "")
+            + "."
+        )
+    return flags
+
+
 async def generate_ai_analysis(
     db: AsyncSession, owner_id: str, report_id: str, plan_tier: str,
     max_photos_per_property: Optional[int] = None, include_map_images: bool = False,
@@ -16907,6 +17848,11 @@ async def _generate_ai_analysis_impl(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Add at least one comparable before generating an AI analysis.")
     if subject.get("latitude") is None or subject.get("longitude") is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "The subject property needs a location before generating an AI analysis.")
+    # Old MLS data = wrong prices and statuses in the report (grader audit 11/13). Checked before anything
+    # is spent; an accuracy-test run values a past date on purpose.
+    _freshness = None if _tmach.current() else await mls_freshness.check(db)
+    if _freshness and _freshness["level"] == "blocked":
+        raise HTTPException(status.HTTP_409_CONFLICT, mls_freshness.blocked_message(_freshness))
     # A CMA values a sale (grader, 10/21: a $1,995/month rental got a "$1,850 fair market value",
     # a "$0" opening offer and an appraisal contingency). Checked before anything is spent.
     if cma_service.is_lease_listing(subject):
@@ -16930,10 +17876,10 @@ async def _generate_ai_analysis_impl(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "AI analysis is not configured yet. Add ANTHROPIC_API_KEY to backend/.env and restart the backend.",
         )
-    if not os.getenv("OPENAI_API_KEY"):
+    if _reasoning_key_missing():
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Final valuation reasoning is not configured yet. Add OPENAI_API_KEY to backend/.env and restart the backend.",
+            "Final valuation reasoning is not configured yet - the AI provider key for it is missing on the server.",
         )
 
     # From here on this is the real (long, paid) run - mark it so a client that navigates away
@@ -17019,7 +17965,12 @@ async def _generate_ai_analysis_impl(
     _comp_cache_key = "cma_comp_cache:" + hashlib.sha256(json.dumps(
         {"c": _cache_stable(content), "s": _SYSTEM_PROMPT, "m": model, "mode": report.mode, "v": PROMPT_VERSION},
         sort_keys=True, default=str).encode("utf-8")).hexdigest()[:48]
-    _cached_comp = await _reasoning_cache_get(db, _comp_cache_key)
+    # this report's own earlier comp ratings first, when its facts and photo count haven't changed
+    _comp_lock_fp = _value_lock_fingerprint(_value_lock_identity(enriched_subject, enriched_comps, with_ratings=False),
+                                            model=model, mode=report.mode, extra={"photos": images_sent})
+    _comp_locked = await _value_lock_get(db, report_id, "comp", _comp_lock_fp)
+    _cached_comp = (copy.deepcopy(_comp_locked["raw"]) if _comp_locked and isinstance(_comp_locked.get("raw"), dict)
+                    else await _reasoning_cache_get(db, _comp_cache_key))
     _subject_dom_now = _as_float(status_timeline.get("active_market_days")) if status_timeline.get("active_market_days") is not None \
         else _as_float(enriched_subject.get("days_on_market"))
     if isinstance(_cached_comp, dict) and _cached_comp.get("comps"):
@@ -17035,7 +17986,7 @@ async def _generate_ai_analysis_impl(
             response = _NS(stop_reason="cache", usage=_NS(input_tokens=0, output_tokens=0),
                            content=[_NS(type="tool_use", name="submit_cma_analysis", input=copy.deepcopy(_cached_comp))])
         else:
-            response = await client.messages.create(
+            response = await _cma_claude.create(client, 
                 model=model,
                 max_tokens=config["cma_ai_max_output_tokens"],
                 system=_SYSTEM_PROMPT,
@@ -17198,7 +18149,7 @@ async def _generate_ai_analysis_impl(
             if _qual_gap_buckets and isinstance(estimate_content, list):
                 estimate_content.append({"type": "text", "text": _v10_qual_gap_directive(_qual_gap_buckets)})
             _tmach.check_payload(estimate_content, "estimate-only retry prompt", comp_prices=_tm_comp_prices, raise_now=False)
-            estimate_response = await client.messages.create(
+            estimate_response = await _cma_claude.create(client, 
                 model=model,
                 max_tokens=_ESTIMATE_ONLY_OUTPUT_TOKENS,
                 system=_estimate_only_system_prompt(report.mode),
@@ -17283,7 +18234,7 @@ async def _generate_ai_analysis_impl(
         try:
             guidance_content = _guidance_content(enriched_subject, enriched_comps, result.get("comps") or [], subject_estimate_raw or {})
             _tmach.check_payload(guidance_content, "guidance prompt", comp_prices=_tm_comp_prices, raise_now=False)
-            g_resp = await client.messages.create(
+            g_resp = await _cma_claude.create(client, 
                 model=model,
                 max_tokens=2500,
                 system=_guidance_system_prompt(report.mode),
@@ -17318,6 +18269,11 @@ async def _generate_ai_analysis_impl(
             and _as_float(result["subject_estimate"].get("value"))
             and not any(_guide_blank(k) for k in _guide_fields)):
         await _reasoning_cache_put(db, _comp_cache_key, {**copy.deepcopy(result), "_subject_dom": _subject_dom_now})
+        await _value_lock_put(db, report_id, "comp", _comp_lock_fp, {**copy.deepcopy(result), "_subject_dom": _subject_dom_now})
+    elif (not _comp_locked and result.get("comps") and isinstance(result.get("subject_estimate"), dict)
+          and _as_float(result["subject_estimate"].get("value")) and not any(_guide_blank(k) for k in _guide_fields)):
+        # answered from the shared cache: this report now holds its own copy
+        await _value_lock_put(db, report_id, "comp", _comp_lock_fp, {**copy.deepcopy(result), "_subject_dom": _subject_dom_now})
 
     cost = ai_config_service.estimate_cost_usd(config, model, usage_input_tokens, usage_output_tokens)
     await record_usage_event(
@@ -17354,6 +18310,7 @@ async def _generate_ai_analysis_impl(
         _enr = enriched_by_key.get(comp.get("listing_key"))
         if _enr:
             comp = _merge_authoritative_property_facts(comp, _enr)
+            comp["builder_base_price"] = True if _enr.get("builder_base_price") else None   # see _builder_base_price_sale
             # OSM road/street classification (road_context_service) - computed during enrichment.
             if _enr.get("road_context") and not comp.get("road_context"):
                 comp["road_context"] = _enr["road_context"]
@@ -17427,6 +18384,7 @@ async def _generate_ai_analysis_impl(
             if _street:
                 _q["street_context"] = _street
         _comp_lbl = _comp_label(len(new_comparables), comp)
+        _amen_before = str(_q.get("amenities") or "")
         _q, _amenity_flags = _reconcile_amenities_quality(
             enriched_subject, comp, _q, _comp_lbl,
         )
@@ -17440,8 +18398,8 @@ async def _generate_ai_analysis_impl(
             _ext = {u for u in _documented_system_updates(comp) if u in ("roof", "siding", "windows")}
             if _ext:
                 _q["exterior"] = "similar"
-                qa_flags.append(f"{_comp_lbl}: exterior set to Similar - its listing documents a new "
-                                f"{', '.join(sorted(_ext))}.")
+                qa_flags.append(f"{_comp_lbl}: exterior set to Similar - its listing documents "
+                                + ", ".join(("a new roof" if u == "roof" else f"new {u}") for u in sorted(_ext)) + ".")
         # A subject that needs a total rehab can't be the better home inside (grader 11/01, 719 Beechwood Rd:
         # comps #1-3 rated "Comp Inferior" on interior next to a gut, which ADDED to the value). Unless the
         # comp's own record says it needed the same work, an Inferior finish / interior becomes Superior.
@@ -17463,14 +18421,11 @@ async def _generate_ai_analysis_impl(
         # A condo has no lot of its own - its Lot rating reads "N/A", never Inferior/Superior (grader, 10/21).
         if _type_family(enriched_subject.get("property_type")) == "condo":
             _q["lot"] = "n_a"
-            # Same building = same pool, gym, doorman: shared amenities are no unit's advantage (grader
-            # 10/23: three 191 Presidential units rated "Comp Superior" on amenities vs #R-605).
-            if _building_key(comp) and _building_key(comp) == _building_key(enriched_subject) \
-                    and str(_q.get("amenities") or "") in ("above", "below"):
-                qa_flags.append(f"{_comp_lbl}: amenities set to Similar - it shares the subject's building amenities.")
-                _q["amenities"] = "similar"
         if _q:
             comp["quality"] = _q
+        # Same building = same pool, gym, doorman: shared amenities are no unit's advantage (grader
+        # 10/23: three 191 Presidential units rated "Comp Superior" on amenities vs #R-605).
+        qa_flags.extend(_same_building_amenities(enriched_subject, comp, _amen_before, _comp_lbl))
 
         new_comparables.append(comp)
 
@@ -17645,6 +18600,19 @@ async def _generate_ai_analysis_impl(
         )
         if final_anchor is not None:
             final_anchor["subject_interior_unknown"] = not _subject_interior_documented(enriched_subject)
+        # The first re-run reuses THIS estimate (test round 11/13, 701 Sturbridge Dr): a re-run with nothing changed
+        # asked the AI for a new estimate - six cents, 98 seconds - and although the final value held, the notes
+        # behind it changed (pool +$15,000 became +$6,000, and a -$53,420 line appeared). Stored under the key the
+        # re-run looks up (see _value_lock_identity); a re-run whose facts differ misses it and asks as before.
+        if subject_estimate_raw and not _tmach.current():
+            try:
+                await _value_lock_put(
+                    db, report_id, "estimate",
+                    _value_lock_fingerprint(_value_lock_identity(enriched_subject, new_comparables, with_ratings=True),
+                                            model=model, mode=report.mode),
+                    {"subject_estimate": copy.deepcopy(subject_estimate_raw)})
+            except Exception:  # noqa: BLE001 - a saved shortcut must never fail a paid run
+                logger.warning("CMA estimate lock seed failed", extra={"report_id": report_id}, exc_info=True)
         _v10 = _apply_v10_valuation(final_anchor, exposure, subject_estimate_raw or {}, subject_asking, prov_anchor=prov_anchor)
         value = _v10["fmv"]
         valuation_trace = _v10["trace"]
@@ -17716,37 +18684,7 @@ async def _generate_ai_analysis_impl(
                 logger.warning(
                     "CMA valuation fell back to AI raw estimate", extra={"report_id": report_id, "ai_value": _ai_v},
                 )
-    # Authoritative status + active-market DOM from the deterministic timeline (never today - list
-    # date once the listing went contingent/pending/closed). Falls back to the subject's own
-    # days_on_market field only when the timeline couldn't compute one.
-    _subject_on_market = bool(status_timeline.get("is_active", True)) and not status_timeline.get("is_under_contract") and not status_timeline.get("is_closed")
-    active_dom = status_timeline.get("active_market_days")
-    if active_dom is None and not status_timeline.get("not_listed"):
-        active_dom = _as_float(subject.get("days_on_market"))
-    # B5: NO hard clamp to list price. Extended active-market exposure is real, meaningful
-    # evidence - flagged for the agent to weigh - but list price is not an absolute ceiling the
-    # value can never cross; a comp-supported estimate above a stale asking price can be correct
-    # (the seller may simply be over/under-priced relative to the market).
-    if value and active_dom is not None and active_dom > 14 and subject_asking and value > subject_asking and _subject_on_market:
-        qa_flags.append(
-            f"Subject has been active {int(active_dom)} days without an accepted offer - the "
-            f"estimated value (${value:,.0f}) exceeds list price (${subject_asking:,.0f}); confirm "
-            "this is justified by the comp evidence, not just the AI's own read."
-        )
-    if active_dom is not None and active_dom > 14 and not _subject_on_market:
-        _stat = (status_timeline.get("current_status") or "under contract").lower()
-        qa_flags.append(
-            f"Subject's active-market window ({int(active_dom)} days) ended when it went {_stat}"
-            + (f" on {status_timeline['under_contract_date']}" if status_timeline.get("under_contract_date") else "")
-            + " - it is not evidence of weak demand, and offer guidance must not treat it as an active listing."
-        )
-    elif status_timeline.get("current_status") and status_timeline.get("current_status") != "Unknown":
-        qa_flags.append(
-            f"Subject listing status: {status_timeline['current_status']}"
-            + (f"; active-market days {int(active_dom)}" if active_dom is not None else "")
-            + (f" ({status_timeline['dom_source']})" if status_timeline.get("dom_source") else "")
-            + "."
-        )
+    qa_flags.extend(_subject_status_flags(subject, status_timeline, value, subject_asking))
     if value and value > 0:
         _se_for_fields = subject_estimate_raw or {}
         # Build deterministic benchmark confidence for the reasoning evidence packet. It does not
@@ -17775,6 +18713,7 @@ async def _generate_ai_analysis_impl(
             anchor=final_anchor, exposure=exposure, v10_result=_v10,
             subject_estimate=_se_for_fields, evidence_by_key=evidence_by_key, outliers=outliers,
             data_quality_flags=qa_flags, deterministic_confidence=_deterministic_confidence,
+            mode=report.mode,
         )
         _tmach.check_payload(_reasoning_packet, "final-valuation evidence packet", comp_prices=_tm_comp_prices)
         _reasoning_output, _reasoning_blocking, _reasoning_cost, _reasoning_usage = await _run_cma_reasoning_stage(
@@ -17802,21 +18741,29 @@ async def _generate_ai_analysis_impl(
                 "expected_sale_price": _apc.get("expected_sale_price"),
                 "allowed_low_price": _apc.get("allowed_low"), "allowed_high_price": _apc.get("allowed_high"),
                 "asking_price": _apc.get("asking_price"), "ratio_used": _apc.get("ratio_used"),
+                "comp_median_sold_to_list_ratio": _apc.get("comp_median_sold_to_list_ratio"),
                 "passed_over": bool(_apc.get("passed_over")),
                 "long_unsold": bool(_apc.get("long_unsold")), "fresh_listing": bool(_apc.get("fresh_listing")),
                 "over_ask_pattern": _apc.get("over_ask_pattern"), "priced_above_sales": bool(_apc.get("priced_above_sales")),
-                "sales_loose_fit": bool(_apc.get("sales_loose_fit")),
+                "sales_loose_fit": bool(_apc.get("sales_loose_fit")), "buyer_report": bool(_apc.get("buyer_report")),
             }
         valuation_trace["authoritative_evidence_snapshot"] = _evidence_snapshot.audit_metadata()
+        # the unsold last listing's price is a real figure the report quotes (735 Concord Ave, 11/14: "$499,500 has
+        # no matching authoritative structured value" - and the sentence was cut from the client's copy)
+        if (status_timeline or {}).get("last_listing"):
+            valuation_trace["subject_last_listing"] = dict(status_timeline["last_listing"])
         # Current competition (grader, 10/21): similar actives + pendings for the report section; a
         # strong pending may nudge the value review (capped), and a big gap is flagged for the agent.
         _competition = await _load_current_competition(db, report, enriched_subject)
         value, final_range_low, final_range_high, _competition_review = _pending_competition_review(
-            enriched_subject, _competition, value, final_range_low, final_range_high, valuation_trace)
+            enriched_subject, _competition, value, final_range_low, final_range_high, valuation_trace,
+            buyer_report=(report.mode == "buyer"),
+            subject_under_contract=bool((status_timeline or {}).get("is_under_contract")))
         valuation_trace["pending_competition"] = _competition_review
         # every dollar from the adjusted sales to the final value, and what that implies for range/confidence (10/24)
         final_range_low, final_range_high, range_pct, confidence = _apply_value_bridge(
             valuation_trace, value, final_range_low, final_range_high, confidence, qa_flags)
+        _sync_trace_final(valuation_trace, value, final_range_low, final_range_high, range_pct)
         qa_blocking.extend(_reasoning_blocking)
         _formula_only_blocks = [b for b in qa_blocking if " RECONCILIATION -" in str(b)]
         if _formula_only_blocks:
@@ -18088,6 +19035,7 @@ async def _generate_ai_analysis_impl(
             _qa_result = _rep["qa_result"]
             qa_flags = list(dict.fromkeys([*qa_flags, *_rep["qa_flags"]]))
             qa_blocking = list(_rep["qa_blocking"])   # only findings the repair + re-check could not clear
+            _persist_comp_note_fixes(report, new_comparables)
         except Exception:  # noqa: BLE001 - the repair must never be the thing that fails a report
             logger.exception("CMA final auto-repair failed for report %s - findings left unchanged", report_id)
             _qa_result, qa_flags = _review_instead_of_block(_qa_result, qa_blocking, qa_flags)
@@ -18142,6 +19090,8 @@ async def _generate_ai_analysis_impl(
             "agent_review": _asking_band_review_note(valuation_trace, value),
             # Agent-only: recent same-community sales left out of the report (grader, 10/25)
             "missed_sales": await _missed_same_community_sales(db, enriched_subject, report.comparables or []),
+            # Agent-only when stale: how current the MLS data behind this report is (grader audit 11/13)
+            "data_freshness": _freshness,
             # Similar homes for sale / under contract now (list prices) + which pendings moved the value.
             "current_competition": {"homes": _competition or [], **(_competition_review or {})},
             # Agent-only: buyer CMA on the agent's own listing (10/24)
@@ -18204,8 +19154,10 @@ async def _generate_ai_analysis_impl(
                 if offer_strategy_considerations:
                     new_pricing["offer_suggestion_notes"] = offer_strategy_considerations
         else:
+            # the value the report states everywhere else (418 Reedville Rd, test round 11/13: "Most likely value
+            # $675,000" above text and a steps table that both said $673,000). The LIST price stays a round figure.
             if _is_blank(new_pricing.get("most_likely_value")):
-                new_pricing["most_likely_value"] = _round_to_5k(value)
+                new_pricing["most_likely_value"] = round(value)
             if _is_blank(new_pricing.get("recommended_min")):
                 new_pricing["recommended_min"] = _round_to_5k(final_range_low)
             if _is_blank(new_pricing.get("recommended_max")):
@@ -18306,10 +19258,20 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
     comps = [c for c in (report.comparables or []) if c.get("is_included", True)]
     if not comps:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Add at least one comparable before recomputing.")
-    if not os.getenv("OPENAI_API_KEY"):
+    # The same stop as the full run (deep dive 11/13: after an agent switched comps off, a re-run went ahead on one)
+    if len([c for c in comps if _usable_sale_comp(report.subject or {}, c)]) < 2:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "Insufficient comparable sales - this needs at least 2 sold homes of the same type with a "
+                            "verified sale price. Switch a comp back on, widen the search or add comps by hand.")
+    # Old MLS data = wrong prices and statuses in the report (grader audit 11/13). Checked before anything
+    # is spent; an accuracy-test run values a past date on purpose.
+    _freshness = None if _tmach.current() else await mls_freshness.check(db)
+    if _freshness and _freshness["level"] == "blocked":
+        raise HTTPException(status.HTTP_409_CONFLICT, mls_freshness.blocked_message(_freshness))
+    if _reasoning_key_missing():
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Final valuation reasoning is not configured yet. Add OPENAI_API_KEY to backend/.env and restart the backend.",
+            "Final valuation reasoning is not configured yet - the AI provider key for it is missing on the server.",
         )
 
     await cma_service.mark_generation_started(db, owner_id, report_id)
@@ -18338,6 +19300,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             _enr = enriched_by_key.get(comp.get("listing_key"))
             if _enr:
                 comp = _merge_authoritative_property_facts(comp, _enr)
+                comp["builder_base_price"] = True if _enr.get("builder_base_price") else None   # see _builder_base_price_sale
                 if _enr.get("price_verified") and _enr.get("sale_price") and not (comp.get("price_verified") and comp.get("sale_price")):
                     for _pk in ("sale_price", "close_price", "close_date", "sale_date", "price_per_sqft"):
                         if _enr.get(_pk) is not None:
@@ -18346,11 +19309,14 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             if comp.get("strength"):
                 comp["strength"] = _normalize_strength(comp["strength"])
             label = _comp_label(len(new_comparables), comp)
+            _amen_before = str((comp.get("quality") or {}).get("amenities") or "")
             comp["quality"], _af = _reconcile_amenities_quality(
                 enriched_subject, comp, comp.get("quality"), label,
             )
             if _af:
                 comp["_amenities_fact_reconciled"] = True
+            # Same rule as the full run: a unit in the subject's own building shares its amenities (11/13).
+            _af = list(_af) + _same_building_amenities(enriched_subject, comp, _amen_before, label)
             _recompute_fact_flags.extend(_af)
             for field in ("ai_commentary", "commentary"):
                 if isinstance(comp.get(field), str) and comp[field]:
@@ -18436,21 +19402,33 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             enriched_subject, new_comparables, 0, estimate_warnings, False, report.mode,
             anchor=v10_anchor, exposure=v10_exposure,
         )
-        response = await client.messages.create(
-            model=model,
-            max_tokens=_ESTIMATE_ONLY_OUTPUT_TOKENS,
-            system=_estimate_only_system_prompt(report.mode),
-            tools=[_tool_for_mode(_ESTIMATE_ONLY_TOOL, report.mode)],
-            tool_choice={"type": "tool", "name": "submit_cma_estimate"},
-            messages=[{"role": "user", "content": estimate_content}],
-        )
-        usage_input_tokens += response.usage.input_tokens
-        usage_output_tokens += response.usage.output_tokens
-        block = next((b for b in response.content if getattr(b, "type", None) == "tool_use" and b.name == "submit_cma_estimate"), None)
-        result = block.input if block and isinstance(block.input, dict) else {}
+        # A re-run with nothing changed reuses this report's last estimate (see _value_lock_identity):
+        # asking again gave a different estimate every time, and the final value moved with it.
+        _est_fp = _value_lock_fingerprint(_value_lock_identity(enriched_subject, new_comparables, with_ratings=True),
+                                          model=model, mode=report.mode)
+        _est_locked = await _value_lock_get(db, report_id, "estimate", _est_fp)
+        if _est_locked and isinstance(_est_locked.get("raw"), dict) and isinstance(_est_locked["raw"].get("subject_estimate"), dict):
+            result = copy.deepcopy(_est_locked["raw"])
+            qa_flags.append("Estimate reused from this report's earlier run (same facts) - no new charge.")
+        else:
+            _est_locked = None
+            response = await _cma_claude.create(client, 
+                model=model,
+                max_tokens=_ESTIMATE_ONLY_OUTPUT_TOKENS,
+                system=_estimate_only_system_prompt(report.mode),
+                tools=[_tool_for_mode(_ESTIMATE_ONLY_TOOL, report.mode)],
+                tool_choice={"type": "tool", "name": "submit_cma_estimate"},
+                messages=[{"role": "user", "content": estimate_content}],
+            )
+            usage_input_tokens += response.usage.input_tokens
+            usage_output_tokens += response.usage.output_tokens
+            block = next((b for b in response.content if getattr(b, "type", None) == "tool_use" and b.name == "submit_cma_estimate"), None)
+            result = block.input if block and isinstance(block.input, dict) else {}
         subject_estimate_raw = result.get("subject_estimate") if isinstance(result.get("subject_estimate"), dict) else None
         if not subject_estimate_raw:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The AI didn't return a usable value estimate - try again.")
+        if _est_locked is None:
+            await _value_lock_put(db, report_id, "estimate", _est_fp, copy.deepcopy(result))
 
         subject_asking = (
             _as_float(status_timeline.get("current_list_price"))
@@ -18510,11 +19488,12 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
         await reconcile_budget(db, reservation, cost)
         _analysis_budget_closed = True
 
+        qa_flags.extend(_subject_status_flags(enriched_subject, status_timeline, value, subject_asking))
         _reasoning_packet = _build_reasoning_evidence_packet(
             subject=enriched_subject, comps=new_comparables, status_timeline=status_timeline,
             anchor=v10_anchor, exposure=v10_exposure, v10_result=_v10,
             subject_estimate=subject_estimate_raw, evidence_by_key=evidence_by_key, outliers=outliers,
-            data_quality_flags=qa_flags, deterministic_confidence=confidence,
+            data_quality_flags=qa_flags, deterministic_confidence=confidence, mode=report.mode,
         )
         _reasoning_output, _reasoning_blocking, _reasoning_cost, _reasoning_usage = await _run_cma_reasoning_stage(
             db, owner_id, plan_tier, config, _reasoning_packet, report_id,
@@ -18540,21 +19519,29 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
                 "expected_sale_price": _apc.get("expected_sale_price"),
                 "allowed_low_price": _apc.get("allowed_low"), "allowed_high_price": _apc.get("allowed_high"),
                 "asking_price": _apc.get("asking_price"), "ratio_used": _apc.get("ratio_used"),
+                "comp_median_sold_to_list_ratio": _apc.get("comp_median_sold_to_list_ratio"),
                 "passed_over": bool(_apc.get("passed_over")),
                 "long_unsold": bool(_apc.get("long_unsold")), "fresh_listing": bool(_apc.get("fresh_listing")),
                 "over_ask_pattern": _apc.get("over_ask_pattern"), "priced_above_sales": bool(_apc.get("priced_above_sales")),
-                "sales_loose_fit": bool(_apc.get("sales_loose_fit")),
+                "sales_loose_fit": bool(_apc.get("sales_loose_fit")), "buyer_report": bool(_apc.get("buyer_report")),
             }
         valuation_trace["authoritative_evidence_snapshot"] = _evidence_snapshot.audit_metadata()
+        # the unsold last listing's price is a real figure the report quotes (735 Concord Ave, 11/14: "$499,500 has
+        # no matching authoritative structured value" - and the sentence was cut from the client's copy)
+        if (status_timeline or {}).get("last_listing"):
+            valuation_trace["subject_last_listing"] = dict(status_timeline["last_listing"])
         # Current competition (grader, 10/21): similar actives + pendings for the report section; a
         # strong pending may nudge the value review (capped), and a big gap is flagged for the agent.
         _competition = await _load_current_competition(db, report, enriched_subject)
         value, final_range_low, final_range_high, _competition_review = _pending_competition_review(
-            enriched_subject, _competition, value, final_range_low, final_range_high, valuation_trace)
+            enriched_subject, _competition, value, final_range_low, final_range_high, valuation_trace,
+            buyer_report=(report.mode == "buyer"),
+            subject_under_contract=bool((status_timeline or {}).get("is_under_contract")))
         valuation_trace["pending_competition"] = _competition_review
         # every dollar from the adjusted sales to the final value, and what that implies for range/confidence (10/24)
         final_range_low, final_range_high, range_pct, confidence = _apply_value_bridge(
             valuation_trace, value, final_range_low, final_range_high, confidence, qa_flags)
+        _sync_trace_final(valuation_trace, value, final_range_low, final_range_high, range_pct)
         qa_blocking.extend(_reasoning_blocking)
         _formula_only_blocks = [b for b in qa_blocking if " RECONCILIATION -" in str(b)]
         if _formula_only_blocks:
@@ -18748,6 +19735,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             _qa_result = _rep["qa_result"]
             qa_flags = list(dict.fromkeys([*qa_flags, *_rep["qa_flags"]]))
             qa_blocking = list(_rep["qa_blocking"])   # only findings the repair + re-check could not clear
+            _persist_comp_note_fixes(report, new_comparables)
         except Exception:  # noqa: BLE001
             logger.exception("CMA recompute auto-repair failed for report %s - findings left unchanged", report_id)
             _qa_result, qa_flags = _review_instead_of_block(_qa_result, qa_blocking, qa_flags)
@@ -18784,7 +19772,11 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             # Agent-only: the asking-price band moved the value well away from what the comps say (grader, 10/21).
             "agent_review": _asking_band_review_note(valuation_trace, value),
             # Agent-only: recent same-community sales left out of the report (grader, 10/25)
+            # same as the full run (deep dive 11/13: it vanished from the agent's property pop-up after a re-run)
+            "subject_road_context": enriched_subject.get("road_context") or None,
             "missed_sales": await _missed_same_community_sales(db, enriched_subject, report.comparables or []),
+            # Agent-only when stale: how current the MLS data behind this report is (grader audit 11/13)
+            "data_freshness": _freshness,
             # Similar homes for sale / under contract now (list prices) + which pendings moved the value.
             "current_competition": {"homes": _competition or [], **(_competition_review or {})},
             # Agent-only: buyer CMA on the agent's own listing (10/24)
@@ -18870,7 +19862,12 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             _old_value = _as_float(_previous_ai_estimate.get("value"))
             _old_low = _as_float(_previous_ai_estimate.get("range_min"))
             _old_high = _as_float(_previous_ai_estimate.get("range_max"))
-            _replace_ai_owned("most_likely_value", _round_to_5k(value), _round_to_5k(_old_value) if _old_value else None)
+            # (a report saved before 11/13 holds the old value rounded to $5,000 - still the AI's own figure)
+            _prev_mlv = None
+            if _old_value:
+                _prev_mlv = (_round_to_5k(_old_value) if new_pricing.get("most_likely_value") == _round_to_5k(_old_value)
+                             else round(_old_value))
+            _replace_ai_owned("most_likely_value", round(value), _prev_mlv)
             _replace_ai_owned("recommended_min", _round_to_5k(final_range_low), _round_to_5k(_old_low) if _old_low else None)
             _replace_ai_owned("recommended_max", _round_to_5k(final_range_high), _round_to_5k(_old_high) if _old_high else None)
             _replace_ai_owned("recommended_list_price", _round_to_5k(value), _round_to_5k(_old_value) if _old_value else None)

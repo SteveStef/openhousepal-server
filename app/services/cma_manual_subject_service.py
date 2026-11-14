@@ -258,6 +258,19 @@ def map_pins_belong(pins: list[tuple[str, float, float]], subject: dict, compara
     return all(any(abs(lat - a) < 1e-5 and abs(lng - b) < 1e-5 for a, b in spots) for _, lat, lng in pins)
 
 
+def google_map_size(size: str) -> str:
+    """Google's static map is at most 640 px on a side and shrinks each side on its own: a 900x420 request
+    came back 640x420, so the report's wide frame cropped the top and bottom of the picture and the
+    northernmost and southernmost pins with them (grader audit 11/13, finding 27: 701 Sturbridge Dr's map
+    had no subject marker and no comp 5). The same shape, inside Google's limit; scale=2 keeps it sharp."""
+    w, _, h = size.partition("x")
+    w, h = int(w), int(h)
+    if max(w, h) > 640:
+        f = 640 / max(w, h)
+        w, h = round(w * f), round(h * f)
+    return f"{w}x{h}"
+
+
 async def cma_map_png(db: AsyncSession, size: str, pins: list[tuple[str, float, float]],
                       zoom: Optional[int] = None) -> Optional[bytes]:
     """PNG of the pins (S = subject, dark; numbers = comps, gold), cached forever by pin set.
@@ -273,11 +286,11 @@ async def cma_map_png(db: AsyncSession, size: str, pins: list[tuple[str, float, 
     if zoom is not None and len(pins) != 1:
         return None
     sig = size + "|" + "|".join(f"{l}:{lat:.6f},{lng:.6f}" for l, lat, lng in pins) + (f"|z{zoom}" if zoom else "")
-    cache_key = "cmamap:v1:" + hashlib.sha1(sig.encode()).hexdigest()
+    cache_key = "cmamap:v2:" + hashlib.sha1(sig.encode()).hexdigest()   # v2: maps drawn at the frame's own shape
     row = (await db.execute(select(ExploreNearbyCache).where(ExploreNearbyCache.cache_key == cache_key))).scalar_one_or_none()
     if row and (row.payload or {}).get("png"):
         return base64.b64decode(row.payload["png"])
-    params = [("size", size), ("scale", "2"), ("maptype", "roadmap"), ("key", key)]
+    params = [("size", google_map_size(size)), ("scale", "2"), ("maptype", "roadmap"), ("key", key)]
     if zoom is not None:
         l, lat, lng = pins[0]
         params += [("center", f"{lat},{lng}"), ("zoom", str(zoom)),

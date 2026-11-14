@@ -112,3 +112,21 @@ def test_hold_released_when_run_fails(stubs, monkeypatch):
         assert stubs.finished == [("A", "failed")]
         assert rl._cma_holds.holds == {}
     asyncio.run(go())
+
+
+def test_finished_report_is_refused_before_anything_is_marked(stubs, monkeypatch):
+    """524 Wales Rd (test round 11/14): a second request on a finished report was marked "generating", failed on
+    the already-has-an-analysis rule a moment later, and left a finished, shared report showing "failed"."""
+    async def finished_report(db, owner_id, report_id):
+        return SimpleNamespace(id=report_id, mode="buyer", ai_analysis={"model": "x"},
+                               pricing={"ai_estimate": {"value": 458000}})
+    monkeypatch.setattr(cma_routes.service, "get_report", finished_report)
+
+    async def go():
+        try:
+            await _start("A")
+        except HTTPException as e:
+            return e
+    err = asyncio.run(go())
+    assert err is not None and err.status_code == 400 and "already has an AI analysis" in err.detail
+    assert stubs.started == [] and stubs.finished == [] and stubs.ran == []

@@ -361,6 +361,15 @@ async def _load_local_proximity_context(db: AsyncSession, subject: dict) -> dict
         ))
     if subject.get("listing_key"):
         query = query.where(Property.listing_key != subject["listing_key"])
+    # Same kind of home, and no leases, BEFORE the 1,000-row limit (deep dive 11/13): for a detached house in a
+    # rowhome area the nearest 1,000 rows of every type and status ran out within a few blocks, too few usable ones
+    # were left, and the density fell back to the 2.5-mile "suburban" default - turning city scoring off.
+    from app.services.cma_ai_service import _type_family
+    from app.services.cma_service import _FAMILY_HOME_TYPES
+    query = query.where(~func.coalesce(mls_mirror.col(Property.mls_property_type, "PropertyType"), "").ilike("%lease%"))
+    _family = _type_family(subject.get("property_type") or subject.get("home_type"))
+    if _family in _FAMILY_HOME_TYPES:
+        query = query.where(Property.home_type.in_(_FAMILY_HOME_TYPES[_family]))
 
     surface = await _load_price_surface(db, subject, lat, lng, subject_sqft) if PRICE_SURFACE_ENABLED else []
     rows = (await db.execute(

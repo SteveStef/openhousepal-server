@@ -630,6 +630,22 @@ def _clean_status(home_status: Optional[str]) -> str:
     return (home_status or "").upper().replace("-BRIGHT", "")
 
 
+def _sold_then_removed(home_status: Optional[str], raw: Optional[dict]) -> bool:
+    """A real sale whose status column no longer says so. When Bright later drops a CLOSED listing, the sync marks
+    the row OFF_MARKET-BRIGHT (property_sync_service.mark_off_market) - but the MLS record itself still says
+    CLOSED and still carries the closing price and date. 142 sales since Nov 2024 are in that state on the local
+    copy and had vanished from every comp search (deep dive 11/13). Read as sold; nothing is written."""
+    if _clean_status(home_status) != "OFF_MARKET":
+        return False
+    raw = raw or {}
+    if not str(raw.get("MlsStatus") or raw.get("StandardStatus") or "").upper().startswith("CLOSED") or not raw.get("CloseDate"):
+        return False
+    try:
+        return float(raw.get("ClosePrice") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _categorize_status(home_status: Optional[str]) -> Optional[str]:
     s = _clean_status(home_status)
     if s.startswith("CLOSED") or s.startswith("SOLD"):
@@ -800,6 +816,20 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
                                 Property.home_type.in_(_FAMILY_HOME_TYPES[_family])))
     if req.listing_key:
         query = query.where(Property.listing_key != req.listing_key)
+    # Manufactured / mobile homes and deeded parking spaces are filed as single-family houses in our copy (788
+    # closed sales since 2025). A double-wide is not a comp for a house, and a parking space is not a home (deep
+    # dive 11/13). They stay in only when the subject itself is a manufactured home.
+    _design = func.coalesce(Property.raw_mls_data["StructureDesignType"].astext, "")
+    _subject_design = ""
+    if req.listing_key:
+        _subject_design = str((await db.execute(
+            select(Property.raw_mls_data["StructureDesignType"].astext).where(Property.listing_key == req.listing_key)
+        )).scalar_one_or_none() or "").lower()
+    query = query.where(~_design.ilike("%parking%"), ~_design.ilike("%garage%"))
+    if "manufactured" in _subject_design or "mobile" in _subject_design:
+        query = query.where(or_(_design.ilike("%manufactured%"), _design.ilike("%mobile%")))
+    else:
+        query = query.where(~_design.ilike("%manufactured%"), ~_design.ilike("%mobile%"))
     # The subject's OWN earlier sales are separate MLS listings (different listing_key) of the same
     # house - they used to come back as a "98% match" comp and anchor the value to itself. Same
     # street address + ZIP, or the same tax parcel, is never a comparable.
@@ -817,10 +847,15 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
             query = query.where(or_(Property.listing_tax_id.is_(None), Property.listing_tax_id != tax_id))
     if req.exclude_listing_keys:
         query = query.where(Property.listing_key.notin_(req.exclude_listing_keys))
+    # A sold home is judged by what it SOLD for, the same basis the "outside the price range" list uses (deep
+    # dive 11/13: listed $700K / sold $650K failed a $325-675K band on its list price, yet wasn't "outside" by its
+    # sale price either - it appeared in neither list). List price when there is no closing price.
+    from sqlalchemy import Numeric, cast
+    _band_price = func.coalesce(cast(func.nullif(Property.raw_mls_data["ClosePrice"].astext, ""), Numeric), Property.price)
     if req.min_price is not None:
-        query = query.where(Property.price >= req.min_price)
+        query = query.where(_band_price >= req.min_price)
     if req.max_price is not None:
-        query = query.where(Property.price <= req.max_price)
+        query = query.where(_band_price <= req.max_price)
     if req.min_sqft is not None:
         query = query.where(Property.living_area >= req.min_sqft)
     if req.max_sqft is not None:
@@ -859,7 +894,11 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
     # still makes the exact call). Otherwise the 400 nearest rows are mostly old sales / actives /
     # other statuses and a wider radius never reaches the in-window sales it was widened for.
     status_u = func.upper(func.coalesce(Property.home_status, ""))
-    is_closed = or_(status_u.like("CLOSED%"), status_u.like("SOLD%"))
+    is_closed = or_(status_u.like("CLOSED%"), status_u.like("SOLD%"),
+                    # sold, then dropped by Bright (see _sold_then_removed) - the Python loop makes the exact call
+                    and_(status_u == "OFF_MARKET-BRIGHT",
+                         func.upper(func.coalesce(Property.raw_mls_data["MlsStatus"].astext, "")).like("CLOSED%"),
+                         func.coalesce(Property.raw_mls_data["ClosePrice"].astext, "") != ""))
     status_terms = []
     if "sold" in req.statuses:
         status_terms.append(is_closed)
@@ -889,7 +928,7 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
         # haversine) and guards a row whose coords went NULL between query and read.
         if not is_within_distance(req.latitude, req.longitude, p.latitude, p.longitude, req.radius_miles):
             continue
-        category = _categorize_status(p.home_status)
+        category = "sold" if _sold_then_removed(p.home_status, p.raw_mls_data) else _categorize_status(p.home_status)
         if category not in req.statuses:
             continue
 
@@ -1169,8 +1208,26 @@ def era_first(ranked: list, subject_year) -> list:
     return same + [c for c in ranked if c not in same]
 
 
+# Acreage (test round 11/14, 418 Reedville Rd - 7.5 acres): the search stopped at 2 miles because five one-acre
+# homes there counted as "enough", so it never reached the other acreage sales a few miles on. For a subject on
+# this much land, a sale only counts toward "enough" when its land is in the same league (not a third / three
+# times, an acre or more apart - the rule the under-contract step uses). TESTED 11/14 on 60 past acreage sales and
+# REJECTED: it was less accurate (seller median miss 13.8% -> 15.7%, 9 closer / 12 further) - a farther or older
+# acreage sale is not a better comp than a near, recent one adjusted for land. Left as a backtest knob; 0 = off.
+AUTO_ACREAGE_USABLE = os.environ.get("CMA_AUTO_ACREAGE_USABLE", "0") == "1"
+_ACREAGE_SUBJECT_MIN_SQFT = 3 * 43560
+_ACREAGE_RATIO, _ACREAGE_MIN_GAP_SQFT = 3.0, 43560
+
+
+def _land_in_league(subject_lot: Optional[float], comp_lot: Optional[float]) -> bool:
+    if not (AUTO_ACREAGE_USABLE and subject_lot and subject_lot >= _ACREAGE_SUBJECT_MIN_SQFT and comp_lot):
+        return True
+    return not (max(subject_lot, comp_lot) / min(subject_lot, comp_lot) >= _ACREAGE_RATIO
+                and abs(subject_lot - comp_lot) >= _ACREAGE_MIN_GAP_SQFT)
+
+
 def plan_auto_search(candidates: List[CmaCompCandidate], family: Optional[str], *, today: date,
-                     subject_year: Optional[float] = None) -> dict:
+                     subject_year: Optional[float] = None, subject_lot: Optional[float] = None) -> dict:
     """Walk the widening steps over one scored candidate pool (fetched at the widest window). Pure, so
     the backtest and the golden tests run exactly what agents get. Returns the chosen radius / sold
     window, whether comps are limited, and the steps taken."""
@@ -1196,7 +1253,8 @@ def plan_auto_search(candidates: List[CmaCompCandidate], family: Optional[str], 
     def usable(radius: float, days: int) -> int:
         return sum(1 for c in candidates
                    if (c.distance_miles or 0) <= radius and (_sale_age_days(c, today) if _sale_age_days(c, today) is not None else 9999) <= days
-                   and _auto_pickable(c) and (c.match_score or 0) >= AUTO_USABLE_MIN_SCORE and era_ok(c))
+                   and _auto_pickable(c) and (c.match_score or 0) >= AUTO_USABLE_MIN_SCORE and era_ok(c)
+                   and _land_in_league(subject_lot, c.lot_size))
 
     steps, chosen = [], None
     for ri, radius in enumerate(ladder):
@@ -1346,6 +1404,12 @@ async def auto_search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *
     # the comp step take 3-4 s on the live data (10/21).
     widest = {"condo": AUTO_RADII["urban"][-1], "attached": AUTO_RADII["attached"][-1]}.get(family, AUTO_RADII["detached"][-1])
     lp = (req.subject.list_price if req.subject else None) or None
+    # A price band only when the subject is FOR SALE now (deep dive 11/13). An off-market or long-ago-sold home's
+    # old list price was still setting a +/-35% band, so today's real comps were left out of the picks and the
+    # side list said "X% more than this home's asking price" about a home with no asking price.
+    _status = str(getattr(req.subject, "mls_status", None) or "").strip().lower() if req.subject else ""
+    if lp and _status and not any(w in _status for w in ("active", "coming", "pending", "contract")):
+        lp = None
     date_to = _parse_date(req.sale_date_to) or today
     # An auction's list price is an opening bid - auction homes sell for a median 1.45x it (see
     # cma_ai_service._auction_listing). A +/-35% band around it only found cheaper homes 3 miles off
@@ -1360,11 +1424,13 @@ async def auto_search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *
         "min_price": round(lp * (1 - _AUTO_PRICE_BAND)) if lp else None, "max_price": round(lp * hi_mult) if lp else None,
     })
     pool = await search_comparables(db, wide, keep_all=True, row_limit=800)
-    plan = plan_auto_search(pool, family, today=date_to, subject_year=(req.subject.year_built if req.subject else None))
+    plan = plan_auto_search(pool, family, today=date_to, subject_year=(req.subject.year_built if req.subject else None),
+                                subject_lot=(req.subject.lot_size if req.subject else None))
     if plan["radius_miles"] > widest:   # rural: still short at 5 mi - look farther
         pool = await search_comparables(db, wide.model_copy(update={"radius_miles": AUTO_RURAL_EXTRA_RADII[-1]}),
                                         keep_all=True, row_limit=800)
-        plan = plan_auto_search(pool, family, today=date_to, subject_year=(req.subject.year_built if req.subject else None))
+        plan = plan_auto_search(pool, family, today=date_to, subject_year=(req.subject.year_built if req.subject else None),
+                                subject_lot=(req.subject.lot_size if req.subject else None))
     chosen = [c for c in pool
               if (c.distance_miles or 0) <= plan["radius_miles"]
               and (_sale_age_days(c, date_to) if _sale_age_days(c, date_to) is not None else 9999) <= plan["sold_within_days"]]
@@ -1409,7 +1475,10 @@ _AUTO_SAME_SUBDIV_MAX = 8
 async def _same_community_older_sales(db: AsyncSession, wide: CmaCompSearchRequest, subject, chosen: list,
                                       plan: dict, date_to: date) -> List[CmaCompCandidate]:
     from app.services import cma_fact_check as fc
-    sub = fc.subdivision_of({"subdivision_name": getattr(subject, "subdivision_name", None)})
+    # with the town, so a "subdivision" that is only the town's name isn't read as a community
+    _subj_row = {"subdivision_name": getattr(subject, "subdivision_name", None), "city": getattr(subject, "city", None),
+                 "township": getattr(subject, "township", None)}
+    sub = fc.subdivision_of(_subj_row)
     if not sub:
         return []
     older = await search_comparables(db, wide.model_copy(update={
@@ -1421,7 +1490,8 @@ async def _same_community_older_sales(db: AsyncSession, wide: CmaCompSearchReque
     for c in older:
         if c.listing_key in seen or not _auto_pickable(c):
             continue
-        if fc.same_subdivision({"subdivision_name": sub}, {"subdivision_name": c.subdivision_name}) is not True:
+        if fc.same_subdivision(_subj_row, {"subdivision_name": c.subdivision_name, "city": getattr(c, "city", None),
+                                           "township": getattr(c, "township", None)}) is not True:
             continue
         age = _sale_age_days(c, date_to)
         if age is None or age <= plan["sold_within_days"]:

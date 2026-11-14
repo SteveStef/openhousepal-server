@@ -138,6 +138,9 @@ class CmaComparable(BaseModel):
     # True only when the transaction is confirmed closed AND the closing price is known. When
     # False this comp must not feed any valuation math (see effectiveCompPrice / valuationComps).
     price_verified: bool = True
+    # New construction that closed well above its list price: the list was the builder's base price, so
+    # "X% over asking" is not shown or counted (cma_ai_service._builder_base_price_sale, 11/13).
+    builder_base_price: Optional[bool] = None
     days_on_market: Optional[int] = None
     cdom: Optional[int] = None
 

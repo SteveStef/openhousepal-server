@@ -6,6 +6,7 @@ feature, so limits and the model can be tuned without a deploy.
 Falls back to conservative hardcoded defaults if the row doesn't exist yet, and
 lazily seeds it on first read.
 """
+import os
 from typing import Optional
 
 from sqlalchemy import select
@@ -133,6 +134,7 @@ DEFAULT_CONFIG = {
         "claude-opus-5-5": {"input_per_mtok": 4.0, "output_per_mtok": 20.0, "cache_read_multiplier": 0.05},
         "claude-sonnet-5-5": {"input_per_mtok": 2.0, "output_per_mtok": 10.0, "cache_read_multiplier": 0.05},
         "gpt-6-astra": {"input_per_mtok": 10.0, "output_per_mtok": 50.0},
+        "claude-fable-5-2": {"input_per_mtok": 8.0, "output_per_mtok": 40.0, "cache_read_multiplier": 0.025},
     },
 
     # Read Aloud (OpenAI TTS) - converts an already-generated Claude reply to speech.
@@ -320,12 +322,16 @@ DEFAULT_CONFIG = {
     # CMA-only generation-count ceiling) - see ai_rate_limit_service.reserve_cma_analysis. Global+
     # emergency layer follows the same reserve_global_and_emergency pattern as area_narrative/
     # area_research above.
-    "cma_ai_model": "claude-sonnet-5",
+    # Looks at the listing photos, rates each comp, writes the comp notes and the clean-ups (owner, 11/13:
+    # Sonnet 5.5 - same price as Sonnet 5; verified on a full report that evening)
+    "cma_ai_model": "claude-sonnet-5-5",
     # Dedicated final-valuation authority. Claude still performs the multimodal comp analysis;
     # V10 still computes the deterministic benchmark. This separate text-only pass receives the
     # completed evidence packet and owns the client-facing FMV/range/confidence when its strict
     # output passes deterministic factual QA.
-    "cma_reasoning_model": "gpt-6-astra",
+    # Decides the final value from the evidence packet (owner, 11/13: Fable 5.2 - one provider for the whole CMA.
+    # An OpenAI model name here still works: cma_ai_service._call_cma_reasoning_model follows the name.)
+    "cma_reasoning_model": "claude-fable-5-2",
     "cma_reasoning_effort": "medium",
     # 12000 (was 6000): high-effort reasoning plus the full JSON was being cut off at 6000. A cut-off
     # response is retried once at 1.75x this budget (cma_ai_service._REASONING_RETRY_TOKEN_MULT).
@@ -832,6 +838,12 @@ class AIConfigService:
         for key, value in list(merged.items()):
             if key.endswith("model") and value in RETIRED_MODELS:
                 merged[key] = RETIRED_MODELS[value]
+
+        # One process can try other CMA models without changing the shared settings (11/13: the private test
+        # backend runs Opus 5.5 / Fable 5.2 while everything else stays on the current models).
+        for key in ("cma_ai_model", "cma_reasoning_model", "cma_reasoning_effort"):
+            if os.getenv(key.upper()):
+                merged[key] = os.getenv(key.upper())
 
         cls._cache = merged
         return merged

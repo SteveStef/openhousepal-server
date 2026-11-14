@@ -155,7 +155,7 @@ def test_hot_market_opening_offer_is_near_asking():
     band = ai._v10_build_buyer_offer_band(500000, 500000, trace=trace, confidence="low")
     assert band["hot_market"] is True
     assert band["opening_low"] >= 485000 and band["opening_high"] >= 495000
-    assert band["opening_pct_phrase"] == "at to about 3% below"
+    assert band["opening_pct_phrase"] == "at or up to about 3% below"
 
 
 def test_unmatched_lower_level_is_stated_as_the_main_uncertainty():

@@ -337,7 +337,13 @@ async def generate_cma_ai_analysis(
     """Writes a short AI-drafted note per comp (ai_commentary) and a proposed value estimate
     (pricing.ai_estimate) - never overwrites the agent's own commentary/pricing, see
     cma_ai_service.py."""
-    await service.get_report(db, current_user.id, report_id)   # 404 for someone else's report
+    _existing = await service.get_report(db, current_user.id, report_id)   # 404 for someone else's report
+    # A report that already has its analysis is refused HERE, before anything is marked. The background run
+    # used to mark it "generating", fail on the same rule a moment later, and leave a finished, shared report
+    # showing "failed" (524 Wales Rd, test round 11/14 - a second request from a stale tab or a double click).
+    from app.services.cma_ai_service import _has_completed_ai_pricing
+    if getattr(_existing, "ai_analysis", None) and _has_completed_ai_pricing(_existing):
+        raise HTTPException(status_code=400, detail="This report already has an AI analysis - regenerating isn't available.")
     # Start gate (before anything is marked or spent): one run per report, and the agent's other
     # in-flight runs count against their allowance - see ai_rate_limit_service.hold_cma_generation.
     # Refused here, the other run's 'generating' marker is left alone.

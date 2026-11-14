@@ -58,11 +58,23 @@ def _place_key(name) -> Optional[str]:
     return s
 
 
-def _subdivision_key(row: Optional[dict]) -> Optional[str]:
-    """None when the MLS 'subdivision' is really the township ('UWCHLAN TWP' on 281 Woodland Dr)."""
+# A "subdivision" that is just the town's own name is not a community (735 Concord Ave, test round 11/13:
+# the MLS lists "DREXEL HILL" as the subdivision of every home in Drexel Hill, so the whole town counted as
+# the subject's own neighborhood - sales up to two years old joined the comps as "same community", and the
+# agent was told three unrelated homes across town were "recent Drexel Hill sales not in this report").
+# A switch only so the free past-sales check can run both ways.
+CITY_NAME_IS_NOT_A_COMMUNITY = True
+
+
+def _subdivision_key(row: Optional[dict], *, town_name_counts: bool = False) -> Optional[str]:
+    """None when the MLS 'subdivision' is really the township ('UWCHLAN TWP' on 281 Woodland Dr) or the town.
+    `town_name_counts` keeps a town's own name (the Match score's "same area" points only - see
+    cma_ai_service._REL_TOWN_NAME_SCORES)."""
     r = row or {}
     k = _place_key(r.get("subdivision_name") or r.get("neighborhood"))
     if not k:
+        return None
+    if CITY_NAME_IS_NOT_A_COMMUNITY and not town_name_counts and k == _place_key(r.get("city")):
         return None
     if re.search(r"\b(?:twp|township|boro|borough|city|county)$", k):
         return None
@@ -90,12 +102,12 @@ def building_key(row: Optional[dict]) -> Optional[str]:
     return f"{street}|{str((row or {}).get('zipcode') or '')[:5]}"
 
 
-def same_subdivision(a: Optional[dict], b: Optional[dict]) -> Optional[bool]:
+def same_subdivision(a: Optional[dict], b: Optional[dict], *, town_name_counts: bool = False) -> Optional[bool]:
     """True/False when both homes have a subdivision on record (or share a building), None otherwise."""
     ba, bb = building_key(a), building_key(b)
     if ba and ba == bb and re.search(r"#|\bunit\b|\bapt\b", f"{(a or {}).get('street_address')} {(b or {}).get('street_address')}", re.I):
         return True
-    ka, kb = _subdivision_key(a), _subdivision_key(b)
+    ka, kb = _subdivision_key(a, town_name_counts=town_name_counts), _subdivision_key(b, town_name_counts=town_name_counts)
     if not ka or not kb:
         return None
     return ka == kb or ka.startswith(kb + " ") or kb.startswith(ka + " ")
@@ -167,6 +179,15 @@ def fix_community_claims(text: str, subject: Optional[dict], comp: Optional[dict
 
     def _sub(m: "re.Match") -> str:
         if _ok(m):
+            return m.group(0)
+        # a school district's own name ("West Chester Area School District"), or a loosely named area / corridor /
+        # section that is neither home's subdivision, is not a subdivision claim (deep dive 11/13: it was replaced
+        # with the comp's subdivision name)
+        if re.match(r"\s+(?:school|sd\b|district)", text[m.end():], re.I):
+            return m.group(0)
+        _name = (m.group("name") or "").strip()
+        if (_name and m.group("kind").lower() in ("area", "corridor", "section")
+                and _place_key(_name) not in {_place_key(s_sub), _place_key(subdivision_of(comp))}):
             return m.group(0)
         new = _area_replacement(m, comp)
         flags.append(f"Fact check: '{m.group(0).strip()}' changed to '{new}' - the MLS subdivisions are "
@@ -282,6 +303,9 @@ def fix_lower_level_claims(text: str, row: Optional[dict], who: str) -> tuple[st
     flags: list[str] = []
 
     def _sub(m: "re.Match") -> str:
+        # "..., while the subject has no finished basement" is about the subject, not this comp (deep dive 11/13)
+        if _about_subject(text, m.start()):
+            return m.group(0)
         word = m.group(0).split()[0].lower()
         noun = "lower level" if "lower" in m.group(0).lower() else "basement"
         new = (f"a finished {noun} of unrecorded size" if word in ("no", "without", "lacks", "lack", "lacking")
@@ -340,7 +364,11 @@ def _similar(a: list[str], b: list[str]) -> float:
 _DISTINCT_TOPIC_WORDS = set((
     "roof furnace hvac heater boiler ac plumbing electrical wiring panel windows siding stucco foundation basement "
     "deck patio pool spa septic well sewer water chimney fireplace kitchen bath bathroom garage driveway solar "
-    "attic insulation gutters radon mold termite lot comp subject buyer seller sale sales pending listing").split())
+    "attic insulation gutters radon mold termite lot comp subject buyer seller sale sales pending listing "
+    # deep dive 11/13: "Have the oil tank inspected ..." was dropped as a repeat of the roof line
+    "oil tank sump pump drainage grading asbestos lead paint cesspool ducts ductwork masonry stairs porch "
+    "fence shed barn outbuilding pond dock elevator sprinkler generator propane cistern skylights flashing "
+    "joists beams crawlspace crawl slab easement survey permit permits zoning flood association hoa").split())
 
 
 def _parallel(sentence: str, w: list[str], prev: list[str]) -> bool:
@@ -440,6 +468,9 @@ def fix_size_claims(text: str, subject: Optional[dict], comp: Optional[dict]) ->
         # "relative to a smaller home" or "than a larger house"
         if re.search(r"\b(?:to|than|from|vs\.?|versus|of|like|unlike)\s+(?:an?|the|any)?\s*$", text[max(0, m.start() - 25):m.start()], re.I):
             return m.group(0)
+        # "The subject is a larger home" is about the subject (deep dive 11/13: it was flipped to "smaller")
+        if _about_subject(text, m.start(), 30):
+            return m.group(0)
         said_bigger = m.group(2).lower() in ("larger", "bigger")
         if abs(r - 1) < _SIZE_SIMILAR:
             flags.append(f"called a comp {m.group(0).strip()!r}, but it is about the same size as the subject")
@@ -506,7 +537,10 @@ def fix_manual_subject_record(text: str, subject: Optional[dict], comp: Optional
     if not text or (subject or {}).get("source") != "manual" or comp is not None:
         return text, []
     t = _MANUAL_NO_UPDATES_RE.sub(lambda m: f"The details provided don't say when the {m.group(1).strip()} were last updated", text)
-    t = _MANUAL_RECORD_RE.sub(lambda m: ("The" if m.group(1)[0].isupper() else "the") + " details provided for the home", t)
+    # (not a sentence about a comp: "Comp #1's sale price is verified in the MLS data" stays - deep dive 11/13)
+    t = _MANUAL_RECORD_RE.sub(
+        lambda m: m.group(0) if re.search(r"\bcomp(?:arable)?s?\b|#\s*\d", t[max(0, m.start() - 60):m.start()], re.I)
+        else ("The" if m.group(1)[0].isupper() else "the") + " details provided for the home", t)
     return (t, ["Fact check: this home was entered by hand - 'the MLS record' about it rewritten, and missing update "
                 "details stated as unknown, not as none."]) if t != text else (text, [])
 
@@ -525,7 +559,10 @@ def fix_subject_lot_words(text: str, subject: Optional[dict], comps: Optional[li
     out, flags = [], []
     for s in sentences(text):
         m = _SUBJECT_LOT_WORD_RE.search(s)
-        if m and not _OTHER_HOME_REF_RE.search(s[:m.start()]):
+        # ... nor one about the comps as a group ("Most of the comparable sales sit on a larger lot than this
+        # home" was flipped to "smaller" - deep dive 11/13)
+        if m and not _OTHER_HOME_REF_RE.search(s[:m.start()]) \
+                and not re.search(r"\bcomp(?:arable)?s?(?:'|\u2019)?\b|\bsales\b|\bneighbou?rs?\b|\bother homes\b", s[:m.start()], re.I):
             wrong = (m.group(1).lower() == "smaller" and lot >= mid * 0.95) or (m.group(1).lower() != "smaller" and lot <= mid * 1.05)
             if wrong:
                 word = "larger" if lot > mid * 1.05 else "smaller" if lot < mid * 0.95 else "similar-size"
@@ -554,6 +591,385 @@ def fix_above_grade_psf_wording(text: str) -> tuple[str, list[str]]:
         if t != text else (text, [])
 
 
+# "at $303 per above-grade square foot, well above the subject's $344 list rate" (CMA test 11/13, 418
+# Reedville Rd comp #1) - the direction word between a comp's $/sq ft and the subject's must match the numbers.
+_PSF_VS_SUBJECT_RE = re.compile(
+    r"\$\s?(?P<a>\d{2,4}(?:\.\d+)?)\s*(?:per|/)\s*(?:above[- ]grade\s+)?(?:sq\.?\s*ft|sqft|square\s+f(?:oo|ee)t)"
+    r"(?P<mid>[^.;$]{0,70}?)"
+    r"\b(?P<adv>(?:well|far|much|meaningfully|significantly|notably|substantially|slightly|just|somewhat|modestly|a\s+bit)\s+)?"
+    r"(?P<dir>above|below|under|over|higher\s+than|lower\s+than)\s+the\s+subject(?:'s|’s)?\s+"
+    r"(?:(?:own\s+)?(?:above[- ]grade\s+)?\$\s?(?P<b>\d{2,4}(?:\.\d+)?)"
+    r"|(?:own\s+)?(?:above[- ]grade\s+)?(?:(?:list|asking)(?:[- ]price)?\s+)?(?:rate|\$/sq\.?\s?ft|price\s+per\s+(?:square\s+foot|sq\.?\s?ft))"
+    r"(?:\s+of\s*\$\s?(?P<b2>\d{2,4}(?:\.\d+)?))?)", re.I)
+_PSF_DIFF_WORDS_RE = re.compile(r"\b(?:premium|discount|more|less|gap|difference|spread|increase|decrease)\b", re.I)
+_BIG_ADV = ("well", "far", "much", "meaningfully", "significantly", "notably", "substantially")
+_SMALL_ADV = ("slightly", "just", "somewhat", "modestly", "a bit")
+
+
+def fix_psf_direction(text: str, subject: Optional[dict]) -> tuple[str, list[str]]:
+    """'$303 ... well above the subject's $344' -> 'well below'. The subject's figure is the one in the
+    sentence, else its above-grade list $/sq ft. A wrong-size adverb is fixed with it ('well' for a
+    gap over 10%, none under 5%); a right direction is left alone."""
+    if not text:
+        return text, []
+    s_psf = subject_list_psf(subject)
+    flags: list[str] = []
+
+    def _fix(m):
+        a = float(m.group("a"))
+        b = float(m.group("b") or m.group("b2") or 0) or s_psf
+        if not b:
+            return m.group(0)
+        # A DIFFERENCE, not the comp's own rate ("closed about $20 per sq ft above the subject's $344",
+        # "a $40/sqft premium over the subject's $344") is already right - deep dive 11/13: both were flipped.
+        if a < 0.5 * b or _PSF_DIFF_WORDS_RE.search(m.group("mid") or ""):
+            return m.group(0)
+        d = m.group("dir").lower()
+        says_lower = d in ("below", "under", "lower than")
+        gap = abs(a - b) / b
+        if gap < 0.01 or says_lower == (a < b):
+            return m.group(0)
+        word = ("below" if d in ("above", "below") else "under" if d in ("over", "under")
+                else "lower than") if a < b else ("above" if d in ("above", "below") else "over" if d in ("over", "under") else "higher than")
+        adv = (m.group("adv") or "").strip().lower()
+        if adv in _BIG_ADV and gap < 0.05:
+            adv = ""
+        elif adv in _SMALL_ADV and gap > 0.10:
+            adv = "well"
+        flags.append(f"Fact check: ${a:,.0f}/sq ft was called '{(m.group('adv') or '') + m.group('dir')}' the subject's "
+                     f"${b:,.0f} - it is {'lower' if a < b else 'higher'}.")
+        start, end = (m.start("adv") if m.group("adv") else m.start("dir")) - m.start(), m.end("dir") - m.start()
+        return m.group(0)[:start] + (f"{adv} " if adv else "") + word + m.group(0)[end:]
+    out = _PSF_VS_SUBJECT_RE.sub(_fix, text)
+    return (out, flags) if flags else (text, [])
+
+
+# "a quiet cul-de-sac, which is a genuine plus versus the subject's more trafficked road setting" (CMA test
+# 11/13, 701 Sturbridge Dr - a subdivision street, and the road lookup had returned nothing). A busier-road
+# claim about the subject needs the road data (or a road-type street name) behind it.
+_SUBJECT_BUSY_ROAD_RE = re.compile(
+    r",?\s*(?:versus|vs\.?|compared\s+(?:with|to)|unlike|over|rather\s+than)\s+the\s+subject(?:'s|’s)\s+"
+    r"(?:(?:more|much\s+more|busier|heavily|higher)[- ]?)?(?:trafficked|busy|busier|high[- ]traffic|heavier[- ]traffic|"
+    r"well[- ]traveled|through)(?:[- ](?:road|street))?(?:\s+(?:setting|location|frontage|exposure|position))?", re.I)
+_THROUGH_STREET_WORDS = ("pike", "highway", "hwy", "route", "rt", "boulevard", "blvd", "road", "rd", "avenue", "ave")
+
+
+def _subject_road_may_be_busy(subject: Optional[dict]) -> bool:
+    verdict = str(((subject or {}).get("road_context") or {}).get("verdict") or "")
+    if verdict in ("quiet", "neutral"):
+        return False
+    if verdict == "through":
+        return True
+    street = re.split(r"\s*#", str((subject or {}).get("street_address") or ""))[0].strip().lower()
+    words = street.split()
+    if not words:
+        return False
+    last = words[-1].rstrip(".")
+    # "Main St", "High Street", "Market St" are usually a town's through streets (deep dive 11/13)
+    if last in ("street", "st") and any(w in ("main", "high", "market", "broad", "state", "front") for w in words[:-1]):
+        return True
+    return last in _THROUGH_STREET_WORDS
+
+
+def fix_subject_busy_road_claim(text: str, subject: Optional[dict]) -> tuple[str, list[str]]:
+    """Drops 'versus the subject's more trafficked road' when nothing says the subject's road is busy
+    (road lookup quiet/neutral, or none and a Drive/Lane/Court-type street). Only a clause that ENDS
+    there is cut (deep dive 11/13: "a plus over the subject's busier Lancaster Avenue frontage" lost its
+    middle, and "Unlike the subject's busy road, this comp ..." was left starting with a comma)."""
+    if not text or _subject_road_may_be_busy(subject) or not _SUBJECT_BUSY_ROAD_RE.search(text):
+        return text, []
+    out, last, changed = [], 0, False
+    for m in _SUBJECT_BUSY_ROAD_RE.finditer(text):
+        after = text[m.end():]
+        if not re.match(r"\s*(?:[,.;:)!?]|$|(?:and|but|while|which|so)\b)", after):
+            continue                                     # the clause runs on (a road name follows): leave it
+        before = text[last:m.start()]
+        at_start = not (text[:m.start()].strip()) or bool(re.search(r"[.!?]\s*$", text[:m.start()]))
+        if at_start:                                     # "Unlike the subject's busy road, this comp ..."
+            lead = re.match(r"\s*,\s*", after)
+            if not lead:
+                continue
+            rest_at = m.end() + lead.end()
+            out.append(before + (" " if before and not before.endswith(" ") else ""))
+            out.append(text[rest_at:rest_at + 1].upper())
+            last = rest_at + 1
+        else:
+            out.append(before)
+            last = m.end()
+        changed = True
+    if not changed:
+        return text, []
+    out.append(text[last:])
+    return "".join(out), ["Fact check: dropped a claim that the subject is on a busier road - nothing on record says so."]
+
+
+# "a production new-construction home on a roughly 8.8-acre lot" (CMA test 11/13, 418 Reedville Rd comp #5 -
+# no lot size on record; its remarks say the community's lots run .21-.40 acres).
+_COMP_ACRE_LOT_RE = re.compile(
+    r"\bon\s+an?\s+(?P<q>(?:roughly|about|approximately|approx\.?|nearly|almost|just\s+over|just\s+under|over|under)\s+)?"
+    r"(?P<n>\d{1,3}(?:\.\d{1,2})?)[- ]acre\s+(?P<noun>lot|homesite|parcel|property|site)\b", re.I)
+
+
+def _lot_acres(d: Optional[dict]) -> Optional[float]:
+    """The lot in acres from the same fields, with the same plausibility test, as lot_acres_text (deep dive
+    11/13: reading lot_size alone wrote a known-bad "431.00-acre" lot into a note and deleted the correct
+    figure of a comp whose record only has acres)."""
+    d = d or {}
+    sqft = _money(d.get("lot_size")) or _money(d.get("lot_size_sqft"))
+    acres = sqft / 43560 if sqft else _money(d.get("lot_size_acres")) or _money(d.get("acres"))
+    if not acres or implausible_lot(acres, _money(d.get("sale_price")) or _money(d.get("list_price")), d.get("home_type")):
+        return None
+    return acres
+
+
+def _about_subject(text: str, pos: int, span: int = 40) -> bool:
+    """The words just before `pos` are about the subject ("the subject, which sits on a ...")."""
+    return bool(re.search(r"\bsubject\b|\bthis home\b", text[max(0, pos - span):pos], re.I))
+
+
+def fix_comp_lot_acres(text: str, subject: Optional[dict], comp: Optional[dict]) -> tuple[str, list[str]]:
+    """A comp note's 'on a X-acre lot' must be the comp's recorded lot: none on record -> the number goes;
+    a different number -> the record's. A figure about the SUBJECT (notes contrast with it) is left alone."""
+    if not text or comp is None:
+        return text, []
+    actual, subj = _lot_acres(comp), _lot_acres(subject)
+    flags: list[str] = []
+
+    def _fix(m):
+        n = float(m.group("n"))
+        if _about_subject(text, m.start()) or (subj and abs(n - subj) <= max(0.05, 0.1 * subj)):
+            return m.group(0)
+        if actual is None:
+            flags.append(f"Fact check: dropped a {n:g}-acre lot size - none is on record for this comparable.")
+            return f"on a {m.group('noun')}"
+        if abs(n - actual) <= max(0.05, 0.1 * actual):
+            return m.group(0)
+        flags.append(f"Fact check: a {n:g}-acre lot was set to {actual:.2f} acres, this comparable's recorded lot.")
+        return f"on a {(m.group('q') or '')}{actual:.2f}-acre {m.group('noun')}"
+    out = _COMP_ACRE_LOT_RE.sub(_fix, text)
+    return (out, flags) if flags else (text, [])
+
+
+# ---- Facts that must agree across the whole report (grader audit 11/13, finding 26) -----------------
+# One Center City condo report said "mid-rise" in one section and "high-rise" in another, showed a comp
+# on "Public Sewer, Public Septic", and discussed a "one-bedroom-plus-den" under a 2-bedroom cover; a
+# Drexel Hill note called a comp's unfinished basement "a step down from the subject's full basement"
+# when the subject's own basement has no finished area on record. Four kinds of conflict, four rules.
+
+_UNIT_FLOOR_RE = re.compile(r"(?:#|\bunit\s+|\bapt\.?\s+|\bph)\s*-?\s*[a-z]?-?(\d{3,4})[a-z]?\b", re.IGNORECASE)
+_HEIGHT_WORD_RE = re.compile(r"\b(low|mid|high)([- ])rise\b", re.IGNORECASE)
+_TALL_BUILDING_WORDS_RE = re.compile(r"high[- ]rise|\btower\b|sky ?line|\b\d{2}(?:st|nd|rd|th)[- ]floor|\b\d{2}[- ]stor(?:y|ies)\b", re.IGNORECASE)
+_OTHER_HOME_RE = re.compile(r"\bcomp(?:arable)?s?\b|\bcomp\s*#|#\s*\d", re.IGNORECASE)
+
+
+def building_height_class(subject: Optional[dict]) -> Optional[str]:
+    """'high' when a CONDO is plainly in a tall building, else None. Our MLS copy has no floor-count field,
+    so this reads the unit number (#4407 = 44th floor) and is deliberately strict: a garden-style community
+    also numbers units "#1305" (building 13), so a floor of 13-19 needs the listing itself to describe a
+    tall building, and only 20+ stands alone (deep dive 11/13). Never guesses mid- or low-rise."""
+    s = subject or {}
+    kind = f"{s.get('property_type') or ''} {s.get('home_type') or ''}".lower()
+    if "condo" not in kind:
+        return None
+    m = _UNIT_FLOOR_RE.search(str(s.get("street_address") or "") + " " + str(s.get("unit_number") or ""))
+    floor = int(m.group(1)[:-2]) if m else None
+    if floor is None or floor < 13:
+        return None
+    remarks = str(s.get("public_remarks") or s.get("remarks") or s.get("listing_remarks") or "")
+    if floor >= 20 or _TALL_BUILDING_WORDS_RE.search(remarks):
+        return "high"
+    return None
+
+
+def fix_building_height_words(text: str, subject: Optional[dict], comp: Optional[dict] = None) -> tuple[str, list[str]]:
+    """'mid-rise' -> 'high-rise' for the SUBJECT'S building only. In a comp's note it applies only when the
+    comp is in that same building; in report text it skips any sentence that mentions a comparable (deep
+    dive 11/13: a comp "in a mid-rise building two blocks away" was being renamed)."""
+    cls = building_height_class(subject)
+    if not text or not cls:
+        return text, []
+    if comp is not None and (not building_key(comp) or building_key(comp) != building_key(subject)):
+        return text, []
+    wrong: list[str] = []
+
+    def swap(m):
+        if m.group(1).lower() == cls:
+            return m.group(0)
+        wrong.append(m.group(0))
+        word = cls.capitalize() if m.group(1)[0].isupper() else cls
+        return f"{word}{m.group(2)}rise"
+    parts = []
+    for sent in re.split(r"(?<=[.!?])(\s+)", text):
+        if comp is None and _OTHER_HOME_RE.search(sent):
+            parts.append(sent)
+        else:
+            parts.append(_HEIGHT_WORD_RE.sub(swap, sent))
+    if not wrong:
+        return text, []
+    return "".join(parts), [f"Building type made consistent: \"{wrong[0]}\" -> \"{cls}-rise\" (from the unit's floor)."]
+
+
+# "one-bedroom-plus-den", "1 bedroom + den", "two bedrooms plus a home office" - joined by plus / + only
+# ("three bedrooms and a study, plus a first-floor primary suite" on a 4-bedroom home is not this - deep dive 11/13)
+_DEN_LAYOUT_RE = re.compile(r"\b(one|two|three|four|1|2|3|4)[- ]bed(?:room)?s?[- ,]*(?:plus|\+)[- ]*(?:a\s+|an\s+)?"
+                            r"(den|home office|office)\b", re.IGNORECASE)
+_WORD_NUM = {"one": 1, "two": 2, "three": 3, "four": 4}
+
+
+def bedroom_record_note(subject: Optional[dict]) -> Optional[str]:
+    """The MLS says N bedrooms and the listing describes N-1 plus a den: one wording for the whole report."""
+    s = subject or {}
+    beds = _money(s.get("beds") or s.get("bedrooms") or s.get("bedrooms_total"))
+    m = _DEN_LAYOUT_RE.search(str(s.get("public_remarks") or s.get("remarks") or s.get("listing_remarks") or ""))
+    if not beds or not m:
+        return None
+    n = _WORD_NUM.get(m.group(1).lower()) or int(m.group(1))
+    if int(beds) != n + 1:
+        return None
+    word = {1: "one", 2: "two", 3: "three", 4: "four"}[n]
+    return (f"{int(beds)} bedrooms on the MLS record; the listing describes the layout as {word} bedroom{'s' if n > 1 else ''} plus a "
+            f"{m.group(2).lower()}. Say exactly that wherever the bedroom count matters (\"listed as {int(beds)} bedrooms; the listing "
+            f"describes {word} bedroom{'s' if n > 1 else ''} plus a {m.group(2).lower()}\") - never state either count alone as the fact, "
+            f"and compare bedroom counts with comps on the MLS count ({int(beds)}).")
+
+
+_BSMT_CMP = (r"(?:step down from|inferior to|worse than|weaker than|lesser than|falls short of|"
+             r"a disadvantage (?:to|versus|against|compared (?:with|to)))")
+_BSMT_SUBJ = r"\s+the subject(?:'s|’s)\s+(?:own\s+)?(?:full\s+)?basement"
+# "Its unfinished basement is a step down from the subject's full basement[, but that is outweighed by ...]"
+_BSMT_VERB_RE = re.compile(
+    r"\b(its|the comp(?:arable)?(?:'s|’s)|this home(?:'s|’s))\s+unfinished basement\s+(?:is|was)\s+(?:a\s+)?" + _BSMT_CMP + _BSMT_SUBJ
+    + r"(?:,\s*but\s+(?:that|this|it)\s+is\s+(?:more than\s+)?(?:outweighed|offset)\s+by\s+(?:[^.]|\.(?=\d))*)?", re.IGNORECASE)
+# "... and an unfinished basement, a step down from the subject's full basement"
+_BSMT_APPOS_RE = re.compile(r"(\bunfinished basement),\s+(?:which is\s+)?(?:a\s+)?" + _BSMT_CMP + _BSMT_SUBJ, re.IGNORECASE)
+
+
+def fix_basement_unlike_comparison(text: str, subject: Optional[dict], comp: Optional[dict]) -> tuple[str, list[str]]:
+    """'Its unfinished basement is a step down from the subject's full basement' compares finish with size.
+    When the subject HAS a basement with no finished area on record, an unfinished comp basement is the same
+    thing, not a shortfall. Only that clause is rewritten - the rest of the sentence stays (deep dive 11/13:
+    the first version cut sentences at decimals and replaced unrelated facts). Not when the subject's lower
+    level is finished, or when it has no basement at all."""
+    s = subject or {}
+    has_basement = bool(str(s.get("basement") or "").strip()) and lower_level_state(s) in ("unfinished", "unknown")
+    if not text or comp is None or not has_basement:
+        return text, []
+    out = _BSMT_VERB_RE.sub(lambda m: f"{m.group(1)} basement is unfinished, and the subject's has no finished area on record either", text)
+    out = _BSMT_APPOS_RE.sub(lambda m: f"{m.group(1)}, and the subject's basement has no finished area on record either", out)
+    if out == text:
+        return text, []
+    return out, ["Comp note: an unfinished basement was called worse than the subject's \"full\" basement, but the subject's has no "
+                 "finished area on record - rewritten as no difference."]
+
+
+def clean_sewer(value):
+    """An agent ticked both 'Public Sewer' and 'Public Septic' (50 S 16th St #5203, a 52nd-floor condo): there
+    is no such thing as a public septic system, so that one entry is dropped. Any other pair ("Private Sewer"
+    + "On Site Septic") is left as the record has it."""
+    if isinstance(value, (list, tuple)):
+        vals = [str(v) for v in value if v]
+        if any(re.search(r"public\s+sewer", v, re.I) for v in vals):
+            vals = [v for v in vals if not re.fullmatch(r"\s*public\s+septic\s*", v, re.I)]
+        return vals if isinstance(value, list) else tuple(vals)
+    return value
+
+
+# New construction that closed above its list price (owner, 11/13): the list was the builder's base
+# price, so the gap is most likely options and upgrades - not "strong demand" or a bidding war
+# (370 Wickmere St: $867,620 against a $554,900 base read "a sold/list ratio of over 1.5", "strong demand").
+_BUILDER_DEMAND_CLAUSE_RE = re.compile(
+    r",?\s*(?:reflecting|showing|a sign of|evidence of|signall?ing|indicating|pointing to|driven by|thanks to)\s+"
+    r"(?:very\s+|unusually\s+|exceptionally\s+)?(?:strong|intense|heavy|robust|high|fierce)\s+(?:buyer\s+)?"
+    r"(?:demand|competition|interest)(?:[^,.;]|\.(?=\d))*", re.IGNORECASE)
+_BUILDER_RATIO_ASIDE_RE = re.compile(r"\s*[-–—]\s*a sold[/-](?:to[- ])?list ratio of(?:[^-–—.]|\.(?=\d))*[-–—]\s*", re.IGNORECASE)
+_BUILDER_CLAIM_RE = re.compile(
+    r"bidding war|multiple offers|competing (?:offers|buyers|bids)|(?:over|above|against)\s+(?:its\s+|the\s+|a\s+)?(?:\$[\d,]+\s+)?"
+    r"(?:asking|list)|sold[/-](?:to[- ])?list|% of (?:its\s+)?(?:asking|list)|strong demand", re.IGNORECASE)
+# "reflects an unusually competitive new-construction bidding situation" -> what it most likely was
+_BUILDER_BIDDING_PHRASE_RE = re.compile(
+    r"\b(?:an?\s+)?(?:(?:unusually|very|highly|intensely|exceptionally)\s+)?(?:competitive\s+)?(?:new[- ]construction\s+)?"
+    r"(?:bidding|multiple[- ]offer)\s+(?:situation|war|contest|environment|scenario)\b", re.IGNORECASE)
+BUILDER_BASE_PRICE_SENTENCE = ("As new construction, its list price was most likely the builder's base price, so the higher "
+                               "sale price most likely reflects options and upgrades the buyer chose rather than a bidding war.")
+
+
+def fix_builder_base_price_claims(text: str, comp: Optional[dict]) -> tuple[str, list[str]]:
+    """Runs on every pass and on saved notes, so it must leave its own sentence and an already-correct
+    "not a bidding war" alone (deep dive 11/13: the second pass turned "rather than a bidding war" into
+    "rather than upgrades over the builder's base price")."""
+    if not text or not comp or not comp.get("builder_base_price"):
+        return text, []
+    had_sentence = BUILDER_BASE_PRICE_SENTENCE in text
+    body = text.replace(BUILDER_BASE_PRICE_SENTENCE, "").rstrip() if had_sentence else text
+    t = _BUILDER_RATIO_ASIDE_RE.sub(" ", _BUILDER_DEMAND_CLAUSE_RE.sub("", body))
+
+    def _bid(m):
+        if re.search(r"\b(?:not|no|never|rather than|than|isn(?:'|’)t|wasn(?:'|’)t)\s+$", t[:m.start()], re.IGNORECASE):
+            return m.group(0)            # "this was not a bidding war" is already the right statement
+        return "upgrades over the builder's base price"
+    t = _BUILDER_BIDDING_PHRASE_RE.sub(_bid, t)
+    flags = []
+    if t != body:
+        flags.append("Comp note: removed 'strong demand' / sold-to-list wording about a new-construction sale "
+                     "(its list price was the builder's base price).")
+    if had_sentence:
+        t = t.rstrip() + " " + BUILDER_BASE_PRICE_SENTENCE
+    elif "base price" not in t.lower() and _BUILDER_CLAIM_RE.search(t):
+        t = t.rstrip() + " " + BUILDER_BASE_PRICE_SENTENCE
+        flags.append("Comp note: added that a new-construction sale above its list price most likely reflects "
+                     "upgrades over the builder's base price, not a bidding war.")
+    return (t, flags) if flags else (text, [])
+
+
+# "closing at 0.986 of list", "sold in 4 days at 1.204 of list" (701 Sturbridge Dr, test round 11/13) - the model
+# copying the sale-to-list ratio out of its data. A client reads percentages, not decimals.
+_RATIO_OF_LIST_RE = re.compile(
+    r"\b(?P<r>[01]\.\d{2,4})(?P<x>x)?\s+(?:of|times)\s+(?P<rest>(?:its\s+|the\s+|their\s+)?(?:final\s+|original\s+|last\s+)?"
+    r"(?:list|asking|listing)(?:\s+price)?)\b", re.IGNORECASE)
+
+
+def fix_ratio_of_list(text: str) -> tuple[str, list[str]]:
+    """'0.986 of list' -> '98.6% of list'. The number is the same; only how it is written changes."""
+    if not text:
+        return text, []
+    flags: list[str] = []
+
+    def _sub(m: "re.Match") -> str:
+        r = float(m.group("r"))
+        if not 0.4 <= r <= 1.9:
+            return m.group(0)
+        pct = f"{r * 100:.1f}".rstrip("0").rstrip(".")
+        flags.append(f"Fact check: '{m.group(0)}' written as a percentage ({pct}%).")
+        return f"{pct}% of {m.group('rest')}"
+
+    return _RATIO_OF_LIST_RE.sub(_sub, text), flags
+
+
+# "a 0.14 acres lot", "same 0.14 acres lot" (735 Concord Ave, test rounds 11/13-11/14) -> "a 0.14-acre lot"
+_ACRES_LOT_RE = re.compile(r"\b(\d+(?:\.\d+)?)[ -]acres\s+(lot|parcel|site|property)\b", re.IGNORECASE)
+
+
+def fix_acres_lot_grammar(text: str) -> tuple[str, list[str]]:
+    if not text:
+        return text, []
+    out = _ACRES_LOT_RE.sub(lambda m: f"{m.group(1)}-acre {m.group(2)}", text)
+    # "a 8.50-acre" / "a 0.14-acre" read aloud: "an eight...", "a zero..." - only 8, 11 and 18 take "an"
+    out = re.sub(r"\ba (?=(?:8|11|18)(?:\.\d+)?-acre\b)", "an ", out)
+    return out, ([] if out == text else ["Fact check: 'N acres lot' written as 'N-acre lot'."])
+
+
+# "It is with a Villanova mailing address" - left in notes saved before the mailing-town rewrite learned
+# "is in <Town>" (701 Sturbridge Dr, test round 11/13). The home HAS the address.
+_IS_WITH_MAILING_RE = re.compile(r"\b(?:is|sits|lies)(?:\s+located)?\s+with\s+an?\s+((?:[A-Z][\w.'’-]*\s+){1,4})mailing address\b")
+
+
+def fix_mailing_address_grammar(text: str) -> tuple[str, list[str]]:
+    if not text:
+        return text, []
+    out = _IS_WITH_MAILING_RE.sub(lambda m: f"has a {m.group(1)}mailing address", text)
+    return out, ([] if out == text else ["Fact check: 'is with a ... mailing address' reworded."])
+
+
 def fix_text(text: str, *, subject: Optional[dict], comp: Optional[dict] = None, who: str = "Text",
              comps: Optional[list] = None) -> tuple[str, list[str]]:
     """Every deterministic rewrite above, in order. `comp` = the home a comp write-up is about; `comps` =
@@ -565,10 +981,19 @@ def fix_text(text: str, *, subject: Optional[dict], comp: Optional[dict] = None,
         lambda x: fix_subject_lot_words(x, subject, comps) if comp is None and comps else (x, []),
         lambda x: fix_above_grade_psf_wording(x),
         lambda x: fix_subject_psf_numbers(x, subject),
+        lambda x: fix_psf_direction(x, subject),
+        lambda x: fix_subject_busy_road_claim(x, subject),
+        lambda x: fix_comp_lot_acres(x, subject, comp),
+        lambda x: fix_building_height_words(x, subject, comp),
+        lambda x: fix_basement_unlike_comparison(x, subject, comp),
+        lambda x: fix_builder_base_price_claims(x, comp),
         lambda x: fix_community_claims(x, subject, comp),
         lambda x: fix_lower_level_claims(x, comp, who) if comp is not None else (x, []),
         lambda x: (lambda t2, f2: (t2, [f"{who}: {m}" for m in f2]))(*fix_size_claims(x, subject, comp)) if comp is not None else (x, []),
         lambda x: fix_size_psf_logic(x, subject, comp) if comp is not None else (x, []),
+        lambda x: fix_ratio_of_list(x),
+        lambda x: fix_acres_lot_grammar(x),
+        lambda x: fix_mailing_address_grammar(x),
         lambda x: fix_field_name_leaks(x),
         lambda x: drop_repeated_sentences(x),
     ):
@@ -695,6 +1120,13 @@ def summarize_history(events: list, *, current_list_date=None, today=None) -> di
                 open_p["end"], open_p["end_event"] = day, "relisted"
                 periods.append(open_p)
             open_p = {"start": day, "list_price": price, "last_price": price, "changes": []}
+        # Under contract: the home is no longer being marketed, so the count stops there (and resumes if it comes
+        # back). Listed Aug 13, relisted Oct 9, under contract Oct 20, report Nov 13 read "35 days on this
+        # listing, about 89 days in total" - true active time 11 and 65 (deep dive 11/13).
+        elif ev == "Under contract" and open_p and not open_p.get("contract"):
+            open_p["contract"] = day
+        elif ev == "Back on market" and open_p and open_p.get("contract"):
+            open_p["paused_days"] = open_p.get("paused_days", 0) + max(0, (day - open_p.pop("contract")).days)
         elif ev in ("Price reduced", "Price increased", "Price changed") and open_p:
             open_p["changes"].append({"date": day, "price": price, "change": e.get("change")})
             if price:
@@ -710,7 +1142,9 @@ def summarize_history(events: list, *, current_list_date=None, today=None) -> di
         periods.append(open_p)
     for p in periods:
         end = p.get("end") or today
-        p["days"] = max(0, (end - p["start"]).days) if p.get("start") else None
+        if p.get("contract") and p["contract"] < end:
+            end = p["contract"]
+        p["days"] = max(0, (end - p["start"]).days - p.get("paused_days", 0)) if p.get("start") else None
     current = None
     if cur:
         current = next((p for p in periods if p.get("start") and abs((p["start"] - cur).days) <= 3), None)
@@ -768,7 +1202,7 @@ def _nice_date(s) -> str:
     return f"{d.strftime('%b')} {d.day}, {d.year}" if d else str(s)
 
 
-def history_sentence(methodology: str, summary: Optional[dict], *, today=None) -> str:
+def history_sentence(methodology: str, summary: Optional[dict], *, today=None, listed: bool = True) -> str:
     """One plain sentence on the home's own record when it matters: relisted (one marketing effort, not a
     fresh listing) and/or sold in the last 3 years. Grader 10/24, 4913 Chancellor St: "mentions longer
     cumulative marketing exposure but doesn't clearly show the earlier listing"."""
@@ -778,7 +1212,9 @@ def history_sentence(methodology: str, summary: Optional[dict], *, today=None) -
         return methodology
     bits = []
     first = (s.get("earlier_listings") or [{}])[0]
-    if s.get("relisted") and s.get("marketing_days_total") and first.get("listed"):
+    # only for a home that is on the market now - an expired 2024 relisting read "has been on the market about
+    # 206 days in total" in a 2026 report (deep dive 11/13)
+    if listed and s.get("relisted") and s.get("marketing_days_total") and first.get("listed"):
         ended = first.get("ended")
         rel = s.get("current_listed")
         bits.append(f"This home has been on the market about {s['marketing_days_total']} {_HISTORY_MARK}: first listed "
@@ -917,6 +1353,9 @@ def prompt_facts_subject(subject: Optional[dict]) -> dict:
                                             if psf else None),
         "lower_level_record": _LL_WORDS[lower_level_state(s)],
         "association_fees": fee_line(s),
+        "bedroom_record": bedroom_record_note(s),
+        "building_type": ({"high": "high-rise building", "mid": "mid-rise building", "low": "low-rise building"}[building_height_class(s)]
+                          + " - use exactly this term" if building_height_class(s) else None),
     }
 
 
