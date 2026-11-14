@@ -54,6 +54,10 @@ def stubs(monkeypatch):
 
     monkeypatch.setattr(ai_config_service, "get_config", get_config)
     monkeypatch.setattr(rl, "total_monthly_ai_cost", total)
+
+    async def no_custom_allowance(db, owner_id):   # no database here: the plan's own allowance applies
+        return None
+    monkeypatch.setattr(rl, "_custom_allowance", no_custom_allowance)
     monkeypatch.setattr(cma_routes.service, "get_report", get_report)
     monkeypatch.setattr(cma_routes.service, "mark_generation_started", mark_started)
     monkeypatch.setattr(cma_routes.service, "mark_generation_finished", mark_finished)

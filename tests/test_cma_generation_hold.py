@@ -18,7 +18,17 @@ OWNER = "owner-aaaa"
 
 @pytest.fixture(autouse=True)
 def _fresh_holds(monkeypatch):
+    from datetime import datetime, timezone
     monkeypatch.setattr(rl, "_cma_holds", rl._CmaGenerationHolds())
+
+    # no database in these tests: no admin-set allowance, and a fixed billing period for the "resets on" text
+    async def no_custom(db, owner_id):
+        return None
+
+    async def period(db, owner_id):
+        return datetime(2026, 11, 13, tzinfo=timezone.utc), datetime(2026, 12, 13, tzinfo=timezone.utc)
+    monkeypatch.setattr(rl, "_custom_allowance", no_custom)
+    monkeypatch.setattr(rl, "usage_period", period)
     yield
 
 
@@ -39,6 +49,32 @@ def test_out_of_allowance_refused(monkeypatch):
     _used(monkeypatch, 20.0)
     with pytest.raises(rl.AIRateLimitExceeded) as exc:
         asyncio.run(rl.hold_cma_generation(None, OWNER, "r1", CONFIG, "IDX"))
+    assert exc.value.reason == "agent_monthly_budget"
+
+
+def test_out_of_allowance_message_says_when_it_resets(monkeypatch):
+    _used(monkeypatch, 20.0)
+    with pytest.raises(rl.AIRateLimitExceeded) as exc:
+        asyncio.run(rl.hold_cma_generation(None, OWNER, "r1", CONFIG, "IDX"))
+    assert "It resets on Dec 13." in exc.value.user_message
+
+
+def test_admin_set_allowance_is_the_one_the_gate_uses(monkeypatch):
+    """An agent whose admin gave their group $30 a month is not refused at the plan's $20 - and an agent
+    given $10 is refused at $10 (test round 11/14: the gate read only the plan's amount)."""
+    async def custom_30(db, owner_id):
+        return 30.0
+
+    async def custom_10(db, owner_id):
+        return 10.0
+    _used(monkeypatch, 23.19)
+    monkeypatch.setattr(rl, "_custom_allowance", custom_30)
+    assert asyncio.run(rl.hold_cma_generation(None, OWNER, "r1", CONFIG, "IDX")) == 0.75
+    monkeypatch.setattr(rl, "_cma_holds", rl._CmaGenerationHolds())
+    _used(monkeypatch, 10.0)
+    monkeypatch.setattr(rl, "_custom_allowance", custom_10)
+    with pytest.raises(rl.AIRateLimitExceeded) as exc:
+        asyncio.run(rl.hold_cma_generation(None, OWNER, "r2", CONFIG, "IDX"))
     assert exc.value.reason == "agent_monthly_budget"
 
 

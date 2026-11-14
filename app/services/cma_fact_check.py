@@ -1035,6 +1035,91 @@ def fix_under_contract_holdout(text: str, subject: Optional[dict]) -> tuple[str,
     return "".join(kept).strip(), ["Fact check: removed 'the seller may be holding out' - this home is already under contract."]
 
 
+# ---- a prediction stated as a fact (outside audit 11/14: "competing offers above asking are not expected" - a
+# home's time on the market makes them less likely; it does not rule them out) ------------------------------------
+_PREDICTION_FIXES = (
+    (re.compile(r"\b((?:competing|multiple|several) offers|a bidding war|offers (?:above|over) (?:asking|list))\b([^.;]{0,50}?)\b"
+                r"(?:are|is) (?:not expected|unlikely|not likely)\b", re.I),
+     lambda m: f"{m.group(1)}{m.group(2).rstrip()} look less likely"),
+    (re.compile(r"\b(?:will|should) (?:sell quickly|find ready buyers|find a buyer quickly|move quickly)\b", re.I),
+     "should draw buyer interest"),
+    (re.compile(r"\bwill (?:attract|draw|generate|bring) (?:multiple|competing) offers\b", re.I), "could draw competing offers"),
+)
+
+
+def fix_certain_predictions(text: str) -> tuple[str, list[str]]:
+    if not text:
+        return text, []
+    out = text
+    for rx, repl in _PREDICTION_FIXES:
+        out = rx.sub(repl, out)
+    return (out, ["Fact check: a prediction about buyers was reworded as what the evidence supports."]) if out != text else (text, [])
+
+
+# ---- "Comp #2 sold above list within 10 days" is checked against Comp #2's own record ---------------------------
+# 701 Great Oak Ln (outside audit 11/14, critical): "Comp #1, Comp #2 and Comp #5, all of which sold above list
+# within 10 days" - #2 had sold 8.3% UNDER asking after 55 days - and "Comp #3 shows that a dated home that lingers
+# and is reduced closes below list" - #3 sold AT asking in 7 days. (The cause there was stale numbering in a reused
+# answer, fixed at its source; this is the net under it, whatever the cause.) Only a plain, one-way claim is
+# checked: a sentence that says both "above" and "below", or that contrasts comps, is left alone.
+_CLAIM_COMP_REF_RE = re.compile(r"\bComps?\s*#\s*\d+(?:\s*(?:,|and|&|or)\s*(?:Comps?\s*)?#\s*\d+)*", re.I)
+_CLAIM_SOLD = r"\b(?:sold|sells?|selling|closed|closes?|closing|went)\b[^.;]{0,60}?"
+_CLAIM_ABOVE_RE = re.compile(_CLAIM_SOLD + r"\b(?:above|over)\s+(?:its\s+|their\s+|the\s+)?(?:list|asking)\b", re.I)
+_CLAIM_BELOW_RE = re.compile(_CLAIM_SOLD + r"\b(?:below|under)\s+(?:its\s+|their\s+|the\s+)?(?:list|asking)\b", re.I)
+_CLAIM_WITHIN_RE = re.compile(r"\bwithin\s+(?:about\s+|just\s+|only\s+)?(\d+)\s+days\b", re.I)
+_CLAIM_CONTRAST_RE = re.compile(r"\b(?:while|whereas|unlike|but|versus|vs\.?|compared (?:with|to)|rather than|except)\b", re.I)
+
+
+def comp_sale_claim_problem(sentence: str, comps: Optional[list]) -> Optional[str]:
+    refs = sorted({int(n) for m in _CLAIM_COMP_REF_RE.finditer(sentence or "") for n in re.findall(r"\d+", m.group(0))})
+    if not refs or not comps:
+        return None
+    above, below = bool(_CLAIM_ABOVE_RE.search(sentence)), bool(_CLAIM_BELOW_RE.search(sentence))
+    within = _CLAIM_WITHIN_RE.search(sentence)
+    if (above and below) or not (above or below or within) or (len(refs) > 1 and _CLAIM_CONTRAST_RE.search(sentence)):
+        return None
+    for n in refs:
+        if n < 1 or n > len(comps) or not isinstance(comps[n - 1], dict):
+            continue
+        c = comps[n - 1]
+        price = _money(c.get("sale_price")) or _money(c.get("close_price"))
+        lp = _money(c.get("list_price"))
+        if price and lp and (above or below):
+            ratio = price / lp
+            if above and ratio <= 1.0005:
+                return (f"Comp #{n} did not sell above its asking price (${price:,.0f} against ${lp:,.0f})")
+            if below and ratio >= 0.9995:
+                return (f"Comp #{n} did not sell below its asking price (${price:,.0f} against ${lp:,.0f})")
+        try:
+            dom = float(c.get("days_on_market")) if c.get("days_on_market") is not None else None
+        except (TypeError, ValueError):
+            dom = None
+        if within and dom is not None and dom > float(within.group(1)) + 0.5:
+            return f"Comp #{n} took {int(dom)} days, not {within.group(1)} or fewer"
+    return None
+
+
+def fix_comp_sale_claims(text: str, comps: Optional[list]) -> tuple[str, list[str]]:
+    if not text or not comps or "#" not in text:
+        return text, []
+    kept, flags = [], []
+    for para in re.split(r"(\n\s*\n)", text):
+        if re.fullmatch(r"\n\s*\n", para or ""):
+            kept.append(para)
+            continue
+        out = []
+        for x in sentences(para):
+            why = comp_sale_claim_problem(x, comps)
+            if why:
+                flags.append(f"Fact check: removed a sentence that didn't match the sale record - {why}.")
+            else:
+                out.append(x)
+        kept.append(" ".join(out))
+    if not flags:
+        return text, []
+    return re.sub(r"\n{3,}", "\n\n", "".join(kept)).strip(), flags
+
+
 def fix_text(text: str, *, subject: Optional[dict], comp: Optional[dict] = None, who: str = "Text",
              comps: Optional[list] = None) -> tuple[str, list[str]]:
     """Every deterministic rewrite above, in order. `comp` = the home a comp write-up is about; `comps` =
@@ -1060,6 +1145,8 @@ def fix_text(text: str, *, subject: Optional[dict], comp: Optional[dict] = None,
         lambda x: fix_acres_lot_grammar(x),
         lambda x: fix_mailing_address_grammar(x),
         lambda x: fix_under_contract_holdout(x, subject) if comp is None else (x, []),
+        lambda x: fix_comp_sale_claims(x, comps) if comp is None and comps else (x, []),
+        lambda x: fix_certain_predictions(x) if comp is None else (x, []),
         lambda x: fix_field_name_leaks(x),
         lambda x: drop_repeated_sentences(x),
     ):
@@ -1290,8 +1377,14 @@ def history_sentence(methodology: str, summary: Optional[dict], *, today=None, l
     ls = s.get("last_sale") or {}
     sold = _d(ls.get("date"))
     if sold and ls.get("price") and ((today or date.today()) - sold).days <= 3 * 365:
-        bits.append(f"It last sold on {_nice_date(sold.isoformat())} for ${float(ls['price']):,.0f}; what has changed "
-                    "since then should be confirmed with the seller.")
+        if s.get("last_sale_is_this_listing"):
+            # a seller report on a home bought not long ago: the reader IS the owner, and everything the report
+            # knows about the home comes from that sale's listing (701 Great Oak Ln, test round 11/14)
+            bits.append(f"It last sold on {_nice_date(sold.isoformat())} for ${float(ls['price']):,.0f}. The description and "
+                        "photos used here are from that listing, so updates made since then are not reflected in this value.")
+        else:
+            bits.append(f"It last sold on {_nice_date(sold.isoformat())} for ${float(ls['price']):,.0f}; what has changed "
+                        "since then should be confirmed with the seller.")
     return (methodology.rstrip() + " " + " ".join(bits)) if bits else methodology
 
 

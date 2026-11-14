@@ -194,11 +194,11 @@ def test_school_district_not_strong_survives_reweighting():
 
 # ---- 4913 Chancellor St remake (10/24 evening) -----------------------------------------------------
 
-def _chancellor_pendings(monkeypatch, implied):
+def _chancellor_pendings(monkeypatch, implied, second_list=299000):
     it = iter(implied)
     monkeypatch.setattr(ai, "_pending_implied_value", lambda s, h, psf: next(it))
     homes = [{"status": "pending", "match_score": 86, "street_address": "5111 LOCUST ST", "list_price": 390000},
-             {"status": "pending", "match_score": 85, "street_address": "5321 LOCUST ST", "list_price": 299000}]
+             {"status": "pending", "match_score": 85, "street_address": "5321 LOCUST ST", "list_price": second_list}]
     trace = {"anchor": {"market_psf": 193}, "asking_price_check": {"allowed_low_price": 370260, "allowed_high_price": 435600}}
     return ai._pending_competition_review({"sqft": 2010}, homes, 395000, 355000, 430000, trace)
 
@@ -211,7 +211,9 @@ def test_pendings_that_disagree_do_not_move_the_value(monkeypatch):
 
 
 def test_pendings_that_agree_still_nudge(monkeypatch):
-    v, lo, hi, info = _chancellor_pendings(monkeypatch, [380000, 384000])
+    # (both within 10% of their own asking price once adjusted - close matches; since 11/14 a pending that needs
+    # more adjusting than that does not move the value)
+    v, lo, hi, info = _chancellor_pendings(monkeypatch, [380000, 384000], second_list=372000)
     assert v < 395000 and info["nudged_from"] == 395000 and all(p["moved_value"] for p in info["pendings_used"])
 
 

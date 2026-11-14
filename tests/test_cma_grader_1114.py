@@ -211,3 +211,270 @@ def test_a_seller_who_accepted_an_offer_is_not_holding_out():
     assert "holding out" not in out and "took longer to go under contract" in out and flags
     # an active listing keeps the sentence
     assert fc.fix_under_contract_holdout(text, {"mls_status": "Active"}) == (text, [])
+
+
+# ---- two new test reports, 11/14 late morning (1802 Ginnodo St, 701 Great Oak Ln) -------------------------------
+
+def _closed_owner_home():
+    subject = {"listing_key": "803664249080", "street_address": "701 GREAT OAK LN", "last_sale_price": 595000.0,
+               "last_sale_date": "2025-04-24", "list_price": 610000.0, "source": "mls"}
+    timeline = {"current_status": "Closed", "is_closed": True, "is_active": False, "close_date": "2025-04-24",
+                "list_date": "2025-03-10"}
+    return svc._seller_not_listed("listing", subject, timeline)
+
+
+def test_seller_report_on_a_home_bought_recently_states_that_sale():
+    from app.services import cma_fact_check as fc
+    subj, tl = _closed_owner_home()
+    hist = subj["_listing_history"]
+    assert hist["last_sale"] == {"date": "2025-04-24", "price": 595000.0} and hist["last_sale_is_this_listing"]
+    assert hist["lines"] == ["Sold 2025-04-24 for $595,000"]
+    assert svc._property_record_facts(subj)["history_lines"] == ["Sold 2025-04-24 for $595,000"]
+    import datetime
+    out = fc.history_sentence("The value is $671,000.", hist, today=datetime.date(2026, 11, 14), listed=False)
+    assert "It last sold on Apr 24, 2025 for $595,000." in out and "updates made since then are not reflected" in out
+    assert "confirmed with the seller" not in out
+    # an earlier sale found by the history lookup keeps the usual wording
+    out = fc.history_sentence("The value is $671,000.", {"last_sale": {"date": "2025-04-24", "price": 595000}},
+                              today=datetime.date(2026, 11, 14))
+    assert "confirmed with the seller" in out
+
+
+def test_agent_is_told_when_the_value_is_far_from_the_homes_own_recent_sale(monkeypatch):
+    import datetime
+    monkeypatch.setattr(svc._tmach, "today", lambda: datetime.date(2026, 11, 14))
+    subj, tl = _closed_owner_home()
+    note = svc._own_sale_review(subj, 671000)
+    assert note and "$595,000" in note["message"] and "13% higher" in note["message"] and "19 months later" in note["message"]
+    assert svc._subject_reviews(subj, tl, 671000)["message"].startswith("Review before sending: this home sold for $595,000")
+    # in line with an ordinary market: no "% higher" note - but a 19-month-old listing still gets the reminder that
+    # the home's condition is as that listing showed it (outside audit 11/14)
+    stale = svc._own_sale_review(subj, 640000)
+    assert stale and "higher" not in stale["message"] and "the value assumes nothing has" in stale["message"]
+    # sold four months ago and valued in line: nothing to say
+    recent = dict(subj, last_sale_date="2026-07-10")
+    assert svc._own_sale_review(recent, 600000) is None
+    # a sale found in the home's EARLIER history (a listed home, a flip) is not this note's business
+    assert svc._own_sale_review({"last_sale_price": 300000, "last_sale_date": "2025-04-24",
+                                 "_listing_history": {"last_sale": {"date": "2025-04-24", "price": 300000}}}, 500000) is None
+
+
+def _pend(addr, lp, sqft, score=76):
+    return {"status": "pending", "street_address": addr, "list_price": lp, "sqft": sqft, "match_score": score,
+            "listing_key": addr, "distance_miles": 0.8, "days_on_market": 10}
+
+
+def test_a_pending_that_needs_a_large_adjustment_does_not_move_the_value(monkeypatch):
+    """701 Great Oak Ln: three pendings 'agreed' above the value, two of them only after 14-17% of adjusting."""
+    implied = {"103 LANTANA DR": 688000, "906 UNIONVILLE WAWASET RD": 746000, "109 W CLAY CREEK LN": 789000,
+               "12 NEAR ST": 700000}
+    monkeypatch.setattr(svc, "_pending_implied_value", lambda subject, h, psf: implied[h["street_address"]])
+    homes = [_pend("103 LANTANA DR", 725000, 2453), _pend("906 UNIONVILLE WAWASET RD", 639900, 2010, 73),
+             _pend("109 W CLAY CREEK LN", 919000, 2948, 72)]
+    trace = {"anchor": {"market_psf": 250}}
+    v, lo, hi, info = svc._pending_competition_review({"sqft": 2342}, homes, 655000, 605000, 710000, trace)
+    assert v == 655000 and info["nudge_pct"] == 0.0 and not any(r["moved_value"] for r in info["pendings_used"])
+    # the agent still hears about the far-off one, without "closely matches"
+    assert "906 UNIONVILLE WAWASET RD" in info["review"] and "partial match" in info["review"]
+    # two that ARE close matches still move it, as before
+    homes = [_pend("103 LANTANA DR", 725000, 2453), _pend("12 NEAR ST", 715000, 2400, 80)]
+    v, lo, hi, info = svc._pending_competition_review({"sqft": 2342}, homes, 655000, 605000, 710000, trace)
+    assert v > 655000 and info["nudge_pct"] > 0
+
+
+def test_judgment_on_something_the_table_prices_says_what_the_step_is():
+    grid = [{"feature_adjustments": {"condition": -27000}, "size_adjustment": 0}]
+    drags = [{"factor": "Home could use updating per its listing remarks", "direction": "down",
+              "evidence_strength": "clearly_market_supported"}]
+    trace = {"authority": "reasoning_model", "deterministic_anchor": 667116, "anchor": {"anchor_value": 667116, "comps": grid},
+             "asking_price_check": {}, "pending_competition": {}, "reasoning_model_fmv": None,
+             "reasoning_model": {"major_value_drivers": [], "major_value_drags": drags}}
+    b = svc._v10_value_bridge(trace, value=655000, range_min=605000, range_max=710000)
+    j = next(x for x in b["steps"] if x["key"] == "judgment")
+    assert j["already_in_grid"] and j["amount"] == -12000
+    assert "already partly counted" not in j["basis"] and "larger than those rates cover" in j["basis"]
+
+
+def test_old_comp_flag_reads_as_a_sentence(monkeypatch):
+    import datetime
+    monkeypatch.setattr(svc._tmach, "today", lambda: datetime.date(2026, 11, 14))
+    flags = svc._far_or_old_comp_flags([{"street_address": "302 MANOR DR", "close_date": "2026-02-27", "distance_miles": 0.13},
+                                        {"street_address": "9 FAR RD", "close_date": "2026-02-27", "distance_miles": 3.2}])
+    assert "sold 9 months ago - check" in flags[0] and " is sold" not in flags[0]
+    assert "is 3.2 miles away and sold 9 months ago" in flags[1]
+
+
+def test_a_rewritten_sale_write_up_never_opens_on_a_bare_it():
+    comp = {"street_address": "702 GREAT OAK LN", "status": "sold", "sale_price": 800000, "list_price": 725000,
+            "close_date": "2026-07-13", "days_on_market": 5}
+    orphan = ("Its interior is materially superior to the subject: remodeled kitchen with quartz and renovated baths. "
+              "The sale sets the ceiling for a fully updated home here. It sold above its list price in 5 days.")
+    out = svc._lead_in_orphan_note(orphan, comp, "Comp #1 (702 GREAT OAK LN)", {})
+    assert out.startswith("702 Great Oak Ln sold for $800,000 on Jul 13, 2026")
+    assert "Its interior is materially superior" in out and "It sold above its list price" not in out
+    # a write-up that already names the sale is left alone
+    named = "Comp #2 (710 WILLOWDALE LN) is in Hickory Hill, 1.08 miles away. It sold as-is."
+    assert svc._lead_in_orphan_note(named, comp, "Comp #2 (710 WILLOWDALE LN)", {}) == named
+
+
+# ---- outside audit of the two new reports, 11/14 afternoon (Ginnodo 79, Great Oak 66) ----------------------------
+
+def test_a_reused_answer_speaks_in_todays_comp_numbers():
+    """701 Great Oak Ln: written when the order was 702 / 302 Manor / 710 Willowdale / 207 Whitestone / 300 Manor,
+    reused after the report had re-sorted them - "Comp #2" must follow 302 Manor Dr to its new place."""
+    then = ["702", "302M", "710W", "207W", "300M"]
+    now = ["702", "710W", "207W", "302M", "300M"]
+    raw = {"subject_estimate": {"listing_strategy": "Buyers will compare the home with Comp #1, Comp #2 and Comp #5, all of "
+                                                    "which sold above list within 10 days. Comp #3 shows that a dated home "
+                                                    "that lingers closes below list. Comps #3 and #4 are farther away."}}
+    got = svc._lock_in_todays_order({"fp": "x", "raw": raw, "order": then}, now)
+    text = got["raw"]["subject_estimate"]["listing_strategy"]
+    assert "Comp #1, Comp #4 and Comp #5, all of which sold above list" in text
+    assert "Comp #2 shows that a dated home" in text and "Comps #2 and #3 are farther away" in text
+    assert got["order"] == now and raw["subject_estimate"]["listing_strategy"].count("Comp #2 and") == 1   # the stored copy is untouched
+    # same order: handed back as it is
+    same = {"fp": "x", "raw": raw, "order": now}
+    assert svc._lock_in_todays_order(same, list(now)) is same
+    # stored before the order was kept, and it names comps by number: not reusable
+    assert svc._lock_in_todays_order({"fp": "x", "raw": raw}, now) is None
+    # ...but an answer with no comp numbers in it is
+    plain = {"fp": "x", "raw": {"final_fmv": 655000, "summary": "The value sits below the renovated sales."}}
+    assert svc._lock_in_todays_order(plain, now) is plain
+    # a different set of comps under the same fingerprint can't happen; if it does, ask again
+    assert svc._lock_in_todays_order({"fp": "x", "raw": raw, "order": then}, ["702", "710W", "207W", "302M", "OTHER"]) is None
+
+
+def test_lock_keeps_the_order_it_was_written_in(monkeypatch):
+    import asyncio
+    store = {}
+
+    async def put(db, key, value):
+        store[key] = value
+
+    async def get(db, key):
+        return store.get(key)
+    monkeypatch.setattr(svc, "_reasoning_cache_put", put)
+    monkeypatch.setattr(svc, "_reasoning_cache_get", get)
+
+    async def go():
+        await svc._value_lock_put(None, "r1", "estimate", "fp1", {"t": "Comp #1 and Comp #2"}, order=["a", "b"])
+        assert store["cma_value_lock:estimate:r1"]["order"] == ["a", "b"]
+        swapped = await svc._value_lock_get(None, "r1", "estimate", "fp1", order=["b", "a"])
+        assert swapped["raw"]["t"] == "Comp #2 and Comp #1"
+        assert await svc._value_lock_get(None, "r1", "estimate", "other-facts", order=["b", "a"]) is None
+    asyncio.run(go())
+
+
+def _great_oak_comps():
+    return [{"street_address": "702 GREAT OAK LN", "sale_price": 800000, "list_price": 725000, "days_on_market": 5},
+            {"street_address": "710 WILLOWDALE LN", "sale_price": 550000, "list_price": 600000, "days_on_market": 55},
+            {"street_address": "207 WHITESTONE DR", "sale_price": 725000, "list_price": 725000, "days_on_market": 7},
+            {"street_address": "302 MANOR DR", "sale_price": 620000, "list_price": 600000, "days_on_market": 10},
+            {"street_address": "300 MANOR DR", "sale_price": 806500, "list_price": 749000, "days_on_market": 4}]
+
+
+def test_a_claim_about_a_numbered_comp_must_match_its_sale_record():
+    from app.services import cma_fact_check as fc
+    comps = _great_oak_comps()
+    wrong = ("**Pricing Position:** We recommend listing at about $655,000.\n\n"
+             "**Competition:** Buyers will compare the home with the updated Fox Lee Manor sales, Comp #1, Comp #2 and Comp #5, "
+             "all of which sold above list within 10 days. Position the home as the value-priced option.\n\n"
+             "**Overpricing Risk:** Pricing at the level of the updated comps invites buyers to price in renovation costs, "
+             "and Comp #3 shows that a dated home that lingers and is reduced closes below list.")
+    out, flags = fc.fix_comp_sale_claims(wrong, comps)
+    assert "Comp #2" not in out and "Comp #3" not in out and len(flags) == 2
+    assert "Comp #2 did not sell above its asking price" in flags[0] and "Comp #3 did not sell below" in flags[1]
+    assert "We recommend listing at about $655,000." in out and "Position the home as the value-priced option." in out
+    # the same sentences with the right numbers are untouched
+    right = wrong.replace("Comp #1, Comp #2 and Comp #5", "Comp #1, Comp #4 and Comp #5").replace("Comp #3 shows", "Comp #2 shows")
+    assert fc.fix_comp_sale_claims(right, comps) == (right, [])
+    # "within N days" on its own
+    assert fc.comp_sale_claim_problem("Comp #2 went under contract within 10 days.", comps) == "Comp #2 took 55 days, not 10 or fewer"
+    # a contrast, or both directions in one sentence, is not a one-way claim - left alone
+    assert fc.comp_sale_claim_problem("Comp #1 sold above list, while Comp #2 sold below list.", comps) is None
+    assert fc.comp_sale_claim_problem("Unlike Comp #1, Comp #2 lingered, but both sold above list eventually.", comps) is None
+    # no comp named, or no sale claim: nothing to check
+    assert fc.comp_sale_claim_problem("Most sales here went above asking within 10 days.", comps) is None
+    assert fc.comp_sale_claim_problem("Comp #2 has a dated interior.", comps) is None
+
+
+def test_the_report_text_chain_runs_the_comp_claim_check():
+    from app.services import cma_fact_check as fc
+    out, flags = fc.fix_text("Comp #2 sold above its asking price within 10 days. The range is wide.", subject={},
+                             comps=_great_oak_comps())
+    assert out == "The range is wide." and any("Comp #2" in f for f in flags)
+
+
+def test_a_judgment_whose_every_reason_is_in_the_table_is_removed():
+    """701 Great Oak Ln: condition came off every sale in the table, then $12,000 more "because it could use updating"."""
+    packet = _packet(667116)
+    packet["deterministic_evidence"]["comp_adjustment_grid"] = [{"comp_label": "Comp #1", "condition": -48000},
+                                                                {"comp_label": "Comp #2", "condition": 22000}]
+    reasoning = {"final_fmv": 655000, "range_low": 605000, "range_high": 705000,
+                 "major_value_drags": [{"factor": "Home could use updating per its listing remarks", "direction": "down"},
+                                       {"factor": "No documented system or finish updates", "direction": "down"},
+                                       {"factor": "No pool or special amenities", "direction": "neutral"}]}
+    out, flags = svc._apply_value_guards(reasoning, packet)
+    assert out["final_fmv"] == 667000 and "already priced in the adjustment table" in out["judgment_discipline"]["why"]
+    assert out["range_low"] == 615000 and out["range_high"] == 720000 and flags
+    # a reason the table can't price (a creek, a view) keeps the step
+    reasoning["major_value_drags"].append({"factor": "Backs to a power-line easement", "direction": "down"})
+    out, flags = svc._apply_value_guards(reasoning, packet)
+    assert out["final_fmv"] == 655000 and not flags
+
+
+def test_seller_market_sentence_states_the_slow_sale_too():
+    comps = [{"sale_price": 800000, "list_price": 725000, "days_on_market": 5, "is_included": True},
+             {"sale_price": 550000, "list_price": 600000, "days_on_market": 55, "is_included": True},
+             {"sale_price": 725000, "list_price": 725000, "days_on_market": 7, "is_included": True}]
+    note = svc._seller_slow_sale_note(comps, 7)
+    assert "one of these sales took 55 days and closed about 8% under its asking price" in note
+    assert svc._seller_slow_sale_note(comps[:1] + comps[2:], 7) == ""
+
+
+def test_predictions_are_reworded_as_what_the_evidence_supports():
+    from app.services import cma_fact_check as fc
+    out, flags = fc.fix_certain_predictions("The home has been on the market longer than most of the sales took, so competing "
+                                            "offers above asking are not expected. A well-prepared listing should find ready buyers.")
+    assert "competing offers above asking look less likely" in out and "should draw buyer interest" in out and flags
+    assert fc.fix_certain_predictions("Offers above asking look less likely.") == ("Offers above asking look less likely.", [])
+
+
+def test_a_pending_homes_adjustments_are_spelled_out():
+    assert svc._pending_adjustment_text([["size", -41000.0], ["baths", 11000.0]]) == "size -$41,000, baths +$11,000"
+    assert svc._pending_adjustment_text(None) == ""
+    final = {"value": 655000, "range_min": 605000, "range_max": 705000}
+    trace = {"pending_competition": {"nudge_pct": 0.0, "pendings_used": [
+        {"street_address": "103 LANTANA DR", "list_price": 725000, "implied_value": 688000, "match_score": 76,
+         "distance_miles": 0.85, "days_on_market": 20, "moved_value": False,
+         "adjustments": [["size", -26000.0], ["age", -18000.0], ["baths", 7000.0]]}]}}
+    out, _ = svc._v10_pending_context_sentence("The value is $655,000.", final=final, trace=trace)
+    assert "with the same rates as the sales (size -$26,000, age -$18,000, baths +$7,000), that asking price implies about $688,000" in out
+    # an older report without the lines keeps the plain wording
+    trace["pending_competition"]["pendings_used"][0].pop("adjustments")
+    out, _ = svc._v10_pending_context_sentence("The value is $655,000.", final=final, trace=trace)
+    assert "Adjusted to this home for size and features, that asking price implies about $688,000" in out
+
+
+def test_a_sale_taxed_far_below_this_home_says_so():
+    subject = {"annual_taxes": 8579, "list_price": 675000}
+    leland = {"street_address": "827 LELAND ST", "sale_price": 520000, "annual_taxes": 1889,
+              "ai_commentary": "It is a 2021 build with 4 beds.", "commentary": "It is a 2021 build with 4 beds."}
+    usual = {"street_address": "852 N 15TH ST", "sale_price": 540000, "annual_taxes": 7248,
+             "ai_commentary": "A 2013 end unit.", "commentary": "A 2013 end unit."}
+    edited = {"street_address": "9 OWN NOTE ST", "sale_price": 520000, "annual_taxes": 1500,
+              "ai_commentary": "A 2020 build.", "commentary": "My own words about this sale."}
+    flags = svc._append_tax_gap_notes(subject, [leland, usual, edited])
+    assert "annual property taxes are $1,889, against $8,579 for this home" in leland["commentary"]
+    assert "tax abatement or an old assessment" in leland["commentary"] and leland["commentary"] == leland["ai_commentary"]
+    assert usual["commentary"] == "A 2013 end unit."
+    assert edited["commentary"] == "My own words about this sale." and "annual property taxes" in edited["ai_commentary"]
+    assert len(flags) == 2
+    # a second pass adds nothing
+    before = leland["commentary"]
+    assert svc._append_tax_gap_notes(subject, [leland]) == [] and leland["commentary"] == before
+    # the listing itself says abatement
+    advertised = {"sale_price": 520000, "annual_taxes": 1889, "public_remarks": "Five years left on the tax abatement!",
+                  "ai_commentary": "New build."}
+    svc._append_tax_gap_notes(subject, [advertised])
+    assert "its listing advertised a tax abatement" in advertised["ai_commentary"]

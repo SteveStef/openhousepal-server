@@ -688,7 +688,11 @@ async def hold_cma_generation(db: AsyncSession, owner_id: str, report_id: str, c
         _cma_holds.prune()
         if report_id in _cma_holds.holds:
             raise CmaGenerationAlreadyRunning()
-        limit = config.get("agent_monthly_ai_budget_usd_by_tier", {}).get(plan_tier)
+        # the agent's own allowance: the amount an admin set for them or their group, else their plan's -
+        # the same number the AI Usage bar and every other AI tool use (test round 11/14: this gate read only
+        # the plan's amount, so an agent given a larger allowance was refused a CMA at the plan's $20, and one
+        # given a smaller allowance was let through here and stopped mid-run instead)
+        limit = await monthly_limit_usd(db, owner_id, config, plan_tier)
         if limit and owner_id not in _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS:
             in_flight = sum(h for (o, h, _) in _cma_holds.holds.values() if o == owner_id)
             used = await total_monthly_ai_cost(db, owner_id)

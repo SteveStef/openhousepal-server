@@ -3207,6 +3207,18 @@ def _seller_not_listed(mode: str, subject: dict, timeline: dict) -> tuple[dict, 
     if tl.get("is_closed") and (close_date or last_price):
         lines.append("Last sold" + (f" {close_date}" if close_date else "") + (f" for ${last_price:,.0f}" if last_price else "") +
                      " (its most recent recorded sale). That is history, not a current asking price.")
+        # ...and the report states it (701 Great Oak Ln, test round 11/14: bought Apr 2025 for $595,000, valued at
+        # $671,000 nineteen months later, and neither the notes nor the record box mentioned the sale - the
+        # history lookup only lists sales BEFORE the listing it is looking at, and this listing IS the sale)
+        _day = str(close_date)[:10] if close_date else ""
+        _hist = dict(subj.get("_listing_history") or {})
+        _ls = _hist.get("last_sale") or {}
+        if _day and last_price and (not _ls.get("price") or str(_ls.get("date") or "") < _day):
+            _hist["last_sale"] = {"date": _day, "price": last_price}
+            _hist["prior_sales"] = [*(_hist.get("prior_sales") or []), {"date": _day, "price": last_price}]
+            _hist["lines"] = [*(_hist.get("lines") or []), f"Sold {_day} for ${last_price:,.0f}"]
+            _hist["last_sale_is_this_listing"] = True
+            subj["_listing_history"] = _hist
     last_listing = _unsold_last_listing(subj, tl)
     if last_listing:
         lines.append(last_listing["line"] + " Buyers did not pay that price: treat it as a ceiling on what the home is worth "
@@ -4332,6 +4344,25 @@ def _search_bracket_note(price: float) -> Optional[str]:
             f"draws offers back up toward its value.")
 
 
+def _seller_slow_sale_note(comps: Optional[list], median_dom) -> str:
+    """The sale that did NOT go quickly, said next to the quick ones."""
+    slow = []
+    for c in comps or []:
+        if not isinstance(c, dict) or not c.get("is_included", True):
+            continue
+        dom = _as_float(c.get("days_on_market"))
+        price = _as_float(c.get("sale_price")) or _as_float(c.get("close_price"))
+        lp = _as_float(c.get("list_price"))
+        if dom is not None and price and lp and dom >= max(30.0, 3.0 * (median_dom or 0)) and price < lp * 0.995:
+            slow.append((dom, price / lp))
+    if not slow:
+        return ""
+    dom, ratio = max(slow)
+    more = "one of these sales" if len(slow) == 1 else f"{len(slow)} of these sales"
+    return (f" Not every sale went that way: {more} took {int(round(dom))} days and closed about "
+            f"{round((1 - ratio) * 100)}% under its asking price.")
+
+
 def _seller_pricing_position(*, value: float, range_min: Optional[float], range_max: Optional[float],
                              subject_asking: Optional[float], status_timeline: Optional[dict], comps: list,
                              confidence: Optional[str] = None, loose_fit: bool = False) -> str:
@@ -4356,8 +4387,11 @@ def _seller_pricing_position(*, value: float, range_min: Optional[float], range_
                       "are a different kind of home from this one, so their pace says little about how fast this home will "
                       "sell - a home with fewer close matches has fewer buyers and usually takes longer to find the right one.")
         elif stl >= 1.01:
+            # (outside audit 11/14, 701 Great Oak Ln: "buyers here compete for well-priced homes" stated as a rule
+            # while one of the five sales had taken 55 days and closed 8% under asking)
             market = (f" The comparable sales closed at a median of about {pct}% above their asking prices{dom_txt} - "
-                      "buyers here compete for well-priced homes, and listing at value (not above it) is what creates that competition.")
+                      "well-priced homes here have drawn quick offers, and listing at value (not above it) gives this "
+                      "home the best chance of the same." + _seller_slow_sale_note(comps, cdom))
         elif stl <= 0.99:
             market = (f" The comparable sales closed at a median of about {pct}% below their asking prices{dom_txt} - "
                       "buyers here negotiate, so a price set above value is likely to sit and then be cut.")
@@ -5377,7 +5411,8 @@ def _far_or_old_comp_flags(comps: list) -> list[str]:
         if sold and (_tmach.today() - sold).days > _OLD_COMP_DAYS:
             bits.append(f"sold {round((_tmach.today() - sold).days / 30.4)} months ago")
         if bits:
-            flags.append(f"{_comp_label(i, comp)} is {' and '.join(bits)} - check it still fits before sending.")
+            _is = "" if bits[0].startswith("sold") else "is "
+            flags.append(f"{_comp_label(i, comp)} {_is}{' and '.join(bits)} - check it still fits before sending.")
     return flags
 
 
@@ -9675,6 +9710,9 @@ brisk market, multiple offers, sales over asking) is already inside every closed
 for it. Do not move final_fmv off the measured evidence by less than 1%: a difference that small is not
 evidence. Move it only for something the adjusted sales cannot measure, and name that thing.
 
+Say what the evidence shows, not what buyers will do. "Competing offers above asking are less likely" is
+supported by a home's time on the market; "are not expected" and "will sell quickly" are predictions.
+
 Range: derive range_low and range_high from the spread of the adjusted comparable evidence and
 your uncertainty. The asking price is never a ceiling or a floor on the range - do not set
 range_high to the asking price because the home has sat. When few sales are close matches (or they
@@ -10096,6 +10134,12 @@ _PENDING_NUDGE_SHARE = 0.25     # move a quarter of the way toward what the pend
 _PENDING_NUDGE_CAP = 0.025      # ...never more than 2.5% in total
 _PENDING_NUDGE_MAX_GAP = 0.15   # pendings more than 15% apart from each other don't agree - no nudge (review only)
 _PENDING_REVIEW_MATCH = 70
+# A pending whose asking price has to be moved more than this to fit the subject is not a close match, so it
+# does not move the value (701 Great Oak Ln, test round 11/14: a 1940 three-bedroom adjusted UP 17% and a
+# $919,000 home adjusted DOWN 14% helped add $16,000 to a dated Cape Cod, right after the valuation took
+# $12,000 off for its condition - a pending has no condition rating, so the further it is from the subject the
+# less its adjusted asking price means). It still shows in the list and in the agent's review.
+_PENDING_NUDGE_MAX_ADJ = 0.10
 _PENDING_REVIEW_GAP = 0.10      # a strong pending implying 10%+ off our value -> agent "Review before sending"
 
 
@@ -10113,6 +10157,45 @@ async def _load_current_competition(db: AsyncSession, report, subject: dict) -> 
     except Exception:   # never let the side section fail a paid run
         logger.warning("CMA current competition lookup failed", exc_info=True)
         return []
+
+
+_PENDING_PART_WORDS = (("size", "size"), ("below_grade", "lower level"), ("baths", "baths"), ("garage", "garage"),
+                       ("lot", "land"), ("age", "age"), ("sewer", "sewer"), ("road", "road"), ("condition", "condition"))
+
+
+def _pending_adjustment_parts(subject: dict, home: dict, market_psf: Optional[float], implied: Optional[float]) -> Optional[list]:
+    """[[what, dollars], ...] - the same lines the sales get, for a home under contract (outside audit 11/14: "the
+    numerical transformations from pending asking prices to subject-equivalent indications are not visible").
+    Best-effort; None when the lines don't add up to the figure used."""
+    try:
+        lp = _as_float(home.get("list_price"))
+        s_ag = _as_float(subject.get("above_grade_finished_area")) or _as_float(subject.get("sqft"))
+        c_ag = _as_float(home.get("sqft"))
+        if not (lp and market_psf and s_ag and c_ag and implied):
+            return None
+        s_bg, s_bg_est = _v10_bg_for_grid(subject, s_ag)
+        c_bg, c_bg_est = _v10_bg_for_grid(home, c_ag)
+        r = {"_c": {**home, "above_grade_finished_area": c_ag}, "price": lp, "sqft": c_ag, "ag": c_ag, "bg": c_bg, "bg_estimated": c_bg_est}
+        feat = _v10_grid_adjustments(subject, r, s_ag, s_bg, s_bg_est, market_psf)
+        parts = [[word, round(_as_float(feat.get(key)) or 0, -3)] for key, word in _PENDING_PART_WORDS]
+        parts = [p for p in parts if abs(p[1]) >= 1000]
+        if abs((lp + sum(p[1] for p in parts)) - implied) > 3000:
+            return None
+        return sorted(parts, key=lambda p: -abs(p[1]))
+    except Exception:  # noqa: BLE001 - a display detail never fails a report
+        return None
+
+
+def _pending_adjustment_text(parts) -> str:
+    """'size -$41,000, baths +$11,000' for the notes."""
+    out = []
+    for p in parts or []:
+        try:
+            word, amt = str(p[0]), float(p[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        out.append(f"{word} {'+' if amt > 0 else '-'}${abs(amt):,.0f}")
+    return ", ".join(out)
 
 
 def _pending_implied_value(subject: dict, home: dict, market_psf: Optional[float]) -> Optional[float]:
@@ -10263,6 +10346,7 @@ def _pending_competition_review(subject: dict, homes: list, value, low, high, tr
         if iv:
             strong.append((h, iv))
     info["pendings_used"] = [{"listing_key": h.get("listing_key"), "street_address": h.get("street_address"),
+                              "adjustments": _pending_adjustment_parts(subject, h, market_psf, iv),
                               "list_price": h.get("list_price"), "implied_value": round(iv / 1000) * 1000,
                               "match_score": h.get("match_score"), "distance_miles": h.get("distance_miles"),
                               "days_on_market": h.get("days_on_market"), "sqft": h.get("sqft")} for h, iv in strong]
@@ -10271,7 +10355,8 @@ def _pending_competition_review(subject: dict, homes: list, value, low, high, tr
     # side of it, and within 15% of each other (one far from the rest is a different home - condition,
     # layout - and goes to the agent's review instead). 4913 Chancellor St was moved down 2.3% by the
     # median of a pending implying $406K (above the value) and one implying $314K (19% below, 10/24).
-    pool = list(strong)
+    pool = [(h, iv) for h, iv in strong
+            if abs(iv - _as_float(h.get("list_price"))) / _as_float(h.get("list_price")) <= _PENDING_NUDGE_MAX_ADJ]
     if len(pool) >= 3:
         mid = _v10_median([iv for _, iv in pool])
         pool = [(h, iv) for h, iv in pool if abs(iv - mid) / mid <= _PENDING_NUDGE_MAX_GAP]
@@ -10311,7 +10396,10 @@ def _pending_competition_review(subject: dict, homes: list, value, low, high, tr
         if (h.get("match_score") or 0) >= _PENDING_REVIEW_MATCH and abs(iv - new_v) / new_v > _PENDING_REVIEW_GAP:
             side = "above" if iv > new_v else "below"
             # (whole thousands: "about $2,152,925 adjusted" read as a precision the estimate doesn't have)
-            info["review"] = (f"Review before sending: {h.get('street_address')} is under contract and closely matches this home "
+            _close = abs(iv - _as_float(h.get("list_price"))) / _as_float(h.get("list_price")) <= _PENDING_NUDGE_MAX_ADJ
+            info["review"] = (f"Review before sending: {h.get('street_address')} is under contract and "
+                              + ("closely matches this home " if _close else "is a partial match for this home ")
+                              + 
                               f"(list ${h.get('list_price'):,.0f}, about ${round(iv / 1000) * 1000:,.0f} adjusted to this home) - "
                               f"{abs(iv - new_v) / new_v * 100:.0f}% {side} this report's value of ${new_v:,.0f}. "
                               "Its contract price isn't known yet; check it before sending.")
@@ -10461,11 +10549,19 @@ def _apply_judgment_discipline(reasoning: dict, evidence_packet: dict) -> tuple[
              "condition": "condition", "age": "age", "lot": "lot"}
     _fams = {fam for row in (det.get("comp_adjustment_grid") or []) for k, fam in _keys.items() if _as_float(row.get(k))}
     _fresh = [n for n in names if not any(re.search(rx, n, re.I) and fam in _fams for fam, rx in _GRID_PRICED_WORDS)]
+    # 4. Every reason named is something the table already prices (701 Great Oak Ln, outside audit 11/14: the table
+    #    took condition off every sale, then a further $12,000 came off "because the home could use updating" -
+    #    flagged as an overlapping deduction, as 701 Sturbridge Dr's was a round earlier). The table's rates are the
+    #    ones checked against past sales; a second helping of the same factor has nothing behind it. The value is
+    #    the measured figure, and how sure we are of the home's condition shows in the range and the confidence.
+    _all_gridded = bool(names) and not _fresh
     names = _fresh or names
     why = None
     # (listed: time on the market either moved the asking-price step already, or the home hasn't sat long enough
     # for it to count at all - either way it is not a second deduction. Not listed: see rule 1.)
-    if names and all(_EXPOSURE_FACTOR_RE.search(n) for n in names):
+    if _all_gridded:
+        why = "every reason named for it is already priced in the adjustment table"
+    elif names and all(_EXPOSURE_FACTOR_RE.search(n) for n in names):
         why = ("market time is already counted in the asking-price step" if check else
                "an earlier listing that did not sell is a ceiling on the value, not a deduction from the sales")
     elif names and all(_DEMAND_FACTOR_RE.search(n) or _MARKET_DEMAND_FACTOR_RE.search(n) for n in names):
@@ -11779,6 +11875,25 @@ def _size_ratio_claim_errors(text: str, areas_c: dict, areas_s: dict) -> list:
 _QUALITY_WORD = {"above": "better than the subject", "below": "weaker than the subject", "similar": "similar to the subject"}
 
 
+_ORPHAN_NOTE_START_RE = re.compile(r"^\s*(?:It|Its|It's)\b")
+_ORPHAN_NOTE_SOLD_RE = re.compile(r"^(?:It|This (?:home|sale)) (?:sold|closed)\b[^.]*\b(?:list|asking)\b[^.]*\.?$", re.I)
+
+
+def _lead_in_orphan_note(text: str, comp: dict, label: str, subject: Optional[dict] = None) -> str:
+    """A rewritten sale write-up that opens on "It" / "Its" with nothing named before it ("Its interior is
+    materially superior to the subject..." - 701 Great Oak Ln, test round 11/14: the targeted rewrite dropped the
+    opening sentence along with the claim it was fixing). It gets the fact template's opening sentence - the
+    address, price, date, sold-vs-asking and days - and loses its own closing "It sold above list in 5 days",
+    which that sentence now states."""
+    if not text or not _ORPHAN_NOTE_START_RE.match(text):
+        return text
+    lead = (_fact_check.sentences(_regenerate_comp_narrative_from_snapshot(comp, label, subject)) or [""])[0].strip()
+    if not lead or lead.startswith(("It ", "Its ")):
+        return text
+    rest = [x for x in _fact_check.sentences(text) if not (" sold for $" in lead and _ORPHAN_NOTE_SOLD_RE.match(x.strip()))]
+    return (lead + " " + " ".join(rest)).strip() if rest else text
+
+
 def _regenerate_comp_narrative_from_snapshot(comp: dict, label: str, subject: Optional[dict] = None) -> str:
     """Build a corrected comp card from canonical facts plus clearly labelled model judgment.
 
@@ -12031,6 +12146,59 @@ async def _targeted_comp_narrative_rewrite(
         return {}
 
 
+_TAX_GAP_RATIO = 0.5          # a sale taxed at half (or less) of this home's rate for its price...
+_TAX_GAP_MIN_PER_YEAR = 2000  # ...and at least this many dollars a year cheaper to own than this home's rate implies
+_TAX_GAP_MARK = "annual property taxes"
+
+
+def _annual_taxes(d: Optional[dict]) -> Optional[float]:
+    v = _as_float(_first_present(d or {}, "annual_taxes", "taxes", "tax_annual_amount"))
+    return v if v and v > 0 else None
+
+
+def _tax_gap_sentence(subject: Optional[dict], comp: Optional[dict], ref_price: Optional[float]) -> Optional[str]:
+    """827 Leland St (outside audit 11/14): annual taxes $1,889 against $8,579 for the subject - five years left
+    on a Philadelphia tax abatement - and the write-up never mentioned it. A home that is much cheaper to own
+    draws more from a buyer than its bricks alone would; the reader is told, in words, with both figures. No
+    dollar adjustment: nothing in our past sales measures one."""
+    s_tax, c_tax = _annual_taxes(subject), _annual_taxes(comp)
+    c_price = _as_float((comp or {}).get("sale_price")) or _as_float((comp or {}).get("close_price"))
+    if not (s_tax and c_tax and c_price and ref_price):
+        return None
+    expected = s_tax * c_price / ref_price          # this sale's taxes at the subject's rate
+    if c_tax > _TAX_GAP_RATIO * expected or expected - c_tax < _TAX_GAP_MIN_PER_YEAR:
+        return None
+    remarks = str(_first_present(comp or {}, "public_remarks", "remarks", "listing_remarks") or "")
+    cause = ("its listing advertised a tax abatement" if re.search(r"\babate", remarks, re.I)
+             else "a gap that size usually means a tax abatement or an old assessment")
+    return (f"Its {_TAX_GAP_MARK} are ${c_tax:,.0f}, against ${s_tax:,.0f} for this home - {cause}. A home that costs "
+            "less to own can draw a higher price, so this sale may overstate what this home would bring.")
+
+
+def _append_tax_gap_notes(subject: Optional[dict], comps: Optional[list]) -> list:
+    """Adds the sentence to each such sale's write-up (once; an agent's own rewritten note is left alone)."""
+    s = subject or {}
+    prices = sorted(p for p in ((_as_float(c.get("sale_price")) or _as_float(c.get("close_price"))) for c in comps or []
+                                if isinstance(c, dict)) if p)
+    ref = (_as_float(s.get("list_price")) or _as_float(s.get("last_sale_price"))
+           or (prices[len(prices) // 2] if prices else None))
+    flags = []
+    for i, comp in enumerate(comps or []):
+        if not isinstance(comp, dict):
+            continue
+        sent = _tax_gap_sentence(s, comp, ref)
+        ai_text = str(comp.get("ai_commentary") or "")
+        if not sent or not ai_text or _TAX_GAP_MARK in ai_text or re.search(r"\babate", ai_text, re.I):
+            continue
+        own_note = comp.get("commentary") and comp.get("commentary") != comp.get("ai_commentary")
+        comp["ai_commentary"] = ai_text.rstrip() + " " + sent
+        if not own_note:
+            comp["commentary"] = comp["ai_commentary"]
+        flags.append(f"{_comp_label(i, comp)}: annual taxes ${_annual_taxes(comp):,.0f} against the subject's "
+                     f"${_annual_taxes(s):,.0f} - said so in its write-up (possible tax abatement).")
+    return flags
+
+
 async def _materialize_snapshot_with_comp_narratives(
     snapshot: _AuthoritativeEvidenceSnapshot, drafts: list[dict],
     *, attempt_rewrite: bool = False, model: str = "",
@@ -12128,6 +12296,7 @@ async def _materialize_snapshot_with_comp_narratives(
             if re_blocking:
                 blocking.extend(re_blocking)
                 continue
+            new_text = _lead_in_orphan_note(new_text, comps[i], label, subject)
             for field in ("ai_commentary", "commentary"):
                 if comps[i].get(field):
                     comps[i][field] = new_text
@@ -12136,6 +12305,7 @@ async def _materialize_snapshot_with_comp_narratives(
         for reasons in per_comp_blocking.values():
             blocking.extend(reasons)
 
+    flags.extend(_append_tax_gap_notes(subject, comps))
     return subject, comps, timeline, list(dict.fromkeys(flags)), list(dict.fromkeys(blocking))
 
 
@@ -12954,20 +13124,51 @@ def _value_lock_key(report_id, kind: str) -> str:
     return f"cma_value_lock:{kind}:{report_id}"
 
 
-async def _value_lock_get(db: AsyncSession, report_id, kind: str, fingerprint: str) -> Optional[dict]:
-    """This report's stored AI answer for `kind`, when its facts (fingerprint) haven't changed."""
+def _lock_order(comps) -> list:
+    """The comps in the order the AI was shown them - what its "Comp #N" numbers mean."""
+    return [str(c.get("listing_key") or c.get("comp_id") or "") for c in (comps or []) if isinstance(c, dict)]
+
+
+def _lock_in_todays_order(got: dict, order_now: Optional[list]) -> Optional[dict]:
+    """A stored answer says "Comp #2" for the comp that was SECOND when it was written. The report re-sorts its
+    comps strongest-first at the very end of a run, so on the next run the same comp can be #4 - and the stored
+    text came back word for word: 701 Great Oak Ln's free re-run told the seller "Comp #1, Comp #2 and Comp #5
+    all sold above list within 10 days" when the new #2 had sold 8% under asking after 55 days, and called the
+    at-asking, seven-day sale at #3 "a dated home that lingers" (outside audit 11/14, its one critical finding;
+    the first run had it right). The fingerprint is the same whatever the order, so the order is stored with
+    the answer and every "Comp #N" in it is renumbered to today's order when it is reused.
+    None = this stored answer can't be trusted for numbering (stored before the order was kept): ask again."""
+    then = got.get("order")
+    if order_now is None:
+        return got
+    if not then:
+        return None if _COMP_REF_RE.search(json.dumps(got.get("raw"), default=str)) else got
+    if list(then) == list(order_now):
+        return got
+    if sorted(then) != sorted(order_now) or len(set(then)) != len(then):
+        return None
+    pos = {k: i + 1 for i, k in enumerate(order_now)}
+    mapping = {i + 1: pos[k] for i, k in enumerate(then) if pos[k] != i + 1}
+    return {**got, "raw": _walk_strings(copy.deepcopy(got["raw"]), lambda t: _renumber_comp_refs(t, mapping)),
+            "order": list(order_now)}
+
+
+async def _value_lock_get(db: AsyncSession, report_id, kind: str, fingerprint: str, order: Optional[list] = None) -> Optional[dict]:
+    """This report's stored AI answer for `kind`, when its facts (fingerprint) haven't changed - with its
+    "Comp #N" numbers in today's comp order (`order`, see _lock_in_todays_order)."""
     if not report_id or _tmach.current():   # accuracy-test runs never reuse (each is its own experiment)
         return None
     got = await _reasoning_cache_get(db, _value_lock_key(report_id, kind))
     if isinstance(got, dict) and got.get("fp") == fingerprint and got.get("raw") is not None:
-        return got
+        return _lock_in_todays_order(got, order)
     return None
 
 
-async def _value_lock_put(db: AsyncSession, report_id, kind: str, fingerprint: str, raw, **more) -> None:
+async def _value_lock_put(db: AsyncSession, report_id, kind: str, fingerprint: str, raw, order: Optional[list] = None, **more) -> None:
     if not report_id or _tmach.current():
         return
-    await _reasoning_cache_put(db, _value_lock_key(report_id, kind), {"fp": fingerprint, "raw": raw, **more})
+    await _reasoning_cache_put(db, _value_lock_key(report_id, kind),
+                               {"fp": fingerprint, "raw": raw, **({"order": list(order)} if order else {}), **more})
 
 
 async def _run_cma_reasoning_stage(
@@ -13009,7 +13210,8 @@ async def _run_cma_reasoning_stage(
         _cache_key = _reasoning_cache_key(evidence_packet, model)
         # this report's own earlier answer first (same facts -> same number, see _value_lock_identity)
         _lock_fp = _value_lock_fingerprint(_packet_lock_identity(evidence_packet), model=model)
-        _locked = await _value_lock_get(db, report_id, "reasoning", _lock_fp)
+        _lock_ord = _lock_order(evidence_packet.get("comparables"))
+        _locked = await _value_lock_get(db, report_id, "reasoning", _lock_fp, order=_lock_ord)
         cached = _locked or await _reasoning_cache_get(db, _cache_key)
         _now_dom = _as_float((evidence_packet.get("subject") or {}).get("dom"))
         _now_cdom = _as_float((evidence_packet.get("subject") or {}).get("cdom"))
@@ -13042,7 +13244,7 @@ async def _run_cma_reasoning_stage(
         if cached is None and not blockers:
             await _reasoning_cache_put(db, _cache_key, {"raw": raw, **_days_now})
         if not blockers and (cached is None or cached is not _locked):
-            await _value_lock_put(db, report_id, "reasoning", _lock_fp, raw, **_days_now)
+            await _value_lock_put(db, report_id, "reasoning", _lock_fp, raw, order=_lock_ord, **_days_now)
         reasoning, guard_flags = _apply_value_guards(reasoning, evidence_packet)
         # the callers move these into qa_flags; the validator's own repairs go first
         reasoning["_guard_flags"] = list(reasoning.pop("_repair_flags", None) or []) + list(guard_flags)
@@ -14494,7 +14696,10 @@ def _v10_value_bridge(trace: Optional[dict], *, value, range_min=None, range_max
         basis = ("A judgment, not a measured adjustment" + (f": {jdg_text}." if jdg_text else
                  ": the reasoning pass weighed the comparable evidence as a whole."))
         if jdg_gridded:
-            basis += " These features are already partly counted in the adjusted sales."
+            # ("already partly counted ..., so this step takes off $12,000" read as counting it twice - 701 Great
+            # Oak Ln, 11/14. The table prices condition and the like at fixed rates; this is the part beyond them.)
+            basis += (" The adjustment table already prices these at fixed rates; this step is a further judgment "
+                      "that the difference here is larger than those rates cover.")
         steps.append({"key": "judgment", "label": "Judgment beyond the measured adjustments", "amount": round(judgment),
                       "basis": basis, "measured": False, "market_supported": jdg_supported, "already_in_grid": jdg_gridded})
     if abs(buyer_cap) >= 500:
@@ -14780,7 +14985,10 @@ def _v10_pending_context_sentence(methodology: str, *, final: Optional[dict], tr
     s = (f" Homes under contract ({_PENDING_CONTEXT_MARK}): {_title_address(p.get('street_address'))}"
          + (f", {dist:.2f} miles away," if dist is not None else "")
          + " went under contract" + (f" after {round(dom)} days" if dom is not None else "")
-         + f" at a ${lp:,.0f} asking price. Adjusted to this home for size and features, that asking price implies about "
+         + f" at a ${lp:,.0f} asking price. Adjusted to this home "
+         + (f"with the same rates as the sales ({_pending_adjustment_text(p.get('adjustments'))})"
+            if _pending_adjustment_text(p.get("adjustments")) else "for size and features")
+         + ", that asking price implies about "
          f"${round(iv, -3):,.0f}, {rel} this report's value. Its contract price isn't known yet, so it is not treated as a sale"
          + (f" - with other close matches it moved the value {'up' if nudge > 0 else 'down'} {abs(nudge):g}% (the most "
             "pending homes may move it is 2.5%)."
@@ -17937,6 +18145,59 @@ def _recent_status_review(status_timeline: Optional[dict]) -> Optional[dict]:
                         "withdrawn or expired - not being relisted, and not under contract - before you send this.")}
 
 
+_OWN_SALE_REVIEW_MIN_DAYS = 90
+_OWN_SALE_REVIEW_MAX_DAYS = 3 * 365
+_OWN_SALE_REVIEW_RATE = (-0.02, 0.07)    # a year: outside this, the agent should know why before sending
+_OWN_SALE_STALE_DAYS = 180               # a listing this old no longer describes the home with any certainty
+
+
+def _own_sale_review(subject: Optional[dict], value) -> Optional[dict]:
+    """Agent-only "Review before sending" for a report built from the home's own sale listing (a seller CMA on a
+    home bought not long ago): the value against what it sold for. 701 Great Oak Ln (test round 11/14) sold for
+    $595,000 in April 2025 "needing updating"; the report valued it at $671,000 from that same description. The
+    sales may well support it - the agent should confirm what has changed before it goes to the owner."""
+    s = subject or {}
+    hist = s.get("_listing_history") or {}
+    if not hist.get("last_sale_is_this_listing"):
+        return None
+    price, sold, v = _as_float(s.get("last_sale_price")), _parse_iso_date(s.get("last_sale_date")), _as_float(value)
+    if not price or not sold or not v:
+        return None
+    days = (_tmach.today() - sold).days
+    if not (_OWN_SALE_REVIEW_MIN_DAYS <= days <= _OWN_SALE_REVIEW_MAX_DAYS):
+        return None
+    rate = (v / price) ** (1 / max(1.0, days / 365.25)) - 1
+    months = round(days / 30.4)
+    if _OWN_SALE_REVIEW_RATE[0] <= rate <= _OWN_SALE_REVIEW_RATE[1]:
+        # in line with an ordinary market - but the home's condition is still as that listing showed it (outside
+        # audit 11/14: "the current condition is not independently verified ... a consequential limitation")
+        if days < _OWN_SALE_STALE_DAYS:
+            return None
+        return {"last_sale_price": price, "last_sale_date": sold.isoformat(),
+                "message": ("Review before sending: everything this report knows about the home's condition comes from its "
+                            f"{_fact_check._nice_date(sold.isoformat())} sale listing (${price:,.0f}), about {months} months ago. "
+                            "Confirm with the owner what has changed since (kitchen, baths, roof, systems) before you send "
+                            "this - the value assumes nothing has.")}
+    pct = (v / price - 1) * 100
+    return {"last_sale_price": price, "last_sale_date": sold.isoformat(), "change_pct": round(pct, 1),
+            "message": (f"Review before sending: this home sold for ${price:,.0f} on {_fact_check._nice_date(sold.isoformat())}, "
+                        f"and this report values it at ${v:,.0f} - {abs(pct):.0f}% {'higher' if pct > 0 else 'lower'}, "
+                        f"about {months} months later. The description and photos used here are from that sale's listing. "
+                        "Confirm with the owner what has changed since (updates, repairs, condition) before you send this.")}
+
+
+def _subject_reviews(subject: Optional[dict], status_timeline: Optional[dict], value) -> Optional[dict]:
+    """The agent-only notes about the subject's own record, as one {message} (the banner shows it first)."""
+    notes = [n for n in (_recent_status_review(status_timeline), _own_sale_review(subject, value)) if n]
+    if not notes:
+        return None
+    out = dict(notes[0])
+    if len(notes) > 1:
+        out["message"] = notes[0]["message"] + " Also: " + re.sub(r"^Review before sending:\s*", "", notes[1]["message"])
+        out["own_sale"] = {k: v for k, v in notes[1].items() if k != "message"}
+    return out
+
+
 def _subject_status_flags(subject: dict, status_timeline: dict, value, subject_asking) -> list[str]:
     """The subject's own status notes for the final valuation and the agent: listed long with a value above its
     asking price, a market window that ENDED at a contract (not weak demand), or simply its status. One helper for
@@ -18149,7 +18410,7 @@ async def _generate_ai_analysis_impl(
     # this report's own earlier comp ratings first, when its facts and photo count haven't changed
     _comp_lock_fp = _value_lock_fingerprint(_value_lock_identity(enriched_subject, enriched_comps, with_ratings=False),
                                             model=model, mode=report.mode, extra={"photos": images_sent})
-    _comp_locked = await _value_lock_get(db, report_id, "comp", _comp_lock_fp)
+    _comp_locked = await _value_lock_get(db, report_id, "comp", _comp_lock_fp, order=_lock_order(enriched_comps))
     _cached_comp = (copy.deepcopy(_comp_locked["raw"]) if _comp_locked and isinstance(_comp_locked.get("raw"), dict)
                     else await _reasoning_cache_get(db, _comp_cache_key))
     _subject_dom_now = _as_float(status_timeline.get("active_market_days")) if status_timeline.get("active_market_days") is not None \
@@ -18450,11 +18711,13 @@ async def _generate_ai_analysis_impl(
             and _as_float(result["subject_estimate"].get("value"))
             and not any(_guide_blank(k) for k in _guide_fields)):
         await _reasoning_cache_put(db, _comp_cache_key, {**copy.deepcopy(result), "_subject_dom": _subject_dom_now})
-        await _value_lock_put(db, report_id, "comp", _comp_lock_fp, {**copy.deepcopy(result), "_subject_dom": _subject_dom_now})
+        await _value_lock_put(db, report_id, "comp", _comp_lock_fp, {**copy.deepcopy(result), "_subject_dom": _subject_dom_now},
+                              order=_lock_order(enriched_comps))
     elif (not _comp_locked and result.get("comps") and isinstance(result.get("subject_estimate"), dict)
           and _as_float(result["subject_estimate"].get("value")) and not any(_guide_blank(k) for k in _guide_fields)):
         # answered from the shared cache: this report now holds its own copy
-        await _value_lock_put(db, report_id, "comp", _comp_lock_fp, {**copy.deepcopy(result), "_subject_dom": _subject_dom_now})
+        await _value_lock_put(db, report_id, "comp", _comp_lock_fp, {**copy.deepcopy(result), "_subject_dom": _subject_dom_now},
+                              order=_lock_order(enriched_comps))
 
     cost = ai_config_service.estimate_cost_usd(config, model, usage_input_tokens, usage_output_tokens)
     await record_usage_event(
@@ -18791,7 +19054,7 @@ async def _generate_ai_analysis_impl(
                     db, report_id, "estimate",
                     _value_lock_fingerprint(_value_lock_identity(enriched_subject, new_comparables, with_ratings=True),
                                             model=model, mode=report.mode),
-                    {"subject_estimate": copy.deepcopy(subject_estimate_raw)})
+                    {"subject_estimate": copy.deepcopy(subject_estimate_raw)}, order=_lock_order(new_comparables))
             except Exception:  # noqa: BLE001 - a saved shortcut must never fail a paid run
                 logger.warning("CMA estimate lock seed failed", extra={"report_id": report_id}, exc_info=True)
         _v10 = _apply_v10_valuation(final_anchor, exposure, subject_estimate_raw or {}, subject_asking, prov_anchor=prov_anchor)
@@ -19276,7 +19539,7 @@ async def _generate_ai_analysis_impl(
             "missed_sales": await _missed_same_community_sales(db, enriched_subject, report.comparables or []),
             # Agent-only when stale: how current the MLS data behind this report is (grader audit 11/13)
             "data_freshness": _freshness,
-            "subject_status_review": _recent_status_review(status_timeline),
+            "subject_status_review": _subject_reviews(enriched_subject, status_timeline, value),
             # Similar homes for sale / under contract now (list prices) + which pendings moved the value.
             "current_competition": {"homes": _competition or [], **(_competition_review or {})},
             # Agent-only: buyer CMA on the agent's own listing (10/24)
@@ -19591,7 +19854,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
         # asking again gave a different estimate every time, and the final value moved with it.
         _est_fp = _value_lock_fingerprint(_value_lock_identity(enriched_subject, new_comparables, with_ratings=True),
                                           model=model, mode=report.mode)
-        _est_locked = await _value_lock_get(db, report_id, "estimate", _est_fp)
+        _est_locked = await _value_lock_get(db, report_id, "estimate", _est_fp, order=_lock_order(new_comparables))
         if _est_locked and isinstance(_est_locked.get("raw"), dict) and isinstance(_est_locked["raw"].get("subject_estimate"), dict):
             result = copy.deepcopy(_est_locked["raw"])
             qa_flags.append("Estimate reused from this report's earlier run (same facts) - no new charge.")
@@ -19613,7 +19876,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
         if not subject_estimate_raw:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The AI didn't return a usable value estimate - try again.")
         if _est_locked is None:
-            await _value_lock_put(db, report_id, "estimate", _est_fp, copy.deepcopy(result))
+            await _value_lock_put(db, report_id, "estimate", _est_fp, copy.deepcopy(result), order=_lock_order(new_comparables))
 
         subject_asking = (
             _as_float(status_timeline.get("current_list_price"))
@@ -19965,7 +20228,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             "missed_sales": await _missed_same_community_sales(db, enriched_subject, report.comparables or []),
             # Agent-only when stale: how current the MLS data behind this report is (grader audit 11/13)
             "data_freshness": _freshness,
-            "subject_status_review": _recent_status_review(status_timeline),
+            "subject_status_review": _subject_reviews(enriched_subject, status_timeline, value),
             # Similar homes for sale / under contract now (list prices) + which pendings moved the value.
             "current_competition": {"homes": _competition or [], **(_competition_review or {})},
             # Agent-only: buyer CMA on the agent's own listing (10/24)
