@@ -38,8 +38,9 @@ def stubs(monkeypatch):
     async def get_report(db, owner_id, report_id):
         return SimpleNamespace(id=report_id)
 
-    async def mark_started(db, owner_id, report_id):
+    async def mark_started(db, owner_id, report_id, *, claim=False):
         state.started.append(report_id)
+        return True   # one server copy here: the claim is always this run's (11/14 claim=True route check)
 
     async def mark_finished(owner_id, report_id, outcome, error=None):
         state.finished.append((report_id, outcome))
@@ -130,3 +131,22 @@ def test_finished_report_is_refused_before_anything_is_marked(stubs, monkeypatch
     err = asyncio.run(go())
     assert err is not None and err.status_code == 400 and "already has an AI analysis" in err.detail
     assert stubs.started == [] and stubs.finished == [] and stubs.ran == []
+
+
+def test_another_server_copy_already_running_it_is_refused(stubs, monkeypatch):
+    """11/14 (several API copies): the in-memory hold only sees its own copy, so the route also claims the
+    report in the database. When another copy already has it, the answer is 409, nothing runs, and this
+    copy's hold is let go (so a later real start isn't blocked)."""
+    async def taken(db, owner_id, report_id, *, claim=False):
+        return False
+    monkeypatch.setattr(cma_routes.service, "mark_generation_started", taken)
+
+    async def go():
+        with pytest.raises(HTTPException) as exc:
+            await _start("A")
+        assert exc.value.status_code == 409
+        assert "already running" in exc.value.detail
+        await asyncio.sleep(0.01)
+        assert stubs.ran == []                    # no AI run was started here
+        assert rl._cma_holds.holds == {}          # and the hold was released
+    asyncio.run(go())
