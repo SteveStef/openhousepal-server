@@ -140,6 +140,12 @@ async def lifespan(app: FastAPI):
         name="Cinematic Video: pick up videos cut off by a restart", replace_existing=True,
         max_instances=1, coalesce=True, next_run_time=_dt.now(_tz.utc) + _td(seconds=45),
     )
+    # Old shared leases + speed-limit counters (app/services/cluster.py) - hourly tidy-up.
+    from app.services.cluster import scheduled_cleanup as _cluster_cleanup
+    scheduler.add_job(
+        _cluster_cleanup, "interval", hours=1, id="cluster_cleanup", name="Tidy shared leases and speed limits",
+        replace_existing=True, max_instances=1, coalesce=True,
+    )
 
     # Schedule email processing every minute
     scheduler.add_job(

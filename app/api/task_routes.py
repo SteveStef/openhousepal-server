@@ -335,7 +335,7 @@ async def public_followup_contact(code: str, request: Request, db: AsyncSession 
     they've done and the agent's own notes. Built live, so notes added since the event was made
     are included."""
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     task = await _task_by_code(db, code)
     if task.lead is None:
         raise HTTPException(status_code=404, detail="This follow-up isn't tied to a contact.")
@@ -381,7 +381,7 @@ async def public_followup_text(code: str, request: Request, db: AsyncSession = D
     calendar event shows), so the agent's own Messages app opens with it written. Opening this
     never checks anything off - only the page's button does (a POST to /done)."""
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     task = await _task_by_code(db, code)
     lead = task.lead
     has_phone = bool(lead is not None and (lead.phone or "").strip())
@@ -510,7 +510,7 @@ async def public_followup_card(code: str, request: Request, db: AsyncSession = D
 @public_router.post("/{code}/done")
 async def public_followup_done(code: str, request: Request, payload: Optional[dict] = Body(None), db: AsyncSession = Depends(get_db)):
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     task = await _task_by_code(db, code)
     via = (payload or {}).get("via")  # "text" / "email" - which button checked it off (11/02)
     if task.completed_at is None:
@@ -535,7 +535,7 @@ async def public_followup_alerts(code: str, request: Request, payload: dict = Bo
     """The person's alert switches from the check-off page (owner, 10/27) - {calendar?, in_app?,
     emails?}: bool. Only ever about the lead on THIS follow-up."""
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     task = await _task_by_code(db, code)
     lead = task.lead
     if lead is None:
@@ -551,7 +551,7 @@ async def public_followup_alerts(code: str, request: Request, payload: dict = Bo
 @public_router.post("/{code}/undo")
 async def public_followup_undo(code: str, request: Request, db: AsyncSession = Depends(get_db)):
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     task = await _task_by_code(db, code)
     if task.completed_at is not None:
         task.completed_at = None

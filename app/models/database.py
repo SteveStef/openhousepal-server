@@ -2915,6 +2915,36 @@ class UsageBudgetCounter(Base):
     )
 
 
+class ClusterLease(Base):
+    """"This is running / this is taken" notes shared by every copy of the API (WEB_WORKERS > 1) -
+    see app/services/cluster.py. One row per (kind, key); a copy that dies stops renewing its rows,
+    and they count as free once expires_at passes."""
+    __tablename__ = "cluster_leases"
+
+    kind = Column(String(40), primary_key=True)
+    key = Column(String(200), primary_key=True)
+    token = Column(String(40), nullable=False)
+    owner_id = Column(String, nullable=True)
+    amount = Column(Float, nullable=False, default=0.0, server_default="0")
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_cluster_leases_owner", "kind", "owner_id"),
+        Index("ix_cluster_leases_expires", "expires_at"),
+    )
+
+
+class RateWindow(Base):
+    """Shared request counters for speed limits (app/services/cluster.py rate_hit) - one row per
+    (key, window start), so a limit holds across every copy of the API."""
+    __tablename__ = "rate_windows"
+
+    key = Column(String(200), primary_key=True)
+    window_start = Column(BigInteger, primary_key=True)   # unix seconds
+    count = Column(Integer, nullable=False, default=0, server_default="0")
+
+
 class ExploreNearbyCache(Base):
     """Persistent cache for the public Explore Nearby feature (nearby_amenities_service.py) -
     the actual lever for cutting Google Places spend on it, not just a rate limit. The same

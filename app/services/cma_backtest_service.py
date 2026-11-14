@@ -523,6 +523,37 @@ _WORKER: Optional[asyncio.Task] = None
 
 
 async def _worker() -> None:
+    """One worker across every copy of the API (shared lease, 11/14) - two would bill the same homes."""
+    from app.services import cluster
+    for _ in range(3):
+        async with cluster.lease("cma_backtest_worker", "all", 120) as token:
+            if token is None:
+                # another copy's worker has it - unless it is just finishing; look again shortly
+                await asyncio.sleep(5)
+                if await cluster.alive("cma_backtest_worker", "all"):
+                    return
+                continue
+            await _worker_held()
+        if not await _queued_batch_left():
+            return
+
+
+async def _queued_batch_left() -> bool:
+    async with AsyncSessionLocal() as db:
+        return (await db.execute(select(CmaBacktestBatch.id).where(
+            CmaBacktestBatch.status.in_(["queued", "running"]),
+            func.coalesce(CmaBacktestBatch.settings["runner"].astext, "api") != "ui",
+        ).limit(1))).first() is not None
+
+
+async def worker_running_anywhere() -> bool:
+    if worker_running():
+        return True
+    from app.services import cluster
+    return await cluster.alive("cma_backtest_worker", "all")
+
+
+async def _worker_held() -> None:
     while True:
         async with AsyncSessionLocal() as db:
             # Browser-run ("ui") batches belong to scripts/cma_backtest_ui_runner.py, never this worker.

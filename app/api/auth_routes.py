@@ -753,7 +753,11 @@ def _schedule_background_sync(user_id: str) -> None:
     async def run():
         from app.database import AsyncSessionLocal
         from sqlalchemy import select as _select
+        from app.services import cluster
         try:
+            # at most once per 15 minutes per agent across every copy of the API (shared lease, 11/14)
+            if await cluster.acquire("paypal_sync", user_id, 15 * 60) is None:
+                return
             async with AsyncSessionLocal() as s:
                 u = (await s.execute(_select(UserModel).where(UserModel.id == user_id))).scalar_one_or_none()
                 if u and u.subscription_id:

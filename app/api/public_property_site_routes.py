@@ -239,7 +239,7 @@ async def record_property_site_view(
 @router.post("/{site_id}/inquiry")
 async def submit_property_site_inquiry(site_id: str, payload: PropertyWebsiteInquiryCreate, request: Request, db: AsyncSession = Depends(get_db)):
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)  # bots can't flood the agent's leads/inbox
+    await check_public_submit(request)  # bots can't flood the agent's leads/inbox
     owner = await _published_owner(db, site_id)
     if not owner:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Property website not found.")
@@ -255,7 +255,7 @@ async def submit_property_site_inquiry(site_id: str, payload: PropertyWebsiteInq
 async def subscribe_property_site_alerts(site_id: str, payload: PropertyWebsiteAlertCreate, request: Request, db: AsyncSession = Depends(get_db)):
     """A guest asks to hear about price changes and new open houses for this home."""
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)  # bots can't flood the agent's leads/inbox
+    await check_public_submit(request)  # bots can't flood the agent's leads/inbox
     owner = await _published_owner(db, site_id)
     if not owner:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Property website not found.")
@@ -274,7 +274,7 @@ async def request_property_site_documents(site_id: str, payload: PropertyWebsite
     """A guest asks for the listing's documents (brochure, disclosures...): they're emailed to them
     and the agent gets the lead - see property_website_service.request_documents."""
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)  # bots can't flood the agent's leads/inbox
+    await check_public_submit(request)  # bots can't flood the agent's leads/inbox
     owner = await _published_owner(db, site_id)
     if not owner:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Property website not found.")
@@ -338,7 +338,7 @@ async def property_site_agent_busy(site_id: str, days: int = 14, db: AsyncSessio
 @router.post("/{site_id}/tour-request")
 async def submit_property_site_tour_request(site_id: str, payload: PropertyWebsiteTourRequestCreate, request: Request, db: AsyncSession = Depends(get_db)):
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)  # bots can't flood the agent's leads/inbox
+    await check_public_submit(request)  # bots can't flood the agent's leads/inbox
     owner = await _published_owner(db, site_id)
     if not owner:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Property website not found.")

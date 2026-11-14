@@ -392,24 +392,36 @@ async def create_asset(
     *, group_id: Optional[str] = None, parent_asset_id: Optional[str] = None,
 ) -> StudioMediaAsset:
     rid = (payload.client_request_id or "").strip() or None
-    if rid:
+    if not rid:
+        return await _create_asset_body(db, user, payload, rid, group_id=group_id, parent_asset_id=parent_asset_id)
+    existing = await _asset_for_request(db, user.id, rid)
+    if existing is not None:
+        return existing
+    # The same press sent twice (a retry on a weak signal) - possibly to two different copies of the
+    # API (11/14): one shared lock per press, so the second waits for the first (a video's provider
+    # call takes a few seconds before its row exists) and then gets that same result - never a
+    # second paid job.
+    from app.services import cluster
+    try:
+        held = cluster.wait_lease("media_press", f"{user.id}:{rid}", timeout=45)
+        await held.__aenter__()
+    except cluster.LeaseBusy:
         existing = await _asset_for_request(db, user.id, rid)
-        if existing is None and (user.id, rid) in _INFLIGHT_REQUESTS:
-            # The first copy of this same press is still submitting (a video's provider call
-            # takes a few seconds before its row exists) - wait for it rather than run twice.
-            for _ in range(60):
-                await asyncio.sleep(0.5)
-                existing = await _asset_for_request(db, user.id, rid)
-                if existing is not None or (user.id, rid) not in _INFLIGHT_REQUESTS:
-                    break
+        if existing is not None:
+            return existing
+        raise HTTPException(status.HTTP_409_CONFLICT, "That's still being started - give it a moment.")
+    try:
+        # (read committed: this query sees a row the other copy committed while we waited)
+        existing = await _asset_for_request(db, user.id, rid)
         if existing is not None:
             return existing
         _INFLIGHT_REQUESTS.add((user.id, rid))
-    try:
-        return await _create_asset_body(db, user, payload, rid, group_id=group_id, parent_asset_id=parent_asset_id)
-    finally:
-        if rid:
+        try:
+            return await _create_asset_body(db, user, payload, rid, group_id=group_id, parent_asset_id=parent_asset_id)
+        finally:
             _INFLIGHT_REQUESTS.discard((user.id, rid))
+    finally:
+        await held.__aexit__(None, None, None)
 
 
 # (owner id, client_request_id) pairs whose Generate is mid-submit in this worker.

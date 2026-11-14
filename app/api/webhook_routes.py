@@ -55,6 +55,22 @@ def _verify_mailgun_inbound(form: dict) -> bool:
 
 @router.post("/webhooks/paypal")
 async def handle_paypal_webhook(request: Request, db: AsyncSession = Depends(get_db)):
+    """PayPal re-sends a notice it thinks went unanswered - with several copies of the API (11/14) the
+    first and the re-send can arrive at two copies at once, both before either has recorded it. One
+    shared lock per PayPal event id makes them take turns: the second then finds it already recorded.
+    (The id read here is only a lock name - the signature is checked inside as before.)"""
+    try:
+        event_id = str((await request.json()).get("id") or "")[:150]
+    except Exception:  # noqa: BLE001 - a bad body is refused inside with the usual answer
+        event_id = ""
+    if not event_id:
+        return await _handle_paypal_webhook(request, db)
+    from app.services import cluster
+    async with cluster.wait_lease("paypal_webhook", event_id, timeout=60):
+        return await _handle_paypal_webhook(request, db)
+
+
+async def _handle_paypal_webhook(request: Request, db: AsyncSession):
     """
     Receive and process PayPal webhook events.
 

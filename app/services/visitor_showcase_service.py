@@ -29,8 +29,20 @@ logger = logging.getLogger(__name__)
 INVITE_TEMPLATE = "visitor_confirmation"
 CANCEL_NOTE = "Not sent - you switched off this visitor's Showcase"
 _tasks: set = set()
-# Visitor ids whose Showcase is being built in the background right now (single API process).
+# Visitor ids whose Showcase is being built in the background right now in THIS copy of the API.
 _building: set = set()
+# ... and in any copy (11/14): every build of a visitor's Showcase - the sign-in build, the agent's
+# switch, the guest's own "Make my Showcase" tap - holds this shared lease, so two copies can never
+# build two Showcases for one guest.
+BUILD_LEASE, BUILD_TTL = "showcase_build", 120
+
+
+async def building_anywhere(visitor_id: str) -> bool:
+    from app.api.open_houses_routes import SHOWCASE_BUILDING
+    if visitor_id in _building or visitor_id in SHOWCASE_BUILDING:
+        return True
+    from app.services import cluster
+    return await cluster.alive(BUILD_LEASE, visitor_id)
 
 
 def has_agent(visitor: OpenHouseVisitor) -> bool:
@@ -98,7 +110,7 @@ async def set_showcase(db, owner: User, visitor: OpenHouseVisitor, oh: OpenHouse
         if col is not None:
             if col.status != "ACTIVE":
                 await CollectionsService.update_collection_status(db, col.id, owner.id, "ACTIVE")
-            if visitor.id not in _building and not await _invite_went_or_waiting(db, owner.id, visitor):
+            if not await building_anywhere(visitor.id) and not await _invite_went_or_waiting(db, owner.id, visitor):
                 await db.commit()
                 from app.models.database import collection_properties
                 count = (await db.execute(select(func.count()).select_from(collection_properties)
@@ -106,7 +118,7 @@ async def set_showcase(db, owner: User, visitor: OpenHouseVisitor, oh: OpenHouse
                 await OpenHouseService.schedule_showcase_invite(
                     db, visitor, oh.id, {"share_token": col.share_token, "collection_id": col.id, "properties_added": count},
                     send_after=timedelta(hours=1))
-        elif visitor.id not in _building:
+        elif not await building_anywhere(visitor.id):
             build = True
     else:
         res = await db.execute(update(ScheduledEmail).where(*_invite_rows(owner.id, visitor), ScheduledEmail.status == "PENDING")
@@ -131,7 +143,7 @@ async def set_showcase(db, owner: User, visitor: OpenHouseVisitor, oh: OpenHouse
             invite_at = datetime.now(timezone.utc) + timedelta(hours=1)
     return {
         "showcase_on": bool(on),
-        "building": build or visitor.id in _building,
+        "building": build or await building_anywhere(visitor.id),
         "showcase_id": col.id if col is not None else None,
         "invite_at": invite_at,
         "invites_cancelled": cancelled,
@@ -142,6 +154,15 @@ def _build_later(visitor_id: str, oh_id: str, owner_id: str, lead_id: Optional[s
     """The sign-in's own Showcase build + invite (create_showcase_and_invite, ~1 hour out), on its
     own DB session after the switch has answered. Skipped if the switch went back off meanwhile."""
     async def run():
+        from app.services import cluster
+        try:
+            async with cluster.lease(BUILD_LEASE, visitor_id, BUILD_TTL) as token:
+                if token is not None:   # None = another copy is building it right now
+                    await build()
+        except Exception:  # noqa: BLE001
+            logger.exception("visitor showcase build failed", extra={"visitor_id": visitor_id})
+
+    async def build():
         from app.database import AsyncSessionLocal
         from app.schemas.open_house import HasAgent, OpenHouseFormSubmission
         from app.services.open_house_service import OpenHouseService

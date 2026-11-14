@@ -270,7 +270,7 @@ async def public_ics(code: str, days: Optional[str] = Query(default=None, max_le
 @router.post("/public/{code}/rsvp")
 async def public_rsvp(code: str, payload: RsvpSubmit, request: Request, db: AsyncSession = Depends(get_db)):
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     inv, owner = await _public(db, code)
     if inv.status != "live":
         raise HTTPException(status_code=422, detail="RSVPs are closed for this event.")
@@ -355,7 +355,7 @@ async def public_rsvp(code: str, payload: RsvpSubmit, request: Request, db: Asyn
 async def public_request(code: str, payload: InvitePublicRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """The Guest Pass's one-tap asks on the invitation: seller disclosure, second tour, stay updated."""
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     inv, owner = await _public(db, code)
     try:
         return await svc.public_request(db, owner, inv, payload)

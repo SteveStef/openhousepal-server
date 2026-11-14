@@ -23,7 +23,7 @@ async def submit_public_question(
     db: AsyncSession = Depends(get_db),
 ):
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     email = payload.email.strip()
     message = payload.message.strip()
     if not email or "@" not in email:

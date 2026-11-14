@@ -112,17 +112,22 @@ async def sync_hub_videos(db, hub: AgentHub, force: bool = False) -> Optional[in
 
 
 def refresh_in_background(hub_id: str) -> None:
-    """Fire-and-forget refresh (own DB session) for a hub whose videos are stale."""
+    """Fire-and-forget refresh (own DB session) for a hub whose videos are stale. One refresh per hub
+    at a time across every copy of the API (shared lease, 11/14)."""
     if hub_id in _in_flight:
         return
     _in_flight.add(hub_id)
 
     async def run():
+        from app.services import cluster
         try:
-            async with AsyncSessionLocal() as db:
-                hub = await db.get(AgentHub, hub_id)
-                if hub is not None:
-                    await sync_hub_videos(db, hub)
+            async with cluster.lease("hub_video_sync", hub_id, 120) as token:
+                if token is None:
+                    return
+                async with AsyncSessionLocal() as db:
+                    hub = await db.get(AgentHub, hub_id)
+                    if hub is not None:
+                        await sync_hub_videos(db, hub)
         except Exception:  # noqa: BLE001
             logger.warning("background agent hub video sync failed", exc_info=True)
         finally:

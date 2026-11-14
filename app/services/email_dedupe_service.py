@@ -19,6 +19,7 @@ Checked from the async send paths: agent_email_health_service.send_gated (agent 
 client_email_service.before_send (client emails, Mailgun or the agent's own mailbox)."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import threading
@@ -54,6 +55,8 @@ NEVER = frozenset({"verify_code", "password_reset", "account_approved", "agent_w
 _recent: dict[str, float] = {}   # key -> when, this process (closes the gap before the log row is written)
 _lock = threading.Lock()
 _TTL = 26 * 3600
+_CLAIM = "email_dedupe"   # shared claim kind (cluster.py)
+_FORGETS: set = set()      # strong refs to claim give-backs
 
 
 def _day(now: Optional[datetime] = None) -> str:
@@ -103,6 +106,11 @@ async def is_repeat(key: Optional[str], template: str, audience: str, owner_id: 
     try:
         repeat = _seen_here(key)
         if not repeat:
+            # The same email decided at the same moment in two copies of the API (11/14): one shared
+            # claim per key - exactly one copy gets it; the other holds its email as a repeat.
+            from app.services import cluster
+            repeat = await cluster.acquire(_CLAIM, key, _TTL) is None
+        if not repeat:
             from sqlalchemy import select
             from app.database import AsyncSessionLocal
             from app.models.database import EmailLog
@@ -126,3 +134,10 @@ def forget(key: Optional[str]) -> None:
     if key:
         with _lock:
             _recent.pop(key, None)
+        try:
+            from app.services import cluster
+            t = asyncio.get_running_loop().create_task(cluster.release(_CLAIM, key))
+            _FORGETS.add(t)
+            t.add_done_callback(_FORGETS.discard)
+        except RuntimeError:   # no running loop (a script) - the claim runs out by itself
+            pass

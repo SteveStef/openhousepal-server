@@ -399,15 +399,37 @@ async def _count_matched(db, collection_id: str, k: str) -> int:
         {"c": collection_id, "k": k})).scalar() or 0)
 
 
+_LEASE, _AGAIN, _LEASE_TTL = "smart_filter", "smart_filter_again", 120
+
+
+async def _passes(collection_id: str) -> bool:
+    """Read while holding the Showcase's shared lease - one copy of the API at a time (11/14: two copies
+    reading the same Showcase at once paid for the same AI reading twice). False = another copy is on it."""
+    from app.services import cluster
+    async with cluster.lease(_LEASE, collection_id, _LEASE_TTL) as token:
+        if token is None:
+            return False
+        while True:
+            _again.discard(collection_id)
+            await cluster.release(_AGAIN, collection_id)
+            await run_for(collection_id)
+            if collection_id not in _again and not await cluster.alive(_AGAIN, collection_id):
+                return True
+
+
 async def _loop(collection_id: str, delay: float = 0) -> None:
+    from app.services import cluster
     try:
         if delay:
             await asyncio.sleep(delay)   # the sync's own commit lands first
-        while True:
-            _again.discard(collection_id)
-            await run_for(collection_id)
-            if collection_id not in _again:
-                break
+        if not await _passes(collection_id):
+            # Another copy is reading it: ask it for one more pass (it checks before it stops), then try
+            # once more ourselves in case it stopped just before seeing the note.
+            await cluster.acquire(_AGAIN, collection_id, 900)
+            if not await _passes(collection_id):
+                return
+        if await cluster.alive(_AGAIN, collection_id):   # asked again just as we were stopping
+            await _passes(collection_id)
     except Exception:  # noqa: BLE001
         logger.warning("showcase smart filter loop failed for %s", collection_id, exc_info=True)
         # never left saying "Reading..." for good

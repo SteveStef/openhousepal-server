@@ -1120,7 +1120,7 @@ async def submit_refine_request(
     instead of (or alongside) editing the criteria themselves. No auth - same public access as
     the other visitor showcase endpoints (interact, comments, view)."""
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)  # bots can't flood the agent's leads/inbox
+    await check_public_submit(request)  # bots can't flood the agent's leads/inbox
     message = (payload.message or "").strip()
     if not message:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message is required")
@@ -1366,7 +1366,7 @@ async def add_property_comment(
     owner_id = await _owner_id_if_owner(db, collection_id, current_user)
     if owner_id is None:
         from app.services.public_rate_limit import check_public_submit
-        check_public_submit(request)  # bots can't flood the agent's leads/inbox
+        await check_public_submit(request)  # bots can't flood the agent's leads/inbox
         await _assert_visitor_can_act(db, collection_id, property_id)
 
     """
@@ -1947,7 +1947,7 @@ async def set_shared_email_frequency(share_token: str, body: SharedEmailFrequenc
     emails on. The agent hears about it."""
     from app.services import client_email_service as ce
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(http_request)
+    await check_public_submit(http_request)
     if body.frequency not in ce.FREQUENCIES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick daily, weekly or every two weeks")
     c = await _shared_collection(db, share_token)
@@ -1963,7 +1963,7 @@ async def dismiss_shared_email_notice(share_token: str, http_request: Request, d
     """The client closed the "your emails went to weekly / paused" note on their Showcase."""
     from app.services import client_email_service as ce
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(http_request)
+    await check_public_submit(http_request)
     c = await _shared_collection(db, share_token)
     if not c.visitor_email:
         return {"ok": True}
@@ -1979,7 +1979,7 @@ async def set_shared_email_time(share_token: str, body: SharedSendTime, http_req
     """The client picks when their Showcase emails arrive (owner, 11/11)."""
     from app.services import client_email_service as ce
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(http_request)
+    await check_public_submit(http_request)
     if body.send_time not in ce.SEND_TIMES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick one of the times shown")
     c = await _shared_collection(db, share_token)
@@ -2214,7 +2214,7 @@ async def schedule_property_tour(
     owner_id = await _owner_id_if_owner(db, collection_id, current_user)
     if owner_id is None:
         from app.services.public_rate_limit import check_public_submit
-        check_public_submit(request)  # bots can't flood the agent's leads/inbox
+        await check_public_submit(request)  # bots can't flood the agent's leads/inbox
 
     """
     Schedule a tour for a property in a collection (public endpoint for visitors)

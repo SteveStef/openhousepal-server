@@ -1145,7 +1145,7 @@ async def submit_blog_lead(
     from app.services import leads_service
     from app.services.agent_email_service import absolute, email_agent
     from app.models.database import Notification
-    check_public_submit(request)
+    await check_public_submit(request)
     name = (payload.name or "").strip()[:120]
     email = (payload.email or "").strip()[:200] or None
     phone = (payload.phone or "").strip()[:40] or None

@@ -556,7 +556,7 @@ async def _old_links_payload(db: AsyncSession, site: Site) -> dict:
     rows = (await db.execute(select(SiteRedirect).where(SiteRedirect.site_id == site.id))).scalars().all()
     domain = await old_links_service.main_custom_domain(db, site.id)
     scan = dict(site.old_links_scan or {})
-    if old_links_service.is_running(site.id):
+    if await old_links_service.is_running(site.id):
         scan["status"] = "running"
     return {
         "domain": (domain.hostname if domain else None),

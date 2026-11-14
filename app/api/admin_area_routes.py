@@ -566,9 +566,14 @@ async def check_places(area_id: str, db: AsyncSession = Depends(get_db), admin: 
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "This town has no map center yet - research it first.")
     if area.id in _busy:
         raise HTTPException(status.HTTP_409_CONFLICT, "This town is already being checked.")
+    from app.services import cluster
     _busy.add(area.id)
     try:
-        result = await asyncio.wait_for(check_town_places(db, area), timeout=240)
+        # one check per town across every copy of the API (shared lease, 11/14) - each one spends Google calls
+        async with cluster.lease("town_places_check", area.id, 120) as token:
+            if token is None:
+                raise HTTPException(status.HTTP_409_CONFLICT, "This town is already being checked.")
+            result = await asyncio.wait_for(check_town_places(db, area), timeout=240)
     except asyncio.TimeoutError:
         raise HTTPException(status.HTTP_504_GATEWAY_TIMEOUT, "The check took too long - try again in a few minutes.")
     finally:

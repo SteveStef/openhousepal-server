@@ -1,6 +1,6 @@
 """
-Usage protection for the AI Assistant: burst + concurrency limits (in-memory, per
-process) and daily/monthly/cost-ceiling limits (backed by AIUsageEvent, so they're
+Usage protection for the AI Assistant: burst + concurrency limits (shared by every API copy
+through app/services/cluster.py) and daily/monthly/cost-ceiling limits (backed by AIUsageEvent, so they're
 correct even across a restart). Also owns writing AIUsageEvent rows - the audit
 trail and the source of truth these checks query.
 
@@ -8,8 +8,10 @@ Every check here runs before the orchestrator ever calls the model. A rejection
 never reaches the Anthropic API, so it costs nothing beyond a DB query.
 """
 import asyncio
+import contextvars
 import logging
 import time
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -38,45 +40,53 @@ class AIRateLimitExceeded(Exception):
         super().__init__(reason)
 
 
-class _InProcessLimiter:
-    """Per-process burst + concurrency tracking. Correct for the current
-    single-instance deployment (see RUN_LOCAL.md). A multi-worker or multi-instance
-    deployment would need this backed by Redis instead - noted here rather than
-    built, since Redis isn't part of the stack today."""
+# The slots this request holds (same task: check_and_reserve -> the route's finally -> release).
+_CHAT_SLOTS: contextvars.ContextVar[tuple] = contextvars.ContextVar("ai_chat_slots", default=())
+_CHAT_SLOT_TTL = 90   # renewed every 30 s while the turn runs; a copy that dies frees it within 90 s
 
-    def __init__(self):
-        self._request_times: dict[str, deque] = defaultdict(deque)
-        self._in_flight: dict[str, int] = defaultdict(int)
-        self._lock = asyncio.Lock()
+
+class _SharedLimiter:
+    """Burst + concurrency limits shared by every copy of the API (WEB_WORKERS > 1, owner 11/14:
+    "people can't do 3 requests when it's supposed to be one") - app/services/cluster.py. 8 a minute
+    means 8 a minute in total, and 2 at once means 2 at once in total, whichever copies they land on."""
 
     async def check_burst(self, user_id: str, requests_per_minute: int):
-        async with self._lock:
-            now = time.monotonic()
-            window = self._request_times[user_id]
-            while window and now - window[0] > 60:
-                window.popleft()
-            if len(window) >= requests_per_minute:
-                raise AIRateLimitExceeded(
-                    "burst_limit",
-                    "You've sent several requests very quickly. Try again shortly.",
-                )
-            window.append(now)
+        from app.services import cluster
+        if not await cluster.rate_hit(f"ai_burst:{user_id}", int(requests_per_minute), 60):
+            raise AIRateLimitExceeded(
+                "burst_limit",
+                "You've sent several requests very quickly. Try again shortly.",
+            )
 
     async def acquire_concurrency(self, user_id: str, max_concurrent: int):
-        async with self._lock:
-            if self._in_flight[user_id] >= max_concurrent:
-                raise AIRateLimitExceeded(
-                    "concurrency_limit",
-                    "You already have a request in progress. Please wait for it to finish.",
-                )
-            self._in_flight[user_id] += 1
+        from app.services import cluster
+        key = f"{user_id}:{uuid.uuid4().hex}"
+        token = await cluster.acquire("ai_chat", key, _CHAT_SLOT_TTL, owner_id=user_id,
+                                      allow=lambda n, _amt: n < int(max_concurrent))
+        if token is None:
+            raise AIRateLimitExceeded(
+                "concurrency_limit",
+                "You already have a request in progress. Please wait for it to finish.",
+            )
+        beat = cluster.start_keep_alive("ai_chat", key, token, _CHAT_SLOT_TTL)
+        _CHAT_SLOTS.set(_CHAT_SLOTS.get() + ((user_id, key, token, beat),))
 
     async def release_concurrency(self, user_id: str):
-        async with self._lock:
-            self._in_flight[user_id] = max(0, self._in_flight[user_id] - 1)
+        from app.services import cluster
+        slots = list(_CHAT_SLOTS.get())
+        for i in range(len(slots) - 1, -1, -1):
+            if slots[i][0] == user_id:
+                _uid, key, token, beat = slots.pop(i)
+                _CHAT_SLOTS.set(tuple(slots))
+                beat.cancel()
+                try:
+                    await cluster.release("ai_chat", key, token)
+                except Exception:  # noqa: BLE001 - it frees itself within _CHAT_SLOT_TTL
+                    logger.warning("chat slot release failed (frees itself shortly)", exc_info=True)
+                return
 
 
-_limiter = _InProcessLimiter()
+_limiter = _SharedLimiter()
 
 
 async def _count_since(db: AsyncSession, owner_id: str, since: datetime, event_type: Optional[str] = None,
@@ -594,7 +604,13 @@ async def check_and_reserve(db: AsyncSession, owner_id: str, config: dict, plan_
     )
 
     # Concurrency reservation happens last so a rejection above never leaves a stuck slot.
-    await _limiter.acquire_concurrency(owner_id, config["max_concurrent_requests"])
+    try:
+        await _limiter.acquire_concurrency(owner_id, config["max_concurrent_requests"])
+    except BaseException:
+        # Refused (or failed) here: the turn never runs, so the platform reservation just made is
+        # handed back in full instead of sitting on the global/emergency counters.
+        await reconcile_budget(db, reservation, 0.0)
+        raise
     return reservation
 
 
@@ -641,9 +657,9 @@ async def reserve_cma_analysis(db: AsyncSession, owner_id: str, config: dict, pl
 # gate runs in the route BEFORE the background run is spawned: under one lock it refuses a
 # report that is already running, and counts every other run this agent has in flight at its
 # worst-case cost (cma_ai_max_cost_per_generation_usd) on top of what's already used. A single
-# run's rule is unchanged (it starts whenever used < allowance). In-process, like
-# _InProcessLimiter above - correct for the single-worker deployment (Dockerfile runs one uvicorn
-# worker); the background runs themselves live in this process too, so a restart clears both.
+# run's rule is unchanged (it starts whenever used < allowance). Checked in this copy's memory
+# first, then the same rule across every copy through a shared lease (cluster.py, 11/14) that
+# frees itself after _CMA_HOLD_STALE_AFTER_SECONDS if a copy dies mid-run.
 
 class CmaGenerationAlreadyRunning(Exception):
     user_message = "This report's AI analysis is already running - it will finish on its own."
@@ -667,6 +683,7 @@ class _CmaGenerationHolds:
 
 
 _cma_holds = _CmaGenerationHolds()
+_CMA_HOLD_TOKENS: dict[str, str] = {}   # report_id -> this copy's shared-hold token
 
 
 def cma_generation_hold_usd(config: dict) -> float:
@@ -708,12 +725,48 @@ async def hold_cma_generation(db: AsyncSession, owner_id: str, report_id: str, c
                     "room for that one. This one wasn't started and nothing was used - try again once it finishes.",
                 )
         _cma_holds.holds[report_id] = (owner_id, hold, time.monotonic())
+    if isinstance(db, AsyncSession):
+        # The same rule across every copy of the API (WEB_WORKERS > 1, 11/14): the in-memory holds
+        # above only see this copy's runs. (Unit tests that pass no session stay in memory.)
+        try:
+            await _shared_cma_hold(db, owner_id, report_id, hold, config, plan_tier)
+        except BaseException:
+            async with _cma_holds.lock:
+                _cma_holds.holds.pop(report_id, None)
+            raise
     return hold
+
+
+async def _shared_cma_hold(db: AsyncSession, owner_id: str, report_id: str, hold: float, config: dict, plan_tier: str) -> None:
+    from app.services import cluster
+    limit = await monthly_limit_usd(db, owner_id, config, plan_tier)
+    unlimited = not limit or owner_id in _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS
+    used = 0.0 if unlimited else await total_monthly_ai_cost(db, owner_id)
+    token = await cluster.acquire(
+        "cma_hold", report_id, _CMA_HOLD_STALE_AFTER_SECONDS, owner_id=owner_id, amount=hold,
+        allow=lambda _n, in_flight: unlimited or used + in_flight < limit)
+    if token is not None:
+        _CMA_HOLD_TOKENS[report_id] = token
+        return
+    if await cluster.alive("cma_hold", report_id):
+        raise CmaGenerationAlreadyRunning()
+    raise AIRateLimitExceeded(
+        "agent_monthly_budget_in_flight",
+        "Your other CMA's AI analysis is still running, and this month's AI allowance only has "
+        "room for that one. This one wasn't started and nothing was used - try again once it finishes.",
+    )
 
 
 async def release_cma_generation(report_id: str) -> None:
     async with _cma_holds.lock:
-        _cma_holds.holds.pop(report_id, None)
+        had = _cma_holds.holds.pop(report_id, None)
+    token = _CMA_HOLD_TOKENS.pop(report_id, None)
+    if had is not None and token:
+        try:
+            from app.services import cluster
+            await cluster.release("cma_hold", report_id, token)   # only our own hold, never a later one
+        except Exception:  # noqa: BLE001 - it frees itself after _CMA_HOLD_STALE_AFTER_SECONDS
+            logger.warning("shared CMA hold release failed", exc_info=True)
 
 
 async def reserve_cma_reasoning(db: AsyncSession, owner_id: str, config: dict, plan_tier: str) -> Reservation:

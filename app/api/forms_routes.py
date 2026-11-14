@@ -2200,7 +2200,7 @@ async def submit_public_form(
     viewer: Optional[User] = Depends(get_current_user_optional),
 ):
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     hub = await hub_by_slug(db, normalize_form_slug(agent_slug))  # current link or its kept old one
     if not hub:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This form could not be found.")

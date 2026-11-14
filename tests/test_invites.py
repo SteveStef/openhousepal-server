@@ -58,7 +58,9 @@ def no_send(monkeypatch):
     from app.services.email_service import EmailService
     monkeypatch.setattr(EmailService, "send_simple_message", fake_send)
     import app.services.public_rate_limit as prl
-    monkeypatch.setattr(prl, "check_public_submit", lambda request: None)
+    async def _no_limit(request):
+        return None
+    monkeypatch.setattr(prl, "check_public_submit", _no_limit)
     return sent
 
 

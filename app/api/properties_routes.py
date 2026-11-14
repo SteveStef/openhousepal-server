@@ -193,7 +193,7 @@ async def message_agent_route(
     # Public, unauthenticated, and it emails the agent - same per-IP spam limit as every other
     # public form (this one had none, so anyone could flood any agent's inbox).
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(http_request)
+    await check_public_submit(http_request)
     return await message_agent(request, db)
 
 
@@ -325,7 +325,7 @@ async def schedule_tour_route(
     # Public, unauthenticated, and it emails the agent - same per-IP spam limit as every other
     # public form (this one had none, so anyone could flood any agent's inbox).
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(http_request)
+    await check_public_submit(http_request)
     return await schedule_tour(request, db)
 
 

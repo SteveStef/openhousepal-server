@@ -93,6 +93,54 @@ _FAL_ESRGAN = "https://fal.run/fal-ai/esrgan"
 _TASKS: dict[str, asyncio.Task] = {}
 _PREP: dict[str, asyncio.Task] = {}
 
+# Several copies of the API (WEB_WORKERS > 1, 11/14): _TASKS/_PREP only know this copy's work, so
+# every run also holds a shared lease (app/services/cluster.py) - "this video is being made". The
+# copy doing the work renews it every 30 s; if that copy dies the lease frees itself within 90 s and
+# the 2-minute sweep (resume_stalled) picks the video up again. Every start / resume / "is it
+# running?" check asks the lease, so no two copies ever make (or pay for) the same video twice.
+_LEASE_TTL = 90
+_K_RENDER, _K_ANALYSIS, _K_PREP = "motion_render", "motion_analysis", "motion_prep"
+_HANDOFFS: set = set()   # strong refs to "start the next shape once this render ends" tasks
+
+
+def _local_alive(asset_id: str) -> bool:
+    t = _TASKS.get(asset_id)
+    return t is not None and not t.done()
+
+
+async def _claim(kind: str, asset_id: str) -> Optional[str]:
+    from app.services import cluster
+    return await cluster.acquire(kind, asset_id, _LEASE_TTL)
+
+
+async def _unclaim(kind: str, asset_id: str, token: Optional[str]) -> None:
+    if not token:
+        return
+    from app.services import cluster
+    try:
+        await cluster.release(kind, asset_id, token)
+    except Exception:  # noqa: BLE001 - it frees itself within _LEASE_TTL
+        logger.warning("motion lease release failed", exc_info=True, extra={"asset_id": asset_id, "kind": kind})
+
+
+async def _alive_anywhere(kind: str, asset_id: str) -> bool:
+    from app.services import cluster
+    return await cluster.alive(kind, asset_id)
+
+
+def _run_claimed(kind: str, asset_id: str, token: str, coro) -> asyncio.Task:
+    """Run `coro` in the background while holding (and renewing) the claimed lease; give it back after."""
+    from app.services import cluster
+
+    async def runner():
+        beat = cluster.start_keep_alive(kind, asset_id, token, _LEASE_TTL)
+        try:
+            await coro
+        finally:
+            beat.cancel()
+            await _unclaim(kind, asset_id, token)
+    return asyncio.create_task(runner())
+
 
 def _worker_url() -> str:
     return (os.environ.get("VIDEO_WORKER_URL") or "http://localhost:8095").rstrip("/")
@@ -962,35 +1010,47 @@ def _listing_text(lp: Optional[dict]) -> str:
 async def start_analysis(db, user: User, asset_id: str) -> StudioMediaAsset:
     asset = await _owned_motion(db, user.id, asset_id)
     opts = dict(asset.options or {})
-    if (opts.get("analysis") or {}).get("status") == "running" and asset_id in _TASKS and not _TASKS[asset_id].done():
+    if (opts.get("analysis") or {}).get("status") == "running" and (_local_alive(asset_id) or await _alive_anywhere(_K_ANALYSIS, asset_id)):
         return asset
-    motion = dict(opts.get("motion") or {})
-    pool = _ensure_pool(motion)
-    if not any(not it.get("analyzed") for it in pool):
-        # Nothing new to look at (no AI needed) - just make sure the picked photos are getting ready.
-        if (opts.get("analysis") or {}).get("status") != "done":
-            opts["analysis"] = {"status": "done", "finished_at": _now(), "cost_usd": 0.0}
-            opts["motion"] = motion
-            asset.options = opts
-            flag_modified(asset, "options")
-            await db.commit()
+    token = None
+    if any(not it.get("analyzed") for it in _ensure_pool(dict(opts.get("motion") or {}))):
+        token = await _claim(_K_ANALYSIS, asset_id)
+        if token is None:          # another copy started it a moment ago (a double press)
             await db.refresh(asset)
-        kick_prep(asset)
-        return asset
-    config = await ai_config_service.get_config(db)
+            return asset
+        await db.refresh(asset)    # read again now that it's ours - another copy may have just finished it
+        opts = dict(asset.options or {})
     try:
-        reservation = await reserve_studio_motion(db, user.id, config, user.plan_tier)
-    except AIRateLimitExceeded as exc:
-        raise _rate_http(exc)
-    opts["motion"] = motion
-    opts["analysis"] = {"status": "running", "started_at": _now(), "step": "labels", "done": 0,
-                        "total": sum(1 for it in pool if not it.get("analyzed"))}
-    asset.options = opts
-    flag_modified(asset, "options")
-    await db.commit()
-    await db.refresh(asset)
-    _TASKS[asset_id] = asyncio.create_task(_run_analysis(asset_id, user.id, reservation))
-    return asset
+        motion = dict(opts.get("motion") or {})
+        pool = _ensure_pool(motion)
+        if not any(not it.get("analyzed") for it in pool):
+            # Nothing new to look at (no AI needed) - just make sure the picked photos are getting ready.
+            if (opts.get("analysis") or {}).get("status") != "done":
+                opts["analysis"] = {"status": "done", "finished_at": _now(), "cost_usd": 0.0}
+                opts["motion"] = motion
+                asset.options = opts
+                flag_modified(asset, "options")
+                await db.commit()
+                await db.refresh(asset)
+            kick_prep(asset)
+            return asset
+        config = await ai_config_service.get_config(db)
+        try:
+            reservation = await reserve_studio_motion(db, user.id, config, user.plan_tier)
+        except AIRateLimitExceeded as exc:
+            raise _rate_http(exc)
+        opts["motion"] = motion
+        opts["analysis"] = {"status": "running", "started_at": _now(), "step": "labels", "done": 0,
+                            "total": sum(1 for it in pool if not it.get("analyzed"))}
+        asset.options = opts
+        flag_modified(asset, "options")
+        await db.commit()
+        await db.refresh(asset)
+        _TASKS[asset_id] = _run_claimed(_K_ANALYSIS, asset_id, token, _run_analysis(asset_id, user.id, reservation))
+        token = None   # the background run gives it back
+        return asset
+    finally:
+        await _unclaim(_K_ANALYSIS, asset_id, token)
 
 
 async def _patch(asset_id: str, fn) -> Optional[StudioMediaAsset]:
@@ -1030,6 +1090,30 @@ def kick_prep(asset: StudioMediaAsset) -> None:
 
 
 async def _run_prep(asset_id: str) -> None:
+    """One copy at a time prepares a video's photos (the shared lease) - a second copy asked to do the
+    same just leaves it; _wait_for_prep is how a render waits for it."""
+    from app.services import cluster
+    async with cluster.lease(_K_PREP, asset_id, _LEASE_TTL) as token:
+        if token is None:
+            if _PREP.get(asset_id) is asyncio.current_task():
+                _PREP.pop(asset_id, None)
+            return
+        await _run_prep_held(asset_id)
+
+
+async def _wait_for_prep(asset_id: str) -> None:
+    """Before a render: let any photo prep (this copy's or another's) finish, then do whatever is left."""
+    running = _PREP.get(asset_id)
+    if running and not running.done():
+        await running
+    for _ in range(600):   # up to ~20 minutes; prep of a full video takes a minute or two
+        if not await _alive_anywhere(_K_PREP, asset_id):
+            break
+        await asyncio.sleep(2)
+    await _run_prep(asset_id)
+
+
+async def _run_prep_held(asset_id: str) -> None:
     try:
         for _ in range(8):  # the agent may pick more photos while this runs - go round again
             async with AsyncSessionLocal() as db:
@@ -1101,7 +1185,8 @@ async def _run_prep(asset_id: str) -> None:
     except Exception:  # noqa: BLE001
         logger.exception("motion prep failed", extra={"asset_id": asset_id})
     finally:
-        _PREP.pop(asset_id, None)
+        if _PREP.get(asset_id) is asyncio.current_task():
+            _PREP.pop(asset_id, None)
         await _patch(asset_id, lambda a, o: o.__setitem__("prep", {"running": False}))
 
 
@@ -1171,7 +1256,8 @@ async def _run_analysis(asset_id: str, owner_id: str, reservation) -> None:
         except Exception:  # noqa: BLE001
             pass
     finally:
-        _TASKS.pop(asset_id, None)
+        if _TASKS.get(asset_id) is asyncio.current_task():
+            _TASKS.pop(asset_id, None)
 
 
 # ------------------------------------------------------------------ render
@@ -1238,11 +1324,26 @@ async def worker_status() -> dict:
 
 async def start_render(db, user: User, asset_id: str, sharpen: Optional[bool], fmt: Optional[str]) -> StudioMediaAsset:
     asset = await _owned_motion(db, user.id, asset_id)
+    render = (asset.options or {}).get("render") or {}
+    if render.get("state") in ("preparing", "queued", "rendering", "finishing") and (_local_alive(asset_id) or await _alive_anywhere(_K_RENDER, asset_id)):
+        return asset
+    token = await _claim(_K_RENDER, asset_id)
+    if token is None:   # another copy is making it right now (a double press, or the sweep picked it up)
+        await db.refresh(asset)
+        return asset
+    try:
+        await db.refresh(asset)   # read again now that it's ours
+        asset = await _start_render_claimed(db, user, asset, fmt, token)
+        token = None              # the background run gives it back
+        return asset
+    finally:
+        await _unclaim(_K_RENDER, asset_id, token)
+
+
+async def _start_render_claimed(db, user: User, asset: StudioMediaAsset, fmt: Optional[str], token: str) -> StudioMediaAsset:
+    asset_id = asset.id
     opts = dict(asset.options or {})
     motion = dict(opts.get("motion") or {})
-    render = opts.get("render") or {}
-    if render.get("state") in ("preparing", "queued", "rendering", "finishing") and asset_id in _TASKS and not _TASKS[asset_id].done():
-        return asset
     visible = [p for p in motion.get("photos") or [] if not p.get("hidden")]
     if len(visible) < 2:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Keep at least 2 photos in the video.")
@@ -1289,7 +1390,7 @@ async def start_render(db, user: User, asset_id: str, sharpen: Optional[bool], f
     flag_modified(asset, "options")
     await db.commit()
     await db.refresh(asset)
-    _TASKS[asset_id] = asyncio.create_task(_run_render(asset_id, user.id, reservation, resume_job=None))
+    _TASKS[asset_id] = _run_claimed(_K_RENDER, asset_id, token, _run_render(asset_id, user.id, reservation, resume_job=None))
     return asset
 
 
@@ -1306,11 +1407,7 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
         job_id = resume_job
         if not job_id and _needs_prep(motion):
             # 0) photos picked moments ago may still be getting their depth maps (free)
-            running = _PREP.get(asset_id)
-            if running and not running.done():
-                await running
-            else:
-                await _run_prep(asset_id)
+            await _wait_for_prep(asset_id)
             async with AsyncSessionLocal() as db:
                 fresh = await db.get(StudioMediaAsset, asset_id)
                 motion = dict(((fresh.options or {}) if fresh else {}).get("motion") or {})
@@ -1633,7 +1730,21 @@ async def _next_remake(asset_id: str, owner_id: str) -> None:
         logger.warning("motion remake queue failed", exc_info=True, extra={"asset_id": asset_id})
         return
     if nxt["t"]:
-        _TASKS[asset_id] = asyncio.create_task(_run_render(asset_id, owner_id, None, resume_job=None))
+        # This render still holds the video's lease until it ends - the next shape starts right after,
+        # under its own lease. (If this copy dies in between, the 2-minute sweep starts it instead.)
+        cur = asyncio.current_task()
+
+        async def start_next():
+            if cur is not None:
+                await asyncio.wait({cur})
+            token = await _claim(_K_RENDER, asset_id)
+            if token is None:
+                return   # the sweep (in some copy) already picked it up
+            _TASKS[asset_id] = _run_claimed(_K_RENDER, asset_id, token, _run_render(asset_id, owner_id, None, resume_job=None))
+
+        t = asyncio.create_task(start_next())
+        _HANDOFFS.add(t)
+        t.add_done_callback(_HANDOFFS.discard)
 
 
 async def _first_to_finish(job_id: str) -> bool:
@@ -1790,14 +1901,26 @@ _RESUMING: set[str] = set()
 
 
 async def _resume(asset: StudioMediaAsset) -> Optional[StudioMediaAsset]:
-    """Picks up a video whose run was cut off by a server restart (deploy). Called by the page's
-    poll AND by the every-2-minutes sweep (resume_stalled), so it finishes even if the agent
-    logged out. Returns the asset only when it had to be marked failed."""
-    if asset.id in _RESUMING or (asset.id in _TASKS and not _TASKS[asset.id].done()):
+    """Picks up a video whose run was cut off by a server restart (deploy) or a copy of the API that
+    died. Called by the page's poll AND by the every-2-minutes sweep (resume_stalled), so it finishes
+    even if the agent logged out. Returns the asset only when it had to be marked failed. Only the copy
+    that takes the video's shared lease picks it up - a video still being made anywhere is left alone."""
+    if asset.id in _RESUMING or _local_alive(asset.id):
         return None
     _RESUMING.add(asset.id)
+    token = await _claim(_K_RENDER, asset.id)
+    if token is None:
+        _RESUMING.discard(asset.id)
+        return None   # being made in some copy right now
     try:
+        async with AsyncSessionLocal() as db:   # read it again now that it's ours
+            fresh = await db.get(StudioMediaAsset, asset.id)
+        if fresh is None:
+            return None
+        asset = fresh
         render = (asset.options or {}).get("render") or {}
+        if render.get("state") not in _ACTIVE:
+            return None   # it finished (or failed) while we were looking
 
         async def fail(msg: str) -> Optional[StudioMediaAsset]:
             def f(a, o):
@@ -1814,7 +1937,8 @@ async def _resume(asset: StudioMediaAsset) -> Optional[StudioMediaAsset]:
             return await fail("That run was interrupted. Press Make video again.")
         if render.get("job_id") and render.get("state") != "preparing":
             # the video maker has it (or lost it - _run_render hands it over again)
-            _TASKS[asset.id] = asyncio.create_task(_run_render(asset.id, asset.owner_id, None, resume_job=render["job_id"]))
+            _TASKS[asset.id] = _run_claimed(_K_RENDER, asset.id, token, _run_render(asset.id, asset.owner_id, None, resume_job=render["job_id"]))
+            token = None
             return None
         # Cut off before the video maker got it (photos being prepared or sharpened): do that part again.
         # Prepared photos are kept, so only what was unfinished runs (and is paid for) again.
@@ -1829,31 +1953,37 @@ async def _resume(asset: StudioMediaAsset) -> Optional[StudioMediaAsset]:
                     reservation = await reserve_studio_motion(db, user.id, config, user.plan_tier)
             except AIRateLimitExceeded:
                 return await fail("That run was interrupted. Press Make video again.")
-        _TASKS[asset.id] = asyncio.create_task(_run_render(asset.id, asset.owner_id, reservation, resume_job=None))
+        _TASKS[asset.id] = _run_claimed(_K_RENDER, asset.id, token, _run_render(asset.id, asset.owner_id, reservation, resume_job=None))
+        token = None
         return None
     finally:
+        await _unclaim(_K_RENDER, asset.id, token)
         _RESUMING.discard(asset.id)
 
 
 async def resume_stalled() -> int:
-    """Scheduler job (main.py, every 2 minutes): videos still being made with no task running on
-    this server - after a restart - pick back up without anyone opening the page."""
+    """Scheduler job (main.py, every 2 minutes): videos still being made with no live run in ANY copy
+    of the API (no live lease) - after a restart or a copy dying - pick back up without anyone
+    opening the page."""
     try:
         async with AsyncSessionLocal() as db:
             rows = (await db.execute(select(StudioMediaAsset).where(
                 StudioMediaAsset.action == "motion",
                 StudioMediaAsset.options["render"]["state"].astext.in_(_ACTIVE),
             ))).scalars().all()
+        from app.services import cluster
+        busy = await cluster.alive_keys(_K_RENDER, [a.id for a in rows])
     except Exception:  # noqa: BLE001
         logger.warning("motion resume sweep failed", exc_info=True)
         return 0
     n = 0
     for a in rows:
-        if a.id in _TASKS and not _TASKS[a.id].done():
+        if _local_alive(a.id) or a.id in busy:
             continue
         try:
-            await _resume(a)
-            n += 1
+            if a.id not in _RESUMING:
+                await _resume(a)
+                n += 1
         except Exception:  # noqa: BLE001
             logger.warning("motion resume failed", exc_info=True, extra={"asset_id": a.id})
     if n:
@@ -1862,19 +1992,19 @@ async def resume_stalled() -> int:
 
 
 async def check(db, asset: StudioMediaAsset) -> StudioMediaAsset:
-    """Called when the page polls: picks a render or analysis back up if the server restarted
-    in the middle (the task lives in this process)."""
+    """Called when the page polls: picks a render or analysis back up if the server restarted (or the
+    copy doing it died) in the middle - judged by the shared leases, so a run in another copy of the
+    API is never mistaken for a dead one."""
     if asset.action != "motion":
         return asset
     opts = asset.options or {}
     render = opts.get("render") or {}
-    running = asset.id in _TASKS and not _TASKS[asset.id].done()
-    if render.get("state") in _ACTIVE and not running:
+    if render.get("state") in _ACTIVE and not _local_alive(asset.id) and not await _alive_anywhere(_K_RENDER, asset.id):
         asset = await _resume(asset) or asset
     if render.get("state") not in ("preparing", "queued", "rendering", "finishing"):
         kick_prep(asset)  # picks depth maps back up after a restart
     analysis = opts.get("analysis") or {}
-    if analysis.get("status") == "running" and not running:
+    if analysis.get("status") == "running" and not _local_alive(asset.id) and not await _alive_anywhere(_K_ANALYSIS, asset.id):
         def stop(a, o):
             o["analysis"] = {"status": "failed", "error": "That was interrupted. Press Try again."}
         asset = await _patch(asset.id, stop) or asset

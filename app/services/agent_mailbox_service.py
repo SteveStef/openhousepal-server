@@ -40,19 +40,15 @@ MS_SCOPES = ["https://graph.microsoft.com/Mail.Send", "https://graph.microsoft.c
 DAILY_CAP = {"google": 400, "microsoft": 250}
 # And no bursts: a personal mailbox suddenly sending dozens of near-identical emails in a few
 # minutes is what spam filters look for. Past this in any rolling hour, OpenHousePal sends the rest.
-HOURLY_CAP = {"google": 60, "microsoft": 40}
-_RECENT_SENDS: dict[str, list[float]] = {}
+# Owner 11/14: 60 an hour was too many - 20 for both. Counted across every copy of the API (cluster.py).
+HOURLY_CAP = {"google": 20, "microsoft": 20}
 
 
-def _hour_full(owner_id: str, provider: str) -> bool:
-    now = time.monotonic()
-    recent = [t for t in _RECENT_SENDS.get(owner_id, []) if now - t < 3600]
-    _RECENT_SENDS[owner_id] = recent
-    return len(recent) >= HOURLY_CAP.get(provider, 40)
-
-
-def _note_send(owner_id: str) -> None:
-    _RECENT_SENDS.setdefault(owner_id, []).append(time.monotonic())
+async def _take_hour_slot(owner_id: str, provider: str) -> bool:
+    """One send from this agent's mailbox this hour (rolling). False = the hour is full - send it
+    through OpenHousePal instead. Taken before sending, so two copies can't both use the last slot."""
+    from app.services import cluster
+    return await cluster.rate_hit(f"mailbox_hour:{owner_id}", HOURLY_CAP.get(provider, 20), 3600)
 _TZ = ZoneInfo("America/New_York")
 
 
@@ -311,9 +307,10 @@ async def send_guest(owner_id: Optional[str], to_email: str, subject: str, templ
             if rule is not None and rule.get("via") == "openhousepal":
                 return None
             today = _today()
-            if conn.sent_day != today:
+            fresh_day = conn.sent_day != today
+            if fresh_day:
                 conn.sent_day, conn.sent_count = today, 0
-            if conn.sent_count >= DAILY_CAP.get(conn.provider, 250) or _hour_full(owner_id, conn.provider):
+            if conn.sent_count >= DAILY_CAP.get(conn.provider, 250) or not await _take_hour_slot(owner_id, conn.provider):
                 return None
             variables = dict(variables)
             ics = variables.pop("_ics", None)   # a client calendar invite (calendar_invite_service)
@@ -355,9 +352,9 @@ async def send_guest(owner_id: Optional[str], to_email: str, subject: str, templ
                 conn.last_error = f"{resp.status_code} {resp.text[:300]}"
                 await db.commit()
                 return None
-            conn.sent_count = (conn.sent_count or 0) + 1
+            # in SQL, so two copies sending at once both count (a new day starts from this one)
+            conn.sent_count = 1 if fresh_day else MailConnection.sent_count + 1
             conn.total_sent = (conn.total_sent or 0) + 1
-            _note_send(owner_id)
             conn.last_sent_at = datetime.now(timezone.utc)
             conn.last_error = None
             await db.commit()

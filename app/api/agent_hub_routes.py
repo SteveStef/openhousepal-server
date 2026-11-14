@@ -1621,7 +1621,7 @@ async def public_list_reviews(slug: str, db: AsyncSession = Depends(get_db)):
 @router.post("/public/{slug}/reviews", status_code=status.HTTP_201_CREATED)
 async def public_submit_review(slug: str, payload: ReviewSubmit, request: Request, db: AsyncSession = Depends(get_db)):
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     from app.models.database import AgentReview, Notification
 
     hub, owner = await _hub_and_owner(db, slug)

@@ -169,7 +169,7 @@ async def resume(batch_id: str, db: AsyncSession = Depends(get_db), admin: User 
 @router.delete("/batches/{batch_id}", status_code=204)
 async def delete_batch(batch_id: str, db: AsyncSession = Depends(get_db), admin: User = Depends(require_admin_user)):
     b = await _owned(db, admin, batch_id)
-    if b.status == "running" and svc.worker_running():
+    if b.status == "running" and await svc.worker_running_anywhere():
         raise HTTPException(status.HTTP_409_CONFLICT, "Stop the test first.")
     ids = [i.get("report_id") for i in (b.items or []) if i.get("report_id")]
     await svc.delete_batch_reports(db, admin.id, ids)
@@ -180,7 +180,7 @@ async def delete_batch(batch_id: str, db: AsyncSession = Depends(get_db), admin:
 @router.delete("/reports")
 async def delete_all_test_reports(db: AsyncSession = Depends(get_db), admin: User = Depends(require_admin_user)):
     """Bulk delete every accuracy-test CMA report (the scoreboards stay; their report links go dead)."""
-    if svc.worker_running():
+    if await svc.worker_running_anywhere():
         raise HTTPException(status.HTTP_409_CONFLICT, "A test is running - stop it first.")
     n = await svc.delete_batch_reports(db, admin.id)
     await db.commit()

@@ -588,6 +588,8 @@ async def _upsert_event(db: AsyncSession, conn: CalendarConnection, kind: str, s
     key = (conn.id, kind, source_id)
     lock = _UPSERT_LOCKS.setdefault(key, asyncio.Lock())
     try:
+        # (across copies of the API the unique constraint + IntegrityError path below catches a double
+        # insert; a follow-up's syncs also take turns across copies in _sync_task)
         async with lock:
             await _upsert_event_locked(db, conn, kind, source_id, body)
     finally:
@@ -931,7 +933,8 @@ async def _sync_task(db: AsyncSession, conn: CalendarConnection, task_id: str) -
     entry = _TASK_SYNC_LOCKS.setdefault(key, [asyncio.Lock(), 0])
     entry[1] += 1
     try:
-        async with entry[0]:
+        from app.services import cluster   # ... and across every copy of the API (11/14)
+        async with entry[0], cluster.wait_lease("cal_task", f"{conn.id}:{task_id}", timeout=60):
             await _sync_task_locked(db, conn, task_id)
     finally:
         entry[1] -= 1
@@ -1225,6 +1228,12 @@ async def reconcile_deleted_followups_throttled(owner_id: str, timeout: float = 
     if last and now - last < _RECONCILE_EVERY:
         return
     _last_reconcile[owner_id] = now
+    try:   # ... and once a minute across every copy of the API (a shared lease that runs out, 11/14)
+        from app.services import cluster
+        if await cluster.acquire("cal_reconcile", owner_id, _RECONCILE_EVERY.total_seconds()) is None:
+            return
+    except Exception:  # noqa: BLE001
+        logger.warning("shared calendar check throttle unavailable", exc_info=True)
     from app.database import AsyncSessionLocal
 
     async def run():

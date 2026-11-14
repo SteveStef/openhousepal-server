@@ -617,7 +617,7 @@ async def submit_open_house_form(
     Submit open house visitor form
     """
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     if form_data.open_house_event_id:
         await _assert_open_house_owner_live(db, form_data.open_house_event_id)
 
@@ -763,7 +763,8 @@ async def _flag_owner_test_signin(db: AsyncSession, visitor: OpenHouseVisitor, f
 
 
 async def _showcase_and_alert(db: AsyncSession, visitor: OpenHouseVisitor, form_data: OpenHouseFormSubmission,
-                              open_house_info: Optional[dict], from_similar_qr: bool, quiet: bool) -> dict:
+                              open_house_info: Optional[dict], from_similar_qr: bool, quiet: bool,
+                              build_showcase: Optional[bool] = None) -> dict:
     """After a sign-in: the guest's Showcase (no agent) + the host's bell alert and wrap-up queue.
     Runs inside the sign-in request - or, when the guest's phone is going straight on to their
     Guest Pass, right after it in the background (user, 10/24: "never wait for the showcase to be
@@ -780,9 +781,21 @@ async def _showcase_and_alert(db: AsyncSession, visitor: OpenHouseVisitor, form_
     if form_data.open_house_event_id and form_data.has_agent.value != "YES" and showcases_on:
         # Builds the showcase AND schedules the guest's invite email (1 hour out) - the same
         # helper backfill_missed_showcases() uses when a Basic agent upgrades.
-        collection_result = await OpenHouseService.create_showcase_and_invite(
-            db, visitor, form_data, send_after=timedelta(hours=1)
-        )
+        # One build per guest across every copy of the API (11/14, visitor_showcase_service.BUILD_LEASE):
+        # build_showcase None = take that lease here, True = the caller holds it, False = another
+        # copy is building it right now (skip - the guest gets that one).
+        if build_showcase is None:
+            from app.services import cluster
+            from app.services.visitor_showcase_service import BUILD_LEASE, BUILD_TTL
+            async with cluster.lease(BUILD_LEASE, visitor.id, BUILD_TTL) as token:
+                if token is not None:
+                    collection_result = await OpenHouseService.create_showcase_and_invite(
+                        db, visitor, form_data, send_after=timedelta(hours=1)
+                    )
+        elif build_showcase:
+            collection_result = await OpenHouseService.create_showcase_and_invite(
+                db, visitor, form_data, send_after=timedelta(hours=1)
+            )
         # The Showcase's homes are in now - re-push this guest's follow-up so its calendar alert
         # carries the real pitch (home count, best match), not the empty just-created Showcase.
         if collection_result.get("success") and visitor.lead_id and open_house_info:
@@ -863,11 +876,16 @@ def _after_signin_later(visitor_id: str, form_data: OpenHouseFormSubmission, ope
     from app.database import AsyncSessionLocal
 
     async def run():
+        from app.services import cluster
+        from app.services.visitor_showcase_service import BUILD_LEASE, BUILD_TTL
         try:
-            async with AsyncSessionLocal() as s:
-                v = await s.get(OpenHouseVisitor, visitor_id)
-                if v is not None:
-                    await _showcase_and_alert(s, v, form_data, open_house_info, from_similar_qr, quiet)
+            # one build per guest across every copy of the API (11/14) - see visitor_showcase_service.BUILD_LEASE
+            async with cluster.lease(BUILD_LEASE, visitor_id, BUILD_TTL) as token:
+                async with AsyncSessionLocal() as s:
+                    v = await s.get(OpenHouseVisitor, visitor_id)
+                    if v is not None:
+                        await _showcase_and_alert(s, v, form_data, open_house_info, from_similar_qr, quiet,
+                                                  build_showcase=token is not None)
         except Exception:
             logger.exception("background showcase build after sign-in failed", extra={"visitor_id": visitor_id})
         finally:

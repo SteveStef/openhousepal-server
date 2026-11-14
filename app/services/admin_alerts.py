@@ -35,6 +35,14 @@ async def alert_admin(area: str, title: str, detail: str = "", *, owner_id: Opti
     if now - _last.get(key, -THROTTLE * 2) < THROTTLE:
         return
     _last[key] = now
+    # ... and once per half hour across every copy of the API (11/14) - a shared lease that simply
+    # runs out after THROTTLE seconds.
+    try:
+        from app.services import cluster
+        if await cluster.acquire("admin_alert", f"{area}|{title}"[:200], THROTTLE) is None:
+            return
+    except Exception:  # noqa: BLE001 - an alert is better twice than never
+        logger.warning("shared alert throttle unavailable", exc_info=True)
     logger.error("admin alert", extra={"area": area, "title": title, "detail": (detail or "")[:500], "owner_id": owner_id, "path": path})
     try:
         from sqlalchemy import select

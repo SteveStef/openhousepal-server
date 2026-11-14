@@ -43,7 +43,7 @@ async def guest_pass_agent_busy(token: str, db: AsyncSession = Depends(get_db)):
 async def guest_pass_request(token: str, body: GuestPassRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """One-tap "request the seller disclosure" / "request a second tour" with their sign-in info."""
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     visitor, oh, _host = await gp.resolve(db, token)
     return await gp.send_request(db, visitor, oh, body.kind, body.preferred_time)
 
@@ -52,7 +52,7 @@ async def guest_pass_request(token: str, body: GuestPassRequest, request: Reques
 async def guest_pass_showcase(token: str, request: Request, db: AsyncSession = Depends(get_db)):
     """Their Showcase link - built now if the sign-in didn't make one."""
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     visitor, oh, host = await gp.resolve(db, token)
     return await gp.open_showcase(db, visitor, oh, host)
 
@@ -98,7 +98,7 @@ async def guest_pass_ping(token: str, body: GuestPassPing, db: AsyncSession = De
 async def guest_pass_question(token: str, body: GuestPassQuestion, request: Request, db: AsyncSession = Depends(get_db)):
     """"Ask {agent} a quick question" - sent as them, from their sign-in info."""
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     visitor, oh, host = await gp.resolve(db, token)
     return await gp.ask_question(db, visitor, oh, host, body.message)
 

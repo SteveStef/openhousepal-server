@@ -575,8 +575,25 @@ async def build_context(db: AsyncSession, site) -> MatchContext:
     )
 
 
+_LEASE = "old_links_scan"
+
+
 async def run_scan(site_id: str) -> None:
-    """Collect + match + store. Own DB session (runs in the background). Never raises."""
+    """Collect + match + store. Own DB session (runs in the background). Never raises. One scan per
+    site at a time across every copy of the API (shared lease, 11/14)."""
+    if site_id in _RUNNING:
+        return
+    try:
+        from app.services import cluster
+        async with cluster.lease(_LEASE, site_id, 120) as token:
+            if token is None:
+                return
+            await _run_scan_held(site_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("old links scan failed", exc_info=True, extra={"site_id": site_id})
+
+
+async def _run_scan_held(site_id: str) -> None:
     from app.database import AsyncSessionLocal
     from app.models.database import Site, SiteRedirect
     if site_id in _RUNNING:
@@ -664,8 +681,11 @@ def queue_scan(site_id: str) -> None:
     task.add_done_callback(_TASKS.discard)
 
 
-def is_running(site_id: str) -> bool:
-    return site_id in _RUNNING
+async def is_running(site_id: str) -> bool:
+    if site_id in _RUNNING:
+        return True
+    from app.services import cluster
+    return await cluster.alive(_LEASE, site_id)
 
 
 async def sweep(db: AsyncSession, limit: int = 3) -> int:

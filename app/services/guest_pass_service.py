@@ -214,11 +214,12 @@ def showcases_offered(host: User, visitor: OpenHouseVisitor, oh: Optional[OpenHo
             and (override is True or oh is None or oh.auto_showcase is not False or bool(getattr(oh, "pass_showcase", False))))
 
 
-def _building(visitor: OpenHouseVisitor, oh: OpenHouseEvent) -> bool:
+async def _building(visitor: OpenHouseVisitor, oh: OpenHouseEvent) -> bool:
     """Their Showcase is still being made right after sign-in (open_houses_routes builds it in the
-    background so the pass opens at once) - the pass says "Your Showcase is loading" and checks back."""
-    from app.api.open_houses_routes import SHOWCASE_BUILDING
-    if visitor.id in SHOWCASE_BUILDING:
+    background so the pass opens at once) - the pass says "Your Showcase is loading" and checks back.
+    Asked across every copy of the API (visitor_showcase_service.building_anywhere, 11/14)."""
+    from app.services.visitor_showcase_service import building_anywhere
+    if await building_anywhere(visitor.id):
         return True
     if oh is not None and oh.auto_showcase is False:
         return False   # built only when they tap it
@@ -270,7 +271,7 @@ async def payload(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHouseEven
     showcase = None
     if showcases_offered(host, visitor, oh):
         col = await _showcase(db, host, visitor)
-        showcase = {"url": await _showcase_url(db, host, col)} if col else {"url": None, "building": _building(visitor, oh)}
+        showcase = {"url": await _showcase_url(db, host, col)} if col else {"url": None, "building": await _building(visitor, oh)}
 
     requested = {r for r in (await db.execute(
         select(OpenHouseFormRequest.form_type).where(
@@ -739,29 +740,42 @@ async def open_showcase(db: AsyncSession, visitor: OpenHouseVisitor, oh: OpenHou
     if not showcases_offered(host, visitor, oh):
         raise HTTPException(status_code=404, detail="Showcases aren't available here.")
     col = await _showcase(db, host, visitor)
-    # Still being built from the sign-in (background) - wait for that one instead of making a second.
-    from app.api.open_houses_routes import SHOWCASE_BUILDING
-    if not col and visitor.id in SHOWCASE_BUILDING:
+    # Still being built from the sign-in (background, in any copy of the API) - wait for that one
+    # instead of making a second.
+    from app.services import cluster
+    from app.services.visitor_showcase_service import BUILD_LEASE, BUILD_TTL, building_anywhere
+    if not col and await building_anywhere(visitor.id):
         import asyncio
         for _ in range(60):
             await asyncio.sleep(0.5)
-            if visitor.id not in SHOWCASE_BUILDING:
+            if not await building_anywhere(visitor.id):
                 break
         col = await _showcase(db, host, visitor)   # read-committed: sees the background write
     if not col:
-        form = OpenHouseFormSubmission(
-            full_name=visitor.full_name, email=visitor.email, phone=visitor.phone or "",
-            has_agent=HasAgent(visitor.has_agent) if visitor.has_agent in HasAgent._value2member_map_ else HasAgent.NO,
-            open_house_event_id=oh.id,
-        )
-        result = await OpenHouseService.create_showcase_and_invite(db, visitor, form, send_after=timedelta(hours=1))
-        if not result.get("success"):
-            raise HTTPException(status_code=409, detail="We couldn't build your Showcase right now.")
-        if visitor.lead_id:
-            from app.services.tasks_service import resync_lead_followups
-            resync_lead_followups(host.id, visitor.lead_id, delay=20)
-        col = await _showcase(db, host, visitor)
+        async with cluster.lease(BUILD_LEASE, visitor.id, BUILD_TTL) as token:
+            if token is None:   # another copy started building it this very moment
+                raise HTTPException(status_code=409, detail="Your Showcase is being made - try again in a moment.")
+            col = await _showcase(db, host, visitor)   # checked again now that it's ours
+            if not col:
+                col = await _make_showcase(db, host, visitor, oh)
     url = await _showcase_url(db, host, col)
     if not url:
         raise HTTPException(status_code=409, detail="We couldn't build your Showcase right now.")
     return {"url": url}
+
+
+async def _make_showcase(db: AsyncSession, host: User, visitor: OpenHouseVisitor, oh: OpenHouseEvent):
+    from app.schemas.open_house import HasAgent, OpenHouseFormSubmission
+    from app.services.open_house_service import OpenHouseService
+    form = OpenHouseFormSubmission(
+        full_name=visitor.full_name, email=visitor.email, phone=visitor.phone or "",
+        has_agent=HasAgent(visitor.has_agent) if visitor.has_agent in HasAgent._value2member_map_ else HasAgent.NO,
+        open_house_event_id=oh.id,
+    )
+    result = await OpenHouseService.create_showcase_and_invite(db, visitor, form, send_after=timedelta(hours=1))
+    if not result.get("success"):
+        raise HTTPException(status_code=409, detail="We couldn't build your Showcase right now.")
+    if visitor.lead_id:
+        from app.services.tasks_service import resync_lead_followups
+        resync_lead_followups(host.id, visitor.lead_id, delay=20)
+    return await _showcase(db, host, visitor)

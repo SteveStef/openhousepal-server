@@ -117,7 +117,7 @@ async def get_area_photo(photo_name: str, db: AsyncSession = Depends(get_db)):
     return Response(content=resp.content, media_type=ctype, headers={"Cache-Control": "public, max-age=86400"})
 
 
-_MAP_HITS: dict[str, list] = {}
+# (per-address map-load limit: shared counter in allow_map_load, cluster.rate_hit)
 
 
 @router.get("/maps/home/{key}.png")
@@ -148,17 +148,11 @@ async def allow_map_load(request: Request, db: AsyncSession = Depends(get_db)):
     Google free tier only); over it, 429 and that page draws the same map on the free OpenFreeMap
     street map instead (frontend lib/freeMap - same pins, shapes and buttons, never billed).
     Per address, at most 60 map loads an hour - a script hammering this can't use up everyone's maps."""
-    import time
-    from app.services import usage_budget_service
+    from app.services import cluster, usage_budget_service
     ip = _client_ip(request) or "unknown"
-    now = time.time()
-    hits = [t for t in _MAP_HITS.get(ip, []) if now - t < 3600]
-    if len(hits) >= 60:
+    # 60 an hour per address across every copy of the API (shared counter, 11/14)
+    if not await cluster.rate_hit(f"map_load:{ip}", 60, 3600):
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Map unavailable.")
-    hits.append(now)
-    if len(_MAP_HITS) > 50_000:
-        _MAP_HITS.clear()
-    _MAP_HITS[ip] = hits
     config = await ai_config_service.get_config(db)
     try:
         await usage_budget_service.reserve(db, {
@@ -1226,7 +1220,7 @@ async def get_site_public_form(
 async def submit_site_public_form(site_id: str, form_id: str, payload: FormSubmissionCreate, request: Request, db: AsyncSession = Depends(get_db),
                                   owner_ref: bool = False):
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     """Submits into the exact same pipeline as the Agent-Hub-scoped public form (same
     FormSubmission row, same Lead upsert via forms_service.submit_form) - the website is another
     source feeding the existing OHP lead system, not a separate inbox."""
@@ -1271,7 +1265,7 @@ async def google_visitor_signin(site_id: str, payload: GoogleVisitorRequest, req
     from app.services import google_visitor_service as gv, leads_service
     from app.services.agent_email_service import absolute, email_agent
     from app.models.database import Lead, LeadEvent, Notification
-    check_public_submit(request)
+    await check_public_submit(request)
     owner = await _published_site_owner(db, site_id)
     if not owner:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Site not found.")
@@ -1397,7 +1391,7 @@ async def ask_about_site_property(site_id: str, listing_key: str, payload: SiteA
     lead (property_page_inquiry) and follow-up - tagged as found on the agent's website."""
     from app.services.public_rate_limit import check_public_submit
     from app.api.properties_routes import AgentMessageRequest, message_agent
-    check_public_submit(request)
+    await check_public_submit(request)
     owner = await _published_site_owner(db, site_id)
     if not owner:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Site not found.")
@@ -1461,7 +1455,7 @@ async def get_site_showcase_creator(
 async def submit_site_showcase_creator(site_id: str, payload: FormSubmissionCreate, request: Request, db: AsyncSession = Depends(get_db),
                                        owner_ref: bool = False):
     from app.services.public_rate_limit import check_public_submit
-    check_public_submit(request)
+    await check_public_submit(request)
     """Submit the IDX Showcase Creator through forms_service.submit_form, preserving the single
     FormSubmission/Lead/Notification/Collection pipeline used by existing OHP public forms."""
     _, _, form = await _get_site_showcase_creator_form(db, site_id)

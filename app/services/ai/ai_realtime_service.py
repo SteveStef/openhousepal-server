@@ -17,6 +17,7 @@ record_realtime_usage, concurrent-session caps, and the idle-abandonment sweep) 
 defense-in-depth, not an absolute guarantee against a single misbehaving forgotten tab.
 """
 import os
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
@@ -66,26 +67,39 @@ Voice transcription can turn a spoken street number into something else (e.g. "e
 
 
 class _ConcurrentSessionLimiter:
-    """In-process count of live Talk to OHP sessions per user. Separate from
-    ai_rate_limit_service's request-burst limiter - a voice session is long-lived and
-    explicitly released on end/abandonment, not auto-released after one request."""
+    """Live Talk to OHP sessions per user, counted across every copy of the API (11/14). A voice
+    session starts with one request and ends with another - with several copies those can land on
+    different copies, so an in-memory count drifted (one copy never counted down -> that agent was
+    refused voice on it until a restart). Each session now holds a shared lease named after its own
+    id (cluster.py): ended -> given back; a copy that dies -> it frees itself after the longest a
+    session can run."""
 
-    def __init__(self):
-        self._counts: Dict[str, int] = defaultdict(int)
+    KIND = "ai_voice"
 
-    def acquire(self, owner_id: str, max_concurrent: int):
-        if self._counts[owner_id] >= max_concurrent:
+    async def acquire(self, owner_id: str, session_id: str, max_concurrent: int, ttl: float):
+        from app.services import cluster
+        token = await cluster.acquire(self.KIND, session_id, ttl, owner_id=owner_id,
+                                      allow=lambda n, _amt: n < int(max_concurrent))
+        if token is None:
             raise AIRateLimitExceeded(
                 "realtime_concurrency_limit",
                 "You already have a voice session in progress. End it before starting another.",
             )
-        self._counts[owner_id] += 1
 
-    def release(self, owner_id: str):
-        self._counts[owner_id] = max(0, self._counts[owner_id] - 1)
+    async def release(self, session_id: str):
+        from app.services import cluster
+        try:
+            await cluster.release(self.KIND, session_id)
+        except Exception:  # noqa: BLE001 - it frees itself when its time runs out
+            logger.warning("voice session slot release failed", exc_info=True)
 
 
 _session_limiter = _ConcurrentSessionLimiter()
+
+
+def _voice_slot_ttl(config: dict) -> float:
+    # the longest a session can run, plus the idle sweep's own window and a margin
+    return float(config.get("realtime_max_session_seconds") or 1800) + float(config.get("realtime_max_idle_seconds") or 300) + 300
 
 
 async def _session_count_since(db: AsyncSession, owner_id: str, since: datetime) -> int:
@@ -100,7 +114,8 @@ async def create_ephemeral_session(db: AsyncSession, current_user: User, config:
     creates the AIRealtimeSession row that tracks it. Raises AIRateLimitExceeded (same shape
     the chat path already uses) if any limit is hit - callers must not proceed. The permanent
     OPENAI_API_KEY is read here and never returned to the caller."""
-    _session_limiter.acquire(current_user.id, config["realtime_max_concurrent_sessions_per_user"])
+    session_id = str(uuid.uuid4())
+    await _session_limiter.acquire(current_user.id, session_id, config["realtime_max_concurrent_sessions_per_user"], _voice_slot_ttl(config))
     reservation: Optional[Reservation] = None
     try:
         now = datetime.now(timezone.utc)
@@ -154,7 +169,7 @@ async def create_ephemeral_session(db: AsyncSession, current_user: User, config:
             response.raise_for_status()
             secret_data = response.json()
 
-        session = AIRealtimeSession(owner_id=current_user.id)
+        session = AIRealtimeSession(id=session_id, owner_id=current_user.id)
         db.add(session)
         await db.commit()
         await db.refresh(session)
@@ -168,8 +183,8 @@ async def create_ephemeral_session(db: AsyncSession, current_user: User, config:
             "max_session_seconds": config["realtime_max_session_seconds"],
             "max_idle_seconds": config["realtime_max_idle_seconds"],
         }
-    except Exception:
-        _session_limiter.release(current_user.id)
+    except BaseException:
+        await _session_limiter.release(session_id)
         # The session never actually started (OpenAI call or DB commit above failed) - refund
         # the Layer-3 reservation in full so a failed session-create never eats into the
         # platform-wide global/emergency budgets. `reservation` stays None if the exception
@@ -208,7 +223,7 @@ async def end_realtime_session(db: AsyncSession, session: AIRealtimeSession, rea
     session.end_reason = reason
     db.add(session)
     await db.commit()
-    _session_limiter.release(session.owner_id)
+    await _session_limiter.release(session.id)
     if config is not None:
         await reconcile_budget(db, _realtime_reservation(session, config), session.estimated_cost_usd or 0.0)
 
