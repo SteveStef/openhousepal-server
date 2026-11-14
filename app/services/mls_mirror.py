@@ -297,16 +297,21 @@ async def _build_index(name: str, sql: str) -> bool:
 async def fill_step(run_seconds: Optional[float] = None, batch: Optional[int] = None) -> dict:
     """One scheduled run: fill old rows for up to `run_seconds`, then (once none are left) build
     the remaining indexes. Returns what it did."""
-    from app.database import AsyncSessionLocal
+    from app.database import AsyncSessionLocal, engine
     stats = {"filled": 0, "batches": 0, "done": False, "indexes": []}
-    async with AsyncSessionLocal() as lockdb:
+    # The one-worker lock lives on ONE dedicated connection for the whole run (autocommit, so no
+    # long transaction). It was taken through a session that handed its connection back to the pool
+    # on commit, then "released" on whatever connection came next - so on live the lock stayed held
+    # by an idle pooled connection and every later run said "another worker" (11/13). If this
+    # connection dies (a database restart), Postgres drops the lock with it.
+    async with engine.connect() as raw_lock:
+        lockdb = await raw_lock.execution_options(isolation_level="AUTOCOMMIT")
         if not (await lockdb.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": _LOCK_KEY})).scalar():
             return {**stats, "skipped": "another worker"}
         try:
             trig = (await lockdb.execute(text(
                 "SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
                 "WHERE c.relname = 'properties' AND t.tgname = 'properties_mls_mirror_trg'"))).first()
-            await lockdb.commit()
             if not trig:
                 return {**stats, "skipped": "migration not applied"}
             if not await _build_index(*UNMIRRORED_INDEX):
@@ -331,7 +336,6 @@ async def fill_step(run_seconds: Optional[float] = None, batch: Optional[int] = 
                 if not _state["ready"] and len(stats["indexes"]) == len(INDEXES):
                     # Fresh planner statistics (the expression map index has none until ANALYZE)
                     # before the readers switch over - a sampled read, not a table scan.
-                    from app.database import engine
                     async with engine.connect() as raw:
                         conn = await raw.execution_options(isolation_level="AUTOCOMMIT")
                         await conn.execute(text("SET statement_timeout = 0"))
@@ -339,8 +343,10 @@ async def fill_step(run_seconds: Optional[float] = None, batch: Optional[int] = 
                     stats["analyzed"] = True
                 await refresh_ready(force=True)
         finally:
-            await lockdb.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _LOCK_KEY})
-            await lockdb.commit()
+            try:
+                await lockdb.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _LOCK_KEY})
+            except Exception:  # connection already gone - the lock went with it
+                pass
     return stats
 
 

@@ -149,6 +149,25 @@ async def test_value_reads_like_the_payload_mirrored_or_not():
 
 
 @pytest.mark.asyncio
+async def test_fill_lock_is_really_released_between_runs():
+    """Live 11/13: the one-worker lock was taken on one pooled connection and 'released' on another,
+    so it stayed held and every later run skipped with "another worker". Two runs in a row must both
+    run, and afterwards nobody may hold the lock."""
+    async with _Db():
+        pass  # skips when the local database / migration isn't there
+    from sqlalchemy import text
+    from app.database import engine
+    first = await mls_mirror.fill_step(run_seconds=0.2, batch=1)
+    second = await mls_mirror.fill_step(run_seconds=0.2, batch=1)
+    assert "skipped" not in first and "skipped" not in second, (first, second)
+    async with engine.connect() as c:
+        held = (await c.execute(text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = :k AND granted"),
+                                {"k": mls_mirror._LOCK_KEY})).scalar()
+        await c.rollback()
+    assert held == 0
+
+
+@pytest.mark.asyncio
 async def test_sql_helpers_give_the_same_answers_switch_on_or_off(monkeypatch):
     from sqlalchemy import func, select
     from app.models.database import Property
