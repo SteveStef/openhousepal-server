@@ -769,13 +769,20 @@ async def release_cma_generation(report_id: str) -> None:
             logger.warning("shared CMA hold release failed", exc_info=True)
 
 
-async def reserve_cma_reasoning(db: AsyncSession, owner_id: str, config: dict, plan_tier: str) -> Reservation:
+async def reserve_cma_reasoning(db: AsyncSession, owner_id: str, config: dict, plan_tier: str,
+                                report_id: Optional[str] = None) -> Reservation:
     """Reserve the dedicated final-valuation reasoning pass independently of Claude analysis."""
     if plan_tier not in MLS_ACCESS_TIERS:
         raise AIRateLimitExceeded(
             "plan_tier", "Your plan doesn't include AI CMA analysis."
         )
-    await enforce_agent_monthly_budget(db, owner_id, config, plan_tier)
+    # A run the start gate let in is allowed to FINISH (test round 11/14, 196 Hudson Dr: 31 cents of allowance
+    # left, the start gate - "under the allowance, so one more run" - let it in, the photo pass cost 52 cents,
+    # and this second check then refused the final pass: a failed report, and the 52 cents spent for nothing).
+    # The start gate already limits how many runs are let in; the last one may finish a little over.
+    admitted = bool(report_id) and str(report_id) in _cma_holds.holds
+    if not admitted:
+        await enforce_agent_monthly_budget(db, owner_id, config, plan_tier)
     return await reserve_global_and_emergency(
         db, "cma_ai_global", config["cma_reasoning_reservation_estimate_usd"],
         config["cma_ai_daily_cost_ceiling_usd"], config["cma_ai_monthly_cost_ceiling_usd"],

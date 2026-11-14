@@ -27,6 +27,21 @@ def _property_address(property_record: Property) -> str:
     )
 
 
+async def _usable(db: AsyncSession, property_record: Property) -> Property:
+    """The home, readable again. The daily-count reservation below rolls the session back when the cap is
+    reached, and a rollback marks every loaded field of the home as "to be re-read" - the caller then read one
+    outside an await and the whole page failed with a 500 (found 11/14 making a test CMA: on a day the 400-a-day
+    address-lookup cap was reached, every home without a stored map point returned "Something went wrong" - the
+    CMA's "use this listing" step, and an agent's website home page - instead of simply keeping the MLS's point)."""
+    try:
+        from sqlalchemy import inspect as _inspect
+        if _inspect(property_record).expired_attributes:
+            await db.refresh(property_record)
+    except Exception:  # noqa: BLE001 - the caller's own read will say what is wrong
+        logger.warning("could not re-read a home after a rolled-back geocode reservation", exc_info=True)
+    return property_record
+
+
 async def ensure_google_rooftop_geocode(db: AsyncSession, property_record: Property) -> Property:
     """
     Cache a Google ROOFTOP geocode for the property.
@@ -64,7 +79,7 @@ async def ensure_google_rooftop_geocode(db: AsyncSession, property_record: Prope
             "platform_emergency": (None, None, config["platform_emergency_daily_cost_ceiling_usd"], config["platform_emergency_monthly_cost_ceiling_usd"]),
         }, config.get("google_geocode_estimated_cost_usd", 0.005), count_delta=1)
     except Exception:  # noqa: BLE001 - over the cap (BudgetExceeded) or the counter failed: no Google call
-        return property_record
+        return await _usable(db, property_record)
 
     try:
         async with httpx.AsyncClient(timeout=12.0) as client:
@@ -73,6 +88,7 @@ async def ensure_google_rooftop_geocode(db: AsyncSession, property_record: Prope
             payload = response.json()
         await charge_google("geocoding")
     except Exception as exc:
+        property_record = await _usable(db, property_record)
         logger.warning("Google geocoding request failed", extra={"listing_key": property_record.listing_key, "error": str(exc)})
         return property_record
 
@@ -93,7 +109,7 @@ async def ensure_google_rooftop_geocode(db: AsyncSession, property_record: Prope
     lat = location.get("lat")
     lng = location.get("lng")
     if lat is None or lng is None:
-        return property_record
+        return await _usable(db, property_record)
 
     property_record.google_rooftop_latitude = float(lat)
     property_record.google_rooftop_longitude = float(lng)

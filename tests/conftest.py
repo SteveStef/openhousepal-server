@@ -12,3 +12,20 @@ import app.database as _db
 def _fresh_db_pool_per_test():
     yield
     _db.engine.sync_engine.dispose(close=False)
+
+
+# Homes under contract stopped moving the value on 11/14 (cma_ai_service._PENDING_NUDGE_ENABLED, default off).
+# The tests written for that machinery keep exercising it switched ON, so it stays correct if it is ever turned
+# back on; tests/test_cma_grader_1114.py checks the default.
+_NUDGE_MACHINERY_TESTS = {
+    "test_cma_deep_dive_valuation", "test_cma_golden_1021", "test_cma_round2_1113", "test_cma_rule_audit_1024",
+}
+
+
+@pytest.fixture(autouse=True)
+def _pending_nudge_for_its_own_tests(request, monkeypatch):
+    if request.module.__name__.split(".")[-1] in _NUDGE_MACHINERY_TESTS:
+        from app.services import cma_ai_service
+        monkeypatch.setattr(cma_ai_service, "_PENDING_NUDGE_ENABLED", True)
+    yield
+

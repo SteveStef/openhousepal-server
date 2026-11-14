@@ -148,3 +148,34 @@ def test_tier_without_cma_refused(monkeypatch):
     with pytest.raises(rl.AIRateLimitExceeded) as exc:
         asyncio.run(rl.hold_cma_generation(None, OWNER, "r1", CONFIG, "NO_MLS"))
     assert exc.value.reason == "plan_tier"
+
+
+def test_a_run_that_was_let_in_may_finish(monkeypatch):
+    """The start gate lets one more run in while the agent is under the allowance; once in, its final pass is not
+    refused because the photo pass used the rest (11/14: a failed report after 52 cents had been spent)."""
+    calls = []
+
+    async def enforce(db, owner_id, config, plan_tier):
+        calls.append(owner_id)
+        raise rl.AIRateLimitExceeded("agent_monthly_budget", "You've reached your AI usage limit for this month.")
+
+    async def reserve(db, bucket, estimate, daily, monthly, config):
+        return "reservation"
+    monkeypatch.setattr(rl, "enforce_agent_monthly_budget", enforce)
+    monkeypatch.setattr(rl, "reserve_global_and_emergency", reserve)
+    config = dict(CONFIG, cma_reasoning_reservation_estimate_usd=0.3, cma_ai_daily_cost_ceiling_usd=50, cma_ai_monthly_cost_ceiling_usd=500)
+    _used(monkeypatch, 19.70)
+
+    async def go():
+        await rl.hold_cma_generation(None, OWNER, "r1", CONFIG, "IDX")           # let in at $19.70 of $20
+        assert await rl.reserve_cma_reasoning(None, OWNER, config, "IDX", report_id="r1") == "reservation"
+        assert calls == []                                                        # not asked again for an admitted run
+        # a re-run (no start gate, no hold) and a different report are still checked
+        with pytest.raises(rl.AIRateLimitExceeded):
+            await rl.reserve_cma_reasoning(None, OWNER, config, "IDX")
+        with pytest.raises(rl.AIRateLimitExceeded):
+            await rl.reserve_cma_reasoning(None, OWNER, config, "IDX", report_id="r2")
+        await rl.release_cma_generation("r1")
+        with pytest.raises(rl.AIRateLimitExceeded):
+            await rl.reserve_cma_reasoning(None, OWNER, config, "IDX", report_id="r1")
+    asyncio.run(go())

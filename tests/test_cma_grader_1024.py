@@ -132,7 +132,8 @@ def test_pending_context_sentence_labels_it_as_not_a_sale():
                                                         "days_on_market": 9}]}}
     out, _ = ai._v10_pending_context_sentence("The value is $1,082,000.", final={"value": 1082000, "range_min": 1000000,
                                                                                     "range_max": 1150000}, trace=trace)
-    assert "102 Steeplewood Dr" in out and "not treated as a sale" in out and "$1,129,000" in out
+    assert "102 Steeplewood Dr" in out and "could not be used as a comparable sale" in out and "$1,129,000" in out
+    assert "does not change the value" in out
 
 
 def test_asking_price_is_never_rewritten_as_a_stale_value():

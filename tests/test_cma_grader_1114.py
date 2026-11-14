@@ -276,7 +276,8 @@ def test_a_pending_that_needs_a_large_adjustment_does_not_move_the_value(monkeyp
     assert v == 655000 and info["nudge_pct"] == 0.0 and not any(r["moved_value"] for r in info["pendings_used"])
     # the agent still hears about the far-off one, without "closely matches"
     assert "906 UNIONVILLE WAWASET RD" in info["review"] and "partial match" in info["review"]
-    # two that ARE close matches still move it, as before
+    # two that ARE close matches would move it - when the nudge is switched on (it is off since 11/14, see below)
+    monkeypatch.setattr(svc, "_PENDING_NUDGE_ENABLED", True)
     homes = [_pend("103 LANTANA DR", 725000, 2453), _pend("12 NEAR ST", 715000, 2400, 80)]
     v, lo, hi, info = svc._pending_competition_review({"sqft": 2342}, homes, 655000, 605000, 710000, trace)
     assert v > 655000 and info["nudge_pct"] > 0
@@ -478,3 +479,159 @@ def test_a_sale_taxed_far_below_this_home_says_so():
                   "ai_commentary": "New build."}
     svc._append_tax_gap_notes(subject, [advertised])
     assert "its listing advertised a tax abatement" in advertised["ai_commentary"]
+
+
+# ---- round 4: a Phoenixville townhouse and a King of Prussia condo (11/14 afternoon) ----------------------------
+
+def test_a_value_is_never_printed_to_the_dollar():
+    assert svc._tidy_value(465196) == 465000 and svc._tidy_value(84260) == 84500
+    assert svc._tidy_value(319900) == 319900 and svc._tidy_value(614000) == 614000 and svc._tidy_value(None) is None
+    out, _ = svc._apply_value_guards({"final_fmv": 465196, "range_low": 442000, "range_high": 492000}, _packet(465196))
+    assert out["final_fmv"] == 465000
+    # never rounded across the asking-price band
+    check = {"asking_price": 470000, "expected_sale_price": 460600, "allowed_low": 0, "allowed_high": 460600,
+             "ratio_used": 0.98, "passed_over": True}
+    out, _ = svc._apply_value_guards({"final_fmv": 460600.4, "range_low": 440000, "range_high": 480000}, _packet(470000, check))
+    assert out["final_fmv"] <= 460600
+
+
+def test_small_and_bracketed_comp_numbers_follow_a_re_order():
+    mapping = {1: 2, 2: 1, 4: 5, 5: 4}
+    assert svc._renumber_comp_refs("Interior-unit position vs. end-unit comps (#2, #4)", mapping) == \
+        "Interior-unit position vs. end-unit comps (#1, #5)"
+    assert svc._renumber_comp_refs("Like comp #5, and Comps #1 and #2.", mapping) == "Like comp #4, and Comps #2 and #1."
+    # no "#": a distance or a count is never touched
+    assert svc._renumber_comp_refs("the comps 2 miles away and comps (4 of them)", mapping) == "the comps 2 miles away and comps (4 of them)"
+
+
+def test_plain_dates_and_american_spelling():
+    from app.services import cma_fact_check as fc
+    out, _ = fc.fix_dates_and_spelling("Comp #1 sold for $525,000 on 2026-09-24 after 7 days. The fee is common to the neighbourhood.")
+    assert out == "Comp #1 sold for $525,000 on Sep 24, 2026 after 7 days. The fee is common to the neighborhood."
+    assert fc.fix_dates_and_spelling("Sold Sep 24, 2026 in a good neighborhood.") == ("Sold Sep 24, 2026 in a good neighborhood.", [])
+    out, _ = fc.fix_text("It closed on 2026-08-05.", subject={}, comp={"street_address": "161 HUDSON"})
+    assert "Aug 5, 2026" in out
+
+
+def test_agent_review_note_uses_whole_thousands():
+    trace = {"deterministic_anchor": 361041, "asking_price_check": {"allowed_high_price": 313502, "asking_price": 319900}}
+    note = svc._asking_band_review_note(trace, 306000)
+    assert note and "$361,000" in note["message"] and "$361,041" not in note["message"]
+
+
+# ---- outside audit of round 4 (King of Prussia condo 68, Phoenixville townhouse 82) ------------------------------
+
+def test_asking_price_step_states_the_sales_behind_it():
+    st = svc._asking_dom_stat("condo", 58)
+    assert st == {"n": 3350, "pct_above_ask": 8.1, "median_ratio": 0.98, "kind": "condos", "span": "45 to 89 days"}
+    assert svc._asking_dom_stat("house", 120)["span"] == "90 days or more" and svc._asking_dom_stat("house", 5) is None
+    grid = [{"feature_adjustments": {"condition": -16400}, "size_adjustment": 0}]
+    apc = {"asking_price": 319900, "expected_sale_price": 313502, "allowed_low_price": 266477, "allowed_high_price": 313502,
+           "ratio_used": 0.98, "comp_median_sold_to_list_ratio": 0.988, "passed_over": True, "dom_used": 58, "home_kind": "condo"}
+    trace = {"authority": "reasoning_model", "deterministic_anchor": 361041, "anchor": {"anchor_value": 361041, "comps": grid},
+             "asking_price_check": apc, "pending_competition": {}, "reasoning_model_fmv": 335000,
+             "reasoning_model": {"major_value_drivers": [], "major_value_drags": [],
+                                 "asking_price_check_applied": {"from": 335000, "to": 313500}}}
+    b = svc._v10_value_bridge(trace, value=313500, range_min=300000, range_max=365000)
+    step = next(x for x in b["steps"] if x["key"] == "listing")
+    assert "3,350 condos in our MLS data took 45 to 89 days to sell" in step["basis"]
+    assert "median of 98% of their final asking price" in step["basis"] and "only about 8% closed above it" in step["basis"]
+    assert "rarely sell for more than" not in step["basis"] and "$313,500" in step["basis"]
+
+
+def test_a_pending_with_a_very_different_monthly_fee_does_not_move_the_value(monkeypatch):
+    implied = {"10502 VALLEY FORGE CIR #502": 296000, "20838 VALLEY FORGE CIR #838": 261000, "10111 VALLEY FORGE CIR #111": 300000}
+    monkeypatch.setattr(svc, "_pending_implied_value", lambda subject, h, psf: implied[h["street_address"]])
+    subject = {"sqft": 1170, "association_fee": 1018, "association_fee_frequency": "Monthly", "home_type": "CONDO"}
+    assert svc._monthly_fee_total(subject) == 1018
+    homes = [dict(_pend("10502 VALLEY FORGE CIR #502", 289900, 1170, 84)),
+             dict(_pend("20838 VALLEY FORGE CIR #838", 270000, 1254, 78), monthly_fee=681)]
+    trace = {"anchor": {"market_psf": 300}}
+    v, lo, hi, info = svc._pending_competition_review(subject, homes, 313500, 300000, 365000, trace)
+    assert v == 313500 and info["nudge_pct"] == 0.0
+    assert info["fee_mismatch"][0]["monthly_fee"] == 681 and info["fee_mismatch"][0]["subject_monthly_fee"] == 1018
+    assert [p["street_address"] for p in info["pendings_used"]] == ["10502 VALLEY FORGE CIR #502"]
+    # same fee (or a fee nobody recorded): a close match again (it would move the value with the nudge switched on)
+    monkeypatch.setattr(svc, "_PENDING_NUDGE_ENABLED", True)
+    homes[1] = dict(_pend("10111 VALLEY FORGE CIR #111", 295000, 1170, 80), monthly_fee=1018)
+    v, lo, hi, info = svc._pending_competition_review(subject, homes, 313500, 300000, 365000, trace)
+    assert v < 313500 and not info.get("fee_mismatch")
+    assert svc._fee_mismatch(1018, 950) is False and svc._fee_mismatch(1018, None) is False and svc._fee_mismatch(120, 60) is False
+
+
+def test_a_sale_with_a_very_different_monthly_fee_says_so():
+    subject = {"association_fee": 1018, "association_fee_frequency": "Monthly", "home_type": "CONDO"}
+    other = {"street_address": "20932 VALLEY FORGE CIR #932", "condo_fee": 681, "condo_fee_frequency": "Monthly",
+             "ai_commentary": "A larger unit in the south tower.", "commentary": "A larger unit in the south tower."}
+    same = {"street_address": "10219 VALLEY FORGE CIR", "association_fee": 1018, "association_fee_frequency": "Monthly",
+            "home_type": "CONDO", "ai_commentary": "Same plan.", "commentary": "Same plan."}
+    flags = svc._append_fee_gap_notes(subject, [other, same])
+    assert "monthly fee is $681, against $1,018 for this home" in other["commentary"] and "may overstate" in other["commentary"]
+    assert same["commentary"] == "Same plan." and len(flags) == 1
+    assert svc._append_fee_gap_notes(subject, [other]) == []   # once
+
+
+def test_first_listed_long_before_the_day_count_is_said():
+    from app.services import cma_fact_check as fc
+    gap = {"list_date": "2026-09-12", "days_since_listed": 63, "days_on_market": 26}
+    out = fc.first_listed_sentence("The value is $465,000.", gap)
+    assert "first entered the MLS on Sep 12, 2026, 63 days ago, though the MLS counts 26 days on market" in out
+    assert "Its real exposure is the longer history." in out
+    assert fc.first_listed_sentence(out, gap) == out and fc.first_listed_sentence("The value is $465,000.", None) == "The value is $465,000."
+
+
+def test_lowest_priced_sale_must_be_the_lowest_priced_sale():
+    from app.services import cma_fact_check as fc
+    comps = [{"street_address": "203 HUDSON DR", "sale_price": 525000}, {"street_address": "113 HUDSON DR", "sale_price": 450000},
+             {"street_address": "218 HUDSON DR", "sale_price": 545000}, {"street_address": "238 HUDSON DR", "sale_price": 480000}]
+    note = ("Comp #4 (238 HUDSON DR) sold for $480,000 on Aug 19, 2026 after 14 days. Its $221 per above-grade sq ft is below the "
+            "subject's $324 list rate, and it is the lowest-priced sale in the set, which marks the floor of the range for this "
+            "product. The subject's 3.5 baths argue for a price above it.")
+    out, flags = fc.fix_price_superlatives(note, comps[3], comps)
+    assert "lowest-priced sale" not in out and "sold for $480,000" in out and "3.5 baths argue" in out and flags
+    # true of the sale that really is the lowest, and of the highest
+    assert fc.fix_price_superlatives("It is the lowest-priced sale in the set.", comps[1], comps) == ("It is the lowest-priced sale in the set.", [])
+    assert fc.fix_price_superlatives("It is the highest-priced sale here.", comps[2], comps)[1] == []
+    assert fc.fix_price_superlatives("It is the highest-priced sale here.", comps[0], comps)[1]
+    # an ADJUSTED or per-square-foot figure is a different measure - left alone
+    assert fc.price_superlative_problem("Its adjusted price is the lowest sale price in the set.", comps[3], comps) is None
+    assert fc.price_superlative_problem("It has the lowest price per square foot of the comps, the lowest sale by rate.", comps[3], comps) is None
+
+
+def test_lower_level_counted_as_above_grade_is_read_as_lower_level():
+    subject = {"property_type": "TOWNHOUSE", "subdivision_name": "LONGFORD CROSSING", "city": "PHOENIXVILLE"}
+    same = {"property_type": "TOWNHOUSE", "subdivision_name": "LONGFORD CROSSING", "city": "PHOENIXVILLE",
+            "lower_level_baths": 1, "lower_level_bedrooms": 1}
+    f = svc._v10_lower_level_in_above_grade
+    assert f(subject, same, 1530, 370, 2170, 0) == 370
+    # a walkout basement with no area on record counts too
+    assert f(subject, dict(same, lower_level_baths=None, lower_level_bedrooms=None, basement="Full, Garage Access, Walkout Level"), 1530, 370, 2170, 0) == 370
+    # left as reported: the sale has its own lower-level area, is no bigger above grade, shows no lower-level rooms,
+    # is in another community, or is a detached house
+    assert f(subject, same, 1530, 370, 1914, 370) == 0
+    assert f(subject, same, 1530, 370, 1600, 0) == 0
+    assert f(subject, dict(same, lower_level_baths=0, lower_level_bedrooms=0), 1530, 370, 2170, 0) == 0
+    assert f(subject, dict(same, subdivision_name="STEELPOINTE"), 1530, 370, 2170, 0) == 0
+    assert f(dict(subject, property_type="SINGLE_FAMILY"), dict(same, property_type="SINGLE_FAMILY"), 1530, 370, 2170, 0) == 0
+    assert f(subject, same, 1530, 0, 2170, 0) == 0
+
+
+def test_a_stored_final_answer_is_not_reused_when_the_evidence_under_it_moved():
+    assert svc._lock_anchor_holds(465196, 465196) and svc._lock_anchor_holds(465196, 466900)   # under 1%: a day's drift
+    assert not svc._lock_anchor_holds(465196, 471279)                                           # the table changed
+    assert svc._lock_anchor_holds(None, 471279) and svc._lock_anchor_holds(465196, None)        # nothing to compare
+
+
+def test_homes_under_contract_never_move_the_value(monkeypatch):
+    """Owner, 11/14: shown to the agent and the client, scored, flagged when far from the value - and that is all."""
+    assert svc._PENDING_NUDGE_ENABLED is False
+    implied = {"A ST": 700000, "B ST": 705000, "C ST": 800000}
+    monkeypatch.setattr(svc, "_pending_implied_value", lambda subject, h, psf: implied[h["street_address"]])
+    homes = [_pend("A ST", 715000, 2400, 90), _pend("B ST", 712000, 2350, 88)]
+    v, lo, hi, info = svc._pending_competition_review({"sqft": 2342}, homes, 655000, 605000, 710000, {"anchor": {"market_psf": 250}})
+    assert (v, lo, hi) == (655000, 605000, 710000) and info["nudge_pct"] == 0.0 and info["nudged_from"] is None
+    assert [p["moved_value"] for p in info["pendings_used"]] == [False, False] and len(info["pendings_used"]) == 2
+    # a strong one far from the value still reaches the agent
+    v, lo, hi, info = svc._pending_competition_review({"sqft": 2342}, [_pend("C ST", 815000, 2400, 90)], 655000, 605000, 710000,
+                                                      {"anchor": {"market_psf": 250}})
+    assert v == 655000 and info["review"] and "C ST" in info["review"]

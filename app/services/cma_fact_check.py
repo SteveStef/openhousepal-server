@@ -1035,6 +1035,79 @@ def fix_under_contract_holdout(text: str, subject: Optional[dict]) -> tuple[str,
     return "".join(kept).strip(), ["Fact check: removed 'the seller may be holding out' - this home is already under contract."]
 
 
+_FIRST_LISTED_MARK = "first entered the MLS"
+
+
+def first_listed_sentence(methodology: str, gap: Optional[dict]) -> str:
+    """One plain sentence when the listing's own list date is weeks older than its day count (see
+    _FIRST_LISTED_GAP_DAYS): the home has been off the market and come back, and a buyer negotiates against the
+    longer history, not the fresh count."""
+    g = gap or {}
+    if not methodology or not g.get("list_date") or _FIRST_LISTED_MARK in methodology or _HISTORY_MARK in methodology:
+        return methodology
+    return (methodology.rstrip() + f" This listing {_FIRST_LISTED_MARK} on {_nice_date(g['list_date'])}, "
+            f"{g['days_since_listed']} days ago, though the MLS counts {g['days_on_market']} days on market - it was off "
+            "the market for part of that time and came back. Its real exposure is the longer history.")
+
+
+# ---- "the lowest-priced sale in the set" must be the lowest-priced sale (outside audit 11/14, 238 Hudson Dr: said
+# of a $480,000 sale when another in the report sold for $450,000 - it was the lowest ADJUSTED price) -----------
+_PRICE_SUPERLATIVE_RE = re.compile(
+    r"\b(lowest|cheapest|least expensive|highest|most expensive|top)[- ](?:priced\s+)?(?:price[d]?\s+)?"
+    r"(?:sale|comp(?:arable)?|transaction|closing)\b|\b(lowest|highest)\s+(?:sale\s+)?price\s+(?:in|of|among)\b", re.I)
+
+
+def price_superlative_problem(sentence: str, comp: Optional[dict], comps: Optional[list]) -> Optional[str]:
+    m = _PRICE_SUPERLATIVE_RE.search(sentence or "")
+    if not m or not comp or not comps or re.search(r"\badjusted\b|per (?:square|sq)|\$/\s*sq|price per", sentence, re.I):
+        return None
+    word = (m.group(1) or m.group(2) or "").lower()
+    low = word in ("lowest", "cheapest", "least expensive")
+    mine = _money(comp.get("sale_price")) or _money(comp.get("close_price"))
+    others = [p for p in ((_money(c.get("sale_price")) or _money(c.get("close_price"))) for c in comps
+                          if isinstance(c, dict) and c is not comp and c.get("is_included", True)) if p]
+    if not mine or not others:
+        return None
+    if (low and mine > min(others)) or (not low and mine < max(others)):
+        return (f"it sold for ${mine:,.0f}, and another sale in the report sold for "
+                f"${(min(others) if low else max(others)):,.0f}")
+    return None
+
+
+def fix_price_superlatives(text: str, comp: Optional[dict], comps: Optional[list]) -> tuple[str, list[str]]:
+    if not text or not comp or not comps:
+        return text, []
+    kept, flags = [], []
+    for x in sentences(text):
+        why = price_superlative_problem(x, comp, comps)
+        if why:
+            flags.append(f"Fact check: removed a 'lowest / highest priced sale' claim - {why}.")
+        else:
+            kept.append(x)
+    return (" ".join(kept), flags) if flags else (text, [])
+
+
+# ---- plain dates and American spelling (196 Hudson Dr, test round 11/14: "sold for $525,000 on 2026-09-24",
+# "common to the neighbourhood") ------------------------------------------------------------------------------
+_ISO_DATE_RE = re.compile(r"\b(20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b")
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_UK_US = (("neighbourhood", "neighborhood"), ("colour", "color"), ("favour", "favor"), ("storey", "story"),
+          ("whilst", "while"), ("kerb", "curb"), ("harbour", "harbor"), ("honour", "honor"))
+_UK_RE = re.compile(r"\b(" + "|".join(uk for uk, _ in _UK_US) + r")", re.I)
+
+
+def fix_dates_and_spelling(text: str) -> tuple[str, list[str]]:
+    if not text:
+        return text, []
+    out = _ISO_DATE_RE.sub(lambda m: f"{_MONTHS[int(m.group(2)) - 1]} {int(m.group(3))}, {m.group(1)}", text)
+
+    def us(m):
+        word = dict(_UK_US)[m.group(1).lower()]
+        return word.capitalize() if m.group(1)[:1].isupper() else word
+    out = _UK_RE.sub(us, out)
+    return (out, []) if out != text else (text, [])
+
+
 # ---- a prediction stated as a fact (outside audit 11/14: "competing offers above asking are not expected" - a
 # home's time on the market makes them less likely; it does not rule them out) ------------------------------------
 _PREDICTION_FIXES = (
@@ -1147,7 +1220,9 @@ def fix_text(text: str, *, subject: Optional[dict], comp: Optional[dict] = None,
         lambda x: fix_under_contract_holdout(x, subject) if comp is None else (x, []),
         lambda x: fix_comp_sale_claims(x, comps) if comp is None and comps else (x, []),
         lambda x: fix_certain_predictions(x) if comp is None else (x, []),
+        lambda x: fix_price_superlatives(x, comp, comps) if comp is not None and comps else (x, []),
         lambda x: fix_field_name_leaks(x),
+        lambda x: fix_dates_and_spelling(x),
         lambda x: drop_repeated_sentences(x),
     ):
         t, f = fn(t)

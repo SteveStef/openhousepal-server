@@ -1080,6 +1080,8 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
             beds=p.bedrooms,
             baths=_mls_baths(p),
             full_baths=_whole(raw.get("BathroomsFull")), half_baths=_whole(raw.get("BathroomsHalf")),
+            lower_level_baths=_whole(raw.get("LowerLevelsTotalBaths")),
+            lower_level_bedrooms=_whole(raw.get("LowerLevelsTotalBedrooms")),
             year_built=p.year_built,
             architectural_style=p.architectural_style,
             levels=p.levels,
@@ -1400,9 +1402,21 @@ async def current_competition(db: AsyncSession, subject: dict, *, listing_key: O
     # Builder listings (Bright NewConstructionYN): shown, labelled, never a guide to a resale's value
     # (510 Newcomen Rd #B3D - a to-be-built floor plan - moved 239 Windham Dr, V2 10/21).
     _keys = [c.listing_key for c in picked]
-    _new_rows = (await db.execute(select(Property.listing_key, Property.raw_mls_data["NewConstructionYN"].astext)
+    _new_rows = (await db.execute(select(Property.listing_key, Property.raw_mls_data["NewConstructionYN"].astext,
+                                          Property.raw_mls_data["AssociationFee"].astext,
+                                          Property.raw_mls_data["AssociationFeeFrequency"].astext,
+                                          Property.raw_mls_data["AssociationFee2"].astext,
+                                          Property.raw_mls_data["AssociationFee2Frequency"].astext)
                                    .where(Property.listing_key.in_(_keys)))).all() if _keys else []
-    new_build = {k for k, v in _new_rows if str(v).lower() in ("true", "1", "yes")}
+    new_build = {r[0] for r in _new_rows if str(r[1]).lower() in ("true", "1", "yes")}
+    # each home's monthly condo / HOA fee (outside audit 11/14: a pending paying $681 a month was read as a close
+    # match for a unit paying $1,018)
+    fees = {}
+    for r in _new_rows:
+        _m = sum(float(f.get("monthly") or 0) for f in cma_fact_check.monthly_fees({
+            "association_fee": r[2], "association_fee_frequency": r[3], "condo_fee": r[4], "condo_fee_frequency": r[5]}))
+        if _m:
+            fees[r[0]] = round(_m)
     out = []
     for c in picked:
         ag = c.above_grade_finished_area or c.sqft
@@ -1418,6 +1432,7 @@ async def current_competition(db: AsyncSession, subject: dict, *, listing_key: O
             "latitude": c.latitude, "longitude": c.longitude,
             "price_cuts": cuts.get(c.listing_key),
             "new_construction": c.listing_key in new_build,
+            "monthly_fee": fees.get(c.listing_key),
             "lot_size": c.lot_size, "below_grade_finished_area": c.below_grade_finished_area,
             "garage": c.garage, "basement": c.basement, "water_source": c.water_source, "sewer": c.sewer,
             "school_district": c.school_district, "township": c.township, "subdivision_name": c.subdivision_name,

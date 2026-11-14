@@ -159,6 +159,9 @@ class CmaComparable(BaseModel):
     # how `baths` is made up (grader audit 11/14: "3 baths" for a home with 2 full and 2 half read as three bathrooms)
     full_baths: Optional[int] = None
     half_baths: Optional[int] = None
+    # rooms the MLS record places on a lower level (see cma_ai_service._v10_lower_level_in_above_grade)
+    lower_level_baths: Optional[int] = None
+    lower_level_bedrooms: Optional[int] = None
     year_built: Optional[int] = None
     architectural_style: Optional[Union[List[str], str]] = None
     levels: Optional[Union[List[str], str]] = None
@@ -277,6 +280,11 @@ class CmaPresentationSettings(BaseModel):
     # always light regardless, since a client shouldn't see a dark page inside the agent's own
     # branded site just because the agent picked dark as their default.
     default_theme: Optional[Literal["light", "dark"]] = None
+    # TESTING ONLY (owner, 11/14): an "Engine review sheet" at the end of the PDF - the engine's own logic, its checks
+    # on this report and its past-sales test results - for the people grading reports while the engine is tested.
+    # None = on for test accounts (@example.com), off for everyone else. To be removed at launch.
+    review_sheet: Optional[bool] = None
+    review_notes: Optional[str] = None   # our own reviewer's grade / notes, printed on that sheet
 
 
 class CmaAiAnalysisMeta(BaseModel):
@@ -427,6 +435,9 @@ class CmaCompCandidate(BaseModel):
     # how `baths` is made up (grader audit 11/14: "3 baths" for a home with 2 full and 2 half read as three bathrooms)
     full_baths: Optional[int] = None
     half_baths: Optional[int] = None
+    # rooms the MLS record places on a lower level (see cma_ai_service._v10_lower_level_in_above_grade)
+    lower_level_baths: Optional[int] = None
+    lower_level_bedrooms: Optional[int] = None
     year_built: Optional[int] = None
     architectural_style: Optional[Union[List[str], str]] = None
     levels: Optional[Union[List[str], str]] = None

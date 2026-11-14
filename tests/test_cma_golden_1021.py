@@ -302,7 +302,7 @@ def test_v2_value_above_comps_is_explained_and_flagged():
             "higher, which moves it up about 2.5% to $1,117,000.") in out
     steps = out.split("Weighted together")[1].split("1,117,000.")[0]
     assert "asking" not in steps   # clients never read that the asking price set the value
-    assert "floor held it at about $1,082,900" in ai._asking_band_review_note(V2_TRACE, 1117000)["message"]   # agent keeps the math
+    assert "floor held it at about $1,083,000" in ai._asking_band_review_note(V2_TRACE, 1117000)["message"]   # agent keeps the math
     note = ai._asking_band_review_note(V2_TRACE, 1117000)
     assert note and note["comps_value"] == 976734 and "14% higher" in note["message"]
 
