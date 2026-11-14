@@ -242,7 +242,7 @@ async def test_site_showcase_creator_submit_uses_existing_form_pipeline(monkeypa
         called["site_id"] = site_id
         return SimpleNamespace(id=site_id), SimpleNamespace(id="agent-a"), form
 
-    async def fake_submit(_db, submitted_form, submitted_payload):
+    async def fake_submit(_db, submitted_form, submitted_payload, owner_test=False):
         called["form"] = submitted_form
         called["payload"] = submitted_payload
         return SimpleNamespace(success=True, message="ok", submission_id="submission-a", redirect_url="/showcase/token-a")

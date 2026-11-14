@@ -108,7 +108,7 @@ async def _forget_activity(db, owner_id: str, lead: Lead, email: str, col_ids: l
     if email:
         # "Jane opened your email" rows are keyed "<email>|<day>", not by the lead (owner, 10/26).
         res = await db.execute(delete(Notification).where(
-            Notification.agent_id == owner_id, Notification.type == "EMAIL_ACTIVITY",
+            Notification.agent_id == owner_id, Notification.type.in_(("EMAIL_ACTIVITY", "LEAD_INTEREST")),
             Notification.reference_id.startswith(email + "|", autoescape=True),
         ).execution_options(synchronize_session=False))
         removed += res.rowcount or 0

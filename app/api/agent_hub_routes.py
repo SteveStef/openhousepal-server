@@ -563,9 +563,9 @@ async def get_public_agent_hub_vcard(
     vcard_text = vcard_service.build_vcard_text(hub, owner, agent_hub_url, photo_base64,
                                                 config=await apply_auto_website(db, owner, hub.config or {}, hub.slug))
 
-    # Same anonymous-only rule as every other Agent Hub event - a logged-in viewer (the owner
-    # previewing their own card) shouldn't inflate the count.
-    if not viewer:
+    # Same rule as every other Agent Hub event - the owner saving their own card isn't a guest.
+    from app.utils.own_traffic import is_own_traffic
+    if not is_own_traffic(viewer, hub.owner_id):
         db.add(AgentHubEvent(owner_id=hub.owner_id, event_type="save_contact", visitor_id=visitor_id))
         await db.commit()
 
@@ -584,18 +584,21 @@ async def track_agent_hub_event(
     payload: AgentHubTrackEvent,
     db: AsyncSession = Depends(get_db),
     viewer: Optional[User] = Depends(get_current_user_optional),
+    owner_ref: bool = False,
 ):
     if payload.event_type not in {"visit", "qr_scan", "interaction", "save_contact"}:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid event type.")
-
-    # Only count fully anonymous visits - a logged-in viewer (the owner previewing, or any
-    # other agent browsing while signed in) is staff traffic, not a real guest.
-    if viewer:
+    if owner_ref:
         return None
 
     from app.services.hub_slugs import hub_by_slug
     hub = await hub_by_slug(db, normalize_slug(slug))   # an old link's visits count too
     if not hub:
+        return None
+    # The agent on their own hub (signed in) isn't a guest - everyone else counts, signed in or
+    # not (owner, 11/13; it used to skip every signed-in viewer). utils/own_traffic.
+    from app.utils.own_traffic import is_own_traffic
+    if is_own_traffic(viewer, hub.owner_id):
         return None
 
     db.add(AgentHubEvent(owner_id=hub.owner_id, event_type=payload.event_type, visitor_id=payload.visitor_id))

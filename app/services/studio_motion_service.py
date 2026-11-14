@@ -76,7 +76,10 @@ ROOMS: dict[str, tuple[str, str]] = {
     "view": ("outdoor", "The setting"), "back": ("exterior", "Rear view"), "aerial": ("aerial", "From above"),
     "detail": ("detail", "Details"), "skip": ("interior", ""),
 }
-POOL_MAX = 40
+# Every listing photo is offered (owner 11/13: a basement bedroom and the primary suite sat past the
+# old first-40 cut, so they never showed under Bedrooms). The AI looks at them in batches.
+POOL_MAX = 100
+LABEL_BATCH = 40
 
 # MLS photos carry the Bright watermark in the bottom-left corner; a strip off the bottom takes it out.
 _BADGE_STRIP = 0.075
@@ -530,8 +533,12 @@ async def add_photos(db, user: User, asset_id: str, photos: list[str]) -> Studio
     mx = int(config.get("studio_motion_max_photos", 15))
     pool += [_new_pool(u) for u in new]
     motion["pool"] = pool
-    # Added photos go straight into the video while there's room (the agent asked for them).
-    room = max(0, mx - len(motion.get("photos") or []))
+    # Added photos go straight into the video while there's room (the agent asked for them) - room
+    # for the chosen length (3/5/7/9 photos), not just the overall maximum, so a 30-second video
+    # never ends up with 8 photos ticked.
+    per_length = {15: 3, 30: 5, 45: 7, 60: 9}.get(int(motion.get("length") or 30), 5)
+    shown = sum(1 for p in motion.get("photos") or [] if not p.get("hidden"))
+    room = max(0, min(mx - len(motion.get("photos") or []), per_length - shown))
     motion["photos"] = list(motion.get("photos") or []) + [_new_photo(u) for u in new[:room]]
     opts["motion"] = motion
     opts["current_hash"] = settings_hash(motion)
@@ -832,10 +839,33 @@ _LABEL_RULES = (
 
 
 async def _label_photos(db, user: User, photos: list[dict], listing_text: str, config: dict) -> tuple[dict, float]:
-    """One vision call over every candidate photo: which room it is, a caption, how good it looks.
-    Results are keyed by the photo's source URL."""
-    from app.services.ai.ai_copywrite_service import _client, _require_key, _thumb
+    """Every candidate photo labelled: which room it is, a caption, how good it looks. Up to
+    LABEL_BATCH photos per vision call (bigger listings run a few calls side by side), recorded as
+    ONE usage event so the room-sorting still counts once toward the agent's video limits."""
+    from app.services.ai.ai_copywrite_service import _require_key
     _require_key()
+    model = config.get("studio_motion_label_model") or config.get("photo_sort_model") or "claude-sonnet-5"
+    batches = [photos[i:i + LABEL_BATCH] for i in range(0, len(photos), LABEL_BATCH)]
+    results = await asyncio.gather(*[_label_batch(b, listing_text, model) for b in batches])
+    out: dict = {"photos": {}, "tagline": "", "seen": set()}
+    tin = tout = 0
+    for part, i_tok, o_tok in results:
+        out["photos"].update(part["photos"])
+        out["seen"] |= part["seen"]
+        out["tagline"] = out["tagline"] or part["tagline"]
+        tin += i_tok
+        tout += o_tok
+    if not tin and not tout:
+        return out, 0.0
+    cost = ai_config_service.estimate_cost_usd(config, model, tin, tout)
+    await record_usage_event(db, user.id, None, model, tin, tout, cost, 0, False, None, event_type=EVENT_TYPE)
+    return out, float(cost)
+
+
+async def _label_batch(photos: list[dict], listing_text: str, model: str) -> tuple[dict, int, int]:
+    """One vision call over up to LABEL_BATCH photos. Results are keyed by the photo's source URL;
+    returns (labels, input tokens, output tokens) - the caller records the usage."""
+    from app.services.ai.ai_copywrite_service import _client, _thumb
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
         thumbs = await asyncio.gather(*[_thumb(client, p.get("clean") or p["source"]) for p in photos])
     content: list = [{"type": "text", "text": "Listing (context only):\n" + (listing_text or "(no description)")[:5000]
@@ -848,18 +878,14 @@ async def _label_photos(db, user: User, photos: list[dict], listing_text: str, c
         content.append({"type": "text", "text": f"Photo {i}:"})
         content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}})
     if not index:
-        return {}, 0.0
+        return {"photos": {}, "tagline": "", "seen": set()}, 0, 0
     content.append({"type": "text", "text": _LABEL_RULES + "\nCall describe_photos."})
-    model = config.get("studio_motion_label_model") or config.get("photo_sort_model") or "claude-sonnet-5"
     resp = await _client().messages.create(
         model=model, max_tokens=min(12000, 800 + 130 * len(index)), tools=[_LABEL_TOOL], tool_choice={"type": "tool", "name": "describe_photos"},
         messages=[{"role": "user", "content": content}],
     )
     if getattr(resp, "stop_reason", None) == "max_tokens":
         logger.warning("motion photo labels cut off", extra={"photos": len(index), "output_tokens": resp.usage.output_tokens})
-    cost = ai_config_service.estimate_cost_usd(config, model, resp.usage.input_tokens, resp.usage.output_tokens)
-    await record_usage_event(db, user.id, None, model, resp.usage.input_tokens, resp.usage.output_tokens,
-                             cost, 0, False, None, event_type=EVENT_TYPE)
     out: dict = {"photos": {}, "tagline": "", "seen": set(index.values())}
     for b in resp.content:
         if getattr(b, "type", None) == "tool_use" and b.name == "describe_photos":
@@ -893,7 +919,7 @@ async def _label_photos(db, user: User, photos: list[dict], listing_text: str, c
                     if len(group) > 1 and _float(it.get("n")) in best and not it.get("drawn"):
                         it["score"] = top + 1
                         break
-    return out, float(cost)
+    return out, int(resp.usage.input_tokens or 0), int(resp.usage.output_tokens or 0)
 
 
 def _apply_label(item: dict, lab: dict) -> None:

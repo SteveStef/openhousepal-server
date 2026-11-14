@@ -100,13 +100,14 @@ async def _count_since(db: AsyncSession, owner_id: str, since: datetime, event_t
 PLATFORM_PAID_EVENT_TYPES = ("area_research", "area_narrative", "area_fair_housing")
 
 
-# The AI helper chat has its own allowance and its own "Chat usage" bar (owner, 11/01) - it never
-# counts on the Monthly AI Usage bar. Read-aloud and live voice are part of the chat.
+# The AI helper chat (with read-aloud and live voice) had its own "Chat usage" bar 11/01-11/13.
+# Since 11/13 (owner) there is ONE "AI Usage" bar per agent: the chat draws from the same allowance
+# as every other AI tool, so an agent can spend all of it on the chat if they like.
 CHAT_EVENT_TYPES = ("chat", "tts", "realtime")
 
 
 def _counts_on_agent_bar():
-    return or_(AIUsageEvent.event_type.is_(None), AIUsageEvent.event_type.notin_(PLATFORM_PAID_EVENT_TYPES + CHAT_EVENT_TYPES))
+    return or_(AIUsageEvent.event_type.is_(None), AIUsageEvent.event_type.notin_(PLATFORM_PAID_EVENT_TYPES))
 
 
 # ---------------------------------------------------------------------------
@@ -224,8 +225,8 @@ def _start_of_month() -> datetime:
 
 
 async def total_monthly_ai_cost(db: AsyncSession, owner_id: str) -> float:
-    """This owner's spend this billing period across every AI tool on the Monthly AI Usage bar
-    (not the chat, which has its own)."""
+    """This owner's spend this billing period across every AI tool on the AI Usage bar - the
+    chat, read-aloud and live voice included (one shared allowance since 11/13)."""
     return await _cost_since(db, owner_id, (await usage_period(db, owner_id))[0], event_type=None)
 
 
@@ -240,6 +241,7 @@ _USAGE_LABELS = {
     "copywrite": "Copywriter & wording checks",
     "studio_media_image": "AI Media pictures", "studio_media_video": "AI Media videos", "studio_motion": "AI Media cinematic videos",
     "external_api": "Maps & place lookups",
+    "chat": "AI helper chat & AI writing", "tts": "Read-aloud & live voice", "realtime": "Read-aloud & live voice",
     "school_lookup": "Cheat sheet schools",
     "cheat_sheet_downtown": "Cheat sheet nearby places", "cheat_sheet_proofread": "Cheat sheet nearby places",
 }
@@ -370,12 +372,14 @@ async def monthly_ai_budget_snapshot(db: AsyncSession, owner_id: str, config: di
         "studio_media_used_usd": round(media_used, 4),
         "studio_media_cap_usd": media_cap,
         "resets_at": period_end.isoformat(),
+        "upgrade": ai_upgrade(config, plan_tier),
     }
 
 
 # ---------------------------------------------------------------------------
-# AI helper chat allowance (owner, 11/01): its own per-plan dollar allowance and "Chat usage" bar,
-# each plan double the one below it so an upgrade is an easy "2x the chat". Same billing period.
+# AI helper chat: 11/01-11/13 it had its own allowance and "Chat usage" bar. Since 11/13 (owner)
+# it draws from the one AI Usage allowance like every other tool; these helpers keep the old
+# names working. chat_allowance_usd_by_tier in the config is no longer enforced.
 # ---------------------------------------------------------------------------
 
 CHAT_UPGRADE_TO = {"NO_MLS": "PRO_NO_MLS", "BASIC": "PREMIUM", "PREMIUM": "IDX"}
@@ -396,32 +400,38 @@ def _chat_upgrade(config: dict, plan_tier: Optional[str]) -> Optional[dict]:
 
 
 def chat_limit_message(config: dict, plan_tier: Optional[str], end: datetime) -> str:
-    up = _chat_upgrade(config, plan_tier)
-    more = (f" Upgrade to {up['name']} for {'double' if up['times'] == 2 else 'more'} the chat." if up else "")
-    return f"You've used this month's AI chat allowance. {resets_text(end)}{more}"
+    up = ai_upgrade(config, plan_tier)
+    more = (f" Upgrade to {up['name']} for {'double' if up['times'] == 2 else 'more'} the AI usage." if up else "")
+    return f"You've used this month's AI usage. {resets_text(end)}{more}"
+
+
+def ai_upgrade(config: dict, plan_tier: Optional[str]) -> Optional[dict]:
+    """The next plan up and how many times the AI allowance it has - for the AI Usage bar's
+    upgrade offer near the limit (one shared bar since 11/13)."""
+    up = CHAT_UPGRADE_TO.get(plan_tier or "")
+    if not up:
+        return None
+    table = config.get("agent_monthly_ai_budget_usd_by_tier") or {}
+    mine, theirs = float(table.get(plan_tier) or 0), float(table.get(up) or 0)
+    times = theirs / mine if mine else 0
+    return {"tier": up, "name": _PLAN_NAMES[up], "times": int(round(times)) if times >= 1.5 else None}
 
 
 async def chat_usage_snapshot(db: AsyncSession, owner_id: str, config: dict, plan_tier: Optional[str]) -> dict:
-    """Powers GET /ai/usage/chat - the "Chat usage" bar. Percent only on screen, like the AI bar."""
-    start, end = await usage_period(db, owner_id)
-    limit = chat_allowance_usd(config, plan_tier)
-    used = await _cost_since_types(db, owner_id, start, CHAT_EVENT_TYPES)
-    recent = min(used, await _cost_since_types(db, owner_id, datetime.now(timezone.utc) - timedelta(hours=1), CHAT_EVENT_TYPES))
-    # One decimal: a single message is a fraction of a percent, so the bar moves after each reply.
-    percent = None if not limit else min(100.0, round(used / limit * 100, 1))
-    recent_percent = None if not limit else min(percent or 0, round(recent / limit * 100, 1))
-    return {
-        "tier": plan_tier or "",
-        "used_usd": round(used, 4),
-        "limit_usd": limit,
-        "percent": percent,
-        "recent_used_usd": round(recent, 4),
-        "recent_percent": recent_percent,
-        "near_limit": bool(percent is not None and percent >= 80),
-        "exhausted": bool(limit and used >= limit),
-        "resets_at": end.isoformat(),
-        "upgrade": _chat_upgrade(config, plan_tier),
-    }
+    """Powers GET /ai/usage/chat. Since 11/13 the chat has no allowance of its own - this is the
+    same AI Usage bar as GET /ai/usage/monthly (every AI tool, chat included), with the percent to
+    one decimal so the bar in the chat still moves after each reply (one message is a fraction of
+    a percent). Kept as its own endpoint so older screens and callers keep working."""
+    snap = await monthly_ai_budget_snapshot(db, owner_id, config, plan_tier or "")
+    limit = snap.get("limit_usd")
+    used, recent = float(snap.get("used_usd") or 0), float(snap.get("recent_used_usd") or 0)
+    if limit:
+        exact = min(100.0, round(used / limit * 100, 1))
+        # A group's shared total can be what the bar shows (it runs out first) - keep that one.
+        snap["percent"] = exact if int(round(exact)) >= int(snap.get("percent") or 0) else float(snap["percent"])
+        snap["recent_percent"] = min(snap["percent"], round(recent / limit * 100, 1))
+    snap["tier"] = plan_tier or ""
+    return snap
 
 
 async def enforce_agent_monthly_budget(db: AsyncSession, owner_id: str, config: dict, plan_tier: str) -> None:
@@ -567,12 +577,15 @@ async def check_and_reserve(db: AsyncSession, owner_id: str, config: dict, plan_
             "monthly_limit", "You've reached your AI usage limit for this month."
         )
 
-    # The plan's chat allowance (chat + read-aloud + live voice), this billing period - the
-    # "Chat usage" bar. Separate from the Monthly AI Usage bar (owner, 11/01).
+    # The one AI Usage allowance (every AI tool, the chat included - owner, 11/13), this billing
+    # period, plus a brokerage group's shared total when it has one.
     if owner_id not in _MONTHLY_BUDGET_UNLIMITED_OWNER_IDS:
-        monthly_cost = await _cost_since_types(db, owner_id, start_of_month, CHAT_EVENT_TYPES)
-        if monthly_cost >= chat_allowance_usd(config, plan_tier):
+        limit = await monthly_limit_usd(db, owner_id, config, plan_tier)
+        if limit and await total_monthly_ai_cost(db, owner_id) >= limit:
             raise AIRateLimitExceeded("cost_ceiling", chat_limit_message(config, plan_tier, period_end))
+        pool = await group_pool(db, owner_id)
+        if pool and pool["used"] >= pool["total"]:
+            raise AIRateLimitExceeded("group_monthly_budget", f"Your team has used this month's AI allowance. {resets_text(pool['resets'])}")
 
     reservation = await reserve_global_and_emergency(
         db, "chat_global", config["chat_global_reservation_estimate_usd"],

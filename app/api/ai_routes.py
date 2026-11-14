@@ -293,7 +293,7 @@ async def home_search_run(message_id: str, search_id: str, body: HomeSearchFilte
     if info["count"] > info["cap"]:
         raise HTTPException(status_code=400, detail=f"{info['count']:,} homes fit - narrow it to {info['cap']} or fewer first.")
     if not info["enough"]:
-        raise HTTPException(status_code=429, detail="There isn't enough chat usage left this month to read these listings. Narrow the search, or get more with your next billing day or a bigger plan.")
+        raise HTTPException(status_code=429, detail="There isn't enough AI usage left this month to read these listings. Narrow the search, or get more with your next billing day or a bigger plan.")
     try:
         reservation = await check_and_reserve(db, current_user.id, config, current_user.plan_tier)
     except AIRateLimitExceeded as e:
@@ -735,8 +735,8 @@ async def get_chat_usage(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
-    """The "Chat usage" bar (owner, 11/01): the AI helper chat's own allowance for this billing
-    period, by plan, separate from the Monthly AI Usage bar. Shown as a percent only."""
+    """The AI Usage bar as the chat shows it - since 11/13 the chat shares the one AI allowance (no
+    separate chat allowance any more). Shown as a percent only."""
     config = await ai_config_service.get_config(db)
     snap = await chat_usage_snapshot(db, current_user.id, config, current_user.plan_tier)
     if not await can_use_helper(db, current_user):
@@ -823,6 +823,12 @@ async def get_ai_speech(
             None, None, None, 0, True, "tts_cost_ceiling", event_type="tts",
         )
         raise HTTPException(status_code=429, detail="You've reached your Read Aloud usage limit for this month.")
+    # Read-aloud draws from the agent's one AI Usage allowance too (owner, 11/13).
+    from app.services.ai.ai_rate_limit_service import enforce_agent_monthly_budget
+    try:
+        await enforce_agent_monthly_budget(db, current_user.id, config, current_user.plan_tier)
+    except AIRateLimitExceeded as e:
+        raise HTTPException(status_code=429, detail=e.user_message)
 
     try:
         reservation = await reserve_global_and_emergency(

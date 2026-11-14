@@ -279,7 +279,7 @@ async def _search_open_houses(db: AsyncSession, current_user: User, args: dict, 
     ids = [e.id for e in events]
     count_stmt = (
         select(OpenHouseVisitor.open_house_event_id, func.count(OpenHouseVisitor.id))
-        .where(OpenHouseVisitor.open_house_event_id.in_(ids))
+        .where(OpenHouseVisitor.open_house_event_id.in_(ids), OpenHouseVisitor.owner_test.isnot(True))  # not the agent's own test
         .group_by(OpenHouseVisitor.open_house_event_id)
     )
     count_result = await db.execute(count_stmt)
@@ -662,7 +662,7 @@ async def _search_showcase_homes(db: AsyncSession, current_user: User, args: dic
     out = _scan_homes(homes, phrases, limits)
     base = {"has_showcase": True, "collection_id": collection.id, "showcase_home_count": len(homes)}
     # Then the AI reads every listing (owner, 11/08: word matching alone misses "owner's retreat on the
-    # main level") - only when the agent's chat allowance has room for it, checked before it runs.
+    # main level") - only when the agent's AI allowance has room for it, checked before it runs.
     question = (args.get("question") or "").strip() or " / ".join(phrases)
     kept = [p for p in homes if _within(p, limits)]
     return {**base, **(await _ai_read(db, current_user, config, question, kept, out))}
@@ -677,7 +677,7 @@ def _within(p: Property, limits: dict) -> bool:
 
 async def _ai_read(db: AsyncSession, current_user: User, config: dict, question: str, homes: list, words: dict) -> dict:
     """The word-match result `words`, replaced by what the AI found reading each listing. Homes it
-    couldn't read (an AI hiccup) keep their word matches. Not enough chat usage left -> the word
+    couldn't read (an AI hiccup) keep their word matches. Not enough AI usage left -> the word
     matches only, and the agent is told how much it would take (owner, 11/08: "do not do it")."""
     from app.services.ai import ai_home_reader as reader
     if not homes:
@@ -692,9 +692,9 @@ async def _ai_read(db: AsyncSession, current_user: User, config: dict, question:
     if left is not None and est > left:
         return {**words, "ai_read": False, "usage_note": (
             f"Not read by AI: reading these {len(to_read)} listings would use {reader.percent_text(reader.percent(est, limit))} of the agent's "
-            f"chat usage and only {reader.percent_text(reader.percent(left, limit))} is left this month. These are word matches only. START "
-            "your reply by saying they're almost out of chat usage this month, so you did a quick word search instead of having AI read "
-            "every listing, and word matches can miss homes; more chat usage comes on their billing day or with a bigger plan.")}
+            f"AI usage and only {reader.percent_text(reader.percent(left, limit))} is left this month. These are word matches only. START "
+            "your reply by saying they're almost out of AI usage this month, so you did a quick word search instead of having AI read "
+            "every listing, and word matches can miss homes; more AI usage comes on their billing day or with a bigger plan.")}
     got = await reader.read(config, question, to_read)
     by_id = {p.id: p for p in to_read}
     matches, maybes = [], []
@@ -725,8 +725,8 @@ async def _ai_read(db: AsyncSession, current_user: User, config: dict, question:
 # "Find homes for sale in Exton with a first-floor primary bedroom" (owner, 11/08). Never reads a whole
 # town by itself: it shows the Home search card (ai_home_search) with the boxes filled from the
 # question. The agent fills the required ones (a town / zip or school district, least beds, least
-# size), watches the free live count and the chat usage it would take, then taps Search - the AI
-# reads at most ai_home_reader.READ_CAP listings, and only when their chat usage has room for it.
+# size), watches the free live count and the AI usage it would take, then taps Search - the AI
+# reads at most ai_home_reader.READ_CAP listings, and only when their AI usage has room for it.
 async def _search_homes_for_sale(db: AsyncSession, current_user: User, args: dict, config: dict) -> dict:
     from app.utils.auth import tier_has_mls
     from app.services.ai import ai_home_search
@@ -739,7 +739,7 @@ async def _search_homes_for_sale(db: AsyncSession, current_user: User, args: dic
             "homes_that_fit_so_far": card["count"] if (f.get("town") or f.get("district")) else None,
             "note": ("A Home search card is under your reply with the boxes filled from what they asked. Nothing has been searched yet: the "
                      "agent fills what's still needed (a town or zip, or a school district; the least bedrooms; the least house size - "
-                     "price is optional), sees how many homes fit and how much of their chat usage reading them takes, and taps Search "
+                     "price is optional), sees how many homes fit and how much of their AI usage reading them takes, and taps Search "
                      f"(it opens at {ai_home_search.reader.READ_CAP} homes or fewer). Reply in 1-2 short lines: what you filled in, what they still need to pick, "
                      "and to tap Search. Never say you searched, never list homes, never give a count of matches.")}
 

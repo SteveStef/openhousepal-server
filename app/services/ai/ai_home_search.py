@@ -2,8 +2,8 @@
 bedroom" never reads a whole town by itself any more. The chat shows a search card with the boxes
 filled from the question; the agent fills the required ones - a town / zip or a school district, the
 least bedrooms and the least house size - and sees, as they type, how many homes fit and how much of
-their chat usage reading them takes. Counting is a plain database count: free, no AI. Search only
-opens at READ_CAP homes or fewer and only when their chat usage has room for it; then the AI reads
+their AI usage reading them takes. Counting is a plain database count: free, no AI. Search only
+opens at READ_CAP homes or fewer and only when their AI usage has room for it; then the AI reads
 each listing (ai_home_reader) and the card shows the matches with the words that show it.
 
 The results are saved on the chat message's card, so they're there when the chat is opened again and

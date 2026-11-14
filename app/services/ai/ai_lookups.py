@@ -88,13 +88,10 @@ async def _ai_usage(db: AsyncSession, user: User, args: dict) -> Any:
     ok, data = await lookup(user, "/ai/usage/monthly")
     if not ok or not isinstance(data, dict):
         return data
-    ok_chat, chat = await lookup(user, "/ai/usage/chat")
-    chat = chat if ok_chat and isinstance(chat, dict) else {}
     return {
-        # This chat has its own allowance and "Chat usage" bar (11/01) - not part of the AI bar.
-        "chat_usage_percent": chat.get("percent"),
-        "chat_resets_on": (chat.get("resets_at") or "")[:10] or None,
-        "chat_upgrade_plan_for_double": (chat.get("upgrade") or {}).get("name"),
+        # One AI Usage bar since 11/13 - the chat draws from it like every other AI tool.
+        "chat_uses_this_same_allowance": True,
+        "upgrade_plan": (data.get("upgrade") or {}).get("name"),
         "ai_usage_resets_on": (data.get("resets_at") or "")[:10] or None,
         "percent_used_this_month": data.get("percent"),
         "near_limit": data.get("near_limit"), "used_up": data.get("exhausted"),

@@ -1047,9 +1047,10 @@ async def get_public_blog(
     if not agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This article could not be found.")
 
-    # Only count fully anonymous requests as a "read" - any logged-in viewer (the owner
-    # previewing, or another agent browsing while signed in) is staff traffic, not a real guest.
-    if track and not viewer:
+    # The author reading their own article (signed in) isn't a reader - anyone else counts
+    # (owner, 11/13 - utils/own_traffic).
+    from app.utils.own_traffic import is_own_traffic
+    if track and not is_own_traffic(viewer, blog.owner_id):
         try:
             db.add(BlogEvent(blog_id=blog.id, owner_id=blog.owner_id, event_type="view"))
             await db.commit()
@@ -1193,13 +1194,17 @@ async def track_blog_event(
     payload: BlogEventCreate,
     db: AsyncSession = Depends(get_db),
     viewer: Optional[User] = Depends(get_current_user_optional),
+    owner_ref: bool = False,
 ):
-    # A "view" ping comes from the IDX website's article page; like the Agent Hub read, a
-    # signed-in viewer (the agent checking their own article) isn't a reader.
-    if payload.event_type == "view" and viewer:
+    # A "view" ping comes from the IDX website's article page; like the Agent Hub read, the agent
+    # checking their own article isn't a reader - nor are their own clicks on it.
+    if owner_ref:
         return
     hub = await hub_by_slug(db, normalize_slug(agent_slug))  # current link or its kept old one
     if not hub:
+        return
+    from app.utils.own_traffic import is_own_traffic
+    if is_own_traffic(viewer, hub.owner_id):
         return
 
     blog_result = await db.execute(

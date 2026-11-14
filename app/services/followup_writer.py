@@ -3,14 +3,14 @@ know about them - which open house (and how long ago), what they answered signin
 Showcase (opened or not, liked, passed), what the agent already sent (never pitch the Showcase twice) and when
 they last heard from the agent.
 
-- One small AI call, on the agent's tap only (never in the background); costs a little of their chat usage,
+- One small AI call, on the agent's tap only (never in the background); costs a little of their AI usage,
   checked first and recorded like any chat answer.
 - Time stays right: the message never says "yesterday" / "this weekend" itself - it says when the open house was
   as a slot, {oh_when:YYYY-MM-DD}, filled in the day the message is shown (tasks_service.fill_when). A follow-up
   that rolls over as overdue reads right the next day, for free.
 - No made-up facts: only what's below goes in; the Showcase link is added by the app, last, never by the AI.
 
-Also: which leads should have a check-in waiting (checkins) - no AI, just the reason, so the agent sees why."""
+Also: which leads should have a check-in waiting (checkins -> checkins_service) - no AI, just the reasons."""
 from __future__ import annotations
 
 import asyncio
@@ -27,10 +27,6 @@ from app.models.database import AgentTask, Lead, LeadEvent, LeadNote, OpenHouseE
 
 logger = get_logger(__name__)
 
-CHECKIN_AFTER_DAYS = 14      # no contact from the agent for this long ...
-CHECKIN_WITHIN_DAYS = 60     # ... on a lead active in the last two months
-QUIET_DAYS = 7               # anything they did this week already has its own suggestion
-DONE_STATUSES = {"signed", "hidden", "converted", "archived"}
 _EST_IN, _EST_OUT = 2600, 260   # tokens a write takes (for the cost shown before the tap)
 _PITCH_SOURCES = {"open_house_signin", "similar_homes_qr", "showcase_setup", "buyer_form", "how_can_we_help"}
 _SHOWCASE_SEEN = {"showcase_view", "showcase_like", "showcase_dislike", "email_clicked", "property_comment"}
@@ -174,7 +170,7 @@ async def facts(db: AsyncSession, owner: User, lead: Lead) -> Dict[str, Any]:
 
 
 async def estimate(db: AsyncSession, owner: User) -> Dict[str, Any]:
-    """What one write takes of the agent's chat usage - shown on the button before the tap."""
+    """What one write takes of the agent's AI usage - shown on the button before the tap."""
     from app.services.ai import ai_home_reader as reader
     from app.services.ai.ai_config_service import ai_config_service
     config = await ai_config_service.get_config(db)
@@ -207,7 +203,7 @@ def _clean_message(msg: str, oh_date: Optional[str], smart: bool = False) -> str
 
 async def write(db: AsyncSession, owner: User, lead: Lead, goal: Optional[str] = None) -> Dict[str, Any]:
     """{message (with {oh_when:..} slots, no footer, {showcase} marker when the link fits), preview (as the client
-    would get it today), title, why, used_percent} - or {error} when the chat usage has no room / it failed."""
+    would get it today), title, why, used_percent} - or {error} when the AI usage has no room / it failed."""
     from app.services import tasks_service as ts
     from app.services.ai import ai_home_reader as reader
     from app.services.ai.ai_config_service import ai_config_service
@@ -216,7 +212,7 @@ async def write(db: AsyncSession, owner: User, lead: Lead, goal: Optional[str] =
     est = ai_config_service.estimate_cost_usd(config, config["model"], _EST_IN, _EST_OUT)
     left, limit = await reader.room(db, owner, config)
     if left is not None and est > left:
-        return {"error": "Not enough chat usage left this month to write it - it resets on your billing day."}
+        return {"error": "Not enough AI usage left this month to write it - it resets on your billing day."}
     f = await facts(db, owner, lead)
     payload = {k: v for k, v in f.items() if not k.startswith("_")}
     if goal and goal.strip():
@@ -261,71 +257,6 @@ async def write(db: AsyncSession, owner: User, lead: Lead, goal: Optional[str] =
 
 
 async def checkins(db: AsyncSession, owner: User, lead_id: Optional[str] = None, limit: int = 60) -> List[Dict[str, Any]]:
-    """Leads that should have a check-in waiting (no AI): active in the last two months, nothing open for them,
-    no word from the agent in two weeks, nothing new from them this week (that gets its own suggestion), not
-    signed / hidden. A lead with their own agent only from the agent's own listing or with a note on them."""
-    from app.services.open_house_service import OpenHouseService
-    now = datetime.now(timezone.utc)
-    q = select(Lead).where(Lead.owner_id == owner.id, Lead.hidden_at.is_(None), Lead.status.notin_(DONE_STATUSES))
-    if lead_id:
-        q = q.where(Lead.id == lead_id)
-    leads = (await db.execute(q)).scalars().all()
-    if not leads:
-        return []
-    ids = [l.id for l in leads]
-    open_for = {r[0] for r in (await db.execute(select(AgentTask.lead_id).where(AgentTask.lead_id.in_(ids), AgentTask.completed_at.is_(None)))).all()}
-    evs: Dict[str, List[LeadEvent]] = {}
-    for e in (await db.execute(select(LeadEvent).where(LeadEvent.lead_id.in_(ids)).order_by(LeadEvent.occurred_at.desc()))).scalars().all():
-        evs.setdefault(e.lead_id, []).append(e)
-    noted = {r[0] for r in (await db.execute(select(LeadNote.lead_id).where(LeadNote.lead_id.in_(ids)))).all()}
-    oh_ids = {e.open_house_event_id for es in evs.values() for e in es if e.source_type == "open_house_visitor" and e.open_house_event_id}
-    ohs = {o.id: o for o in (await db.execute(select(OpenHouseEvent).where(OpenHouseEvent.id.in_(oh_ids))))
-           .scalars().all()} if oh_ids else {}
-    try:
-        mine = await OpenHouseService.owned_listing_keys(db, owner, {o.listing_key for o in ohs.values() if o.listing_key})
-    except Exception:  # noqa: BLE001
-        mine = set()
-    out = []
-    for l in leads:
-        if l.id in open_for:
-            continue
-        es = evs.get(l.id, [])
-        created = l.created_at if l.created_at.tzinfo else l.created_at.replace(tzinfo=timezone.utc)
-        latest = max([created] + [(e.occurred_at if e.occurred_at.tzinfo else e.occurred_at.replace(tzinfo=timezone.utc)) for e in es])
-        if now - latest > timedelta(days=CHECKIN_WITHIN_DAYS):
-            continue
-        if any(now - (e.occurred_at if e.occurred_at.tzinfo else e.occurred_at.replace(tzinfo=timezone.utc)) < timedelta(days=QUIET_DAYS) for e in es):
-            continue
-        touched = l.last_contacted_at or created
-        touched = touched if touched.tzinfo else touched.replace(tzinfo=timezone.utc)
-        if now - touched < timedelta(days=CHECKIN_AFTER_DAYS):
-            continue
-        visit = next((e for e in es if e.source_type == "open_house_visitor"), None)
-        oh = ohs.get(visit.open_house_event_id) if visit is not None and visit.open_house_event_id else None
-        own = bool(oh is not None and oh.listing_key and oh.listing_key in mine)
-        has_note = l.id in noted or bool((l.notes or "").strip())
-        if l.represented == "yes" and not (own or has_note):
-            continue
-        # The reason, so the agent sees why (free - no AI).
-        bits = []
-        weeks = max(2, (now - touched).days // 7)
-        bits.append(f"No word from you in {weeks} weeks" if l.last_contacted_at else f"You haven't reached out yet ({weeks} weeks)")
-        if visit is not None:
-            street = _street(oh.address if oh is not None else visit.property_address)
-            when = _eastern_date(visit.occurred_at)
-            bits.append(f"met at {street or 'your open house'}" + (f" on {when.strftime('%b')} {when.day}" if when else ""))
-        seen = any(e.source_type in _SHOWCASE_SEEN for e in es)
-        has_showcase = any(e.collection_id for e in es)
-        if has_showcase:
-            likes = sum(1 for e in es if e.source_type == "showcase_like")
-            bits.append(f"liked {likes} home{'s' if likes != 1 else ''} in their Showcase" if likes else
-                        ("looked at their Showcase" if seen else "never opened their Showcase"))
-        if has_note:
-            bits.append("you have notes on them")
-        if l.represented == "yes":
-            bits.append("has an agent - " + ("your listing" if own else "noted"))
-        out.append({"lead_id": l.id, "name": l.name or l.email or "This lead", "first": _first_name(l.name),
-                    "reason": " · ".join(bits), "kind": "text" if l.phone else "email",
-                    "_latest": latest.isoformat()})
-    out.sort(key=lambda x: x.pop("_latest"), reverse=True)
-    return out[:limit]
+    """Leads worth a check-in, best first, with their group and reasons - see checkins_service (owner, 11/13)."""
+    from app.services import checkins_service
+    return await checkins_service.checkins(db, owner, lead_id=lead_id, limit=limit)

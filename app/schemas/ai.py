@@ -258,10 +258,12 @@ class MonthlyAIUsageResponse(BaseModel):
     # This month's spend by feature: [{label, usd, percent}] - the meter's "What used it".
     breakdown: list = []
     resets_at: Optional[str] = None  # end of this billing period - the bar resets then
+    upgrade: Optional[dict] = None  # {tier, name, times} - the next plan up, for the near-limit offer
 
 
 class ChatUsageResponse(BaseModel):
-    """GET /ai/usage/chat - the AI helper chat's own "Chat usage" bar (owner, 11/01)."""
+    """GET /ai/usage/chat - since 11/13 the same one AI Usage bar as /ai/usage/monthly (the chat
+    has no allowance of its own any more), percent to one decimal for the chat's slim bar."""
     tier: str
     used_usd: float
     limit_usd: Optional[float] = None
@@ -271,7 +273,7 @@ class ChatUsageResponse(BaseModel):
     near_limit: bool = False
     exhausted: bool = False
     resets_at: Optional[str] = None
-    upgrade: Optional[dict] = None  # {tier, name, times} - the plan with more chat, if any
+    upgrade: Optional[dict] = None  # {tier, name, times} - the next plan up (more AI usage), if any
 
 
 class CopywriteRequest(BaseModel):

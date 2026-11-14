@@ -118,6 +118,9 @@ async def create_ephemeral_session(db: AsyncSession, current_user: User, config:
         cost_so_far = await monthly_cost_so_far(db, current_user.id, "realtime")
         if cost_so_far >= config["realtime_monthly_cost_ceiling_usd"]:
             raise AIRateLimitExceeded("realtime_cost_ceiling", "You've reached your voice usage limit for this month.")
+        # Live voice draws from the agent's one AI Usage allowance too (owner, 11/13).
+        from app.services.ai.ai_rate_limit_service import enforce_agent_monthly_budget
+        await enforce_agent_monthly_budget(db, current_user.id, config, current_user.plan_tier)
 
         # Layer 3: reserved once for the whole session (worst case realtime_max_session_seconds),
         # trued up in end_realtime_session once the session's real accumulated cost is known -

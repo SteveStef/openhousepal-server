@@ -102,6 +102,12 @@ def _eastern():
     return ZoneInfo(TZ)
 
 
+def _real_forms():
+    """Form visits that aren't the agent's own test (forms_service.real_form_sessions)."""
+    from app.services.forms_service import real_form_sessions
+    return real_form_sessions()
+
+
 async def _count_series(db: AsyncSession, col, unit: str, since, *where, joins: Iterable = ()) -> dict[date, int]:
     b = _bucket(col, unit)
     q = select(b.label("b"), func.count()).select_from(col.class_ if hasattr(col, "class_") else None)
@@ -162,7 +168,7 @@ async def overview(db: AsyncSession, days: int) -> dict:
     active_series = {b: len({u for u, d in active_rows if b <= d < b + timedelta(days=step)}) for b in buckets}
     joined = await _count_series(db, m.User.created_at, unit, since, m.User.id.in_(ids))
 
-    signins = await _count_series(db, m.OpenHouseVisitor.created_at, unit, since, m.OpenHouseEvent.agent_id.in_(ids),
+    signins = await _count_series(db, m.OpenHouseVisitor.created_at, unit, since, m.OpenHouseEvent.agent_id.in_(ids), m.OpenHouseVisitor.owner_test.isnot(True),
                                   joins=[(m.OpenHouseEvent, m.OpenHouseEvent.id == m.OpenHouseVisitor.open_house_event_id)])
     showcases = await _count_series(db, m.Collection.created_at, unit, since)
     leads = await _count_series(db, m.Lead.created_at, unit, since)
@@ -208,11 +214,13 @@ async def signins(db: AsyncSession, days: int) -> dict:
 
     rows = (await db.execute(
         select(E.agent_id, V.signin_seconds, V.signin_mode, V.signin_device, V.has_agent, V.lead_id, func.timezone(TZ, V.created_at))
-        .join(E, E.id == V.open_house_event_id).where(_in(V.created_at, since))
+        .join(E, E.id == V.open_house_event_id).where(_in(V.created_at, since), V.owner_test.isnot(True))
     )).all()
+    # The agent's own test sign-ins (and the showings that became them) aren't guests (utils/own_traffic).
+    from app.services.stats_service import real_signin_views
     views = await _by_owner(db, select(E.agent_id, func.count()).select_from(W).join(E, E.id == W.open_house_event_id)
-                            .where(_in(W.created_at, since)).group_by(E.agent_id))
-    tracked_views = (await db.execute(select(func.count(), func.count(W.visitor_id)).where(_in(W.created_at, since), W.mode.isnot(None)))).one()
+                            .where(_in(W.created_at, since), real_signin_views()).group_by(E.agent_id))
+    tracked_views = (await db.execute(select(func.count(), func.count(W.visitor_id)).where(_in(W.created_at, since), W.mode.isnot(None), real_signin_views()))).one()
 
     secs = [r[1] for r in rows if r[1]]
     by_mode: dict[str, list] = {}
@@ -232,7 +240,7 @@ async def signins(db: AsyncSession, days: int) -> dict:
     # Deleted ones count too (owner 10/27): they were held, and their sign-ins were real.
     today = now.astimezone(_eastern()).date()
     start_day = since.astimezone(_eastern()).date() if since else None
-    vis_n = select(V.open_house_event_id.label("oh"), func.count().label("n")).group_by(V.open_house_event_id).subquery()
+    vis_n = select(V.open_house_event_id.label("oh"), func.count().label("n")).where(V.owner_test.isnot(True)).group_by(V.open_house_event_id).subquery()
     oh_rows = (await db.execute(
         select(E.agent_id, E.scheduled_date, E.created_at, func.coalesce(vis_n.c.n, 0))
         .outerjoin(vis_n, vis_n.c.oh == E.id)
@@ -249,8 +257,8 @@ async def signins(db: AsyncSession, days: int) -> dict:
     buckets = _buckets(days, now, first)
     series = _merge_series(
         buckets,
-        signins=await _count_series(db, V.created_at, unit, since),
-        views=await _count_series(db, W.created_at, unit, since),
+        signins=await _count_series(db, V.created_at, unit, since, V.owner_test.isnot(True)),
+        views=await _count_series(db, W.created_at, unit, since, real_signin_views()),
     )
 
     total = len(rows)
@@ -295,7 +303,7 @@ async def _forms(db: AsyncSession, since, agents: dict) -> dict:
     """Agent Hub forms (Typeform-style): opened, started, finished, and how long finishing took."""
     S, F = m.FormViewSession, m.AgentForm
     rows = (await db.execute(
-        select(S.owner_id, F.form_type, S.started_at, S.completed_at).join(F, F.id == S.form_id).where(_in(S.created_at, since))
+        select(S.owner_id, F.form_type, S.started_at, S.completed_at).join(F, F.id == S.form_id).where(_in(S.created_at, since), _real_forms())
     )).all()
     by_type: dict[str, dict] = {}
     by_agent: dict[str, dict] = {}
@@ -591,9 +599,10 @@ async def guests(db: AsyncSession, days: int) -> dict:
                                                                                   H.owner_id.in_(list(agents))))).scalar() or 0
     spot = (await db.execute(select(func.count(), func.count(distinct(PV.visitor_id))).where(_in(PV.created_at, since)))).one()
     blog = dict((await db.execute(select(B.event_type, func.count()).where(_in(B.created_at, since)).group_by(B.event_type))).all())
-    form = (await db.execute(select(func.count(), func.count(S.started_at), func.count(S.completed_at)).where(_in(S.created_at, since)))).one()
-    oh_views = (await db.execute(select(func.count()).select_from(m.OpenHouseSignInView).where(_in(m.OpenHouseSignInView.created_at, since)))).scalar() or 0
-    oh_signins = (await db.execute(select(func.count()).select_from(m.OpenHouseVisitor).where(_in(m.OpenHouseVisitor.created_at, since)))).scalar() or 0
+    form = (await db.execute(select(func.count(), func.count(S.started_at), func.count(S.completed_at)).where(_in(S.created_at, since), _real_forms()))).one()
+    from app.services.stats_service import real_signin_views
+    oh_views = (await db.execute(select(func.count()).select_from(m.OpenHouseSignInView).where(_in(m.OpenHouseSignInView.created_at, since), real_signin_views()))).scalar() or 0
+    oh_signins = (await db.execute(select(func.count()).select_from(m.OpenHouseVisitor).where(_in(m.OpenHouseVisitor.created_at, since), m.OpenHouseVisitor.owner_test.isnot(True),))).scalar() or 0
     sc = dict((await db.execute(select(L.source_type, func.count()).where(L.source_type.in_(SHOWCASE_GUEST_EVENTS), _in(L.occurred_at, since))
                                 .group_by(L.source_type))).all())
     comments = (await db.execute(select(func.count()).select_from(m.PropertyComment).where(m.PropertyComment.is_agent.is_(False),
@@ -623,9 +632,9 @@ async def guests(db: AsyncSession, days: int) -> dict:
         buckets,
         hub=await _count_series(db, H.created_at, unit, since, H.event_type == "visit"),
         spotlight=await _count_series(db, PV.created_at, unit, since),
-        signins=await _count_series(db, m.OpenHouseVisitor.created_at, unit, since),
+        signins=await _count_series(db, m.OpenHouseVisitor.created_at, unit, since, m.OpenHouseVisitor.owner_test.isnot(True)),
         showcase=await _count_series(db, L.occurred_at, unit, since, L.source_type.in_(SHOWCASE_GUEST_EVENTS)),
-        forms=await _count_series(db, S.completed_at, unit, since),
+        forms=await _count_series(db, S.completed_at, unit, since, _real_forms()),
     )
 
     hub_by = await _by_owner(db, select(H.owner_id, func.count()).where(H.event_type == "visit", _in(H.created_at, since)).group_by(H.owner_id))
@@ -633,8 +642,8 @@ async def guests(db: AsyncSession, days: int) -> dict:
                               .where(_in(PV.created_at, since)).group_by(PW.owner_id))
     signin_by = await _by_owner(db, select(m.OpenHouseEvent.agent_id, func.count()).select_from(m.OpenHouseVisitor)
                                 .join(m.OpenHouseEvent, m.OpenHouseEvent.id == m.OpenHouseVisitor.open_house_event_id)
-                                .where(_in(m.OpenHouseVisitor.created_at, since)).group_by(m.OpenHouseEvent.agent_id))
-    form_by = await _by_owner(db, select(S.owner_id, func.count()).where(S.completed_at.isnot(None), _in(S.completed_at, since)).group_by(S.owner_id))
+                                .where(_in(m.OpenHouseVisitor.created_at, since), m.OpenHouseVisitor.owner_test.isnot(True)).group_by(m.OpenHouseEvent.agent_id))
+    form_by = await _by_owner(db, select(S.owner_id, func.count()).where(S.completed_at.isnot(None), _in(S.completed_at, since), _real_forms()).group_by(S.owner_id))
     sc_by = await _by_owner(db, select(m.Lead.owner_id, func.count()).select_from(L).join(m.Lead, m.Lead.id == L.lead_id)
                             .where(L.source_type.in_(SHOWCASE_GUEST_EVENTS), _in(L.occurred_at, since)).group_by(m.Lead.owner_id))
     open_by = await _by_owner(db, select(m.ClientEmail.owner_id, func.count()).where(m.ClientEmail.opened_at.isnot(None),

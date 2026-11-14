@@ -1135,17 +1135,37 @@ def template_payload(rule_key: str, user: Optional[User]) -> dict:
 
 async def _open_auto_task_for_lead(db: AsyncSession, owner_id: str, lead_id: str) -> bool:
     """One open automatic follow-up per person at a time - a guest who fills out a form, then
-    comments, then asks for a showing gets ONE reminder to reach out, not three."""
-    row = await db.execute(
-        select(AgentTask.id).where(
+    comments, then asks for a showing gets ONE reminder to reach out, not three.
+    An OVERDUE one never counts (owner, 11/14): a follow-up the agent missed must not stop the
+    next thing the person does from making a fresh one."""
+    rows = (await db.execute(
+        select(AgentTask).where(
             AgentTask.owner_id == owner_id,
             AgentTask.lead_id == lead_id,
             AgentTask.auto_source.is_not(None),
             AgentTask.auto_source != LIKES_RULE,   # a "homes they liked" card doesn't block the rest
             AgentTask.completed_at.is_(None),
-        ).limit(1)
-    )
-    return row.scalar_one_or_none() is not None
+        )
+    )).scalars().all()
+    return any(not is_overdue(t) for t in rows)
+
+
+def is_overdue(task: AgentTask, now: Optional[datetime] = None) -> bool:
+    """Open and its day (or time) has passed - the agent missed it."""
+    return compute_bucket(task, now) == "overdue"
+
+
+async def redate_if_overdue(db: AsyncSession, owner: Optional[User], task: AgentTask, rule: str,
+                            occurred_at: Optional[datetime] = None) -> bool:
+    """New activity folded onto an open follow-up the agent already missed: give it a fresh day (the
+    rule's own timing) and a fresh reminder, so the new activity reaches them instead of landing on
+    a card that's already in the past (owner, 11/14). The caller commits + resyncs the calendar."""
+    if owner is None or not is_overdue(task):
+        return False
+    due, remind, all_day = await plan_followup(db, owner, rule, occurred_at or datetime.now(timezone.utc))
+    task.due_at, task.remind_at, task.all_day = due, remind, all_day
+    task.reminder_sent_at = None
+    return True
 
 
 # The agent's alert switches for ONE person (owner, 10/27) - Lead.alert_prefs, set from the "Mark
@@ -1275,6 +1295,7 @@ async def create_auto_followup(
                 AgentTask.owner_id == owner_id, AgentTask.lead_id == lead_id, AgentTask.auto_source == auto_source,
                 AgentTask.completed_at.is_(None)).order_by(AgentTask.created_at.desc()).limit(1))).scalar_one_or_none()
             if same is not None:
+                await redate_if_overdue(db, user, same, rule, occurred_at)
                 same.auto_source_id = source_id
                 same.title = title
                 same.context = (context or "")[:240] or same.context
@@ -1299,6 +1320,7 @@ async def create_auto_followup(
                         AgentTask.completed_at.is_(None)))).scalars().all():
                     old_ev = await db.get(_LE, same.auto_source_id) if same.auto_source_id else None
                     if old_ev is not None and (old_ev.property_address or "").split(",")[0].strip().lower() == new_addr:
+                        await redate_if_overdue(db, user, same, rule, occurred_at)
                         same.auto_source_id = source_id
                         same.title, same.notes = title, notes or same.notes
                         same.context = (context or "")[:240] or same.context
@@ -1714,6 +1736,35 @@ def _count_words(template: str, parts: dict) -> str:
     return tpl
 
 
+# What one Showcase says for a follow-up (count, best home, candidates, must-haves), kept a minute.
+# Building it loads the guest's whole Showcase page (~16 queries each), and the follow-up list did
+# that for every Showcase on every open - the Dash, the Follow-ups page and each check-off reload
+# (11/14: ~600 ms of the list's ~1 s). A minute behind the live Showcase is fine for a text draft.
+_SHOWCASE_PITCH_TTL = 60.0
+_showcase_pitch_cache: dict[str, tuple[float, tuple]] = {}
+
+
+def _cached_pitch(token: str) -> Optional[tuple]:
+    import copy
+    import time as _time
+    hit = _showcase_pitch_cache.get(token)
+    if hit is None or _time.monotonic() - hit[0] > _SHOWCASE_PITCH_TTL:
+        return None
+    return copy.deepcopy(hit[1])   # callers add to these dicts - never share them
+
+
+def _store_pitch(token: str, value: tuple) -> None:
+    import copy
+    import time as _time
+    now = _time.monotonic()
+    if len(_showcase_pitch_cache) > 500:
+        for k in [k for k, (at, _) in _showcase_pitch_cache.items() if now - at > _SHOWCASE_PITCH_TTL]:
+            _showcase_pitch_cache.pop(k, None)
+        if len(_showcase_pitch_cache) > 500:
+            _showcase_pitch_cache.clear()
+    _showcase_pitch_cache[token] = (now, copy.deepcopy(value))
+
+
 async def lead_showcase_info(db: AsyncSession, owner: User, leads: list) -> dict[str, dict]:
     """{lead_id: {"url", "count", "parts"}} for leads WITHOUT an agent who have a live Showcase.
     Built from the exact data the guest's Showcase page loads (CollectionsService.
@@ -1756,17 +1807,22 @@ async def lead_showcase_info(db: AsyncSession, owner: User, leads: list) -> dict
     out: dict[str, dict] = {}
     cache: dict[str, tuple] = {}
     for lead_id, token in latest.items():
+        if token not in cache and (hit := _cached_pitch(token)) is not None:
+            cache[token] = hit
         if token not in cache:
+            complete = True   # only a clean build is kept for the next list (_store_pitch)
             try:
                 payload = await CollectionsService.get_shared_collection(db, token) or {}
             except Exception:
                 logger.warning("showcase payload failed for %s", token, exc_info=True)
                 payload = {}
+                complete = False
             try:
                 cands = _standout_candidates(payload)
             except Exception:  # noqa: BLE001 - the per-follow-up pick is a refinement, never fatal
                 logger.warning("showcase candidates failed for %s", token, exc_info=True)
                 cands = None
+                complete = False
             try:
                 smart = smart_summary(payload)
                 ph = (await db.execute(select(CollectionPreferences.ai_wants).where(
@@ -1783,7 +1839,10 @@ async def lead_showcase_info(db: AsyncSession, owner: User, leads: list) -> dict
                     smart["phrases"] = ph.get("phrases") or {}
             except Exception:  # noqa: BLE001
                 smart = None
+                complete = False
             cache[token] = (*_pick_standout(payload), cands, smart)
+            if complete and payload:
+                _store_pitch(token, cache[token])
         count, best, _match, days, cands, smart = cache[token]
         from app.services.showcase_links import showcase_path
         url = clean_url(f"{base}{await showcase_path(share_token=token, db=db) or f'/showcase/{token}'}")
@@ -2423,6 +2482,7 @@ def schedule_followup_for_lead_event(owner_id: str, lead_id: str, event_id: str,
                     AgentTask.owner_id == owner_id, AgentTask.lead_id == lead.id,
                     AgentTask.auto_source == rule, AgentTask.completed_at.is_(None)).limit(1))).scalar_one_or_none()
                 if open_one is not None:
+                    await redate_if_overdue(db, await db.get(User, owner_id), open_one, rule, event.occurred_at)
                     open_one.notes = _alert_notes(rule, lead, event)
                     await db.commit()
                     resync_lead_followups(owner_id, lead.id)
@@ -2626,6 +2686,7 @@ async def _likes_followup(collection_id: str) -> Optional[AgentTask]:
                 calendar_sync_service.unsync_task_bg(owner_id, tid)
                 return None
             title, context, notes, message = likes_text(owner, lead, homes)
+            await redate_if_overdue(db, owner, open_task, LIKES_RULE, now)
             open_task.title, open_task.context, open_task.notes = title, context[:240], notes
             open_task.suggested_message = message
             open_task.auto_source_id = homes[0]["event"].id   # the card's home = the newest one
@@ -3286,10 +3347,17 @@ async def create_open_house_followup(
         # open house while their last "Reach out" is still open moves that card to the newest open
         # house instead of adding a second; any other open follow-up already covers reaching out.
         # (Once it's done, a later sign-in gets a fresh one.) The visit is still on their lead.
-        open_task = (await db.execute(select(AgentTask).where(
+        opens = (await db.execute(select(AgentTask).where(
             AgentTask.owner_id == owner_id, AgentTask.lead_id == lead.id, AgentTask.auto_source.is_not(None),
             AgentTask.auto_source != LIKES_RULE,   # a "homes they liked" card never stands in for this
-            AgentTask.completed_at.is_(None)).order_by(AgentTask.created_at.desc()).limit(1))).scalar_one_or_none()
+            AgentTask.completed_at.is_(None)).order_by(AgentTask.created_at.desc()))).scalars().all()
+        # A follow-up the agent already missed (overdue) doesn't cover this visit (owner, 11/14) -
+        # except their own sign-in card, which moves to this open house and gets a fresh day.
+        live = [t for t in opens if not is_overdue(t)]
+        missed_signin = [t for t in opens if t.auto_source in ("open_house_signin", "similar_homes_qr")] if property_address else []
+        open_task = live[0] if live else (missed_signin[0] if missed_signin else None)
+        if open_task is not None:
+            await redate_if_overdue(db, owner, open_task, open_task.auto_source, occurred_at)
         if open_task is not None:
             if open_task.auto_source in ("open_house_signin", "similar_homes_qr") and property_address:
                 from app.services.email_service import _tidy_subject

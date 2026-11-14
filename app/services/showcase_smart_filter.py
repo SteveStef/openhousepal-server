@@ -8,7 +8,7 @@ The other homes stay, without the star or the line.
 - Runs after the agent saves the search or the must-haves, and when a new listing lands in the Showcase.
   Each home is read once per set of must-haves (collection_properties.ai_match.k) - a new listing costs
   one home's read, not the whole Showcase's.
-- Costs the agent's chat usage, like the chat's own listing reads: checked against what's left before
+- Costs the agent's AI usage, like the chat's own listing reads: checked against what's left before
   anything runs (none left: nothing runs and the Showcase says so), held against the platform-wide AI
   ceilings while it runs, then recorded.
 - Starred once: if the agent takes the star off, the next read never puts it back (ai_match.starred).
@@ -303,7 +303,7 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
                 await db.execute(text("update collection_properties set ai_match = cast(:m as jsonb) where collection_id = :c and property_id = :p"),
                                  {"m": json.dumps(m), "c": collection_id, "p": p.id})
             await db.commit()
-            # What this read took of the agent's chat usage - shown on the Showcase like the chat shows it.
+            # What this read took of the agent's AI usage - shown on the Showcase like the chat shows it.
             used = reader.percent(spent, limit) if limit else None
             out = {**st, "wants": wants, "state": "done", "left": len(failed), "read": len(todo) - len(failed),
                    "matched": await _count_matched(db, collection_id, k), "at": datetime.now(timezone.utc).isoformat(),
@@ -342,7 +342,7 @@ async def _avg_desc_chars(db) -> float:
 
 async def estimate(db, user, homes: int, n_wants: int) -> Dict[str, Any]:
     """What reading `homes` homes for `n_wants` must-haves takes - the chat's own Home search math (owner,
-    11/09): a percent of the agent's chat usage, what's left, and whether it can run at all (300 homes at
+    11/09): a percent of the agent's AI usage, what's left, and whether it can run at all (300 homes at
     most, and only when the usage has room). No AI - a plain estimate."""
     from app.services.ai import ai_home_reader as reader
     from app.services.ai.ai_config_service import ai_config_service

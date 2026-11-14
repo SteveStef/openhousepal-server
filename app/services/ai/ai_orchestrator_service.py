@@ -528,9 +528,9 @@ async def run_turn(
         if not any(r.get("tool") == "remove_showcase_homes" and (r.get("payload") or {}).get("collection_id") == cid for r in all_refs):
             all_refs.append(card)
     _howto_button(user_message, all_refs)
-    # Word matches only (not enough chat usage left for AI reading): always said, never left to the model.
-    if any(c.get("words_only") for c in showcase_cards.values()) and not re.search(r"chat usage|allowance", text or "", re.I):
-        text = ("You're almost out of chat usage this month, so this was a quick word search instead of AI reading every listing - "
+    # Word matches only (not enough AI usage left for AI reading): always said, never left to the model.
+    if any(c.get("words_only") for c in showcase_cards.values()) and not re.search(r"AI usage|allowance", text or "", re.I):
+        text = ("You're almost out of AI usage this month, so this was a quick word search instead of AI reading every listing - "
                 "some homes may be missed.\n\n" + (text or ""))
     return _no_pretend_cards(text, all_refs), all_refs, usage_state
 
@@ -558,7 +558,7 @@ async def _showcase_card(db, user, tool: str, args: dict, result: dict, cards: D
             card["looked_for"] = list(dict.fromkeys((card.get("looked_for") or []) + (result.get("looked_for") or [])))[:12]
         # The AI's "maybe" homes (only a hint) show greyed, last, with why.
         if result.get("ai_read") is False:
-            card["words_only"] = True   # not enough chat usage left for AI reading - the card says so
+            card["words_only"] = True   # not enough AI usage left for AI reading - the card says so
         for m in result.get("matches") or []:
             if m.get("maybe") and m.get("property_id"):
                 card.setdefault("doubtful", {})[m["property_id"]] = m["maybe"]
@@ -575,7 +575,7 @@ async def _showcase_card(db, user, tool: str, args: dict, result: dict, cards: D
     total = len(card["homes"])
     note += (f" The Showcase has {total} home{'s' if total != 1 else ''} in all right now (the card shows every one) - when you say how "
              "many are in it, use that number, never the length of a list above.")
-    # The card has every match - the model only needs a few to name, not all of them (saves chat usage).
+    # The card has every match - the model only needs a few to name, not all of them (saves AI usage).
     trimmed = {**result}
     if searched and len(result.get("matches") or []) > 8:
         trimmed["matches"] = [m for m in result["matches"] if not m.get("maybe")][:6] + [m for m in result["matches"] if m.get("maybe")][:2]

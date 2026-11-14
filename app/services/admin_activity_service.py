@@ -56,12 +56,14 @@ FEATURES: list[Feature] = [
             describe=lambda r: f"Set up an open house at {_street(r.address) or 'a home'}"),
     Feature("signins", "Open house sign-ins", "open_house", "result", m.OpenHouseVisitor, "created_at", owner=m.OpenHouseEvent.agent_id,
             joins=[(m.OpenHouseEvent, m.OpenHouseEvent.id == m.OpenHouseVisitor.open_house_event_id)],
+            where=[m.OpenHouseVisitor.owner_test.isnot(True)],   # not the agent's own test sign-in (utils/own_traffic)
             describe=lambda r: "Got an open house sign-in"),
     Feature("team_broadcasts", "Asked team to host", "open_house", "action", m.OpenHouseTeamBroadcast, "created_at",
             describe=lambda r: "Asked their team to host an open house"),
     # ── leads + follow-ups
     Feature("leads", "New leads", "leads", "result", m.Lead, "created_at", describe=lambda r: "Got a new lead"),
     Feature("form_responses", "Form responses", "leads", "result", m.FormSubmission, "created_at",
+            where=[m.FormSubmission.owner_test.isnot(True)],
             describe=lambda r: f"Got a form response ({(r.form_type or 'form').replace('_', ' ')})"),
     Feature("showcases", "Showcases made", "leads", "result", m.Collection, "created_at",
             describe=lambda r: "A Showcase was made for a lead"),
@@ -182,7 +184,7 @@ async def _active_days(db: AsyncSession, now: datetime, agent_id: Optional[str] 
 async def _open_house_stats(db: AsyncSession, agent_id: Optional[str] = None) -> dict[str, dict]:
     """Per agent: open houses, how many have already happened, how many of those got sign-ins."""
     visitors = (select(m.OpenHouseVisitor.open_house_event_id.label("oh"), func.count().label("n"))
-                .group_by(m.OpenHouseVisitor.open_house_event_id).subquery())
+                .where(m.OpenHouseVisitor.owner_test.isnot(True)).group_by(m.OpenHouseVisitor.open_house_event_id).subquery())
     today = _today_eastern()
     # Deleted open houses still count (owner 10/27): they really happened, and so did their sign-ins.
     q = (select(m.OpenHouseEvent.agent_id, m.OpenHouseEvent.scheduled_date, m.OpenHouseEvent.created_at, func.coalesce(visitors.c.n, 0))
@@ -306,7 +308,7 @@ async def agent_detail(db: AsyncSession, agent_id: str) -> Optional[dict]:
 
     # Their open houses, newest first, with how many signed in (counts only).
     visitors = (select(m.OpenHouseVisitor.open_house_event_id.label("oh"), func.count().label("n"))
-                .group_by(m.OpenHouseVisitor.open_house_event_id).subquery())
+                .where(m.OpenHouseVisitor.owner_test.isnot(True)).group_by(m.OpenHouseVisitor.open_house_event_id).subquery())
     oh_rows = (await db.execute(
         select(m.OpenHouseEvent, func.coalesce(visitors.c.n, 0)).outerjoin(visitors, visitors.c.oh == m.OpenHouseEvent.id)
         .where(m.OpenHouseEvent.agent_id == agent_id)

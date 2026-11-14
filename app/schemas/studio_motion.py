@@ -11,7 +11,7 @@ MotionFormat = Literal["16:9", "9:16", "1:1", "4:5"]
 class MotionCreateRequest(BaseModel):
     # Every photo the video may use (all of a listing's, or the agent's uploads) - the agent picks
     # the length and the rooms in the editor, and the video's photos are chosen from these.
-    photos: List[str] = Field(..., min_length=1, max_length=200)  # the service keeps the first 40
+    photos: List[str] = Field(..., min_length=1, max_length=200)  # the service keeps the first 100 (POOL_MAX)
     source_kind: Literal["listing", "upload"] = "listing"
     linked_property: Optional[LinkedProperty] = None
     # The agent's own details for the badge / closing card (from their profile, editable later).

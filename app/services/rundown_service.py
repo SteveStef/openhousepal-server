@@ -25,7 +25,7 @@ logger = get_logger(__name__)
 # Notification type -> the Rundown section it belongs in ("what happened today").
 _GROUPS: list[tuple[str, str, set[str]]] = [
     ("leads", "Leads & sign-ins", {"OPEN_HOUSE_SIGN_IN", "PORTAL_LEAD", "LEAD", "PROPERTY_INQUIRY", "OPEN_HOUSE_SECOND_VISIT",
-                                   "OPEN_HOUSE_DISCLOSURE", "OPEN_HOUSE_FORM_REQUEST"}),
+                                   "OPEN_HOUSE_DISCLOSURE", "OPEN_HOUSE_FORM_REQUEST", "LEAD_INTEREST"}),
     ("showcases", "Showcases", {"PROPERTY_INTERACTION", "PROPERTY_COMMENT", "REFINE_SEARCH_REQUEST", "SHOWCASE_SEARCH_CHANGED",
                                 "TOUR_REQUEST", "PROPERTY_SYNC_UPDATE"}),
     ("forms", "Forms & invites", {"FORM_SUBMISSION", "INVITE_RSVP"}),
@@ -180,21 +180,25 @@ async def _stat_people(db: AsyncSession, user: User, start: datetime, notes: lis
     def street(p) -> str:
         return nice_street(p.street_address or p.unparsed_address or "", p.city or "") if p else "a home"
 
+    not_self_lead = or_(Lead.email.is_(None), func.lower(Lead.email) != func.lower(user.email or ""))
+
     async def new_leads():
-        res = await db.execute(select(Lead).where(Lead.owner_id == user.id, Lead.created_at >= start, Lead.hidden_at.is_(None))
+        res = await db.execute(select(Lead).where(Lead.owner_id == user.id, Lead.created_at >= start, Lead.hidden_at.is_(None), not_self_lead)
                                .order_by(Lead.created_at.desc()).limit(MAX_STAT_PEOPLE))
         return [{"who": _who(l.name, l.email or "New lead"), "what": "New lead", "at": l.created_at, "link": f"/leads/{l.id}"}
                 for l in res.scalars().all()]
 
     async def lead_events(kinds: list[str], what: str):
         res = await db.execute(select(LeadEvent, Lead).join(Lead, Lead.id == LeadEvent.lead_id)
-                               .where(Lead.owner_id == user.id, LeadEvent.source_type.in_(kinds), LeadEvent.occurred_at >= start)
+                               .where(Lead.owner_id == user.id, LeadEvent.source_type.in_(kinds), LeadEvent.occurred_at >= start,
+                                      ~LeadEvent.source_id.in_(select(OpenHouseVisitor.id).where(OpenHouseVisitor.owner_test.is_(True))))
                                .order_by(LeadEvent.occurred_at.desc()).limit(MAX_STAT_PEOPLE))
         return [{"who": _who(l.name, l.email or "A visitor"), "what": e.summary or what, "at": e.occurred_at, "link": f"/leads/{l.id}"}
                 for e, l in res.all()]
 
     async def forms():
-        res = await db.execute(select(FormSubmission).where(FormSubmission.owner_id == user.id, FormSubmission.created_at >= start)
+        res = await db.execute(select(FormSubmission).where(FormSubmission.owner_id == user.id, FormSubmission.created_at >= start,
+                                                            FormSubmission.owner_test.isnot(True))
                                .order_by(FormSubmission.created_at.desc()).limit(MAX_STAT_PEOPLE))
         return [{"who": _who(s.contact_name, s.contact_email or "Someone"),
                  "what": f"Answered your {(s.form_type or 'form').replace('_', ' ')} form" + (f" · {s.property_address}" if s.property_address else ""),
@@ -365,16 +369,21 @@ async def build_rundown(db: AsyncSession, user: User, now: datetime | None = Non
     unread_today = sum(1 for n in notes if not n.is_read) + (1 if bell is not None and not bell.is_read else 0)
 
     # --- the day's numbers ---------------------------------------------------------------------------
+    # The agent's own test sign-ins / form answers / a lead with their own email never count (11/13).
+    from app.models.database import OpenHouseVisitor
+    not_self_lead = or_(Lead.email.is_(None), func.lower(Lead.email) != func.lower(user.email or ""))
+    own_tests = select(OpenHouseVisitor.id).where(OpenHouseVisitor.owner_test.is_(True))
     lead_events = lambda kinds: (select(func.count(LeadEvent.id)).join(Lead, Lead.id == LeadEvent.lead_id)  # noqa: E731
                                  .where(Lead.owner_id == user.id, LeadEvent.source_type.in_(kinds), LeadEvent.occurred_at >= start))
     likes = sum(1 for n in notes if n.type == "PROPERTY_INTERACTION" and (n.message or "").startswith("Liked"))
     stats = [
         {"key": "new_leads", "label": "New leads", "link": "/leads",
-         "value": await _count(db, select(func.count(Lead.id)).where(Lead.owner_id == user.id, Lead.created_at >= start))},
+         "value": await _count(db, select(func.count(Lead.id)).where(Lead.owner_id == user.id, Lead.created_at >= start, not_self_lead))},
         {"key": "sign_ins", "label": "Sign-ins", "link": "/leads",
-         "value": await _count(db, lead_events(["open_house_visitor"]))},
+         "value": await _count(db, lead_events(["open_house_visitor"]).where(~LeadEvent.source_id.in_(own_tests)))},
         {"key": "forms", "label": "Form responses", "link": "/studio/forms",
-         "value": await _count(db, select(func.count(FormSubmission.id)).where(FormSubmission.owner_id == user.id, FormSubmission.created_at >= start))},
+         "value": await _count(db, select(func.count(FormSubmission.id)).where(FormSubmission.owner_id == user.id, FormSubmission.created_at >= start,
+                                                                               FormSubmission.owner_test.isnot(True)))},
         {"key": "tours", "label": "Tours asked for", "link": "/leads",
          "value": await _count(db, lead_events(["property_tour", "property_page_tour_request", "property_website_tour_request"]))},
         {"key": "guest_pass", "label": "Guest Pass visits", "link": "/open-houses",
@@ -398,6 +407,16 @@ async def build_rundown(db: AsyncSession, user: User, now: datetime | None = Non
     for s in stats:
         s["people"] = people.get(s["key"], [])
 
+    # Leads without an agent opening / clicking the same email again - a quiet "worth a check-in"
+    # with a one-tap follow-up (lead_interest_service, owner 11/13).
+    try:
+        from app.services import lead_interest_service
+        interest = await lead_interest_service.signals(db, user.id, now=now, limit=6)
+    except Exception:  # noqa: BLE001
+        logger.warning("rundown interest signals failed", exc_info=True)
+        await db.rollback()
+        interest = []
+
     to_do_count = len(followups) + len(todo) + len(client_asks)
     return {
         "date": local_day,
@@ -413,6 +432,7 @@ async def build_rundown(db: AsyncSession, user: User, now: datetime | None = Non
         "followup_overdue": brief.get("followup_overdue") or 0,
         "actions": todo,
         "client_activity": client_asks,
+        "interest": interest,
         "showcase": {"new": sc["new"], "drops": sc["drops"], "clients": len(sc["showcases"]), "homes": homes} if sc else None,
         "happened": happened,
         "happened_count": len(notes),

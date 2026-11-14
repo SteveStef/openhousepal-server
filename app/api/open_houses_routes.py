@@ -9,7 +9,8 @@ from app.database import get_db
 from app.models.database import LeadEvent, LeadNote, OpenHouseEvent, OpenHouseHostRequest, OpenHouseListingNote, User, OpenHouseVisitor, OpenHouseSignInView, OpenHouseFormRequest, Notification, ScheduledEmail, AgentHub, Property
 from app.services import email_signature_service
 from app.services.open_house_manager_service import INACTIVE_STATUSES
-from app.utils.auth import get_current_active_user, require_active_plan, require_broker_authorization
+from app.utils.auth import get_current_active_user, get_current_user_optional, require_active_plan, require_broker_authorization
+from app.utils.own_traffic import contact_is_owner, is_own_traffic, not_owner_test
 from app.schemas.open_house import OpenHouseCreateRequest, OpenHouseResponse, OpenHouseFormSubmission, OpenHouseFormResponse, VisitorResponse, NoteUpdate, QrDarkModeUpdate, ShareGuestsUpdate, GuestSettingsUpdate, OpenHouseSnapshotUpdate, OpenHouseCheatSheetSnapshotUpdate, OpenHouseCheatSheetPhotosUpdate, OpenHouseFormRequestCreate, OpenHouseFormRequestResponse, OpenHouseFormRequestType
 from app.schemas.leads import LeadNoteCreate, LeadNoteUpdate
 from app.services.open_house_service import OpenHouseService
@@ -206,6 +207,7 @@ async def get_open_houses(
                 OpenHouseVisitor.open_house_event_id.label("open_house_event_id"),
                 func.count(OpenHouseVisitor.id).label("visitor_count"),
             )
+            .where(not_owner_test(OpenHouseVisitor.owner_test))   # the agent's own test sign-in isn't a guest
             .group_by(OpenHouseVisitor.open_house_event_id)
             .subquery()
         )
@@ -502,7 +504,8 @@ async def get_open_house(
 ):
     """Single open house's property details - backs the Visitor Insights page header photo/address."""
     visitor_count_result = await db.execute(
-        select(func.count(OpenHouseVisitor.id)).where(OpenHouseVisitor.open_house_event_id == open_house_id)
+        select(func.count(OpenHouseVisitor.id)).where(OpenHouseVisitor.open_house_event_id == open_house_id,
+                                                not_owner_test(OpenHouseVisitor.owner_test))
     )
     visitor_count = visitor_count_result.scalar() or 0
 
@@ -607,7 +610,8 @@ async def delete_open_house(
 async def submit_open_house_form(
     form_data: OpenHouseFormSubmission,
     request: Request,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    viewer: Optional[User] = Depends(get_current_user_optional),
 ):
     """
     Submit open house visitor form
@@ -654,6 +658,12 @@ async def submit_open_house_form(
         visitor = await OpenHouseService.create_visitor(db, form_data)
 
         open_house_info = await OpenHouseService.get_open_house_event_by_id(db, form_data.open_house_event_id) if form_data.open_house_event_id else None
+        # The host testing their own sign-in: still saved and works end to end, but not a stat.
+        try:
+            await _flag_owner_test_signin(db, visitor, form_data, open_house_info, viewer)
+        except Exception:
+            logger.exception("owner-test check on sign-in failed (non-fatal)")
+            await db.rollback()
         from_similar_qr = (form_data.intent or "").lower() == "similar"
         # Someone with an agent scanning the Similar Homes QR: the page tells them kindly we can't
         # help with their search, and the host isn't bothered - no lead, alert or wrap-up email.
@@ -732,6 +742,24 @@ async def submit_open_house_form(
             status_code=500,
             detail="Failed to process form submission"
         )
+
+
+async def _flag_owner_test_signin(db: AsyncSession, visitor: OpenHouseVisitor, form_data: OpenHouseFormSubmission,
+                                  open_house_info: Optional[dict], viewer: Optional[User]) -> bool:
+    """Marks a sign-in as the host's own test (owner_test) when they're signed in to their account
+    on their own phone (not a Kiosk tablet - guests sign in on the host's signed-in tablet there),
+    or typed their own account email anywhere. See utils/own_traffic."""
+    agent_id = (open_house_info or {}).get("agent_id")
+    if not agent_id:
+        return False
+    test = (is_own_traffic(viewer, agent_id) and (form_data.signin_mode or "").lower() != "kiosk")
+    if not test:
+        test = contact_is_owner(await db.get(User, agent_id), visitor.email)
+    if test:
+        visitor.owner_test = True
+        db.add(visitor)
+        await db.commit()
+    return test
 
 
 async def _showcase_and_alert(db: AsyncSession, visitor: OpenHouseVisitor, form_data: OpenHouseFormSubmission,
@@ -974,7 +1002,8 @@ async def track_signin_view(
     open_house_event_id: str,
     mode: Optional[str] = None,
     device: Optional[str] = None,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    viewer: Optional[User] = Depends(get_current_user_optional),
 ):
     """
     Fired once each time the public sign-in form is actually shown to someone (a guest's own
@@ -984,9 +1013,15 @@ async def track_signin_view(
     surface to a guest - a missed view just slightly undercounts a stat, nothing more.
     """
     try:
-        oh_result = await db.execute(select(OpenHouseEvent.id).where(OpenHouseEvent.id == open_house_event_id))
-        if not oh_result.scalar_one_or_none():
+        oh_result = await db.execute(select(OpenHouseEvent.agent_id).where(OpenHouseEvent.id == open_house_event_id))
+        agent_id = oh_result.scalar_one_or_none()
+        if not agent_id:
             raise HTTPException(status_code=404, detail="Open house not found")
+
+        # The host opening their own sign-in page while signed in isn't a guest (owner, 11/13) - except
+        # on a Kiosk tablet, which is the host's signed-in device that guests themselves sign in on.
+        if is_own_traffic(viewer, agent_id) and (mode or "").strip().lower() != "kiosk":
+            return {"success": True, "view_id": None}
 
         from app.services.open_house_service import SIGNIN_DEVICES, SIGNIN_MODES, _word
         view = OpenHouseSignInView(open_house_event_id=open_house_event_id,

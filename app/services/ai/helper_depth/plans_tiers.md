@@ -51,21 +51,20 @@ Order in each line: No-MLS Basic / No-MLS Premium / Basic / Premium / IDX.
 - No-MLS Basic also gets Your sales (they print on the Brag Sheet).
 - Review plans add Reviews. Signature plans (IDX, No-MLS Premium) add Email signature. IDX adds Website homes, Your website, Web address.
 
-## AI allowance (the "Monthly AI Usage" meter)
-- One shared monthly allowance covers every AI tool together. The agent decides how to spend it.
+## AI allowance (the "AI Usage" meter)
+- One shared monthly allowance covers every AI tool together, the AI helper chat included (since 11/13 there is no separate chat allowance). The agent decides how to spend it - they can use all of it on the chat if they like.
 - Relative size: No-MLS Basic and Basic = 1x. No-MLS Premium and Premium = 2x ("2X Basic's AI Credits"). IDX = 4x ("4X Basic's AI Credits"). It is shown as a percent, never as dollars.
 - It resets every month on the agent's billing day (the day their plan renews), not the 1st. At 100% you see "You've reached this month's AI limit - it resets on [their date]."
 - At 90% Media Lab photo and video pause ("AI Studio photo and video are paused until it resets").
-- What uses it: CMA AI analysis (the biggest everyday user), Cheat Sheet Recap, Polish with AI on your bio, the Blog AI writer and its rewrite tools, Spotlight's automatic setup and Room by Room, Media Lab and pasting reviews to import. Some map and place lookups your actions trigger also count a little. Chatting with the AI helper does NOT use it.
+- What uses it: CMA AI analysis (the biggest everyday user), Cheat Sheet Recap, Polish with AI on your bio, the Blog AI writer and its rewrite tools, Spotlight's automatic setup and Room by Room, Media Lab and pasting reviews to import. Some map and place lookups your actions trigger also count a little. Chatting with the AI helper (and read-aloud / live voice) uses it too, as do AI follow-up writing and Showcase must-haves.
 - The meter shows in Settings and inside the AI tools before you run them (for example "under 1% of your monthly AI").
 - "Your team has used this month's AI allowance. It resets on [date]." - the agent's plan is paid by their brokerage or team and shares one AI allowance with the team; it comes back on that date. Their broker or the OpenHousePal team (Help) can help. Only explain this when the agent saw that message - never bring up team allowances otherwise, and never say dollar amounts.
 
-## AI helper chat (the "Chat Usage" meter)
-- The AI helper chat has its own separate allowance, shown as a percent on the "Chat Usage" meter (on the helper's start screen and in Settings). It never uses the Monthly AI Usage allowance.
-- Inside a chat it's always showing, to one decimal, and moves after each reply: on a phone as a slim "CHAT" line on the sheet's top bar (above the X); on a computer as a slim line above the typing box. A typical reply is a small fraction of a percent.
-- Relative size: No-MLS Basic and Basic = 1x. No-MLS Premium and Premium = 2x. IDX = 4x. Each plan has double the chat of the one below it. Never say dollar amounts.
-- It resets on the same billing day as the AI meter. Near the limit the meter appears above the typing box with an upgrade button ("Upgrade to Premium for 2x the chat"). At 100% the chat says it's used up, when it resets, and which plan has double.
-- Things the helper makes for you (designs, Showcases, forms, follow-ups) don't cost extra - only the chat messages count. Starting the Blog AI writer from the chat uses the Monthly AI Usage allowance, same as starting it on the Blogs page.
+## AI helper chat and the AI Usage meter
+- The chat uses the same one AI Usage allowance as every other AI tool - there is no separate "Chat Usage" meter any more.
+- Inside a chat the AI Usage bar is always showing, to one decimal, and moves after each reply: on a phone as a slim "AI" line on the sheet's top bar (above the X); on a computer as a slim line above the typing box. A typical reply is a small fraction of a percent.
+- Near the limit the meter shows an upgrade button ("Upgrade to Premium for 2x the AI usage"). At 100% the chat says the AI usage is used up and when it resets.
+- Things the helper makes for you (designs, Showcases, forms, follow-ups) don't cost extra - only the chat messages and the AI reading/writing they ask for count.
 - Media Lab also has its own count limits on how many photo edits and videos can be made per day and per month.
 
 ## Storage

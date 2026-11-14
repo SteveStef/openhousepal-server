@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import HTTPException, status
-from sqlalchemy import case, func, literal_column, null, select
+from sqlalchemy import case, func, literal_column, null, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -579,7 +579,18 @@ async def record_form_progress(db: AsyncSession, form: AgentForm, payload: FormP
     await db.commit()
 
 
-async def submit_form(db: AsyncSession, form: AgentForm, payload: FormSubmissionCreate) -> FormSubmissionResponse:
+def real_form_sessions():
+    """Form visits that aren't the agent's own test: a visit whose submission is flagged owner_test
+    (see submit_form) is left out of views / completions / drop-off. utils/own_traffic."""
+    tests = select(FormSubmission.id).where(FormSubmission.owner_test.is_(True))
+    return or_(FormViewSession.submission_id.is_(None), FormViewSession.submission_id.notin_(tests))
+
+
+async def submit_form(db: AsyncSession, form: AgentForm, payload: FormSubmissionCreate,
+                      owner_test: bool = False) -> FormSubmissionResponse:
+    """owner_test: the caller already knows this is the form's own agent (signed in on their own
+    form). A fill with the agent's own account email is flagged here too. Either way it's saved and
+    works like any other - it's only left out of stats."""
     await assert_form_is_live(db, form)
     answers_by_id = {answer.question_id: answer.value for answer in payload.answers}
 
@@ -711,9 +722,26 @@ async def submit_form(db: AsyncSession, form: AgentForm, payload: FormSubmission
         campaign_id=campaign_id,
         showing=showing,
     )
+    try:
+        from app.models.database import User as _Owner
+        from app.utils.own_traffic import contact_is_owner
+        if owner_test or contact_is_owner(await db.get(_Owner, form.owner_id), submission.contact_email):
+            submission.owner_test = True
+    except Exception:  # never blocks the submission
+        logger.warning("owner-test check on form submission failed", exc_info=True)
     db.add(submission)
     await db.commit()
     await db.refresh(submission)
+    if submission.owner_test and payload.session_key:
+        # Tie the visit to its test submission so the visit drops out of views / drop-off too.
+        try:
+            await db.execute(update(FormViewSession).where(
+                FormViewSession.form_id == form.id, FormViewSession.session_key == payload.session_key,
+            ).values(submission_id=submission.id))
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            logger.warning("linking owner-test visit failed", exc_info=True)
 
     gate = _showcase_gate(form, answers_by_id)
     # A seller already working with another agent is represented too (no follow-up for them).

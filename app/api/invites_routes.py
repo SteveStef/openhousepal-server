@@ -15,7 +15,7 @@ from app.database import get_db
 from app.models.database import EventInvite, EventInviteRecipient, EventInviteRsvp, User
 from app.schemas.invites import InvitePublicRequest, InviteSave, InviteSendRequest, InviteStatusUpdate, RsvpSubmit
 from app.services import invites_service as svc
-from app.utils.auth import owner_has_access, require_active_plan
+from app.utils.auth import get_current_user_optional, owner_has_access, require_active_plan
 
 logger = get_logger(__name__)
 
@@ -229,8 +229,14 @@ async def public_invite(code: str, host: Optional[str] = Query(default=None, max
 
 
 @router.post("/public/{code}/view", status_code=status.HTTP_204_NO_CONTENT)
-async def public_view(code: str, db: AsyncSession = Depends(get_db)):
+async def public_view(code: str, db: AsyncSession = Depends(get_db),
+                      viewer: Optional[User] = Depends(get_current_user_optional),
+                      owner_ref: bool = False):
     inv, _ = await _public(db, code)
+    # The agent opening their own invitation isn't a guest view (owner, 11/13 - utils/own_traffic).
+    from app.utils.own_traffic import is_own_traffic
+    if owner_ref or is_own_traffic(viewer, inv.owner_id):
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
     await db.execute(update(EventInvite).where(EventInvite.id == inv.id).values(view_count=EventInvite.view_count + 1))
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

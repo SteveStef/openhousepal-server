@@ -164,6 +164,9 @@ async def test_town_research_ai_stays_off_the_agent_bar():
     class CaptureDb:
         statements = []
 
+        async def get(self, *_a, **_k):  # usage_period() looks the agent up - none: calendar month
+            return None
+
         async def execute(self, stmt):
             self.statements.append(str(stmt.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})))
 

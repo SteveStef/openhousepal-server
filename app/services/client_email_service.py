@@ -373,7 +373,7 @@ async def before_send(owner_id: Optional[str], to: Optional[str], template: str,
                         return None
             links = {k: variables[k] for k in LINK_VARS if isinstance(variables.get(k), str) and variables[k].startswith("http")}
             rec = ClientEmail(owner_id=owner_id, recipient_email=email, template=template, subject=(subject or "")[:500],
-                              kind=kind, status="sending", links=links or None)
+                              kind=kind, status="sending", links=links or None, about=about_from(variables) or None)
             db.add(rec)
             if dkey:
                 _DEDUPE_PENDING[rec.id] = dkey   # recorded with the email if it goes from their own mailbox
@@ -394,6 +394,36 @@ async def before_send(owner_id: Optional[str], to: Optional[str], template: str,
     except Exception:  # noqa: BLE001 - tracking must never stop an email
         logger.warning("client email tracking failed - sending untracked", exc_info=True)
         return None, variables
+
+
+_ABOUT_KEYS = ("street_address", "city", "state", "image", "price", "beds", "baths", "sqft", "is_price_drop", "old_price", "new_price")
+
+
+def about_from(variables: dict) -> list[dict]:
+    """The homes an email was about, from its own variables (digest / Showcase emails carry
+    `properties` or `homes`; a sign-in thank-you or tour email names one address) - so the agent
+    can see what someone was opening and clicking (owner, 11/13). At most 8, small fields only."""
+    out: list[dict] = []
+    try:
+        for key in ("properties", "homes"):
+            for h in variables.get(key) or []:
+                if isinstance(h, dict) and (h.get("street_address") or h.get("address")):
+                    row = {k: h.get(k) for k in _ABOUT_KEYS if h.get(k) not in (None, "")}
+                    row.setdefault("street_address", h.get("address"))
+                    out.append(row)
+            if out:
+                break
+        if not out:
+            addr = variables.get("property_address") or variables.get("home_address") or variables.get("street")
+            if isinstance(addr, str) and addr.strip():
+                row = {"street_address": addr.strip()[:200]}
+                img = variables.get("property_image") or variables.get("home_image")
+                if isinstance(img, str) and img.startswith("http"):
+                    row["image"] = img
+                out.append(row)
+    except Exception:  # noqa: BLE001 - nice to have; never stops an email
+        return []
+    return [{k: (str(v)[:300] if isinstance(v, str) else v) for k, v in r.items()} for r in out[:8]]
 
 
 def failure_reason(code: Optional[int], body: Optional[str]) -> str:
@@ -526,12 +556,15 @@ async def record_open(db, track_id: str) -> None:
         logger.info("Email open ignored - the agent's Sent folder", extra={"client_email": rec.id, "undone": len(undone)})
         return
     rec.open_count = (rec.open_count or 0) + 1
+    rec.last_engaged_at = _now()
     first = rec.opened_at is None
     if first:
         rec.opened_at = _now()
     await db.commit()
     if first:
         await _engaged(db, rec, "opened")
+    elif rec.open_count >= 2:
+        await _repeat(db, rec)
 
 
 async def record_click(db, track_id: str, key: str) -> Optional[str]:
@@ -542,6 +575,7 @@ async def record_click(db, track_id: str, key: str) -> Optional[str]:
     if rec.status != "sent" or _scanner(rec):
         return url
     rec.click_count = (rec.click_count or 0) + 1
+    rec.last_engaged_at = _now()
     first = rec.clicked_at is None
     if first:
         rec.clicked_at = _now()
@@ -551,7 +585,20 @@ async def record_click(db, track_id: str, key: str) -> Optional[str]:
     await db.commit()
     if first:
         await _engaged(db, rec, "clicked")
+    if (rec.click_count or 0) >= 2 or ((rec.open_count or 0) >= 2 and not first):
+        await _repeat(db, rec)
     return url
+
+
+async def _repeat(db, rec: ClientEmail) -> None:
+    """A second (third...) open or click of the same email - worth telling the agent about, quietly,
+    with a check-in to add (lead_interest_service, owner 11/13). Never stops the open / click."""
+    try:
+        from app.services import lead_interest_service
+        await lead_interest_service.note_repeat(db, rec)
+    except Exception:  # noqa: BLE001
+        logger.warning("repeat engagement note failed", exc_info=True)
+        await db.rollback()
 
 
 async def record_visit(db, track_id: str) -> None:
@@ -941,4 +988,5 @@ def email_out(r: ClientEmail) -> dict:
             "kind": r.kind, "via": r.via, "status": r.status, "error": r.error, "created_at": r.created_at.isoformat() if r.created_at else None,
             "delivery": r.delivery, "delivery_note": r.delivery_note, "delivery_at": r.delivery_at.isoformat() if r.delivery_at else None,
             "sent_at": r.sent_at.isoformat() if r.sent_at else None, "opened_at": r.opened_at.isoformat() if r.opened_at else None,
-            "open_count": r.open_count or 0, "clicked_at": r.clicked_at.isoformat() if r.clicked_at else None, "click_count": r.click_count or 0}
+            "open_count": r.open_count or 0, "clicked_at": r.clicked_at.isoformat() if r.clicked_at else None, "click_count": r.click_count or 0,
+            "last_engaged_at": r.last_engaged_at.isoformat() if r.last_engaged_at else None, "about": r.about or []}

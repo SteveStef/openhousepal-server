@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from app.models.database import ClientEmail, Lead, Notification, User
 from app.services import client_email_service as ce
 from app.services.agent_email_service import app_url
-from app.utils.auth import get_current_active_user
+from app.utils.auth import get_current_active_user, get_current_user_optional
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["client-emails"])
@@ -51,9 +51,14 @@ async def track_click(track_id: str, key: str, db: AsyncSession = Depends(get_db
 
 
 @router.post("/e/v/{track_id}")
-async def track_visit(track_id: str, db: AsyncSession = Depends(get_db)):
-    """The Showcase page was opened from a personal email's own link (?ce=<id>) - no redirect hop."""
+async def track_visit(track_id: str, db: AsyncSession = Depends(get_db), viewer: Optional[User] = Depends(get_current_user_optional)):
+    """The Showcase page was opened from a personal email's own link (?ce=<id>) - no redirect hop.
+    The agent opening their own email's link (signed in) is not their client clicking (owner, 11/13)."""
     try:
+        if viewer is not None:
+            rec = await db.get(ClientEmail, track_id[:64])
+            if rec is not None and rec.owner_id == viewer.id:
+                return {"ok": True}
         await ce.record_visit(db, track_id[:64])
     except Exception:  # noqa: BLE001
         logger.warning("visit tracking failed", exc_info=True)
@@ -283,3 +288,51 @@ async def person_frequency(body: PersonFrequency, db: AsyncSession = Depends(get
 @router.put("/client-emails/people")
 async def switch_person(body: PersonSwitch, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_active_user)):
     return await ce.set_manual(db, user.id, await _known_contact(db, user, body.email), body.on)
+
+
+# ---------------------------------------------------------------- "worth a check-in" (owner, 11/13)
+# A lead without an agent opening / clicking the same email 2+ times: lead_interest_service.
+
+class InterestFollowup(BaseModel):
+    due_at: Optional[datetime] = None
+
+
+@router.get("/client-emails/interest")
+async def interest_signals(lead_id: Optional[str] = None, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_active_user)):
+    from app.services import lead_interest_service as li
+    return {"signals": await li.signals(db, user.id, lead_id=lead_id)}
+
+
+@router.post("/client-emails/{email_id}/interest/follow-up", status_code=201)
+async def interest_followup(email_id: str, body: Optional[InterestFollowup] = None, db: AsyncSession = Depends(get_db),
+                            user: User = Depends(get_current_active_user)):
+    from app.api.task_routes import _to_out
+    from app.services import lead_interest_service as li
+    try:
+        task = await li.add_followup(db, user, email_id, due_at=body.due_at if body else None)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Email not found")
+    await db.refresh(task, attribute_names=["lead"])
+    return _to_out(task)
+
+
+@router.post("/client-emails/{email_id}/interest/clear")
+async def interest_clear(email_id: str, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_active_user)):
+    from app.services import lead_interest_service as li
+    try:
+        await li.clear(db, user, email_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Email not found")
+    return {"ok": True}
+
+
+@router.get("/client-emails/{email_id}/detail")
+async def email_detail(email_id: str, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_active_user)):
+    """One email, opened up (owner, 11/13): the homes it showed, and - for older emails that didn't
+    record them - the homes the person looked at on their Showcase after it went out."""
+    from app.services import lead_interest_service as li
+    rec = await db.get(ClientEmail, email_id)
+    if rec is None or rec.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Email not found")
+    viewed = [] if rec.about else await li._viewed_after(db, user.id, rec.recipient_email, rec.sent_at, limit=6)
+    return {**ce.email_out(rec), "viewed_after": viewed}

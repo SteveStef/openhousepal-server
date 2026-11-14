@@ -29,7 +29,7 @@ On the right, after a thin divider, there are small icons with no words. Hover o
 - **Account setup** (clipboard icon, until setup is finished): reopens the step-by-step setup. Once it's finished it lives in **Settings**.
 - **Help** (question mark): your support tickets. A red dot means support has replied.
 - **Settings** (gear): your profile, notifications, billing and account. A red "!" means something required is still missing.
-- The **bell**: your notifications.
+- The **bell**: your notifications. Small same-day things of one kind combine into one row ("Jake, Emma and Jim opened your email · Frank also clicked your link", "Jake liked 3 homes and disliked 1", several sign-ins at one open house, several answers to the same form). Tapping a combined row opens **Activity**, which lists each one. Requests, comments, tours, reviews, reminders and someone opening the same email again always get their own row.
 - **Sun / moon**: switches the app between light and dark.
 - **Logout**.
 
@@ -576,7 +576,8 @@ A red number on **Opens** means something is waiting on you (a host request, a r
 **What you'll see:**
 - **Header counts:** **Unread** (new leads), **Open houses** (host requests or replies waiting on you) and **Follow-ups** (due now). It updates on its own.
 - **Quick-create buttons:** **Create Open House Kit**, **Create Showcase**, **Create Form**, **Create Design**, **Create Blog Post**, **Create CMA**, **Media Lab**. If your plan doesn't include a tool, its button shows a lock (tap it to see the upgrade) or is hidden. On a phone these buttons aren't shown on the Dash - use the menu.
-- **Today's Rundown** - your daily briefing. Tap it to open it right on the page.
+- **Today's Rundown** - your daily briefing. Tap it to open it right on the page. The big button at the bottom marks today read and closes it (or just closes it when everything is read). If you already looked at it today, anything that happened since glows gold with a "New" tag, and its group moves to the top.
+  - **Worth a check-in**: a lead with no agent (or not sure) who opens the same email twice or more, or clicks it twice or more. It says what they opened, which homes the email showed (or which homes they looked at after it), and suggests a time to text them (this afternoon if it's morning, otherwise tomorrow at 10). **Add follow-up** makes that follow-up in one tap (it goes in your Follow-ups and calendar); the X dismisses it. The same card shows on that lead's page above their follow-ups, and the bell gets one quiet "Worth a check-in" row per person per day.
 - **Account setup card** - the remaining setup steps for your plan (**Start setup**, **Continue setup** or **Pick up where I left off**). Skipped steps stay as small chips you can tap later.
 - **Stat tiles** (computer and tablet): **Agent Hub Visitors**, **New Leads**, **Sign-ins**, **Forms Viewed**, **Forms Filled**, **Blog Reads**. Tiles for tools your plan doesn't have are hidden. Drag a tile to reorder it.
 - **Yellow banner** "*N* host request(s) waiting on your response" - tap it to open your Host Requests in Manager.
@@ -731,6 +732,8 @@ If the listing agent isn't on OpenHousePal, a note to them opens ("Say hi to" th
 **Where:** Opens > **Manager**.
 
 **Top of the page:** **Scheduled**, **Needs host**, **Avg guests**, **Priority** counts, plus **Refresh Listings**, **My Team** and **Host Requests**. Search and sort your listings (Days on Market or Price).
+
+**Under contract:** listings that are Under contract or Pending sit in their own section below a line, each with a purple **Under contract** (or **Pending**) badge - there's no need to find hosts for them; they stay for their history and insights.
 
 **Each listing card:** a weekend calendar (tap a day to start finding a host for it), **View Insights** and **Manage Hosts**.
 
@@ -917,7 +920,7 @@ Every follow-up's calendar event has links:
 - Numbers at the top (last 30 days): **Sent**, **Opened**, **Clicked**, **Slowed** (people who stopped opening, so they get fewer).
 - The tracker lists your leads only. Delete a lead and they leave it.
 - People filters: **All**, **On**, **Weekly**, **Off**, **Slowed**. Sort: Latest email, Most engaged, Least engaged, Name A-Z.
-- Each person: **Turn off** / **Turn back on** their automatic emails, a **How often** menu, and **Their emails**, which opens what they were sent in a pop-up. A **Why:** line explains a slowdown.
+- Each person: **Turn off** / **Turn back on** their automatic emails, a **How often** menu, and **Their emails**, which opens what they were sent in a pop-up - tap any email there to see how many times they opened and clicked it and the homes it showed (for older emails: the homes they looked at after it). A **Why:** line explains a slowdown.
 - The amber number on the **Email Tracker** button on Leads ("2 slowed") counts people the rules just slowed. It clears once you've looked.
 
 **The automatic rules:**
@@ -1195,8 +1198,8 @@ If your profile is missing something ads must show (like your brokerage or phone
 ### Cinematic Video (its own editor)
 Saved as a draft from the first tap - every change saves by itself, and a live preview of the real video sits beside the steps (a tall video beside them, a wide one above them; always above on a phone). **See an example** plays a short sample. It also runs right inside the AI chat.
 1. **Length & shape** - **15**, **30**, **45** or **60 sec** (the length sets how many photos fit: up to 3, 5, 7 or 9 - each room gets about 5-6 seconds), and the shape: **Landscape**, **Vertical**, **Square** or **Portrait**. Other shapes can be added once it's made.
-2. **What to show** - the AI sorts the home's photos into rooms (about 15-40 seconds). Tap the rooms you want (Front of the home, Kitchen, Pool, Dining room...); **Our pick** resets to the suggestion. Missing one? **Don't see something? Add photos**.
-3. **Check each photo** - one at a time: **Yes, looks right**, **Show another** (the next photo of that room) or **Take it out**; edit the caption or the small line above it, or change the room under **Wrong room?**. **They all look right - skip ahead** checks them all.
+2. **What to show** - the AI sorts every one of the home's photos into rooms (about 15-40 seconds). Tap a room (Front of the home, Kitchen, Bedrooms, Pool...) to open all of its photos with tick boxes - our pick ("Our pick") is ticked to start - and tick the ones you want, e.g. 3 of the 5 bedroom photos (up to the length's limit: 3, 5, 7 or 9 photos). **Done** closes it, **Take this room out** unticks that room. Floor plans, garages, closets and photos the AI couldn't place are under **Other photos** - nothing is hidden. **Our pick** resets everything to the suggestion. Missing one? **Don't see something? Add photos**.
+3. **Check each photo** - one at a time: **Yes, looks right**, **Try another** (goes through every photo of that room in turn, e.g. "2 of 4") or **Take it out**; edit the caption or the small line above it, or change the room under **Wrong room?**. **They all look right - skip ahead** checks them all.
 4. **What's it for?** - Just Listed, Coming Soon, Open House (add the day and time), Price Improved (the old price is crossed out), Under Contract, Just Sold, Back on Market, New Construction, Private Listing or Custom. Sets the opening words and the closing card.
 5. **Look & motion** - **Default** (pick an accent color) or **Luxe** (Gold, Silver or Bronze); style **Cinematic** (**Glide** and **Bold** say "Coming soon").
 6. **Order & transitions** - one transition for the whole video (Clean cut, Crossfade, Dip to black, Light leak, Whip pan, Zoom through) or a different one between any two rooms, plus a camera move per room.

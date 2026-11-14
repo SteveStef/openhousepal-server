@@ -7,8 +7,8 @@ with the exact words that show it.
 Cheap on purpose: Haiku 5.5, about 400 words of input per home, 20 homes per call, only the hits come
 back. A 100-home Showcase is about half a cent; READ_CAP (300 homes) is the most one question reads.
 The cost is worked out BEFORE anything runs (estimate) and checked against what's left of the agent's
-chat allowance (room) - a read that wouldn't fit never starts (owner, 11/08). The real cost is
-counted on the agent's Chat usage bar like any chat answer.
+AI allowance (room) - a read that wouldn't fit never starts (owner, 11/08). The real cost is
+counted on the agent's AI Usage bar like any chat answer.
 
 Every quote is checked against the listing's real text; one that isn't really there is dropped (the
 "why" stays), so the card never shows words the listing didn't say."""
@@ -122,7 +122,7 @@ def estimate_for(config: dict, homes: List[Property]) -> float:
 
 
 async def room(db, user: User, config: dict) -> Tuple[Optional[float], float]:
-    """(dollars left on the agent's chat allowance - None when it has no limit, the allowance)."""
+    """(dollars left on the agent's AI allowance - None when it has no limit, the allowance)."""
     from app.services.ai import ai_rate_limit_service as rl
     snap = await rl.chat_usage_snapshot(db, user.id, config, user.plan_tier)
     limit = float(snap.get("limit_usd") or 0)

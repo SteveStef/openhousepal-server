@@ -38,6 +38,8 @@ from app.schemas.forms import (
     SubmissionReviewedUpdate,
 )
 from app.utils.auth import get_current_active_user, get_current_user_optional, require_active_plan
+from app.utils.own_traffic import is_own_traffic, not_owner_test
+from app.services.forms_service import real_form_sessions
 from app.services.forms_service import record_form_progress, normalize_campaign_redirect, normalize_form_redirect, form_after_submit, campaign_after_submit, active_campaign_for_token, clean_question_forks
 from app.services.leads_service import upsert_lead
 from app.services.agent_email_service import agent_public_phone
@@ -944,12 +946,12 @@ async def _campaign_counts(db: AsyncSession, form_id: str) -> Dict[Optional[str]
     own approach. Keyed by campaign_id (None = General)."""
     counts: Dict[Optional[str], Dict[str, int]] = defaultdict(lambda: {"views": 0, "leads": 0})
     views_result = await db.execute(
-        select(FormViewSession.campaign_id, func.count()).where(FormViewSession.form_id == form_id).group_by(FormViewSession.campaign_id)
+        select(FormViewSession.campaign_id, func.count()).where(FormViewSession.form_id == form_id, real_form_sessions()).group_by(FormViewSession.campaign_id)
     )
     for campaign_id, count in views_result.all():
         counts[campaign_id]["views"] = count
     leads_result = await db.execute(
-        select(FormSubmission.campaign_id, func.count()).where(FormSubmission.form_id == form_id).group_by(FormSubmission.campaign_id)
+        select(FormSubmission.campaign_id, func.count()).where(FormSubmission.form_id == form_id, not_owner_test(FormSubmission.owner_test)).group_by(FormSubmission.campaign_id)
     )
     for campaign_id, count in leads_result.all():
         counts[campaign_id]["leads"] = count
@@ -1082,7 +1084,7 @@ async def get_forms_stats_summary(
 ):
     """Accumulated views/completions across every one of the owner's forms - powers the summary
     strip at the top of the Forms tab. No per-question funnel (that's only meaningful per-form)."""
-    result = await db.execute(select(FormViewSession).where(FormViewSession.owner_id == current_user.id))
+    result = await db.execute(select(FormViewSession).where(FormViewSession.owner_id == current_user.id, real_form_sessions()))
     sessions = result.scalars().all()
     return _build_stats_payload(sessions, [])
 
@@ -1099,7 +1101,7 @@ async def get_form_stats(
     campaign's stats and from General-only stats below - never conflate the three."""
     form = await get_owned_form(db, form_id, current_user.id)
     days = days if days in STATS_RANGES else 30
-    result = await db.execute(select(FormViewSession).where(FormViewSession.form_id == form_id))
+    result = await db.execute(select(FormViewSession).where(FormViewSession.form_id == form_id, real_form_sessions()))
     sessions = _in_range(result.scalars().all(), days)
     breakdown = await _campaign_breakdown(db, form_id) if form.form_type in CAMPAIGN_ELIGIBLE_FORM_TYPES else None
     if breakdown is not None and days:
@@ -1241,7 +1243,7 @@ async def get_general_campaign_stats(
     form = await get_owned_form(db, form_id, current_user.id)
     _require_campaign_eligible(form)
     days = days if days in STATS_RANGES else 30
-    result = await db.execute(select(FormViewSession).where(FormViewSession.form_id == form_id, FormViewSession.campaign_id.is_(None)))
+    result = await db.execute(select(FormViewSession).where(FormViewSession.form_id == form_id, FormViewSession.campaign_id.is_(None), real_form_sessions()))
     sessions = _in_range(result.scalars().all(), days)
     return _build_stats_payload(sessions, form.questions, days=days)
 
@@ -1260,7 +1262,7 @@ async def get_campaign_stats(
     _require_campaign_eligible(form)
     await get_owned_campaign(db, form_id, campaign_id, current_user.id)
     days = days if days in STATS_RANGES else 30
-    result = await db.execute(select(FormViewSession).where(FormViewSession.form_id == form_id, FormViewSession.campaign_id == campaign_id))
+    result = await db.execute(select(FormViewSession).where(FormViewSession.form_id == form_id, FormViewSession.campaign_id == campaign_id, real_form_sessions()))
     sessions = _in_range(result.scalars().all(), days)
     return _build_stats_payload(sessions, form.questions, days=days)
 
@@ -2066,6 +2068,7 @@ async def get_public_form(
     c: Optional[str] = Query(None, description="Campaign token from the link (?c=) - its after-submit choice overrides the form's."),
     preview: bool = Query(False, description="An editor's live preview (setup flow / form Settings) - not a visit."),
     db: AsyncSession = Depends(get_db),
+    viewer: Optional[User] = Depends(get_current_user_optional),
 ):
     hub = await hub_by_slug(db, normalize_form_slug(agent_slug))  # current link or its kept old one
     if not hub:
@@ -2089,10 +2092,10 @@ async def get_public_form(
     from app.services.forms_service import assert_form_is_live
     await assert_form_is_live(db, form)
 
-    # Submissions count regardless of whether the visitor is logged in, so views need to match -
-    # excluding logged-in viewers here (but not on submit) made Completion Rate nonsensical
-    # whenever an agent tested their own form while signed in: fills went up, views stayed at 0.
-    if not preview:
+    # The form's own agent (signed in) isn't a visitor - and their own submit is flagged owner_test
+    # and left out of fills too, so Completion Rate stays even (owner, 11/13 - utils/own_traffic).
+    # Anyone else signed in still counts, on both sides.
+    if not preview and not is_own_traffic(viewer, form.owner_id):
         try:
             db.add(AgentHubEvent(owner_id=form.owner_id, event_type="form_view"))
             await db.commit()
@@ -2173,7 +2176,7 @@ async def track_form_progress(
             return {"success": True}
         # The agent trying out their own form isn't a visitor - same rule as Agent Hub visits and
         # blog reads, so "Forms Viewed" on Dash only counts real guests.
-        if viewer and viewer.id == form.owner_id:
+        if is_own_traffic(viewer, form.owner_id):
             return {"success": True}
 
         await record_form_progress(db, form, payload)
@@ -2194,6 +2197,7 @@ async def submit_public_form(
     payload: FormSubmissionCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
+    viewer: Optional[User] = Depends(get_current_user_optional),
 ):
     from app.services.public_rate_limit import check_public_submit
     check_public_submit(request)
@@ -2216,7 +2220,7 @@ async def submit_public_form(
     # with the website's site-scoped form endpoint (public_site_routes.py) so both public entry
     # points submit into the exact same pipeline instead of duplicating it.
     from app.services.forms_service import submit_form
-    return await submit_form(db, form, payload)
+    return await submit_form(db, form, payload, owner_test=is_own_traffic(viewer, form.owner_id))
 
 
 @router.get("/public/{agent_slug}/{form_slug}/showing/{submission_id}")

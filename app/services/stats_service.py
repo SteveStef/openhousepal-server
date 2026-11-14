@@ -3,10 +3,11 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Literal
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.database import AgentHubEvent, BlogEvent, FormSubmission, FormViewSession, Lead, OpenHouseEvent, OpenHouseVisitor, OpenHouseSignInView
+from app.models.database import AgentHubEvent, BlogEvent, FormSubmission, FormViewSession, Lead, OpenHouseEvent, OpenHouseVisitor, OpenHouseSignInView, User
+from app.utils.own_traffic import not_owner_test
 
 Metric = Literal["agent_hub_visits", "agent_hub_interactions", "qr_scans", "form_views", "form_fills", "blog_reads", "open_house_signins", "new_leads", "open_house_signin_views", "open_house_unrepresented"]
 
@@ -25,6 +26,20 @@ def local_day(ts: datetime) -> date:
 # A visitor "interacted" when they clicked anything on the hub OR saved the contact card (the vCard
 # download is logged server-side, so it still counts if the click ping was cut off by the download).
 _EVENT_TYPES_BY_UNIQUE_METRIC = {"agent_hub_visits": ("visit",), "agent_hub_interactions": ("interaction", "save_contact")}
+
+
+def real_signin_views():
+    """Sign-in page showings that aren't the host's own test: a Kiosk showing still counts when it's
+    recorded (guests use the host's signed-in tablet), unless it turned into a sign-in flagged as
+    the host's own (owner_test, e.g. they typed their own email). See utils/own_traffic."""
+    tests = select(OpenHouseVisitor.id).where(OpenHouseVisitor.owner_test.is_(True))
+    return or_(OpenHouseSignInView.visitor_id.is_(None), OpenHouseSignInView.visitor_id.notin_(tests))
+
+
+def not_owner_lead(owner_id: str):
+    """A lead made from the agent's own email (their test sign-in / form fill) isn't a new lead."""
+    own_email = select(User.email).where(User.id == owner_id).scalar_subquery()
+    return or_(Lead.email.is_(None), func.lower(Lead.email) != func.lower(own_email))
 
 
 def _hub_visit_filter():
@@ -64,13 +79,14 @@ async def _timestamps_for_metric(db: AsyncSession, owner_id: str, metric: Metric
     elif metric == "form_views":
         # One per visitor session (reloads don't double count) - the same numbers the Forms tab's
         # per-form insights show, across Agent Hub and IDX form URLs alike.
+        from app.services.forms_service import real_form_sessions
         stmt = select(FormViewSession.created_at).where(
-            FormViewSession.owner_id == owner_id,
+            FormViewSession.owner_id == owner_id, real_form_sessions(),
             FormViewSession.created_at >= since, FormViewSession.created_at <= until,
         )
     elif metric == "form_fills":
         stmt = select(FormSubmission.created_at).where(
-            FormSubmission.owner_id == owner_id,
+            FormSubmission.owner_id == owner_id, not_owner_test(FormSubmission.owner_test),
             FormSubmission.created_at >= since, FormSubmission.created_at <= until,
         )
     elif metric == "blog_reads":
@@ -83,13 +99,13 @@ async def _timestamps_for_metric(db: AsyncSession, owner_id: str, metric: Metric
             select(OpenHouseVisitor.created_at)
             .join(OpenHouseEvent, OpenHouseVisitor.open_house_event_id == OpenHouseEvent.id)
             .where(
-                OpenHouseEvent.agent_id == owner_id,
+                OpenHouseEvent.agent_id == owner_id, not_owner_test(OpenHouseVisitor.owner_test),
                 OpenHouseVisitor.created_at >= since, OpenHouseVisitor.created_at <= until,
             )
         )
     elif metric == "new_leads":
         stmt = select(Lead.created_at).where(
-            Lead.owner_id == owner_id,
+            Lead.owner_id == owner_id, not_owner_lead(owner_id),
             Lead.created_at >= since, Lead.created_at <= until,
         )
     elif metric == "open_house_signin_views":
@@ -97,7 +113,7 @@ async def _timestamps_for_metric(db: AsyncSession, owner_id: str, metric: Metric
             select(OpenHouseSignInView.created_at)
             .join(OpenHouseEvent, OpenHouseSignInView.open_house_event_id == OpenHouseEvent.id)
             .where(
-                OpenHouseEvent.agent_id == owner_id,
+                OpenHouseEvent.agent_id == owner_id, real_signin_views(),
                 OpenHouseSignInView.created_at >= since, OpenHouseSignInView.created_at <= until,
             )
         )
@@ -106,7 +122,7 @@ async def _timestamps_for_metric(db: AsyncSession, owner_id: str, metric: Metric
             select(OpenHouseVisitor.created_at)
             .join(OpenHouseEvent, OpenHouseVisitor.open_house_event_id == OpenHouseEvent.id)
             .where(
-                OpenHouseEvent.agent_id == owner_id, OpenHouseVisitor.has_agent == "NO",
+                OpenHouseEvent.agent_id == owner_id, OpenHouseVisitor.has_agent == "NO", not_owner_test(OpenHouseVisitor.owner_test),
                 OpenHouseVisitor.created_at >= since, OpenHouseVisitor.created_at <= until,
             )
         )
@@ -220,17 +236,18 @@ def _tidy(s) -> str:
 async def get_breakdown(db: AsyncSession, owner_id: str, metric: str, start: date, end: date, limit: int = 6) -> dict:
     from sqlalchemy import func
     from app.models.database import AgentForm, Blog, LeadEvent
+    from app.services.forms_service import real_form_sessions
     since, until = day_bounds(start, end)
     rows: List[tuple] = []
     rate = {}
     if metric in ("form_views", "form_fills", "form_completion"):
         views = dict((await db.execute(
             select(AgentForm.title, func.count()).select_from(FormViewSession).join(AgentForm, AgentForm.id == FormViewSession.form_id)
-            .where(FormViewSession.owner_id == owner_id, FormViewSession.created_at >= since, FormViewSession.created_at < until)
+            .where(FormViewSession.owner_id == owner_id, real_form_sessions(), FormViewSession.created_at >= since, FormViewSession.created_at < until)
             .group_by(AgentForm.title))).all())
         fills = dict((await db.execute(
             select(AgentForm.title, func.count()).select_from(FormSubmission).join(AgentForm, AgentForm.id == FormSubmission.form_id)
-            .where(FormSubmission.owner_id == owner_id, FormSubmission.created_at >= since, FormSubmission.created_at < until)
+            .where(FormSubmission.owner_id == owner_id, not_owner_test(FormSubmission.owner_test), FormSubmission.created_at >= since, FormSubmission.created_at < until)
             .group_by(AgentForm.title))).all())
         if metric == "form_views":
             rows = list(views.items())
@@ -247,12 +264,12 @@ async def get_breakdown(db: AsyncSession, owner_id: str, metric: str, start: dat
     elif metric in ("open_house_signins", "open_house_unrepresented", "open_house_signin_views", "open_house_signin_completion"):
         def visitors(unrep: bool = False):
             q = (select(OpenHouseEvent.address, func.count()).select_from(OpenHouseVisitor).join(OpenHouseEvent, OpenHouseVisitor.open_house_event_id == OpenHouseEvent.id)
-                 .where(OpenHouseEvent.agent_id == owner_id, OpenHouseVisitor.created_at >= since, OpenHouseVisitor.created_at < until))
+                 .where(OpenHouseEvent.agent_id == owner_id, not_owner_test(OpenHouseVisitor.owner_test), OpenHouseVisitor.created_at >= since, OpenHouseVisitor.created_at < until))
             if unrep:
                 q = q.where(OpenHouseVisitor.has_agent == "NO")
             return q.group_by(OpenHouseEvent.address)
         page_views = (select(OpenHouseEvent.address, func.count()).select_from(OpenHouseSignInView).join(OpenHouseEvent, OpenHouseSignInView.open_house_event_id == OpenHouseEvent.id)
-                      .where(OpenHouseEvent.agent_id == owner_id, OpenHouseSignInView.created_at >= since, OpenHouseSignInView.created_at < until)
+                      .where(OpenHouseEvent.agent_id == owner_id, real_signin_views(), OpenHouseSignInView.created_at >= since, OpenHouseSignInView.created_at < until)
                       .group_by(OpenHouseEvent.address))
         if metric == "open_house_signin_views":
             rows = (await db.execute(page_views)).all()
@@ -264,7 +281,7 @@ async def get_breakdown(db: AsyncSession, owner_id: str, metric: str, start: dat
             rows = (await db.execute(visitors(metric == "open_house_unrepresented"))).all()
     elif metric == "new_leads":
         from app.api.lead_routes import _origin_group
-        leads = (await db.execute(select(Lead.id).where(Lead.owner_id == owner_id, Lead.created_at >= since, Lead.created_at < until))).scalars().all()
+        leads = (await db.execute(select(Lead.id).where(Lead.owner_id == owner_id, not_owner_lead(owner_id), Lead.created_at >= since, Lead.created_at < until))).scalars().all()
         groups: Dict[str, int] = defaultdict(int)
         if leads:
             evs = (await db.execute(select(LeadEvent).where(LeadEvent.lead_id.in_(leads)).order_by(LeadEvent.lead_id, LeadEvent.occurred_at))).scalars().all()

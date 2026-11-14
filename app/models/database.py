@@ -309,6 +309,8 @@ class FormSubmission(Base):
     # request as Pending until the agent confirms a time, then Confirmed.
     showing = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # The form's own agent testing it (signed in, or their own email) - kept, left out of stats.
+    owner_test = Column(Boolean, nullable=True)
 
     form = relationship("AgentForm", back_populates="submissions")
 
@@ -739,6 +741,12 @@ class ClientEmail(Base):
     open_count = Column(Integer, nullable=False, default=0, server_default='0')
     clicked_at = Column(DateTime(timezone=True), nullable=True)
     click_count = Column(Integer, nullable=False, default=0, server_default='0')
+    # The homes this email was about ([{street_address, city, image, price, ...}], from its own
+    # variables - client_email_service.about_from), its latest open / click, and when the agent
+    # cleared its "worth a check-in" nudge (lead_interest_service, owner 11/13).
+    about = Column(JSONB, nullable=True)
+    last_engaged_at = Column(DateTime(timezone=True), nullable=True)
+    nudge_cleared_at = Column(DateTime(timezone=True), nullable=True)
     # Last time this email's image loaded as part of the agent scrolling their own Sent folder - not
     # counted as an open (client_email_service._sent_folder_burst, owner 10/26).
     sent_folder_seen_at = Column(DateTime(timezone=True), nullable=True)
@@ -1391,6 +1399,9 @@ class OpenHouseVisitor(Base):
     signin_seconds = Column(Integer, nullable=True)
     signin_mode = Column(String(12), nullable=True)
     signin_device = Column(String(12), nullable=True)
+    # The hosting agent testing their own sign-in (signed in on their phone, or their own email) -
+    # kept and works like any sign-in, but left out of every stat (utils/own_traffic, 11/13).
+    owner_test = Column(Boolean, nullable=True)
 
     # Relationships
     open_house_event = relationship("OpenHouseEvent")

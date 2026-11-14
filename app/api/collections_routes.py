@@ -2075,7 +2075,7 @@ async def save_smart_filter(collection_id: str, body: SmartFilterUpdate, db: Asy
                             current_user: User = Depends(require_premium_plan)):
     """The agent's smart filter (owner, 11/09): up to 3 things the AI looks for in every home of this
     Showcase - the homes that have them all are starred with a line saying so. Agent only: it spends the
-    agent's chat usage. An empty list turns it off (the stars it gave stay)."""
+    agent's AI usage. An empty list turns it off (the stars it gave stay)."""
     from app.utils.auth import tier_has_mls
     from app.services.showcase_smart_filter import save_wants
     coll = (await db.execute(select(Collection).where(Collection.id == collection_id))).scalar_one_or_none()
@@ -2109,7 +2109,7 @@ class SmartFilterEstimate(BaseModel):
 @router.post("/smart-filter/estimate")
 async def smart_filter_estimate(body: SmartFilterEstimate, db: AsyncSession = Depends(get_db),
                                 current_user: User = Depends(require_premium_plan)):
-    """What reading the search's homes for the must-haves would take of the agent's chat usage - the same
+    """What reading the search's homes for the must-haves would take of the agent's AI usage - the same
     numbers the chat's Home search card shows. Free: no AI."""
     from app.services.showcase_smart_filter import estimate
     return await estimate(db, current_user, body.count, body.wants)

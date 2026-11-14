@@ -8,6 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.services import guest_pass_service as gp
+from app.utils.auth import get_current_user_optional
+from app.utils.own_traffic import is_own_traffic
 
 router = APIRouter()
 
@@ -65,10 +67,14 @@ class GuestPassSeen(BaseModel):
 
 
 @router.post("/guest-pass/{token}/seen")
-async def guest_pass_seen(token: str, body: GuestPassSeen, db: AsyncSession = Depends(get_db)):
+async def guest_pass_seen(token: str, body: GuestPassSeen, db: AsyncSession = Depends(get_db),
+                          viewer=Depends(get_current_user_optional)):
     """What they did on their pass - see guest_pass_service.track. Fire-and-forget; each thing is one
     line per visit and the rows per guest are capped, so it needs no rate limit of its own."""
     visitor, oh, host = await gp.resolve(db, token)
+    # The host opening a guest's pass themselves isn't the guest's activity (owner, 11/13).
+    if is_own_traffic(viewer, oh.agent_id if oh else None):
+        return {"noted": False}
     return await gp.track(db, visitor, oh, host, body.view, body.key, body.session, body.seconds)
 
 
@@ -77,10 +83,13 @@ class GuestPassPing(BaseModel):
 
 
 @router.post("/guest-pass/{token}/ping")
-async def guest_pass_ping(token: str, body: GuestPassPing, db: AsyncSession = Depends(get_db)):
+async def guest_pass_ping(token: str, body: GuestPassPing, db: AsyncSession = Depends(get_db),
+                          viewer=Depends(get_current_user_optional)):
     """Heartbeat while the Guest Pass is open on the guest's screen (every ~20s) - how long each
     visit lasted and whether they came back another day, for the agent's activity log."""
     visitor, oh, _host = await gp.resolve(db, token)
+    if is_own_traffic(viewer, oh.agent_id if oh else None):
+        return {"ok": True}
     await gp.ping(db, visitor, oh, body.session)
     return {"ok": True}
 

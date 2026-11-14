@@ -587,3 +587,25 @@ async def get_recent_failures(
     abuse limits stopped (not errors)."""
     from app.services.admin_failures_service import recent_failures
     return await recent_failures(db, days=max(1, min(int(days), 90)), include_limits=include_limits)
+
+
+# Admin Insights -> AI chat (owner, 11/13): who uses the AI helper, how much, for how long and for
+# what - counts, times and feature names only, never message text (admin_chat_usage_service).
+@router.get("/chat-usage")
+async def get_chat_usage(days: int = 30, db: AsyncSession = Depends(get_db), admin: UserModel = Depends(require_admin_user)):
+    from app.services import admin_chat_usage_service as chat_usage
+    if days not in chat_usage.PERIODS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"days must be one of {chat_usage.PERIODS}")
+    return await chat_usage.overview(db, days)
+
+
+@router.get("/chat-usage/agents/{agent_id}")
+async def get_agent_chat_usage(agent_id: str, days: int = 30, db: AsyncSession = Depends(get_db),
+                               admin: UserModel = Depends(require_admin_user)):
+    from app.services import admin_chat_usage_service as chat_usage
+    if days not in chat_usage.PERIODS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"days must be one of {chat_usage.PERIODS}")
+    out = await chat_usage.agent_detail(db, agent_id, days)
+    if out is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+    return out

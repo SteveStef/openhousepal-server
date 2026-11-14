@@ -19,7 +19,7 @@ from app.services.email_service import tidy_caps
 
 MEDIA_PLANS = {"IDX", "PRO_NO_MLS"}
 TOOLS = ("twilight", "lights_on", "virtual_staging", "enhance", "video", "cinematic")
-CINEMATIC_MAX = 40  # photos it may choose from (the editor picks the video's own by room and length)
+CINEMATIC_MAX = 100  # photos it may choose from (every listing photo - studio_motion_service.POOL_MAX) (the editor picks the video's own by room and length)
 ROOMS = ("living_room", "family_room", "primary_bedroom", "bedroom", "nursery", "kitchen", "dining_room", "office", "basement",
          "bonus_room", "home_gym", "sunroom", "entryway", "patio")
 STYLES = ("modern", "transitional", "luxury", "traditional")
@@ -37,7 +37,7 @@ async def _p_media(db, user, a):
     if key and has_mls:
         p = (await db.execute(select(Property).where(Property.listing_key == key))).scalars().first()
         if p is not None:
-            photos = [x for x in (p.photos or []) if isinstance(x, str)][:40] if isinstance(p.photos, list) else []
+            photos = [x for x in (p.photos or []) if isinstance(x, str)][:CINEMATIC_MAX] if isinstance(p.photos, list) else []
             listing = {"listing_key": key, "address": tidy_caps(p.street_address) or "", "city": tidy_caps(p.city) or "", "state": p.state, "zipcode": p.zipcode,
                        "price": p.price, "beds": p.bedrooms, "baths": p.bathrooms, "sqft": p.living_area, "photos": photos}
     ups = (await db.execute(select(StudioMediaAsset.result_url).where(StudioMediaAsset.owner_id == user.id, StudioMediaAsset.kind == "upload", StudioMediaAsset.result_url.isnot(None))

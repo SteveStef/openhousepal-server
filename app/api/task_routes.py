@@ -581,11 +581,63 @@ async def _ai_user(db: AsyncSession, user: User) -> User:
 @router.get("/checkins")
 async def list_checkins(lead_id: Optional[str] = Query(None), db: AsyncSession = Depends(get_db),
                         current_user: User = Depends(get_current_active_user)):
-    """Leads with a check-in waiting (no AI - just who and why), and what one written message takes."""
-    from app.services import followup_writer
+    """Leads worth a check-in (no AI - who, why, best first, grouped) and what one written message takes."""
+    from app.services import checkins_service, followup_writer
     items = await followup_writer.checkins(db, current_user, lead_id=lead_id)
     est = await followup_writer.estimate(db, current_user)
-    return {"items": items, "estimate": est}
+    return {"items": items, "groups": checkins_service.GROUPS, "estimate": est}
+
+
+class CheckinAddBody(_BM):
+    reason: Optional[str] = None    # the "why now" line shown on the card - kept in the follow-up's notes
+
+
+async def _owned_lead(db: AsyncSession, lead_id: str, user: User) -> Lead:
+    lead = await db.get(Lead, lead_id)
+    if lead is None or lead.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return lead
+
+
+@router.post("/checkins/{lead_id}/add", response_model=TaskOut, status_code=201)
+async def quick_add_checkin(lead_id: str, body: CheckinAddBody, db: AsyncSession = Depends(get_db),
+                            current_user: User = Depends(get_current_active_user)):
+    """One tap, no AI (owner, 11/13): a check-in for tomorrow with the plain "how's the search going?" text
+    (their Showcase link last when they have one), signed like the automatic ones."""
+    from datetime import datetime as _dt, time as _time, timedelta as _td
+    from app.services import checkins_service
+    lead = await _owned_lead(db, lead_id, current_user)
+    has_sc = False
+    try:
+        has_sc = bool((await tasks_service.lead_showcase_info(db, current_user, [lead])).get(lead.id))
+    except Exception:  # noqa: BLE001
+        logger.warning("showcase lookup failed for quick check-in %s", lead.id, exc_info=True)
+    first = tasks_service._guest_first(lead.name) or ""
+    msg = checkins_service.quick_message(first, current_user, has_sc)
+    # Tomorrow, whole day (noon due, the phone buzzes at 9 AM Eastern) - same as the other suggested ones.
+    day = (_dt.now(tasks_service.EASTERN) + _td(days=1)).date()
+    at = lambda h: _dt.combine(day, _time(h), tzinfo=tasks_service.EASTERN)
+    task = AgentTask(owner_id=current_user.id, lead_id=lead.id, title=f"Check in with {first or lead.name or 'them'}",
+                     notes=f"Why now: {body.reason}" if (body.reason or "").strip() else None,
+                     kind="text" if lead.phone else "email", priority="normal", due_at=at(12), remind_at=at(9), all_day=True,
+                     suggested_message=tasks_service.with_footer(msg, current_user) or msg)
+    db.add(task)
+    await db.commit()
+    await db.refresh(task, attribute_names=["lead"])
+    calendar_sync_service.sync_task_bg(current_user.id, task.id)
+    return _to_out(task)
+
+
+@router.post("/checkins/{lead_id}/skip")
+async def skip_checkin(lead_id: str, days: int = Query(30, ge=0, le=365), db: AsyncSession = Depends(get_db),
+                       current_user: User = Depends(get_current_active_user)):
+    """"Not now": this person's check-in stays away for 30 days (days=0 brings it back)."""
+    from datetime import datetime as _dt, timezone as _tz
+    from app.services import checkins_service
+    await _owned_lead(db, lead_id, current_user)
+    current_user.followup_rules = checkins_service.with_skip(current_user.followup_rules, lead_id, _dt.now(_tz.utc), days)
+    await db.commit()
+    return {"ok": True, "days": days}
 
 
 @router.post("/write")

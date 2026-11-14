@@ -1184,12 +1184,13 @@ async def get_site_public_form_by_type(
     site_id: str,
     form_type: str,
     track_view: bool = Query(True, description="Set false for metadata/preflight reads that should not count as a visitor view."),
+    owner_ref: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
     if form_type != "how_can_i_help":
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Unsupported default form type.")
     _, user, form = await _get_site_default_form(db, site_id, form_type)
-    if track_view:
+    if track_view and not owner_ref:
         try:
             db.add(AgentHubEvent(owner_id=form.owner_id, event_type="form_view"))
             await db.commit()
@@ -1204,13 +1205,14 @@ async def get_site_public_form(
     form_id: str,
     track_view: bool = Query(True, description="Set false for metadata/preflight reads that should not count as a visitor view."),
     c: Optional[str] = Query(None, description="Campaign token from the link (?c=)."),
+    owner_ref: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
     """Site-scoped twin of forms_routes.get_public_form (which requires an Agent Hub slug to
     resolve ownership) - same AgentForm row, same response shape, just reached by an agent's
     Site instead of their Agent Hub. Website Builder does not require Agent Hub to exist."""
     _, user, form = await _get_site_form(db, site_id, form_id)
-    if track_view:
+    if track_view and not owner_ref:
         try:
             db.add(AgentHubEvent(owner_id=form.owner_id, event_type="form_view"))
             await db.commit()
@@ -1221,14 +1223,16 @@ async def get_site_public_form(
 
 
 @router.post("/{site_id}/forms/{form_id}/submit", response_model=FormSubmissionResponse)
-async def submit_site_public_form(site_id: str, form_id: str, payload: FormSubmissionCreate, request: Request, db: AsyncSession = Depends(get_db)):
+async def submit_site_public_form(site_id: str, form_id: str, payload: FormSubmissionCreate, request: Request, db: AsyncSession = Depends(get_db),
+                                  owner_ref: bool = False):
     from app.services.public_rate_limit import check_public_submit
     check_public_submit(request)
     """Submits into the exact same pipeline as the Agent-Hub-scoped public form (same
     FormSubmission row, same Lead upsert via forms_service.submit_form) - the website is another
     source feeding the existing OHP lead system, not a separate inbox."""
     _, _, form = await _get_site_form(db, site_id, form_id)
-    return await forms_service.submit_form(db, form, payload)
+    # owner_ref: the site's own agent testing it - saved and works, left out of stats.
+    return await forms_service.submit_form(db, form, payload, owner_test=owner_ref)
 
 
 class SiteAskRequest(BaseModel):
@@ -1412,10 +1416,13 @@ async def ask_about_site_property(site_id: str, listing_key: str, payload: SiteA
 
 
 @router.post("/{site_id}/forms/{form_id}/progress")
-async def track_site_public_form_progress(site_id: str, form_id: str, payload: FormProgressUpdate, db: AsyncSession = Depends(get_db)):
+async def track_site_public_form_progress(site_id: str, form_id: str, payload: FormProgressUpdate, db: AsyncSession = Depends(get_db),
+                                          owner_ref: bool = False):
     """Best-effort form progress tracking for website-hosted form aliases. Uses the same
     FormViewSession table as the Agent Hub URL so stats stay canonical across both public
     doorways."""
+    if owner_ref:   # the site's own agent trying their form - not a visit (utils/own_traffic)
+        return {"success": True}
     try:
         _, _, form = await _get_site_form(db, site_id, form_id)
         await _track_site_form_progress(db, form, payload)
@@ -1431,6 +1438,7 @@ async def track_site_public_form_progress(site_id: str, form_id: str, payload: F
 async def get_site_showcase_creator(
     site_id: str,
     track_view: bool = Query(True, description="Set false for metadata/preflight reads that should not count as a visitor view."),
+    owner_ref: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
     """Branded IDX doorway into the canonical showcase_request AgentForm.
@@ -1440,7 +1448,7 @@ async def get_site_showcase_creator(
     drives the same OHP Showcase creation workflow as the Agent Hub QR/link path.
     """
     _, user, form = await _get_site_showcase_creator_form(db, site_id)
-    if track_view:
+    if track_view and not owner_ref:
         try:
             db.add(AgentHubEvent(owner_id=form.owner_id, event_type="form_view"))
             await db.commit()
@@ -1450,17 +1458,21 @@ async def get_site_showcase_creator(
 
 
 @router.post("/{site_id}/showcase-creator/submit", response_model=FormSubmissionResponse)
-async def submit_site_showcase_creator(site_id: str, payload: FormSubmissionCreate, request: Request, db: AsyncSession = Depends(get_db)):
+async def submit_site_showcase_creator(site_id: str, payload: FormSubmissionCreate, request: Request, db: AsyncSession = Depends(get_db),
+                                       owner_ref: bool = False):
     from app.services.public_rate_limit import check_public_submit
     check_public_submit(request)
     """Submit the IDX Showcase Creator through forms_service.submit_form, preserving the single
     FormSubmission/Lead/Notification/Collection pipeline used by existing OHP public forms."""
     _, _, form = await _get_site_showcase_creator_form(db, site_id)
-    return await forms_service.submit_form(db, form, payload)
+    return await forms_service.submit_form(db, form, payload, owner_test=owner_ref)
 
 
 @router.post("/{site_id}/showcase-creator/progress")
-async def track_site_showcase_creator_progress(site_id: str, payload: FormProgressUpdate, db: AsyncSession = Depends(get_db)):
+async def track_site_showcase_creator_progress(site_id: str, payload: FormProgressUpdate, db: AsyncSession = Depends(get_db),
+                                               owner_ref: bool = False):
+    if owner_ref:
+        return {"success": True}
     try:
         _, _, form = await _get_site_showcase_creator_form(db, site_id)
         await _track_site_form_progress(db, form, payload)
