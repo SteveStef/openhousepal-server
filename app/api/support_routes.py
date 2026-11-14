@@ -12,6 +12,7 @@ Suggest a feature), plus a small whitelisted `details` blob the browser fills in
 page they came from, browser/device/screen, urgency) and optional screenshots on the first
 message - all shown to the admin beside the thread.
 """
+import asyncio
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 
@@ -143,7 +144,7 @@ async def upload_screenshot(
     except ValueError:
         raise HTTPException(status_code=422, detail="Please attach a JPG, PNG or WebP image.")
     try:
-        url = s3_service.upload_bytes(jpeg, SCREENSHOT_PREFIX, ".jpg", "image/jpeg")
+        url = await asyncio.to_thread(s3_service.upload_bytes, jpeg, SCREENSHOT_PREFIX, ".jpg", "image/jpeg")
     except Exception as e:
         logger.error("uploading support screenshot failed", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail="Couldn't upload that screenshot - please try again.")

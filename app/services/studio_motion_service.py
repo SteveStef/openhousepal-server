@@ -569,7 +569,7 @@ async def remove_photo(db, owner_id: str, asset_id: str, photo_id: str) -> Studi
         if p.get("source") in in_pool:
             continue  # its files stay with the pool (it can be picked again); deleted with the project
         for k in ("clean", "depth", "sharp"):
-            s3_service.delete_by_url(p.get(k))
+            await asyncio.to_thread(s3_service.delete_by_url, p.get(k))
     return asset
 
 
@@ -1534,7 +1534,7 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
                 if u:
                     await storage_ledger_service.release(db, u)
         for u in old_urls:
-            s3_service.delete_by_url(u)
+            await asyncio.to_thread(s3_service.delete_by_url, u)
         if asset and (asset.options or {}).get("render", {}).get("main", True):
             popts = dict(asset.options or {})
             old_prev = popts.get("preview_frame_url")
@@ -1551,7 +1551,7 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
                 def keep_prev(a, o):
                     o["preview_frame_url"] = info[0]
                 await _patch(asset_id, keep_prev)
-                s3_service.delete_by_url(old_prev)
+                await asyncio.to_thread(s3_service.delete_by_url, old_prev)
         # Only now (the video is safely stored) let the worker drop its copy - a restart before this
         # point resumes and downloads it again instead of losing the finished render.
         if lam:

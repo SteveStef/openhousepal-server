@@ -1431,7 +1431,7 @@ async def upload_my_photo(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
 
     old_photo_url = current_user.photo_url
-    photo_url = s3_service.upload_bytes(contents, "agent-photos", ".jpg", "image/jpeg")
+    photo_url = await asyncio.to_thread(s3_service.upload_bytes, contents, "agent-photos", ".jpg", "image/jpeg")
     current_user.photo_url = photo_url
     hub = (await db.execute(select(AgentHub).where(AgentHub.owner_id == current_user.id))).scalar_one_or_none()
     if hub:
@@ -1440,7 +1440,7 @@ async def upload_my_photo(
         hub.config = cfg
     await db.commit()
 
-    s3_service.delete_by_url(old_photo_url)
+    await asyncio.to_thread(s3_service.delete_by_url, old_photo_url)
     from app.services import storage_ledger_service
     await storage_ledger_service.release(db, old_photo_url)
     await storage_ledger_service.record(db, current_user.id, "agent_photo", photo_url, len(contents))
@@ -1477,7 +1477,7 @@ async def upload_my_sale_photo(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
 
-    photo_url = s3_service.upload_bytes(contents, "agent-sale-photos", extension, file.content_type)
+    photo_url = await asyncio.to_thread(s3_service.upload_bytes, contents, "agent-sale-photos", extension, file.content_type)
     from app.services import storage_ledger_service
     await storage_ledger_service.record(db, current_user.id, "agent_sale_photo", photo_url, len(contents))
     return {"photo_url": photo_url}
@@ -1498,7 +1498,7 @@ async def delete_my_photo(
         hub.config = cfg
     await db.commit()
 
-    s3_service.delete_by_url(old_photo_url)
+    await asyncio.to_thread(s3_service.delete_by_url, old_photo_url)
     from app.services import storage_ledger_service
     await storage_ledger_service.release(db, old_photo_url)
 

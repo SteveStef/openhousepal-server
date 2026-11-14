@@ -20,6 +20,7 @@ every call counts against the agent's shared Monthly AI Usage allowance
 interview up-front with the upgrade/usage message instead of failing after the agent typed it all.
 """
 from __future__ import annotations
+import asyncio
 
 import html
 import json
@@ -411,7 +412,7 @@ async def _ai_town_photo(db: AsyncSession, user: User, area: MarketArea) -> dict
             "trees and setting characteristic of the area, in soft daylight. No text, no signs with words, no logos, no people.",
             size="1536x1024", quality="medium",
         )
-        url = s3_service.upload_bytes(_wide(result.image_bytes), "town-photos", ".jpg", "image/jpeg")
+        url = await asyncio.to_thread(s3_service.upload_bytes, _wide(result.image_bytes), "town-photos", ".jpg", "image/jpeg")
         await record_usage_event(db, user.id, None, provider.model, None, None, _image_cost(result, config, 0.04), 0, False, None, event_type="studio_media_image")
     except Exception as exc:  # noqa: BLE001
         logger.warning("ai town photo failed", extra={"area": area.slug, "error": str(exc) or repr(exc)})

@@ -13,12 +13,18 @@ logger = logging.getLogger(__name__)
 # Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# Connections per copy of the API. One copy (WEB_WORKERS=1, the default): 10 + 20 extra, as always.
+# Several copies each get a smaller pool, so together they stay well under Postgres's default 100
+# connections (3 copies: 3 x (6 + 8) = 42 at the very most). 11/14.
+_WEB_WORKERS = max(1, int(os.getenv("WEB_WORKERS", "1") or 1))
+_POOL, _OVERFLOW = (10, 20) if _WEB_WORKERS == 1 else (6, 8)
+
 # Create async engine optimized for PostgreSQL
 engine = create_async_engine(
     DATABASE_URL,
     echo=True if os.getenv("DEBUG") == "true" else False,
-    pool_size=10,
-    max_overflow=20,
+    pool_size=_POOL,
+    max_overflow=_OVERFLOW,
     pool_recycle=3600
 )
 

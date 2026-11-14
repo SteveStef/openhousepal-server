@@ -3,6 +3,7 @@ storage limit, the size limit and the agent's upload library all apply, and it c
 takes a photo. Every address read back is checked against the agent's own uploads, so a card can never
 be pointed at someone else's file or an outside address.
 """
+import asyncio
 import base64
 import io
 from typing import Optional
@@ -30,7 +31,7 @@ async def add(db: AsyncSession, user: User, data: bytes, content_type: str) -> d
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         # A logo needs its see-through background, which the JPG copy loses.
         try:
-            png_url = s3_service.upload_bytes(data, "ai-attachments", ".png", "image/png")
+            png_url = await asyncio.to_thread(s3_service.upload_bytes, data, "ai-attachments", ".png", "image/png")
             asset.options = {**(asset.options or {}), "png_url": png_url}
             flag_modified(asset, "options")
             await db.commit()

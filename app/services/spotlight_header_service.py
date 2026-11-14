@@ -14,6 +14,7 @@ reused by any other Spotlight site for the same home. This module only adds:
   never does. Built with the same bundled ffmpeg the video pipeline already uses.
 """
 from __future__ import annotations
+import asyncio
 
 import os
 from typing import Optional
@@ -143,9 +144,9 @@ async def make_loop(clip_url: str) -> dict:
         await asyncio.to_thread(build_boomerang, src, out)
         await asyncio.to_thread(poster_frame, out, poster)
         with open(out, "rb") as f:
-            url = s3_service.upload_bytes(f.read(), _S3_PREFIX, ".mp4", "video/mp4", cache_control=_CACHE)
+            url = await asyncio.to_thread(s3_service.upload_bytes, f.read(), _S3_PREFIX, ".mp4", "video/mp4", cache_control=_CACHE)
         with open(poster, "rb") as f:
-            poster_url = s3_service.upload_bytes(f.read(), _S3_PREFIX, ".jpg", "image/jpeg", cache_control=_CACHE)
+            poster_url = await asyncio.to_thread(s3_service.upload_bytes, f.read(), _S3_PREFIX, ".jpg", "image/jpeg", cache_control=_CACHE)
         return {"url": url, "poster": poster_url}
     finally:
         shutil.rmtree(work, ignore_errors=True)

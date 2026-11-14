@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
@@ -138,12 +139,12 @@ async def upload_brand_logo(
 
     kit = await get_or_create_brand_kit(db, current_user.id)
     old_url = getattr(kit, f"{slot}_logo_url")
-    url = s3_service.upload_bytes(contents, "studio-media", extension, content_type)
+    url = await asyncio.to_thread(s3_service.upload_bytes, contents, "studio-media", extension, content_type)
     setattr(kit, f"{slot}_logo_url", url)
     await db.commit()
     await db.refresh(kit)
 
-    s3_service.delete_by_url(old_url)
+    await asyncio.to_thread(s3_service.delete_by_url, old_url)
     await storage_ledger_service.release(db, old_url)
     await storage_ledger_service.record(db, current_user.id, "brand_logo", url, len(contents))
 
@@ -164,7 +165,7 @@ async def delete_brand_logo(
     await db.commit()
     await db.refresh(kit)
 
-    s3_service.delete_by_url(old_url)
+    await asyncio.to_thread(s3_service.delete_by_url, old_url)
     await storage_ledger_service.release(db, old_url)
 
     return _kit_out(kit, current_user)
@@ -198,7 +199,7 @@ async def upload_studio_media(
 
     cfg = await ai_config_service.get_config(db)
     await storage_ledger_service.enforce_cap(db, current_user.id, cfg, getattr(current_user, "plan_tier", None), len(contents))
-    url = s3_service.upload_bytes(contents, "studio-media", extension, file.content_type)
+    url = await asyncio.to_thread(s3_service.upload_bytes, contents, "studio-media", extension, file.content_type)
     cat = category if category in ("blog", "design", "brand_logo") else "studio_media"
     await storage_ledger_service.record(db, current_user.id, cat, url, len(contents))
     return MediaUploadResponse(url=url)

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -984,7 +985,7 @@ async def delete_manual_listing(db: AsyncSession, current_user: User, listing_ke
     await db.delete(prop)
     await db.commit()
 
-    s3_service.delete_by_url(photo_url)
+    await asyncio.to_thread(s3_service.delete_by_url, photo_url)
     await storage_ledger_service.release(db, photo_url)
 
 

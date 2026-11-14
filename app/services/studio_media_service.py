@@ -365,7 +365,7 @@ async def _runway_fetchable_url(source_url: str, config: Optional[dict] = None) 
         return source_url  # untouched upload, already fine - skip the redundant re-upload
     ext = ".png" if content_type == "image/png" else ".jpg"
     try:
-        return s3_service.upload_bytes(data, _S3_PREFIX, ext, content_type)
+        return await asyncio.to_thread(s3_service.upload_bytes, data, _S3_PREFIX, ext, content_type)
     except Exception as exc:  # noqa: BLE001
         logger.warning("studio media video source mirror failed", extra={"error": _exc_text(exc)})
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Couldn't prepare that photo for video.") from exc
@@ -873,7 +873,7 @@ async def _store_image_asset(db, user, payload, effects, action_label, options, 
     # Always store the edit at the source MLS photo's exact aspect first (no crop/distortion).
     final_bytes = _match_source_dimensions(image_bytes, source_bytes)
     try:
-        result_url = s3_service.upload_bytes(final_bytes, _S3_PREFIX, ".png", "image/png")
+        result_url = await asyncio.to_thread(s3_service.upload_bytes, final_bytes, _S3_PREFIX, ".png", "image/png")
     except Exception as exc:  # noqa: BLE001
         if reservation is not None:
             await reconcile_budget(db, reservation, 0.0)
@@ -886,8 +886,8 @@ async def _store_image_asset(db, user, payload, effects, action_label, options, 
         try:
             up_bytes = await _magnific_image_upscale(result_url, config, asset_id=action_label)
             if up_bytes:
-                new_url = s3_service.upload_bytes(up_bytes, _S3_PREFIX, ".png", "image/png")
-                s3_service.delete_by_url(result_url)
+                new_url = await asyncio.to_thread(s3_service.upload_bytes, up_bytes, _S3_PREFIX, ".png", "image/png")
+                await asyncio.to_thread(s3_service.delete_by_url, result_url)
                 result_url, final_bytes = new_url, up_bytes
                 cost += float(config.get("studio_media_image_upscale_estimate_usd", 0.25) or 0.0)
         except Exception as exc:  # noqa: BLE001
@@ -907,7 +907,7 @@ async def _store_image_asset(db, user, payload, effects, action_label, options, 
         if asset is None:
             # Deleted while it was still working - nothing to keep (the spend above is real and
             # stays counted; only the file goes).
-            s3_service.delete_by_url(result_url)
+            await asyncio.to_thread(s3_service.delete_by_url, result_url)
             raise HTTPException(status.HTTP_410_GONE, "That project was deleted.")
         keep = {k: v for k, v in (asset.options or {}).items() if k in ("client_request_id", "custom_name", "staging_tag")}
         asset.options = {**(options.model_dump(exclude_none=True)), **keep, "effects": effects,
@@ -954,7 +954,7 @@ async def _enhance_photo_for_video(image_url: str, config: dict) -> str:
     if not up_bytes:
         return image_url
     try:
-        return s3_service.upload_bytes(up_bytes, _S3_PREFIX, ".png", "image/png")
+        return await asyncio.to_thread(s3_service.upload_bytes, up_bytes, _S3_PREFIX, ".png", "image/png")
     except Exception as exc:  # noqa: BLE001
         logger.warning("studio media video photo-enhance upload failed", extra={"error": _exc_text(exc)})
         return image_url
@@ -1449,7 +1449,7 @@ async def _download_and_concat(clips: list[dict], tmpdir: str) -> str:
     if len(paths) == 1:
         os.replace(paths[0], stitched)
     else:
-        _concat_mp4(paths, stitched)
+        await asyncio.to_thread(_concat_mp4, paths, stitched)
     return stitched
 
 
@@ -1533,7 +1533,7 @@ async def reframe_video_bytes(result_url: str, ratio_key: str) -> bytes:
             r.raise_for_status()
         with open(src, "wb") as f:
             f.write(r.content)
-        _run_vf(src, out, _reframe_vf(ratio_key), preset="fast", crf=20)
+        await asyncio.to_thread(_run_vf, src, out, _reframe_vf(ratio_key), preset="fast", crf=20)
         with open(out, "rb") as f:
             return f.read()
     except HTTPException:
@@ -2003,11 +2003,11 @@ async def export_video_bytes(
         # placements separately and is responsible for choosing ones that don't collide.
         png = await _render_branding_png(user, brand, out_w, out_h, position=branding.get("position", "top-left"))
         if png:
-            data = _composite_overlay(data, png, timed=False)
+            data = await asyncio.to_thread(_composite_overlay, data, png, timed=False)
 
     if title_card and title_card.get("enabled"):
         png = _render_title_card_png(title_card, asset.linked_property, out_w, out_h)
-        data = _composite_overlay(data, png, timed=True)
+        data = await asyncio.to_thread(_composite_overlay, data, png, timed=True)
 
     return data
 
@@ -2275,7 +2275,7 @@ async def _finish_video_runway_legacy(db, asset, opts: dict, clips: list[dict], 
                     async with httpx.AsyncClient(timeout=httpx.Timeout(240.0, connect=15.0), follow_redirects=True) as client:
                         r = await client.get(mpoll.output_url)
                         r.raise_for_status()
-                    result_url = s3_service.upload_bytes(r.content, _S3_PREFIX, ".mp4", "video/mp4")
+                    result_url = await asyncio.to_thread(s3_service.upload_bytes, r.content, _S3_PREFIX, ".mp4", "video/mp4")
                     store_exc = None
                     break
                 except Exception as exc:  # noqa: BLE001
@@ -2301,7 +2301,7 @@ async def _finish_video_runway_legacy(db, asset, opts: dict, clips: list[dict], 
             asset.status = "succeeded"
             asset.result_url = result_url
             asset.cost_usd = cost
-            final_size = _probe_video_size_bytes(r.content)
+            final_size = await asyncio.to_thread(_probe_video_size_bytes, r.content)
             opts["size_bytes"] = len(r.content)
             opts["upscaled_by"] = asset.provider
             opts["upscale_completed"] = True
@@ -2310,7 +2310,7 @@ async def _finish_video_runway_legacy(db, asset, opts: dict, clips: list[dict], 
             opts["upscale_resolution"] = config.get("studio_media_video_upscale_resolution")
             if final_size:
                 opts["final_width"], opts["final_height"] = final_size
-            preview_info = _store_preview_frame(r.content, opts)
+            preview_info = await asyncio.to_thread(_store_preview_frame, r.content, opts)
             asset.options = opts
             await _settle_video(db, asset, cost, est_cost, block_reason=None)
             await db.commit()
@@ -2379,8 +2379,8 @@ async def _finish_video_runway_legacy(db, asset, opts: dict, clips: list[dict], 
             try:
                 bh = int(config.get("studio_media_video_upscale_base_height", 1080) or 1080)
                 bw = (bh * 16 // 9); bw -= bw % 2
-                base_bytes, final_secs = _assemble_final(stitched, tmpdir, config, asset, out_wh=(bw, bh), enhance=False)
-                base_url = s3_service.upload_bytes(base_bytes, _S3_PREFIX, ".mp4", "video/mp4")
+                base_bytes, final_secs = await asyncio.to_thread(_assemble_final, stitched, tmpdir, config, asset, out_wh=(bw, bh), enhance=False)
+                base_url = await asyncio.to_thread(s3_service.upload_bytes, base_bytes, _S3_PREFIX, ".mp4", "video/mp4")
                 mprov = video_provider(asset.provider, asset.provider_model or config["studio_media_video_model"])
                 # Pass the whole config dict rather than individually-named kwargs - a prior
                 # version passed `resolution=`, a name fal_video.py's submit_video_upscale never
@@ -2420,11 +2420,8 @@ async def _finish_video_runway_legacy(db, asset, opts: dict, clips: list[dict], 
             except Exception as exc:  # noqa: BLE001 - fall back to the local enhance pass
                 logger.warning("ai upscale submit failed -> local ffmpeg 4K enhance", extra={"asset_id": asset.id, "error": _exc_text(exc)})
 
-        final_bytes, final_secs = _assemble_final(
-            stitched, tmpdir, config, asset, out_wh=None,
-            enhance=bool(config.get("studio_media_video_enhance", True)),
-        )
-        result_url = s3_service.upload_bytes(final_bytes, _S3_PREFIX, ".mp4", "video/mp4")
+        final_bytes, final_secs = await asyncio.to_thread(_assemble_final, stitched, tmpdir, config, asset, out_wh=None, enhance=bool(config.get("studio_media_video_enhance", True)))
+        result_url = await asyncio.to_thread(s3_service.upload_bytes, final_bytes, _S3_PREFIX, ".mp4", "video/mp4")
     except Exception as exc:  # noqa: BLE001
         logger.warning("studio media video assemble failed", extra={"asset_id": asset.id, "error": _exc_text(exc)})
         asset.status = "failed"
@@ -2443,7 +2440,7 @@ async def _finish_video_runway_legacy(db, asset, opts: dict, clips: list[dict], 
     asset.status = "succeeded"
     asset.result_url = result_url
     asset.cost_usd = cost
-    final_size = _probe_video_size_bytes(final_bytes)
+    final_size = await asyncio.to_thread(_probe_video_size_bytes, final_bytes)
     opts["size_bytes"] = len(final_bytes)
     opts["upscaled_by"] = "ffmpeg"
     opts["upscale_completed"] = False
@@ -2452,7 +2449,7 @@ async def _finish_video_runway_legacy(db, asset, opts: dict, clips: list[dict], 
         opts["final_width"], opts["final_height"] = final_size
     if final_secs:
         opts["duration_seconds"] = round(final_secs, 1)  # actual stored length after any trim
-    preview_info = _store_preview_frame(final_bytes, opts)
+    preview_info = await asyncio.to_thread(_store_preview_frame, final_bytes, opts)
     asset.options = opts
     await _settle_video(db, asset, cost, est_cost, block_reason=None)
     await db.commit()
@@ -2568,11 +2565,8 @@ async def _finish_video_per_clip(db, asset, opts: dict, clips: list[dict], confi
         # re-processing of footage that's already as good as this pipeline can make it. Only run
         # it when upscaling wasn't attempted at all for this asset (minimax, or upscaling turned
         # off), matching what the old whole-video path did for those same two cases.
-        final_bytes, final_secs = _assemble_final(
-            stitched, tmpdir, config, asset, out_wh=None,
-            enhance=(not can_upscale) and bool(config.get("studio_media_video_enhance", True)),
-        )
-        result_url = s3_service.upload_bytes(final_bytes, _S3_PREFIX, ".mp4", "video/mp4")
+        final_bytes, final_secs = await asyncio.to_thread(_assemble_final, stitched, tmpdir, config, asset, out_wh=None, enhance=(not can_upscale) and bool(config.get("studio_media_video_enhance", True)))
+        result_url = await asyncio.to_thread(s3_service.upload_bytes, final_bytes, _S3_PREFIX, ".mp4", "video/mp4")
     except Exception as exc:  # noqa: BLE001
         logger.warning("studio media video assemble failed", extra={"asset_id": asset.id, "error": _exc_text(exc)})
         asset.status = "failed"
@@ -2593,7 +2587,7 @@ async def _finish_video_per_clip(db, asset, opts: dict, clips: list[dict], confi
     asset.status = "succeeded"
     asset.result_url = result_url
     asset.cost_usd = cost
-    final_size = _probe_video_size_bytes(final_bytes)
+    final_size = await asyncio.to_thread(_probe_video_size_bytes, final_bytes)
     opts["size_bytes"] = len(final_bytes)
     all_upscaled = all(c.get("upscaled") for c in clips)
     any_upscaled = any(c.get("upscaled") for c in clips)
@@ -2609,7 +2603,7 @@ async def _finish_video_per_clip(db, asset, opts: dict, clips: list[dict], confi
             preup_stitched = await _download_and_concat_normalized(preup_clips, preup_tmpdir)
             with open(preup_stitched, "rb") as f:
                 preup_bytes = f.read()
-            opts["preupscale_result_url"] = s3_service.upload_bytes(preup_bytes, _S3_PREFIX, ".mp4", "video/mp4")
+            opts["preupscale_result_url"] = await asyncio.to_thread(s3_service.upload_bytes, preup_bytes, _S3_PREFIX, ".mp4", "video/mp4")
             opts["preupscale_size_bytes"] = len(preup_bytes)
         except Exception as exc:  # noqa: BLE001 - comparison aid only, never blocks the real result
             logger.warning("pre-upscale comparison video failed (non-fatal)", extra={"asset_id": asset.id, "error": _exc_text(exc)})
@@ -2625,7 +2619,7 @@ async def _finish_video_per_clip(db, asset, opts: dict, clips: list[dict], confi
         opts["final_width"], opts["final_height"] = final_size
     if final_secs:
         opts["duration_seconds"] = round(final_secs, 1)
-    preview_info = _store_preview_frame(final_bytes, opts)
+    preview_info = await asyncio.to_thread(_store_preview_frame, final_bytes, opts)
     asset.options = opts
     await _settle_video(db, asset, cost, est_cost, block_reason=None)
     await db.commit()
@@ -2657,7 +2651,7 @@ async def _download_and_concat_normalized(clips: list[dict], tmpdir: str) -> str
     if len(paths) == 1:
         os.replace(paths[0], stitched)
         return stitched
-    sizes = [_probe_video_size(p) for p in paths]
+    sizes = [await asyncio.to_thread(_probe_video_size, p) for p in paths]
     known = [s for s in sizes if s]
     if known:
         target = Counter(known).most_common(1)[0][0]
@@ -2666,11 +2660,11 @@ async def _download_and_concat_normalized(clips: list[dict], tmpdir: str) -> str
                 fixed = os.path.join(tmpdir, f"c{i:02d}_fit.mp4")
                 vf = f"scale={target[0]}:{target[1]}:flags=lanczos+accurate_rnd+full_chroma_int,setsar=1"
                 try:
-                    _run_vf(paths[i], fixed, vf, preset="veryfast", crf=20)
+                    await asyncio.to_thread(_run_vf, paths[i], fixed, vf, preset="veryfast", crf=20)
                     paths[i] = fixed
                 except Exception as exc:  # noqa: BLE001 - concat below may still fail; logged either way
                     logger.warning("per-clip resolution normalize failed", extra={"error": _exc_text(exc)})
-    _concat_mp4(paths, stitched)
+    await asyncio.to_thread(_concat_mp4, paths, stitched)
     return stitched
 
 
@@ -2690,8 +2684,8 @@ async def _finish_video_from_base(db, asset, opts: dict, config: dict, est_cost:
         src = os.path.join(tmpdir, "base.mp4")
         with open(src, "wb") as f:
             f.write(r.content)
-        final_bytes, _secs = _assemble_final(src, tmpdir, config, asset, out_wh=None, enhance=True)
-        result_url = s3_service.upload_bytes(final_bytes, _S3_PREFIX, ".mp4", "video/mp4")
+        final_bytes, _secs = await asyncio.to_thread(_assemble_final, src, tmpdir, config, asset, out_wh=None, enhance=True)
+        result_url = await asyncio.to_thread(s3_service.upload_bytes, final_bytes, _S3_PREFIX, ".mp4", "video/mp4")
     except Exception as exc:  # noqa: BLE001
         logger.warning("ai upscale fallback assemble failed", extra={"asset_id": asset.id, "error": _exc_text(exc)})
         if base_url:
@@ -2719,14 +2713,14 @@ async def _finish_video_from_base(db, asset, opts: dict, config: dict, est_cost:
     asset.status = "succeeded"
     asset.result_url = result_url
     asset.cost_usd = cost
-    final_size = _probe_video_size_bytes(final_bytes)
+    final_size = await asyncio.to_thread(_probe_video_size_bytes, final_bytes)
     opts["size_bytes"] = len(final_bytes)
     opts["upscaled_by"] = "ffmpeg"
     opts["upscale_completed"] = False
     opts["upscale_vendor"] = opts.get("upscale_vendor") or "ffmpeg"
     if final_size:
         opts["final_width"], opts["final_height"] = final_size
-    preview_info = _store_preview_frame(final_bytes, opts)
+    preview_info = await asyncio.to_thread(_store_preview_frame, final_bytes, opts)
     asset.options = opts
     await _settle_video(db, asset, cost, est_cost, block_reason=None)
     await db.commit()
@@ -2848,7 +2842,7 @@ async def upload_photo(db: AsyncSession, user: User, data: bytes, content_type: 
     if len(data) > _SOURCE_MAX_BYTES:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "That photo is over 12MB once converted - try a smaller one.")
     try:
-        url = s3_service.upload_bytes(data, _S3_PREFIX, ".jpg", "image/jpeg")
+        url = await asyncio.to_thread(s3_service.upload_bytes, data, _S3_PREFIX, ".jpg", "image/jpeg")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Couldn't save that photo.") from exc
     asset = StudioMediaAsset(
@@ -2872,7 +2866,7 @@ async def delete_asset(db: AsyncSession, owner_id: str, asset_id: str) -> None:
     preview_url = (asset.options or {}).get("preview_frame_url")
     await db.delete(asset)
     await db.commit()
-    s3_service.delete_by_url(result_url)  # never touches source_photo_url
-    s3_service.delete_by_url(preview_url)
+    await asyncio.to_thread(s3_service.delete_by_url, result_url)  # never touches source_photo_url
+    await asyncio.to_thread(s3_service.delete_by_url, preview_url)
     await storage_ledger_service.release(db, result_url)
     await storage_ledger_service.release(db, preview_url)

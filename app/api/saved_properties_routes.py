@@ -5,6 +5,7 @@ not-yet-listed property to attach. Saving here is purely a personal convenience 
 creates a real Open House Manager listing (Property/is_manual) or an Agent Hub recent sale
 (the config.recentSales array) - the agent still adds those deliberately on their own pages.
 """
+import asyncio
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -78,7 +79,7 @@ async def delete_saved_property(
     # Best-effort - a saved property's photo isn't shared with anything else once removed, but a
     # failed S3 delete shouldn't block the user from removing the entry itself.
     try:
-        s3_service.delete_by_url(photo_url)
+        await asyncio.to_thread(s3_service.delete_by_url, photo_url)
         await storage_ledger_service.release(db, photo_url)
     except Exception as e:
         logger.warning("saved property photo cleanup failed", extra={"error": str(e)})

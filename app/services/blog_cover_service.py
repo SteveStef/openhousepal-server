@@ -6,6 +6,7 @@ the agent's own comment ("make it dusk", "no snow"). Same model, limits and mone
 Media (reserve -> call -> record the real cost -> settle; a failed call is recorded as blocked and
 costs nothing). The picture is only a suggestion until the agent taps "Use as cover".
 """
+import asyncio
 import io
 from datetime import datetime, timezone
 
@@ -116,7 +117,7 @@ async def make_cover(db: AsyncSession, user: User, blog: Blog, idea: str | None,
     cost = _image_cost(result, config, est)
     data = _wide(result.image_bytes)
     try:
-        url = s3_service.upload_bytes(data, _PREFIX, ".jpg", "image/jpeg")
+        url = await asyncio.to_thread(s3_service.upload_bytes, data, _PREFIX, ".jpg", "image/jpeg")
     except Exception as exc:  # noqa: BLE001
         await reconcile_budget(db, reservation, 0.0)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Couldn't save the picture - nothing was charged.") from exc

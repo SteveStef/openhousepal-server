@@ -360,10 +360,14 @@ async def generate_cma_ai_analysis(
         # ('generating') and the page polls GET /{id} until it's 'complete' or 'failed' (with
         # generation_error saying why). Nothing the network does can break it any more.
         try:
-            await service.mark_generation_started(db, current_user.id, report_id)
+            claimed = await service.mark_generation_started(db, current_user.id, report_id, claim=True)
         except BaseException:
             await release_cma_generation(report_id)
             raise
+        if not claimed:
+            # Another server copy is already running this report (11/14 - several copies): leave it be.
+            await release_cma_generation(report_id)
+            raise HTTPException(status_code=409, detail=CmaGenerationAlreadyRunning.user_message)
         owner_id, tier = current_user.id, current_user.plan_tier
         opts = dict(max_photos_per_property=payload.max_photos_per_property, include_map_images=payload.include_map_images,
                     force_regenerate=payload.force_regenerate)

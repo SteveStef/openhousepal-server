@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 import uuid
 from functools import lru_cache
 from typing import Optional
@@ -25,9 +26,16 @@ AWS_S3_HOST = f"{AWS_S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com"
 PUBLIC_URL_HOST = os.environ.get("CDN_HOST") or AWS_S3_HOST
 
 
+_CLIENT_LOCK = threading.Lock()
+
+
 @lru_cache(maxsize=1)
 def _client():
-    return boto3.client("s3", region_name=AWS_REGION)
+    # Uploads/deletes run in worker threads (asyncio.to_thread) so they never freeze the server;
+    # boto3's default session isn't thread-safe while a client is being made, so the first one is
+    # made under a lock (the client itself is thread-safe once made). 11/14 load test.
+    with _CLIENT_LOCK:
+        return boto3.client("s3", region_name=AWS_REGION)
 
 
 def upload_bytes(data: bytes, key_prefix: str, extension: str, content_type: str, cache_control: str | None = None) -> str:

@@ -4,6 +4,7 @@ Mirrors app.services.website.site_service's draft/publish shape (see publish_pro
 but one owner can have many of these (unlike the one-per-owner Site), so slug generation has to
 stay globally unique against BOTH tables - see _unique_property_slug.
 """
+import asyncio
 import os
 import re
 from copy import deepcopy
@@ -570,7 +571,7 @@ async def update_draft(db: AsyncSession, site: PropertyWebsite, patch: dict) -> 
     # tracked upload elsewhere in the app. Never touches a URL still referenced after the edit.
     removed = before - _uploaded_urls(draft)
     for url in removed:
-        s3_service.delete_by_url(url)
+        await asyncio.to_thread(s3_service.delete_by_url, url)
         await storage_ledger_service.release(db, url)
     return site
 
@@ -609,7 +610,7 @@ async def delete(db: AsyncSession, site: PropertyWebsite) -> None:
     await db.commit()
     domain_resolution_service.invalidate_property_website(site_id)
     for url in uploaded:
-        s3_service.delete_by_url(url)
+        await asyncio.to_thread(s3_service.delete_by_url, url)
         await storage_ledger_service.release(db, url)
 
 

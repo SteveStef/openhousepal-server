@@ -336,18 +336,30 @@ def _reconcile_stale_generation(report: CmaReport) -> None:
         report.generation_status = "failed"
 
 
-async def mark_generation_started(db: AsyncSession, owner_id: str, report_id: str) -> None:
+async def mark_generation_started(db: AsyncSession, owner_id: str, report_id: str, *, claim: bool = False) -> bool:
     """Stamped right before the expensive part of generate_ai_analysis/recompute_valuation
     begins, and committed immediately (independent of whatever the caller does with `db` for the
     rest of the request) so a concurrent GET - the list page, or the same report reopened after
     navigating away - can see 'generating' right away instead of only after the whole run
-    finishes."""
-    await db.execute(
+    finishes.
+
+    claim=True (the Create AI Analysis route, 11/14): only stamps when no other run is going on this
+    report - checked and written in one statement, so two server copies can't both start the same
+    report (the in-memory hold only sees its own copy). A 'generating' older than the stale window
+    doesn't count. Returns False when another run already has it. The run's own later re-stamp
+    (claim=False) always writes, as before."""
+    cond = [CmaReport.id == report_id, CmaReport.owner_id == owner_id]
+    if claim:
+        stale_before = datetime.now(timezone.utc) - timedelta(seconds=_GENERATION_STALE_AFTER_SECONDS)
+        cond.append(or_(CmaReport.generation_status.is_distinct_from("generating"),
+                        CmaReport.generation_started_at.is_(None), CmaReport.generation_started_at < stale_before))
+    res = await db.execute(
         update(CmaReport)
-        .where(CmaReport.id == report_id, CmaReport.owner_id == owner_id)
+        .where(*cond)
         .values(generation_status="generating", generation_started_at=datetime.now(timezone.utc), generation_error=None)
     )
     await db.commit()
+    return bool(res.rowcount)
 
 
 async def mark_generation_finished(owner_id: str, report_id: str, outcome: str, error: Optional[str] = None) -> None:

@@ -32,5 +32,8 @@ COPY . .
 
 EXPOSE 8000
 
-# Run migrations and start the server
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+# Run migrations and start the server.
+# WEB_WORKERS = how many copies of the API serve requests side by side (default 1 = exactly as before).
+# Set it to 2-4 (no more than the server's CPU cores) so one slow request never holds up everyone.
+# Only one copy runs the scheduled jobs (app/services/scheduler_leader.py), so it's safe to raise.
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${WEB_WORKERS:-1}"]

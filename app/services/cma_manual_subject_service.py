@@ -11,6 +11,7 @@ seller CMAs). Everything here is a helper for the subject step; nothing changes 
     the backend's Google key (the live browser key has no Static Maps access) and stored in S3.
 """
 from __future__ import annotations
+import asyncio
 
 import math
 import os
@@ -215,7 +216,7 @@ async def save_subject_photo(db: AsyncSession, user: User, jpeg: bytes) -> str:
     from app.services.ai.ai_config_service import ai_config_service
     config = await ai_config_service.get_config(db)
     await storage_ledger_service.enforce_cap(db, user.id, config, getattr(user, "plan_tier", None), len(jpeg))
-    url = s3_service.upload_bytes(jpeg, "cma-subject-photos", ".jpg", "image/jpeg")
+    url = await asyncio.to_thread(s3_service.upload_bytes, jpeg, "cma-subject-photos", ".jpg", "image/jpeg")
     await storage_ledger_service.record(db, user.id, "listing_photo", url, len(jpeg))
     return url
 

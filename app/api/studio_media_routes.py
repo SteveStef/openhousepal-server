@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -292,7 +293,7 @@ async def delete_asset(
     extra = studio_motion_service.files_of(asset) if asset.action == "motion" else []
     await studio_media_service.delete_asset(db, current_user.id, asset_id)
     for url in extra:
-        s3_service.delete_by_url(url)
+        await asyncio.to_thread(s3_service.delete_by_url, url)
         await storage_ledger_service.release(db, url)
 
 

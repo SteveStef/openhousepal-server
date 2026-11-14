@@ -4,6 +4,7 @@ Open to any signed-in agent, including one still waiting for broker approval or 
 a plan yet: the shared "about you" steps can be done ahead of time, so everything is ready the
 moment they're approved. Plan-specific steps go through each feature's own (plan-gated) endpoint.
 """
+import asyncio
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
@@ -220,7 +221,7 @@ async def upload_photo(file: UploadFile = File(...), db: AsyncSession = Depends(
     except ValueError as e:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
     old = current_user.photo_url
-    url = s3_service.upload_bytes(contents, "agent-photos", ".jpg", "image/jpeg")
+    url = await asyncio.to_thread(s3_service.upload_bytes, contents, "agent-photos", ".jpg", "image/jpeg")
     current_user.photo_url = url
     hub = await _hub(db, current_user)
     cfg = dict(hub.config or {})
@@ -228,7 +229,7 @@ async def upload_photo(file: UploadFile = File(...), db: AsyncSession = Depends(
     hub.config = cfg
     await db.commit()
     if old and old != url:
-        s3_service.delete_by_url(old)
+        await asyncio.to_thread(s3_service.delete_by_url, old)
         from app.services import storage_ledger_service
         await storage_ledger_service.release(db, old)
     from app.services import storage_ledger_service

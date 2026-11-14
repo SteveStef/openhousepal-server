@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
@@ -575,7 +576,7 @@ async def upload_manual_listing_photo(
     from app.services.ai.ai_config_service import ai_config_service
     _cfg = await ai_config_service.get_config(db)
     await storage_ledger_service.enforce_cap(db, current_user.id, _cfg, getattr(current_user, "plan_tier", None), len(contents))
-    photo_url = s3_service.upload_bytes(contents, "manual-listing-photos", extension, file.content_type)
+    photo_url = await asyncio.to_thread(s3_service.upload_bytes, contents, "manual-listing-photos", extension, file.content_type)
     await storage_ledger_service.record(db, current_user.id, "listing_photo", photo_url, len(contents))
     return {"photo_url": photo_url}
 

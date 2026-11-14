@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import uuid
@@ -803,7 +804,7 @@ async def update_blog(
     # A changed cover image orphaned the old file (in S3 and in the storage ledger) - same
     # release-old-then-record-new pattern as brand logos/agent photos.
     if "cover_image_url" in data and old_cover_url and old_cover_url != blog.cover_image_url:
-        s3_service.delete_by_url(old_cover_url)
+        await asyncio.to_thread(s3_service.delete_by_url, old_cover_url)
         await storage_ledger_service.release(db, old_cover_url)
 
     return blog
@@ -937,7 +938,7 @@ async def delete_blog(
     await db.commit()
 
     if cover_url:
-        s3_service.delete_by_url(cover_url)
+        await asyncio.to_thread(s3_service.delete_by_url, cover_url)
         await storage_ledger_service.release(db, cover_url)
 
 

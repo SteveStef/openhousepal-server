@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+import asyncio
 import uvicorn
 import os
 import re
@@ -360,10 +361,14 @@ async def lifespan(app: FastAPI):
 
     # DISABLE_SCHEDULER=true for a second local/test copy of the API, so it never repeats the
     # real server's jobs (MLS sync, reminder emails, digests...).
+    leader_task = None
     if os.getenv("DISABLE_SCHEDULER", "false").lower() == "true":
         logger.warning("Scheduler disabled (DISABLE_SCHEDULER=true) - no scheduled jobs will run in this process")
     else:
-        scheduler.start()
+        # Several copies of the API (WEB_WORKERS > 1) must not all run the jobs: only the copy that
+        # holds the database "scheduler" lock does; the others keep checking and take over if it goes.
+        from app.services.scheduler_leader import run_scheduler_when_leader
+        leader_task = asyncio.create_task(run_scheduler_when_leader(scheduler))
     logger.info(
         "APScheduler started",
         extra={
@@ -377,6 +382,12 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down application")
+    if leader_task is not None:
+        leader_task.cancel()   # lets go of the scheduler lock so another copy takes over at once
+        try:
+            await leader_task
+        except BaseException:  # noqa: BLE001 - CancelledError on the way out
+            pass
     if scheduler.running:
         scheduler.shutdown()
     logger.info("APScheduler stopped")

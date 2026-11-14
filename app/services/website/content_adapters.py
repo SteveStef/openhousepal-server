@@ -2177,6 +2177,9 @@ async def get_area_inventory(
     filters = [
         location_filter,
         Property.home_status.notin_(INACTIVE_STATUSES),
+        # "Homes for sale" means for sale (owner, 11/14): a Pending / Under Contract home already has a
+        # buyer, so it isn't listed here (the town's market numbers count those separately).
+        ~or_(Property.home_status.ilike("%PENDING%"), Property.home_status.ilike("%UNDER CONTRACT%")),
         geography.residential_for_sale_filter(Property),
         internet_display_ok(),
     ]
