@@ -61,7 +61,8 @@ async def search_cma_comparables(
     """Suggests candidate comparables from the local MLS mirror around a location - the agent
     decides what actually gets added to the CMA, this just narrows the search."""
     from app.services import cma_backtest_arms as _arms
-    arm = await _arms.find_arm(db, current_user.id, listing_key=payload.listing_key)
+    arm = await _arms.find_arm(db, current_user.id, listing_key=payload.listing_key,
+                               address=_arms.subject_address(payload.listing_key, payload.subject))
     if arm:   # CMA accuracy test only: the search window ends on the as-of date
         payload = _arms.shift_search_window(payload, arm)
     with _arms.activated(arm):
@@ -79,7 +80,8 @@ async def auto_search_cma_comparables(
     distance, never past this product's limit) and says when comps are limited - see
     cma_service.auto_search_comparables. Manual changes after that use /comparables/search."""
     from app.services import cma_backtest_arms as _arms
-    arm = await _arms.find_arm(db, current_user.id, listing_key=payload.listing_key)
+    arm = await _arms.find_arm(db, current_user.id, listing_key=payload.listing_key,
+                               address=_arms.subject_address(payload.listing_key, payload.subject))
     if arm:
         payload = _arms.shift_search_window(payload, arm)
     with _arms.activated(arm):

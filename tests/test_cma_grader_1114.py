@@ -523,7 +523,7 @@ def test_agent_review_note_uses_whole_thousands():
 
 def test_asking_price_step_states_the_sales_behind_it():
     st = svc._asking_dom_stat("condo", 58)
-    assert st == {"n": 3350, "pct_above_ask": 8.1, "median_ratio": 0.98, "kind": "condos", "span": "45 to 89 days"}
+    assert st == {"n": 3350, "pct_above_ask": 8.1, "median_ratio": 0.98, "kind": "condos", "span": "45 to 89 days", "segment": "condo"}
     assert svc._asking_dom_stat("house", 120)["span"] == "90 days or more" and svc._asking_dom_stat("house", 5) is None
     grid = [{"feature_adjustments": {"condition": -16400}, "size_adjustment": 0}]
     apc = {"asking_price": 319900, "expected_sale_price": 313502, "allowed_low_price": 266477, "allowed_high_price": 313502,
@@ -635,3 +635,21 @@ def test_homes_under_contract_never_move_the_value(monkeypatch):
     v, lo, hi, info = svc._pending_competition_review({"sqft": 2342}, [_pend("C ST", 815000, 2400, 90)], 655000, 605000, 710000,
                                                       {"anchor": {"market_psf": 250}})
     assert v == 655000 and info["review"] and "C ST" in info["review"]
+
+
+def test_interior_finish_items_count_as_priced_by_the_condition_line():
+    """Test round 6, 104 Linda Ln (entered by hand): condition came off the updated sales in the table, then $13,000
+    more came off as a judgment labelled "carpet over hardwood in bedrooms"."""
+    packet = _packet(630570)
+    packet["deterministic_evidence"]["comp_adjustment_grid"] = [{"comp_label": "Comp #2", "condition": -29000, "baths": -7000},
+                                                                {"comp_label": "Comp #5", "condition": -24000}]
+    reasoning = {"final_fmv": 618000, "range_low": 580000, "range_high": 655000,
+                 "major_value_drags": [{"factor": "1990s kitchen and both baths", "direction": "down"},
+                                       {"factor": "Carpet over hardwood in bedrooms", "direction": "down"},
+                                       {"factor": "No pool or fully finished walkout level versus top sale", "direction": "neutral"}]}
+    out, flags = svc._apply_value_guards(reasoning, packet)
+    assert out["final_fmv"] == 631000 and "already priced in the adjustment table" in out["judgment_discipline"]["why"] and flags
+    # with no condition line in the table, the same reasons are NOT already priced - the step stays
+    packet["deterministic_evidence"]["comp_adjustment_grid"] = [{"comp_label": "Comp #2", "garage": 9000}]
+    out, flags = svc._apply_value_guards(reasoning, packet)
+    assert out["final_fmv"] == 618000

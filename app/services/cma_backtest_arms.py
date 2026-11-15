@@ -62,6 +62,18 @@ async def find_arm(db: AsyncSession, owner_id: Optional[str], *, listing_key: Op
     return None
 
 
+def subject_address(listing_key, subject) -> Optional[str]:
+    """The street address to match an arm on when the home was ENTERED BY HAND (no listing picked, so no
+    listing_key). Owner, 11/15: the seller test with no asking price must be built in the browser exactly as an
+    agent would build it - Enter Manually, type the facts, upload the photos - and the arm still has to cap the
+    comps at the as-of date and run the AI inside the time machine. None when a listing was picked (the listing_key
+    match is the one that counts)."""
+    if listing_key or subject is None:
+        return None
+    s = subject if isinstance(subject, dict) else (subject.model_dump() if hasattr(subject, "model_dump") else {})
+    return (s or {}).get("street_address") or None
+
+
 def tm_from_arm(arm: CmaBacktestArm) -> cma_time_machine.TimeMachine:
     f = arm.facts or {}
     d = lambda v: date.fromisoformat(str(v)[:10]) if v else None  # noqa: E731

@@ -127,6 +127,29 @@ def _property_display_facts(prop: Property) -> Dict[str, Any]:
     }
 
 
+def whole_building_baths(building_beds, twins) -> Optional[float]:
+    """The bath count of a multi-family building, taken from another record of the SAME building - never from a
+    record of one of its units. Outside audit of round 6, 519 Grove St: a 5-bedroom duplex was shown with "2 baths"
+    that came from an old RENTAL listing of its 3-bedroom unit (the listing itself describes two full baths and a
+    half bath). `twins` = (bathrooms, bedrooms, home_type, mls_property_type) rows at the same address, newest
+    first. A lease record, or a record with fewer bedrooms than the building, is one unit: skipped. None = unknown."""
+    try:
+        beds = float(building_beds) if building_beds else None
+    except (TypeError, ValueError):
+        beds = None
+    for row in twins or []:
+        baths, t_beds, home_type, mls_type = (list(row) + [None] * 4)[:4]
+        if not baths or "LEASE" in str(home_type or "").upper() or "lease" in str(mls_type or "").lower():
+            continue
+        try:
+            if beds and t_beds and float(t_beds) < beds:
+                continue
+        except (TypeError, ValueError):
+            continue
+        return float(baths)
+    return None
+
+
 async def subject_from_listing(db: AsyncSession, listing_key: str) -> Optional[Dict[str, Any]]:
     """Full CMA subject for one MLS listing from our mirror (see the /subject-from-listing route)."""
     prop = (await db.execute(select(Property).where(Property.listing_key == str(listing_key)))).scalar_one_or_none()
@@ -139,11 +162,11 @@ async def subject_from_listing(db: AsyncSession, listing_key: str) -> Optional[D
     if not subject.get("baths") and _mls_baths(prop) is None:
         # Multi-Family listing (no bath count from Bright). The same house is often also filed as
         # a Residential listing that does carry baths - use that, else leave it for the agent.
-        twin = (await db.execute(select(Property.bathrooms).where(
+        twins = (await db.execute(select(Property.bathrooms, Property.bedrooms, Property.home_type, Property.mls_property_type).where(
             Property.street_address == prop.street_address, Property.zipcode == prop.zipcode,
             Property.listing_key != prop.listing_key, Property.bathrooms > 0,
-        ).order_by(Property.modification_timestamp.desc().nullslast()).limit(1))).scalar_one_or_none()
-        subject["baths"] = twin
+        ).order_by(Property.modification_timestamp.desc().nullslast()).limit(12))).all()
+        subject["baths"] = whole_building_baths(getattr(prop, "bedrooms", None), twins)
     subject = _merge_authoritative_subject_facts(subject, prop)
     raw = getattr(prop, "raw_mls_data", None) or {}
     extra = {
@@ -313,7 +336,8 @@ async def _published_idx_site_url(db: AsyncSession, owner_id: str) -> Optional[s
     return f"https://{hostname}"
 
 
-_GENERATION_STALE_AFTER_SECONDS = 1800  # a request still marked "generating" past this almost
+# (testing only: with CMA_SLOW_LANE=1 - see cma_claude - a healthy run waits on the half-price queue for many minutes)
+_GENERATION_STALE_AFTER_SECONDS = 4 * 3600 if os.getenv("CMA_SLOW_LANE") == "1" else 1800  # a request still marked "generating" past this almost
 # certainly crashed/restarted mid-run rather than genuinely still being in flight, so stop showing
 # the client a spinner for it. Was 480s - shorter than a worst-case real run (main photo call +
 # estimate-only retry + guidance pass + comp rewrites + the reasoning pass with up to 3 attempts at
@@ -514,7 +538,8 @@ async def update_report(db: AsyncSession, owner_id: str, report_id: str, payload
     if "subject" in data:
         # CMA accuracy test only: a live arm for this agent + listing makes this an as-of test report.
         from app.services import cma_backtest_arms as _arms
-        _arm = await _arms.find_arm(db, owner_id, listing_key=(data["subject"] or {}).get("listing_key"))
+        _lk = (data["subject"] or {}).get("listing_key")
+        _arm = await _arms.find_arm(db, owner_id, listing_key=_lk, address=_arms.subject_address(_lk, data["subject"]))
         with _arms.activated(_arm):
             data["subject"] = await _canonical_subject_snapshot(db, data["subject"] or {})
         if _arm:
@@ -778,6 +803,77 @@ _FAMILY_HOME_TYPES = {
 }
 
 
+_UNIT_WORDS = {"five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12}
+_UNIT_COUNT_RE = re.compile(
+    r"\b(\d{1,3}|five|six|seven|eight|nine|ten|eleven|twelve)[\s-]*(?:unit|apartment|apt)s?\b(?!\s*(?:#|no\.?|number|\d))",
+    re.IGNORECASE)
+INCOME_PROPERTY_MIN_UNITS = 5
+
+
+def multi_family_unit_count(subject) -> Optional[int]:
+    """How many units a multi-family building has, or None. Bright sends no total-unit field, but it does send the
+    unit MIX on nearly every multi-family record (OneBedroomUnits / TwoBedroomUnits / ThreeBedroomUnits - found
+    11/15; 519 Grove St = one two-bedroom unit + one three-bedroom unit). That sum is used when it is there (as the
+    record's own keys, or the names the CMA gives them); otherwise the listing's own words ("5 UNITS", "five-unit
+    building") are the source."""
+    get = (lambda k: subject.get(k)) if isinstance(subject, dict) else (lambda k: getattr(subject, k, None))
+    for key in ("number_of_units", "units_total", "unit_count"):
+        try:
+            n = int(float(get(key)))
+            if n > 0:
+                return n
+        except (TypeError, ValueError):
+            pass
+    raw = get("raw_mls_data") if not isinstance(subject, dict) or isinstance(subject.get("raw_mls_data"), dict) else None
+    mix = 0
+    for ours, theirs in (("efficiency_units", "EfficiencyUnits"), ("one_bedroom_units", "OneBedroomUnits"), ("two_bedroom_units", "TwoBedroomUnits"),
+                         ("three_bedroom_units", "ThreeBedroomUnits"), ("four_bedroom_units", "FourBedroomUnits")):
+        v = get(ours)
+        if v in (None, "") and isinstance(raw, dict):
+            v = raw.get(theirs)
+        try:
+            mix += int(float(v)) if v not in (None, "") else 0
+        except (TypeError, ValueError):
+            pass
+    if mix >= 2:
+        return mix
+    best = None
+    for m in _UNIT_COUNT_RE.finditer(str(get("public_remarks") or "")):
+        raw = m.group(1).lower()
+        n = _UNIT_WORDS.get(raw) or (int(raw) if raw.isdigit() else None)
+        if n and 2 <= n <= 300:
+            best = max(best or 0, n)
+    return best
+
+
+def non_home_subject_problem(property_type, subject=None) -> Optional[str]:
+    """Why this subject cannot have a CMA, in the agent's words - or None. A commercial property trades on its
+    income and a lot on what can be built; neither is priced from home sales, and the search below never returns
+    commercial or land sales. Before this (test round 11/14) a 5-unit building filed as a Commercial Sale went
+    through as a subject with no type family, and was given four townhouses as its comparable sales.
+
+    The same goes for a building of five or more units (same test, the same building's Multi-Family record): it
+    was valued at $400,000 from the sales of two- and three-unit buildings and its seller told to cut 19% - while
+    its $56,000 of yearly rent, which is what its buyers price, never entered the value. Two to four units stay in:
+    they are bought with home loans and sell against each other."""
+    t = str(property_type or "").strip().lower().replace("_", " ")
+    if subject is not None and ("multi" in t or "plex" in t):
+        units = multi_family_unit_count(subject)
+        if units and units >= INCOME_PROPERTY_MIN_UNITS:
+            return (f"The listing describes this as a {units}-unit building. Buildings with five or more units are "
+                    "priced on their rents and expenses, not on sales of nearby homes, so a CMA can't value this one - "
+                    "an income analysis (rent roll, expenses and a cap rate) is the right tool. A CMA works for a "
+                    "single home or a 2-4 unit building.")
+    if "commercial" in t or "business" in t:
+        return ("This property is filed as a commercial listing. A CMA values a home from sales of similar homes, so "
+                "it can't price a commercial property. If it is really a house, townhouse, condo or a 2-4 unit home, "
+                "change Property Type on the Subject step.")
+    if t in ("land", "lot", "lots/land", "vacant land"):
+        return ("This property is filed as land. A CMA values a home from sales of similar homes, so it can't price "
+                "a lot. If there is a home on it, change Property Type on the Subject step.")
+    return None
+
+
 def _comp_sanity_problem(c: "CmaCompCandidate") -> Optional[str]:
     if not (c.street_address or "").strip() or len((c.street_address or "").strip()) < 4:
         return "no street address"
@@ -830,7 +926,11 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
     # Same product only: a condo's comps are condos, a townhouse's townhouses (grader 10/21). Rows with
     # no type on record stay in and are scored.
     from app.services.cma_ai_service import _type_family as _tf
-    _family = _tf(req.property_type or (req.subject.property_type if req.subject else None))
+    _subject_type = req.property_type or (req.subject.property_type if req.subject else None)
+    _not_a_home = non_home_subject_problem(_subject_type, req.subject)
+    if _not_a_home:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_not_a_home)
+    _family = _tf(_subject_type)
     if _family in _FAMILY_HOME_TYPES:
         query = query.where(or_(Property.home_type.is_(None), Property.home_type == HomeType.OTHER.value,
                                 Property.home_type.in_(_FAMILY_HOME_TYPES[_family])))

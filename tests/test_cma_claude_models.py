@@ -88,3 +88,87 @@ def test_final_value_answer_is_read_from_plain_or_wrapped_json():
 def test_every_claude_call_in_the_engine_goes_through_the_helper():
     src = (root_dir / "app" / "services" / "cma_ai_service.py").read_text(encoding="utf-8")
     assert "client.messages.create(" not in src.replace("_cma_claude.create(client", "")
+
+
+# ---- the slower, half-price line (testing only, 11/15) --------------------------------------------------------------
+
+class _Queue:
+    """A stand-in batch queue: `outcomes` are what each 'is it done yet?' answers, then one result row."""
+    def __init__(self, states, result):
+        self.states, self.result, self.created, self.cancelled = list(states), result, [], []
+
+    async def create(self, requests):
+        self.created.append(requests)
+        return NS(id="batch_1")
+
+    async def retrieve(self, batch_id):
+        return NS(processing_status=self.states.pop(0) if self.states else "ended")
+
+    async def cancel(self, batch_id):
+        self.cancelled.append(batch_id)
+
+    async def results(self, batch_id):
+        async def rows():
+            yield NS(result=self.result)
+        return rows()
+
+
+def _queued_client(states, result, fallback=None):
+    c = _Client([fallback] if fallback is not None else [])
+    c.messages.batches = _Queue(states, result)
+    return c
+
+
+async def _no_sleep(_):
+    return None
+
+
+def test_the_slow_line_is_off_unless_switched_on(monkeypatch):
+    monkeypatch.delenv("CMA_SLOW_LANE", raising=False)
+    c = _queued_client(["ended"], NS(type="succeeded", message=_resp(text="queued")), fallback=_resp(text="now"))
+    r = asyncio.run(cma_claude.create(c, model="claude-sonnet-5-5", max_tokens=100, messages=[{"role": "user", "content": "x"}]))
+    assert r.content[0].text == "now" and c.messages.batches.created == [] and len(c.calls) == 1
+
+
+def test_switched_on_the_request_goes_through_the_queue_at_half_the_tokens(monkeypatch):
+    monkeypatch.setenv("CMA_SLOW_LANE", "1")
+    c = _queued_client(["in_progress", "ended"], NS(type="succeeded", message=_resp(text="queued", i=1001, o=40)))
+    r = asyncio.run(cma_claude.through_the_queue(c, {"model": "claude-sonnet-5-5", "max_tokens": 100,
+                                                     "messages": [{"role": "user", "content": "x"}]}, sleep=_no_sleep))
+    assert r.content[0].text == "queued" and c.calls == []                 # nothing was sent the normal way
+    assert (r.usage.input_tokens, r.usage.output_tokens) == (501, 20)       # half price = half the tokens, rounded up
+    sent = c.messages.batches.created[0][0]["params"]
+    assert sent["model"] == "claude-sonnet-5-5" and sent["messages"][0]["content"] == "x"
+
+
+def test_a_request_the_queue_cannot_answer_is_sent_the_normal_way(monkeypatch):
+    monkeypatch.setenv("CMA_SLOW_LANE", "1")
+    for kind in ("errored", "expired", "canceled"):
+        c = _queued_client(["ended"], NS(type=kind), fallback=_resp(text="now", i=100, o=10))
+        r = asyncio.run(cma_claude.create(c, model="claude-sonnet-5", max_tokens=100, messages=[{"role": "user", "content": "x"}]))
+        assert r.content[0].text == "now" and r.usage.input_tokens == 100   # the normal way, at the normal price
+
+
+def test_a_request_still_waiting_at_the_time_limit_is_cancelled_and_sent_the_normal_way(monkeypatch):
+    monkeypatch.setenv("CMA_SLOW_LANE", "1")
+    monkeypatch.setenv("CMA_SLOW_LANE_CAP_MIN", "1")
+    c = _queued_client(["in_progress"] * 50, NS(type="succeeded", message=_resp(text="late")))
+    ticks = iter(range(0, 100000, 40))                                      # each look at the clock is 40 seconds later
+    r = asyncio.run(cma_claude.through_the_queue(c, {"model": "m", "max_tokens": 1, "messages": []},
+                                                 sleep=_no_sleep, clock=lambda: next(ticks)))
+    assert r is None and c.messages.batches.cancelled == ["batch_1"]
+
+
+def test_a_client_with_no_queue_is_always_sent_the_normal_way(monkeypatch):
+    monkeypatch.setenv("CMA_SLOW_LANE", "1")                                # the accuracy test's stub client
+    c = _Client([_resp(text="now")])
+    r = asyncio.run(cma_claude.create(c, model="claude-sonnet-5", max_tokens=100, messages=[{"role": "user", "content": "x"}]))
+    assert r.content[0].text == "now"
+
+
+def test_the_final_value_step_tries_the_queue_first():
+    src = (root_dir / "app" / "services" / "cma_ai_service.py").read_text(encoding="utf-8")
+    i = src.index("async def _call_cma_reasoning_claude")
+    body = src[i:i + 4000]
+    assert body.index("_cma_claude.through_the_queue(client, kwargs)") < body.index("messages.stream(**kwargs)")
+

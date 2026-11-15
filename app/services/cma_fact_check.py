@@ -1108,6 +1108,45 @@ def fix_dates_and_spelling(text: str) -> tuple[str, list[str]]:
     return (out, []) if out != text else (text, [])
 
 
+# ---- "the listing shows no inclusions" - a claim about a field our MLS feed does not carry -----------------------
+# Outside audit 11/14, 404 Mountainview Dr #404: "The listing shows no stated inclusions or exclusions" while the
+# public listing names the washer, dryer and refrigerator. The feed we receive has no inclusions / exclusions field
+# at all, so "none stated" is a statement about our copy, not about the listing. The advice that follows (confirm
+# what conveys) is right and stays; the claim it rested on goes.
+_NO_INCLUSIONS_RE = re.compile(
+    r"\b(?:The|This|Its)\s+(?:listing|MLS\s+(?:record|listing)|record)\s+(?:shows|states|has|lists|gives|names|notes|includes|mentions)\s+no\s+"
+    r"(?:stated\s+|listed\s+|specific\s+)?(?:inclusions(?:\s+or\s+exclusions)?|exclusions(?:\s+or\s+inclusions)?|"
+    # (test round 6, 5232 Diamond St: "The listing names no included or excluded items.")
+    r"included\s+(?:or|and)\s+excluded\s+items|excluded\s+(?:or|and)\s+included\s+items|items\s+(?:as\s+)?included\s+or\s+excluded|included\s+items)"
+    r"(?:\s+(?:on\s+record|in\s+the\s+(?:record|data|listing)))?\s*(?:,\s*so\s+|;\s*|\.\s+|\.$|\s+-\s+)?", re.I)
+_NO_INCLUSIONS_LOOSE_RE = re.compile(
+    r"\b(?:no|without\s+any)\s+(?:stated\s+|listed\s+)?(?:inclusions\s+or\s+exclusions|inclusions|exclusions)\s+(?:are|is|were)\s+"
+    r"(?:stated|listed|shown|noted|given|on\s+record)(?:\s+in\s+the\s+listing)?\s*(?:,\s*so\s+|;\s*|\.\s+)?", re.I)
+
+
+def fix_inclusion_absence_claims(text: str) -> tuple[str, list[str]]:
+    if not text or not ("clusion" in text or "ncluded" in text):
+        return text, []
+
+    def _cap(rest: str) -> str:
+        return rest[:1].upper() + rest[1:] if rest else rest
+    out, n = text, 0
+    for rx in (_NO_INCLUSIONS_RE, _NO_INCLUSIONS_LOOSE_RE):
+        while True:
+            m = rx.search(out)
+            if not m:
+                break
+            lead = "The inclusions and exclusions are not in our MLS data, so "
+            tail = out[m.end():]
+            # "…, so confirm that the washer conveys" keeps its advice; a bare claim just goes
+            joined = lead + tail[:1].lower() + tail[1:] if m.group(0).rstrip().endswith("so") else _cap(tail)
+            out = out[:m.start()] + joined
+            n += 1
+    if not n:
+        return text, []
+    return re.sub(r"\s{2,}", " ", out).strip(), ["Fact check: removed a claim that the listing states no inclusions - that field is not in our MLS data."]
+
+
 # ---- a prediction stated as a fact (outside audit 11/14: "competing offers above asking are not expected" - a
 # home's time on the market makes them less likely; it does not rule them out) ------------------------------------
 _PREDICTION_FIXES = (
@@ -1223,6 +1262,7 @@ def fix_text(text: str, *, subject: Optional[dict], comp: Optional[dict] = None,
         lambda x: fix_price_superlatives(x, comp, comps) if comp is not None and comps else (x, []),
         lambda x: fix_field_name_leaks(x),
         lambda x: fix_dates_and_spelling(x),
+        lambda x: fix_inclusion_absence_claims(x),
         lambda x: drop_repeated_sentences(x),
     ):
         t, f = fn(t)
@@ -1324,7 +1364,7 @@ def _d(s):
         return None
 
 
-def summarize_history(events: list, *, current_list_date=None, today=None) -> dict:
+def summarize_history(events: list, *, current_list_date=None, today=None, current_days=None) -> dict:
     """The home's earlier listings and sales from price_history_service.get_history (newest first).
 
     4913 Chancellor St: bought Mar 13 2026 for $200,000, listed Aug 13 2026 (price changed Oct 6), taken off
@@ -1392,6 +1432,18 @@ def summarize_history(events: list, *, current_list_date=None, today=None) -> di
         chain_days += p.get("days") or 0
         nxt_start = p["start"]
     cur_days = (current or {}).get("days")
+    # One day count for the current listing, everywhere in the report: the MLS's own count when it has one. Counted
+    # from the dates it came out 65 for a listing whose MLS record says 61 (the MLS does not count its coming-soon
+    # days), and one report said "61 days", "65 days on this listing" and "about 86 days in total" on three pages
+    # (test round 11/14, 172 E Tally Ho Turn). A count that is far from the dates is left alone - that is a
+    # different listing's number, not a rounding of this one.
+    try:
+        _mls_days = int(float(current_days)) if current_days is not None else None
+    except (TypeError, ValueError):
+        _mls_days = None
+    if _mls_days is not None and cur_days is not None and current is not None and not current.get("end") \
+            and 0 <= _mls_days and abs(cur_days - _mls_days) <= 14:
+        cur_days = _mls_days
     lines: list[str] = []
     for s in prior_sales[-2:]:
         lines.append(f"Sold {s['date'].isoformat()}" + (f" for ${s['price']:,.0f}" if s.get("price") else " (price not in the MLS record)"))

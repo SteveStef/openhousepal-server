@@ -10,12 +10,12 @@ from app.services.address_search_service import (
 
 
 def cand(street, *, key=None, city="PHILADELPHIA", state="PA", zipcode="19102", status="ACTIVE-BRIGHT",
-         ptype="Residential", price=100000.0, modified=(2026, 1, 1)):
+         ptype="Residential", price=100000.0, modified=(2026, 1, 1), home_type=None):
     return Candidate(
         listing_key=key or f"{street}|{status}|{modified}", street_address=street,
         full_address=f"{street}, {city}, {state} {zipcode}", city=city, state=state, zipcode=zipcode,
         home_status=status, mls_property_type=ptype, price=price,
-        modified=datetime(*modified, tzinfo=timezone.utc),
+        modified=datetime(*modified, tzinfo=timezone.utc), extra={"home_type": home_type} if home_type else {},
     )
 
 
@@ -172,3 +172,70 @@ def test_unrelated_streets_are_dropped_when_nothing_matches():
 
 def test_rental_note_text():
     assert RENTAL_NOTE == "Rental listing - a CMA values a sale"
+
+
+
+# ---- a home filed twice: once as a home, once as a commercial record (test round 11/14) ----------------
+
+def test_the_homes_own_listing_beats_a_commercial_record_of_the_same_address():
+    """315 W Fornance St, Norristown: Multi-Family and Commercial Sale, both active, same day. The commercial
+    record has no bedrooms, baths or size, and was the one offered."""
+    multi = cand("315 W FORNANCE ST", key="multi", ptype="Multi-Family", modified=(2026, 10, 7))
+    commercial = cand("315 W FORNANCE ST", key="comm", ptype="Commercial Sale", modified=(2026, 10, 8))
+    assert pick_record([commercial, multi]).listing_key == "multi"
+    hits = group_and_pick(parse_query("315 w fornance st"), [commercial, multi])
+    assert len(hits) == 1 and hits[0].record.listing_key == "multi" and hits[0].non_home is None and hits[0].others == 1
+
+
+def test_a_stage_still_comes_first():
+    """A home that sold as a house years ago and is for sale as a commercial property today: today's listing."""
+    old_home = cand("9 OAK ST", key="home", status="CLOSED-BRIGHT", modified=(2019, 1, 1))
+    commercial = cand("9 OAK ST", key="comm", ptype="Commercial Sale", modified=(2026, 10, 8))
+    assert pick_record([old_home, commercial]).listing_key == "comm"
+
+
+def test_a_commercial_or_land_only_address_cannot_be_the_subject():
+    from app.services.address_search_service import NON_HOME_NOTES, _result_dict
+    for ptype, home_type, kind in (("Commercial Sale", None, "commercial"), ("Land", None, "land"),
+                                   (None, "COMMERCIAL", "commercial"), ("Business Opportunity", None, "commercial")):
+        hits = group_and_pick(parse_query("12 mill rd"), [cand("12 MILL RD", ptype=ptype, home_type=home_type)])
+        assert hits[0].non_home == kind
+        row = _result_dict(hits[0], {}, False, False)
+        assert row["selectable"] is False and row["note"] == NON_HOME_NOTES[kind]
+        # other tools that search every listing (allow_rentals) are not affected
+        row = _result_dict(hits[0], {}, True, False)
+        assert row["selectable"] is True and row["note"] is None
+    home = group_and_pick(parse_query("12 mill rd"), [cand("12 MILL RD", ptype="Residential")])[0]
+    assert home.non_home is None and _result_dict(home, {}, False, False)["selectable"] is True
+    farm = group_and_pick(parse_query("12 mill rd"), [cand("12 MILL RD", ptype="Farm")])[0]
+    assert farm.non_home is None
+
+
+def test_comp_search_refuses_a_commercial_or_land_subject_in_plain_words():
+    from app.services.cma_service import non_home_subject_problem
+    assert "commercial" in non_home_subject_problem("COMMERCIAL")
+    assert "commercial" in non_home_subject_problem("Commercial Sale")
+    assert "land" in non_home_subject_problem("LAND")
+    for ok in ("SINGLE_FAMILY", "Townhouse / row", "MULTI_FAMILY", "CONDO", "FARM", "Garden / low-rise condo", None, ""):
+        assert non_home_subject_problem(ok) is None
+
+
+def test_a_building_of_five_or_more_units_is_not_valued_from_home_sales():
+    from app.services.cma_service import multi_family_unit_count, non_home_subject_problem
+    five = {"property_type": "MULTI_FAMILY", "public_remarks": "5 UNITS   Exceptional 5-unit cash-flowing property. "
+            "The building offers a mix of three one-bedroom units and two studios, all currently leased."}
+    assert multi_family_unit_count(five) == 5
+    msg = non_home_subject_problem("MULTI_FAMILY", five)
+    assert msg and "5-unit" in msg and "rents" in msg
+    # two to four units are still a CMA
+    for remarks in ("Well kept duplex, 2 units, separate utilities.", "Three-unit building with parking.",
+                    "Four unit twin. Unit 5 on the mailbox is storage only.", "", None):
+        d = {"property_type": "MULTI_FAMILY", "public_remarks": remarks}
+        assert non_home_subject_problem("MULTI_FAMILY", d) is None, remarks
+    # a house whose text happens to count units of something is never read as a building
+    house = {"property_type": "SINGLE_FAMILY", "public_remarks": "One of only 12 units in this enclave."}
+    assert non_home_subject_problem("SINGLE_FAMILY", house) is None
+    condo = {"property_type": "CONDO", "public_remarks": "Boutique building of 8 units."}
+    assert non_home_subject_problem("CONDO", condo) is None
+    assert multi_family_unit_count({"public_remarks": "Six-unit apartment building, fully rented"}) == 6
+

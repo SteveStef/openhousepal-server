@@ -12,7 +12,112 @@ Older models (Sonnet 5, Haiku) go through unchanged.
 Non-streaming on purpose: the accuracy-test dry run swaps in a stub client that only implements
 messages.create.
 """
+import asyncio
+import logging
+import math
+import os
+import time
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# ---- The slower, half-price line (TESTING ONLY - owner, 11/15) -------------------------------------------------
+# "If we use the take-your-time AI we are using with blogs, would we save a lot of money? Maybe we do that for all
+# testing." With CMA_SLOW_LANE=1 every CMA request is sent through Anthropic's batch queue - the same request, the
+# same model, the same answer, at half the price (measured on the blog writer 11/14: $0.53 against $1.08-1.23) -
+# and the engine waits for it. A report then takes many minutes instead of two or three, which a test batch does
+# not mind. Off by default and never set on the live site: an agent's report is always sent the normal way.
+#   - one request per batch, asked about every 15-30 seconds;
+#   - a request still waiting after CMA_SLOW_LANE_CAP_MIN minutes (25) is cancelled and sent the normal way;
+#   - a request the queue could not answer (an error, expired) is sent the normal way, so the usual handling of
+#     that error runs unchanged;
+#   - an answer that came through the queue has its token counts HALVED before it is handed back, so every cost
+#     the engine records for it is what it really cost. (The counts in the usage log therefore read half under
+#     this switch. A real agent-facing version would keep its own tally, as the blog writer does.)
+
+
+def slow_lane_on() -> bool:
+    return os.getenv("CMA_SLOW_LANE") == "1"
+
+
+def _cap_seconds() -> float:
+    try:
+        return max(60.0, float(os.getenv("CMA_SLOW_LANE_CAP_MIN", "25")) * 60)
+    except ValueError:
+        return 1500.0
+
+
+def _plain(o):
+    """Request parameters as plain JSON (an earlier answer's content blocks, sent back on a second ask, included)."""
+    if hasattr(o, "model_dump"):
+        return o.model_dump(mode="json", exclude_unset=True)
+    if isinstance(o, dict):
+        return {k: _plain(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_plain(v) for v in o]
+    return o
+
+
+def _halve_usage(message) -> None:
+    usage = getattr(message, "usage", None)
+    for field in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
+        n = getattr(usage, field, None)
+        if isinstance(n, (int, float)) and n:
+            try:
+                setattr(usage, field, int(math.ceil(n / 2)))
+            except Exception:  # noqa: BLE001 - a usage object that can't be changed over-reports this one call
+                pass
+
+
+async def through_the_queue(client, kwargs: dict, *, sleep=asyncio.sleep, clock=time.monotonic):
+    """Send one request through the batch queue and wait for it. The message (usage halved), or None when the
+    switch is off, the client has no queue (the accuracy test's stub), or the queue did not answer - the caller
+    then sends the request the normal way."""
+    batches = getattr(getattr(client, "messages", None), "batches", None)
+    if not slow_lane_on() or batches is None:
+        return None
+    params = _plain({k: v for k, v in kwargs.items() if k != "extra_body"})
+    params.update(_plain(kwargs.get("extra_body") or {}))
+    try:
+        batch = await batches.create(requests=[{"custom_id": "cma", "params": params}])
+    except Exception:  # noqa: BLE001
+        logger.warning("CMA slow lane: could not queue the request - sending it the normal way", exc_info=True)
+        return None
+    began, cap = clock(), _cap_seconds()
+    while True:
+        try:
+            state = await batches.retrieve(batch.id)
+        except Exception:  # noqa: BLE001 - a dropped connection: ask again
+            state = None
+        if state is not None and getattr(state, "processing_status", None) == "ended":
+            break
+        waited = clock() - began
+        if waited > cap:
+            try:
+                await batches.cancel(batch.id)
+            except Exception:  # noqa: BLE001 - an answer that still arrives is never read
+                pass
+            logger.info("CMA slow lane: still waiting after %.0f minutes - sending it the normal way", cap / 60)
+            return None
+        await sleep(15 if waited < 180 else 30)
+    try:
+        async for row in await batches.results(batch.id):
+            result = getattr(row, "result", None)
+            if getattr(result, "type", None) == "succeeded":
+                _halve_usage(result.message)
+                logger.info("CMA slow lane: answered after %.0f s", clock() - began, extra={"model": params.get("model")})
+                return result.message
+            logger.warning("CMA slow lane: the queue did not answer (%s) - sending it the normal way", getattr(result, "type", None))
+            return None
+    except Exception:  # noqa: BLE001
+        logger.warning("CMA slow lane: could not read the answer - sending it the normal way", exc_info=True)
+    return None
+
+
+async def _send(client, kw: dict):
+    msg = await through_the_queue(client, kw)
+    return msg if msg is not None else await client.messages.create(**kw)
+
 
 # Models that reject a forced tool choice and always think.
 NEW_CLAUDE_PREFIXES = ("claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1", "claude-fable-5-2",
@@ -61,13 +166,13 @@ async def create(client, *, effort: Optional[str] = None, **kwargs):
     """client.messages.create(**kwargs) for any Claude model. On a current model, a call that forced a tool
     is asked once more when the tool call didn't come; the returned response's usage is the total spent."""
     kw, name = prepare(kwargs, effort)
-    resp = await client.messages.create(**kw)
+    resp = await _send(client, kw)
     if not name or _has_tool_call(resp, name) or getattr(resp, "stop_reason", None) in ("max_tokens", "refusal"):
         return resp
     spent_in, spent_out = int(resp.usage.input_tokens or 0), int(resp.usage.output_tokens or 0)
     kw["messages"] = [*kw["messages"], {"role": "assistant", "content": resp.content},
                       {"role": "user", "content": f"Now call {name} with your result."}]
-    resp = await client.messages.create(**kw)
+    resp = await _send(client, kw)
     try:
         resp.usage.input_tokens = int(resp.usage.input_tokens or 0) + spent_in
         resp.usage.output_tokens = int(resp.usage.output_tokens or 0) + spent_out

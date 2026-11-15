@@ -171,3 +171,154 @@ def test_a_failure_leaves_the_report_alone(monkeypatch):
     out = asyncio.run(audit.run(None, r, owner_id="o1", config={}, model="m", client=object(), create=boom, record_usage_event=none,
                                 add_spend=none, estimate_cost=lambda *a: 0.0, lock_get=none, lock_put=none))
     assert out is None and r.pricing is before
+
+
+# ---- v2 (first live batch, 11/14): not finding a detail is not the detail being wrong ---------------------------
+
+def _mini():
+    pricing = {"listing_strategy_notes": "**Pricing Position:** The current $469,900 asking price is about 2% above the "
+               "supported value of $460,000. We recommend repositioning to about $460,000.\n\n**Overpricing Risk:** "
+               "After 61 days on the market without an accepted offer, buyers have answered that price. The home shows well.",
+               "ai_estimate": {"value": 460000, "methodology_summary": "It adds a deck and a wooded view. Possession is "
+                               "listed as negotiable. The two larger sales carry little weight."}}
+    comps = [{"street_address": "1 A ST", "commentary": "It adds a deck and tree view. It sold in 3 days.", "ai_commentary":
+              "It adds a deck and tree view. It sold in 3 days."}]
+    packet = audit.build_packet({"street_address": "9 Z ST"}, comps, pricing, "listing")
+    return pricing, comps, packet
+
+
+def test_a_detail_the_audit_could_not_find_is_never_removed_from_the_text():
+    pricing, comps, packet = _mini()
+    findings = [
+        {"where": "comp_note:1", "sentence": "It adds a deck and tree view.", "kind": "unsupported",
+         "why": "No deck or view appears in the records.", "action": "remove"},
+        {"where": "methodology", "sentence": "Possession is listed as negotiable.", "kind": "unsupported",
+         "why": "No possession terms appear in the facts.", "action": "remove"},
+    ]
+    new_pricing, new_comps, applied, for_agent = audit.apply_findings(pricing, comps, findings, packet)
+    assert applied == [] and for_agent == []
+    assert new_comps[0]["commentary"] == comps[0]["commentary"]
+    assert "Possession is listed as negotiable." in new_pricing["ai_estimate"]["methodology_summary"]
+    assert [u["sentence"] for u in audit.unverified_findings(findings)] == [f["sentence"] for f in findings]
+
+
+def test_a_finding_that_talks_itself_out_of_the_error_is_dropped():
+    pricing, comps, packet = _mini()
+    findings = [
+        {"where": "comp_note:1", "sentence": "It sold in 3 days.", "kind": "contradiction",
+         "why": "The record shows 3 days on market, so this is true; no conflict.", "action": "flag"},
+        {"where": "methodology", "sentence": "The two larger sales carry little weight.", "kind": "contradiction",
+         "why": "Comp 3 has a 24.7% share, one of the largest.", "action": "remove"},
+    ]
+    new_pricing, _, applied, for_agent = audit.apply_findings(pricing, comps, findings, packet)
+    assert for_agent == []
+    assert [a["sentence"] for a in applied] == ["The two larger sales carry little weight."]
+    assert "little weight" not in new_pricing["ai_estimate"]["methodology_summary"]
+
+
+def test_speculation_is_removed_but_the_computed_pricing_position_is_only_flagged():
+    pricing, comps, packet = _mini()
+    findings = [
+        {"where": "strategy", "sentence": "After 61 days on the market without an accepted offer, buyers have answered that price.",
+         "kind": "speculation", "why": "States how buyers reacted with nothing behind it.", "action": "remove"},
+        {"where": "strategy", "sentence": "We recommend repositioning to about $460,000.", "kind": "inconsistent",
+         "why": "Disagrees with another section.", "action": "remove"},
+    ]
+    new_pricing, _, applied, for_agent = audit.apply_findings(pricing, comps, findings, packet)
+    assert [a["sentence"] for a in applied] == [findings[0]["sentence"]]
+    assert "buyers have answered" not in new_pricing["listing_strategy_notes"]
+    assert "We recommend repositioning to about $460,000." in new_pricing["listing_strategy_notes"]
+    assert [n["sentence"] for n in for_agent] == ["We recommend repositioning to about $460,000."]
+
+
+def test_the_packet_carries_each_homes_own_record_and_listing_text():
+    comps = [{"street_address": "1 A ST", "listing_key": "k1", "public_remarks": "Deck off the kitchen with a wooded view.",
+              "heating": ["Heat Pump"], "sewer": ["On Site Septic"], "school_district": "COATESVILLE AREA",
+              "architectural_style": ["Ranch/Rambler"], "photos": ["http://x/1.jpg"], "latitude": 40.1}]
+    packet = audit.build_packet({"street_address": "9 Z ST", "public_remarks": "Possession negotiable.", "cooling": ["Central A/C"]},
+                                comps, {"ai_estimate": {"value": 1}}, "buyer")
+    c = packet["facts"]["comparable_sales"][0]
+    assert c["listing_text"].startswith("Deck off the kitchen") and c["heating"] == ["Heat Pump"]
+    assert c["school_district"] == "COATESVILLE AREA" and c["architectural_style"] == ["Ranch/Rambler"]
+    assert "photos" not in c and "latitude" not in c
+    assert packet["facts"]["subject"]["listing_text"] == "Possession negotiable."
+
+
+def test_the_engines_own_computed_lines_are_neither_edited_nor_flagged():
+    pricing, comps, packet = _mini()
+    findings = [
+        {"where": "methodology", "sentence": "The value is therefore not set above about $583,000.", "kind": "inconsistent",
+         "why": "The adjusted sales figure of $593,000 less $13,000 gives $580,000, not $583,000.", "action": "flag"},
+        {"where": "comp_note:1", "sentence": "Its annual property taxes are $6,596, against $8,735 for this home - a gap that "
+         "size usually means a tax abatement or an old assessment.", "kind": "speculation",
+         "why": "The reason for the tax gap is asserted without any supporting fact.", "action": "remove"},
+        {"where": "comp_note:1", "sentence": "It sold in 3 days.", "kind": "inconsistent",
+         "why": "Fine as 3 days, flagged only lightly.", "action": "flag"},
+    ]
+    _, _, applied, for_agent = audit.apply_findings(pricing, comps, findings, packet)
+    assert applied == [] and for_agent == []
+
+
+# ---- outside audit of round 5 (11/14 night): a fact the listing or the MLS record states is verified ---------------
+
+def test_the_whole_listing_description_reaches_the_last_reader():
+    # 18 Colts Neck Dr: "all new Anderson windows & doors ... updated HVAC system" sits 2,244 characters in. The
+    # text was cut at 1,800, so the reader listed the home's new windows as something it "could not verify".
+    long_text = ("Welcome home. " * 160) + "All new Anderson windows & doors throughout and an updated HVAC system."
+    assert len(long_text) > 2200
+    packet = audit.build_packet({"street_address": "18 COLTS NECK DR", "public_remarks": long_text}, [],
+                                {"ai_estimate": {"value": 1}}, "buyer")
+    assert "Anderson windows" in packet["facts"]["subject"]["listing_text"]
+    assert "updated HVAC system" in packet["facts"]["subject"]["listing_text"]
+
+
+def test_each_homes_own_mls_record_reaches_the_last_reader():
+    # 101 Sues Way "the water heater is electric", 404 Mountainview Dr "possession is negotiable ... natural gas hot
+    # water ... a gas fireplace": every one is a field of the home's Bright record, which the saved report does not
+    # keep. The caller passes the records in; names, phone numbers and photo links stay out.
+    records = {
+        "s1": {"HotWater": ["Natural Gas"], "Possession": ["Negotiable"], "FireplaceFeatures": ["Gas/Propane"],
+               "Flooring": ["Carpet", "Wood"], "ListAgentFullName": "Some Agent", "ListAgentEmail": "a@example.com",
+               "ListPictureURL": "http://x/1.jpg", "ListingTaxID": "43-05", "PublicRemarks": "Top-floor unit."},
+        "c1": {"HotWater": ["Electric"], "Heating": ["Baseboard - Hot Water"], "ListOfficePhone": "5550100",
+               "PublicRemarks": "A much longer description than the saved one, ending with a home gym."},
+    }
+    comps = [{"street_address": "1 A ST", "listing_key": "c1", "public_remarks": "Short."}]
+    packet = audit.build_packet({"street_address": "404 M DR", "listing_key": "s1"}, comps, {"ai_estimate": {"value": 1}},
+                                "buyer", records=records)
+    subj, comp = packet["facts"]["subject"], packet["facts"]["comparable_sales"][0]
+    assert subj["mls_record"] == {"FireplaceFeatures": ["Gas/Propane"], "Flooring": ["Carpet", "Wood"],
+                                  "HotWater": ["Natural Gas"], "Possession": ["Negotiable"]}
+    assert subj["listing_text"] == "Top-floor unit."                      # a snapshot with no description gets the record's
+    assert comp["mls_record"]["HotWater"] == ["Electric"] and "ListOfficePhone" not in comp["mls_record"]
+    assert comp["listing_text"].endswith("home gym.")                     # ...and a shortened one gets the full text
+    flat = str(packet)
+    assert "Some Agent" not in flat and "a@example.com" not in flat and "http://x/1.jpg" not in flat and "43-05" not in flat
+
+
+def test_no_records_passed_changes_nothing():
+    comps = [{"street_address": "1 A ST", "listing_key": "c1", "public_remarks": "Short."}]
+    a = audit.build_packet({"street_address": "9 Z ST", "listing_key": "s1"}, comps, {"ai_estimate": {"value": 1}}, "buyer")
+    b = audit.build_packet({"street_address": "9 Z ST", "listing_key": "s1"}, comps, {"ai_estimate": {"value": 1}}, "buyer", records={})
+    assert a == b and "mls_record" not in a["facts"]["subject"]
+
+
+def test_the_reader_is_told_where_verified_facts_live():
+    assert "listing_text" in audit.SYSTEM and "mls_record" in audit.SYSTEM and "balcony" in audit.SYSTEM
+
+
+# ---- outside audits of rounds 5 and 6: a detail found in neither the listing nor the record is put to the agent ------
+
+def test_details_it_could_not_find_are_listed_for_the_agent_to_check():
+    unverified = [{"where": "inspection", "kind": "unsupported", "sentence": "Verify the condition of the carport roof covering.",
+                   "why": "The subject has a detached garage and no carport in the facts."},
+                  {"where": "comp_note:3", "kind": "unsupported", "sentence": "It has a fully renovated kitchen with quartz counters.",
+                   "why": "Listing says 'gorgeous counters', not quartz."}]
+    msg = audit.agent_message([], unverified)
+    assert msg.startswith("Review before sending: these details are in neither the listing text nor the MLS record")
+    assert "check each against the photos" in msg and "carport roof covering" in msg and "quartz counters" in msg
+    both = audit.agent_message([{"why": "Comp 3 carries a 24.7% share.", "sentence": "It carries little weight."}], unverified)
+    assert "the final read of this report noted - Comp 3 carries a 24.7% share." in both and "These details are in neither" in both
+    assert audit.agent_message([], []) is None and audit.agent_message([]) is None
+    many = audit.agent_message([], [dict(unverified[0], sentence=f"Sentence {i}.") for i in range(6)])
+    assert "(+2 more)" in many and "Sentence 3." in many and "Sentence 4." not in many

@@ -242,6 +242,19 @@ class Candidate:
         return "LEASE" in (self.mls_property_type or "").upper()
 
     @property
+    def non_home(self) -> Optional[str]:
+        """'commercial' | 'land' when this record is not a home's listing at all (test round 11/14: 315 W Fornance
+        St, Norristown is in the MLS twice - once as Multi-Family, once as a Commercial Sale with no bedrooms, no
+        size and no baths - and the search offered the commercial record as "the" home)."""
+        t = (self.mls_property_type or "").strip().upper()
+        h = str((self.extra or {}).get("home_type") or "").strip().upper()
+        if "COMMERCIAL" in t or "BUSINESS" in t or h == "COMMERCIAL":
+            return "commercial"
+        if t == "LAND" or h == "LAND":
+            return "land"
+        return None
+
+    @property
     def status_tier(self) -> int:
         return status_tier(self.home_status)
 
@@ -366,8 +379,9 @@ def _ts(c: Candidate) -> float:
 
 def pick_record(records: list[Candidate]) -> Candidate:
     """Sale listings beat rentals; then Active/Coming Soon, Pending, the latest Closed sale,
-    anything else; newest first within each."""
-    return min(records, key=lambda c: (c.is_rental, c.status_tier, -_ts(c)))
+    anything else; at the same stage the home's own listing beats a commercial / land record of the
+    same address; newest first within each."""
+    return min(records, key=lambda c: (c.is_rental, c.status_tier, bool(c.non_home), -_ts(c)))
 
 
 @dataclass
@@ -376,6 +390,7 @@ class Hit:
     score: Score
     others: int          # other records of the same home
     rental_only: bool
+    non_home: Optional[str] = None   # 'commercial' | 'land': the only record of this address is not a home
 
 
 def group_and_pick(pq: ParsedQuery, candidates: list[Candidate]) -> list[Hit]:
@@ -385,7 +400,7 @@ def group_and_pick(pq: ParsedQuery, candidates: list[Candidate]) -> list[Hit]:
     hits: list[Hit] = []
     for recs in groups.values():
         rec = pick_record(recs)
-        hits.append(Hit(rec, score_candidate(pq, rec), len(recs) - 1, rec.is_rental))
+        hits.append(Hit(rec, score_candidate(pq, rec), len(recs) - 1, rec.is_rental, rec.non_home))
     hits.sort(key=lambda h: (*h.score.key(), h.rental_only, h.record.status_tier, -_ts(h.record)))
     if hits and hits[0].score.hard_missing == 0:
         hits = [h for h in hits if h.score.hard_missing == 0]
@@ -484,6 +499,12 @@ def _to_candidate(row: Any) -> Candidate:
 
 
 RENTAL_NOTE = "Rental listing - a CMA values a sale"
+# A CMA prices a home from sales of similar homes: it has no way to price a business property or a bare lot
+# (the comp search never returns commercial or land sales), so these cannot be the subject either.
+NON_HOME_NOTES = {
+    "commercial": "Commercial listing - a CMA values a home from home sales",
+    "land": "Land listing - a CMA values a home, not a lot",
+}
 
 
 async def search_homes(db: AsyncSession, query: str, *, limit: int = 8, allow_rentals: bool = False,
@@ -562,8 +583,8 @@ def _result_dict(h: Hit, ex: dict, allow_rentals: bool, fuzzy_used: bool) -> dic
         "beds": e.get("bedrooms"), "baths": e.get("bathrooms"), "sqft": e.get("living_area"),
         "propertyType": c.mls_property_type, "propertySubType": ex.get("sub_type") or e.get("home_type"),
         "isRental": h.rental_only,
-        "selectable": (not h.rental_only) or allow_rentals,
-        "note": RENTAL_NOTE if h.rental_only and not allow_rentals else None,
+        "selectable": (not h.rental_only and not h.non_home) or allow_rentals,
+        "note": (RENTAL_NOTE if h.rental_only else NON_HOME_NOTES.get(h.non_home)) if not allow_rentals else None,
         "otherRecords": h.others,
         "match": "exact" if exact and unit_ok else ("close" if not fuzzy_used or exact else "fuzzy"),
     }
