@@ -199,3 +199,19 @@ def test_a_county_article_uses_only_the_agents_towns_inside_that_county():
     assert "areas = towns_inside(served, geos, about_county)" in run and "THIS ARTICLE IS ABOUT {about_county.upper()}" in run
     assert "never give a price, count or pace for the county as a whole" in run
 
+
+def test_a_county_is_never_looked_up_made_or_researched_as_a_town():
+    from app.api import blog_routes
+    for name in ("Chester County", "Chester County, PA", "Prince George's County"):
+        assert pipe.is_county(name), name
+    for name in ("Kennett Square", "County Line", "Media", "Countryside", ""):
+        assert not pipe.is_county(name), name
+    run = inspect.getsource(pipe._run)
+    assert 'names=[n for n in brief.get("areas") or [] if not is_county(n)]' in run and "if not is_county(a.name)" in run
+    card = inspect.getsource(blog_routes.blog_town_card)
+    assert card.index("_pipe.is_county(name)") < card.index("get_or_create_market_area")          # answered before any record is made
+    assert '"status": "none", "kind": "county"' in card
+    probe = inspect.getsource(blog_routes._writer_probe)
+    assert "if not _pipe.is_county(n)" in probe                                                    # never "New to us: Chester County"
+    assert "A county article:" in inspect.getsource(blog_routes.blog_ai_preflight)
+

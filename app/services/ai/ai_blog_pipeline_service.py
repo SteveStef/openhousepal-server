@@ -2175,6 +2175,11 @@ def county_named(names) -> Optional[str]:
     return next(iter(found)) if len(found) == 1 else None
 
 
+def is_county(name) -> bool:
+    """'Chester County', 'Chester County, PA' - a county, never a town to look up, create or research."""
+    return bool(_COUNTY_NAMED.search(str(name or "")))
+
+
 def county_share(geo: Optional[dict], county: str) -> float:
     """How much of a town's homes (percent) sit in municipalities of this county, from our own records."""
     want, total = tk.norm_place(re.sub(r"\s+County$", "", county or "", flags=re.I)), 0.0
@@ -2221,8 +2226,10 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
     state = (user.state if hasattr(user, "state") and user.state else None) or next((s.get("state") for s in sales if s.get("state")), None) or "PA"
 
     # --- 1. What we already know (free) ---------------------------------------------------
-    areas = await tk.find_areas(db, slugs=list(brief.get("area_slugs") or []), names=list(brief.get("areas") or []), state=state)
-    areas = areas[:4]
+    # A county is never looked up as a town (11/15: typing "Chester County" had made a town record by that name, and the
+    # article treated the county as a town with no homes) - it is handled by the county rules below.
+    areas = await tk.find_areas(db, slugs=list(brief.get("area_slugs") or []), names=[n for n in brief.get("areas") or [] if not is_county(n)], state=state)
+    areas = [a for a in areas if not is_county(a.name)][:4]
     # The article's towns decide the state, not the agent's profile: 11/01 a PA agent writing about
     # Frederick, MD would otherwise get Pennsylvania's transfer tax, programs and research.
     town_states = {(a.state or "").upper() for a in areas if a.state}

@@ -388,6 +388,11 @@ async def blog_town_card(
     state = typed_state or agent_state
     if len(name) < 2 or len(state) != 2:
         raise HTTPException(status_code=422, detail="Type the town's name.")
+    from app.services.ai import ai_blog_pipeline_service as _pipe
+    if _pipe.is_county(name):
+        # A county gets no Town Spotlight and is never made into a town record (11/15): the article uses the agent's
+        # own towns inside it as its examples.
+        return {"status": "none", "kind": "county", "name": name}
     # A town we already know by this name (any state unless one was typed, any kind - a Philly
     # neighborhood too) is the one meant; only a brand-new name becomes a new town in the agent's
     # state (CMA/blog test 11/13: "Cherry Hill" from a PA agent had made "Cherry Hill, PA").
@@ -932,7 +937,7 @@ async def _writer_probe(user: User, names: list[str], slugs: list[str]) -> dict:
     from app.services.areas import town_knowledge_service as tk
     from app.utils.auth import tier_has_mls
 
-    out = {"busy": False, "unknown": [], "seconds": 0.0, "outside": []}
+    out = {"busy": False, "unknown": [], "seconds": 0.0, "outside": [], "counties": []}
     t0 = time.monotonic()
 
     async def probe() -> None:
@@ -941,7 +946,9 @@ async def _writer_probe(user: User, names: list[str], slugs: list[str]) -> dict:
                 await db.execute(text("SET LOCAL statement_timeout = 20000"))
                 state = (getattr(user, "state", None) or "PA").strip().upper()[:2]
                 areas = list(await tk.find_areas(db, slugs=slugs[:5])) if slugs else []
-                for raw in names[:5]:
+                from app.services.ai import ai_blog_pipeline_service as _pipe
+                out["counties"] = [str(n).split(",")[0].strip() for n in names[:5] if _pipe.is_county(n)]
+                for raw in [n for n in names[:5] if not _pipe.is_county(n)]:
                     # the same town lookup the article run itself uses (ai_blog_pipeline_service -> find_areas)
                     found = await tk.find_areas(db, names=[str(raw)], state=state)
                     a = found[0] if found else None
@@ -952,7 +959,6 @@ async def _writer_probe(user: User, names: list[str], slugs: list[str]) -> dict:
                     if not a or a.enrichment_status not in ("ENRICHED", "PARTIAL"):
                         out["unknown"].append(str(raw).split(",")[0].strip())
                 # towns in a state the agent doesn't work in -> the writer asks whether they are licensed there
-                from app.services.ai import ai_blog_pipeline_service as _pipe
                 out["outside"] = (await _pipe.out_of_area_states(db, user, {(a.state or "").upper() for a in areas if a.state}))[0]
                 known = [a for a in areas if a.enrichment_status in ("ENRICHED", "PARTIAL")] or areas
                 if known:
@@ -1007,6 +1013,9 @@ async def blog_ai_preflight(
         towns = ", ".join(probe["unknown"])
         checks.append({"key": "towns", "level": "warn", "title": f"New to us: {towns}",
                        "detail": "The AI researches it from scratch - a little slower, with fewer local numbers. Check the spelling if that's a typo."})
+    elif probe.get("counties") and not slugs and len(probe["counties"]) == len(names):
+        checks.append({"key": "towns", "level": "ok", "title": f"A county article: {probe['counties'][0]}",
+                       "detail": "Your own towns inside the county are its examples. We don't hold county-wide totals, so each town's own numbers are used."})
     elif names or slugs:
         checks.append({"key": "towns", "level": "ok", "title": "Your towns are on file"})
     if probe.get("outside"):
