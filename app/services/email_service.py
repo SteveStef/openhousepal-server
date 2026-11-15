@@ -42,6 +42,7 @@ TEMPLATE_VERSION_SUFFIX = "_v2"
 
 
 AGENT_HEALTH_TEMPLATES = {"agent_weekly_summary", "agent_email_test"}
+BLOG_OVERNIGHT_TEMPLATES = {"blog_article_ready", "blog_article_failed"}  # blog_overnight_service.render_email
 HOST_ASK_TEMPLATES = {"host_request_group_received"}  # host_ask_email_service.render
 PAYMENT_REQUEST_TEMPLATES = {"payment_request", "payment_request_failed", "group_invite"}  # payment_request_service.render
 
@@ -310,6 +311,10 @@ class EmailService:
                 # Admin payment requests (payment_request_service) - designed v2 look, rendered here.
                 from app.services.payment_request_service import render as render_payment
                 data["subject"], data["html"], data["text"] = render_payment(template, subject, template_variables)
+            elif template in BLOG_OVERNIGHT_TEMPLATES:
+                # An overnight article is ready / couldn't be finished (blog_overnight_service) - rendered here.
+                from app.services.ai.blog_overnight_service import render_email as render_blog_overnight
+                data["subject"], data["html"], data["text"] = render_blog_overnight(template, subject, template_variables)
             elif template in AGENT_HEALTH_TEMPLATES:
                 # The weekly summary / test email of agent_email_health_service - rendered here too.
                 from app.services.agent_email_health_service import render as render_health

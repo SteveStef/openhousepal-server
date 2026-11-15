@@ -126,7 +126,7 @@ def test_protections_say_no_numbers():
 
 # --- pass list (built-in grader) ----------------------------------------------------------------
 def test_pass_list_is_fixed_and_cut_items_exist():
-    assert bfc.PASS_IDS[:3] == ["facts", "place", "dates"] and len(bfc.PASS_IDS) == 11
+    assert bfc.PASS_IDS[:3] == ["facts", "place", "dates"] and len(bfc.PASS_IDS) == 12 and "asked" in bfc.PASS_IDS
     assert bfc.CUT_IF_STILL_FAILING <= set(bfc.PASS_IDS)
 
 

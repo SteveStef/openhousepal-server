@@ -134,6 +134,9 @@ async def get_my_blogs(
         review = blog.ai_review or {}
         if review.get("status") == "running":
             item.ai_state = "failed" if _job_is_stale(review) else "running"
+            if item.ai_state == "running" and review.get("mode") == "overnight":
+                item.ai_state = "overnight"
+                item.ai_ready_at = (review.get("overnight") or {}).get("likely_at")
         elif review.get("status") in ("interview", "failed") and review.get("new"):
             item.ai_state = review["status"]
         items.append(item)
@@ -199,6 +202,99 @@ async def get_linkable_areas(
     return await blog_neighborhoods.linkable_areas(db, current_user)
 
 
+_LENGTH_COST = {"short": 0.8, "standard": 1.0, "long": 1.3}
+
+
+def _middle_cost(costs: list) -> Optional[float]:
+    """The middle of what recent articles cost - None until there are three to go by."""
+    from statistics import median
+    costs = [float(c) for c in costs if c and float(c) > 0]
+    return round(float(median(costs)), 4) if len(costs) >= 3 else None
+
+
+async def _article_estimate(db: AsyncSession, config: dict, engine: str, length: str) -> tuple[float, float]:
+    """(usd to write it now, usd to write it overnight) for the "about N% of your monthly AI" notes.
+    Owner 11/14: "tell the agent exactly how much usage it works". The note used to be one fixed figure in the
+    settings (0.90) while real articles were costing 1.08-1.23 after the research step started reading its sources
+    properly. Now it is the middle of what the last dozen finished articles of each kind really cost (any agent,
+    past 30 days), and the fixed figure only until there are three to go by."""
+    from datetime import timedelta
+    from sqlalchemy import text
+    from app.services.ai import ai_blog_pipeline_service
+    scale = _LENGTH_COST.get(length, 1.0)
+    now_usd = night_usd = None
+    try:
+        async with db.begin_nested():
+            rows = (await db.execute(text(
+                "select (ai_review->>'run_cost_usd')::float as usd, coalesce(ai_review->>'overnight', 'false') = 'true' as night "
+                "from blogs where ai_review->>'status' = 'done' and ai_review->>'engine' = :engine "
+                "and ai_review->>'run_cost_usd' is not null and ai_review->>'run_finished_at' > :since "
+                "order by ai_review->>'run_finished_at' desc limit 60"),
+                {"engine": engine, "since": (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()})).all()
+        now_usd = _middle_cost([r[0] for r in rows if not r[1]][:12])
+        night_usd = _middle_cost([r[0] for r in rows if r[1]][:12])
+    except Exception:  # noqa: BLE001 - the note falls back to the fixed figure; it never blocks the screen
+        logger.warning("blog estimate: could not read recent article costs", exc_info=True)
+    usd = (now_usd or float((config.get("blog_pipeline_typical_usd") or {}).get(engine, 0.9))) * scale
+    night = night_usd * scale if night_usd else ai_blog_pipeline_service.overnight_usd(config, usd)
+    return round(usd, 5), round(min(night, usd), 5)
+
+
+WORST_CASE_MARGIN = 1.3      # until three real articles can be measured: a heavy brief ran about 1.27x the middle (11/14)
+
+
+async def _article_worst(db: AsyncSession, engine: str, length: str, usd: float) -> float:
+    """The most a Save usage article is likely to use - the top of the range the agent sees BEFORE creating (owner
+    11/15: "worst case scenario spend"). If the slower line is busy and the time cap finishes every step the fast
+    way, the article costs what a "Write it now" article costs - and a heavy one costs more than the middle one. So:
+    the HIGHEST of the last dozen "Write it now" articles (30 days), never less than the middle figure."""
+    from datetime import timedelta
+    from sqlalchemy import text
+    scale = _LENGTH_COST.get(length, 1.0)
+    try:
+        async with db.begin_nested():
+            rows = (await db.execute(text(
+                "select (ai_review->>'run_cost_usd')::float as usd, coalesce(ai_review->>'overnight', 'false') = 'true' as night "
+                "from blogs where ai_review->>'status' = 'done' and ai_review->>'engine' = :engine "
+                "and ai_review->>'run_cost_usd' is not null and ai_review->>'run_finished_at' > :since "
+                "order by ai_review->>'run_finished_at' desc limit 60"),
+                {"engine": engine, "since": (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()})).all()
+        seen = [float(r[0]) for r in rows if not r[1] and r[0] and float(r[0]) > 0][:12]
+        if len(seen) >= 3:
+            return round(max(usd, max(seen) * scale), 5)
+    except Exception:  # noqa: BLE001 - the note falls back to the margin; it never blocks the screen
+        logger.warning("blog estimate: could not read recent article costs for the worst case", exc_info=True)
+    return round(usd * WORST_CASE_MARGIN, 5)
+
+
+async def _slow_minutes(db: AsyncSession, engine: str) -> Optional[int]:
+    """How long Save usage mode has really been taking: the middle of the last dozen such articles (30 days), with a
+    third added and rounded up to five minutes, so "likely ready by" is a time we usually beat. None until there
+    are three to go by (the service's own figure is used then)."""
+    from datetime import timedelta
+    from statistics import median
+    from sqlalchemy import text
+    try:
+        async with db.begin_nested():
+            rows = (await db.execute(text(
+                "select ai_review->>'run_started_at', ai_review->>'run_finished_at' from blogs where ai_review->>'status' = 'done' "
+                "and ai_review->>'engine' = :engine and coalesce(ai_review->>'overnight', 'false') = 'true' "
+                "and ai_review->>'run_finished_at' > :since order by ai_review->>'run_finished_at' desc limit 12"),
+                {"engine": engine, "since": (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()})).all()
+        took = []
+        for started, finished in rows:
+            try:
+                took.append((datetime.fromisoformat(finished) - datetime.fromisoformat(started)).total_seconds() / 60)
+            except (TypeError, ValueError):
+                pass
+        if len(took) < 3:
+            return None
+        return max(10, int(-(-(median(took) * 1.33) // 5) * 5))
+    except Exception:  # noqa: BLE001
+        logger.warning("blog estimate: could not read recent save-usage run times", exc_info=True)
+        return None
+
+
 @router.get("/ai/estimate")
 async def estimate_blog_ai(
     length: str = "standard",
@@ -211,11 +307,61 @@ async def estimate_blog_ai(
     config = await ai_config_service.get_config(db)
     # The researched article (Premium by default): its measured typical cost, scaled by length.
     engine = config.get("blog_pipeline_default_engine", "max")
-    typical = float((config.get("blog_pipeline_typical_usd") or {}).get(engine, 0.65))
-    usd = typical * {"short": 0.8, "standard": 1.0, "long": 1.3}.get(length, 1.0)
+    # Overnight (owner 11/14): the same article through the half-price queue - what it uses, and when it is likely ready.
+    usd, night = await _article_estimate(db, config, engine, length)
+    worst = await _article_worst(db, engine, length, usd)
     from app.services.ai.ai_rate_limit_service import monthly_limit_usd
     limit = await monthly_limit_usd(db, current_user.id, config, current_user.plan_tier)
-    return {"usd": round(usd, 5), "percent": round(usd / float(limit) * 100, 2) if limit else None}
+    from app.services.ai import blog_overnight_service
+    return {"usd": round(usd, 5), "percent": round(usd / float(limit) * 100, 2) if limit else None,
+            "overnight": {"usd": round(night, 5), "percent": round(night / float(limit) * 100, 2) if limit else None,
+                          "usd_max": round(worst, 5), "percent_max": round(worst / float(limit) * 100, 2) if limit else None,
+                          **blog_overnight_service.times(config, await _slow_minutes(db, engine))}}
+
+
+@router.post("/ai/suggest")
+async def blog_ai_suggest(
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_design_access),
+):
+    """Tappable starting points for the writer's interview, read from the article's title (owner 11/14: "I wish I
+    was selecting more than typing, based on suggestions the AI sees from the title"). Free picks (audience, the
+    town in the title, closing button) plus one very small AI call for the angle / goal / key points / take choices -
+    see blog_suggest_service. Never an error for the screen: without AI it returns the built-in choices."""
+    from app.services.ai import blog_suggest_service
+    title = str(payload.get("title") or "")[:200]
+    preset = str(payload.get("preset") or "")[:80] or None
+    # What we hold about the agent (owner 11/14: "are we using their recent sales, towns, profile, bio?"): the towns
+    # on their site, the homes they sold by town, their bio, the articles they already wrote, today's month.
+    context = await blog_suggest_service.agent_context(db, current_user)
+    try:
+        return await blog_suggest_service.suggest(db, current_user, title=title, preset=preset, context=context)
+    except Exception:
+        logger.warning("blog suggestions failed - built-in choices returned", exc_info=True)
+        await db.rollback()
+        return {**blog_suggest_service.merge(blog_suggest_service.from_title(title, preset=preset, known_towns=context.get("towns")), None, title, context=context), "cost_usd": 0.0}
+
+
+@router.post("/ai/title-ideas")
+async def blog_ai_title_ideas(
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_design_access),
+):
+    """Titles to tap on the "Give it a title" screen, built from the agent's own towns, sales, bio, the month and what
+    they have not written yet (owner 11/14: "having title suggestions also be very intelligent"). One very small AI
+    call per agent per day; plain-code ideas when the AI can't be asked. Never an error for the screen."""
+    from app.services.ai import blog_suggest_service
+    preset = str(payload.get("preset") or "")[:80] or None
+    template_title = str(payload.get("template_title") or "")[:120] or None
+    context = await blog_suggest_service.agent_context(db, current_user)
+    try:
+        return await blog_suggest_service.title_ideas(db, current_user, preset=preset, template_title=template_title, context=context)
+    except Exception:
+        logger.warning("blog title ideas failed - built-in ideas returned", exc_info=True)
+        await db.rollback()
+        return {"titles": blog_suggest_service.code_titles(context), "ai": False, "cost_usd": 0.0}
 
 
 @router.post("/ai/town-card")
@@ -232,14 +378,22 @@ async def blog_town_card(
     from app.models.database import MarketArea
     from app.services.areas import area_enrichment_service
     from app.services.ai import ai_blog_writer_service
+    from app.services.areas.town_knowledge_service import best_area_by_name
     name = str(payload.get("name") or "").split(",")[0].strip()[:80]
-    state = str(payload.get("state") or "").strip().upper()
-    if not state:
+    typed_state = str(payload.get("state") or "").strip().upper()
+    if not typed_state:
         tail = str(payload.get("name") or "").split(",")[1:]
-        state = (tail[0].strip().upper()[:2] if tail else "") or (current_user.state or "PA").strip().upper()[:2]
+        typed_state = tail[0].strip().upper()[:2] if tail else ""
+    agent_state = (current_user.state or "PA").strip().upper()[:2]
+    state = typed_state or agent_state
     if len(name) < 2 or len(state) != 2:
         raise HTTPException(status_code=422, detail="Type the town's name.")
-    area = await area_enrichment_service.get_or_create_market_area(db, name, state)
+    # A town we already know by this name (any state unless one was typed, any kind - a Philly
+    # neighborhood too) is the one meant; only a brand-new name becomes a new town in the agent's
+    # state (CMA/blog test 11/13: "Cherry Hill" from a PA agent had made "Cherry Hill, PA").
+    area = await best_area_by_name(db, name, state=typed_state or None, prefer_state=agent_state)
+    if area is None:
+        area = await area_enrichment_service.get_or_create_market_area(db, name, state)
     if area.enrichment_status == "ENRICHED":
         card = await ai_blog_writer_service.town_card_for_area(db, area)
         if not card.get("photo"):  # a real landmark photo for the preview (the AI picture waits for the article)
@@ -337,6 +491,20 @@ async def generate_blog_with_ai(
     )
 
 
+_CHECKED_TEXT_BLOCKS = {"paragraph", "heading", "subheading", "quote", "callout", "bulleted_list", "numbered_list"}
+
+
+def _checked_text_hash(blocks) -> str:
+    """A fingerprint of the WORDS the fact-check read (text blocks only - moving a photo, a card or the look is
+    not an edit). Engine audit 11/14: the green "Verified" badge stayed exactly the same after the agent rewrote
+    the article by hand, though nothing they typed had been checked."""
+    import hashlib
+    from app.services.ai import ai_blog_writer_service
+    rows = [b if isinstance(b, dict) else b.model_dump() for b in blocks or []]
+    text = ai_blog_writer_service.blocks_to_text([b for b in rows if b.get("type") in _CHECKED_TEXT_BLOCKS])
+    return hashlib.sha1(" ".join(text.split()).encode("utf-8")).hexdigest()[:16]
+
+
 def _apply_ai_result(blog: Blog, result: dict) -> None:
     """Write a finished AI draft (single-call writer or pipeline) onto the article."""
     blog.title = result["title"] or blog.title
@@ -353,7 +521,8 @@ def _apply_ai_result(blog: Blog, result: dict) -> None:
         blog.linked_properties = result["linked_properties"]
     review = result.get("verification")
     blog.ai_review = {**review, "status": "done", "facts_used": result.get("facts_used") or [],
-                      "cover_image_idea": result.get("cover_image_idea") or None} if review else None
+                      "cover_image_idea": result.get("cover_image_idea") or None,
+                      "text_hash": _checked_text_hash(result["blocks"]), "edited": False} if review else None
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +537,10 @@ _AI_JOB_STALE_SECONDS = 15 * 60
 
 
 def _job_is_stale(review: dict) -> bool:
+    if (review or {}).get("mode") == "overnight":
+        # An overnight run waits for hours by design - it is only "stale" past its own deadline.
+        from app.services.ai import blog_overnight_service
+        return blog_overnight_service.is_stale(review)
     try:
         started = datetime.fromisoformat(review.get("stage_at") or review.get("started_at"))
     except Exception:
@@ -394,33 +567,76 @@ def _same_run(review: Optional[dict], job: dict) -> bool:
     return bool(job.get("started_at")) and (review or {}).get("started_at") == job.get("started_at")
 
 
-async def _run_blog_ai_job(blog_id: str, user_id: str, brief: dict, engine: str) -> None:
+async def _run_blog_ai_job(blog_id: str, user_id: str, brief: dict, engine: str, overnight: bool = False, resume: bool = False) -> None:
+    """`overnight`: the same run through the half-price queue (blog_overnight_service) - hours, not minutes,
+    and able to carry on after a restart (`resume`: this is such a pick-up)."""
+    from app.services.ai import blog_overnight_service as night
+    if not overnight:
+        return await _run_blog_ai_job_inner(blog_id, user_id, brief, engine)
+    night._RUNNING.add(blog_id)
+    try:
+        return await _run_blog_ai_job_inner(blog_id, user_id, brief, engine, overnight=True, resume=resume)
+    except night.Superseded:
+        # Given up, replaced, deleted or picked up by another copy of the server - that run's owner finishes it.
+        logger.info("overnight article: this process no longer owns the run", extra={"blog_id": blog_id})
+    finally:
+        night._RUNNING.discard(blog_id)
+
+
+async def _run_blog_ai_job_inner(blog_id: str, user_id: str, brief: dict, engine: str, overnight: bool = False, resume: bool = False) -> None:
     import asyncio
     import time
     from sqlalchemy import update
     from app.database import AsyncSessionLocal
     from app.services.ai import ai_blog_pipeline_service
+    from app.services.ai import blog_overnight_service as night
 
     error = None
     result = None
+    journal = None
     async with AsyncSessionLocal() as db:
         user = await db.get(User, user_id)
         blog = await db.get(Blog, blog_id)
         if not user or not blog:
             return
-        job = dict(blog.ai_review or {})
+        # This job IS the run: each stage write says "running" even if a stray autosave got in
+        # before the job's first read (see save_blog_ai_brief).
+        job = {**dict(blog.ai_review or {}), "status": "running"}
         stage_clock = {"name": job.get("stage") or "gathering", "at": time.monotonic()}
+
+        async def save_overnight() -> None:
+            """The run's own memory goes on the row with every step - and tells this process when the run is no
+            longer its own."""
+            saved = await db.execute(update(Blog).where(
+                Blog.id == blog_id, Blog.ai_review["started_at"].astext == str(job.get("started_at")),
+                Blog.ai_review["status"].astext == "running",
+                Blog.ai_review["overnight"]["worker"].astext == night.WORKER).values(ai_review=dict(job)))
+            await db.commit()
+            if not saved.rowcount:
+                raise night.Superseded()
+
+        if overnight:
+            job["overnight"] = dict(job.get("overnight") or {})
+            journal = night.Journal(job["overnight"], save_overnight, resumed=resume)
+            # Set before the run's task is created, so the task carries it.
+            ai_blog_pipeline_service.TRANSPORT.set(night.BatchTransport(journal, db))
 
         async def on_stage(name: str) -> None:
             stage_clock.update(name=name, at=time.monotonic())
             job.update(stage=name, stage_at=datetime.now(timezone.utc).isoformat())
+            if overnight:
+                job["overnight"]["lease_at"] = job["stage_at"]
+                return await save_overnight()
             await db.execute(update(Blog).where(Blog.id == blog_id, Blog.ai_review["started_at"].astext == str(job.get("started_at")))
                              .values(ai_review=dict(job)))
             await db.commit()
 
-        run = asyncio.create_task(ai_blog_pipeline_service.run_pipeline(db, user, brief, engine=engine, on_stage=on_stage))
+        run = asyncio.create_task(ai_blog_pipeline_service.run_pipeline(
+            db, user, brief, engine=engine, on_stage=on_stage, **({"overnight": True, "journal": journal} if overnight else {})))
         began = time.monotonic()
         stopped = None
+        # An overnight run ends itself at its deadline (the queue wait checks it); this is only the backstop.
+        time_limit = (night.DEADLINE_HOURS * 3600 + 1800) if overnight else _AI_JOB_TIME_LIMIT_SECONDS
         while not run.done():
             await asyncio.wait({run}, timeout=_AI_JOB_POLL_SECONDS)
             if run.done():
@@ -429,8 +645,8 @@ async def _run_blog_ai_job(blog_id: str, user_id: str, brief: dict, engine: str)
             limit = _AI_JOB_STAGE_LIMITS.get(stage_clock["name"])
             if limit and now - stage_clock["at"] > limit:
                 stopped = _AI_JOB_BUSY_ERROR
-            elif now - began > _AI_JOB_TIME_LIMIT_SECONDS:
-                stopped = _AI_JOB_SLOW_ERROR
+            elif now - began > time_limit:
+                stopped = night.SLOW_ERROR if overnight else _AI_JOB_SLOW_ERROR
             if stopped:
                 logger.warning("AI blog job stopped", extra={"blog_id": blog_id, "stage": stage_clock["name"], "seconds": round(now - began)})
                 run.cancel()
@@ -458,15 +674,28 @@ async def _run_blog_ai_job(blog_id: str, user_id: str, brief: dict, engine: str)
 
     # The ending is written on a fresh connection, so the run's long transaction is over either way.
     async with AsyncSessionLocal() as db:
+
+        async def give_back() -> None:
+            # An overnight run knows exactly which charges were its own (hours may have passed, with other
+            # articles written in between); a normal run gives back what was charged since it started.
+            if journal is not None:
+                await night.refund_events(db, journal.event_ids())
+            else:
+                await ai_blog_pipeline_service.refund_since(db, user_id, job.get("started_at"))
+
         if stopped:
-            await ai_blog_pipeline_service.refund_since(db, user_id, job.get("started_at"))
+            await give_back()
         blog = await db.get(Blog, blog_id)
         if not blog:
             return
-        if not _same_run(blog.ai_review, job):
+        mine = _same_run(blog.ai_review, job) and (
+            not overnight or ((blog.ai_review or {}).get("overnight") or {}).get("worker") == night.WORKER)
+        if overnight and _same_run(blog.ai_review, job) and not mine:
+            return   # another copy of the server picked this run up - it finishes it
+        if not mine:
             logger.warning("AI blog job finished after it was given up - not written", extra={"blog_id": blog_id, "failed": bool(error)})
             if not error:
-                await ai_blog_pipeline_service.refund_since(db, user_id, job.get("started_at"))
+                await give_back()
             return
         if error:
             blog.ai_review = {**job, "status": "failed", "error": error}
@@ -477,6 +706,9 @@ async def _run_blog_ai_job(blog_id: str, user_id: str, brief: dict, engine: str)
             # What this run used and how long it took - the writer's "receipt" (user, 10/24).
             blog.ai_review = {**(blog.ai_review or {}),
                               "run_cost_usd": float((result.get("usage") or {}).get("cost_usd") or 0.0),
+                              # What the agent typed stays with the finished article: it is the only record of which
+                              # first-person lines are the agent's own words (11/14 grader: an outside reader can't tell).
+                              "brief": job.get("brief") or None,
                               "run_started_at": job.get("started_at"),
                               "run_finished_at": datetime.now(timezone.utc).isoformat()}
             logger.info("AI blog draft generated", extra={"blog_id": blog.id, "owner_id": user_id, "engine": engine, "cost_usd": result["usage"]["cost_usd"]})
@@ -491,6 +723,10 @@ async def _run_blog_ai_job(blog_id: str, user_id: str, brief: dict, engine: str)
             link=f"/studio/blogs/{blog.id}", is_read=False, created_at=datetime.now(timezone.utc),
         ))
         await db.commit()
+        if overnight:
+            # The agent walked away on purpose: an email too, every time (owner 11/14: "it will alert them").
+            await _email_overnight_result(db, user_id, blog.id, title, error,
+                                          None if error else float((result.get("usage") or {}).get("cost_usd") or 0.0))
     # Started from the AI helper's chat? Its card and chat hear about it too (owner, 11/01) - a no-op
     # otherwise (ai_notify only answers what it was asked to watch).
     from app.services.ai import ai_notify
@@ -499,6 +735,51 @@ async def _run_blog_ai_job(blog_id: str, user_id: str, brief: dict, engine: str)
         f"Your blog draft \u201c{title}\u201d is ready. Give it a read, pick its look and publish when you're happy - nothing is live until you do."
         if not error else f"The blog draft about {{label}} didn't finish: {error}",
         link=f"/studio/blogs/{blog_id}", link_label="Open the draft")
+
+
+async def _email_overnight_result(db: AsyncSession, user_id: str, blog_id: str, title: str, error: Optional[str], cost_usd: Optional[float]) -> None:
+    try:
+        from app.services.agent_email_service import absolute, email_agent
+        from app.services.ai.ai_config_service import ai_config_service
+        from app.services.ai.ai_rate_limit_service import monthly_limit_usd
+        owner = await db.get(User, user_id)
+        if owner is None:
+            return
+        used_line = None
+        if cost_usd:
+            limit = await monthly_limit_usd(db, user_id, await ai_config_service.get_config(db), owner.plan_tier)
+            if limit:
+                used_line = f"It used about {max(0.1, round(cost_usd / float(limit) * 100, 1)):g}% of this month's AI usage."
+        email_agent(owner, None, "blog_article_failed" if error else "blog_article_ready",
+                    (f"We couldn't finish your article: {title}" if error else f"Your article is ready: {title}")[:150],
+                    {"article_title": title, "link": absolute(f"/studio/blogs/{blog_id}"), "reason": error, "used_line": used_line},
+                    always=True)
+    except Exception:  # noqa: BLE001 - never sink a finished article on its notice
+        logger.warning("overnight article email failed", exc_info=True, extra={"blog_id": blog_id})
+
+
+async def _finish_overnight_failed(blog_id: str, owner_id: str, error: str) -> None:
+    """End an overnight run nobody can finish (past its deadline, or it kept dying): refund what it charged,
+    keep the agent's answers, and tell them - bell and email."""
+    from app.database import AsyncSessionLocal
+    from app.services.ai import blog_overnight_service as night
+    async with AsyncSessionLocal() as db:
+        blog = await db.get(Blog, blog_id)
+        review = dict((blog.ai_review if blog else None) or {})
+        if not blog or review.get("status") != "running" or review.get("mode") != "overnight":
+            return
+        ov = review.get("overnight") or {}
+        await night.refund_events(db, [i for ids in (ov.get("events") or {}).values() for i in ids])
+        blog = await db.get(Blog, blog_id)
+        blog.ai_review = {**{k: v for k, v in review.items() if k != "overnight"}, "status": "failed", "error": error}
+        title = (blog.title or "your article")[:120]
+        db.add(Notification(
+            agent_id=owner_id, type="BLOG_AI_FAILED", reference_type="BLOG", reference_id=blog.id,
+            title=f"Couldn't finish \u201c{title}\u201d"[:200], message=f"{error} Your answers are saved - open it to try again."[:500],
+            link=f"/studio/blogs/{blog.id}", is_read=False, created_at=datetime.now(timezone.utc),
+        ))
+        await db.commit()
+        await _email_overnight_result(db, owner_id, blog.id, title, error, None)
 
 
 async def _mark_ai_alert_seen(db: AsyncSession, blog_id: str, owner_id: str) -> None:
@@ -513,7 +794,7 @@ def _brief_store(brief: dict) -> dict:
     """The interview answers kept on the article so a draft can be finished later - capped so a
     runaway paste can't bloat the row."""
     import json
-    out = {k: v for k, v in (brief or {}).items() if k not in ("engine", "blog_id")}
+    out = {k: v for k, v in (brief or {}).items() if k not in ("engine", "blog_id", "overnight")}
     return out if len(json.dumps(out, default=str)) <= 40_000 else {k: out.get(k) for k in ("topic", "goal", "audiences", "areas", "tone", "length", "cta")}
 
 
@@ -549,7 +830,20 @@ async def save_blog_ai_brief(
             blog.category = str(payload["category_hint"])[:80]
         db.add(blog)
     else:
-        blog.title = topic[:200]
+        # Check-and-write in one statement: an autosave that read the draft just before "Write my
+        # article" started the job must not land after it and flip the running job back to an
+        # unfinished draft (blog test 11/13 - the list said "Unfinished AI draft" while the AI wrote,
+        # and a second Write would have started a second paid run).
+        from sqlalchemy import update
+        saved = await db.execute(
+            update(Blog).where(Blog.id == blog.id, Blog.ai_review["status"].astext.in_(("interview", "failed")))
+            .values(title=topic[:200], ai_review={"status": "interview", "new": True, "brief": _brief_store(brief),
+                                                  "step": step, "saved_at": now})
+        )
+        await db.commit()
+        if not saved.rowcount:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This article is no longer an unfinished AI draft.")
+        return {"blog_id": blog.id, "saved_at": now}
     blog.ai_review = {"status": "interview", "new": True, "brief": _brief_store(brief), "step": step, "saved_at": now}
     await db.commit()
     await db.refresh(blog)
@@ -569,6 +863,7 @@ async def start_blog_ai_job(
     from app.services.ai import ai_blog_pipeline_service
     if not payload.topic.strip():
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Tell the AI what this article is about.")
+    overnight = bool(payload.overnight)
     engine = await ai_blog_pipeline_service.precheck(db, current_user, payload.engine)
     existing = await get_owned_blog(db, payload.blog_id, current_user.id) if payload.blog_id else None
     now = datetime.now(timezone.utc).isoformat()
@@ -590,17 +885,38 @@ async def start_blog_ai_job(
             blog.category = payload.category_hint
         db.add(blog)
         previous = None
+    brief = payload.model_dump()
+    brief["listings"] = [p.model_dump(exclude_none=True) for p in payload.listings]
+    brief.pop("overnight", None)
     blog.ai_review = {"status": "running", "stage": "gathering", "engine": engine, "started_at": now, "stage_at": now,
                       "new": is_new, "previous": previous, "brief": _brief_store(payload.model_dump(mode="json"))}
+    extra: dict = {}
+    if overnight:
+        import json
+        from app.services.ai import blog_overnight_service
+        from app.services.ai.ai_config_service import ai_config_service
+        from app.services.ai.ai_rate_limit_service import monthly_limit_usd
+        config = await ai_config_service.get_config(db)
+        # The run reads its brief back from the row, so a run picked up after a restart reads the very same one.
+        state = blog_overnight_service.new_state(brief, config, await _slow_minutes(db, engine))
+        brief = json.loads(json.dumps(state["brief"]))
+        blog.ai_review = {**blog.ai_review, "mode": "overnight", "overnight": state}
+        now_usd, usd = await _article_estimate(db, config, engine, payload.length)
+        now_usd = await _article_worst(db, engine, payload.length, now_usd)        # the top of the range: the worst case
+        limit = await monthly_limit_usd(db, current_user.id, config, current_user.plan_tier)
+        extra = {"mode": "overnight", "likely_at": state["likely_at"], "latest_at": state["latest_at"],
+                 "cap_minutes": state["cap_minutes"], "max_minutes": state["cap_minutes"] + blog_overnight_service.FAST_FINISH_MINUTES,
+                 # what it uses: this at best (every step answered in the slower line), `percent_max` at worst (the
+                 # time cap finished it the fast way)
+                 "percent": round(usd / float(limit) * 100, 2) if limit else None,
+                 "percent_max": round(now_usd / float(limit) * 100, 2) if limit else None}
     await db.commit()
     await db.refresh(blog)
 
-    brief = payload.model_dump()
-    brief["listings"] = [p.model_dump(exclude_none=True) for p in payload.listings]
-    task = asyncio.create_task(_run_blog_ai_job(blog.id, current_user.id, brief, engine))
+    task = asyncio.create_task(_run_blog_ai_job(blog.id, current_user.id, brief, engine, overnight=overnight))
     _AI_JOBS.add(task)
     task.add_done_callback(_AI_JOBS.discard)
-    return {"blog_id": blog.id, "status": "running", "stage": "gathering", "engine": engine}
+    return {"blog_id": blog.id, "status": "running", "stage": "gathering", "engine": engine, **extra}
 
 
 async def _writer_probe(user: User, names: list[str], slugs: list[str]) -> dict:
@@ -616,7 +932,7 @@ async def _writer_probe(user: User, names: list[str], slugs: list[str]) -> dict:
     from app.services.areas import town_knowledge_service as tk
     from app.utils.auth import tier_has_mls
 
-    out = {"busy": False, "unknown": [], "seconds": 0.0}
+    out = {"busy": False, "unknown": [], "seconds": 0.0, "outside": []}
     t0 = time.monotonic()
 
     async def probe() -> None:
@@ -635,6 +951,9 @@ async def _writer_probe(user: User, names: list[str], slugs: list[str]) -> dict:
                     # so "on file" means researched - anything else gets the "new to us" note.
                     if not a or a.enrichment_status not in ("ENRICHED", "PARTIAL"):
                         out["unknown"].append(str(raw).split(",")[0].strip())
+                # towns in a state the agent doesn't work in -> the writer asks whether they are licensed there
+                from app.services.ai import ai_blog_pipeline_service as _pipe
+                out["outside"] = (await _pipe.out_of_area_states(db, user, {(a.state or "").upper() for a in areas if a.state}))[0]
                 known = [a for a in areas if a.enrichment_status in ("ENRICHED", "PARTIAL")] or areas
                 if known:
                     await tk.town_dossier(db, known[0], include_bank=False, mls=tier_has_mls(user.plan_tier))
@@ -683,13 +1002,18 @@ async def blog_ai_preflight(
         checks.append({"key": "servers", "level": "block", "title": "Our servers are very busy right now",
                        "detail": "Writing would stall on its first step. Your answers are saved - check again in a few minutes."})
     else:
-        checks.append({"key": "servers", "level": "ok", "title": "Ready to write - usually 2-4 minutes"})
+        checks.append({"key": "servers", "level": "ok", "title": "Our servers are ready"})   # how long it takes is shown with each way of writing it
     if probe["unknown"]:
         towns = ", ".join(probe["unknown"])
         checks.append({"key": "towns", "level": "warn", "title": f"New to us: {towns}",
                        "detail": "The AI researches it from scratch - a little slower, with fewer local numbers. Check the spelling if that's a typo."})
     elif names or slugs:
         checks.append({"key": "towns", "level": "ok", "title": "Your towns are on file"})
+    if probe.get("outside"):
+        where = ai_blog_pipeline_service.state_names(probe["outside"])
+        checks.append({"key": "license", "level": "ask", "title": f"Are you licensed in {where}?", "states": probe["outside"],
+                       "detail": f"This town is outside the states you work in. If you aren't licensed in {where}, the article will say so and offer to "
+                                 "introduce the reader to an agent who is, instead of offering your own services there."})
     logger.info("blog writer preflight", extra={"owner_id": current_user.id, "busy": probe["busy"], "seconds": probe["seconds"]})
     return {"ready": not any(c["level"] == "block" for c in checks), "checks": checks, "seconds": probe["seconds"]}
 
@@ -707,11 +1031,21 @@ async def get_blog_ai_job(
         state, review = "failed", {**review, "error": "The AI writer took too long - please try again. Nothing was charged for this try."}
         # The run died part-way (e.g. a restart) - give back what its finished steps charged.
         from app.services.ai import ai_blog_pipeline_service
-        await ai_blog_pipeline_service.refund_since(db, current_user.id, review.get("started_at"))
+        if review.get("mode") == "overnight":
+            from app.services.ai import blog_overnight_service
+            ov = review.get("overnight") or {}
+            await blog_overnight_service.refund_events(db, [i for ids in (ov.get("events") or {}).values() for i in ids])
+            blog = await get_owned_blog(db, blog_id, current_user.id)
+        else:
+            await ai_blog_pipeline_service.refund_since(db, current_user.id, review.get("started_at"))
     if state == "interview":
         return {"status": "interview", "brief": review.get("brief"), "step": review.get("step")}
     if state == "running":
-        return {"status": "running", "stage": review.get("stage"), "engine": review.get("engine"), "started_at": review.get("started_at")}
+        out = {"status": "running", "stage": review.get("stage"), "engine": review.get("engine"), "started_at": review.get("started_at")}
+        if review.get("mode") == "overnight":
+            from app.services.ai import blog_overnight_service
+            out.update(blog_overnight_service.public_state(review))
+        return out
     if state == "failed":
         error = review.get("error") or "The AI writer could not finish this draft."
         # A brand-new article stays a DRAFT holding the agent's answers (open it to try again - user,
@@ -797,6 +1131,13 @@ async def update_blog(
     old_cover_url = blog.cover_image_url
     for field, value in data.items():
         setattr(blog, field, value)
+    # The fact-check covered the words the AI wrote. Once the agent changes them the report says so
+    # (and says "verified" again if they put the text back).
+    review = blog.ai_review if isinstance(blog.ai_review, dict) else None
+    if "blocks" in data and review and review.get("status") == "done" and review.get("text_hash"):
+        edited = _checked_text_hash(data["blocks"]) != review["text_hash"]
+        if bool(review.get("edited")) != edited:
+            blog.ai_review = {**review, "edited": edited}
 
     await db.commit()
     await db.refresh(blog)

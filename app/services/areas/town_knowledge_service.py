@@ -29,7 +29,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -175,16 +175,21 @@ def _places_items(area: MarketArea, facts: dict) -> list[dict]:
         for r in walk["rows"]:
             if r.get("label") and r.get("pct") is not None:
                 out.append({"topic": "transit" if r.get("key") == "transit" else "downtown",
-                            "claim": (f"About {r['pct']}%" if r["pct"] else "Almost no") + f" {'of ' if r['pct'] else ''}{area.name} homes are within a {mins}-minute walk of {r['label'].lower()} (an OpenStreetMap estimate from a sample of {walk['homes_checked']} homes).",
+                            # Grader 11/14 (High): this was worded "within a 15-minute walk" - a walking TIME - while the
+                            # figure is a straight-line distance, which streets, creeks and highways can make much longer.
+                            "claim": (f"About {r['pct']}%" if r["pct"] else "Almost no") + f" {'of ' if r['pct'] else ''}{area.name} homes are within about {walk_miles(mins)} miles of "
+                                     f"{r['label'].lower()}, measured in a straight line (an OpenStreetMap estimate from a sample of {walk['homes_checked']} homes). "
+                                     "That is a distance, not a walking time: the walk itself is often longer, depending on the streets.",
+                            "note": "State it as a straight-line distance. Never as a walking time ('a 15-minute walk') and never as 'walkable'.",
                             "source_name": "OpenStreetMap (OpenHousePal walk check)", "source_url": "https://www.openstreetmap.org", "as_of": _date(walk.get("computed_at")), "confidence": 0.9})
         if walk.get("stations"):
-            out.append({"topic": "transit", "claim": f"Rail and trolley stops within a {mins}-minute walk of {area.name} homes: {', '.join(walk['stations'][:6])} (OpenStreetMap).",
+            out.append({"topic": "transit", "claim": f"Rail and trolley stops within about {walk_miles(mins)} miles (straight line) of some {area.name} homes: {', '.join(walk['stations'][:6])} (OpenStreetMap).",
                         "source_name": "OpenStreetMap (OpenHousePal walk check)", "source_url": "https://www.openstreetmap.org", "as_of": _date(walk.get("computed_at")), "confidence": 0.9})
     commute = facts.get("commute") or {}
     for d in (commute.get("destinations") or [])[:4]:
         if d.get("name") and d.get("drive_minutes"):
             transit = f" and about {d['transit_minutes']} minutes by public transit" if d.get("transit_minutes") else ""
-            out.append({"topic": "transit", "claim": f"From {area.name}, {d['name']} is about {d.get('miles')} miles away: about {d['drive_minutes']} minutes by car{transit}, leaving at {commute.get('departure') or 'a weekday morning'} (Google Maps estimate).",
+            out.append({"topic": "transit", "claim": f"From {area.name}, {d['name']} is about {d.get('miles')} miles away: about {d['drive_minutes']} minutes by car{transit}, leaving at {commute.get('departure') or 'a weekday morning'} (Google Maps estimate, measured from the center of {area.name} - a specific home's trip will differ).",
                         "source_name": "Google Maps", "source_url": None, "as_of": _date(commute.get("computed_at")), "confidence": 0.85})
     flood = facts.get("flood") or {}
     if flood.get("homes_checked") and flood.get("high_risk_pct") is not None:
@@ -297,6 +302,7 @@ async def geography_profile(db: AsyncSession, area: MarketArea) -> dict:
             total = sum(m["share"] for m in small)
             towns["_small"] = {"name": f"{what} (" + ", ".join(names[:6]) + (" and others" if len(names) > 6 else "") + ")",
                                "share": pct(total), "sort": total, "county": None, "source": "census", "kind": "small"}
+        fit_shares([t for t in towns.values() if isinstance(t.get("share"), int)])
     # Not measured (no Census answer): the stored TIGER shares - whose "Unincorporated X County" row is
     # only the remainder (100% minus the towns on the map), so it never gets a share of its own below.
     for m in [] if towns else (bounds.get("municipalities") or []):
@@ -387,6 +393,9 @@ async def geography_profile(db: AsyncSession, area: MarketArea) -> dict:
         add(f"{area.name} homes span " + ", ".join(f"{_county_label(c['name'])} ({c['share']}%)" for c in counties) + ".")
     return {
         "town": area.name, "slug": area.slug, "kind": kind, "townships": tw, "school_districts": list(districts.values()),
+        # A district serving under 3% of the homes isn't listed (Media: 97% listed; Penn-Delco and Garnet Valley serve the
+        # rest). Complete only when one district covers every home we hold - anything shown from this list says so.
+        "districts_complete": len(districts) == 1 and (next(iter(districts.values())).get("share") or 0) >= 99.5,
         "counties": [_county_label(c["name"]) for c in counties], "mailing_towns": [m["name"].title() for m in mailing],
         # The measured outlines (every town + county land) - the tax split places listings with them.
         "muni_shapes": [{"name": m["name"], "rings": m["rings"]} for m in (measured or {}).get("rows") or [] if m.get("rings")],
@@ -753,6 +762,358 @@ async def save_state_items(db: AsyncSession, state: str, items: list[dict]) -> i
 
 
 # ---------------------------------------------------------------------------
+# Municipal facts - a township's or borough's OWN sale rules, fees and offices (shared_knowledge "muni:PA:county:name").
+#
+# Grader round 7 (11/15): a Media seller article left out Middletown Township's sewer certification - which a Media
+# article written the day before HAD found. A fact about one municipality had no home of its own: it is not about
+# the mailing town (so it missed the town's bank), and the state-wide bank either took it by accident (23 of the
+# 64 "state-wide" Pennsylvania facts were one township's rule, handed to every Pennsylvania article) or threw it
+# away because it named its county (Middletown's did). What research finds about a municipality is now kept under
+# that municipality and handed to every article whose homes sit in it.
+# ---------------------------------------------------------------------------
+
+_MUNI_WORD = re.compile(r"\b(?:[A-Z][A-Za-z.'-]+\s){1,3}(?:Township|Borough)\b")
+
+
+def municipalities(profiles: list[dict]) -> list[dict]:
+    """The municipalities the article's homes sit in: [{name, county, share}], largest share first. The grouped
+    "other municipalities (...)" row has no rules of its own to look up."""
+    out, seen = [], set()
+    for p in profiles or []:
+        for t in p.get("townships") or []:
+            name = str(t.get("name") or "").strip()
+            key = (_muni_key(name), norm_place(t.get("county")))
+            if not name or not key[0] or t.get("kind") == "small" or t.get("remainder") or key in seen:
+                continue
+            seen.add(key)
+            out.append({"name": name, "county": t.get("county"), "share": t.get("sort", t.get("share"))})
+    return sorted(out, key=lambda m: -(m["share"] if isinstance(m["share"], (int, float)) else 0))
+
+
+def _muni_key(name: Optional[str]) -> str:
+    """'Doylestown Township' and 'Doylestown Borough' are two municipalities: the kind stays in the key."""
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).split())
+
+
+def muni_scope(state: Optional[str], muni: dict) -> str:
+    """Two Middletown Townships in one state are two places: the county is part of the key."""
+    return f"muni:{(state or '').upper()}:{norm_place(muni.get('county'))}:{_muni_key(muni.get('name'))}"
+
+
+def _names_muni(muni: dict, text: str) -> bool:
+    return bool(re.search(r"(?<![A-Za-z])" + re.escape(muni["name"]) + r"(?![A-Za-z])", text or "", re.I))
+
+
+def muni_of(item: dict, munis: list[dict]) -> Optional[dict]:
+    """The ONE municipality of this article a fact is about: the one its `town` names in full ("Middletown
+    Township"), else the only one its claim or source names. A fact naming two of them, or none, is not a municipal
+    fact - and a bare mailing-town name ("Media") is never read as the borough of the same name."""
+    town = str(item.get("town") or "").split(",")[0].strip().lower()
+    by_town = [m for m in munis or [] if town and m["name"].lower() == town]
+    if len(by_town) == 1:
+        return by_town[0]
+    named = [m for m in munis or [] if _names_muni(m, f"{item.get('claim') or ''} {item.get('source_name') or ''}")]
+    return named[0] if len(named) == 1 else None
+
+
+def split_state_items(items: list[dict], munis: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(state-wide facts, facts that are really one of THIS article's municipalities'). A "state-wide" fact that is
+    another town's township rule is neither - it is left out of this article."""
+    general, local = [], []
+    for i in items or []:
+        if not _MUNI_WORD.search(str(i.get("claim") or "")):
+            general.append(i)
+            continue
+        m = muni_of({**i, "town": ""}, munis)
+        if m:
+            local.append({**i, "municipality": m["name"]})
+    return general, local
+
+
+async def muni_items(db: AsyncSession, state: str, munis: list[dict]) -> list[dict]:
+    """What we already hold about each of these municipalities, minus expired facts."""
+    from app.models.database import SharedKnowledge
+    scopes = {muni_scope(state, m): m for m in munis or []}
+    if not scopes or not state:
+        return []
+    rows = (await db.execute(select(SharedKnowledge).where(SharedKnowledge.scope.in_(list(scopes))))).scalars().all()
+    now, out = datetime.now(timezone.utc), []
+    for row in rows:
+        m = scopes.get(row.scope)
+        if m:
+            # a stored fact whose page turns out to be another county's is never handed over (round 8)
+            out += [{**i, "origin": "state_bank", "town": "general", "municipality": m["name"]} for i in _fresh(row.items or [], now)
+                    if not jurisdiction_problem(i, m)]
+    return out
+
+
+async def save_muni_items(db: AsyncSession, state: str, muni: dict, items: list[dict]) -> int:
+    """Keep sourced facts about one municipality (deduped, capped, expired pruned). Rates never go here."""
+    from app.models.database import SharedKnowledge
+    items = [i for i in items or [] if i.get("source_url") and i.get("claim") and i.get("topic") not in ("rates", "market")
+             and not jurisdiction_problem(i, muni)]
+    if not items or not state or not _muni_key(muni.get("name")):
+        return 0
+    scope = muni_scope(state, muni)
+    row = (await db.execute(select(SharedKnowledge).where(SharedKnowledge.scope == scope))).scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    current = _fresh(row.items if row else [], now)
+    seen = {c.get("id") for c in current}
+    added = 0
+    # a page read again today: what we held from it earlier has now been re-read (see recheck_pages)
+    read_now = {it["source_url"] for it in items if not it.get("saved_at")}      # a fact being MOVED here was not just read
+    reread = [c for c in current if c.get("source_url") in read_now and not c.get("rechecked_at")]
+    for c in reread:
+        c["rechecked_at"] = now.isoformat()
+    again = 0
+    for it in items:
+        iid = _iid(scope, it["claim"])
+        if iid in seen:
+            # the same words read again on a later run: that reading counts (confirmed_specifics)
+            if not it.get("saved_at"):
+                old = next((c for c in current if c.get("id") == iid), None)
+                if old is not None:
+                    old["reads"] = (list(old.get("reads") or []) + [now.isoformat()])[-4:]
+                    again += 1
+            continue
+        seen.add(iid)
+        current.append({"id": iid, "topic": it.get("topic") or "other", "claim": it["claim"], "source_name": it.get("source_name") or _domain(it.get("source_url")),
+                        "source_url": it["source_url"], "as_of": it.get("as_of"), "confidence": it.get("confidence"),
+                        **({"jurisdiction": it["jurisdiction"]} if it.get("jurisdiction") else {}),
+                        # a fact moved here from the old state-wide store keeps the day it was read
+                        "saved_at": it.get("saved_at") or now.isoformat()})
+        added += 1
+    if added or reread or again:
+        if row is None:
+            row = SharedKnowledge(scope=scope, items=[])
+            db.add(row)
+        row.items = current[-_BANK_MAX_ITEMS:]
+        flag_modified(row, "items")
+        await db.commit()
+    return added
+
+
+# Stored procedure facts read before this day were read under a rule that let one deadline stand for a page that gives
+# two (grader round 7: Media Borough's page says "application 20 days before settlement" AND "schedule the inspection
+# 15 days before"; we held only the second). Each such page is read once more, then left alone.
+RECHECK_BEFORE = "2026-11-15"
+_LEAD_TIME = re.compile(r"\b(?:\d+|two|three|four|six)\s*(?:business\s+|calendar\s+)?(?:days?|weeks?)\b", re.I)
+
+
+def recheck_pages(items: list[dict], limit: int = 2) -> list[dict]:
+    """[{municipality, url}] - official pages behind stored municipal facts that carry a deadline, were read before
+    RECHECK_BEFORE and have not been read again since."""
+    out, seen = [], set()
+    for i in items or []:
+        url = i.get("source_url")
+        if (url and url not in seen and not i.get("rechecked_at") and str(i.get("saved_at") or "")[:10] < RECHECK_BEFORE
+                and _LEAD_TIME.search(str(i.get("claim") or ""))):
+            seen.add(url)
+            out.append({"municipality": i.get("municipality"), "url": url})
+    return out[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Whose page is it? Grader round 8 (11/15): a Media article (Upper Providence Township, DELAWARE County) stated a
+# sewer-billing rule read on upperprovmcpa.gov - the site of Upper Providence Township, MONTGOMERY County. A real
+# government page, accurately paraphrased, about a different municipality with the same name; it was also stored
+# as a fact about Delaware County's. Pennsylvania has many such pairs (Middletown, Springfield, Newtown, ...).
+# A fact is taken as a municipality's only when it is positively tied to that municipality's COUNTY.
+# ---------------------------------------------------------------------------
+
+# One site, many municipalities: the web address says nothing about whose page it is.
+_SHARED_CODE_HOSTS = ("ecode360.com", "municode.com", "amlegal.com", "generalcode.com", "codepublishing.com", "wikipedia.org")
+# County shorthand municipal sites put in their address ("middletowndelcopa.gov", "upperprovmcpa.gov").
+_COUNTY_HOST_TOKENS = {"delco": "delaware", "montco": "montgomery", "mcpa": "montgomery", "chesco": "chester", "buckscounty": "bucks",
+                       "bucksco": "bucks", "berksco": "berks", "lancasterco": "lancaster"}
+
+
+def _host(url) -> str:
+    return re.sub(r"^https?://(www\.)?", "", str(url or "").lower()).split("/")[0]
+
+
+def _counties_of_page(item: dict) -> set[str]:
+    """Every county this fact's page is tied to: what the researcher read on the page itself (`jurisdiction`), a
+    county named in the claim or source name, and county shorthand in the web address."""
+    said = {norm_place(m) for m in re.findall(r"\b([A-Z][a-z]+(?:\s[A-Z][a-z']+)?)\s+County\b", str(item.get("jurisdiction") or ""))}
+    host = _host(item.get("source_url"))
+    tokens = {county for token, county in _COUNTY_HOST_TOKENS.items() if token in host}
+    return {c for c in said | _counties_named(item) | tokens if c}
+
+
+def jurisdiction_problem(item: dict, muni: dict) -> Optional[str]:
+    """Why this fact cannot be taken as being about `muni` - its page is tied to a different county - or None."""
+    ours = norm_place(muni.get("county"))
+    theirs = _counties_of_page(item)
+    if ours and theirs and ours not in theirs:
+        return f"{' / '.join(sorted(t.title() for t in theirs))} County, not {ours.title()} County"
+    return None
+
+
+def only_this_jurisdiction(items: list[dict], munis: list[dict], held: Optional[list[dict]] = None) -> tuple[list[dict], list[str]]:
+    """(facts that may be used, what was left out and why). A fact about one of the article's municipalities stays
+    only if its page is tied to that municipality's county: the page's own words (`jurisdiction`), a county in the
+    claim, county shorthand in the address - or the page is on a site we already hold for that municipality. A fact
+    tied to another county, or to none, is not used and not stored. Everything else passes untouched."""
+    trusted: dict[str, set[str]] = {}
+    for h in held or []:
+        host = _host(h.get("source_url"))
+        if host and not any(host.endswith(s) for s in _SHARED_CODE_HOSTS):
+            trusted.setdefault(_muni_key(h.get("municipality")), set()).add(host)
+    kept, notes = [], []
+    for i in items or []:
+        m = muni_of(i, munis)
+        if not m:
+            kept.append(i)
+            continue
+        why = jurisdiction_problem(i, m)
+        if why:
+            notes.append(f"A page for a different {m['name']} was found and NOT used ({why}): {i.get('source_url')}")
+            continue
+        ours = norm_place(m.get("county"))
+        if ours in _counties_of_page(i) or _host(i.get("source_url")) in trusted.get(_muni_key(m["name"]), set()):
+            kept.append({**i, "municipality": m["name"]})
+        else:
+            notes.append(f"Could not confirm that this page belongs to {m['name']}, {_county_label(m.get('county')) or 'its county'} - not used: {i.get('source_url')}")
+    return kept, notes
+
+
+# ---------------------------------------------------------------------------
+# A requirement with no "how far ahead". Round 8: both Media articles named Marple Township's resale inspection and
+# said no lead time was published - the township's resale application says "at least two (2) weeks prior to
+# settlement" and "$200". Malvern Borough's sewer certification was named without its 10-business-day processing
+# time. Research had read the page that LINKS the form, not the form.
+# ---------------------------------------------------------------------------
+_REQ_KINDS = (("sewer certification or sewer lateral inspection", re.compile(r"\bsewer|\blateral", re.I)),
+              ("resale / use-and-occupancy certificate", re.compile(r"occupancy|\bU\s?&\s?O\b|resale (?:inspection|certificate|application)", re.I)))
+_REQUIRES = re.compile(r"\brequire[sd]?\b|\bmust\b|\bis needed\b|\bneeds? (?:a|an|to)\b", re.I)
+_NOT_REQUIRED = re.compile(r"\b(?:does not|doesn't|do not|is not|isn't|not) requir|\bno (?:resale|certificate|use and occupancy|u&o)\b", re.I)
+
+
+def lead_time_gaps(munis: list[dict], items: list[dict], limit: int = 3) -> list[str]:
+    """For each of the article's municipalities, largest first: a sale requirement we hold with no lead time,
+    processing time or deadline anywhere in what we hold about it. Each is something to open the FORM for."""
+    out = []
+    for m in munis or []:
+        mine = [i for i in items or [] if _muni_key(i.get("municipality")) == _muni_key(m["name"])]
+        for label, kind in _REQ_KINDS:
+            about = [i for i in mine if kind.search(str(i.get("claim") or ""))]
+            needed = [i for i in about if _REQUIRES.search(str(i.get("claim") or "")) and not _NOT_REQUIRED.search(str(i.get("claim") or ""))]
+            if needed and not any(_LEAD_TIME.search(str(i.get("claim") or "")) for i in about):
+                out.append(f"{m['name']}, {_county_label(m.get('county')) or ''}: how far before settlement its {label} must be applied for, how long it "
+                           "takes and its fee - not checked: open the application form or instruction sheet itself (a page read), not the page that links it")
+    return out[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Only what we are sure of is stated as a number (owner, 11/15: "be more broad about it - mentioning that it exists,
+# not exact numbers, if we aren't for sure ... less fact dependent on stuff not from our DB").
+#
+# A township's deadline, processing time or fee comes from ONE reading of a web page by the AI. Three grader rounds
+# found those readings incomplete or misapplied (one of a page's two deadlines; a processing time written as a filing
+# deadline; a deadline that sat on a form nobody opened). So a number from a municipal page may be stated only when
+# TWO separate readings of that same page, on separate runs, both gave it. Until then the article says the
+# requirement exists, that it has to be started early, and links the page - no number. Our own figures (MLS
+# counts and prices, the payment math, the hand-verified tables) are not affected.
+# ---------------------------------------------------------------------------
+_WORD_NUMBERS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "ten": 10, "fourteen": 14, "fifteen": 15,
+                 "twenty": 20, "thirty": 30, "sixty": 60, "ninety": 90}
+_SPECIFIC = re.compile(
+    r"\$\s?\d[\d,]*(?:\.\d\d)?"
+    r"|\b(?:\d+|" + "|".join(_WORD_NUMBERS) + r")\s*(?:\(\d+\)\s*)?(?:business\s+|calendar\s+|working\s+)?(?:days?|weeks?|months?)\b", re.I)
+_SEPARATE_READS = timedelta(minutes=30)
+_NOT_CONFIRMED = "(a lead time or fee its page gives - not yet confirmed: do NOT state a number)"
+
+
+def _specific_key(token: str) -> str:
+    t = " ".join(token.lower().split())
+    if t.startswith("$"):
+        return "$" + re.sub(r"[^\d.]", "", t).rstrip(".").replace(".00", "")
+    m = re.match(r"(\d+|[a-z]+)", t)
+    n = m.group(1)
+    unit = "day" if "day" in t else "week" if "week" in t else "month"
+    return f"{_WORD_NUMBERS.get(n, n)} {unit}"
+
+
+def specifics(text: Optional[str]) -> set[str]:
+    """The numbers a municipal fact gives a reader to act on: '$200', '20 day', '2 week', '10 day' ("ten (10)
+    business days")."""
+    return {_specific_key(m.group(0)) for m in _SPECIFIC.finditer(text or "")}
+
+
+def confirmed_specifics(items: list[dict], now: Optional[datetime] = None) -> set[str]:
+    """Numbers that TWO separate readings of the same page both gave. `items`: everything held about ONE municipality,
+    stored (with the time each was read: `saved_at`, and `reads` when the same wording was read again) and fresh (no
+    `saved_at`: read just now). Readings less than half an hour apart are one run."""
+    now = now or datetime.now(timezone.utc)
+    by_page: dict[str, list[tuple[datetime, set[str]]]] = {}
+    for i in items or []:
+        tokens = specifics(i.get("claim"))
+        if not tokens or not i.get("source_url"):
+            continue
+        times = [i.get("saved_at")] + list(i.get("reads") or []) if i.get("saved_at") else [None]
+        for t in times:
+            try:
+                when = datetime.fromisoformat(t) if t else now
+            except (TypeError, ValueError):
+                continue
+            by_page.setdefault(str(i["source_url"]), []).append((when, tokens))
+    sure: set[str] = set()
+    for reads in by_page.values():
+        seen: dict[str, list[datetime]] = {}
+        for when, tokens in sorted(reads, key=lambda r: r[0]):
+            for tok in tokens:
+                runs = seen.setdefault(tok, [])
+                if not runs or when - runs[-1] >= _SEPARATE_READS:
+                    runs.append(when)
+        sure |= {tok for tok, runs in seen.items() if len(runs) >= 2}
+    return sure
+
+
+def mask_unconfirmed(claim: str, sure: set[str]) -> tuple[str, int]:
+    """The claim as the writer may see it: every number not yet confirmed by a second reading is replaced by a note
+    saying so. Returns (claim, how many were held back)."""
+    held = 0
+
+    def swap(m):
+        nonlocal held
+        if _specific_key(m.group(0)) in sure:
+            return m.group(0)
+        held += 1
+        return _NOT_CONFIRMED
+    return _SPECIFIC.sub(swap, claim or ""), held
+
+
+def unconfirmed_pages(items: list[dict], limit: int = 2) -> list[dict]:
+    """[{municipality, url}] - official pages we hold a number from that no second reading has confirmed yet: each is
+    worth one more page read."""
+    out, seen = [], set()
+    by_muni: dict[str, list[dict]] = {}
+    for i in items or []:
+        by_muni.setdefault(_muni_key(i.get("municipality")), []).append(i)
+    for mine in by_muni.values():
+        sure = confirmed_specifics(mine)
+        for i in mine:
+            url = i.get("source_url")
+            if url and url not in seen and specifics(i.get("claim")) - sure:
+                seen.add(url)
+                out.append({"municipality": i.get("municipality"), "url": url})
+    return out[:limit]
+
+
+def merge_items(*lists: list[dict]) -> list[dict]:
+    """One list, each claim once (the first copy wins)."""
+    out, seen = [], set()
+    for items in lists:
+        for i in items or []:
+            key = " ".join(str(i.get("claim") or "").lower().split())
+            if key and key not in seen:
+                seen.add(key)
+                out.append(i)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Mortgage rates straight from Freddie Mac's published PMMS history (free, no key, updated every
 # Thursday) - exact and dated, so no AI research is spent on rates. Cached in-process for 6h.
 # ---------------------------------------------------------------------------
@@ -813,6 +1174,22 @@ async def freddie_mac_rate_items() -> list[dict]:
     return items
 
 
+def fit_shares(rows: list[dict]) -> None:
+    """Whole-number shares that add up (grader audit 11/13, finding 16: Kennett Square's municipalities
+    read 42% + 26% + 18% + 10% + 2% + 2% + 2% = 102%, each rounded on its own). Largest-remainder
+    rounding on the exact shares ("sort"): the parts total the rounded sum, never more. In place."""
+    exact = [float(r.get("sort") or 0) for r in rows]
+    if not rows or any(x < 1 for x in exact):
+        return
+    floors = [int(x) for x in exact]
+    left = round(sum(exact)) - sum(floors)
+    order = sorted(range(len(rows)), key=lambda i: (-(exact[i] - floors[i]), -exact[i]))
+    for i in order[:max(0, left)]:
+        floors[i] += 1
+    for r, v in zip(rows, floors):
+        r["share"] = v
+
+
 def _fmt_money(v) -> str:
     v = float(v)
     return f"${v / 1_000_000:.2f}M".replace(".00M", "M") if v >= 1_000_000 else f"${round(v / 1000):,}K"
@@ -836,7 +1213,9 @@ def market_definition(area: MarketArea, geo: Optional[dict] = None) -> str:
         return f"{area.name} numbers cover homes inside the {area.name} boundary on our map; {_HOME_TYPES_NOTE}."
     # A remainder row (not measured) is "other parts of X County" - never "Unincorporated X County".
     label = lambda t: f"other parts of {re.sub(r'^unincorporated\s+', '', t['name'], flags=re.I)}" if t.get("remainder") else t["name"]
-    where = ", ".join(label(t) for t in tw) if len(tw) > 1 else ""
+    # named places first, the grouped "other municipalities (...)" row last (it sat in the middle of the list)
+    grouped = lambda t: bool(t.get("remainder")) or t.get("kind") == "small" or str(t.get("name") or "").lower().startswith("other ")
+    where = ", ".join(label(t) for t in sorted(tw, key=grouped)) if len(tw) > 1 else ""
     return f"{area.name} numbers cover homes with {_a(area.name)} {area.name} mailing address" + (f", which spans {where}" if where else "") + f"; {_HOME_TYPES_NOTE}."
 
 
@@ -869,7 +1248,8 @@ def sales_snapshot_items(area: MarketArea, snap: dict, geo: Optional[dict] = Non
     if cur.get("by_type") and parts_fit(cur.get("closed_count"), [v["count"] for v in cur["by_type"].values()]):
         names = {"condo": "condos", "townhouse": "townhomes", "house": "single-family houses"}
         add(f"{area.name}: closed sales by type in {win}: " + "; ".join(
-            f"{names[k]} {_fmt_money(v['median_close_price'])} median ({v['count']} sales)" for k, v in cur["by_type"].items()) + ".")
+            f"{names[k]} {_fmt_money(v['median_close_price'])} median ({v['count']} sales)" for k, v in cur["by_type"].items()) + "."
+            + attached_styles_note((cur["by_type"].get("townhouse") or {}).get("styles")))
     if cur.get("median_sale_to_list_pct"):
         va = cur.get("vs_asking") or {}
         split = (f"; of the {va['of']} sales with a list price, {va['above']} sold above asking, {va['at']} at exactly asking and {va['below']} below"
@@ -887,6 +1267,75 @@ def sales_snapshot_items(area: MarketArea, snap: dict, geo: Optional[dict] = Non
     if not snap.get("prior_year_reliable", True):
         add(f"{area.name}: year-ago comparisons are left out - our Bright MLS history for the same window a year earlier is incomplete, so those numbers would mislead.")
     return out
+
+
+def _lot_words(sqft: float) -> str:
+    """0.25 -> 'about a quarter of an acre'-style plain figure: acres from a tenth of an acre up, square
+    feet below that (a city lot)."""
+    acres = sqft / 43560.0
+    if acres < 0.1:
+        return f"about {int(round(sqft / 50.0) * 50):,} square feet"
+    a = f"{acres:.2f}".rstrip("0").rstrip(".") if acres < 2 else f"{acres:.1f}".rstrip("0").rstrip(".")
+    return f"about {a} acre{'' if a == '1' else 's'}"
+
+
+def lot_items(area: MarketArea, lot: dict, geo: Optional[dict] = None) -> list[dict]:
+    """Lot sizes of the houses sold here as evidence items (market_stats_service.get_area_lot_profile) -
+    the answer to "how much land do you get", overall and for each municipality with 5+ sales."""
+    if not lot or not lot.get("count"):
+        return []
+    town = _town(area)
+    win = f"from {lot['from']} to {lot['to']}"
+    names = {norm_place(t["name"]): t["name"] for t in (geo or {}).get("townships") or [] if t.get("name") and not t.get("remainder")}
+    out = []
+
+    def add(claim):
+        out.append({"topic": "market", "claim": claim, "source_name": "Bright MLS (OpenHousePal data)", "source_url": None,
+                    "as_of": lot["to"], "confidence": 0.95, "town": town, "origin": "mls_live", "id": _iid(town, claim)})
+
+    add(f"{area.name} lot sizes (how much land a house comes with): the {lot['count']} single-family houses sold {win} with a lot size on record "
+        f"sat on a median lot of {_lot_words(lot['median_sqft'])}; the middle half ran from {_lot_words(lot['p25_sqft'])} to {_lot_words(lot['p75_sqft'])}, "
+        f"and {lot['acre_plus_count']} of the {lot['count']} had an acre or more. Townhomes and condos are not counted.")
+    rows = [m for m in lot.get("by_municipality") or [] if norm_place(m["name"]) in names] if names else []
+    if len(rows) >= 2:
+        add(f"{area.name} lot sizes by municipality (the same house sales, {win}; median lot): "
+            + "; ".join(f"{names[norm_place(m['name'])]} {_lot_words(m['median_sqft'])} ({m['count']} sales)" for m in rows)
+            + ". Municipalities with fewer than 5 such sales are left out.")
+    return out
+
+
+def walk_miles(minutes) -> str:
+    """The straight-line distance our walk check really measures for an N-minute walk (0.6 miles for 15)."""
+    try:
+        return f"{round(float(minutes) * 0.04, 1):g}"
+    except (TypeError, ValueError):
+        return "0.6"
+
+
+def attached_styles_note(styles: Optional[dict]) -> str:
+    """ " Of the 19 townhome sales, 10 were twins (...) with a $520,000 median and 9 were row townhomes ..." - or ""."""
+    if not styles or not (styles.get("twin") or {}).get("count"):
+        return ""
+    def part(key, words):
+        s = styles.get(key) or {}
+        if not s.get("count"):
+            return None
+        return (f"{s['count']} {'was a' if s['count'] == 1 else 'were'} {words if s['count'] != 1 else words.rstrip('s')}"
+                + (f" with a {_fmt_money(s['median_close_price'])} median" if s.get("median_close_price") else " (too few for a median of their own)"))
+    bits = [b for b in (part("twin", "twins (a house that shares one side wall with its neighbor)"), part("row", "row townhomes")) if b]
+    total = sum((styles.get(k) or {}).get("count") or 0 for k in ("twin", "row"))
+    return f" Of those {total} townhome sales, " + " and ".join(bits) + "."
+
+
+def few_fees_claim(few: dict, label: str) -> str:
+    """What a handful of listings charge - said as a handful, never as the typical fee."""
+    n, of = few["homes"], few.get("of")
+    lo, hi = few["low_monthly"], few["high_monthly"]
+    amount = f"${lo:,}/month" if lo == hi else f"${lo:,} to ${hi:,}/month"
+    kind = label if n != 1 else label.rstrip("s")
+    return (f"{'the ' if n > 1 else ''}{n if n > 1 else 'one'}{f' of the {of}' if of and of > n else ''} {kind} for sale that "
+            f"{'list' if n > 1 else 'lists'} a monthly condo or association fee {'show' if n > 1 else 'shows'} {amount}, all fees combined - "
+            "too few listings for a typical figure, so ask for the fee on any home you're considering.")
 
 
 def cost_items(area: MarketArea, cost: dict, geo: Optional[dict] = None) -> list[dict]:
@@ -931,11 +1380,15 @@ def cost_items(area: MarketArea, cost: dict, geo: Optional[dict] = None) -> list
             continue
         add(f"{area.name}: {label} for sale that list a monthly condo or association fee show a median of ${h['median_monthly']:,}/month, all fees combined "
             + (f"({h['homes']} of the {h['of']} {label} for sale show a fee)." if h.get("of") else f"({h['homes']} listings).") + covers, "market")
+    for kind, label in (("condo", "condos"), ("townhouse", "townhomes")):
+        few = (cost.get("hoa_few") or {}).get(kind)
+        if few and not (cost.get("hoa") or {}).get(kind) and parts_fit(few.get("of") or few["homes"], [few["homes"]]):
+            add(f"{area.name}: " + few_fees_claim(few, label), "market")
     if tf and parts_fit(tf["of"], [tf["condo_fee"], tf["hoa_only"], tf["no_fee"]]):
         # 11/01 grader: "with a condo or townhome, the inspection only covers part of what you're
         # buying" - true of a condo unit, not of a townhome owned with its land.
         add(f"{area.name}: \"townhome\" is a building style, not a kind of ownership. Of the {tf['of']} townhomes for sale, {tf['condo_fee']} list a "
-            f"condominium fee (often a sign the townhome is owned as a condo unit), {tf['hoa_only']} list only an HOA fee and {tf['no_fee']} list no fee. "
+            f"condominium fee (often a sign the townhome is owned as a condo unit), {tf['hoa_only']} list only an HOA fee and {tf['no_fee']} show no fee on the listing - which means none was REPORTED, not that the home has none. "
             # Round 7 grader: ownership type matters, but the association's governing documents decide
             # who maintains what (Maryland's condo law lets declarations and bylaws set it).
             "Whether a townhome is owned as a condo unit or fee simple (with its land) matters, but the association's governing documents "
@@ -944,12 +1397,25 @@ def cost_items(area: MarketArea, cost: dict, geo: Optional[dict] = None) -> list
     if mix and parts_fit(mix["homes"], [mix["attached"]["count"], mix["house"]["count"]]):
         def group(g, label):
             return f"{g['count']} {label}" + (f" (median list price {_fmt_money(g['median'])})" if g.get("median") else "")
-        add(f"{area.name}: of its {mix['homes']} homes for sale on {on}, " + group(mix["attached"], "are condos or townhomes")
-            + " and " + group(mix["house"], "are single-family houses") + ".", "market")
+        # Name the group by what is in it: "40 condos or townhomes" followed by "the 40 townhomes" left a reader
+        # unsure whether there were any condos at all (11/14 grader).
+        attached_n, town_n = mix["attached"]["count"], (tf.get("of") if tf else None)
+        if town_n is not None and attached_n and town_n == attached_n:
+            attached_words, attached_note = "townhomes", " (all townhomes - no condos are for sale)"
+        elif town_n is not None and 0 < town_n < attached_n:
+            attached_words, attached_note = "condos or townhomes", f" ({attached_n - town_n} condos and {town_n} townhomes)"
+        else:
+            attached_words, attached_note = "condos or townhomes", ""
+        add(f"{area.name}: of its {mix['homes']} homes for sale on {on}, " + group(mix["attached"], f"are {attached_words}") + attached_note
+            + " and " + group(mix["house"], "are single-family houses")
+            # the parts say what is left over, so a reader's sum reaches the total (11/14 Ardmore: 13 + 1 + 4 of "19 homes")
+            + (lambda rest: f"; the other {rest} {'is' if rest == 1 else 'are'} another type (multi-family, for example)" if rest > 0 else "")(
+                int(mix["homes"]) - int((mix["attached"] or {}).get("count") or 0) - int((mix["house"] or {}).get("count") or 0))
+            + ".", "market")
         low = mix["low_quarter"]
         if low["count"] and parts_fit(low["count"], [low["attached"]]):
-            add(f"{area.name}: in the lowest-priced quarter of its homes for sale on {on}, {low['attached']} of {low['count']} are condos or townhomes"
-                + (" - so that quarter price mostly reflects condos and townhomes, not houses." if low["attached"] * 2 > low["count"] else "."), "market")
+            add(f"{area.name}: in the lowest-priced quarter of its homes for sale on {on}, {low['attached']} of {low['count']} are {attached_words}"
+                + (f" - so that quarter price mostly reflects {attached_words.replace(' or ', ' and ')}, not houses." if low["attached"] * 2 > low["count"] else "."), "market")
         def some(g, what):
             n = g["count"]
             head = f"none of its {mix['homes']} homes for sale on {on} is" if not n else f"{n} of its {mix['homes']} homes for sale on {on} {'is' if n == 1 else 'are'}"
@@ -962,7 +1428,18 @@ def cost_items(area: MarketArea, cost: dict, geo: Optional[dict] = None) -> list
                 "on land the buyer owns or on leased land with a monthly lot rent, and financing differs; each listing says which.", "market")
     fin = cost.get("financing") or {}
     if fin.get("mix") and parts_fit(fin["closed_sales"], [fin["recorded"]]):
-        mix = ", ".join(f"{m['type']} {m['pct']}%" for m in fin["mix"][:5])
+        # Each share was rounded on its own and anything past the fifth kind was dropped, so a list could total 99%
+        # (11/14 Fishtown: 65 + 23 + 7 + 3 + 1). Largest-remainder rounding, and what isn't listed is "other".
+        counted = all(m.get("count") is not None for m in fin["mix"]) and fin.get("recorded")
+        exact = [(m["count"] * 100 / fin["recorded"]) if counted else float(m["pct"]) for m in fin["mix"][:5]]
+        names = [m["type"] for m in fin["mix"][:5]]
+        if counted and 100 - sum(exact) >= 0.5:
+            exact.append(100 - sum(exact))
+            names.append("other")
+        whole = [int(x) for x in exact]
+        for i in sorted(range(len(exact)), key=lambda i: -(exact[i] - whole[i]))[:max(0, round(sum(exact)) - sum(whole))]:
+            whole[i] += 1
+        mix = ", ".join(f"{n} {v}%" for n, v in zip(names, whole) if v)
         # The window our records fully cover (11/01: "since Nov 1, 2025" was really two months).
         span = f"in the {fin['days']} days ending {fin['through']}" if fin.get("days") and fin.get("through") else f"since {fin['since']}"
         add(f"{area.name}: how buyers paid, from the {fin['recorded']} of {fin['closed_sales']} closed sales {span} that recorded it in Bright MLS: {mix}.", "market")
@@ -1025,6 +1502,18 @@ def conforming_limit(today=None) -> Optional[int]:
     return 832_750 if (today or datetime.now(timezone.utc).date()).isoformat() <= "2026-12-31" else None
 
 
+# FHA's one-unit loan limits for case numbers assigned in 2026, read on HUD's own page 11/15/2026 (Mortgagee Letter
+# 2025-23): every county's limit lies between the low-cost "floor" and the high-cost "ceiling". We do not hold each
+# county's own figure, so the engine only ever says "may be above this county's limit" - never the county's number.
+_FHA_LIMITS = {"year": 2026, "floor": 541_287, "ceiling": 1_249_125, "valid_through": "2026-12-31", "verified": "2026-11-15",
+               "source_name": "HUD: FHA 2026 loan limits (Mortgagee Letter 2025-23)", "source_url": "https://www.hud.gov/news/hud-no-25-145"}
+
+
+def fha_limits(today=None) -> Optional[dict]:
+    """HUD's national FHA floor and ceiling while they are current (None after their year ends)."""
+    return dict(_FHA_LIMITS) if (today or datetime.now(timezone.utc).date()).isoformat() <= _FHA_LIMITS["valid_through"] else None
+
+
 _CLL_TABLES: dict[int, Optional[dict]] = {}
 
 
@@ -1079,22 +1568,237 @@ def federal_items(today=None) -> list[dict]:
             for t, c, n, u, a, through in _FEDERAL_FACTS if not through or today <= through]
 
 
+# ---------------------------------------------------------------------------
+# Transfer taxes an article may state (owner, 11/13: "stay safe but be informative" - this replaces
+# the 10/24 rule "never state a transfer tax rate"). A rate or dollar example may be given, worded as
+# an ESTIMATE, only when it is in this hand-verified table: each row was read off the government's own
+# page on `verified` and is dropped after `valid_through`, so an out-of-date rate is never stated.
+# Any other rate (a town's local share we never read, another state) stays unstated. To renew a row:
+# re-read its page, then move both dates.
+# ---------------------------------------------------------------------------
+_TRANSFER_TAX = {
+    "philadelphia": {
+        "verified": "2026-11-14", "valid_through": "2027-06-30",   # the City has changed its rate on a July 1 before
+        "source_name": "City of Philadelphia: Realty Transfer Tax",
+        "source_url": "https://www.phila.gov/services/payments-assistance-taxes/taxes/property-and-real-estate-taxes/realty-transfer-tax/",
+        "total_pct": 4.578, "city_pct": 3.578, "state_pct": 1.0,
+    },
+    "pa": {
+        "verified": "2026-11-14", "valid_through": "2027-11-30",
+        "source_name": "PA Department of Revenue: Realty Transfer Tax",
+        "source_url": "https://www.pa.gov/agencies/revenue/resources/tax-types-and-information/realty-transfer-tax",
+        "state_pct": 1.0, "usual_local_pct": 1.0,
+    },
+    "nj": {
+        "verified": "2026-11-14", "valid_through": "2027-06-30",
+        "source_name": "NJ Division of Taxation: Realty Transfer Fee",
+        "source_url": "https://www.nj.gov/treasury/taxation/realty.shtml",
+        # Standard rate, dollars per $500 of the sale price, by slice of the price: (top of slice, rate).
+        "not_over_350k": ((150_000, 2.00), (200_000, 3.35), (350_000, 3.90)),
+        "over_350k": ((150_000, 2.90), (200_000, 4.25), (550_000, 4.80), (850_000, 5.30), (1_000_000, 5.80)),
+    },
+}
+_TRANSFER_TAX_MIN_SALES = 5      # a "typical price" example needs at least this many sales behind it
+
+
+def nj_realty_transfer_fee(price: float) -> Optional[int]:
+    """New Jersey's standard seller-paid Realty Transfer Fee on a sale of `price`, in whole dollars -
+    None above $1,000,000 (a second, graduated fee starts there; we don't estimate it)."""
+    if not price or price <= 0 or price > 1_000_000:
+        return None
+    bands = _TRANSFER_TAX["nj"]["not_over_350k" if price <= 350_000 else "over_350k"]
+    fee, floor = 0.0, 0
+    for top, per_500 in bands:
+        if price > floor:
+            fee += (min(price, top) - floor) / 500 * per_500
+        floor = top
+    return round(fee)
+
+
+def transfer_tax_facts(state: Optional[str], profiles: list[dict], sold: Optional[dict] = None, today=None) -> Optional[dict]:
+    """What this article may say about transfer tax in numbers: {"rates": percents it may state,
+    "amounts": dollar figures it may state, "items": ledger items, "note": the writer's instruction}.
+    None when we hold nothing verified for the place - then the article names the tax and nothing more.
+
+    `profiles` = the article's towns (geography_profile); `sold` = {"price", "count", "from", "to",
+    "town"} for the worked example (the towns' median sold price), or None for no example."""
+    today = str(today or datetime.now(timezone.utc).date().isoformat())[:10]
+    state = (state or "").upper()
+    total_pct = None
+    live = lambda key: today <= _TRANSFER_TAX[key]["valid_through"]
+    counties = [set((p.get("norm") or {}).get("counties") or []) for p in profiles or []]
+    all_philly = bool(counties) and all(c == {"philadelphia"} for c in counties)
+    price = None
+    if sold and sold.get("price") and (sold.get("count") or 0) >= _TRANSFER_TAX_MIN_SALES:
+        price = int(round(float(sold["price"]) / 5000.0) * 5000)
+    basis = (f"about the median price of the {sold['count']} homes sold in {sold['town']} from {sold['from']} to {sold['to']}"
+             if price else "")
+    money = lambda v: f"${int(round(v)):,}"
+    EXACT = " The settlement company's figures for the sale give the exact amount."   # so the fact-checker keeps that line
+    near = lambda v: int(round(v / 100.0) * 100)       # an estimate is given to the nearest $100
+
+    def item(row: dict, claim: str, calc: bool = False) -> dict:
+        return {"topic": "taxes", "claim": claim, "source_name": "OpenHousePal calculation" if calc else row["source_name"],
+                "source_url": None if calc else row["source_url"], "as_of": row["verified"], "confidence": 0.98, "town": "general",
+                "origin": "transfer_tax", "id": _iid("transfer_tax", claim)}
+
+    if state == "PA" and all_philly and live("philadelphia"):
+        row = _TRANSFER_TAX["philadelphia"]
+        total, city, st = row["total_pct"], row["city_pct"], row["state_pct"]
+        items = [item(row, f"TRANSFER TAX (verified on the City's own page {row['verified']} - may be stated, as an estimate): Philadelphia's realty "
+                           f"transfer tax is currently {total}% of the sale price in total - {city}% City of Philadelphia plus {st:g}% Commonwealth of "
+                           "Pennsylvania. Buyer and seller commonly split it; the Agreement of Sale sets who pays what." + EXACT)]
+        rates, amounts = [total, city, st], []
+        if price:
+            whole = near(price * total / 100)
+            half = whole // 2          # half of the stated total, so the two figures always agree
+            amounts = [price, whole, half]
+            items.append(item(row, f"Transfer tax example (an estimate): on a {money(price)} sale - {basis} - {total}% comes to about {money(whole)} "
+                                   f"in total, or about {money(half)} each when buyer and seller split it evenly.", calc=True))
+        total_pct = total
+        note = (f"Philadelphia's realty transfer tax: about {total}% of the sale price in total ({city}% City + {st:g}% Commonwealth), commonly split "
+                "between buyer and seller." + (f" Worked example you may use: on a {money(price)} sale ({basis}) that is about {money(amounts[1])} in "
+                                               f"total, about {money(amounts[2])} each when split evenly." if price else ""))
+    elif state == "PA" and not all_philly and live("pa"):
+        row = _TRANSFER_TAX["pa"]
+        st, loc = row["state_pct"], row["usual_local_pct"]
+        items = [item(row, f"TRANSFER TAX (verified on the PA Department of Revenue's own pages {row['verified']} - may be stated, as an estimate): "
+                           f"Pennsylvania's state realty transfer tax is {st:g}% of the sale price, and a local realty transfer tax is due on top of it - "
+                           f"{loc:g}% in most places, more in some. We do NOT hold the local rate for this article's municipalities, so no total for "
+                           "them may be stated. Buyer and seller commonly split the tax; the Agreement of Sale sets who pays what." + EXACT)]
+        rates, amounts = [st, loc], []
+        note = (f"Pennsylvania's realty transfer tax: the state's part is about {st:g}% of the sale price, and a local transfer tax is added on top - "
+                f"about {loc:g}% in most places and more in some. We do not hold these municipalities' own local rate: say the local part varies and "
+                "never give a total percent or a dollar figure for this town.")
+    elif state == "NJ" and live("nj") and price and nj_realty_transfer_fee(price):
+        row = _TRANSFER_TAX["nj"]
+        fee = near(nj_realty_transfer_fee(price))
+        items = [item(row, f"Realty Transfer Fee example (an estimate from New Jersey's published standard rate schedule, read {row['verified']} - may be "
+                           f"stated, as an estimate): on a {money(price)} sale - {basis} - the seller's New Jersey Realty Transfer Fee comes to about "
+                           f"{money(fee)}. The fee rises in steps with the price; reduced rates exist for some sellers (seniors, blind or disabled "
+                           "persons, low- and moderate-income housing), and a separate graduated fee applies above $1,000,000." + EXACT)]
+        rates, amounts = [], [price, fee]
+        note = (f"New Jersey's Realty Transfer Fee is paid by the seller and rises in steps with the price. Worked example you may use: on a "
+                f"{money(price)} sale ({basis}) it comes to about {money(fee)} at the standard rate. Give no per-$500 rates and no percent; say some "
+                "sellers qualify for a reduced rate and that sales above $1,000,000 carry a separate fee.")
+    else:
+        return None
+    # `total_pct` only where we hold the place's WHOLE transfer tax (Philadelphia) - what a closing-cost figure
+    # for that place has to be consistent with.
+    return {"rates": rates, "amounts": amounts, "items": items, "note": note, "source_url": row["source_url"], "source_name": row["source_name"],
+            "total_pct": total_pct, "place": "Philadelphia" if total_pct else None}
+
+
+# ---------------------------------------------------------------------------
+# Philadelphia's property-tax abatement, from the City's own pages (hand-verified like the transfer tax).
+# 11/14: a Fishtown article's research ran out of look-ups before it reached the City's abatement page, so
+# the article leaned on a 2022 think-tank report and never mentioned the Homestead Exemption. The facts a
+# buyer needs don't change week to week - they are held here and dropped after `valid_through`.
+# ---------------------------------------------------------------------------
+_PHILA_ABATEMENT = {
+    "verified": "2026-11-14", "valid_through": "2027-06-30",
+    "page_name": "City of Philadelphia: Get a property tax abatement",
+    "page_url": "https://www.phila.gov/services/payments-assistance-taxes/taxes/property-and-real-estate-taxes/get-real-estate-tax-relief/get-a-property-tax-abatement/",
+    "form_name": "City of Philadelphia, Office of Property Assessment: abatement application, new residential construction (revised 02/2024)",
+    "form_url": "https://www.phila.gov/documents/applications-for-property-tax-abatements/",
+    # The governing text. 11/14 outside grader (second round): the fact said "projects PERMITTED by the end of 2021".
+    # The Code's own words are "applications for exemption initially applied for on or before December 31, 2021" -
+    # the permit date, the application date and the date the abatement begins are three different days.
+    # RULE for every hand-verified legal fact: read the governing text, and use ITS operative term for any dividing line.
+    "code_name": "The Philadelphia Code, Section 19-1303.4(5) (exemption schedule, new residential construction)",
+    "code_url": "https://codelibrary.amlegal.com/codes/philadelphia/latest/philadelphia_pa/0-0-0-297867",
+}
+_ABATEMENT_ASKED = re.compile(r"abatement|abated", re.I)
+
+
+def philadelphia_abatement_items(state: Optional[str], profiles: list[dict], brief: dict, today=None) -> list[dict]:
+    """The City's own abatement facts as ledger items - only for an article whose towns are all in
+    Philadelphia and whose brief asks about abatements."""
+    today = str(today or datetime.now(timezone.utc).date().isoformat())[:10]
+    row = _PHILA_ABATEMENT
+    counties = [set((p.get("norm") or {}).get("counties") or []) for p in profiles or []]
+    said = " ".join(str(brief.get(k) or "") for k in ("topic", "goal", "key_points"))
+    if (state or "").upper() != "PA" or not counties or any(c != {"philadelphia"} for c in counties) or today > row["valid_through"] \
+            or not _ABATEMENT_ASKED.search(said):
+        return []
+
+    def item(claim: str, code: bool = False) -> dict:
+        return {"topic": "taxes", "claim": claim, "source_name": row["code_name" if code else "page_name"],
+                "source_url": row["code_url" if code else "page_url"], "as_of": row["verified"], "confidence": 0.98, "town": "general",
+                "origin": "verified_local", "id": _iid("phila_abatement", claim)}
+    return [
+        # 11/14 outside grader: the first version gave the declining schedule as THE rule for new construction.
+        # It is the rule only for projects from 2022 on; older abatements, still on homes for sale, are exempt in
+        # full to the end. A verified fact states which cases it covers and which it does not.
+        item("PHILADELPHIA ABATEMENT - NEW CONSTRUCTION HAS TWO SCHEDULES, AND BOTH ARE ON HOMES FOR SALE TODAY (state both; this dividing "
+             "line is the point, not fine print). The Philadelphia Code sets the schedule by WHEN THE ABATEMENT WAS FIRST APPLIED FOR (the "
+             "Code's exemption schedule for new residential construction, read " + row["verified"] + "; the change took effect January 1, 2022). "
+             "EARLIER schedule - abatements applied for on or before December 31, 2021: the value of the new building is exempt in full for "
+             "the whole ten-year term, so the tax bill rises all at once when the abatement ends. CURRENT schedule - abatements applied for "
+             "after December 31, 2021 (2022 and later): the abated portion of the building's value declines each year of the ten-year term, so "
+             "the bill steps up every year during the abatement. The dividing line is the date of the abatement APPLICATION - not the "
+             "building-permit date, not the year the home was built or sold, and not the year the abatement began - so a listing's dates "
+             "alone don't show which schedule it is on: it has to be confirmed for that home. Either way the abatement covers the "
+             "building, not the land; bills can also change with tax rates and assessed value; and the builder or developer applies, not the "
+             "buyer of the finished home.", code=True),
+        item("PHILADELPHIA ABATEMENT (the City's own abatement page, read " + row["verified"] + "): the City runs separate abatement programs - "
+             "one for new residential construction and one for improvements (rehab) to existing residential properties, each a 10-year abatement "
+             "with its own terms. Which program a listing has, and its start and end dates, has to be confirmed for that home with the City's "
+             "Office of Property Assessment, which handles abatements."),
+        item("PHILADELPHIA ABATEMENT (the City's own abatement page, read " + row["verified"] + "): a property with a 10-year residential tax "
+             "abatement is not eligible for the Homestead Exemption; once the abatement has expired, the homeowner can apply for it."),
+    ]
+
+
+_STATUS_RANK = {"ENRICHED": 0, "PARTIAL": 1, "RESEARCHING": 2, "PENDING": 3, "FAILED": 4}
+
+
+def _area_pick_key(a: MarketArea, prefer_state: Optional[str]) -> tuple:
+    """Best-first: researched, then placed on a map (outline / ZIPs / centre), then the agent's own
+    state, then the oldest row."""
+    placed = bool((a.geography or {}).get("type") or a.zip_codes or a.centroid_lat is not None)
+    return (_STATUS_RANK.get(a.enrichment_status or "", 5), 0 if placed else 1,
+            0 if prefer_state and a.state == prefer_state else 1, a.created_at or datetime.max.replace(tzinfo=timezone.utc))
+
+
+async def best_area_by_name(db: AsyncSession, name: str, *, state: Optional[str] = None,
+                            prefer_state: Optional[str] = None) -> Optional[MarketArea]:
+    """The town a typed name means. `state` = typed by the agent ("Cherry Hill, NJ") and binding;
+    otherwise every state counts and `prefer_state` (the agent's) only breaks ties. CMA/blog test
+    11/13: "Cherry Hill" typed by a PA agent made and researched a new "Cherry Hill, PA" next to the
+    real Cherry Hill, NJ, and "Fishtown" made an empty city row next to the researched Fishtown
+    neighborhood - the article then read "0 sales, 0 homes for sale in Fishtown"."""
+    name = (name or "").strip()
+    if not name:
+        return None
+    q = select(MarketArea).where(func.lower(MarketArea.name) == name.lower())
+    if state:
+        q = q.where(MarketArea.state == state.strip().upper())
+    rows = (await db.execute(q)).scalars().all()
+    prefer = (prefer_state or "").strip().upper() or None
+    return min(rows, key=lambda a: _area_pick_key(a, prefer)) if rows else None
+
+
 async def find_areas(db: AsyncSession, *, slugs: list[str] = (), names: list[str] = (), state: Optional[str] = None) -> list[MarketArea]:
-    """MarketAreas by slug, or by town name ("Ardmore", "Ardmore, PA")."""
+    """MarketAreas by slug, or by town name ("Ardmore", "Ardmore, PA"). A bare name may be in any
+    state - `state` (the agent's) only breaks ties (best_area_by_name)."""
     found: dict[str, MarketArea] = {}
     if slugs:
         for a in (await db.execute(select(MarketArea).where(MarketArea.slug.in_(list(slugs))))).scalars().all():
             found[a.id] = a
     for raw in names or []:
         name, _, st = str(raw).partition(",")
-        q = select(MarketArea).where(MarketArea.name.ilike(name.strip()))
-        st = (st.strip() or state or "").upper()
-        if st:
-            q = q.where(MarketArea.state == st)
-        a = (await db.execute(q.limit(1))).scalars().first()
+        a = await best_area_by_name(db, name, state=st.strip()[:2] or None, prefer_state=state)
         if a:
             found[a.id] = a
-    return list(found.values())
+    # The same place twice (a stray duplicate row picked by slug + the real one by name): keep the
+    # better row - one town, one set of numbers.
+    best: dict[tuple, MarketArea] = {}
+    for a in found.values():
+        k = (a.name.strip().lower(), a.state)
+        if k not in best or _area_pick_key(a, state) < _area_pick_key(best[k], state):
+            best[k] = a
+    return list(best.values())
 
 
 async def town_dossier(db: AsyncSession, area: MarketArea, *, include_bank: bool = True, mls: bool = True) -> dict:
@@ -1131,6 +1835,11 @@ async def town_dossier(db: AsyncSession, area: MarketArea, *, include_bank: bool
             logger.warning("town dossier: sales snapshot failed for %s", area.slug, exc_info=True)
             snap = {}
         items += sales_snapshot_items(area, snap, geo)
+        try:
+            from app.services.areas.market_stats_service import get_area_lot_profile
+            items += lot_items(area, await get_area_lot_profile(db, scope), geo)
+        except Exception:
+            logger.warning("town dossier: lot profile failed for %s", area.slug, exc_info=True)
         try:
             # The town's census outlines (town map, TIGER) place each listing by its map location.
             munis = (geo or {}).get("muni_shapes") or [m for m in (((area.facts or {}).get("boundaries") or {}).get("municipalities") or []) if m.get("rings")]

@@ -268,9 +268,7 @@ def blog_flags(review: Optional[dict]) -> list[str]:
     more = len(review.get("open_issues") or []) - 5
     if more > 0:
         out.append(f"...and {more} more flag{'s' if more > 1 else ''}")
-    nums = [_s(n)[:60] for n in (review.get("numbers_to_verify") or []) if _s(n)][:8]
-    if nums:
-        out.append("Numbers to double-check: " + ", ".join(nums))
+    # (11/15, owner: no homework lists - the article's numbers are checked before it is saved, so they are not listed)
     geo = review.get("geography_flags_open")
     if isinstance(geo, int) and geo > 0:
         out.append(f"{geo} town/school-district line{'s' if geo > 1 else ''} to check")
@@ -330,8 +328,6 @@ async def _p_blog_publish(db, user, a):
         flags = blog_flags(review)
         if flags:
             warn = "Check these before it goes live: " + " • ".join(flags)
-        elif review.get("status") == "done" and not review.get("finished"):
-            warn = "You haven't gone through Fact-check & finish on this draft yet - worth a read first."
     return Prepared(head, lines, payload, warning=warn, confirm_label={"now": "Publish", "schedule": "Schedule"}.get(when, "Confirm"))
 
 

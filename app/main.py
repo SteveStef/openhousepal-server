@@ -375,6 +375,10 @@ async def lifespan(app: FastAPI):
         # holds the database "scheduler" lock does; the others keep checking and take over if it goes.
         from app.services.scheduler_leader import run_scheduler_when_leader
         leader_task = asyncio.create_task(run_scheduler_when_leader(scheduler))
+    # Overnight articles (blog_overnight_service): a run whose copy of the server restarted is picked up again.
+    # Every copy watches, scheduler or not - one of them claims the run.
+    from app.services.ai import blog_overnight_service
+    app.state.blog_overnight_watch = asyncio.create_task(blog_overnight_service.watch())
     logger.info(
         "APScheduler started",
         extra={
@@ -388,6 +392,7 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down application")
+    app.state.blog_overnight_watch.cancel()
     if leader_task is not None:
         leader_task.cancel()   # lets go of the scheduler lock so another copy takes over at once
         try:

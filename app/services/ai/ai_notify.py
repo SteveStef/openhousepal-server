@@ -32,6 +32,25 @@ def _state(user: User) -> dict:
     return dict(user.setup_state or {})
 
 
+def blog_run_dead(rv: dict, now: datetime) -> bool:
+    """Has this article's run died? The Blogs page's own rule: failed, or no new step for 15 minutes. Save usage mode
+    waits in a slower line on purpose (a step can sit there for half an hour), so it is only dead past its own
+    deadline - never because 15 minutes went by (11/14: the chat would have called a healthy article dead and
+    told the agent "nothing was charged")."""
+    if rv.get("status") == "failed":
+        return True
+    if rv.get("status") != "running":
+        return False
+    if rv.get("mode") == "overnight":
+        from app.services.ai import blog_overnight_service
+        return blog_overnight_service.is_stale(rv)
+    try:
+        last = datetime.fromisoformat(rv.get("stage_at") or rv.get("started_at") or "")
+    except ValueError:
+        return False
+    return now - last > timedelta(minutes=15)
+
+
 async def watch(db: AsyncSession, user: User, key: str, ctx: dict, label: str) -> None:
     """Remember which chat card is waiting on `key` (e.g. "cma:<report id>"). Commits."""
     if not ctx or not ctx.get("message_id"):
@@ -103,7 +122,7 @@ async def working(db: AsyncSession, user: User) -> list[dict]:
         except ValueError:
             continue
         kind, rid = key.split(":", 1)
-        if now - at > timedelta(hours=2):
+        if now - at > timedelta(hours=2 if kind != "blog" else 21):   # a Save usage article has up to 20 hours before it gives up itself
             dead.append((key, kind, rid, None))
             continue
         out.append({"key": key, "kind": kind, "id": rid, "label": w.get("label") or "", "at": at.isoformat(), "stage": None})
@@ -117,13 +136,9 @@ async def working(db: AsyncSession, user: User) -> list[dict]:
                 continue
             rv = reviews.get(j["id"]) or {}
             j["stage"] = rv.get("stage")
-            # The Blogs page's own rule: a run with no new stage for 15 minutes has died
-            try:
-                last = datetime.fromisoformat(rv.get("stage_at") or rv.get("started_at") or "")
-            except ValueError:
-                last = None
-            if rv.get("status") == "failed" or (rv.get("status") == "running" and last and now - last > timedelta(minutes=15)):
-                out.remove(j); dead.append((j["key"], "blog", j["id"], rv.get("started_at")))
+            if blog_run_dead(rv, now):
+                # (a Save usage run gives back exactly its own charges when it ends itself - never "everything since it started")
+                out.remove(j); dead.append((j["key"], "blog", j["id"], None if rv.get("mode") == "overnight" else rv.get("started_at")))
     media = [j["id"] for j in out if j["kind"] == "media"]
     if media:
         # Backstop for a job whose own finish was lost (a restart): the project row knows.

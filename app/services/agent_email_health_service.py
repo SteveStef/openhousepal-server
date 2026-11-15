@@ -74,6 +74,8 @@ CRITICAL_TEMPLATES = frozenset({
     "subscription_cancelled", "subscription_suspended", "subscription_plan_changed", "trial_ending_soon",
     "domain_verified", "domain_verification_failed", "domain_update", "calendar_disconnected",
     "crm_push_failing", "support_ticket_reply",
+    # an article written in Save usage mode: ready, or couldn't be finished (blog_overnight_service)
+    "blog_article_ready", "blog_article_failed",
     # this system's own emails
     SUMMARY_TEMPLATE, TEST_TEMPLATE,
 })
@@ -90,6 +92,7 @@ LABELS = {
     "studio_media_failed": "Studio video couldn't finish", "team_new_listing": "Teammate's new listing",
     "new_review_received": "New review", "team_broadcast_claimed": "Broadcast claimed",
     "team_invite_accepted": "Team invite accepted", "my_listing_updated": "Listing updated",
+    "blog_article_ready": "Article ready (Save usage mode)", "blog_article_failed": "Article couldn't finish (Save usage mode)",
     "new_lead_captured": "New lead", "form_submission_received": "Form response", "open_house_recap": "Open house wrap-up",
     "open_house_form_request": "Open house request", "invite_rsvp_agent": "Invite RSVP", "invite_day_before_agent": "Event tomorrow",
     "tour_request": "Tour request", "property_comment": "Client comment", "refine_search_request": "Search change request",

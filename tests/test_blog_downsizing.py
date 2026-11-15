@@ -39,18 +39,14 @@ def _blocks(*sections):
     return out
 
 
-def test_video_gets_a_lead_in_when_its_section_never_mentions_it():
+def test_a_video_is_never_put_inside_the_article():
+    """11/15: the video is a closing "Related video" card (tests/test_blog_related_content.py) - no section is written
+    around it and no "watch it just below" line is added."""
     brief = {"video": {"url": "https://youtu.be/x", "title": "Should You Sell Your House Now, Or Wait | Philly Suburbs"}}
-    out = w.place_video(_blocks(("What your home could sell for now", "Prices held."), ("Costs", "Transfer tax."), ("Talk to me", "Call.")), brief)
-    i = next(n for n, b in enumerate(out) if b["type"] == "youtube")
-    assert "watch <em>Should You Sell Your House Now, Or Wait</em> just below" in out[i - 1]["data"]["html"]
-
-
-def test_video_has_no_extra_line_when_the_writer_introduced_it():
-    brief = {"video": {"url": "https://youtu.be/x", "title": "Selling in Wayne"}}
-    out = w.place_video(_blocks(("Selling in Wayne", "Watch my video below."), ("Talk to me", "Call.")), brief)
-    i = next(n for n, b in enumerate(out) if b["type"] == "youtube")
-    assert out[i - 1]["data"]["html"] == "Watch my video below."
+    blocks = _blocks(("What your home could sell for now", "Prices held."), ("Costs", "Transfer tax."), ("Talk to me", "Call."))
+    out = w.place_related(blocks, w.related_blocks(brief, [], []))
+    assert not any(b["type"] == "youtube" for b in out) and out[:len(blocks)] == blocks
+    assert out[-1]["type"] == "video_showcase" and not any("just below" in str(b["data"].get("html") or "") for b in out)
 
 
 def test_downsizing_brief_gets_its_checklist_and_others_do_not():

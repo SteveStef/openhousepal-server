@@ -38,11 +38,14 @@ PROTECTIONS = [
      "name": "PHFA home loans and down payment help",
      "says": "The Pennsylvania Housing Finance Agency (PHFA) offers home loans and down payment and closing cost help for qualifying buyers through participating lenders.",
      "source_name": "Pennsylvania Housing Finance Agency", "source_url": "https://www.phfa.org/"},
-    {"state": "PA", "readers": {"older"}, "key": "pa_ptrr", "check": r"Property Tax/Rent Rebate|Rent Rebate",
+    # 11/14 grader (Media): "eligible Pennsylvanians ... conditions apply" hid who the program is even for. A protection says
+    # WHO it is for in general words (read on the state's page 11/14) - never the ages or the income figure, which change.
+    {"state": "PA", "readers": {"older"}, "key": "pa_ptrr",
+     "check": r"Rent Rebate[\s\S]{0,500}?\bincome\b|\bincome\b[\s\S]{0,400}?Rent Rebate",
      "name": "Pennsylvania Property Tax/Rent Rebate Program",
-     "says": "Pennsylvania's Property Tax/Rent Rebate Program can return part of the property taxes paid by qualifying older homeowners.",
+     "says": "Pennsylvania's Property Tax/Rent Rebate Program can return part of the property taxes or rent paid by older adults, widows and widowers, and people with disabilities whose household income is under the program's limit - the state's page lists the current ages and income limit.",
      "source_name": "Pennsylvania Department of Revenue - Property Tax/Rent Rebate Program",
-     "source_url": "https://www.revenue.pa.gov/IncentivesCreditsPrograms/PropertyTaxRentRebateProgram/"},
+     "source_url": "https://www.pa.gov/agencies/revenue/ptrr"},
     # Maryland
     # Round 4 named the lower transfer tax but not who pays. Round 7 grader: "by default toward the seller,
     # unless the contract says otherwise" blurred the law - some of these costs are assigned by law
@@ -136,7 +139,11 @@ PROTECTIONS = [
      "source_name": "DC Code Section 42-1302",
      "source_url": "https://code.dccouncil.gov/us/dc/council/code/sections/42-1302"},
     # New Jersey
+    # `scope`: the limit the sentence must keep (grader 11/15: "Once the contract is signed, New Jersey's attorney review
+    # period lets either side's attorney ... cancel" - the rule covers contracts a real estate agent prepares, not every one).
     {"state": "NJ", "readers": {"buyer", "seller"}, "key": "nj_attorney_review", "check": r"attorney review",
+     "scope": r"prepared by (?:a |an |the |your )?(?:licensed )?(?:real estate )?(?:agent|broker|licensee|salesperson)|(?:agent|broker|realtor)[- ]prepared"
+              r"|\bmost\b|\bgenerally\b|\busually\b|\btypical(?:ly)?\b|\bcommon(?:ly)?\b|\boften\b",
      "name": "New Jersey attorney review",
      "says": "In New Jersey, a sales contract prepared by a real estate agent comes with an attorney review period, when either side's attorney can review it, ask for changes or cancel.",
      "source_name": "New Jersey Real Estate Commission rules (N.J.A.C. 11:5-6.2)", "source_url": None},
@@ -184,9 +191,63 @@ _READERS = (
 )
 
 
+# --- Who the article is for - decided ONCE, here, for every step ---------------------------------
+# Engine audit 11/14: "is this a buyer or a seller article?" was answered by five different word
+# matches in five places (research checklist, reader protections, payment example, local sale rules,
+# the checker) and they disagreed: "how quickly homes are selling" made a BUYING article a seller one
+# for the protections but not for research; a SELLER article that mentioned buyers got a buyer's
+# payment example. Now: the audience the agent picked decides; the words are only the fallback.
+_BUYER_AUDIENCES = {"buyers", "first-time buyers", "move-up buyers", "luxury buyers", "relocating"}
+_SELLER_AUDIENCES = {"sellers"}
+# "Selling" said about the market ("homes are selling in a week", "what homes sell for") is not a seller.
+_MARKET_SELLING = re.compile(
+    r"\b(?:homes|houses|properties|listings|condos|townhomes|rowhomes|they|everything|what(?:'s| is| are)?)\s+(?:\w+\s+){0,2}sell(?:ing|s)?\b"
+    r"|\bbest[- ]selling\b", re.I)
+_SELLER_ACT = re.compile(r"\bsell(?:ing)?\b|\blist(?:ing)? (?:your|my|a|the) (?:home|house)|\bhome sale\b|\bnet proceeds\b", re.I)
+_SELLER_NOUN = re.compile(r"\bsellers?\b", re.I)
+# The reader as the one doing it ("buying a home", "first-time") - "buyers" alone can be other people.
+_BUYER_ACT = re.compile(r"\bbuy(?:ing)?\b|\bpurchas(?:e|ing)\b|first[- ]time|\bfirst home\b|\bstarter home|\bmoving to\b|\brelocat|\bhouse[- ]?hunt", re.I)
+_BUYER_NOUN = re.compile(r"\bbuyers?\b|\bhomebuyers?\b", re.I)
+
+
+def _seller_words(text: str, nouns: bool = True) -> bool:
+    rest = _MARKET_SELLING.sub(" ", text or "")
+    return bool(_SELLER_ACT.search(rest) or (nouns and _SELLER_NOUN.search(rest)))
+
+
+class _SellerArticle:
+    """Kept as a .search()-able so older call sites and tests read the same."""
+    @staticmethod
+    def search(text: str) -> bool:
+        return _seller_words(text)
+
+
+SELLER_ARTICLE = _SellerArticle()
+
+
+def reader_sides(brief: dict) -> set[str]:
+    """{"buyer"}, {"seller"}, both or neither - the ONE answer every step uses."""
+    head = " ".join(str(brief.get(k) or "") for k in ("topic", "goal"))
+    audiences = [str(a) for a in brief.get("audiences") or []]
+    aud = {a.lower().strip() for a in audiences}
+    picked = ({"buyer"} if aud & _BUYER_AUDIENCES else set()) | ({"seller"} if aud & _SELLER_AUDIENCES else set())
+    if picked:
+        # The agent said who it is for. The headline adds the other side only when the reader does it
+        # themselves ("sell, then buy smaller") - never because the other side is mentioned in passing.
+        return picked | ({"seller"} if _seller_words(head, nouns=False) else set()) | ({"buyer"} if _BUYER_ACT.search(head) else set())
+    said = " ".join([head, str(brief.get("key_points") or "")] + audiences)
+    seller = _seller_words(said)
+    buyer = bool(_BUYER_ACT.search(said)) or (not seller and bool(_BUYER_NOUN.search(said)))
+    return ({"seller"} if seller else set()) | ({"buyer"} if buyer else set())
+
+
 def article_readers(brief: dict) -> set[str]:
     said = " ".join(str(brief.get(k) or "") for k in ("topic", "goal", "key_points")) + " " + " ".join(brief.get("audiences") or [])
-    return {name for name, rx in _READERS if rx.search(said)}
+    sides = reader_sides(brief)
+    out = {name for name, rx in _READERS if name not in ("buyer", "seller") and rx.search(said)} | sides
+    if "first_time" in out and "buyer" not in sides:
+        out.discard("first_time")       # first-time buyers named in passing in an article for someone else
+    return out
 
 
 def protections_for(states: set[str], brief: dict, investment: bool = False, places: Optional[set[str]] = None,
@@ -253,6 +314,21 @@ _FINE_PRINT = [
     (re.compile(r"\b(within|after|before)\s+(\d+|three|five|seven|ten)\s+(business |calendar )?days\b", re.I), "a legal deadline"),
     (re.compile(r"\bdeadline (is|of)\b[^.]{0,30}\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.? \d", re.I), "a program deadline"),
 ]
+# A transfer-tax rate we hold from the government's own page may be stated, worded as an estimate
+# (owner 11/13 - replaces "never state a transfer tax rate"). `tax_rates` = those percents.
+_PCT_NUM = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(?:%|percent\b)", re.I)
+_ESTIMATE_WORDS = re.compile(r"\babout\b|\baround\b|\broughly\b|\bapproximately\b|\bestimate[ds]?\b|\bcurrently\b|\bnearly\b|\bjust (?:over|under)\b|\bclose to\b|\bas of\b", re.I)
+
+
+def _held_tax_rate(sentence: str, tax_rates) -> Optional[bool]:
+    """None = the sentence states a rate we don't hold (or we hold none). True = every percent in it
+    is a held rate and it is worded as an estimate. False = held rates, but stated flat."""
+    pcts = [float(x) for x in _PCT_NUM.findall(sentence)]
+    if not tax_rates or not pcts or any(all(abs(p - float(r)) > 0.0005 for r in tax_rates) for p in pcts):
+        return None
+    return bool(_ESTIMATE_WORDS.search(sentence))
+
+
 _MARKET_SHARE = re.compile(r"\beffective\b|of (the )?(list|sale|asking|purchase) price|of (the )?(home'?s? )?(price|value)\b", re.I)
 _CLOSING_TAX = re.compile(r"transfer|recordation|grantor|mansion", re.I)
 # A property-tax burden as a percent (of list price, value, or bare) reads like an official rate
@@ -293,6 +369,28 @@ _HALF_LOGIC = re.compile(r"\bhalf (of )?(the |those |these )?(homes |sales )?(so
 _ANECDOTE = re.compile(r"\bI(?:'ve| have)\s+(?:seen|watched|helped|worked with|sold|had|guided|walked)\b|\bin my experience\b|\bmy (?:past |recent )?(?:clients|buyers|sellers)\b|\bI once\b|\bone of my\b", re.I)
 
 
+_TAKE_WORD = re.compile(r"[a-z]{4,}")
+_TAKE_FILLER = {"experience", "people", "usually", "often", "that", "this", "with", "from", "here", "have", "they", "their", "there", "what",
+                "when", "which", "than", "then", "them", "were", "been", "most", "many", "more", "very", "just", "your", "about"}
+
+
+def _agents_own_take(sentence: str, personal: str, opinion: bool = False) -> bool:
+    """The sentence restates the take the agent wrote in the brief - "In my experience, ..." in front of
+    the agent's own words is theirs to say, not an invented story (11/14 Kennett Square: the agent wrote
+    "people moving here are usually surprised how quickly the walkable borough turns into open farmland";
+    the editor framed it as "In my experience, ..." and this check then deleted it)."""
+    theirs = set(_TAKE_WORD.findall((personal or "").lower())) - _TAKE_FILLER
+    said = [w for w in _TAKE_WORD.findall(sentence.lower()) if w not in _TAKE_FILLER]
+    if len(theirs) < 3 or len(said) < 3:
+        return False
+    shared = sum(1 for w in said if w in theirs)
+    # "In my experience, ..." only frames an opinion as the agent's own - which is what the fact-check is told to do with
+    # the brief's take. A paraphrase shares fewer words than a quote, so it needs two of the agent's own words and a
+    # quarter of the sentence (11/14 Media: the checker's "In my experience" fix was thrown out and the flat claim stayed).
+    # A story ("I've helped", "one of my clients") still has to be the agent's words.
+    return (shared >= 2 and shared / len(said) >= 0.25) if opinion else shared / len(said) >= 0.6
+
+
 def _sentences(text: str) -> list[str]:
     out = []
     for line in text.splitlines():
@@ -300,8 +398,10 @@ def _sentences(text: str) -> list[str]:
     return out
 
 
-def final_lint(text: str, brief: dict) -> list[dict]:
-    """Sentences that break a hard rule: [{"sentence", "kind", "fix"}]."""
+def final_lint(text: str, brief: dict, tax_rates=None) -> list[dict]:
+    """Sentences that break a hard rule: [{"sentence", "kind", "fix"}]. `tax_rates` = the transfer-tax
+    percents we hold from the government's own page for this article's place (they may be stated, as an
+    estimate); None or empty = no transfer-tax rate may be stated at all."""
     text = _plain(text)
     personal = (brief.get("personal_take") or "").lower()
     found, seen = [], set()
@@ -317,7 +417,14 @@ def final_lint(text: str, brief: dict) -> list[dict]:
             continue
         # The percent in a loan sentence is the mortgage rate or down payment (the payment card,
         # "at 7.24%, ... including property tax"), not a tax figure.
-        tax_pct = not _LOAN_CONTEXT.search(s) and bool(_TAX_PCT.search(s) or (tax_ctx and _PCT_OF_PRICE.search(s) and not _SALE_WORDS.search(s)))
+        # A transfer-tax rate we hold: fine when worded as an estimate, sent back when stated flat.
+        held = _held_tax_rate(s, tax_rates) if _CLOSING_TAX.search(s) else None
+        if held is False:
+            flag(s, "rule_detail", "It states a transfer-tax rate as a flat fact. Keep the rate but word it as an estimate (\"about\", \"currently\") "
+                                   "and tell the reader the settlement company gives the exact figure.")
+        # A transfer-tax sentence is a closing-tax matter (handled just below), never "a property tax as a percent" -
+        # the wrong label sent the repair off to delete a rate it should have replaced with the one we hold.
+        tax_pct = held is None and not _CLOSING_TAX.search(s) and not _LOAN_CONTEXT.search(s) and bool(_TAX_PCT.search(s) or (tax_ctx and _PCT_OF_PRICE.search(s) and not _SALE_WORDS.search(s)))
         tax_ctx = bool(_TAX_WORDS.search(s)) or (tax_ctx and tax_pct)
         if tax_pct:
             flag(s, "rule_detail", "It gives a property tax as a percent, which reads like an official tax rate. Leave the percents out: say property taxes "
@@ -325,6 +432,8 @@ def final_lint(text: str, brief: dict) -> list[dict]:
                                    "and assessment for the home. A dated median tax bill in dollars from the listings can stay.")
         for rx, what in ([] if tax_pct else _FINE_PRINT):
             if not rx.search(s) or (what == "a legal deadline" and not _DEADLINE_CONTEXT.search(s)):
+                continue
+            if what == "a closing-tax or tax rate" and held is not None:
                 continue
             # A tax bill as a share of the price is handled above (_TAX_PCT), not as a closing tax.
             if what == "a closing-tax or tax rate" and _MARKET_SHARE.search(s) and not _CLOSING_TAX.search(s):
@@ -338,6 +447,10 @@ def final_lint(text: str, brief: dict) -> list[dict]:
                 flag(s, "rule_detail", "It says which office collects or receives closing taxes or fees - local procedure that's easy to misstate. Leave the procedure out: "
                                        "say the state and county transfer taxes, recordation taxes and recording fees can affect closing costs, and to ask the "
                                        "settlement company or attorney for an itemized estimate for the specific property.")
+            elif what == "a closing-tax or tax rate" and tax_rates and _CLOSING_TAX.search(s):
+                flag(s, "rule_detail", "It states a transfer-tax rate we don't hold from the official page. The only rates this article may give are "
+                                       + ", ".join(f"{float(r):g}%" for r in tax_rates) + " - exactly as the TRANSFER TAX ledger item gives them, worded as "
+                                       "an estimate. Use those or name the tax with no rate, and point the reader to the settlement company for the figure.")
             else:
                 flag(s, "rule_detail", f"It states {what}. Name the rule or program in general words with no rates, amounts, limits or deadlines, "
                                        "and point the reader to me, the settlement company or the official source for the current figure.")
@@ -367,7 +480,7 @@ def final_lint(text: str, brief: dict) -> list[dict]:
             flag(s, "condo_townhome", "This treats every townhome like a condo. A townhome is a building style: one owned as a condo unit shares "
                                       "the building with the association, one owned with its land doesn't. Say \"with a condo (or a townhome owned as a condo unit)\".")
         m = _ANECDOTE.search(s)
-        if m and m.group(0).lower() not in personal:
+        if m and m.group(0).lower() not in personal and not _agents_own_take(s, personal, opinion=m.group(0).lower() == "in my experience"):
             flag(s, "invented_experience", "A first-person story or track record the agent never gave. Remove the experience claim; keep any useful advice in general words.")
     return found
 
@@ -381,11 +494,12 @@ PASS_LIST = [
     ("facts", "No wrong or made-up facts", "Every fact matches its source; nothing is invented or stretched."),
     ("place", "Right place", "Right towns, counties and school districts; no other county's rules, fees or sources."),
     ("dates", "Numbers say what they cover", "Every market number says the dates and the homes it covers, and counts that come from different windows aren't mixed up."),
-    ("fine_print", "No fine print", "No tax rates, mills, property taxes as a percent, program limits, amounts, legal deadlines or which office collects a closing tax - laws and programs are named only."),
+    ("fine_print", "No fine print", "No tax rates, mills, property taxes as a percent, program limits, amounts, legal deadlines or which office collects a closing tax - laws and programs are named only. Two exceptions: a transfer-tax rate or dollar example we hold from the government's own page, given as an estimate; and a municipality's own lead time for applying for a resale certificate, from its own page."),
     ("math", "Numbers read correctly", "Statistics are explained correctly (a 100% median sale-to-list ratio doesn't mean half sold above asking)."),
     ("stories", "No invented stories", "No stories, sales, clients or experience the agent didn't give."),
     ("protections", "Reader protections", "The state rules and programs that protect this reader are named in plain words."),
     ("fit", "Fits the reader", "Everything fits this reader: no live-in programs for investors, townhomes not assumed to be condos, nothing that decides a rule applies to them."),
+    ("asked", "Answers what you asked", "Every question and point in the agent's brief gets a direct answer from the data, or the article says plainly that we don't have it - never a different fact in its place."),
     ("voice", "Agent's own voice", "First person throughout - never \"ask Peter\", \"your agent\" or a third-person sales pitch."),
     ("next_step", "Right next step", "A clear next step that fits the reader, with Ask lines where readers need personal help. The agent's own closing (e.g. \"I'll start your search\") is right in any state."),
     ("complete", "Finished article", "No blanks, placeholders, empty headings or notes to the agent."),
@@ -399,10 +513,10 @@ _LINT_TO_PASS = {"rule_detail": "fine_print", "stat_logic": "math", "count_misma
 _PLACEHOLDER = re.compile(r"_{3,}|\[(?:insert|add|enter|your|todo|tbd)[^\]]*\]|\bTBD\b|\{\{", re.I)
 
 
-def code_checks(text: str, brief: dict, protections: list[dict], agent_name: str = "") -> dict[str, list[dict]]:
+def code_checks(text: str, brief: dict, protections: list[dict], agent_name: str = "", tax_rates=None) -> dict[str, list[dict]]:
     """The pass-list items plain code can check: {item id: [{"quote", "why", "fix"}]}."""
     out: dict[str, list[dict]] = {}
-    for h in final_lint(text, brief):
+    for h in final_lint(text, brief, tax_rates):
         out.setdefault(_LINT_TO_PASS[h["kind"]], []).append({"quote": h["sentence"], "why": h["kind"], "fix": h["fix"]})
     for p in missing_protections(text, protections):
         out.setdefault("protections", []).append({"quote": "", "why": f"never names {p['name']}",

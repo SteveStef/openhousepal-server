@@ -138,6 +138,7 @@ class BlogListItem(BaseModel):
     view_count: int = 0
     # Unfinished AI article: 'interview' (answers saved, never written), 'running', 'failed'.
     ai_state: Optional[str] = None
+    ai_ready_at: Optional[str] = None   # an overnight article: when it is likely ready (ISO time)
 
     class Config:
         from_attributes = True
@@ -249,8 +250,8 @@ class BlogAiBrief(BaseModel):
     sale_ids: List[str] = []
     area_slugs: List[str] = []  # towns to add a Town Spotlight section for (Areas slugs)
     listings: List[LinkedProperty] = []
-    # One of the agent's videos (YouTube) to tie in: the writer gives it a section of its own and
-    # the video is embedded right there.
+    # One of the agent's videos (YouTube): shown as a "Related video" card at the END of the article
+    # (11/15) - placed by code, the AI is not told about it (ai_blog_writer_service.related_blocks).
     video: Optional[BlogAiVideo] = None
     tone: Literal['warm', 'professional', 'luxury', 'energetic', 'straight'] = 'warm'
     length: Literal['short', 'standard', 'long'] = 'standard'
@@ -262,6 +263,13 @@ class BlogAiBrief(BaseModel):
     # Set to rewrite an existing article in place ("Draft with AI" inside the editor); omitted
     # creates a brand-new DRAFT article.
     blog_id: Optional[str] = None
+    # Write it overnight: the same researched article through the half-price queue (blog_overnight_service) -
+    # ready in an hour or two instead of minutes, for about half the AI usage.
+    overnight: bool = False
+    # Asked on the writer's last step only when the town is outside every state the agent works in: "Are you licensed
+    # in <state>?" False -> the article offers an introduction to an agent licensed there, not the agent's own
+    # services (grader 11/15). None = never asked (the AI chat) -> as before.
+    licensed_there: Optional[bool] = None
 
 
 class BlogAiFact(BaseModel):

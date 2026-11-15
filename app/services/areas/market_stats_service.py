@@ -529,12 +529,16 @@ async def get_area_sales_snapshot(db: AsyncSession, scope: dict, days: int = 90)
     async def window(start: date, stop: date) -> dict:
         rows = (await db.execute(
             select(mls_mirror.text_field("ClosePrice"), mls_mirror.col(Property.price, "ListPrice"),
-                   mls_mirror.col(Property.days_on_market, "DaysOnMarket"), Property.home_type)
+                   mls_mirror.col(Property.days_on_market, "DaysOnMarket"), Property.home_type, Property.structure_type)
             .where(*base, close_date > start.isoformat(), close_date <= stop.isoformat())
         )).all()
         prices, ratios, doms = [], [], []
         by_type: dict[str, list[float]] = {"condo": [], "townhouse": [], "house": []}
-        for cp, lp, dom, home_type in rows:
+        # Bright files a twin (semi-detached: one shared wall) under "townhouse". An agent who asks about "condos,
+        # townhomes and twins" was told there was no twin figure while 10 of Ardmore's 19 "townhome" sales WERE twins
+        # (grader 11/14). The structure type tells them apart.
+        styles: dict[str, list[float]] = {"twin": [], "row": []}
+        for cp, lp, dom, home_type, structure in rows:
             cpv = _num(cp)
             if not cpv or cpv < geography.MIN_PLAUSIBLE_SALE_PRICE:
                 continue
@@ -542,6 +546,10 @@ async def get_area_sales_snapshot(db: AsyncSession, scope: dict, days: int = 90)
             kind = {"CONDO": "condo", "TOWNHOUSE": "townhouse", "SINGLE_FAMILY": "house", "Single Family": "house"}.get(home_type)
             if kind:
                 by_type[kind].append(cpv)
+            if kind == "townhouse":
+                style = attached_style(structure)
+                if style:
+                    styles[style].append(cpv)
             lpv = _num(lp)
             if lpv and lpv > 0:
                 ratios.append(cpv / lpv)
@@ -562,6 +570,10 @@ async def get_area_sales_snapshot(db: AsyncSession, scope: dict, days: int = 90)
         # What each kind of home sold for (11/01 Arlington condo article: the only sold median mixed
         # in $1.5M houses, so the writer reached for a news site's one-month condo average).
         types = {k: {"count": len(v), "median_close_price": round(_median(v))} for k, v in by_type.items() if len(v) >= 5}
+        if "townhouse" in types and styles["twin"] and len(styles["twin"]) + len(styles["row"]) == types["townhouse"]["count"]:
+            # every one of them is one or the other, so the two lines add up to the townhome line; a median needs 5
+            types["townhouse"]["styles"] = {k: {"count": len(v), **({"median_close_price": round(_median(v))} if len(v) >= 5 else {})}
+                                            for k, v in styles.items() if v}
         if len(types) > 1:
             out["by_type"] = types
         return out
@@ -586,6 +598,13 @@ async def get_area_sales_snapshot(db: AsyncSession, scope: dict, days: int = 90)
     under_contract = (await db.execute(
         select(func.count(Property.id)).where(location_filter, resid, Property.home_status.in_(UNDER_CONTRACT_STATUSES))
     )).scalar() or 0
+    # The for-sale count is only as current as our MLS copy (grader audit 11/13: "183 homes for sale as of
+    # Nov 13" came from data last updated Oct 19). Stamped with the day the data was last updated.
+    from app.services import mls_freshness
+    _fresh = await mls_freshness.check(db)
+    _inventory_day = today
+    if _fresh.get("current_through") and (_fresh.get("age_hours") or 0) > mls_freshness.WARN_HOURS:
+        _inventory_day = min(today, date.fromisoformat(_fresh["current_through"][:10]))
     return {
         "window_days": days,
         "data_through": end.isoformat(),
@@ -596,7 +615,7 @@ async def get_area_sales_snapshot(db: AsyncSession, scope: dict, days: int = 90)
         "active_median_list_price": round(float(active[1])) if active[1] is not None else None,
         "active_p25_list_price": round(float(active[2])) if active[2] is not None else None,
         "under_contract_count": int(under_contract),
-        "inventory_as_of": today.isoformat(),
+        "inventory_as_of": _inventory_day.isoformat(),
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -659,6 +678,17 @@ def _place_of(lat, lng, munis: list[dict]) -> Optional[str]:
     if lat is None or lng is None:
         return None
     return next((m["name"] for m in munis if bs.contains(m["rings"], float(lng), float(lat), m["box"])), None)
+
+
+def attached_style(structure) -> Optional[str]:
+    """"twin" (semi-detached: one shared wall) or "row" for a home Bright files under townhouse - None when the
+    listing's structure type doesn't say."""
+    words = " ".join(str(x) for x in structure).lower() if isinstance(structure, (list, tuple)) else str(structure or "").lower()
+    if "twin" in words or "semi-detached" in words or "semi detached" in words:
+        return "twin"
+    if "row" in words or "townhouse" in words or "town house" in words:
+        return "row"
+    return None
 
 
 async def get_area_cost_profile(db: AsyncSession, scope: dict, munis: Optional[list[dict]] = None) -> dict:
@@ -747,15 +777,22 @@ async def get_area_cost_profile(db: AsyncSession, scope: dict, munis: Optional[l
             # Parts that don't fit inside the total are a data error - leave the split out.
             "by_township": split if parts_fit(len(bills), [r["homes"] for r in split]) else [],
         }
-    hoa = {}
+    hoa, hoa_few = {}, {}
     listed = {"CONDO": sum(1 for r in rows if r[2] == "CONDO"), "TOWNHOUSE": sum(1 for r in rows if r[2] == "TOWNHOUSE")}
     for kind, vals in fees.items():
         # A fee median needs 10+ listings that show a fee, and says how many of the listings that is.
         if len(vals) >= 10:
             top = [(c, round(n * 100 / len(vals))) for (k, c), n in covers.most_common() if k == kind and n * 2 >= len(vals)][:6]
             hoa[kind.lower()] = {"homes": len(vals), "of": listed[kind], "median_monthly": round(_median(vals)), "covers": top}
+        elif vals:
+            # Fewer than that is no "typical" fee - but it IS what those listings charge. An agent asked for "monthly
+            # payment plus HOA or condo fees" and the article had to say it had no dollar amounts while three
+            # listings showed one (grader 11/14). The few are given as what they are: a range, with their count.
+            hoa_few[kind.lower()] = {"homes": len(vals), "of": listed[kind], "low_monthly": round(min(vals)), "high_monthly": round(max(vals))}
     if hoa:
         out["hoa"] = hoa
+    if hoa_few:
+        out["hoa_few"] = hoa_few
     if sum(town_own.values()) >= 10:
         out["townhome_fees"] = {"of": sum(town_own.values()), **{k: town_own.get(k, 0) for k in ("condo_fee", "hoa_only", "no_fee")}}
     mix = _home_mix(homes)
@@ -813,6 +850,50 @@ async def count_shared_for_sale(db: AsyncSession, scope_a: dict, scope_b: dict) 
     ))).scalar() or 0
 
 
+LOT_MIN_SQFT, LOT_MAX_SQFT = 500, 200 * 43560     # a lot size outside this is a data-entry slip, not a lot
+LOT_MIN_SALES = 8                                  # fewer house sales than this says nothing about "typical"
+
+
+async def get_area_lot_profile(db: AsyncSession, scope: dict, days: int = 365) -> dict:
+    """How much land single-family houses come with here: lot sizes of the houses SOLD in the last
+    `days`, overall and per municipality. Grader audit 11/13: asked "how much land do you get" in
+    Kennett Square, an article said "compare listing by listing" - the records have the answer
+    (the borough about a quarter acre, Kennett Township about an acre).
+    {} when fewer than LOT_MIN_SALES houses with a lot size on record sold. Sizes are square feet."""
+    from datetime import date, timedelta
+    location_filter = geography.location_filter(Property, scope)
+    if location_filter is None:
+        return {}
+    close_date = mls_mirror.close_date()
+    today = date.today()
+    rows = (await db.execute(
+        select(Property.township, Property.lot_size, close_date)
+        .where(location_filter, geography.residential_for_sale_filter(Property), Property.home_status.in_(_SOLD_STATUSES),
+               Property.home_type.in_(("SINGLE_FAMILY", "Single Family")),
+               close_date > (today - timedelta(days=days)).isoformat(), close_date <= today.isoformat())
+    )).all()
+    lots, by_muni, dates = [], {}, []
+    for township, lot, closed in rows:
+        v = _num(lot)
+        if not v or not (LOT_MIN_SQFT <= v <= LOT_MAX_SQFT):
+            continue
+        lots.append(v)
+        dates.append(str(closed)[:10])
+        if township:
+            by_muni.setdefault(str(township).strip(), []).append(v)
+    if len(lots) < LOT_MIN_SALES:
+        return {}
+    lots.sort()
+    q = lambda p: lots[min(len(lots) - 1, int(round(p * (len(lots) - 1))))]
+    return {
+        "count": len(lots), "from": min(dates), "to": max(dates),
+        "median_sqft": round(_median(lots)), "p25_sqft": round(q(0.25)), "p75_sqft": round(q(0.75)),
+        "acre_plus_count": sum(1 for v in lots if v >= 43560),
+        "by_municipality": [{"name": k, "count": len(v), "median_sqft": round(_median(v))}
+                            for k, v in sorted(by_muni.items(), key=lambda kv: -len(kv[1])) if len(v) >= 5],
+    }
+
+
 async def area_geography_mix(db: AsyncSession, scope: dict) -> dict:
     """Which townships / counties / school districts the homes of an area actually sit in, from
     the MLS records themselves (every home on record there, any status): the shares, plus the
@@ -863,7 +944,7 @@ async def older_homes_share(db: AsyncSession, scopes: list[dict], before: int = 
     return round(sum(1 for y in years if y < before) / len(years), 3) if len(years) >= 20 else None
 
 
-async def entry_price_profile(db: AsyncSession, scopes: list[dict]) -> dict:
+async def entry_price_profile(db: AsyncSession, scopes: list[dict], house_near: Optional[float] = None) -> dict:
     """Homes for sale across several areas at once (each home once, even where the areas
     overlap): the 25th-percentile and median list price, and the median annual tax as a share of
     list price for homes priced near that 25th percentile - the inputs of an article's worked
@@ -907,5 +988,12 @@ async def entry_price_profile(db: AsyncSession, scopes: list[dict]) -> dict:
         if len(near_k) < 5:
             near_k = [t / p for p, t in homes if t and t > 100]
         out.update({("houses" if kind == "house" else "attached"): len(homes), f"{kind}_median": round(km),
-                    f"tax_pct_near_{kind}": round(_median(near_k) * 100, 2) if len(near_k) >= 5 else None})
+                    f"tax_pct_near_{kind}": round(_median(near_k) * 100, 2) if len(near_k) >= 5 else None,
+                    f"tax_homes_{kind}": len(near_k)})
+        # The tax estimate for a house priced at `house_near` (the median SOLD price, when the example uses it)
+        # comes from houses listed near that price, not near the higher asking-price median.
+        if kind == "house" and house_near:
+            near_s = [t / p for p, t in homes if 0.75 * house_near <= p <= 1.25 * house_near and t and t > 100]
+            if len(near_s) >= 5:
+                out.update({"tax_pct_near_house_sold": round(_median(near_s) * 100, 2), "tax_homes_house_sold": len(near_s)})
     return out

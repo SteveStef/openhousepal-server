@@ -2271,9 +2271,11 @@ async def _p_blog(db, user, a):
     # The Blogs page's own interview as the card's steps (owner, 11/01: "exactly how it would be if you
     # were actually on the blog ... questions answered by checking off boxes"): Topic (an angle + what
     # readers walk away with), Readers (who + towns + Town Spotlight), Key points (ideas to check off,
-    # their take, numbers), Your homes (sales + listings), Video (their YouTube, "Fits" first), Style
+    # their take, numbers), Related homes (sales + listings), Related video (their YouTube, "Fits" first), Style
     # (tone, length with its share of the AI allowance, the ending button).
-    percents = {}
+    # Save usage (the default) or Write it now - the Blogs page's own choice, with its own numbers (owner 11/14:
+    # "make sure the AI chat blog flow is the same as our normal flow ... the chat bot actually has that option").
+    percents, percents_save, save_times = {}, {}, {}
     for ln in BLOG_LENGTHS:
         try:
             est = await call_as_agent(user, "GET", "/studio/blogs/ai/estimate", params={"length": ln})
@@ -2281,6 +2283,10 @@ async def _p_blog(db, user, a):
             est = None
         if (est or {}).get("percent") is not None:
             percents[ln] = est["percent"]
+        night = (est or {}).get("overnight") or {}
+        if night.get("percent") is not None:
+            percents_save[ln] = night["percent"]
+            save_times = {k: night.get(k) for k in ("typical_minutes", "max_minutes", "cap_minutes")}
     try:
         from app.services.ai import ai_blog_writer_service
         ctx = await ai_blog_writer_service.build_context(db, user)
@@ -2291,17 +2297,22 @@ async def _p_blog(db, user, a):
     cards = {str(c.get("name") or "").lower(): c.get("slug") for c in (ctx.get("area_cards") or []) if c.get("slug")}
     # every sale (newest first) - the card recommends the ones in the towns picked and shows 5 at a time
     sales = [{"id": str(x.get("id")), "address": x.get("address") or "", "city": x.get("city") or "", "price": x.get("price"),
-              "date": str(x.get("sold_date") or "")[:7], "photo": x.get("image_url")}
+              "date": str(x.get("sold_date") or "")[:7], "sold": str(x.get("sold_date") or "")[:10], "photo": x.get("image_url")}
              for x in (ctx.get("recent_sales") or [])[:60] if x.get("id")]
     listings = [{k: x.get(k) for k in ("id", "address", "city", "state", "price", "beds", "baths", "sqft", "status", "image_url")}
                 for x in (ctx.get("listings") or [])[:12] if x.get("id")]
-    videos = [{k: v.get(k) for k in ("id", "title", "url", "image", "kind")} for v in (ctx.get("videos") or []) if _yt(v.get("url") or "")][:24]
-    want_areas = [t for t in (a.get("areas") or []) if isinstance(t, str) and t.strip()][:5]
-    body = {"topic": topic[:500], "tone": a.get("tone") if a.get("tone") in BLOG_TONES else "warm",
-            "length": a.get("length") if a.get("length") in BLOG_LENGTHS else "standard",
-            "audiences": [x for x in (a.get("audiences") or []) if x in BLOG_AUDIENCES],
-            "areas": want_areas, "cta": a.get("cta") if a.get("cta") in BLOG_CTAS else "how_can_i_help",
-            "area_slugs": [cards[t.lower()] for t in want_areas if t.lower() in cards]}
+    videos = [{k: v.get(k) for k in ("id", "title", "url", "image", "kind")} for v in (ctx.get("videos") or []) if _yt(v.get("url") or "")][:60]
+    sug = await _blog_title_read(db, user, topic, a)
+    # What the agent already said in chat wins; otherwise the title decides (reader, town, tone, length, ending button).
+    want_areas = [t for t in (a.get("areas") or []) if isinstance(t, str) and t.strip()][:5] or list(sug.get("areas") or [])[:5]
+    body = {"topic": topic[:500], "tone": a.get("tone") if a.get("tone") in BLOG_TONES else (sug.get("tone") if sug.get("tone") in BLOG_TONES else "warm"),
+            "length": a.get("length") if a.get("length") in BLOG_LENGTHS else (sug.get("length") if sug.get("length") in BLOG_LENGTHS else "standard"),
+            "audiences": [x for x in (a.get("audiences") or []) if x in BLOG_AUDIENCES] or [x for x in (sug.get("audiences") or []) if x in BLOG_AUDIENCES],
+            "areas": want_areas,
+            "cta": a.get("cta") if a.get("cta") in BLOG_CTAS else (sug.get("cta") if sug.get("cta") in BLOG_CTAS else "how_can_i_help"),
+            "area_slugs": [cards[t.lower()] for t in want_areas if t.lower() in cards],
+            # Save usage unless they asked for it right away
+            "overnight": bool(percents_save) and a.get("speed") != "now"}
     if _s(a.get("key_points")):
         body["key_points"] = _s(a["key_points"])[:2000]
     if _s(a.get("goal")):
@@ -2309,10 +2320,43 @@ async def _p_blog(db, user, a):
     from app.utils.auth import luxe_blog_theme_allowed
     options = {"areas": areas, "area_cards": cards, "sales": sales, "listings": listings, "videos": videos, "luxe_ok": bool(luxe_blog_theme_allowed(user)),
                "idx_ok": user.plan_tier == "IDX", "attached_cover": _s(a.get("cover_photo_url")) or None,
-               "angles": _strs(a.get("angles"), 5, 200), "goals": _strs(a.get("goals"), 4, 200), "point_ideas": _strs(a.get("point_ideas"), 7, 200)}
+               "angles": _strs(sug.get("angles"), 5, 200), "goals": _strs(sug.get("goals"), 4, 200), "point_ideas": _strs(sug.get("key_points"), 9, 200),
+               # "My take: ..." lines to tap and make their own; the price the title is about and the town they sold in
+               # (the card recommends those sales first); and why the smart choices are resting, when they are
+               # what they named in chat is theirs; anything else may start from the style of their last article (the card does that)
+               "said": {"tone": a.get("tone") in BLOG_TONES, "length": a.get("length") in BLOG_LENGTHS},
+               "takes": _strs(sug.get("takes"), 3, 240), "price": sug.get("price") or None, "sales_town": sug.get("sales_town") or None,
+               "paused": (sug.get("paused") or {}).get("message") if isinstance(sug.get("paused"), dict) else None}
     return Prepared("Write a blog post with AI", [f"Topic: {topic[:200]}", "Saved as a draft - never published until you do"],
-                    {"body": body, "percents": percents, "options": options},
+                    {"body": body, "percents": percents, "percents_save": percents_save, "save_times": save_times, "options": options},
                     warning="This uses your monthly AI allowance.", confirm_label="Write it", picker="blog")
+
+
+async def _blog_title_read(db, user, topic: str, a: dict) -> dict:
+    """The Blogs page's own reading of the title (blog_suggest_service): the reader and the town in it, the angle /
+    goal / key-point / take choices - built from the agent's towns, sales, bio and past articles, cleaned by the same
+    rules (no numbers, no fair-housing words, "my recent X sales" only where they sold) - plus the title's price.
+    One very small metered call, shared with the page (same title = no second charge). When that reading is resting
+    (97% of the month's AI used) or fails, the ideas the helper itself passed go through the same clean-up instead."""
+    from app.services.ai import blog_suggest_service as bss
+    mine = {"angles": _strs(a.get("angles"), 5, 200), "goals": _strs(a.get("goals"), 4, 200), "key_points": _strs(a.get("point_ideas"), 7, 200), "takes": []}
+    try:
+        sctx = await bss.agent_context(db, user)
+        out = await bss.suggest(db, user, title=topic, context=sctx)
+        if out.get("ai"):
+            # the helper's own ideas fill in behind the page's, cleaned the same way
+            extra = bss.merge(bss.from_title(topic, known_towns=list(sctx.get("towns") or []) + [t["town"] for t in sctx.get("sales") or []]),
+                              mine, topic, context=sctx) if any(mine.values()) else {}
+            for key in ("angles", "goals", "key_points"):
+                have = {x.lower() for x in out.get(key) or []}
+                out[key] = list(out.get(key) or []) + [x for x in (extra.get(key) or []) if x.lower() not in have]
+            return out
+        base = bss.from_title(topic, known_towns=list(sctx.get("towns") or []) + [t["town"] for t in sctx.get("sales") or []])
+        cleaned = bss.merge(base, mine, topic, context=sctx) if any(mine.values()) else out
+        return {**cleaned, "paused": out.get("paused")}
+    except Exception:  # noqa: BLE001 - the card still opens with the helper's own ideas
+        logger.warning("blog title read for the chat card failed", exc_info=True)
+        return {"angles": mine["angles"], "goals": mine["goals"], "key_points": mine["key_points"]}
 
 
 def _adjust_blog(user, payload: dict, picks: dict) -> dict:
@@ -2327,6 +2371,9 @@ def _adjust_blog(user, payload: dict, picks: dict) -> dict:
         body["length"] = picks["length"]
     if picks.get("cta") in BLOG_CTAS:
         body["cta"] = picks["cta"]
+    if picks.get("when") in ("save", "now"):
+        # Save usage only where the card could offer it (its numbers came back)
+        body["overnight"] = picks["when"] == "save" and bool(out.get("percents_save"))
     if isinstance(picks.get("audiences"), list):
         body["audiences"] = [x for x in picks["audiences"] if x in BLOG_AUDIENCES]
     if isinstance(picks.get("areas"), list):
@@ -2398,17 +2445,30 @@ async def _r_blog(db, user, p):
     from app.services.ai import ai_notify
     from app.services.ai.ai_actions import CARD
     await ai_notify.watch(db, user, f"blog:{bid}", CARD.get() or {}, _s((p.get("body") or {}).get("topic"))[:80] or "your topic")
+    if (out or {}).get("mode") == "overnight":
+        most = (out or {}).get("max_minutes")
+        return {"working": True, "link": f"/studio/blogs/{bid}",
+                "message": "Writing your draft in Save usage mode - the same article (same research, same writing, same fact-check), made a little "
+                           "slower so it usually uses about half the AI. It's usually ready in 10 to 20 minutes"
+                           + (f", {most} at most" if most else "") + ". If the slower line is busy we finish it the fast way after "
+                           f"{(out or {}).get('cap_minutes') or 30} minutes, and those last steps use the normal amount - you pay for what it really "
+                           "used. I'll tell you right here when it's ready, even if you close the site."}
     return {"working": True, "link": f"/studio/blogs/{bid}",
             "message": "Writing your draft now - researching, writing and fact-checking takes a few minutes. I'll tell you right here when it's "
                        "ready, even if you close the site."}
 
 _simple("write_blog_post", "Start the AI blog writer on a topic (draft only; uses the agent's AI allowance). Plans with Blogs. "
-        "You CAN write blog posts - never say otherwise. The card is the Blogs page's own interview as check-box steps (topic angle + what readers walk away with, who it's for, towns + Town Spotlight, key points, their take and numbers, their sales and listings, one of their YouTube videos, tone, length, the ending button, the article's look and color, its category and cover photo, and where it shows) - "
-        "set it up as soon as you have the topic and never ask those in chat (pass them only if they already said). ALWAYS pass angles (4-5 sharper titles on their topic), goals (3-4 one-line things a reader should walk away knowing or doing) and point_ideas (5-7 specific key points worth covering) - they're the check boxes on the card.",
+        "You CAN write blog posts - never say otherwise. The card is the Blogs page's own interview as check-box steps (topic angle + what readers walk away with, who it's for, towns + Town Spotlight, key points, their take and numbers, related content for the END of the article - their sales, listings and one of their YouTube videos, shown as cards after the article ends (the AI does not write about them or build a section around them; a sale is only written about when the title itself is about the agent's own sales) - tone, length, the ending button, the article's look and color, its category and cover photo, and where it shows) - "
+        "set it up as soon as you have the topic and never ask those in chat (pass them only if they already said). The card also asks how soon they need it: "
+        "Save usage (already picked - the same article made a little slower; it usually uses about half the AI and the card shows the range, lower figure usual, higher figure the most; "
+        "usually 10-20 minutes, 70 at most because we only finish it the fast way after a full hour) or Write it now (2-4 minutes, the normal amount). The agent pays for what the article really used. "
+        "There is no way to speed up an article once it has started; "
+        "pass speed 'now' only if they said they need it right away. ALWAYS pass angles (4-5 sharper titles on their topic), goals (3-4 one-line things a reader should walk away knowing or doing) and point_ideas (5-7 specific key points worth covering) - they're the check boxes on the card.",
         _obj({"topic": {"type": "string"}, "key_points": {"type": "string"}, "goal": {"type": "string"}, "tone": {"type": "string", "enum": list(BLOG_TONES)},
               "length": {"type": "string", "enum": list(BLOG_LENGTHS)}, "audiences": {"type": "array", "items": {"type": "string", "enum": list(BLOG_AUDIENCES)}},
               "areas": {"type": "array", "items": {"type": "string"}, "description": "Towns the article is about, if they named any (up to 5)."},
               "cta": {"type": "string", "enum": list(BLOG_CTAS)},
+              "speed": {"type": "string", "enum": ["save", "now"], "description": "'now' only if they said they need it right away; otherwise leave it out (Save usage)."},
               "angles": {"type": "array", "items": {"type": "string"}}, "goals": {"type": "array", "items": {"type": "string"}},
               "point_ideas": {"type": "array", "items": {"type": "string"}}, "cover_photo_url": {"type": "string", "description": "A photo they attached, for the cover."}}, ["topic"]), _p_blog, _r_blog, STUDIO, adjust=_adjust_blog)
 

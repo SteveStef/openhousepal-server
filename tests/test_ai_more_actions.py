@@ -154,7 +154,7 @@ def test_blog_flags_lists_open_issues_numbers_and_geography():
               "numbers_to_verify": ["$612,000", "12%"], "geography_flags_open": 1}
     flags = more.blog_flags(review)
     assert flags[0] == "“Median price rose 12%” - Source says 8%"
-    assert "...and 1 more flag" in flags and "Numbers to double-check: $612,000, 12%" in flags
+    assert "...and 1 more flag" in flags and not any("double-check" in f for f in flags)      # no homework lists (owner 11/15)
     assert any("school-district" in f for f in flags)
     assert more.blog_flags({"status": "done", "checked": False})[-1].startswith("The fact-check didn't finish")
     assert more.blog_flags(None) == []
@@ -172,7 +172,7 @@ def test_publish_card_warns_with_the_flags(monkeypatch):
 def test_publish_card_without_flags_but_unfinished(monkeypatch):
     monkeypatch.setattr(more, "_one", _fake_one(_blog(ai_review={"status": "done", "finished": False})))
     p = run(more._p_blog_publish(None, USER, {"blog_id": "b1", "when": "now"}))
-    assert "Fact-check & finish" in p.warning
+    assert p.warning is None                                    # a finished article is not nagged about (owner 11/15)
 
 
 def test_schedule_card_and_its_checks(monkeypatch):

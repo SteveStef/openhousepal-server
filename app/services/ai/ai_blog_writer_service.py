@@ -27,7 +27,7 @@ import json
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException, status
@@ -337,6 +337,16 @@ async def town_card_for_area(db: AsyncSession, area: MarketArea) -> dict:
     checked = await reconcile_public_schools(db, area, scope) if facts.get("public_schools") else None
     items = ((resolve_photo_urls(facts.get("photos")) or {}).get("items") or [])
     photos = [{"url": it["url"], "credit": it.get("attribution") or it.get("author") or "Google Maps"} for it in items[:4] if it.get("url")]
+    nearby = _area_hover_facts(facts, stats)
+    # "Girard" alone doesn't say what it is: each transit name carries its kind from the town's record
+    # ("Girard (subway station)", "Orange St/Media (light rail / trolley stop)").
+    kinds = {str(e.get("name") or "").strip(): str(e.get("category") or "").strip()
+             for e in ((facts.get("transportation") or {}).get("entities") or []) if isinstance(e, dict)}
+    if nearby.get("transportation"):
+        # lower-case the kind's first letter unless it starts with a name in capitals ("SEPTA Market-Frankford Line ...")
+        low = lambda k: k if k[:2].isupper() else k[:1].lower() + k[1:]
+        nearby["transportation"] = [f"{n} ({low(kinds[n])})" if kinds.get(n) and kinds[n].lower() not in n.lower() else n
+                                    for n in nearby["transportation"]]
     return {
         "slug": area.slug, "name": area.name, "state": area.state, "county": area.county,
         "photo": photos[0]["url"] if photos else None, "photos": photos,
@@ -344,7 +354,7 @@ async def town_card_for_area(db: AsyncSession, area: MarketArea) -> dict:
         "median_price": stats.get("median_price"), "active_count": stats.get("active_count"),
         "min_price": stats.get("min_price"), "max_price": stats.get("max_price"), "price_range_basis": stats.get("price_range_basis"),
         "school_districts": _public_school_districts({"public_schools": checked} if checked else facts, stats.get("school_districts") or []),
-        "nearby": _area_hover_facts(facts, stats),
+        "nearby": nearby,
         "as_of": datetime.now(timezone.utc).strftime("%B %Y"),
     }
 
@@ -710,59 +720,93 @@ def _video(brief: dict) -> Optional[dict]:
     return None
 
 
-def _video_line(brief: dict) -> Optional[str]:
+# ---------------------------------------------------------------------------
+# Related content - the agent's own video, sales and listings, shown at the END of the article
+# (owner, 11/15: "more of a footer thing", not something worked into the article).
+#
+# Until 11/15 the AI was told about each of them and asked to write around it. It can't watch a video (it saw
+# only the title, wrote "my video is just below" and the video landed twelve paragraphs later), and working a
+# sale into the argument is where the checker kept catching slips (a 16-month-old sale compared with "today's
+# median"; "the sales show competing offers"). Now plain code adds them as cards just before the closing button,
+# and the AI is told NOTHING about them - not even "don't mention the video": round G (11/15) had that sentence in the
+# writer's rules and an article with no video at all came back with "the agent's video on the topic is not included
+# here". One exception: an article that is ABOUT the agent's own sales or
+# listings ("What my recent Gladwyne sales say about pricing") still gets their facts, because they are the topic.
+# ---------------------------------------------------------------------------
+
+_OWN_SALES = re.compile(
+    r"(?i:\b(?:my|our))\s+(?i:(?:own|recent|latest|last|past|newest|\d+|two|three|four|five)\s+)*(?:[A-Z][\w'.&-]*\s+){0,3}"
+    r"(?i:sales?|sold\s+homes?|closings?|closed\s+sales?|transactions?)\b"
+    r"|(?i:\bi(?:'ve|\s+have)?\s+(?:just\s+|recently\s+)?sold\b|\bjust\s+sold\b|\bsold\s+by\s+me\b)")
+_OWN_LISTINGS = re.compile(
+    r"(?i:\b(?:my|our))\s+(?i:(?:own|new|newest|latest|current|active|\d+|two|three)\s+)*(?:[A-Z][\w'.&-]*\s+){0,3}(?i:listings?)\b"
+    r"|(?i:\bjust\s+listed\b|\bi(?:'m|\s+am)\s+listing\b|\bcoming\s+soon\b|\bopen\s+house\b)")
+
+
+def about_own(brief: dict, kind: str) -> bool:
+    """Is the article ABOUT the agent's own sales ("sales") or listings ("listings")? Read from what the agent asked
+    for - the title, the goal and the key points. Their personal take is their own words either way."""
+    said = " ".join(str(brief.get(k) or "") for k in ("topic", "goal", "key_points"))
+    return bool((_OWN_SALES if kind == "sales" else _OWN_LISTINGS).search(said))
+
+
+def _place_name(brief: dict) -> str:
+    towns = [str(a).split(",")[0].strip() for a in (brief.get("areas") or []) if str(a).split(",")[0].strip()]
+    return "" if not towns else towns[0] if len(towns) == 1 else f"{', '.join(towns[:-1])} & {towns[-1]}"
+
+
+def _all_local(props: list[dict], brief: dict) -> bool:
+    towns = {str(a).split(",")[0].strip().lower() for a in (brief.get("areas") or [])} - {""}
+    return bool(props) and bool(towns) and all(str(p.get("city") or "").strip().lower() in towns for p in props)
+
+
+def _street(address, city) -> str:
+    """The street line only. A hub sale's address can carry its town and ZIP ("112 Wilton Woods Ln, Media, Pa 19063"),
+    and the card shows the town on its own line."""
+    a, c = str(address or "").strip(), str(city or "").strip()
+    cut = re.search(r",\s*" + re.escape(c) + r"\b", a, re.I) if c else None
+    return (a[:cut.start()] if cut and cut.start() >= 3 else a).strip(" ,")
+
+
+def related_blocks(brief: dict, sales: list[dict], listings: list[dict]) -> list[dict]:
+    """The agent's extras as closing cards, in the order a reader meets them: their sales, their listings, their
+    video. Same block types and titles as the Finish step's "show your work" row, so every look, the editor and the
+    PDF already know them. Real data only - each card is the hub's own record, nothing written by the AI."""
+    place = _place_name(brief)
+    out = []
+    if sales:
+        picked = bool(brief.get("sale_ids"))
+        # The automatic "my recent sales" set shows the newest four from the last 12 months (older ones read as stale).
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=366)).date().isoformat()
+        shown = sales if picked else ([s for s in sales if str(s.get("sold_date") or "")[:10] >= cutoff] or sales)[:4]
+        props = [{"id": s.get("id"), "address": _street(s.get("address"), s.get("city")), "city": s.get("city"), "state": s.get("state"), "price": s.get("price"),
+                  "beds": s.get("beds"), "baths": s.get("baths"), "sqft": s.get("sqft"), "status": "Sold", "sold_date": s.get("sold_date"),
+                  "image_url": s.get("image_url")} for s in shown[:6] if s.get("address")]
+        if props:
+            out.append({"id": _bid("property_showcase"), "type": "property_showcase", "data": {
+                "kind": "sales", "title": f"Recent Sales in {place}" if place and _all_local(props, brief) else "Recent Sales in the Area", "properties": props}})
+    if listings:
+        props = [{"id": p.get("listing_key") or p.get("id"), "address": _street(p.get("address"), p.get("city")), "city": p.get("city"), "state": p.get("state"),
+                  "price": p.get("price"), "beds": p.get("beds"), "baths": p.get("baths"), "sqft": p.get("sqft"), "status": p.get("status"),
+                  "image_url": p.get("image_url")} for p in listings[:6] if p.get("address")]
+        if props:
+            out.append({"id": _bid("property_showcase"), "type": "property_showcase", "data": {
+                "kind": "listings", "title": f"Homes for Sale in {place}" if place and _all_local(props, brief) else "Homes for Sale", "properties": props}})
     v = _video(brief)
-    if not v:
-        return None
-    named = f'titled "{v["title"]}"' if v["title"] else "(no title given)"
-    return (
-        f"A video of the agent's will be embedded in this article - {named}. Give it a home: make ONE of the H2 "
-        "sections the natural place for it (its heading should connect to what the video is about), and in that "
-        "section tell the reader they can watch the video just below. Only describe the video by what its title says - "
-        "never invent what it shows."
-    )
+    if v:
+        out.append({"id": _bid("video_showcase"), "type": "video_showcase", "data": {
+            "title": "Related video", "videos": [{"id": v["url"], "url": v["url"], "title": v["title"], "image": None}]}})
+    return out
 
 
-_WORD = re.compile(r"[a-z0-9']{3,}")
-_STOP = {"the", "and", "for", "with", "you", "your", "what", "how", "this", "that", "from", "are", "our", "into", "about", "tour", "video"}
-
-
-def place_video(blocks: list[dict], brief: dict) -> list[dict]:
-    """Embed the brief's video at the end of the section written for it: the section that tells the
-    reader to watch it (or, failing that, the one sharing the most words with the video's title),
-    else right after the intro. Leaves the blocks alone when there's no video."""
-    v = _video(brief)
-    if not v:
+def place_related(blocks: list[dict], related: list[dict]) -> list[dict]:
+    """Closing words -> sources -> the related cards -> the closing button -> the signature. Never inside the article."""
+    if not related:
         return blocks
-    heads = [i for i, b in enumerate(blocks) if b.get("type") == "heading"]
-    title_words = {w for w in _WORD.findall(v["title"].lower()) if w not in _STOP}
-
-    def text(b: dict) -> str:
-        return re.sub(r"<[^>]+>", " ", str((b.get("data") or {}).get("html") or (b.get("data") or {}).get("text") or "")).lower()
-
-    best, best_score = None, 0.0
-    for n, h in enumerate(heads[:-1] if len(heads) > 1 else heads):  # never the closing section
-        end = heads[n + 1] if n + 1 < len(heads) else len(blocks)
-        body = " ".join(text(b) for b in blocks[h + 1:end])
-        head = text(blocks[h])
-        score = (6 if re.search(r"\b(video|watch)\b", body) else 0)
-        score += 2 * len(title_words & set(_WORD.findall(head))) + len(title_words & set(_WORD.findall(body)))
-        if score > best_score:
-            best, best_score = (h, end), score
-    if best:
-        at = best[1]
-    else:
-        at = heads[0] if heads else min(1, len(blocks))
-    block = {"id": _bid("youtube"), "type": "youtube", "data": {"url": v["url"], "title": v["title"]}}
-    # 11/01: the writer skipped its "watch the video below" line and the video sat between two
-    # sections with no context - say what it is when the section doesn't already.
-    start = max((h for h in heads if h < at), default=-1)
-    if not any(re.search(r"\b(video|watch)\b", text(b)) for b in blocks[start + 1:at]):
-        name = re.split(r"\s+[|\-–—]\s+", v["title"])[0].strip(" .:") if v["title"] else ""
-        # A pasted link may not be the agent's own video - never say "my video".
-        lead = f"For more on this, watch <em>{html.escape(name)}</em> just below." if name else "For more on this, watch the video just below."
-        return blocks[:at] + [{"id": _bid("paragraph"), "type": "paragraph", "data": {"html": lead}}, block] + blocks[at:]
-    return blocks[:at] + [block] + blocks[at:]
+    at = next((i for i, b in enumerate(blocks) if b.get("type") == "cta"), None)
+    if at is None:
+        at = next((i for i, b in enumerate(blocks) if b.get("type") in ("agent_profile", "related_articles")), len(blocks))
+    return blocks[:at] + related + blocks[at:]
 
 
 def _brief_text(brief: dict, profile: dict, sales: list[dict], listings: list[dict], areas: Optional[list[dict]] = None) -> tuple[str, str]:
@@ -789,7 +833,6 @@ def _brief_text(brief: dict, profile: dict, sales: list[dict], listings: list[di
         brief.get("personal_take") and f"The agent's personal take / local story (weave this in faithfully):\n{brief['personal_take'].strip()}",
         brief.get("facts") and f"Facts and numbers the agent provided (the ONLY statistics you may cite):\n{brief['facts'].strip()}",
         brief.get("category_hint") and f"Preferred category: {brief['category_hint']}",
-        _video_line(brief),
     ]
     data_lines = []
     if sales:
@@ -1018,7 +1061,15 @@ def _name_ask_topics(blocks: list[dict]) -> list[dict]:
             continue
         if t != "ask_agent" or (b.get("data") or {}).get("topic"):
             continue
-        topic = re.split(r"[?:]", head)[0].strip(" .-")
+        parts = [x.strip(" .-") for x in re.split(r"[?:]", head) if x.strip(" .-")]
+        topic = parts[0] if parts else ""
+        # "Negotiated: commission and seller assist" - the word before the colon is a label, the words after it
+        # are what the section is about (11/14 Media: the line read "Ask me about Negotiated").
+        if ":" in head and len(parts) > 1:
+            if topic.lower() in _GENERIC_HEADS:
+                continue
+            if len(parts[1].split()) >= 2:
+                topic = parts[1]
         topic = re.sub(r"\s*\([^)]*\)", "", topic)
         if not topic or topic.lower() in _GENERIC_HEADS or len(topic) > 60:
             continue
@@ -1087,7 +1138,7 @@ def blocks_to_text(blocks: list) -> str:
 # Number audit - the "no fabricated statistics" safety net
 # ---------------------------------------------------------------------------
 
-_NUM = re.compile(r"\$?\d[\d,]*(?:\.\d+)?\s*(?:%|percent|million|mil|m\b|k\b|thousand)?", re.IGNORECASE)
+_NUM = re.compile(r"\$?\d[\d,]*(?:\.\d+)?\s*(?:%|percent|million|mil(?![a-z])|m\b|k\b|thousand)?", re.IGNORECASE)
 
 
 def _norm_number(token: str) -> Optional[float]:
@@ -1160,7 +1211,9 @@ async def _metered_call(db: AsyncSession, user: User, *, system: str, tool: dict
 
     try:
         client = _client()
-        resp = await client.messages.create(
+        from app.services import cma_claude  # one request shape for old and current Claude models
+        resp = await cma_claude.create(
+            client,
             model=model,
             max_tokens=max_tokens,
             system=system,
@@ -1205,7 +1258,9 @@ async def generate_article(db: AsyncSession, user: User, brief: dict) -> dict:
         except Exception:
             logger.warning("blog writer: area spotlight lookup failed", exc_info=True)
 
-    user_msg, source = _brief_text(brief, profile, sales, listings, spotlight)
+    related = related_blocks(brief, sales, listings)
+    user_msg, source = _brief_text(brief, profile, sales if about_own(brief, "sales") else [],
+                                   listings if about_own(brief, "listings") else [], spotlight)
     ai_config = await ai_config_service.get_config(db)
     article, usage = await _metered_call(
         db, user, system=_SYSTEM, tool=_ARTICLE_TOOL, user_msg=user_msg,
@@ -1222,12 +1277,7 @@ async def generate_article(db: AsyncSession, user: User, brief: dict) -> dict:
         heads = [i for i, b in enumerate(blocks) if b["type"] == "heading"]
         at = heads[1] if len(heads) > 1 else (heads[0] if heads else min(2, len(blocks)))
         blocks[at:at] = [area_spotlight_block(c) for c in spotlight]
-    if listings:
-        # Attached listings render as real property cards just before the closing section.
-        cards = [{"id": _bid("property_card"), "type": "property_card", "data": {"property": p, "displaySize": "large"}} for p in listings]
-        closing_idx = max((i for i, b in enumerate(blocks) if b["type"] == "heading"), default=len(blocks))
-        blocks[closing_idx:closing_idx] = cards
-    blocks = place_video(blocks, brief)
+    blocks = place_related(blocks, related)
     full_text = "\n".join([article.get("title", ""), article.get("subtitle", ""), article.get("meta_description", ""), blocks_to_text(blocks)])
     category = article.get("category") if article.get("category") in BLOG_CATEGORIES else (brief.get("category_hint") or None)
     return {
