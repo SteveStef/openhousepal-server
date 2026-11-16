@@ -208,6 +208,19 @@ _REFINE_ACTIONS = {
     "custom": "Revise this section following the agent's instruction.",
 }
 
+# In an article the AI wrote, the editor sends only the passage the agent typed or changed - the fact-checked
+# paragraphs around it are not sent to be rewritten (11/16).
+_ONE_PASSAGE = ("\nWhat you were given under SECTION TO REVISE is ONE passage inside a section, not a whole section: return only that "
+                "passage, revised, as the same kind of block it is: a paragraph stays ONE paragraph of about the same length. Only when "
+                "the task itself asks for a list may one short list follow it. Never a heading or subheading. "
+                "Leave `heading` empty. Do not repeat or rewrite anything else from the article, and add no advice that the passage "
+                "or the article does not already give.")
+
+
+def _has_heading(section_blocks: list) -> bool:
+    return any(isinstance(b, dict) and b.get("type") == "heading" for b in section_blocks or [])
+
+
 _SECTION_TOOL = {
     "name": "submit_section",
     "description": "Submit the revised section.",
@@ -1000,6 +1013,8 @@ def _ask_block(topic: str = "") -> dict:
     """The small "Ask [agent] about ..." line with Call / Text / Email under a sentence that sends the
     reader to the agent (the page fills in the agent's name and contact)."""
     topic = re.sub(r"\s+", " ", topic or "").strip(" .:-")[:60]
+    if topic and _INSTRUCTION_HEAD.match(topic):   # "compare total monthly costs" is an instruction, not a topic
+        topic = ""
     return {"id": _bid("ask_agent"), "type": "ask_agent", "data": {"topic": topic} if topic else {}}
 
 
@@ -1044,6 +1059,11 @@ def ask_agent_rows(blocks: list[dict], limit: int = 3) -> list[dict]:
 
 
 _GENERIC_HEADS = {"the bottom line", "bottom line", "at a glance", "next steps", "the next step", "faq", "faqs"}
+# Words that only start an instruction. Left out on purpose because they also start real topics: use ("use and
+# occupancy"), price, drive ("drive times"), walk, plan, budget, tour, line, set, work.
+_INSTRUCTION_HEAD = re.compile(r"(?:do(?:n'?t)?|never|always|compare|get|check|know|start|tell|ask|add|find|make|confirm|read|take|try|weigh|pick|"
+                               r"choose|decide|build|gather|prepare|visit|talk|think|watch|keep|consider|expect|understand|learn|"
+                               r"let|put|wait|begin|avoid|bring|save|meet|hire|be|have)\b", re.I)
 
 
 def _name_ask_topics(blocks: list[dict]) -> list[dict]:
@@ -1072,6 +1092,10 @@ def _name_ask_topics(blocks: list[dict]) -> list[dict]:
                 topic = parts[1]
         topic = re.sub(r"\s*\([^)]*\)", "", topic)
         if not topic or topic.lower() in _GENERIC_HEADS or len(topic) > 60:
+            continue
+        # A heading that is an instruction ("Compare total monthly costs, not just the sale price") is not a topic:
+        # the line read "Ask me about compare total monthly costs..." (11/16, Wilmington). It stays a plain "Ask me".
+        if _INSTRUCTION_HEAD.match(topic):
             continue
         first, _, rest = topic.partition(" ")
         if first.lower() in lower_words or first.lower() in ("the", "a", "an", "your", "what", "how", "why", "when"):
@@ -1197,12 +1221,25 @@ def number_audit(article_text: str, source_text: str) -> list[str]:
 # Calls
 # ---------------------------------------------------------------------------
 
-async def _metered_call(db: AsyncSession, user: User, *, system: str, tool: dict, user_msg: str, max_tokens: int, refine: bool):
+# "Refine with AI" in the editor rewrites a passage the agent typed: a small job. It ran on the article writer's
+# model and cost about 2.5 cents a press (measured 11/16 on one real section: Sonnet 5 $0.0249, Sonnet 5.5 $0.0300,
+# Haiku 5.5 $0.0013 - same facts kept, same quality of sentence). Owner: "that seems extremely high ... it should be
+# cheap". A setting named blog_refine_model overrides it.
+REFINE_MODEL = "claude-haiku-5-5"
+REFINE_TYPICAL_USD = 0.002          # what the editor quotes before a press; the real cost is shown after
+
+
+def refine_model(config: dict) -> str:
+    return config.get("blog_refine_model") or REFINE_MODEL
+
+
+async def _metered_call(db: AsyncSession, user: User, *, system: str, tool: dict, user_msg: str, max_tokens: int, refine: bool,
+                        model: Optional[str] = None):
     _require_key()
     config = await ai_config_service.get_config(db)
     if len(user_msg) > config["blog_writer_max_input_chars"]:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "That's a lot of detail - trim your answers a little and try again.")
-    model = config["blog_writer_model"]
+    model = model or config["blog_writer_model"]
     try:
         reservation = await reserve_blog_writer(db, user.id, config, user.plan_tier, refine=refine)
     except AIRateLimitExceeded as e:
@@ -1297,13 +1334,143 @@ async def generate_article(db: AsyncSession, user: User, brief: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# "Refine" in the editor = a writing fixer (owner, 11/16): "it just makes sure the grammar is correct, like going to
+# a model and saying fix this sentence ... definitely don't be adding sections ... shows a before and after and you
+# click which one you want". Each passage goes in with its id and comes back with the same id: nothing can be added,
+# merged or moved. Code then checks every reply - a number, a link or a name that changed, or a passage that grew or
+# shrank a lot, is thrown away and the agent's own words stay. The article around it is never sent or touched.
+# ---------------------------------------------------------------------------
+_POLISH_SYSTEM = (
+    "You are a careful copy editor fixing a real estate agent's own writing, one passage at a time. Fix spelling, grammar, "
+    "punctuation, capitalization and clumsy wording so each passage reads cleanly in the agent's own plain, first-person voice.\n"
+    "Rules, all of them:\n"
+    "- Keep the meaning. Keep every fact, number, price, date, name and place exactly as written.\n"
+    "- Add nothing: no new sentence, advice, example, explanation, fact or opinion. Remove no point the agent made.\n"
+    "- Keep each passage about the same length, and keep it the same passage: never merge, split, add, drop or reorder passages.\n"
+    "- A passage of several lines (a list) comes back with the same number of lines, in the same order.\n"
+    "- Keep **bold**, *italic* and [words](link) marks around the same words, with the same link.\n"
+    "- A passage that is already fine comes back unchanged.\n"
+    "Return every passage, with its id, by calling submit_passages."
+)
+_POLISH_TOOL = {
+    "name": "submit_passages",
+    "description": "Return every passage with its id and its corrected text.",
+    "input_schema": {"type": "object", "properties": {"passages": {"type": "array", "items": {
+        "type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}}, "required": ["id", "text"]}}},
+        "required": ["passages"]},
+}
+POLISH_TYPES = ("paragraph", "heading", "subheading", "callout", "quote", "bulleted_list", "numbered_list")
+POLISH_MAX_CHARS = 12000
+_INLINE_OK = re.compile(r"</?(?:strong|b|em|i|a|br)\b[^>]*>", re.I)
+_A_TAG = re.compile(r'<a\b[^>]*?href="([^"]*)"[^>]*>(.*?)</a>', re.I | re.S)
+_ITALIC = re.compile(r"(?<![*\w])\*(?!\*)([^*\n]+?)\*(?![*\w])")
+_DIGITS = re.compile(r"\d[\d,]*(?:\.\d+)?")
+_NAME = re.compile(r"(?<![.!?:]\s)(?<!^)(?<!\n)\b[A-Z][a-zA-Z'’-]{3,}\b", re.M)
+
+
+def html_to_marks(value: str) -> Optional[str]:
+    """The editor's inline HTML as plain words with **bold**, *italic* and [words](link) marks - or None when it
+    holds any other kind of formatting (that passage is then left alone rather than risk losing it)."""
+    if re.search(r"<[^>]+>", _INLINE_OK.sub("", value or "")):
+        return None
+    t = re.sub(r"<br\s*/?>", "\n", value or "", flags=re.I)
+    t = _A_TAG.sub(lambda m: f"[{m.group(2)}]({html.unescape(m.group(1))})", t)
+    t = re.sub(r"</?(?:strong|b)\b[^>]*>", "**", t, flags=re.I)
+    t = re.sub(r"</?(?:em|i)\b[^>]*>", "*", t, flags=re.I)
+    return html.unescape(t).replace(" ", " ").strip()
+
+
+def marks_to_html(text: str, links: set) -> str:
+    """Back to the editor's inline HTML. Only a link the passage already had keeps its address."""
+    return _ITALIC.sub(r"<em>\1</em>", _rich(text, links))
+
+
+def _plain(marks: str) -> str:
+    return re.sub(r"\[([^\[\]]+)\]\((https?://[^\s()]+)\)", r"\1", marks or "").replace("**", "").replace("*", "")
+
+
+def polish_problem(before: str, after: str) -> Optional[str]:
+    """Why a corrected passage may NOT replace the agent's own (None = it may). Plain code, no judgement:
+    a number changed, a link changed, a line was added or lost, a name appeared that the agent never wrote, or the
+    passage grew or shrank by more than a fix to its grammar could explain."""
+    nums = lambda t: sorted(n.replace(",", "").rstrip(".") for n in _DIGITS.findall(_plain(t)))        # noqa: E731
+    if nums(before) != nums(after):
+        return "a number changed"
+    links = lambda t: sorted(m.group(2) for m in _MD_LINK.finditer(t or ""))                           # noqa: E731
+    if links(before) != links(after):
+        return "a link changed"
+    if len([x for x in before.split("\n") if x.strip()]) != len([x for x in after.split("\n") if x.strip()]):
+        return "a line was added or lost"
+    a, b = _plain(before), _plain(after)
+    if len(b) > len(a) * 1.4 + 40 or len(b) < len(a) * 0.55 - 10:
+        return "it grew or shrank too much"
+    had = a.lower()
+    new_names = [n for n in _NAME.findall(b) if n.lower() not in had]
+    if new_names:
+        return f"a name the agent did not write ({new_names[0]})"
+    return None
+
+
+async def polish_blocks(db: AsyncSession, user: User, *, title: str, blocks: list) -> dict:
+    """Fix the grammar and wording of the agent's own passages. Returns {"changes": [{id, type, before, after, data}],
+    "usage"}: `before` / `after` are the plain words to show side by side, `data` is what to put in the block when the
+    agent picks the new version. A passage the checks reject, or that came back the same, is simply not in the list."""
+    held: dict[str, dict] = {}
+    for b in blocks or []:
+        if not isinstance(b, dict) or b.get("type") not in POLISH_TYPES or not b.get("id"):
+            continue
+        data = b.get("data") or {}
+        if b["type"] in ("bulleted_list", "numbered_list"):
+            items = [str(i) for i in (data.get("items") or []) if str(i).strip()]
+            marks, links = "\n".join(items), set()
+        else:
+            raw = data.get("html") or html.escape(str(data.get("text") or ""), quote=False)
+            marks = html_to_marks(raw)
+            links = {html.unescape(m.group(1)) for m in _A_TAG.finditer(raw)}
+        if marks and marks.strip():
+            held[str(b["id"])] = {"type": b["type"], "marks": marks, "links": links}
+    if not held:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "There is nothing written here yet - write a line or two first.")
+    if sum(len(h["marks"]) for h in held.values()) > POLISH_MAX_CHARS:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "That is a lot at once - refine one section at a time.")
+    user_msg = (f"Article title (for context only): {title}\n\nPASSAGES TO FIX (json):\n"
+                + json.dumps([{"id": i, "kind": h["type"], "text": h["marks"]} for i, h in held.items()], ensure_ascii=False))
+    config = await ai_config_service.get_config(db)
+    result, usage = await _metered_call(db, user, system=_POLISH_SYSTEM, tool=_POLISH_TOOL, user_msg=user_msg,
+                                        max_tokens=config["blog_refine_max_output_tokens"], refine=True, model=refine_model(config))
+    changes, refused = [], []
+    for p in _coerce(result.get("passages"), list):
+        if not isinstance(p, dict):
+            continue
+        h = held.get(str(p.get("id")))
+        after = str(p.get("text") or "").strip()
+        if not h or not after or after == h["marks"]:
+            continue
+        why = polish_problem(h["marks"], after)
+        if why:
+            refused.append(why)
+            continue
+        if h["type"] in ("bulleted_list", "numbered_list"):
+            data = {"items": [x.strip() for x in after.split("\n") if x.strip()]}
+        else:
+            data = {"html": marks_to_html(after, h["links"])}
+        changes.append({"id": str(p["id"]), "type": h["type"], "before": _plain(h["marks"]), "after": _plain(after), "data": data})
+    if refused:
+        logger.info("blog polish: %d corrected passage(s) not offered: %s", len(refused), "; ".join(sorted(set(refused))))
+    return {"changes": changes, "usage": usage}
+
+
 async def refine_section(db: AsyncSession, user: User, *, title: str, section_blocks: list, article_text: str,
                          action: str, instruction: Optional[str]) -> dict:
     action = action if action in _REFINE_ACTIONS else "custom"
     if action == "custom" and not (instruction or "").strip():
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Tell the AI how to change this section.")
     section_text = blocks_to_text(section_blocks)
-    if not section_text.strip():
+    # A heading with nothing written under it is still empty: given only a heading, the AI wrote a whole section of
+    # its own out of the rest of the article (11/16, pressed for real on a new article's starter section).
+    body_text = blocks_to_text([b for b in section_blocks if isinstance(b, dict) and b.get("type") != "heading"])
+    if not section_text.strip() or (_has_heading(section_blocks) and not body_text.strip()):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "This section is empty - write a line or two first.")
     config = await _hub_config(db, user.id)
     profile = _agent_profile(user, config)
@@ -1313,11 +1480,12 @@ async def refine_section(db: AsyncSession, user: User, *, title: str, section_bl
         f"Article title: {title}\n\n== FULL ARTICLE (context only) ==\n{article_text[:9000]}\n\n"
         f"== SECTION TO REVISE ==\n{section_text}\n\n== TASK ==\n{_REFINE_ACTIONS[action]}"
         + (f"\nAgent's instruction: {instruction.strip()}" if (instruction or "").strip() else "")
+        + ("" if _has_heading(section_blocks) else _ONE_PASSAGE)
     )
     ai_config = await ai_config_service.get_config(db)
     result, usage = await _metered_call(
         db, user, system=_REFINE_SYSTEM, tool=_SECTION_TOOL, user_msg=user_msg,
-        max_tokens=ai_config["blog_refine_max_output_tokens"], refine=True,
+        max_tokens=ai_config["blog_refine_max_output_tokens"], refine=True, model=refine_model(ai_config),
     )
     blocks = []
     heading = (result.get("heading") or "").strip()
@@ -1327,6 +1495,9 @@ async def refine_section(db: AsyncSession, user: User, *, title: str, section_bl
     tmp = {"sections": [{"heading": "", "blocks": _coerce(result.get("blocks"), list)}]}
     strip_placeholders(tmp)
     blocks.extend(_convert_blocks(tmp["sections"][0]["blocks"] if tmp["sections"] else []))
+    if not _has_heading(section_blocks):
+        # one passage in, one passage out: never a heading of its own dropped into the middle of someone's section
+        blocks = [b for b in blocks if b.get("type") not in ("heading", "subheading")]
     for b in blocks:
         if isinstance(b.get("data"), dict):
             b["data"] = {k: v for k, v in b["data"].items() if v is not None}

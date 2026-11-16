@@ -508,7 +508,12 @@ def station_kind(tags: dict) -> Optional[str]:
             or (not served and re.search(r"\b(?:rail\s?road|railway|freight|yard)\b", str(t.get("name") or ""), re.IGNORECASE)
                 and not re.search(r"\bstation\b", str(t.get("name") or ""), re.IGNORECASE)):
         return None
-    if t.get("station") in ("light_rail", "tram") or t.get("light_rail") == "yes" or t.get("tram") == "yes":
+    if t.get("station") in ("light_rail", "tram"):
+        return "trolley"
+    # A subway station that a trolley or light-rail line also stops at is still a train station:
+    # Bethesda's Metro station carries light_rail=yes for the Purple Line and read "Bethesda
+    # (trolley)" on a town card (11/16 out-of-state test); Philadelphia's 15th Street has tram=yes.
+    if t.get("station") != "subway" and t.get("subway") != "yes" and (t.get("light_rail") == "yes" or t.get("tram") == "yes"):
         return "trolley"
     return "train"
 

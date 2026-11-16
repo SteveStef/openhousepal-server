@@ -415,6 +415,12 @@ def how_counted_notes(text: str, pay_ex: Optional[dict] = None, town_card: bool 
     right but their samples and methods were invisible)."""
     plain = bfc._plain(text or "")
     out = [note for rx, note in _HOW_COUNTED[:4] if rx.search(plain)]
+    # The drive-time note is for a drive. "Trains take about 48 minutes to 30th Street" matched it (11/16, Wilmington)
+    # and the article carried a Google Maps note with no drive time in it.
+    drive = _HOW_COUNTED[1]
+    if drive[1] in out and not any(drive[0].search(x) and (re.search(r"\bdriv|\bby car\b|Google", x, re.I) or not _TRANSIT_WORD.search(x))
+                                   for x in _SENTENCES.split(plain)):
+        out.remove(drive[1])
     if town_card:
         out.append(_HOW_COUNTED[4][1])
     return out
@@ -434,6 +440,31 @@ _COVERAGE = _COVERAGE + (
      "look complete when it isn't. Where the ledger says a program may not be available at the payment example's price (an FHA county "
      "limit, a state program's price limit), say that in the same place you name the programs - a reader must not be sent to ask about "
      "a loan the example's own price rules out without being told."),
+)
+
+
+_COVERAGE = _COVERAGE + (
+    # Grader round 12 (11/16), Wilmington DE: a relocation article comparing Delaware's taxes and living costs with
+    # Pennsylvania's never said Delaware has no sales tax, never named the City of Wilmington's wage tax (the page was
+    # found on a shared code site and could not be tied to the city's county), and named no neighborhood although the
+    # title and the first key point asked for them. Moving somewhere is its own kind of article, like downsizing.
+    (re.compile(r"\bmoving to\b|\bmove to\b|relocat|cost of living|living costs?|\bsales tax|income tax|wage tax|taxes? compare|\bvs\.? .{0,40}\btax", re.I),
+     "This is a MOVING / RELOCATION or tax-comparison article. Only for what the topic, goal or key points actually ask about and ALREADY "
+     "KNOWN does not answer - one look-up each, official pages only, with the destination's COUNTY in the search: (1) when taxes or living "
+     "costs are asked about and the reader is coming from, or comparing with, ANOTHER STATE: the destination state's revenue or tax "
+     "agency - whether the state has a general sales tax at all, and what kind of personal income tax it has (flat or graduated); "
+     "(2) when taxes or living costs are asked about: the destination municipality's OWN website - whether it levies its own wage, "
+     "earned-income or local income tax and who pays it (residents, people who work there, or both), reporting the municipality, county "
+     "and state the page shows; (3) when the topic or key points ask about neighborhoods or areas: the names of the place's "
+     "neighborhoods or districts from the city's, county's or its planning or tourism agency's own page, with one plain fact each that "
+     "the page gives (where it is, the kind of homes or streets, a park, a main street, a transit stop). Never who lives there.",
+     "A reader moving in from another state expects, in plain words with NO rates or amounts: whether the new state has a general sales tax; "
+     "the kind of state income tax it has next to the one they pay now; any city or local wage or earned-income tax the ledger holds and "
+     "who pays it - it can differ between a home inside the city line and one just outside it; and, when neighborhoods were asked for, the "
+     "neighborhoods the ledger names, each with the plain fact the ledger gives - a place and what is there, never who lives there or who "
+     "it suits. Researched public facts about a place are not the agent's own services: an agent who is not licensed in the state still "
+     "gives them, and offers the introduction for the home search itself. If the ledger holds none of these, say which one you could not "
+     "confirm rather than passing over it."),
 )
 
 
@@ -524,7 +555,7 @@ Rules:
 - Schools: districts, boundaries, budgets, millage, official policies - never rankings or opinions unless attributed to a named source.
 - Never research or report anything about the demographics, religion, ethnicity or "type" of residents, or crime.
 - A page that sets out a procedure usually carries more than one deadline, fee or step ("mail the application and the check at least 20 days before settlement" AND "call to schedule the inspection at least 15 days before settlement"). Report EVERY deadline, lead time and fee that page gives, each with what it is for - one of two deadlines reported as the procedure is a wrong item (grader 11/15, Media Borough).
-- WHOSE PAGE IS IT? Many municipalities share a name inside one state (Pennsylvania has an Upper Providence Township in Delaware County and another in Montgomery County; several Middletown, Springfield and Newtown Townships). Put the COUNTY in every search for a township, borough or authority ("Upper Providence Township Delaware County sewer certification"). Before you report anything from a municipal page, find on the page itself - its header, footer or office address - which county it is in, and give it in `jurisdiction`. If the page belongs to a same-named municipality in another county, do NOT report it: add "found only <name>, <other county>'s page" to not_found (grader 11/15: a Montgomery County township's sewer page was used for the Delaware County township of the same name).
+- WHOSE PAGE IS IT? Many municipalities share a name inside one state (Pennsylvania has an Upper Providence Township in Delaware County and another in Montgomery County; several Middletown, Springfield and Newtown Townships). Put the COUNTY in every search for a township, borough, city or authority ("Upper Providence Township Delaware County sewer certification"; "City of Wilmington New Castle County wage tax"). Before you report anything from a municipal page, find on the page itself - its header, footer or office address - which county it is in, and give it in `jurisdiction`. If the page belongs to a same-named municipality in another county, do NOT report it: add "found only <name>, <other county>'s page" to not_found (grader 11/15: a Montgomery County township's sewer page was used for the Delaware County township of the same name).
 - The deadline and the fee for a certificate are usually on the APPLICATION FORM or instruction sheet, not on the page that links to it. When a page says a certificate or inspection is required and points to a form, open the form (a page read) and report what it says: how far before settlement to apply, how long it takes, and the fee (grader 11/15: Marple Township's resale application says "at least two (2) weeks prior to settlement" and "$200" - we had read only the page above it).
 - Say what KIND of time a page gives, in its own words: a deadline for filing ("submit the application at least 20 days before settlement"), a step to schedule ("call 15 days before"), or how long the work takes ("certification takes a minimum of two weeks"). Never turn one kind into another.
 - Do NOT report phone numbers, email addresses, street addresses, room numbers or office hours: report what the page REQUIRES and the page's address - the article sends readers to the page for contact details (owner 11/15).
@@ -1107,14 +1138,22 @@ def payment_basis(brief: dict) -> str:
     return "attached" if _ATTACHED_TYPE.search(text) else "entry"
 
 
+# A fee joins the payment card only when at least this share of that type's listings report one. 11/16 out-of-state
+# round: Wilmington, DE - 36 of the 240 townhomes for sale listed a fee (median $28 a month) and the card added
+# "$28/month" to a $200,000 example, as if the typical townhome there had one. The article's own text still says how
+# many listings give a fee.
+FEE_TYPICAL_SHARE = 0.5
+
+
 def example_fees(cost: Optional[dict]) -> dict:
     """{"townhouse" / "condo": the median association fee of that type's listings} - only where the town's own fact
-    states that median (10+ listings)."""
+    states that median (10+ listings) and at least half of that type's listings report a fee."""
     out = {}
     for kind, label in (("townhouse", "townhomes"), ("condo", "condos")):
         h = ((cost or {}).get("hoa") or {}).get(kind) or {}
-        if h.get("median_monthly") and (h.get("homes") or 0) >= 10:
-            out[kind] = {"monthly": int(h["median_monthly"]), "homes": int(h["homes"]), "label": label}
+        homes, of = h.get("homes") or 0, h.get("of") or 0
+        if h.get("median_monthly") and homes >= 10 and (not of or homes / of >= FEE_TYPICAL_SHARE):
+            out[kind] = {"monthly": int(h["median_monthly"]), "homes": int(homes), "label": label}
     return out
 
 
@@ -1642,6 +1681,25 @@ _BEFORE_SETTLEMENT = re.compile(
     r"(?:settlement|closing|date of occupancy|occupancy)", re.I)
 _MUNI_STEP = re.compile(r"(?=.*\b(?:township|borough|municipalit\w+|code office|authority)\b)(?=.*\b(?:application|inspection|permit|fee)\b)", re.I | re.S)
 _FEE_SIZED = 2000          # a municipal fee; a larger dollar figure in the same sentence is a price or a cost, not this
+
+
+def hold_back_unplaced(items: list[dict]) -> int:
+    """House rule 1's backstop: how many numbers were held back. A local sale-requirement fact (a certificate, an
+    inspection, a sewer certification) read on the web that could NOT be tied to one of the article's municipalities
+    has no page-by-page record, so no second reading can ever confirm it: its day counts and fees are held back like
+    any number read once. 11/16 out-of-state round, Haddonfield NJ: the borough's page was read once, the fact said
+    "Borough of Haddonfield" where we expected "Haddonfield Borough", so it was nobody's municipal fact and "at least
+    10 days before settlement" was printed (the borough's own application form words it differently). The name is
+    recognised now (tk.muni_forms); this catches the next wording we have not met."""
+    held = 0
+    for i in items or []:
+        claim = str(i.get("claim") or "")
+        if (i.get("municipality") or not i.get("source_url") or str(i.get("town") or "general").split(",")[0].strip().lower() == "general"
+                or "do NOT state a number" in claim or not _MUNI_REQUIREMENT.search(claim)):
+            continue
+        i["claim"], n = tk.mask_unconfirmed(claim, set(), set())
+        held += n
+    return held
 
 
 def unconfirmed_number_claims(text: str, ledger: list[dict], brief: Optional[dict] = None) -> list[tuple[str, str]]:
@@ -2539,7 +2597,9 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
                 "  1. the REQUIRED LOOK-UPS below, if there are any (the official page itself);\n"
                 "  2. each question or point in the topic and key points that neither the ALREADY KNOWN facts nor anything listed as "
                 "already supplied answers - one focused search per point, aimed at the official source for it (the city or township, "
-                "its water or code department, the state agency);\n"
+                "its water or code department, the state agency). EVERY key point gets its first look-up before ANY point gets a "
+                "second one: a point left with no look-up at all is the worst outcome (a relocation article used four look-ups on "
+                "income tax and none on the neighborhoods its title promised);\n"
                 "  3. the official page that publishes property-tax rates for the relevant township(s)/school district(s) (to link - "
                 "articles never quote rates), if it isn't already known;\n"
                 "  4. only with look-ups left over: local developments from the last 12 months that matter to this topic.\n"
@@ -2696,6 +2756,7 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
         for i in mine:
             i["claim"], n = tk.mask_unconfirmed(i["claim"], sure, disputed)
             held_back += n
+    held_back += hold_back_unplaced(research_items + [i for i in known_items if i.get("origin") in ("evidence_bank", "idx_research", "web_research")])
     if held_back:
         logger.info("blog pipeline: %d municipal number(s) held back - not yet confirmed by a second reading, or in dispute", held_back)
 
@@ -2716,7 +2777,10 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
     # disclosure needs how old the listings are. Then every 1%+ local government is a must-name item.
     places = {tk.norm_place(a.name) for a in areas} | {tk.norm_place(c) for p in profiles for c in p.get("counties") or []}
     try:
-        older = await older_homes_share(db, [geo_scope.scope_for_market_area(a) for a in areas]) if areas else None
+        # A plan with no MLS reads nothing from the listings, not even to decide which rules to mention (owner, 11/16:
+        # "it just can't use data from our database or the Bright MLS at all"). The lead-paint rule is then named
+        # when the agent's own brief talks about older homes.
+        older = await older_homes_share(db, [geo_scope.scope_for_market_area(a) for a in areas]) if areas and mls_ok else None
     except Exception:
         logger.warning("blog pipeline: older-homes share failed", exc_info=True)
         older = None

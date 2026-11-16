@@ -1325,7 +1325,7 @@ Invitations for an **Open House** ("Invite buyers, neighbors and clients to tour
 5. It's **Saved as a draft - nothing is published until you say so.**
 
 ### Edit and publish
-- In the editor: add a cover photo, sections, category, tags, look (Classic, Luxe [IDX and No-MLS Premium], Editorial, Modern, Midnight), and search/share titles. AI section tools: **Make it shorter**, **Expand with more depth**, **Make it more local**, **Make it more personal**, **Rewrite it fresher**.
+- In the editor: add a cover photo, sections, category, tags, look (Classic, Luxe [IDX and No-MLS Premium], Editorial, Modern, Midnight), and search/share titles. **Refine** (the sparkle on a section you wrote or changed yourself): tap it, then **Fix my writing** - it fixes spelling, grammar and wording only, never your facts or numbers, and adds nothing. You see **Yours** beside the **New version** and pick **Use the new version** or **Keep mine**. It says about how much of your monthly AI it uses before, and what it used after. Paragraphs the AI writer wrote don't show it. There is no "Draft with AI" button in the editor: to have the AI write an article, start it from **Create a Blog** > **Write it with AI**.
 - **Publish** → **Publish now**, or schedule it (e.g. "Next Monday 8 AM"). A published article can be updated ("Update published article") or unpublished.
 - Where it shows: switches **Show on my Agent Hub**, **Featured on Agent Hub**, and **Show on my IDX Site** (IDX). On the Blogs list, each card's **Shows on** has **Agent Hub** and **IDX Site** switches.
 - Changing an article's link "breaks links people already shared".

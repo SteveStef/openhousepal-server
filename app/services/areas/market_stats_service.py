@@ -796,23 +796,27 @@ def _home_mix(homes: list[dict]) -> dict:
     for: condos/townhomes vs single-family houses (count + median list price), how much of the
     lowest-priced quarter is condos/townhomes (11/01: Wayne's quarter-price of $296K next to an
     $876K median sale read as a typo without it), one-level homes, and 55+ communities."""
-    if len(homes) < 8:
+    # ONE population for every count: each home for sale, with or without a list price. Only the medians and the
+    # lowest-priced quarter need a price. 11/16 (Wilmington, DE): one of 240 townhomes had no list price, so the
+    # article said "292 condos or townhomes", "240 townhomes" and "53 condos that list a fee" - 240 + 53 is 293.
+    priced = [h for h in homes if h.get("price")]
+    if len(priced) < 8:
         return {}
     out: dict = {"homes": len(homes)}
     for key in ("attached", "house", "one_level", "manufactured"):
-        group = [h["price"] for h in homes if h[key]]
-        out[key] = {"count": len(group), "median": round(_median(group)) if len(group) >= 5 else None}
-    prices = sorted(h["price"] for h in homes)
+        group = [h["price"] for h in priced if h[key]]
+        out[key] = {"count": sum(1 for h in homes if h[key]), "median": round(_median(group)) if len(group) >= 5 else None}
+    prices = sorted(h["price"] for h in priced)
     pos = 0.25 * (len(prices) - 1)  # same interpolation as percentile_cont in the sales snapshot
     lo = int(pos)
     p25 = prices[lo] + (prices[min(lo + 1, len(prices) - 1)] - prices[lo]) * (pos - lo)
-    low = [h for h in homes if h["price"] <= p25]
+    low = [h for h in priced if h["price"] <= p25]
     out["low_quarter"] = {"count": len(low), "attached": sum(1 for h in low if h["attached"])}
     recorded = [h for h in homes if h["senior"] is not None]
     # Only when most listings fill the field in - otherwise "none in a 55+ community" could just be blanks.
     if len(recorded) >= 0.6 * len(homes):
-        senior = [h["price"] for h in recorded if h["senior"]]
-        out["senior"] = {"count": len(senior), "median": round(_median(senior)) if len(senior) >= 5 else None}
+        senior = [h["price"] for h in recorded if h["senior"] and h.get("price")]
+        out["senior"] = {"count": sum(1 for h in recorded if h["senior"]), "median": round(_median(senior)) if len(senior) >= 5 else None}
     return out
 
 
@@ -912,11 +916,13 @@ async def get_area_cost_profile(db: AsyncSession, scope: dict, munis: Optional[l
                 for c in (includes if isinstance(includes, list) else []):
                     if c and str(c).strip().lower() not in ("none", "other", "see remarks"):
                         covers[(home_type, str(c).strip())] += 1
-        if price_v and price_v >= geography.MIN_PLAUSIBLE_SALE_PRICE:
+        # Every home for sale is counted (the query's filter already drops implausible prices; a listing with no
+        # list price yet stays, with no price) - see _home_mix.
+        if not price_v or price_v >= geography.MIN_PLAUSIBLE_SALE_PRICE:
             # 11/01 grader: Rehoboth's "one-level homes" median mixed in manufactured homes (often on
             # leased land, with lot rent and different financing) - they're counted on their own.
             manufactured = "manufactured" in str(structure or "").lower()
-            homes.append({"price": price_v, "attached": home_type in ("CONDO", "TOWNHOUSE"), "manufactured": manufactured,
+            homes.append({"price": price_v or None, "attached": home_type in ("CONDO", "TOWNHOUSE"), "manufactured": manufactured,
                           "house": home_type in ("SINGLE_FAMILY", "Single Family") and not manufactured,
                           "one_level": _one_level(levels) and not manufactured,
                           "senior": None if senior in (None, "") else str(senior).lower() == "true"})
@@ -1120,7 +1126,7 @@ async def entry_price_profile(db: AsyncSession, scopes: list[dict], house_near: 
     rows = (await db.execute(
         select(Property.price, mls_mirror.col(Property.tax_annual_amount, "TaxAnnualAmount"), Property.home_type,
                mls_mirror.col(Property.mls_structure_design_type, "StructureDesignType"), mls_mirror.col(Property.tax_year, "TaxYear"))
-        .where(or_(*filters), geography.residential_for_sale_filter(Property), Property.home_status.in_(FOR_SALE_STATUSES), Property.price.isnot(None))
+        .where(or_(*filters), geography.residential_for_sale_filter(Property), Property.home_status.in_(FOR_SALE_STATUSES))
     )).all()
     return entry_profile([tuple(r) for r in rows], house_near)
 
@@ -1141,15 +1147,20 @@ def entry_profile(rows: list[tuple], house_near: Optional[float] = None) -> dict
     fallback is now reported (tax_scope "all") so the card can say what it really used."""
     from collections import Counter
     homes, years = [], Counter()
+    # A home for sale with no list price yet is still a home for sale: it is in every COUNT the card states (the same
+    # counts the article gives - 11/16 Wilmington: the article said 483 homes for sale, the card 482), never in a price.
+    unpriced = Counter()
     for p, t, ht, s, y in rows:
         p, t = _num(p), _num(t)
-        if not p:
-            continue
         # Manufactured homes aren't counted as single-family houses - the same rule as the article's own
         # house count (get_area_cost_profile). 11/02 round 14 Lancaster: the card said 134 houses at $485K
         # while the article said 122 houses at $520K.
         if "manufactured" in str(s or "").lower() and ht in ("SINGLE_FAMILY", "Single Family"):
             ht = None
+        if not p:
+            unpriced["all"] += 1
+            unpriced["house" if ht in ("SINGLE_FAMILY", "Single Family") else "attached" if ht in ("CONDO", "TOWNHOUSE") else "other"] += 1
+            continue
         year = str(y)[:4] if y else None
         usable = bool(t and t > 100 and p >= geography.MIN_PLAUSIBLE_SALE_PRICE)
         if usable and year:
@@ -1168,7 +1179,7 @@ def entry_profile(rows: list[tuple], house_near: Optional[float] = None) -> dict
     ratios, scope = [h[1] / h[0] for h in near if h[1]], "near"
     if len(ratios) < 5:
         ratios, scope = [h[1] / h[0] for h in homes if h[1]], "all"
-    out = {"homes": len(prices), "p25": round(p25), "median": round(_median(prices)),
+    out = {"homes": len(prices) + unpriced["all"], "p25": round(p25), "median": round(_median(prices)),
            "tax_pct_near_p25": round(_median(ratios) * 100, 2) if len(ratios) >= 5 else None,
            "tax_homes": len(ratios), "tax_scope": scope,
            # What the homes near the entry price ARE: an example priced where most homes are condos or townhomes
@@ -1188,7 +1199,7 @@ def entry_profile(rows: list[tuple], house_near: Optional[float] = None) -> dict
         near_k, scope_k = [t / p for p, t in homes_k if 0.75 * km <= p <= 1.25 * km and t], "near"
         if len(near_k) < 5:
             near_k, scope_k = [t / p for p, t in homes_k if t], "all"
-        out.update({("houses" if kind == "house" else "attached"): len(homes_k), f"{kind}_median": round(km),
+        out.update({("houses" if kind == "house" else "attached"): len(homes_k) + unpriced[kind], f"{kind}_median": round(km),
                     f"tax_pct_near_{kind}": round(_median(near_k) * 100, 2) if len(near_k) >= 5 else None,
                     f"tax_homes_{kind}": len(near_k), f"tax_scope_{kind}": scope_k})
         # The tax estimate for a house priced at `house_near` (the median SOLD price, when the example uses it)

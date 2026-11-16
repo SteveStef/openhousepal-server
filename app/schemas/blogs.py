@@ -293,6 +293,21 @@ class BlogAiRefineRequest(BaseModel):
     instruction: Optional[str] = None
 
 
+class BlogAiPolishRequest(BaseModel):
+    """The editor's Refine button: the agent's own passages, to have their grammar and wording fixed."""
+    title: str = ''
+    blocks: List[BlogBlock]
+
+
+class BlogAiPolishResponse(BaseModel):
+    # One per passage that came back better AND passed the checks: {id, type, before, after, data}.
+    changes: List[dict] = []
+    # What this press really used: {"usd", "percent" of the agent's monthly AI}.
+    used: Optional[dict] = None
+
+
 class BlogAiRefineResponse(BaseModel):
     blocks: List[BlogBlock]
     numbers_to_verify: List[str] = []
+    # What this press really used: {"usd", "percent" of the agent's monthly AI}. Shown right after it.
+    used: Optional[dict] = None

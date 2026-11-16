@@ -19,7 +19,7 @@ from app.schemas.blogs import (
     BlogAiBrief,
     BlogAiGenerateResponse,
     BlogAiRefineRequest,
-    BlogAiRefineResponse,
+    BlogAiRefineResponse, BlogAiPolishRequest, BlogAiPolishResponse,
     BlogAnalyticsResponse,
     BlogCreate,
     BlogEventCreate,
@@ -1119,7 +1119,45 @@ async def refine_blog_section_with_ai(
         action=payload.action,
         instruction=payload.instruction,
     )
-    return BlogAiRefineResponse(blocks=result["blocks"], numbers_to_verify=result["numbers_to_verify"])
+    used = float((result.get("usage") or {}).get("cost_usd") or 0)
+    return BlogAiRefineResponse(blocks=result["blocks"], numbers_to_verify=result["numbers_to_verify"],
+                                used=await _ai_share(db, current_user, used))
+
+
+@router.post("/ai/polish", response_model=BlogAiPolishResponse)
+async def polish_blog_passages_with_ai(
+    payload: BlogAiPolishRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_design_access),
+):
+    """The editor's Refine button (owner, 11/16): fix the grammar and wording of the agent's own passages. Returns
+    each improved passage beside the original so the agent picks one; nothing is written here."""
+    from app.services.ai import ai_blog_writer_service
+    result = await ai_blog_writer_service.polish_blocks(db, current_user, title=payload.title, blocks=[b.model_dump() for b in payload.blocks])
+    used = float((result.get("usage") or {}).get("cost_usd") or 0)
+    return BlogAiPolishResponse(changes=result["changes"], used=await _ai_share(db, current_user, used))
+
+
+async def _ai_share(db: AsyncSession, user: User, usd: float) -> dict:
+    """An AI cost as the agent sees it: dollars and its share of their monthly AI (None = no monthly limit)."""
+    from app.services.ai.ai_config_service import ai_config_service
+    from app.services.ai.ai_rate_limit_service import monthly_limit_usd
+    limit = await monthly_limit_usd(db, user.id, await ai_config_service.get_config(db), user.plan_tier)
+    return {"usd": round(usd, 5), "percent": round(usd / float(limit) * 100, 4) if limit else None}
+
+
+@router.get("/ai/refine-estimate")
+async def get_blog_refine_estimate(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_design_access),
+):
+    """What one "Refine with AI" press usually uses, shown on the button before it is pressed (owner, 11/16:
+    every AI button says how much it will use, and afterwards how much it did)."""
+    from app.services.ai import ai_blog_writer_service
+    from app.services.ai.ai_config_service import ai_config_service
+    config = await ai_config_service.get_config(db)
+    usd = float(config.get("blog_refine_typical_usd") or ai_blog_writer_service.REFINE_TYPICAL_USD)
+    return await _ai_share(db, current_user, usd)
 
 
 @router.get("/{blog_id}", response_model=BlogResponse)

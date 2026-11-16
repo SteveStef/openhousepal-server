@@ -98,7 +98,7 @@ def test_research_is_asked_for_the_county_and_given_it():
     props = pipe._EVIDENCE_TOOL["input_schema"]["properties"]["items"]["items"]
     assert "jurisdiction" in props["required"] and "COUNTY" in props["properties"]["jurisdiction"]["description"]
     rules = pipe._RESEARCH_SYSTEM
-    assert "WHOSE PAGE IS IT?" in rules and "Put the COUNTY in every search for a township, borough or authority" in rules
+    assert "WHOSE PAGE IS IT?" in rules and "Put the COUNTY in every search for a township, borough, city or authority" in rules   # "city" added 11/16 (round 12, Wilmington DE)
     assert "do NOT report it" in rules
     import inspect
     src = inspect.getsource(pipe._run)

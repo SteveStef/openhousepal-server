@@ -800,8 +800,21 @@ def muni_scope(state: Optional[str], muni: dict) -> str:
     return f"muni:{(state or '').upper()}:{norm_place(muni.get('county'))}:{_muni_key(muni.get('name'))}"
 
 
+_MUNI_KIND_LAST = re.compile(r"^(?P<base>.+?)\s+(?P<kind>Township|Borough|City|Town|Village)$", re.I)
+
+
+def muni_forms(name: Optional[str]) -> list[str]:
+    """The ways one municipality's name is written: our 'Haddonfield Borough' is 'Borough of Haddonfield' on its own
+    website (New Jersey and Delaware sites, and many Pennsylvania ones). 11/16 out-of-state round: Haddonfield's page
+    was read once and its "10 days before settlement" went into the article unheld - the fact named the "Borough of
+    Haddonfield", so it was never taken as that municipality's fact and the read-twice rule never saw it."""
+    name = " ".join(str(name or "").split())
+    m = _MUNI_KIND_LAST.match(name)
+    return [name] + ([f"{m['kind']} of {m['base']}"] if m else []) if name else []
+
+
 def _names_muni(muni: dict, text: str) -> bool:
-    return bool(re.search(r"(?<![A-Za-z])" + re.escape(muni["name"]) + r"(?![A-Za-z])", text or "", re.I))
+    return any(re.search(r"(?<![A-Za-z])" + re.escape(f) + r"(?![A-Za-z])", text or "", re.I) for f in muni_forms(muni["name"]))
 
 
 def muni_of(item: dict, munis: list[dict]) -> Optional[dict]:
@@ -809,7 +822,7 @@ def muni_of(item: dict, munis: list[dict]) -> Optional[dict]:
     Township"), else the only one its claim or source names. A fact naming two of them, or none, is not a municipal
     fact - and a bare mailing-town name ("Media") is never read as the borough of the same name."""
     town = str(item.get("town") or "").split(",")[0].strip().lower()
-    by_town = [m for m in munis or [] if town and m["name"].lower() == town]
+    by_town = [m for m in munis or [] if town and town in {f.lower() for f in muni_forms(m["name"])}]
     if len(by_town) == 1:
         return by_town[0]
     named = [m for m in munis or [] if _names_muni(m, f"{item.get('claim') or ''} {item.get('source_name') or ''}")]
@@ -985,7 +998,14 @@ def only_this_jurisdiction(items: list[dict], munis: list[dict], held: Optional[
 # time. Research had read the page that LINKS the form, not the form.
 # ---------------------------------------------------------------------------
 _REQ_KINDS = (("sewer certification or sewer lateral inspection", re.compile(r"\bsewer|\blateral", re.I)),
-              ("resale / use-and-occupancy certificate", re.compile(r"occupancy|\bU\s?&\s?O\b|resale (?:inspection|certificate|application)", re.I)))
+              ("resale / use-and-occupancy certificate", re.compile(r"occupancy|\bU\s?&\s?O\b|resale (?:inspection|certificate|application)", re.I)),
+              # Grader round 12 (11/16), Haddonfield NJ: the borough's web page and its own application form give different
+              # fees and lead times for the SMOKE-DETECTOR certificate - a requirement kind the "official pages disagree"
+              # check did not know, so holding both pages would still have confirmed a number. A claim about an occupancy
+              # certificate that merely mentions smoke alarms stays with the occupancy kind above.
+              ("smoke-detector / fire-safety certificate",
+               re.compile(r"^(?![\s\S]*(?:occupancy|\bU\s?&\s?O\b))[\s\S]*?(?:smoke[- ](?:detector|alarm)|carbon[- ]monoxide|"
+                          r"fire[- ](?:safety|prevention|marshal|extinguisher)|\bCSDCMAC\b)", re.I)))
 _REQUIRES = re.compile(r"\brequire[sd]?\b|\bmust\b|\bis needed\b|\bneeds? (?:a|an|to)\b", re.I)
 _NOT_REQUIRED = re.compile(r"\b(?:does not|doesn't|do not|is not|isn't|not) requir|\bno (?:resale|certificate|use and occupancy|u&o)\b", re.I)
 

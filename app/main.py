@@ -154,6 +154,13 @@ async def lifespan(app: FastAPI):
         _market_counts, "interval", minutes=30, id="whole_market_counts", name="Keep the whole-market sold counts fresh",
         replace_existing=True, max_instances=1, coalesce=True, next_run_time=_dt.now(_tz.utc) + _td(seconds=90),
     )
+    # A scheduled article goes live at its time (blog_schedule_service). Until 11/16 nothing published one: it stayed
+    # "Scheduled" for good.
+    from app.services.blog_schedule_service import scheduled_publish_due as _blogs_due
+    scheduler.add_job(
+        _blogs_due, "interval", minutes=1, id="blog_publish_due", name="Publish scheduled articles when their time comes",
+        replace_existing=True, max_instances=1, coalesce=True, next_run_time=_dt.now(_tz.utc) + _td(seconds=40),
+    )
 
     # Schedule email processing every minute
     scheduler.add_job(
