@@ -200,7 +200,7 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
                      your_notes: Optional[list] = None, lead_name: Optional[str] = None,
                      comments: Optional[list] = None, lead=None, details: Optional[list] = None,
                      prop: Optional[dict] = None, message_override: Optional[str] = None,
-                     showcase_link: Optional[str] = None) -> dict:
+                     showcase_link: Optional[str] = None, visits: Optional[list] = None) -> dict:
     """Google-shaped event for a follow-up. The description is PLAIN TEXT on purpose: Google's web
     view renders HTML, but the iPhone Calendar app (and other synced clients) showed the raw tags
     ("<b><a href=...>&#9989;"). So no bold / italics / underline - sections are told apart with an
@@ -281,6 +281,10 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
     since = since_lines(task.notes)
     notes = "\n".join(l for l in (task.notes or "").splitlines()
                       if not l.startswith(skip) and not l.startswith(GUEST_PASS_SEEN) and not l.startswith(SINCE_PREFIX)).strip()
+    if visits and not done:
+        # 2+ open houses (or the same one twice): every visit with what the home was like - the
+        # text stays the agent's normal open-house one, so this is where "repeat visit" shows.
+        parts.append("\U0001F3E1 THEIR OPEN HOUSE VISITS\n" + "\n".join(f"• {v}" for v in visits))
     if since and not done:
         parts.append("\U0001F195 NEW SINCE THIS WAS ADDED\n" + "\n".join(f"• {s}" for s in since))
     # A line of space between the heads-up and the agent's own note.
@@ -1041,12 +1045,15 @@ async def task_body_for(db: AsyncSession, task: AgentTask) -> dict:
         prop = await followup_property(db, task, owner)
     except Exception:
         logger.warning("follow-up property lookup failed for task %s", task.id, exc_info=True)
-    from app.services.tasks_service import showcase_go_url
+    visits = None
+    from app.services.tasks_service import SIGNIN_FOLLOWUP_SOURCES, open_house_visit_lines, showcase_go_url
+    if task.auto_source in SIGNIN_FOLLOWUP_SOURCES and task.completed_at is None:
+        visits = await open_house_visit_lines(db, task.lead_id)
     showcase = await _showcase_info_for(db, task)
     return _task_event_body(task, showcase, followup_color(owner), done_url(code),
                             owner=owner, contact_link=contact_url(code) if lead is not None else None,
                             your_notes=your_notes, lead_name=(lead.name or "").split(" ")[0] if lead is not None else None,
-                            comments=comments, lead=lead, details=details, prop=prop,
+                            comments=comments, lead=lead, details=details, prop=prop, visits=visits,
                             showcase_link=showcase_go_url(code) if (showcase or (prop or {}).get("where") == "showcase") else None)
 
 

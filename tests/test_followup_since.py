@@ -288,9 +288,9 @@ def test_search_change_wording_has_no_zero_minimum():
 
 @pytest.mark.asyncio
 async def test_second_open_house_gets_the_normal_open_house_text(monkeypatch):
-    """Owner, 11/16: a 2nd (different) open house = the agent's normal open-house text for that
-    house ("thanks for stopping by my open house at ..."), not "great to see you again". The title
-    still says "2nd open house". The same house again keeps its come-back text."""
+    """Owner, 11/16: a repeat visit - another open house OR the same one again - gets the agent's
+    normal open-house text for that house ("thanks for stopping by my open house at ..."): one
+    message to edit. The title still says "2nd open house" / "2nd visit"."""
     import app.main  # noqa: F401
     from app.database import AsyncSessionLocal
     tag = f"zqsince-{uuid.uuid4().hex[:8]}"
@@ -299,8 +299,7 @@ async def test_second_open_house_gets_the_normal_open_house_text(monkeypatch):
         return {"label": "2nd open house", "context": "Signed in at 2 of your open houses - latest 12 Oak St", "message": None}
 
     async def same_house(db, lead_id, address, owner=None):
-        return {"label": "2nd visit", "context": "Came back to your open house - 12 Oak St (2nd visit)",
-                "message": "Hi {first_name}. Thanks for coming back to see 12 Oak St again!"}
+        return {"label": "2nd visit", "context": "Came back to your open house - 12 Oak St (2nd visit)", "message": None}
     try:
         async with AsyncSessionLocal() as db:
             agent, lead = await _setup(db, tag)
@@ -320,7 +319,62 @@ async def test_second_open_house_gets_the_normal_open_house_text(monkeypatch):
             await ts.create_open_house_followup(db, owner_id=agent.id, lead=lead, signin_id=None,
                                                 property_address="12 OAK ST, WAYNE, PA", occurred_at=NOW, commit=True)
             await db.refresh(card)
-            assert "Thanks for coming back to see 12 Oak St again" in card.suggested_message
+            assert card.title.endswith("- 2nd visit")
+            assert "open house at 12 Oak St" in card.suggested_message and "coming back" not in card.suggested_message.lower()
         await _drain()
     finally:
+        await _cleanup(tag)
+
+
+@pytest.mark.asyncio
+async def test_repeat_visit_real_path_and_visit_lines():
+    """The real path: two sign-ins (two open houses) linked to the lead -> the card's title, the
+    normal text for the newest house, and "Their open house visits" with each home's details on
+    the calendar event."""
+    import app.main  # noqa: F401
+    from datetime import date
+    from app.database import AsyncSessionLocal
+    from app.models.database import OpenHouseEvent, OpenHouseVisitor
+    from app.services.calendar_sync_service import task_body_for
+    tag = f"zqsince-{uuid.uuid4().hex[:8]}"
+    try:
+        async with AsyncSessionLocal() as db:
+            agent, lead = await _setup(db, tag)
+            ohs = []
+            for addr, beds, baths, sqft, price in (("1650 SKINNERS TURN RD, OWINGS, MD", 4, 3, 2850, 725000),
+                                                   ("239 WINDHAM DR, EXTON, PA", 3, 2.5, 1980, 489000)):
+                oh = OpenHouseEvent(qr_code=f"{tag}-{len(ohs)}", agent_id=agent.id, address=addr, bedrooms=beds, bathrooms=baths,
+                                    living_area=sqft, price=price, scheduled_date=date.today())
+                db.add(oh)
+                ohs.append(oh)
+            await db.commit()
+            made = None
+            for i, oh in enumerate(ohs):
+                v = OpenHouseVisitor(open_house_event_id=oh.id, full_name="Sally Since", email=lead.email, phone=lead.phone,
+                                     has_agent="NO", lead_id=lead.id, qr_code=oh.qr_code, created_at=NOW + timedelta(minutes=i))
+                db.add(v)
+                await db.commit()
+                t = await ts.create_open_house_followup(db, owner_id=agent.id, lead=lead, signin_id=v.id,
+                                                        property_address=oh.address, occurred_at=NOW + timedelta(minutes=i), commit=True)
+                made = made or t
+            await db.refresh(made)
+            assert made.title.endswith("- 2nd open house")
+            assert "open house at 239 Windham Dr" in made.suggested_message
+            lines = await ts.open_house_visit_lines(db, lead.id)
+            assert len(lines) == 2 and "1650 Skinners Turn Rd · 4 bd · 3 ba · 2,850 sq ft · $725,000" in lines[0]
+            assert "239 Windham Dr · 3 bd · 2.5 ba · 1,980 sq ft · $489,000" in lines[1]
+            desc = (await task_body_for(db, made))["description"]
+            assert "THEIR OPEN HOUSE VISITS" in desc and "2,850 sq ft" in desc
+            assert "Also signed in at" not in desc
+    finally:
+        async with AsyncSessionLocal() as db:
+            from sqlalchemy import delete, select
+            from app.models.database import AgentTask, OpenHouseEvent, OpenHouseVisitor, User
+            ids = (await db.execute(select(User.id).where(User.email.like(f"{tag}%")))).scalars().all()
+            if ids:
+                await db.execute(delete(AgentTask).where(AgentTask.owner_id.in_(ids)))
+                await db.execute(delete(OpenHouseVisitor).where(OpenHouseVisitor.email.like(f"{tag}%")))
+                await db.execute(delete(OpenHouseEvent).where(OpenHouseEvent.agent_id.in_(ids)))
+                await db.commit()
+        await _drain()
         await _cleanup(tag)

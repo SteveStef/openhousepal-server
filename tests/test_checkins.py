@@ -113,3 +113,30 @@ def test_quick_message():
 def test_never_contacted_doesnt_say_since_you_last_reached_out():
     r = cs.evaluate(sig(emails_opened=2, open_total=3, last_open=days_ago(2)), NOW)
     assert r["headline"] == "Opened your emails 3 times - last on Wednesday"
+
+
+def test_note_buying_signals_count():
+    # 11/16: the agent's own note saying they're pre-approved / moving soon used to count for nothing
+    pre = cs.evaluate(sig(notes=[note("4-5 beds TE schools, 3-5k sqft, Pre-approved with Chase")]), NOW)
+    plain = cs.evaluate(sig(notes=[note("4-5 beds TE schools, 3-5k sqft")]), NOW)
+    assert "Pre-approved" in pre["tags"] and pre["score"] > plain["score"]
+    soon = cs.evaluate(sig(notes=[note("Relocating from Ohio, lease is up in March")]), NOW)
+    assert "Ready soon (your note)" in soon["tags"]
+    assert "Pre-approved" not in plain["tags"] and not any("Ready" in t for t in plain["tags"])
+
+
+def test_price_drop_email_is_named():
+    r = cs.evaluate(sig(emails_opened=2, open_total=3, last_open=days_ago(1), ever_contacted=True, last_touch=days_ago(9),
+                        hot_email="2439 Horseshoe Trl dropped to $1,195,000", hot_email_at=days_ago(1)), NOW)
+    everything = [r["headline"], *r["reasons"]]
+    assert any("“2439 Horseshoe Trl dropped to $1,195,000”" in x for x in everything)
+    assert cs.HOT_SUBJECT.search("25 Spring Valley Rd dropped to $1,090,000")
+    assert not cs.HOT_SUBJECT.search("Peter updated your Showcase search")
+
+
+def test_display_name_and_street_tidy():
+    assert cs.nice_name("peter judd") == "Peter Judd" and cs.nice_name("PETER JUDD") == "Peter Judd"
+    assert cs.nice_name("Céline Guemnie Tafo") == "Céline Guemnie Tafo" and cs.nice_name("McKenzie O'Neil") == "McKenzie O'Neil"
+    assert cs._street("1330 N Avignon Dr #, Gladwyne, PA") == "1330 N Avignon Dr"
+    from app.services.tasks_service import _guest_first
+    assert _guest_first("peter judd") == "Peter" and _guest_first("JOHN DOE") == "John" and _guest_first("DeShawn Lee") == "DeShawn"

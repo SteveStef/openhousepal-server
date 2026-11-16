@@ -127,6 +127,8 @@ async def list_tasks(
                     t.property = await tasks_service.followup_property(db, by_id[t.id], current_user)
                     t.requested_times = await tasks_service.task_requested_times(db, by_id[t.id]) or None
                     t.request = await tasks_service.task_request(db, by_id[t.id])
+                    if by_id[t.id].auto_source in tasks_service.SIGNIN_FOLLOWUP_SOURCES:
+                        t.visits = await tasks_service.open_house_visit_lines(db, t.lead_id) or None
                     if by_id[t.id].auto_source != "form_unfinished":  # its notes already list the answers so far
                         t.details = tasks_service.card_details(await tasks_service.request_details(db, by_id[t.id]), t.requested_times) or None
                 except Exception:

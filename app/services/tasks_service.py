@@ -741,7 +741,10 @@ def _first(name: Optional[str]) -> str:
 def _guest_first(name: Optional[str]) -> str:
     """First name for a text to the guest - "JOHN" typed in capitals reads as John."""
     first = _first(name)
-    return first.capitalize() if first.isupper() else first
+    if first.isupper():
+        return first.capitalize()
+    # "peter" typed in lower case reads Peter (11/16 - "Hi peter" in a text to the client)
+    return first[:1].upper() + first[1:] if first.islower() else first
 
 
 # ---------------------------------------------------------------- editable message templates
@@ -3389,23 +3392,74 @@ async def _repeat_visit(db: AsyncSession, lead_id: str, property_address: Option
     street = (property_address or "").split(",")[0].strip()
     from app.services.email_service import _tidy_subject
     place = _tidy_subject(street) if street else "the open house"
+    # The TEXT is always the agent's own open-house message for this house (owner, 11/16: one message
+    # to edit, not a second "come back" one). The title, the line under it and the "Their open house
+    # visits" list (open_house_visit_lines) tell the agent it's a repeat visit and what they saw.
     if houses >= 2:
         label = f"{_ordinal(houses)} open house"
         context = f"Signed in at {houses} of your open houses - latest {place}"
-        # A DIFFERENT open house: the agent's own open-house text for this house, like any sign-in
-        # (owner, 11/16 - "thanks for visiting this open house"). The title and the calendar still
-        # say "2nd open house" so the agent knows. None = use the normal message.
-        message = None
     else:
-        # Back at the same house - 2nd, 3rd, 4th time (user, 10/19): never "want a second look?"
-        # again; just questions, or a private tour this week. Same words every repeat.
         label = f"{_ordinal(len(rows))} visit"
         context = f"Came back to your open house - {place} ({_ordinal(len(rows))} visit)"
-        me = _intro(owner)
-        message = ("Hi {first_name}" + (f", {me}" if me else "") + ". Thanks for coming back to see "
-                   + (place if street else "the home") + " again! I wanted to reach out to see if you had any questions "
-                   f"or interest in a private tour of the property this week.{SHOWCASE_MARKER}")
-    return {"label": label, "context": context, "message": message}
+    return {"label": label, "context": context, "message": None}
+
+
+async def open_house_visit_lines(db: AsyncSession, lead_id: Optional[str]) -> list[str]:
+    """Every open house of this agent's the person signed in at, oldest first, when there are 2+
+    (owner, 11/16 - the text stays the normal one, so the agent sees here that it's a repeat visit
+    and what the earlier home was like): "Sat, Nov 14 - 1650 Skinners Turn Rd · 4 bd · 3 ba ·
+    2,850 sq ft · $725,000 · Tredyffrin-Easttown SD". Never raises."""
+    if not lead_id:
+        return []
+    try:
+        from app.models.database import OpenHouseEvent as _OHE, OpenHouseVisitor, Property
+        from app.services.email_service import _tidy_subject
+        rows = (await db.execute(
+            select(OpenHouseVisitor.created_at, _OHE)
+            .join(_OHE, _OHE.id == OpenHouseVisitor.open_house_event_id)
+            .where(OpenHouseVisitor.lead_id == lead_id)
+            .order_by(OpenHouseVisitor.created_at))).all()
+        if len(rows) < 2:
+            return []
+        keys = {oh.listing_key for _, oh in rows if oh.listing_key}
+        district, listing = {}, {}
+        if keys:
+            for p in (await db.execute(select(Property).where(Property.listing_key.in_(keys)))).scalars().all():
+                district[p.listing_key] = p.school_district_name
+                listing[p.listing_key] = p   # beds / baths / size / price when the open house didn't keep them
+        seen: dict[str, int] = {}
+        out = []
+        for at, oh in rows:
+            street = _tidy_subject((oh.address or "").split(",")[0].strip()) or "an open house"
+            seen[oh.id] = seen.get(oh.id, 0) + 1
+            day = at.astimezone(EASTERN) if at else None
+            bits = [f"{day:%a}, {day:%b} {day.day} - {street}" if day else street]
+            if seen[oh.id] > 1:
+                bits[0] += f" (visit {seen[oh.id]})"
+            p = listing.get(oh.listing_key)
+            beds = oh.bedrooms or getattr(p, "bedrooms", None)
+            baths = oh.bathrooms or getattr(p, "bathrooms", None)
+            sqft = oh.living_area or getattr(p, "living_area", None)
+            price = oh.price or getattr(p, "price", None)
+            if beds:
+                bits.append(f"{float(beds):g} bd")
+            if baths:
+                bits.append(f"{float(baths):g} ba")
+            if sqft:
+                bits.append(f"{int(sqft):,} sq ft")
+            if price:
+                bits.append(_money(price))
+            sd = (district.get(oh.listing_key) or "").strip()
+            if sd:
+                sd = _nice_case(sd)
+                low = sd.lower()
+                # "Downingtown Area" -> "Downingtown Area SD"; "Calvert County Public Schools" stays
+                bits.append(sd if "school" in low or "district" in low or sd.endswith(" SD") else f"{sd} SD")
+            out.append(" · ".join(b for b in bits if b))
+        return out[-6:]
+    except Exception:
+        logger.warning("open house visit lines failed for lead %s", lead_id, exc_info=True)
+        return []
 
 
 async def create_open_house_followup(
@@ -3493,12 +3547,12 @@ async def create_open_house_followup(
                 if signin_id and await open_house_followups_mode(db, signin_id) == "on":
                     open_task.auto_source_id = signin_id
                 open_task.suggested_message = await signin_message()
-                # Tidy case ("239 Windham Dr", not "239 WINDHAM DR") - it shows on the calendar.
+                # Every visit (with the homes' details) shows under "Their open house visits"
+                # (open_house_visit_lines) - no "Also signed in at" note line any more. Only when
+                # the visits can't be listed (not linked to their lead) is a short note left.
                 shown = _tidy_subject(property_address.split(",")[0].strip()) or property_address
-                if property_address not in (open_task.notes or "") and shown not in (open_task.notes or ""):
+                if not repeat and property_address not in (open_task.notes or "") and shown not in (open_task.notes or ""):
                     open_task.notes = ((open_task.notes or "") + f"\nAlso signed in at: {shown}").strip()
-                elif repeat:
-                    open_task.notes = ((open_task.notes or "") + f"\nSigned in again: {shown}").strip()
             elif repeat or property_address:
                 # Some other follow-up is still open for them (a form, an RSVP...) - it covers
                 # reaching out, but the visit shows on it and its calendar event under "New since

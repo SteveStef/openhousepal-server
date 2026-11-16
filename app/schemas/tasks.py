@@ -82,6 +82,9 @@ class TaskOut(BaseModel):
     # What they told you (form answers, their message) - same lines as the calendar alert's
     # "WHAT THEY TOLD YOU", minus the picked times (the card shows those on their own).
     details: Optional[list[str]] = None
+    # Open-house sign-in cards for someone at 2+ of your open houses: each visit, oldest first, with
+    # the home's beds / baths / sq ft / price / school district (tasks_service.open_house_visit_lines).
+    visits: Optional[list[str]] = None
     # The request this follow-up answers, when the card can answer it in place (tasks_service.task_request)
     request: Optional[dict] = None
     created_at: datetime

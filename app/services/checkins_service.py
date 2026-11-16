@@ -18,6 +18,7 @@ The top 3 are "Recommended", then "Worth a check-in", then "Less likely to respo
 The scoring + wording is pure (evaluate) so it's tested without a database; gather() reads the signals."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -87,7 +88,24 @@ def gap_phrase(days: int) -> str:
 def _street(address: Optional[str]) -> str:
     from app.services.email_service import tidy_caps
     s = (address or "").split(",")[0].strip()
+    s = re.sub(r"\s*#\s*$", "", s)   # "1330 N Avignon Dr #" (the unit number never came through)
     return tidy_caps(s) if s else ""
+
+
+def nice_name(name: Optional[str]) -> str:
+    """"peter judd" / "PETER JUDD" -> "Peter Judd" for display; mixed case is left as typed."""
+    n = " ".join((name or "").split())
+    return n.title() if n and "@" not in n and (n.islower() or n.isupper()) else n
+
+
+# Your own note says they're ready - the strongest sign there is (11/16: "pre-approved" in a note
+# counted for nothing; only the form answer did).
+_NOTE_PRE = re.compile(r"\bpre[\s-]?(?:approved|approval|qual(?:ified)?)\b", re.I)
+_NOTE_CASH = re.compile(r"\b(?:cash buyer|paying cash|all[\s-]cash|cash offer)\b", re.I)
+_NOTE_SOON = re.compile(r"\b(?:asap|right away|this month|next month|relocat\w*|lease (?:is )?(?:up|ends?)|"
+                        r"must move|have to move|ready to (?:buy|move|make an offer)|already sold|sold their)\b", re.I)
+# An email whose subject is itself a reason to text: a price drop or a home back on the market.
+HOT_SUBJECT = re.compile(r"\b(?:dropped to \$|price (?:drop|cut|reduced)|back on (?:the )?market)", re.I)
 
 
 def _join(items: List[str]) -> str:
@@ -135,6 +153,8 @@ class Signals:
     last_view: Optional[datetime] = None
     timeline: Optional[str] = None            # their sign-in / form answer
     pre_approved: Optional[str] = None
+    hot_email: Optional[str] = None           # subject of a price-drop / back-on-market email they opened
+    hot_email_at: Optional[datetime] = None
 
 
 _SOON = ("right away", "asap", "1-3 months", "1–3 months", "0-3 months", "immediately")
@@ -143,13 +163,16 @@ _SOON = ("right away", "asap", "1-3 months", "1–3 months", "0-3 months", "imme
 def _intent_bits(s: Signals) -> List[tuple]:
     out = []
     pa = (s.pre_approved or "").strip().lower()
-    if pa.startswith("yes"):
+    note_text = " ".join(n.get("text") or "" for n in s.notes)
+    if pa.startswith("yes") or _NOTE_PRE.search(note_text):
         out.append((8, "Pre-approved"))
-    elif "cash" in pa:
+    elif "cash" in pa or _NOTE_CASH.search(note_text):
         out.append((8, "Paying cash"))
     tl = (s.timeline or "").strip().lower()
     if tl and any(w in tl for w in _SOON):
         out.append((8, "Buying in 1-3 months" if "month" in tl else "Buying right away"))
+    elif _NOTE_SOON.search(note_text):
+        out.append((8, "Ready soon (your note)"))
     elif "research" in tl:
         out.append((-5, None))
     return out
@@ -190,6 +213,9 @@ def evaluate(s: Signals, now: datetime) -> Optional[Dict[str, Any]]:
         txt = (f"Opened your email {when_phrase(s.last_open, now)}" if n == 1
                else f"Opened your emails {n} times {since}- last {when_phrase(s.last_open, now)}")
         bits.append((max(w, 4), txt))
+    if s.hot_email:
+        # The email itself is the opener: "saw 2439 Horseshoe Trl dropped - want to see it?"
+        bits.append((12 + (6 if recent(s.hot_email_at) else 0), f"Opened your email “{s.hot_email}” {when_phrase(s.hot_email_at, now)}"))
     showcase_recent = recent(s.last_like) or recent(s.last_comment) or recent(s.last_view)
     sc_bonus = 8 if showcase_recent else 0
     if s.liked:
@@ -392,7 +418,7 @@ async def gather(db: AsyncSession, owner, lead_id: Optional[str] = None, now: Op
         touch = max([d for d in (_utc(l.last_contacted_at), last_done.get(l.id)) if d], default=None)
         # Anything before the last follow-up was made (or the last touch) is covered already.
         cutoff = max([d for d in (touch, last_made.get(l.id), window) if d])
-        s = Signals(lead_id=l.id, name=l.name or l.email or "This lead", first=_guest_first(l.name) or "",
+        s = Signals(lead_id=l.id, name=nice_name(l.name) or l.email or "This lead", first=_guest_first(l.name) or "",
                     represented=l.represented or "unknown", status=l.status or "new",
                     has_phone=bool((l.phone or "").strip()), has_email=bool((l.email or "").strip()),
                     created_at=_utc(l.created_at), last_touch=touch, ever_contacted=touch is not None)
@@ -450,6 +476,9 @@ async def gather(db: AsyncSession, owner, lead_id: Optional[str] = None, now: Op
                 s.emails_opened += 1
                 s.open_total += max(1, m.open_count or 0)
                 s.last_open = max(opened, s.last_open or opened)
+                subj = " ".join((m.subject or "").split())
+                if subj and HOT_SUBJECT.search(subj) and (s.hot_email_at is None or opened > s.hot_email_at):
+                    s.hot_email, s.hot_email_at = subj[:90], opened
             clicked = _utc(m.clicked_at)
             if clicked and clicked > cutoff:
                 s.clicks += 1
