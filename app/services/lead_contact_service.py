@@ -155,7 +155,7 @@ async def send_invite(db, owner: User, lead: Lead, kind: str) -> bool:
         from app.services.email_avatar_service import agent_email_vars
         from app.services.showcase_links import showcase_path
         from app.services.website.site_service import resolve_owner_public_base_url
-        if await BlacklistService.is_blacklisted(db, lead.email):
+        if await BlacklistService.is_blacklisted(db, lead.email, owner.id, manual=True):
             return False
         base = await resolve_owner_public_base_url(db, owner)
         link = f"{base.rstrip('/')}{await showcase_path(col, db=db)}"

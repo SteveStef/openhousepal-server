@@ -466,7 +466,7 @@ class PropertyTourService:
             from app.services.blacklist_service import BlacklistService
             from app.services.website.site_service import resolve_owner_public_base_url
             to = tour.visitor_email or collection.visitor_email
-            if not to or await BlacklistService.is_blacklisted(db, to):
+            if not to or await BlacklistService.is_blacklisted(db, to, collection.owner_id, manual=True):
                 return
             agent = await db.get(User, collection.owner_id)
             prop = await db.get(Property, tour.property_id)

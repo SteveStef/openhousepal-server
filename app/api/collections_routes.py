@@ -154,18 +154,22 @@ async def _assert_visitor_can_act(db: AsyncSession, collection_id: str, property
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="That home isn't in this Showcase.")
 
 
-async def _agent_unsubscribe(db: AsyncSession, address: str, t: Optional[str]) -> Optional[dict]:
-    """The link was on an email from an agent's OWN mailbox (t = that email's id, with_unsub_tag):
-    stop only that agent's emails (owner, 11/16). None when it isn't one - the platform-wide list then."""
-    if not t or len(t) > 64:
-        return None
+async def _agent_unsubscribe(db: AsyncSession, address: str, t: Optional[str], a: Optional[str] = None) -> Optional[dict]:
+    """Every unsubscribe link says which agent's email it was on (a = signed agent tag, t = the email's
+    id): only that agent's automatic emails stop (owner, 11/16). None for an old link that doesn't say -
+    the platform-wide list then, as before."""
     from app.models.database import ClientEmail
     from app.services.client_email_service import unsubscribe_from_agent
-    rec = await db.get(ClientEmail, t)
-    if rec is None or not rec.owner_id or (rec.recipient_email or "").strip().lower() != address.strip().lower():
+    from app.services.email_service import agent_from_unsub_token
+    owner_id = agent_from_unsub_token(a, address) if a else None
+    if owner_id is None and t and len(t) <= 64:
+        rec = await db.get(ClientEmail, t)
+        if rec is not None and rec.owner_id and (rec.recipient_email or "").strip().lower() == address.strip().lower():
+            owner_id = rec.owner_id
+    agent = await db.get(User, owner_id) if owner_id else None
+    if agent is None:
         return None
-    await unsubscribe_from_agent(db, rec.owner_id, address)
-    agent = await db.get(User, rec.owner_id)
+    await unsubscribe_from_agent(db, owner_id, address)
     name = f"{getattr(agent, 'first_name', '') or ''} {getattr(agent, 'last_name', '') or ''}".strip() or "this agent"
     return {"success": True, "scope": "agent", "agent_name": name,
             "message": f"Unsubscribed {address} from {name}'s emails."}
@@ -176,6 +180,7 @@ async def unsubscribe_visitor(
     request: Optional[UnsubscribeRequest] = None,
     email: Optional[str] = Query(None),
     t: Optional[str] = Query(None),
+    a: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -188,7 +193,7 @@ async def unsubscribe_visitor(
     if "@" not in address:
         raise HTTPException(status_code=400, detail="That unsubscribe link is missing an email address.")
     try:
-        agent_only = await _agent_unsubscribe(db, address, t)
+        agent_only = await _agent_unsubscribe(db, address, t, a)
         if agent_only is not None:
             return agent_only
         if await BlacklistService.blacklist_email(db, address):
@@ -204,6 +209,7 @@ async def unsubscribe_visitor(
 async def unsubscribe_one_click(
     email: str,
     t: Optional[str] = Query(None),
+    a: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -211,7 +217,7 @@ async def unsubscribe_one_click(
     Gmail/Yahoo send a POST to this URL with the email in the query string.
     """
     try:
-        if await _agent_unsubscribe(db, email, t) is not None:
+        if await _agent_unsubscribe(db, email, t, a) is not None:
             return {"success": True}
         if await BlacklistService.blacklist_email(db, email):
             from app.services.leads_service import log_unsubscribe
@@ -402,7 +408,7 @@ async def send_showcase_invite(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
     if not coll.visitor_email:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This Showcase has no email address.")
-    if await BlacklistService.is_blacklisted(db, coll.visitor_email):
+    if await BlacklistService.is_blacklisted(db, coll.visitor_email, coll.owner_id, manual=True):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="They unsubscribed from emails, so it can't be sent.")
     if not coll.notify_visitor:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Showcase emails are off for them - turn them on first.")
@@ -2243,6 +2249,8 @@ async def rebuild_from_open_house(
     col = (await db.execute(select(Collection).where(Collection.id == collection_id, Collection.owner_id == current_user.id))).scalar_one_or_none()
     if col is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    if col.status != "ACTIVE":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Their Showcase is off - turn it on first.")
     oh = await db.get(_OHE, oh_id) if oh_id else None
     if oh is None or oh.agent_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Open house not found")

@@ -513,7 +513,7 @@ class CollectionsService:
                 # Convert to response format
                 is_blacklisted = False
                 if collection.visitor_email:
-                    is_blacklisted = await BlacklistService.is_blacklisted(db, collection.visitor_email)
+                    is_blacklisted = await BlacklistService.is_blacklisted(db, collection.visitor_email, collection.owner_id)
                     
                 collection_data = {
                     "id": collection.id,
@@ -1038,7 +1038,7 @@ class CollectionsService:
 
             is_blacklisted = False
             if collection.visitor_email:
-                is_blacklisted = await BlacklistService.is_blacklisted(db, collection.visitor_email)
+                is_blacklisted = await BlacklistService.is_blacklisted(db, collection.visitor_email, collection.owner_id)
 
             try:
                 original_property_data = await _resolve_original_property_data(db, collection)
@@ -1827,7 +1827,7 @@ class CollectionsService:
 
             is_blacklisted = False
             if collection.visitor_email:
-                is_blacklisted = await BlacklistService.is_blacklisted(db, collection.visitor_email)
+                is_blacklisted = await BlacklistService.is_blacklisted(db, collection.visitor_email, collection.owner_id)
 
             try:
                 original_property_data = await _resolve_original_property_data(db, collection)

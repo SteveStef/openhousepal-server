@@ -832,7 +832,7 @@ async def queue_showcase_ready(db: AsyncSession, collection_id: str, from_agent:
                                 .where(Collection.id == collection_id))).scalar_one_or_none()
         if col is None or col.status != "ACTIVE" or not col.visitor_email or not getattr(col, "notify_visitor", True):
             return False
-        if await BlacklistService.is_blacklisted(db, col.visitor_email):
+        if await BlacklistService.is_blacklisted(db, col.visitor_email, col.owner_id, manual=from_agent or manual):
             return False
         owner = await db.get(User, col.owner_id)
         total = (await db.execute(
@@ -950,7 +950,7 @@ async def queue_search_changed(db: AsyncSession, collection_id: str, before_ids:
                                 .where(Collection.id == collection_id))).scalar_one_or_none()
         if col is None or col.status != "ACTIVE" or not col.visitor_email or not getattr(col, "notify_visitor", True) or not col.preferences:
             return False
-        if await BlacklistService.is_blacklisted(db, col.visitor_email):
+        if await BlacklistService.is_blacklisted(db, col.visitor_email, col.owner_id):
             return False
         after = await showcase_home_ids(db, col.id)
         built = None

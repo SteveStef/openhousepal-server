@@ -1,3 +1,5 @@
+from typing import Optional
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.database import BlacklistedEmail
@@ -7,9 +9,14 @@ logger = get_logger(__name__)
 
 class BlacklistService:
     @staticmethod
-    async def is_blacklisted(db: AsyncSession, email: str) -> bool:
+    async def is_blacklisted(db: AsyncSession, email: str, owner_id: Optional[str] = None, manual: bool = False) -> bool:
         """
-        Check if an email is blacklisted.
+        Should this agent's email to this person be held back?
+        - The platform-wide list (blacklisted_emails): unsubscribes from before 11/16, when one link
+          stopped every agent. Still honoured for everything.
+        - owner_id given: they unsubscribed from THIS agent (owner, 11/16 - every unsubscribe is per
+          agent now: client_email_service.AGENT_UNSUB). That holds the agent's automatic emails;
+          manual=True (the agent pressed a button to send this one) still goes.
         """
         if not email:
             return False
@@ -19,7 +26,12 @@ class BlacklistService:
             result = await db.execute(
                 select(BlacklistedEmail).where(BlacklistedEmail.email == email_lower)
             )
-            return result.scalars().first() is not None
+            if result.scalars().first() is not None:
+                return True
+            if owner_id and not manual:
+                from app.services.client_email_service import unsubscribed_from_agent
+                return await unsubscribed_from_agent(db, owner_id, email_lower)
+            return False
         except Exception as e:
             logger.error(f"Error checking blacklist for {email}: {e}")
             return False

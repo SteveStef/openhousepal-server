@@ -747,7 +747,7 @@ async def email_guest_confirmation(db: AsyncSession, owner: User, inv: EventInvi
         return
     try:
         from app.services.blacklist_service import BlacklistService
-        if await BlacklistService.is_blacklisted(db, rsvp.email):
+        if await BlacklistService.is_blacklisted(db, rsvp.email, owner.id):
             return
         from app.services.agent_email_service import email_person
         from app.services.email_avatar_service import agent_email_vars
@@ -797,7 +797,7 @@ async def send_invitations(db: AsyncSession, owner: User, inv: EventInvite, reci
         if not _EMAIL_RE.match(e):
             skipped.append({"email": e, "reason": "not a valid email"})
             continue
-        if await BlacklistService.is_blacklisted(db, e):
+        if await BlacklistService.is_blacklisted(db, e, owner.id, manual=True):
             skipped.append({"email": e, "reason": "unsubscribed"})
             continue
         rec = existing.get(e)

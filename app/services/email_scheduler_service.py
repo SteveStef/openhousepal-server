@@ -50,7 +50,8 @@ class EmailSchedulerService:
                         if email_record.status != "PENDING":
                             continue
                         # Check if recipient is blacklisted
-                        if await BlacklistService.is_blacklisted(db, email_record.recipient_email):
+                        if await BlacklistService.is_blacklisted(db, email_record.recipient_email, email_record.owner_id,
+                                                                 manual=bool((email_record.template_variables or {}).get("_manual"))):
                             logger.info(f"Skipping blacklisted email {email_record.id} for {email_record.recipient_email}")
                             email_record.status = "CANCELLED"
                             email_record.error_message = "Recipient is blacklisted"

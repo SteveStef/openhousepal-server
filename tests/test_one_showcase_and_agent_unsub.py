@@ -1,8 +1,9 @@
 """Owner, 11/16:
 - ONE Showcase per agent per client: a second open house of the same agent keeps the Showcase (and
   link) they have - no second invite. Another agent's Showcase for the same person is never touched.
-- Unsubscribing from an email that went out from an agent's OWN mailbox stops only that agent's
-  emails (both ways it sends), not other agents'. The agent can't turn it back on."""
+- Every unsubscribe link is per agent (whether the email went from the agent's own mailbox or from
+  OpenHousePal): that agent's AUTOMATIC emails stop for good (the agent can't turn them back on), other
+  agents' don't, and what the agent sends by hand still goes."""
 import uuid
 
 import pytest
@@ -122,6 +123,11 @@ async def test_unsubscribe_from_agents_own_mailbox_stops_only_that_agent():
             assert not await ces.unsubscribed_from_agent(db, jess.id, guest)
             st = await ces.status_for(db, me.id, guest)
             assert st["mode"] == "off" and "Unsubscribed from your emails" in (st.get("reason") or "")
+            from app.services.blacklist_service import BlacklistService
+            assert await BlacklistService.is_blacklisted(db, guest, me.id)                    # my automatic emails: held
+            assert not await BlacklistService.is_blacklisted(db, guest, me.id, manual=True)   # what I send by hand: goes
+            assert not await BlacklistService.is_blacklisted(db, guest, jess.id)              # Jess: untouched
+            assert not await BlacklistService.is_blacklisted(db, guest)                       # nobody else's list
             # the agent can't switch it back on, and deleting the lead doesn't wipe it
             st = await ces.set_manual(db, me.id, guest, True)
             assert st["mode"] == "off"
@@ -131,9 +137,12 @@ async def test_unsubscribe_from_agents_own_mailbox_stops_only_that_agent():
             assert await ces.unsubscribed_from_agent(db, me.id, guest)
             await ces.set_frequency(db, me.id, guest, "weekly", by="agent")
             assert await ces.unsubscribed_from_agent(db, me.id, guest)
-        # nothing goes from me (manual sends included); Jess's emails still go
-        assert await ces.before_send(me.id, guest, "showcase_invite", "Hi", {"_manual": True}) is None
-        assert await ces.before_send(jess.id, guest, "showcase_invite", "Hi", {}) is not None
+        # my automatic emails stop; my hand-sent ones still go; Jess's emails still go
+        assert await ces.before_send(me.id, guest, "showcase_daily_digest", "New homes", {}) is None
+        assert await ces.before_send(me.id, guest, "visitor_confirmation", "Your homes", {}) is None
+        assert await ces.before_send(me.id, guest, "visitor_confirmation", "Your homes", {"_manual": True}) is not None
+        assert await ces.before_send(me.id, guest, "tour_confirmed", "Tour", {}) is not None
+        assert await ces.before_send(jess.id, guest, "showcase_daily_digest", "New homes", {}) is not None
     finally:
         await _cleanup(tag)
 
@@ -146,3 +155,39 @@ def test_mailbox_unsubscribe_links_are_tagged():
     h = unsubscribe_headers(tpl, "a@b.com", {}, track_id="abc")["List-Unsubscribe"]
     assert h.count("t=abc") == 2
     assert "t=" not in unsubscribe_headers(tpl, "a@b.com", {})["List-Unsubscribe"]
+
+
+
+@pytest.mark.asyncio
+async def test_every_unsubscribe_link_names_its_agent():
+    """An email OpenHousePal sends for an agent (not only one from the agent's mailbox) carries a signed
+    agent tag; that link unsubscribes from that agent only. A forged or mismatched tag does nothing."""
+    import app.main  # noqa: F401
+    from app.database import AsyncSessionLocal
+    from app.services import client_email_service as ces
+    from app.services.email_service import agent_from_unsub_token, agent_unsub_token, unsubscribe_headers, SHOWCASE_UNSUBSCRIBE_TEMPLATES
+    from app.api.collections_routes import _agent_unsubscribe
+    tag = f"{NOW_TAG}-{uuid.uuid4().hex[:8]}"
+    guest = f"{tag}-andrew@example.com"
+    try:
+        async with AsyncSessionLocal() as db:
+            jess, me = await _agents(db, tag)
+        tok = agent_unsub_token(me.id, guest)
+        assert agent_from_unsub_token(tok, guest.upper()) == me.id
+        assert agent_from_unsub_token(tok, "someone-else@example.com") is None
+        assert agent_from_unsub_token(jess.id + "." + tok.split(".")[1], guest) is None
+        # the send pipeline tags the footer link of any email sent for an agent
+        gate = await ces.before_send(jess.id, guest, "showcase_daily_digest", "New homes",
+                                     {"Unsub": f"https://openhousepal.com/unsubscribe?email={guest}"})
+        unsub = gate[1]["Unsub"]
+        assert f"a={agent_unsub_token(jess.id, guest)}" in unsub
+        tpl = next(iter(SHOWCASE_UNSUBSCRIBE_TEMPLATES))
+        assert unsubscribe_headers(tpl, guest, {"Unsub": unsub})["List-Unsubscribe"].count("a=") == 2
+        async with AsyncSessionLocal() as db:
+            assert await _agent_unsubscribe(db, guest, None, "forged.abc") is None
+            out = await _agent_unsubscribe(db, guest, None, agent_unsub_token(jess.id, guest))
+            assert out["scope"] == "agent"
+            assert await ces.unsubscribed_from_agent(db, jess.id, guest)
+            assert not await ces.unsubscribed_from_agent(db, me.id, guest)
+    finally:
+        await _cleanup(tag)

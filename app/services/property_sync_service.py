@@ -1554,7 +1554,7 @@ class PropertySyncService:
         # 1. Visitor Email (queued for the daily digest)
         if collection.visitor_email and getattr(collection, 'notify_visitor', True):
             # Check if visitor is blacklisted
-            if await BlacklistService.is_blacklisted(db, collection.visitor_email):
+            if await BlacklistService.is_blacklisted(db, collection.visitor_email, collection.owner_id):
                 logger.info(f"Skipping scheduled email for blacklisted visitor: {collection.visitor_email}")
             else:
                 template = "showcase_daily_digest"  # queued for the 4:30 digest, never sent on its own

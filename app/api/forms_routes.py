@@ -1775,7 +1775,7 @@ async def _email_showing_confirmed(db: AsyncSession, submission: FormSubmission,
         from app.services.website.site_service import owner_links, resolve_owner_public_base_url
         to = submission.contact_email
         info = submission.showing or {}
-        if not to or await BlacklistService.is_blacklisted(db, to):
+        if not to or await BlacklistService.is_blacklisted(db, to, agent.id, manual=True):
             return
         try:
             when = datetime.strptime(f"{info.get('confirmed_date')} {info.get('confirmed_time')}", "%Y-%m-%d %H:%M")

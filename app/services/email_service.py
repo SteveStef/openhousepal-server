@@ -169,6 +169,39 @@ def prepare_template_email(subject: str, template_variables: Optional[Dict[str, 
     return _tidy_subject(subject), variables
 
 
+def agent_unsub_token(owner_id: str, email: str) -> str:
+    """Signed "this agent" tag for an unsubscribe link (a=...): owner id + a short HMAC over owner + address,
+    so the link can only ever unsubscribe THAT address from THAT agent (owner, 11/16)."""
+    import hashlib, hmac
+    key = (os.getenv("JWT_SECRET_KEY") or "dev-insecure").encode()
+    sig = hmac.new(key, f"unsub|{owner_id}|{(email or '').strip().lower()}".encode(), hashlib.sha256).hexdigest()[:20]
+    return f"{owner_id}.{sig}"
+
+
+def agent_from_unsub_token(token: Optional[str], email: str) -> Optional[str]:
+    """The agent id in a valid a=... tag for this address, else None."""
+    import hmac
+    owner_id = (token or "").rsplit(".", 1)[0]
+    if not token or "." not in token or len(token) > 120:
+        return None
+    return owner_id if hmac.compare_digest(agent_unsub_token(owner_id, email), token) else None
+
+
+def with_agent_tag(url: Optional[str], owner_id: Optional[str], email: Optional[str]) -> Optional[str]:
+    """Every client email's unsubscribe link says which agent it came from - unsubscribing stops only that
+    agent's emails (owner, 11/16)."""
+    if not url or not owner_id or not email or "a=" in url:
+        return url
+    return f"{url}{'&' if '?' in url else '?'}a={agent_unsub_token(owner_id, email)}"
+
+
+def _unsub_params(variables: Dict[str, Any]) -> str:
+    """The a=... / t=... tags on this email's own unsubscribe link, for the List-Unsubscribe header."""
+    import re as _re
+    url = str((variables or {}).get("Unsub") or "")
+    return "".join(f"&{k}={v}" for k, v in _re.findall(r"[?&](a|t)=([^&#]+)", url))
+
+
 def with_unsub_tag(url: Optional[str], track_id: Optional[str]) -> Optional[str]:
     """An unsubscribe link on an email from the agent's OWN mailbox carries that email's id (t=...):
     unsubscribing from it stops only that agent's emails, not every agent's (owner, 11/16)."""
@@ -185,8 +218,9 @@ def unsubscribe_headers(template: str, to_email: str, template_variables: Dict[s
     api_url = os.getenv('API_URL', 'https://api.openhousepal.com')
     if template in SHOWCASE_UNSUBSCRIBE_TEMPLATES:
         e = quote(to_email or "", safe="")
-        one = with_unsub_tag(f"{api_url.rstrip('/')}/collections/unsubscribe/one-click?email={e}", track_id)
-        page = with_unsub_tag(f"{client_url.rstrip('/')}/unsubscribe?email={e}", track_id)
+        tags = _unsub_params(template_variables)
+        one = with_unsub_tag(f"{api_url.rstrip('/')}/collections/unsubscribe/one-click?email={e}{tags}", track_id)
+        page = with_unsub_tag(f"{client_url.rstrip('/')}/unsubscribe?email={e}{tags}", track_id)
         return {
             "List-Unsubscribe": f"<{one}>, <{page}>",
             "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
