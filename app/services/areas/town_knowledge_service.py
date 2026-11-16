@@ -1316,13 +1316,15 @@ def attached_styles_note(styles: Optional[dict]) -> str:
     """ " Of the 19 townhome sales, 10 were twins (...) with a $520,000 median and 9 were row townhomes ..." - or ""."""
     if not styles or not (styles.get("twin") or {}).get("count"):
         return ""
-    def part(key, words):
+    def part(key, words, one):
         s = styles.get(key) or {}
         if not s.get("count"):
             return None
-        return (f"{s['count']} {'was a' if s['count'] == 1 else 'were'} {words if s['count'] != 1 else words.rstrip('s')}"
+        # "1 was a twin (...)": the old rstrip('s') could not reach the s of "twins (...)" (round 10: "1 was a twins").
+        return (f"{s['count']} {'was a' if s['count'] == 1 else 'were'} {words if s['count'] != 1 else one}"
                 + (f" with a {_fmt_money(s['median_close_price'])} median" if s.get("median_close_price") else " (too few for a median of their own)"))
-    bits = [b for b in (part("twin", "twins (a house that shares one side wall with its neighbor)"), part("row", "row townhomes")) if b]
+    bits = [b for b in (part("twin", "twins (a house that shares one side wall with its neighbor)", "twin (a house that shares one side wall with its neighbor)"),
+                        part("row", "row townhomes", "row townhome")) if b]
     total = sum((styles.get(k) or {}).get("count") or 0 for k in ("twin", "row"))
     return f" Of those {total} townhome sales, " + " and ".join(bits) + "."
 

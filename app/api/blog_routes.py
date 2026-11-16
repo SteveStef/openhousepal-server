@@ -962,7 +962,13 @@ async def _writer_probe(user: User, names: list[str], slugs: list[str]) -> dict:
                 out["outside"] = (await _pipe.out_of_area_states(db, user, {(a.state or "").upper() for a in areas if a.state}))[0]
                 known = [a for a in areas if a.enrichment_status in ("ENRICHED", "PARTIAL")] or areas
                 if known:
-                    await tk.town_dossier(db, known[0], include_bank=False, mls=tier_has_mls(user.plan_tier))
+                    t_dossier = time.monotonic()
+                    looked = await tk.town_dossier(db, known[0], include_bank=False, mls=tier_has_mls(user.plan_tier))
+                    # The town's sales look-up swallows its own time-outs (it returns no numbers instead). Coming back
+                    # empty after most of the 20-second limit is "busy", not "ready" (11/15: the card said ready, the
+                    # log said the look-up had timed out).
+                    if tier_has_mls(user.plan_tier) and not (looked or {}).get("sales_snapshot") and time.monotonic() - t_dossier > 15:
+                        out["busy"] = True
             except Exception as exc:
                 msg = str(exc).lower()
                 if "statement timeout" in msg or "canceling statement" in msg:

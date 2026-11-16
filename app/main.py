@@ -146,6 +146,14 @@ async def lifespan(app: FastAPI):
         _cluster_cleanup, "interval", hours=1, id="cluster_cleanup", name="Tidy shared leases and speed limits",
         replace_existing=True, max_instances=1, coalesce=True,
     )
+    # The two whole-market sold counts an article's first step needs take 45 seconds on live: kept fresh in the
+    # database here so no article waits for them (11/15: "our servers are very busy" with nobody on the site).
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from app.services.areas.market_stats_service import refresh_whole_market_counts as _market_counts
+    scheduler.add_job(
+        _market_counts, "interval", minutes=30, id="whole_market_counts", name="Keep the whole-market sold counts fresh",
+        replace_existing=True, max_instances=1, coalesce=True, next_run_time=_dt.now(_tz.utc) + _td(seconds=90),
+    )
 
     # Schedule email processing every minute
     scheduler.add_job(

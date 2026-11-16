@@ -113,7 +113,7 @@ LOANS, PROGRAMS AND ABSOLUTE STATEMENTS
 Rules differ by loan type: mortgage insurance, minimum down payment and credit rules for conventional, FHA, VA, USDA and state-agency (e.g. PHFA) loans are not the same. Always name the loan type a rule applies to ("on a conventional loan with less than 20% down, lenders generally require PMI"), and mention when a common alternative differs (VA: no monthly mortgage insurance; FHA: mortgage insurance at any down payment) if the ledger has it. Words like must, always, never, required, all, every, only need a ledger item that says exactly that for the same scope - otherwise qualify them ("generally", "on most conventional loans") or name the scope.
 
 CONTACT DETAILS AND OTHER PEOPLE'S SMALL PRINT - LEAVE THEM ON THEIR PAGE
-Never print a phone number, an email address, or the street address, room number or opening hours of an office, inspector, authority or company: they change, and they are not what the article is for (owner 11/15). Say whose page has them and link that page. When you say what an inspection looks at, give a few items as examples ("items such as ...") and link the full checklist - never equipment specifications (which kind of alarm, battery, wiring or size): the checklist states them exactly and a partial version sends a seller to buy the wrong thing. A law, contract right or protection keeps EVERY limit of its ledger wording (which contracts, which homes, who it covers): never widen it to every sale.
+Never print a phone number, an email address, or the street address, room number or opening hours of an office, inspector, authority or company: they change, and they are not what the article is for (owner 11/15). Say whose page has them and link that page. The same goes for a train, bus or ferry timetable: say about how long the ride takes and about how often it runs ("about 40 minutes to Suburban Station on weekday morning trains, which run every 20-40 minutes"), with the timetable's date and its link - never a departure or arrival clock time ("the 7:48 AM train", "arrives at 8:28", ":51 past the hour"), even when the ledger gives one: one misread row sends a commuter to the wrong train, and the times change with every new timetable. When you say what an inspection looks at, give a few items as examples ("items such as ...") and link the full checklist - never equipment specifications (which kind of alarm, battery, wiring or size): the checklist states them exactly and a partial version sends a seller to buy the wrong thing. A law, contract right or protection keeps EVERY limit of its ledger wording (which contracts, which homes, who it covers): never widen it to every sale.
 
 THE TITLE'S PROMISE
 If the title names a season, a year or a situation ("this winter"), at least one short passage must speak to what is different about it for this reader, as your own practical advice in general words (for a winter sale: short daylight for photos and showings, clear walks and steps, the holiday weeks) - no statistic the ledger doesn't hold, and never a claim that homes sell better or worse then unless the ledger says so.
@@ -183,12 +183,16 @@ _COVERAGE = _COVERAGE + (
     (re.compile(r"\btrain\b|\brail\b|commut|\bstation\b|septa|nj transit|\bmarc\b|\bvre\b|metro\b|\btransit\b", re.I),
      "This article is asked about GETTING AROUND BY TRAIN or transit. From the transit agency's OWN pages only: the line and the station "
      "that serve the town; the scheduled trip from that station to the main downtown station - open the line's current timetable and "
-     "report one weekday morning trip (departure, arrival, minutes) and the weekend pattern, with the timetable's effective date; and the "
+     "report ABOUT HOW LONG the ride takes on weekday morning trains, in minutes (a range across two or three trains: \"about 38-45 "
+     "minutes\"), about how often they run, and the weekend pattern, with the timetable's effective date. Read each time from THAT "
+     "station's own row, and do NOT report departure or arrival clock times (\"the 7:48 AM\"): one row off gives a commuter the wrong "
+     "train, and the times change with every timetable (grader 11/15: Rosemont's 7:48 was reported as Bryn Mawr's). Also the "
      "fare for that trip from the agency's fare page. A map's door-to-door estimate is not a train time. Budget: one search to find "
      "the timetable, one page read of it, and one look-up for the fare - three in all, never the same page twice - so the article's "
      "other points still get their look-ups.",
-     "A reader who asked about the train expects: the station and the line, the scheduled trip to downtown with the timetable's date, and "
-     "where to check fares - from the agency's own pages in the ledger. If the ledger holds only a map's door-to-door estimate, say plainly "
+     "A reader who asked about the train expects: the station and the line, about how long the scheduled ride to downtown takes and about "
+     "how often trains run (with the timetable's date and its link), and where to check fares - from the agency's own pages in the ledger. "
+     "Never a departure or arrival clock time, even when the ledger holds one. If the ledger holds only a map's door-to-door estimate, say plainly "
      "that it is an estimate from the center of town and not the train's timetable, and point to the agency's schedule."),
     (re.compile(r"inherit|estate sale|probate|\bheirs?\b|executor|personal representative|passed away|deceased", re.I),
      "This is an INHERITED HOME / ESTATE article. From official sources for the article's state and county: who can sell an inherited home "
@@ -506,7 +510,7 @@ Rules:
 - Use the web_search tool. Prefer, in order: county/municipal government, school district websites, state/federal government (Census), Freddie Mac / Federal Reserve, Bright MLS / brokerage research, established real estate data providers, reputable local journalism. Never rely on random blogs, SEO listicles or AI-generated pages when a primary source exists.
 - Every item must be a fact you actually read on the page you cite, with its number, geography and date window. If two sources disagree, report the more authoritative one and say so in the claim.
 - A claim states ONLY what that page says. Your own reasoning, advice, caveats or context ("so confirm each property's municipality", "Villanova and Wayne lie partly in...") never goes in a claim - put caveats in `note`. Never state which township, county or school district a town lies in unless the cited page says exactly that for that town; the TOWNS section already gives the verified split.
-- Train, bus and ferry times and fares come only from the transit agency's own schedule or fare pages (NJ Transit, SEPTA, MARC, VRE, WMATA, DART, Amtrak for Amtrak trains) - never trip planners or aggregators (Rome2rio, Moovit, Wanderu); name the line and the stations.
+- Train, bus and ferry times and fares come only from the transit agency's own schedule or fare pages (NJ Transit, SEPTA, MARC, VRE, WMATA, DART, Amtrak for Amtrak trains) - never trip planners or aggregators (Rome2rio, Moovit, Wanderu); name the line and the stations. Report about how long the ride takes (minutes, read from that station's OWN row of the timetable) and about how often it runs, with the timetable's effective date - not departure or arrival clock times: the article does not print them.
 - Never report a passing status as a fact: a parking lot that is "full" or has a waiting list today, a service alert, a suspension "until further notice", a sale or closure "this week". Report what the page gives as standing (the lot has 109 spaces; permits are required) with the page's date, or leave it out.
 - For every law, tax rule, credit, exemption or disclosure duty the article will lean on, also look for (a) exceptions that fit the article's situation - an estate or trust sale, a foreclosure, a condo, a manufactured home, a first-time buyer, an older homeowner - and (b) changes enacted or taking effect in the last two years. Report each exception or change as its own item from the official source (e.g. 'Maryland's seller disclosure law does not apply to sales by a personal representative administering an estate').
 - For every program, credit or tax break you report, say its basic eligibility condition in the claim when the source gives it (who it's for, whether the buyer must live in the home as a principal residence) - the writer uses that to leave out programs that don't fit the reader.
@@ -1092,20 +1096,59 @@ def payment_basis(brief: dict) -> str:
     return "attached" if _ATTACHED_TYPE.search(text) else "entry"
 
 
+def example_fees(cost: Optional[dict]) -> dict:
+    """{"townhouse" / "condo": the median association fee of that type's listings} - only where the town's own fact
+    states that median (10+ listings)."""
+    out = {}
+    for kind, label in (("townhouse", "townhomes"), ("condo", "condos")):
+        h = ((cost or {}).get("hoa") or {}).get(kind) or {}
+        if h.get("median_monthly") and (h.get("homes") or 0) >= 10:
+            out[kind] = {"monthly": int(h["median_monthly"]), "homes": int(h["homes"]), "label": label}
+    return out
+
+
 def example_fee(cost: Optional[dict]) -> Optional[dict]:
     """The association fee an attached-home example may add: the median of the condos or townhomes for sale that
     list one, whichever the town has more of - only where the town's own fact states that median (10+ listings)."""
     best = None
-    for kind, label in (("townhouse", "townhomes"), ("condo", "condos")):
-        h = ((cost or {}).get("hoa") or {}).get(kind) or {}
-        if h.get("median_monthly") and (h.get("homes") or 0) >= 10 and (best is None or h["homes"] > best["homes"]):
-            best = {"monthly": int(h["median_monthly"]), "homes": int(h["homes"]), "label": label}
+    for f in example_fees(cost).values():
+        if best is None or f["homes"] > best["homes"]:
+            best = f
     return best
+
+
+# An entry-price example ("a quarter of the homes for sale are at or below this price") adds the association fee when
+# at least this share of the homes for sale near that price are condos or townhomes (and at least five are near it).
+ENTRY_FEE_SHARE = 2 / 3
+
+
+def entry_fee(entry: dict, fees: Optional[dict]) -> Optional[dict]:
+    """The fee an ENTRY-price example adds: when most homes for sale near that price are condos or townhomes, the
+    median fee of whichever of the two is more common there - and only where the town's own fact states that median.
+    Grader round 10 (11/15): Wayne's $290,000 example sat among condos whose listings showed a $352 median fee, and
+    Kennett Square's $540,000 example among townhomes (38 fees, $215 median); both cards left the fee out because the
+    ARTICLE was not about condos. The reader's monthly cost is about the home, not the article's title."""
+    near = (entry or {}).get("near_homes") or 0
+    condos, towns = (entry or {}).get("near_condos") or 0, (entry or {}).get("near_townhomes") or 0
+    if near < 5 or (condos + towns) / near < ENTRY_FEE_SHARE:
+        return None
+    fee = (fees or {}).get("condo" if condos >= towns else "townhouse")
+    return {**fee, "near": near, "near_attached": condos + towns} if fee else None
+
+
+def tax_basis_words(kind: str, homes: Optional[int], scope: Optional[str]) -> str:
+    """Whose tax bills the example's estimate used, in the card's words. "similar-priced" only when it is true: with
+    too few bills near the price the estimate uses every listing that shows one, and says so (round 10, Radnor: "the
+    42 similar-priced homes for sale" beside the article's own "32 listings that show an annual property tax")."""
+    what = {"house": "single-family houses", "attached": "condos and townhomes"}.get(kind, "homes")
+    if scope == "all" and homes:
+        return f"tax bills of the {homes} {what} for sale that list one"
+    return (f"tax bills of the {homes} " if homes else "tax bills of ") + f"similar-priced {what} for sale"
 
 
 def payment_example(entry: dict, rate: dict, area_names: list[str], *, conforming_limit: Optional[int] = None, limit_area: Optional[str] = None,
                     basis: str = "entry", sold_house: Optional[dict] = None, transfer_tax: Optional[dict] = None,
-                    fee: Optional[dict] = None, fha: Optional[dict] = None) -> Optional[dict]:
+                    fee: Optional[dict] = None, fha: Optional[dict] = None, fees: Optional[dict] = None) -> Optional[dict]:
     """A worked example for a realistic entry price (the 25th-percentile list price of homes for
     sale across the article's towns): down payment, loan, principal & interest at Freddie Mac's
     latest 30-year average, a property-tax estimate from similar listings' tax bills, and closing
@@ -1116,6 +1159,8 @@ def payment_example(entry: dict, rate: dict, area_names: list[str], *, conformin
     price = _round_price(entry[f"{kind}_median"] if kind != "entry" else entry["p25"])
     tax_pct = entry.get(f"tax_pct_near_{kind}") if kind != "entry" else entry.get("tax_pct_near_p25")
     tax_homes = entry.get(f"tax_homes_{kind}") if kind != "entry" else entry.get("tax_homes")
+    # "near": bills of homes priced near the example; "all": too few of those, so every listing's bill was used.
+    tax_scope = entry.get(f"tax_scope_{kind}") if kind != "entry" else entry.get("tax_scope")
     # A house example is priced at what houses SOLD for, when there are enough recent sales - asking prices of
     # the houses still for sale lean high (11/14 Kennett Square: a $990,000 example while houses sold for a
     # median of $738,000, which also put two of its three loans over the jumbo line).
@@ -1123,7 +1168,7 @@ def payment_example(entry: dict, rate: dict, area_names: list[str], *, conformin
     if sold:
         price = _round_price(sold["price"])
         if entry.get("tax_pct_near_house_sold"):
-            tax_pct, tax_homes = entry["tax_pct_near_house_sold"], entry.get("tax_homes_house_sold")
+            tax_pct, tax_homes, tax_scope = entry["tax_pct_near_house_sold"], entry.get("tax_homes_house_sold"), "near"
     tax_mo = round(price * tax_pct / 100 / 12) if tax_pct else None
     # Closing costs: the CFPB's national 2-5%. Where we hold the place's whole transfer tax, the low end can't
     # sit below the buyer's customary half of that tax alone (11/14 grader, Fishtown: "$6,900-$17,250" beside a
@@ -1148,7 +1193,8 @@ def payment_example(entry: dict, rate: dict, area_names: list[str], *, conformin
     # Grader round 7: "what it really costs each month" - where the example IS a condo or townhome and the town's
     # listings give a median association fee, the card adds it. Insurance and mortgage insurance stay out: we hold
     # no real quote for either.
-    fee = fee if kind == "attached" and fee and fee.get("monthly") else None
+    # Round 10: an entry-price example adds it too when most homes for sale near its price are condos or townhomes.
+    fee = fee if kind == "attached" and fee and fee.get("monthly") else entry_fee(entry, fees) if kind == "entry" else None
     if fee:
         for sc in scenarios:
             sc["with_fee"] = sc["monthly_before_insurance"] + fee["monthly"]
@@ -1168,10 +1214,7 @@ def payment_example(entry: dict, rate: dict, area_names: list[str], *, conformin
         "rate": rate["rate_30"], "rate_as_of": rate.get("as_of"), "term_years": 30,
         # The estimate's basis in words only - a tax bill as a percent of price reads like a tax
         # rate (11/01 grader, Princeton). The percent stays internal (tax_pct) for the math.
-        "tax_pct": tax_pct, "tax_basis": ((f"tax bills of the {tax_homes} " if tax_homes else "tax bills of ")
-                                          + {"house": "similar-priced single-family houses for sale",
-                                             "attached": "similar-priced condos and townhomes for sale"}.get(kind, "similar-priced homes for sale")
-                                          if tax_pct else None),
+        "tax_pct": tax_pct, "tax_basis": tax_basis_words(kind, tax_homes, tax_scope) if tax_pct else None,
         "closing_low": closing_low, "closing_high": closing_high, "transfer_tax": tt,
         # What the range is made of, in the card's own words (None = the plain national 2-5%).
         "closing_basis": (f"your half of {tt['place']}'s realty transfer tax (about {writer._money(tt['half'])} when buyer and seller split it evenly, "
@@ -1214,7 +1257,10 @@ def payment_example_items(ex: dict) -> list[dict]:
                     else "(the CFPB's typical 2-5% of the price is a national guide)."))
     fee = ex.get("fee")
     if fee:
-        items.append(f"Payment example with the association fee: the {fee['homes']} {fee['label']} for sale that list a monthly fee show a median of "
+        items.append("Payment example with the association fee: "
+                     + (f"{fee['near_attached']} of the {fee['near']} homes for sale near this price are condos or townhomes, so the example adds a fee. "
+                        if fee.get("near") else "")
+                     + f"{'The' if fee.get('near') else 'the'} {fee['homes']} {fee['label']} for sale that list a monthly fee show a median of "
                      f"{m(fee['monthly'])}/month, all fees combined. Adding that fee brings the example to about "
                      + ", ".join(f"{m(sc['with_fee'])}/month at {sc['down_pct']}% down" for sc in ex["scenarios"])
                      + " - still before homeowners insurance, and before mortgage insurance under 20% down. A home's own fee can be higher or lower.")
@@ -1455,6 +1501,7 @@ def _tidy_spaces(node):
 
 
 _OFFICIAL_HOST = re.compile(r"\.(?:gov|edu|us|org|mil)$", re.I)
+_OPEN_WIKI = re.compile(r"(?:^|\.)(?:wikipedia|wikimedia|wiktionary|wikivoyage|wikidata|wikibooks|fandom|wikia)\.(?:org|com)$", re.I)
 
 
 def official_source(url) -> bool:
@@ -1463,9 +1510,12 @@ def official_source(url) -> bool:
     article's public source list linked another agent's website (a stored "schools" fact had come from it)."""
     from urllib.parse import urlparse
     try:
-        return bool(_OFFICIAL_HOST.search(urlparse(str(url or "")).hostname or ""))
+        host = urlparse(str(url or "")).hostname or ""
     except ValueError:
         return False
+    # An encyclopedia anyone can edit ends in .org and is not anybody's official page (grader round 10: Wikipedia sat
+    # in three source lists, behind stored facts about school districts and private schools).
+    return bool(_OFFICIAL_HOST.search(host)) and not _OPEN_WIKI.search(host)
 
 
 def trusted_stored_research(items: list[dict]) -> list[dict]:
@@ -1552,6 +1602,11 @@ def code_problems(text: str, *, brief: dict, protections: list[dict], agent_name
     for quote, pr in broadened_protections(text, protections):
         add("protection_scope", "protections", quote, f"states {pr['name']} as if it covered every sale - the sentence must keep its limits, as in: "
             f"\"{pr['says']}\"", note=f"{pr['name']} is stated more widely than the rule goes.", says=pr["says"], name=pr["name"])
+    for quote in clock_time_claims(text, brief):
+        add("clock_time", "fine_print", quote, "prints a departure or arrival clock time for a train, bus or ferry - reword with NO clock time: say "
+            "about how long the ride takes and about how often it runs, per the timetable (keep its link and its effective date); a timetable "
+            "row is easy to misread by one station and the times change with every new timetable",
+            note="The article printed a train or bus clock time - it should give the ride's length and point to the timetable.")
     for quote in walk_time_claims(text):
         add("walk_time", "math", quote, "states a share of homes as a walking TIME; our figure is a straight-line distance - say \"within about "
             "0.6 miles, measured in a straight line\" (same share, same place), and never \"a 15-minute walk\" or \"walkable\"",
@@ -1762,7 +1817,7 @@ def _settle_how(p: dict) -> Optional[str]:
 
 
 _SETTLED = {"unconfirmed_number": "A township number we have read only once", "contact_detail": "A phone number, email or office address",
-            "protection_scope": "A rule stated more widely than it goes"}
+            "protection_scope": "A rule stated more widely than it goes", "clock_time": "A train or bus clock time"}
 
 
 def settle_leftovers(article: dict, find_problems) -> tuple[int, list[dict]]:
@@ -1798,6 +1853,31 @@ settle_unconfirmed = settle_leftovers       # the name it had while it knew one 
 
 _WALK_TIME = re.compile(r"\b\d+[- ]minute walk\b|\bwalking distance\b|\bwalk(?:able)? to\b", re.I)
 _SHARE = re.compile(r"\b\d{1,3}(?:\.\d)?\s?%|\balmost no\b|\bnearly all\b|\bmost homes\b", re.I)
+
+
+# "the 7:48 AM train", "reaches Suburban Station at 8:28", "at :51 past the hour", "at :30".
+_CLOCK_TIME = re.compile(r"(?<![\w:.$/])(?:[1-9]|1[0-2]):[0-5]\d(?![\d:%])(?:\s*(?:a\.?m\.?|p\.?m\.?)(?![a-z]))?|(?<![\w:.$/]):[0-5]\d(?![\d:%])", re.I)
+_TRANSIT_WORD = re.compile(r"\btrains?\b|\brail\b|\bbus(?:es)?\b|\bferr(?:y|ies)\b|\bstations?\b|\btrolleys?\b|\bsubway\b|\bSEPTA\b|"
+                           r"\bNJ Transit\b|\bMARC\b|\bVRE\b|\bMetro(?:rail)?\b|\bAmtrak\b|\bPATCO\b|\btimetable|\bdepart", re.I)
+
+
+def clock_time_claims(text: str, brief: Optional[dict] = None) -> list[str]:
+    """Sentences that print a train, bus or ferry clock time. Grader round 10 (11/15): "From Bryn Mawr, the 7:48 AM
+    weekday train reaches Suburban Station at 8:28" - 7:48 is Rosemont's row of that timetable; Bryn Mawr's is 7:50.
+    The right timetable, read one row off: no later step can catch that without reading the timetable again, and the
+    times change with every new one - so the article gives the ride's length and how often, and the timetable's link
+    has the times. A time the agent typed in their own brief ("I take the 7:15 from Wayne") is theirs and stays."""
+    ours = " ".join(" ".join(str(x) for x in v) if isinstance(v, (list, tuple)) else str(v or "") for v in (brief or {}).values() if not isinstance(v, dict))
+    out = []
+    for sentence in _SENTENCES.split(text or ""):
+        t = re.sub(r"^(?:#{2,3} |- )", "", sentence.strip())
+        if not t or t.startswith("[Ask-me line"):
+            continue
+        plain = re.sub(r"\]\([^)\s]+\)|https?://\S+", "]", t)
+        times = [m.group(0).strip() for m in _CLOCK_TIME.finditer(plain)]
+        if times and _TRANSIT_WORD.search(plain) and not all(x in ours for x in times):
+            out.append(t)
+    return out
 
 
 def walk_time_claims(text: str) -> list[str]:
@@ -2377,7 +2457,8 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
             pay_ex = payment_example(entry, await tk.freddie_mac_latest(), [a.name for a in areas], conforming_limit=(cll or {}).get("limit"),
                                      limit_area=_and_list((cll or {}).get("counties") or []) or None, basis=payment_basis(brief),
                                      sold_house=house_sold, transfer_tax=tax_facts,
-                                     fee=example_fee(dossiers[0].get("cost")) if len(dossiers) == 1 else None, fha=tk.fha_limits())
+                                     fee=example_fee(dossiers[0].get("cost")) if len(dossiers) == 1 else None, fha=tk.fha_limits(),
+                                     fees=example_fees(dossiers[0].get("cost")) if len(dossiers) == 1 else None)
             if pay_ex and cll:
                 pay_ex["limit_source"] = {k: cll[k] for k in ("source_name", "source_url", "published")}
         except Exception:
@@ -2668,7 +2749,7 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
     if spotlight:
         inserted.append("Town Spotlight cards for " + ", ".join(c["name"] for c in spotlight) + " (photo, homes for sale, median list price, price range, school districts), placed after the first section.")
     if pay_ex:
-        inserted.append(f"A 'What it could cost' payment example card for a {writer._money(pay_ex['price'])} home (5%, 10% and 20% down; the numbers are the 'Payment example' ledger items), placed after the section about mortgages, budgets or costs - point to it in one sentence; don't redo its math.")
+        inserted.append(f"A 'What it could cost' payment example card for a {writer._money(pay_ex['price'])} home (5%, 10% and 20% down; the numbers are the 'Payment example' ledger items), placed after the section about mortgages, budgets or costs - point to it in one sentence; don't redo its math. If you say why the example uses that price, give ONLY the reason in the 'Worked payment example' ledger item (\"{pay_ex['price_basis']}\") - never tie the price to another ledger number that happens to equal it.")
     inserted.append("A 'Sources & data notes' list at the end with every source and what each area's numbers cover.")
     if brief.get("area_slugs"):
         inserted.append("Links from each town's first mention to the agent's neighborhood guide for it (homes for sale, prices, schools).")

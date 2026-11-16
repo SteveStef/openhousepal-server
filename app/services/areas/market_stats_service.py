@@ -442,35 +442,200 @@ async def _global(key, compute):
     return value
 
 
-async def _closed_count_all(db: AsyncSession, start: str, stop: str) -> int:
+# --- The two whole-market counts, kept in the database -------------------------------------------------------------
+# Counting a year of closings across the whole MLS takes 45 seconds on live (11/15: a 12 GB table). Kept only in each
+# API copy's own memory, the first article after a quiet hour or after any deploy waited on it - or was told "our
+# servers are very busy". They are only ever used as a ratio ("is our sold data complete this far back?"), so a count
+# from a day or two earlier is as good: it is read from system_settings by every copy, survives a deploy, and is
+# refreshed in the background (refresh_whole_market_counts, scheduled in main.py). No migration: the table exists.
+_STORE_PREFIX = "market_cache:"
+_STORE_MAX_AGE_H = 36          # older than this, a stored count is not used
+_STORE_NEAR_DAYS = 3           # a window ending within this many days of the one asked for is close enough
+_REFRESH_AFTER_H = 6
+
+
+def _age_hours(at: Optional[str], now: datetime) -> float:
+    try:
+        return (now - datetime.fromisoformat(str(at))).total_seconds() / 3600
+    except (TypeError, ValueError):
+        return 1e9
+
+
+def _days_apart(a: str, b: str) -> int:
+    from datetime import date
+    try:
+        return abs((date.fromisoformat(str(a)[:10]) - date.fromisoformat(str(b)[:10])).days)
+    except (TypeError, ValueError):
+        return 10 ** 6
+
+
+def usable_slices(row: Optional[dict], end_iso: str, slice_days: int, n: int, now: datetime) -> Optional[list[int]]:
+    """The stored slice counts, when they are recent and for (nearly) the same window - else None."""
+    if not isinstance(row, dict) or row.get("slice_days") != slice_days or len(row.get("value") or []) < n:
+        return None
+    if _age_hours(row.get("at"), now) > _STORE_MAX_AGE_H or _days_apart(row.get("end"), end_iso) > _STORE_NEAR_DAYS:
+        return None
+    return [int(v or 0) for v in row["value"]]
+
+
+def usable_count(row: Optional[dict], start_iso: str, stop_iso: str, now: datetime) -> Optional[int]:
+    """A stored count for this window, or for one of the same length ending within a few days of it - else None."""
+    best = None
+    for key, e in ((row or {}).get("entries") or {}).items():
+        s0, _, s1 = str(key).partition("|")
+        if _age_hours((e or {}).get("at"), now) > _STORE_MAX_AGE_H or _days_apart(s0, s1) != _days_apart(start_iso, stop_iso):
+            continue
+        gap = _days_apart(s1, stop_iso)
+        if gap <= _STORE_NEAR_DAYS and (best is None or gap < best[0]):
+            best = (gap, int(e.get("value") or 0))
+    return None if best is None else best[1]
+
+
+def _persist() -> bool:
+    import os
+    return not os.environ.get("PYTEST_CURRENT_TEST")          # tests use stand-in databases: memory only
+
+
+async def _stored(name: str) -> Optional[dict]:
+    """What is kept for `name` - read on its own connection, so a failure here can never spoil the caller's work."""
+    if not _persist():
+        return None
+    try:
+        from app.database import AsyncSessionLocal
+        from app.models.database import SystemSettings
+        async with AsyncSessionLocal() as own:
+            row = (await own.execute(select(SystemSettings).where(SystemSettings.key == _STORE_PREFIX + name))).scalar_one_or_none()
+            return row.value if row is not None and isinstance(row.value, dict) else None
+    except Exception:
+        return None
+
+
+async def _store(name: str, value: dict) -> None:
+    if not _persist():
+        return
+    try:
+        from app.database import AsyncSessionLocal
+        from app.models.database import SystemSettings
+        async with AsyncSessionLocal() as own:
+            row = (await own.execute(select(SystemSettings).where(SystemSettings.key == _STORE_PREFIX + name))).scalar_one_or_none()
+            if row is None:
+                own.add(SystemSettings(key=_STORE_PREFIX + name, value=value))
+            else:
+                row.value = value
+            await own.commit()
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("market stats: could not keep %s", name, exc_info=True)
+
+
+def _remember(key, value):
+    import time
+    _global_cache[key] = (time.monotonic(), value)
+    return value
+
+
+def _remembered(key):
+    import time
+    hit = _global_cache.get(key)
+    return hit[1] if hit and time.monotonic() - hit[0] < _GLOBAL_TTL_S else None
+
+
+async def _count_closed(db: AsyncSession, start: str, stop: str) -> int:
     close_date = mls_mirror.close_date()
-
-    async def compute():
-        return (await db.execute(select(func.count(Property.id)).where(
-            geography.residential_for_sale_filter(Property), Property.home_status.in_(_SOLD_STATUSES), close_date > start, close_date <= stop,
-        ))).scalar() or 0
-    return await _global(("closed_all", start, stop), compute)
+    return (await db.execute(select(func.count(Property.id)).where(
+        geography.residential_for_sale_filter(Property), Property.home_status.in_(_SOLD_STATUSES), close_date > start, close_date <= stop,
+    ))).scalar() or 0
 
 
-async def _closed_counts_by_slice(db: AsyncSession, end, slice_days: int, n_slices: int) -> list[int]:
-    """All closings in each `slice_days` step back from `end`, newest first - ONE pass over the
-    table for every slice (at least a year's worth, so the 90-day snapshot and the 12-month cost
-    profile share it). It was one full pass per slice: ~15 passes, two minutes on a cold cache."""
+async def _keep_count(start: str, stop: str, value: int, now: datetime) -> None:
+    row = await _stored("closed_all") or {}
+    entries = {k: v for k, v in (row.get("entries") or {}).items() if _age_hours((v or {}).get("at"), now) <= _STORE_MAX_AGE_H}
+    entries[f"{start}|{stop}"] = {"value": int(value), "at": now.isoformat()}
+    await _store("closed_all", {"entries": dict(sorted(entries.items(), key=lambda kv: kv[1]["at"])[-12:])})
+
+
+async def _closed_count_all(db: AsyncSession, start: str, stop: str) -> int:
+    key = ("closed_all", start, stop)
+    hit = _remembered(key)
+    if hit is not None:
+        return hit
+    now = datetime.now(timezone.utc)
+    kept = usable_count(await _stored("closed_all"), start, stop, now)
+    if kept is not None:
+        return _remember(key, kept)
+    value = await _count_closed(db, start, stop)
+    await _keep_count(start, stop, value, now)
+    return _remember(key, value)
+
+
+async def _count_slices(db: AsyncSession, end, slice_days: int, n: int) -> list[int]:
+    """All closings in each `slice_days` step back from `end`, newest first - ONE pass over the table for every slice."""
     from datetime import timedelta
     from sqlalchemy import and_
     close_date = mls_mirror.close_date()
-    n = max(n_slices, 12)
     bounds = [((end - timedelta(days=(i + 1) * slice_days)).isoformat(), (end - timedelta(days=i * slice_days)).isoformat()) for i in range(n)]
+    row = (await db.execute(select(*[
+        func.count(Property.id).filter(and_(close_date > start, close_date <= stop)) for start, stop in bounds
+    ]).where(
+        geography.residential_for_sale_filter(Property), Property.home_status.in_(_SOLD_STATUSES),
+        close_date > bounds[-1][0], close_date <= bounds[0][1],
+    ))).one()
+    return [int(v or 0) for v in row]
 
-    async def compute():
-        row = (await db.execute(select(*[
-            func.count(Property.id).filter(and_(close_date > start, close_date <= stop)) for start, stop in bounds
-        ]).where(
-            geography.residential_for_sale_filter(Property), Property.home_status.in_(_SOLD_STATUSES),
-            close_date > bounds[-1][0], close_date <= bounds[0][1],
-        ))).one()
-        return [int(v or 0) for v in row]
-    return await _global(("closed_slices", end.isoformat(), slice_days, n), compute)
+
+async def _closed_counts_by_slice(db: AsyncSession, end, slice_days: int, n_slices: int) -> list[int]:
+    """All closings in each `slice_days` step back from `end`, newest first (at least a year's worth, so the 90-day
+    snapshot and the 12-month cost profile share it). From memory, else from the database's kept copy (a window ending
+    a day or two earlier is close enough), and only when neither has it, counted now - 45 seconds on live."""
+    n = max(n_slices, 12)
+    key = ("closed_slices", end.isoformat(), slice_days, n)
+    hit = _remembered(key)
+    if hit is not None:
+        return hit
+    now = datetime.now(timezone.utc)
+    kept = usable_slices(await _stored("closed_slices"), end.isoformat(), slice_days, n, now)
+    if kept is not None:
+        return _remember(key, kept)
+    value = await _count_slices(db, end, slice_days, n)
+    await _store("closed_slices", {"end": end.isoformat(), "slice_days": slice_days, "n": n, "value": value, "at": now.isoformat()})
+    return _remember(key, value)
+
+
+async def refresh_whole_market_counts() -> dict:
+    """Scheduled (main.py): keeps the database's copy of the two whole-market counts fresh, so no article ever waits
+    for them. Counts again only when the newest close date moved or the kept copy is over six hours old."""
+    from datetime import date, timedelta
+    from app.database import AsyncSessionLocal
+    out = {"slices": False, "prior": False}
+    if not _persist():
+        return out
+    now = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as db:
+        close_date = mls_mirror.close_date()
+        latest = (await db.execute(select(func.max(close_date)).where(
+            Property.home_status.in_(_SOLD_STATUSES), geography.residential_for_sale_filter(Property), close_date <= date.today().isoformat()))).scalar()
+        if not latest:
+            return out
+        end = date.fromisoformat(str(latest)[:10])
+        row = await _stored("closed_slices")
+        if not (isinstance(row, dict) and row.get("end") == end.isoformat() and row.get("slice_days") == 30 and _age_hours(row.get("at"), now) < _REFRESH_AFTER_H):
+            value = await _count_slices(db, end, 30, 12)
+            await _store("closed_slices", {"end": end.isoformat(), "slice_days": 30, "n": 12, "value": value, "at": now.isoformat()})
+            _remember(("closed_slices", end.isoformat(), 30, 12), value)
+            out["slices"] = True
+        # the same window one year earlier, for the 90-, 60- and 30-day snapshots an article can ask for
+        kept = (await _stored("closed_all") or {}).get("entries") or {}
+        prior_end = end - timedelta(days=365)
+        for days in (90, 60, 30):
+            start, stop = (prior_end - timedelta(days=days)).isoformat(), prior_end.isoformat()
+            e = kept.get(f"{start}|{stop}")
+            if e and _age_hours(e.get("at"), now) < _REFRESH_AFTER_H:
+                continue
+            value = await _count_closed(db, start, stop)
+            await _keep_count(start, stop, value, now)
+            _remember(("closed_all", start, stop), value)
+            out["prior"] = True
+    return out
 
 
 async def covered_days(db: AsyncSession, end, max_days: int, slice_days: int = 30) -> int:
@@ -760,7 +925,7 @@ async def get_area_cost_profile(db: AsyncSession, scope: dict, munis: Optional[l
         # One tax year per town (11/01: Villanova's median mixed 2025 and 2026 bills next to towns
         # on 2026): the newest year with 5+ listings and a quarter of the bills (Frederick: 9 bills
         # marked 2027 out of hundreds), else every bill labeled with the usual year.
-        newest = max((y for y, n in years.items() if n >= max(5, 0.25 * len(taxes))), default=None)
+        newest = bill_year(years, len(taxes))
         # One set of bills for the total, the median, the share of list price AND the split.
         bills = [b for b in taxes if b[1] == newest] if newest else list(taxes)
         by_town: dict[str, list[float]] = {}
@@ -954,46 +1119,82 @@ async def entry_price_profile(db: AsyncSession, scopes: list[dict], house_near: 
         return {}
     rows = (await db.execute(
         select(Property.price, mls_mirror.col(Property.tax_annual_amount, "TaxAnnualAmount"), Property.home_type,
-               mls_mirror.col(Property.mls_structure_design_type, "StructureDesignType"))
+               mls_mirror.col(Property.mls_structure_design_type, "StructureDesignType"), mls_mirror.col(Property.tax_year, "TaxYear"))
         .where(or_(*filters), geography.residential_for_sale_filter(Property), Property.home_status.in_(FOR_SALE_STATUSES), Property.price.isnot(None))
     )).all()
-    # Manufactured homes aren't counted as single-family houses - the same rule as the article's own
-    # house count (get_area_cost_profile). 11/02 round 14 Lancaster: the card said 134 houses at $485K
-    # while the article said 122 houses at $520K.
-    rows = [(p, t, None if "manufactured" in str(s or "").lower() and ht in ("SINGLE_FAMILY", "Single Family") else ht) for p, t, ht, s in rows]
+    return entry_profile([tuple(r) for r in rows], house_near)
+
+
+def bill_year(years, n_bills: int) -> Optional[str]:
+    """One tax year per set of listing tax bills: the newest year that 5+ listings and a quarter of the bills carry,
+    else None (every bill counts, whatever its year). ONE rule for the town's tax fact and the payment card."""
+    return max((y for y, n in years.items() if n >= max(5, 0.25 * n_bills)), default=None)
+
+
+def entry_profile(rows: list[tuple], house_near: Optional[float] = None) -> dict:
+    """entry_price_profile's arithmetic, from rows of (list price, annual tax, home type, structure, tax year) - no
+    database. A tax bill counts here exactly when it counts in the town's own tax fact (get_area_cost_profile): over
+    $100, on a plausibly priced home, and of the one tax year that fact uses. Grader round 10 (11/15), Radnor: the
+    article said "the 32 listings that show an annual property tax" (tax year 2026) while the card said its estimate
+    used "the 42 similar-priced homes for sale" - every bill of any year, and not similar-priced at all: with too few
+    bills near the price the estimate had fallen back to every listing and kept the "similar-priced" wording. The
+    fallback is now reported (tax_scope "all") so the card can say what it really used."""
+    from collections import Counter
+    homes, years = [], Counter()
+    for p, t, ht, s, y in rows:
+        p, t = _num(p), _num(t)
+        if not p:
+            continue
+        # Manufactured homes aren't counted as single-family houses - the same rule as the article's own
+        # house count (get_area_cost_profile). 11/02 round 14 Lancaster: the card said 134 houses at $485K
+        # while the article said 122 houses at $520K.
+        if "manufactured" in str(s or "").lower() and ht in ("SINGLE_FAMILY", "Single Family"):
+            ht = None
+        year = str(y)[:4] if y else None
+        usable = bool(t and t > 100 and p >= geography.MIN_PLAUSIBLE_SALE_PRICE)
+        if usable and year:
+            years[year] += 1
+        homes.append([float(p), float(t) if usable else None, ht, year])
+    newest = bill_year(years, sum(1 for h in homes if h[1]))
+    if newest:
+        for h in homes:
+            if h[3] != newest:
+                h[1] = None
+    prices = sorted(h[0] for h in homes)
+    if len(prices) < 10:
+        return {}
+    p25 = prices[int(0.25 * (len(prices) - 1))]
+    near = [h for h in homes if 0.75 * p25 <= h[0] <= 1.25 * p25]
+    ratios, scope = [h[1] / h[0] for h in near if h[1]], "near"
+    if len(ratios) < 5:
+        ratios, scope = [h[1] / h[0] for h in homes if h[1]], "all"
+    out = {"homes": len(prices), "p25": round(p25), "median": round(_median(prices)),
+           "tax_pct_near_p25": round(_median(ratios) * 100, 2) if len(ratios) >= 5 else None,
+           "tax_homes": len(ratios), "tax_scope": scope,
+           # What the homes near the entry price ARE: an example priced where most homes are condos or townhomes
+           # adds their association fee (round 10: Wayne's $290,000 example sat among condos with a $352 median fee
+           # and left it out).
+           "near_homes": len(near), "near_condos": sum(1 for h in near if h[2] == "CONDO"),
+           "near_townhomes": sum(1 for h in near if h[2] == "TOWNHOUSE")}
     # A move-up or single-family article's example is a typical single-family house, a condo /
     # townhome article's a typical attached home - never the cheapest quarter of every type (11/01
     # grader: a Frederick single-family article showed a $390,000 example while houses ran $600,000+).
     # Each type's tax estimate comes from that same type's listings.
-    typed = {}
     for kind, types in (("house", ("SINGLE_FAMILY", "Single Family")), ("attached", ("CONDO", "TOWNHOUSE"))):
-        typed[kind] = [(float(p), _num(t)) for p, t, ht in rows if p and ht in types]
-    rows = [(p, t) for p, t, _ in rows]
-    prices = sorted(float(p) for p, _ in rows if p)
-    if len(prices) < 10:
-        return {}
-    p25 = prices[int(0.25 * (len(prices) - 1))]
-    near = [(float(p), _num(t)) for p, t in rows if p and 0.75 * p25 <= float(p) <= 1.25 * p25]
-    ratios = [t / p for p, t in near if t and t > 100]
-    if len(ratios) < 5:
-        ratios = [_num(t) / float(p) for p, t in rows if p and _num(t) and _num(t) > 100]
-    out = {"homes": len(prices), "p25": round(p25), "median": round(_median(prices)),
-           "tax_pct_near_p25": round(_median(ratios) * 100, 2) if len(ratios) >= 5 else None,
-           "tax_homes": len(ratios)}
-    for kind, homes in typed.items():
-        if len(homes) < 10:
+        homes_k = [(h[0], h[1]) for h in homes if h[2] in types]
+        if len(homes_k) < 10:
             continue
-        km = _median([p for p, _ in homes])
-        near_k = [t / p for p, t in homes if 0.75 * km <= p <= 1.25 * km and t and t > 100]
+        km = _median([p for p, _ in homes_k])
+        near_k, scope_k = [t / p for p, t in homes_k if 0.75 * km <= p <= 1.25 * km and t], "near"
         if len(near_k) < 5:
-            near_k = [t / p for p, t in homes if t and t > 100]
-        out.update({("houses" if kind == "house" else "attached"): len(homes), f"{kind}_median": round(km),
+            near_k, scope_k = [t / p for p, t in homes_k if t], "all"
+        out.update({("houses" if kind == "house" else "attached"): len(homes_k), f"{kind}_median": round(km),
                     f"tax_pct_near_{kind}": round(_median(near_k) * 100, 2) if len(near_k) >= 5 else None,
-                    f"tax_homes_{kind}": len(near_k)})
+                    f"tax_homes_{kind}": len(near_k), f"tax_scope_{kind}": scope_k})
         # The tax estimate for a house priced at `house_near` (the median SOLD price, when the example uses it)
         # comes from houses listed near that price, not near the higher asking-price median.
         if kind == "house" and house_near:
-            near_s = [t / p for p, t in homes if 0.75 * house_near <= p <= 1.25 * house_near and t and t > 100]
+            near_s = [t / p for p, t in homes_k if 0.75 * house_near <= p <= 1.25 * house_near and t]
             if len(near_s) >= 5:
                 out.update({"tax_pct_near_house_sold": round(_median(near_s) * 100, 2), "tax_homes_house_sold": len(near_s)})
     return out
