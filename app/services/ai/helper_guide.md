@@ -934,7 +934,7 @@ Every follow-up's calendar event has links:
 - When the rules slow a client to weekly or stop their emails, their Showcase tells them once at the top - with a tip to check their junk or spam folder, and buttons to keep daily or go weekly (or turn emails back on). Opening their Showcase already counts as being active, so their emails go back to normal.
 - Personal emails (tour confirmation, reply to their comment, the thank-you after signing in) always send.
 - **Unsubscribed**, bounced ("Fix their email address to send again") or marked-as-spam people can't be switched back on by you.
-- Unsubscribing from an email OpenHousePal sent stops emails from every agent on OpenHousePal. Unsubscribing from an email that went out from your own connected Gmail / Outlook stops only your emails (both from your mailbox and from OpenHousePal) - their lead says **Unsubscribed from your emails**.
+- Unsubscribing is per agent: when a client unsubscribes from one of your emails (sent from your connected Gmail / Outlook or from OpenHousePal), your automatic emails to them stop for good - other agents' emails don't. Their lead says **Unsubscribed from your emails**. What you send them by hand still goes: **Send invite again**, a Showcase you build for them, a reply to their comment, a tour or showing you confirm, an invitation you send.
 
 ---
 
