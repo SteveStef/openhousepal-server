@@ -886,7 +886,9 @@ The **Follow-ups** switch at the top of the page. Off = "No automatic follow-ups
 - **"..." (Snooze or delete)** > **Snooze**: **Tomorrow**, **In 3 days**, **Next week** (it keeps its time of day), or delete it.
 - Ready-to-send message: **Text**, **Copy email**, or copy the message. If the message has a blank like [ADD DATE & TIME], replace it before sending.
 - Showing requests show **Book in ShowingTime** with the listing agent's phone, email and MLS#, and **Mark scheduled** once booked.
-- **Suggested from what they just did:** a suggested follow-up you can add with **Add for tomorrow**.
+- **Suggested from what they just did:** a suggested follow-up you can add with **Add for tomorrow**. A guest with their own agent at your own listing gets **Ask [name] for feedback on [home]** with a listing-agent text.
+- **New since this was added** (blue box, also on the calendar event): what the person did after the follow-up was made - a form, an RSVP, a question, a Showcase search change, turning off emails, a review. The ready-to-send text doesn't change.
+- **Their open house visits** (gold box on open-house cards, also on the calendar event): every open house they came to, with each home's beds, baths, size, price and school district. A repeat visit still uses your normal open-house text; the title says **2nd open house** (another home) or **2nd visit** (same home).
 - **Inbox** button: every follow-up added in the last two weeks, newest first.
 
 ### Automatic follow-ups (the situations)
