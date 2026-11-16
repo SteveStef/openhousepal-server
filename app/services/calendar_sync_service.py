@@ -210,8 +210,9 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
     contacts -> why + the home (linked) -> what they told you -> Showcase comments -> your notes ->
     the ready-to-send text, last, so "copy everything below" is literally true.
     `message_override` = an already-assembled message (the settings page's live preview)."""
-    from app.services.tasks_service import (ALERT_NOTE_RULES, FILL_IN_ANSWER, FILL_IN_TIME, GUEST_PASS_SEEN, NOTED_GUEST_SOURCE, SHOWING_RULES, _pretty_phone, carried_forward,
-                                            clean_url, full_message, reminder_overrides, task_day, task_prefix)
+    from app.services.tasks_service import (ALERT_NOTE_RULES, FILL_IN_ANSWER, FILL_IN_TIME, GUEST_PASS_SEEN, NOTED_GUEST_SOURCE, SHOWING_RULES, SINCE_PREFIX,
+                                            _pretty_phone, carried_forward, clean_url, full_message, reminder_overrides, since_lines,
+                                            task_day, task_prefix)
     done_link, contact_link, showcase_link = clean_url(done_link), clean_url(contact_link), clean_url(showcase_link)
     due = _to_utc(task.due_at)
     done = task.completed_at is not None
@@ -276,7 +277,12 @@ def _task_event_body(task: AgentTask, showcase: Optional[dict] = None, color: st
         skip += ("Email: ", "Phone: ")  # shown in the contact block above
     # What they opened on their Guest Pass since the open house gets its own section (below).
     seen = [l[len(GUEST_PASS_SEEN):] for l in (task.notes or "").splitlines() if l.startswith(GUEST_PASS_SEEN)]
-    notes = "\n".join(l for l in (task.notes or "").splitlines() if not l.startswith(skip) and not l.startswith(GUEST_PASS_SEEN)).strip()
+    # What they did after this follow-up was made (tasks_service.note_activity_on_open_followups).
+    since = since_lines(task.notes)
+    notes = "\n".join(l for l in (task.notes or "").splitlines()
+                      if not l.startswith(skip) and not l.startswith(GUEST_PASS_SEEN) and not l.startswith(SINCE_PREFIX)).strip()
+    if since and not done:
+        parts.append("\U0001F195 NEW SINCE THIS WAS ADDED\n" + "\n".join(f"• {s}" for s in since))
     # A line of space between the heads-up and the agent's own note.
     notes = notes.replace("\nYour note: ", "\n\nYour note: ")
     if notes:

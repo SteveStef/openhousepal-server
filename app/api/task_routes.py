@@ -613,6 +613,9 @@ async def quick_add_checkin(lead_id: str, body: CheckinAddBody, db: AsyncSession
     except Exception:  # noqa: BLE001
         logger.warning("showcase lookup failed for quick check-in %s", lead.id, exc_info=True)
     first = tasks_service._guest_first(lead.name) or ""
+    same = await _just_added(db, current_user.id, lead.id, f"Check in with {first or lead.name or 'them'}")
+    if same is not None:
+        return _to_out(same)   # tapped twice / on two devices - one check-in
     msg = checkins_service.quick_message(first, current_user, has_sc)
     # Tomorrow, whole day (noon due, the phone buzzes at 9 AM Eastern) - same as the other suggested ones.
     day = (_dt.now(tasks_service.EASTERN) + _td(days=1)).date()
@@ -688,6 +691,20 @@ async def task_counts(
     )
 
 
+JUST_ADDED_WINDOW = timedelta(minutes=10)
+
+
+async def _just_added(db: AsyncSession, owner_id: str, lead_id: Optional[str], title: str) -> Optional[AgentTask]:
+    """The same follow-up (same person, same title, still open) added moments ago - a double tap,
+    two tabs, or a suggestion tapped on the phone and the laptop (owner, 11/16)."""
+    since = datetime.now(timezone.utc) - JUST_ADDED_WINDOW
+    q = select(AgentTask).options(selectinload(AgentTask.lead)).where(
+        AgentTask.owner_id == owner_id, AgentTask.title == title, AgentTask.completed_at.is_(None),
+        AgentTask.auto_source.is_(None), AgentTask.created_at >= since)
+    q = q.where(AgentTask.lead_id == lead_id) if lead_id else q.where(AgentTask.lead_id.is_(None))
+    return (await db.execute(q.order_by(AgentTask.created_at.desc()).limit(1))).scalar_one_or_none()
+
+
 @router.post("", response_model=TaskOut, status_code=201)
 async def create_task(
     payload: TaskCreate,
@@ -702,6 +719,9 @@ async def create_task(
         owned = (await db.execute(select(Lead.id).where(Lead.id == payload.lead_id, Lead.owner_id == current_user.id))).first()
         if not owned:
             raise HTTPException(status_code=404, detail="Lead not found")
+    same = await _just_added(db, current_user.id, payload.lead_id, payload.title.strip())
+    if same is not None:
+        return _to_out(same)   # a double tap / a second device - one follow-up, one calendar event
     task = AgentTask(
         owner_id=current_user.id,
         lead_id=payload.lead_id,

@@ -231,6 +231,14 @@ async def log_activity(
         )
         db.add(event)
         await db.commit()
+        try:
+            # Something the agent should know (changed their search, stopped emails, left a review):
+            # their open follow-up says so too, on the card and the calendar event (owner, 11/16).
+            from app.services.tasks_service import SINCE_LOG_TYPES, note_activity_bg
+            if source_type in SINCE_LOG_TYPES:
+                note_activity_bg(owner_id, lead.id, event.id)
+        except Exception:
+            logger.warning("could not note activity on open follow-ups", exc_info=True)
         return event
     except Exception as e:
         logger.warning(f"Could not log lead activity ({source_type}): {e}")

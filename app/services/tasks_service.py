@@ -2176,6 +2176,96 @@ def resync_lead_followups(owner_id: str, lead_id: str, delay: float = 0) -> None
     t.add_done_callback(_PENDING.discard)
 
 
+# ---------------------------------------------------------------- new activity on an open follow-up
+# (owner, 11/16: "auto updating in the calendar when something happens that the agent should know
+# about"). Only one automatic follow-up is open per person, so a form, a question or an RSVP that
+# comes in while one is waiting used to make nothing and say nothing - the card (and its calendar
+# event) still read as if nothing had happened. Now every open follow-up for them made BEFORE it
+# gets a "Since then:" line (card + its own section on the calendar event) and is re-pushed.
+# Skipped when the activity got a follow-up of its own (that card already says it), and never for
+# what already shows elsewhere: likes (their own card), comments (lead_comment_details), Guest Pass
+# taps (GUEST_PASS_SEEN) and repeat sign-ins (create_open_house_followup).
+SINCE_PREFIX = "Since then: "
+SINCE_MAX = 5
+# Through upsert_lead -> schedule_followup_for_lead_event.
+SINCE_EVENT_TYPES = {
+    "form_submission", "invite_rsvp", "website_google_signin", "portal_lead", "blog_inquiry",
+    "property_website_inquiry", "property_page_inquiry",
+    "property_tour", "property_website_tour_request", "property_page_tour_request",
+    "open_house_disclosure", "open_house_second_visit",
+}
+# Through leads_service.log_activity (they never make a follow-up themselves).
+SINCE_LOG_TYPES = {"showcase_search_changed", "showcase_emails_off", "email_unsubscribed", "review_left"}
+
+
+def since_lines(notes: Optional[str]) -> list[str]:
+    return [l[len(SINCE_PREFIX):] for l in (notes or "").splitlines() if l.startswith(SINCE_PREFIX)]
+
+
+async def note_activity_on_open_followups(db: AsyncSession, owner_id: str, lead_id: str, event_id: str) -> list[str]:
+    """Add this activity to every open follow-up for the person that was made before it. Returns the
+    ids it changed (the caller re-pushes them to the calendar). Commits."""
+    from app.models.database import LeadEvent
+    from app.services.email_service import _tidy_subject
+    event = await db.get(LeadEvent, event_id)
+    if event is None or event.lead_id != lead_id:
+        return []
+    own = (await db.execute(select(AgentTask.id).where(
+        AgentTask.owner_id == owner_id, AgentTask.auto_source_id == event_id).limit(1))).first()
+    if own:
+        return []
+    at = event.occurred_at or datetime.now(timezone.utc)
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    tasks = (await db.execute(select(AgentTask).where(
+        AgentTask.owner_id == owner_id, AgentTask.lead_id == lead_id, AgentTask.completed_at.is_(None),
+        AgentTask.created_at < at))).scalars().all()
+    what = _tidy_subject(" ".join((event.summary or "").split()))[:200]
+    if not tasks or not what:
+        return []
+    if event.source_type in SINCE_EVENT_TYPES and says_has_agent(event.raw_snapshot):
+        what += " (said they have an agent)"
+    day = at.astimezone(EASTERN)
+    line = f"{SINCE_PREFIX}{what} · {day:%a}, {day:%b} {day.day}"
+    changed = []
+    for t in tasks:
+        lines = (t.notes or "").splitlines()
+        if line in lines:
+            continue
+        since = [l for l in lines if l.startswith(SINCE_PREFIX)]
+        if len(since) >= SINCE_MAX:
+            lines.remove(since[0])   # the oldest goes - the card stays short
+        lines.append(line)
+        t.notes = "\n".join(lines).strip()
+        changed.append(t.id)
+    if changed:
+        await db.commit()
+    return changed
+
+
+async def _note_activity(owner_id: str, lead_id: str, event_id: str) -> None:
+    """note_activity_on_open_followups on its own session, then the calendar. Never raises."""
+    try:
+        from app.database import AsyncSessionLocal
+        from app.services import calendar_sync_service
+        async with AsyncSessionLocal() as db:
+            ids = await note_activity_on_open_followups(db, owner_id, lead_id, event_id)
+        for tid in ids:
+            calendar_sync_service.sync_task_bg(owner_id, tid)
+    except Exception:
+        logger.warning("noting activity %s on open follow-ups failed", event_id, exc_info=True)
+
+
+def note_activity_bg(owner_id: str, lead_id: str, event_id: str) -> None:
+    import asyncio
+    try:
+        t = asyncio.get_running_loop().create_task(_note_activity(owner_id, lead_id, event_id))
+    except RuntimeError:
+        return
+    _PENDING.add(t)
+    t.add_done_callback(_PENDING.discard)
+
+
 def apply_lead_alerts_bg(owner_id: str, lead_id: str) -> None:
     """Their calendar switch just changed: re-push every follow-up of theirs that can sit on the
     calendar (open ones + the crossed-out ones from the last two weeks) - _sync_task_locked puts
@@ -2543,6 +2633,9 @@ def schedule_followup_for_lead_event(owner_id: str, lead_id: str, event_id: str,
             logger.error("FOLLOW-UP BUILD FAILED for %s event %s (lead %s) - leaving a plain needs-attention follow-up",
                          source_type, event_id, lead_id, exc_info=True)
             await attention_followup(owner_id, lead_id, event_id, source_type)
+        # Whatever it made (or didn't), a follow-up already waiting for them hears about it.
+        if source_type in SINCE_EVENT_TYPES:
+            await _note_activity(owner_id, lead_id, event_id)
 
     try:
         t = asyncio.get_running_loop().create_task(run())

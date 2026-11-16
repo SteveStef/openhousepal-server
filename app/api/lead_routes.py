@@ -1242,6 +1242,7 @@ async def update_lead(
     lead = await _load_owned_lead(db, lead_id, current_user.id)
     old_email, old_phone, old_name = lead.email, lead.phone, lead.name
     old_represented = lead.represented
+    old_notes = lead.notes
     # Emails to the old address, read before the change: off there = ask before restarting (11/12).
     old_state = None
     if body.email is not None and old_email and normalize_email(body.email) not in (None, "", old_email):
@@ -1301,6 +1302,11 @@ async def update_lead(
         from app.services.tasks_service import on_represented_change
         await on_represented_change(db, current_user.id, await _load_owned_lead(db, lead_id, current_user.id),
                                     old_represented, body.represented)
+    if (body.represented is not None and body.represented != old_represented) or (body.notes is not None and body.notes != old_notes):
+        # Their open follow-ups' calendar events show the Showcase pitch (only without an agent) and
+        # the agent's notes - both just changed (owner, 11/16).
+        from app.services.tasks_service import resync_lead_followups
+        resync_lead_followups(current_user.id, lead_id)
     # Re-fetch (rather than db.refresh with relationship attribute_names) - AsyncSession's
     # refresh() can attempt a synchronous lazy-load for relationship attributes and raise
     # MissingGreenlet; a plain re-query with selectinload is the reliable async-safe path.
@@ -1508,6 +1514,9 @@ async def update_lead_note(
     db.add(note)
     await db.commit()
     note = await _reload_note(db, note_id)
+    # Their open follow-up's calendar event quotes the agent's notes - keep it current (owner, 11/16).
+    from app.services.tasks_service import resync_lead_followups
+    resync_lead_followups(current_user.id, note.lead_id)
     return _to_lead_note_out(note)
 
 
@@ -1518,6 +1527,9 @@ async def delete_lead_note(
     current_user: User = Depends(get_current_active_user),
 ):
     note = await _load_owned_note(db, note_id, current_user.id)
+    lead_id = note.lead_id
     await db.delete(note)
     await db.commit()
+    from app.services.tasks_service import resync_lead_followups
+    resync_lead_followups(current_user.id, lead_id)
     return {"success": True}
