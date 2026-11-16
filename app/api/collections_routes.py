@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Query, Request, status
+from fastapi import APIRouter, Body, HTTPException, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Any, List, Optional
 from pydantic import BaseModel
@@ -154,10 +154,28 @@ async def _assert_visitor_can_act(db: AsyncSession, collection_id: str, property
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="That home isn't in this Showcase.")
 
 
+async def _agent_unsubscribe(db: AsyncSession, address: str, t: Optional[str]) -> Optional[dict]:
+    """The link was on an email from an agent's OWN mailbox (t = that email's id, with_unsub_tag):
+    stop only that agent's emails (owner, 11/16). None when it isn't one - the platform-wide list then."""
+    if not t or len(t) > 64:
+        return None
+    from app.models.database import ClientEmail
+    from app.services.client_email_service import unsubscribe_from_agent
+    rec = await db.get(ClientEmail, t)
+    if rec is None or not rec.owner_id or (rec.recipient_email or "").strip().lower() != address.strip().lower():
+        return None
+    await unsubscribe_from_agent(db, rec.owner_id, address)
+    agent = await db.get(User, rec.owner_id)
+    name = f"{getattr(agent, 'first_name', '') or ''} {getattr(agent, 'last_name', '') or ''}".strip() or "this agent"
+    return {"success": True, "scope": "agent", "agent_name": name,
+            "message": f"Unsubscribed {address} from {name}'s emails."}
+
+
 @router.post("/unsubscribe")
 async def unsubscribe_visitor(
     request: Optional[UnsubscribeRequest] = None,
     email: Optional[str] = Query(None),
+    t: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -170,6 +188,9 @@ async def unsubscribe_visitor(
     if "@" not in address:
         raise HTTPException(status_code=400, detail="That unsubscribe link is missing an email address.")
     try:
+        agent_only = await _agent_unsubscribe(db, address, t)
+        if agent_only is not None:
+            return agent_only
         if await BlacklistService.blacklist_email(db, address):
             from app.services.leads_service import log_unsubscribe
             await log_unsubscribe(db, address)
@@ -181,7 +202,8 @@ async def unsubscribe_visitor(
 
 @router.post("/unsubscribe/one-click")
 async def unsubscribe_one_click(
-    email: str, 
+    email: str,
+    t: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -189,6 +211,8 @@ async def unsubscribe_one_click(
     Gmail/Yahoo send a POST to this URL with the email in the query string.
     """
     try:
+        if await _agent_unsubscribe(db, email, t) is not None:
+            return {"success": True}
         if await BlacklistService.blacklist_email(db, email):
             from app.services.leads_service import log_unsubscribe
             await log_unsubscribe(db, email)
@@ -2201,6 +2225,61 @@ async def update_preferences_and_refresh(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update preferences and refresh properties"
         )
+
+
+@router.post("/{collection_id}/rebuild-from-open-house")
+async def rebuild_from_open_house(
+    collection_id: str,
+    payload: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_premium_plan),
+):
+    """Agent only (owner, 11/16): a client who came to more than one of this agent's open houses keeps
+    ONE Showcase. This rebuilds its search as if it had been made from one of the other open houses
+    they came to - same link; every home they liked, commented on, toured or opened stays, and so do
+    the agent's own picks. Their client hears about it in the usual "updated your search" email."""
+    from app.models.database import OpenHouseEvent as _OHE, OpenHouseVisitor as _Visitor
+    oh_id = str((payload or {}).get("open_house_event_id") or "")
+    col = (await db.execute(select(Collection).where(Collection.id == collection_id, Collection.owner_id == current_user.id))).scalar_one_or_none()
+    if col is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Showcase not found")
+    oh = await db.get(_OHE, oh_id) if oh_id else None
+    if oh is None or oh.agent_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Open house not found")
+    came = (await db.execute(select(_Visitor.id).where(
+        _Visitor.open_house_event_id == oh.id, func.lower(_Visitor.email) == (col.visitor_email or "").strip().lower()).limit(1))).first()
+    if came is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="They didn't sign in at that open house.")
+
+    from app.services.showcase_digest_service import queue_search_changed, showcase_home_ids
+    before_ids = await showcase_home_ids(db, collection_id)
+    col.original_open_house_event_id = oh.id
+    from app.services.open_house_service import _nice_name
+    col.name = _nice_name(oh.address) or col.name
+    await db.commit()
+    prefs = await CollectionPreferencesService.auto_generate_preferences(db, collection_id)
+    if prefs is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That open house has no address to build a search from.")
+    # As if it had been made from that open house: its circle, price and home type - not a town list,
+    # a drawn area or another home to compare with that the search had before.
+    for f in ("cities", "townships", "school_districts", "counties", "search_polygon", "compare_property_listing_key"):
+        setattr(prefs, f, None)
+    prefs.show_match_score = True
+    result = await CollectionsService.repopulate_collection_from_preferences(db, collection_id, commit=False, preferences=prefs, keep_viewed=True)
+    if not result.get("success"):
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=result.get("error") or "Couldn't rebuild it just now - try again.")
+    await db.commit()
+    await queue_search_changed(db, collection_id, before_ids)
+    await db.execute(update(Collection).where(Collection.id == collection_id).values(last_agent_dismissed_at=datetime.now(timezone.utc)))
+    await db.commit()
+    after_ids = await showcase_home_ids(db, collection_id)
+    await _after_search_change(db, col, len(after_ids))
+    from app.services.showcase_smart_filter import schedule_if_on
+    await schedule_if_on(db, [collection_id])
+    return {"success": True, "collection_id": collection_id, "built_around": col.name,
+            "added": len(set(after_ids) - set(before_ids)), "removed": len(set(before_ids) - set(after_ids)),
+            "properties_count": len(after_ids)}
 
 
 @router.post("/{collection_id}/properties/{property_id}/schedule-tour", response_model=PropertyTourResponse)

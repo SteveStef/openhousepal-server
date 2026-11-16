@@ -169,15 +169,26 @@ def prepare_template_email(subject: str, template_variables: Optional[Dict[str, 
     return _tidy_subject(subject), variables
 
 
-def unsubscribe_headers(template: str, to_email: str, template_variables: Dict[str, Any]) -> Dict[str, str]:
-    """List-Unsubscribe headers for the guest emails that carry them (RFC 8058 one-click)."""
+def with_unsub_tag(url: Optional[str], track_id: Optional[str]) -> Optional[str]:
+    """An unsubscribe link on an email from the agent's OWN mailbox carries that email's id (t=...):
+    unsubscribing from it stops only that agent's emails, not every agent's (owner, 11/16)."""
+    if not url or not track_id or "t=" in url:
+        return url
+    return f"{url}{'&' if '?' in url else '?'}t={track_id}"
+
+
+def unsubscribe_headers(template: str, to_email: str, template_variables: Dict[str, Any], track_id: Optional[str] = None) -> Dict[str, str]:
+    """List-Unsubscribe headers for the guest emails that carry them (RFC 8058 one-click).
+    track_id: sent from the agent's own mailbox - the links say so (with_unsub_tag)."""
     from urllib.parse import quote
     client_url = os.getenv('CLIENT_URL', 'https://openhousepal.com')
     api_url = os.getenv('API_URL', 'https://api.openhousepal.com')
     if template in SHOWCASE_UNSUBSCRIBE_TEMPLATES:
         e = quote(to_email or "", safe="")
+        one = with_unsub_tag(f"{api_url.rstrip('/')}/collections/unsubscribe/one-click?email={e}", track_id)
+        page = with_unsub_tag(f"{client_url.rstrip('/')}/unsubscribe?email={e}", track_id)
         return {
-            "List-Unsubscribe": f"<{api_url.rstrip('/')}/collections/unsubscribe/one-click?email={e}>, <{client_url.rstrip('/')}/unsubscribe?email={e}>",
+            "List-Unsubscribe": f"<{one}>, <{page}>",
             "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
         }
     if template in OWN_UNSUBSCRIBE_TEMPLATES and template_variables.get("unsubscribe_url"):

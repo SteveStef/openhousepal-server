@@ -94,7 +94,7 @@ async def _send_via_owner(owner_id: str, to: str, subject: str, template: str, v
         return
     track_id, variables = gate
     sent = await send_guest(owner_id, to, subject, template, strip_private(variables),
-                            from_name=None if from_name == "OpenHousePal" else from_name)
+                            from_name=None if from_name == "OpenHousePal" else from_name, track_id=track_id)
     if sent is None:
         code, body = await asyncio.get_running_loop().run_in_executor(None, _send_full, to, subject, template, variables, reply_to, from_name)
         await after_send(track_id, code < 300, "openhousepal", code=code, detail=body)

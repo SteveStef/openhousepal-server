@@ -79,7 +79,7 @@ class EmailSchedulerService:
                                 continue
                             track_id, variables = gate
                             sent = await send_guest(email_record.owner_id, email_record.recipient_email, email_record.subject,
-                                                    email_record.template_name, strip_private(variables))
+                                                    email_record.template_name, strip_private(variables), track_id=track_id)
                         status_code, response_text = sent or email_service.send_simple_message(
                             to_email=email_record.recipient_email,
                             subject=email_record.subject,

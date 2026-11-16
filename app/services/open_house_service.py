@@ -115,6 +115,31 @@ class OpenHouseService:
         return visitor
 
     @staticmethod
+    async def reusable_showcase(db: AsyncSession, agent_id: Optional[str], email: Optional[str]) -> Optional[Collection]:
+        """This agent's live Showcase for this email (newest), waking one that slept for no
+        response. None when there isn't one. Commits a wake-up."""
+        from sqlalchemy import func as _f
+        from app.services import showcase_sleep
+        address = (email or "").strip().lower()
+        if not agent_id or not address:
+            return None
+        def q(status):
+            return select(Collection).where(Collection.owner_id == agent_id, _f.lower(Collection.visitor_email) == address,
+                                            Collection.status == status, Collection.share_token.is_not(None))
+        col = (await db.execute(q("ACTIVE").order_by(Collection.created_at.desc()).limit(1))).scalar_one_or_none()
+        if col is not None:
+            return col
+        woke = await showcase_sleep.wake_no_response(db, agent_id, address)
+        if not woke:
+            return None
+        await db.commit()
+        try:
+            await showcase_sleep.catch_up(db, woke)
+        except Exception:  # noqa: BLE001 - the homes catch up on the next run anyway
+            logger.warning("woken showcase catch-up failed", exc_info=True)
+        return (await db.execute(q("ACTIVE").order_by(Collection.created_at.desc()).limit(1))).scalar_one_or_none()
+
+    @staticmethod
     async def create_collection_for_visitor(
         db: AsyncSession,
         visitor: OpenHouseVisitor,
@@ -151,6 +176,18 @@ class OpenHouseService:
             from app.utils.auth import owner_has_access, SHOWCASE_ACCESS_TIERS
             if not owner_has_access(agent, SHOWCASE_ACCESS_TIERS):
                 return {"success": False, "properties_added": 0, "reason": "basic_plan"}
+
+            # ONE Showcase per agent per client (owner, 11/16): someone at a second of this agent's
+            # open houses keeps the Showcase (and link) they have - their likes, comments and tours
+            # stay where they are. It is NOT re-centred on the new home on its own: the agent may
+            # have learned they didn't like it, so the lead page has "Rebuild around this open
+            # house" for that. One that fell asleep because they stopped opening emails wakes up
+            # (a new sign-in is a sign of life); one the agent switched off stays off, and they get
+            # a fresh one as before. Another agent's Showcase for the same person is never touched.
+            existing = await OpenHouseService.reusable_showcase(db, agent_id, visitor.email)
+            if existing is not None:
+                return {"success": True, "properties_added": 0, "collection_id": existing.id,
+                        "share_token": existing.share_token, "reused": True}
 
             # Create collection (always ACTIVE, no limit)
             collection = Collection(
@@ -230,6 +267,10 @@ class OpenHouseService:
         signed in on a Premium agent's open house."""
         collection_result = await OpenHouseService.create_collection_for_visitor(db, visitor, form_data)
         if not (collection_result.get("success") and collection_result.get("share_token")):
+            return collection_result
+        if collection_result.get("reused"):
+            # They already have this agent's Showcase (owner, 11/16): same link, no second "your
+            # homes are ready" email. The agent can rebuild it around this open house from the lead.
             return collection_result
         await OpenHouseService.schedule_showcase_invite(db, visitor, form_data.open_house_event_id, collection_result, send_after=send_after)
         return collection_result

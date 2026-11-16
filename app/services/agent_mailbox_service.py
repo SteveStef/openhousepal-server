@@ -288,7 +288,7 @@ def _dev_suppressed() -> bool:
 
 
 async def send_guest(owner_id: Optional[str], to_email: str, subject: str, template: str, variables: dict,
-                     *, from_name: Optional[str] = None) -> Optional[tuple[int, str]]:
+                     *, from_name: Optional[str] = None, track_id: Optional[str] = None) -> Optional[tuple[int, str]]:
     """Send one guest email from the agent's mailbox. Returns (status, info) when the mailbox sent
     it, or None when the caller should send it through OpenHousePal instead. Never raises."""
     if not owner_id or not to_email:
@@ -314,6 +314,10 @@ async def send_guest(owner_id: Optional[str], to_email: str, subject: str, templ
                 return None
             variables = dict(variables)
             ics = variables.pop("_ics", None)   # a client calendar invite (calendar_invite_service)
+            # From the agent's own mailbox: its unsubscribe link stops only this agent's emails (11/16).
+            from app.services.email_service import with_unsub_tag
+            if variables.get("Unsub"):
+                variables["Unsub"] = with_unsub_tag(variables["Unsub"], track_id)
             subject, variables = prepare_template_email(subject, variables)
             name = from_name or variables.get("agent_name") or ""
             if _dev_suppressed():
@@ -331,7 +335,7 @@ async def send_guest(owner_id: Optional[str], to_email: str, subject: str, templ
                 from app.services.email_top_line import _text, fix_weekly_line
                 if (fixed := fix_weekly_line(html, variables)) is not None:   # picked weekly: say so (11/13)
                     html, text = fixed, _text(fixed)
-                headers = unsubscribe_headers(template, to_email, variables)
+                headers = unsubscribe_headers(template, to_email, variables, track_id=track_id)
             try:
                 token = await _access_token(db, conn)
                 resp = await _deliver(conn, token, to=to_email, subject=subject, html=html, text=text, from_name=name, headers=headers, ics=ics)

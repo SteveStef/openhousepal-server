@@ -825,6 +825,12 @@ async def _showcase_and_alert(db: AsyncSession, visitor: OpenHouseVisitor, form_
                 # right when it matters (they get it automatically on upgrade, see
                 # backfill_missed_showcases). Only on the Bright ladder: No-MLS has no Showcases.
                 notif_message = "Signed in at your open house"
+                if collection_result.get("reused"):
+                    # Same Showcase, same link (11/16) - the lead page can rebuild it around this home.
+                    notif_message = ("Came to another of your open houses - they keep the Showcase they have. "
+                                     "Rebuild it around this home from their lead if it fits them better.")
+                    if visitor.lead_id:
+                        notification_link = f"/leads?lead={visitor.lead_id}"
                 if collection_result.get("reason") == "basic_plan":
                     hosting_agent = await db.get(User, open_house_event.agent_id)
                     if hosting_agent and hosting_agent.plan_tier == "BASIC":

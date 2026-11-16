@@ -1352,7 +1352,20 @@ async def lead_open_house_showcase(
     col = await vss.visitor_showcase(db, current_user.id, visitor) if plan else None
     on = plan and vss.effective_on(oh, visitor)
     rule = client_rule(current_user, vss.INVITE_TEMPLATE)
+    # Every one of this agent's open houses they came to (oldest first) + the one their Showcase is
+    # built around - the lead page offers "Rebuild around ..." for the others (owner, 11/16).
+    visited, seen = [], set()
+    for oid, addr, at in (await db.execute(
+            select(OpenHouseEvent.id, OpenHouseEvent.address, OpenHouseVisitor.created_at)
+            .join(OpenHouseVisitor, OpenHouseVisitor.open_house_event_id == OpenHouseEvent.id)
+            .where(OpenHouseVisitor.lead_id == lead_id, OpenHouseEvent.agent_id == current_user.id)
+            .order_by(OpenHouseVisitor.created_at))).all():
+        if oid not in seen:
+            seen.add(oid)
+            visited.append({"open_house_id": oid, "address": addr, "signed_in_at": at})
     return {
+        "visited": visited,
+        "built_around_open_house_id": col.original_open_house_event_id if col is not None else None,
         "visitor_id": visitor.id,
         "open_house_id": oh.id if oh else None,
         "address": oh.address if oh else None,

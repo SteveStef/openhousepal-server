@@ -83,7 +83,12 @@ LEAD_DELETED = "lead_deleted"
 # the old one were off (bounced, unsubscribed, ignored, turned off): held until the agent says to turn
 # them back on, which starts the unopened count over (user, 11/12).
 EMAIL_CHANGED = "email_changed"
-MANUAL_OFF = ("off", LEAD_DELETED, EMAIL_CHANGED)
+# ClientEmailPref.manual when the person unsubscribed from an email that went out from THIS agent's own
+# mailbox (owner, 11/16): every email from this agent stops - their own mailbox and OpenHousePal's -
+# but other agents' are untouched, and the agent can't turn it back on. (Unsubscribing from an email
+# OpenHousePal itself sent stops every agent's emails: the platform-wide list, BlacklistService.)
+AGENT_UNSUB = "unsubscribed"
+MANUAL_OFF = ("off", LEAD_DELETED, EMAIL_CHANGED, AGENT_UNSUB)
 
 
 def _norm(email: Optional[str]) -> str:
@@ -119,6 +124,9 @@ def decide(emails: list[dict], *, manual: Optional[str], reset_at: Optional[date
     now = now or _now()
     if unsubscribed:
         return {"mode": "off", "reason": "Unsubscribed from emails", "unopened": 0, "unopened_days": 0, "weekly_unopened": 0, "code": "unsubscribed"}
+    if manual == AGENT_UNSUB:
+        return {"mode": "off", "reason": "Unsubscribed from your emails - nothing more goes to them from you", "unopened": 0,
+                "unopened_days": 0, "weekly_unopened": 0, "code": "unsubscribed"}
     if manual == "off":
         return {"mode": "off", "reason": "Turned off by you", "unopened": 0, "unopened_days": 0, "weekly_unopened": 0, "code": "manual_off"}
     if manual == LEAD_DELETED:
@@ -323,6 +331,16 @@ async def before_send(owner_id: Optional[str], to: Optional[str], template: str,
     # "_manual": the agent pressed Send invite (again) themselves - it goes, same day or not, and a
     # Studio -> Email switch for that kind doesn't hold it back (only an unsubscribe would).
     from app.services import email_dedupe_service as dd
+    if owner_id and to:
+        # Unsubscribed from this agent's own email: nothing from this agent, manual sends included (11/16).
+        try:
+            from app.database import AsyncSessionLocal
+            async with AsyncSessionLocal() as _db:
+                if await unsubscribed_from_agent(_db, owner_id, to):
+                    logger.info("client email held (unsubscribed from this agent)", extra={"template": template, "owner_id": owner_id})
+                    return None
+        except Exception:  # noqa: BLE001 - never let this check stop an email by crashing
+            logger.warning("agent unsubscribe check failed", exc_info=True)
     manual = bool(variables.get("_manual"))
     variables = {k: v for k, v in variables.items() if k != "_manual"}
     dkey = dd.key_for(to, template, subject, variables)
@@ -751,9 +769,39 @@ async def _engaged(db, rec: ClientEmail, what: str) -> None:
 
 # ---------------------------------------------------------------- agent controls + lists
 
+async def unsubscribed_from_agent(db, owner_id: Optional[str], email: Optional[str]) -> bool:
+    """They unsubscribed from this agent's own-mailbox email (AGENT_UNSUB)."""
+    if not owner_id or not email:
+        return False
+    p = await _pref(db, owner_id, _norm(email), create=False)
+    return p is not None and p.manual == AGENT_UNSUB
+
+
+async def unsubscribe_from_agent(db, owner_id: str, email: str) -> bool:
+    """The footer link of an email that went from this agent's own mailbox: nothing more from this agent
+    (any address it would go from), other agents untouched. On their lead's history + bell. Commits.
+    False when it was already so."""
+    email = _norm(email)
+    pref = await _pref(db, owner_id, email)
+    if pref.manual == AGENT_UNSUB:
+        return False
+    pref.manual, pref.mode, pref.changed_at = AGENT_UNSUB, "off", _now()
+    pref.reason = "Unsubscribed from your emails - nothing more goes to them from you"
+    lead = await _lead(db, owner_id, email)
+    if lead is not None:
+        from app.services.leads_service import log_activity
+        await log_activity(db, owner_id=owner_id, email=email, lead=lead, source_type="email_unsubscribed",
+                           summary="Unsubscribed from your emails", raw_snapshot={"scope": "agent"})
+    await db.commit()
+    return True
+
+
 async def set_manual(db, owner_id: str, email: str, on: bool) -> dict:
     email = _norm(email)
     pref = await _pref(db, owner_id, email)
+    if pref.manual == AGENT_UNSUB:
+        # They unsubscribed themselves - the agent can't send to them again (11/16).
+        return await status_for(db, owner_id, email)
     lead = await _lead(db, owner_id, email)
     from app.services.leads_service import log_activity
     woke: list[str] = []
@@ -788,7 +836,7 @@ async def set_frequency(db, owner_id: str, email: str, value: str, by: str = "ag
         raise ValueError("Unknown email frequency")
     email = _norm(email)
     pref = await _pref(db, owner_id, email)
-    if pref.manual == LEAD_DELETED:
+    if pref.manual == LEAD_DELETED or (pref.manual == AGENT_UNSUB and by != "client"):
         return await status_for(db, owner_id, email)
     lead = await _lead(db, owner_id, email)
     pref.frequency = None if value == "daily" else value
@@ -853,7 +901,7 @@ async def stop_for_deleted_lead(db, owner_id: str, email: Optional[str]) -> bool
     if not email:
         return False
     pref = await _pref(db, owner_id, email)
-    if pref.manual != "off":
+    if pref.manual not in ("off", AGENT_UNSUB):
         pref.manual, pref.mode, pref.changed_at = LEAD_DELETED, "off", _now()
         pref.reason = "You deleted their lead"
     return True

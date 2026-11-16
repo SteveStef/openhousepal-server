@@ -1935,10 +1935,13 @@ class CollectionsService:
         db: AsyncSession,
         collection_id: str,
         commit: bool = True,
-        preferences: Optional[CollectionPreferences] = None
+        preferences: Optional[CollectionPreferences] = None,
+        keep_viewed: bool = False,
     ) -> Dict[str, Any]:
         """
         Standardized utility to sync a collection's properties with its preferences.
+        keep_viewed: homes the client opened stay too (the agent rebuilding a Showcase around
+        another open house - nothing they engaged with disappears, owner 11/16).
         """
         # Local import to avoid circular dependency
         from app.services.property_service import property_service
@@ -1997,7 +2000,10 @@ class CollectionsService:
                     collection_properties.c.property_id.in_(select(PropertyTour.property_id).where(PropertyTour.collection_id == collection_id)),
                     # The agent's own picks (recommended / added by hand from a home's page) stay too.
                     collection_properties.c.property_id.in_(select(PropertyInteraction.property_id).where(
-                        and_(PropertyInteraction.collection_id == collection_id, PropertyInteraction.agent_recommended_at.is_not(None))))
+                        and_(PropertyInteraction.collection_id == collection_id, PropertyInteraction.agent_recommended_at.is_not(None)))),
+                    *([collection_properties.c.property_id.in_(select(PropertyInteraction.property_id).where(
+                        and_(PropertyInteraction.collection_id == collection_id, PropertyInteraction.view_count > 0,
+                             PropertyInteraction.disliked.is_not(True))))] if keep_viewed else []),
                 )
             )
             keep_ids_res = await db.execute(keep_query)
