@@ -1705,7 +1705,8 @@ def _describe_search_change(payload: dict) -> list:
     """A client's own Showcase search edit -> [{"label", "value"}] rows for their lead's activity.
     Pass only what changed (_only_changed) - the window sends every field."""
     def money(v):
-        return f"${v:,.0f}" if isinstance(v, (int, float)) else None
+        # $0 = no minimum: "Up to $1,200,000", never "$0-$1,200,000" (11/16)
+        return f"${v:,.0f}" if isinstance(v, (int, float)) and v > 0 else None
 
     def span(lo, hi, unit=""):
         if lo and hi:

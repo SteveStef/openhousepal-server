@@ -726,7 +726,7 @@ def task_prefix(task: AgentTask) -> str:
 
 def short_person(name: Optional[str]) -> str:
     """"Jane Buyer" -> "Jane B." (an email or a single name stays as it is)."""
-    parts = (name or "").strip().split()
+    parts = [p for p in (name or "").strip().split() if not p.startswith("(")]  # "Jo Lee (Test)" -> "Jo L."
     if len(parts) < 2 or "@" in parts[0]:
         one = (name or "").strip()
         return one.title() if one and "@" not in one and (one.isupper() or one.islower()) else one
@@ -2202,6 +2202,26 @@ def since_lines(notes: Optional[str]) -> list[str]:
     return [l[len(SINCE_PREFIX):] for l in (notes or "").splitlines() if l.startswith(SINCE_PREFIX)]
 
 
+def add_since_line(task: AgentTask, what: str, at: datetime) -> bool:
+    """One "Since then: <what> · Mon, Nov 16" line on the follow-up (no commit). Only the newest
+    SINCE_MAX are kept, so the card and its calendar event never grow past a few short lines. The
+    suggested message is never touched. False when that exact line is already there."""
+    what = " ".join((what or "").split())[:240]
+    if not what:
+        return False
+    day = (at if at.tzinfo else at.replace(tzinfo=timezone.utc)).astimezone(EASTERN)
+    line = f"{SINCE_PREFIX}{what} · {day:%a}, {day:%b} {day.day}"
+    lines = (task.notes or "").splitlines()
+    if line in lines:
+        return False
+    since = [l for l in lines if l.startswith(SINCE_PREFIX)]
+    if len(since) >= SINCE_MAX:
+        lines.remove(since[0])   # the oldest goes - the card stays short
+    lines.append(line)
+    task.notes = "\n".join(lines).strip()
+    return True
+
+
 async def note_activity_on_open_followups(db: AsyncSession, owner_id: str, lead_id: str, event_id: str) -> list[str]:
     """Add this activity to every open follow-up for the person that was made before it. Returns the
     ids it changed (the caller re-pushes them to the calendar). Commits."""
@@ -2225,19 +2245,12 @@ async def note_activity_on_open_followups(db: AsyncSession, owner_id: str, lead_
         return []
     if event.source_type in SINCE_EVENT_TYPES and says_has_agent(event.raw_snapshot):
         what += " (said they have an agent)"
-    day = at.astimezone(EASTERN)
-    line = f"{SINCE_PREFIX}{what} · {day:%a}, {day:%b} {day.day}"
-    changed = []
-    for t in tasks:
-        lines = (t.notes or "").splitlines()
-        if line in lines:
-            continue
-        since = [l for l in lines if l.startswith(SINCE_PREFIX)]
-        if len(since) >= SINCE_MAX:
-            lines.remove(since[0])   # the oldest goes - the card stays short
-        lines.append(line)
-        t.notes = "\n".join(lines).strip()
-        changed.append(t.id)
+    if event.source_type == "showcase_search_changed":
+        # What they changed it to, short: "Changed their Showcase search - Price up to $1,100,000; Towns Wayne"
+        rows = [r for r in ((event.raw_snapshot or {}).get("answers") or []) if isinstance(r, dict) and r.get("label") and r.get("value")]
+        if rows:
+            what += " - " + "; ".join(f"{r['label']} {str(r['value'])[:1].lower()}{str(r['value'])[1:60]}" for r in rows[:3])
+    changed = [t.id for t in tasks if add_since_line(t, what, at)]
     if changed:
         await db.commit()
     return changed
@@ -3447,8 +3460,12 @@ async def create_open_house_followup(
         # A follow-up the agent already missed (overdue) doesn't cover this visit (owner, 11/14) -
         # except their own sign-in card, which moves to this open house and gets a fresh day.
         live = [t for t in opens if not is_overdue(t)]
-        missed_signin = [t for t in opens if t.auto_source in ("open_house_signin", "similar_homes_qr")] if property_address else []
-        open_task = live[0] if live else (missed_signin[0] if missed_signin else None)
+        signin_cards = [t for t in opens if t.auto_source in ("open_house_signin", "similar_homes_qr")]
+        live_signin = [t for t in signin_cards if not is_overdue(t)]
+        missed_signin = [t for t in signin_cards if is_overdue(t)] if property_address else []
+        # Their own open-house card first (11/16: with a tour request also open - newer - the visit
+        # went onto the tour card and the open-house card never said "2nd open house").
+        open_task = (live_signin[0] if live_signin else live[0] if live else missed_signin[0] if missed_signin else None)
         if open_task is not None:
             await redate_if_overdue(db, owner, open_task, open_task.auto_source, occurred_at)
         if open_task is not None:
@@ -3459,15 +3476,21 @@ async def create_open_house_followup(
                     open_task.title = f"Follow up with {repeat_name} - {repeat['label']}"
                     open_task.suggested_message = with_when_slot(repeat["message"].replace("{first_name}", _guest_first(lead.name)),
                                                                  await visit_day(db, signin_id, occurred_at))
-                if property_address not in (open_task.notes or ""):
-                    open_task.notes = ((open_task.notes or "") + f"\nAlso signed in at: {property_address}").strip()
+                # Tidy case ("239 Windham Dr", not "239 WINDHAM DR") - it shows on the calendar.
+                shown = _tidy_subject(property_address.split(",")[0].strip()) or property_address
+                if property_address not in (open_task.notes or "") and shown not in (open_task.notes or ""):
+                    open_task.notes = ((open_task.notes or "") + f"\nAlso signed in at: {shown}").strip()
                 elif repeat:
-                    open_task.notes = ((open_task.notes or "") + f"\nSigned in again: {property_address}").strip()
-            elif repeat:
-                # Some other follow-up is still open for them - it covers reaching out, but it
-                # should say they came back (so the repeat visit still shows on the calendar).
-                open_task.notes = ((open_task.notes or "") + f"\n{repeat['context']}.").strip()
-            if (open_task.auto_source in ("open_house_signin", "similar_homes_qr") and property_address) or repeat:
+                    open_task.notes = ((open_task.notes or "") + f"\nSigned in again: {shown}").strip()
+            elif repeat or property_address:
+                # Some other follow-up is still open for them (a form, an RSVP...) - it covers
+                # reaching out, but the visit shows on it and its calendar event under "New since
+                # this was added" (11/16: a first sign-in used to leave no trace there at all).
+                from app.services.email_service import _tidy_subject
+                street = (property_address or "").split(",")[0].strip()
+                add_since_line(open_task, _tidy_subject(repeat["context"] if repeat else f"Signed in at your open house - {street}"),
+                               occurred_at)
+            if (open_task.auto_source in ("open_house_signin", "similar_homes_qr") and property_address) or repeat or property_address:
                 if commit:
                     await db.commit()
                 else:

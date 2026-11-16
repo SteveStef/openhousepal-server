@@ -212,3 +212,75 @@ async def test_same_followup_added_twice_is_one():
         await _drain()
     finally:
         await _cleanup(tag)
+
+
+@pytest.mark.asyncio
+async def test_open_house_signin_reaches_the_open_followup():
+    """11/16: signing in at an open house while another follow-up (a form) is open used to leave no
+    trace on it. Now it's a "Since then" line. And with their open-house card AND a tour request
+    open, the visit goes onto the open-house card - never the tour card."""
+    import app.main  # noqa: F401
+    from app.database import AsyncSessionLocal
+    from app.models.database import AgentTask
+    tag = f"zqsince-{uuid.uuid4().hex[:8]}"
+    try:
+        async with AsyncSessionLocal() as db:
+            agent, lead = await _setup(db, tag)
+            form_card = _task(agent, lead, source="form_submission", context="Submitted Buyer form")
+            db.add(form_card)
+            await db.commit()
+            made = await ts.create_open_house_followup(db, owner_id=agent.id, lead=lead, signin_id=None,
+                                                       property_address="239 WINDHAM DR, BERWYN, PA",
+                                                       occurred_at=NOW, commit=True)
+            assert made is None   # one open follow-up per person - the form card covers reaching out
+            await db.refresh(form_card)
+            assert ts.since_lines(form_card.notes) and ts.since_lines(form_card.notes)[0].startswith("Signed in at your open house - 239 Windham Dr")
+            assert form_card.suggested_message is None   # the message is never touched
+
+            form_card.completed_at = NOW
+            signin_card = _task(agent, lead, made=-120, context="Signed in at your open house - 1650 Skinners Turn Rd")
+            tour_card = _task(agent, lead, source="showing_request", made=-30, context="Asked to tour 1650 Skinners Turn Rd")
+            db.add_all([signin_card, tour_card])
+            await db.commit()
+            await ts.create_open_house_followup(db, owner_id=agent.id, lead=lead, signin_id=None,
+                                                property_address="12 OAK ST, WAYNE, PA", occurred_at=NOW, commit=True)
+            await db.refresh(signin_card)
+            await db.refresh(tour_card)
+            assert "12 Oak St" in (signin_card.context or "")
+            assert "Also signed in at: 12 Oak St" in (signin_card.notes or "")   # tidy case on the calendar
+            assert tour_card.context == "Asked to tour 1650 Skinners Turn Rd" and not ts.since_lines(tour_card.notes)
+        await _drain()
+    finally:
+        await _cleanup(tag)
+
+
+@pytest.mark.asyncio
+async def test_search_change_says_what_changed():
+    import app.main  # noqa: F401
+    from app.database import AsyncSessionLocal
+    tag = f"zqsince-{uuid.uuid4().hex[:8]}"
+    try:
+        async with AsyncSessionLocal() as db:
+            agent, lead = await _setup(db, tag)
+            card = _task(agent, lead)
+            db.add(card)
+            ev = _event(lead, "showcase_search_changed", "Changed their Showcase search",
+                        raw_snapshot={"answers": [{"label": "Price", "value": "Up to $1,200,000"}, {"label": "Bedrooms", "value": "4+"}]})
+            db.add(ev)
+            await db.commit()
+            await ts.note_activity_on_open_followups(db, agent.id, lead.id, ev.id)
+            await db.refresh(card)
+            assert ts.since_lines(card.notes)[0].startswith("Changed their Showcase search - Price up to $1,200,000; Bedrooms 4+ · ")
+    finally:
+        await _cleanup(tag)
+
+
+def test_short_person_drops_bracketed_words():
+    assert ts.short_person("Olivia Story (Test)") == "Olivia S."
+    assert ts.short_person("Jane Buyer") == "Jane B."
+
+
+def test_search_change_wording_has_no_zero_minimum():
+    from app.api.collections_routes import _describe_search_change
+    rows = _describe_search_change({"min_price": 0, "max_price": 1200000})
+    assert rows[0] == {"label": "Price", "value": "Up to $1,200,000"}
