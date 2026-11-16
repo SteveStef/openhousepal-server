@@ -3392,8 +3392,10 @@ async def _repeat_visit(db: AsyncSession, lead_id: str, property_address: Option
     if houses >= 2:
         label = f"{_ordinal(houses)} open house"
         context = f"Signed in at {houses} of your open houses - latest {place}"
-        message = ("Hi {first_name}, great to see you again" + (f" at {place}" if street else "") + "! That's "
-                   f"{houses} of my open houses now, so I'd love to help you find the right one. How's the search going?{SHOWCASE_MARKER}")
+        # A DIFFERENT open house: the agent's own open-house text for this house, like any sign-in
+        # (owner, 11/16 - "thanks for visiting this open house"). The title and the calendar still
+        # say "2nd open house" so the agent knows. None = use the normal message.
+        message = None
     else:
         # Back at the same house - 2nd, 3rd, 4th time (user, 10/19): never "want a second look?"
         # again; just questions, or a private tour this week. Same words every repeat.
@@ -3449,6 +3451,16 @@ async def create_open_house_followup(
         repeat = await _repeat_visit(db, lead.id, property_address, owner)
         repeat_name = (lead.name or "this guest").strip()
 
+        async def signin_message() -> str:
+            """Same house again: the come-back text. Otherwise (first visit OR a different open
+            house): the agent's own open-house text for THIS house. Either way "when they came"
+            is a slot filled the day it's shown ("yesterday" -> "last weekend")."""
+            if repeat and repeat.get("message"):
+                msg = repeat["message"].replace("{first_name}", _guest_first(lead.name))
+            else:
+                msg = render_rule_message(owner, rule, name=lead.name, address=await _open_house_short(db, signin_id, property_address))
+            return with_when_slot(msg, await visit_day(db, signin_id, occurred_at) if rule in OH_WHEN_SOURCES else None)
+
         # One open follow-up per person (what the Follow-ups page promises): signing in at another
         # open house while their last "Reach out" is still open moves that card to the newest open
         # house instead of adding a second; any other open follow-up already covers reaching out.
@@ -3474,8 +3486,13 @@ async def create_open_house_followup(
                 open_task.context = _tidy_subject(repeat["context"] if repeat else f"Signed in at your open house - {property_address}")[:240]
                 if repeat:
                     open_task.title = f"Follow up with {repeat_name} - {repeat['label']}"
-                    open_task.suggested_message = with_when_slot(repeat["message"].replace("{first_name}", _guest_first(lead.name)),
-                                                                 await visit_day(db, signin_id, occurred_at))
+                # The card is now about the open house they just came to: its house line, listing
+                # link and text all name the newest one (11/16 - the house line kept the first).
+                # (Not when this open house keeps its follow-ups off the calendar - the card already
+                # on the calendar mustn't vanish from it because they came to that one too.)
+                if signin_id and await open_house_followups_mode(db, signin_id) == "on":
+                    open_task.auto_source_id = signin_id
+                open_task.suggested_message = await signin_message()
                 # Tidy case ("239 Windham Dr", not "239 WINDHAM DR") - it shows on the calendar.
                 shown = _tidy_subject(property_address.split(",")[0].strip()) or property_address
                 if property_address not in (open_task.notes or "") and shown not in (open_task.notes or ""):
@@ -3525,11 +3542,7 @@ async def create_open_house_followup(
             done_code=new_done_code(),
             auto_source=rule,
             auto_source_id=dedup_key,
-            suggested_message=with_when_slot(
-                repeat["message"].replace("{first_name}", _guest_first(lead.name)) if repeat else
-                render_rule_message(owner, rule, name=lead.name, address=await _open_house_short(db, signin_id, property_address)),
-                # when they came, as a slot filled the day it's shown ("yesterday" -> "last weekend")
-                await visit_day(db, signin_id, occurred_at) if rule in OH_WHEN_SOURCES else None),
+            suggested_message=await signin_message(),
             # The sheet's bottom "Want to see more homes like these?" QR (-> sign-in -> Showcase), not
             # one of the per-home QRs (those open that home's listing page - tracked separately).
             # MLS capitals tidied like every other follow-up ("26 OLD GULPH RD" read as shouting).

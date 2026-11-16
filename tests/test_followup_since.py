@@ -284,3 +284,43 @@ def test_search_change_wording_has_no_zero_minimum():
     from app.api.collections_routes import _describe_search_change
     rows = _describe_search_change({"min_price": 0, "max_price": 1200000})
     assert rows[0] == {"label": "Price", "value": "Up to $1,200,000"}
+
+
+@pytest.mark.asyncio
+async def test_second_open_house_gets_the_normal_open_house_text(monkeypatch):
+    """Owner, 11/16: a 2nd (different) open house = the agent's normal open-house text for that
+    house ("thanks for stopping by my open house at ..."), not "great to see you again". The title
+    still says "2nd open house". The same house again keeps its come-back text."""
+    import app.main  # noqa: F401
+    from app.database import AsyncSessionLocal
+    tag = f"zqsince-{uuid.uuid4().hex[:8]}"
+
+    async def other_house(db, lead_id, address, owner=None):
+        return {"label": "2nd open house", "context": "Signed in at 2 of your open houses - latest 12 Oak St", "message": None}
+
+    async def same_house(db, lead_id, address, owner=None):
+        return {"label": "2nd visit", "context": "Came back to your open house - 12 Oak St (2nd visit)",
+                "message": "Hi {first_name}. Thanks for coming back to see 12 Oak St again!"}
+    try:
+        async with AsyncSessionLocal() as db:
+            agent, lead = await _setup(db, tag)
+            card = _task(agent, lead, made=-120, context="Signed in at your open house - 1650 Skinners Turn Rd",
+                         suggested_message="Hi Sally, thanks for stopping by my open house at 1650 Skinners Turn Rd!")
+            db.add(card)
+            await db.commit()
+            monkeypatch.setattr(ts, "_repeat_visit", other_house)
+            await ts.create_open_house_followup(db, owner_id=agent.id, lead=lead, signin_id=None,
+                                                property_address="12 OAK ST, WAYNE, PA", occurred_at=NOW, commit=True)
+            await db.refresh(card)
+            assert card.title.endswith("- 2nd open house")
+            assert "open house at 12 Oak St" in card.suggested_message and "1650 Skinners" not in card.suggested_message
+            assert "great to see you again" not in card.suggested_message
+
+            monkeypatch.setattr(ts, "_repeat_visit", same_house)
+            await ts.create_open_house_followup(db, owner_id=agent.id, lead=lead, signin_id=None,
+                                                property_address="12 OAK ST, WAYNE, PA", occurred_at=NOW, commit=True)
+            await db.refresh(card)
+            assert "Thanks for coming back to see 12 Oak St again" in card.suggested_message
+        await _drain()
+    finally:
+        await _cleanup(tag)
