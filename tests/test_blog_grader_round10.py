@@ -52,15 +52,15 @@ def test_with_too_few_bills_near_the_price_the_card_says_what_it_really_used():
     assert entry["homes"] == 13 and entry["tax_scope"] == "all"
     assert entry["tax_homes"] == 8                                                  # the 2026 bills only - the same 8 the article's fact counts
     ex = pipe.payment_example(entry, RATE, ["Radnor"], basis="entry")
-    assert ex["tax_basis"] == "tax bills of the 8 homes for sale that list one" and "similar-priced" not in ex["tax_basis"]
+    assert ex["tax_basis"] == "tax bills of the 8 homes for sale that list one, scaled to this price" and "similar-priced" not in ex["tax_basis"]
     # ... and "similar-priced" stays where it is true
     near = [(300_000 + i * 5_000, 3_600 + i * 50, "CONDO", "Unit/Flat/Apartment", "2026") for i in range(12)]
     entry2 = ms.entry_profile(near)
     assert entry2["tax_scope"] == "near" and entry2["tax_homes"] <= 12
-    assert pipe.payment_example(entry2, RATE, ["Wayne"], basis="entry")["tax_basis"] == f"tax bills of the {entry2['tax_homes']} similar-priced homes for sale"
-    assert pipe.tax_basis_words("house", 6, "near") == "tax bills of the 6 similar-priced single-family houses for sale"
-    assert pipe.tax_basis_words("attached", 14, "all") == "tax bills of the 14 condos and townhomes for sale that list one"
-    assert pipe.tax_basis_words("entry", None, None) == "tax bills of similar-priced homes for sale"         # an entry made before this change
+    assert pipe.payment_example(entry2, RATE, ["Wayne"], basis="entry")["tax_basis"] == f"tax bills of the {entry2['tax_homes']} similar-priced homes for sale, scaled to this price"
+    assert pipe.tax_basis_words("house", 6, "near") == "tax bills of the 6 similar-priced single-family houses for sale, scaled to this price"
+    assert pipe.tax_basis_words("attached", 14, "all") == "tax bills of the 14 condos and townhomes for sale that list one, scaled to this price"
+    assert pipe.tax_basis_words("entry", None, None) == "tax bills of similar-priced homes for sale, scaled to this price"         # an entry made before this change
 
 
 def test_a_bill_counts_in_the_card_exactly_when_it_counts_in_the_towns_fact():

@@ -108,14 +108,14 @@ def test_a_house_example_uses_what_houses_sold_for_when_there_are_enough_sales()
     ex = pipe.payment_example(ENTRY, RATE, ["Kennett Square"], basis="house", sold_house=sold, conforming_limit=832_750, limit_area="Chester County")
     assert ex["price"] == pipe._round_price(738_000)
     assert ex["price_basis"] == "About the median price of the 42 single-family houses sold in Kennett Square in the 90 days ending 2026-11-13."
-    assert ex["tax_pct"] == 1.3 and ex["tax_basis"] == "tax bills of the 9 similar-priced single-family houses for sale"
+    assert ex["tax_pct"] == 1.3 and ex["tax_basis"] == "tax bills of the 9 similar-priced single-family houses for sale, scaled to this price"
     assert [s["jumbo"] for s in ex["scenarios"]] == [False, False, False]      # the $990,000 version had two jumbo loans
     # too few sales, or not a house article: the listing-based example as before
     few = pipe.payment_example(ENTRY, RATE, ["Kennett Square"], basis="house", sold_house={**sold, "count": 6})
     assert few["price"] == 990_000 and "median list price of the 37 single-family houses for sale" in few["price_basis"]
-    assert few["tax_basis"] == "tax bills of the 12 similar-priced single-family houses for sale"
+    assert few["tax_basis"] == "tax bills of the 12 similar-priced single-family houses for sale, scaled to this price"
     entry = pipe.payment_example(ENTRY, RATE, ["Fishtown"], basis="entry", sold_house=sold)
-    assert entry["price"] == 345_000 and entry["tax_basis"] == "tax bills of the 41 similar-priced homes for sale"
+    assert entry["price"] == 345_000 and entry["tax_basis"] == "tax bills of the 41 similar-priced homes for sale, scaled to this price"
 
 
 # ------------------------------------------------------------------ Kennett 2: one name for one group of homes

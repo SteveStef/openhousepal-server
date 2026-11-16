@@ -248,7 +248,9 @@ _COVERAGE = _COVERAGE + (
      "apply well before that\") - never write a processing time as a filing deadline. Where an item says a lead time or fee is \"not yet confirmed\", give NO number for it: "
      "name the requirement, say it has to be started well before settlement, link the municipality's page for the current timing and fee, and "
      "offer to confirm it for the seller's address - a number we have read only once is not stated (owner 11/15) - a seller planning a move needs it "
-     "(owner 11/14; grader 11/15). "
+     "(owner 11/14; grader 11/15). Where the item says the municipality's own official pages give it DIFFERENTLY, add one plain sentence "
+     "that its own pages give different figures (name the two, e.g. its web page and its code), so the current one has to be confirmed "
+     "with the municipality - still no number from either (grader round 11). "
      "No other day counts, and never a lead time the ledger doesn't give. If the ledger has NO such item for a town the "
      "article covers, say in one sentence that many municipalities require a resale inspection or a smoke-detector certificate before "
      "settlement and that the seller should confirm with the municipality early - never say or imply that none is required. When the "
@@ -969,6 +971,15 @@ def brief_first(items: list[dict], brief: dict) -> list[dict]:
     return sorted(items, key=lambda it: -score(it))
 
 
+_TOO_MANY_WS = re.compile(r"^(https?://)w{4,}\.", re.I)
+
+
+def tidy_url(url) -> str:
+    """A source link as a reader should see it: "https://wwww.septa.org/fares/" (research typed one w too many; the
+    site answers on any name, so nothing caught it - rounds 10 and 11) becomes "https://www.septa.org/fares/"."""
+    return _TOO_MANY_WS.sub(r"\1www.", str(url or "").strip())
+
+
 def _build_ledger(items: list[dict], per_town_cap: int = 55) -> tuple[list[dict], str]:
     """Number every item [E1]..[En] and render the ledger text. The cap is on a town's STORED research
     only (it used to count the town's MLS numbers too, so every new MLS fact pushed a stored one out)."""
@@ -983,7 +994,7 @@ def _build_ledger(items: list[dict], per_town_cap: int = 55) -> tuple[list[dict]
             continue
         per_town[town] = per_town.get(town, 0) + (1 if capped else 0)
         seen.add(key)
-        ledger.append({**it, "eid": f"E{len(ledger) + 1}"})
+        ledger.append({**it, **({"source_url": tidy_url(it["source_url"])} if it.get("source_url") else {}), "eid": f"E{len(ledger) + 1}"})
     lines = []
     for it in ledger:
         src = it.get("source_name") or "source"
@@ -1141,9 +1152,15 @@ def tax_basis_words(kind: str, homes: Optional[int], scope: Optional[str]) -> st
     too few bills near the price the estimate uses every listing that shows one, and says so (round 10, Radnor: "the
     42 similar-priced homes for sale" beside the article's own "32 listings that show an annual property tax")."""
     what = {"house": "single-family houses", "attached": "condos and townhomes"}.get(kind, "homes")
+    # "scaled to this price": the estimate is each bill's share of its own home's price, applied to the example's
+    # price - so it is NOT the median bill the article quotes for the same homes (round 11, Radnor: a $9,583 median
+    # bill in the text beside about $5,892 a year on the card's $460,000 home, both from the same 32 listings).
     if scope == "all" and homes:
-        return f"tax bills of the {homes} {what} for sale that list one"
-    return (f"tax bills of the {homes} " if homes else "tax bills of ") + f"similar-priced {what} for sale"
+        return f"tax bills of the {homes} {what} for sale that list one{TAX_SCALED}"
+    return (f"tax bills of the {homes} " if homes else "tax bills of ") + f"similar-priced {what} for sale{TAX_SCALED}"
+
+
+TAX_SCALED = ", scaled to this price"
 
 
 def payment_example(entry: dict, rate: dict, area_names: list[str], *, conforming_limit: Optional[int] = None, limit_area: Optional[str] = None,
@@ -2587,7 +2604,7 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
         for it in research_list(found.get("items")):
             if isinstance(it, dict) and it.get("claim") and it.get("source_url"):
                 research_items.append({"topic": it.get("topic") or "other", "claim": it["claim"].strip(), "source_name": it.get("source_name") or tk._domain(it.get("source_url")),
-                                       "source_url": it["source_url"], "as_of": it.get("as_of"), "confidence": it.get("confidence"), "town": it.get("town") or "general",
+                                       "source_url": tidy_url(it["source_url"]), "as_of": it.get("as_of"), "confidence": it.get("confidence"), "town": it.get("town") or "general",
                                        "origin": "web_research", "read_on": datetime.now(timezone.utc).date().isoformat(),
                                        **({"jurisdiction": str(it["jurisdiction"])[:160]} if it.get("jurisdiction") else {})})
         return [x.strip() for x in research_list(found.get("not_found")) if isinstance(x, str) and x.strip()]
@@ -2667,15 +2684,20 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
     # Only what we are sure of is given to the writer as a number (owner 11/15). A municipal deadline, processing time
     # or fee that no second reading of its page has confirmed is replaced, in the writer's copy, by a note saying so:
     # the article then says the requirement exists and links the page. The store keeps the full wording.
+    # A number the municipality's own official pages give differently (its web page says 10 business days, its code
+    # says 30 days - round 11) is held back the same way, however often either page was read, with a note saying the
+    # pages differ.
     held_back = 0
     for m in munis:
         mine = [i for i in muni_known + research_items if tk._muni_key(i.get("municipality")) == tk._muni_key(m["name"])]
-        sure = tk.confirmed_specifics(mine)
+        sure, disputed = tk.confirmed_specifics(mine), tk.disputed_specifics(mine)
+        if disputed:
+            logger.info("blog pipeline: %s's official pages disagree about %s - held back", m["name"], sorted(disputed))
         for i in mine:
-            i["claim"], n = tk.mask_unconfirmed(i["claim"], sure)
+            i["claim"], n = tk.mask_unconfirmed(i["claim"], sure, disputed)
             held_back += n
     if held_back:
-        logger.info("blog pipeline: %d municipal number(s) held back - not yet confirmed by a second reading", held_back)
+        logger.info("blog pipeline: %d municipal number(s) held back - not yet confirmed by a second reading, or in dispute", held_back)
 
     brief_facts = []
     if not_licensed:

@@ -1023,6 +1023,10 @@ _SPECIFIC = re.compile(
     r"|\b(?:\d+|" + "|".join(_WORD_NUMBERS) + r")\s*(?:\(\d+\)\s*)?(?:business\s+|calendar\s+|working\s+)?(?:days?|weeks?|months?)\b", re.I)
 _SEPARATE_READS = timedelta(minutes=30)
 _NOT_CONFIRMED = "(a lead time or fee its page gives - not yet confirmed: do NOT state a number)"
+# the same marker words, so every check that looks for a held-back number finds this one too
+_IN_DISPUTE = ("(a lead time or fee this municipality's own official pages give DIFFERENTLY - not yet confirmed: do NOT state a number; "
+               "say its own official pages (its web page and its code, say) give different figures, so the current one has to be "
+               "confirmed with the municipality)")
 
 
 def _specific_key(token: str) -> str:
@@ -1041,10 +1045,76 @@ def specifics(text: Optional[str]) -> set[str]:
     return {_specific_key(m.group(0)) for m in _SPECIFIC.finditer(text or "")}
 
 
+# Two official pages of ONE municipality can give different numbers for the same thing (round 11: Radnor Township's
+# Real Estate Transfers page says the application goes in "no less than 10 business days prior to settlement", its
+# code §142-4 says 30 days, or 14 for a quick settlement; the page's fee is not the code's either). We cannot know which
+# one the township applies today, and reading either page twice does not settle it. So a number in dispute is never
+# "confirmed": the article names the requirement, links the page, and says the township's own pages differ.
+_AHEAD_OF_SALE = re.compile(r"\b(?:before|prior to|in advance of|ahead of)\s+(?:the\s+|a\s+)?(?:settlement|closing|transfer|sale|conveyance)\b", re.I)
+_FEE_WORD = re.compile(r"\bfees?\b|\bcosts?\b|\bcharged?\b", re.I)
+_CLAUSES = re.compile(r"(?<=[.;:])\s+")
+
+
+def _page_key(url: Optional[str]) -> str:
+    from urllib.parse import urlparse
+    u = urlparse(str(url or "").strip())
+    return (u.netloc.lower().removeprefix("www.") + u.path.rstrip("/").lower()) if u.netloc else ""
+
+
+def disputed_specifics(items: list[dict]) -> set[str]:
+    """Numbers two official pages of ONE municipality disagree about. `items`: everything held about that municipality.
+    For each sale requirement (the occupancy certificate, the sewer certification) each page's filing lead times (the
+    day, week or month counts given as "before settlement") and its fees are gathered; when two pages each give some and
+    neither page's set sits inside the other's, every one of them is in dispute."""
+    held: dict[tuple[str, str], dict[str, set[tuple[str, object]]]] = {}        # (requirement, "lead" | "fee") -> page -> (number, its size)
+    for i in items or []:
+        claim, page = str(i.get("claim") or ""), _page_key(i.get("source_url"))
+        if not page:
+            continue
+        for label, kind in _REQ_KINDS:
+            if not kind.search(claim):
+                continue
+            for clause in _CLAUSES.split(claim):
+                ahead, fee = _AHEAD_OF_SALE.search(clause), _FEE_WORD.search(clause)
+                for m in _SPECIFIC.finditer(clause):
+                    key = _specific_key(m.group(0))
+                    if key.startswith("$"):
+                        if fee:
+                            held.setdefault((label, "fee"), {}).setdefault(page, set()).add((key, key))
+                    elif ahead:
+                        held.setdefault((label, "lead"), {}).setdefault(page, set()).add((key, _calendar_days(m.group(0))))
+    out: set[str] = set()
+    for pages in held.values():
+        keys = sorted(pages)
+        for n, a in enumerate(keys):
+            for b in keys[n + 1:]:
+                # "10 business days" on one page and "two weeks" on the other are the same deadline, and a page that
+                # gives one of the other's two deadlines is only shorter - neither is a dispute. Radnor is: its page
+                # gives 10 business days (and 10 days for the rush fee), its code 30 days and 14.
+                sa, sb = {size for _k, size in pages[a]}, {size for _k, size in pages[b]}
+                if not (sa <= sb or sb <= sa):
+                    out |= {k for k, _s in pages[a] | pages[b]}
+    return out
+
+
+def _calendar_days(token: str) -> int:
+    """A lead time as calendar days, so the same deadline said two ways compares equal: '10 business days' and
+    'two weeks' are both 14; '1 month' and '30 days' are both 30."""
+    t = " ".join(token.lower().split())
+    n = re.match(r"(\d+|[a-z]+)", t).group(1)
+    n = int(_WORD_NUMBERS.get(n, n))
+    if "week" in t:
+        return n * 7
+    if "month" in t:
+        return n * 30
+    return round(n * 7 / 5) if ("business" in t or "working" in t) else n
+
+
 def confirmed_specifics(items: list[dict], now: Optional[datetime] = None) -> set[str]:
-    """Numbers that TWO separate readings of the same page both gave. `items`: everything held about ONE municipality,
-    stored (with the time each was read: `saved_at`, and `reads` when the same wording was read again) and fresh (no
-    `saved_at`: read just now). Readings less than half an hour apart are one run."""
+    """Numbers that TWO separate readings of the same page both gave, minus any number the municipality's own pages
+    disagree about (disputed_specifics). `items`: everything held about ONE municipality, stored (with the time each
+    was read: `saved_at`, and `reads` when the same wording was read again) and fresh (no `saved_at`: read just now).
+    Readings less than half an hour apart are one run."""
     now = now or datetime.now(timezone.utc)
     by_page: dict[str, list[tuple[datetime, set[str]]]] = {}
     for i in items or []:
@@ -1067,17 +1137,22 @@ def confirmed_specifics(items: list[dict], now: Optional[datetime] = None) -> se
                 if not runs or when - runs[-1] >= _SEPARATE_READS:
                     runs.append(when)
         sure |= {tok for tok, runs in seen.items() if len(runs) >= 2}
-    return sure
+    return sure - disputed_specifics(items)
 
 
-def mask_unconfirmed(claim: str, sure: set[str]) -> tuple[str, int]:
+def mask_unconfirmed(claim: str, sure: set[str], disputed: Optional[set[str]] = None) -> tuple[str, int]:
     """The claim as the writer may see it: every number not yet confirmed by a second reading is replaced by a note
-    saying so. Returns (claim, how many were held back)."""
+    saying so, and a number the municipality's own pages disagree about by a note saying that. Returns (claim, how many
+    were held back)."""
     held = 0
 
     def swap(m):
         nonlocal held
-        if _specific_key(m.group(0)) in sure:
+        key = _specific_key(m.group(0))
+        if key in (disputed or ()):
+            held += 1
+            return _IN_DISPUTE
+        if key in sure:
             return m.group(0)
         held += 1
         return _NOT_CONFIRMED
@@ -1092,7 +1167,8 @@ def unconfirmed_pages(items: list[dict], limit: int = 2) -> list[dict]:
     for i in items or []:
         by_muni.setdefault(_muni_key(i.get("municipality")), []).append(i)
     for mine in by_muni.values():
-        sure = confirmed_specifics(mine)
+        # a number in dispute is not settled by another reading of either page: it is no reason to read one again
+        sure = confirmed_specifics(mine) | disputed_specifics(mine)
         for i in mine:
             url = i.get("source_url")
             if url and url not in seen and specifics(i.get("claim")) - sure:
