@@ -830,10 +830,13 @@ async def estimate(db, user: User, photos: int, sharpen: bool, seconds: float = 
     analyze = estimate_photo_sort_usd(config, n) + n * (float(config.get("studio_motion_depth_price_per_photo_usd", 0.0) or 0.0)
                                                         + float(config.get("studio_motion_erase_price_per_photo_usd", 0.0) or 0.0))
     sharp = n * float(config.get("studio_motion_sharpen_price_per_photo_usd", 0.006) or 0.0) if sharpen else 0.0
+    # a Fast Cut prepares only the photos its plan shows: about 23 in 30 s, about 50 in a minute
+    used = min(n, 25 if float(seconds or 30) < 45 else 51) if fast else n
+    gpu = 0.0
     if fast and gpu_prep.enabled():
-        # a Fast Cut's photos are prepared on our own Amazon graphics machine (measured 11/17: 23 photos in 398 s,
-        # ~2 minutes of it starting up, at about $0.53 an hour) - split between the depth / clean-up and the sharpening
-        gpu = vl.charge_usd((150.0 + 11.0 * n) / 3600.0 * 0.55, config)
+        # a Fast Cut's photos are prepared on our own Amazon graphics machine (measured 11/17: 22-23 photos in about
+        # 400 s, ~2.5 minutes of it starting up, at about $0.53 an hour) - split between the depth / clean-up and the sharpening
+        gpu = vl.charge_usd((150.0 + 11.0 * used) / 3600.0 * 0.55, config)
         analyze = estimate_photo_sort_usd(config, n) + gpu * 0.5
         sharp = gpu * 0.5 if sharpen else 0.0
     snap = await monthly_ai_budget_snapshot(db, user.id, config, user.plan_tier)
@@ -855,6 +858,17 @@ async def estimate(db, user: User, photos: int, sharpen: bool, seconds: float = 
     if fast:
         model = config.get("fast_cut_model") or FAST_CUT_MODEL
         fast_edit = float(ai_config_service.estimate_cost_usd(config, model, int(1500 + 420 * n + 950 * n + 1100 * max(1, n // 7) + 7200), int(600 + 95 * n)))
+    # The two speed buttons show EVERYTHING making the video uses (owner 11/17: show the real difference): the AI
+    # editor's look, preparing the planned photos, the door finder, the twilight ending and making the video. The
+    # room sort is the same either way and already done by the time a video is made, so it is left out.
+    # Measured 11/17 on a brand-new 34-photo home, 30 s: Save usage 24.6c, Make it now 47.2c (+ sort 6.3c each).
+    # A Fast Cut is heavier to make than the per-second price assumes: Lambda 17.9c vs 13.5c, spot 5.4c vs 4.6c.
+    twi_now = 0.061 if fast else 0.0      # AI Twilight edit 5.5c + sharpening 0.6c
+    twi_save = 0.034 if fast else 0.0     # the same edit the half-price way 2.8c + sharpening 0.6c
+    door = 0.009 if fast else 0.0
+    heavy_now, heavy_low = (1.33, 1.17) if fast else (1.0, 1.0)
+    save_all = fast_edit * 0.5 + gpu + door * 0.5 + twi_save + min(render, render_low) * heavy_low
+    now_all = fast_edit + gpu + door + twi_now + render_now * heavy_now
     return {
         # overnight mode: the same video on our own video maker - the render costs no AI
         "overnight_available": bool(plan), "overnight_ready_at": (plan or {}).get("ready_at"), "overnight_held": bool((plan or {}).get("held")),
@@ -864,11 +878,11 @@ async def estimate(db, user: User, photos: int, sharpen: bool, seconds: float = 
         "fast_edit_usd": round(fast_edit, 4), "fast_edit_percent": pct(fast_edit) if fast else None,
         # Save usage / Make it now (the AI editor's look + making the video; photo preparation is the same either way):
         # "save" usually uses the low figure, at most the high one (a step that waited too long finishes the normal way)
-        "speed_save_usd": round(fast_edit * 0.5 + min(render, render_low), 4), "speed_save_usd_max": round(fast_edit + render, 4),
-        "speed_now_usd": round(fast_edit + render_now, 4),
-        "speed_save_percent": pct(fast_edit * 0.5 + min(render, render_low)) if paid or fast else None,
-        "speed_save_percent_max": pct(fast_edit + render) if paid or fast else None,
-        "speed_now_percent": pct(fast_edit + render_now) if paid or fast else None,
+        "speed_save_usd": round(save_all, 4), "speed_save_usd_max": round(now_all, 4),
+        "speed_now_usd": round(now_all, 4),
+        "speed_save_percent": pct(save_all) if paid or fast else None,
+        "speed_save_percent_max": pct(now_all) if paid or fast else None,
+        "speed_now_percent": pct(now_all) if paid or fast else None,
         "speed_save_cap_minutes": FAST_SAVE_CAP_MINUTES,
         "render_paused": bool(paid and would_refuse),
         "photos": n, "analyze_usd": round(analyze, 4), "sharpen_usd": round(sharp, 4),
