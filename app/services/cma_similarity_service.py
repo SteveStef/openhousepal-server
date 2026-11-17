@@ -31,12 +31,15 @@ MAX_DENSITY_SEARCH_MILES = 20.0
 DENSITY_RINGS_MILES = (2.0, 5.0, 10.0, MAX_DENSITY_SEARCH_MILES)
 
 
-async def nearest_rows(db: AsyncSession, ordered_query, lat: float, lng: float, distance_expr, rings, limit: int) -> list:
+async def nearest_rows(db: AsyncSession, ordered_query, lat: float, lng: float, distance_expr, rings, limit: int,
+                       settled=None) -> list:
     """The `limit` rows of `ordered_query` (ordered by distance) nearest the point, out to rings[-1] miles - asking
     for each ring in turn and stopping at the first that is already full. Exactly what one look out to rings[-1]
-    returns: every row past ring r is farther than every row inside it."""
+    returns: every row past ring r is farther than every row inside it.
+    settled(rows): the caller can also stop at a ring whose rows already decide its answer (the density look only
+    needs the 8th-12th nearest qualifying homes - see density_settled)."""
     rows: list = []
-    for miles in rings:
+    for i, miles in enumerate(rings):
         lat_off, lng_off = get_lat_long_offsets(lat, miles)
         q = ordered_query.where(
             Property.latitude.between(lat - lat_off, lat + lat_off),
@@ -45,9 +48,21 @@ async def nearest_rows(db: AsyncSession, ordered_query, lat: float, lng: float, 
             distance_expr <= miles,
         ).limit(limit)
         rows = (await db.execute(q)).mappings().all()
-        if len(rows) >= limit:
+        if len(rows) >= limit or (settled is not None and i < len(rings) - 1 and settled(rows)):
             break
     return rows
+
+
+def density_settled(ctx: dict) -> bool:
+    """True when a ring's homes already fix the density answer, so no farther home can change it (live 11/17,
+    3558 Sawmill Rd: the 10-mile ring alone took 34 s off the disk, to find 12 homes the 5-mile ring already had).
+    The answer = the 8th-12th nearest qualifying homes in the FIRST recency window that has enough of them. When the
+    ring already has 12 in the first (newest) window, the full look picks that same window, and its 12 nearest are
+    these - every home past the ring is farther. Only the "N suitable local references" count (an agent-only note)
+    then counts the homes in the ring rather than in the 1,000 nearest."""
+    return (ctx.get("recency_window_days") == DENSITY_RECENCY_WINDOWS_DAYS[0]
+            and not ctx.get("fallback_used")
+            and int(ctx.get("reference_count") or 0) >= DENSITY_NEIGHBOR_END)
 DENSITY_SQFT_RATIO_MIN = 0.75
 DENSITY_SQFT_RATIO_MAX = 1.25
 DENSITY_DETACHED_LOT_RATIO_MIN = 0.50
@@ -391,8 +406,16 @@ async def _load_local_proximity_context(db: AsyncSession, subject: dict) -> dict
 
     surface = await _load_price_surface(db, subject, lat, lng, subject_sqft) if PRICE_SURFACE_ENABLED else []
     rows = await nearest_rows(db, query.order_by(distance_expr.asc(), Property.listing_key.asc()), lat, lng,
-                              distance_expr, DENSITY_RINGS_MILES, 1000)
-    references = [
+                              distance_expr, DENSITY_RINGS_MILES, 1000,
+                              settled=lambda ring: density_settled(build_adaptive_proximity_context(subject, _density_refs(ring))))
+    ctx = build_adaptive_proximity_context(subject, _density_refs(rows))
+    if surface:
+        ctx["_price_surface"] = surface
+    return ctx
+
+
+def _density_refs(rows) -> list:
+    return [
         {
             "listing_key": row["listing_key"],
             "street_address": row["street_address"],
@@ -413,10 +436,6 @@ async def _load_local_proximity_context(db: AsyncSession, subject: dict) -> dict
         }
         for row in rows
     ]
-    ctx = build_adaptive_proximity_context(subject, references)
-    if surface:
-        ctx["_price_surface"] = surface
-    return ctx
 
 
 # Neighborhood price map (10/23): recent same-type sales of similar size around the subject, as
