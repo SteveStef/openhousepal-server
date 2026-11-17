@@ -419,13 +419,14 @@ async def export_asset(
 
 @router.get("/motion/estimate", response_model=MotionEstimateResponse)
 async def motion_estimate(
-    photos: int = Query(7, ge=1, le=30),
+    photos: int = Query(7, ge=1, le=120),
     sharpen: bool = Query(True),
     seconds: float = Query(30, ge=5, le=120),
+    fast: bool = Query(False),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_studio_media_access),
 ):
-    return await studio_motion_service.estimate(db, current_user, photos, sharpen, seconds)
+    return await studio_motion_service.estimate(db, current_user, photos, sharpen, seconds, fast)
 
 
 @router.get("/motion/health")
@@ -488,6 +489,17 @@ async def motion_analyze(
     return await studio_motion_service.start_analysis(db, current_user, asset_id)
 
 
+@router.post("/motion/{asset_id}/fast-plan")
+async def motion_fast_plan(
+    asset_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_media_access),
+):
+    """A Fast Cut's plan, shot by shot, before it is made (the photo order and the stat slides). The AI editor
+    looks at the photos first if it has not yet (once per set of photos, on the agent's usage)."""
+    return await studio_motion_service.fast_outline(db, current_user, asset_id)
+
+
 @router.post("/motion/{asset_id}/render", response_model=StudioMediaAssetResponse)
 async def motion_render(
     asset_id: str,
@@ -496,4 +508,4 @@ async def motion_render(
     current_user: User = Depends(require_studio_media_access),
 ):
     """Make (or remake) the video, or another size of it. Only new photo sharpening costs AI."""
-    return await studio_motion_service.start_render(db, current_user, asset_id, payload.sharpen, payload.format)
+    return await studio_motion_service.start_render(db, current_user, asset_id, payload.sharpen, payload.format, payload.overnight)

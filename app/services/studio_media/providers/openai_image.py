@@ -6,6 +6,7 @@ OPENAI_API_KEY pattern as ai_tts_service.py.
 """
 import base64
 import os
+from typing import Optional
 
 import httpx
 
@@ -84,6 +85,59 @@ class OpenAIImageProvider(ImageEditProvider):
             provider_cost_usd=None,
             usage=usage,
         )
+
+    async def edit_batch(self, image_url: str, prompt: str, size: str, quality: str, cap_seconds: float) -> Optional[ImageEditResult]:
+        """The same edit through OpenAI's Batch API - half price, answered later (tested 11/16: a twilight edit with
+        gpt-image-2 came back in 161 s). The photo is passed by its public link. None when it hasn't answered within
+        cap_seconds (the batch is cancelled; the caller sends it the normal way) or the batch failed. The usage
+        returned is HALVED, so a cost worked out from it is what the batch really cost."""
+        import asyncio
+        import json as _json
+        import time as _time
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            return None
+        h = {"Authorization": f"Bearer {api_key}"}
+        body = {"model": self.model, "prompt": prompt, "n": 1, "size": size, "quality": quality, "images": [{"image_url": image_url}]}
+        line = _json.dumps({"custom_id": "edit", "method": "POST", "url": "/v1/images/edits", "body": body}).encode()
+        bid = None
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                f = await client.post("https://api.openai.com/v1/files", headers=h, data={"purpose": "batch"}, files={"file": ("edit.jsonl", line, "application/jsonl")})
+                f.raise_for_status()
+                b = await client.post("https://api.openai.com/v1/batches", headers=h, json={"input_file_id": f.json()["id"], "endpoint": "/v1/images/edits", "completion_window": "24h"})
+                b.raise_for_status()
+                bid = b.json()["id"]
+                began = _time.monotonic()
+                st: dict = {}
+                while _time.monotonic() - began < cap_seconds:
+                    await asyncio.sleep(10)
+                    try:
+                        st = (await client.get(f"https://api.openai.com/v1/batches/{bid}", headers=h)).json()
+                    except httpx.HTTPError:
+                        continue
+                    if st.get("status") in ("completed", "failed", "expired", "cancelled"):
+                        break
+                if st.get("status") != "completed" or not st.get("output_file_id"):
+                    if st.get("status") not in ("failed", "expired", "cancelled"):
+                        try:
+                            await client.post(f"https://api.openai.com/v1/batches/{bid}/cancel", headers=h)
+                        except httpx.HTTPError:
+                            pass
+                    logger.info("openai batch edit not back in time - sending it the normal way", extra={"status": st.get("status")})
+                    return None
+                out = (await client.get(f"https://api.openai.com/v1/files/{st['output_file_id']}/content", headers=h)).text
+                row = _json.loads(out.splitlines()[0])
+                payload = ((row.get("response") or {}).get("body")) or {}
+                b64 = payload["data"][0]["b64_json"]
+        except Exception as exc:  # noqa: BLE001 - the caller sends it the normal way
+            logger.warning("openai batch edit failed", extra={"error": str(exc)[:300], "batch": bid})
+            return None
+        u = payload.get("usage") or {}
+        details = u.get("input_tokens_details") or {}
+        usage = {"text_input": details.get("text_tokens", 0) / 2, "image_input": details.get("image_tokens", u.get("input_tokens", 0)) / 2,
+                 "image_output": u.get("output_tokens", 0) / 2}
+        return ImageEditResult(image_bytes=base64.b64decode(b64), content_type="image/png", provider_cost_usd=None, usage=usage)
 
     async def generate(self, prompt: str, size: str = "1536x1024", quality: str = "high") -> ImageEditResult:
         """A brand-new image from a prompt (blog cover photos) - /v1/images/generations."""

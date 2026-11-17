@@ -38,6 +38,10 @@ from app.database import AsyncSessionLocal
 from app.models.database import Property, StudioMediaAsset, User
 from app.services import s3_service, storage_ledger_service
 from app.services import video_lambda_service as vl
+from app.services import video_spot_service as vs
+from app.services import gpu_prep_service as gpu_prep
+from app.services import fast_cut_planner as fastcut
+from app.services import fast_cut_edit, fast_cut_recipe
 from app.services.ai.ai_config_service import ai_config_service
 from app.utils.auth import tier_has_mls
 from app.services.ai.ai_rate_limit_service import (
@@ -58,6 +62,14 @@ STYLES = ("cinematic", "glide", "bold")
 TRANSITIONS = ("cut", "crossfade", "dip", "light", "whip", "zoom")
 MOVES = ("auto", "push", "slide_left", "slide_right", "rise", "orbit", "drone")
 FORMATS = ("16:9", "9:16", "1:1", "4:5")
+# Two kinds of AI Video share one project and one editor (owner 11/14): the calm Cinematic Video and the
+# beat-synced Fast Cut (fast_cut_planner.py). A Fast Cut shows many more photos.
+VIDEO_KINDS = ("cinematic", "fastcut")
+FAST_SONGS = fast_cut_recipe.SONGS
+SPEEDS = ("save", "now")   # how soon the agent needs the video: "save" = the slower, cheaper lines (the default), "now" = the fast ones
+FAST_SAVE_CAP_MINUTES = 12   # "save": the Fast Cut AI look waits this long in the half-price queue, then finishes the normal way
+FAST_CUT_MODEL = "claude-sonnet-5-5"   # the model the approved Fast Cut recipe was tuned and reviewed with (window boxes, subject centring)   # every one cut to the same beat pattern (the owner's approved set)
+FAST_MAX_PHOTOS = 60
 MUSIC = ("bright", "elegant", "none")
 # Owner 11/12: real recorded-style tracks (ElevenLabs Music, made once) replaced the code-made
 # "piano"/"ambient" placeholders. Choices saved before then map to the new ones.
@@ -153,6 +165,165 @@ def _worker_headers() -> dict:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---- Overnight mode (owner 11/14: "make the video way slower for way cheaper"). The only part of a
+# video whose price depends on speed is the render: AWS Lambda is fast and paid; our own video maker
+# (VIDEO_WORKER_URL, frontend/video-worker) is slow and free. So "overnight" = the same video, made on
+# our own video maker during the quiet hours instead of on AWS. Photo prep and sharpening cost the same
+# either way and still happen straight away. Offered only while AWS is the normal path AND our own video
+# maker answers. Quiet hours (Eastern): VIDEO_OVERNIGHT_HOURS / config studio_motion_overnight_hours,
+# "1-6" by default; "any" = no waiting (a video maker on its own server can run all day).
+_SLOW: dict[str, Any] = {"at": 0.0, "h": None}
+_OVERNIGHT_STALE = 40 * 3600   # a scheduled video may sit this long before it counts as interrupted
+
+
+async def _slow_lane() -> Optional[dict]:
+    """Our own video maker's /health when overnight mode can be offered, else None."""
+    if not vl.enabled():
+        return None
+    if time.time() - _SLOW["at"] < 20:
+        return _SLOW["h"]
+    h = None
+    try:
+        async with httpx.AsyncClient(timeout=4) as client:
+            r = await client.get(f"{_worker_url()}/health")
+        if r.status_code == 200:
+            h = r.json()
+    except (httpx.HTTPError, ValueError):
+        h = None
+    _SLOW.update(at=time.time(), h=h)
+    return h
+
+
+def _overnight_hours(config: dict) -> Optional[tuple[int, int]]:
+    raw = str(os.environ.get("VIDEO_OVERNIGHT_HOURS") or config.get("studio_motion_overnight_hours") or "1-6").strip().lower()
+    if raw in ("any", "all", "off", "none"):
+        return None
+    try:
+        a, b = (int(x) % 24 for x in raw.split("-", 1))
+    except ValueError:
+        return (1, 6)
+    return None if a == b else (a, b)
+
+
+def _overnight_opens(now: datetime, hours: Optional[tuple[int, int]]) -> datetime:
+    """When our own video maker may next start a video (now, if the quiet hours are on)."""
+    if not hours:
+        return now
+    from zoneinfo import ZoneInfo
+    a, b = hours
+    n = now.astimezone(ZoneInfo("America/New_York"))
+    if (a <= n.hour < b) if a < b else (n.hour >= a or n.hour < b):
+        return now
+    start = n.replace(hour=a, minute=0, second=0, microsecond=0)
+    if start <= n:
+        start += timedelta(days=1)
+    return start.astimezone(timezone.utc)
+
+
+async def _overnight_ahead(skip_id: Optional[str] = None) -> int:
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(select(StudioMediaAsset.id).where(
+            StudioMediaAsset.action == "motion",
+            StudioMediaAsset.options["render"]["state"].astext.in_(("preparing", "queued", "rendering")),
+            StudioMediaAsset.options["render"]["overnight"].astext == "true",
+        ))).all()
+    return len([r for r in rows if r[0] != skip_id])
+
+
+async def overnight_plan(config: dict, seconds: float, skip_id: Optional[str] = None) -> Optional[dict]:
+    """None when overnight mode can't be offered; else about when an overnight video would be ready -
+    the quiet hours' start (or now), the overnight videos already ahead, and this one, at our own
+    video maker's measured speed, with a quarter extra so the promise is kept."""
+    h = await _slow_lane()
+    if not h:
+        return None
+    now = datetime.now(timezone.utc)
+    opens = _overnight_opens(now, _overnight_hours(config))
+    per = float(h.get("start_seconds") or 20) + 30 * (float(seconds or 30) + 10) * float(h.get("sec_per_frame") or 0.7) + _SAVE_SECS["v"]
+    try:
+        ahead = await _overnight_ahead(skip_id)
+    except Exception:  # noqa: BLE001
+        ahead = 0
+    wait = float(h.get("wait_seconds") or 0) if opens <= now else 0.0
+    ready = opens + timedelta(seconds=wait + per * ahead + per * 1.25 + 60)
+    return {"ready_at": ready.isoformat(), "held": opens > now, "opens_at": opens.isoformat(), "ahead": ahead, "seconds": round(per)}
+
+
+async def _notify_overnight_done(asset_id: str) -> None:
+    """An overnight video is ready: the bell AND an email, every time (the agent chose to walk away)."""
+    try:
+        from app.models.database import Notification
+        from app.services.agent_email_service import absolute, email_agent
+        async with AsyncSessionLocal() as db:
+            asset = await db.get(StudioMediaAsset, asset_id)
+            if not asset:
+                return
+            address = (asset.linked_property or {}).get("address") if asset.linked_property else None
+            db.add(Notification(
+                agent_id=asset.owner_id, type="STUDIO_MEDIA_VIDEO_READY", reference_type="STUDIO_MEDIA_ASSET", reference_id=asset.id,
+                title="Your overnight video is ready",
+                message=f"The Cinematic Video for {address or 'your property'} was made overnight and is ready to watch.",
+                property_address=address, link=f"/studio/media/{asset.id}", is_read=False,
+            ))
+            await db.commit()
+            owner = await db.get(User, asset.owner_id)
+            email_agent(owner, "STUDIO_MEDIA_VIDEO_READY", "studio_media_ready", "Your overnight video is ready",
+                        {"media_type": "Cinematic Video", "property_address": address, "link": absolute(f"/studio/media/{asset.id}")})
+    except Exception:  # noqa: BLE001 - never sink a finished video on its notice
+        logger.warning("overnight video notice failed", exc_info=True, extra={"asset_id": asset_id})
+
+
+async def _overnight_hold(asset_id: str, owner_id: str, reservation):
+    """Waits for the quiet hours. Returns (still_overnight, reservation): False when the agent pressed
+    "Make it now instead" while it waited (then AWS makes it, and the AI for that is reserved here)."""
+    told = None
+    while True:
+        async with AsyncSessionLocal() as db:
+            a = await db.get(StudioMediaAsset, asset_id)
+            config = await ai_config_service.get_config(db)
+            if a is None:
+                raise RuntimeError("That video was deleted.")
+            r = (a.options or {}).get("render") or {}
+            if not r.get("overnight"):
+                try:
+                    u = await db.get(User, owner_id)
+                    res = await reserve_studio_motion(db, owner_id, config, u.plan_tier)
+                    await _patch(asset_id, lambda a_, o: o.__setitem__("render", {**(o.get("render") or {}), "held": False, "stage": "Waiting for the video maker"}))
+                    return False, res
+                except AIRateLimitExceeded:
+                    # no AI left for a paid render after all - it stays on the free overnight line
+                    await _patch(asset_id, lambda a_, o: o.__setitem__("render", {**(o.get("render") or {}), "overnight": True}))
+        now = datetime.now(timezone.utc)
+        opens = now if r.get("no_hold") else _overnight_opens(now, _overnight_hours(config))
+        if opens <= now:
+            await _patch(asset_id, lambda a_, o: o.__setitem__("render", {**(o.get("render") or {}), "held": False, "stage": "Waiting for the video maker"}))
+            return True, reservation
+        if told != opens:
+            told = opens
+            plan = await overnight_plan(config, 30, asset_id)
+            ready = (plan or {}).get("ready_at") or r.get("ready_at")
+
+            def hold(a_, o):
+                cur = o.get("render") or {}
+                if cur.get("overnight"):
+                    o["render"] = {**cur, "state": "queued", "held": True, "stage": "Scheduled for tonight", "opens_at": opens.isoformat(),
+                                   "ready_at": ready, "eta_at": None, "progress": max(0.12, cur.get("progress") or 0)}
+            await _patch(asset_id, hold)
+        await asyncio.sleep(15.0)
+
+
+async def make_now(db, user: User, asset_id: str) -> StudioMediaAsset:
+    """"Make it now instead": a video still waiting for tonight is made on AWS right away."""
+    asset = await _owned_motion(db, user.id, asset_id)
+    render = (asset.options or {}).get("render") or {}
+    if not (render.get("overnight") and render.get("held") and render.get("state") in _ACTIVE):
+        return asset
+    config = await ai_config_service.get_config(db)
+    if await studio_motion_would_refuse(db, user.id, config, user.plan_tier):
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "You've reached your AI limit for now, so this one stays scheduled for tonight (that part is free).")
+    return await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "overnight": False, "stage": "Starting now"})) or asset
 
 
 def _txt(v: Any, n: int) -> str:
@@ -281,7 +452,7 @@ def _new_photo(url: str) -> dict:
     }
 
 
-_POOL_AI = ("room", "kind", "label", "kicker", "sure", "score", "focusX", "lights", "water", "sky", "trees", "fire", "fireBox", "analyzed")
+_POOL_AI = ("room", "kind", "label", "kicker", "sure", "score", "focusX", "lights", "water", "sky", "trees", "fire", "fireBox", "analyzed", "dusk", "toilet", "altX")
 _FILES = ("clean", "depth", "sharp", "sharpDepth")  # sharpDepth: the depth map has crisp (Marigold) edges
 
 
@@ -313,7 +484,7 @@ def _ensure_pool(motion: dict) -> list[dict]:
 def _photo_from_pool(item: dict, pid: str) -> dict:
     p = _new_photo(item["source"])
     p["id"] = pid
-    for k in ("kind", "label", "kicker", "sure", "focusX", "lights", "water", "sky", "trees", "fire", "fireBox", "analyzed", "room") + _FILES:
+    for k in ("kind", "label", "kicker", "sure", "focusX", "lights", "water", "sky", "trees", "fire", "fireBox", "analyzed", "room", "dusk", "toilet", "altX") + _FILES:
         if item.get(k) is not None:
             p[k] = item[k]
     if not p.get("kicker") and item.get("room") in ROOMS:
@@ -475,7 +646,8 @@ def _clean_settings(incoming: dict, current: dict) -> dict:
     photos = []
     seen: set = set()
     src_photos = incoming["photos"] if isinstance(incoming.get("photos"), list) else (current.get("photos") or [])
-    for p in src_photos[:16]:
+    fast_now = (incoming.get("kind") if incoming.get("kind") in VIDEO_KINDS else current.get("kind")) == "fastcut"
+    for p in src_photos[:FAST_MAX_PHOTOS if fast_now else 16]:
         if not isinstance(p, dict):
             continue
         pid = str(p.get("id") or "")
@@ -508,12 +680,17 @@ def _clean_settings(incoming: dict, current: dict) -> dict:
         for k in ("lights", "water", "sky", "trees", "fire", "hidden", "confirmed"):
             q[k] = bool(p.get(k, base.get(k, False)))
         q["fireBox"] = _box(p.get("fireBox", base.get("fireBox")))
+        if base.get("aimX") is not None:
+            q["aimX"] = base["aimX"]   # the door finder's answer (server-made, like the files)
         q["transitionIn"] = p.get("transitionIn") if p.get("transitionIn") in TRANSITIONS else None
         photos.append(q)
     out["photos"] = photos
     pick = lambda key, allowed, dflt: incoming.get(key) if incoming.get(key) in allowed else current.get(key, dflt)  # noqa: E731
     out["theme"] = pick("theme", THEMES, "classic")
     out["style"] = pick("style", STYLES, "cinematic")
+    out["kind"] = pick("kind", VIDEO_KINDS, "cinematic")
+    out["song"] = pick("song", FAST_SONGS, "skyline")
+    out["speed"] = pick("speed", SPEEDS, "save")
     out["transition"] = pick("transition", TRANSITIONS, "cut")
     out["situation"] = pick("situation", SITUATIONS, "just_listed")
     out["metal"] = pick("metal", METALS, "gold")
@@ -543,6 +720,18 @@ def _clean_settings(incoming: dict, current: dict) -> dict:
         "name": _txt(ag_in.get("name", cur_ag.get("name")), 60), "brokerage": _txt(ag_in.get("brokerage", cur_ag.get("brokerage")), 80),
         "phone": _txt(ag_in.get("phone", cur_ag.get("phone")), 30), "email": _txt(ag_in.get("email", cur_ag.get("email")), 80),
         "photo": photo if isinstance(photo, str) and photo.startswith(("http://", "https://")) else None,
+    }
+    # Fast Cut: the AI editor's answer is server-made (like the files); the agent's own changes to the order and
+    # which stats show come from the editor screen.
+    cur_fast = current.get("fast") or {}
+    fast_in = incoming.get("fast") if isinstance(incoming.get("fast"), dict) else {}
+    ids_now = {p["id"] for p in photos}
+    order_in = fast_in.get("order", cur_fast.get("order") or [])
+    off_in = fast_in.get("stats_off", cur_fast.get("stats_off") or [])
+    out["fast"] = {
+        **({"edit": cur_fast["edit"]} if cur_fast.get("edit") else {}),
+        "order": [i for i in dict.fromkeys(order_in if isinstance(order_in, list) else []) if i in ids_now][:120],
+        "stats_off": [k for k in dict.fromkeys(off_in if isinstance(off_in, list) else []) if k in ("bedbath", "living", "exterior")],
     }
     sec_in = incoming.get("sections") or {}
     cur_sec = current.get("sections") or {}
@@ -634,21 +823,53 @@ async def _owned_motion(db, owner_id: str, asset_id: str, lock: bool = False) ->
 
 # ------------------------------------------------------------------ costs
 
-async def estimate(db, user: User, photos: int, sharpen: bool, seconds: float = 30) -> dict:
+async def estimate(db, user: User, photos: int, sharpen: bool, seconds: float = 30, fast: bool = False) -> dict:
     config = await ai_config_service.get_config(db)
-    n = max(1, min(int(photos or 1), int(config.get("studio_motion_max_photos", 15))))
+    n = max(1, min(int(photos or 1), FAST_MAX_PHOTOS if fast else int(config.get("studio_motion_max_photos", 15))))
     from app.services.ai.ai_copywrite_service import estimate_photo_sort_usd
     analyze = estimate_photo_sort_usd(config, n) + n * (float(config.get("studio_motion_depth_price_per_photo_usd", 0.0) or 0.0)
                                                         + float(config.get("studio_motion_erase_price_per_photo_usd", 0.0) or 0.0))
     sharp = n * float(config.get("studio_motion_sharpen_price_per_photo_usd", 0.006) or 0.0) if sharpen else 0.0
+    if fast and gpu_prep.enabled():
+        # a Fast Cut's photos are prepared on our own Amazon graphics machine (measured 11/17: 23 photos in 398 s,
+        # ~2 minutes of it starting up, at about $0.53 an hour) - split between the depth / clean-up and the sharpening
+        gpu = vl.charge_usd((150.0 + 11.0 * n) / 3600.0 * 0.55, config)
+        analyze = estimate_photo_sort_usd(config, n) + gpu * 0.5
+        sharp = gpu * 0.5 if sharpen else 0.0
     snap = await monthly_ai_budget_snapshot(db, user.id, config, user.plan_tier)
     limit = snap.get("limit_usd")
     pct = (lambda v: round(v / float(limit) * 100, 2) if limit else None)
     paid = vl.enabled()
     render = vl.estimate_usd(seconds, config) if paid else 0.0
+    # Owner 11/14: a discounted Amazon machine makes the video first (cheaper, a few minutes slower);
+    # Lambda only if none can be had - so making it uses between these two.
+    render_low = vs.estimate_usd(seconds, config) if paid and vs.enabled() else render
+    render_now = render   # "Make it now": Lambda's own price (unless this month's free allowance makes it)
+    if paid and vs.enabled() and await _lambda_still_free(int(30 * (float(seconds or 30) + 10))):
+        render = render_now = render_low   # made free on Lambda and counted at the low figure
     would_refuse = await studio_motion_would_refuse(db, user.id, config, user.plan_tier)
+    plan = await overnight_plan(config, seconds) if paid else None
+    # Fast Cut: the AI editor's one look at the photos (which to use, the order, where each subject is, flames,
+    # windows) - once per set of photos; remakes and the other shape / length reuse it
+    fast_edit = 0.0
+    if fast:
+        model = config.get("fast_cut_model") or FAST_CUT_MODEL
+        fast_edit = float(ai_config_service.estimate_cost_usd(config, model, int(1500 + 420 * n + 950 * n + 1100 * max(1, n // 7) + 7200), int(600 + 95 * n)))
     return {
+        # overnight mode: the same video on our own video maker - the render costs no AI
+        "overnight_available": bool(plan), "overnight_ready_at": (plan or {}).get("ready_at"), "overnight_held": bool((plan or {}).get("held")),
+        "overnight_saves_usd": render if plan else 0.0, "overnight_saves_percent": pct(render) if plan else None,
         "render_usd": render, "render_percent": pct(render) if paid else None, "render_paid": paid,
+        "render_usd_low": min(render, render_low), "render_percent_low": pct(min(render, render_low)) if paid else None,
+        "fast_edit_usd": round(fast_edit, 4), "fast_edit_percent": pct(fast_edit) if fast else None,
+        # Save usage / Make it now (the AI editor's look + making the video; photo preparation is the same either way):
+        # "save" usually uses the low figure, at most the high one (a step that waited too long finishes the normal way)
+        "speed_save_usd": round(fast_edit * 0.5 + min(render, render_low), 4), "speed_save_usd_max": round(fast_edit + render, 4),
+        "speed_now_usd": round(fast_edit + render_now, 4),
+        "speed_save_percent": pct(fast_edit * 0.5 + min(render, render_low)) if paid or fast else None,
+        "speed_save_percent_max": pct(fast_edit + render) if paid or fast else None,
+        "speed_now_percent": pct(fast_edit + render_now) if paid or fast else None,
+        "speed_save_cap_minutes": FAST_SAVE_CAP_MINUTES,
         "render_paused": bool(paid and would_refuse),
         "photos": n, "analyze_usd": round(analyze, 4), "sharpen_usd": round(sharp, 4),
         "analyze_percent": pct(analyze), "sharpen_percent": pct(sharp), "month_percent": snap.get("percent"),
@@ -848,6 +1069,9 @@ _LABEL_TOOL = {
                 "label": {"type": "string", "description": "On-screen caption, 2-6 words, natural and specific to what is visible, e.g. 'Chef's kitchen with island', 'Pool & gardens', 'Primary suite'. Under 34 characters."},
                 "kicker": {"type": "string", "description": "1-2 word small line above it, e.g. 'The kitchen', 'Outdoors', 'Retreat'. Under 16 characters."},
                 "sure": {"type": "boolean", "description": "False when you are not sure what room this is (the agent will check it)."},
+                "second_x": {"type": "number", "description": "Only if the photo has a SECOND, different thing worth its own close shot, well away from the main subject (at least a quarter of the photo's width from focus_x) - e.g. the sitting area in a bedroom whose subject is the bed, the range wall in a kitchen whose subject is the island: its position 0 (left edge) to 1 (right edge). Leave it out when the rest of the photo is plain wall, floor, a doorway or part of something cut off."},
+                "dusk": {"type": "boolean", "description": "True for an outdoor photo taken at dusk, twilight or night (dark or sunset sky, the home's lights glowing)."},
+                "toilet": {"type": "boolean", "description": "True when a toilet is a main thing in view (centred or large in the frame). False when it is small, at the edge or not there."},
                 "score": {"type": "integer", "description": (
                     "How well this photo would show off its room as a slow camera shot in a premium listing video, 1-10. "
                     "9-10: the room's best features fill the frame, close and clear (a kitchen's island, cabinets and counters; a living room's seating and fireplace; a bed and its setting), bright, sharp, level, furnished or staged. "
@@ -929,7 +1153,9 @@ async def _label_batch(photos: list[dict], listing_text: str, model: str) -> tup
     if not index:
         return {"photos": {}, "tagline": "", "seen": set()}, 0, 0
     content.append({"type": "text", "text": _LABEL_RULES + "\nCall describe_photos."})
-    resp = await _client().messages.create(
+    from app.services import cma_claude  # one request shape for old and current Claude models
+    resp = await cma_claude.create(
+        _client(),
         model=model, max_tokens=min(12000, 800 + 130 * len(index)), tools=[_LABEL_TOOL], tool_choice={"type": "tool", "name": "describe_photos"},
         messages=[{"role": "user", "content": content}],
     )
@@ -988,11 +1214,16 @@ def _apply_label(item: dict, lab: dict) -> None:
         item["focusX"] = min(1.0, max(0.0, float(lab.get("focus_x", 0.5))))
     except (TypeError, ValueError):
         item["focusX"] = 0.5
-    for k in ("lights", "water", "sky", "trees"):
+    for k in ("lights", "water", "sky", "trees", "dusk", "toilet"):
         item[k] = bool(lab.get(k, False))
     # flames only move where the AI says they are - a colour match alone would flicker wood floors
     item["fireBox"] = _box(lab.get("fire_box")) if lab.get("fire") else None
     item["fire"] = bool(item["fireBox"])
+    try:
+        ax = float(lab["second_x"]) if lab.get("second_x") is not None else None
+    except (TypeError, ValueError):
+        ax = None
+    item["altX"] = ax if ax is not None and 0.0 <= ax <= 1.0 and abs(ax - item["focusX"]) >= 0.22 else None
     item["analyzed"] = True
 
 
@@ -1070,9 +1301,25 @@ async def _patch(asset_id: str, fn) -> Optional[StudioMediaAsset]:
         return asset
 
 
+def _fast_plan_ids(motion: dict) -> Optional[set]:
+    """Fast Cut with the AI editor's look done: the ids of the photos the planned video shows (the same for every
+    shape). None = every photo counts (a Cinematic Video, or a Fast Cut not looked at yet / not plannable)."""
+    if not fastcut.is_fast(motion) or not (motion.get("fast") or {}).get("edit"):
+        return None
+    try:
+        props = fast_cut_recipe.plan(motion, motion.get("format") or "9:16")
+    except Exception:  # noqa: BLE001 - the older planner will make it: every photo counts
+        return None
+    ids = {sh.get("photo") for sh in props.get("shots") or [] if sh.get("photo")}
+    return ids or None
+
+
 def _needs_prep(motion: dict) -> list[dict]:
     seen, out = set(), []
+    only = _fast_plan_ids(motion)
     for p in motion.get("photos") or []:
+        if only is not None and p.get("id") not in only:
+            continue   # a Fast Cut prepares only the photos in the video
         if p.get("hidden") or p.get("prep_failed") or (p.get("clean") and p.get("depth")) or p.get("source") in seen:
             continue
         seen.add(p.get("source"))
@@ -1085,6 +1332,8 @@ def kick_prep(asset: StudioMediaAsset) -> None:
     as soon as they're picked, so the preview gets its 3D camera and Make starts right away."""
     if asset.id in _PREP and not _PREP[asset.id].done():
         return
+    if fastcut.is_fast((asset.options or {}).get("motion") or {}):
+        return   # a Fast Cut prepares its photos at Make, once the plan says which ones are in the video
     if _needs_prep((asset.options or {}).get("motion") or {}):
         _PREP[asset.id] = asyncio.create_task(_run_prep(asset.id))
 
@@ -1264,13 +1513,373 @@ async def _run_analysis(asset_id: str, owner_id: str, reservation) -> None:
 
 def settings_hash(motion: dict) -> str:
     # Only what changes the video itself (not the photo pool, room picks or checkmarks).
-    keep = {k: v for k, v in (motion or {}).items() if k not in ("ordered_by_ai", "pool", "want")}
-    keep["photos"] = [{k: v for k, v in p.items() if k not in ("confirmed", "sure", "analyzed", "clean", "depth", "sharp", "sharpDepth", "room", "prep_failed", "score")}
+    keep = {k: v for k, v in (motion or {}).items() if k not in ("ordered_by_ai", "pool", "want", "speed")}
+    if isinstance(keep.get("fast"), dict):   # the AI editor's answer is derived from the photos, not a setting
+        keep["fast"] = {k: v for k, v in keep["fast"].items() if k != "edit"}
+    keep["photos"] = [{k: v for k, v in p.items() if k not in ("confirmed", "sure", "analyzed", "clean", "depth", "sharp", "sharpDepth", "room", "prep_failed", "score", "twi", "twi_failed")}
                       for p in keep.get("photos") or []]
     return hashlib.sha1(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
+def _saving(motion: dict) -> bool:
+    return (motion or {}).get("speed") != "now"
+
+
+def _save_seconds(motion: dict, config: dict) -> Optional[float]:
+    """How long a "Save usage" AI call may wait in the half-price queue (None = send it the normal way)."""
+    if not _saving(motion):
+        return None
+    try:
+        return max(2.0, float(config.get("fast_cut_save_cap_minutes") or FAST_SAVE_CAP_MINUTES)) * 60
+    except (TypeError, ValueError):
+        return FAST_SAVE_CAP_MINUTES * 60.0
+
+
+async def _aim_fronts(asset_id: str, owner_id: str, motion: dict) -> dict:
+    """Fast Cut: the front-of-home photos (the opening and closing shots) get the exact spot of the front
+    door (fast_cut_aim). Once per photo - kept on it as aimX; a small AI call each, on the agent's usage."""
+    from app.services import fast_cut_aim
+    pool = {it.get("source"): it for it in motion.get("pool") or []}
+    fronts = [p for p in motion.get("photos") or [] if not p.get("hidden") and p.get("aimX") is None
+              and (p.get("room") or (pool.get(p.get("source")) or {}).get("room")) == "front"][:2]
+    if not fronts:
+        return motion
+    try:
+        async with AsyncSessionLocal() as db:
+            config = await ai_config_service.get_config(db)
+        model = config.get("fast_cut_model") or FAST_CUT_MODEL
+        found = await asyncio.gather(*[fast_cut_aim.find(p.get("clean") or p["source"], model, _save_seconds(motion, config)) for p in fronts])
+        got = {p["id"]: f for p, f in zip(fronts, found) if f}
+        if not got:
+            return motion
+        tin, tout = sum(f[1] for f in got.values()), sum(f[2] for f in got.values())
+        cost = float(ai_config_service.estimate_cost_usd(config, model, tin, tout))
+        async with AsyncSessionLocal() as db:
+            await record_usage_event(db, owner_id, None, model, tin, tout, cost, 0, False, None, event_type=EVENT_TYPE)
+
+        def keep(a, o):
+            m = dict(o.get("motion") or {})
+            m["photos"] = [{**p, "aimX": got[p["id"]][0]} if p.get("id") in got else p for p in m.get("photos") or []]
+            o["motion"] = m
+            a.cost_usd = round(float(a.cost_usd or 0) + cost, 4)
+        a2 = await _patch(asset_id, keep)
+        return dict((a2.options or {}).get("motion") or motion) if a2 else motion
+    except Exception:  # noqa: BLE001 - never hold a video up for this
+        logger.warning("fast cut door finder skipped", exc_info=True, extra={"asset_id": asset_id})
+        return motion
+
+
+_FAST_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+async def _gpu_prep(asset_id: str, owner_id: str, motion: dict) -> dict:
+    """Fast Cut + Save usage: the planned photos that still need anything (clean copy, depth, sharpening) are prepared
+    on one rented Amazon graphics machine (gpu_prep_service). The machine's id is kept on the render, so a restart
+    waits for the same machine instead of renting another. Never raises: what it didn't finish is left for the photo
+    service."""
+    only = _fast_plan_ids(motion)
+    if only is None:
+        return motion
+    todo, seen = [], set()
+    for p in motion.get("photos") or []:
+        if p.get("id") in only and not p.get("hidden") and p.get("source") not in seen and not (p.get("clean") and p.get("depth") and p.get("sharp")):
+            seen.add(p.get("source"))
+            todo.append(p)
+    if not todo:
+        return motion
+    job = None
+    try:
+        async with AsyncSessionLocal() as db:
+            asset = await db.get(StudioMediaAsset, asset_id)
+            erase = ((asset.source_kind if asset else None) or "listing") == "listing"
+            job = (((asset.options or {}).get("render") or {}) if asset else {}).get("gpu_prep")
+            config = await ai_config_service.get_config(db)
+        if not job:
+            # Save usage waits a while for a machine (one frees up, Amazon finds one) before paying the photo service
+            # about 5x more; "Make it now" doesn't wait. VIDEO_GPU_WAIT_SECONDS sets the wait (default 8 minutes).
+            deadline = time.time() + (float(os.environ.get("VIDEO_GPU_WAIT_SECONDS") or 480) if _saving(motion) else 0)
+            told = False
+            while True:
+                try:
+                    job = await gpu_prep.start([{"id": p["id"], "src": p["source"]} for p in todo], erase)
+                    break
+                except gpu_prep.GpuBusy as exc:
+                    if time.time() >= deadline:
+                        logger.info("no graphics machine free - the photo service prepares the photos", extra={"asset_id": asset_id, "reason": str(exc)})
+                        return motion
+                    if not told:
+                        told = True
+                        await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "stage": "Waiting for the photo machine"}))
+                    await asyncio.sleep(30)
+            await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "gpu_prep": job}))
+        await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "stage": "Getting your photos ready (the cheaper way)", "progress": 0.03}))
+        st = {"state": "working", "done": 0, "seconds": 0}
+        began = time.time()
+        while time.time() - began < 30 * 60:
+            st = await gpu_prep.status(job)
+            if st["state"] != "working":
+                break
+            n = st.get("done") or 0
+            await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "progress": 0.03 + 0.12 * n / max(1, len(todo))}))
+            await asyncio.sleep(15)
+        got = await gpu_prep.results(job)
+
+        def finish(pid: str, files: dict) -> dict:
+            clean = _make_clean(files["clean"], False)
+            depth = _match_depth(files["mg"], _soften_depth(files["da"], 0))
+            up = lambda b, folder: s3_service.upload_bytes(b, f"{_S3_PREFIX}/{folder}", ".jpg", "image/jpeg", "public, max-age=31536000, immutable")  # noqa: E731
+            return {"clean": up(clean, "photos"), "depth": up(depth, "depth"), "sharp": up(files["sharp"], "sharp"), "sharpDepth": True}
+        made: dict[str, dict] = {}
+        for pid, files in got.items():
+            try:
+                made[pid] = await asyncio.to_thread(finish, pid, files)
+            except Exception:  # noqa: BLE001 - that photo goes to the photo service
+                logger.warning("gpu photo result unusable", exc_info=True, extra={"asset_id": asset_id, "photo": pid})
+        cost = vl.charge_usd(gpu_prep.cost_usd(st), config)
+        if cost:
+            async with AsyncSessionLocal() as db:
+                await record_usage_event(db, owner_id, None, "aws:gpu-prep", None, None, cost, 0, False, None, event_type=EVENT_TYPE)
+        by_src = {p["source"]: made[p["id"]] for p in todo if p["id"] in made}
+        logger.info("gpu photo machine finished", extra={"asset_id": asset_id, "photos": len(todo), "made": len(made), "seconds": round(st.get("seconds") or 0), "usd": cost})
+
+        def keep(a, o):
+            m = dict(o.get("motion") or {})
+            # every copy of a prepared photo gets its files, and the project's photo pool keeps them for later picks
+            m["photos"] = [{**p, **by_src[p.get("source")]} if p.get("source") in by_src else p for p in m.get("photos") or []]
+            m["pool"] = [{**it, **{k: v for k, v in by_src[it.get("source")].items() if k in ("clean", "depth", "sharpDepth", "sharp")}} if it.get("source") in by_src else it
+                         for it in m.get("pool") or []]
+            o["motion"] = m
+            o["render"] = {k: v for k, v in (o.get("render") or {}).items() if k != "gpu_prep"}
+            a.cost_usd = round(float(a.cost_usd or 0) + cost, 4)
+        a2 = await _patch(asset_id, keep)
+        return dict((a2.options or {}).get("motion") or motion) if a2 else motion
+    except Exception:  # noqa: BLE001 - never hold a video up for this
+        logger.warning("gpu photo prep skipped", exc_info=True, extra={"asset_id": asset_id})
+        return motion
+    finally:
+        if job:
+            await gpu_prep.cleanup(job)
+
+
+async def _fast_twilight(asset_id: str, owner_id: str, motion: dict) -> dict:
+    """Fast Cut, owner 11/16: a daytime closing photo gets its AI Twilight version (the same edit as Media Lab's Twilight
+    tool - every window pane lit, lanterns on, a real sunset sky), sharpened and sized to match the daytime photo exactly,
+    so the ending dissolves from day into it on the same camera move. Once per photo (kept as `twi`); on the agent's
+    usage. Any failure leaves the drawn window glow as the ending (fast_cut_recipe falls back to it)."""
+    if not (motion.get("fast") or {}).get("edit"):
+        return motion
+    try:
+        props = fast_cut_recipe.plan(motion, motion.get("format") or "9:16")
+    except Exception:  # noqa: BLE001
+        return motion
+    shots = props.get("shots") or []
+    if not shots:
+        return motion
+    pid = shots[-1].get("photo")
+    info = ((motion.get("fast") or {}).get("edit") or {}).get("photos", {}).get(pid) or {}
+    p = next((q for q in motion.get("photos") or [] if q.get("id") == pid), None)
+    if not p or p.get("twi") or p.get("twi_failed") or not p.get("clean") or not p.get("sharp"):
+        return motion
+    if info.get("light") != "day" or info.get("kind") not in ("exterior", "aerial", "pool"):
+        return motion
+    from PIL import Image
+    from app.services.studio_media.prompts import build_stacked_prompt
+    from app.services.studio_media.providers.base import ImageEditRequest
+    from app.services.studio_media.providers.registry import image_provider
+    from app.services.studio_media_service import _image_cost
+    try:
+        async with AsyncSessionLocal() as db:
+            config = await ai_config_service.get_config(db)
+            owner = await db.get(User, owner_id)
+            if owner is None or await studio_motion_would_refuse(db, owner_id, config, owner.plan_tier):
+                return motion   # no AI left this month: the drawn glow ending
+        await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "stage": "Turning the ending to twilight"}))
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0), follow_redirects=True) as client:
+            day = (await client.get(p["clean"])).content
+            sharp_bytes = (await client.get(p["sharp"])).content
+            sharp_size = await asyncio.to_thread(lambda: Image.open(io.BytesIO(sharp_bytes)).size)
+            provider = image_provider(config["studio_media_image_provider"], config["studio_media_image_model"])
+            prompt = build_stacked_prompt(["twilight"], {})
+            result = None
+            if _saving(motion) and hasattr(provider, "edit_batch"):
+                # Save usage: OpenAI's half-price slow lane (owner 11/16; tested: 161 s), the normal way after 12 minutes
+                result = await provider.edit_batch(p["clean"], prompt, config["studio_media_image_size"], config["studio_media_image_quality"],
+                                                   _save_seconds(motion, config) or 720)
+            if result is None:
+                result = await provider.edit(ImageEditRequest(image_bytes=day, image_content_type="image/jpeg", prompt=prompt,
+                                                              size=config["studio_media_image_size"], quality=config["studio_media_image_quality"]))
+            cost = _image_cost(result, config, float(config.get("studio_media_image_reservation_estimate_usd") or 0.05))
+            async with AsyncSessionLocal() as db:
+                await record_usage_event(db, owner_id, None, provider.model, None, None, cost, 0, False, None, event_type=EVENT_TYPE)
+            raw_url = await asyncio.to_thread(s3_service.upload_bytes, result.image_bytes, f"{_S3_PREFIX}/twilight", ".png" if "png" in (result.content_type or "") else ".jpg",
+                                              result.content_type or "image/png", "public, max-age=31536000, immutable")
+            # sharpen it like every other photo, then size it EXACTLY like the daytime photo (the dissolve lines them up)
+            sharp_cost = 0.0
+            try:
+                out = await _fal(client, _FAL_ESRGAN, {"image_url": raw_url, "scale": 2, "model": "RealESRGAN_x4plus", "output_format": "jpeg"})
+                big = (await client.get(((out or {}).get("image") or {})["url"], timeout=120)).content
+                sharp_cost = float(config.get("studio_motion_sharpen_price_per_photo_usd", 0.006) or 0.0)
+            except Exception:  # noqa: BLE001 - unsharpened is still far better than the drawn glow
+                logger.warning("fast cut twilight sharpen skipped", exc_info=True, extra={"asset_id": asset_id})
+                big = result.image_bytes
+
+            def fit(b: bytes) -> bytes:
+                im = Image.open(io.BytesIO(b)).convert("RGB").resize(sharp_size, Image.LANCZOS)
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=92)
+                return buf.getvalue()
+            twi = await asyncio.to_thread(s3_service.upload_bytes, await asyncio.to_thread(fit, big), f"{_S3_PREFIX}/twilight", ".jpg", "image/jpeg", "public, max-age=31536000, immutable")
+            if sharp_cost:
+                async with AsyncSessionLocal() as db:
+                    await record_usage_event(db, owner_id, None, "fal:esrgan", None, None, sharp_cost, 0, False, None, event_type=EVENT_TYPE)
+
+        def keep(a, o):
+            m = dict(o.get("motion") or {})
+            m["photos"] = [{**q, "twi": twi} if q.get("id") == pid else q for q in m.get("photos") or []]
+            o["motion"] = m
+            a.cost_usd = round(float(a.cost_usd or 0) + cost + sharp_cost, 4)
+        a2 = await _patch(asset_id, keep)
+        return dict((a2.options or {}).get("motion") or motion) if a2 else motion
+    except Exception:  # noqa: BLE001 - never hold a video up for this
+        logger.warning("fast cut twilight ending skipped", exc_info=True, extra={"asset_id": asset_id})
+
+        def mark(a, o):
+            m = dict(o.get("motion") or {})
+            m["photos"] = [{**q, "twi_failed": True} if q.get("id") == pid else q for q in m.get("photos") or []]
+            o["motion"] = m
+        await _patch(asset_id, mark)
+        return motion
+
+
+async def _fast_edit(asset_id: str, owner_id: str, motion: dict) -> dict:
+    """Fast Cut: the AI editor's one look at the video's photos (fast_cut_edit) - which are used, in what order,
+    where each one's subject is, flames, the closing photo's windows. Kept on the project (motion.fast.edit) and
+    reused until a photo is ADDED; on the agent's usage. Never holds a video up: on failure the older planner
+    makes it from the room labels."""
+    vis = [p for p in motion.get("photos") or [] if not p.get("hidden")]
+    ids = [p["id"] for p in vis]
+    if fast_cut_edit.covers((motion.get("fast") or {}).get("edit"), ids):
+        return motion
+    lock = _FAST_LOCKS.setdefault(asset_id, asyncio.Lock())
+    async with lock:
+        try:
+            async with AsyncSessionLocal() as db:
+                asset = await db.get(StudioMediaAsset, asset_id)
+                config = await ai_config_service.get_config(db)
+                latest = dict(((asset.options or {}) if asset else {}).get("motion") or {})
+                lp = asset.linked_property if asset else None
+            if fast_cut_edit.covers((latest.get("fast") or {}).get("edit"), ids):   # another request just did it
+                return {**motion, "fast": {**(motion.get("fast") or {}), "edit": latest["fast"]["edit"]}}
+            model = config.get("fast_cut_model") or FAST_CUT_MODEL
+            edit, tin, tout = await fast_cut_edit.run([{"id": p["id"], "url": p.get("clean") or p["source"]} for p in vis], _listing_text(lp), model,
+                                                      _save_seconds(motion, config))
+            cost = float(ai_config_service.estimate_cost_usd(config, model, tin, tout)) if (tin or tout) else 0.0
+            if cost:
+                async with AsyncSessionLocal() as db:
+                    await record_usage_event(db, owner_id, None, model, tin, tout, cost, 0, False, None, event_type=EVENT_TYPE)
+            if not edit:
+                return motion
+
+            def keep(a, o):
+                m = dict(o.get("motion") or {})
+                m["fast"] = {**(m.get("fast") or {}), "edit": edit}
+                o["motion"] = m
+                a.cost_usd = round(float(a.cost_usd or 0) + cost, 4)
+            a2 = await _patch(asset_id, keep)
+            return dict((a2.options or {}).get("motion") or motion) if a2 else {**motion, "fast": {**(motion.get("fast") or {}), "edit": edit}}
+        except Exception:  # noqa: BLE001
+            logger.warning("fast cut editor pass skipped", exc_info=True, extra={"asset_id": asset_id})
+            return motion
+
+
+# "Save usage": the look can take minutes, so the plan screen does not hold a request open for it - the look runs
+# in the background under a lease (one copy of the API, once) and the screen asks again every few seconds.
+_K_FASTEDIT = "motion_fastedit"
+_FAST_BG: dict[str, asyncio.Task] = {}
+_FAST_FAILED: dict[str, float] = {}
+
+
+async def _fast_edit_working(asset_id: str) -> bool:
+    t = _FAST_BG.get(asset_id)
+    return (t is not None and not t.done()) or await _alive_anywhere(_K_FASTEDIT, asset_id)
+
+
+async def _fast_edit_start(asset_id: str, owner_id: str, motion: dict) -> None:
+    if await _fast_edit_working(asset_id):
+        return
+    token = await _claim(_K_FASTEDIT, asset_id)
+    if not token:
+        return
+
+    async def look():
+        out = await _fast_edit(asset_id, owner_id, motion)
+        if (out.get("fast") or {}).get("edit"):
+            _FAST_FAILED.pop(asset_id, None)
+        else:
+            _FAST_FAILED[asset_id] = time.time()
+    _FAST_BG[asset_id] = _run_claimed(_K_FASTEDIT, asset_id, token, look())
+
+
+async def _fast_edit_wait(asset_id: str, motion: dict) -> dict:
+    """Before a render asks for the look itself: a look already running (this copy or another) is waited for."""
+    waited = 0
+    while waited < (FAST_SAVE_CAP_MINUTES + 6) * 60 and await _fast_edit_working(asset_id):
+        await asyncio.sleep(5)
+        waited += 5
+    if not waited:
+        return motion
+    async with AsyncSessionLocal() as db:
+        a = await db.get(StudioMediaAsset, asset_id)
+    return dict(((a.options or {}) if a else {}).get("motion") or motion)
+
+
+async def fast_outline(db, user: User, asset_id: str) -> dict:
+    """The Fast Cut's plan, shot by shot, BEFORE it is made - what the editor screen shows so the agent can check
+    the photo order and the stat slides. Runs the AI editor first if these photos have not been looked at."""
+    asset = await _owned_motion(db, user.id, asset_id)
+    motion = dict((asset.options or {}).get("motion") or {})
+    if not fastcut.is_fast(motion):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "This video is not a Fast Cut.")
+    vis = [p for p in motion.get("photos") or [] if not p.get("hidden")]
+    if len(vis) < fast_cut_recipe.MIN_PHOTOS:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"A Fast Cut needs at least {fast_cut_recipe.MIN_PHOTOS} photos - add a few more, or make a Cinematic Video.")
+    if not fast_cut_edit.covers((motion.get("fast") or {}).get("edit"), [p["id"] for p in vis]):
+        config = await ai_config_service.get_config(db)
+        if await studio_motion_would_refuse(db, user.id, config, user.plan_tier):
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "You've reached this month's AI usage, so the photos can't be looked at just now.")
+        if _saving(motion):
+            if time.time() - _FAST_FAILED.get(asset_id, 0) < 300 and not await _fast_edit_working(asset_id):
+                _FAST_FAILED.pop(asset_id, None)   # (the screen's "Try again" starts a fresh look)
+                raise HTTPException(status.HTTP_502_BAD_GATEWAY, "We couldn't look at those photos just now. Try again in a moment.")
+            await _fast_edit_start(asset_id, user.id, motion)
+            return {"working": True, "speed": "save", "cap_minutes": int((_save_seconds(motion, config) or 0) // 60)}
+        motion = await _fast_edit(asset_id, user.id, motion)
+    edit = (motion.get("fast") or {}).get("edit")
+    if not edit:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "We couldn't look at those photos just now. Try again in a moment.")
+    try:
+        props = fast_cut_recipe.plan(motion, motion.get("format") or "9:16")
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+    usable = sum(1 for p in vis if p["id"] in edit["photos"] and not edit["photos"][p["id"]].get("skip"))
+    need_long = fast_cut_recipe.photos_needed(True)
+    return {
+        "rows": fast_cut_recipe.outline(props, motion), "order": props.get("order") or [], "seconds": props["duration"], "song": fast_cut_recipe.song_of(motion),
+        "long": fast_cut_recipe.is_long(motion), "usable": usable, "needed": fast_cut_recipe.photos_needed(fast_cut_recipe.is_long(motion)),
+        "needed_long": need_long, "recommend": 60 if usable >= need_long else 30,
+        "skipped": [p["id"] for p in vis if (edit["photos"].get(p["id"]) or {}).get("skip")],
+        "seconds_short": round(fast_cut_recipe.seconds(False), 1), "seconds_long": round(fast_cut_recipe.seconds(True), 1),
+    }
+
+
 def worker_props(motion: dict, fmt: str) -> dict:
+    if fastcut.is_fast(motion):
+        if (motion.get("fast") or {}).get("edit"):
+            try:
+                return fast_cut_recipe.plan(motion, fmt)   # the approved edit (the AI editor's picks on the song's beats)
+            except ValueError:
+                pass
+        return fastcut.plan({**motion, "length": 30, "song": "skyline"}, fmt)   # fallback: the older planner, from the room labels
     photos = []
     for p in motion.get("photos") or []:
         src = p.get("sharp") or p.get("clean") or p.get("source")  # sharpened copy whenever there is one (always on, 11/12)
@@ -1300,7 +1909,7 @@ async def worker_status() -> dict:
     """Is the video maker up, and how long would a video take right now (its measured speed + the
     line ahead) - the Make step's "To make" figure (QA 11/12: it was a fixed guess)."""
     if vl.enabled():  # AWS Lambda (owner 11/13): always up; a short line only while every slot is busy
-        h = vl.health()
+        h = vs.health() if vs.enabled() and not await _lambda_still_free(900) else vl.health()
         try:
             making, waiting = await _lambda_line()
             wait = await _line_wait_seconds(making, len(waiting))
@@ -1322,9 +1931,11 @@ async def worker_status() -> dict:
         return {"worker": False}
 
 
-async def start_render(db, user: User, asset_id: str, sharpen: Optional[bool], fmt: Optional[str]) -> StudioMediaAsset:
+async def start_render(db, user: User, asset_id: str, sharpen: Optional[bool], fmt: Optional[str], overnight: Optional[bool] = None) -> StudioMediaAsset:
     asset = await _owned_motion(db, user.id, asset_id)
     render = (asset.options or {}).get("render") or {}
+    if overnight is False and render.get("overnight") and render.get("held") and render.get("state") in _ACTIVE:
+        return await make_now(db, user, asset_id)
     if render.get("state") in ("preparing", "queued", "rendering", "finishing") and (_local_alive(asset_id) or await _alive_anywhere(_K_RENDER, asset_id)):
         return asset
     token = await _claim(_K_RENDER, asset_id)
@@ -1333,20 +1944,22 @@ async def start_render(db, user: User, asset_id: str, sharpen: Optional[bool], f
         return asset
     try:
         await db.refresh(asset)   # read again now that it's ours
-        asset = await _start_render_claimed(db, user, asset, fmt, token)
+        asset = await _start_render_claimed(db, user, asset, fmt, token, bool(overnight))
         token = None              # the background run gives it back
         return asset
     finally:
         await _unclaim(_K_RENDER, asset_id, token)
 
 
-async def _start_render_claimed(db, user: User, asset: StudioMediaAsset, fmt: Optional[str], token: str) -> StudioMediaAsset:
+async def _start_render_claimed(db, user: User, asset: StudioMediaAsset, fmt: Optional[str], token: str, overnight: bool = False) -> StudioMediaAsset:
     asset_id = asset.id
     opts = dict(asset.options or {})
     motion = dict(opts.get("motion") or {})
     visible = [p for p in motion.get("photos") or [] if not p.get("hidden")]
     if len(visible) < 2:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Keep at least 2 photos in the video.")
+    if fastcut.is_fast(motion) and len(visible) < fastcut.MIN_PHOTOS:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"A Fast Cut needs at least {fastcut.MIN_PHOTOS} photos - add a few more, or make a Cinematic Video.")
     unready = bool(_needs_prep(motion))
     if not await worker_alive():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "The video maker is restarting. Try again in a minute.")
@@ -1359,7 +1972,9 @@ async def _start_render_claimed(db, user: User, asset: StudioMediaAsset, fmt: Op
     need_sharp = [p for p in visible if not p.get("sharp")]
     reservation = None
     skip_sharp = False
-    if vl.enabled():
+    plan = await overnight_plan(config, float(motion.get("length") or 30), asset_id) if overnight else None
+    overnight = bool(plan)   # asked for, and our own video maker is there to do it
+    if vl.enabled() and not overnight:
         # Making the video now costs real money (AWS Lambda, owner 11/13) and counts on the agent's
         # monthly AI usage - so it needs AI left this month, like every other AI Media tool.
         try:
@@ -1383,6 +1998,8 @@ async def _start_render_claimed(db, user: User, asset: StudioMediaAsset, fmt: Op
         "started_at": _now(), "target": target, "main": main, "sharpen_count": len(need_sharp), "hash": settings_hash(motion),
         "skip_sharp": skip_sharp,
     }
+    if overnight:
+        opts["render"].update(overnight=True, ready_at=plan["ready_at"], held=bool(plan["held"]), opens_at=plan["opens_at"])
     if asset.status in ("draft", "failed") and main:
         asset.status = "processing"
         asset.error_message = None
@@ -1404,7 +2021,20 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
         motion = dict(opts.get("motion") or {})
         render = dict(opts.get("render") or {})
         target = render.get("target") or motion.get("format", "16:9")
+        overnight = bool(render.get("overnight"))
         job_id = resume_job
+        if not job_id and fastcut.is_fast(motion):
+            # the AI editor's look first: only the photos it puts in the video are prepared and sharpened
+            if not fast_cut_edit.covers((motion.get("fast") or {}).get("edit"), [p["id"] for p in motion.get("photos") or [] if not p.get("hidden")]):
+                await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "stage": "The AI editor is looking at your photos"}))
+            motion = await _fast_edit_wait(asset_id, motion)
+            motion = await _fast_edit(asset_id, owner_id, motion)
+            if gpu_prep.enabled():
+                # Save usage AND Make it now (owner 11/16): our own Amazon graphics machine prepares the planned photos (~0.3 cents each instead of
+                # ~1.7); whatever it couldn't do is prepared by the photo service just below, as before
+                motion = await _gpu_prep(asset_id, owner_id, motion)
+            if _needs_prep(motion):
+                await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "stage": "Getting your photos ready"}))
         if not job_id and _needs_prep(motion):
             # 0) photos picked moments ago may still be getting their depth maps (free)
             await _wait_for_prep(asset_id)
@@ -1416,6 +2046,9 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
             # 1) sharpen (always - once per photo, kept for every later render; skipped only when the
             # agent's AI for the month ran out, start_render's skip_sharp)
             visible = [p for p in motion.get("photos") or [] if not p.get("hidden")]
+            only = _fast_plan_ids(motion)
+            if only is not None:
+                visible = [p for p in visible if p.get("id") in only]
             need = [] if render.get("skip_sharp") else [p for p in visible if not p.get("sharp")]
             if need:
                 sharpened: dict[str, str] = {}
@@ -1448,32 +2081,58 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
                     a.cost_usd = round(float(a.cost_usd or 0) + spent, 4)
                 a2 = await _patch(asset_id, keep_sharp)
                 motion = dict((a2.options or {}).get("motion") or {})
-            if reservation is not None and not vl.enabled():
+            if reservation is not None and (overnight or not vl.enabled()):
                 async with AsyncSessionLocal() as db:
                     await reconcile_budget(db, reservation, spent)
                 reservation = None
+            if overnight:
+                # overnight mode: wait for the quiet hours (unless the agent switches it to "now")
+                overnight, reservation = await _overnight_hold(asset_id, owner_id, reservation)
             # 2) hand it to the video maker (AWS Lambda when set up, else the self-hosted worker)
+            if fastcut.is_fast(motion):
+                motion = await _aim_fronts(asset_id, owner_id, motion)
+                motion = await _fast_edit(asset_id, owner_id, motion)
+                motion = await _fast_twilight(asset_id, owner_id, motion)   # the ending: the AI Twilight version of a daytime closing photo
             props = worker_props(motion, target)
-            if vl.enabled():
-                job_id = await _lambda_take_turn(asset_id, props)
+            if vl.enabled() and not overnight:
+                job_id = await _spot_or_lambda(asset_id, props, now=not _saving(motion))
             else:
                 async with httpx.AsyncClient(timeout=30) as client:
-                    r = await client.post(f"{_worker_url()}/jobs", json={"props": props}, headers=_worker_headers())
-                    r.raise_for_status()
+                    for attempt in range(90 if overnight else 1):
+                        try:
+                            r = await client.post(f"{_worker_url()}/jobs", json={"props": props}, headers=_worker_headers())
+                            r.raise_for_status()
+                            break
+                        except httpx.HTTPError:
+                            # overnight: nobody is waiting at the screen - keep trying for an hour and a half
+                            if not overnight or attempt == 89:
+                                raise
+                            await asyncio.sleep(60)
                     job_id = r.json()["id"]
             await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "job_id": job_id, "state": "queued",
                                                                           "stage": "Waiting for the video maker", "progress": max(0.12, (o.get("render") or {}).get("progress") or 0)}))
+        props = worker_props(motion, target)
         # 3) follow the worker. Runs on the server, so the agent can close the page, log out or turn
         # their computer off - the bell (and their next daily briefing) tells them when it's ready.
         last = None
         resent = 0
-        lam = vl.is_lambda_job(job_id)
+        spot = vs.is_spot_job(job_id)          # a discounted Amazon machine (the first try)
+        lam = vl.is_lambda_job(job_id) or spot  # made on Amazon either way
         async with httpx.AsyncClient(timeout=30) as client:
             while True:
                 await asyncio.sleep(5.0 if lam else 2.0)
                 if lam:
-                    j = await vl.status(job_id)
+                    j = await (vs.status(job_id) if spot else vl.status(job_id))
                     if j.get("busy_check"):
+                        continue
+                    if j.get("status") == "failed" and spot:
+                        # the rented machine didn't finish (taken back, or it broke): Lambda makes it instead,
+                        # by itself - the agent just sees it take a little longer
+                        logger.warning("spot video didn't finish - Lambda takes over", extra={"asset_id": asset_id, "reason": str(j.get("error"))[:200]})
+                        await vs.cleanup(job_id)
+                        await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "job_id": None, "eta_at": None, "route": "lambda", "stage": "Starting the cameras"}))
+                        job_id = await _lambda_take_turn(asset_id, props)
+                        spot, last = False, None
                         continue
                     if j.get("status") == "failed":
                         raise RuntimeError("worker: " + str(j.get("error") or "render failed"))
@@ -1556,7 +2215,7 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
                         await reconcile_budget(db, reservation, spent)
                 return
             if lam:
-                video = await vl.fetch(job_id, j.get("out_key"))  # the cover is taken from the video itself below
+                video = await (vs.fetch(job_id) if spot else vl.fetch(job_id, j.get("out_key")))  # the cover is taken from the video itself below
             else:
                 fr = await client.get(f"{_worker_url()}/jobs/{job_id}/file", headers=_worker_headers(), timeout=300)
                 fr.raise_for_status()
@@ -1570,9 +2229,16 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
         if lam:
             # What AWS charged for this video goes on the agent's monthly AI usage (owner 11/13).
             async with AsyncSessionLocal() as db:
-                aws = vl.charge_usd(j.get("remotion_cost_usd") or 0, await ai_config_service.get_config(db))
+                raw = float((j.get("cost_usd") if spot else j.get("remotion_cost_usd")) or 0)
+                if not spot:
+                    made = await db.get(StudioMediaAsset, asset_id)
+                    if made is not None and ((made.options or {}).get("render") or {}).get("route") == "free":
+                        # made on the free Lambda allowance (cost us nothing): the agent's usage counts the
+                        # low discounted-machine figure, not Lambda's full price (owner 11/14)
+                        raw = min(raw, vs.equivalent_usd(j.get("frames")))
+                aws = vl.charge_usd(raw, await ai_config_service.get_config(db))
                 if aws:
-                    await record_usage_event(db, owner_id, None, "aws:lambda", None, None, aws, 0, False, None, event_type=EVENT_TYPE)
+                    await record_usage_event(db, owner_id, None, "aws:spot" if spot else "aws:lambda", None, None, aws, 0, False, None, event_type=EVENT_TYPE)
             spent += aws
             if reservation is not None:
                 async with AsyncSessionLocal() as db:
@@ -1623,7 +2289,8 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
             except ValueError:
                 pass
             o["render"] = {"state": "done", "progress": 1.0, "stage": "Done", "finished_at": _now(), "seconds": secs,
-                           "target": render.get("target"), "main": render.get("main", True), "width": width}
+                           "target": render.get("target"), "main": render.get("main", True), "width": width,
+                           "overnight": bool(render.get("overnight")) and not lam}
         asset = await _patch(asset_id, finish)
         _SAVE_SECS["v"] = _SAVE_SECS["v"] * 0.6 + (time.time() - save_t0) * 0.4  # learned, for the next countdown
         async with AsyncSessionLocal() as db:
@@ -1652,7 +2319,9 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
                 await asyncio.to_thread(s3_service.delete_by_url, old_prev)
         # Only now (the video is safely stored) let the worker drop its copy - a restart before this
         # point resumes and downloads it again instead of losing the finished render.
-        if lam:
+        if spot:
+            await vs.cleanup(job_id)
+        elif lam:
             await vl.cleanup(job_id)
         else:
             try:
@@ -1660,7 +2329,10 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
                     await client.delete(f"{_worker_url()}/jobs/{job_id}", headers=_worker_headers())
             except httpx.HTTPError:
                 pass  # the worker clears old files by itself after 3 hours
-        if newly_done["v"] and asset:
+        was_overnight = bool(asset and ((asset.options or {}).get("render") or {}).get("overnight"))
+        if was_overnight and (asset.options or {}).get("render", {}).get("main", True):
+            await _notify_overnight_done(asset_id)
+        elif newly_done["v"] and asset:
             async with AsyncSessionLocal() as db:
                 fresh = await db.get(StudioMediaAsset, asset_id)
                 from app.services.studio_media_service import _notify_video_done
@@ -1669,7 +2341,7 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
                 await _notify_video_done(db, fresh, email_ready=False)
         if _TASKS.get(asset_id) is asyncio.current_task():
             _TASKS.pop(asset_id, None)
-        await _next_remake(asset_id, owner_id)
+        await _next_remake(asset_id, owner_id, was_overnight)
     except Exception as exc:  # noqa: BLE001
         logger.exception("motion render failed", extra={"asset_id": asset_id})
         detail = str(exc)
@@ -1699,10 +2371,10 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
             _TASKS.pop(asset_id, None)
 
 
-async def _next_remake(asset_id: str, owner_id: str) -> None:
+async def _next_remake(asset_id: str, owner_id: str, overnight: bool = False) -> None:
     """After an updated main video: re-make the next out-of-date extra shape (render only - the
     photos are already prepared, so sharpening is never re-run here)."""
-    if vl.enabled():
+    if vl.enabled() and not overnight:
         # each remake is a paid AWS render now - not once the agent's AI for the month is used up
         # (the out-of-date shapes stay listed; Make it re-makes them when there's AI again)
         try:
@@ -1724,6 +2396,8 @@ async def _next_remake(asset_id: str, owner_id: str) -> None:
         o["remake_formats"] = q
         o["render"] = {"state": "queued", "progress": 0.0, "stage": "Waiting for the video maker", "started_at": _now(),
                        "target": nxt["t"], "main": False, "sharpen_count": 0, "hash": settings_hash(motion), "skip_sharp": True}
+        if overnight:   # the other shapes follow on the same free line, straight after (no second night's wait)
+            o["render"].update(overnight=True, no_hold=True)
     try:
         await _patch(asset_id, take)
     except Exception:  # noqa: BLE001
@@ -1836,6 +2510,57 @@ async def _line_wait_seconds(making: list[dict], ahead_waiting: int) -> float:
     return queue[0] if queue else 0.0
 
 
+async def _lambda_still_free(frames: int) -> bool:
+    """True while this month's FREE Lambda allowance (400,000 GB-seconds for the whole AWS account) still
+    covers this video with room to spare - then Lambda costs us nothing and is the cheapest (and fastest)
+    way to make it. The reading is up to 10 minutes old and CloudWatch runs a little behind, so the last
+    15% is left alone. VIDEO_FREE_LAMBDA_FIRST=0 turns this off (always the discounted machine first)."""
+    if (os.environ.get("VIDEO_FREE_LAMBDA_FIRST") or "1").strip().lower() in ("0", "off", "false", "no"):
+        return False
+    try:
+        from app.services import provider_limits_service as pl
+        aws = await pl._aws_cached()
+        used = float(aws["gb_seconds"])
+        need = max(1, int(frames or 900)) * 9.0   # measured: about 8 GB-seconds a frame
+        return used + need < 0.85 * pl.LAMBDA_FREE_GB_SECONDS
+    except Exception:  # noqa: BLE001 - can't tell: treat the free allowance as used up
+        return False
+
+
+async def _spot_or_lambda(asset_id: str, props: dict, now: bool = False) -> str:
+    """Owner 11/14 (price over speed): whichever costs us least makes the video. While the month's free
+    Lambda allowance lasts, that is Lambda (free). After that a discounted Amazon machine makes it when
+    one can be had - waiting a few minutes for one if the account's limit is reached - and Lambda
+    (paid) only when none can."""
+    route = "lambda"
+    if vs.enabled() and await _lambda_still_free(vl.frames_estimate(props)):
+        route = "free"
+    elif vs.enabled() and not now:   # ("Make it now": straight to Lambda, the fast line)
+        deadline = time.time() + vs.wait_seconds()
+        told = False
+        while True:
+            try:
+                job_id = await vs.start(props, vl.composition_of(props))
+                frames = vl.frames_estimate(props)
+                eta_at = (datetime.now(timezone.utc) + timedelta(seconds=vs.video_seconds(frames) + _SAVE_SECS["v"])).isoformat()
+                await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "job_id": job_id, "state": "queued", "ahead": 0, "route": "spot",
+                                                                              "stage": "Starting the cameras", "eta_at": eta_at, "eta_learned": True}))
+                return job_id
+            except vs.SpotBusy as exc:
+                if time.time() >= deadline:
+                    logger.info("no spot machine in time - Lambda makes the video", extra={"asset_id": asset_id, "reason": str(exc)})
+                    break
+                if not told:
+                    told = True
+                    await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "state": "queued", "stage": "Waiting for the video maker"}))
+                await asyncio.sleep(20.0)
+            except Exception:  # noqa: BLE001 - this route isn't usable here (permissions, set-up): Lambda
+                logger.warning("spot video machine couldn't be started - Lambda makes the video", exc_info=True, extra={"asset_id": asset_id})
+                break
+    await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "route": route}))
+    return await _lambda_take_turn(asset_id, props)
+
+
 async def _lambda_take_turn(asset_id: str, props: dict) -> str:
     """Wait for a free Lambda slot (first come, first served), then start this video on AWS."""
     frames = vl.frames_estimate(props)
@@ -1933,7 +2658,7 @@ async def _resume(asset: StudioMediaAsset) -> Optional[StudioMediaAsset]:
             started = datetime.fromisoformat(render["started_at"]).timestamp() if render.get("started_at") else 0
         except ValueError:
             started = 0
-        if started and time.time() - started > 6 * 3600:
+        if started and time.time() - started > (_OVERNIGHT_STALE if render.get("overnight") else 6 * 3600):
             return await fail("That run was interrupted. Press Make video again.")
         if render.get("job_id") and render.get("state") != "preparing":
             # the video maker has it (or lost it - _run_render hands it over again)

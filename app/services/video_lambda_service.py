@@ -111,7 +111,14 @@ def video_seconds(frames: int, lambdas: Optional[int] = None) -> float:
     return _SPEED["start_seconds"] + max(1, int(frames or 900)) * sec_per_frame(lambdas)
 
 
+def composition_of(props: dict) -> str:
+    """Which video template these props are for: a Fast Cut's props are a shot list."""
+    return "FastCut" if isinstance(props.get("shots"), list) else "CinematicVideo"
+
+
 def frames_estimate(props: dict) -> int:
+    if isinstance(props.get("shots"), list):   # a Fast Cut knows its exact length (the song's)
+        return int(30 * float(props.get("duration") or 30)) + 1
     # opening + rooms + end card; the real count comes back from Lambda. A little high on purpose.
     return int(30 * (float(props.get("length") or 30) + 10))
 
@@ -126,7 +133,7 @@ async def start(props: dict) -> str:
     lambdas = lambdas_per_video()
     fpl = max(20, math.ceil(frames_estimate(props) / lambdas))
     params = RenderMediaParams(
-        composition="CinematicVideo", input_props=props, codec="h264", crf=21, audio_codec="aac",
+        composition=composition_of(props), input_props=props, codec="h264", crf=21, audio_codec="aac",
         privacy=Privacy.PRIVATE, frames_per_lambda=fpl, concurrency_per_lambda=2, max_retries=1,
         timeout_in_milliseconds=240000,
         # A plain dict in the renderer's own spelling: the library's ChromiumOptions is sent with

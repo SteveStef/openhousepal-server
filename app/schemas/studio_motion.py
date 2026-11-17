@@ -32,6 +32,9 @@ class MotionRenderRequest(BaseModel):
     sharpen: Optional[bool] = None
     # Another shape of the same video (made from the same settings, kept beside the main one).
     format: Optional[MotionFormat] = None
+    # Overnight mode (11/14): made on our own video maker in the quiet hours - no AI for the render.
+    # False on a video already scheduled = "make it now instead".
+    overnight: Optional[bool] = None
 
 
 class MotionEstimateResponse(BaseModel):
@@ -48,3 +51,22 @@ class MotionEstimateResponse(BaseModel):
     render_percent: Optional[float] = None
     render_paid: bool = False
     render_paused: bool = False
+    # the cheapest it can be (a discounted Amazon machine) - render_usd is the most (Lambda)
+    render_usd_low: float = 0.0
+    render_percent_low: Optional[float] = None
+    # Fast Cut only: the AI editor's one look at the photos (once per set of photos)
+    fast_edit_usd: float = 0.0
+    fast_edit_percent: Optional[float] = None
+    # Save usage / Make it now: the AI editor's look + making the video (photo preparation is the same either way)
+    speed_save_usd: float = 0.0
+    speed_save_usd_max: float = 0.0
+    speed_now_usd: float = 0.0
+    speed_save_percent: Optional[float] = None
+    speed_save_percent_max: Optional[float] = None
+    speed_now_percent: Optional[float] = None
+    speed_save_cap_minutes: int = 12
+    overnight_available: bool = False
+    overnight_ready_at: Optional[str] = None
+    overnight_held: bool = False
+    overnight_saves_usd: float = 0.0
+    overnight_saves_percent: Optional[float] = None

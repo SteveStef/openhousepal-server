@@ -52,6 +52,8 @@ async def _p_media(db, user, a):
     payload = {"tool": tool, "photo": photo or None, "uploads": uploads, "listing": listing, "has_mls": has_mls,
                "room_type": a.get("room_type") if a.get("room_type") in ROOMS else None, "style": a.get("style") if a.get("style") in STYLES else None,
                "enhancements": [e for e in (a.get("enhancements") or []) if e in ENHANCE], "video_style": "day_to_twilight" if a.get("video_style") == "day_to_twilight" else "standard",
+               "video_kind": "fast_cut" if a.get("video_kind") == "fast_cut" else "cinematic",   # which kind of AI Video the editor starts on
+               "video_speed": "now" if a.get("speed") == "now" else "save",   # Save usage (the default) or Make it now
                "usage": {k: usage.get(k) for k in ("image_est_usd", "video_est_usd", "month_ai_budget_usd", "month_ai_percent")}}
     return Prepared("Make AI media", ["Pick the tool and the photo - it comes out in your Media Lab and your original stays as it is"], payload,
                     warning="This uses your monthly AI allowance.", confirm_label="Make it", picker="media")
@@ -130,12 +132,27 @@ async def _r_cinematic(user, p: dict, linked: Optional[dict]) -> dict:
         body["linked_property"] = linked
     out = await _run_route(user, "POST", "/studio/media-lab/motion", body)
     aid = (out or {}).get("id")
+    fast = p.get("video_kind") == "fast_cut"
     if not aid:
-        return {"message": "Your Cinematic Video is waiting in Media Lab.", "link": "/studio/media"}
+        return {"message": "Your video is waiting in Media Lab.", "link": "/studio/media"}
+    now = p.get("video_speed") == "now"
+    start = {"speed": "now" if now else "save"}
+    if fast:   # the editor opens on Fast Cut (tall, the shape it is mostly posted in); they can still switch kinds on step 1
+        start.update(kind="fastcut", format="9:16", length=30)
+    try:
+        await _run_route(user, "PATCH", f"/studio/media-lab/motion/{aid}", {"settings": start})
+    except ActionError:
+        fast = False
+    how = (" It's set to Make it now - the fastest way." if now else
+           " It's set to Save usage - the slower, cheaper way (a few minutes longer, less of your AI); switch to Make it now on the first step if you're in a hurry.")
     try:
         await _run_route(user, "POST", f"/studio/media-lab/motion/{aid}/analyze")
     except ActionError:
         pass  # the editor starts it itself when it opens
+    if fast:
+        return {"message": "Your Fast Cut is started - I'm sorting the photos now. Pick 30 seconds or a minute and the song below, "
+                           "take out any photos you don't want, check the order and the stats, and make it - right here. It's saved as you go." + how,
+                "link": f"/studio/media/motion/{aid}"}
     return {"message": "Your Cinematic Video is started - I'm sorting the photos into rooms now. Pick the length and shape "
                        "below, tap the rooms to show, check each photo and make it - right here. It's saved as you go.",
             "link": f"/studio/media/motion/{aid}"}
@@ -174,9 +191,9 @@ async def _r_media(db, user, p):
 
 
 _simple("make_ai_media", "Make AI media from a photo, the Media Lab's tools: twilight (day to dusk), lights_on, virtual_staging (needs a room and a style), enhance (grass, sky, brighten_exterior, lighting, polish, yard_cleanup, "
-        "declutter, remove_furniture), an AI video (1 to 7 landscape photos, standard or day_to_twilight) or a Cinematic Video (tool=cinematic: uses every photo of the named listing, or 2+ uploads picked on the card; then its editor opens right in the chat to pick the length and shape, tap the rooms to show, check each photo, the look and make it - no AI video model, well under 1% of their AI). Set it up right away: the card asks the tool, the photo and that tool's choices with a preview. "
-        "Pass photo_url when they attached a photo (from the [Photo attached: url] note), listing_key when they named one of their homes, and room_type or style if you can see or were told them. Runs in the background; never ask them to wait. IDX and Pro plans.",
+        "declutter, remove_furniture), an AI video clip (tool=video: an AI model animates 1 to 7 single photos, standard or day_to_twilight - ONLY when they ask to animate or bring to life particular photos, or for a day-to-twilight clip; NEVER for a reel or a video of a whole listing) or an AI Video tour of a home in one of two kinds (tool=cinematic for both; video_kind=cinematic is the slow, elegant film-style tour, video_kind=fast_cut is Fast Cut - lots of photos cut quickly on the beat of a song, 30 seconds or a minute, made for Reels and TikTok; ALWAYS use tool=cinematic with video_kind=fast_cut when they ask for a fast cut, a reel, a Reel / TikTok / Shorts video, quick cuts or a video on the beat; a plain 'video of' or 'video tour of' a listing is tool=cinematic with video_kind=cinematic; a Fast Cut (only a Fast Cut) can be made two ways - speed=save (the default: Save usage, the slower and cheaper way, usually 5 to 10 minutes longer for less of their monthly AI - also when they say the slow way, the cheap way or to save usage) or speed=now (Make it now, the fastest way - when they say fast, right now, in a hurry or the fast way); it is the same video either way): uses every photo of the named listing, or 2+ uploads picked on the card; then its editor opens right in the chat to pick the length and shape, tap the rooms to show, check each photo, the look and make it - no AI video model, well under 1% of their AI). Set it up right away: the card asks the tool, the photo and that tool's choices with a preview. "
+        "Pass photo_url when they attached a photo (from the [Photo attached: url] note), listing_key when they named a home (for tool=cinematic with a named home the listing_key is REQUIRED: look the home up first and pass its listing_key, so the card arrives with all of that home's photos - never open the card for a named home without it), and room_type or style if you can see or were told them. Runs in the background; never ask them to wait. IDX and Pro plans.",
         _obj({"tool": {"type": "string", "enum": list(TOOLS)}, "photo_url": {"type": "string"}, "listing_key": {"type": "string"},
               "room_type": {"type": "string", "enum": list(ROOMS)}, "style": {"type": "string", "enum": list(STYLES)},
-              "enhancements": {"type": "array", "items": {"type": "string", "enum": list(ENHANCE)}}, "video_style": {"type": "string", "enum": ["standard", "day_to_twilight"]}}),
+              "enhancements": {"type": "array", "items": {"type": "string", "enum": list(ENHANCE)}}, "video_style": {"type": "string", "enum": ["standard", "day_to_twilight"]}, "video_kind": {"type": "string", "enum": ["cinematic", "fast_cut"]}, "speed": {"type": "string", "enum": ["save", "now"]}}),
         _p_media, _r_media, MEDIA_PLANS, adjust=_adjust_media)

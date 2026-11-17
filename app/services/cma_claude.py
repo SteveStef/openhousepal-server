@@ -69,12 +69,14 @@ def _halve_usage(message) -> None:
                 pass
 
 
-async def through_the_queue(client, kwargs: dict, *, sleep=asyncio.sleep, clock=time.monotonic):
+async def through_the_queue(client, kwargs: dict, *, sleep=asyncio.sleep, clock=time.monotonic, cap_seconds: Optional[float] = None):
     """Send one request through the batch queue and wait for it. The message (usage halved), or None when the
     switch is off, the client has no queue (the accuracy test's stub), or the queue did not answer - the caller
     then sends the request the normal way."""
     batches = getattr(getattr(client, "messages", None), "batches", None)
-    if not slow_lane_on() or batches is None:
+    # cap_seconds: an agent chose the slower, half-price way for this request (video "Save usage", 11/16) - it goes
+    # through the queue whatever the testing switch says, and is sent the normal way after that long
+    if not (cap_seconds or slow_lane_on()) or batches is None:
         return None
     params = _plain({k: v for k, v in kwargs.items() if k != "extra_body"})
     params.update(_plain(kwargs.get("extra_body") or {}))
@@ -83,7 +85,7 @@ async def through_the_queue(client, kwargs: dict, *, sleep=asyncio.sleep, clock=
     except Exception:  # noqa: BLE001
         logger.warning("CMA slow lane: could not queue the request - sending it the normal way", exc_info=True)
         return None
-    began, cap = clock(), _cap_seconds()
+    began, cap = clock(), (float(cap_seconds) if cap_seconds else _cap_seconds())
     while True:
         try:
             state = await batches.retrieve(batch.id)
@@ -99,7 +101,7 @@ async def through_the_queue(client, kwargs: dict, *, sleep=asyncio.sleep, clock=
                 pass
             logger.info("CMA slow lane: still waiting after %.0f minutes - sending it the normal way", cap / 60)
             return None
-        await sleep(15 if waited < 180 else 30)
+        await sleep(8 if cap_seconds and waited < 300 else 15 if waited < 180 else 30)
     try:
         async for row in await batches.results(batch.id):
             result = getattr(row, "result", None)
@@ -114,8 +116,8 @@ async def through_the_queue(client, kwargs: dict, *, sleep=asyncio.sleep, clock=
     return None
 
 
-async def _send(client, kw: dict):
-    msg = await through_the_queue(client, kw)
+async def _send(client, kw: dict, direct: bool = False, slow_cap: Optional[float] = None):
+    msg = None if direct else await through_the_queue(client, kw, cap_seconds=slow_cap)
     return msg if msg is not None else await client.messages.create(**kw)
 
 
@@ -162,17 +164,19 @@ def _has_tool_call(resp, name: str) -> bool:
     return any(getattr(b, "type", None) == "tool_use" and getattr(b, "name", None) == name for b in (resp.content or []))
 
 
-async def create(client, *, effort: Optional[str] = None, **kwargs):
+async def create(client, *, effort: Optional[str] = None, direct: bool = False, slow_cap: Optional[float] = None, **kwargs):
     """client.messages.create(**kwargs) for any Claude model. On a current model, a call that forced a tool
-    is asked once more when the tool call didn't come; the returned response's usage is the total spent."""
+    is asked once more when the tool call didn't come; the returned response's usage is the total spent.
+    direct=True: never through the testing-only half-price queue - for a step with seconds to answer (the photo
+    sorter), where a queued request would always time out."""
     kw, name = prepare(kwargs, effort)
-    resp = await _send(client, kw)
+    resp = await _send(client, kw, direct, slow_cap)
     if not name or _has_tool_call(resp, name) or getattr(resp, "stop_reason", None) in ("max_tokens", "refusal"):
         return resp
     spent_in, spent_out = int(resp.usage.input_tokens or 0), int(resp.usage.output_tokens or 0)
     kw["messages"] = [*kw["messages"], {"role": "assistant", "content": resp.content},
                       {"role": "user", "content": f"Now call {name} with your result."}]
-    resp = await _send(client, kw)
+    resp = await _send(client, kw, direct)   # (the second ask is short: never queued)
     try:
         resp.usage.input_tokens = int(resp.usage.input_tokens or 0) + spent_in
         resp.usage.output_tokens = int(resp.usage.output_tokens or 0) + spent_out
