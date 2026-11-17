@@ -59,6 +59,15 @@ def machine_type() -> str:
     return os.environ.get("VIDEO_SPOT_TYPE") or "c7i.4xlarge"
 
 
+def machine_vcpus() -> int:
+    """vCPUs of the machine type by its size name (c7i.4xlarge -> 16): what one machine takes of the account's limit."""
+    size = machine_type().split(".")[-1]
+    if size.endswith("xlarge"):
+        n = size[:-len("xlarge")]
+        return 4 * (int(n) if n.isdigit() else 1)
+    return {"large": 2, "medium": 1, "small": 1, "micro": 1, "nano": 1}.get(size, 4)
+
+
 def wait_seconds() -> float:
     """How long a video may wait for a machine before Lambda makes it instead."""
     return float(os.environ.get("VIDEO_SPOT_WAIT_SECONDS") or 240)
@@ -231,7 +240,9 @@ SERVE_URL='{os.environ["REMOTION_SERVE_URL"]}' PROGRESS_URL='{put("progress.json
 
 async def start(props: dict, composition: str = "CinematicVideo") -> str:
     """Rent a machine and set it making the video. SpotBusy = none to be had right now (try again or use
-    Lambda); any other error = this route isn't usable here (use Lambda)."""
+    Lambda); any other error = this route isn't usable here (use Lambda) - incl. an account limit below one machine."""
+    if await asyncio.to_thread(vl.spot_too_small, vl.SPOT_QUOTA_STANDARD, machine_vcpus()):
+        raise RuntimeError(f"video machine: the account's spot limit is below one {machine_type()} (increase not approved yet)")
     job = await asyncio.to_thread(_launch, props, composition)
     logger.info("spot video machine started", extra={"job": job, "type": machine_type()})
     return job

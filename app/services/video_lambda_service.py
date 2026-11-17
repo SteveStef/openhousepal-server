@@ -95,6 +95,27 @@ def account_limit() -> int:
     return _ACCOUNT["limit"]
 
 
+_SPOT_QUOTA: dict[str, tuple[float, Optional[float]]] = {}
+SPOT_QUOTA_STANDARD = "L-34B43A08"   # "All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests" (vCPUs)
+SPOT_QUOTA_GPU = "L-3819A6DF"        # "All G and VT Spot Instance Requests" (vCPUs)
+
+
+def spot_too_small(quota_code: str, vcpus_needed: int) -> bool:
+    """True when this account's spot limit is below one machine of this size - Amazon can never give one, so a video
+    should not wait for it (live 11/17: the new video account starts with 0 graphics / 8 standard vCPUs while the
+    increase is reviewed; a Save usage video sat 30 minutes in a line that could never move). Read from AWS at most
+    every 15 minutes, so an approved increase is picked up by itself. False when the limit can't be read (the old
+    behaviour: try, and wait if Amazon says busy)."""
+    at, val = _SPOT_QUOTA.get(quota_code, (0.0, None))
+    if time.time() - at > 900:
+        try:
+            val = float(aws_session().client("service-quotas").get_service_quota(ServiceCode="ec2", QuotaCode=quota_code)["Quota"]["Value"])
+        except Exception:  # noqa: BLE001 - unknown: keep the last figure read
+            pass
+        _SPOT_QUOTA[quota_code] = (time.time(), val)
+    return val is not None and val < vcpus_needed
+
+
 def lambdas_per_video() -> int:
     """How many Lambdas one video is split across: REMOTION_MAX_LAMBDAS (7 - sized for a 10-at-once
     account) while the account is small; once AWS allows 100+ at once, 40 (about 1-2 minutes a video,

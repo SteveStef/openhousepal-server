@@ -247,7 +247,8 @@ $PY job.py
                 return f"{PREFIX}{bucket}:{run}:{iid}"
             except ClientError as exc:
                 last = (exc.response.get("Error") or {}).get("Code") or "error"
-                if last.startswith("Unauthorized") or last in ("AuthFailure", "OptInRequired", "InvalidClientTokenId", "Blocked"):
+                if last.startswith(("Unauthorized", "AuthFailure")) or last in ("OptInRequired", "InvalidClientTokenId", "Blocked"):
+                    # (incl. AuthFailure.ServiceLinkedRoleCreationNotPermitted - the account's Spot role missing, live 11/17)
                     # this server's Amazon key may not rent machines: not "busy" - no point waiting for one
                     _cleanup_sync(f"{PREFIX}{bucket}:{run}:none")
                     raise RuntimeError(f"graphics machine not allowed here: {last}") from exc
@@ -258,7 +259,10 @@ $PY job.py
 
 
 async def start(photos: list[dict], erase: bool) -> str:
-    """photos: [{"id", "src"}]. Rents a machine and sets it preparing them. GpuBusy = none to be had right now."""
+    """photos: [{"id", "src"}]. Rents a machine and sets it preparing them. GpuBusy = none to be had right now;
+    RuntimeError = none can ever be had here (the account's limit is below one machine) - don't wait for one."""
+    if await asyncio.to_thread(vl.spot_too_small, vl.SPOT_QUOTA_GPU, 4):   # every type in TYPES has 4+ vCPUs
+        raise RuntimeError("graphics machine: the account's spot limit is below one machine (increase not approved yet)")
     job = await asyncio.to_thread(_launch, photos, erase)
     logger.info("gpu photo machine started", extra={"job": job, "photos": len(photos)})
     return job
