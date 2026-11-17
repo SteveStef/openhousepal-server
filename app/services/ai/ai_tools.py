@@ -468,10 +468,22 @@ async def _get_showcase_info(db: AsyncSession, current_user: User, args: dict, c
     if not collection:
         return {"has_showcase": False}
 
+    # Their link - the one their invite and follow-up texts use (11/16 chat test: "what's his Showcase
+    # link" got "copy it from his lead page").
+    link = None
+    try:
+        from app.services.showcase_links import showcase_path
+        from app.services.website.site_service import resolve_owner_public_base_url
+        if collection.share_token:
+            link = f"{(await resolve_owner_public_base_url(db, current_user)).rstrip('/')}{await showcase_path(collection, db=db)}"
+    except Exception:  # noqa: BLE001
+        logger.warning("showcase link for the chat failed", exc_info=True)
+
     return {
         "has_showcase": True,
         "collection_id": collection.id,
         "status": collection.status,
+        "link": link,
         "is_shared": bool(collection.is_public and collection.share_token),
         "property_count": len(collection.properties or []),
         "new_match_count": CollectionsService.count_new_properties(collection),
@@ -1020,7 +1032,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "get_showcase_info",
-        "description": "Check whether one of the agent's own leads has an OpenHousePal Showcase (property collection) and its engagement stats - shared status, property count, last visitor activity.",
+        "description": "Check whether one of the agent's own leads has an OpenHousePal Showcase (property collection) and its engagement stats - their Showcase link (the one their invite uses - give it when asked), shared status, property count, last visitor activity.",
         "input_schema": {
             "type": "object",
             "properties": {"lead_id": {"type": "string"}},

@@ -118,6 +118,21 @@ async def _lead(db, user, args) -> Lead:
     return await _one(db, select(Lead).where(Lead.id == _need_id(args, "lead_id"), Lead.owner_id == user.id), "I couldn't find that person in your leads.")
 
 
+async def _lead_named(db, user, name: str) -> Optional[Lead]:
+    """One of the agent's leads by (part of) their name - None when nobody matches; two people with
+    that name: asks which."""
+    name = _s(name)
+    if not name:
+        return None
+    rows = (await db.execute(select(Lead).where(Lead.owner_id == user.id, Lead.hidden_at.is_(None), Lead.name.ilike(f"%{name}%")).limit(3))).scalars().all()
+    if len(rows) > 1:
+        exact = [l for l in rows if (l.name or "").strip().lower() == name.lower()]
+        if len(exact) == 1:
+            return exact[0]
+        raise ActionError("Which one? " + ", ".join(f"{l.name} ({l.email or l.phone or 'no email'})" for l in rows) + " - give me the lead_id.")
+    return rows[0] if rows else None
+
+
 async def _task(db, user, args) -> AgentTask:
     return await _one(db, select(AgentTask).where(AgentTask.id == _need_id(args, "task_id"), AgentTask.owner_id == user.id), "I couldn't find that follow-up.")
 
@@ -299,7 +314,12 @@ _simple("resend_showcase_invite", "Email a lead their Showcase invite again (Pre
 async def _p_client_emails(db, user, a):
     email = _s(a.get("email")).lower()
     if "@" not in email:
-        raise ActionError("Which client's email address?")
+        # "nvm turn them back on" (11/16 chat test): the chat knows WHO, not always the address -
+        # find it from the lead instead of asking the agent to type it.
+        lead = await _lead(db, user, a) if a.get("lead_id") else await _lead_named(db, user, a.get("lead_name"))
+        email = _s(lead.email if lead else "").lower()
+    if "@" not in email:
+        raise ActionError("Which client? (I need their name or email address.)")
     on = bool(a.get("on"))
     if on:
         # They unsubscribed (from this agent, or before 11/16 from everyone): it can't be turned back on -
@@ -319,7 +339,8 @@ async def _r_client_emails(db, user, p):
     await _run_route(user, "PUT", "/client-emails/people", {"email": p["email"], "on": p["on"]})
     return {"message": "Saved.", "link": "/leads/emails"}
 
-_simple("set_client_automatic_emails", "Email Tracker: turn a client's automatic emails off, or back on.", _obj({"email": {"type": "string"}, "on": {"type": "boolean"}}, ["email", "on"]),
+_simple("set_client_automatic_emails", "Email Tracker: turn a client's automatic emails off, or back on. Give their email, or lead_id / lead_name and it finds the address.",
+        _obj({"email": {"type": "string"}, "lead_id": {"type": "string"}, "lead_name": {"type": "string"}, "on": {"type": "boolean"}}, ["on"]),
         _p_client_emails, _r_client_emails)
 
 
@@ -347,12 +368,9 @@ async def _p_new_task(db, user, a):
     elif _s(a.get("lead_name")):
         # "remind me to call Test Client..." - attach the lead by name (owner's test, 11/01: it was
         # saved with no lead). Two people with that name: ask which.
-        name = _s(a["lead_name"])
-        rows = (await db.execute(select(Lead).where(Lead.owner_id == user.id, Lead.hidden_at.is_(None), Lead.name.ilike(f"%{name}%")).limit(3))).scalars().all()
-        if len(rows) > 1:
-            raise ActionError("Which one? " + ", ".join(f"{l.name} ({l.email or l.phone or 'no email'})" for l in rows) + " - give me the lead_id.")
-        if rows:
-            body["lead_id"] = rows[0].id; lines.append(f"For: {rows[0].name}")
+        found = await _lead_named(db, user, a["lead_name"])
+        if found:
+            body["lead_id"] = found.id; lines.append(f"For: {found.name}")
     due = _when(a)
     if due:
         body["due_at"] = due; body["all_day"] = not _s(a.get("due_time"))
@@ -508,8 +526,21 @@ def _search_lines(a: dict) -> tuple[dict, list]:
 
 async def _p_new_showcase(db, user, a):
     name, email = _s(a.get("client_name")), _s(a.get("client_email")).lower()
+    if name and "@" not in email:
+        # One of their leads already: the address is on file (11/16 chat test - it asked the agent to type it).
+        lead = await _lead_named(db, user, name)
+        if lead and lead.email:
+            name, email = lead.name or name, lead.email.lower()
     if not name or "@" not in email:
         raise ActionError("I need the client's name and email.")
+    if not a.get("second_showcase"):
+        # One Showcase per client (owner, 11/16): point at the one they have instead of a quiet second.
+        have = (await db.execute(select(Collection).where(Collection.owner_id == user.id, func.lower(Collection.visitor_email) == email,
+                                                          Collection.status.in_(("ACTIVE", "INACTIVE"))).order_by(Collection.created_at.desc()).limit(1))).scalars().first()
+        if have is not None:
+            asleep = " (asleep - set_showcase wakes it)" if have.status != "ACTIVE" else ""
+            raise ActionError(f"{name} already has a Showcase{asleep}: “{have.name}” (collection_id {have.id}). Change its search with update_showcase_search "
+                              "(or rebuild it around another open house they came to). Only make a second, separate one if the agent says so - then pass second_showcase=true.")
     search, lines = _search_lines(a)
     if not any(k in search for k in ("cities", "townships", "school_districts")):
         raise ActionError("Which towns, townships or school districts should their search cover?")
@@ -555,8 +586,9 @@ async def _r_new_showcase(db, user, p):
     return {"message": "Showcase made.", "link": f"/showcases?showcase={cid}" if cid else "/showcases", "share": share}
 
 _simple("create_showcase", "Make a new Showcase (saved home search that updates itself) for a client - also adds them as a lead. Needs at least one town/township/school district. email_client=true emails them their Showcase now. client_emails=false when they say not to email the client (no emails at all until the agent turns them on; otherwise they get daily new-match emails).",
-        _obj({"client_name": {"type": "string"}, "client_email": {"type": "string"}, "client_phone": {"type": "string"}, "email_client": {"type": "boolean"}, "client_emails": {"type": "boolean"}, **_SEARCH_PROPS},
-             ["client_name", "client_email"]), _p_new_showcase, _r_new_showcase, SHOWCASE)
+        _obj({"client_name": {"type": "string"}, "client_email": {"type": "string"}, "client_phone": {"type": "string"}, "email_client": {"type": "boolean"}, "client_emails": {"type": "boolean"},
+              "second_showcase": {"type": "boolean", "description": "Only when the agent says they want a second, separate Showcase for a client who already has one."}, **_SEARCH_PROPS},
+             ["client_name"]), _p_new_showcase, _r_new_showcase, SHOWCASE)
 
 
 async def _towns_not_townships(db, search: dict, lines: list) -> None:

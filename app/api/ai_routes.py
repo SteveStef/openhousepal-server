@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
@@ -96,6 +97,16 @@ def _form_card_lines(c: dict) -> str:
             ) if lines else ""
 
 
+def _made_id(c: dict) -> str:
+    """The id of what a done card made, when its link carries one - "actually make that Friday" right
+    after a follow-up was added (11/16 chat test): without it the model guessed an id, got "not found"
+    and set up a second follow-up instead of moving the first."""
+    if c.get("status") != "done":
+        return ""
+    m = re.search(r"[?&]task=([A-Za-z0-9-]{8,})", str(c.get("result_link") or ""))
+    return f" - the follow-up it made has task_id {m.group(1)}" if m else ""
+
+
 def _card_note(m: AIMessage) -> str:
     """What happened to the Confirm cards on a past reply (10/30) - otherwise the model only sees its
     own "tap Confirm" text and can't tell a done action from an untapped one. It rides on the NEXT
@@ -107,6 +118,7 @@ def _card_note(m: AIMessage) -> str:
     return "(App note, not from the agent - the cards your last reply showed: " + "; ".join(
         f"“{c.get('title')}” - {_CARD_STATUS.get(c.get('status'), c.get('status'))}"
         + (f" ({c.get('result_message')})" if c.get("status") == "failed" and c.get("result_message") else "")
+        + _made_id(c)
         + (_form_card_lines(c) if c.get("tool") in FORM_CARD_TOOLS and c.get("status") == "pending" else "")
         + (f" - its link (shown as a preview card): {c['share']['url']}" if isinstance(c.get("share"), dict) and c["share"].get("url") else "") for c in cards) + ")\n\nThe agent says:\n"
 

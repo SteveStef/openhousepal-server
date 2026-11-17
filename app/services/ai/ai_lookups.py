@@ -51,10 +51,36 @@ def _route(name: str, description: str, path: str, *, schema: Optional[dict] = N
 _q = lambda **keys: (lambda a: {k: a[src] for k, src in keys.items() if a.get(src) not in (None, "")} or None)
 
 # --- Follow-ups / leads / client emails ---
-_route("list_followups", "List the agent's follow-ups (to-dos) with their ids, due times and who they're for. Filter by bucket (overdue, today, upcoming, someday) and/or one lead. Use before changing or checking off a follow-up.",
-       "/tasks", schema=_obj({"bucket": {"type": "string", "enum": ["overdue", "today", "upcoming", "someday"]}, "lead_id": {"type": "string"}, "include_done": {"type": "boolean"}}),
-       query=lambda a: {k: v for k, v in {"bucket": a.get("bucket"), "lead_id": a.get("lead_id"), "include_done": "true" if a.get("include_done") else None}.items() if v} or None, max_list=25)
+async def _list_followups(db: AsyncSession, user: User, args: dict) -> Any:
+    """The agent's follow-ups; for one person pass lead_id or lead_name (11/16 chat test: asked "what
+    follow-ups do I have for him", the chat read the whole list - 25 oldest first - and missed his)."""
+    from sqlalchemy import func
+    from app.models.database import Lead
+    lead_id = args.get("lead_id")
+    name = " ".join(str(args.get("lead_name") or "").split())
+    if not lead_id and name:
+        rows = (await db.execute(select(Lead.id, Lead.name).where(Lead.owner_id == user.id, Lead.hidden_at.is_(None),
+                                                                  Lead.name.ilike(f"%{name}%")).limit(3))).all()
+        exact = [r for r in rows if (r.name or "").strip().lower() == name.lower()]
+        if len(rows) > 1 and len(exact) != 1:
+            return {"error": "which_one", "message": "More than one lead has that name: " + ", ".join(f"{r.name} (lead_id {r.id})" for r in rows)}
+        if not rows:
+            return {"error": "not_found", "message": f"No lead named {name}."}
+        lead_id = (exact or rows)[0].id
+    params = {k: v for k, v in {"bucket": args.get("bucket"), "lead_id": lead_id if lead_id and _ID.match(str(lead_id)) else None,
+                                "include_done": "true" if args.get("include_done") else None}.items() if v} or None
+    ok, data = await lookup(user, "/tasks", params=params, max_list=25)
+    return data
+
+
+LOOKUPS["list_followups"] = ("List the agent's follow-ups (to-dos) with their ids, due times and who they're for. Filter by bucket (overdue, today, upcoming, someday) and/or one person "
+                             "(lead_id, or lead_name and it finds them) - ALWAYS filter by the person when the question is about one. Use before changing or checking off a follow-up.",
+                             _obj({"bucket": {"type": "string", "enum": ["overdue", "today", "upcoming", "someday"]}, "lead_id": {"type": "string"},
+                                   "lead_name": {"type": "string"}, "include_done": {"type": "boolean"}}), None, _list_followups)
 _route("get_followup_settings", "The agent's automatic follow-up settings: the master switch, each rule (on/off, when, style) and calendar alerts.", "/tasks/auto-rules", max_str=300)
+_route("get_worth_a_checkin", "The Follow-ups page's 'Worth a check-in' list: leads worth reaching out to now, best first, each with why (opened an email, new matches, liked homes, quiet a while...). "
+       "Use for 'who should I check in with / reach out to'. To add one, create_followup titled 'Check in with <first name>'.",
+       "/tasks/checkins", schema=_obj({"lead_id": {"type": "string"}}), query=_q(lead_id="lead_id"), max_list=15)
 _route("get_lead_notes", "Every note on one lead, newest first, with note ids.", "/leads/{lead_id}/notes", schema=_obj({"lead_id": {"type": "string"}}, ["lead_id"]), ids=("lead_id",))
 _route("get_email_tracker_people", "Email Tracker: each client the agent emails automatically, whether those emails are on, weekly or off, and why (unopened, unsubscribed, bounced).", "/client-emails/people", max_list=40)
 _route("get_client_email_log", "Emails OpenHousePal sent the agent's clients, with opened/clicked, newest first. Filter by one client's email address.",
