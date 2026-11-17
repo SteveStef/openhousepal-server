@@ -52,15 +52,14 @@ def _region() -> str:
 
 
 def _ec2(fast: bool = False):
-    import boto3
     from botocore.config import Config
     # one try per zone and machine type: Amazon's own retries made a "none spare" answer take ~10 s each
-    return boto3.client("ec2", region_name=_region(), config=Config(retries={"max_attempts": 1, "mode": "standard"}) if fast else None)
+    # (the video account's keys when set - video_lambda_service.aws_session)
+    return vl.aws_session().client("ec2", config=Config(retries={"max_attempts": 1, "mode": "standard"}) if fast else None)
 
 
 def _s3():
-    import boto3
-    return boto3.client("s3", region_name=_region())
+    return vl.aws_session().client("s3")
 
 
 def _bucket() -> str:
@@ -183,7 +182,6 @@ json.dump(T, open("timing.json", "w"))
 
 
 def _launch(photos: list[dict], erase: bool) -> str:
-    import boto3
     from botocore.exceptions import ClientError
     s3 = _s3()
     bucket = _bucket()
@@ -219,7 +217,7 @@ curl -s '{get("job.json")}' -o job.json
 curl -s '{get("job.py")}' -o job.py
 $PY job.py
 """
-    ssm = boto3.client("ssm", region_name=_region())
+    ssm = vl.aws_session().client("ssm")
     try:
         ami = ssm.get_parameter(Name="/aws/service/deeplearning/ami/x86_64/oss-nvidia-driver-gpu-pytorch-2.7-ubuntu-22.04/latest/ami-id")["Parameter"]["Value"]
     except Exception:  # noqa: BLE001 - the same image, found by name

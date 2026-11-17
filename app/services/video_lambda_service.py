@@ -11,7 +11,8 @@ Turned on by env (unset = the old self-hosted worker at VIDEO_WORKER_URL):
   REMOTION_REGION          default us-east-1
   REMOTION_MAX_LAMBDAS     how many Lambdas one video is split across (default 7 - a new AWS account
                            allows 10 at once, and progress checks count too; raise once AWS raises it)
-AWS keys: the usual AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (boto3's normal lookup).
+AWS keys: VIDEO_AWS_ACCESS_KEY_ID / VIDEO_AWS_SECRET_ACCESS_KEY (the video-only AWS account, 11/17) when set,
+else the usual AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY. See aws_session().
 
 Job ids look like "lambda:<bucket>:<renderId>" so a restart picks the render back up (_resume).
 """
@@ -47,16 +48,26 @@ def _region() -> str:
     return os.environ.get("REMOTION_REGION") or "us-east-1"
 
 
-def _client():
+def aws_session(region: Optional[str] = None):
+    """The AWS login every video maker uses (Lambda renders, the rented video / photo machines, their bucket, the
+    admin's Lambda usage card). Owner 11/17: the video making lives in its OWN AWS account (OpenHousePal's, with a
+    spend limit) so its variable bill never lands on the account that keeps the site's files - so it takes
+    VIDEO_AWS_ACCESS_KEY_ID / VIDEO_AWS_SECRET_ACCESS_KEY when set. Unset: the server's normal AWS key, as before."""
     import boto3
+    kid, sec = os.environ.get("VIDEO_AWS_ACCESS_KEY_ID"), os.environ.get("VIDEO_AWS_SECRET_ACCESS_KEY")
+    if kid and sec:
+        return boto3.Session(aws_access_key_id=kid, aws_secret_access_key=sec, region_name=region or _region())
+    return boto3.Session(region_name=region or _region())
+
+
+def _client():
     from remotion_lambda import RemotionClient
     return RemotionClient(region=_region(), serve_url=os.environ["REMOTION_SERVE_URL"],
-                          function_name=os.environ["REMOTION_FUNCTION_NAME"], session=boto3.Session(region_name=_region()))
+                          function_name=os.environ["REMOTION_FUNCTION_NAME"], session=aws_session())
 
 
 def _s3():
-    import boto3
-    return boto3.client("s3", region_name=_region())
+    return aws_session().client("s3")
 
 
 def _split(job_id: str) -> tuple[str, str]:
@@ -76,8 +87,7 @@ def account_limit() -> int:
     if _ACCOUNT["limit"] and time.time() - _ACCOUNT["at"] < 3600:
         return _ACCOUNT["limit"]
     try:
-        import boto3
-        s = boto3.client("lambda", region_name=_region()).get_account_settings()
+        s = aws_session().client("lambda").get_account_settings()
         lim = int(((s.get("AccountLimit") or {}).get("ConcurrentExecutions")) or 10)
     except Exception:  # noqa: BLE001
         lim = _ACCOUNT["limit"] or 10

@@ -46,9 +46,8 @@ def _aws_lambda_month() -> Optional[dict]:
     account-wide AWS/Lambda metrics). Blocking - run in a thread. None when AWS isn't set up."""
     if not os.environ.get("REMOTION_FUNCTION_NAME"):
         return None
-    import boto3
-    region = os.environ.get("REMOTION_REGION") or "us-east-1"
-    cw = boto3.client("cloudwatch", region_name=region)
+    from app.services.video_lambda_service import aws_session
+    cw = aws_session().client("cloudwatch")   # the video account's own Lambda use (its own keys when set)
     start, end = _month_start(), datetime.now(timezone.utc)
 
     def total(metric: str) -> float:

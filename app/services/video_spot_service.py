@@ -69,13 +69,11 @@ def _region() -> str:
 
 
 def _ec2():
-    import boto3
-    return boto3.client("ec2", region_name=_region())
+    return vl.aws_session().client("ec2")   # the video account's keys when set (video_lambda_service.aws_session)
 
 
 def _s3():
-    import boto3
-    return boto3.client("s3", region_name=_region())
+    return vl.aws_session().client("s3")
 
 
 def _bucket() -> str:
@@ -160,7 +158,6 @@ fs.writeFileSync('node.json', JSON.stringify({ render_s: (Date.now() - t0) / 100
 
 
 def _launch(props: dict, composition: str) -> str:
-    import boto3
     from botocore.exceptions import ClientError
     s3 = _s3()
     bucket = _bucket()
@@ -193,7 +190,7 @@ EOF
 SERVE_URL='{os.environ["REMOTION_SERVE_URL"]}' PROGRESS_URL='{put("progress.json")}' COMPOSITION='{composition}' node r.mjs
 [ -s out.mp4 ] && curl -sf -X PUT -T out.mp4 '{put("out.mp4")}' && touch uploaded
 """
-    ami = boto3.client("ssm", region_name=_region()).get_parameter(
+    ami = vl.aws_session().client("ssm").get_parameter(
         Name="/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id")["Parameter"]["Value"]
     # cheapest zone first (11/17: the same machine's spot price differs a lot from zone to zone); a zone with none
     # spare -> the next one; the account's own limit -> none anywhere
