@@ -144,11 +144,11 @@ async def send_invite(db, owner: User, lead: Lead, kind: str) -> bool:
     if not cid or not lead.email:
         return False
     if kind == "showcase" or not opts["open_house"]:
-        return await queue_showcase_ready(db, cid)
+        return await queue_showcase_ready(db, cid, manual=True)   # the agent pressed Send (again) - by hand
     col = await db.get(Collection, cid)
     oh = await db.get(OpenHouseEvent, col.original_open_house_event_id) if col else None
     if col is None or oh is None:
-        return await queue_showcase_ready(db, cid)
+        return await queue_showcase_ready(db, cid, manual=True)   # the agent pressed Send (again) - by hand
     try:
         from app.services.agent_email_service import agent_public_phone
         from app.services.blacklist_service import BlacklistService
@@ -176,6 +176,9 @@ async def send_invite(db, owner: User, lead: Lead, kind: str) -> bool:
                 "agent_name": f"{owner.first_name or ''} {owner.last_name or ''}".strip(), "agent_email": owner.email or "",
                 "agent_phone": await agent_public_phone(db, owner),
                 "Unsub": f"{front}/unsubscribe?email={quote(lead.email, safe='')}",
+                # The agent pressed Send (again): by hand - goes even to someone unsubscribed from
+                # their automatic emails (11/16).
+                "_manual": True,
                 **(await agent_email_vars(db, owner)),
             },
             scheduled_for=datetime.now(timezone.utc), status="PENDING", owner_id=owner.id,

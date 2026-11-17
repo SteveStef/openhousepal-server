@@ -301,6 +301,13 @@ async def _p_client_emails(db, user, a):
     if "@" not in email:
         raise ActionError("Which client's email address?")
     on = bool(a.get("on"))
+    if on:
+        # They unsubscribed (from this agent, or before 11/16 from everyone): it can't be turned back on -
+        # say so instead of a "Saved." that changes nothing (11/16).
+        from app.services.blacklist_service import BlacklistService
+        if await BlacklistService.is_blacklisted(db, email, user.id):
+            raise ActionError("They unsubscribed from your emails, so their automatic emails can't be turned back on. "
+                              "Anything you send them yourself still goes - re-sending their Showcase invite, replying to a comment, confirming a tour.")
     # Their name when they're one of the agent's leads - the address alone read like a stranger (11/02 review)
     name = (await db.execute(select(Lead.name).where(Lead.owner_id == user.id, func.lower(Lead.email) == email, Lead.name.isnot(None)).limit(1))).scalar()
     return Prepared(f"{'Turn back on' if on else 'Turn off'} automatic emails to {name or email}",
@@ -622,6 +629,44 @@ async def _r_showcase_state(db, user, p):
     if "notify_visitor" in b:
         await _run_route(user, "PATCH", f"/collections/{cid}/notifications", {"notify_visitor": b["notify_visitor"], "notify_agent": b["notify_agent"]})
     return {"message": "Saved.", "link": f"/showcases?showcase={cid}"}
+
+async def _p_rebuild_showcase(db, user, a):
+    from app.models.database import OpenHouseVisitor
+    from app.services.email_service import tidy_caps as _tc
+    c = await _showcase(db, user, a)
+    if c.status != "ACTIVE":
+        raise ActionError(f"{_sc_name(c)} is asleep - wake it up first.")
+    rows = (await db.execute(select(OpenHouseEvent.id, OpenHouseEvent.address).join(
+        OpenHouseVisitor, OpenHouseVisitor.open_house_event_id == OpenHouseEvent.id).where(
+        OpenHouseEvent.agent_id == user.id, func.lower(OpenHouseVisitor.email) == (c.visitor_email or "").strip().lower()))).all()
+    came = {oid: addr for oid, addr in rows}
+    if not came:
+        raise ActionError(f"{c.visitor_name or 'They'} didn't sign in at any of your open houses, so there's no open house to rebuild it around.")
+    want = _s(a.get("open_house_id"))
+    words = _s(a.get("open_house_address")).lower()
+    pick = want if want in came else next((oid for oid, addr in came.items() if words and words.split(",")[0].strip() in (addr or "").lower()), None)
+    if pick is None:
+        raise ActionError("They came to " + ", ".join(_tc((x or "").split(",")[0]) for x in came.values()) + " - which one should it be built around?")
+    if pick == c.original_open_house_event_id:
+        raise ActionError(f"{_sc_name(c)} is already built around {_tc((came[pick] or '').split(',')[0])}.")
+    street = _tc((came[pick] or "").split(",")[0]) or "that open house"
+    return Prepared(f"Rebuild {_sc_name(c)} around {street}",
+                    [f"Homes like {street}, near it, at its price", "Same link - nothing new to send them",
+                     "Every home they liked, commented on, toured or opened stays, and so do your own picks"],
+                    {"collection_id": c.id, "open_house_event_id": pick},
+                    warning=f"{c.visitor_name or 'Your client'} hears about the new search in their next daily email.", confirm_label="Rebuild it")
+
+
+async def _r_rebuild_showcase(db, user, p):
+    r = await _run_route(user, "POST", f"/collections/{p['collection_id']}/rebuild-from-open-house", {"open_house_event_id": p["open_house_event_id"]})
+    added = (r or {}).get("added") or 0
+    return {"message": f"Rebuilt - {(r or {}).get('properties_count', 0)} homes" + (f", {added} new" if added else "") + ". Same link.",
+            "link": f"/showcases?showcase={p['collection_id']}"}
+
+_simple("rebuild_showcase_around_open_house", "A client who came to more than one of the agent's open houses keeps ONE Showcase. This rebuilds its search as if it had been made from another open house they came to (same link; liked / commented / toured / opened homes stay). Give the open house's id or its street.",
+        _obj({"collection_id": {"type": "string"}, "open_house_id": {"type": "string"}, "open_house_address": {"type": "string"}}, ["collection_id"]),
+        _p_rebuild_showcase, _r_rebuild_showcase, SHOWCASE)
+
 
 _simple("set_showcase", "Wake up / put to sleep, star, or turn emails on/off (to the client, to the agent) for one Showcase.",
         _obj({"collection_id": {"type": "string"}, "awake": {"type": "boolean"}, "starred": {"type": "boolean"}, "email_client": {"type": "boolean"}, "email_me": {"type": "boolean"}}, ["collection_id"]),
