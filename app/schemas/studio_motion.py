@@ -65,6 +65,11 @@ class MotionEstimateResponse(BaseModel):
     speed_save_percent_max: Optional[float] = None
     speed_now_percent: Optional[float] = None
     speed_save_cap_minutes: int = 12
+    # when it would be ready if started now, the line ahead included (11/17)
+    speed_save_ready_minutes: Optional[int] = None
+    speed_now_ready_minutes: Optional[int] = None
+    speed_save_ahead: int = 0
+    speed_now_ahead: int = 0
     overnight_available: bool = False
     overnight_ready_at: Optional[str] = None
     overnight_held: bool = False

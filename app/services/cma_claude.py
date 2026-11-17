@@ -118,7 +118,15 @@ async def through_the_queue(client, kwargs: dict, *, sleep=asyncio.sleep, clock=
 
 async def _send(client, kw: dict, direct: bool = False, slow_cap: Optional[float] = None):
     msg = None if direct else await through_the_queue(client, kw, cap_seconds=slow_cap)
-    return msg if msg is not None else await client.messages.create(**kw)
+    if msg is not None:
+        return msg
+    resp = await client.messages.create(**kw)
+    if slow_cap and not direct:
+        # the agent chose Save usage (video, 11/17): the half price was promised, so the usage counted is halved even
+        # though the queue didn't answer in time and this went the normal way (the platform pays the difference)
+        logger.info("save usage request sent the normal way - counted at half price")
+        _halve_usage(resp)
+    return resp
 
 
 # Models that reject a forced tool choice and always think.

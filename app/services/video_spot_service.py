@@ -90,19 +90,30 @@ def _split(job_id: str) -> tuple[str, str, str]:
     return bucket, run, iid
 
 
-def price_usd_hr() -> float:
-    """Today's price of the machine (asked at most every 30 minutes; the dearest zone, to be safe)."""
-    if _PRICE["usd_hr"] and time.time() - _PRICE["at"] < 1800:
-        return _PRICE["usd_hr"]
+def _zone_prices() -> dict:
+    """{zone: today's spot price of the machine} (asked at most every 30 minutes)."""
+    if _PRICE.get("zones") and time.time() - _PRICE["at"] < 1800:
+        return _PRICE["zones"]
     try:
         r = _ec2().describe_spot_price_history(InstanceTypes=[machine_type()], ProductDescriptions=["Linux/UNIX"],
-                                               StartTime=datetime.now(timezone.utc), MaxResults=20)
-        ps = [float(x["SpotPrice"]) for x in r["SpotPriceHistory"]]
-        usd = max(ps) if ps else 0.26
+                                               StartTime=datetime.now(timezone.utc), MaxResults=40)
+        zones: dict = {}
+        for x in r["SpotPriceHistory"]:
+            zones[x["AvailabilityZone"]] = min(float(x["SpotPrice"]), zones.get(x["AvailabilityZone"], 99.0))
     except Exception:  # noqa: BLE001
-        usd = _PRICE["usd_hr"] or 0.26
-    _PRICE.update(at=time.time(), usd_hr=usd)
-    return usd
+        zones = _PRICE.get("zones") or {}
+    if zones:
+        _PRICE.update(at=time.time(), zones=zones, usd_hr=max(zones.values()))
+    return zones
+
+
+def price_usd_hr(az: Optional[str] = None) -> float:
+    """Today's price of the machine in its own zone (11/17: was the dearest zone, which over-counted); the dearest
+    zone when the zone isn't known."""
+    zones = _zone_prices()
+    if az and az in zones:
+        return zones[az]
+    return max(zones.values()) if zones else (_PRICE.get("usd_hr") or 0.26)
 
 
 def video_seconds(frames: int) -> float:
@@ -120,7 +131,8 @@ def equivalent_usd(frames: Optional[int]) -> float:
     """What a video of this many frames costs on a discounted machine (before the safety factor) - the
     figure an agent's usage counts when the video was made on the FREE Lambda allowance instead
     (owner 11/14: a video that cost us nothing must not tick their usage up at the full Lambda price)."""
-    return (video_seconds(int(frames or 900)) + 30.0) / 3600.0 * (_PRICE["usd_hr"] or 0.26)
+    zones = _zone_prices()   # the cheapest zone: where our machine is tried first
+    return (video_seconds(int(frames or 900)) + 30.0) / 3600.0 * (min(zones.values()) if zones else (_PRICE["usd_hr"] or 0.26))
 
 
 def health() -> dict:
@@ -183,24 +195,41 @@ SERVE_URL='{os.environ["REMOTION_SERVE_URL"]}' PROGRESS_URL='{put("progress.json
 """
     ami = boto3.client("ssm", region_name=_region()).get_parameter(
         Name="/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id")["Parameter"]["Value"]
+    # cheapest zone first (11/17: the same machine's spot price differs a lot from zone to zone); a zone with none
+    # spare -> the next one; the account's own limit -> none anywhere
     try:
-        r = _ec2().run_instances(
-            ImageId=ami, InstanceType=machine_type(), MinCount=1, MaxCount=1, UserData=user_data,
-            InstanceInitiatedShutdownBehavior="terminate",
-            InstanceMarketOptions={"MarketType": "spot", "SpotOptions": {"SpotInstanceType": "one-time", "InstanceInterruptionBehavior": "terminate"}},
-            BlockDeviceMappings=[{"DeviceName": "/dev/sda1", "Ebs": {"VolumeSize": 16, "VolumeType": "gp3", "DeleteOnTermination": True}}],
-            TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": "ohp-video-" + run[:10]}, {"Key": "ohp", "Value": "video-spot"}]}])
-    except ClientError as exc:
+        subnets = [(x["AvailabilityZone"], x["SubnetId"]) for x in _ec2().describe_subnets(Filters=[{"Name": "default-for-az", "Values": ["true"]}])["Subnets"]]
+    except Exception:  # noqa: BLE001 - let Amazon pick the zone
+        subnets = []
+    zones = _zone_prices()
+    subnets = sorted(subnets, key=lambda z: zones.get(z[0], 99.0)) or [(None, None)]
+    code = ""
+    for az, sn in subnets:
         try:
-            s3.delete_object(Bucket=bucket, Key=pre + "props.json")
-        except Exception:  # noqa: BLE001
-            pass
-        code = (exc.response.get("Error") or {}).get("Code") or ""
-        if code in ("MaxSpotInstanceCountExceeded", "InsufficientInstanceCapacity", "SpotMaxPriceTooLow", "InstanceLimitExceeded",
-                    "VcpuLimitExceeded", "RequestLimitExceeded", "Unsupported"):
-            raise SpotBusy(code) from exc
-        raise
-    return f"{PREFIX}{bucket}:{run}:{r['Instances'][0]['InstanceId']}"
+            r = _ec2().run_instances(
+                ImageId=ami, InstanceType=machine_type(), MinCount=1, MaxCount=1, UserData=user_data,
+                InstanceInitiatedShutdownBehavior="terminate",
+                InstanceMarketOptions={"MarketType": "spot", "SpotOptions": {"SpotInstanceType": "one-time", "InstanceInterruptionBehavior": "terminate"}},
+                BlockDeviceMappings=[{"DeviceName": "/dev/sda1", "Ebs": {"VolumeSize": 16, "VolumeType": "gp3", "DeleteOnTermination": True}}],
+                TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": "ohp-video-" + run[:10]}, {"Key": "ohp", "Value": "video-spot"}]}],
+                **({"SubnetId": sn} if sn else {}))
+            return f"{PREFIX}{bucket}:{run}:{r['Instances'][0]['InstanceId']}"
+        except ClientError as exc:
+            code = (exc.response.get("Error") or {}).get("Code") or ""
+            if code in ("InsufficientInstanceCapacity", "SpotMaxPriceTooLow", "Unsupported"):
+                continue   # none spare in this zone: the next one
+            try:
+                s3.delete_object(Bucket=bucket, Key=pre + "props.json")
+            except Exception:  # noqa: BLE001
+                pass
+            if code in ("MaxSpotInstanceCountExceeded", "InstanceLimitExceeded", "VcpuLimitExceeded", "RequestLimitExceeded"):
+                raise SpotBusy(code) from exc
+            raise
+    try:
+        s3.delete_object(Bucket=bucket, Key=pre + "props.json")
+    except Exception:  # noqa: BLE001
+        pass
+    raise SpotBusy(code or "InsufficientInstanceCapacity")
 
 
 async def start(props: dict, composition: str = "CinematicVideo") -> str:
@@ -235,7 +264,8 @@ def _status(job_id: str) -> dict:
     if not cached or time.time() - cached[0] > 20 or done:
         try:
             inst = _ec2().describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
-            _STATE[iid] = (time.time(), json.dumps({"state": inst["State"]["Name"], "launch": inst["LaunchTime"].timestamp()}))
+            _STATE[iid] = (time.time(), json.dumps({"state": inst["State"]["Name"], "launch": inst["LaunchTime"].timestamp(),
+                                                    "az": (inst.get("Placement") or {}).get("AvailabilityZone")}))
         except Exception:  # noqa: BLE001
             if not cached:
                 _STATE[iid] = (time.time(), json.dumps({"state": "unknown", "launch": time.time()}))
@@ -251,7 +281,7 @@ def _status(job_id: str) -> dict:
             _SPEED["start_seconds"] = _SPEED["start_seconds"] * 0.6 + max(30.0, el - float(node["render_s"]) - 15) * 0.4
         _STATE.pop(iid, None)
         # the machine is paid for from its start until it is gone (about half a minute after it finishes)
-        cost = (el + 30.0) / 3600.0 * price_usd_hr()
+        cost = (el + 30.0) / 3600.0 * price_usd_hr(info.get("az"))
         return {"status": "done", "progress": 1.0, "frames": frames, "width": node.get("width"), "fps": node.get("fps") or 30,
                 "out_key": pre + "out.mp4", "cost_usd": round(cost, 5), "seconds": round(el)}
     if info["state"] in ("shutting-down", "terminated", "stopping", "stopped"):

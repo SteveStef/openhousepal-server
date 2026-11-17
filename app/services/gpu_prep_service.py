@@ -229,8 +229,15 @@ $PY job.py
     ec2 = _ec2(fast=True)
     subnets = sorted((x["AvailabilityZone"], x["SubnetId"]) for x in ec2.describe_subnets(Filters=[{"Name": "default-for-az", "Values": ["true"]}])["Subnets"])
     last = ""
+    # cheapest zone first (11/17: Amazon's spot price for the same machine was $0.56 an hour in one zone and $0.88 in another)
+    try:
+        hist = ec2.describe_spot_price_history(InstanceTypes=list(TYPES), ProductDescriptions=["Linux/UNIX"],
+                                               StartTime=datetime.now(timezone.utc), MaxResults=100)["SpotPriceHistory"]
+        zone_price = {(x["InstanceType"], x["AvailabilityZone"]): float(x["SpotPrice"]) for x in hist}
+    except Exception:  # noqa: BLE001 - the plain order then
+        zone_price = {}
     for itype in TYPES:
-        for az, sn in subnets:
+        for az, sn in sorted(subnets, key=lambda z, t=itype: zone_price.get((t, z[0]), 99.0)):
             try:
                 r = ec2.run_instances(
                     ImageId=ami, InstanceType=itype, MinCount=1, MaxCount=1, UserData=user_data, SubnetId=sn,

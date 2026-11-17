@@ -869,6 +869,27 @@ async def estimate(db, user: User, photos: int, sharpen: bool, seconds: float = 
     heavy_now, heavy_low = (1.33, 1.17) if fast else (1.0, 1.0)
     save_all = fast_edit * 0.5 + gpu + door * 0.5 + twi_save + min(render, render_low) * heavy_low
     now_all = fast_edit + gpu + door + twi_now + render_now * heavy_now
+    # When it would be ready if started now (owner 11/17: show the REAL wait, line included, before they pick):
+    # measured 11/17 with nobody in line - Save usage ~25 min, Make it now ~15 min for 30 s (a minute: more photos to
+    # prepare, twice the video to make), plus whoever is in line for our machines / Lambda right now.
+    long = float(seconds or 30) >= 45
+    save_min, now_min, save_ahead, now_ahead = (33.0 if long else 25.0), (21.0 if long else 15.0), 0, 0
+    if fast:
+        try:
+            if gpu_prep.enabled():
+                gw, ga = await _mline_newcomer_wait("gpu")
+                save_min += gw / 60
+                save_ahead = max(save_ahead, ga)
+            if vs.enabled():
+                sw, sa = await _mline_newcomer_wait("spot")
+                save_min += max(0.0, sw - (150 + 11 * used + 200)) / 60   # its photos and twilight take that long anyway
+                save_ahead = max(save_ahead, sa)
+            if paid:
+                lm, lw = await _lambda_line()
+                now_min += (await _line_wait_seconds(lm, len(lw))) / 60
+                now_ahead = len(lw) + (1 if lm else 0)
+        except Exception:  # noqa: BLE001 - the plain figures then
+            logger.warning("ready-time estimate: lines unreadable", exc_info=True)
     return {
         # overnight mode: the same video on our own video maker - the render costs no AI
         "overnight_available": bool(plan), "overnight_ready_at": (plan or {}).get("ready_at"), "overnight_held": bool((plan or {}).get("held")),
@@ -884,6 +905,8 @@ async def estimate(db, user: User, photos: int, sharpen: bool, seconds: float = 
         "speed_save_percent_max": pct(now_all) if paid or fast else None,
         "speed_now_percent": pct(now_all) if paid or fast else None,
         "speed_save_cap_minutes": FAST_SAVE_CAP_MINUTES,
+        "speed_save_ready_minutes": round(save_min), "speed_now_ready_minutes": round(now_min),
+        "speed_save_ahead": save_ahead, "speed_now_ahead": now_ahead,
         "render_paused": bool(paid and would_refuse),
         "photos": n, "analyze_usd": round(analyze, 4), "sharpen_usd": round(sharp, 4),
         "analyze_percent": pct(analyze), "sharpen_percent": pct(sharp), "month_percent": snap.get("percent"),
@@ -1398,6 +1421,9 @@ async def _run_prep_held(asset_id: str) -> None:
                 erase = bool(config.get("studio_motion_erase_badge", True)) and not capped
                 price = float(config.get("studio_motion_depth_price_per_photo_usd", 0.007) or 0.0)
                 erase_price = float(config.get("studio_motion_erase_price_per_photo_usd", 0.004) or 0.0)
+                if ((asset.options or {}).get("render") or {}).get("charge_as_save"):
+                    # a Save usage Fast Cut whose photo machine Amazon couldn't give: counted at our machine's price
+                    price, erase_price = _GPU_PHOTO_USD, 0.0
             total = len(todo)
             await _patch(asset_id, lambda a, o: o.__setitem__("prep", {"running": True, "done": 0, "total": total}))
             results: dict[str, dict] = {}
@@ -1583,6 +1609,143 @@ async def _aim_fronts(asset_id: str, owner_id: str, motion: dict) -> dict:
         return motion
 
 
+# ------------------------------------------------------------------ the lines for our own Amazon machines
+# Owner 11/17: "Save usage" videos WAIT THEIR TURN for the cheap machines (and are told their place in line and the
+# real wait) instead of being moved to a dearer way after a few minutes. Two lines, kept on each video's render:
+#   gpu  - the graphics machine that prepares a Fast Cut's photos (render.gpu_line_at / gpu_prep / gpu_end / gpu_secs)
+#   spot - the discounted machine that makes the video        (render.spot_line_at / job_id "spot:..." / eta_at / spot_secs)
+# Only as many machines run at once as the account allows (VIDEO_GPU_MAX / VIDEO_SPOT_MAX, default 2 each). "Make it
+# now" never waits and never goes ahead of anyone: a free machine with nobody waiting, else its own faster way. A
+# Save usage video leaves its line only when Amazon has had NO machine to give for a long while (an outage) - then
+# the dearer way makes it, still counted at the Save usage price.
+_MLINE_LOCKS = {"gpu": asyncio.Lock(), "spot": asyncio.Lock()}
+_MLINE_KEYS = {"gpu": 740_511_16, "spot": 740_511_17}
+_MLINE_OUTAGE = 30 * 60      # Amazon had no machine for this long while it was this video's turn: the other way
+_MLINE_CEILING = 3 * 3600    # never wait longer than this in all (far past any real line)
+
+
+def _mline_slots(kind: str) -> int:
+    env = "VIDEO_GPU_MAX" if kind == "gpu" else "VIDEO_SPOT_MAX"
+    try:
+        return max(1, int(os.environ.get(env) or 2))
+    except ValueError:
+        return 2
+
+
+async def _mline(kind: str) -> tuple[list[dict], list[dict]]:
+    """(on a machine now, with when it should be done; waiting - oldest first, with how long each will take)."""
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(select(StudioMediaAsset.id, StudioMediaAsset.options).where(
+            StudioMediaAsset.action == "motion",
+            StudioMediaAsset.options["render"]["state"].astext.in_(_ACTIVE),
+        ))).all()
+    making, waiting = [], []
+    for aid, opts in rows:
+        r = (opts or {}).get("render") or {}
+        if kind == "gpu":
+            if r.get("gpu_prep"):
+                making.append({"id": aid, "end": r.get("gpu_end")})
+            elif r.get("gpu_line_at"):
+                waiting.append({"id": aid, "line_at": r["gpu_line_at"], "secs": r.get("gpu_secs")})
+        else:
+            if vs.is_spot_job(r.get("job_id")) and r.get("state") in ("queued", "rendering"):
+                making.append({"id": aid, "end": r.get("eta_at")})
+            elif r.get("spot_line_at") and not r.get("job_id"):
+                waiting.append({"id": aid, "line_at": r["spot_line_at"], "secs": r.get("spot_secs")})
+    waiting.sort(key=lambda w: (w["line_at"], w["id"]))
+    return making, waiting
+
+
+def _mline_wait(kind: str, making: list[dict], ahead: list[dict]) -> float:
+    """Seconds until a machine is free for a video with `ahead` waiting in front of it."""
+    now = datetime.now(timezone.utc)
+    left = []
+    for m in making:
+        try:
+            left.append(max(0.0, (datetime.fromisoformat(m["end"]) - now).total_seconds()) if m.get("end") else 300.0)
+        except (TypeError, ValueError):
+            left.append(300.0)
+    left.sort()
+    queue = [0.0] * max(0, _mline_slots(kind) - len(left)) + left
+    for w in ahead:
+        queue.sort()
+        t = queue.pop(0)
+        queue.append(t + float(w.get("secs") or 420))
+    queue.sort()
+    return queue[0] if queue else 0.0
+
+
+async def _mline_newcomer_wait(kind: str) -> tuple[float, int]:
+    """(seconds a video joining this line now would wait, videos ahead of it) - for the Save usage button."""
+    try:
+        making, waiting = await _mline(kind)
+        return _mline_wait(kind, making, waiting), len(waiting) + max(0, len(making) - _mline_slots(kind) + 1)
+    except Exception:  # noqa: BLE001
+        return 0.0, 0
+
+
+async def _mline_turn(asset_id: str, kind: str, secs: float, start, busy_exc, saving: bool, after_secs: float = 0.0):
+    """Wait for this video's turn on our own machine and start it there: start() -> job id (raises busy_exc when Amazon
+    has none to give right now). Returns the job id, or None = make it the other way (see the note above). While it
+    waits, the video's screen shows its place in line and a countdown that includes the rest of the making."""
+    slots = _mline_slots(kind)
+    line_key, secs_key = f"{kind}_line_at", f"{kind}_secs"
+    if saving:
+        await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), line_key: (o.get("render") or {}).get(line_key) or _now(),
+                                                                      secs_key: round(secs)}))
+
+    def leave(a, o):
+        o["render"] = {k: v for k, v in (o.get("render") or {}).items() if k not in (line_key, secs_key)}
+    began, busy_since, last = time.time(), None, None
+    try:
+        while True:
+            async with _MLINE_LOCKS[kind], _line_db_lock(_MLINE_KEYS[kind]):
+                making, waiting = await _mline(kind)
+                ids = [w["id"] for w in waiting]
+                ahead = waiting[:ids.index(asset_id)] if asset_id in ids else waiting
+                if len(making) + len(ahead) < slots:
+                    try:
+                        return await start()
+                    except busy_exc as exc:
+                        if not saving:
+                            return None
+                        busy_since = busy_since or time.time()
+                        logger.info("our machine: Amazon has none right now - keeps its place in line", extra={"asset_id": asset_id, "line": kind, "reason": str(exc)[:120]})
+                elif not saving:
+                    return None   # "Make it now": no free machine without making someone wait - its own faster way
+            waited = time.time() - began
+            if (busy_since and time.time() - busy_since > _MLINE_OUTAGE) or waited > _MLINE_CEILING:
+                logger.warning("our machine: gave up waiting - made the other way at the Save usage price", extra={"asset_id": asset_id, "line": kind, "waited": round(waited)})
+                return None
+            wait = max(_mline_wait(kind, making, ahead), 60.0 if busy_since else 0.0)
+            eta = int(wait + secs + after_secs + _SAVE_SECS["v"])
+            eta_at = (datetime.now(timezone.utc) + timedelta(seconds=eta)).isoformat()
+            if last and last["ahead"] == len(ahead) and abs((datetime.fromisoformat(last["eta_at"]) - datetime.fromisoformat(eta_at)).total_seconds()) < max(30, 0.08 * eta):
+                eta_at = last["eta_at"]   # a steady countdown unless the line really moved
+            what = "the photo machine" if kind == "gpu" else "the video maker"
+            stage = (f"Waiting for Amazon to free up {what}" if busy_since and not ahead else
+                     f"In line for {what}" if ahead or making else f"Starting {what}")
+            cur = {"state": "queued", "ahead": len(ahead), "eta_at": eta_at, "stage": stage}
+            if cur != last:
+                await _patch(asset_id, lambda a, o, c=cur: o.__setitem__("render", {**(o.get("render") or {}), **c, "eta_learned": True}))
+                last = cur
+            await asyncio.sleep(15)
+    finally:
+        await _patch(asset_id, leave)
+
+
+async def _charge_as_save(asset_id: str) -> bool:
+    """A Save usage video that had to be made a dearer way (an Amazon outage): counted at the Save usage price."""
+    async with AsyncSessionLocal() as db:
+        a = await db.get(StudioMediaAsset, asset_id)
+        return bool(a and ((a.options or {}).get("render") or {}).get("charge_as_save"))
+
+
+# Save usage price of preparing one photo when the photo service had to do it (our machine's cost, ~0.33c a photo -
+# split between the depth / clean-up and the sharpening)
+_GPU_PHOTO_USD = 0.0017
+
+
 _FAST_LOCKS: dict[str, asyncio.Lock] = {}
 
 
@@ -1609,24 +1772,29 @@ async def _gpu_prep(asset_id: str, owner_id: str, motion: dict) -> dict:
             job = (((asset.options or {}).get("render") or {}) if asset else {}).get("gpu_prep")
             config = await ai_config_service.get_config(db)
         if not job:
-            # Save usage waits a while for a machine (one frees up, Amazon finds one) before paying the photo service
-            # about 5x more; "Make it now" doesn't wait. VIDEO_GPU_WAIT_SECONDS sets the wait (default 8 minutes).
-            deadline = time.time() + (float(os.environ.get("VIDEO_GPU_WAIT_SECONDS") or 480) if _saving(motion) else 0)
-            told = False
-            while True:
-                try:
-                    job = await gpu_prep.start([{"id": p["id"], "src": p["source"]} for p in todo], erase)
-                    break
-                except gpu_prep.GpuBusy as exc:
-                    if time.time() >= deadline:
-                        logger.info("no graphics machine free - the photo service prepares the photos", extra={"asset_id": asset_id, "reason": str(exc)})
-                        return motion
-                    if not told:
-                        told = True
-                        await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "stage": "Waiting for the photo machine"}))
-                    await asyncio.sleep(30)
-            await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "gpu_prep": job}))
-        await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "stage": "Getting your photos ready (the cheaper way)", "progress": 0.03}))
+            # its turn on our graphics machine (Save usage waits in line for it; Make it now only takes a free one)
+            secs = 150.0 + 11.0 * len(todo) + 30.0
+            frames = int(30 * (57 if (motion.get("length") or 30) >= 45 else 30))
+            after = (200.0 if _saving(motion) else 60.0) + vs.video_seconds(frames)
+
+            async def start():
+                j = await gpu_prep.start([{"id": p["id"], "src": p["source"]} for p in todo], erase)
+                end = (datetime.now(timezone.utc) + timedelta(seconds=secs)).isoformat()
+                await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "gpu_prep": j, "gpu_end": end, "state": "preparing", "ahead": 0}))
+                return j
+            try:
+                job = await _mline_turn(asset_id, "gpu", secs, start, gpu_prep.GpuBusy, _saving(motion), after)
+            except Exception:  # noqa: BLE001 - not usable here (set-up, permissions): the photo service, at the same price
+                logger.warning("graphics machine couldn't be started", exc_info=True, extra={"asset_id": asset_id})
+                job = None
+            if not job:
+                # either speed: the photos are counted at our machine's price, the one the buttons showed (a Make it
+                # now video that found no free machine, or a Save usage video after an Amazon outage)
+                await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "charge_as_save": True}))
+                logger.info("no graphics machine for this video - the photo service prepares the photos", extra={"asset_id": asset_id})
+                await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "state": "preparing", "ahead": 0}))
+                return motion
+        await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "stage": "Getting your photos ready", "progress": 0.03}))
         st = {"state": "working", "done": 0, "seconds": 0}
         began = time.time()
         while time.time() - began < 30 * 60:
@@ -1673,6 +1841,8 @@ async def _gpu_prep(asset_id: str, owner_id: str, motion: dict) -> dict:
     finally:
         if job:
             await gpu_prep.cleanup(job)
+            # the machine is free again for the next video in line
+            await _patch(asset_id, lambda a, o: o.__setitem__("render", {k: v for k, v in (o.get("render") or {}).items() if k not in ("gpu_prep", "gpu_end")}))
 
 
 async def _fast_twilight(asset_id: str, owner_id: str, motion: dict) -> dict:
@@ -1719,10 +1889,16 @@ async def _fast_twilight(asset_id: str, owner_id: str, motion: dict) -> dict:
                 # Save usage: OpenAI's half-price slow lane (owner 11/16; tested: 161 s), the normal way after 12 minutes
                 result = await provider.edit_batch(p["clean"], prompt, config["studio_media_image_size"], config["studio_media_image_quality"],
                                                    _save_seconds(motion, config) or 720)
+            fell_back = False
             if result is None:
+                fell_back = _saving(motion)
                 result = await provider.edit(ImageEditRequest(image_bytes=day, image_content_type="image/jpeg", prompt=prompt,
                                                               size=config["studio_media_image_size"], quality=config["studio_media_image_quality"]))
             cost = _image_cost(result, config, float(config.get("studio_media_image_reservation_estimate_usd") or 0.05))
+            if fell_back:
+                # Save usage was promised: the agent pays the half price even when the slow lane didn't answer in time
+                logger.info("save usage twilight sent the normal way - agent charged the half price", extra={"asset_id": asset_id, "real_usd": cost})
+                cost = round(cost / 2, 5)
             async with AsyncSessionLocal() as db:
                 await record_usage_event(db, owner_id, None, provider.model, None, None, cost, 0, False, None, event_type=EVENT_TYPE)
             raw_url = await asyncio.to_thread(s3_service.upload_bytes, result.image_bytes, f"{_S3_PREFIX}/twilight", ".png" if "png" in (result.content_type or "") else ".jpg",
@@ -2083,6 +2259,8 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
                             await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "progress": prog}))
                     await asyncio.gather(*[one(p) for p in need])
                 price = float(config.get("studio_motion_sharpen_price_per_photo_usd", 0.006) or 0.0)
+                if await _charge_as_save(asset_id):
+                    price = _GPU_PHOTO_USD   # Save usage price (see _GPU_PHOTO_USD)
                 spent = price * len(sharpened)
                 if spent:
                     async with AsyncSessionLocal() as db:
@@ -2144,7 +2322,9 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
                         # by itself - the agent just sees it take a little longer
                         logger.warning("spot video didn't finish - Lambda takes over", extra={"asset_id": asset_id, "reason": str(j.get("error"))[:200]})
                         await vs.cleanup(job_id)
-                        await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "job_id": None, "eta_at": None, "route": "lambda", "stage": "Starting the cameras"}))
+                        # (a Save usage video is still counted at the discounted machine's price)
+                        took_over = "saved" if _saving(motion) else "lambda"
+                        await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "job_id": None, "eta_at": None, "route": took_over, "stage": "Starting the cameras"}))
                         job_id = await _lambda_take_turn(asset_id, props)
                         spot, last = False, None
                         continue
@@ -2246,7 +2426,7 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
                 raw = float((j.get("cost_usd") if spot else j.get("remotion_cost_usd")) or 0)
                 if not spot:
                     made = await db.get(StudioMediaAsset, asset_id)
-                    if made is not None and ((made.options or {}).get("render") or {}).get("route") == "free":
+                    if made is not None and ((made.options or {}).get("render") or {}).get("route") in ("free", "saved"):
                         # made on the free Lambda allowance (cost us nothing): the agent's usage counts the
                         # low discounted-machine figure, not Lambda's full price (owner 11/14)
                         raw = min(raw, vs.equivalent_usd(j.get("frames")))
@@ -2461,7 +2641,7 @@ _LINE_DB_LOCK = 740_511_15   # the same line lock across every copy of the API (
 
 
 @asynccontextmanager
-async def _line_db_lock():
+async def _line_db_lock(key: int = _LINE_DB_LOCK):
     """Only one copy of the API at a time looks at the line and starts the next video, so two copies can
     never both start 'the last free slot'. A Postgres advisory lock on one connection held just for this
     short step (Postgres frees it by itself if the connection drops); the connection is thrown away
@@ -2469,13 +2649,13 @@ async def _line_db_lock():
     from app.database import engine
     conn = await engine.connect()
     try:
-        await conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": _LINE_DB_LOCK})
+        await conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": key})
         await conn.commit()
         try:
             yield
         finally:
             try:
-                await conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _LINE_DB_LOCK})
+                await conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
                 await conn.commit()
             except Exception:  # noqa: BLE001
                 await conn.invalidate()
@@ -2547,30 +2727,35 @@ async def _spot_or_lambda(asset_id: str, props: dict, now: bool = False) -> str:
     one can be had - waiting a few minutes for one if the account's limit is reached - and Lambda
     (paid) only when none can."""
     route = "lambda"
-    if vs.enabled() and await _lambda_still_free(vl.frames_estimate(props)):
+    lambda_idle = True
+    if not now:
+        # the free allowance is Lambda, and Lambda makes one video at a time: a Save usage video only takes it when
+        # nobody is making or waiting there, so it never holds up a "Make it now" video (owner 11/17)
+        try:
+            making, waiting = await _lambda_line()
+            lambda_idle = not making and not waiting
+        except Exception:  # noqa: BLE001
+            lambda_idle = False
+    if vs.enabled() and lambda_idle and await _lambda_still_free(vl.frames_estimate(props)):
         route = "free"
     elif vs.enabled() and not now:   # ("Make it now": straight to Lambda, the fast line)
-        deadline = time.time() + vs.wait_seconds()
-        told = False
-        while True:
-            try:
-                job_id = await vs.start(props, vl.composition_of(props))
-                frames = vl.frames_estimate(props)
-                eta_at = (datetime.now(timezone.utc) + timedelta(seconds=vs.video_seconds(frames) + _SAVE_SECS["v"])).isoformat()
-                await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "job_id": job_id, "state": "queued", "ahead": 0, "route": "spot",
-                                                                              "stage": "Starting the cameras", "eta_at": eta_at, "eta_learned": True}))
-                return job_id
-            except vs.SpotBusy as exc:
-                if time.time() >= deadline:
-                    logger.info("no spot machine in time - Lambda makes the video", extra={"asset_id": asset_id, "reason": str(exc)})
-                    break
-                if not told:
-                    told = True
-                    await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "state": "queued", "stage": "Waiting for the video maker"}))
-                await asyncio.sleep(20.0)
-            except Exception:  # noqa: BLE001 - this route isn't usable here (permissions, set-up): Lambda
-                logger.warning("spot video machine couldn't be started - Lambda makes the video", exc_info=True, extra={"asset_id": asset_id})
-                break
+        frames = vl.frames_estimate(props)
+        secs = vs.video_seconds(frames)
+
+        async def start():
+            job = await vs.start(props, vl.composition_of(props))
+            eta_at = (datetime.now(timezone.utc) + timedelta(seconds=secs + _SAVE_SECS["v"])).isoformat()
+            await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "job_id": job, "state": "queued", "ahead": 0, "route": "spot",
+                                                                          "stage": "Starting the cameras", "eta_at": eta_at, "eta_learned": True}))
+            return job
+        try:
+            job_id = await _mline_turn(asset_id, "spot", secs, start, vs.SpotBusy, True)
+        except Exception:  # noqa: BLE001 - this route isn't usable here (permissions, set-up): Lambda
+            logger.warning("spot video machine couldn't be started - Lambda makes the video", exc_info=True, extra={"asset_id": asset_id})
+            job_id = None
+        if job_id:
+            return job_id
+        route = "saved"   # a Save usage video Lambda had to make: counted at the discounted machine's price
     await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "route": route}))
     return await _lambda_take_turn(asset_id, props)
 
