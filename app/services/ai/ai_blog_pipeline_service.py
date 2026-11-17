@@ -1204,7 +1204,8 @@ TAX_SCALED = ", scaled to this price"
 
 def payment_example(entry: dict, rate: dict, area_names: list[str], *, conforming_limit: Optional[int] = None, limit_area: Optional[str] = None,
                     basis: str = "entry", sold_house: Optional[dict] = None, transfer_tax: Optional[dict] = None,
-                    fee: Optional[dict] = None, fha: Optional[dict] = None, fees: Optional[dict] = None) -> Optional[dict]:
+                    fee: Optional[dict] = None, fha: Optional[dict] = None, fees: Optional[dict] = None,
+                    homes_for_sale: Optional[int] = None) -> Optional[dict]:
     """A worked example for a realistic entry price (the 25th-percentile list price of homes for
     sale across the article's towns): down payment, loan, principal & interest at Freddie Mac's
     latest 30-year average, a property-tax estimate from similar listings' tax bills, and closing
@@ -1212,6 +1213,12 @@ def payment_example(entry: dict, rate: dict, area_names: list[str], *, conformin
     if not entry or not entry.get("p25") or not rate or not rate.get("rate_30"):
         return None
     kind = basis if basis in ("house", "attached") and entry.get(f"{basis}_median") else "entry"
+    # ONE count of homes for sale per article. The card reads the listings a moment after the article's own snapshot,
+    # and a listing can leave the market in between (11/17 Wilmington proof: the article said 482 homes, the card 481).
+    # When the two are the same homes give or take a couple, the card states the article's number.
+    n_homes = entry.get("homes") or 0
+    if homes_for_sale and n_homes and abs(int(homes_for_sale) - n_homes) <= max(2, round(0.01 * n_homes)):
+        n_homes = int(homes_for_sale)
     price = _round_price(entry[f"{kind}_median"] if kind != "entry" else entry["p25"])
     tax_pct = entry.get(f"tax_pct_near_{kind}") if kind != "entry" else entry.get("tax_pct_near_p25")
     tax_homes = entry.get(f"tax_homes_{kind}") if kind != "entry" else entry.get("tax_homes")
@@ -1266,7 +1273,7 @@ def payment_example(entry: dict, rate: dict, area_names: list[str], *, conformin
         "price": price, "price_basis": (f"About the median price of the {sold['count']} single-family houses sold in {_and_list(area_names)} in {sold['window']}." if sold
                                         else f"About the median list price of the {entry['houses']} single-family houses for sale across {_and_list(area_names)}." if kind == "house"
                                         else f"About the median list price of the {entry['attached']} condos and townhomes for sale across {_and_list(area_names)}." if kind == "attached"
-                                        else f"About a quarter of the {entry['homes']} homes for sale across {_and_list(area_names)} are listed at or below this price."),
+                                        else f"About a quarter of the {n_homes} homes for sale across {_and_list(area_names)} are listed at or below this price."),
         "rate": rate["rate_30"], "rate_as_of": rate.get("as_of"), "term_years": 30,
         # The estimate's basis in words only - a tax bill as a percent of price reads like a tax
         # rate (11/01 grader, Princeton). The percent stays internal (tax_pct) for the math.
@@ -2533,7 +2540,8 @@ async def _run(db: AsyncSession, user: User, brief: dict, engine: str, spec: dic
                                      limit_area=_and_list((cll or {}).get("counties") or []) or None, basis=payment_basis(brief),
                                      sold_house=house_sold, transfer_tax=tax_facts,
                                      fee=example_fee(dossiers[0].get("cost")) if len(dossiers) == 1 else None, fha=tk.fha_limits(),
-                                     fees=example_fees(dossiers[0].get("cost")) if len(dossiers) == 1 else None)
+                                     fees=example_fees(dossiers[0].get("cost")) if len(dossiers) == 1 else None,
+                                     homes_for_sale=(dossiers[0].get("sales_snapshot") or {}).get("active_count") if len(dossiers) == 1 else None)
             if pay_ex and cll:
                 pay_ex["limit_source"] = {k: cll[k] for k in ("source_name", "source_url", "published")}
         except Exception:

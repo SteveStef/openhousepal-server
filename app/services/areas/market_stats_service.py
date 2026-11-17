@@ -896,7 +896,13 @@ async def get_area_cost_profile(db: AsyncSession, scope: dict, munis: Optional[l
     fees: dict[str, list[float]] = {"CONDO": [], "TOWNHOUSE": []}
     covers: Counter = Counter()
     town_own: Counter = Counter()
+    # How many condos / townhomes are for sale - counted here, by name, with everything else. It used to be read
+    # afterwards from the row by position (r[2]) and that position had become the longitude: the count was always 0,
+    # so "36 of the 240 townhomes show a fee" was never known and the payment card's "at least half of them report
+    # a fee" rule could not work (11/17: the Wilmington proof article still carried the $28 fee).
+    listed: Counter = Counter()
     for price, lat, lng, home_type, tax, tax_year, fee, freq, levels, senior, fee2, freq2, includes, structure in rows:
+        listed[home_type] += 1
         tax_v, price_v = _num(tax), _num(price)
         if tax_v and tax_v > 100 and price_v and price_v >= geography.MIN_PLAUSIBLE_SALE_PRICE:
             year = str(tax_year)[:4] if tax_year else None
@@ -949,7 +955,6 @@ async def get_area_cost_profile(db: AsyncSession, scope: dict, munis: Optional[l
             "by_township": split if parts_fit(len(bills), [r["homes"] for r in split]) else [],
         }
     hoa, hoa_few = {}, {}
-    listed = {"CONDO": sum(1 for r in rows if r[2] == "CONDO"), "TOWNHOUSE": sum(1 for r in rows if r[2] == "TOWNHOUSE")}
     for kind, vals in fees.items():
         # A fee median needs 10+ listings that show a fee, and says how many of the listings that is.
         if len(vals) >= 10:
