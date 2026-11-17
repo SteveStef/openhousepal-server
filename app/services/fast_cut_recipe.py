@@ -385,7 +385,8 @@ def plan(motion: dict, fmt: str) -> dict:
              "copy": {k: copy.get(k) or "" for k in ("kicker", "title", "tagline", "cta")},
              "facts": {"address": text["address"], "cityLine": text["cityLine"]}, "agent": motion.get("agent") or {"name": ""}, "sections": sections}
     music = f"motion/fastcut/{song_of(motion)}{'60' if long else ''}.wav"
-    out_shots = [{k: v for k, v in s.items() if not k.startswith("_")} for s in shots]
+    # (each shot keeps which part of the song it is in - the editor's "Your shots" board groups them by it)
+    out_shots = [{**{k: v for k, v in s.items() if not k.startswith("_")}, "section": s.get("_sec")} for s in shots]
     # "order": the photos of the two runs as they were laid out - what the editor screen reorders (fast.order)
     return {"shots": out_shots, "format": fmt, "music": music, "duration": dur, "text": text, "accent": accent, "brand": brand,
             "order": list(hook_seq) + list(drop_seq)}
@@ -399,6 +400,6 @@ def outline(props: dict, motion: dict) -> list[dict]:
         q = labels.get(s.get("photo")) or {}
         rows.append({"photo": s.get("photo"), "start": s["start"], "seconds": round(s["end"] - s["start"], 2), "what": q.get("what") or "",
                      "stat": s.get("fact"), "role": "opening" if i == 0 else "closing" if i == len(props["shots"]) - 1 else "",
-                     "movable": s.get("slot") == "run", "kind": s.get("kind"),
+                     "movable": s.get("slot") == "run", "kind": s.get("kind"), "section": s.get("section"),
                      "fire": bool(s.get("fire")), "dusk": bool(s.get("dusk"))})
     return rows
