@@ -172,7 +172,9 @@ async def cma_ai_estimate(
         rows = (await db.execute(_text(
             "select (ai_analysis->>'cost_usd')::float, (ai_analysis->'save_usage'->>'minutes')::float from cma_reports "
             "where ai_analysis is not null and is_backtest is false and (ai_analysis->>'cost_usd')::float > 0 "
-            "and (ai_analysis ? 'save_usage') = :save order by (ai_analysis->>'generated_at') desc nulls last limit 20"),
+            # a run picked back up after a restart only knows part of its cost and time - left out
+            "and (ai_analysis ? 'save_usage') = :save and coalesce(ai_analysis->'save_usage'->>'resumed', 'false') <> 'true' "
+            "order by (ai_analysis->>'generated_at') desc nulls last limit 20"),
             {"save": save})).all()
         return [(float(r[0]), r[1]) for r in rows]
 
@@ -188,7 +190,7 @@ async def cma_ai_estimate(
     # "usd"/"percent"/"max_percent" stay as they were (the made-now figure) for anything already reading them
     return {"usd": round(typical, 3), "percent": pct(typical), "max_percent": pct(cap),
             "now": {"usd": round(typical, 3), "percent": pct(typical), "minutes": cma_save_usage.NOW_MINUTES},
-            # at best every step goes through the slower line; at worst the hour runs out and the rest is made the
+            # at best every step goes through the slower line; at worst the 20 minutes run out and the rest is made the
             # normal way - never more than a report made now
             "save_usage": {"usd": round(save_usd, 3), "percent": pct(save_usd), "usd_max": round(typical, 3), "percent_max": pct(typical),
                            **cma_save_usage.times(config, sum(minutes) / len(minutes) if minutes else None)}}
@@ -417,7 +419,8 @@ async def _run_generation(report_id: str, owner_id: str, tier, opts: dict, save_
                 # ready by" is measured from these
                 rep.ai_analysis = {**(rep.ai_analysis or {}),
                                    "save_usage": {**cma_save_usage.run_record(su, began), **({"resumed": True} if resumed else {})}}
-                cost = float((rep.ai_analysis or {}).get("cost_usd") or 0) or None
+                # a run picked back up after a restart only knows its own part of the cost: no "used about X%" line
+                cost = None if resumed else (float((rep.ai_analysis or {}).get("cost_usd") or 0) or None)
                 await s.commit()
             else:
                 await _generate_maybe_as_of(s, owner_id, report_id, tier, opts)

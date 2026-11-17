@@ -11925,8 +11925,8 @@ async def _call_cma_reasoning_claude(config: dict, evidence_packet: dict) -> tup
             kwargs["messages"] = [{"role": "user", "content": ask + "\n\nReturn ONLY one JSON object (no prose, no code "
                                    "fence) that matches this JSON schema exactly:\n" + json.dumps(_CMA_REASONING_SCHEMA, separators=(",", ":"))}]
         try:
-            # (testing only: with CMA_SLOW_LANE=1 the request goes through the half-price queue first - see cma_claude)
-            msg = await _cma_claude.through_the_queue(client, kwargs)
+            # Save usage (and the CMA_SLOW_LANE testing switch): the half-price queue first - see cma_claude
+            msg = await _cma_claude.queue_for_report(client, kwargs)
             if msg is None:
                 async with client.with_options(timeout=timeout_s).messages.stream(**kwargs) as stream:
                     msg = await stream.get_final_message()

@@ -148,6 +148,21 @@ async def through_the_queue(client, kwargs: dict, *, sleep=asyncio.sleep, clock=
     return None
 
 
+async def queue_for_report(client, kwargs: dict):
+    """For a request sent its own way (the final value step streams its answer): through the half-price queue while
+    the report is made in Save usage mode and its time is not used up. None = send it the normal way. Counted in the
+    report's record either way. Outside Save usage: only the testing switch, as before.
+    (Live 11/17, 119 East Ln: this step called through_the_queue directly, never saw Save usage, and paid full price
+    - about 23 cents of a report's ~40.)"""
+    report = _SAVE_USAGE.get()
+    if report is None:
+        return await through_the_queue(client, kwargs)
+    cap = _report_cap(report)
+    msg = await through_the_queue(client, kwargs, cap_seconds=cap) if cap else None
+    report["queued" if msg is not None else "fast"] += 1
+    return msg
+
+
 async def _send(client, kw: dict, direct: bool = False, slow_cap: Optional[float] = None):
     report = None if (direct or slow_cap) else _SAVE_USAGE.get()
     cap = slow_cap if report is None else _report_cap(report)

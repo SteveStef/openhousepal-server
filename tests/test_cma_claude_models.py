@@ -170,5 +170,5 @@ def test_the_final_value_step_tries_the_queue_first():
     src = (root_dir / "app" / "services" / "cma_ai_service.py").read_text(encoding="utf-8")
     i = src.index("async def _call_cma_reasoning_claude")
     body = src[i:i + 4000]
-    assert body.index("_cma_claude.through_the_queue(client, kwargs)") < body.index("messages.stream(**kwargs)")
+    assert body.index("_cma_claude.queue_for_report(client, kwargs)") < body.index("messages.stream(**kwargs)")
 

@@ -200,3 +200,25 @@ def test_only_runs_the_button_started_are_picked_up_and_the_mark_is_cleared_when
     assert "limit - _FAST_RUN_SECONDS" in one and 'await cluster.release("cma_hold", rid)' in one
     import app.main as m
     assert "cma_run_resume" in inspect.getsource(m)
+
+
+def test_the_final_value_step_also_uses_the_slower_line_in_save_usage(monkeypatch):
+    """Live 11/17 (119 East Ln): the final value step called the queue itself, never saw Save usage, paid full price."""
+    queued = []
+
+    async def queue(client, kw, cap_seconds=None, **_):
+        if cap_seconds is None and not cma_claude.slow_lane_on():
+            return None
+        queued.append(cap_seconds)
+        return NS(content=[], usage=NS(input_tokens=5, output_tokens=5), stop_reason="end_turn")
+    monkeypatch.setattr(cma_claude, "through_the_queue", queue)
+    monkeypatch.delenv("CMA_SLOW_LANE", raising=False)
+    assert asyncio.run(cma_claude.queue_for_report(None, {})) is None and queued == []      # made now: normal way
+    t = [0.0]
+    with cma_claude.save_usage(20, clock=lambda: t[0]) as su:
+        assert asyncio.run(cma_claude.queue_for_report(None, {})) is not None
+        t[0] = 1190.0                                                                        # 20 minutes used up
+        assert asyncio.run(cma_claude.queue_for_report(None, {})) is None
+    assert queued == [1200.0] and su["queued"] == 1 and su["fast"] == 1
+    src = inspect.getsource(cma_ai_service._call_cma_reasoning_claude)
+    assert "await _cma_claude.queue_for_report(client, kwargs)" in src and "_cma_claude.through_the_queue(" not in src

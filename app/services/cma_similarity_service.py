@@ -25,6 +25,29 @@ MIN_DENSITY_REFERENCE_COUNT = 10
 DENSITY_NEIGHBOR_START = 8
 DENSITY_NEIGHBOR_END = 12
 MAX_DENSITY_SEARCH_MILES = 20.0
+# Looked at close first, wider only when needed (live 11/17, 119 East Ln: the one 20-mile look read hundreds of
+# thousands of homes off the disk - 100+ seconds - and the agent's first comp search came back empty). The nearest N
+# within 2 miles ARE the nearest N within 20 when 2 miles already holds N: the same homes, in the same order.
+DENSITY_RINGS_MILES = (2.0, 5.0, 10.0, MAX_DENSITY_SEARCH_MILES)
+
+
+async def nearest_rows(db: AsyncSession, ordered_query, lat: float, lng: float, distance_expr, rings, limit: int) -> list:
+    """The `limit` rows of `ordered_query` (ordered by distance) nearest the point, out to rings[-1] miles - asking
+    for each ring in turn and stopping at the first that is already full. Exactly what one look out to rings[-1]
+    returns: every row past ring r is farther than every row inside it."""
+    rows: list = []
+    for miles in rings:
+        lat_off, lng_off = get_lat_long_offsets(lat, miles)
+        q = ordered_query.where(
+            Property.latitude.between(lat - lat_off, lat + lat_off),
+            Property.longitude.between(lng - lng_off, lng + lng_off),
+            mls_mirror.in_box(lat - lat_off, lat + lat_off, lng - lng_off, lng + lng_off),
+            distance_expr <= miles,
+        ).limit(limit)
+        rows = (await db.execute(q)).mappings().all()
+        if len(rows) >= limit:
+            break
+    return rows
 DENSITY_SQFT_RATIO_MIN = 0.75
 DENSITY_SQFT_RATIO_MAX = 1.25
 DENSITY_DETACHED_LOT_RATIO_MIN = 0.50
@@ -326,7 +349,6 @@ async def _load_local_proximity_context(db: AsyncSession, subject: dict) -> dict
     if lat is None or lng is None:
         return build_adaptive_proximity_context(subject, [])
 
-    lat_offset, lng_offset = get_lat_long_offsets(lat, MAX_DENSITY_SEARCH_MILES)
     distance_expr = distance_miles_sql(Property.latitude, Property.longitude, lat, lng)
     query = select(
         Property.listing_key,
@@ -344,11 +366,7 @@ async def _load_local_proximity_context(db: AsyncSession, subject: dict) -> dict
         Property.home_status,
         mls_mirror.close_date().label("close_date_v"),  # only CloseDate was read - not the whole payload
     ).where(
-        Property.latitude.between(lat - lat_offset, lat + lat_offset),
-        Property.longitude.between(lng - lng_offset, lng + lng_offset),
-        mls_mirror.in_box(lat - lat_offset, lat + lat_offset, lng - lng_offset, lng + lng_offset),
         Property.is_manual.is_(False),
-        distance_expr <= MAX_DENSITY_SEARCH_MILES,
     )
     subject_sqft = _as_float(
         subject.get("above_grade_finished_area") or subject.get("sqft") or subject.get("living_area")
@@ -372,9 +390,8 @@ async def _load_local_proximity_context(db: AsyncSession, subject: dict) -> dict
         query = query.where(Property.home_type.in_(_FAMILY_HOME_TYPES[_family]))
 
     surface = await _load_price_surface(db, subject, lat, lng, subject_sqft) if PRICE_SURFACE_ENABLED else []
-    rows = (await db.execute(
-        query.order_by(distance_expr.asc(), Property.listing_key.asc()).limit(1000)
-    )).mappings().all()
+    rows = await nearest_rows(db, query.order_by(distance_expr.asc(), Property.listing_key.asc()), lat, lng,
+                              distance_expr, DENSITY_RINGS_MILES, 1000)
     references = [
         {
             "listing_key": row["listing_key"],
@@ -412,6 +429,7 @@ PRICE_SURFACE_MILES = 6.0
 PRICE_SURFACE_DAYS = 365
 PRICE_SURFACE_SQFT_RATIO = (0.6, 1.6)
 PRICE_SURFACE_MAX_ROWS = 5000
+PRICE_SURFACE_RINGS_MILES = (PRICE_SURFACE_MILES,)
 
 
 async def _load_price_surface(db: AsyncSession, subject: dict, lat: float, lng: float,
@@ -422,7 +440,6 @@ async def _load_price_surface(db: AsyncSession, subject: dict, lat: float, lng: 
     since = (as_of - timedelta(days=PRICE_SURFACE_DAYS)).isoformat()
     close_price = Property.mls_close_price if mls_mirror.ready() else func.nullif(Property.raw_mls_data["ClosePrice"].astext, "")
     close_date = mls_mirror.close_date()
-    lat_offset, lng_offset = get_lat_long_offsets(lat, PRICE_SURFACE_MILES)
     distance_expr = distance_miles_sql(Property.latitude, Property.longitude, lat, lng)
     # Each sale's condition tier rides along (5th field) so the price level can be read condition-neutral
     # (cma_ai_service CMA_AREA_PRICE_COND - a block of unrenovated rentals is not a cheap location).
@@ -435,19 +452,19 @@ async def _load_price_surface(db: AsyncSession, subject: dict, lat: float, lng: 
         func.coalesce(Property.above_grade_finished_area, Property.living_area).label("sqft"),
         *cond_cols,
     ).where(
-        Property.latitude.between(lat - lat_offset, lat + lat_offset),
-        Property.longitude.between(lng - lng_offset, lng + lng_offset),
-        mls_mirror.in_box(lat - lat_offset, lat + lat_offset, lng - lng_offset, lng + lng_offset),
         Property.is_manual.is_(False),
         func.upper(Property.home_status).like("CLOSED%"),
         close_date >= since, close_date <= as_of.isoformat(),
-        distance_expr <= PRICE_SURFACE_MILES,
     )
     if subject_sqft:
         reference_sqft = func.coalesce(Property.above_grade_finished_area, Property.living_area)
         query = query.where(reference_sqft.between(subject_sqft * PRICE_SURFACE_SQFT_RATIO[0],
                                                    subject_sqft * PRICE_SURFACE_SQFT_RATIO[1]))
-    rows = (await db.execute(query.order_by(distance_expr.asc()).limit(PRICE_SURFACE_MAX_ROWS))).mappings().all()
+    # one look out to 6 miles (rings were tried 11/17: sales this recent rarely fill 2 or 4 miles, so it asked 2-3 times).
+    # listing_key settles sales at the very same distance: in a dense city block the 5,000 cap used to cut through a
+    # tie in a different place each time, so two searches of one home could read a slightly different price level.
+    rows = await nearest_rows(db, query.order_by(distance_expr.asc(), Property.listing_key.asc()), lat, lng,
+                              distance_expr, PRICE_SURFACE_RINGS_MILES, PRICE_SURFACE_MAX_ROWS)
     tier_of = None
     if with_cond:
         from app.services.cma_ai_service import _condition_tier as tier_of
