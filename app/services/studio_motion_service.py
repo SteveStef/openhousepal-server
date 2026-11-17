@@ -957,7 +957,13 @@ async def _fal(client: httpx.AsyncClient, url: str, payload: dict) -> dict:
     key = os.environ.get("FAL_KEY")
     if not key:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Photo depth isn't set up on this server yet.")
-    r = await client.post(url, headers={"Authorization": f"Key {key}"}, json=payload, timeout=180)
+    # several videos on the photo service at once (11/17: e.g. a few "Make it now" Fast Cuts while our machines are
+    # busy) can get "too many requests" - wait a little and ask again instead of losing that photo
+    for attempt in range(6):
+        r = await client.post(url, headers={"Authorization": f"Key {key}"}, json=payload, timeout=180)
+        if r.status_code not in (429, 502, 503, 504) or attempt == 5:
+            break
+        await asyncio.sleep(min(30.0, 3.0 * 2 ** attempt))
     r.raise_for_status()
     return r.json()
 
