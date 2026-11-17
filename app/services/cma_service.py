@@ -8,7 +8,7 @@ from datetime import datetime, date, timedelta, timezone
 from typing import Any, Dict, Optional, List
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
@@ -344,6 +344,15 @@ _GENERATION_STALE_AFTER_SECONDS = 4 * 3600 if os.getenv("CMA_SLOW_LANE") == "1" 
 # a 180s timeout each + the language polish), so a slow but healthy run could read as "failed".
 
 
+def _stale_after(report) -> int:
+    """How long a run may be marked "generating" before it counts as dead. A Save usage run waits in the slower line
+    for up to about 25 minutes by design (cma_save_usage)."""
+    if getattr(report, "generation_mode", None) == "save_usage":
+        from app.services import cma_save_usage
+        return max(_GENERATION_STALE_AFTER_SECONDS, cma_save_usage.stale_after_seconds())
+    return _GENERATION_STALE_AFTER_SECONDS
+
+
 def _reconcile_stale_generation(report: CmaReport) -> None:
     """A 'generating' status is only meaningful while the request that set it is still running.
     If the server died or restarted mid-generation, nothing would ever clear it - so treat one
@@ -356,11 +365,12 @@ def _reconcile_stale_generation(report: CmaReport) -> None:
     started = report.generation_started_at
     if started.tzinfo is None:
         started = started.replace(tzinfo=timezone.utc)
-    if (datetime.now(timezone.utc) - started).total_seconds() > _GENERATION_STALE_AFTER_SECONDS:
+    if (datetime.now(timezone.utc) - started).total_seconds() > _stale_after(report):
         report.generation_status = "failed"
 
 
-async def mark_generation_started(db: AsyncSession, owner_id: str, report_id: str, *, claim: bool = False) -> bool:
+async def mark_generation_started(db: AsyncSession, owner_id: str, report_id: str, *, claim: bool = False,
+                                  mode: Optional[str] = None) -> bool:
     """Stamped right before the expensive part of generate_ai_analysis/recompute_valuation
     begins, and committed immediately (independent of whatever the caller does with `db` for the
     rest of the request) so a concurrent GET - the list page, or the same report reopened after
@@ -374,14 +384,25 @@ async def mark_generation_started(db: AsyncSession, owner_id: str, report_id: st
     (claim=False) always writes, as before."""
     cond = [CmaReport.id == report_id, CmaReport.owner_id == owner_id]
     if claim:
-        stale_before = datetime.now(timezone.utc) - timedelta(seconds=_GENERATION_STALE_AFTER_SECONDS)
+        from app.services import cma_save_usage
+        now = datetime.now(timezone.utc)
+        stale_before = now - timedelta(seconds=_GENERATION_STALE_AFTER_SECONDS)
+        su_stale_before = now - timedelta(seconds=max(_GENERATION_STALE_AFTER_SECONDS, cma_save_usage.stale_after_seconds()))
         cond.append(or_(CmaReport.generation_status.is_distinct_from("generating"),
-                        CmaReport.generation_started_at.is_(None), CmaReport.generation_started_at < stale_before))
-    res = await db.execute(
-        update(CmaReport)
-        .where(*cond)
-        .values(generation_status="generating", generation_started_at=datetime.now(timezone.utc), generation_error=None)
-    )
+                        CmaReport.generation_started_at.is_(None),
+                        and_(CmaReport.generation_mode.is_distinct_from("save_usage"), CmaReport.generation_started_at < stale_before),
+                        and_(CmaReport.generation_mode == "save_usage", CmaReport.generation_started_at < su_stale_before)))
+    now_ = datetime.now(timezone.utc)
+    started = now_
+    if not claim:
+        # the run's own re-stamp keeps the time the button was pressed while a button run is going - a run picked
+        # back up after a restart must not get a fresh clock (its time limit counts from the press)
+        started = case((and_(CmaReport.generation_status == "generating", CmaReport.generation_mode.isnot(None),
+                             CmaReport.generation_started_at.isnot(None)), CmaReport.generation_started_at), else_=now_)
+    values = dict(generation_status="generating", generation_started_at=started, generation_error=None)
+    if mode:
+        values["generation_mode"] = mode
+    res = await db.execute(update(CmaReport).where(*cond).values(**values))
     await db.commit()
     return bool(res.rowcount)
 
@@ -402,7 +423,10 @@ async def mark_generation_finished(owner_id: str, report_id: str, outcome: str, 
         await session.execute(
             update(CmaReport)
             .where(CmaReport.id == report_id, CmaReport.owner_id == owner_id, CmaReport.generation_status.in_(allowed))
-            .values(generation_status=outcome, generation_error=(error or None) if outcome != "complete" else None)
+            # generation_mode is cleared: it marks a run the button started that is still going - the restart sweep
+            # (cma_routes.resume_stalled) picks only those back up, never a later recompute or an accuracy test
+            .values(generation_status=outcome, generation_error=(error or None) if outcome != "complete" else None,
+                    generation_mode=None)
         )
         await session.commit()
 
@@ -485,6 +509,7 @@ async def list_reports(db: AsyncSession, owner_id: str) -> List[CmaReportListIte
             export_allowed=not qa_blocking,
             qa_blocking_count=len(qa_blocking),
             generation_status=r.generation_status,
+            generation_mode=getattr(r, "generation_mode", None),
             # The list card paces its own live % from this, and says why a run stopped.
             generation_started_at=r.generation_started_at,
             generation_error=r.generation_error if r.generation_status == 'failed' else None,

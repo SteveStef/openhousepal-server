@@ -2699,6 +2699,9 @@ class CmaReport(Base):
     generation_started_at = Column(DateTime(timezone=True), nullable=True)
     # Why the last AI run didn't finish, in plain words (a usage limit, an error) - shown on the page.
     generation_error = Column(String, nullable=True)
+    # How the run was asked for (11/17): 'save_usage' (the slower, half-price line - up to about 25 minutes) or 'now'.
+    # Set only while a run the button started is going (cleared when it ends) - the restart pickup looks for it.
+    generation_mode = Column(String(20), nullable=True)
 
     # Public share link - opaque slug, distinct from the DB id so a shared link can't be used to
     # probe/enumerate reports. Nullable until the agent first shares. The agent keeps editing the

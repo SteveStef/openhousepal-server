@@ -355,6 +355,7 @@ class CmaReportResponse(BaseModel):
     use_signature_card: bool = True
     generation_status: Optional[Literal["generating", "complete", "failed"]] = None
     generation_started_at: Optional[datetime] = None
+    generation_mode: Optional[Literal["save_usage", "now"]] = None
     generation_error: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
@@ -380,6 +381,7 @@ class CmaReportListItem(BaseModel):
     qa_blocking_count: int = 0
     generation_status: Optional[Literal["generating", "complete", "failed"]] = None
     generation_started_at: Optional[datetime] = None
+    generation_mode: Optional[Literal["save_usage", "now"]] = None
     generation_error: Optional[str] = None
     updated_at: Optional[datetime] = None
     created_at: datetime
@@ -416,6 +418,9 @@ class CmaGenerateAiAnalysisRequest(BaseModel):
     # takes minutes - a phone or a proxy dropping one long request showed "Network error" while
     # the report was in fact being finished.
     background: bool = False
+    # Save usage (owner 11/17): the same report through the slower, half-price line - always run in the background,
+    # the agent is told by the bell and an email when it is ready (cma_save_usage).
+    save_usage: bool = False
 
 
 class CmaCompSearchRequest(BaseModel):

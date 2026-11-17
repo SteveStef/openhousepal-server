@@ -163,12 +163,35 @@ async def cma_ai_estimate(
                .order_by(AIUsageEvent.created_at.desc()).limit(40)).subquery()
         return float((await db.execute(select(func.avg(sub.c.estimated_cost_usd)))).scalar() or 0)
 
-    typical = (await avg("cma_ai")) + (await avg("cma_reasoning"))
+    # Made the normal way: the real cost of recent finished reports (11/17 - the usage log mixes in half-price
+    # answers once Save usage runs exist, so whole reports are read instead); the usage log until there are some.
+    from sqlalchemy import text as _text
+    from app.services import cma_save_usage
+
+    async def report_costs(save: bool) -> list:
+        rows = (await db.execute(_text(
+            "select (ai_analysis->>'cost_usd')::float, (ai_analysis->'save_usage'->>'minutes')::float from cma_reports "
+            "where ai_analysis is not null and is_backtest is false and (ai_analysis->>'cost_usd')::float > 0 "
+            "and (ai_analysis ? 'save_usage') = :save order by (ai_analysis->>'generated_at') desc nulls last limit 20"),
+            {"save": save})).all()
+        return [(float(r[0]), r[1]) for r in rows]
+
+    now_rows = await report_costs(False)
+    typical = sum(r[0] for r in now_rows) / len(now_rows) if len(now_rows) >= 3 else (await avg("cma_ai")) + (await avg("cma_reasoning"))
     if typical <= 0:
         typical = cap * 0.6
     typical = min(typical, cap)
+    save_rows = await report_costs(True)
+    save_usd = sum(r[0] for r in save_rows) / len(save_rows) if len(save_rows) >= 3 else typical / 2
+    minutes = [r[1] for r in save_rows[:5] if r[1]]
     pct = (lambda usd: round(usd / float(limit) * 100, 1) if limit else None)
-    return {"usd": round(typical, 3), "percent": pct(typical), "max_percent": pct(cap)}
+    # "usd"/"percent"/"max_percent" stay as they were (the made-now figure) for anything already reading them
+    return {"usd": round(typical, 3), "percent": pct(typical), "max_percent": pct(cap),
+            "now": {"usd": round(typical, 3), "percent": pct(typical), "minutes": cma_save_usage.NOW_MINUTES},
+            # at best every step goes through the slower line; at worst the hour runs out and the rest is made the
+            # normal way - never more than a report made now
+            "save_usage": {"usd": round(save_usd, 3), "percent": pct(save_usd), "usd_max": round(typical, 3), "percent_max": pct(typical),
+                           **cma_save_usage.times(config, sum(minutes) / len(minutes) if minutes else None)}}
 
 
 # ---- Manual subject (a home not on the MLS yet) - see cma_manual_subject_service ----
@@ -338,6 +361,207 @@ async def _generate_maybe_as_of(db, owner_id: str, report_id: str, tier, opts: d
             await db.commit()
 
 
+# ---------------------------------------------------------------------------------------------------
+# A background run, and picking one back up after a restart (owner 11/17: "a blog in Save usage mode picks itself
+# back up after a restart; CMAs don't - easy fix? do it"). Every push restarts the server; a run cut off by it used
+# to be lost and the agent had to press the button again. Now a live run renews a shared marker every minute
+# (cluster lease "cma_run"); the every-2-minutes sweep (resume_stalled, main.py) finds a run still marked
+# "generating" with no live marker and runs it again from the start - the same as the agent pressing the button,
+# within its own time limit (a Save usage run keeps the time it has already used: it never goes past ~25 minutes
+# in all). Only runs the button / the AI helper started (generation_mode set) are ever picked up.
+# ---------------------------------------------------------------------------------------------------
+_RUN_LEASE = "cma_run"
+_RUN_LEASE_TTL = 180            # renewed every minute; a restart lets it lapse within 3 minutes
+_RESUME_AFTER_SECONDS = 240     # a run this young is never taken for dead
+_FAST_RUN_SECONDS = 8 * 60      # room a whole report needs the normal way (about 3 minutes; 8 to be safe)
+_RESUME_OPTS = dict(max_photos_per_property=None, include_map_images=True, force_regenerate=False)   # what the page asks for
+_LOCAL_RUNS: set = set()        # report ids being made in THIS copy right now
+CUT_OFF_MESSAGE = "That run was cut off by a site update and there wasn't time left to finish it. Press the button to make it again."
+
+
+def _start_run(report_id: str, owner_id: str, tier, opts: dict, save_usage: bool, config: dict, address: str,
+               began, *, run_token: Optional[str] = None, resumed: bool = False) -> None:
+    task = asyncio.create_task(_run_generation(report_id, owner_id, tier, opts, save_usage, config, address, began,
+                                               run_token=run_token, resumed=resumed))
+    _LOCAL_RUNS.add(report_id)
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+    task.add_done_callback(lambda _t: _LOCAL_RUNS.discard(report_id))
+
+
+async def _run_generation(report_id: str, owner_id: str, tier, opts: dict, save_usage: bool, config: dict, address: str,
+                          began, *, run_token: Optional[str] = None, resumed: bool = False) -> None:
+    """One background run (the button / the AI helper, or the sweep picking one back up). The caller has taken
+    the allowance hold (hold_cma_generation) and marked the report "generating"; this always gives both back."""
+    from datetime import datetime as _dt, timezone as _tz
+    from app.database import AsyncSessionLocal
+    from app.services import cluster, cma_claude, cma_save_usage
+    ok, err, cost, beat = False, None, None, None
+    try:
+        if run_token is None:
+            run_token = await cluster.acquire(_RUN_LEASE, report_id, _RUN_LEASE_TTL)
+        if run_token:
+            beat = cluster.start_keep_alive(_RUN_LEASE, report_id, run_token, _RUN_LEASE_TTL)
+    except Exception:  # noqa: BLE001 - the run itself matters more than the marker
+        logger.warning("CMA run marker not taken", exc_info=True, extra={"report_id": report_id})
+    try:
+        async with AsyncSessionLocal() as s:
+            await service.drop_subject_from_comps(s, owner_id, report_id)
+            if save_usage:
+                # the slower line's time is counted from when the agent pressed the button - a run picked back up
+                # after a restart only has what is left of it (none left: the rest is made the normal way)
+                left = cma_save_usage.cap_minutes(config) - (_dt.now(_tz.utc) - began).total_seconds() / 60
+                with cma_claude.save_usage(max(0.0, left)) as su:
+                    rep = await _generate_maybe_as_of(s, owner_id, report_id, tier, opts)
+                # how long it took and how much went through the slower line - later reports' "likely
+                # ready by" is measured from these
+                rep.ai_analysis = {**(rep.ai_analysis or {}),
+                                   "save_usage": {**cma_save_usage.run_record(su, began), **({"resumed": True} if resumed else {})}}
+                cost = float((rep.ai_analysis or {}).get("cost_usd") or 0) or None
+                await s.commit()
+            else:
+                await _generate_maybe_as_of(s, owner_id, report_id, tier, opts)
+        ok = True
+    except AIRateLimitExceeded as e:
+        err = e.user_message
+    except HTTPException as e:
+        err = str(e.detail)
+    except asyncio.CancelledError:
+        # the server is shutting down (a push): leave it marked "generating" - the sweep picks it back up
+        if beat:
+            beat.cancel()
+        raise
+    except Exception:
+        logger.exception("CMA AI analysis failed unexpectedly (background)", extra={"report_id": report_id})
+        err = "The AI analysis hit an unexpected error partway through - please try again."
+        try:
+            from app.services.admin_alerts import alert_admin
+            await alert_admin("cma", "CMA AI analysis crashed", f"report {report_id}", owner_id=owner_id)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        await service.mark_generation_finished(owner_id, report_id, "complete" if ok else "failed", error=err)
+    finally:
+        await release_cma_generation(report_id)
+        if beat:
+            beat.cancel()
+        if run_token:
+            try:
+                await cluster.release(_RUN_LEASE, report_id, run_token)
+            except Exception:  # noqa: BLE001 - it lapses by itself
+                pass
+        await _tell(owner_id, report_id, address, save_usage, ok, err, cost)
+
+
+async def _tell(owner_id: str, report_id: str, address: str, save_usage: bool, ok: bool, err: Optional[str], cost) -> None:
+    from app.services import cma_save_usage
+    if save_usage:
+        # the agent chose to walk away: the bell and an email, every time
+        await cma_save_usage.tell_agent(owner_id, report_id, address, None if ok else err, cost)
+    # Started as an AI CMA from the helper's chat? Its card and chat hear about it
+    # (no-op otherwise - ai_notify only answers what it was asked to watch).
+    try:
+        from app.services.ai import ai_notify
+        await ai_notify.finished(
+            owner_id, f"cma:{report_id}", ok,
+            "Your AI CMA for {label} is finished - comps picked, value estimated and the report written. Take a look before you share it."
+            if ok else f"The AI CMA for {{label}} didn't finish: {err or 'something went wrong'} Open it to try again or pick the comps yourself.",
+            link=f"/studio/cma/{report_id}", link_label="Open the CMA")
+    except Exception:  # noqa: BLE001
+        logger.warning("CMA helper notice failed", exc_info=True, extra={"report_id": report_id})
+
+
+async def resume_stalled() -> int:
+    """Scheduler job (main.py, every 2 minutes): CMA runs the button started that are still marked "generating"
+    with no live run in ANY copy of the API - cut off by a restart - start again by themselves. Returns how many
+    this copy took."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from sqlalchemy import select
+    from app.database import AsyncSessionLocal
+    from app.models.database import CmaReport
+    from app.services import cluster
+    try:
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(select(CmaReport.id, CmaReport.owner_id, CmaReport.generation_started_at).where(
+                CmaReport.generation_status == "generating",
+                CmaReport.generation_mode.in_(("now", "save_usage")),
+                CmaReport.generation_started_at < _dt.now(_tz.utc) - _td(seconds=_RESUME_AFTER_SECONDS)))).all()
+        busy = await cluster.alive_keys(_RUN_LEASE, [r[0] for r in rows])
+    except Exception:  # noqa: BLE001
+        logger.warning("CMA resume sweep failed", exc_info=True)
+        return 0
+    n = 0
+    for rid, owner_id, started in rows:
+        if rid in _LOCAL_RUNS or rid in busy:
+            continue
+        try:
+            n += await _resume_one(rid, owner_id, started)
+        except Exception:  # noqa: BLE001
+            logger.warning("CMA resume failed", exc_info=True, extra={"report_id": rid})
+    if n:
+        logger.info("CMA runs picked back up after a restart", extra={"count": n})
+    return n
+
+
+async def _resume_one(rid: str, owner_id: str, started) -> int:
+    from datetime import datetime as _dt, timezone as _tz
+    from app.database import AsyncSessionLocal
+    from app.models.database import CmaReport, User
+    from app.services import cluster
+    from app.services.ai.ai_config_service import ai_config_service
+    from app.services.cma_ai_service import _has_completed_ai_pricing
+    token = await cluster.acquire(_RUN_LEASE, rid, _RUN_LEASE_TTL)
+    if token is None:
+        return 0   # some copy has it right now
+    handed = False
+    try:
+        async with AsyncSessionLocal() as db:
+            rep = await db.get(CmaReport, rid)
+            if rep is None or rep.generation_status != "generating" or rep.generation_started_at != started \
+                    or rep.generation_mode not in ("now", "save_usage"):
+                return 0   # it finished, failed or started again while we looked
+            save = rep.generation_mode == "save_usage"
+            subj = rep.subject or {}
+            address = str(subj.get("street_address") or subj.get("address") or "your home")
+            done = bool(rep.ai_analysis) and _has_completed_ai_pricing(rep)
+            cost = float((rep.ai_analysis or {}).get("cost_usd") or 0) or None
+            limit = service._stale_after(rep)
+            user = await db.get(User, owner_id)
+            config = await ai_config_service.get_config(db)
+            began = started if started.tzinfo else started.replace(tzinfo=_tz.utc)
+            if done:
+                # it finished - only the "finished" mark was lost with the restart
+                await service.mark_generation_finished(owner_id, rid, "complete")
+                await _tell(owner_id, rid, address, save, True, None, cost)
+                return 1
+            if user is None or (_dt.now(_tz.utc) - began).total_seconds() > limit - _FAST_RUN_SECONDS:
+                await service.mark_generation_finished(owner_id, rid, "failed", error=CUT_OFF_MESSAGE)
+                await _tell(owner_id, rid, address, save, False, CUT_OFF_MESSAGE, None)
+                return 1
+            # its allowance hold went with the old copy: take it again (the old shared one first - it was this run's)
+            await cluster.release("cma_hold", rid)
+            try:
+                await hold_cma_generation(db, owner_id, rid, config, user.plan_tier)
+            except CmaGenerationAlreadyRunning:
+                return 0
+            except AIRateLimitExceeded as e:
+                await service.mark_generation_finished(owner_id, rid, "failed", error=e.user_message)
+                await _tell(owner_id, rid, address, save, False, e.user_message, None)
+                return 1
+            tier = user.plan_tier
+        logger.info("CMA run picked back up after a restart", extra={"report_id": rid, "save_usage": save})
+        try:
+            _start_run(rid, owner_id, tier, dict(_RESUME_OPTS), save, config, address, began, run_token=token, resumed=True)
+        except BaseException:
+            await release_cma_generation(rid)
+            raise
+        handed = True
+        return 1
+    finally:
+        if not handed:
+            await cluster.release(_RUN_LEASE, rid, token)
+
+
 @router.post("/{report_id}/generate-ai-analysis", response_model=CmaReportResponse)
 async def generate_cma_ai_analysis(
     report_id: str,
@@ -360,19 +584,23 @@ async def generate_cma_ai_analysis(
     # in-flight runs count against their allowance - see ai_rate_limit_service.hold_cma_generation.
     # Refused here, the other run's 'generating' marker is left alone.
     from app.services.ai.ai_config_service import ai_config_service
+    _config = await ai_config_service.get_config(db)
     try:
-        await hold_cma_generation(db, current_user.id, report_id, await ai_config_service.get_config(db), current_user.plan_tier)
+        await hold_cma_generation(db, current_user.id, report_id, _config, current_user.plan_tier)
     except CmaGenerationAlreadyRunning as e:
         raise HTTPException(status_code=409, detail=e.user_message)
     except AIRateLimitExceeded as e:
         raise HTTPException(status_code=429, detail=e.user_message)
 
-    if payload.background:
+    save_usage = bool(payload.save_usage)
+    if payload.background or save_usage:
         # Runs on its own session, untied to this request: the answer comes back at once
         # ('generating') and the page polls GET /{id} until it's 'complete' or 'failed' (with
         # generation_error saying why). Nothing the network does can break it any more.
+        # Save usage (11/17): always this way - the same run through the slower, half-price line (cma_save_usage).
         try:
-            claimed = await service.mark_generation_started(db, current_user.id, report_id, claim=True)
+            claimed = await service.mark_generation_started(db, current_user.id, report_id, claim=True,
+                                                            mode="save_usage" if save_usage else "now")
         except BaseException:
             await release_cma_generation(report_id)
             raise
@@ -380,51 +608,16 @@ async def generate_cma_ai_analysis(
             # Another server copy is already running this report (11/14 - several copies): leave it be.
             await release_cma_generation(report_id)
             raise HTTPException(status_code=409, detail=CmaGenerationAlreadyRunning.user_message)
-        owner_id, tier = current_user.id, current_user.plan_tier
+        _subj = getattr(_existing, "subject", None) or {}
+        address = str(_subj.get("street_address") or _subj.get("address") or "your home")
         opts = dict(max_photos_per_property=payload.max_photos_per_property, include_map_images=payload.include_map_images,
                     force_regenerate=payload.force_regenerate)
-
-        async def run():
-            ok, err = False, None
-            from app.database import AsyncSessionLocal
-            try:
-                async with AsyncSessionLocal() as s:
-                    await service.drop_subject_from_comps(s, owner_id, report_id)
-                    await _generate_maybe_as_of(s, owner_id, report_id, tier, opts)
-                ok = True
-            except AIRateLimitExceeded as e:
-                err = e.user_message
-            except HTTPException as e:
-                err = str(e.detail)
-            except Exception:
-                logger.exception("CMA AI analysis failed unexpectedly (background)", extra={"report_id": report_id})
-                err = "The AI analysis hit an unexpected error partway through - please try again."
-                try:
-                    from app.services.admin_alerts import alert_admin
-                    await alert_admin("cma", "CMA AI analysis crashed", f"report {report_id}", owner_id=owner_id)
-                except Exception:  # noqa: BLE001
-                    pass
-            finally:
-                try:
-                    await service.mark_generation_finished(owner_id, report_id, "complete" if ok else "failed", error=err)
-                finally:
-                    await release_cma_generation(report_id)
-                    # Started as an AI CMA from the helper's chat? Its card and chat hear about it
-                    # (no-op otherwise - ai_notify only answers what it was asked to watch).
-                    from app.services.ai import ai_notify
-                    await ai_notify.finished(
-                        owner_id, f"cma:{report_id}", ok,
-                        "Your AI CMA for {label} is finished - comps picked, value estimated and the report written. Take a look before you share it."
-                        if ok else f"The AI CMA for {{label}} didn't finish: {err or 'something went wrong'} Open it to try again or pick the comps yourself.",
-                        link=f"/studio/cma/{report_id}", link_label="Open the CMA")
-
+        from datetime import datetime as _dt, timezone as _tz
         try:
-            task = asyncio.create_task(run())
+            _start_run(report_id, current_user.id, current_user.plan_tier, opts, save_usage, _config, address, _dt.now(_tz.utc))
         except BaseException:
             await release_cma_generation(report_id)
             raise
-        _BACKGROUND.add(task)
-        task.add_done_callback(_BACKGROUND.discard)
         return await service.get_report(db, current_user.id, report_id)
 
     success = False

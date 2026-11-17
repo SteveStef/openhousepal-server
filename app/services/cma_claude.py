@@ -13,6 +13,7 @@ Non-streaming on purpose: the accuracy-test dry run swaps in a stub client that 
 messages.create.
 """
 import asyncio
+import contextvars
 import logging
 import math
 import os
@@ -38,6 +39,37 @@ logger = logging.getLogger(__name__)
 
 def slow_lane_on() -> bool:
     return os.getenv("CMA_SLOW_LANE") == "1"
+
+
+# ---- Save usage for a whole CMA report (owner, 11/17) -------------------------------------------------------------
+# "I want CMAs to have the save usage mode and the make it now like our other features." Inside
+# `with save_usage(minutes):` every engine request that is not marked direct goes through the half-price queue until
+# `minutes` after the report started; after that it is sent the normal way, so a report never waits much past the
+# limit. What it costs is what it really used: an answer from the queue is counted at half (through_the_queue halves
+# its token counts), one sent the normal way at full price. The counts are kept for the report's record.
+_SAVE_USAGE: contextvars.ContextVar = contextvars.ContextVar("cma_save_usage", default=None)
+
+
+class save_usage:
+    def __init__(self, minutes: float, *, clock=time.monotonic):
+        self.minutes, self.clock = float(minutes), clock
+
+    def __enter__(self) -> dict:
+        self.state = {"deadline": self.clock() + self.minutes * 60, "clock": self.clock, "queued": 0, "fast": 0}
+        self._token = _SAVE_USAGE.set(self.state)
+        return self.state
+
+    def __exit__(self, *exc):
+        _SAVE_USAGE.reset(self._token)
+        return False
+
+
+def _report_cap(state: Optional[dict]) -> Optional[float]:
+    """Seconds this request may wait in the queue under a Save usage report, or None = send it the normal way."""
+    if not state:
+        return None
+    left = state["deadline"] - state["clock"]()
+    return left if left >= 60 else None
 
 
 def _cap_seconds() -> float:
@@ -117,9 +149,15 @@ async def through_the_queue(client, kwargs: dict, *, sleep=asyncio.sleep, clock=
 
 
 async def _send(client, kw: dict, direct: bool = False, slow_cap: Optional[float] = None):
-    msg = None if direct else await through_the_queue(client, kw, cap_seconds=slow_cap)
+    report = None if (direct or slow_cap) else _SAVE_USAGE.get()
+    cap = slow_cap if report is None else _report_cap(report)
+    msg = None if direct or (report is not None and cap is None) else await through_the_queue(client, kw, cap_seconds=cap)
     if msg is not None:
+        if report is not None:
+            report["queued"] += 1
         return msg
+    if report is not None:
+        report["fast"] += 1
     resp = await client.messages.create(**kw)
     if slow_cap and not direct:
         # the agent chose Save usage (video, 11/17): the half price was promised, so the usage counted is halved even

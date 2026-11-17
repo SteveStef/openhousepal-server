@@ -38,7 +38,7 @@ def stubs(monkeypatch):
     async def get_report(db, owner_id, report_id):
         return SimpleNamespace(id=report_id)
 
-    async def mark_started(db, owner_id, report_id, *, claim=False):
+    async def mark_started(db, owner_id, report_id, *, claim=False, mode=None):
         state.started.append(report_id)
         return True   # one server copy here: the claim is always this run's (11/14 claim=True route check)
 
@@ -64,6 +64,17 @@ def stubs(monkeypatch):
     monkeypatch.setattr(cma_routes.service, "drop_subject_from_comps", drop)
     monkeypatch.setattr(cma_routes, "_generate_maybe_as_of", fake_generate)
     monkeypatch.setattr(app_database, "AsyncSessionLocal", _FakeSession)
+    # the run's "still going" marker for the restart pickup (cluster lease) - no database here
+    from app.services import cluster
+
+    async def acquire(*a, **k):
+        return "tok"
+
+    async def release(*a, **k):
+        return None
+    monkeypatch.setattr(cluster, "acquire", acquire)
+    monkeypatch.setattr(cluster, "release", release)
+    monkeypatch.setattr(cluster, "start_keep_alive", lambda *a: asyncio.get_running_loop().create_task(asyncio.sleep(3600)))
     return state
 
 
@@ -141,7 +152,7 @@ def test_another_server_copy_already_running_it_is_refused(stubs, monkeypatch):
     """11/14 (several API copies): the in-memory hold only sees its own copy, so the route also claims the
     report in the database. When another copy already has it, the answer is 409, nothing runs, and this
     copy's hold is let go (so a later real start isn't blocked)."""
-    async def taken(db, owner_id, report_id, *, claim=False):
+    async def taken(db, owner_id, report_id, *, claim=False, mode=None):
         return False
     monkeypatch.setattr(cma_routes.service, "mark_generation_started", taken)
 

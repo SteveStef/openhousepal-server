@@ -140,6 +140,14 @@ async def lifespan(app: FastAPI):
         name="Cinematic Video: pick up videos cut off by a restart", replace_existing=True,
         max_instances=1, coalesce=True, next_run_time=_dt.now(_tz.utc) + _td(seconds=45),
     )
+    # CMA reports still being made when the server restarted (a push) start again by themselves (owner, 11/17) -
+    # the first look 4 minutes after start, so a run in a copy still shutting down is never doubled.
+    from app.api.cma_routes import resume_stalled as _cma_resume
+    scheduler.add_job(
+        _cma_resume, "interval", minutes=2, id="cma_run_resume",
+        name="CMA: pick up reports cut off by a restart", replace_existing=True,
+        max_instances=1, coalesce=True, next_run_time=_dt.now(_tz.utc) + _td(seconds=240),
+    )
     # Old shared leases + speed-limit counters (app/services/cluster.py) - hourly tidy-up.
     from app.services.cluster import scheduled_cleanup as _cluster_cleanup
     scheduler.add_job(
