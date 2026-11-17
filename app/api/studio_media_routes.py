@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import APIRouter, Depends, File, Query, Response, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, Query, Response, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -498,6 +498,17 @@ async def motion_fast_plan(
     """A Fast Cut's plan, shot by shot, before it is made (the photo order and the stat slides). The AI editor
     looks at the photos first if it has not yet (once per set of photos, on the agent's usage)."""
     return await studio_motion_service.fast_outline(db, current_user, asset_id)
+
+
+@router.post("/motion/{asset_id}/fast-preview")
+async def motion_fast_preview(
+    asset_id: str,
+    body: dict = Body(default_factory=dict),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_studio_media_access),
+):
+    """A Fast Cut's live preview: the render's own planner on the editor's current choices (no AI, nothing saved)."""
+    return await studio_motion_service.fast_preview(db, current_user, asset_id, body.get("motion") or {})
 
 
 @router.post("/motion/{asset_id}/render", response_model=StudioMediaAssetResponse)

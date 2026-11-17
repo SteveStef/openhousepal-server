@@ -154,7 +154,8 @@ async def _r_cinematic(user, p: dict, linked: Optional[dict]) -> dict:
                            "take out any photos you don't want, check the order and the stats, and make it - right here. It's saved as you go." + how,
                 "link": f"/studio/media/motion/{aid}"}
     return {"message": "Your Cinematic Video is started - I'm sorting the photos into rooms now. Pick the length and shape "
-                       "below, tap the rooms to show, check each photo and make it - right here. It's saved as you go.",
+                       "below, tap the rooms to show, drag them into the order you want (it starts in our suggested order), check each photo "
+                       "and make it - right here. It's saved as you go.",
             "link": f"/studio/media/motion/{aid}"}
 
 

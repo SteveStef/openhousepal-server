@@ -199,6 +199,19 @@ class PropertyService:
             # Anchor 2: Contains the primary street word (Handles Lane vs Ln)
             if street_root:
                 filters.append(Property.street_address.ilike(f"%{street_root}%"))
+            # ...and every other name word too: matching only the first one found "26 S OLD GLEBE RD #203-B"
+            # for "26 Old Gulph Rd" (owner 11/17). Suffixes and directionals are handled on their own; the
+            # few words Bright shortens either way may match in either form.
+            _suffixes = {'ST', 'STREET', 'AVE', 'AVENUE', 'RD', 'ROAD', 'DR', 'DRIVE', 'LN', 'LANE', 'PL', 'PLACE', 'TER',
+                         'TERRACE', 'CT', 'COURT', 'BLVD', 'BOULEVARD', 'HWY', 'HIGHWAY', 'CIR', 'CIRCLE', 'WAY', 'PIKE'}
+            _short = {'MOUNT': 'MT', 'MT': 'MOUNT', 'SAINT': 'ST', 'FORT': 'FT', 'FT': 'FORT'}
+            for token in street_tokens[1:]:
+                word = re.sub(r'[^a-zA-Z0-9]', '', token).upper()
+                if (len(word) < 3 or word in directionals or word in _suffixes or token == street_root
+                        or token.startswith('#') or word.isdigit()):
+                    continue
+                forms = [word] + ([_short[word]] if word in _short else [])
+                filters.append(or_(*[Property.street_address.op('~*')(rf"\m{re.escape(f)}\M") for f in forms]))
 
             # 3.4 Suffix Mapping (ST/STREET, AVE/AVENUE, etc.)
             suffix_map = {

@@ -2068,6 +2068,35 @@ async def fast_outline(db, user: User, asset_id: str) -> dict:
     }
 
 
+async def fast_preview(db, user: User, asset_id: str, live: dict) -> dict:
+    """The Fast Cut's live preview in the editor (owner 11/17: "a preview just like the cinematic one"): the
+    same planner the render uses, on the editor's current choices - the home's own photos cut on the chosen
+    song's beats. Pure arithmetic: no AI, nothing saved, costs nothing. Until the agent has picked photos it
+    plays the home's best-scored ones."""
+    asset = await _owned_motion(db, user.id, asset_id)
+    saved = dict((asset.options or {}).get("motion") or {})
+    motion = {**saved, **{k: v for k, v in (live or {}).items() if k in (
+        "photos", "theme", "accent", "metal", "situation", "copy", "facts", "sections", "agent", "format", "length", "song")}}
+    # the AI editor's look (fast.edit) lives only on the saved copy - the editor's order / stat switches go on top
+    motion["fast"] = {**(saved.get("fast") or {}), **{k: v for k, v in ((live or {}).get("fast") or {}).items() if k != "edit"}}
+    vis = [p for p in motion.get("photos") or [] if not p.get("hidden")]
+    if len(vis) < fastcut.MIN_PHOTOS:
+        pool = [dict(p, id=p.get("id") or f"pool-{i}") for i, p in enumerate(saved.get("pool") or [])
+                if p.get("analyzed") and (p.get("room") or "skip") != "skip"]
+        pool.sort(key=lambda p: -float(p.get("score") or 0))
+        motion["photos"] = pool[:50]
+    fmt = motion.get("format") or "9:16"
+    try:
+        if (motion.get("fast") or {}).get("edit"):
+            try:
+                return {"props": fast_cut_recipe.plan(motion, fmt), "exact": True}
+            except ValueError:
+                pass
+        return {"props": fastcut.plan(motion, fmt), "exact": False}
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+
+
 def worker_props(motion: dict, fmt: str) -> dict:
     if fastcut.is_fast(motion):
         if (motion.get("fast") or {}).get("edit"):
