@@ -23,6 +23,14 @@ _NUDGE_MACHINERY_TESTS = {
 
 
 @pytest.fixture(autouse=True)
+def _no_final_read_unless_a_test_asks(monkeypatch):
+    """The CMA final read is on by default since 11/15 and makes a real AI call. No test may reach it by accident:
+    it is off here, and the tests that exercise it (tests/test_cma_final_audit.py) switch it on with a stand-in model."""
+    monkeypatch.setenv("CMA_FINAL_AUDIT", "0")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _pending_nudge_for_its_own_tests(request, monkeypatch):
     if request.module.__name__.split(".")[-1] in _NUDGE_MACHINERY_TESTS:
         from app.services import cma_ai_service

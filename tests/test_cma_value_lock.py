@@ -86,7 +86,9 @@ async def test_a_rerun_with_only_a_note_changed_reuses_the_reports_answer(monkey
 
     async def call_model(config, packet):
         calls.append(1)
-        return {"final_fmv": 1800000 - 25000 * (len(calls) - 1), "range_low": 1700000, "range_high": 1900000}, {"input_tokens": 1, "output_tokens": 1}
+        return {"final_fmv": 1800000 - 25000 * (len(calls) - 1), "range_low": 1700000, "range_high": 1900000,
+                "final_valuation_summary": "Valued from the closest sale.",   # a full answer: a thin one is never stored
+                "comp_roles": [{"comp_id": "a", "role": "direct_analog", "reason": "closest"}]}, {"input_tokens": 1, "output_tokens": 1}
 
     async def noop(*a, **k):
         return None

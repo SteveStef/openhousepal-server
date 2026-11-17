@@ -20,7 +20,14 @@ What it may never do: change the value, the range, a comp, an adjustment or a sh
 
 It cannot see anything outside our data - a public site showing a different status, a price cut the MLS feed
 never sent. It is best-effort: any failure leaves the report exactly as it was. Identical reports reuse the
-stored result (no second charge). Off unless CMA_FINAL_AUDIT=1 - it adds an AI call to every report.
+stored result (no second charge). On for every report since 11/15 (CMA_FINAL_AUDIT=0 turns it off); it adds one
+AI call, about 2 cents.
+
+It is not a step for the agent (owner, 11/15: "as long as it does not add a confusing step for the agent and it
+just comes out as a finished report"). What it fixes, it fixes silently. What it leaves for the agent is kept short
+and to things worth a look: a note that talks itself down ("minor", "fine otherwise", "low-risk") is dropped, and so
+is a "could not verify" about something a photo shows (counters, cabinets, flooring, a dated kitchen) - the writers
+saw the photos and this reader did not.
 """
 import copy
 import hashlib
@@ -45,7 +52,9 @@ _PROTECTED_RE = re.compile(r"final fair market value|supported (?:valuation )?ra
 
 
 def enabled() -> bool:
-    return os.getenv("CMA_FINAL_AUDIT", "0") == "1"
+    """On unless CMA_FINAL_AUDIT=0 (owner, 11/15: part of the main flow). On the last seven test reports it fixed 15
+    sentences the report's own numbers showed to be wrong - at least one in every report - for about 2 cents each."""
+    return os.getenv("CMA_FINAL_AUDIT", "1") != "0"
 
 
 TOOL = {
@@ -162,7 +171,26 @@ _ENGINE_SENTENCE_RE = re.compile(
     r"The value is therefore not set above|That takes off \$|Together: \$|How the value was reached|"
     r"Homes under contract \(market context|a gap that size usually means|monthly fee is \$|first entered the MLS|"
     r"is being sold at auction|the rate past local acreage sales support|points to a sale near \$|"
+    # the judgment step's own line: its reason comes from the photos; the read once replaced it with "judgment
+    # beyond the measured adjustments takes off $13,000", which says nothing (104 Linda Ln, 11/15)
+    r"not a measured adjustment|not measured adjustments|"
     r"listing text describes a finished basement", re.I)
+# A note LEFT FOR THE AGENT that talks itself down is noise, not a note (seven test reports, 11/15: "Minor; lot
+# 34,412 sqft equals 0.79 acres, so this is consistent", "...mixed siding; main issue none", "Hedged wording, so it
+# is not a claim of fact. Flagged only as low-risk", "Garbled phrase; comp 3 is farthest comp but fine otherwise").
+# Only notes are dropped by this - a sentence the read actually fixes is never judged by these words.
+_WEAK_NOTE_RE = re.compile(
+    r"\bminor\b|\bmild\b|main issue none|\bfine otherwise\b|\bbut fine\b|,\s*fine\b|\bis fine\b|low[- ]risk|"
+    r"not a claim of fact|\bis consistent\b|\bconsistent with\b|^\s*weak\b|^\s*hedged\b|only partly right|"
+    r"\bunverified\.?$", re.I)
+# "Could not verify" about something a PHOTO shows. The reader is told not to raise these and still did on five of
+# seven reports ("the listing says 'gorgeous counters', not quartz"). The agent is only asked about what no photo
+# can show: a roof, a system, an age, a permit, a fee, a date, who lives there.
+_PHOTO_VISIBLE_RE = re.compile(
+    r"\b(?:granite|quartz|marble|laminate|formica|counters?|countertops?|cabinet\w*|floor\w*|carpet\w*|hardwoods?|"
+    r"tiled?|stainless|appliances?|finish(?:es)?|dated|paint\w*|siding|stucco|brick|deck|patio|porch|pergola|"
+    r"balcony|fenc\w+|landscap\w+)\b", re.I)
+MAX_AGENT_NOTES = 3
 # kinds the audit may act on by itself; "unsupported" (it could not FIND a detail) is never one of them
 _EDIT_KINDS = {"contradiction", "inconsistent", "speculation"}
 
@@ -371,6 +399,7 @@ def apply_findings(pricing: dict, comps: list, findings: list, packet: dict) -> 
             continue
         changes += 1
         applied.append({**note, "action": action, "replacement": replacement or None})
+    for_agent = [n for n in for_agent if not _WEAK_NOTE_RE.search(n.get("why") or "")]
     return pricing, comps, applied, for_agent
 
 
@@ -380,7 +409,9 @@ def unverified_findings(findings: list) -> list:
     out = []
     for f in (findings or [])[:MAX_FINDINGS]:
         if isinstance(f, dict) and str(f.get("kind") or "") == "unsupported" \
-                and not _SELF_CANCELLED_RE.search(str(f.get("why") or "")):
+                and not _SELF_CANCELLED_RE.search(str(f.get("why") or "")) \
+                and not _WEAK_NOTE_RE.search(str(f.get("why") or "")) \
+                and not _PHOTO_VISIBLE_RE.search(str(f.get("why") or "")):
             out.append({"where": str(f.get("where") or ""), "kind": "unsupported",
                         "sentence": str(f.get("sentence") or "").strip()[:400], "why": str(f.get("why") or "").strip()[:300]})
     return out
@@ -405,15 +436,15 @@ def agent_message(for_agent: list, unverified: Optional[list] = None) -> Optiona
     parts = []
     if for_agent:
         bits = []
-        for n in for_agent[:4]:
+        for n in for_agent[:MAX_AGENT_NOTES]:
             q = f" (\"{n['sentence'][:140]}\")" if n.get("sentence") else ""
             bits.append(f"{n['why']}{q}")
-        more = f" (+{len(for_agent) - 4} more)" if len(for_agent) > 4 else ""
+        more = f" (+{len(for_agent) - MAX_AGENT_NOTES} more)" if len(for_agent) > MAX_AGENT_NOTES else ""
         parts.append("the final read of this report noted - " + "; ".join(bits) + more + ".")
     if unverified:
-        bits = [f"\"{u['sentence'][:140]}\" ({u['why'][:120].rstrip('.')})" for u in unverified[:4] if u.get("sentence")]
+        bits = [f"\"{u['sentence'][:140]}\" ({u['why'][:120].rstrip('.')})" for u in unverified[:MAX_AGENT_NOTES] if u.get("sentence")]
         if bits:
-            more = f" (+{len(unverified) - 4} more)" if len(unverified) > 4 else ""
+            more = f" (+{len(unverified) - MAX_AGENT_NOTES} more)" if len(unverified) > MAX_AGENT_NOTES else ""
             lead = ("These details are in neither the listing text nor the MLS record - check each against the photos, and "
                     "take out any you cannot confirm: ")
             parts.append((lead if for_agent else lead[:1].lower() + lead[1:]) + "; ".join(bits) + more + ".")
@@ -421,7 +452,7 @@ def agent_message(for_agent: list, unverified: Optional[list] = None) -> Optiona
 
 
 async def run(db, report, *, owner_id: str, config: dict, model: str, client, create, record_usage_event, add_spend,
-              estimate_cost, lock_get, lock_put, records: Optional[dict] = None) -> Optional[dict]:
+              estimate_cost, lock_get, lock_put, records: Optional[dict] = None, guard=None) -> Optional[dict]:
     """Audit report.pricing / report.comparables in place. Returns the stored audit record, or None when off / failed.
     The callables are passed in so this module has no import cycle with cma_ai_service and tests need no network."""
     if not enabled():
@@ -435,6 +466,8 @@ async def run(db, report, *, owner_id: str, config: dict, model: str, client, cr
                               records=records)
         if not packet["text"]:
             return None
+        if guard is not None:
+            guard(packet)                 # accuracy-test time machine: raises (and the read is skipped) on a leak
         fp = fingerprint(packet, model)
         cached = await lock_get(db, getattr(report, "id", None), "audit", fp)
         cost = 0.0

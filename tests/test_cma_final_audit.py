@@ -199,7 +199,8 @@ def test_a_detail_the_audit_could_not_find_is_never_removed_from_the_text():
     assert applied == [] and for_agent == []
     assert new_comps[0]["commentary"] == comps[0]["commentary"]
     assert "Possession is listed as negotiable." in new_pricing["ai_estimate"]["methodology_summary"]
-    assert [u["sentence"] for u in audit.unverified_findings(findings)] == [f["sentence"] for f in findings]
+    # listed for the agent to check - except what a photo shows (the deck; 11/15), which the writers saw
+    assert [u["sentence"] for u in audit.unverified_findings(findings)] == ["Possession is listed as negotiable."]
 
 
 def test_a_finding_that_talks_itself_out_of_the_error_is_dropped():
@@ -321,4 +322,87 @@ def test_details_it_could_not_find_are_listed_for_the_agent_to_check():
     assert "the final read of this report noted - Comp 3 carries a 24.7% share." in both and "These details are in neither" in both
     assert audit.agent_message([], []) is None and audit.agent_message([]) is None
     many = audit.agent_message([], [dict(unverified[0], sentence=f"Sentence {i}.") for i in range(6)])
-    assert "(+2 more)" in many and "Sentence 3." in many and "Sentence 4." not in many
+    assert "(+3 more)" in many and "Sentence 2." in many and "Sentence 3." not in many
+
+
+# ---- 11/15: part of the main flow (owner: "as long as it does not add a confusing step for the agent and it just comes
+# out as a finished report") - on by default, and what it leaves for the agent is short and worth reading ---------------
+
+def test_the_final_read_is_on_unless_switched_off(monkeypatch):
+    monkeypatch.delenv("CMA_FINAL_AUDIT", raising=False)
+    assert audit.enabled() is True
+    monkeypatch.setenv("CMA_FINAL_AUDIT", "0")
+    assert audit.enabled() is False
+    monkeypatch.setenv("CMA_FINAL_AUDIT", "1")
+    assert audit.enabled() is True
+
+
+def test_a_note_that_talks_itself_down_never_reaches_the_agent():
+    r = _report()
+    p = audit.build_packet(r.subject, r.comparables, r.pricing, r.mode)
+    weak = ["Minor; lot 34,412 sqft equals 0.79 acres, so this is consistent.",
+            "Comp 1 is a 4-bed twin; $310,000/2,203 is about $141, fine, but the 'brick, similar exterior' is mixed siding; main issue none.",
+            "Hedged wording, so it is not a claim of fact. Flagged only as low-risk.",
+            "Garbled phrase; comp 3 is farthest comp but fine otherwise.",
+            "Comp 3 has 16.7% share, but 'moderate' is fine; unverified.",
+            "Predicting the outcome is stated as likely fact beyond the figures; mild, but the claim rests on no figure.",
+            "Weak; consistent with facts.", "Hedged, but speculates about seller motive with no supporting fact."]
+    real = "The sale is over a year older than the others, yet the methodology calls it one of three nearby sales used."
+    findings = [_finding(where="methodology", sentence="", kind="omission", action="flag", why=w) for w in weak + [real]]
+    _, _, applied, for_agent = audit.apply_findings(r.pricing, r.comparables, findings, p)
+    assert applied == [] and [n["why"] for n in for_agent] == [real]
+
+
+def test_a_real_fix_is_never_dropped_for_its_wording():
+    """The weak-note words judge only what is LEFT for the agent - a sentence the read fixes is still fixed."""
+    r = _report()
+    p = audit.build_packet(r.subject, r.comparables, r.pricing, r.mode)
+    f = _finding(where="comp_note:2", sentence="Comp #2 is the lowest-priced sale in the set.", why="A minor slip, but Comp #2 is not the lowest sale.")
+    _, comps, applied, for_agent = audit.apply_findings(r.pricing, r.comparables, [f], p)
+    assert len(applied) == 1 and for_agent == [] and "lowest-priced" not in comps[1]["ai_commentary"]
+
+
+def test_the_agent_is_not_asked_to_verify_what_a_photo_shows():
+    found = audit.unverified_findings([
+        {"kind": "unsupported", "sentence": "It has a fully renovated kitchen with quartz counters.", "why": "Listing says 'gorgeous counters', not quartz."},
+        {"kind": "unsupported", "sentence": "Its oak-cabinet kitchen and carpeted lower level are dated.", "why": "Comp 1 facts describe solid cabinetry and no oak cabinets or carpeted lower level."},
+        {"kind": "unsupported", "sentence": "Its kitchen finishes are dated beside the subject's.", "why": "Nothing in the facts says its kitchen finishes are dated."},
+        {"kind": "unsupported", "sentence": "Verify the condition of the carport roof covering.", "why": "The subject has a detached garage and no carport in the facts."},
+        {"kind": "unsupported", "sentence": "Central air is documented as updated.", "why": "Subject facts do not say the central air was updated; only that central A/C exists."},
+        {"kind": "unsupported", "sentence": "It is a turnkey, occupied home.", "why": "Occupancy is not stated anywhere in comp 5's facts."},
+    ])
+    assert [u["sentence"] for u in found] == ["Verify the condition of the carport roof covering.", "Central air is documented as updated.",
+                                              "It is a turnkey, occupied home."]
+
+
+def test_the_judgment_steps_own_line_is_left_alone():
+    r = _report()
+    line = "A judgment, not a measured adjustment: carpet over hardwood in the bedrooms."
+    r.pricing["ai_estimate"]["methodology_summary"] += " " + line
+    p = audit.build_packet(r.subject, r.comparables, r.pricing, r.mode)
+    f = _finding(where="methodology", sentence=line, action="replace", replacement="A judgment, not a measured adjustment: judgment beyond the measured adjustments.",
+                 why="The facts give no carpet-over-hardwood reason for it.")
+    pricing, _, applied, for_agent = audit.apply_findings(r.pricing, r.comparables, [f], p)
+    assert applied == [] and for_agent == [] and line in pricing["ai_estimate"]["methodology_summary"]
+
+
+def test_a_guard_that_objects_skips_the_read_and_costs_nothing(monkeypatch):
+    """Accuracy-test time machine: the packet is scanned for the hidden sale facts before it is sent."""
+    monkeypatch.setenv("CMA_FINAL_AUDIT", "1")
+    r = _report()
+    before = r.pricing
+    called = {"n": 0}
+
+    async def create(client, **kw):
+        called["n"] += 1
+
+    async def nothing(*a, **k):
+        return None
+
+    def guard(packet):
+        assert packet["text"] and packet["facts"]
+        raise RuntimeError("leak")
+
+    out = asyncio.run(audit.run(None, r, owner_id="o1", config={}, model="m", client=object(), create=create, record_usage_event=nothing,
+                                add_spend=nothing, estimate_cost=lambda *a: 0.0, lock_get=nothing, lock_put=nothing, guard=guard))
+    assert out is None and called["n"] == 0 and r.pricing is before

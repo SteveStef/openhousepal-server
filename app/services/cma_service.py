@@ -532,9 +532,59 @@ async def get_report(db: AsyncSession, owner_id: str, report_id: str) -> CmaRepo
     return report
 
 
+COMPS_LOCKED_MESSAGE = ("The comps are locked once the AI has written this report, so every home in it has been "
+                        "through the full analysis. To use different comps, start a new CMA for this home.")
+
+
+def _comps_on_report(comparables) -> set:
+    """Which comps are ON a report (switched-off ones are not): by the comp's own id, else its listing."""
+    return {str(c.get("id") or c.get("listing_key") or c.get("street_address") or "")
+            for c in (comparables or []) if isinstance(c, dict) and c.get("is_included", True)}
+
+
+RATINGS_LOCKED_MESSAGE = ("The ratings are locked once the AI has written this report - its value and its wording were "
+                          "worked out from them. To rate the comps differently, start a new CMA for this home.")
+
+
+def _comp_ratings(comparables) -> dict:
+    """Each comp's ratings and weight class as the value step read them (owner 11/17: "after the AI run I thought we
+    lock it, as the entire report is built around including all comps"). A rating changed afterwards showed on the
+    page and the PDF while the value, the adjustments and every sentence still came from the old one. Blank, missing
+    and null all count as the same thing, so an ordinary save never trips this."""
+    from app.schemas.cma import CmaQualityAssessment
+    from app.services.cma_ai_service import _normalize_strength as _norm    # "primary" and "strong" are one class
+    out = {}
+    for c in (comparables or []):
+        if not isinstance(c, dict):
+            continue
+        q = c.get("quality") if isinstance(c.get("quality"), dict) else {}
+        key = str(c.get("id") or c.get("listing_key") or c.get("street_address") or "")
+        out[key] = (tuple((f, str(q.get(f))) for f in sorted(CmaQualityAssessment.model_fields) if q.get(f)),
+                    _norm(c.get("strength")) if c.get("strength") else None)
+    return out
+
+
+def comps_locked(report) -> bool:
+    """True once the AI analysis has run (owner 11/16): from then on no comp is added, taken off, switched off or
+    switched back on. The write-up names the comps it was written from, and a comp added afterwards would never
+    get the photo read the others got - so different comps means a new CMA. Ratings, notes, wording and
+    everything else on the report stay editable."""
+    if getattr(report, "ai_analysis", None):
+        return True
+    # ... and while the AI is writing it (the run reads the comps at its start; a comp taken off in those minutes
+    # would be on the report's pages but not in its value). A run that died is not a lock: see the stale check.
+    _reconcile_stale_generation(report)
+    return getattr(report, "generation_status", None) == "generating"
+
+
 async def update_report(db: AsyncSession, owner_id: str, report_id: str, payload: CmaReportUpdate) -> CmaReport:
     report = await _get_owned(db, owner_id, report_id)
     data = payload.model_dump(exclude_unset=True)
+    if "comparables" in data and comps_locked(report):
+        if _comps_on_report(data["comparables"]) != _comps_on_report(report.comparables):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=COMPS_LOCKED_MESSAGE)
+        if _comp_ratings(data["comparables"]) != _comp_ratings(report.comparables):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=RATINGS_LOCKED_MESSAGE)
     if "subject" in data:
         # CMA accuracy test only: a live arm for this agent + listing makes this an as-of test report.
         from app.services import cma_backtest_arms as _arms
@@ -622,6 +672,13 @@ async def get_public_report(db: AsyncSession, slug: str) -> CmaPublicResponse:
     return await build_report_payload(db, report, owner, map_ref=slug)
 
 
+def client_comparables(comparables) -> list:
+    """The comps as a client page / PDF gets them: without the AI's unconfirmed first read of a rating
+    (`ai_quality_read`), which is for the agent's Analysis screen only (owner 11/15)."""
+    return [{k: v for k, v in c.items() if k != "ai_quality_read"} if isinstance(c, dict) else c
+            for c in (comparables or [])]
+
+
 async def build_report_payload(db: AsyncSession, report: CmaReport, owner: Optional[User], map_ref: str) -> CmaPublicResponse:
     """The client view of a report (share link, PDF) - also what Admin -> Grading builds its PDF from."""
     brand_result = await db.execute(select(StudioBrandKit).where(StudioBrandKit.owner_id == report.owner_id))
@@ -651,7 +708,7 @@ async def build_report_payload(db: AsyncSession, report: CmaReport, owner: Optio
         client_name=report.client_name,
         mode=report.mode,
         subject=report.subject or {},
-        comparables=report.comparables or [],
+        comparables=client_comparables(report.comparables),
         pricing=report.pricing or {},
         market_context=report.market_context or {},
         improvements=report.improvements or [],
@@ -874,6 +931,25 @@ def non_home_subject_problem(property_type, subject=None) -> Optional[str]:
     return None
 
 
+def unusual_structure_problem(structure_design) -> Optional[str]:
+    """Why a home the MLS files as a single-family house still cannot have a CMA, in the agent's words - or None.
+    Bright's StructureDesignType is the only place a manufactured / mobile home or a deeded parking space shows.
+
+    Owner, 11/15: "We shouldn't do mobile homes... keep it to more traditional real estate" - the same plain message
+    as a commercial listing. The free check that day (17 past manufactured-home sales) had the value more than 15%
+    off on one in four, and 17% of them sell more than 10% away from their asking price: many sit on leased land,
+    and the lot rent that buyers price is not in the MLS."""
+    d = str(structure_design or "").strip().lower()
+    if "manufactured" in d or "mobile" in d:
+        return ("The MLS lists this as a manufactured (mobile) home. These are priced differently from houses - many "
+                "sit on leased land, and the lot rent buyers weigh is not in the MLS - so a CMA can't value this one. "
+                "A CMA works for a house, townhouse, condo or a 2-4 unit home.")
+    if "parking" in d or "garage" in d:
+        return ("The MLS lists this as a garage or parking space, not a home, so a CMA can't value it. "
+                "A CMA works for a house, townhouse, condo or a 2-4 unit home.")
+    return None
+
+
 def _comp_sanity_problem(c: "CmaCompCandidate") -> Optional[str]:
     if not (c.street_address or "").strip() or len((c.street_address or "").strip()) < 4:
         return "no street address"
@@ -938,7 +1014,7 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
         query = query.where(Property.listing_key != req.listing_key)
     # Manufactured / mobile homes and deeded parking spaces are filed as single-family houses in our copy (788
     # closed sales since 2025). A double-wide is not a comp for a house, and a parking space is not a home (deep
-    # dive 11/13). They stay in only when the subject itself is a manufactured home.
+    # dive 11/13). A subject that is one of these is declined just below (11/15), so they are never comps.
     # Checked in the Python loop below, on the rows already read - NOT in SQL: as a WHERE on the MLS payload it
     # made the database open the full payload of every home in the search box, and the live comp step went from
     # a few seconds to 65 (11/14, an hour after it shipped).
@@ -948,6 +1024,9 @@ async def search_comparables(db: AsyncSession, req: CmaCompSearchRequest, *, kee
             select(Property.raw_mls_data["StructureDesignType"].astext).where(Property.listing_key == req.listing_key)
         )).scalar_one_or_none() or "").lower()
     _subject_manufactured = "manufactured" in _subject_design or "mobile" in _subject_design
+    _not_valued = unusual_structure_problem(_subject_design)
+    if _not_valued:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_not_valued)
     # The subject's OWN earlier sales are separate MLS listings (different listing_key) of the same
     # house - they used to come back as a "98% match" comp and anchor the value to itself. Same
     # street address + ZIP, or the same tax parcel, is never a comparable.

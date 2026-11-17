@@ -375,6 +375,16 @@ _SYSTEM_PROMPT = (
     "renovated should be treated as updated despite its age, and a newer property with worn or "
     "original finishes should be treated as dated despite being newer. This is usually the single "
     "biggest driver of finish_quality - weight it accordingly. "
+    "KITCHEN AND BATHROOMS, RATED ON THEIR OWN: besides the overall ratings, fill quality.kitchen and "
+    "quality.bathrooms for each comp - that comp's kitchen against the subject's kitchen, and its bathrooms "
+    "(taken together) against the subject's. Read them from the photos, on this scale: new or just renovated; "
+    "updated, newer; clean but dated; original or old; rough, in need of work. A home can have a new kitchen "
+    "and original baths - rate each for what it is. Leave one out whenever the photos of the comp OR of the "
+    "subject do not show that room; never fill it from the listing text alone. In the comp's note, say it in "
+    "one plain clause when it differs ('a newer kitchen than the subject's', 'its baths are original, where "
+    "the subject's are updated') and say nothing about it when it is similar. These two ratings only "
+    "describe: they carry no adjustment of their own, and finish_quality and interior stay your overall "
+    "read of the home exactly as you would have rated them without these two rows. "
     "For exterior/curb appeal specifically: when given, trust construction_materials/"
     "exterior_features/roof_type/architectural_style data over a visual guess from photos alone - "
     "a listing's stated materials are more reliable than what a photo suggests. As a general "
@@ -599,8 +609,8 @@ _SYSTEM_PROMPT = (
     "primary living-area figure\"; \"a shake roof on an estate this size is a significant capital "
     "item - verify its age and remaining useful life\". estimated_value_context must be "
     "qualitative, never a dollar amount or a percent-of-cost.\n"
-    "(C) COMP-VS-SUBJECT DIRECTION. finish_quality / interior / exterior / lot / amenities / "
-    "layout describe THIS COMP RELATIVE TO THE SUBJECT: \"above\" = the comp is superior to the "
+    "(C) COMP-VS-SUBJECT DIRECTION. finish_quality / interior / exterior / kitchen / bathrooms / lot / "
+    "amenities / layout describe THIS COMP RELATIVE TO THE SUBJECT: \"above\" = the comp is superior to the "
     "subject on that dimension, \"below\" = the comp is inferior to the subject, \"similar\" = "
     "roughly equal. Your written note MUST agree with the ratings - if you rate a comp's finish "
     "\"above\" (comp is superior), do not elsewhere call the subject the more updated / higher-end "
@@ -671,6 +681,8 @@ _SUBMIT_TOOL = {
                                 "finish_quality": {"type": "string", "enum": ["below", "similar", "above"], "description": "'above' = comp's finishes are superior to the subject's; 'below' = inferior."},
                                 "interior": {"type": "string", "enum": ["below", "similar", "above"], "description": "'above' = comp interior superior to subject."},
                                 "exterior": {"type": "string", "enum": ["below", "similar", "above"], "description": "'above' = comp exterior/curb appeal superior to subject."},
+                                "kitchen": {"type": "string", "enum": ["below", "similar", "above"], "description": "The comp's KITCHEN against the subject's kitchen, from the photos: 'above' = newer / more updated than the subject's, 'below' = more dated, older or rougher. Omit unless photos show BOTH kitchens."},
+                                "bathrooms": {"type": "string", "enum": ["below", "similar", "above"], "description": "The comp's BATHROOMS, taken together, against the subject's, from the photos: 'above' = newer / more updated, 'below' = more dated, older or rougher. Omit unless photos show bathrooms in BOTH homes."},
                                 "lot": {"type": "string", "enum": ["below", "similar", "above"], "description": "'above' = comp lot/land superior to subject (only with a concrete stated reason)."},
                                 "amenities": {"type": "string", "enum": ["below", "similar", "above"], "description": "'above' = comp amenities superior to subject."},
                                 "layout": {"type": "string", "enum": ["below", "similar", "above"], "description": "'above' = comp layout/usable space superior to subject."},
@@ -1350,10 +1362,38 @@ def _normalize_strength(value) -> Optional[str]:
         return None
     v = str(value).lower()
     return _STRENGTH_ALIASES.get(v, v if v in _CANONICAL_STRENGTHS else "supporting")
+
+
+# Rating rows that only describe. "Should we be adding kitchen as another thing to click, similar to comp inferior
+# etc, and bathrooms?" (owner 11/16) - yes, without a price: Finish quality and Interior already carry what
+# condition is worth, and a second pair of rows moving dollars would count the same difference twice. So these two
+# are kept out of the value step's evidence, out of the adjustment table and out of every weight; pricing them
+# separately is a change for the past-sales check to earn first. (Later 11/16 he asked for them to SET Interior,
+# 40% each - see _interior_from_rooms; that runs once when the AI's ratings come in; CMA_INTERIOR_TIE=0 = off.)
+_DESCRIPTIVE_QUALITY_ROWS = ("kitchen", "bathrooms")
+
+
+def _priced_ratings(quality) -> dict:
+    """A comp's ratings as the value step sees them: everything except the rows that only describe."""
+    return {k: v for k, v in (quality or {}).items() if k not in _DESCRIPTIVE_QUALITY_ROWS} if isinstance(quality, dict) else {}
+
+
+def _ai_quality_read(ai_quality) -> Optional[dict]:
+    """The AI's own rating of each dimension, valid values only, None when it rated nothing. Kept on the comp
+    as `ai_quality_read` for the agent's Analysis screen (a blank rating shows it with a one-tap "Use it")."""
+    if not isinstance(ai_quality, dict):
+        return None
+    return {f: ai_quality[f] for f, allowed in _QUALITY_FIELD_VALUES.items() if ai_quality.get(f) in allowed} or None
+
+
 _QUALITY_FIELD_VALUES = {
     "finish_quality": {"below", "similar", "above"},
     "interior": {"below", "similar", "above"},
     "exterior": {"below", "similar", "above"},
+    # Kitchen and Bathrooms (owner, 11/16): two rows of their own, read from the photos the room sorter now always
+    # sends. They DESCRIBE - no adjustment, no weight, nothing in the value reads them (see _DESCRIPTIVE_QUALITY_ROWS).
+    "kitchen": {"below", "similar", "above"},
+    "bathrooms": {"below", "similar", "above"},
     "lot": {"below", "similar", "above"},
     "amenities": {"below", "similar", "above"},
     "layout": {"below", "similar", "above"},
@@ -2827,9 +2867,16 @@ def _flag_changed(obj, attr: str) -> None:
 
 async def _run_final_audit(db: AsyncSession, report, owner_id: str, config: dict, model: str) -> None:
     """The in-site grader (cma_final_audit): one last read of the finished text against the report's own facts.
-    Off unless CMA_FINAL_AUDIT=1. Never changes a value; never fails a report."""
+    On for every report (owner, 11/15: "we should just have that a part of the main flow... it just comes out as a
+    finished report"); CMA_FINAL_AUDIT=0 turns it off. Never changes a value; never fails a report.
+
+    Inside the accuracy-test time machine it runs only for a report built in the browser under an arm (a full report
+    someone reads - it must come out exactly as a live one would), never for the bulk accuracy test, which only
+    scores values. There the subject's MLS record is the masked one (no sale facts), and the packet is scanned for
+    the hidden sale price and dates before it is sent: a hit skips the read."""
     from app.services import cma_final_audit
-    if not cma_final_audit.enabled() or _tmach.current():
+    tm = _tmach.current()
+    if not cma_final_audit.enabled() or (tm is not None and not getattr(tm, "final_read", False)):
         return
     try:
         from app.services.usage_budget_service import add_spend
@@ -2844,11 +2891,23 @@ async def _run_final_audit(db: AsyncSession, report, owner_id: str, config: dict
                 records = {str(k): raw for k, raw in _rows.all() if isinstance(raw, dict)}
         except Exception:  # noqa: BLE001 - the read still runs on the saved report alone
             logger.warning("CMA final audit: could not load the MLS records", exc_info=True)
+        guard = None
+        if tm is not None:
+            _own = str((report.subject or {}).get("listing_key") or tm.listing_key or "")
+            if _own in records:
+                records[_own] = _tmach.masked_raw(records[_own], tm)
+
+            def guard(packet):
+                seen = len(tm.leak_log)
+                _tmach.check_payload(packet, "final read", raise_now=False)
+                if len(tm.leak_log) > seen:
+                    del tm.leak_log[seen:]          # nothing was sent, so nothing leaked - the read is simply skipped
+                    raise RuntimeError("final read skipped: its packet held facts from after the as-of date")
         await cma_final_audit.run(
             db, report, owner_id=owner_id, config=config, model=model, client=_get_client(), create=_cma_claude.create,
             record_usage_event=record_usage_event, add_spend=add_spend,
             estimate_cost=ai_config_service.estimate_cost_usd, lock_get=_value_lock_get, lock_put=_value_lock_put,
-            records=records)
+            records=records, guard=guard)
         _flag_changed(report, "pricing")
         _flag_changed(report, "comparables")
     except Exception:  # noqa: BLE001
@@ -2902,8 +2961,10 @@ def _subject_runtime_facts(subject: Optional[dict]) -> dict:
     relist and $200,000 March sale never showed (10/24, after the 10/23 grader asked for exactly that)."""
     s = subject or {}
     keep = {k: s[k] for k in ("_listing_history", "road_context", "road_context_note") if k in s}
+    # sale_type and the unit mix: read after this rebuild by the agent's evidence label and the income-property
+    # sentence. Without them a short sale's label never said so (first browser-built short-sale report, 11/15).
     for k in ("association_fee", "association_fee_frequency", "condo_fee", "condo_fee_frequency",
-              "association_fee_includes"):
+              "association_fee_includes", "sale_type", "one_bedroom_units", "two_bedroom_units", "three_bedroom_units"):
         if s.get(k) not in (None, ""):
             keep[k] = s[k]
     return keep
@@ -2915,10 +2976,13 @@ def _property_record_facts(subject: Optional[dict]) -> Optional[dict]:
     s = subject or {}
     fees = _fact_check.monthly_fees(s)
     hist = s.get("_listing_history") or {}
-    if not fees and not hist.get("lines"):
+    # this listing's own price moves go in the same box, after the earlier history (grader 11/15: a buyer should
+    # see that 451 Spruce Dr started at $685,000 and was cut four times)
+    lines = [*(hist.get("lines") or []), *((hist.get("current_price_changes") or {}).get("lines") or [])]
+    if not fees and not lines:
         return None
     return {"fees": fees or None, "fee_includes": _fact_check.fee_includes(s) or None,
-            "history_lines": hist.get("lines") or None, "last_sale": hist.get("last_sale"),
+            "history_lines": lines or None, "last_sale": hist.get("last_sale"),
             "relisted": bool(hist.get("relisted")), "marketing_days_total": hist.get("marketing_days_total"),
             "current_listing_days": hist.get("current_listing_days")}
 
@@ -2968,10 +3032,45 @@ async def _attach_listing_history(db: AsyncSession, subject: dict, listing_key: 
     tl = dict(subject.get("_status_timeline") or {})
     summary = _fact_check.summarize_history(events, current_list_date=tl.get("list_date"), today=as_of,
                                             current_days=tl.get("active_market_days") if tl.get("is_active", True) else None)
-    if not summary["lines"]:
+    # The current listing's own price moves, from our sync's log (cma_fact_check.current_price_changes). Only for a
+    # home that is for sale now - a closed or off-market record has no "current listing" to describe.
+    pc = summary.get("current_price_changes") if (tl.get("is_active") or tl.get("is_under_contract")) else None
+    summary["current_price_changes"] = pc
+    if not summary["lines"] and not pc:
         return subject
     out = dict(subject)
     out["_listing_history"] = summary
+    if pc:
+        tl["price_changes"] = pc
+        cur_price = _as_float(tl.get("current_list_price")) or _as_float(subject.get("list_price"))
+        first = _as_float(pc.get("first_price"))
+        if first and cur_price and abs(first - cur_price) > 1:
+            # the timeline's own "Listed <date> $<today's price>" line was written without the first price
+            # (519 Grove St: "Listed 2026-09-25 $425,000" for a home that listed at $450,000)
+            _now, _then = f"${cur_price:,.0f}", f"${first:,.0f}"
+            tl["summary_lines"] = [ln.replace(_now, _then) if str(ln).strip().startswith("- Listed") else ln
+                                   for ln in (tl.get("summary_lines") or [])]
+            tl["history_events"] = [({**e, "price": round(first)} if e.get("event") == "listed" and e.get("price")
+                                     and abs(float(e["price"]) - cur_price) <= 1 else e) for e in (tl.get("history_events") or [])]
+        tl["summary_lines"] = [*(tl.get("summary_lines") or []), "Price changes on this listing (our MLS log):",
+                               *(f"  - {ln}" for ln in pc["lines"]), f"  - {pc['prompt_note']}"]
+        # Bright never sends the first asking price (OriginalListPrice is always empty in our feed), so the
+        # exposure step, the buyer-leverage score and both models only ever saw today's price.
+        if first and cur_price and not _as_float(tl.get("original_list_price")) and abs(first - cur_price) > 1:
+            tl["original_list_price"] = first
+            tl["price_reduction_pct"] = round((first - cur_price) / first * 100, 1) if first > cur_price else 0.0
+            if len(pc.get("steps") or []) >= 2 and not _as_float(tl.get("previous_list_price")):
+                tl["previous_list_price"] = _as_float(pc["steps"][-1].get("from"))
+        if pc.get("steps"):
+            tl["history_events"] = [*(tl.get("history_events") or []), *(
+                # (change_amount: so the report's number check knows "$13,000 cut" is a real figure - it reads every
+                # price / amount in the valuation record, see _structured_currency_values)
+                {"event": "price_decrease" if s["to"] < s["from"] else "price_increase", "source": "mls_log",
+                 "date": s["date"], "from_price": s["from"], "to_price": s["to"], "change_amount": abs(s["to"] - s["from"])}
+                for s in pc["steps"])]
+    if not summary["lines"]:
+        out["_status_timeline"] = tl
+        return out
     tl["prior_history"] = summary
     tl["summary_lines"] = [*(tl.get("summary_lines") or []), "Earlier MLS history of this home:",
                            *(f"  - {ln}" for ln in summary["lines"])]
@@ -2989,7 +3088,11 @@ async def _attach_listing_history(db: AsyncSession, subject: dict, listing_key: 
     return out
 
 
-async def _enrich_with_property_data(db: AsyncSession, subject: dict, comps: list[dict]) -> tuple[dict, list[dict]]:
+_PREVIEW_ROAD_LOOKUP_S = 5.0     # the free adjusted-sales preview waits this long, at most, for road data it has not saved
+
+
+async def _enrich_with_property_data(db: AsyncSession, subject: dict, comps: list[dict], *,
+                                     live_status: bool = True) -> tuple[dict, list[dict]]:
     """Joins _PROPERTY_ENRICHMENT_FIELDS in from the raw synced Property row (by listing_key) onto
     copies of the subject/comp dicts, so the AI sees Bright's actual construction_materials/
     exterior_features/roof_type/architectural_style/foundation_details instead of only what
@@ -3068,7 +3171,9 @@ async def _enrich_with_property_data(db: AsyncSession, subject: dict, comps: lis
     live_overlay: Optional[dict] = None
     live_status_note: Optional[str] = None
     # Time-machine (accuracy test) runs never re-pull live status - it would reveal the sale.
-    if listing_key and not _tmach.current():
+    # (live_status=False: the free adjusted-sales preview - it reads prices and facts, not today's status, and must
+    # not call the MLS every time an agent adds or removes a comp)
+    if listing_key and live_status and not _tmach.current():
         try:
             live = await bright_mls_service.get_property_by_listing_key(listing_key)
         except Exception as exc:
@@ -3101,8 +3206,12 @@ async def _enrich_with_property_data(db: AsyncSession, subject: dict, comps: lis
         _pts = [(subject_out.get("latitude"), subject_out.get("longitude"))] + [
             (c.get("latitude"), c.get("longitude")) for c in comps_out
         ]
-        _rc = await road_context_service.get_road_contexts(
+        _rc_call = road_context_service.get_road_contexts(
             db, _pts, [subject_out.get("street_address")] + [c.get("street_address") for c in comps_out])
+        # The free preview must feel instant: saved road answers come back in milliseconds, and a home with none
+        # saved is not worth a minute of waiting on the map servers (75 s measured with them down) - it falls back
+        # to the address, exactly as it does when they fail.
+        _rc = await _rc_call if live_status else await asyncio.wait_for(_rc_call, timeout=_PREVIEW_ROAD_LOOKUP_S)
 
         def _rc_note(ctx: dict) -> Optional[str]:
             if not ctx or not ctx.get("summary"):
@@ -5643,10 +5752,309 @@ def _photo_urls(data: dict, max_photos: int) -> list[str]:
         photos = [data["photo_url"]]
     if len(photos) <= max_photos:
         return photos
+    # The room-sorted pick, when the sorter ran for this home (see _sort_report_photos): kitchens, baths and the
+    # front of the home first. Without it - sorter off, failed, or timed out - the old head-and-tail pick below.
+    pick = [u for u in (data.get("_photo_pick") or []) if u in photos]
+    if pick:
+        return pick[:max_photos]
     head_count = max(0, max_photos - _PHOTO_TAIL_COUNT)
     head = photos[:head_count]
     tail = photos[len(photos) - (max_photos - head_count):] if max_photos > head_count else []
     return head + tail
+
+
+# ---- Which photos the AI reads: sorted by room first (owner, 11/15) ---------------------------------------------
+# "What if we miss photos of the kitchen or bathrooms our AI uses to understand finish quality?" Measured on 17
+# homes (622 photos) the head-and-tail pick above saw a bathroom photo in 3 of them and NO kitchen photo in 6 -
+# two of the three homes being valued among them (1014 Foulk Rd: five front shots, five of the yard, no kitchen,
+# no bath). Listing agents lead with the exterior and the living room; the rooms that show a home's finish level
+# come later. So before the photo pass, the small model looks at EVERY photo of a long gallery as a thumbnail and
+# says which room it shows (about half a cent a report, 0.3 cents measured per home set), and the pick takes the
+# front of the home, kitchens and baths first. The same model reads the picked photos at the same size as before -
+# the owner's call after the side-by-side test: the small model can sort photos but cannot judge finishes (it left
+# whole comps out), and smaller photos cost one finish rating per home.
+# A home's labels are stored for good, keyed on its photo list: a sold home's photos never change, so the second
+# report that uses a comp sorts it free.
+_PHOTO_SORT_MODEL = "claude-haiku-5-5"
+_PHOTO_SORT_EDGE_PX = 384            # thumbnail size for the sorter: enough to tell a kitchen from a bedroom
+_PHOTO_SORT_MAX_GALLERY = 60         # photos looked at per home (a longer gallery's first 60)
+_PHOTO_SORT_TIMEOUT_S = 75.0         # the whole sorting step; past this the report goes on with the old pick
+_PHOTO_SORT_DOWNLOADS = 12           # thumbnails fetched at once, across all homes
+_PHOTO_SORT_LABEL_SHORT = os.getenv("CMA_PHOTO_SORT_SHORT", "1") != "0"   # label galleries short enough to be sent whole too
+_PHOTO_ROOMS = ("kitchen", "bathroom", "living_or_family_room", "dining_room", "bedroom", "basement_or_lower_level",
+                "exterior_front", "exterior_back_or_yard", "garage_or_utility", "floor_plan_or_map",
+                "community_or_view", "other")
+# Which room each next photo comes from, in order, until the limit is reached. A room the gallery doesn't have (or
+# has run out of) is skipped. With 14: the front, three kitchen, three bath, two living, the yard, the basement, a
+# bedroom, the dining room and one "other" room - a sunroom, a bonus room, a porch. ("other" is in the first 14 on
+# purpose: 1014 Foulk Rd's three-season room is five photos of its gallery and a feature the report leans on, and
+# with "other" at the end of the list the AI was shown none of them.)
+_PHOTO_PICK_ORDER = ("exterior_front", "kitchen", "bathroom", "living_or_family_room", "kitchen", "bathroom",
+                     "exterior_back_or_yard", "basement_or_lower_level", "bedroom", "kitchen", "bathroom", "dining_room",
+                     "other", "living_or_family_room", "exterior_front", "basement_or_lower_level", "bedroom",
+                     "garage_or_utility", "exterior_back_or_yard", "community_or_view")
+_PHOTO_SORT_TOOL = {
+    "name": "label_photos", "description": "Label every photo of the listing by the room or area it shows.",
+    "input_schema": {"type": "object", "properties": {"photos": {"type": "array", "items": {
+        "type": "object", "properties": {
+            "n": {"type": "integer", "description": "the photo's number"},
+            "room": {"type": "string", "enum": list(_PHOTO_ROOMS)},
+            "shows_finishes": {"type": "boolean", "description": "true when the photo clearly shows cabinets, counters, "
+                               "appliances, flooring, bath fixtures or other finishes whose quality or age a buyer would judge"}},
+        "required": ["n", "room", "shows_finishes"]}}}, "required": ["photos"]},
+}
+
+
+def photo_sort_on() -> bool:
+    return os.getenv("CMA_PHOTO_SORT", "1") != "0"
+
+
+def _pick_photos_by_room(urls: list, labels: Optional[list], max_photos: int) -> Optional[list]:
+    """The photos to send, from the sorter's labels ([{n, room, shows_finishes}], n counted from 1 over `urls`).
+    None when the labels can't be trusted (fewer than half the photos labelled) - the caller keeps the old pick.
+    Returned in gallery order. The front of the home is always in: the first photo labelled exterior_front, or
+    the gallery's lead photo when nothing was."""
+    n_total = len(urls)
+    room: dict[int, str] = {}
+    fin: set[int] = set()
+    for row in labels or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            n = int(row.get("n"))
+        except (TypeError, ValueError):
+            continue
+        if not (1 <= n <= n_total) or n in room:
+            continue
+        room[n] = row.get("room") if row.get("room") in _PHOTO_ROOMS else "other"
+        if row.get("shows_finishes") is True:
+            fin.add(n)
+    if n_total <= max_photos or len(room) < max(2, n_total // 2):
+        return None
+    by_room: dict[str, list[int]] = {}
+    for n in sorted(room, key=lambda n: (n not in fin, n)):      # finish-showing shots first, then gallery order
+        by_room.setdefault(room[n], []).append(n)
+    front = by_room.get("exterior_front") or []
+    if front:
+        front.sort()                                              # the front of the home: the agent's own lead shot
+    picked: list[int] = []
+    if not front:
+        picked.append(1)                                          # nothing labelled as the front: keep the lead photo
+    for want in _PHOTO_PICK_ORDER:
+        if len(picked) >= max_photos:
+            break
+        nxt = next((n for n in by_room.get(want, []) if n not in picked), None)
+        if nxt is not None:
+            picked.append(nxt)
+    if len(picked) < max_photos:                                  # a short list of rooms: fill with what is left
+        rest = [n for n in sorted(room, key=lambda n: (room[n] in ("floor_plan_or_map", "community_or_view"), n not in fin, n))
+                if n not in picked]
+        rest += [n for n in range(1, n_total + 1) if n not in room and n not in picked]
+        picked += rest[: max_photos - len(picked)]
+    return [urls[n - 1] for n in sorted(picked)]
+
+
+def _rooms_in_pick(urls: list, labels: Optional[list], pick: list) -> list:
+    """Which rooms the picked photos show, by the sorter's labels - what the AI was actually shown of this home."""
+    room = {}
+    for row in labels or []:
+        try:
+            n = int(row.get("n"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if 1 <= n <= len(urls) and row.get("room") in _PHOTO_ROOMS:
+            room[urls[n - 1]] = row["room"]
+    return sorted({room[u] for u in pick if u in room})
+
+
+def _photo_room_by_url(urls: list, labels: Optional[list]) -> Optional[dict]:
+    """{photo url: room} from the sorter's labels, or None when they cannot be trusted (fewer than half the photos
+    labelled). Saved on the report as `photo_rooms` so the photo viewer can show just the kitchens or just the baths
+    of the subject and a comp side by side (owner 11/16: "since we sort through all the pictures and label them,
+    shouldn't there be a clickable button where it says kitchen and baths?")."""
+    room: dict = {}
+    for row in labels or []:
+        try:
+            n = int(row.get("n"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if 1 <= n <= len(urls) and row.get("room") in _PHOTO_ROOMS:
+            room.setdefault(urls[n - 1], row["room"])
+    return room if urls and len(room) >= max(1, len(urls) // 2) else None
+
+
+def _photo_rooms_for(photos, room_by_url: Optional[dict]) -> Optional[list]:
+    """The saved form: one entry per photo of the home, in gallery order - the room, or None for a photo that was
+    not labelled (past the first 60, or the sorter skipped it). None when nothing is known about this home."""
+    if not room_by_url:
+        return None
+    out = [room_by_url.get(u) for u in (photos or [])]
+    return out if any(out) else None
+
+
+def _drop_unseen_room_ratings(ai_quality: dict, subject_rooms: Optional[list], comp_rooms: Optional[list]) -> dict:
+    """A Kitchen or Bathrooms rating stands only when the AI was shown that room in BOTH homes. The prompt says so,
+    and the first test report (1014 Foulk Rd, 11/16, run with the old photo pick) rated the kitchen on all five
+    comps without one photo of the subject's kitchen - from the listing's words. Where the sorter ran we know which
+    rooms were sent, so the rule is enforced here. None = that home's gallery was short and sent whole, unlabelled:
+    nothing is known, the AI's rating is left alone."""
+    out = dict(ai_quality or {})
+    for row, room in (("kitchen", "kitchen"), ("bathrooms", "bathroom")):
+        if row in out and any(seen is not None and room not in seen for seen in (subject_rooms, comp_rooms)):
+            out.pop(row)
+    return out
+
+
+# Interior, set from the rooms (owner 11/16: Kitchen and Bathrooms "should be filled by AI and change the interior
+# quality setting for that comp ... not completely control it as there might be other rooms, but it should probably
+# count for like kitchen being 40% baths being 40%"). Interior is the row that moves price (one step of the
+# condition line), so this is a pricing change. Sold-homes test 11/16 (4 homes, 19 comps, pre-scan on): the rule
+# agreed with the AI's own Interior on all 19, so the sales figure was identical with it on and off - no harm,
+# and it holds Interior to the two rooms from here on. ON; CMA_INTERIOR_TIE=0 switches it off.
+#   score = 40% Kitchen + 40% Bathrooms + 20% the AI's own overall read of the interior (above +1, similar 0, below -1)
+#   Interior = above at +0.5 or more, below at -0.5 or less, otherwise similar.
+# So one room alone never flips it, a better kitchen and worse baths cancel out, and the two rooms together decide
+# it whatever the rest looks like. A room the AI could not compare (blank row) hands its share to the overall read;
+# with both rows blank the AI's own Interior stands untouched.
+_INTERIOR_TIE_SHARE = {"kitchen": 0.4, "bathrooms": 0.4}
+_INTERIOR_TIE_FLIP = 0.5
+_TIE_VAL = {"above": 1.0, "similar": 0.0, "below": -1.0}
+
+
+def interior_tie_on() -> bool:
+    return os.getenv("CMA_INTERIOR_TIE", "1") == "1"
+
+
+def _interior_from_rooms(kitchen, bathrooms, overall) -> Optional[str]:
+    """Interior from the Kitchen row, the Bathrooms row and the AI's own overall interior read. None = nothing to
+    go on (no row and no overall read), so the caller leaves Interior as it is."""
+    rows = {"kitchen": str(kitchen or "").lower(), "bathrooms": str(bathrooms or "").lower()}
+    overall = str(overall or "").lower()
+    rated = {k: _TIE_VAL[v] for k, v in rows.items() if v in _TIE_VAL}
+    if not rated:
+        return overall if overall in _TIE_VAL else None
+    score = sum(_INTERIOR_TIE_SHARE[k] * v for k, v in rated.items())
+    if overall in _TIE_VAL:   # the overall read carries its own 20% plus the share of any room left blank
+        score += (1.0 - sum(_INTERIOR_TIE_SHARE[k] for k in rated)) * _TIE_VAL[overall]
+    score = round(score, 3)
+    return "above" if score >= _INTERIOR_TIE_FLIP else "below" if score <= -_INTERIOR_TIE_FLIP else "similar"
+
+
+def _photo_rooms_key(urls: list) -> str:
+    return "cma_photo_rooms:" + hashlib.sha256("\n".join(urls).encode("utf-8")).hexdigest()[:48]
+
+
+async def _photo_rooms_get(key: str) -> Optional[list]:
+    """A home's stored room labels (kept for good - no expiry: the same photo list is the same photos)."""
+    try:
+        from sqlalchemy import text as _text
+        from app.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as cdb:
+            row = (await cdb.execute(_text("SELECT value FROM system_settings WHERE key = :k"), {"k": key})).first()
+        labels = (row[0] or {}).get("labels") if row and isinstance(row[0], dict) else None
+        return labels if isinstance(labels, list) and labels else None
+    except Exception:  # noqa: BLE001 - a miss is never an error
+        return None
+
+
+async def _photo_rooms_put(key: str, labels: list) -> None:
+    try:
+        from sqlalchemy import text as _text
+        from app.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as cdb:
+            await cdb.execute(_text(
+                "INSERT INTO system_settings (key, value) VALUES (:k, CAST(:v AS jsonb)) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()"),
+                {"k": key, "v": json.dumps({"labels": labels})})
+            await cdb.commit()
+    except Exception:  # noqa: BLE001
+        logger.warning("CMA photo room labels: could not store", exc_info=True)
+
+
+async def _label_gallery(client, http: httpx.AsyncClient, gate: asyncio.Semaphore, urls: list) -> tuple[Optional[list], dict]:
+    """Ask the small model which room each photo shows. (labels or None, {input_tokens, output_tokens})."""
+    async def thumb(u):
+        async with gate:
+            return await _fetch_image_block(http, u, edge=_PHOTO_SORT_EDGE_PX)
+    blocks = await asyncio.gather(*[thumb(u) for u in urls])
+    content: list = []
+    for i, b in enumerate(blocks, 1):
+        if b:
+            content += [{"type": "text", "text": f"Photo {i}:"}, b[0]]
+    if sum(1 for b in blocks if b) < max(2, len(urls) // 2):
+        return None, {}
+    content.append({"type": "text", "text": "Label every photo above with the label_photos tool, one entry per photo number."})
+    # direct=True: never through the testing-only half-price queue - a queued request takes minutes and this step
+    # has _PHOTO_SORT_TIMEOUT_S to finish.
+    resp = await _cma_claude.create(client, direct=True, model=_PHOTO_SORT_MODEL, max_tokens=6000, tools=[_PHOTO_SORT_TOOL],
+                                    tool_choice={"type": "tool", "name": "label_photos"},
+                                    system="You label real-estate listing photos by room.",
+                                    messages=[{"role": "user", "content": content}])
+    usage = {"input_tokens": int(getattr(resp.usage, "input_tokens", 0) or 0),
+             "output_tokens": int(getattr(resp.usage, "output_tokens", 0) or 0)}
+    block = next((b for b in (resp.content or []) if getattr(b, "type", None) == "tool_use"), None)
+    labels = (block.input or {}).get("photos") if block is not None and isinstance(block.input, dict) else None
+    return (labels if isinstance(labels, list) and labels else None), usage
+
+
+async def _sort_report_photos(db: AsyncSession, owner_id: str, config: dict, subject: dict, comps: list, max_photos: int) -> float:
+    """Set `_photo_pick` on the subject and on every comp whose gallery is longer than the photo limit (see the
+    note above _PHOTO_SORT_MODEL). Returns what the sorting cost, already recorded against the agent's usage.
+    Never fails a report: a home that can't be sorted, and the whole step past its time limit, keep the old pick."""
+    tm = _tmach.current()
+    if not photo_sort_on() or (tm is not None and getattr(tm, "fake_client", None) is not None):
+        return 0.0
+    homes = []
+    for h in [subject, *comps]:
+        urls = [u for u in (h.get("photos") or []) if u][:_PHOTO_SORT_MAX_GALLERY]
+        # Short galleries are sent whole, but are labelled too (11/16): the viewer's Kitchen / Baths buttons need
+        # every home's rooms, and the both-homes rule for the Kitchen and Bathrooms rows can then be held everywhere.
+        if len(urls) > max_photos or (_PHOTO_SORT_LABEL_SHORT and len(urls) >= 2):
+            homes.append((h, urls))
+    if not homes:
+        return 0.0
+    used: list[dict] = []
+    gate = asyncio.Semaphore(_PHOTO_SORT_DOWNLOADS)
+    client = _get_client()
+
+    async def one(h: dict, urls: list, http: httpx.AsyncClient) -> None:
+        try:
+            key = _photo_rooms_key(urls)
+            labels = await _photo_rooms_get(key)
+            if labels is None:
+                labels, usage = await _label_gallery(client, http, gate, urls)
+                if usage:
+                    used.append(usage)
+                if labels and _photo_room_by_url(urls, labels):
+                    await _photo_rooms_put(key, labels)
+            by_url = _photo_room_by_url(urls, labels)
+            if by_url:
+                h["_photo_room_by_url"] = by_url
+            pick = _pick_photos_by_room(urls, labels, max_photos)
+            if pick:
+                h["_photo_pick"] = pick
+                h["_photo_rooms_sent"] = _rooms_in_pick(urls, labels, pick)
+            elif by_url and len(urls) <= max_photos:
+                h["_photo_rooms_sent"] = sorted(set(by_url.values()))   # sent whole: every labelled room was shown
+        except Exception as exc:  # noqa: BLE001 - this home keeps the old pick
+            logger.info("CMA photo sort skipped for one home", extra={"error": f"{type(exc).__name__}: {str(exc)[:160]}"})
+
+    try:
+        async with httpx.AsyncClient() as http:
+            await asyncio.wait_for(asyncio.gather(*[one(h, urls, http) for h, urls in homes]), timeout=_PHOTO_SORT_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001 - a timeout or a transport failure: whatever was sorted so far stands
+        logger.warning("CMA photo sort did not finish - the unsorted homes keep the old pick",
+                       extra={"error": type(exc).__name__})
+    cost = sum(ai_config_service.estimate_cost_usd(config, _PHOTO_SORT_MODEL, u["input_tokens"], u["output_tokens"]) for u in used)
+    if used:
+        try:
+            await record_usage_event(db, owner_id, None, _PHOTO_SORT_MODEL, sum(u["input_tokens"] for u in used),
+                                     sum(u["output_tokens"] for u in used), cost, 0, False, None, event_type="cma_ai")
+            from app.services.usage_budget_service import add_spend
+            await add_spend(db, ["cma_ai_global", "platform_emergency"], cost)
+        except Exception:  # noqa: BLE001
+            logger.warning("CMA photo sort: could not record its usage", exc_info=True)
+    return cost
 
 
 def _compute_fingerprint(subject: dict, comps: list[dict], max_photos: int, include_map_images: bool) -> str:
@@ -5678,7 +6086,7 @@ def _image_token_estimate(width: int, height: int) -> int:
     return max(1, (width * height) // 750)
 
 
-async def _fetch_image_block(http: httpx.AsyncClient, url: str) -> Optional[tuple[dict, int]]:
+async def _fetch_image_block(http: httpx.AsyncClient, url: str, edge: Optional[int] = None) -> Optional[tuple[dict, int]]:
     """Downloads, resizes if needed, and base64-encodes one photo rather than handing Claude the
     raw URL - MLS media CDNs commonly disallow bot fetching in robots.txt, and Anthropic's
     url-source images respect that (confirmed: Bright's own CDN 400s with "disallowed by the
@@ -5691,7 +6099,7 @@ async def _fetch_image_block(http: httpx.AsyncClient, url: str) -> Optional[tupl
         content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
         if not content_type.startswith("image/"):
             return None
-        image_bytes, content_type, width, height = _resize_if_needed(resp.content, content_type)
+        image_bytes, content_type, width, height = _resize_if_needed(resp.content, content_type, edge)   # edge: the photo sorter's thumbnails
         if content_type not in _AI_IMAGE_TYPES.values():
             # one photo the AI can't take must never cost the agent the whole report (735 Concord Ave,
             # 11/13: Bright served two photos labelled "image/jpg" and the provider refused the request)
@@ -5714,7 +6122,7 @@ async def _fetch_image_block(http: httpx.AsyncClient, url: str) -> Optional[tupl
 _AI_IMAGE_TYPES = {"JPEG": "image/jpeg", "MPO": "image/jpeg", "PNG": "image/png", "GIF": "image/gif", "WEBP": "image/webp"}
 
 
-def _resize_if_needed(image_bytes: bytes, content_type: str) -> tuple[bytes, str, int, int]:
+def _resize_if_needed(image_bytes: bytes, content_type: str, edge: Optional[int] = None) -> tuple[bytes, str, int, int]:
     """Downscales an image to fit _MAX_IMAGE_EDGE_PX on its longest edge, preserving aspect ratio.
     Returns (bytes, content_type, final_width, final_height) - the final dimensions feed the real
     pre-flight cost projection (_image_token_estimate), not just the resized bytes. Returns the
@@ -5722,17 +6130,18 @@ def _resize_if_needed(image_bytes: bytes, content_type: str) -> tuple[bytes, str
     reason (Claude still gets the original then, same as before this existed - errors here must
     never break a generation over one oddly-formatted photo; the dimension guess is deliberately
     the worst case so a cost projection never silently undercounts an image it couldn't measure)."""
+    limit = edge or _MAX_IMAGE_EDGE_PX
     try:
         from io import BytesIO
         from PIL import Image
         with Image.open(BytesIO(image_bytes)) as img:
             width, height = img.size
             real_type = _AI_IMAGE_TYPES.get((img.format or "").upper())
-            if max(width, height) <= _MAX_IMAGE_EDGE_PX and real_type:
+            if max(width, height) <= limit and real_type:
                 return image_bytes, real_type, width, height
             # too big, or a format the AI doesn't take (AVIF, BMP, TIFF...): re-save as a JPEG
             img = img.convert("RGB")
-            img.thumbnail((_MAX_IMAGE_EDGE_PX, _MAX_IMAGE_EDGE_PX), Image.LANCZOS)
+            img.thumbnail((limit, limit), Image.LANCZOS)
             out = BytesIO()
             img.save(out, format="JPEG", quality=85)
             return out.getvalue(), "image/jpeg", img.width, img.height
@@ -6829,7 +7238,7 @@ def _anchor_loose_fit_reasons(subject: dict, rows: list) -> list:
     if rows and len(heavy) * 2 > len(rows):
         out.append(f"Adjustments exceed 20% of the sale price on {len(heavy)} of {len(rows)} verified sales - "
                    "the closest available sales still differ a lot from this home.")
-    matches = [_as_float((r.get("_c") or {}).get("match_score")) for r in rows]
+    matches = [_plain_match_score(r.get("_c")) for r in rows]
     matches = [m for m in matches if m is not None]
     if matches and max(matches) < _LOOSE_FIT_MIN_MATCH:
         out.append(f"No sale is a close match for this home (the best is a {round(max(matches))}% match).")
@@ -8149,7 +8558,17 @@ def _apply_continuous_relevance_weighting(
             _anchor_rows[key]["display_role"] = _normalize_strength(comp.get("strength")) or "supporting"
         raw_relevance = row["adjusted_relevance_score"]
         comp["match_score"] = calibrate_match_percentage(raw_relevance)
+        # Price level inside the Match % (cma_comp_pick.apply_price_level, 11/17): the points this sale lost in the
+        # comp search are kept on it and taken off again here, so the report shows the score the agent picked by.
+        # `match_before_price_level` is the plain score - the evidence label and the loose-fit test read that one
+        # (their thresholds were measured on plain scores), and nothing in the weights reads either.
+        _pl = ((comp.get("similarity_details") or {}).get("price_level")) if isinstance(comp.get("similarity_details"), dict) else None
+        _plain_match = comp["match_score"]
+        if isinstance(_pl, dict) and _as_float(_pl.get("points_off")):
+            comp["match_score"] = int(max(0, round(_plain_match - float(_pl["points_off"]))))
         comp["similarity_details"] = {
+            "price_level": _pl if isinstance(_pl, dict) else None,
+            "match_before_price_level": _plain_match,
             "version": result.get("version"),
             "display_calibration_version": MATCH_DISPLAY_CALIBRATION_VERSION,
             "density_context": copy.deepcopy(result.get("density_context")),
@@ -8166,6 +8585,14 @@ def _apply_continuous_relevance_weighting(
         }
         updated.append(comp)
     return _annotate_comp_valuation_roles(updated, result.get("anchor")), result.get("anchor"), result
+
+
+def _plain_match_score(comp) -> Optional[float]:
+    """A comp's Match % before price level was taken into it - what the evidence label's thresholds were measured on."""
+    c = comp if isinstance(comp, dict) else {}
+    d = c.get("similarity_details") if isinstance(c.get("similarity_details"), dict) else {}
+    plain = _as_float(d.get("match_before_price_level"))
+    return plain if plain is not None else _as_float(c.get("match_score"))
 
 
 def _v10_location_class_review(subject: dict, comps: list, evidence_by_key: dict) -> list:
@@ -8419,6 +8846,33 @@ _V10_STRONG_RENO_RE = re.compile(
 )
 
 
+# "Sold as-is" is a sale term, not a condition (sold-homes test 11/16, 2992 2nd St: the subject's record says
+# "Major Rehab Needed", comp 302 Rogers Rd's says "Average" and "Property to be sold AS-IS"; the AI, with photos of
+# both, rated the comp ABOVE on finishes and interior, and this check turned both to BELOW - two steps the wrong
+# way on a home the engine then valued 15% high). The as-is rule no longer forces a comp below the subject when
+#   - the subject's own condition field lists "Major Rehab Needed" (it was read as "below average" because the
+#     field also carried that, and the better of the two won), or
+#   - both homes have a recorded condition and the comp's is no worse than the subject's.
+# In those cases it only softens a "below" to "similar", as it already did for a subject that needs major work.
+# CMA_ASIS_GUARD=0 restores the old rule.
+_V10_ASIS_GUARD = os.getenv("CMA_ASIS_GUARD", "1") == "1"
+
+
+def _record_says_major_rehab(d: Optional[dict]) -> bool:
+    raw = _first_present(d or {}, "property_condition", "condition")
+    vals = raw if isinstance(raw, (list, tuple)) else ([raw] if raw else [])
+    return any(_COND_TIER_FIELD.get(_norm_token(v).replace("_", " ")) == 0.0 for v in vals)
+
+
+def _comp_record_no_worse(subject_tier: Optional[float], comp: Optional[dict]) -> bool:
+    """Both homes carry a condition FIELD on their records and the comp's is at least the subject's. The comp's
+    tier is read from its field only - its "sold as-is" words are the very thing in question."""
+    raw = _first_present(comp or {}, "property_condition", "condition")
+    vals = raw if isinstance(raw, (list, tuple)) else ([raw] if raw else [])
+    tiers = [_COND_TIER_FIELD[k] for k in (_norm_token(v).replace("_", " ") for v in vals) if k in _COND_TIER_FIELD]
+    return subject_tier is not None and bool(tiers) and max(tiers) >= subject_tier
+
+
 def _v10_condition_rating_consistency_check(subject: dict, comps: list) -> list:
     """Runs right before the weighted qualitative signals are computed. The structured
     finish_quality / interior / exterior ratings must not contradict a comp's OWN narrative and
@@ -8436,6 +8890,8 @@ def _v10_condition_rating_consistency_check(subject: dict, comps: list) -> list:
     subj_original = _documented_condition_deficit(subject)
     _st = _condition_tier(subject)
     subj_project = _st is not None and _st <= 0.5   # the subject's own listing: needs major work / as-is
+    if _V10_ASIS_GUARD and _record_says_major_rehab(subject):
+        subj_project = True
     for i, c in enumerate(comps):
         if not c.get("is_included", True):
             continue
@@ -8469,7 +8925,7 @@ def _v10_condition_rating_consistency_check(subject: dict, comps: list) -> list:
                 fixes["interior"] = "above" if strong_reno else "similar"
             elif q.get("interior") in (None, "", "similar") and strong_reno:
                 fixes["interior"] = "above"
-        elif asis and not reno and subj_project:
+        elif asis and not reno and (subj_project or (_V10_ASIS_GUARD and _comp_record_no_worse(_st, c))):
             # both sides need work: an as-is sale is no weaker inside than a home needing a total rehab
             # (11/01 regen of 719 Beechwood Rd: 441 Manchester Ave, sold as-is, was re-rated Inferior)
             if q.get("finish_quality") == "below":
@@ -8666,6 +9122,7 @@ def _compute_exposure(subject: dict, status_timeline: dict, comp_median_dom: Opt
         "original_list_price": round(orig_list) if orig_list else None,
         "previous_list_price": round(prev_list) if prev_list else None,
         "price_cut_pct": round(price_cut_pct, 1),
+        "price_cut_amount": round(orig_list - cur_list) if (orig_list and cur_list and orig_list > cur_list) else None,
         "price_reduced": price_reduced,
         "price_increase": price_increase,
         "price_history": price_history,
@@ -10034,6 +10491,9 @@ def _build_reasoning_evidence_packet(
         "auction_listing": (dict(_auction_listing(subject), note=_AUCTION_PROMPT_NOTE) if _auction_listing(subject) else None),
         "original_list_price": _as_float(tl.get("original_list_price")) or _as_float(subject.get("original_list_price")),
         "price_history": exposure.get("price_history") or tl.get("history_events") or [],
+        # every asking-price move on this listing, from our own sync log (cma_fact_check.current_price_changes)
+        "price_changes_this_listing": ([*(tl["price_changes"].get("lines") or []), tl["price_changes"].get("prompt_note")]
+                                       if isinstance(tl.get("price_changes"), dict) else None),
         "status": tl.get("current_status") or subject.get("status") or subject.get("mls_status"),
         "dom": None if tl.get("not_listed") else (tl.get("active_market_days") if tl.get("active_market_days") is not None else subject.get("days_on_market")),
         "cdom": None if tl.get("not_listed") else (tl.get("cumulative_dom") if tl.get("cumulative_dom") is not None else subject.get("cumulative_days_on_market")),
@@ -10142,7 +10602,7 @@ def _build_reasoning_evidence_packet(
             "comp_classification": _normalize_strength(comp.get("strength")),
             "size_adjusted_value": ct.get("size_adjusted_price"),
             "normalized_price_per_sqft": ct.get("adjusted_above_grade_psf") or comp.get("price_per_sqft"),
-            "better_worse_ratings": comp.get("quality") or {},
+            "better_worse_ratings": _priced_ratings(comp.get("quality")),   # not the rows that only describe
             "comp_narrative": comp.get("ai_commentary") or comp.get("commentary") or "",
             "evidence_score": evidence_by_key.get(comp.get("listing_key")) or {},
             "outlier_flag": outliers.get(comp.get("listing_key")),
@@ -10466,6 +10926,13 @@ def _monthly_fee_total(row: Optional[dict]) -> Optional[float]:
     return total or None
 
 
+def _record_monthly_fee(row: Optional[dict]) -> float:
+    """A comp's HOA / condo fee per month as its MLS record files it, saved on the comp as `monthly_fee` for the
+    report's comparison table (owner 11/16: the fee belongs in the table of every home's facts, not a box of its
+    own). 0.0 = looked up, none on record - so the table can tell "no fee" from a report made before this."""
+    return float(sum(float(f.get("monthly") or 0) for f in _fact_check.monthly_fees(row or {})))
+
+
 def _fee_mismatch(a, b) -> bool:
     a, b = _as_float(a), _as_float(b)
     return bool(a and b and abs(a - b) >= _FEE_GAP_MIN and abs(a - b) / max(a, b) > _FEE_GAP_PCT)
@@ -10486,6 +10953,128 @@ async def _load_current_competition(db: AsyncSession, report, subject: dict) -> 
     except Exception:   # never let the side section fail a paid run
         logger.warning("CMA current competition lookup failed", exc_info=True)
         return []
+
+
+# ---- A short paragraph on the current competition (owner, 11/15) -------------------------------------------------
+# "Make a section the AI makes where it comments on what's for sale ... and under contract, but not checking those
+# photos as that's too much - it's more informing that these are our current competition. Everything must be client
+# facing." One small call on the report's own model, from the facts already on the For sale now / Under contract now
+# cards (no photos, no listing descriptions). It is client-facing text that no other check reads, so it is checked
+# here and DROPPED whole if it cites a price or an address that is not on those cards; a sentence about a home's
+# condition, or one that says what a home under contract sold for, is cut (nobody looked at photos, and a contract
+# price is not public). Saved as ai_estimate.competition_commentary; None = the report shows the cards alone.
+_COMPETITION_NOTE_MAX_HOMES = 8
+_COMPETITION_CONDITION_RE = re.compile(
+    r"\b(renovat\w*|remodel\w*|updated?|upgrad\w*|dated|outdated|condition|finish(?:es|ed)?|well[- ]maintained|well[- ]kept|"
+    r"move[- ]in[- ]ready|turn[- ]?key|pristine|fixer\w*|immaculate|modern(?:i[sz]ed)?|charming|stunning|beautiful)\b", re.I)
+_COMPETITION_SOLD_RE = re.compile(r"\b(sold|closed|went)\s+(?:for|at)\s+\$|\bcontract price (?:of|was|is)\s+\$", re.I)
+_COMPETITION_ADDRESS_RE = re.compile(
+    r"\b(\d{1,6})(?:-\d+)?\s+(?:[A-Za-z0-9.'-]+\s+){0,4}(?:rd|road|ln|lane|ave|avenue|st|street|dr|drive|ct|court|cir|circle|"
+    r"blvd|boulevard|pike|way|pl|place|ter|terrace|hwy|highway|trl|trail|sq|square|row|run|walk)\b", re.I)
+_COMPETITION_NOTE_SYSTEM = (
+    "You write ONE short paragraph (3 to 5 sentences, under 110 words) for a client-facing real-estate CMA report. It "
+    "sits under the cards of similar homes that are for sale now and similar homes that are under contract now, and "
+    "tells the reader what that competition means. Plain, warm and professional - the voice of an experienced agent. "
+    "No bullet points, no headings, no greeting.\n"
+    "Rules:\n"
+    "- Use ONLY the facts given. Write every dollar amount and address exactly as given.\n"
+    "- You have NOT seen photos or descriptions of these homes. Never describe their condition, finishes, updates, "
+    "style or appeal.\n"
+    "- A home under contract has an ASKING price only: its contract price is not public. Never say or imply what it "
+    "sold for.\n"
+    "- Do not state or imply what the subject home is worth, and give no offer, pricing or negotiating advice - other "
+    "sections of the report do that.\n"
+    "- Say what the reader can take from it: how many similar homes are available and under contract, how their asking "
+    "prices and sizes sit against the subject's, how quickly similar homes are going under contract (days on market), "
+    "and the one or two closest alternatives by address.\n"
+    "- audience 'buyer': these are the homes the buyer could choose instead, and what other buyers are competing for. "
+    "audience 'seller': these are the listings this home would compete with for the same buyers.\n"
+    "Reply with the paragraph only."
+)
+
+
+def _competition_signature(homes) -> list:
+    """Which homes, at which asking prices and statuses - the paragraph is about exactly these."""
+    return sorted([str(h.get("listing_key") or h.get("street_address") or ""), round(_as_float(h.get("list_price")) or 0),
+                   str(h.get("status") or "")] for h in (homes or []) if isinstance(h, dict))
+
+
+def _competition_facts(subject: dict, homes: list, mode: Optional[str], status_timeline: Optional[dict]) -> dict:
+    tl = status_timeline or {}
+    s_sqft = _as_float(subject.get("above_grade_finished_area")) or _as_float(subject.get("sqft"))
+    ask = None if tl.get("not_listed") else _as_float(subject.get("list_price"))
+    rows = []
+    for h in sorted(homes, key=lambda h: (-(h.get("match_score") or 0), _as_float(h.get("distance_miles")) or 99))[:_COMPETITION_NOTE_MAX_HOMES]:
+        cuts = h.get("price_cuts")
+        rows.append({k: v for k, v in {
+            "address": _title_address(h.get("street_address")), "status": "under contract" if h.get("status") == "pending" else "for sale",
+            "asking_price": f"${_as_float(h.get('list_price')):,.0f}" if _as_float(h.get("list_price")) else None,
+            "asking_price_per_sqft": f"${_as_float(h.get('price_per_sqft')):,.0f}" if _as_float(h.get("price_per_sqft")) else None,
+            "beds": h.get("beds"), "baths": h.get("baths"), "sqft": h.get("sqft"), "year_built": h.get("year_built"),
+            "days_on_market": h.get("days_on_market"),
+            "miles_away": round(_as_float(h.get("distance_miles")), 1) if _as_float(h.get("distance_miles")) is not None else None,
+            "price_reductions": (len(cuts) if isinstance(cuts, list) else cuts if isinstance(cuts, int) else None) or None,
+            "new_construction": True if h.get("new_construction") else None,
+        }.items() if v not in (None, "")})
+    return {
+        "audience": "seller" if mode in ("seller", "listing") else "buyer",
+        "subject": {k: v for k, v in {
+            "address": _title_address(subject.get("street_address")),
+            "asking_price": f"${ask:,.0f}" if ask else "not currently listed",
+            "asking_price_per_sqft": f"${ask / s_sqft:,.0f}" if ask and s_sqft else None,
+            "beds": subject.get("beds"), "baths": subject.get("baths"), "sqft": round(s_sqft) if s_sqft else None,
+            "year_built": subject.get("year_built"),
+            "days_on_market": None if tl.get("not_listed") else tl.get("active_market_days"),
+        }.items() if v not in (None, "")},
+        "for_sale_count": sum(1 for h in homes if h.get("status") != "pending"),
+        "under_contract_count": sum(1 for h in homes if h.get("status") == "pending"),
+        "similar_homes": rows,
+    }
+
+
+def _competition_note_checked(text: str, facts: dict) -> Optional[str]:
+    """The paragraph as it may be shown to a client, or None. Dropped whole for a price or an address that is not in
+    the facts it was given; a sentence on condition, or on what a home under contract "sold for", is cut."""
+    text = " ".join(str(text or "").replace("—", " - ").split()).strip().strip('"')
+    if not text or text.startswith(("-", "*", "#")):
+        return None
+    homes = facts.get("similar_homes") or []
+    subj = facts.get("subject") or {}
+    money = [d for d in (_as_float(re.sub(r"[^\d.]", "", str(v))) for row in [subj, *homes]
+                         for k, v in row.items() if "price" in k and "$" in str(v)) if d]
+    for m in re.finditer(r"\$\s?([\d,]+(?:\.\d+)?)\s*([kKmM]\b)?", text):
+        fig = _as_float(m.group(1).replace(",", ""))
+        if fig is None:
+            return None
+        fig *= {"k": 1_000, "m": 1_000_000}.get((m.group(2) or "").lower(), 1)
+        if not any(abs(fig - known) <= max(1.0, 0.005 * known) for known in money):
+            return None                       # a figure that is on no card: the paragraph is not shown
+    numbers = {re.match(r"\d+", str(r.get("address") or "")).group(0) for r in [subj, *homes] if re.match(r"\d+", str(r.get("address") or ""))}
+    if any(m.group(1) not in numbers for m in _COMPETITION_ADDRESS_RE.finditer(text)):
+        return None                           # an address that is on no card
+    kept = [s for s in _fact_check.sentences(text) if not _COMPETITION_CONDITION_RE.search(s) and not _COMPETITION_SOLD_RE.search(s)]
+    out = " ".join(kept).strip()
+    out, _ = _fact_check.fix_dates_and_spelling(out)
+    return out if 60 <= len(out) <= 1200 and len(kept) >= 2 else None
+
+
+async def _competition_commentary(subject: dict, homes: Optional[list], mode: Optional[str], status_timeline: Optional[dict],
+                                  *, model: str) -> Optional[str]:
+    """One short client-facing paragraph on the homes for sale / under contract now (see the note above). Best-effort:
+    any failure, and any answer that does not pass the check, is None - the report then shows the cards alone."""
+    homes = [h for h in (homes or []) if isinstance(h, dict) and _as_float(h.get("list_price"))]
+    if not homes or os.getenv("CMA_COMPETITION_NOTE", "1") == "0" or _tmach.current():
+        return None
+    try:
+        facts = _competition_facts(subject, homes, mode, status_timeline)
+        resp = await _cma_claude.create(_get_client(), effort="low", model=model, max_tokens=700, system=_COMPETITION_NOTE_SYSTEM,
+                                        messages=[{"role": "user", "content": json.dumps(facts, separators=(",", ":"), default=str)}])
+        _note_extra_usage(resp, model, "competition_commentary")
+        text = "".join(getattr(b, "text", "") for b in (resp.content or []) if getattr(b, "type", None) == "text")
+        return _competition_note_checked(text, facts)
+    except Exception:  # noqa: BLE001 - a side paragraph never fails a paid report
+        logger.warning("CMA competition paragraph failed", exc_info=True)
+        return None
 
 
 _PENDING_PART_WORDS = (("size", "size"), ("below_grade", "lower level"), ("baths", "baths"), ("garage", "garage"),
@@ -10829,6 +11418,29 @@ _EVIDENCE_GROSS_PCT = 15.0        # the typical (share-weighted) sale needed thi
 _EVIDENCE_MATCH_SCORE = 80.0      # the typical (share-weighted) sale's Match score is under this
 
 
+# Kinds of SALE whose asking price is a weaker guide (free checks 11/15, local MLS copy). Share of closed sales since
+# 11/2025 that sold more than 10% away from their final asking price:
+#   ordinary sale 7.4% (59,661) | bank-owned 26.0% (812) | short sale 20.8% (202) | estate 17.8% (320)
+#   (auctions, 58%, are handled apart: their list price is an opening bid; manufactured homes, 16.8%, are not valued
+#   at all - cma_service.unusual_structure_problem)
+# And on 114 such past sales valued the day before they went under contract, the ones with NONE of the three signs
+# did no better than ordinary homes with one: typical miss 4.1%, 11% off by more than 15% (ordinary homes with no
+# sign: 3.5% and 3%). So a listed home sold this way is never labelled Strong. The value itself is not touched: the
+# asking-price rule still helped on these (typical miss 11% -> 6-7% on bank-owned and short sales).
+def _special_sale_kind(subject: Optional[dict]) -> Optional[str]:
+    d = subject or {}
+    sale_type = d.get("sale_type")
+    vals = sale_type if isinstance(sale_type, (list, tuple)) else [sale_type] if sale_type else []
+    low = " | ".join(str(v).lower().replace(" ", "") for v in vals)
+    if "bankowned" in low or "hudowned" in low:
+        return "a bank-owned home"
+    if "shortsale" in low:
+        return "a short sale"
+    if "probate" in low:
+        return "an estate sale"
+    return None
+
+
 def _evidence_strength(subject: Optional[dict], trace: Optional[dict], value, comps: Optional[list] = None) -> Optional[dict]:
     t = trace or {}
     v = _as_float(value)
@@ -10841,7 +11453,7 @@ def _evidence_strength(subject: Optional[dict], trace: Optional[dict], value, co
     if gross >= _EVIDENCE_GROSS_PCT:
         signs.append(f"the sales needed large adjustments to match this home (about {round(gross)}% of each sale price on average)")
     # the Match score of the sales the value rests on, each counted by its share of the value
-    score = {str(c.get("listing_key")): _as_float(c.get("match_score")) for c in (comps or []) if isinstance(c, dict) and c.get("listing_key")}
+    score = {str(c.get("listing_key")): _plain_match_score(c) for c in (comps or []) if isinstance(c, dict) and c.get("listing_key")}
     pairs = [(float(r["normalized_weight"]), score.get(str(r.get("listing_key")))) for r in rows]
     pairs = [(w, m) for w, m in pairs if m is not None]
     match = (sum(w * m for w, m in pairs) / sum(w for w, _ in pairs)) if pairs else None
@@ -10854,6 +11466,7 @@ def _evidence_strength(subject: Optional[dict], trace: Optional[dict], value, co
         signs.append(f"the adjusted sales (about ${round(anchor, -3):,.0f}) and the ${asking:,.0f} asking price are "
                      f"{round(abs(anchor - asking) / asking * 100)}% apart")
     multi = _type_family(_first_present(subject or {}, "property_type", "home_type")) == "multi"
+    special = _special_sale_kind(subject)
     if multi:
         level = "limited"
         record = ("This is a multi-unit income property, and the MLS carries no rent or expense data - the value comes only "
@@ -10867,6 +11480,16 @@ def _evidence_strength(subject: Optional[dict], trace: Optional[dict], value, co
             "fair": "On past sales with one sign like this, half landed within about 6% of the real price and about one in six was off by more than 15%.",
             "limited": "On past sales with two or more signs like these, about one in four was off by more than 15%.",
         }[level]
+        if special:
+            if level == "strong":
+                level = "fair"
+                record = (f"The sales are close matches, but this is {special}, and the asking price on these is a weaker "
+                          "guide: about one in five sells more than 10% away from it, against one in fourteen ordinary "
+                          "sales. On past sales like this, half landed within about 4% of the real price and about one "
+                          "in nine was off by more than 15%.")
+            else:
+                record += (f" This is also {special}: the asking price on these is a weaker guide (about one in five "
+                           "sells more than 10% away from it).")
     else:
         level = "limited" if len(signs) >= 2 else "fair"
         record = {
@@ -10879,6 +11502,7 @@ def _evidence_strength(subject: Optional[dict], trace: Optional[dict], value, co
     label = {"strong": "Strong evidence", "fair": "Fair evidence", "limited": "Limited evidence"}[level]
     why = ("; ".join(signs[:4])[:1].upper() + "; ".join(signs[:4])[1:] + ".") if signs else None
     return {"level": level, "label": label, "signs": signs, "listed": listed, "multi_family": multi,
+            "special_sale": special if (listed and not multi) else None,
             "match_score": round(match, 1) if match is not None else None, "gross_adjustment_pct": round(gross, 1),
             "message": f"{label}. " + (f"{why} " if why else "") + record}
 
@@ -11243,6 +11867,31 @@ def _reasoning_json_from_text(text: str) -> Optional[dict]:
         return obj if isinstance(obj, dict) else None
 
 
+def _reasoning_answer_is_thin(raw, evidence_packet: Optional[dict] = None) -> bool:
+    """True when the final-valuation answer has its numbers but none of its explanation. The answer schema makes
+    every field REQUIRED, but an empty string and an empty list both satisfy it: 21 Cordele Rd (live round 8,
+    11/15) came back in 432 tokens with final_valuation_summary "", comp_roles [], no drivers, no drags, no
+    floor/ceiling/primary comps. The validator repaired all of that without a word, so the client got the
+    stock two-sentence summary, every comp fell to "market context", and the hollow answer was stored for 14
+    days. Thin = no summary, or comps to classify and not one classified."""
+    if not isinstance(raw, dict):
+        return False
+    if not _coerce_ai_text(raw.get("final_valuation_summary")).strip():
+        return True
+    has_comps = bool((evidence_packet or {}).get("comparables"))
+    roles = [r for r in (raw.get("comp_roles") or []) if isinstance(r, dict) and str(r.get("comp_id") or "").strip()]
+    return has_comps and not roles
+
+
+_REASONING_THIN_NUDGE = (
+    "\n\nIMPORTANT: an earlier answer to this exact request filled in the numbers but left the explanation empty. "
+    "Fill in EVERY field: final_valuation_summary (the client's paragraph), comp_roles with one entry for every "
+    "comparable, primary_comps / floor_comps / ceiling_comps, major_value_drivers, major_value_drags, "
+    "market_exposure_assessment, why_final_differs_from_anchor and why_final_differs_from_v10. "
+    "An empty string or an empty list is not an acceptable answer for any of them."
+)
+
+
 async def _call_cma_reasoning_claude(config: dict, evidence_packet: dict) -> tuple[dict, dict]:
     """The final-valuation pass on a Claude model (owner, 11/13: one provider for the whole CMA). Same
     instructions, same evidence packet, same answer schema as the OpenAI path, so nothing downstream changes.
@@ -11250,7 +11899,9 @@ async def _call_cma_reasoning_claude(config: dict, evidence_packet: dict) -> tup
     - Structured output (output_config.format) holds the answer to the schema; if the API rejects the schema
       itself, the call is repeated once asking for the same JSON in plain text.
     - Streamed, because a top model can think for minutes and a silent connection would time out.
-    - A policy decline (stop_reason "refusal") is retried once on _REASONING_CLAUDE_FALLBACK_MODEL."""
+    - A policy decline (stop_reason "refusal") is retried once on _REASONING_CLAUDE_FALLBACK_MODEL.
+    - An answer with numbers and no explanation (_reasoning_answer_is_thin) is asked for ONCE more, with a line
+      saying what was left empty; if the second is no fuller, the first is returned (never worse than before)."""
     client = _provider_client()
     model = config["cma_reasoning_model"]
     effort = config.get("cma_reasoning_effort", "medium")
@@ -11260,16 +11911,18 @@ async def _call_cma_reasoning_claude(config: dict, evidence_packet: dict) -> tup
     usage_total: dict = {}
     last_error = "unknown"
     use_format = True
+    thin_raw: Optional[dict] = None   # a first answer that had numbers but no explanation (kept as the fallback)
     for attempt in range(_REASONING_MAX_RETRIES + 1):
-        if attempt:
+        if attempt and thin_raw is None:
             await asyncio.sleep(_REASONING_RETRY_BACKOFF_S[min(attempt - 1, len(_REASONING_RETRY_BACKOFF_S) - 1)])
+        ask = packet_text + (_REASONING_THIN_NUDGE if thin_raw is not None else "")
         kwargs = dict(model=model, max_tokens=max_tokens, system=_CMA_REASONING_SYSTEM_PROMPT,
-                      messages=[{"role": "user", "content": packet_text}])
+                      messages=[{"role": "user", "content": ask}])
         if use_format:
             kwargs["output_config"] = {"effort": effort, "format": {"type": "json_schema", "schema": _CMA_REASONING_SCHEMA}}
         else:
             kwargs["output_config"] = {"effort": effort}
-            kwargs["messages"] = [{"role": "user", "content": packet_text + "\n\nReturn ONLY one JSON object (no prose, no code "
+            kwargs["messages"] = [{"role": "user", "content": ask + "\n\nReturn ONLY one JSON object (no prose, no code "
                                    "fence) that matches this JSON schema exactly:\n" + json.dumps(_CMA_REASONING_SCHEMA, separators=(",", ":"))}]
         try:
             # (testing only: with CMA_SLOW_LANE=1 the request goes through the half-price queue first - see cma_claude)
@@ -11286,11 +11939,15 @@ async def _call_cma_reasoning_claude(config: dict, evidence_packet: dict) -> tup
                                extra={"model": model, "error": str(exc)[:300]})
                 use_format = False
                 continue
+            if thin_raw is not None:
+                return thin_raw, usage_total   # the one extra ask failed: the first answer stands
             if code in (401, 403, 404) or (code == 400 and not use_format):
                 raise _ReasoningCallError(f"reasoning request failed ({last_error})", usage_total) from exc
             logger.warning("CMA reasoning (Claude) call failed - retrying", extra={"model": model, "error": last_error, "attempt": attempt + 1})
             continue
         _add_usage(usage_total, {"input_tokens": getattr(msg.usage, "input_tokens", 0), "output_tokens": getattr(msg.usage, "output_tokens", 0)})
+        if thin_raw is not None and msg.stop_reason in ("refusal", "max_tokens"):
+            return thin_raw, usage_total
         if msg.stop_reason == "refusal":
             last_error = "model declined the request"
             if model != _REASONING_CLAUDE_FALLBACK_MODEL:
@@ -11304,10 +11961,20 @@ async def _call_cma_reasoning_claude(config: dict, evidence_packet: dict) -> tup
             continue
         text = "".join(getattr(b, "text", "") for b in (msg.content or []) if getattr(b, "type", None) == "text")
         raw = _reasoning_json_from_text(text)
+        if thin_raw is not None:
+            # the one extra ask: take it only when it is a full answer, else the first answer stands
+            return (raw if raw is not None and not _reasoning_answer_is_thin(raw, evidence_packet) else thin_raw), usage_total
         if raw is None:
             last_error = "answer was not a JSON object"
             continue
+        if _reasoning_answer_is_thin(raw, evidence_packet) and attempt < _REASONING_MAX_RETRIES:
+            logger.warning("CMA reasoning (Claude): numbers with no explanation - asking once more",
+                           extra={"model": model, "output_tokens": getattr(msg.usage, "output_tokens", 0)})
+            thin_raw = raw
+            continue
         return raw, usage_total
+    if thin_raw is not None:
+        return thin_raw, usage_total
     raise _ReasoningCallError(f"reasoning request failed ({last_error})", usage_total)
 
 
@@ -11653,6 +12320,10 @@ def _validate_reasoning_valuation(result: dict, evidence_packet: dict) -> tuple[
         _as_float((evidence_packet.get("deterministic_evidence") or {}).get("deterministic_anchor")),
         _as_float((evidence_packet.get("deterministic_evidence") or {}).get("old_v10_final_fmv")),
     ]
+    # every earlier asking price of this listing is in the packet (price_changes_this_listing), so citing one is
+    # citing the record - not an unsupported figure
+    for _ln in (evidence_packet.get("subject") or {}).get("price_changes_this_listing") or []:
+        known_dollars.update(round(float(m.group(1).replace(",", ""))) for m in re.finditer(r"\$(\d[\d,]*)", str(_ln)))
     known_dollars.update(
         round(abs(normalized["final_fmv"] - benchmark))
         for benchmark in benchmark_values if benchmark and abs(normalized["final_fmv"] - benchmark) >= 1
@@ -12023,9 +12694,19 @@ def _drop_engine_clauses(text: str) -> str:
         head = sent[:m.start()]
         cut = max(head.rfind(", "), head.rfind(" - "), head.rfind("; "))
         before = sent[:cut].rstrip(" ,;-") if cut > 0 else ""
-        if len(before.split()) >= 5:
+        # What is left must be a sentence. "Given the distance and the different setting, it carries less weight."
+        # was cut back to "Given the distance and the different setting." - a lead-in with nothing after it
+        # (811 Ridley Creek Dr, comp #3, 11/15). A lead-in clause alone goes with the rest.
+        if len(before.split()) >= 5 and not _LEAD_IN_ONLY_RE.match(before):
             kept.append(before + ("" if before.endswith((".", "!", "?")) else "."))
     return " ".join(kept)
+
+
+# a clause that only sets up a main clause: "Given X", "Because of X and Y", "Although it is larger" - no comma, so
+# no main clause follows inside it
+_LEAD_IN_ONLY_RE = re.compile(
+    r"^(?:Given|Because|Since|Although|Though|While|Whereas|Due\s+to|Despite|Considering|In\s+light\s+of|With|As|If|When)\b[^,;:]*$",
+    re.IGNORECASE)
 
 
 def _reconcile_comp_hard_facts(
@@ -12760,10 +13441,19 @@ def _append_fee_gap_notes(subject: Optional[dict], comps: Optional[list]) -> lis
         if not _fee_mismatch(s_fee, c_fee) or not ai_text or _FEE_GAP_MARK in ai_text:
             continue
         lower = c_fee < s_fee
-        sent = (f"Its {_FEE_GAP_MARK}{c_fee:,.0f}, against ${s_fee:,.0f} for this home. A "
-                + ("lower fee makes a home cheaper to own, so this sale may overstate" if lower
-                   else "higher fee makes a home dearer to own, so this sale may understate")
-                + " what this home would bring - check what each fee covers.")
+        if _fact_check.same_subdivision(subject, comp) is True:
+            # One community, one association: like homes pay about the same, so a gap between the two records is
+            # how or when each was filled in, not a cheaper home. 3930 Ashland Dr #238 (live round 8, 11/15): its
+            # 2025 record carries $227 where its own 2024 record had $222 + $114, and this home's says $359 - the
+            # report told the buyer the comp was "cheaper to own" and its price "may overstate" this home's.
+            sent = (f"Its {_FEE_GAP_MARK}{c_fee:,.0f} on its MLS record, against ${s_fee:,.0f} for this home. Both are in the "
+                    "same community, so the gap is more likely an older figure or a fee left off one record than a real "
+                    "difference in the cost of owning - confirm the current fee with the association.")
+        else:
+            sent = (f"Its {_FEE_GAP_MARK}{c_fee:,.0f}, against ${s_fee:,.0f} for this home. A "
+                    + ("lower fee makes a home cheaper to own, so this sale may overstate" if lower
+                       else "higher fee makes a home dearer to own, so this sale may understate")
+                    + " what this home would bring - check what each fee covers.")
         own_note = comp.get("commentary") and comp.get("commentary") != comp.get("ai_commentary")
         comp["ai_commentary"] = ai_text.rstrip() + " " + sent
         if not own_note:
@@ -13840,7 +14530,10 @@ async def _run_cma_reasoning_stage(
         if _locked and not _lock_anchor_holds(_locked.get("anchor"), _lock_anchor):
             _locked = None
         cached = _locked or await _reasoning_cache_get(db, _cache_key)
-        _now_dom = _as_float((evidence_packet.get("subject") or {}).get("dom"))
+        # a stored answer with numbers and no explanation is not reused: ask again (see _reasoning_answer_is_thin)
+        if isinstance(cached, dict) and _reasoning_answer_is_thin(cached.get("raw"), evidence_packet):
+            cached = _locked = None
+        _now_dom =_as_float((evidence_packet.get("subject") or {}).get("dom"))
         _now_cdom = _as_float((evidence_packet.get("subject") or {}).get("cdom"))
         _now_total = _as_float((evidence_packet.get("subject") or {}).get("marketing_days_total"))
         _days_now = {"subject_dom": _now_dom, "subject_cdom": _now_cdom, "subject_total": _now_total}
@@ -13868,13 +14561,18 @@ async def _run_cma_reasoning_stage(
         cost = ai_config_service.estimate_cost_usd(config, model, input_tokens, output_tokens) if cached is None else 0.0
         if reasoning is None:
             reasoning, blockers = _validate_reasoning_valuation(raw, evidence_packet)
-        if cached is None and not blockers:
+        # ... and one that is still thin after the extra ask is used for this run but never stored
+        _thin = _reasoning_answer_is_thin(raw, evidence_packet)
+        if cached is None and not blockers and not _thin:
             await _reasoning_cache_put(db, _cache_key, {"raw": raw, **_days_now})
-        if not blockers and (cached is None or cached is not _locked):
+        if not blockers and not _thin and (cached is None or cached is not _locked):
             await _value_lock_put(db, report_id, "reasoning", _lock_fp, raw, order=_lock_ord, anchor=_lock_anchor, **_days_now)
         reasoning, guard_flags = _apply_value_guards(reasoning, evidence_packet)
         # the callers move these into qa_flags; the validator's own repairs go first
         reasoning["_guard_flags"] = list(reasoning.pop("_repair_flags", None) or []) + list(guard_flags)
+        if _thin:
+            reasoning["_guard_flags"].append("The valuation pass gave its numbers without its written explanation, even when "
+                                             "asked a second time - the summary on this report is the standard short one.")
         if cached is not None:
             reasoning["_guard_flags"].append("Final valuation reused from an identical earlier run (same evidence) - no new charge.")
         else:
@@ -14331,7 +15029,7 @@ def _v10_pre_export_qa(
         q = c.get("quality") or {}
         comp_by_num[i + 1] = {
             "strength": _normalize_strength(c.get("strength")),
-            "quality": {k: str(q.get(k) or "").lower() for k in _V10_ALL_DIMS},
+            "quality": {k: str(q.get(k) or "").lower() for k in (*_V10_ALL_DIMS, *_DESCRIPTIVE_QUALITY_ROWS)},
             "address": str(c.get("street_address") or "").lower(),
         }
     for tc in anchor_comps:
@@ -14694,6 +15392,14 @@ def _v10_pre_export_qa(
             for pat, dim, claimed in _DIM_PHRASES:
                 if not pat.search(chunk):
                     continue
+                # A sentence about the kitchen (or the baths) answers to that room's own row when it is rated:
+                # a comp with a newer kitchen and original baths can be "similar" on finish overall, and "a
+                # newer kitchen" is then true, not a contradiction of the finish rating.
+                if dim == "finish_quality":
+                    _noun = (pat.search(chunk).group(2) or "").lower()
+                    _row = "kitchen" if _noun.startswith("kitchen") else "bathrooms" if _noun.startswith("bath") else None
+                    if _row and info["quality"].get(_row) in ("below", "similar", "above"):
+                        dim = _row
                 rating = info["quality"].get(dim)
                 opp = "below" if claimed == "above" else "above"
                 if rating == opp:
@@ -15081,8 +15787,9 @@ def _v10_asking_gap_sentence(methodology: str, *, final: Optional[dict], trace: 
     if _BRIDGE_MARK in methodology:
         # the value bridge already gives both figures - only the "loose fit" caution is new
         if ((trace or {}).get("anchor") or {}).get("loose_fit") and "rough guide" not in methodology:
-            return methodology.rstrip() + (" None of the comparable sales is a close match for this home, so treat "
-                                           "the adjusted-sales figure as a rough guide."), [
+            # (worded to stand on its own: the value-steps passage it used to follow is no longer shown, 11/16)
+            return methodology.rstrip() + (" None of the comparable sales is a close match for this home, so the "
+                                           "sales are a rough guide here."), [
                 "Methodology summary: noted that the adjusted-sales figure is a rough guide (no close match)."]
         return methodology, []
     sentence = (f" The ${ask:,.0f} asking price is about {round(abs(gap))}% {'above' if gap > 0 else 'below'} "
@@ -15652,7 +16359,12 @@ def _v10_pending_context_sentence(methodology: str, *, final: Optional[dict], tr
             "pending homes may move it is 2.5%)."
             if nudge and p.get("moved_value", True) and (gap > 0) == (nudge > 0) else
             (" - it sits inside the supported range and backs it." if inside else
-                           " - it is a reason the range is as wide as it is; check its sale price when it closes.")))
+             # Outside the range: say so. It used to read "it is a reason the range is as wide as it is" - but a home
+             # under contract never widens the range, and 21 Cordele Rd (live round 8, 11/15) printed that line under a
+             # $367,000-$398,000 range about a home implying $333,000 (outside audit: the text "does not reconcile").
+             (f" or the range. It points {'below' if (lo and iv < lo) or (not lo and gap < 0) else 'above'} the supported range, "
+              f"so treat it as a caution on the {'low' if (lo and iv < lo) or (not lo and gap < 0) else 'high'} side and check "
+              "its sale price when it closes."))))
     return methodology.rstrip() + s, ["Methodology summary: said how the strongest nearby home under contract was weighed."]
 
 
@@ -18817,7 +19529,10 @@ async def _build_content(subject: dict, comps: list[dict], max_photos: int, warn
         if _own:
             add_text(f"The first {min(len(_own), max_photos)} subject photo(s) below were taken by the agent and show the home's "
                      "CURRENT condition - read finishes, updates and condition from them the same way as the comps' photos.")
-        await add_images("Subject", {**subject, "photos": list(dict.fromkeys(_own + [u for u in (subject.get("photos") or []) if u]))}
+        await add_images("Subject", {**subject, "photos": list(dict.fromkeys(_own + [u for u in (subject.get("photos") or []) if u])),
+                                     # ... then the room-sorted pick of the listing's photos, when there is one
+                                     "_photo_pick": (list(dict.fromkeys(_own + list(subject["_photo_pick"])))
+                                                     if subject.get("_photo_pick") else None)}
                          if _own else subject)
         for i, comp in enumerate(comps):
             await add_images(_comp_label(i, comp), comp)
@@ -19076,6 +19791,17 @@ async def _generate_ai_analysis_impl(
                 _ec["share_of_value_pct"] = round(_s * 100)
 
     warnings: list[str] = []
+    # Long galleries are sorted by room first, so the photo pass sees kitchens, baths and the front of each home
+    # (see _sort_report_photos). Its small cost is recorded there and added to this report's total below.
+    _photo_sort_cost = await _sort_report_photos(db, owner_id, config, enriched_subject, enriched_comps, max_photos)
+    # (noted here: the subject snapshot is rebuilt further down and would no longer carry the pick)
+    _photos_sorted = [k for k, d in [("Subject", enriched_subject), *((_comp_label(i, c), c) for i, c in enumerate(enriched_comps))]
+                      if d.get("_photo_pick")] or None
+    # which rooms the AI was shown of each home (None = not sorted): a Kitchen / Bathrooms rating needs both homes'
+    _room_maps = {"subject": enriched_subject.get("_photo_room_by_url"),
+                  **{c.get("listing_key"): c.get("_photo_room_by_url") for c in enriched_comps if c.get("listing_key")}}
+    _rooms_sent = {"subject": enriched_subject.get("_photo_rooms_sent"),
+                   **{c.get("listing_key"): c.get("_photo_rooms_sent") for c in enriched_comps if c.get("listing_key")}}
     content, images_sent, projected_tokens = await _build_content(
         enriched_subject, enriched_comps, max_photos, warnings, include_map_images, report.mode,
         anchor=prov_anchor, exposure=prov_exposure,
@@ -19461,6 +20187,10 @@ async def _generate_ai_analysis_impl(
         _enr = enriched_by_key.get(comp.get("listing_key"))
         if _enr:
             comp = _merge_authoritative_property_facts(comp, _enr)
+            comp["monthly_fee"] = _record_monthly_fee(_enr)
+            _pr = _photo_rooms_for(comp.get("photos"), _room_maps.get(comp.get("listing_key")))
+            if _pr:
+                comp["photo_rooms"] = _pr     # which room each photo shows, for the viewer's Kitchen / Baths buttons
             comp["builder_base_price"] = True if _enr.get("builder_base_price") else None   # see _builder_base_price_sale
             # OSM road/street classification (road_context_service) - computed during enrichment.
             if _enr.get("road_context") and not comp.get("road_context"):
@@ -19486,12 +20216,28 @@ async def _generate_ai_analysis_impl(
             if comp.get("strength"):
                 comp["strength"] = _normalize_strength(comp["strength"])
             ai_quality = ai.get("quality") if isinstance(ai.get("quality"), dict) else {}
+            ai_quality = _drop_unseen_room_ratings(ai_quality, _rooms_sent.get("subject"), _rooms_sent.get(comp.get("listing_key")))
             existing_quality = dict(comp.get("quality") or {})
+            # Interior from the rooms (see _interior_from_rooms; CMA_INTERIOR_TIE=0 switches it off). A Kitchen or
+            # Bathrooms rating the agent set before the run counts as that room's rating; an Interior the agent
+            # set is never touched (the loop below only fills blanks). `ai_quality_read` keeps the AI's own read.
+            _merge_quality = dict(ai_quality)
+            if interior_tie_on():
+                _tied = _interior_from_rooms(existing_quality.get("kitchen") or ai_quality.get("kitchen"),
+                                             existing_quality.get("bathrooms") or ai_quality.get("bathrooms"),
+                                             ai_quality.get("interior"))
+                if _tied:
+                    _merge_quality["interior"] = _tied
             for field, allowed in _QUALITY_FIELD_VALUES.items():
-                value = ai_quality.get(field)
+                value = _merge_quality.get(field)
                 if value in allowed and not existing_quality.get(field):
                     existing_quality[field] = value
             comp["quality"] = existing_quality
+            # The AI's own read of each rating, kept beside the final ones (owner 11/15: a rating the engine
+            # leaves blank is a suggestion to the agent, "maybe show the agent what it thinks if anything").
+            # The record checks below may clear a rating they can't confirm; the Analysis screen shows this
+            # read on a blank row so the agent can keep it with one tap. Never shown to a client.
+            comp["ai_quality_read"] = _ai_quality_read(ai_quality)
 
             # Fix 2: carry the AI's machine-checkable Strong market-location override onto the comp
             # so _v10_location_class_review can validate it against structured evidence.
@@ -19908,6 +20654,8 @@ async def _generate_ai_analysis_impl(
         # strong pending may nudge the value review (capped), and a big gap is flagged for the agent.
         _competition = await _load_current_competition(db, report, enriched_subject)
         value = _tidy_value(value)
+        # a short client-facing paragraph on that competition (see _competition_commentary) - a small follow-up call
+        _competition_note = await _competition_commentary(enriched_subject, _competition, report.mode, status_timeline, model=model)
         value, final_range_low, final_range_high, _competition_review = _pending_competition_review(
             enriched_subject, _competition, value, final_range_low, final_range_high, valuation_trace,
             buyer_report=(report.mode == "buyer"),
@@ -20044,6 +20792,9 @@ async def _generate_ai_analysis_impl(
         report.subject = _reconciled_subject_snapshot(
             _merge_authoritative_property_facts(report.subject or {}, enriched_subject), status_timeline,
         )
+        _subject_rooms = _photo_rooms_for((report.subject or {}).get("photos"), _room_maps.get("subject"))
+        if _subject_rooms:
+            report.subject = {**report.subject, "photo_rooms": _subject_rooms}
         enriched_subject = {**dict(report.subject or {}), **_history_keep}
 
         # Suggested improvements are also normalized before final QA. They remain outside the
@@ -20255,6 +21006,8 @@ async def _generate_ai_analysis_impl(
             "subject_status_review": _subject_reviews(enriched_subject, status_timeline, value),
             # Similar homes for sale / under contract now (list prices) + which pendings moved the value.
             "current_competition": {"homes": _competition or [], **(_competition_review or {})},
+            # Client-facing paragraph under those cards (None = the cards alone)
+            "competition_commentary": _competition_note,
             # Agent-only: buyer CMA on the agent's own listing (10/24)
             "audience_review": await _audience_review(db, owner_id, report.mode, enriched_subject),
             # the list price is an opening bid (11/01) - the PDF labels it that way
@@ -20372,7 +21125,9 @@ async def _generate_ai_analysis_impl(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "model": model,
         "reasoning_model": config.get("cma_reasoning_model"),
-        "cost_usd": round(cost + _reasoning_cost, 4),
+        "cost_usd": round(cost + _reasoning_cost + _photo_sort_cost, 4),
+        "photo_sort_cost_usd": round(_photo_sort_cost, 4),
+        "photos_sorted_by_room": _photos_sorted,
         "followup_calls": [u["label"] for u in _extra_usage] or None,
         "followup_cost_usd": round(_extra_cost, 4),
         "comp_analysis_cost_usd": round(cost, 4),
@@ -20391,6 +21146,65 @@ async def _generate_ai_analysis_impl(
     await db.commit()
     await db.refresh(report)
     return report
+
+
+async def adjusted_sales_preview(db: AsyncSession, owner_id: str, report_id: str) -> dict:
+    """What the comparable sales point to RIGHT NOW, by the adjustment table alone - no AI call, no charge.
+
+    For the report editor (owner, 11/16): when an agent adds or removes a comp the pages, map and charts change at
+    once but the value did not, because the only way to re-work it was the paid AI re-run (recompute_valuation).
+    This is the free half: the same weighted adjusted-sales figure the report is built on, worked out from the
+    comps as they stand now, shown next to the figure and the value the report still carries. It changes nothing in
+    the report - the agent decides whether to pay for the full refresh of the value and the write-up.
+
+    A comp added from inside the report has no ratings yet: it is weighed on its record (size, beds, baths, lot,
+    age, distance) and listed under `unrated`, so the screen can say its condition has not been compared."""
+    report = await cma_service._get_owned(db, owner_id, report_id)
+    est = (report.pricing or {}).get("ai_estimate") or {}
+    trace = est.get("valuation_trace") or {}
+    subject, _ = _drop_impossible_last_sale(report.subject or {})
+    comps = [c for c in (report.comparables or []) if c.get("is_included", True)]
+    key = lambda c: str(c.get("listing_key") or c.get("street_address") or "")   # noqa: E731
+    built_on = sorted(key(c) for c in ((trace.get("anchor") or {}).get("comps") or []) if key(c))
+    now = sorted(key(c) for c in comps if key(c))
+    report_sales = _as_float(trace.get("deterministic_anchor")) or _as_float((trace.get("anchor") or {}).get("anchor_value"))
+    out = {
+        "adjusted_sales": None, "low": None, "high": None, "comps_used": 0,
+        "report_adjusted_sales": round(report_sales) if report_sales else None,
+        "report_value": _as_float(est.get("value")),
+        # the comps are not the ones the report's value was built on
+        "comps_changed": bool(built_on) and built_on != now,
+        "added": [c.get("street_address") for c in comps if key(c) not in built_on] if built_on else [],
+        "removed_count": len([k for k in built_on if k not in now]),
+        "unrated": [c.get("street_address") for c in comps
+                    if not any((c.get("quality") or {}).get(k) for k in ("finish_quality", "interior", "exterior"))],
+        "message": None,
+    }
+    if len([c for c in comps if _usable_sale_comp(report.subject or {}, c)]) < 2:
+        out["message"] = ("This needs at least 2 sold homes of the same type with a verified sale price. "
+                          "Switch a comp back on or add another.")
+        return out
+    try:
+        enriched_subject, enriched_comps = await _enrich_with_property_data(db, subject, comps, live_status=False)
+        status_timeline = enriched_subject.get("_status_timeline") or {}
+        enriched_subject = _reconciled_subject_snapshot(enriched_subject, status_timeline)
+        enriched_subject, status_timeline = _seller_not_listed(report.mode, enriched_subject, status_timeline)
+        proximity = await load_local_proximity_context(db, enriched_subject)
+        anchor, _exposure = _v10_provisional_inputs(enriched_subject, enriched_comps, status_timeline, density_context=proximity)
+    except Exception:  # noqa: BLE001 - a preview never breaks the editor
+        logger.warning("CMA adjusted-sales preview failed", exc_info=True, extra={"report_id": report_id})
+        out["message"] = "Couldn't work out the sales figure just now. Try again in a moment."
+        return out
+    value = _as_float((anchor or {}).get("anchor_value")) if (anchor or {}).get("mode") not in (None, "insufficient") else None
+    if not value:
+        out["message"] = "These comps are not enough to work out a figure. Add another sold home of the same type."
+        return out
+    out.update({
+        "adjusted_sales": round(value, -3), "low": round(_as_float(anchor.get("anchor_low")), -3) if _as_float(anchor.get("anchor_low")) else None,
+        "high": round(_as_float(anchor.get("anchor_high")), -3) if _as_float(anchor.get("anchor_high")) else None,
+        "comps_used": len([c for c in (anchor.get("comps") or []) if (c.get("normalized_weight") or 0) > 0]),
+    })
+    return out
 
 
 async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, plan_tier: str) -> CmaReport:
@@ -20462,6 +21276,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             _enr = enriched_by_key.get(comp.get("listing_key"))
             if _enr:
                 comp = _merge_authoritative_property_facts(comp, _enr)
+                comp["monthly_fee"] = _record_monthly_fee(_enr)
                 comp["builder_base_price"] = True if _enr.get("builder_base_price") else None   # see _builder_base_price_sale
                 if _enr.get("price_verified") and _enr.get("sale_price") and not (comp.get("price_verified") and comp.get("sale_price")):
                     for _pk in ("sale_price", "close_price", "close_date", "sale_date", "price_per_sqft"):
@@ -20697,6 +21512,12 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
         # strong pending may nudge the value review (capped), and a big gap is flagged for the agent.
         _competition = await _load_current_competition(db, report, enriched_subject)
         value = _tidy_value(value)
+        # No paid call on a free re-run: the stored paragraph stays while it is still about the same homes at the
+        # same asking prices, and is dropped the moment that list changes.
+        _prev_comp = ((report.pricing or {}).get("ai_estimate") or {})
+        _competition_note = (_prev_comp.get("competition_commentary")
+                             if _competition_signature(_competition) == _competition_signature(
+                                 (_prev_comp.get("current_competition") or {}).get("homes")) else None)
         value, final_range_low, final_range_high, _competition_review = _pending_competition_review(
             enriched_subject, _competition, value, final_range_low, final_range_high, valuation_trace,
             buyer_report=(report.mode == "buyer"),
@@ -20951,6 +21772,8 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
             "subject_status_review": _subject_reviews(enriched_subject, status_timeline, value),
             # Similar homes for sale / under contract now (list prices) + which pendings moved the value.
             "current_competition": {"homes": _competition or [], **(_competition_review or {})},
+            # Client-facing paragraph under those cards (None = the cards alone)
+            "competition_commentary": _competition_note,
             # Agent-only: buyer CMA on the agent's own listing (10/24)
             "audience_review": await _audience_review(db, owner_id, report.mode, enriched_subject),
             # the list price is an opening bid (11/01) - the PDF labels it that way

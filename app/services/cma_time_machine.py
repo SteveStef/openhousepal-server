@@ -54,6 +54,9 @@ class TimeMachine:
     captured: list = field(default_factory=list)
     # The subject part of the main comp-analysis prompt, kept for the human review of each test report.
     prompt_excerpt: Optional[str] = None
+    # True for a report built in the browser under an accuracy-test arm: it is a full report someone will read, so
+    # it gets the same final read a live report gets (11/15). The bulk accuracy test only scores values - no read.
+    final_read: bool = False
 
 
 _CURRENT: contextvars.ContextVar[Optional[TimeMachine]] = contextvars.ContextVar("cma_time_machine", default=None)
@@ -276,9 +279,25 @@ def check_structured(subject: dict, timeline: dict, comps: list, where: str) -> 
     status = str((timeline or {}).get("current_status") or "").lower()
     if (timeline or {}).get("is_closed") or (timeline or {}).get("is_under_contract") or status in ("closed", "pending"):
         problems.append(f"subject status reads '{timeline.get('current_status')}'")
-    for k in ("close_price", "close_date", "sale_price", "last_sale_price"):
+    for k in ("close_price", "close_date", "sale_price"):
         if (subject or {}).get(k):
             problems.append(f"subject carries {k}")
+    # The home's OWN EARLIER sale (a separate, older MLS listing of the same house) was public on the as-of date and
+    # the engine is meant to use it - 2992 2nd St, Norristown sold in June 2024 and was relisted in 2026; the old
+    # rule stopped that report before it started (11/15). It is a leak only when it is the hidden sale: no date, a
+    # date on or after the as-of date, or the hidden price itself.
+    lsp = (subject or {}).get("last_sale_price")
+    if lsp:
+        try:
+            lsd = date.fromisoformat(str((subject or {}).get("last_sale_date"))[:10])
+        except ValueError:
+            lsd = None
+        try:
+            is_hidden_price = bool(tm.close_price) and abs(float(lsp) - float(tm.close_price)) < 1
+        except (TypeError, ValueError):
+            is_hidden_price = True
+        if lsd is None or lsd >= tm.as_of or is_hidden_price:
+            problems.append("subject carries last_sale_price")
     if tm.list_price and (subject or {}).get("list_price") and abs(float(subject["list_price"]) - tm.list_price) > 1:
         problems.append("subject list price is not the as-of list price")
     for c in comps or []:

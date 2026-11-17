@@ -66,7 +66,11 @@ async def search_cma_comparables(
     if arm:   # CMA accuracy test only: the search window ends on the as-of date
         payload = _arms.shift_search_window(payload, arm)
     with _arms.activated(arm):
-        return await service.search_comparables(db, payload)
+        results = await service.search_comparables(db, payload)
+    # For a listed home the Match % of each sale includes its price level (cma_comp_pick.apply_price_level)
+    from app.services import cma_comp_pick
+    _subj = payload.subject.model_dump() if payload.subject else {}
+    return cma_comp_pick.apply_price_level(_subj, results, asking_price=_subj.get("list_price"), subject_sqft=payload.subject_sqft)
 
 
 @router.post("/comparables/auto-search")
@@ -86,7 +90,13 @@ async def auto_search_cma_comparables(
         payload = _arms.shift_search_window(payload, arm)
     with _arms.activated(arm):
         out = await service.auto_search_comparables(db, payload)
-    return {**out, "results": [c.model_dump() for c in out["results"]]}
+    # For a listed home the Match % of each sale includes its price level (cma_comp_pick.apply_price_level), so
+    # the list still runs highest to lowest and the Comps step still picks the highest.
+    from app.services import cma_comp_pick
+    _subj = payload.subject.model_dump() if payload.subject else {}
+    results = cma_comp_pick.apply_price_level(_subj, out["results"], asking_price=_subj.get("list_price"),
+                                              subject_sqft=payload.subject_sqft)
+    return {**out, "results": [c.model_dump() for c in results]}
 
 
 @router.get("/public/{slug}", response_model=CmaPublicResponse)
@@ -448,6 +458,19 @@ async def generate_cma_ai_analysis(
             await service.mark_generation_finished(current_user.id, report_id, "complete" if success else "failed")
         finally:
             await release_cma_generation(report_id)
+
+
+@router.get("/{report_id}/adjusted-sales-preview")
+async def cma_adjusted_sales_preview(
+    report_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_mls_access),
+    _broker: User = Depends(require_broker_authorization),
+):
+    """Free, no AI: what the comparable sales point to with the comps as they stand now, next to the figure and the
+    value the report still carries - for the editor after a comp is added or removed. Changes nothing in the report.
+    See cma_ai_service.adjusted_sales_preview."""
+    return await cma_ai_service.adjusted_sales_preview(db, current_user.id, report_id)
 
 
 @router.post("/{report_id}/recompute-valuation", response_model=CmaReportResponse)

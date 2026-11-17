@@ -44,6 +44,9 @@ class CmaSubjectProperty(BaseModel):
     source: CompSource = 'mls'
     photo_url: Optional[str] = None
     photos: List[str] = []
+    # which room each photo shows (the AI run's photo sorter), one entry per photo, None = not labelled. For the
+    # photo viewer's Kitchen / Baths buttons; missing on reports made before 11/16.
+    photo_rooms: Optional[List[Optional[str]]] = None
     street_address: Street = None
     city: Optional[str] = None
     state: Optional[str] = None
@@ -104,6 +107,9 @@ class CmaQualityAssessment(BaseModel):
     finish_quality: Optional[SimpleRating] = None
     interior: Optional[SimpleRating] = None
     exterior: Optional[SimpleRating] = None
+    # Kitchen and Bathrooms against the subject's (11/16): descriptive rows - shown and written up, never priced
+    kitchen: Optional[SimpleRating] = None
+    bathrooms: Optional[SimpleRating] = None
     # 'n_a' = a condo / unit has no lot of its own (10/21) - without it every condo report failed to load
     lot: Optional[Literal['below', 'similar', 'above', 'n_a']] = None
     amenities: Optional[SimpleRating] = None
@@ -123,10 +129,16 @@ class CmaComparable(BaseModel):
     source: CompSource = 'mls'
     is_included: bool = True
     order_index: int = 0
+    # HOA / condo fee per month from the MLS record (cma_ai_service._record_monthly_fee): 0 = none on record,
+    # None = a report made before 11/16. For the comparison table; nothing in the value reads it.
+    monthly_fee: Optional[float] = None
     status: CompStatus = 'sold'
 
     photo_url: Optional[str] = None
     photos: List[str] = []
+    # which room each photo shows (the AI run's photo sorter), one entry per photo, None = not labelled. For the
+    # photo viewer's Kitchen / Baths buttons; missing on reports made before 11/16.
+    photo_rooms: Optional[List[Optional[str]]] = None
     street_address: Street = None
     city: Optional[str] = None
     state: Optional[str] = None
@@ -192,6 +204,9 @@ class CmaComparable(BaseModel):
     road_context_note: Optional[str] = None
 
     quality: CmaQualityAssessment = Field(default_factory=CmaQualityAssessment)
+    # What the AI itself rated each dimension, before the record checks (which may clear a rating they
+    # can't confirm). Agent-only: shown on a blank rating row as "AI's read", never on a client report.
+    ai_quality_read: Optional[Dict[str, str]] = None
     strength: Optional[CompStrength] = None
     # Claude's proposed role is audit-only after generation. `strength` is the deterministic role
     # derived from continuous relevance and is the role shown to clients.
@@ -270,6 +285,13 @@ class CmaImprovement(BaseModel):
     ai_generated: bool = False
 
 
+class CmaPresentationNote(BaseModel):
+    """A section the agent added to the report by hand (Review step, edit-on-the-report)."""
+    id: str
+    title: Optional[str] = None
+    body: Optional[str] = None
+
+
 class CmaPresentationSettings(BaseModel):
     hidden_sections: List[str] = []
     hidden_comp_ids: List[str] = []
@@ -285,6 +307,24 @@ class CmaPresentationSettings(BaseModel):
     # None = on for test accounts (@example.com), off for everyone else. To be removed at launch.
     review_sheet: Optional[bool] = None
     review_notes: Optional[str] = None   # our own reviewer's grade / notes, printed on that sheet
+    # ---- Edit-on-the-report (11/15): what the agent changed on the real report in the Review step. The client
+    # page and the PDF read these through ONE set of rules (frontend lib/cmaReport.ts), so an edit can never be
+    # in one and not the other. None of this is engine input: saving it never touches the valuation.
+    # Section keys in the order shown (an agent's own note is "note:<id>"); None = the standard order.
+    section_order: Optional[List[str]] = None
+    # The agent's own note sections, placed by section_order.
+    notes: List[CmaPresentationNote] = []
+    # The agent's wording, by text key (e.g. "valuation_notes", "inspection", "offer", "title:pricing").
+    # A key that is absent shows the report's own text; an empty string means the agent cleared it.
+    text: Dict[str, str] = {}
+    # The agent's numbers, by figure key (e.g. "value", "offer_min"). Absent = the report's own number.
+    figures: Dict[str, Optional[float]] = {}
+    # Which photo leads for a home: "subject" or a comp id -> photo url.
+    photo_picks: Dict[str, str] = {}
+    # The comp ids in the order the report's wording numbers them ("Comp #2"), kept from before the agent first
+    # hid, removed or re-ordered a comp, so those mentions can be re-numbered. Tied to one analysis run.
+    comp_numbering: Optional[List[str]] = None
+    comp_numbering_at: Optional[str] = None
 
 
 class CmaAiAnalysisMeta(BaseModel):

@@ -1257,6 +1257,7 @@ def fix_text(text: str, *, subject: Optional[dict], comp: Optional[dict] = None,
         lambda x: fix_acres_lot_grammar(x),
         lambda x: fix_mailing_address_grammar(x),
         lambda x: fix_under_contract_holdout(x, subject) if comp is None else (x, []),
+        lambda x: fix_no_price_change_claims(x, subject) if comp is None else (x, []),
         lambda x: fix_comp_sale_claims(x, comps) if comp is None and comps else (x, []),
         lambda x: fix_certain_predictions(x) if comp is None else (x, []),
         lambda x: fix_price_superlatives(x, comp, comps) if comp is not None and comps else (x, []),
@@ -1364,6 +1365,101 @@ def _d(s):
         return None
 
 
+def current_price_changes(period: Optional[dict]) -> Optional[dict]:
+    """The asking-price moves of the listing that is on the market now, from one period of summarize_history.
+
+    451 Spruce Dr, Exton (live round 8, 11/15): listed at $685,000, cut to $675,000, $663,000, $650,000 and
+    $649,000 in three weeks - every cut was in our own sync log - and the report told the buyer the home had
+    been on the market "without a price change". The engine read the first asking price only from Bright's
+    OriginalListPrice, which our feed never carries, so no report ever knew about a cut. 6505 Senator Ln's
+    $485,000 -> $475,000 was missing the same way.
+
+    known: True  = we watched this listing from its first day, so the list below is complete (it may be empty:
+                   "no price change" is then a fact);
+           False = Bright says the price changed but our log has no amounts, or we never saw the first price -
+                   nobody may say the price has not changed.
+    None when there is no current listing to speak of."""
+    if not period or period.get("end") or not period.get("start"):
+        return None
+    first = _money(period.get("list_price"))
+    steps, unknown = [], False
+    for c in period.get("changes") or []:
+        if c.get("change") and c.get("price"):
+            steps.append({"date": c["date"].isoformat(), "to": round(c["price"]), "from": round(c["price"] - c["change"])})
+        else:
+            unknown = True
+    if steps and not first:
+        first = steps[0]["from"]
+    last = steps[-1]["to"] if steps else None
+    cuts = [s for s in steps if s["to"] < s["from"]]
+    out = {"known": bool(first) and not unknown, "listed": period["start"].isoformat(), "first_price": round(first) if first else None,
+           "steps": steps, "reductions": len(cuts), "increases": len(steps) - len(cuts),
+           "total_change": (last - round(first)) if (first and last) else 0,
+           "total_change_pct": round((last - first) / first * 100, 1) if (first and last) else 0.0}
+    lines = []
+    if first:
+        lines.append(f"This listing: listed {_nice_date(out['listed'])} at ${first:,.0f}")
+    for s in steps:
+        lines.append(f"Price {'reduced' if s['to'] < s['from'] else 'raised'} {_nice_date(s['date'])}, from ${s['from']:,.0f} to ${s['to']:,.0f}")
+    if len(steps) > 1 and first:
+        lines.append(f"In all: {len(cuts)} reduction{'s' if len(cuts) != 1 else ''}"
+                     + (f" and {out['increases']} increase{'s' if out['increases'] != 1 else ''}" if out["increases"] else "")
+                     + f", now ${abs(out['total_change']):,.0f} ({abs(out['total_change_pct'])}%) "
+                     + ("below" if out["total_change"] < 0 else "above") + " the first asking price")
+    if unknown:
+        lines.append("The MLS shows a price change on this listing whose earlier price is not in our MLS feed")
+    out["lines"] = lines if (steps or unknown) else []          # shown in the report's record box
+    # what the models are told, on top of the lines
+    out["prompt_note"] = ("Never say the price has not changed, was not reduced, or is unchanged." if (steps or unknown)
+                          else "No price change since it was listed (our MLS log covers this listing from its first day)." if first
+                          else "Price changes on this listing are not known - do not say whether the price has or has not changed.")
+    return out
+
+
+_PRICE_NOUN = r"(?:price|asking[- ]price|list[- ]price)"
+_PRICE_MOVE = r"(?:change|cut|reduction|drop|adjustment|decrease)s?"
+# A statement about what HAS happened to the price ("without a price change", "has not reduced its price", "the
+# asking price is unchanged") - not advice about what to do next ("no price reduction is needed yet").
+_NO_PRICE_CHANGE_RE = re.compile(
+    rf"\bwithout (?:a |any )?(?:single )?{_PRICE_NOUN} {_PRICE_MOVE}\b"
+    rf"|\b(?:no|zero) {_PRICE_NOUN} {_PRICE_MOVE}\b(?!\s+(?:is|are|would be|should be|looks?|seems?)\s+(?:needed|recommended|necessary|warranted|required))"
+    rf"|\b(?:has not|hasn'?t|have not|haven'?t|has yet to|has never|not yet)\s+(?:been\s+)?(?:reduc\w+|cut|dropp?ed|lower\w*|chang\w+|adjust\w+)\b"
+    rf"[^.;!?]{{0,20}}?\b(?:price|asking)\b"
+    rf"|\b{_PRICE_NOUN}\b[^.;!?]{{0,15}}?\b(?:(?:is|remains|has remained|has stayed|has held)\s+unchanged"
+    rf"|(?:has not|hasn'?t)\s+(?:changed|moved|been (?:reduced|cut|lowered)))\b"
+    rf"|\b(?:held|holding|kept|keeping)\s+(?:its|the|their)\s+(?:original |initial |asking |list )?price\b"
+    rf"|\bstill at (?:its|the) original (?:asking |list )?price\b",
+    re.IGNORECASE)
+
+
+def fix_no_price_change_claims(text: str, subject: Optional[dict]) -> tuple[str, list[str]]:
+    """Drop a sentence saying the subject's price has not changed when our log shows it has (or shows a change we
+    can't size). Report-level text only: a comp's write-up may truly be about a comp that never cut."""
+    s0 = subject if isinstance(subject, dict) else {}
+    pc = (s0.get("_listing_history") or {}).get("current_price_changes") or (s0.get("_status_timeline") or {}).get("price_changes")
+    if not text or not isinstance(pc, dict) or not (pc.get("steps") or pc.get("lines")):
+        return text, []          # no change on record (or nothing known): the sentence is left as written
+    kept, dropped = [], []
+    for para in re.split(r"(\n\s*\n)", text):
+        if re.fullmatch(r"\n\s*\n", para or ""):
+            kept.append(para)
+            continue
+        keep = []
+        for s in sentences(para):
+            # a sentence about one numbered comp ("Comp #2 sold in 9 days without a price change") is that comp's
+            # story; "longer than some comparable sales without a price change" is about this home
+            if _NO_PRICE_CHANGE_RE.search(s) and not re.search(r"#\d|\bcomp(?:arable)?\s+\d", s, re.IGNORECASE):
+                dropped.append(s)
+            else:
+                keep.append(s)
+        kept.append(" ".join(keep))
+    if not dropped:
+        return text, []
+    n = pc.get("reductions") or len(pc.get("steps") or []) or 1
+    return "".join(kept).strip(), [f"Fact check: removed a sentence saying the price has not changed - the MLS log shows "
+                                   f"{n} price change{'s' if n != 1 else ''} on this listing (\"{dropped[0][:80]}\")."]
+
+
 def summarize_history(events: list, *, current_list_date=None, today=None, current_days=None) -> dict:
     """The home's earlier listings and sales from price_history_service.get_history (newest first).
 
@@ -1461,7 +1557,9 @@ def summarize_history(events: list, *, current_list_date=None, today=None, curre
                        "since the earlier listing began")
     last_sale = prior_sales[-1] if prior_sales else None
     return {
-        "prior_sales": [{"date": s["date"].isoformat(), "price": s.get("price")} for s in prior_sales],
+        # the CURRENT listing's own asking-price moves (see current_price_changes)
+        "current_price_changes": current_price_changes(current),
+        "prior_sales":[{"date": s["date"].isoformat(), "price": s.get("price")} for s in prior_sales],
         "last_sale": {"date": last_sale["date"].isoformat(), "price": last_sale.get("price")} if last_sale else None,
         "earlier_listings": [{"listed": p["start"].isoformat(), "list_price": p.get("list_price"), "last_price": p.get("last_price"),
                               "ended": p["end"].isoformat() if p.get("end") else None, "end_event": p.get("end_event"),
@@ -1503,7 +1601,12 @@ def history_sentence(methodology: str, summary: Optional[dict], *, today=None, l
                     + " - one marketing effort, not a new listing.")
     ls = s.get("last_sale") or {}
     sold = _d(ls.get("date"))
-    if sold and ls.get("price") and ((today or date.today()) - sold).days <= 3 * 365:
+    # Already said - by an earlier pass through here or by the writer itself ("The home last sold on Jun 7, 2024 for
+    # $331,700; ... It last sold on Jun 7, 2024 for $331,700; ..." - 2992 2nd St, 11/15): the same sale price next to
+    # "last sold" is the same statement, never added twice.
+    _price_txt = f"${float(ls['price']):,.0f}" if ls.get("price") else None
+    _said = bool(_price_txt and _price_txt in methodology and re.search(r"\blast sold\b", methodology, re.I))
+    if sold and ls.get("price") and not _said and ((today or date.today()) - sold).days <= 3 * 365:
         if s.get("last_sale_is_this_listing"):
             # a seller report on a home bought not long ago: the reader IS the owner, and everything the report
             # knows about the home comes from that sale's listing (701 Great Oak Ln, test round 11/14)

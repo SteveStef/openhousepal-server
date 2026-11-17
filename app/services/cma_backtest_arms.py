@@ -80,6 +80,7 @@ def tm_from_arm(arm: CmaBacktestArm) -> cma_time_machine.TimeMachine:
     return cma_time_machine.TimeMachine(
         listing_key=arm.listing_key, as_of=d(f["as_of"]), list_price=f.get("list_price"), dom=f.get("dom_as_of"),
         close_price=f.get("close_price"), close_date=d(f.get("close_date")), contract_date=d(f.get("contract_date")),
+        final_read=True,
     )
 
 
