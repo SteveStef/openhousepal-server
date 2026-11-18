@@ -35,7 +35,7 @@ On the right, after a thin divider, there are small icons with no words. Hover o
 
 ### On a phone
 
-Tap the menu button at the top right. Every section is a card. Tap a section to unfold its pages:
+Tap the menu button at the top right. Every section is a card. The section for the page you're on opens already unfolded with that page highlighted (on a CMA, **Tools** is open with **CMA** lit up); tap a section to unfold or fold its pages:
 
 - **Dashboard**
 - **Open Houses**: My Opens, Discovery, Manager
@@ -576,7 +576,9 @@ A red number on **Opens** means something is waiting on you (a host request, a r
 **What you'll see:**
 - **Header counts:** **Unread** (new leads), **Open houses** (host requests or replies waiting on you) and **Follow-ups** (due now). It updates on its own.
 - **Quick-create buttons:** **Create Open House Kit**, **Create Showcase**, **Create Form**, **Create Design**, **Create Blog Post**, **Create CMA**, **Media Lab**. If your plan doesn't include a tool, its button shows a lock (tap it to see the upgrade) or is hidden. On a phone these buttons aren't shown on the Dash - use the menu.
-- **Today's Rundown** - your daily briefing. Tap it to open it right on the page. The big button at the bottom marks today read and closes it (or just closes it when everything is read). If you already looked at it today, anything that happened since glows gold with a "New" tag, and its group moves to the top.
+- **Today's Rundown** - your daily briefing. Tap it to open it right on the page. The big button at the bottom marks today read and closes it (or just closes it when everything is read). If you already looked at it today, anything that happened since glows gold with a "New" tag, and its group moves to the top. Only opening it in the app (or tapping something in the briefing email) counts as looking - just opening the email doesn't, because iPhone Mail opens emails on its own.
+  - **Since you last looked**: if you haven't opened your Rundown in the app for a day or more, it also shows what happened between your last look and today (up to your last 7 days): those days' numbers (tap one to see who), Showcase news from those days, and each day folded up (tap a day to see everything from it). The **Since you last looked** button near the top jumps down to it. It stays until midnight once you've seen it, and **Mark all as read** marks those days read too. Anything older, or past the list, is on your **Activity** page.
+  - Agents on the once-a-week briefing email see the whole week's Showcase news in the Rundown, not just the last couple of days.
   - **Worth a check-in**: a lead with no agent (or not sure) who opens the same email twice or more, or clicks it twice or more. It says what they opened, which homes the email showed (or which homes they looked at after it), and suggests a time to text them (this afternoon if it's morning, otherwise tomorrow at 10). **Add follow-up** makes that follow-up in one tap (it goes in your Follow-ups and calendar); the X dismisses it. The same card shows on that lead's page above their follow-ups, and the bell gets one quiet "Worth a check-in" row per person per day.
 - **Account setup card** - the remaining setup steps for your plan (**Start setup**, **Continue setup** or **Pick up where I left off**). Skipped steps stay as small chips you can tap later.
 - **Stat tiles** (computer and tablet): **Agent Hub Visitors**, **New Leads**, **Sign-ins**, **Forms Viewed**, **Forms Filled**, **Blog Reads**. Tiles for tools your plan doesn't have are hidden. Drag a tile to reorder it.
