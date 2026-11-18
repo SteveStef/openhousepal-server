@@ -24,11 +24,41 @@ def test_daily_counts_only_from_the_change():
     assert rules(emails, reset_at=NOW - timedelta(days=1))["mode"] == "daily"
 
 
-def test_weekly_emails_stop_after_five_unopened():
-    four = [unopened(7 * i + 2, WEEKLY_TEMPLATE) for i in range(WEEKLY_STRIKES - 1)]
-    assert WEEKLY_STRIKES == 5
-    assert rules(four)["mode"] == "weekly"
-    assert rules(four + [unopened(60, WEEKLY_TEMPLATE)])["mode"] == "off"
+def test_two_unopened_weekly_after_three_daily_stop_them():
+    """Owner, 11/18: 3 unopened days -> weekly, then 2 unopened weekly ones -> off. At most 5 unopened."""
+    daily = [unopened(20), unopened(19), unopened(18)]
+    assert WEEKLY_STRIKES == 2
+    one_weekly = daily + [unopened(11, WEEKLY_TEMPLATE)]
+    d = rules(one_weekly)
+    assert (d["mode"], d["weekly_unopened"]) == ("weekly", 1)
+    assert "1 more goes unopened" in d["reason"]
+    d = rules(one_weekly + [unopened(4, WEEKLY_TEMPLATE)])
+    assert (d["mode"], d["code"], d["unopened"]) == ("off", "weekly_unopened", 5)
+
+
+def test_the_old_seven_unopened_still_weekly_case_is_off_now():
+    # one lead had 7 sent, 0 opened and was still on weekly (owner, 11/18)
+    seven = [unopened(30), unopened(29), unopened(28)] + [unopened(21 - 7 * i, WEEKLY_TEMPLATE) for i in range(3)] + [unopened(1)]
+    assert rules(seven)["mode"] == "off"
+
+
+def test_several_emails_on_one_day_count_once():
+    # an open house thank-you + the evening update on the same day are one unopened day
+    same_day = [unopened(5, "visitor_confirmation"), unopened(5), unopened(4)]
+    assert rules(same_day)["mode"] == "daily"
+    assert rules(same_day + [unopened(3)])["mode"] == "weekly"
+
+
+def test_an_open_house_invite_counts_as_one_weekly_email():
+    daily = [unopened(20), unopened(19), unopened(18)]
+    assert rules(daily + [unopened(12, "visitor_confirmation")])["mode"] == "weekly"
+    assert rules(daily + [unopened(12, "visitor_confirmation"), unopened(5, WEEKLY_TEMPLATE)])["mode"] == "off"
+
+
+def test_an_open_puts_them_back_on_daily():
+    emails = [unopened(20), unopened(19), unopened(18), unopened(11, WEEKLY_TEMPLATE), unopened(4, WEEKLY_TEMPLATE)]
+    d = decide(emails, manual=None, reset_at=None, last_engaged=NOW - timedelta(days=2), now=NOW)
+    assert d["mode"] == "daily"
 
 
 def test_a_chosen_weekly_stays_weekly_however_many_go_unopened():

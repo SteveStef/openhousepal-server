@@ -240,11 +240,15 @@ async def email_log(email: Optional[str] = None, q: Optional[str] = None, limit:
     rows = (await db.execute(stmt.order_by(ClientEmail.sent_at.desc().nullslast(), ClientEmail.created_at.desc()).offset(offset).limit(limit))).scalars().all()
     emails = {r.recipient_email for r in rows}
     leads = await _who(db, user, emails)
+    # What each email had in it + its photo (owner, 11/18) - unopened ones too.
+    from app.services.email_contents_service import contents_for
+    contents = await contents_for(db, list(rows))
     since = func.now() - func.make_interval(0, 0, 0, 30)
     stats = (await db.execute(select(func.count(), func.count(ClientEmail.opened_at), func.count(ClientEmail.clicked_at)).where(
         ClientEmail.owner_id == user.id, ClientEmail.status == "sent", ClientEmail.sent_at >= since))).one()
     return {
-        "emails": [{**ce.email_out(r), "lead_id": (leads.get(r.recipient_email) or {}).get("id"), "name": (leads.get(r.recipient_email) or {}).get("name")} for r in rows],
+        "emails": [{**ce.email_out(r), "contents": contents.get(r.id), "lead_id": (leads.get(r.recipient_email) or {}).get("id"),
+                    "name": (leads.get(r.recipient_email) or {}).get("name")} for r in rows],
         "total": total,
         "stats_30d": {"sent": stats[0], "opened": stats[1], "clicked": stats[2],
                       "open_rate": round(100 * stats[1] / stats[0]) if stats[0] else None,
@@ -334,5 +338,7 @@ async def email_detail(email_id: str, db: AsyncSession = Depends(get_db), user: 
     rec = await db.get(ClientEmail, email_id)
     if rec is None or rec.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Email not found")
-    viewed = [] if rec.about else await li._viewed_after(db, user.id, rec.recipient_email, rec.sent_at, limit=6)
-    return {**ce.email_out(rec), "viewed_after": viewed}
+    from app.services.email_contents_service import contents_for
+    contents = (await contents_for(db, [rec])).get(rec.id)
+    viewed = [] if (contents or {}).get("homes") else await li._viewed_after(db, user.id, rec.recipient_email, rec.sent_at, limit=6)
+    return {**ce.email_out(rec), "contents": contents, "viewed_after": viewed}

@@ -684,12 +684,14 @@ async def task_counts(
     )
     tasks = rows.scalars().all()
     buckets = [tasks_service.compute_bucket(t) for t in tasks]
+    tomorrow = datetime.now(timezone.utc).astimezone(tasks_service.EASTERN).date() + timedelta(days=1)
     return TaskCounts(
         overdue=buckets.count("overdue"),
         today=buckets.count("today"),
         upcoming=buckets.count("upcoming"),
         someday=buckets.count("someday"),
         open_total=len(tasks),
+        tomorrow=sum(1 for t, b in zip(tasks, buckets) if b == "upcoming" and tasks_service.task_day(t) == tomorrow),
     )
 
 

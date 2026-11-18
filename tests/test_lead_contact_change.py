@@ -206,7 +206,7 @@ async def test_ignored_weekly_emails_hold_and_showcase_stays_asleep_until_yes():
         ev = (await db.execute(select(LeadEvent).where(LeadEvent.lead_id == s["lead"]))).scalars().all()
         for e in ev:
             e.occurred_at = datetime.now(timezone.utc) - timedelta(days=90)
-        for i in range(ce.WEEKLY_STRIKES):
+        for i in range(ce.STRIKE_DAYS + ce.WEEKLY_STRIKES):   # 3 daily, then 2 weekly (owner, 11/18)
             await _sent(db, s["agent"], s["old"], 3 + 7 * i, template=ce.WEEKLY_TEMPLATE)
         await db.commit()
     old_st = await _status(s, s["old"])

@@ -13,10 +13,12 @@ The rules (user, 10/06): mailbox providers rank a sender by whether people open 
 we stop sending automatic updates to people who never open them.
 
   daily   the normal state.
-  weekly  they left emails unopened on STRIKE_DAYS different days (each given GRACE to be opened) -
-          the daily Showcase digest becomes one weekly digest, Spotlight alerts at most one a week.
-  off     they also left WEEKLY_STRIKES weekly digests unopened - no automatic emails at all, and
-          their Showcases with this agent go to sleep (showcase_sleep.py).
+  weekly  they left emails unopened on STRIKE_DAYS (3) different days in a row (each given GRACE to be
+          opened) - the daily Showcase digest becomes one weekly digest, Spotlight alerts at most one
+          a week. Any tracked email counts, an open house thank-you / invite too (once).
+  off     then WEEKLY_STRIKES (2) more went unopened (each on its own day) - no automatic emails at
+          all, and their Showcases with this agent go to sleep (showcase_sleep.py). So at most 5
+          emails ever go unopened (owner, 11/18).
 
 Any sign of life - opening or clicking an email, using their Showcase, signing in at an open house -
 puts them straight back on daily (the count starts again from there). The agent can turn a person
@@ -48,8 +50,10 @@ TRACKED_TEMPLATES = AUTO_TEMPLATES | {
 # href="{{ ... }}"; unsubscribe, mailto: and tel: links are never wrapped).
 LINK_VARS = ("showcase_link", "collection_link", "site_url")
 
+# Owner, 11/18: 3 unopened in a row (sent on 3 different days) -> weekly; then 2 unopened weekly
+# ones -> off (their Showcase can go to sleep) until they open one, then straight back to daily.
 STRIKE_DAYS = 3
-WEEKLY_STRIKES = 5
+WEEKLY_STRIKES = 2
 GRACE = timedelta(hours=12)
 WEEKLY_GAP = timedelta(days=6, hours=12)
 BIWEEKLY_GAP = timedelta(days=13, hours=12)
@@ -148,15 +152,18 @@ def decide(emails: list[dict], *, manual: Optional[str], reset_at: Optional[date
     unopened = [e for e in emails
                 if e.get("sent_at") and (start is None or e["sent_at"] > start) and e["sent_at"] <= now - GRACE
                 and not e.get("opened_at") and not e.get("clicked_at")]
-    days = {_day(e["sent_at"]) for e in unopened}
-    weekly = sum(1 for e in unopened if e.get("template") == WEEKLY_TEMPLATE)
+    days = sorted({_day(e["sent_at"]) for e in unopened})
+    # Owner, 11/18: the first STRIKE_DAYS unopened days put them on weekly; every unopened day after
+    # that is one of the weekly emails (a weekly update, a Spotlight alert, an open house invite -
+    # each counts once). WEEKLY_STRIKES of those -> off: at most 5 emails ever go unopened.
+    weekly = max(0, len(days) - STRIKE_DAYS)
     out = {"unopened": len(unopened), "unopened_days": len(days), "weekly_unopened": weekly}
     if weekly >= WEEKLY_STRIKES:
         return {**out, "mode": "off", "code": "weekly_unopened",
-                "reason": f"Didn't open {weekly} weekly emails in a row, so automatic emails stopped. They restart by themselves when this person opens an email or uses their Showcase."}
+                "reason": f"Didn't open {len(unopened)} emails in a row (3 daily, then {weekly} weekly), so automatic emails stopped and their Showcase can go to sleep. They're back on daily by themselves when this person opens an email or uses their Showcase."}
     if len(days) >= STRIKE_DAYS:
         return {**out, "mode": "weekly", "code": "unopened_days",
-                "reason": f"Didn't open {len(unopened)} emails sent on {len(days)} different days, so updates switched to one email a week. Back to daily as soon as they open one."}
+                "reason": f"Didn't open {len(unopened)} emails sent on {len(days)} different days, so updates switched to one email a week. If {WEEKLY_STRIKES - weekly} more {'goes' if WEEKLY_STRIKES - weekly == 1 else 'go'} unopened, automatic emails stop. Back to daily as soon as they open one."}
     return {**out, "mode": "daily", "code": "ok", "reason": None}
 
 
@@ -283,16 +290,16 @@ async def _announce(db, owner_id: str, email: str, old: str, new: str, reason: s
     who = _first(name, email)
     lead = await _lead(db, owner_id, email)
     if new == "weekly":
-        source, title, msg = "email_weekly", f"{who}: emails now weekly", f"{who} hasn't opened their last few emails, so Showcase updates now go once a week. That keeps your emails out of junk."
+        source, title, msg = "email_weekly", f"{who}: emails now weekly", f"{who} hasn't opened their last {STRIKE_DAYS} emails, so Showcase updates now go once a week. If {WEEKLY_STRIKES} weekly ones go unopened too, automatic emails stop until {who} opens one. That keeps your emails out of junk."
         if still_using:
             msg += f" {who} keeps using their Showcase, so it stays open."
     elif new == "off":
         if still_using and not slept:
-            source, title, msg = "email_paused", f"{who}: automatic emails stopped", f"{who} didn't open {WEEKLY_STRIKES} weekly emails in a row, so automatic emails stopped - but {who} keeps using their Showcase, so it stays open and keeps updating."
+            source, title, msg = "email_paused", f"{who}: automatic emails stopped", f"{who} didn't open {STRIKE_DAYS + WEEKLY_STRIKES} emails in a row (the last {WEEKLY_STRIKES} weekly), so automatic emails stopped - but {who} keeps using their Showcase, so it stays open and keeps updating."
         elif slept:
-            source, title, msg = "email_paused", f"{who}: Showcase asleep", f"{who} didn't open {WEEKLY_STRIKES} weekly emails in a row, so automatic emails stopped and their Showcase went to sleep (Showcases -> Inactive). It wakes up by itself if {who} opens it or an old email."
+            source, title, msg = "email_paused", f"{who}: Showcase asleep", f"{who} didn't open {STRIKE_DAYS + WEEKLY_STRIKES} emails in a row (the last {WEEKLY_STRIKES} weekly), so automatic emails stopped and their Showcase went to sleep (Showcases -> Inactive). It wakes up by itself if {who} opens it or an old email."
         else:
-            source, title, msg = "email_paused", f"{who}: automatic emails stopped", f"{who} didn't open {WEEKLY_STRIKES} weekly emails in a row, so automatic emails stopped. They restart by themselves if {who} opens one or visits their Showcase."
+            source, title, msg = "email_paused", f"{who}: automatic emails stopped", f"{who} didn't open {STRIKE_DAYS + WEEKLY_STRIKES} emails in a row (the last {WEEKLY_STRIKES} weekly), so automatic emails stopped. They restart by themselves if {who} opens one or visits their Showcase."
     else:
         source, title, msg = "email_resumed", f"{who}: emails back to daily", f"{who} {trigger or 'is active again'}, so their updates are back to normal."
     if lead is not None:
@@ -424,7 +431,7 @@ async def before_send(owner_id: Optional[str], to: Optional[str], template: str,
         return None, variables
 
 
-_ABOUT_KEYS = ("street_address", "city", "state", "image", "price", "beds", "baths", "sqft", "is_price_drop", "old_price", "new_price")
+_ABOUT_KEYS = ("street_address", "city", "state", "image", "price", "beds", "baths", "sqft", "is_price_drop", "old_price", "new_price", "kind")
 
 
 def about_from(variables: dict) -> list[dict]:
@@ -445,10 +452,16 @@ def about_from(variables: dict) -> list[dict]:
             addr = variables.get("property_address") or variables.get("home_address") or variables.get("street")
             if isinstance(addr, str) and addr.strip():
                 row = {"street_address": addr.strip()[:200]}
-                img = variables.get("property_image") or variables.get("home_image")
+                img = variables.get("property_image") or variables.get("home_image") or variables.get("hero_image")
                 if isinstance(img, str) and img.startswith("http"):
                     row["image"] = img
-                out.append(row)
+                # A Spotlight alert: what changed about the home (owner, 11/18 - shown under the email).
+                if variables.get("price_changed"):
+                    row.update({"kind": "price_drop" if variables.get("price_down") else "price_change",
+                                "old_price": variables.get("old_price"), "new_price": variables.get("new_price"), "price": variables.get("new_price")})
+                elif str(variables.get("headline") or "").lower() in ("sold", "under contract", "new open house"):
+                    row["kind"] = {"sold": "sold", "under contract": "pending"}.get(str(variables["headline"]).lower(), "open_house")
+                out.append({k: v for k, v in row.items() if v not in (None, "")})
     except Exception:  # noqa: BLE001 - nice to have; never stops an email
         return []
     return [{k: (str(v)[:300] if isinstance(v, str) else v) for k, v in r.items()} for r in out[:8]]
@@ -1037,6 +1050,14 @@ async def people(db, owner_id: str) -> dict[str, dict]:
             "last_clicked_at": max([r.clicked_at for r in rs if r.clicked_at] or [None]).isoformat() if any(r.clicked_at for r in rs) else None,
             # Mailgun said their address bounced / they marked it as spam - shown as a red problem line.
             "problem": {"delivery": pr.delivery, "note": pr.delivery_note, "at": pr.delivery_at.isoformat() if pr.delivery_at else None} if pr else None,
+            # The card's breakdown (owner, 11/18): the same 90 days as the open rate, automatic vs
+            # personal, and where they are in the 3 daily -> 2 weekly -> off rule.
+            "stats_90": {"sent": len(sent90), "opened": opened90, "clicked": sum(1 for r in sent90 if r.clicked_at),
+                         "click_rate": _rate(len(sent90), sum(1 for r in sent90 if r.clicked_at)),
+                         "auto": sum(1 for r in sent90 if r.kind == "auto"), "personal": sum(1 for r in sent90 if r.kind != "auto"),
+                         "opens_total": sum(int(r.open_count or 0) for r in sent90), "clicks_total": sum(int(r.click_count or 0) for r in sent90)},
+            "unopened_days": d.get("unopened_days", 0), "weekly_unopened": d.get("weekly_unopened", 0),
+            "first_sent_at": rs[-1].sent_at.isoformat() if rs else None,
         }
     return out
 

@@ -99,3 +99,5 @@ class TaskCounts(BaseModel):
     upcoming: int
     someday: int
     open_total: int
+    # Open follow-ups on tomorrow's (Eastern) calendar day - the Dash's "N follow-ups tomorrow" button.
+    tomorrow: int = 0

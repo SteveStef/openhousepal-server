@@ -174,7 +174,8 @@ _STEP_WORDS = {
     "search_properties": "Searching the MLS", "get_property_detail": "Reading the listing", "look_up_agent": "Looking up that agent",
     "get_property_matches": "Matching homes", "get_showcase_info": "Opening the Showcase", "search_showcase_homes": "Reading every listing in the Showcase", "search_homes_for_sale": "Setting up a home search", "get_similar_properties": "Finding similar homes",
     "get_cma_summary": "Reading the CMA", "get_agent_activity_summary": "Reading your activity", "get_priority_summary": "Checking what needs you",
-    "show_homes": "Pulling up the homes",
+    "show_homes": "Pulling up the homes", "show_leads": "Pulling up their leads", "get_worth_a_checkin": "Checking who's worth a check-in",
+    "get_things_to_do": "Checking what's on your plate",
 }
 
 
@@ -262,8 +263,8 @@ async def run_turn(
     showcase_cards: Dict[str, dict] = {}
     usage_state = {"model": config["model"], "input_tokens": 0, "output_tokens": 0, "tool_call_count": 0, "tool_names": []}
     # Lookups this plan gets + things it can set up for a Confirm tap (ai_actions.py, 10/30).
-    from app.services.ai import ai_home_cards
-    tools = ai_tools.tools_for(current_user) + ai_actions.action_tools_for(current_user) + ai_ui_tools.UI_TOOL_DEFINITIONS + [ai_home_cards.TOOL, ai_showcase_cards.MARK_TOOL]
+    from app.services.ai import ai_home_cards, ai_lead_cards
+    tools = ai_tools.tools_for(current_user) + ai_actions.action_tools_for(current_user) + ai_ui_tools.UI_TOOL_DEFINITIONS + [ai_home_cards.TOOL, ai_lead_cards.TOOL, ai_showcase_cards.MARK_TOOL]
 
     # The agent's own listings and sales, known up front (owner, 10/30: it guessed "your newest listing"
     # from days on market, then lost it on a follow-up) - newest first, with each one's listing key so
@@ -295,6 +296,7 @@ async def run_turn(
                     "A Confirm card exists ONLY when you call an action tool in this turn - never type a card, “[Card: …]” or “tap Confirm” without calling the tool. "
                     "AI usage is ONLY ever a percent of their monthly allowance - never say a dollar amount, cost or the allowance's size. "
                     "For 'what should I do / anything I should do', call get_things_to_do and answer from it in that order (overdue follow-ups first, then what's waiting on them) - at most 3 things, one short line each, and a show_link button to the first one's page (/leads/tasks for follow-ups); unseen Showcase matches are never the answer. "
+                    "Whenever the answer is about people from their leads (that list, who to reach out to, one lead), call show_leads with their lead_ids instead of describing them in text. "
                     "Don't keep bringing up an earlier topic (a wrong design, an old alert) once it's been answered."
                     + mine_text,
         }
@@ -321,10 +323,15 @@ async def run_turn(
     listed = False
     homes_nudged = False
     seen_homes: dict = {}  # listing_key -> "602 holywell" for every home a lookup returned this turn
+    leads_nudged = False
+    seen_leads: dict = {}  # lead_id -> "jane smith" for every lead a lookup returned this turn
     _progress(current_user.id, "Thinking")
 
+    def _lead_cards_made() -> bool:
+        return any(r.get("record_type") == "leads" for r in all_refs)
+
     async def _run() -> str:
-        nonlocal nudged, promised, listed, homes_nudged
+        nonlocal nudged, promised, listed, homes_nudged, leads_nudged
         for _ in range(config["max_iterations"]):
             response = await _call_model()
             usage_state["input_tokens"] += response.usage.input_tokens
@@ -360,7 +367,7 @@ async def run_turn(
                 # In a long chat it sometimes says "tap Confirm on the card" without making one
                 # (owner's test, 11/01) - one nudge to make the real card, then whatever it says.
                 # ("...on the card" about the Home search card the last reply showed is true - no nudge.)
-                if not nudged and _CLAIMS_CARD.search(text or "") and not showcase_cards and "Home search card" not in user_message and not any(r.get("record_type") in ("action", "homes", "hosting", "home_search", "showcase_homes") for r in all_refs):
+                if not nudged and _CLAIMS_CARD.search(text or "") and not showcase_cards and "Home search card" not in user_message and not any(r.get("record_type") in ("action", "homes", "leads", "hosting", "home_search", "showcase_homes") for r in all_refs):
                     # (11/09: a fresh chat's Home search card wasn't counted, so the reminder made it say
                     # "the search card is already on your reply from my last message")
                     nudged = True
@@ -386,6 +393,33 @@ async def run_turn(
                         _, entry = await ai_home_cards.run(db, current_user, {"which": "homes", "listing_keys": named[:40]})
                         if entry:
                             all_refs.append(entry)
+                # People it names show as lead cards, never a wall of text (owner, 11/18) - same rules as
+                # homes: two or more written out without cards -> one nudge to call show_leads; cards made
+                # but 3+ still written out -> one nudge to say it short; one named -> its card is added.
+                # (Not when a Confirm card or a Showcase card already is the answer about that person.)
+                if seen_leads and text and not showcase_cards and not any(r.get("record_type") == "action" for r in all_refs):
+                    lead_cards = _lead_cards_made()
+                    named = ai_lead_cards.mentioned(text, seen_leads)
+                    restated = (lead_cards or len(named) == 1) and ai_lead_cards.restates_card(text)
+                    if restated and not lead_cards and not leads_nudged:
+                        # one person, card facts typed out ("Status: New / Source: Open house"): their card
+                        # goes under the reply now, and the rewrite below leaves those lines to it
+                        _, entry = await ai_lead_cards.run(db, current_user, {"groups": [{"leads": [{"lead_id": named[0]}]}]})
+                        if entry:
+                            all_refs.append(entry)
+                            lead_cards = True
+                        else:
+                            restated = False
+                    if (len(named) >= (3 if lead_cards else 2) or restated) and not leads_nudged and usage_state["tool_call_count"] < config["max_tool_calls_per_turn"] - 1:
+                        leads_nudged = True
+                        messages.append({"role": "assistant", "content": response.content})
+                        messages.append({"role": "user", "content": (ai_lead_cards.SHORTEN if len(named) >= 3 else ai_lead_cards.SHORTEN_ONE) if lead_cards else ai_lead_cards.NUDGE})
+                        _progress(current_user.id, "Tidying the answer")
+                        continue
+                    if named and not lead_cards:
+                        _, entry = await ai_lead_cards.run(db, current_user, {"groups": [{"leads": [{"lead_id": i} for i in named[:ai_lead_cards.MAX_LEADS]]}]})
+                        if entry:
+                            all_refs.append(entry)
                 return text or "I wasn't able to come up with a response. Please try rephrasing your question."
 
             tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
@@ -393,7 +427,12 @@ async def run_turn(
             said = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
             # Only buttons (choices / Go there) on a reply that's already written: show them with
             # it and stop - another model call would just repeat the text.
-            only_ui = said and all(b.name in ai_ui_tools.UI_TOOL_NAMES or b.name == ai_home_cards.NAME for b in tool_use_blocks)
+            only_ui = said and all(b.name in ai_ui_tools.UI_TOOL_NAMES or b.name in (ai_home_cards.NAME, ai_lead_cards.NAME) for b in tool_use_blocks)
+            # ...unless that text writes the people out anyway (3+ named next to their cards): then the
+            # tool result's note gets one more call to say it in a line or two.
+            if only_ui and any(b.name == ai_lead_cards.NAME for b in tool_use_blocks) and (
+                    len(ai_lead_cards.mentioned(said, seen_leads)) >= 3 or ai_lead_cards.restates_card(said)):
+                only_ui = False
 
             tool_results = []
             for block in tool_use_blocks:
@@ -424,6 +463,17 @@ async def run_turn(
                         all_refs.append(entry)
                     tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(result, default=str)})
                     continue
+                if block.name == ai_lead_cards.NAME:
+                    # The people it's talking about as lead cards under the reply (owner, 11/18) - one set
+                    # per reply: asked again after a nudge, the new one replaces the first.
+                    result, entry = await ai_lead_cards.run(db, current_user, args)
+                    if entry:
+                        all_refs[:] = [r for r in all_refs if r.get("record_type") != "leads"]
+                        all_refs.append(entry)
+                        for name, lid in ai_lead_cards.lead_names(entry):
+                            seen_leads.setdefault(lid, ai_lead_cards._norm(name))
+                    tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(result, default=str)})
+                    continue
                 if block.name in ai_ui_tools.UI_TOOL_NAMES:
                     # Choices / "Go there" buttons shown under the reply - nothing to look up or change.
                     result, entry = ai_ui_tools.run(block.name, args)
@@ -445,6 +495,8 @@ async def run_turn(
                 result = await ai_tools.execute_tool(db, current_user, block.name, args, config)
                 if isinstance(result, (dict, list)) and block.name not in ai_showcase_cards.CARD_TOOLS:
                     ai_home_cards.collect(result, seen_homes)
+                if isinstance(result, (dict, list)):
+                    ai_lead_cards.collect(result, seen_leads)
                 # The AI reading of listings a tool did (ai_home_reader) counts on this answer's usage.
                 if isinstance(result, dict) and isinstance(result.get("_ai_cost"), dict):
                     spent = result.pop("_ai_cost")
@@ -498,7 +550,7 @@ async def run_turn(
         kinds = {r.get("record_type") for r in all_refs}
         if "action" in kinds:
             return "Here it is - check the details on the card below, then tap the button to send it."
-        if kinds & {"homes", "hosting", "home_search", "showcase_homes"}:
+        if kinds & {"homes", "leads", "hosting", "home_search", "showcase_homes"}:
             return "Here's what I found - it's on the cards below."
         return "I wasn't able to finish researching that within my turn budget. Try asking a more specific question, or split it into smaller questions."
 
@@ -631,7 +683,7 @@ def _no_pretend_cards(text: str, refs: List[dict]) -> str:
 
 # A sentence about how the chat works rather than the answer ("The sales list is already in my context,
 # so I'll show those as cards" - 11/02). Agents never need to hear it.
-_NARRATION = re.compile(r"[^.!?\n]*\b(?:in my context|my context|as (?:home |small )?cards|show (?:them|those|these) (?:as|in) cards|"
+_NARRATION = re.compile(r"[^.!?\n]*\b(?:in my context|my context|as (?:home |small |lead )?cards|show (?:them|those|these) (?:as|in) cards|"
                         r"I can show them|I'll show (?:them|those|these)\b)[^.!?\n]*[.!?]?[ \t]*", re.I)
 
 

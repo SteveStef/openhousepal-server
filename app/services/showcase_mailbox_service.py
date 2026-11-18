@@ -51,8 +51,10 @@ async def quiet_activity(db: AsyncSession, owner_id: str, collections: List[Coll
     )).all()
     email_ids = [e.source_id for e, _ in rows if e.source_type in EMAIL_TYPES and e.source_id]
     templates: Dict[str, str] = {}
+    recs: Dict[str, ClientEmail] = {}
     if email_ids:
-        templates = dict((await db.execute(select(ClientEmail.id, ClientEmail.template).where(ClientEmail.id.in_(email_ids)))).all())
+        recs = {r.id: r for r in (await db.execute(select(ClientEmail).where(ClientEmail.id.in_(email_ids)))).scalars().all()}
+        templates = {i: r.template for i, r in recs.items()}
     picked = []
     for ev, email in rows:
         if ev.source_type in EMAIL_TYPES:
@@ -66,12 +68,25 @@ async def quiet_activity(db: AsyncSession, owner_id: str, collections: List[Coll
         if len(picked) >= limit:
             break
     photos = await _photos(db, list(by_id), {_street(e.property_address) for e, _ in picked if e.property_address})
-    return [{
-        "id": f"ev-{ev.id}", "type": KIND[ev.source_type], "title": ev.summary, "message": ev.summary,
-        "collection_id": col.id, "showcase_name": col.visitor_name or col.name, "property_id": None,
-        "property_address": ev.property_address, "photo": photos.get(_street(ev.property_address)),
-        "link": f"/showcases?showcase={col.id}", "is_read": True, "created_at": ev.occurred_at.isoformat(),
-    } for ev, col in picked]
+    # The email behind an "Opened a Showcase email" row: what it had in it and its photo (owner, 11/18).
+    from app.services.email_contents_service import contents_for
+    shown = {ev.source_id for ev, _ in picked if ev.source_type in EMAIL_TYPES and ev.source_id in recs}
+    contents = await contents_for(db, [recs[i] for i in shown])
+    out = []
+    for ev, col in picked:
+        row = {
+            "id": f"ev-{ev.id}", "type": KIND[ev.source_type], "title": ev.summary, "message": ev.summary,
+            "collection_id": col.id, "showcase_name": col.visitor_name or col.name, "property_id": None,
+            "property_address": ev.property_address, "photo": photos.get(_street(ev.property_address)),
+            "link": f"/showcases?showcase={col.id}", "is_read": True, "created_at": ev.occurred_at.isoformat(),
+        }
+        if ev.source_type in EMAIL_TYPES and ev.source_id in recs:
+            from app.services.client_email_service import email_out
+            c = contents.get(ev.source_id) or {}
+            row.update({"email_id": ev.source_id, "email": {**email_out(recs[ev.source_id]), "contents": c or None},
+                        "photo": c.get("photo") or row["photo"]})
+        out.append(row)
+    return out
 
 
 def merged(notes: List[dict], quiet: List[dict], limit: int = 120) -> List[dict]:
@@ -95,4 +110,6 @@ async def mailbox(db: AsyncSession, collection: Collection, activity_types: Sequ
         "photo": photos.get(n.property_id), "link": n.link, "is_read": n.is_read, "created_at": n.created_at.isoformat(),
     } for n in notes]
     quiet = await quiet_activity(db, collection.owner_id, [collection], since)
-    return {"homes": homes, "activity": merged(note_rows, quiet), "new_matches": sum(1 for h in homes if h.get("is_new"))}
+    return {"homes": homes, "activity": merged(note_rows, quiet), "new_matches": sum(1 for h in homes if h.get("is_new")),
+            # "All emails" opens the Email Tracker on just this client (owner, 11/18).
+            "client_email": _norm(collection.visitor_email) or None}

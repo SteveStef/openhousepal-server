@@ -8,10 +8,10 @@ down for everyone. So, for emails TO agents (email_agent: briefings, alerts, rou
             button (`link`) goes through /e/a/<id>/go, which counts as an open too (images blocked).
             The EmailLog row id is the token.
   normal    the usual state.
-  weekly    FIRST_STRIKE tracked emails in a row unopened (each given GRACE to be opened): non-critical
+  weekly    tracked emails unopened in a row on FIRST_STRIKE (3) different days (each given GRACE): non-critical
             emails (DIGESTIBLE - the daily digest, round-ups) wait for one weekly summary; Dash notice
             "Your daily digest emails went to weekly" (That's fine / Make daily again) + a bell alert.
-  off       SECOND_STRIKE weekly summaries unopened: routine emails stop altogether ("asleep") until
+  off       SECOND_STRIKE (2) weekly summaries unopened: routine emails stop altogether ("asleep") until
             they open any of our emails or tap Turn back on. CRITICAL emails - a new lead, a tour /
             showing request, an RSVP, account and billing notices - always go out at once, whatever the state.
   (warned)  an older state (10/24-11/11) - read as normal now.
@@ -42,10 +42,12 @@ from app.models.database import AgentEmailHealth, EmailLog, Notification, User
 
 logger = logging.getLogger(__name__)
 
-# Owner, 11/11: 4 unopened in a row -> weekly (one summary a week); then 3 weekly summaries unopened
-# -> asleep (routine emails stop) until they open any of our emails or tap "Turn back on".
-FIRST_STRIKE = 4            # unopened in a row -> weekly
-SECOND_STRIKE = 3           # weekly summaries unopened -> asleep
+# Owner, 11/18 (was 4 / 3 since 11/11): unopened in a row on 3 different days -> weekly (one summary
+# a week); then 2 weekly summaries unopened -> asleep (routine emails stop) until they open any of
+# our emails or tap "Turn back on" - the same rule as the agent's own client emails.
+FIRST_STRIKE = 3            # unopened in a row, on this many different days -> weekly
+SECOND_STRIKE = 2           # weekly summaries unopened -> asleep
+from app.services.tasks_service import EASTERN as _EASTERN  # noqa: E402
 GRACE = timedelta(hours=24)  # an email only counts as unopened a day after it was sent
 SCANNER_WINDOW = timedelta(seconds=20)
 SUMMARY_GAP = timedelta(days=7)
@@ -163,6 +165,9 @@ def decide(emails: list[dict], *, mode: str = "normal", warned_at: Optional[date
                 and e["sent_at"] <= now - GRACE and (start is None or e["sent_at"] > start)
                 and not e.get("opened_at") and not e.get("clicked_at")]
     n = len(unopened)
+    # Owner, 11/18: unopened on FIRST_STRIKE different days in a row (an agent gets several a day -
+    # one busy day isn't "ignoring us").
+    n_days = len({e["sent_at"].astimezone(_EASTERN).date() for e in unopened})
     engaged_since = lambda t: bool(t and start and start > t)  # noqa: E731
     # Weekly summaries left unopened since the switch to weekly (the summary is the only routine email then).
     summaries = [e for e in unopened if weekly_at and e["sent_at"] > weekly_at and e.get("template") == SUMMARY_TEMPLATE]
@@ -170,7 +175,7 @@ def decide(emails: list[dict], *, mode: str = "normal", warned_at: Optional[date
         if mode == "off" or len(summaries) >= SECOND_STRIKE:
             return {"mode": "off", "unopened": n, "after_warning": len(summaries), "code": "off"}
         return {"mode": "weekly", "unopened": n, "after_warning": len(summaries), "code": "weekly"}
-    if n >= FIRST_STRIKE:
+    if n_days >= FIRST_STRIKE:
         return {"mode": "weekly", "unopened": n, "after_warning": 0, "code": "weekly"}
     return {"mode": "normal", "unopened": n, "after_warning": 0, "code": "ok"}
 
@@ -230,13 +235,13 @@ async def refresh(db, user_id: str, *, announce: bool = True) -> dict:
             h.warned_at = now
             if announce:
                 _bell(db, user_id, "Are our emails landing in junk?",
-                      f"We've emailed you, but you haven't opened our last {FIRST_STRIKE} emails. They may be landing in junk/spam - "
+                      f"We've emailed you, but you haven't opened our emails on {FIRST_STRIKE} different days. They may be landing in junk/spam - "
                       "please find one, mark it Not spam and move it to your inbox.", f"warned|{now.date().isoformat()}")
         elif d["mode"] == "weekly":
             h.weekly_at = now
             if announce:
                 _bell(db, user_id, "Your daily digest emails went to weekly",
-                      f"You haven't opened our last {FIRST_STRIKE} emails, so routine ones (your daily digest, round-ups) now come as one weekly summary. "
+                      f"You haven't opened our emails on {FIRST_STRIKE} different days, so routine ones (your daily digest, round-ups) now come as one weekly summary. "
                       "New leads, tour requests and account emails still arrive right away. If they're landing in junk or spam, move one to your inbox.",
                       f"weekly|{now.date().isoformat()}")
         elif d["mode"] == "off":

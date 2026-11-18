@@ -1,6 +1,6 @@
 """Showcases that go to sleep (user, 10/22).
 
-A client who ignored 5 weekly emails in a row (client_email_service.decide -> "off") stops getting
+A client who left 5 emails unopened in a row - 3 daily, then 2 weekly (client_email_service.decide -> "off", owner 11/18) - stops getting
 automatic emails, and - unless the agent is still minding them (starred the Showcase, or in the last
 2 weeks opened it, opened the lead, marked them contacted, wrote a note or checked off a follow-up;
 the agent still gets that Showcase's updates in their briefing) - their Showcases go to sleep: status INACTIVE with
@@ -31,8 +31,8 @@ NO_RESPONSE = "no_response"
 AGENT = "agent"
 AGENT_WATCH = timedelta(days=14)   # the agent opened it this recently -> it stays awake
 # The client used one of their Showcases (looked at homes, liked, commented, asked for a tour) this
-# recently -> it stays awake even though they ignore the emails (user, 10/24). The span of the 3
-# ignored weekly emails; once they stop using it for that long it can fall asleep as usual.
+# recently -> it stays awake even though they ignore the emails (user, 10/24). About the span of the
+# ignored emails (3 days + 2 weekly); once they stop using it for that long it can fall asleep as usual.
 CLIENT_USING = timedelta(days=21)
 
 

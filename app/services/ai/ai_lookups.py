@@ -132,12 +132,35 @@ async def _things_to_do(db: AsyncSession, user: User, args: dict) -> Any:
     ok, data = await lookup(user, "/api/v1/rundown/today")
     if not ok or not isinstance(data, dict):
         return data
+    # Who each item is about (lead_id), so the people show as lead cards (show_leads, 11/18): a follow-up's
+    # lead comes from its task (the link is /leads/tasks?task=<id>), anything else from a /leads/<id> link.
+    task_ids = {m.group(1) for f in (data.get("followups") or [])[:10] for m in [re.search(r"[?&]task=([A-Za-z0-9-]{8,})", str(f.get("link") or ""))] if m}
+    task_lead: dict = {}
+    if task_ids:
+        from app.models.database import AgentTask, Lead
+        try:
+            rows = (await db.execute(select(AgentTask.id, AgentTask.lead_id, Lead.name).join(Lead, Lead.id == AgentTask.lead_id)
+                                     .where(AgentTask.owner_id == user.id, AgentTask.id.in_(task_ids)))).all()
+            task_lead = {r.id: (r.lead_id, r.name) for r in rows}
+        except Exception:  # noqa: BLE001 - the list still works without who it's about
+            await db.rollback()
+
+    def who(item: dict) -> dict:
+        link = str(item.get("link") or "")
+        m = re.search(r"[?&]task=([A-Za-z0-9-]{8,})", link)
+        if m and m.group(1) in task_lead:
+            lid, name = task_lead[m.group(1)]
+            return {"lead_id": lid, "lead_name": name}
+        m = re.search(r"/leads/([0-9a-fA-F-]{36})(?:$|[?#])", link)
+        return {"lead_id": m.group(1)} if m else {}
+
     return {
-        "follow_ups_due": [{"title": f.get("title"), "when": f.get("when"), "overdue": f.get("overdue")} for f in (data.get("followups") or [])[:10]],
-        "waiting_on_you": [{"title": a.get("title"), "detail": a.get("detail")} for a in (data.get("actions") or [])[:10]],
-        "client_asks": [{"title": a.get("title"), "detail": a.get("detail")} for a in (data.get("client_activity") or [])[:10]],
+        "follow_ups_due": [{"title": f.get("title"), "when": f.get("when"), "overdue": f.get("overdue"), **who(f)} for f in (data.get("followups") or [])[:10]],
+        "waiting_on_you": [{"title": a.get("title"), "detail": a.get("detail"), **who(a)} for a in (data.get("actions") or [])[:10]],
+        "client_asks": [{"title": a.get("title"), "detail": a.get("detail"), **who(a)} for a in (data.get("client_activity") or [])[:10]],
         "todays_numbers": {s.get("label"): s.get("value") for s in (data.get("stats") or []) if s.get("value")},
         "note": "Answer 'what should I do' from follow_ups_due, waiting_on_you and client_asks, in that order (overdue first). "
+                "Items with a lead_id are about that person: show them with show_leads (a heading like 'Overdue' / 'Today', the to-do as a point). "
                 "New Showcase matches are NOT a to-do - clients get them by email on their own; mention them only if asked.",
     }
 

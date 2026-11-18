@@ -42,7 +42,8 @@ def test_has_agent_only_with_note_or_own_listing():
     # the owner's case: says the note, at the listing - not "has an agent - your listing" as the reason
     assert r["headline"].startswith("You left a note on Jane at your listing, 417 Dogwood Ln: “Wants a first-floor")
     assert "Has an agent - your listing" in r["tags"]
-    assert r["gap"] == "You haven't reached out since they came to 417 Dogwood Ln on Oct 25"
+    assert r["gap"] == "You haven't reached out yet (2 weeks since they came in)"
+    assert r["origin"].startswith("Added to your leads on Oct 25")   # no origin event given here
 
 
 def test_reasons_lead_with_the_strongest():
@@ -140,3 +141,20 @@ def test_display_name_and_street_tidy():
     assert cs._street("1330 N Avignon Dr #, Gladwyne, PA") == "1330 N Avignon Dr"
     from app.services.tasks_service import _guest_first
     assert _guest_first("peter judd") == "Peter" and _guest_first("JOHN DOE") == "John" and _guest_first("DeShawn Lee") == "DeShawn"
+
+
+def test_every_checkin_says_how_they_came_in():
+    # owner 11/18: always from the lead's own first event - never the AI's words
+    at = days_ago(33)
+    o = lambda t, **kw: cs.origin_line({"type": t, "at": at, **kw}, days_ago(40), NOW)
+    assert o("open_house_visitor", street="1330 N Avignon Dr") == "Signed in at your 1330 N Avignon Dr open house on Oct 11"
+    assert o("form_submission", form="I'm Buying") == "Filled out your I'm Buying form on Oct 11"
+    assert o("form_submission", form="What's My Home Worth?") == "Filled out your “What's My Home Worth?” form on Oct 11"
+    assert o("property_website_inquiry", street="847 Lesley Rd") == "Asked about 847 Lesley Rd on your Spotlight on Oct 11"
+    assert o("property_page_tour_request", street="26 Old Gulph Rd", site=True) == "Asked for a tour of 26 Old Gulph Rd on your website on Oct 11"
+    assert o("showcase_view") == "Came in through their Showcase on Oct 11"
+    assert o("portal_lead", title="Zillow", street="26 Old Gulph Rd") == "Came in as a Zillow lead about 26 Old Gulph Rd on Oct 11"
+    assert cs.origin_line(None, days_ago(40), NOW) == "Added to your leads on Oct 4"
+    assert cs.date_phrase(datetime(2025, 9, 2, 16, tzinfo=timezone.utc), NOW) == "on Sep 2, 2025"
+    r = cs.evaluate(sig(notes=[note()], origin={"type": "form_submission", "at": days_ago(19), "form": "I'm Buying"}), NOW)
+    assert r["origin"] == "Filled out your I'm Buying form on Oct 25"

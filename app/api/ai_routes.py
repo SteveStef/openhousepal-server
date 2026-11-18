@@ -136,6 +136,13 @@ def _ids_note(m: AIMessage) -> str:
             continue
         seen.add(key)
         parts.append(f"{'lead_id' if key[0] == 'lead' else 'Showcase collection_id'} {key[1]}")
+    # The people on its lead cards (11/18) - "text the first one" needs who that was.
+    for t in m.tool_calls or []:
+        if isinstance(t, dict) and t.get("record_type") == "leads":
+            from app.services.ai.ai_lead_cards import lead_names
+            people = [f"{n} (lead_id {i})" for n, i in lead_names(t) if i and ("lead", i) not in seen][:8]
+            if people:
+                parts.append("lead cards shown, in order: " + ", ".join(people))
     # The Home search card under that reply, if the agent ran it - which homes it found.
     for t in m.tool_calls or []:
         if isinstance(t, dict) and t.get("record_type") == "home_search":

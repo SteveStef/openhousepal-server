@@ -155,6 +155,83 @@ class Signals:
     pre_approved: Optional[str] = None
     hot_email: Optional[str] = None           # subject of a price-drop / back-on-market email they opened
     hot_email_at: Optional[datetime] = None
+    # How they first came in (their oldest real event, all time) - see origin_line. None = added by hand.
+    origin: Optional[Dict[str, Any]] = None
+
+
+# ------------------------------------------------------------------ how they came in (owner, 11/18)
+# Every check-in says how the person first came in, from their own data - never the AI's words:
+# "Signed in at your 1330 N Avignon Dr open house on Oct 11", "Filled out your I'm Buying form on Oct 3".
+# Email tracking / email-setting events are never an origin (they only happen to an existing lead).
+NOT_ORIGIN = ("email_opened", "email_clicked", "email_weekly", "email_paused", "email_resumed",
+              "email_unsubscribed", "showcase_emails_off", "showcase_emails_on")
+_SHOWCASE_ACTIVITY = ("showcase_like", "showcase_dislike", "showcase_view", "showcase_opened", "showcase_refine",
+                      "showcase_search_changed", "property_comment")
+
+
+def date_phrase(dt: Optional[datetime], now: datetime) -> str:
+    """'on Oct 11' (Eastern day); the year is added only when it isn't this year."""
+    if dt is None:
+        return ""
+    d = _eastern(dt).date()
+    year = f", {d.year}" if d.year != _eastern(now).date().year else ""
+    return f"on {d.strftime('%b')} {d.day}{year}"
+
+
+def _form_words(title: str) -> str:
+    t = " ".join((title or "").split()).strip()
+    if not t:
+        return ""
+    if "?" in t or "!" in t:
+        t = f"“{t}”"
+    return t if t.lower().endswith(" form") else f"{t} form"
+
+
+def origin_line(o: Optional[Dict[str, Any]], created_at: Optional[datetime], now: datetime) -> str:
+    """One plain sentence: how this person first came in, with the date. Always returns something."""
+    added = f"Added to your leads {date_phrase(created_at, now)}".strip()
+    if not o:
+        return added
+    t, street, d = o.get("type") or "", o.get("street") or "", date_phrase(o.get("at"), now)
+    title = " ".join((o.get("title") or "").split())
+    form = _form_words(o.get("form") or "")
+    if t == "open_house_visitor":
+        return f"Signed in at your {street} open house {d}" if street else f"Signed in at one of your open houses {d}"
+    if t == "open_house_second_visit":
+        return f"Asked for a second visit to {street} after your open house {d}" if street else f"Asked for a second visit after your open house {d}"
+    if t == "open_house_disclosure":
+        return f"Asked for the seller disclosure at your {street} open house {d}" if street else f"Asked for a seller disclosure at your open house {d}"
+    if t in ("guest_pass_home", "guest_pass_activity"):
+        return f"Came in through your open house Guest Pass {d}"
+    if t == "form_submission":
+        return f"Filled out your {form} {d}" if form else f"Filled out one of your forms {d}"
+    if t == "form_partial":
+        return f"Started your {form} {d} (didn't finish)" if form else f"Started one of your forms {d} (didn't finish)"
+    if t == "invite_rsvp":
+        return f"RSVP'd to your {title} invite {d}" if title else f"RSVP'd to one of your invites {d}"
+    if t == "collection_visitor":
+        return f"Came in through a Showcase you made for them {d}"
+    if t == "property_tour":
+        return f"Asked for a showing of {street} in their Showcase {d}" if street else f"Asked for a showing in their Showcase {d}"
+    if t in _SHOWCASE_ACTIVITY:
+        return f"Came in through their Showcase {d}"
+    if t in ("property_website_inquiry", "property_website_tour_request"):
+        ask = "Asked for a tour of" if t.endswith("tour_request") else "Asked about"
+        return f"{ask} {street} on your Spotlight {d}" if street else f"Reached out on your Spotlight {d}"
+    if t in ("property_page_inquiry", "property_page_tour_request"):
+        ask = "Asked for a tour of" if t.endswith("tour_request") else "Asked about"
+        where = "your website" if o.get("site") else "your listing page"
+        return f"{ask} {street} on {where} {d}" if street else f"Reached out on {where} {d}"
+    if t == "blog_inquiry":
+        return f"Asked a question on your article “{note_snippet(title, 60)}” {d}" if title else f"Asked a question on one of your articles {d}"
+    if t == "website_google_signin":
+        return f"Signed in on your website with Google {d}"
+    if t == "portal_lead":
+        src = title or "portal"
+        return f"Came in as a {src} lead about {street} {d}" if street else f"Came in as a {src} lead {d}"
+    if t == "review_left":
+        return f"Left you a review {d}"
+    return added
 
 
 _SOON = ("right away", "asap", "1-3 months", "1–3 months", "0-3 months", "immediately")
@@ -281,13 +358,11 @@ def evaluate(s: Signals, now: datetime) -> Optional[Dict[str, Any]]:
         score += 4
 
     # How long since the agent reached out - always the last line.
-    first_visit = s.visits[-1] if s.visits else None
+    # (Where + when they came in is its own line now - origin - so this no longer repeats it.)
     if s.ever_contacted:
         gap = f"Last heard from you {when_phrase(touch, now)} ({gap_phrase(quiet_days)} ago)"
-    elif first_visit is not None and first_visit.get("street"):
-        gap = f"You haven't reached out since they came to {first_visit['street']} {when_phrase(first_visit['at'], now)}"
     else:
-        gap = f"You haven't reached out since they became a lead {when_phrase(created, now)}"
+        gap = f"You haven't reached out yet ({gap_phrase(quiet_days)} since they came in)"
 
     bits = [b for b in bits if b[1]]
     bits.sort(key=lambda b: -b[0])
@@ -297,7 +372,7 @@ def evaluate(s: Signals, now: datetime) -> Optional[Dict[str, Any]]:
     # they liked / commented on, no agent of their own). Those can be added in one tap, no AI.
     simple = not (s.notes or s.liked or s.commented) and s.represented != "yes"
     return {"score": int(round(score)), "headline": headline, "reasons": reasons[1:4], "tags": tags[:3],
-            "gap": gap, "simple": simple, "quiet_days": quiet_days}
+            "gap": gap, "simple": simple, "quiet_days": quiet_days, "origin": origin_line(s.origin, s.created_at, now)}
 
 
 def group_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -355,7 +430,7 @@ def _answer_any(snapshot: Any, *qids: str) -> Optional[str]:
 
 
 async def gather(db: AsyncSession, owner, lead_id: Optional[str] = None, now: Optional[datetime] = None) -> List[Signals]:
-    from app.models.database import AgentTask, ClientEmail, Lead, LeadEvent, LeadNote, OpenHouseEvent
+    from app.models.database import AgentForm, AgentTask, ClientEmail, Lead, LeadEvent, LeadNote, OpenHouseEvent
     from app.services.open_house_service import OpenHouseService
     from app.services.tasks_service import _guest_first, lead_alerts
     now = _utc(now) or datetime.now(timezone.utc)
@@ -401,6 +476,40 @@ async def gather(db: AsyncSession, owner, lead_id: Optional[str] = None, now: Op
         mine = set()
     own = lambda oh_id: bool(oh_id and oh_id in ohs and ohs[oh_id].listing_key and ohs[oh_id].listing_key in mine)
 
+    # How each one first came in: their oldest real event, all time (one row per lead).
+    firsts: Dict[str, Any] = {e.lead_id: e for e in (await db.execute(
+        select(LeadEvent).where(LeadEvent.lead_id.in_(ids), LeadEvent.source_type.notin_(NOT_ORIGIN))
+        .order_by(LeadEvent.lead_id, LeadEvent.occurred_at.asc()).distinct(LeadEvent.lead_id))).scalars().all()}
+    form_ids = {e.form_id for e in firsts.values() if e.form_id}
+    form_titles = {f.id: f.title for f in (await db.execute(select(AgentForm).where(AgentForm.id.in_(form_ids)))).scalars().all()} if form_ids else {}
+    first_oh_ids = {e.open_house_event_id for e in firsts.values() if e.open_house_event_id} - set(ohs)
+    if first_oh_ids:
+        ohs.update({o.id: o for o in (await db.execute(select(OpenHouseEvent).where(OpenHouseEvent.id.in_(first_oh_ids)))).scalars().all()})
+
+    def _origin(l) -> Optional[Dict[str, Any]]:
+        e = firsts.get(l.id)
+        if e is None:
+            return None
+        at, created = _utc(e.occurred_at), _utc(l.created_at)
+        if created and at and at - created > timedelta(days=2):
+            return None   # on their list well before anything happened - added by hand / imported
+        snap = e.raw_snapshot if isinstance(e.raw_snapshot, dict) else {}
+        oh = ohs.get(e.open_house_event_id) if e.open_house_event_id else None
+        form = form_titles.get(e.form_id) or ""
+        if not form:
+            m = re.match(r"^(?:Submitted|Filled out|Started your)\s+(.+?)(?:\s+form)?(?:\s*\(didn't finish\))?$", e.summary or "")
+            form = m.group(1) if m else ""
+        title = ""
+        if e.source_type == "invite_rsvp" and " - " in (e.summary or ""):
+            title = e.summary.split(" - ", 1)[1]
+        elif e.source_type == "blog_inquiry":
+            title = snap.get("blog_title") or ""
+        elif e.source_type == "portal_lead":
+            title = snap.get("portal_title") or (snap.get("portal") or "").title()
+        came = snap.get("came_from") if isinstance(snap.get("came_from"), dict) else {}
+        return {"type": e.source_type, "at": at, "street": _street(oh.address if oh is not None else e.property_address),
+                "form": form, "title": title, "site": came.get("src") == "site"}
+
     by_email = {(l.email or "").strip().lower(): l.id for l in leads if (l.email or "").strip()}
     mails: Dict[str, list] = {}
     if by_email:
@@ -421,7 +530,8 @@ async def gather(db: AsyncSession, owner, lead_id: Optional[str] = None, now: Op
         s = Signals(lead_id=l.id, name=nice_name(l.name) or l.email or "This lead", first=_guest_first(l.name) or "",
                     represented=l.represented or "unknown", status=l.status or "new",
                     has_phone=bool((l.phone or "").strip()), has_email=bool((l.email or "").strip()),
-                    created_at=_utc(l.created_at), last_touch=touch, ever_contacted=touch is not None)
+                    created_at=_utc(l.created_at), last_touch=touch, ever_contacted=touch is not None,
+                    origin=_origin(l))
         for n in notes.get(l.id, []):
             oh = ohs.get(n.open_house_event_id) if n.open_house_event_id else None
             s.notes.append({"text": n.text, "at": _utc(n.created_at), "open_house": oh is not None,

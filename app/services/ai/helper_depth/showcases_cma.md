@@ -59,7 +59,7 @@ Showcases and CMA in depth: every Showcase search option, match score, compare h
 - Did a client get their invite? The lead's page (Their Showcase card) says **Invite emailed** + date, or **Invite never sent** / **Invite not sent - held back by your email settings** / **Invite didn't go through**, with **Send invite** or **Send invite again**. When it was opened is in that lead's **Emails** card.
 - **New homes & price drops**: at most one email a day at 4:30 PM Eastern, only on days something changed. Or **Once a week** for everyone (Tools → Email → How often: Up to daily / Once a week). Each person can also be slowed automatically. The weekly email says why it's weekly ("Once a week, as you picked" with a **Change how often** link, "Once a week, with everything new in one email", or "We now send these once a week").
 - Every row in Tools → Email can be switched off and sent **From your email** (connected Gmail) or **OpenHousePal**.
-- Automatic slowing: unopened on 3 different days → weekly; 3 ignored weekly emails → automatic emails stop. Opening one or using the Showcase turns daily back on.
+- Automatic slowing: 3 unopened in a row on different days → weekly; 2 unopened weekly ones → automatic emails stop (5 at most). Opening one or using the Showcase turns daily back on.
 
 ## Sleep and wake
 - Falls asleep (moves to Inactive) when automatic emails have stopped for that client and you haven't touched them in 2 weeks (opened the Showcase or lead, marked contacted, wrote a note, checked off a follow-up). A client still using their Showcase stays awake. Asleep = no new matches, emails or alerts; nothing deleted; link still works.

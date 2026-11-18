@@ -850,7 +850,13 @@ async def _get_priority_summary(db: AsyncSession, current_user: User, args: dict
     of the model re-deriving recency/priority from a raw lead+timestamp dump itself."""
     from app.services.ai import ai_insights_service
     priorities = await ai_insights_service.get_insights(db, current_user)
-    return {"priorities": priorities}
+    # The person each item is about, so they show as lead cards (show_leads, 11/18) - from the item's
+    # own "lead-<id>-kind" id, never guessed.
+    out = []
+    for p in priorities or []:
+        m = re.match(r"lead-([0-9a-fA-F-]{36})-", str(p.get("id") or "")) if isinstance(p, dict) else None
+        out.append({**p, "lead_id": m.group(1)} if m else p)
+    return {"priorities": out}
 
 
 async def _look_up_agent(db: AsyncSession, current_user: User, args: dict, config: dict) -> dict:
