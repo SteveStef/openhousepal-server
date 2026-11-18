@@ -244,6 +244,7 @@ The Link tab also has buttons to copy, open and share your link.
 These are the same details you see in **Settings → Profile**. Change them in either place and both update.
 
 - **Profile**: your photo, Full Name, Title, Brokerage, Team, Market and About.
+  - Your team name shows on your Agent Hub beside your brokerage, with a dot between them (like "Main Line Realty · The Smith Group"), on the hub and its Sales page. To hide it there, switch off **Show it on my Agent Hub** under Team name (Profile tab), or on the **About you** step of Account setup. It's on by default. Your email signature has its own **Team** switch, and your Save Contact card its own.
 - **Contact**: call, text and email.
 - **Social Links**: Instagram, Facebook, YouTube, TikTok and Website.
 - **Contact Card**: what people get when they tap Save Contact.
@@ -529,6 +530,7 @@ A real person replies right on this page, and you get a notification when they d
 The steps are grouped. Which ones you see depends on your plan:
 
 - **About you**: About you, How to reach you, License number, Your photo, Your story, Your socials. The first three are **Required**.
+  - On plans with an Agent Hub, the **About you** step has **Show it on my Agent Hub** under Team name: the team name beside your brokerage on your hub (on by default).
 - **Your pages**: Your sales, Reviews, Your brand, Agent Hub, Your forms, Email signature.
 - **Your open houses**: Open house defaults.
 - **Staying in touch**: Alerts & follow-ups, Calendar, Your email, Your CRM.

@@ -50,7 +50,8 @@ NOT_USING_STEPS = {"calendar", "mailbox", "crm"}
 # the head start every plan shares.
 CORE_STEPS = ["about", "contact", "license", "photo", "story", "socials"]
 
-HUB_LOOK_KEYS = {"hubTheme", "hubAccent", "hubLuxeMetal", "visitorDarkMode", "mobileHeader"}
+# (+ showTeamOnHub: the team name beside the brokerage on the hub, default on - owner 11/18)
+HUB_LOOK_KEYS = {"hubTheme", "hubAccent", "hubLuxeMetal", "visitorDarkMode", "mobileHeader", "showTeamOnHub"}
 PLACEHOLDER_PHOTO = "/home.jpg"
 
 
@@ -242,6 +243,14 @@ async def apply_info(db: AsyncSession, user: User, hub: AgentHub, patch: dict) -
     hub.config = cfg
 
 
+def crm_step_done(user) -> bool:
+    """Leads are really going to a CRM. A Follow Up Boss key FUB refused doesn't count -
+    crm_dispatch_service.probe_fub_account stores the "rejected" note; same rule as Settings >
+    Integrations (deep audit, 11/18: setup said "Connected" and Done with a rejected key)."""
+    fub_ok = bool(user.crm_fub_api_key) and "rejected" not in (user.crm_fub_account_note or "").lower()
+    return bool(user.crm_push_enabled and (fub_ok or user.crm_webhook_url or user.crm_parse_email))
+
+
 async def compute(db: AsyncSession, user: User, hub: AgentHub) -> dict:
     """Steps for this agent's plan with live status: done / skipped / todo."""
     cfg = hub.config or {}
@@ -303,7 +312,7 @@ async def compute(db: AsyncSession, user: User, hub: AgentHub) -> dict:
             mb = (await db.execute(select(MailConnection).where(MailConnection.owner_id == user.id))).scalar_one_or_none()
             done[step] = bool(mb and mb.enabled and mb.status == "ok")
         elif step == "crm":
-            done[step] = bool(user.crm_push_enabled and (user.crm_fub_api_key or user.crm_webhook_url or user.crm_parse_email))
+            done[step] = crm_step_done(user)
         elif step == "areas":
             done[step] = await _exists(select(func.count()).select_from(AgentMarketArea).where(AgentMarketArea.owner_id == user.id))
         elif step == "homes":
