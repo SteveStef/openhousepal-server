@@ -121,8 +121,14 @@ async def _link_domain_state(db: AsyncSession, user: User) -> dict:
     custom = await site_service.connected_custom_domain(db, site)
     platform = os.getenv("FRONTEND_URL", os.getenv("CLIENT_URL", "http://localhost:3000"))
     prefers_own = user.links_use_own_domain is not False
+    from app.models.database import AgentHub
+    hub_slug = (await db.execute(select(AgentHub.slug).where(AgentHub.owner_id == user.id))).scalar_one_or_none()
     return {
         "site_enabled": site.is_enabled is not False,
+        # While the website is off: the own domain shows the Agent Hub (False) or forwards to
+        # hub_url - "Turn my domain off completely" (True, owner 11/18).
+        "domain_forwards": bool(site.domain_forwards_when_off),
+        "hub_url": f"{platform.rstrip('/')}/{hub_slug}" if hub_slug else None,
         "has_custom_domain": custom is not None,
         "custom_domain": custom,
         "use_own_domain": bool(custom) and prefers_own,
@@ -195,6 +201,26 @@ async def set_site_enabled(
     public site isn't served and every link falls back to openhousepal.com; on = back exactly
     as it was. Returns the same state as GET /me/link-domain."""
     await site_service.set_site_enabled(db, current_user, body.enabled)
+    return await _link_domain_state(db, current_user)
+
+
+class DomainForwardUpdate(BaseModel):
+    forward: bool
+
+
+@router.put("/me/domain-forward")
+async def set_domain_forward(
+    body: DomainForwardUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_plan_tier(PlanTier.IDX)),
+):
+    """While the website is off: the agent's own domain shows their Agent Hub (forward false) or
+    forwards every visit to their openhousepal.com Hub address (forward true - "Turn my domain off
+    completely", owner 11/18). The website's on/off switch is untouched. Returns the link-domain state."""
+    site = await site_service.get_or_create_site(db, current_user)
+    site.domain_forwards_when_off = bool(body.forward)
+    db.add(site)
+    await db.commit()
     return await _link_domain_state(db, current_user)
 
 

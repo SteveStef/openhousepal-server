@@ -2348,6 +2348,10 @@ class Site(Base):
     # openhousepal.com - for agents who already have a website of their own. Independent of
     # `status` so turning it back on restores the exact published site.
     is_enabled = Column(Boolean, nullable=False, default=True, server_default='true')
+    # While the website is switched off, the agent's own domain shows their Agent Hub by itself
+    # (False, the default) or forwards to their openhousepal.com Hub address - "Turn my domain off
+    # completely", so Google drops it (True, owner 11/18). Ignored while the website is on.
+    domain_forwards_when_off = Column(Boolean, nullable=False, default=False, server_default='false')
 
     # draft_data and published_snapshot share one shape ({"pages": [...], "theme": {...}}) so
     # publishing is a cheap copy, not a transform. The public renderer only ever reads

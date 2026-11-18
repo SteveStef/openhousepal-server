@@ -102,10 +102,14 @@ def issues_for(rows: list[SiteDomain], tier: Optional[str] = "IDX", enabled: Opt
             issue = ("plan_ended", f"{main.hostname} no longer shows your website",
                      "Your IDX plan has ended, so your own domain has nothing to show. Renew the IDX plan "
                      "(Settings > Billing) and it comes straight back - nothing to change at your domain company.")
+        elif enabled is False:
+            # Switched off on purpose: the domain shows their Agent Hub, or forwards to it if they
+            # turned the domain off completely (owner 11/18) - nothing to fix.
+            return []
         else:
-            issue = ("site_off", f"{main.hostname} isn't showing anything",
-                     "Your IDX website is switched off (Settings > IDX Website). Turn it back on, or remove the "
-                     "domain if you're not using it.")
+            issue = ("site_off", f"{main.hostname} isn't showing anything yet",
+                     "Your IDX website hasn't been published yet. Publish it from the website editor and your "
+                     "domain shows it.")
         return [{"hostname": main.hostname, "code": issue[0], "title": issue[1], "fix": issue[2],
                  "since": (_aware(main.updated_at) or _aware(main.created_at)).isoformat()}]
     for d in rows:

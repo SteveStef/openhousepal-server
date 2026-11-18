@@ -378,13 +378,15 @@ When it's off:
 - **Nothing is deleted.** Every new QR code, Guest Pass, Showcase, form and copied link uses openhousepal.com instead.
 - Your Agent Hub, open houses and leads keep working.
 - Switch it back on any time and it's back exactly as published.
+- If you have your own domain, **IDX Domain** asks **While your website is off, yourdomain.com…**:
+  - **Shows my Agent Hub** (the default): your domain keeps working and shows your Agent Hub by itself, with your name in Google. OpenHousePal's own pages (pricing, sign-in and so on) never open on your domain.
+  - **Turned off completely**: every visit to your domain goes to your Agent Hub on openhousepal.com, and Google stops listing your domain over the next few weeks. It asks **Turn yourdomain.com off completely?** first. Business cards, signs and emails printed with your domain still open - they just land on your Agent Hub page on OpenHousePal. Your domain stays connected and nothing is deleted; switch back to **Shows my Agent Hub** any time (visitors see it right away, Google takes a few weeks to list it again). Paying for the domain itself is between you and your domain company.
 
-The same Settings tab also shows:
+The Settings tab, top to bottom:
 
-- **Your Website**: whether it's **Published & live**, **Draft — not published yet** or **Turned off — not visible to anyone**, plus its address and a copy button.
-- **View My Website** and **Edit My Website**.
-- **IDX Domain**.
-- **More website settings**: quick links to Pages & sections, Look & colors, Featured homes, Towns you serve, Google and Domain.
+- **Your website** (one card): the **IDX Website** on/off switch, whether it's **Published & live**, **Draft — not published yet** or **Turned off — not visible to anyone**, its address with a copy button, **View My Website** and **Edit My Website**.
+- **IDX Domain**: one box for the question that fits (website on with your own domain: **Use my own domain for my links**; website off with your own domain: what your domain does while it's off), **Your links use** with the address, then your addresses - the free one and your own domain - with Default badges, connecting or buying a domain, and **Change my link**.
+- **More website settings**: quick links to Pages & sections, Look & colors, Featured homes, Towns you serve and Google.
 
 ### Your web address and your own domain
 

@@ -446,16 +446,38 @@ async def list_warm_hosts(db: AsyncSession = Depends(get_db)):
 @router.get("/hub-domain")
 async def get_hub_only_domain(host: str, db: AsyncSession = Depends(get_db)):
     """An agent on the IDX plan switched the website off but has their own domain: that domain shows
-    their Agent Hub by itself, as if they never had a website (owner, 11/04). {"hub_slug": null} = no."""
-    from app.models.database import AgentHub
+    their Agent Hub by itself, as if they never had a website (owner, 11/04). {"hub_slug": null} = no.
+    Owner 11/18 - an agent's domain advertises THEM, never OpenHousePal, and a dead page is never
+    listed by Google:
+      {"hub_slug": "<slug>"}   - show that Hub (it really is live: same check as its public page)
+      {"forward_to": "<url>"}  - "Turn my domain off completely": every visit goes to their
+                                 openhousepal.com Hub address (or openhousepal.com if it isn't live)
+      {"dead": true}           - their domain, but no live Hub to show: a plain "not available" 404
+    """
+    import os
+    from fastapi import HTTPException as _HTTPException
+    from app.api.agent_hub_routes import _resolve_public_hub
     try:
         row = (await db.execute(
             select(Site, User).join(SiteDomain, SiteDomain.site_id == Site.id).join(User, User.id == Site.owner_id)
             .where(SiteDomain.hostname == host.strip().lower(), SiteDomain.status == "ACTIVE", Site.is_enabled.is_(False))
         )).first()
-        if not row or not _idx_owner_live(row[1]):
+        if not row:
             return {"hub_slug": None}
-        slug = (await db.execute(select(AgentHub.slug).where(AgentHub.owner_id == row[1].id))).scalar_one_or_none()
+        site, owner = row
+        slug = (await db.execute(select(AgentHub.slug).where(AgentHub.owner_id == owner.id))).scalar_one_or_none()
+        live = False
+        if slug and _idx_owner_live(owner):
+            try:
+                await _resolve_public_hub(slug, db)
+                live = True
+            except _HTTPException:
+                live = False
+        if site.domain_forwards_when_off:
+            platform = os.getenv("FRONTEND_URL", os.getenv("CLIENT_URL", "https://openhousepal.com")).rstrip("/")
+            return {"hub_slug": None, "forward_to": f"{platform}/{slug}" if live else platform}
+        if not live:
+            return {"hub_slug": None, "dead": True}
         return {"hub_slug": slug}
     except Exception:  # noqa: BLE001 - fail open: the domain answers the way it always did
         logger.exception("hub-domain lookup failed for %s", host)

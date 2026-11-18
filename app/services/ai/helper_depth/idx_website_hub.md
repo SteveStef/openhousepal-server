@@ -57,7 +57,8 @@ IDX website, Agent Hub and Review Hub in depth: website sections, pages, looks, 
 ## On/off and which links your QR codes use (Settings → IDX Website)
 - **IDX Website** switch: On ("your IDX website is live on your addresses") / Off ("you're using a website of your own"; asks **Turn off your IDX website?** - "Nothing is deleted"). Off: the site isn't shown and nothing links to it; your Agent Hub, open houses and leads keep working. Back on = exactly as published.
 - **Use my own domain for my links** (once your own domain is live): new sign-in QR codes, Guest Passes, Showcases, forms, Agent Hub and signature links use your domain. Off keeps them on openhousepal.com. Links you already handed out keep working either way.
-- Also there: Your Website status (Published & live / Draft — not published yet / Turned off — not visible to anyone), **View My Website**, **Edit My Website**, **More website settings**.
+- **While your website is off, yourdomain.com…** (website off + your own domain, 11/18): **Shows my Agent Hub** (default - the domain shows the Hub by itself with your name in Google; OpenHousePal's own pages never open there) or **Turned off completely** (asks first; every visit goes to your openhousepal.com Agent Hub, Google drops the domain over a few weeks; the domain stays connected, nothing is deleted, switch back any time).
+- Layout: one **Your website** card (the on/off switch, status Published & live / Draft — not published yet / Turned off — not visible to anyone, address + copy, **View My Website**, **Edit My Website**), then **IDX Domain** (the one question that fits, **Your links use**, your addresses, connect / buy a domain, **Change my link**), then **More website settings** (Pages & sections, Look & colors, Featured homes, Towns you serve, Google).
 
 # AGENT HUB (Premium, IDX, No-MLS Premium; Tools → Agent Hub, "One link, all of you")
 

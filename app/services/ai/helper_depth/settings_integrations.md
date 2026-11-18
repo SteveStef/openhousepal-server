@@ -14,7 +14,7 @@ Tabs: **Profile**, **Notifications**, **Tools**, **IDX Website** (IDX only), **B
 
 **Tools** - quick status of **Calendar**, **Reviews** and **CRM**, each with **Manage** or **Open & Set Up**.
 
-**IDX Website** (IDX) - the website on/off switch, Your Website status, **View My Website** / **Edit My Website**, **IDX Domain** (free address, your own domain, **Use my own domain for my links**), **More website settings**.
+**IDX Website** (IDX) - one **Your website** card (the on/off switch, status, address, **View My Website** / **Edit My Website**), **IDX Domain** (free address, your own domain, **Use my own domain for my links** while the website is on; **Shows my Agent Hub** / **Turned off completely** for your domain while it's off), **More website settings**.
 
 **Billing** - Current Plan, status (Free Trial, Active, Cancelled, Payment Failed, Expired; or Managed / Brokerage Paid), dates (Trial Ends, Active Since, Last Billing, First Payment / Next Renewal, Access Ends), **View full plan details**, **Plan Options** ("Upgrade or Modify"), **Manage Subscription** → **Cancel Plan**, **Restore Access**, **Update payment method on PayPal** (PayPal-account payers), **Start Fresh** (new card), **Resubscribe**. Restart and plan changes open a card window (**Debit or Credit Card**; PayPal account shows Coming soon). The Monthly AI Usage and storage meters also show in Settings.
 
