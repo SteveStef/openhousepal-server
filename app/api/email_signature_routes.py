@@ -177,6 +177,8 @@ async def get_my_email_signature_html(
         await db.commit()
 
     hub_config = await _get_agent_hub_config(db, current_user.id)
+    if await _hub_off(db, current_user):
+        hub_config = {**hub_config, "_hubOff": True}   # Agent Hub switched off (11/18): no "My Agent Hub" button
 
     # The look the agent is copying (colors, dark, Luxe + its metal) is stamped into every picture
     # link ("<token>~<look>"): the pictures keep drawing with THIS look until they copy again (owner,
@@ -277,6 +279,14 @@ async def _resolve_featured_listing_link(db: AsyncSession, owner: User, signatur
     return await property_website_service.resolve_listing_link(db, owner, listing_key, fallback_address, skip_spotlight=skip_spotlight)
 
 
+async def _hub_off(db: AsyncSession, owner: User) -> bool:
+    """The agent switched their Agent Hub off (11/18) and has no live IDX website showing it inside
+    their own About / Sales pages - the Hub, Sales and Listings links lead nowhere."""
+    from app.api.agent_hub_routes import _idx_site_live, hub_switched_on
+    hub = (await db.execute(select(AgentHub).where(AgentHub.owner_id == owner.id))).scalar_one_or_none()
+    return hub is not None and not hub_switched_on(hub) and not await _idx_site_live(db, owner)
+
+
 @router.get("/go/{owner_id}/hub")
 async def stable_agent_hub_redirect(owner_id: str, db: AsyncSession = Depends(get_db)):
     """The permanent link an installed signature's "My Agent Hub" button points to - looked up
@@ -284,7 +294,7 @@ async def stable_agent_hub_redirect(owner_id: str, db: AsyncSession = Depends(ge
     hub_result = await db.execute(select(AgentHub).where(AgentHub.owner_id == owner_id))
     hub = hub_result.scalar_one_or_none()
     owner = await db.get(User, owner_id) if hub else None
-    if not hub or not owner or not owner_has_access(owner, EMAIL_SIGNATURE_ACCESS_TIERS):
+    if not hub or not owner or not owner_has_access(owner, EMAIL_SIGNATURE_ACCESS_TIERS) or await _hub_off(db, owner):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
     return RedirectResponse((await owner_links(db, owner, hub.slug)).hub())
 
@@ -297,7 +307,7 @@ async def stable_sales_redirect(owner_id: str, db: AsyncSession = Depends(get_db
     hub_result = await db.execute(select(AgentHub).where(AgentHub.owner_id == owner_id))
     hub = hub_result.scalar_one_or_none()
     owner = await db.get(User, owner_id) if hub else None
-    if not hub or not owner or not owner_has_access(owner, EMAIL_SIGNATURE_ACCESS_TIERS):
+    if not hub or not owner or not owner_has_access(owner, EMAIL_SIGNATURE_ACCESS_TIERS) or await _hub_off(db, owner):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
     return RedirectResponse((await owner_links(db, owner, hub.slug)).sales())
 
@@ -309,7 +319,7 @@ async def stable_listings_redirect(owner_id: str, db: AsyncSession = Depends(get
     hub_result = await db.execute(select(AgentHub).where(AgentHub.owner_id == owner_id))
     hub = hub_result.scalar_one_or_none()
     owner = await db.get(User, owner_id) if hub else None
-    if not hub or not owner or not owner_has_access(owner, EMAIL_SIGNATURE_ACCESS_TIERS):
+    if not hub or not owner or not owner_has_access(owner, EMAIL_SIGNATURE_ACCESS_TIERS) or await _hub_off(db, owner):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
     return RedirectResponse((await owner_links(db, owner, hub.slug)).sales())
 

@@ -62,6 +62,8 @@ IDX website, Agent Hub and Review Hub in depth: website sections, pages, looks, 
 
 # AGENT HUB (Premium, IDX, No-MLS Premium; Tools → Agent Hub, "One link, all of you")
 
+**On/off switch** (11/18, top of Tools → Agent Hub, on by default; asks **Turn off your Agent Hub?**): off = the Hub link and its Sales page stop opening and drop out of Google; nothing links to it (new Brag Sheet codes, Guest Passes, Spotlights, forms, the email signature - re-copy the signature to drop its button); forms, the review link, blogs and Save Contact keep working; an IDX agent's live website keeps showing it in its About/Sales pages; nothing deleted, back on = as it was.
+
 ## Tabs (with a live preview; **Views** and **Interacted** counts on top)
 - **Profile**: photo (drag the circle to reposition; any JPG, PNG, WebP or iPhone photo, shrunk to fit), Agent name, Professional title, Brokerage name, Team name ("Only if you are on a team"; switch **Show it on my Agent Hub** under it - on by default - puts it beside your brokerage with a dot, "Main Line Realty · The Smith Group", on the hub and its Sales page), Market or service area, About me, RE License number (private; locked once saved - support changes it). Shared with Settings → Profile.
 - **Contact**: Call, Text and Email buttons; Social Links (Instagram, Facebook, YouTube, TikTok, Website); **Contact Card** - what people save with **Save Contact**: name always, plus Mobile Phone, Email, Brokerage, Photo, Website, Agent Hub link, Job Title, Office Phone, Office Address, Team, Instagram, Facebook, YouTube, Custom Link and a short note. Turning one off only leaves it off the saved card.

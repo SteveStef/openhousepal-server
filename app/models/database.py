@@ -186,6 +186,10 @@ class AgentHub(Base):
     # Cheat Sheet already handed out) keeps resolving to this hub instead of 404ing.
     previous_slugs = Column(JSONB, nullable=False, server_default='[]')
     status = Column(String, default="DRAFT", nullable=False)
+    # The agent's Agent Hub on/off switch (Tools -> Agent Hub, owner 11/18). Off = the Hub page, its
+    # Sales/Listings pages and Save Contact card don't open and nothing links to it; forms, reviews
+    # and blogs keep working. Kept apart from `config`, which the editor saves whole.
+    is_public = Column(Boolean, nullable=False, default=True, server_default='true')
     # Full page-builder payload (profile, contact, social links, sales/video/tour/blog carousels,
     # layout/visibility flags) - the single source of truth served to public visitors by slug.
     config = Column(JSONB, nullable=False, server_default='{}')

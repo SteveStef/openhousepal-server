@@ -215,6 +215,13 @@ Signed up through an offer? The confirmation warns first that you'll lose your o
 
 **Plans:** Premium, IDX, No-MLS Premium.
 
+**Turning it off:** at the top of **Tools → Agent Hub** is **Your Agent Hub is on**, with a switch (on by default). Don't use the Agent Hub? Switch it off - it asks **Turn off your Agent Hub?** first. While it's off:
+- Your Agent Hub link (openhousepal.com/your-name) and its Sales page don't open, and Google drops them over the next few weeks.
+- Nothing links to it any more: new Brag Sheet QR codes, Guest Passes, Listing Spotlights, forms and your email signature leave it out (copy your signature again to take the **My Agent Hub** button off one you already pasted).
+- Your forms, your review link, your blog posts and the Save Contact card keep working.
+- On the IDX plan, your website's About and Sales pages keep showing it while your website is on.
+- Nothing is deleted. You can keep editing it, and switching it back on brings it back exactly as it was.
+
 **Where:** **Tools → Agent Hub**. The editor's headline is "One link, all of you". It has six tabs: **Profile**, **Contact**, **Listings & Sales**, **Media**, **Layout** and **Link**. A live preview sits beside the editor. Your view counts (**Views**, **Interacted**) appear at the top.
 
 ### Your hub's address

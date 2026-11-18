@@ -2024,8 +2024,8 @@ async def _follow_new_title(db: AsyncSession, form: AgentForm, old_title: str, o
 
 def _agent_hub_is_live(agent: User, hub: AgentHub) -> bool:
     from app.utils.auth import owner_has_access, AGENT_HUB_ACCESS_TIERS
-    from app.api.agent_hub_routes import _hub_has_minimum_content
-    return owner_has_access(agent, AGENT_HUB_ACCESS_TIERS) and _hub_has_minimum_content(hub.config or {})
+    from app.api.agent_hub_routes import _hub_has_minimum_content, hub_switched_on
+    return owner_has_access(agent, AGENT_HUB_ACCESS_TIERS) and _hub_has_minimum_content(hub.config or {}) and hub_switched_on(hub)
 
 
 @router.get("/public/{agent_slug}/agent-busy")

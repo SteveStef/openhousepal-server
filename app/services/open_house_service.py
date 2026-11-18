@@ -456,9 +456,11 @@ class OpenHouseService:
         if not agent or not owner_has_access(agent, AGENT_HUB_ACCESS_TIERS):
             return {"available": False, "ready": False, "url": None}
         hub = (await db.execute(select(AgentHub).where(AgentHub.owner_id == agent.id))).scalar_one_or_none()
-        from app.api.agent_hub_routes import _hub_has_minimum_content
+        from app.api.agent_hub_routes import _hub_has_minimum_content, hub_switched_on
         if not hub or not _hub_has_minimum_content(hub.config or {}):
             return {"available": True, "ready": False, "url": None}
+        if not hub_switched_on(hub):   # the agent switched it off (11/18): nothing links to it
+            return {"available": False, "ready": False, "url": None, "off": True}   # no "finish your Hub" nudges either
         return {"available": True, "ready": True, "url": (await owner_links(db, agent, hub.slug)).hub()}
 
     @staticmethod

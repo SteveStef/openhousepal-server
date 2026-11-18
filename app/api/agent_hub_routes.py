@@ -362,7 +362,7 @@ async def check_slug(
     }
 
 
-async def _resolve_public_hub(slug: str, db: AsyncSession) -> tuple[AgentHub, User]:
+async def _resolve_public_hub(slug: str, db: AsyncSession, embedded: bool = False, contact_card: bool = False) -> tuple[AgentHub, User]:
     if slug.lower() in HIDDEN_TEST_HUBS:
         raise HTTPException(status_code=404, detail="Agent Hub not found")
     normalized = normalize_slug(slug)
@@ -395,7 +395,30 @@ async def _resolve_public_hub(slug: str, db: AsyncSession) -> tuple[AgentHub, Us
     if not _hub_has_minimum_content(hub.config or {}):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This Agent Hub isn't set up yet.")
 
+    # Switched off by the agent (owner, 11/18): the link stops working. The one exception is the
+    # agent's own live IDX website, whose About and Sales pages show the Hub inside them - those are
+    # website pages, so they keep working while the website is on (`embedded`).
+    # The Save Contact card (`contact_card`) isn't the Hub - the email signature's Save Contact badge
+    # uses it too, so it keeps working.
+    if hub.is_public is False and not contact_card and not (embedded and await _idx_site_live(db, owner)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This Agent Hub isn't active.")
+
     return hub, owner
+
+
+def hub_switched_on(hub: Optional[AgentHub]) -> bool:
+    """The agent hasn't switched their Agent Hub off (Tools -> Agent Hub). Every place that links
+    to the Hub checks this alongside _hub_has_minimum_content."""
+    return hub is not None and hub.is_public is not False
+
+
+async def _idx_site_live(db: AsyncSession, owner: User) -> bool:
+    """The agent's IDX website is up: IDX plan, published and switched on."""
+    from app.models.database import Site
+    if not owner_has_access(owner, {"IDX"}):
+        return False
+    site = (await db.execute(select(Site).where(Site.owner_id == owner.id))).scalar_one_or_none()
+    return bool(site and site.status == "PUBLISHED" and site.is_enabled is not False)
 
 
 def _hub_has_minimum_content(config: dict) -> bool:
@@ -435,9 +458,11 @@ async def _with_listing_links(db: AsyncSession, owner: User, config: dict, src: 
 @router.get("/public/{slug}")
 async def get_public_agent_hub(
     slug: str,
+    embedded: bool = Query(False),
     db: AsyncSession = Depends(get_db),
 ):
-    hub, owner = await _resolve_public_hub(slug, db)
+    # `embedded`: shown inside the agent's own IDX website (?idx_light) - see _resolve_public_hub.
+    hub, owner = await _resolve_public_hub(slug, db, embedded=embedded)
     # A linked YouTube channel refreshes once a day - if it's due, refresh in the background so
     # the next visit shows the new uploads (this page never waits on YouTube).
     from app.services.agent_hub_video_sync import refresh_in_background, wants_sync
@@ -540,13 +565,14 @@ async def get_public_signature_card(
 async def get_public_agent_hub_vcard(
     slug: str,
     visitor_id: Optional[str] = Query(None),
+    embedded: bool = Query(False),
     db: AsyncSession = Depends(get_db),
     viewer: Optional[User] = Depends(get_current_user_optional),
 ):
     """Powers the Agent Hub's "Save Contact" button - generates a .vcf on the fly from exactly
     the fields the agent opted into under Contact Card settings (config.contactCard), so tapping
     it opens the visitor's native contact-save flow on iOS/Android/desktop with no manual entry."""
-    hub, owner = await _resolve_public_hub(slug, db)
+    hub, owner = await _resolve_public_hub(slug, db, embedded=embedded, contact_card=True)
 
     config = hub.config or {}
     fields = vcard_service.resolve_contact_card_fields(config)
@@ -556,7 +582,8 @@ async def get_public_agent_hub_vcard(
         photo_base64 = await vcard_service.fetch_photo_base64(photo_url)
 
     agent_hub_url = ""
-    if fields["agentHubUrl"]["include"]:
+    # No Agent Hub link on the card while the Hub is switched off (unless their website shows it).
+    if fields["agentHubUrl"]["include"] and (hub_switched_on(hub) or await _idx_site_live(db, owner)):
         agent_hub_url = (await owner_links(db, owner, hub.slug)).hub()
 
     from app.services.website_link_service import apply_auto_website
@@ -816,7 +843,29 @@ async def get_my_agent_hub(
     from app.services import brand_look_service
     look = await brand_look_service.get_look(db, current_user)
     config = brand_look_service.hub_config_with_brand(await live_hub_config(db, current_user, hub.config or {}), look)
-    return {"id": hub.id, "slug": hub.slug, "status": hub.status, "config": config, "brand_look": look}
+    return {"id": hub.id, "slug": hub.slug, "status": hub.status, "config": config, "brand_look": look,
+            "is_public": hub.is_public is not False, "idx_site_live": await _idx_site_live(db, current_user)}
+
+
+class HubVisibilityUpdate(BaseModel):
+    is_public: bool
+
+
+@router.put("/me/visibility")
+async def set_my_agent_hub_visibility(
+    payload: HubVisibilityUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """The Agent Hub on/off switch (Tools -> Agent Hub, owner 11/18). Off = its page, Sales/Listings
+    pages and Save Contact card stop opening (404, so Google drops them) and nothing links to it -
+    QR codes on new Brag Sheets, Guest Passes, Spotlights, forms and signatures leave it out. Forms,
+    reviews and blogs keep working. Nothing in the Hub is deleted; on again = back as it was."""
+    hub = await _ensure_hub(db, current_user)
+    hub.is_public = bool(payload.is_public)
+    db.add(hub)
+    await db.commit()
+    return {"is_public": hub.is_public, "idx_site_live": await _idx_site_live(db, current_user)}
 
 
 @router.put("/me/config")

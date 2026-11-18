@@ -2218,7 +2218,8 @@ def _resolved_links(cfg: dict, hub: dict, redirect_base_url: str) -> dict:
     # email_signature_routes.py) rather than a directly-resolved URL, so it keeps working across
     # slug renames, domain changes, and tier upgrades/downgrades without the agent ever having to
     # touch Gmail/Outlook again.
-    agent_hub_url = f"{redirect_base_url}/hub" if redirect_base_url else ""
+    # No Hub button while the agent has their Agent Hub switched off (11/18; the install route sets _hubOff).
+    agent_hub_url = f"{redirect_base_url}/hub" if redirect_base_url and not hub.get("_hubOff") else ""
     return {
         "website": website,
         "agentHubUrl": agent_hub_url if fields["agentHubUrl"]["include"] and agent_hub_url else "",

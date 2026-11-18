@@ -172,9 +172,9 @@ async def render_payload(db: AsyncSession, site: PropertyWebsite, user, draft: d
     # "Visit my Agent Hub" - whenever the public hub page would actually load (same rule as
     # agent_hub_routes._resolve_public_hub: a name + a way to reach them; the status column is
     # not what gates the public page).
-    from app.api.agent_hub_routes import _hub_has_minimum_content
+    from app.api.agent_hub_routes import _hub_has_minimum_content, hub_switched_on
     hub = (await db.execute(select(AgentHub).where(AgentHub.owner_id == user.id))).scalar_one_or_none()
-    if hub is not None and hub.slug and _hub_has_minimum_content(hub.config or {}):
+    if hub is not None and hub.slug and _hub_has_minimum_content(hub.config or {}) and hub_switched_on(hub):
         from app.services.website.site_service import owner_links
         default_agent["hub_url"] = (await owner_links(db, user, hub.slug)).hub()
     snapshot = site.property_snapshot or {}
