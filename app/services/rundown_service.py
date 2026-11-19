@@ -346,13 +346,39 @@ async def _happenings(db: AsyncSession, user: User, notes: list) -> tuple[list[d
         for vid, has in (await db.execute(select(OpenHouseVisitor.id, OpenHouseVisitor.has_agent)
                                           .where(OpenHouseVisitor.id.in_(visitor_ids)))).all():
             agent_of[vid] = {"YES": "Has an agent", "NO": "No agent"}.get(str(has or "").upper(), "")
+    done_of = await _done_marks(db, user, notes)
     items = [{
         "id": n.id, "type": n.type, "title": n.title, "message": n.message, "address": n.property_address,
         "link": links.get(n.id) or n.link or "", "showcase_link": showcases.get(n.id), "is_read": bool(n.is_read), "at": n.created_at,
         "agent_status": agent_of.get(n.reference_id) if n.reference_type == "VISITOR" else None,
+        "done": done_of.get(n.id),
         "_group": _GROUP_OF.get(n.type, "other"),
     } for n in notes]
     return items, links
+
+
+async def _done_marks(db: AsyncSession, user: User, notes: list) -> dict[str, str]:
+    """What you already took care of gets a green check (owner, 11/19: a follow-up reminder for a text already
+    sent looked like it still needed doing): a follow-up reminder whose follow-up is checked off -> "Done";
+    a tour request you confirmed -> "Confirmed" (marked done -> "Done"). Never fatal."""
+    from app.models.database import AgentTask, PropertyTour
+    out: dict[str, str] = {}
+    try:
+        task_ids = {n.reference_id for n in notes if n.type == "TASK_REMINDER" and n.reference_type == "TASK" and n.reference_id}
+        if task_ids:
+            done = {tid for tid, at in (await db.execute(select(AgentTask.id, AgentTask.completed_at).where(
+                AgentTask.id.in_(task_ids), AgentTask.owner_id == user.id))).all() if at is not None}
+            out.update({n.id: "Done" for n in notes if n.type == "TASK_REMINDER" and n.reference_id in done})
+        tour_ids = {n.reference_id for n in notes if n.type == "TOUR_REQUEST" and n.reference_type == "TOUR" and n.reference_id}
+        if tour_ids:
+            state = {tid: ("Done" if finished else "Confirmed") for tid, cdate, finished in (await db.execute(
+                select(PropertyTour.id, PropertyTour.confirmed_date, PropertyTour.is_completed).where(PropertyTour.id.in_(tour_ids)))).all()
+                if finished or cdate}
+            out.update({n.id: state[n.reference_id] for n in notes if n.type == "TOUR_REQUEST" and n.reference_id in state})
+    except Exception:  # noqa: BLE001
+        logger.warning("rundown done marks failed", exc_info=True)
+        await db.rollback()
+    return out
 
 
 def _grouped(items: list[dict]) -> list[dict]:

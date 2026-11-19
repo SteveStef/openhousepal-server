@@ -480,6 +480,8 @@ The bell in the app always shows everything. This tab only controls which notifi
 
 The top of every daily briefing email says how often and when it comes, with a **Change how often or when** link that opens this setting.
 
+In the briefing on the site (**What happened today**), things you already took care of get a green check: a follow-up reminder whose follow-up you checked off says **Done**, and a tour request you confirmed says **Confirmed**.
+
 **Tools → Email** is also where you:
 
 - Choose which emails your clients get.
