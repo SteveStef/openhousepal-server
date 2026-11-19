@@ -927,6 +927,52 @@ def without_their_agent(message: Optional[str], represented: Optional[str]) -> O
     return cleaned if len(cleaned) >= 12 else out
 
 
+_AGENT_QIDS = ("has_agent", "sc_has_agent", "buy_working_with_agent", "sell_working_with_agent")
+
+
+def _agent_answer(snapshot: object) -> Optional[bool]:
+    """A form / sign-in snapshot's answer to "are you working with an agent?" - True, False or None (not asked)."""
+    if not isinstance(snapshot, dict):
+        return None
+    for qid in _AGENT_QIDS:
+        v = (_answer(snapshot, qid) or "").strip().lower()
+        if v.startswith("yes"):
+            return True
+        if v.startswith("no"):
+            return False
+    return None
+
+
+async def has_own_agent(db: AsyncSession, lead: Optional[Lead]) -> bool:
+    """The lead has their own agent (owner, 11/19): the lead page says so, OR their latest answer anywhere - an open
+    house sign-in, a form, an event RSVP - said yes. (The lead page keeps the first answer it got, so a later "yes"
+    on another form still counts here.) No answer anywhere = no agent."""
+    if lead is None:
+        return False
+    if getattr(lead, "represented", None) == "yes":
+        return True
+    from app.models.database import EventInviteRsvp, LeadEvent, OpenHouseVisitor
+    found: list = []
+    for when, v in (await db.execute(select(OpenHouseVisitor.created_at, OpenHouseVisitor.has_agent)
+                                     .where(OpenHouseVisitor.lead_id == lead.id))).all():
+        if v and str(v).upper() in ("YES", "NO"):
+            found.append((when, str(v).upper() == "YES"))
+    for when, snap in (await db.execute(select(LeadEvent.occurred_at, LeadEvent.raw_snapshot)
+                                        .where(LeadEvent.lead_id == lead.id))).all():
+        a = _agent_answer(snap)
+        if a is not None:
+            found.append((when, a))
+    for when, v in (await db.execute(select(EventInviteRsvp.created_at, EventInviteRsvp.has_agent)
+                                     .where(EventInviteRsvp.lead_id == lead.id))).all():
+        if v is not None:
+            found.append((when, bool(v)))
+    if not found:
+        return False
+    far = datetime.min.replace(tzinfo=timezone.utc)
+    latest = max(found, key=lambda x: (x[0].replace(tzinfo=timezone.utc) if x[0] is not None and x[0].tzinfo is None else x[0]) or far)
+    return latest[1]
+
+
 # ---- the Showcase pitch: the SECOND part of the message, also editable per situation ----
 # Filled from the guest's live Showcase each time the message is shown. A sentence holding
 # {best_home} is dropped when there's no standout home; {why_now} is a sentence of its own (or

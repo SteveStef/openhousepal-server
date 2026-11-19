@@ -374,8 +374,8 @@ async def _p_new_task(db, user, a):
             body["lead_id"] = found.id; lines.append(f"For: {found.name}"); for_lead = found
     if for_lead is not None and _s(a.get("suggested_message")):
         # The chat's draft never says "your agent" to someone who has none (or didn't say) - owner, 11/19.
-        from app.services.tasks_service import without_their_agent
-        a = {**a, "suggested_message": without_their_agent(_s(a["suggested_message"]), getattr(for_lead, "represented", None))}
+        from app.services.tasks_service import has_own_agent, without_their_agent
+        a = {**a, "suggested_message": without_their_agent(_s(a["suggested_message"]), "yes" if await has_own_agent(db, for_lead) else "no")}
     due = _when(a)
     if due:
         body["due_at"] = due; body["all_day"] = not _s(a.get("due_time"))

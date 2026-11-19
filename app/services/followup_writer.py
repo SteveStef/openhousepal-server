@@ -154,7 +154,7 @@ async def facts(db: AsyncSession, owner: User, lead: Lead) -> Dict[str, Any]:
     return {
         "today": f"{_eastern_date(now)} ({_eastern_date(now).strftime('%A')})",
         "first": _first_name(lead.name), "agent": (owner.first_name or "").strip(), "brokerage": (owner.brokerage or "").strip(),
-        "has_own_agent": lead.represented == "yes", "status": lead.status,
+        "has_own_agent": await ts.has_own_agent(db, lead), "status": lead.status,
         "has_phone": bool(lead.phone), "has_email": bool(lead.email),
         "met_at_open_house": ({"address": _street(oh.address if oh is not None else visit.property_address),
                                "date": str(_eastern_date(visit.occurred_at)), "agents_own_listing": own_listing}
@@ -242,7 +242,7 @@ async def write(db: AsyncSession, owner: User, lead: Lead, goal: Optional[str] =
     finally:
         await reconcile_budget(db, reservation, spent)
     message = _clean_message(out.get("message") or "", f["_oh_date"], smart=bool((f.get("showcase") or {}).get("must_haves")))
-    message = ts.without_their_agent(message, lead.represented) or message   # no agent (or unknown): never "your agent"
+    message = ts.without_their_agent(message, "yes" if f["has_own_agent"] else "no") or message   # no agent (or unknown): never "your agent"
     if len(message) < 12:
         return {"error": "Couldn't write it just now - try again."}
     if out.get("link") and f["_showcase_url"]:

@@ -131,3 +131,70 @@ async def test_write_it_for_me_three_leads():
                 await db.execute(delete(OpenHouseEvent).where(OpenHouseEvent.agent_id.in_(ids)))
                 await db.execute(delete(User).where(User.id.in_(ids)))
                 await db.commit()
+
+
+# ---- "has an agent" comes from ANY of their answers, not only the lead page (owner, 11/19) ----
+
+@pytest.mark.asyncio
+async def test_has_own_agent_reads_every_answer():
+    import app.main  # noqa: F401
+    from sqlalchemy import delete, select
+    from app.database import AsyncSessionLocal
+    from app.models.database import Lead, LeadEvent, OpenHouseEvent, OpenHouseVisitor, User
+    tag = f"zqagsrc-{uuid.uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc)
+    form_yes = {"answers": [{"questionId": "sc_has_agent", "label": "Are you working with an agent?", "value": "Yes"}]}
+    form_seller_yes = {"answers": [{"questionId": "sell_working_with_agent", "value": "Yes, I am"}]}
+    try:
+        async with AsyncSessionLocal() as db:
+            agent = User(email=f"{tag}@example.com", hashed_password="x", first_name="Peter", last_name="Stefan", state="PA",
+                         brokerage="COMPASS", mls_id=tag.upper(), plan_tier="BASIC", subscription_status="ACTIVE")
+            db.add(agent)
+            await db.commit()
+            oh = OpenHouseEvent(agent_id=agent.id, qr_code=tag, address="417 Dogwood Ln, Coatesville, PA 19320", scheduled_date=now.date())
+            db.add(oh)
+            await db.commit()
+
+            async def lead(name, rep):
+                l = Lead(owner_id=agent.id, name=name, email=f"{tag}-{name.split()[0].lower()}@example.com", phone="6105550123",
+                         represented=rep, status="new", tags=[])
+                db.add(l)
+                await db.commit()
+                return l
+
+            def visit(l, has, when):
+                db.add(OpenHouseVisitor(full_name=l.name, email=l.email, phone=l.phone, has_agent=has, open_house_event_id=oh.id,
+                                        qr_code=tag, lead_id=l.id, created_at=when))
+
+            def form(l, snap, when):
+                db.add(LeadEvent(lead_id=l.id, source_type="form_submission", occurred_at=when, summary="Filled out a form", raw_snapshot=snap))
+
+            # said NO at the open house, then YES on a buyer form later: has an agent (lead page still says no)
+            a = await lead("Ann Laterform", "no"); visit(a, "NO", now - timedelta(days=20)); form(a, form_yes, now - timedelta(days=5))
+            # lead page unknown, open house sign-in said YES
+            b = await lead("Bea Signin", "unknown"); visit(b, "YES", now - timedelta(days=3))
+            # a seller form said yes
+            c = await lead("Cal Seller", "unknown"); form(c, form_seller_yes, now - timedelta(days=2))
+            # said yes long ago, NO at the latest open house: no agent now
+            d = await lead("Dee Changed", "unknown"); form(d, form_yes, now - timedelta(days=60)); visit(d, "NO", now - timedelta(days=1))
+            # Janet: no, and nothing else
+            e = await lead("Janet Plain", "no"); visit(e, "NO", now - timedelta(days=25))
+            # nobody ever asked
+            f = await lead("Fay Unknown", "unknown")
+            # the agent marked them "Has an agent" on the lead page
+            g = await lead("Gus Marked", "yes")
+            await db.commit()
+            got = {l.name.split()[0]: await ts.has_own_agent(db, l) for l in (a, b, c, d, e, f, g)}
+            assert got == {"Ann": True, "Bea": True, "Cal": True, "Dee": False, "Janet": False, "Fay": False, "Gus": True}, got
+    finally:
+        async with AsyncSessionLocal() as db:
+            ids = (await db.execute(select(User.id).where(User.email.like(f"{tag}%")))).scalars().all()
+            if ids:
+                lead_ids = (await db.execute(select(Lead.id).where(Lead.owner_id.in_(ids)))).scalars().all()
+                await db.execute(delete(OpenHouseVisitor).where(OpenHouseVisitor.qr_code == tag))
+                if lead_ids:
+                    await db.execute(delete(LeadEvent).where(LeadEvent.lead_id.in_(lead_ids)))
+                await db.execute(delete(Lead).where(Lead.owner_id.in_(ids)))
+                await db.execute(delete(OpenHouseEvent).where(OpenHouseEvent.agent_id.in_(ids)))
+                await db.execute(delete(User).where(User.id.in_(ids)))
+                await db.commit()
