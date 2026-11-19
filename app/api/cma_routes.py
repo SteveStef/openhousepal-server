@@ -350,7 +350,8 @@ async def _generate_maybe_as_of(db, owner_id: str, report_id: str, tier, opts: d
             rep = await service.get_report(db, owner_id, report_id)
             tm.fake_client = StubAnthropic({"list_price": (arm.facts or {}).get("list_price"), "comps": [
                 {"listing_key": c.get("listing_key"), "address": c.get("street_address"), "price": c.get("sale_price") or c.get("list_price")}
-                for c in (rep.comparables or []) if c.get("is_included", True)]})
+                for c in (rep.comparables or []) if c.get("is_included", True)],
+                **((arm.facts or {}).get("stub") or {})})
             tm.fake_reasoning = stub_reasoning
             opts = {**opts, "include_map_images": False}   # the one paid Google call - off in a dry run
         try:
@@ -359,7 +360,11 @@ async def _generate_maybe_as_of(db, owner_id: str, report_id: str, tier, opts: d
             for i, cap in enumerate(tm.captured):
                 cma_time_machine.check_payload(cap, f"captured model request {i + 1} ({cap.get('provider')})", raise_now=False)
             arm.facts = {**(arm.facts or {}), "leak_checks": tm.checks, "leak_log": tm.leak_log,
-                         "captured_requests": len(tm.captured), "ai_input_excerpt": tm.prompt_excerpt}
+                         "captured_requests": len(tm.captured), "ai_input_excerpt": tm.prompt_excerpt,
+                         # which AI steps each run asked for, run after run (the seller photo read is reused, 11/19)
+                         "captured_tools": [*((arm.facts or {}).get("captured_tools") or []),
+                                            [",".join(c.get("tool") or []) or ("text" if c.get("provider") == "anthropic" else str(c.get("provider")))
+                                             for c in tm.captured]]}
             await db.commit()
 
 
@@ -563,6 +568,40 @@ async def _resume_one(rid: str, owner_id: str, started) -> int:
     finally:
         if not handed:
             await cluster.release(_RUN_LEASE, rid, token)
+
+
+class SellerPrefillRequest(BaseModel):
+    save_usage: bool = True
+
+
+@router.get("/{report_id}/seller-prefill")
+async def get_seller_prefill(
+    report_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_mls_access),
+    _broker: User = Depends(require_broker_authorization),
+):
+    """Seller Compare step (11/19): where the AI's read of the photos stands - none / reading / ready (with the answers
+    it suggests) / failed - and whether the comps or photos changed since (stale). See cma_seller_prefill."""
+    from app.services import cma_seller_prefill as pf
+    rep = await service.get_report(db, current_user.id, report_id)     # 404 for someone else's report
+    return pf.public_state(rep, await pf.get_state(db, report_id))
+
+
+@router.post("/{report_id}/seller-prefill")
+async def start_seller_prefill(
+    report_id: str,
+    payload: SellerPrefillRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_mls_access),
+    _broker: User = Depends(require_broker_authorization),
+):
+    """Seller Compare step: the AI reads the photos and suggests the answers. The report reuses this read (no second
+    look at the photos). Save usage = the slower, half-price line, with a bell when it is done."""
+    from app.services import cma_seller_prefill as pf
+    from app.services.ai.ai_config_service import ai_config_service
+    rep = await service.get_report(db, current_user.id, report_id)
+    return await pf.start(db, current_user, rep, await ai_config_service.get_config(db), payload.save_usage)
 
 
 @router.post("/{report_id}/generate-ai-analysis", response_model=CmaReportResponse)

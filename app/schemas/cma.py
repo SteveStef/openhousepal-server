@@ -101,6 +101,45 @@ class CmaSubjectProperty(BaseModel):
     # The agent's own photos of the home today (optional, seller CMA on a home not listed) - read by the
     # same AI pass and rules as the comps' listing photos (10/25).
     condition_photos: List[str] = []
+    # Seller report only (11/18): the agent's answers about the home after the comps are picked - see
+    # CmaSellerAnswers. None = not asked / not answered.
+    seller_answers: Optional["CmaSellerAnswers"] = None
+
+
+SellerPlacement = Literal['below_all', 'lower_half', 'upper_half', 'above_all', 'not_sure']
+RoomState = Literal['original', 'updated', 'redone', 'not_sure']
+ReplacedItem = Literal['roof', 'heating_cooling', 'windows', 'water_heater', 'electrical', 'plumbing', 'siding', 'flooring']
+
+
+class CmaReplaced(BaseModel):
+    item: ReplacedItem
+    year: Optional[int] = None
+
+
+class CmaSellerAnswers(BaseModel):
+    """What the agent who has walked the home says about it (seller CMA, 11/18). With no asking price the
+    comps can't tell a redone home from a dated one; the one fact that fixes most of that is where the home
+    sits among the comps the agent picked (`placement`). The rest are facts the AI writes from."""
+    # On condition and finishes (size, age and lot are already adjusted for), this home is:
+    # rougher than every comp / below the middle / above the middle / nicer than every comp.
+    placement: Optional[SellerPlacement] = None
+    # Comp by comp (owner 11/18): each comp's listing key (or its id) -> this home is nicer than it ('better'), about
+    # the same ('same'), not as nice ('worse') or 'not_sure'. Used instead of `placement` when present.
+    comp_marks: Dict[str, Literal['better', 'same', 'worse', 'not_sure']] = {}
+    kitchen: Optional[RoomState] = None
+    kitchen_year: Optional[int] = None
+    baths: Optional[RoomState] = None
+    baths_year: Optional[int] = None
+    replaced: List[CmaReplaced] = []
+    # Two paths (11/19, cma_seller_prefill): inside photos or not; the AI read these answers were filled from (its
+    # finished_at); answers the agent changed from what the photos suggested and confirmed (comp keys, 'kitchen',
+    # 'baths'). Bookkeeping for the Compare step - the engine reads only the answers above.
+    inside_photos: Optional[Literal['yes', 'no']] = None
+    ai_applied: Optional[str] = None
+    kept: List[str] = []
+
+
+CmaSubjectProperty.model_rebuild()
 
 
 class CmaQualityAssessment(BaseModel):

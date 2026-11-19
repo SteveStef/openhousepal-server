@@ -589,6 +589,21 @@ def _comp_ratings(comparables) -> dict:
     return out
 
 
+SELLER_ANSWERS_LOCKED_MESSAGE = ("Your answers about the home are locked once the AI has written this report - its value "
+                                 "was worked out from them. To answer differently, start a new CMA for this home.")
+
+
+def _seller_answers(subject) -> dict:
+    """The seller questions as the value step read them (11/18). Blank, missing and null are the same thing."""
+    sa = (subject or {}).get("seller_answers") if isinstance(subject, dict) else None
+    if not isinstance(sa, dict):
+        return {}
+    out = {k: v for k, v in sa.items() if v not in (None, "", [])}
+    if out.get("replaced"):
+        out["replaced"] = sorted((str(x.get("item")), x.get("year")) for x in out["replaced"] if isinstance(x, dict))
+    return out
+
+
 def comps_locked(report) -> bool:
     """True once the AI analysis has run (owner 11/16): from then on no comp is added, taken off, switched off or
     switched back on. The write-up names the comps it was written from, and a comp added afterwards would never
@@ -610,6 +625,8 @@ async def update_report(db: AsyncSession, owner_id: str, report_id: str, payload
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=COMPS_LOCKED_MESSAGE)
         if _comp_ratings(data["comparables"]) != _comp_ratings(report.comparables):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=RATINGS_LOCKED_MESSAGE)
+    if "subject" in data and comps_locked(report) and _seller_answers(data["subject"]) != _seller_answers(report.subject):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=SELLER_ANSWERS_LOCKED_MESSAGE)
     if "subject" in data:
         # CMA accuracy test only: a live arm for this agent + listing makes this an as-of test report.
         from app.services import cma_backtest_arms as _arms

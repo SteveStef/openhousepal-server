@@ -54,15 +54,28 @@ class _Messages:
         name = tools[0].get("name") if tools else None
         usage = SimpleNamespace(input_tokens=0, output_tokens=0)
         if name == "submit_cma_analysis":
+            # a test can give each comp's ratings and the home's kitchen / baths (arm.facts["stub"]) - the seller
+            # Compare step's photo read is tested with them (11/19)
+            _q = self._ctx.get("stub_quality") or {}
             comps = [{"listing_key": c["listing_key"], "note": f"{c.get('address') or 'This sale'} is a dry-run placeholder note.",
-                      "strength": "supporting", "quality": {}} for c in (self._ctx.get("comps") or [])]
+                      "strength": "supporting", "quality": dict(_q.get(str(c["listing_key"])) or {})} for c in (self._ctx.get("comps") or [])]
             data = {"comps": comps, "subject_estimate": _subject_estimate(self._ctx)}
+            if self._ctx.get("stub_rooms") and "subject_rooms" in ((tools[0].get("input_schema") or {}).get("properties") or {}):
+                data["subject_rooms"] = dict(self._ctx["stub_rooms"])
         elif name == "submit_cma_estimate":
             data = {"subject_estimate": _subject_estimate(self._ctx)}
         elif name:
             props = ((tools[0].get("input_schema") or {}).get("properties") or {})
             data = {k: _STUB_TEXT for k in props}
         else:
+            if "comp write-ups in a home-value report" in str(kwargs.get("system") or ""):
+                # the seller note rewrite (cma_ai_service._rewrite_overridden_comp_notes): one stand-in note per key
+                import json as _json, re as _re
+                text = str(((kwargs.get("messages") or [{}])[0]).get("content") or "")
+                keys = _re.findall(r"^\[([^\]]+)\]", text, _re.M)
+                return SimpleNamespace(content=[SimpleNamespace(type="text", text=_json.dumps(
+                    {"notes": [{"key": k, "text": f"Dry-run rewritten note for {k} - follows the agent's answer."} for k in keys]}))],
+                    usage=usage, stop_reason="end_turn")
             return SimpleNamespace(content=[SimpleNamespace(type="text", text="{}")], usage=usage, stop_reason="end_turn")
         return SimpleNamespace(content=[SimpleNamespace(type="tool_use", name=name, input=data)], usage=usage, stop_reason="tool_use")
 

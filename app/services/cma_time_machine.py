@@ -100,7 +100,8 @@ _REMARK_LEAK_RE = re.compile(
     # sale) and not "back on market" (a fallen-through EARLIER deal - known on the as-of date).
     r"[^.!?\n]*\b(?:under\s+(?:contract|agreement|deposit)|pending|(?:has|was|have\s+been|been|just)\s+sold|"
     r"sold\s*!|settled|closed\s+(?:on|at|for)|"
-    r"accepted\s+(?:an\s+)?offer|multiple\s+offers|highest\s+and\s+best|offer\s+deadline|"
+    r"accepted\s+(?:an\s+)?offer|multiple\s+offers|highest\s*(?:and|&)\s*best|best\s*(?:and|&)\s*(?:highest|final)|"
+    r"offers?\s+(?:are\s+)?due|offer\s+deadline|thank\s+you\s+(?:so\s+much\s+)?for\s+your\s+interest|"
     r"kick[- ]?out|cancel+ed|no\s+more\s+showings|"
     r"showings?\s+(?:have\s+)?(?:stopped|paused|suspended))(?:\b|(?<=!))[^.!?\n]*[.!?]?",
     re.IGNORECASE,
