@@ -10,6 +10,29 @@ from app.models.database import Property
 from app.services.usage_owner import charge_google
 
 
+def _own_session():
+    """A short session of its own for this module's writes (stand-in in tests)."""
+    from app.database import AsyncSessionLocal
+    return AsyncSessionLocal()
+
+
+async def _save(property_record: Property, **values) -> None:
+    """Save the geocode on its own session and copy it onto the caller's home without making it dirty.
+    Never commits the CALLER's session: that commit expired every object the request had already loaded
+    (the agent, the Showcase...) and the next plain read of one failed with a 500 - the first open of a
+    brand-new listing's details (Day 7 audit, 11/19: New Matches mailbox)."""
+    from sqlalchemy import update
+    from sqlalchemy.orm.attributes import set_committed_value
+    async with _own_session() as s:
+        await s.execute(update(Property).where(Property.id == property_record.id).values(**values))
+        await s.commit()
+    for k, v in values.items():
+        try:
+            set_committed_value(property_record, k, v)
+        except Exception:  # noqa: BLE001 - a plain stand-in object (tests)
+            setattr(property_record, k, v)
+
+
 logger = get_logger(__name__)
 
 GEOCODING_URL = "https://maps.googleapis.com/maps/api/geocode/json"
@@ -73,11 +96,14 @@ async def ensure_google_rooftop_geocode(db: AsyncSession, property_record: Prope
     try:
         from app.services import usage_budget_service
         from app.services.ai.ai_config_service import ai_config_service
-        config = await ai_config_service.get_config(db)
-        await usage_budget_service.reserve(db, {
-            "google_geocode": (config.get("google_geocode_daily_limit", 400), config.get("google_geocode_monthly_limit", 8000), None, None),
-            "platform_emergency": (None, None, config["platform_emergency_daily_cost_ceiling_usd"], config["platform_emergency_monthly_cost_ceiling_usd"]),
-        }, config.get("google_geocode_estimated_cost_usd", 0.005), count_delta=1)
+        # The daily-count reservation commits (or rolls back over the cap) - on its own session, so the
+        # caller's loaded objects stay readable (see _save).
+        async with _own_session() as own:
+            config = await ai_config_service.get_config(own)
+            await usage_budget_service.reserve(own, {
+                "google_geocode": (config.get("google_geocode_daily_limit", 400), config.get("google_geocode_monthly_limit", 8000), None, None),
+                "platform_emergency": (None, None, config["platform_emergency_daily_cost_ceiling_usd"], config["platform_emergency_monthly_cost_ceiling_usd"]),
+            }, config.get("google_geocode_estimated_cost_usd", 0.005), count_delta=1)
     except Exception:  # noqa: BLE001 - over the cap (BudgetExceeded) or the counter failed: no Google call
         return await _usable(db, property_record)
 
@@ -99,10 +125,7 @@ async def ensure_google_rooftop_geocode(db: AsyncSession, property_record: Prope
     )
     if not best:
         location_type = ((results[0].get("geometry") or {}).get("location_type") if results else None)
-        property_record.google_geocode_location_type = location_type
-        property_record.google_geocoded_at = datetime.now(timezone.utc)
-        await db.commit()
-        await db.refresh(property_record)
+        await _save(property_record, google_geocode_location_type=location_type, google_geocoded_at=datetime.now(timezone.utc))
         return property_record
 
     location = (best.get("geometry") or {}).get("location") or {}
@@ -111,10 +134,6 @@ async def ensure_google_rooftop_geocode(db: AsyncSession, property_record: Prope
     if lat is None or lng is None:
         return await _usable(db, property_record)
 
-    property_record.google_rooftop_latitude = float(lat)
-    property_record.google_rooftop_longitude = float(lng)
-    property_record.google_geocode_location_type = "ROOFTOP"
-    property_record.google_geocoded_at = datetime.now(timezone.utc)
-    await db.commit()
-    await db.refresh(property_record)
+    await _save(property_record, google_rooftop_latitude=float(lat), google_rooftop_longitude=float(lng),
+                google_geocode_location_type="ROOFTOP", google_geocoded_at=datetime.now(timezone.utc))
     return property_record
