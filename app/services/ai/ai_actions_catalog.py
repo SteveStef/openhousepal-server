@@ -363,14 +363,19 @@ async def _p_new_task(db, user, a):
         raise ActionError("What's the follow-up?")
     body = {"title": title[:200], "kind": a.get("kind") if a.get("kind") in ("call", "text", "email", "showing", "general") else "general"}
     lines = [title]
+    for_lead = None
     if a.get("lead_id"):
-        lead = await _lead(db, user, a); body["lead_id"] = lead.id; lines.append(f"For: {lead.name}")
+        lead = await _lead(db, user, a); body["lead_id"] = lead.id; lines.append(f"For: {lead.name}"); for_lead = lead
     elif _s(a.get("lead_name")):
         # "remind me to call Test Client..." - attach the lead by name (owner's test, 11/01: it was
         # saved with no lead). Two people with that name: ask which.
         found = await _lead_named(db, user, a["lead_name"])
         if found:
-            body["lead_id"] = found.id; lines.append(f"For: {found.name}")
+            body["lead_id"] = found.id; lines.append(f"For: {found.name}"); for_lead = found
+    if for_lead is not None and _s(a.get("suggested_message")):
+        # The chat's draft never says "your agent" to someone who has none (or didn't say) - owner, 11/19.
+        from app.services.tasks_service import without_their_agent
+        a = {**a, "suggested_message": without_their_agent(_s(a["suggested_message"]), getattr(for_lead, "represented", None))}
     due = _when(a)
     if due:
         body["due_at"] = due; body["all_day"] = not _s(a.get("due_time"))

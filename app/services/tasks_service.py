@@ -906,6 +906,27 @@ def with_footer(message: Optional[str], user: Optional[User]) -> Optional[str]:
     return f"{message.rstrip()}\n\n{footer}"
 
 
+# A message only talks about the guest's own agent when they said they have one (owner, 11/19: Janet said
+# "no" at 417 Dogwood Ln and the AI still wrote "if you or your agent have any questions"). "No" and
+# unknown read the same: no agent. "you or your agent" -> "you"; a sentence still about "your agent" goes.
+_THEIR_AGENT = r"your\s+(?:own\s+)?(?:buyer'?s\s+|buying\s+)?(?:real\s+estate\s+agent|agent|realtor)(?!\s+hub)\b"
+_YOU_OR_THEIR_AGENT = re.compile(r"\byou\s*(?:or|and|/|&)\s*" + _THEIR_AGENT, re.I)
+_THEIR_AGENT_RE = re.compile(r"\b" + _THEIR_AGENT, re.I)
+
+
+def without_their_agent(message: Optional[str], represented: Optional[str]) -> Optional[str]:
+    if not message or represented == "yes" or not _THEIR_AGENT_RE.search(message):
+        return message
+    out = _YOU_OR_THEIR_AGENT.sub(lambda m: "You" if m.group(0)[0] == "Y" else "you", message)
+    lines = []
+    for line in out.split("\n"):
+        parts = re.split(r"(?<=[.!?])\s+", line)
+        kept = [p for p in parts if not _THEIR_AGENT_RE.search(p)]
+        lines.append(" ".join(kept) if len(kept) != len(parts) else line)
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return cleaned if len(cleaned) >= 12 else out
+
+
 # ---- the Showcase pitch: the SECOND part of the message, also editable per situation ----
 # Filled from the guest's live Showcase each time the message is shown. A sentence holding
 # {best_home} is dropped when there's no standout home; {why_now} is a sentence of its own (or

@@ -53,8 +53,10 @@ _SYSTEM = (
     "- Use the agent's notes to make it personal (their timeline, what they want), but never quote a note word for word "
     "and never mention anything private or about who they are (family, age, religion, origin, disability) - homes, "
     "timing and their search only.\n"
-    "- If the lead has their own agent: only talk about the agent's own listing they saw, and write it so it works if "
+    "- Only if has_own_agent is true: only talk about the agent's own listing they saw, and write it so it works if "
     "they pass it to their agent (e.g. 'if you or your agent have any questions about ...'). Never offer to help them search.\n"
+    "- If has_own_agent is false, never mention an agent of theirs at all - no 'your agent', no 'you or your agent'. "
+    "Write to them alone (e.g. 'if you have any questions about the home ...').\n"
     "- If the agent gave a goal for this follow-up, write toward it.\n"
     "- link: true only if adding their Showcase link at the end would help (they have one and it fits); the app adds it.\n"
     "Answer with JSON only: {\"title\":\"short to-do for the agent, e.g. 'Text Nicole - still looking?'\","
@@ -240,6 +242,7 @@ async def write(db: AsyncSession, owner: User, lead: Lead, goal: Optional[str] =
     finally:
         await reconcile_budget(db, reservation, spent)
     message = _clean_message(out.get("message") or "", f["_oh_date"], smart=bool((f.get("showcase") or {}).get("must_haves")))
+    message = ts.without_their_agent(message, lead.represented) or message   # no agent (or unknown): never "your agent"
     if len(message) < 12:
         return {"error": "Couldn't write it just now - try again."}
     if out.get("link") and f["_showcase_url"]:
