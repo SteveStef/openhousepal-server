@@ -845,7 +845,7 @@ Click a lead to open it. You'll see:
 - **Edit** (next to their name): change name, email or phone, then **Save**. If you change the email and they have a Showcase, you're asked **"Send a new invite?"** - choose **No thanks** or **Yes, send one**, then pick **Showcase from an open house** or **Normal Showcase invite**. Their Showcase now goes to the new address either way.
 - **Call / Text / Email** buttons and copy buttons for phone and email.
 - **Where they stand** menu: New ("Haven't talked yet"), Contacted, In talks ("Actively working together"), Signed ("Your client").
-- **Do they have an agent?** menu: No agent, Not sure, Has an agent (moves them to the "Has agent" tab).
+- **Do they have an agent?** menu: No agent, Not sure, Has an agent (moves them to the "Has agent" tab; if they have a Showcase it asks "delete their Showcase?" - Delete Showcase stops its emails and alerts, Keep it leaves it).
 - **How they found you:** Came from, First touch, Latest, and "What they told you". **See it in Activity** jumps to the full entry. If they came from an open house and did more on their Guest Pass than land on it, a **Guest Pass** button opens what they did.
 - **Waiting on you:** each open request with **Open** and **Done** (Done = "I've handled this - clear it").
 - **Follow-ups** section (see section 2), with **Alert settings** and **All follow-ups**.
@@ -1288,7 +1288,7 @@ What a Fast Cut does by itself: the title and the ending are a nameplate that dr
 **Where:** **Tools > Calendar**.
 
 1. Under **Google Calendar** click **Connect Google**.
-2. Sign in with Google. "If Google says 'unverified app': Advanced → Go to OpenHousePal → Allow."
+2. Sign in with Google. Google shows OpenHousePal is verified - pick your account and click Allow.
 3. You land back on the page, synced.
 
 When connected: **Sync now** pushes everything again; **Disconnect** removes the "OpenHousePal" calendar and its events from your Google account. If it says **Sign-in expired**, click **Reconnect**.

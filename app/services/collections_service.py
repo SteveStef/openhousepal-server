@@ -2076,6 +2076,38 @@ class CollectionsService:
             return {'success': False, 'error': str(e)}
 
     @staticmethod
+    async def _stop_showcase_mail(db: AsyncSession, collection: Collection, user_id: str) -> int:
+        """Cancel this Showcase's waiting emails + switch its open house guests' Showcase off (see
+        delete_collection). Its own savepoint: a failure here never blocks the delete. -> emails cancelled."""
+        from app.models.database import OpenHouseEvent, OpenHouseVisitor
+        from app.services.visitor_showcase_service import INVITE_TEMPLATE
+        email = (collection.visitor_email or "").strip().lower()
+        vars_ = ScheduledEmail.template_variables
+        mine = [vars_["_collection_id"].astext == str(collection.id)]
+        if email:
+            # Its invites carry the Showcase link but not its id: the open house thank-you, "your
+            # Showcase is ready" (forms) and "homes I picked for you" (shared by the agent).
+            mine.append(and_(ScheduledEmail.template_name.in_((INVITE_TEMPLATE, "showcase_ready", "showcase_shared")),
+                             func.lower(func.trim(ScheduledEmail.recipient_email)) == email))
+        try:
+            async with db.begin_nested():
+                res = await db.execute(update(ScheduledEmail).where(
+                    ScheduledEmail.status.in_(("PENDING", "DIGEST")),
+                    or_(ScheduledEmail.owner_id == user_id, vars_["_owner_id"].astext == str(user_id)),
+                    or_(*mine),
+                ).values(status="CANCELLED", error_message="Not sent - you deleted their Showcase")
+                 .execution_options(synchronize_session=False))
+                if email:
+                    mine_oh = select(OpenHouseEvent.id).where(OpenHouseEvent.agent_id == user_id)
+                    await db.execute(update(OpenHouseVisitor).where(
+                        OpenHouseVisitor.open_house_event_id.in_(mine_oh), func.lower(func.trim(OpenHouseVisitor.email)) == email,
+                    ).values(showcase_override=False).execution_options(synchronize_session=False))
+            return res.rowcount or 0
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to stop the deleted Showcase's emails: {e}")
+            return 0
+
+    @staticmethod
     async def delete_collection(
         db: AsyncSession,
         collection_id: str,
@@ -2118,6 +2150,13 @@ class CollectionsService:
                     await db.delete(task)
             except Exception as e:
                 logger.error(f"Failed to remove the deleted Showcase's follow-ups: {e}")
+
+            # Emails still waiting to go out with this Showcase in them - its open house thank-you /
+            # invite, a digest, a "search updated" note - are cancelled, so the client never gets a
+            # link to a page that's gone; and an open house guest's Showcase switch goes off, so it
+            # isn't quietly built again (owner 11/19: marking a lead "has an agent" offers this delete
+            # - "no more alerts regarding it"). Their other emails from the agent are untouched.
+            await CollectionsService._stop_showcase_mail(db, collection, user_id)
 
             # Delete the collection. Its collection_properties links, likes/views and comments go
             # with it (ON DELETE CASCADE on collection_id). The homes themselves are never deleted:

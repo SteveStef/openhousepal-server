@@ -215,6 +215,10 @@ def _showcase_gate(form: AgentForm, answers_by_id: dict) -> Optional[str]:
         if "buy" not in ans("intent"):
             return None
         a = ans("buy_working_with_agent") or ans("sc_has_agent")
+    elif form.form_type == "showcase_request":
+        # Setup My Own Showcase asks it first ("has_agent"); its leads stayed "Not sure" though they
+        # had just said "No, I'm not working with an agent" (Day 6 audit, 11/19).
+        a = ans("has_agent")
     else:
         return None
     if not a:
