@@ -621,6 +621,34 @@ async def _towns_not_townships(db, search: dict, lines: list) -> None:
 _SIDE_WORDS = re.compile(r"\b(east|west|north|south|central)\b", re.I)
 
 
+async def _side_townships(db, district: str) -> dict:
+    """{"East": ["Uwchlan", "Upper Uwchlan", ...], "West": [...]} - the townships of a district whose listings (every
+    listing ever, sold ones too) name one side's high school at least 80% of the time, 20+ such listings. A plain
+    township search then keeps only that side - exact, even for a listing that leaves its high school blank
+    (owner, 11/19: Lisa's "DASD East" - about half the listings in her range had no high school)."""
+    rows = (await db.execute(select(Property.township, Property.high_school, func.count()).where(
+        Property.school_district_name == district, Property.township.isnot(None), Property.high_school.isnot(None))
+        .group_by(Property.township, Property.high_school))).all()
+    per: dict = {}
+    for twp, hs, n in rows:
+        s = next((m.group(1).title() for m in _SIDE_WORDS.finditer(hs or "") if m.group(1).upper() not in district.upper()), None)
+        if s:
+            per.setdefault(tidy_caps(twp), {}).setdefault(s, 0)
+            per[tidy_caps(twp)][s] += n
+    out: dict = {}
+    for twp, sides in sorted(per.items(), key=lambda kv: -sum(kv[1].values())):
+        total = sum(sides.values())
+        side, n = max(sides.items(), key=lambda kv: kv[1])
+        if total < 20:
+            continue
+        if n / total >= 0.8:
+            out.setdefault(side, []).append(twp)
+        elif n / total >= 0.55:
+            # split between high schools, mostly one side - named apart, never searched as if it were one side
+            out.setdefault("_split", []).append(f"{twp} (mostly {side})")
+    return out
+
+
 async def _real_districts(db, search: dict, lines: list) -> None:
     """School districts as the MLS names them (owner, 11/19: the chat saved "DASD East" - no listing has that
     district, so the Showcase would come back empty). "DASD" / "Downingtown Area SD" -> "DOWNINGTOWN AREA"; a
@@ -671,8 +699,14 @@ async def _real_districts(db, search: dict, lines: list) -> None:
                 Property.school_district_name == found, Property.high_school.ilike(f"%{side.group(1)}%"))
                 .group_by(Property.high_school).order_by(func.count().desc()).limit(1))).first()
             school = tidy_caps(schools[0]) if schools else None
+            st = await _side_townships(db, found)
+            twps = st.get(side.group(1).title()) or []
+            split = [s for s in st.get("_split", []) if f"mostly {side.group(1).title()}" in s]
             notes.append(f"“{side.group(1).title()}” isn't its own district, so this searches all of {tidy_caps(found)}"
-                         + (f". To star the homes zoned for {school}, add it as a must-have - I can set that up" if school else ""))
+                         + (f". Its {side.group(1).lower()}-side townships (by their listings' high school): {', '.join(twps)} - "
+                            "search those to keep only that side (exact, even when a listing leaves the school out)" if twps else "")
+                         + (f". Split between schools: {', '.join(split)} - add it too and star the high school to tell them apart" if split else "")
+                         + (f". Or, to just star the homes zoned for {school}, make it a must-have" if school else ""))
     # A district with more than one high school: name them, so a side ("DASD East") is one must-have away even
     # when the district was asked for by its plain name (owner, 11/19: "I wish the AI was smart enough to make that
     # recommendation").
@@ -692,9 +726,11 @@ async def _real_districts(db, search: dict, lines: list) -> None:
             name, total = groups.get(s.group(1).title(), (tidy_caps(h), 0))
             groups[s.group(1).title()] = (name, total + n)
         if len(groups) >= 2:
-            parts = [f"{k}: {name}, {n} for sale" for k, (name, n) in groups.items()]
-            notes.append(f"{tidy_caps(d)} has {len(groups)} high schools ({'; '.join(parts)}) - "
-                         "to favor one, make its high school a must-have (starred)")
+            twps = await _side_townships(db, d)
+            parts = [f"{k}: {name}, {n} for sale" + (f" - townships {', '.join(twps[k])}" if twps.get(k) else "") for k, (name, n) in groups.items()]
+            notes.append(f"{tidy_caps(d)} has {len(groups)} high schools ({'; '.join(parts)})"
+                         + (f"; split between them: {', '.join(twps['_split'])}" if twps.get("_split") else "")
+                         + " - to keep one side, search its townships; to just favor one, make its high school a must-have (starred)")
     out = [tidy_caps(d) for d in out]   # "Downingtown Area", as the search editor shows it (matching ignores case)
     search["school_districts"] = out
     lines[:] = [l for l in lines if not l.startswith("School districts:")] + [f"School districts: {', '.join(tidy_caps(d) for d in out)}"] + notes

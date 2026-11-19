@@ -12,6 +12,7 @@ When the agent hasn't opened it in the app for a while, it also carries "Since y
 Read only - building the Rundown never claims digest rows or sends anything."""
 from __future__ import annotations
 
+import re
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
@@ -357,6 +358,50 @@ async def _happenings(db: AsyncSession, user: User, notes: list) -> tuple[list[d
     return items, links
 
 
+async def _waiting_on_you(db: AsyncSession, user: User, notes: list, items: list, brief: dict) -> set:
+    """Bell items that are already under Things to do and still waiting on you - they stay up there only, so
+    nothing shows twice (owner, 11/19: "I don't want people being overwhelmed"). Once handled they're back in the
+    day's log, with the green check where there is one. Never fatal - worst case something shows twice.
+    - a follow-up reminder whose follow-up is listed (open, due)
+    - a tour request not confirmed yet ("N showing requests waiting on you", names on that row)
+    - a request to change their search still open ("N clients want their search changed")
+    - a client changing their own search ("X changed their own search")
+    - a form response not opened yet ("N form responses you haven't opened")"""
+    from app.models.database import Collection, FormSubmission, PropertyTour
+    out: set = set()
+    try:
+        rows = [*brief.get("actions", []), *brief.get("client_activity", [])]
+        has = lambda words: any(words in (r.get("title") or "") for r in rows)  # noqa: E731
+        by_id = {n.id: n for n in notes}
+        done = {i["id"] for i in items if i.get("done")}
+        listed = {k.split(":", 1)[1] for f in brief.get("followups", []) for k in (f.get("_all_keys") or [f.get("_key") or ""]) if k.startswith("task:")}
+        for n in notes:
+            if n.id in done:
+                continue
+            if n.type == "TASK_REMINDER" and n.reference_id in listed:
+                out.add(n.id)
+        refs = lambda t, rt: {n.reference_id for n in notes if n.type == t and n.reference_type == rt and n.reference_id and n.id not in done}  # noqa: E731
+        if has("showing request") and (ids := refs("TOUR_REQUEST", "TOUR")):
+            waiting = set((await db.execute(select(PropertyTour.id).where(
+                PropertyTour.id.in_(ids), PropertyTour.confirmed_date.is_(None), PropertyTour.is_completed.is_(False)))).scalars().all())
+            out |= {n.id for n in notes if n.type == "TOUR_REQUEST" and n.reference_id in waiting}
+        if has("their search changed") and (ids := refs("REFINE_SEARCH_REQUEST", "COLLECTION")):
+            waiting = set((await db.execute(select(Collection.id).where(
+                Collection.id.in_(ids), Collection.owner_id == user.id, Collection.refine_request_message.isnot(None)))).scalars().all())
+            out |= {n.id for n in notes if n.type == "REFINE_SEARCH_REQUEST" and n.reference_id in waiting}
+        changed_rows = {m.group(1) for r in rows if "changed their own search" in (r.get("title") or "")
+                        for m in [re.search(r"showcase=([0-9a-f-]{36})", r.get("link") or "")] if m}
+        out |= {n.id for n in notes if n.type == "SHOWCASE_SEARCH_CHANGED" and (n.collection_id or n.reference_id) in changed_rows}
+        if has("form response") and (ids := refs("FORM_SUBMISSION", "FORM_SUBMISSION")):
+            waiting = set((await db.execute(select(FormSubmission.id).where(
+                FormSubmission.id.in_(ids), FormSubmission.owner_id == user.id, FormSubmission.is_reviewed.is_(False)))).scalars().all())
+            out |= {n.id for n in notes if n.type == "FORM_SUBMISSION" and n.reference_id in waiting}
+    except Exception:  # noqa: BLE001
+        logger.warning("rundown waiting-on-you check failed", exc_info=True)
+        await db.rollback()
+    return out
+
+
 async def _done_marks(db: AsyncSession, user: User, notes: list) -> dict[str, str]:
     """What you already took care of gets a green check (owner, 11/19: a follow-up reminder for a text already
     sent looked like it still needed doing): a follow-up reminder whose follow-up is checked off -> "Done";
@@ -577,15 +622,11 @@ async def build_rundown(db: AsyncSession, user: User, now: datetime | None = Non
     items, links = await _happenings(db, user, list(notes))
     # Nothing twice (owner, 11/19: "I don't want people being overwhelmed"): a follow-up reminder for a
     # follow-up already listed under Things to do stays there only. A finished one stays here, checked.
-    listed = {k.split(":", 1)[1] for f in brief["followups"] for k in (f.get("_all_keys") or [f.get("_key") or ""]) if k.startswith("task:")}
-    if listed:
-        by_id = {n.id: n for n in notes}
-        twice = {i["id"] for i in items if i["type"] == "TASK_REMINDER" and not i.get("done")
-                 and getattr(by_id.get(i["id"]), "reference_id", None) in listed}
-        if twice:
-            items = [i for i in items if i["id"] not in twice]
-            notes = [n for n in notes if n.id not in twice]
-            happened_total = max(0, happened_total - len(twice))
+    twice = await _waiting_on_you(db, user, notes, items, brief)
+    if twice:
+        items = [i for i in items if i["id"] not in twice]
+        notes = [n for n in notes if n.id not in twice]
+        happened_total = max(0, happened_total - len(twice))
     happened = _grouped(items)
     unread_today = sum(1 for n in notes if not n.is_read) + (1 if bell is not None and not bell.is_read else 0)
 

@@ -99,6 +99,35 @@ def _money(v: Any) -> str | None:
         return None
 
 
+def _names_line(names: list, total: int, lead: str = "") -> str:
+    """"Lisa Kalisperis, Nicole Williams + 2 more" - up to 3 names, then how many more."""
+    shown = []
+    for n in names:
+        n = " ".join(str(n).split())
+        if n and n not in shown:
+            shown.append(n)
+    shown = shown[:3]
+    if not shown:
+        return ""
+    more = total - len(shown)
+    return f"{lead}{', '.join(shown)}" + (f" + {more} more" if more > 0 else "")
+
+
+async def _waiting_tours_line(db: AsyncSession, user_id: str) -> str:
+    """The tour requests still waiting on the agent, as "Nicole Williams - 12 Oak St, ..." (newest first)."""
+    from app.models.database import Property, PropertyTour
+    rows = (await db.execute(
+        select(PropertyTour.visitor_name, Property.street_address, Property.city)
+        .join(Collection, Collection.id == PropertyTour.collection_id)
+        .outerjoin(Property, Property.id == PropertyTour.property_id)
+        .where(Collection.owner_id == user_id, PropertyTour.confirmed_date.is_(None), PropertyTour.is_completed.is_(False))
+        .order_by(PropertyTour.created_at.desc()).limit(4))).all()
+    total = (await db.execute(
+        select(func.count(PropertyTour.id)).join(Collection, Collection.id == PropertyTour.collection_id)
+        .where(Collection.owner_id == user_id, PropertyTour.confirmed_date.is_(None), PropertyTour.is_completed.is_(False)))).scalar() or 0
+    return _names_line([f"{(n or 'A client').strip()} - {nice_street(s, c)}" if s else (n or "") for n, s, c in rows], total)
+
+
 def _plural(n: int, one: str, many: str) -> str:
     return f"{n} {one if n == 1 else many}"
 
@@ -725,8 +754,12 @@ async def _briefing(db: AsyncSession, user: User, now: datetime, showcase_access
     unread_forms = (await db.execute(select(func.count()).select_from(FormSubmission).where(
         FormSubmission.owner_id == user.id, FormSubmission.is_reviewed.is_(False)))).scalar() or 0
     if unread_forms:
+        who = (await db.execute(select(FormSubmission.contact_name, FormSubmission.contact_email).where(
+            FormSubmission.owner_id == user.id, FormSubmission.is_reviewed.is_(False))
+            .order_by(FormSubmission.created_at.desc()).limit(4))).all()
         actions.append({"badge": str(unread_forms), "title": _plural(unread_forms, "form response", "form responses") + " you haven't opened",
-                        "detail": "", "link": absolute("/studio/forms")})
+                        "detail": _names_line([(n or e or "").strip() for n, e in who if (n or e)], unread_forms, "From "),
+                        "link": absolute("/studio/forms")})
     # A support reply they haven't read (the Help icon's red dot).
     try:
         from app.api.support_routes import _is_unread_for_agent
@@ -767,12 +800,19 @@ async def _briefing(db: AsyncSession, user: User, now: datetime, showcase_access
     if showcase_access:
         from app.services.collections_service import CollectionsService
         refine, showings = await CollectionsService.count_pending_refine_requests(db, str(user.id), split=True)
+        # Who and which home (owner, 11/19): these rows stand in for the same requests in the day's log, so
+        # the names ride along here instead of the item showing twice (rundown_service._waiting_on_you).
         if showings:
             activity.append({"badge": str(showings), "title": _plural(showings, "showing request", "showing requests") + " waiting on you",
-                             "detail": "", "link": absolute("/showcases")})
+                             "detail": await _waiting_tours_line(db, user.id), "link": absolute("/showcases")})
         if refine:
+            from app.models.database import Collection as _Sc   # (Collection is imported again further down this function)
+            names = (await db.execute(select(_Sc.visitor_name).where(
+                _Sc.owner_id == user.id, _Sc.refine_request_message.isnot(None))
+                .order_by(_Sc.refine_request_at.desc().nullslast())
+                .limit(4))).scalars().all()
             activity.append({"badge": str(refine), "title": _plural(refine, "client wants", "clients want") + " their search changed",
-                             "detail": "", "link": absolute("/showcases")})
+                             "detail": _names_line([n for n in names if n], refine), "link": absolute("/showcases")})
         # Clients who changed their own search since yesterday's briefing - who, and what it is now.
         try:
             from app.models.database import Collection, Lead, LeadEvent
