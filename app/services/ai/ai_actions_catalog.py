@@ -614,12 +614,56 @@ async def _towns_not_townships(db, search: dict, lines: list) -> None:
                 lines.append(f"{label}: {', '.join(search[k])}")
 
 
+_SIDE_WORDS = re.compile(r"\b(east|west|north|south|central)\b", re.I)
+
+
+async def _real_districts(db, search: dict, lines: list) -> None:
+    """School districts as the MLS names them (owner, 11/19: the chat saved "DASD East" - no listing has that
+    district, so the Showcase would come back empty). "DASD" / "Downingtown Area SD" -> "DOWNINGTOWN AREA"; a
+    side ("East") isn't a district: the whole district is searched and the card names that side's high school
+    as the must-have to star. A name no listing has is refused, never saved."""
+    from app.services.ai.ai_home_search import FOR_SALE, resolve_district
+    names = list(search.get("school_districts") or [])
+    if not names:
+        return
+    out, notes = [], []
+    all_d = None
+    for raw in names:
+        side = _SIDE_WORDS.search(raw or "")
+        text = re.sub(r"\s+", " ", _SIDE_WORDS.sub(" ", raw or "")).strip(" ,-")
+        found = await resolve_district(db, text) if text else None
+        if not found and re.fullmatch(r"[A-Za-z]{2,7}", text or ""):
+            # initials: DASD = Downingtown Area School District, TESD = Tredyffrin-Easttown, WCASD = West Chester Area
+            if all_d is None:
+                all_d = (await db.execute(select(Property.school_district_name, func.count()).where(
+                    Property.school_district_name.isnot(None), Property.home_status.in_(FOR_SALE))
+                    .group_by(Property.school_district_name).order_by(func.count().desc()))).all()
+            want = text.upper().removesuffix("SD")
+            found = next((d for d, _ in all_d if "".join(w[0] for w in re.split(r"[\s\-]+", d.upper()) if w) == want), None)
+        if not found:
+            raise ActionError(f"I couldn't find a school district called “{raw}” in the listings - say its full name "
+                              "(like “Downingtown Area”) and I'll set it.")
+        if found not in out:
+            out.append(found)
+        if side:
+            schools = (await db.execute(select(Property.high_school, func.count()).where(
+                Property.school_district_name == found, Property.high_school.ilike(f"%{side.group(1)}%"))
+                .group_by(Property.high_school).order_by(func.count().desc()).limit(1))).first()
+            school = tidy_caps(schools[0]) if schools else None
+            notes.append(f"“{side.group(1).title()}” isn't its own district, so this searches all of {tidy_caps(found)}"
+                         + (f". To star the homes zoned for {school}, add it as a must-have - I can set that up" if school else ""))
+    out = [tidy_caps(d) for d in out]   # "Downingtown Area", as the search editor shows it (matching ignores case)
+    search["school_districts"] = out
+    lines[:] = [l for l in lines if not l.startswith("School districts:")] + [f"School districts: {', '.join(tidy_caps(d) for d in out)}"] + notes
+
+
 async def _p_showcase_search(db, user, a):
     c = await _showcase(db, user, a)
     search, lines = _search_lines(a)
     if not search:
         raise ActionError("What should change in their search?")
     await _towns_not_townships(db, search, lines)
+    await _real_districts(db, search, lines)
     # Towns replace a distance / drawn-area search - left in place, the old circle adds its homes on
     # top (owner, 10/31: Bryn Mawr + Gladwyne showed Penn Valley, Narberth, Bala Cynwyd, Ardmore).
     if any(k in search for k in ("cities", "townships")):
@@ -636,8 +680,75 @@ async def _r_showcase_search(db, user, p):
     n = (out or {}).get("properties_count")
     return {"message": f"Search updated{f' - {n} homes match now' if n is not None else ''}.", "link": f"/showcases?showcase={p['collection_id']}"}
 
-_simple("update_showcase_search", "Change a Showcase's search (price, beds, baths, size, year built, towns, types). Only the fields given change. Use collection_id from list_showcases.",
+_simple("update_showcase_search", "Change a Showcase's search (price, beds, baths, size, year built, towns, types). Only the fields given change. Use collection_id from list_showcases. "
+        "The search can't filter on words in a listing, a feature or a school - for those use set_showcase_must_haves (it stars the homes that have them), "
+        "and say so in the same reply instead of saying it can't be done. Keep 'if possible' / 'ideally' wishes out of the search (they'd hide homes) - "
+        "make them must-haves. For a district's side or a school ('DASD East'), search the whole district and make the high school a must-have.",
         _obj({"collection_id": {"type": "string"}, **_SEARCH_PROPS}, ["collection_id"]), _p_showcase_search, _r_showcase_search, SHOWCASE)
+
+
+async def _showcase_of(db, user, a) -> Collection:
+    """Their Showcase by collection_id - or by the person (lead_id), since the chat often holds the lead's id
+    (11/19 replay: "I couldn't find Lisa's Showcase under that ID")."""
+    cid = (a.get("collection_id") or "").strip()
+    if cid:
+        c = (await db.execute(select(Collection).where(Collection.id == cid, Collection.owner_id == user.id))).scalar_one_or_none()
+        if c is not None:
+            return c
+    for lid in [x for x in (a.get("lead_id"), cid) if x]:
+        lead = (await db.execute(select(Lead).where(Lead.id == lid, Lead.owner_id == user.id))).scalar_one_or_none()
+        if lead is not None and lead.email:
+            c = (await db.execute(select(Collection).where(Collection.owner_id == user.id, func.lower(Collection.visitor_email) == lead.email.lower())
+                                  .order_by(Collection.created_at.desc()).limit(1))).scalar_one_or_none()
+            if c is not None:
+                return c
+    raise ActionError("I couldn't find that Showcase - look it up with list_showcases and use its collection_id.")
+
+
+async def _p_showcase_must_haves(db, user, a):
+    """Must-haves (owner, 11/19 - Lisa wanted "DASD East only"): the AI reads every home in the Showcase and stars the
+    ones that have them all, like the search editor's Must-haves box. Same route, same limits, same AI usage."""
+    from app.services.showcase_smart_filter import MAX_WANTS, clean_wants, estimate, showcase_home_count, state_of
+    from app.utils.auth import tier_has_mls
+    c = await _showcase_of(db, user, a)
+    if not (tier_has_mls(user.plan_tier) or user.is_admin):
+        raise ActionError("Must-haves read MLS listings - they're on the MLS plans.")
+    wants = clean_wants(a.get("wants"))
+    if not wants:
+        raise ActionError(f"What should every starred home have? Up to {MAX_WANTS} things, like \"Pool\" or \"Downingtown East high school\".")
+    pref = (await db.execute(select(CollectionPreferences).where(CollectionPreferences.collection_id == c.id))).scalar_one_or_none()
+    had = clean_wants(state_of(pref).get("wants")) if pref is not None else []
+    n = await showcase_home_count(db, c.id)
+    est = await estimate(db, user, n, len(wants))
+    if n > est["cap"]:
+        raise ActionError(f"{_sc_name(c)} has {n} homes - the AI reads every one, so narrow the search to {est['cap']} or fewer first.")
+    if not est["enough"]:
+        raise ActionError("Not enough AI usage left this month to read those homes - it resets on your billing day.")
+    lines = [f"Must-haves: {', '.join(wants)}"]
+    if had and [w.lower() for w in had] != [w.lower() for w in wants]:
+        lines.append(f"Replaces: {', '.join(had)}")
+    lines += ["Homes that have all of them get the Recommended star and a line saying so; the rest stay, without it",
+              (f"Reads {n} home{'s' if n != 1 else ''}" + (f" · uses ~{est['usage_percent']}% of AI usage" if est.get("usage_percent") else ""))
+              if n else "No homes for sale in it right now - new ones are read as they arrive"]
+    return Prepared(f"Star homes in {_sc_name(c)}", lines, {"collection_id": c.id, "body": {"wants": wants}},
+                    warning=f"{c.visitor_name or 'Your client'} sees the stars too.")
+
+
+async def _r_showcase_must_haves(db, user, p):
+    out = await _run_route(user, "PUT", f"/collections/{p['collection_id']}/smart-filter", p["body"])
+    st = (out or {}).get("smart_filter") or {}
+    reading = st.get("state") == "reading"
+    return {"message": "Reading the homes now - the stars show on the Showcase as they're found." if reading else "Must-haves saved.",
+            "link": f"/showcases?showcase={p['collection_id']}"}
+
+_simple("set_showcase_must_haves",
+        "Set a Showcase's must-haves (up to 3, e.g. 'Pool', 'First-floor primary bedroom', 'Downingtown East high school', 'Mentions east side'): "
+        "the AI reads every home in it and stars the ones that have ALL of them (Recommended star + a line under the address - the client sees it); "
+        "the others stay, unstarred. Use it whenever they want homes narrowed by something the search can't filter - words in the description, "
+        "features, a school (listings carry their elementary / middle / high school, so a school must-have is exact). It replaces the must-haves "
+        "already there - pass every one to keep. Uses a little AI usage (the card shows how much). Use collection_id from list_showcases, or the lead_id of the person.",
+        _obj({"collection_id": {"type": "string"}, "lead_id": {"type": "string"}, "wants": {"type": "array", "items": {"type": "string"}, "maxItems": 3}}, ["wants"]),
+        _p_showcase_must_haves, _r_showcase_must_haves, SHOWCASE)
 
 
 async def _p_showcase_state(db, user, a):

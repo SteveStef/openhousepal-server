@@ -670,7 +670,7 @@ async def _search_showcase_homes(db: AsyncSession, current_user: User, args: dic
         return {"error": "not_found", "message": "No lead found with that id - look them up with search_leads by name to get the right lead_id and try again (don't ask the agent for it)."}
     if not collection:
         return {"has_showcase": False, "message": "This lead doesn't have a Showcase yet."}
-    homes = list(collection.properties or [])
+    homes = await _with_raw(db, list(collection.properties or []))
     out = _scan_homes(homes, phrases, limits)
     base = {"has_showcase": True, "collection_id": collection.id, "showcase_home_count": len(homes)}
     # Then the AI reads every listing (owner, 11/08: word matching alone misses "owner's retreat on the
@@ -678,6 +678,29 @@ async def _search_showcase_homes(db: AsyncSession, current_user: User, args: dic
     question = (args.get("question") or "").strip() or " / ".join(phrases)
     kept = [p for p in homes if _within(p, limits)]
     return {**base, **(await _ai_read(db, current_user, config, question, kept, out))}
+
+
+async def _with_raw(db: AsyncSession, homes: list) -> list:
+    """Showcase homes are loaded without their whole Bright record (mls_mirror.selectin_without_raw), but the
+    keyword check (_feature_strings / _floor_facts) and the listing reader read it - touching it unloaded
+    crashed the check (owner, 11/19: "The tool returned a system error" twice on Lisa's Showcase). Load it
+    for just these homes, in one query."""
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy.exc import NoInspectionAvailable
+
+    def unloaded(p) -> bool:
+        try:
+            return "raw_mls_data" in sa_inspect(p).unloaded
+        except NoInspectionAvailable:   # not a database row (tests' stand-ins) - nothing to load
+            return False
+    ids = [p.id for p in homes if unloaded(p)]
+    if not ids:
+        return homes
+    from sqlalchemy.orm import undefer
+    rows = (await db.execute(select(Property).where(Property.id.in_(ids)).options(undefer(Property.raw_mls_data))
+                             .execution_options(populate_existing=True))).scalars().all()
+    by_id = {p.id: p for p in rows}
+    return [by_id.get(p.id, p) for p in homes]
 
 
 def _within(p: Property, limits: dict) -> bool:

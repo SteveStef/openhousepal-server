@@ -202,6 +202,39 @@ async def _replace_open_form_cards(db: AsyncSession, conversation_id: str, refs:
             flag_modified(m, "tool_calls")
 
 
+# A reply that sends them to a button ("tap Confirm on the Uwchlan change first") while no new card came with it.
+_POINTS_AT_CARD = re.compile(r"\b(?:tap|tapping|click|clicking|press|pressing|hit|hitting)\b[^.!?\n]{0,30}\b(?:confirm|save|apply|send|make it|button|card)\b"
+                             r"|\bconfirm(?:ing)?\s+(?:the|that|on the|it)\b|\bon the card\b|\bthe card (?:above|earlier|I made)\b"
+                             r"|\bcard\b[^.!?\n]{0,60}\b(?:still )?(?:waiting|pending)\b", re.I)
+
+
+async def _bring_down_waiting_card(db: AsyncSession, conversation_id: str, text: str, refs: list) -> list:
+    """The reply points them at a button on a card from earlier in this chat that's still waiting (owner, 11/19:
+    "I wish you showed the confirm button under this text, but I just scrolled up and clicked it"): that card
+    moves down under this reply - the same card (same id), so it can only ever run once - and the old spot says
+    it moved. Only when this reply made no card of its own; the newest waiting card, from the last 20 replies."""
+    if not text or not _POINTS_AT_CARD.search(text) or any(isinstance(r, dict) and r.get("record_type") == "action" for r in refs or []):
+        return refs
+    rows = (await db.execute(select(AIMessage).where(AIMessage.conversation_id == conversation_id, AIMessage.role == "assistant")
+                             .order_by(AIMessage.created_at.desc()).limit(20))).scalars().all()
+    now = datetime.now(timezone.utc)
+    from sqlalchemy.orm.attributes import flag_modified
+    for m in rows:
+        for c in reversed(m.tool_calls or []):
+            if not (isinstance(c, dict) and c.get("record_type") == "action" and c.get("status") == "pending"):
+                continue
+            try:
+                if datetime.fromisoformat(c["expires_at"]) < now:
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+            moved = {**c, "moved_from": m.id}
+            c.update(status="replaced", result_message="Moved down to my newest message.")
+            flag_modified(m, "tool_calls")
+            return [*(refs or []), moved]
+    return refs
+
+
 async def _build_history(db: AsyncSession, conversation: AIConversation, max_messages: int) -> tuple[List[dict], str]:
     """Recent-message replay window, oldest first. Only the final text of each past turn is
     replayed - not the tool calls that produced it - so token cost stays flat as a
@@ -683,6 +716,10 @@ async def send_ai_message(
             raise HTTPException(status_code=504 if e.reason == "timeout" else 503, detail=e.user_message)
 
         await _replace_open_form_cards(db, conversation.id, refs)
+        try:
+            refs = await _bring_down_waiting_card(db, conversation.id, text, refs)
+        except Exception:  # noqa: BLE001 - a convenience, never a reason to lose the answer
+            logger.warning("bring-down card failed", exc_info=True)
         assistant_msg = AIMessage(conversation_id=conversation.id, role="assistant", content=text, tool_calls=refs or None)
         db.add(assistant_msg)
 
