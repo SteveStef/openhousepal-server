@@ -1136,6 +1136,13 @@ async def get_my_recent_sales(
             "Agent Hub recent-sales local fallback query exceeded 6s - returning empty",
             extra={"user_id": current_user.id},
         )
+        # The cancelled query leaves the session's transaction broken; without a rollback the
+        # request's own commit (get_db) raised PendingRollbackError -> a 500 instead of "no sales"
+        # (Day 3 audit 11/18: every new agent's first Agent Hub / setup Sales load).
+        try:
+            await db.rollback()
+        except Exception:
+            logger.warning("recent-sales rollback after timeout failed", exc_info=True)
         return []
 
     sales_by_listing = {}

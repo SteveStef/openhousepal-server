@@ -1309,8 +1309,8 @@ When connected: **Sync now** pushes everything again; **Disconnect** removes the
 2. **Emails to your clients - What your clients get**: each row has an on/off switch and **Sends from** (**Your email** or **OpenHousePal**).
    - *Most important*: Showcase invite after your open house (with **Goes out**: **Right away**, 15 or 30 minutes after, or **1 hour after**), Showcases you make for a client, Showcase link when someone makes their own, Tour confirmations, Your replies to their comments.
    - *Automatic updates*: New homes & price drops in their Showcase (**How often**: **Up to daily** or **Once a week**), Listing Spotlight alerts.
-   - Off means it never goes out. No-MLS plans only see the rows that apply to them.
-3. **Emails to you - What lands in your inbox**: on/off for New leads & sign-ins, Client requests in Showcases, Open house host requests, **Daily briefing**, Liked homes, Showcase activity, New reviews, Spotlight weekly report (Mondays), Team & broadcasts, My listing updates, AI media ready. Your in-app bell always shows everything.
+   - Off means it never goes out. Each plan only sees the rows that apply to it (Showcase rows on Premium and IDX, Listing Spotlight alerts on IDX).
+3. **Emails to you - What lands in your inbox**: on/off for New leads & sign-ins, Client requests in Showcases, Open house host requests, **Daily briefing**, Liked homes, Showcase activity, New reviews, Spotlight weekly report (Mondays), Team & broadcasts, My listing updates, AI media ready - only the ones your plan includes. Daily briefing is on every plan. Your in-app bell always shows everything.
 
 ### Change your daily briefing time
 In **Emails to you**, make sure **Daily briefing** is on, then pick **How often** (**Every day** or **Once a week (Mondays)**) and use **Arrives at** to pick a time (every 15 minutes from 6:00 AM to 9:00 PM, **Eastern time**). It saves instantly (you'll see "Saved"). The default is 4:30 PM.

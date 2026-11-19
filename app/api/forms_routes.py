@@ -831,7 +831,13 @@ async def get_or_create_forms(db: AsyncSession, owner_id: str) -> List[AgentForm
             db.add(new_form)
             next_order += 1
 
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError:
+            # Two requests made a brand-new agent's starter forms at the same moment (the Forms
+            # page / setup fire several calls at once) - the other one won; use its rows instead
+            # of answering with a 500 (Day 3 audit 11/18: uq_agent_forms_owner_slug).
+            await db.rollback()
         result = await db.execute(select(AgentForm).where(AgentForm.owner_id == owner_id))
         all_forms = result.scalars().all()
 

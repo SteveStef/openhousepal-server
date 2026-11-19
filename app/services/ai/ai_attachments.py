@@ -54,8 +54,10 @@ def note(attached: list) -> str:
 
 
 async def _fetch(url: str) -> bytes:
+    # Public addresses only (app.utils.safe_fetch) - never our own network (security pass 11/18).
+    from app.utils.safe_fetch import safe_get
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url)
+        r = await safe_get(client, url)
         r.raise_for_status()
         return r.content
 

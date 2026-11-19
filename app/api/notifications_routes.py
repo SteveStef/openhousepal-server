@@ -265,20 +265,41 @@ async def _email_settings_payload(db: AsyncSession, user: User) -> dict:
     s = es.resolve(user.email_settings)
     prefs = notification_preferences_service.resolve_prefs(user.notification_prefs)
     cats = {c["id"]: c for c in notification_preferences_service.categories_payload()}
-    # Only what this plan actually sends. No-MLS plans have no Showcases, Spotlights or hosting
-    # (Bright MLS features) - their clients only get tour confirmations from this list.
-    from app.utils.auth import REVIEWS_ACCESS_TIERS, STUDIO_MEDIA_ACCESS_TIERS, tier_has_mls
+    # Only what this plan actually sends (Day 3 audit 11/18: Basic was shown Showcase, Spotlight, review
+    # and AI media switches, Premium Spotlight + AI media). No-MLS plans have no Showcases, Spotlights or
+    # hosting (Bright MLS features) - their clients only get tour confirmations from this list.
+    from app.utils.auth import REVIEWS_ACCESS_TIERS, SHOWCASE_ACCESS_TIERS, STUDIO_MEDIA_ACCESS_TIERS, tier_has_mls
     plan = getattr(user, "plan_tier", None)
     client_rows = es.CLIENT_EMAILS
     hidden_cats: set = set()
-    if plan and not tier_has_mls(plan):
-        client_rows = [c for c in es.CLIENT_EMAILS if c["key"] == "tour_confirmed"]
-        hidden_cats = {"showcase_requests", "host_requests", "showcase_digest", "liked_homes", "showcase_activity", "spotlight_weekly", "listing_updates", "team"}
+    no_mls = bool(plan) and not tier_has_mls(plan)
+    showcases = not plan or plan in SHOWCASE_ACCESS_TIERS
+    if plan:
+        hidden_client: set = set()
+        if not showcases:
+            hidden_client |= {"showcase_invite", "showcase_shared", "showcase_ready", "comment_reply", "showcase_updates"}
+            hidden_cats |= {"showcase_requests", "liked_homes", "showcase_activity"}
+        if plan != "IDX":  # Listing Spotlight is on the IDX plan only
+            hidden_client.add("spotlight_alerts")
+            hidden_cats.add("spotlight_weekly")
+        if no_mls:
+            # The daily briefing still goes to No-MLS agents (send_agent_briefings), so its switch, time
+            # and daily/weekly choice stay - just worded without Showcases (it used to be hidden, so they
+            # couldn't turn it off or move it).
+            hidden_cats |= {"host_requests", "listing_updates", "team"}
         if plan not in REVIEWS_ACCESS_TIERS:
             hidden_cats.add("reviews")
         if plan not in STUDIO_MEDIA_ACCESS_TIERS:
             hidden_cats.add("ai_media")
-    receive = [{**t, "categories": [{**cats[c], "email": prefs[c]["email"]} for c in t["categories"] if c in cats and c not in hidden_cats]} for t in es.RECEIVE_TIERS]
+        client_rows = [c for c in es.CLIENT_EMAILS if c["key"] not in hidden_client]
+
+    def _cat(c: str) -> dict:
+        row = {**cats[c], "email": prefs[c]["email"]}
+        if not showcases and c == "showcase_digest":
+            row["help"] = ("One email a day: your follow-ups, anything waiting on you and a wrap-up of each "
+                           "open house that's over. Skipped on days with nothing to report.")
+        return row
+    receive = [{**t, "categories": [_cat(c) for c in t["categories"] if c in cats and c not in hidden_cats]} for t in es.RECEIVE_TIERS]
     return {
         "client": [{k: v for k, v in {**c, **s["client"][c["key"]]}.items() if k != "templates"} for c in client_rows],
         "invite_delay": s["invite_delay"], "invite_delays": list(es.INVITE_DELAYS),

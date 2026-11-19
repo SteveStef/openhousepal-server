@@ -6094,7 +6094,10 @@ async def _fetch_image_block(http: httpx.AsyncClient, url: str, edge: Optional[i
     Returns (content_block, estimated_tokens), or None (skip, don't fail the whole generation) on
     any download/content-type problem."""
     try:
-        resp = await http.get(url, timeout=15.0)
+        # Public addresses only (app.utils.safe_fetch): a manual subject photo URL is agent-set
+        # (security pass 11/18). MLS CDN photos are public, so nothing real is refused.
+        from app.utils.safe_fetch import safe_get
+        resp = await safe_get(http, url, timeout=15.0)
         resp.raise_for_status()
         content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
         if not content_type.startswith("image/"):

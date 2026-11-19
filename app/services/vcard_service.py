@@ -100,8 +100,10 @@ async def fetch_photo_base64(photo_url: Optional[str]) -> Optional[str]:
     if not photo_url or not photo_url.startswith("http"):
         return None
     try:
+        # Public addresses only (app.utils.safe_fetch) - the photo URL is agent-set (security pass 11/18).
+        from app.utils.safe_fetch import safe_get
         async with httpx.AsyncClient(timeout=PHOTO_FETCH_TIMEOUT_SECONDS) as client:
-            response = await client.get(photo_url)
+            response = await safe_get(client, photo_url)
         if response.status_code != 200:
             return None
         content_type = response.headers.get("content-type", "")

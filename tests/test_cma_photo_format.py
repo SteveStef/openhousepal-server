@@ -18,6 +18,8 @@ def _img(fmt: str, size=(640, 480)) -> bytes:
 
 
 class _Resp:
+    is_redirect = False  # safe_get (11/18 security pass) follows redirects itself
+
     def __init__(self, content, content_type):
         self.content = content
         self.headers = {"content-type": content_type}
@@ -30,12 +32,24 @@ class _Http:
     def __init__(self, resp):
         self.resp = resp
 
-    async def get(self, url, timeout=None):
+    async def get(self, url, timeout=None, **kwargs):
         return self.resp
 
 
-def _block(content, content_type):
+def _block(content, content_type, monkeypatch=None):
     return asyncio.run(svc._fetch_image_block(_Http(_Resp(content, content_type)), "http://photos.example/1.jpg"))
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _public_address(monkeypatch):
+    """The made-up photos.example host doesn't resolve; these tests are about photo formats, not the
+    public-address check (app.utils.safe_fetch), so treat it as public."""
+    async def _ok(url, trust_own=True):
+        return None
+    monkeypatch.setattr("app.utils.safe_fetch.assert_public_url", _ok)
 
 
 def test_mislabelled_jpeg_is_sent_as_a_real_jpeg():
