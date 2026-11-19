@@ -26,7 +26,8 @@ async def test_done_reminders_and_confirmed_tours_are_marked():
             done = AgentTask(owner_id=agent.id, title="Text Nicole - grandmother's first-floor bedroom search", kind="text",
                              completed_at=now)
             open_ = AgentTask(owner_id=agent.id, title="Call Janet", kind="call")
-            db.add_all([done, open_])
+            due_today = AgentTask(owner_id=agent.id, title="Email Sam about 12 Oak St", kind="email", due_at=now, all_day=True)
+            db.add_all([done, open_, due_today])
             await db.commit()
             prop_id = (await db.execute(select(Property.id).limit(1))).scalar()
             col = Collection(name="Nicole", owner_id=agent.id, status="ACTIVE", share_token=tag)
@@ -45,13 +46,17 @@ async def test_done_reminders_and_confirmed_tours_are_marked():
                 return Notification(agent_id=agent.id, type=kind, reference_type=rtype, reference_id=rid, title=title, message=msg,
                                     link="/leads/tasks", is_read=False)
             db.add_all([note("TASK_REMINDER", "TASK", done.id, "Follow-up reminder", done.title),
-                        note("TASK_REMINDER", "TASK", open_.id, "Follow-up reminder", open_.title)]
+                        note("TASK_REMINDER", "TASK", open_.id, "Follow-up reminder", open_.title),
+                        note("TASK_REMINDER", "TASK", due_today.id, "Follow-up reminder", due_today.title)]
                        + [note("TOUR_REQUEST", "TOUR", t.id, "Tour request", f"tour {i}") for i, t in enumerate(tours)])
             await db.commit()
 
             r = await build_rundown(db, agent)
             got = {i["message"]: i.get("done") for g in r["happened"] for i in g["items"]}
             assert got[done.title] == "Done" and got["Call Janet"] is None, got
+            # due today = already under Things to do: not repeated under What happened today (owner, 11/19)
+            assert any(f["title"].startswith("Email Sam") for f in r["followups"]), r["followups"]
+            assert "Email Sam about 12 Oak St" not in got, got
             if tours:
                 assert got["tour 0"] == "Confirmed" and got["tour 1"] is None, got
     finally:

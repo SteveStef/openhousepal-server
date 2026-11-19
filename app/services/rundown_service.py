@@ -575,6 +575,17 @@ async def build_rundown(db: AsyncSession, user: User, now: datetime | None = Non
     happened_total = len(notes) if len(notes) < MAX_TIMELINE else await _count(db, select(func.count(Notification.id)).where(
         Notification.agent_id == user.id, Notification.created_at >= start, Notification.type != RUNDOWN_TYPE))
     items, links = await _happenings(db, user, list(notes))
+    # Nothing twice (owner, 11/19: "I don't want people being overwhelmed"): a follow-up reminder for a
+    # follow-up already listed under Things to do stays there only. A finished one stays here, checked.
+    listed = {k.split(":", 1)[1] for f in brief["followups"] for k in (f.get("_all_keys") or [f.get("_key") or ""]) if k.startswith("task:")}
+    if listed:
+        by_id = {n.id: n for n in notes}
+        twice = {i["id"] for i in items if i["type"] == "TASK_REMINDER" and not i.get("done")
+                 and getattr(by_id.get(i["id"]), "reference_id", None) in listed}
+        if twice:
+            items = [i for i in items if i["id"] not in twice]
+            notes = [n for n in notes if n.id not in twice]
+            happened_total = max(0, happened_total - len(twice))
     happened = _grouped(items)
     unread_today = sum(1 for n in notes if not n.is_read) + (1 if bell is not None and not bell.is_read else 0)
 

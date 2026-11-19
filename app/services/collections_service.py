@@ -236,6 +236,26 @@ async def _ai_starred_ids(db, collection_id: str, smart_lookup: dict | None = No
     return set(v) if isinstance(v, dict) else set()
 
 
+async def engaged_home_ids(db: AsyncSession, collection_id: str, keep_viewed: bool = False) -> set:
+    """Homes in this Showcase that stay when its search changes: ones the client liked, passed on (disliked -
+    owner, 11/19: "homes that have had engagement like they'd like dislike or a comment or a tour, they don't
+    leave the showcase"), commented on or asked to tour, and the agent's own picks. A plain view isn't enough
+    (keep_viewed: rebuilding around another open house keeps viewed ones too)."""
+    in_sc = collection_properties.c.property_id
+    mine = PropertyInteraction.collection_id == collection_id
+    keep_query = select(in_sc).where(collection_properties.c.collection_id == collection_id).where(or_(
+        in_sc.in_(select(PropertyInteraction.property_id).where(and_(mine, PropertyInteraction.liked == True))),  # noqa: E712
+        in_sc.in_(select(PropertyInteraction.property_id).where(and_(mine, PropertyInteraction.disliked == True))),  # noqa: E712
+        in_sc.in_(select(PropertyComment.property_id).where(PropertyComment.collection_id == collection_id)),
+        in_sc.in_(select(PropertyTour.property_id).where(PropertyTour.collection_id == collection_id)),
+        # The agent's own picks (recommended / added by hand from a home's page) stay too.
+        in_sc.in_(select(PropertyInteraction.property_id).where(and_(mine, PropertyInteraction.agent_recommended_at.is_not(None)))),
+        *([in_sc.in_(select(PropertyInteraction.property_id).where(
+            and_(mine, PropertyInteraction.view_count > 0, PropertyInteraction.disliked.is_not(True))))] if keep_viewed else []),
+    ))
+    return {r[0] for r in (await db.execute(keep_query)).all()}
+
+
 class CollectionsService:
 
     @staticmethod
@@ -1981,33 +2001,8 @@ class CollectionsService:
             matching_properties = [p for p in matching_properties if p.id not in removed_ids]
             new_match_ids -= removed_ids
 
-            # 3. Identify IDs of properties to PROTECT (those with user interactions)
-            # We don't want to remove properties the user has actually engaged with (Liked, Commented, Toured)
-            # A simple 'view' is NOT enough to protect a property from being cleared.
-            keep_query = select(collection_properties.c.property_id).where(
-                collection_properties.c.collection_id == collection_id
-            ).where(
-                or_(
-                    collection_properties.c.property_id.in_(
-                        select(PropertyInteraction.property_id).where(
-                            and_(
-                                PropertyInteraction.collection_id == collection_id,
-                                PropertyInteraction.liked == True
-                            )
-                        )
-                    ),
-                    collection_properties.c.property_id.in_(select(PropertyComment.property_id).where(PropertyComment.collection_id == collection_id)),
-                    collection_properties.c.property_id.in_(select(PropertyTour.property_id).where(PropertyTour.collection_id == collection_id)),
-                    # The agent's own picks (recommended / added by hand from a home's page) stay too.
-                    collection_properties.c.property_id.in_(select(PropertyInteraction.property_id).where(
-                        and_(PropertyInteraction.collection_id == collection_id, PropertyInteraction.agent_recommended_at.is_not(None)))),
-                    *([collection_properties.c.property_id.in_(select(PropertyInteraction.property_id).where(
-                        and_(PropertyInteraction.collection_id == collection_id, PropertyInteraction.view_count > 0,
-                             PropertyInteraction.disliked.is_not(True))))] if keep_viewed else []),
-                )
-            )
-            keep_ids_res = await db.execute(keep_query)
-            protected_ids = {r[0] for r in keep_ids_res.fetchall()}
+            # 3. Identify IDs of properties to PROTECT (those with user interactions) - engaged_home_ids
+            protected_ids = await engaged_home_ids(db, collection_id, keep_viewed=keep_viewed)
             # A star the must-haves reader gave (showcase_smart_filter) isn't the agent's own pick: it never
             # keeps a home the new search leaves out (owner, 11/09 - a client's "4+ beds" kept the AI's
             # starred 3-bed homes). The agent's own stars still do; liked / commented / toured still do.

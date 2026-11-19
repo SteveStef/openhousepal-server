@@ -550,6 +550,10 @@ async def _p_new_showcase(db, user, a):
     if not any(k in search for k in ("cities", "townships", "school_districts")):
         raise ActionError("Which towns, townships or school districts should their search cover?")
     await _towns_not_townships(db, search, lines)
+    await _real_districts(db, search, lines)
+    count_line = await _match_preview(db, search)
+    if count_line:
+        lines.append(count_line.replace("After this change: ", "To start: "))
     send = bool(a.get("email_client"))
     # "Don't email her yet" = no emails to the client at all - the welcome AND the daily new-match
     # emails (owner's test, 11/01: only the welcome was skipped). Default: their daily emails run.
@@ -629,9 +633,24 @@ async def _real_districts(db, search: dict, lines: list) -> None:
     out, notes = [], []
     all_d = None
     for raw in names:
-        side = _SIDE_WORDS.search(raw or "")
-        text = re.sub(r"\s+", " ", _SIDE_WORDS.sub(" ", raw or "")).strip(" ,-")
-        found = await resolve_district(db, text) if text else None
+        # The whole name first: "West Chester Area", "North Penn", "Central Bucks" have a side word in their real name.
+        # Then each side word taken out on its own ("Central Bucks East" -> Central Bucks, side East), last first.
+        side, text, found = None, raw, None
+        sides = list(_SIDE_WORDS.finditer(raw or ""))
+        whole = await resolve_district(db, raw) if sides else None
+        if whole and all(m.group(1).upper() in whole.upper() for m in sides):
+            found = whole
+        else:
+            for m in reversed(sides):
+                t = re.sub(r"\s+", " ", (raw[:m.start()] + " " + raw[m.end():])).strip(" ,-")
+                f = await resolve_district(db, t) if t else None
+                if f and m.group(1).upper() not in f.upper():
+                    side, text, found = m, t, f
+                    break
+            if found is None:
+                text = re.sub(r"\s+", " ", _SIDE_WORDS.sub(" ", raw or "")).strip(" ,-")
+                found = await resolve_district(db, text) if text else None
+                side = sides[-1] if sides else None   # checked against the district found, below
         if not found and re.fullmatch(r"[A-Za-z]{2,7}", text or ""):
             # initials: DASD = Downingtown Area School District, TESD = Tredyffrin-Easttown, WCASD = West Chester Area
             if all_d is None:
@@ -640,6 +659,8 @@ async def _real_districts(db, search: dict, lines: list) -> None:
                     .group_by(Property.school_district_name).order_by(func.count().desc()))).all()
             want = text.upper().removesuffix("SD")
             found = next((d for d, _ in all_d if "".join(w[0] for w in re.split(r"[\s\-]+", d.upper()) if w) == want), None)
+        if side is not None and found and side.group(1).upper() in found.upper():
+            side = None
         if not found:
             raise ActionError(f"I couldn't find a school district called “{raw}” in the listings - say its full name "
                               "(like “Downingtown Area”) and I'll set it.")
@@ -652,9 +673,68 @@ async def _real_districts(db, search: dict, lines: list) -> None:
             school = tidy_caps(schools[0]) if schools else None
             notes.append(f"“{side.group(1).title()}” isn't its own district, so this searches all of {tidy_caps(found)}"
                          + (f". To star the homes zoned for {school}, add it as a must-have - I can set that up" if school else ""))
+    # A district with more than one high school: name them, so a side ("DASD East") is one must-have away even
+    # when the district was asked for by its plain name (owner, 11/19: "I wish the AI was smart enough to make that
+    # recommendation").
+    for d in out:
+        if any(tidy_caps(d) in n for n in notes):
+            continue
+        rows = (await db.execute(select(Property.high_school, func.count()).where(
+            Property.school_district_name == d, Property.high_school.isnot(None), Property.home_status.in_(FOR_SALE))
+            .group_by(Property.high_school).order_by(func.count().desc()).limit(12))).all()
+        # Listings spell one school several ways ("DHS EAST", "DOWNINGTOWN HS EAST CAMPUS", "RADNOR H") - only real
+        # sides count (East / West...), each once; a district whose name has the side word ("West Chester") isn't split by it.
+        groups: dict = {}
+        for h, n in rows:
+            s = next((m for m in _SIDE_WORDS.finditer(h or "") if m.group(1).upper() not in d.upper()), None)
+            if not s:
+                continue
+            name, total = groups.get(s.group(1).title(), (tidy_caps(h), 0))
+            groups[s.group(1).title()] = (name, total + n)
+        if len(groups) >= 2:
+            parts = [f"{k}: {name}, {n} for sale" for k, (name, n) in groups.items()]
+            notes.append(f"{tidy_caps(d)} has {len(groups)} high schools ({'; '.join(parts)}) - "
+                         "to favor one, make its high school a must-have (starred)")
     out = [tidy_caps(d) for d in out]   # "Downingtown Area", as the search editor shows it (matching ignores case)
     search["school_districts"] = out
     lines[:] = [l for l in lines if not l.startswith("School districts:")] + [f"School districts: {', '.join(tidy_caps(d) for d in out)}"] + notes
+
+
+async def _match_preview(db, search: dict, pref=None, collection_id: Optional[str] = None) -> Optional[str]:
+    """How many homes the Showcase will hold after this change (owner, 11/19: "whenever it's changing a showcase,
+    it also says how many matches will be inside of it after this change") - the refresh's own search, run before
+    anything is saved, plus the homes that stay anyway (collections_service.engaged_home_ids). None if it can't tell."""
+    from types import SimpleNamespace
+    from app.services.collections_service import engaged_home_ids
+    from app.services.property_service import property_service
+    from app.services.showcase_limit import SHOWCASE_FETCH, SHOWCASE_MAX_HOMES
+    cols = CollectionPreferences.__table__.columns.keys()
+    base = {k: (getattr(pref, k, None) if pref is not None else None) for k in cols}
+    base.update({k: v for k, v in search.items() if k in cols})
+    try:
+        homes = await property_service.get_properties_by_preferences(db, SimpleNamespace(**base), max_properties=SHOWCASE_FETCH)
+        ids = {p.id for p in homes}
+        stay = 0
+        if collection_id:
+            from app.models.database import PropertyInteraction
+            out = {r[0] for r in (await db.execute(select(PropertyInteraction.property_id).where(
+                PropertyInteraction.collection_id == collection_id, PropertyInteraction.agent_removed_at.isnot(None)))).all()}
+            ids -= out
+            stay = len(await engaged_home_ids(db, collection_id) - ids)
+    except Exception:  # noqa: BLE001 - the card still works without the number
+        logger.warning("showcase match preview failed", exc_info=True)
+        await db.rollback()
+        return None
+    n = len(ids)
+    if n > SHOWCASE_MAX_HOMES:
+        head = f"After this change: {SHOWCASE_MAX_HOMES}+ homes match (the Showcase holds the {SHOWCASE_MAX_HOMES} best)"
+    elif n:
+        head = f"After this change: {n} home{'s' if n != 1 else ''} match{'es' if n == 1 else ''} the search"
+    else:
+        head = "After this change: no homes for sale match right now - new listings that fit are added as they come"
+    if stay:
+        head += f", plus {stay} they liked, passed on, commented on or asked to tour (those always stay)"
+    return head
 
 
 async def _p_showcase_search(db, user, a):
@@ -671,6 +751,21 @@ async def _p_showcase_search(db, user, a):
         if pref and ((pref.diameter and pref.lat is not None) or pref.search_polygon):
             search.update({"address": None, "lat": None, "long": None, "diameter": None, "search_polygon": None})
             lines.append("Drops the old distance / drawn-area search, so only these towns count")
+    pref_now = (await db.execute(select(CollectionPreferences).where(CollectionPreferences.collection_id == c.id))).scalar_one_or_none()
+    count_line = await _match_preview(db, search, pref_now, c.id)
+    if count_line:
+        lines.append(count_line)
+        # Towns + a district that leave only a few homes (owner, 11/19 - Lisa: "DASD East only, and if at all possible
+        # Uwchlan" left 1 home): say what the district alone holds, so the wider search with the town starred is on the table.
+        few = re.match(r"After this change: (no homes|(\d+) homes?)", count_line)
+        districts = search.get("school_districts") or (getattr(pref_now, "school_districts", None) or [])
+        towns = [*(search.get("townships") or []), *(search.get("cities") or [])]
+        if few and towns and districts and (few.group(2) is None or int(few.group(2)) <= 5):
+            wide = await _match_preview(db, {**search, "townships": [], "cities": []}, pref_now)
+            m = re.match(r"After this change: (\d+\+?) homes?", wide or "")
+            if m:
+                lines.append(f"Without the town filter, {', '.join(tidy_caps(d) for d in districts)} has {m.group(1)} homes - "
+                             f"to keep them, search the whole district and make {' / '.join(towns)} a must-have (starred) instead")
     return Prepared(f"Change {_sc_name(c)} search", lines + ["Only these parts change; the rest stays"], {"collection_id": c.id, "body": search},
                     warning=f"{c.visitor_name or 'Your client'} hears about the new search in their next daily email.")
 
@@ -683,7 +778,9 @@ async def _r_showcase_search(db, user, p):
 _simple("update_showcase_search", "Change a Showcase's search (price, beds, baths, size, year built, towns, types). Only the fields given change. Use collection_id from list_showcases. "
         "The search can't filter on words in a listing, a feature or a school - for those use set_showcase_must_haves (it stars the homes that have them), "
         "and say so in the same reply instead of saying it can't be done. Keep 'if possible' / 'ideally' wishes out of the search (they'd hide homes) - "
-        "make them must-haves. For a district's side or a school ('DASD East'), search the whole district and make the high school a must-have.",
+        "make them must-haves. For a district's side or a school ('DASD East'), search the whole district and make the high school a must-have. "
+        "Always say in your reply how many homes it will hold after the change (the card's 'After this change' line); when that's only a few, "
+        "say so and suggest the wider search with must-haves starring the preferred town or school.",
         _obj({"collection_id": {"type": "string"}, **_SEARCH_PROPS}, ["collection_id"]), _p_showcase_search, _r_showcase_search, SHOWCASE)
 
 

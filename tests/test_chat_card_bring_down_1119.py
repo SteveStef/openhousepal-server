@@ -158,3 +158,22 @@ async def test_district_names_resolve_and_sides_become_must_have_hint():
             assert bool(side) == ("East" in raw), (raw, lines)
         with pytest.raises(ActionError):
             await _real_districts(db, {"school_districts": ["Zzyzx Unified"]}, [])
+
+
+@pytest.mark.asyncio
+async def test_side_words_inside_real_district_names():
+    """'West Chester Area' / 'Central Bucks' carry a side word in their own name - never split by it; 'Central Bucks East' is."""
+    import app.main  # noqa: F401
+    from sqlalchemy import select
+    from app.database import AsyncSessionLocal
+    from app.models.database import Property
+    from app.services.ai.ai_actions_catalog import _real_districts
+    async with AsyncSessionLocal() as db:
+        for raw, want, side in (("West Chester Area", "West Chester Area", False), ("WCASD", "West Chester Area", False),
+                                ("Central Bucks East", "Central Bucks", True), ("North Penn", "North Penn", False)):
+            if not (await db.execute(select(Property.id).where(Property.school_district_name.ilike(want)).limit(1))).first():
+                continue
+            search, lines = {"school_districts": [raw]}, []
+            await _real_districts(db, search, lines)
+            assert search["school_districts"] == [want], (raw, search)
+            assert any("isn't its own district" in l for l in lines) == side, (raw, lines)
