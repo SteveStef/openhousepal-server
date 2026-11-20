@@ -205,13 +205,83 @@ async def place_wants(db, wants: List[str]) -> Dict[str, Dict[str, Any]]:
             if hit:
                 word = {"twp": "Township", "boro": "Borough"}.get(kind, kind.title())
                 out[w] = {"field": "township", "values": {name, f"{name} TWP", f"{name} TOWNSHIP", f"{name} BORO", f"{name} BOROUGH"},
-                          "say": f"In {nice}" + (f" {word}" if word else (" Township" if hit.upper().endswith(("TWP", "TOWNSHIP")) else ""))}
+                          "say": f"In {nice}" + (f" {word}" if word else (" Township" if hit.upper().endswith(("TWP", "TOWNSHIP")) else "")),
+                          "name": nice}
                 continue
         if kind in ("", "town", "city"):
-            hit = (await db.execute(select(Property.city).where(Property.city == name).limit(1))).scalar()
+            hit = (await db.execute(select(Property.city, Property.state).where(Property.city == name).limit(1))).first()
             if hit:
-                out[w] = {"field": "city", "values": {name}, "say": f"In {nice}"}
+                out[w] = {"field": "city", "values": {name}, "say": f"In {nice}", "name": f"{nice}, {hit.state}" if hit.state else nice}
     return out
+
+
+_SCHOOL_WANT = re.compile(r"\b(high\s*schools?|hs|schools?|school\s+district|district)\b", re.I)
+_NEAR_WORDS = re.compile(r"\b(walk|walking|walkable|near|nearby|close|bus|minutes?|mins?|drive|driving|across|blocks?|mile|miles)\b", re.I)
+
+
+async def split_filter_wants(db, wants: List[str], districts: Optional[List[str]] = None) -> tuple:
+    """Owner 11/20: "a township actually shouldn't be a must-have - it's a basic sorting feature now". Must-haves are
+    features the search can't see; a township / town / school is a filter. Returns (feature wants, moves):
+    a move = {"want", "to": "townships"|"cities"|"high_schools"|"school_note", "value", "say"}. A school want becomes
+    the High school filter only when the Showcase has a district and exactly one of its schools fits; otherwise it
+    is a note ("pick the high school under School districts") - never a guessed filter, never an AI read (a listing
+    that leaves the school out could never be starred, and "DOWNINGTOWN" was once read as East)."""
+    places = await place_wants(db, wants)
+    keep, moves = [], []
+    opts = None
+    for w in wants:
+        p = places.get(w)
+        if p and not _SCHOOL_WANT.search(w):
+            moves.append({"want": w, "to": "townships" if p["field"] == "township" else "cities", "value": p["name"],
+                          "say": p["say"].replace("In ", "", 1)})
+            continue
+        if _SCHOOL_WANT.search(w) and not _NEAR_WORDS.search(w):
+            hit = None
+            if districts:
+                from app.services import home_school_service as hs
+                if opts is None:
+                    opts = await hs.schools_in(db, districts)
+                hit = hs.match_school_name(opts, w)
+            if hit:
+                moves.append({"want": w, "to": "high_schools", "value": hit["key"], "say": hit["name"]})
+            else:
+                moves.append({"want": w, "to": "school_note", "value": None, "say": w})
+            continue
+        keep.append(w)
+    return keep, moves
+
+
+def moves_line(moves: List[Dict[str, Any]]) -> str:
+    """One plain sentence for the agent: where each township / town / school went."""
+    parts = []
+    for m in moves:
+        if m["to"] == "townships":
+            parts.append(f"{m['say']} is now a Townships filter")
+        elif m["to"] == "cities":
+            parts.append(f"{m['say']} is now a Towns filter")
+        elif m["to"] == "high_schools":
+            parts.append(f"{m['say']} is now the High school filter")
+        else:
+            parts.append(f"“{m['want']}” isn't a must-have - pick the school district and high school in the search instead")
+    return "; ".join(parts)
+
+
+async def apply_filter_moves(db, prefs, moves: List[Dict[str, Any]]) -> bool:
+    """Puts the moved townships / towns / high school into the Showcase's search. True if the search changed."""
+    changed = False
+    for field in ("townships", "cities", "high_schools"):
+        add = [m["value"] for m in moves if m["to"] == field and m.get("value")]
+        if not add:
+            continue
+        cur = list(getattr(prefs, field, None) or [])
+        low = {str(x).split(",")[0].strip().lower() for x in cur}
+        new = cur + [v for v in add if str(v).split(",")[0].strip().lower() not in low]
+        if new != cur:
+            setattr(prefs, field, new)
+            changed = True
+    if changed:
+        await db.flush()
+    return changed
 
 
 def place_verdict(p, place: Dict[str, Any]) -> Dict[str, Any]:
@@ -570,9 +640,13 @@ async def save_wants(db, collection_id: str, raw: Any, user=None) -> Dict[str, A
     wants = clean_wants(raw)
     old = state_of(prefs)
     phrases = {}
+    # townships / towns / schools are search filters, not must-haves (owner, 11/20) - checked before and after tidying
+    wants, moves = await split_filter_wants(db, wants, list(prefs.school_districts or []))
     if wants and user is not None:
         wants, phrases = await tidy_wants(db, user, wants, old.get("phrases"))
-        wants = clean_wants(wants)
+        wants, more = await split_filter_wants(db, clean_wants(wants), list(prefs.school_districts or []))
+        moves += more
+    search_changed = await apply_filter_moves(db, prefs, moves) if moves else False
     changed = wants_key(wants) != wants_key(clean_wants(old.get("wants")))
     st = {**old, "wants": wants, "state": ("reading" if changed or old.get("state") != "done" else "done") if wants else "off",
           "at": datetime.now(timezone.utc).isoformat()}
@@ -584,8 +658,19 @@ async def save_wants(db, collection_id: str, raw: Any, user=None) -> Dict[str, A
         # each home's answer per must-have stays (run_for reuses it - only new must-haves are read); the line goes
         await db.execute(text("update collection_properties set ai_match = case when ai_match ? 'per' "
                               "then jsonb_build_object('per', ai_match->'per') else null end where collection_id = :c"), {"c": collection_id})
+    st.pop("moved", None)
+    if moves:
+        st["moved"] = moves
     await db.execute(text("update collection_preferences set ai_wants = cast(:v as jsonb) where id = :i"), {"v": json.dumps(st), "i": prefs.id})
     await db.commit()
+    if search_changed:
+        # the moved township / town / school changes which homes are in it
+        from app.services.collections_service import CollectionsService
+        try:
+            await CollectionsService.repopulate_collection_from_preferences(db, collection_id, commit=True)
+        except Exception:
+            logger.warning("refresh after a must-have became a filter failed", exc_info=True)
+            await db.rollback()
     if wants:
         schedule(collection_id)
     return st

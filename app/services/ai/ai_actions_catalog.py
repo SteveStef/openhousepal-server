@@ -565,15 +565,23 @@ async def _p_new_showcase(db, user, a):
     body = {"name": f"{name}'s Showcase", "visitor_name": name, "visitor_email": email, "visitor_phone": _s(a.get("client_phone")),
             "visiting_reason": "buying", "has_agent": "no", "email_client": send and not quiet, **search}
     # Must-haves right away (owner, 11/19: every way a Showcase is made can carry them) - same rules as set_showcase_must_haves
-    from app.services.showcase_smart_filter import clean_wants, place_wants
+    from app.services.showcase_smart_filter import clean_wants, moves_line, split_filter_wants
     from app.utils.auth import tier_has_mls
     wants = clean_wants(a.get("must_haves"))
     if wants:
+        # a township / town / school is a search filter, not a must-have (owner, 11/20)
+        wants, moves = await split_filter_wants(db, wants, list(body.get("school_districts") or []))
+        for m in moves:
+            if m["to"] in ("townships", "cities", "high_schools") and m.get("value"):
+                cur = list(body.get(m["to"]) or [])
+                if m["value"] not in cur:
+                    body[m["to"]] = cur + [m["value"]]
+        if moves:
+            lines.append(moves_line(moves))
+    if wants:
         if not (tier_has_mls(user.plan_tier) or user.is_admin):
             raise ActionError("Must-haves read MLS listings - they're on the MLS plans. Make it without them?")
-        free = await place_wants(db, wants)
-        lines.append(f"Must-haves: {', '.join(wants)} - homes that have all of them get the Recommended star"
-                     + (" (towns are checked free; the rest use a little AI usage)" if len(free) < len(wants) else " (checked free)"))
+        lines.append(f"Must-haves: {', '.join(wants)} - homes that have all of them get the Recommended star (uses a little AI usage)")
     lines = [f"Client: {name} ({email})"] + lines + ["Also adds them to your leads"]
     if quiet:
         lines.append("No emails to them for now - turn their emails on in the Showcase whenever you're ready")
@@ -614,7 +622,7 @@ _simple("create_showcase", "Make a new Showcase (saved home search that updates 
         _obj({"client_name": {"type": "string"}, "client_email": {"type": "string"}, "client_phone": {"type": "string"}, "email_client": {"type": "boolean"}, "client_emails": {"type": "boolean"},
               "second_showcase": {"type": "boolean", "description": "Only when the agent says they want a second, separate Showcase for a client who already has one."},
               "must_haves": {"type": "array", "items": {"type": "string"}, "maxItems": 3,
-                             "description": "Up to 3 things every starred home should have ('Pool', 'In Uwchlan Township') - wishes, not filters."},
+                             "description": "Up to 3 features every starred home should have ('Pool', 'First-floor primary bedroom'). Never a township, town or school - those go in the search filters."},
               **_SEARCH_PROPS},
              ["client_name"]), _p_new_showcase, _r_new_showcase, SHOWCASE)
 
@@ -757,8 +765,8 @@ async def _real_high_schools(db, search: dict, lines: list, districts: list) -> 
             keys.append(hit["key"])
             placed = hit["homes"] - hit["named"]
             said.append(f"{hit['name']} - {hit['homes']} for sale"
-                        + (f" ({placed} of them don't name a school in the listing, so the government school map and the homes around "
-                           "them place them)" if placed else ""))
+                        + (f" ({placed} of them don't name a school in the listing - placed because their township, the government "
+                           "school map and the nearby listings all agree)" if placed else ""))
     if "high_schools" in search:
         search["high_schools"] = keys
         lines[:] = [l for l in lines if not l.startswith("High school")]
@@ -855,12 +863,13 @@ async def _r_showcase_search(db, user, p):
 _simple("update_showcase_search", "Change a Showcase's search (price, beds, baths, size, year built, towns, types). Only the fields given change. Use collection_id from list_showcases. "
         "The search can't filter on words in a listing or a feature - for those use set_showcase_must_haves (it stars the homes that have them), "
         "and say so in the same reply instead of saying it can't be done. Keep 'if possible' / 'ideally' wishes out of the search (they'd hide homes) - "
-        "make them must-haves. For a district's side or one high school ('DASD East', 'only Conestoga'), set school_districts AND high_schools - "
+        "make feature wishes must-haves. Townships, towns and schools are search filters, never must-haves: a township goes in townships, a town in "
+        "cities, and a district's side or one high school ('DASD East', 'only Conestoga') in school_districts AND high_schools - "
         "it keeps only homes going to that school, including listings that leave the school out when their township, the government school map and the "
-        "nearby listings all agree (the rest show as 'school unknown' so none are missed; the card says how many). A preferred town inside it ('if possible Uwchlan') is a must-have, which stars those homes "
-        "with a plain 'In Uwchlan Township' line (free, no AI reading) - never a town filter that hides the rest. "
+        "nearby listings all agree (the rest show as 'school unknown' so none are missed; the card says how many). For a preferred township on top "
+        "('if possible Uwchlan'), say how many homes the township filter would leave and let the agent choose - adding it hides the rest. "
         "Always say in your reply how many homes it will hold after the change (the card's 'After this change' line); when that's only a few, "
-        "say so and suggest the wider search with must-haves starring the preferred town or school.",
+        "say so and suggest the wider search.",
         _obj({"collection_id": {"type": "string"}, **_SEARCH_PROPS}, ["collection_id"]), _p_showcase_search, _r_showcase_search, SHOWCASE)
 
 
@@ -885,28 +894,26 @@ async def _showcase_of(db, user, a) -> Collection:
 async def _p_showcase_must_haves(db, user, a):
     """Must-haves (owner, 11/19 - Lisa wanted "DASD East only"): the AI reads every home in the Showcase and stars the
     ones that have them all, like the search editor's Must-haves box. Same route, same limits, same AI usage."""
-    from app.services.showcase_smart_filter import MAX_WANTS, clean_wants, estimate, place_wants, showcase_home_count, state_of
+    from app.services.showcase_smart_filter import MAX_WANTS, clean_wants, estimate, moves_line, showcase_home_count, split_filter_wants, state_of
     from app.utils.auth import tier_has_mls
     c = await _showcase_of(db, user, a)
     if not (tier_has_mls(user.plan_tier) or user.is_admin):
         raise ActionError("Must-haves read MLS listings - they're on the MLS plans.")
     wants = clean_wants(a.get("wants"))
     if not wants:
-        raise ActionError(f"What should every starred home have? Up to {MAX_WANTS} things, like \"Pool\" or \"In Uwchlan Township\".")
+        raise ActionError(f"What should every starred home have? Up to {MAX_WANTS} features, like \"Pool\" or \"First-floor primary bedroom\".")
     pref = (await db.execute(select(CollectionPreferences).where(CollectionPreferences.collection_id == c.id))).scalar_one_or_none()
     had = clean_wants(state_of(pref).get("wants")) if pref is not None else []
     n = await showcase_home_count(db, c.id)
-    places = await place_wants(db, wants)
-    read = [w for w in wants if w not in places]
+    read, moves = await split_filter_wants(db, wants, list(getattr(pref, "school_districts", None) or []))
     est = await estimate(db, user, n, max(1, len(read)))
     if read and n > est["cap"]:
         raise ActionError(f"{_sc_name(c)} has {n} homes - the AI reads every one, so narrow the search to {est['cap']} or fewer first.")
     if read and not est["enough"]:
         raise ActionError("Not enough AI usage left this month to read those homes - it resets on your billing day.")
-    lines = [f"Must-haves: {', '.join(wants)}"]
-    if places:
-        lines.append(f"{' / '.join(places[w]['say'] for w in places)}: checked from each listing's own township or town - exact, free, "
-                     "and the star line says it plainly")
+    lines = [f"Must-haves: {', '.join(read)}"] if read else ["No must-haves left - those are search filters"]
+    if moves:
+        lines.append(moves_line(moves) + " (a filter keeps only those homes)")
     if had and [w.lower() for w in had] != [w.lower() for w in wants]:
         lines.append(f"Replaces: {', '.join(had)}")
     lines += ["Homes that have all of them get the Recommended star and a line saying so; the rest stay, without it",
@@ -925,11 +932,11 @@ async def _r_showcase_must_haves(db, user, p):
             "link": f"/showcases?showcase={p['collection_id']}"}
 
 _simple("set_showcase_must_haves",
-        "Set a Showcase's must-haves (up to 3, e.g. 'Pool', 'First-floor primary bedroom', 'In Uwchlan Township'): "
+        "Set a Showcase's must-haves (up to 3 features, e.g. 'Pool', 'First-floor primary bedroom', '9 ft ceilings'): "
         "the AI reads every home in it and stars the ones that have ALL of them (Recommended star + a line under the address - the client sees it); "
-        "the others stay, unstarred. Use it whenever they want homes narrowed by something the search can't filter - words in the description, "
-        "features, a preferred town ('In Uwchlan Township' - checked from the listing's own township, free, and the line says it plainly). "
-        "To keep only one high school, use update_showcase_search high_schools instead (a must-have can't see a school the listing leaves out). "
+        "the others stay, unstarred. Use it whenever they want homes narrowed by something the search can't filter - words in the description, features. "
+        "Never a township, town or school - those are search filters (update_showcase_search townships / cities / school_districts + high_schools); "
+        "one passed here is moved into the search filter and the card says so. "
         "It replaces the must-haves "
         "already there - pass every one to keep. Uses a little AI usage (the card shows how much). Use collection_id from list_showcases, or the lead_id of the person.",
         _obj({"collection_id": {"type": "string"}, "lead_id": {"type": "string"}, "wants": {"type": "array", "items": {"type": "string"}, "maxItems": 3}}, ["wants"]),

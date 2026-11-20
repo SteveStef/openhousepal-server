@@ -101,12 +101,14 @@ async def test_must_haves_card():
             await db.commit()
             ai_actions._load()
             res, entry = await ai_actions.propose(db, agent, "set_showcase_must_haves",
-                                                  {"collection_id": col.id, "wants": ["Downingtown East high school"]})
+                                                  {"collection_id": col.id, "wants": ["Pool", "Downingtown East high school"]})
             assert entry is not None, res
             assert entry["title"] == "Star homes in Lisa Testcase's Showcase"
-            assert entry["details"][0] == "Must-haves: Downingtown East high school"
+            # a school is a search filter, not a must-have (owner, 11/20) - the card says where it goes
+            assert entry["details"][0] == "Must-haves: Pool"
+            assert any("High school filter" in d or "isn't a must-have" in d for d in entry["details"]), entry["details"]
             assert any(d.startswith(f"Reads {len(ids)} home") for d in entry["details"]), entry["details"]
-            assert entry["payload"]["body"] == {"wants": ["Downingtown East high school"]}
+            assert entry["payload"]["body"] == {"wants": ["Pool", "Downingtown East high school"]}
             # the chat often holds the person's id, not the Showcase's - either finds it
             from app.models.database import Lead
             col.visitor_email = f"{tag}-lisa@example.com"

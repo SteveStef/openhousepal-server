@@ -104,7 +104,9 @@ async def test_form_submission_builds_showcase_with_townships_and_must_haves(mon
             assert res and res["created"]
             pref = (await db.execute(select(CollectionPreferences).where(CollectionPreferences.collection_id == res["collection_id"]))).scalar_one()
             assert pref.townships == ["Uwchlan, PA"] and pref.school_districts == ["Downingtown Area, PA"]
-            assert (pref.ai_wants or {}).get("wants") == ["Pool", "In Uwchlan Township"]
+            # a township is a filter, not a must-have (owner, 11/20): it's already in Townships, so only Pool is read
+            assert (pref.ai_wants or {}).get("wants") == ["Pool"]
+            assert [m["to"] for m in (pref.ai_wants or {}).get("moved") or []] == ["townships"]
             homes = (await db.execute(select(collection_properties.c.property_id).where(collection_properties.c.collection_id == res["collection_id"]))).all()
             from app.models.database import Property
             twps = {(await db.get(Property, h[0])).township for h in homes}
@@ -179,8 +181,9 @@ async def test_chat_makes_a_showcase_with_must_haves():
                                                       "must_haves": ["Pool", "In Uwchlan Township"]})
             body = prep.payload["body"]
             assert body["school_districts"] == ["Downingtown Area"] and body["townships"] == ["Uwchlan"]
-            assert prep.payload["wants"] == ["Pool", "In Uwchlan Township"]
-            assert any(l.startswith("Must-haves: Pool, In Uwchlan Township") for l in prep.details), prep.details
+            assert prep.payload["wants"] == ["Pool"] and body["townships"] == ["Uwchlan"]
+            assert any(l.startswith("Must-haves: Pool -") for l in prep.details), prep.details
+            assert any("Uwchlan Township is now a Townships filter" in l for l in prep.details), prep.details
         finally:
             await db.execute(delete(User).where(User.id == agent.id))
             await db.commit()

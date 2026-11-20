@@ -906,6 +906,33 @@ async def schools_in(db, districts: List[str]) -> List[Dict[str, Any]]:
     return sorted([o for o in res if o["key"] != "unknown"], key=lambda o: -o["homes"]) + unknown
 
 
+_PICK_FILLER = re.compile(r"\b(high|school|schools|hs|senior|sr|campus|area|sd|district|the|in|only|go|goes|going|to|for|of)\b", re.I)
+
+
+def match_school_name(opts: List[Dict[str, Any]], raw: str) -> Optional[Dict[str, Any]]:
+    """Words someone typed ("Downingtown East schools") -> one of the district's high schools (schools_in rows).
+    None unless exactly one school fits - a side word (East/West) must be in the school's name."""
+    def words(s: str) -> set:
+        return {w for w in re.findall(r"[a-z0-9]+", _PICK_FILLER.sub(" ", (s or "").lower())) if len(w) > 1}
+    want = words(raw)
+    side = {w for w in want if w.upper() in _SIDES}
+    scored = []
+    for o in opts:
+        if o.get("key") in (None, "unknown"):
+            continue
+        have = words(o.get("name") or "")
+        if side and not side <= have:
+            continue
+        n = len(want & have)
+        if n:
+            scored.append((n, o))
+    if not scored:
+        return None
+    best = max(n for n, _ in scored)
+    top = [o for n, o in scored if n == best]
+    return top[0] if len(top) == 1 else None
+
+
 async def names_for(db, keys: List[str]) -> Dict[str, str]:
     keys = [k for k in (keys or []) if k]
     if not keys:
