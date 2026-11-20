@@ -507,7 +507,7 @@ _SEARCH_PROPS = {
     "school_districts": {"type": "array", "items": {"type": "string"}},
     "high_schools": {"type": "array", "items": {"type": "string"}, "description": "Only homes going to these high schools, as people say them "
                      "('Downingtown East', 'Conestoga') - for a district's side or one school. Keeps listings that leave the school blank too "
-                     "(placed by the government school map / nearby homes). Give the district as well. [] = any high school."},
+                     "(placed only where the township, the government school map and the nearby listings all agree; otherwise shown as 'school unknown'). Give the district as well. [] = any high school."},
     "is_single_family": {"type": "boolean"}, "is_town_house": {"type": "boolean"}, "is_condo": {"type": "boolean"}, "is_multi_family": {"type": "boolean"},
 }
 
@@ -856,8 +856,8 @@ _simple("update_showcase_search", "Change a Showcase's search (price, beds, bath
         "The search can't filter on words in a listing or a feature - for those use set_showcase_must_haves (it stars the homes that have them), "
         "and say so in the same reply instead of saying it can't be done. Keep 'if possible' / 'ideally' wishes out of the search (they'd hide homes) - "
         "make them must-haves. For a district's side or one high school ('DASD East', 'only Conestoga'), set school_districts AND high_schools - "
-        "it keeps only homes going to that school, including listings that leave the school out (placed by the government school map and the "
-        "homes around them; the card says how many). A preferred town inside it ('if possible Uwchlan') is a must-have, which stars those homes "
+        "it keeps only homes going to that school, including listings that leave the school out when their township, the government school map and the "
+        "nearby listings all agree (the rest show as 'school unknown' so none are missed; the card says how many). A preferred town inside it ('if possible Uwchlan') is a must-have, which stars those homes "
         "with a plain 'In Uwchlan Township' line (free, no AI reading) - never a town filter that hides the rest. "
         "Always say in your reply how many homes it will hold after the change (the card's 'After this change' line); when that's only a few, "
         "say so and suggest the wider search with must-haves starring the preferred town or school.",

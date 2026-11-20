@@ -2,13 +2,16 @@
 "Downingtown East only" search silently missed most homes. Worked out once per home in the background, kept in
 home_schools, and read by the Showcase search as one indexed lookup - nothing runs while anyone searches.
 
-Trust order:
+Never a guess (owner, 11/19: "even one home being wrong is bad - better unknown and a few more matches"):
 1. Bright's own answer (the listing names its high school).
-2. The government school map (NCES attendance boundaries, nces_attendance_boundaries) where it covers the home,
-   checked against nearby listings that name their school. The map's lines are from 2015-16, so where the
-   homes around this one clearly say otherwise, those homes win - they reflect today's lines.
-3. Nearby listings alone (7 closest within 3/4 mile that name a school; 80% must agree) where the map has nothing.
-Otherwise the home's school stays unknown: a high-school search (always inside a picked district) still shows it,
+2. Otherwise ONLY when three separate signals all name the same school: the home's township (98%+ of its 10+
+   for-sale homes that name a school), the government school map (NCES attendance boundaries) and the nearby
+   listings (the 7 closest within 3/4 mile - 5+ of them, every one the same). Live hidden test on 217k named
+   listings (11/19): 66k placed, 18 wrong (about 1 in 3,700); PA 1 in 3,200, NJ 1 in 3,700, MD 1 in 5,100, DE
+   none. VA/DC/WV have almost no township data, so blank homes there stay unknown. 826 Williamsburg Blvd
+   (Uwchlan, goes to Downingtown WEST) was the lesson - its township and the 2015 map say East, the homes around
+   it say West.
+Anything else stays unknown. A high-school search (always inside a picked district) still shows unknown homes,
 with a "School unknown" note - nobody misses a home because the listing left the school out.
 
 A value that only names the district ("DOWNINGTOWN" in a district with an East and a West school) says nothing
@@ -23,8 +26,8 @@ district, a spelling whose homes sit inside one map school's lines (75%+ of 5+ h
 every spelling lands on the same key ("nces:<school id>"). Spellings the map can't place keep their own key
 ("txt:<STATE>:<name>").
 
-`sure` = Bright named it, or the map and the nearby homes agree. Unsure homes are still searched (they are
-the best answer there is), and the chat says so.
+`sure` is always true for a placed home now (Bright named it, or all three agreed); source "agreed" marks the
+worked-out ones.
 """
 import asyncio
 import logging
@@ -107,6 +110,11 @@ class _Grid:
         self.cells[(int(lat / self.CELL), int(lng / self.CELL))].append((pid, lat, lng, key))
 
     def vote(self, lat, lng, skip=None) -> Optional[str]:
+        k, share, n = self.detail(lat, lng, skip)
+        return k if n >= NEAR_MIN and share >= NEAR_AGREE else None
+
+    def detail(self, lat, lng, skip=None) -> Tuple[Optional[str], float, int]:
+        """(the most common school among the closest named listings, its share, how many listings)."""
         cy, cx = int(lat / self.CELL), int(lng / self.CELL)
         cand = []
         for dy in (-1, 0, 1):
@@ -119,10 +127,10 @@ class _Grid:
                         cand.append((d, key))
         cand.sort(key=lambda t: t[0])
         near = [k for _, k in cand[:NEAR_K]]
-        if len(near) < NEAR_MIN:
-            return None
+        if not near:
+            return None, 0.0, 0
         top, n = Counter(near).most_common(1)[0]
-        return top if n / len(near) >= NEAR_AGREE else None
+        return top, n / len(near), len(near)
 
 
 class _MapSchools:
@@ -283,7 +291,8 @@ def _fullest(spellings: Counter) -> str:
 _NAME_FILLER = {"HS", "SENIOR", "SR", "AREA", "HIGH", "SCHOOL", "CAMPUS"}
 _SIDES = {"EAST", "WEST", "NORTH", "SOUTH", "CENTRAL", "NORTHEAST", "NORTHWEST", "SOUTHEAST", "SOUTHWEST"}
 RARE = 8      # fewer named homes than this, unplaced by the map: a stray spelling
-TWP_MIN, TWP_AGREE = 10, 0.9     # a township that all but agrees on its school
+TWP_MIN, TWP_AGREE = 10, 0.98    # a township that agrees on its school
+NEAR_ALL = 5                      # nearby listings that must ALL name the same school
 
 
 def _twp(r) -> Optional[str]:
@@ -442,22 +451,22 @@ def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapScho
         return f"nces:{sid}" if sid else None
 
     def blank_answer(lat, lng, skip=None, twp=None) -> Tuple[Optional[str], Optional[str], bool]:
-        if twp and twp in twp_school:
-            return twp_school[twp], "township", True
-        m, near = map_key(lat, lng), grid.vote(lat, lng, skip=skip)
-        if m and near:
-            return (m, "map", True) if m == near else (near, "nearby", False)
-        if m:
-            return m, "map", False
-        if near:
-            return near, "nearby", False
+        """Only when three independent signals name the same school - otherwise unknown (shown, marked)."""
+        t = twp_school.get(twp) if twp else None
+        if not t:
+            return None, None, False
+        m = map_key(lat, lng)
+        nk, share, n = grid.detail(lat, lng, skip=skip)
+        if m and nk and t == m == nk and share >= 1.0 and n >= NEAR_ALL:
+            return t, "agreed", True
         return None, None, False
 
-    stats: Dict[str, Any] = {"homes": len(targets), "bright": 0, "map": 0, "nearby": 0, "township": 0, "unknown": 0, "sure": 0,
+    stats: Dict[str, Any] = {"homes": len(targets), "bright": 0, "agreed": 0, "unknown": 0, "sure": 0,
                              "vague": sorted(vague), "merged": dict(merged)}
     if evaluate:
         # Hide a sample of named homes' own answers and see what the other sources would have said.
         ok = Counter()
+        triples = []
         for r in [r for r in ev if r.id in home_spell][::max(1, len(home_spell) // EVAL_SAMPLE)]:
             truth = key_of_spell(home_spell[r.id])
             m, near = map_key(r.latitude, r.longitude), grid.vote(r.latitude, r.longitude, skip=r.id)
@@ -469,7 +478,21 @@ def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapScho
                 ok[("map alone", "right" if m == truth else "wrong", False)] += 1
             if near:
                 ok[("near alone", "right" if near == truth else "wrong", False)] += 1
+            # the township's answer without this home's own vote
+            t_key, t_share, t_n = None, 0.0, 0
+            tw = _twp(r)
+            if tw and tw in twp_votes:
+                c = Counter(twp_votes[tw])
+                c[truth] -= 1
+                c = +c
+                if c:
+                    t_key, top = c.most_common(1)[0]
+                    t_n = sum(c.values())
+                    t_share = top / t_n
+            nk, nsh, nn = grid.detail(r.latitude, r.longitude, skip=r.id)
+            triples.append((t_key, round(t_share, 3), t_n, m, near, truth, nk, round(nsh, 3), nn))
         stats["evaluate"] = ok
+        stats["triples"] = triples
 
     now = datetime.now(timezone.utc)
     rows = []
@@ -785,19 +808,17 @@ async def _quick_key(db, property_id: str) -> Optional[str]:
                 twp_key = votes[0].hs_key
         if own:
             k, src, sure = own, "bright", True
-        elif twp_key:
-            k, src, sure = twp_key, "township", True
-        elif p.lat is not None:
+        elif twp_key and p.lat is not None:
             g = _Grid()
             for r in near_rows:
-                nk = key_of(norm_school(r.high_school) or "")
-                if nk:
-                    g.add(r.id, r.latitude, r.longitude, nk)
-            near = g.vote(p.lat, p.lng, skip=p.id)
-            if map_key and near:
-                k, src, sure = (map_key, "map", True) if map_key == near else (near, "nearby", False)
+                nkey = key_of(norm_school(r.high_school) or "")
+                if nkey:
+                    g.add(r.id, r.latitude, r.longitude, nkey)
+            nk, share, n = g.detail(p.lat, p.lng, skip=p.id)
+            if map_key and nk and twp_key == map_key == nk and share >= 1.0 and n >= NEAR_ALL:
+                k, src, sure = twp_key, "agreed", True
             else:
-                k, src, sure = (map_key, "map", False) if map_key else ((near, "nearby", False) if near else (None, None, False))
+                k, src, sure = None, None, False
         else:
             k, src, sure = None, None, False
         name = names.get(k) if k else None

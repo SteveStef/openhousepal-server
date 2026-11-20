@@ -59,11 +59,11 @@ async def test_fill_keeps_bright_first_and_places_blank_homes():
         # every spelling of the East campus lands on one key
         east = {r.hs_key for r in named if "EAST" in (r.high_school or "").upper()}
         assert len(east) == 1, east
-        # most blank listings get a school too
+        # some blank listings get a school - only where township, map and nearby listings all agree (the rest stay unknown)
         blank = [r for r in rows if not hs.norm_school(r.high_school)]
         if blank:
-            assert sum(1 for r in blank if r.hs_key) / len(blank) > 0.8
-            assert all(r.source in ("map", "nearby", "township") for r in blank if r.hs_key)
+            assert any(r.hs_key for r in blank)
+            assert all(r.source == "agreed" and r.sure for r in blank if r.hs_key)
 
 
 @pytest.mark.asyncio
@@ -104,7 +104,7 @@ async def test_search_keeps_only_that_school_including_blank_listings():
         # listings that leave the school out are in it
         srcs = dict((await db.execute(text("SELECT property_id, source FROM home_schools WHERE property_id = ANY(:ids)"),
                                       {"ids": [p.id for p in east_homes]})).all())
-        assert any(s in ("map", "nearby") for s in srcs.values())
+        assert set(srcs.values()) <= {"bright", "agreed", None}      # None = school unknown, kept in (marked)
 
 
 @pytest.mark.asyncio
@@ -123,7 +123,7 @@ async def test_new_listing_quick_key_matches_the_pass():
                                         "AND hs_key IS NOT NULL ORDER BY property_id LIMIT 10"), {"d": u.d})).all()
     for r in named:
         assert await hs.quick_key(r.property_id) == r.hs_key
-    # a listing that leaves the school out: the quick look agrees with the full pass (map + nearby agreed there)
+    # a listing that leaves the school out: the quick look agrees with the full pass (township + map + nearby agreed)
     if placed:
         same = [await hs.quick_key(r.property_id) == r.hs_key for r in placed]
         assert sum(same) >= len(same) - 1, same
