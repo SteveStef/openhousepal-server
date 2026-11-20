@@ -195,3 +195,40 @@ async def test_wants_for_lists_each_showcases_must_haves():
             await db.execute(delete(Collection).where(Collection.id.in_(ids[:2])))
             await db.execute(delete(User).where(User.id == ids[2]))
             await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_chat_naming_only_a_school_keeps_the_must_haves():
+    """Live chat check 11/20: "make Downingtown East a must-have" on a Showcase with Pool + Fenced yard would have wiped
+    them - the school goes into the search and the must-haves stay."""
+    import app.main  # noqa: F401
+    from sqlalchemy import delete
+    from app.database import AsyncSessionLocal
+    from app.models.database import Collection, CollectionPreferences, User
+    from app.services.ai import ai_actions
+    tag = f"zqkw-{uuid.uuid4().hex[:8]}"
+    async with AsyncSessionLocal() as db:
+        agent = User(email=f"{tag}@example.com", hashed_password="x", first_name="Z", last_name="Q", state="PA", brokerage="B",
+                     mls_id=tag.upper(), plan_tier="IDX", subscription_status="ACTIVE")
+        db.add(agent)
+        await db.commit()
+        col = Collection(name="L", owner_id=agent.id, status="ACTIVE", share_token=tag, visitor_name="Lisa Keeps")
+        db.add(col)
+        await db.commit()
+        ids = (col.id, agent.id)
+        db.add(CollectionPreferences(collection_id=ids[0], school_districts=["Downingtown Area"],
+                                     ai_wants={"wants": ["Pool", "Fenced yard"], "state": "done"}))
+        await db.commit()
+        try:
+            ai_actions._load()
+            res, entry = await ai_actions.propose(db, agent, "set_showcase_must_haves",
+                                                  {"collection_id": ids[0], "wants": ["Downingtown East high school"]})
+            assert entry is not None, res
+            assert entry["details"][0] == "Must-haves stay: Pool, Fenced yard", entry["details"]
+            assert not any(d.startswith("Replaces") for d in entry["details"])
+            assert entry["payload"]["body"]["wants"][:2] == ["Pool", "Fenced yard"]
+        finally:
+            await db.execute(delete(CollectionPreferences).where(CollectionPreferences.collection_id == ids[0]))
+            await db.execute(delete(Collection).where(Collection.id == ids[0]))
+            await db.execute(delete(User).where(User.id == ids[1]))
+            await db.commit()

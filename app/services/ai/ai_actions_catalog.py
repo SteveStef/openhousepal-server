@@ -906,19 +906,26 @@ async def _p_showcase_must_haves(db, user, a):
     had = clean_wants(state_of(pref).get("wants")) if pref is not None else []
     n = await showcase_home_count(db, c.id)
     read, moves = await split_filter_wants(db, wants, list(getattr(pref, "school_districts", None) or []))
+    kept = False
+    if not read and moves and had:
+        # Only a township / town / school was named ("make DASD East a must-have"): that goes into the search, and the
+        # must-haves already there stay - a live chat check (11/20) would have wiped Pool + Fenced yard here.
+        read, wants, kept = list(had), list(had) + wants, True
+    same = kept or (bool(had) and [x.lower() for x in read] == [x.lower() for x in had])
     est = await estimate(db, user, n, max(1, len(read)))
     if read and n > est["cap"]:
         raise ActionError(f"{_sc_name(c)} has {n} homes - the AI reads every one, so narrow the search to {est['cap']} or fewer first.")
     if read and not est["enough"]:
         raise ActionError("Not enough AI usage left this month to read those homes - it resets on your billing day.")
-    lines = [f"Must-haves: {', '.join(read)}"] if read else ["No must-haves left - those are search filters"]
+    lines = [(f"Must-haves stay: {', '.join(read)}" if same else f"Must-haves: {', '.join(read)}")] if read \
+        else ["No must-haves left - those are search filters"]
     if moves:
         lines.append(moves_line(moves) + " (a filter keeps only those homes)")
-    if had and [w.lower() for w in had] != [w.lower() for w in wants]:
+    if had and not same:
         lines.append(f"Replaces: {', '.join(had)}")
     lines += ["Homes that have all of them get the Recommended star and a line saying so; the rest stay, without it",
               ((f"Reads {n} home{'s' if n != 1 else ''}" + (f" · uses ~{est['usage_percent']}% of AI usage" if est.get("usage_percent") else ""))
-               if read else f"Checks {n} home{'s' if n != 1 else ''} · no AI usage")
+               if read and not same else f"Checks {n} home{'s' if n != 1 else ''} · no AI usage")
               if n else "No homes for sale in it right now - new ones are checked as they arrive"]
     return Prepared(f"Star homes in {_sc_name(c)}", lines, {"collection_id": c.id, "body": {"wants": wants}},
                     warning=f"{c.visitor_name or 'Your client'} sees the stars too.")
@@ -936,7 +943,8 @@ _simple("set_showcase_must_haves",
         "the AI reads every home in it and stars the ones that have ALL of them (Recommended star + a line under the address - the client sees it); "
         "the others stay, unstarred. Use it whenever they want homes narrowed by something the search can't filter - words in the description, features. "
         "Never a township, town or school - those are search filters (update_showcase_search townships / cities / school_districts + high_schools); "
-        "one passed here is moved into the search filter and the card says so. "
+        "one passed here is moved into the search filter and the card says so (the must-haves already there stay). "
+        "Keep the must-haves already there (see get_showcase_info) and add the new one, unless the agent says to drop or replace them. "
         "It replaces the must-haves "
         "already there - pass every one to keep. Uses a little AI usage (the card shows how much). Use collection_id from list_showcases, or the lead_id of the person.",
         _obj({"collection_id": {"type": "string"}, "lead_id": {"type": "string"}, "wants": {"type": "array", "items": {"type": "string"}, "maxItems": 3}}, ["wants"]),
