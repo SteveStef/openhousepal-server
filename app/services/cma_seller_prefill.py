@@ -281,6 +281,7 @@ async def _tell(owner_id: str, report_id: str, address: str, err: Optional[str])
 
 
 # ---- Update the value (owner 11/19): an answer changed on the finished seller report -------------------------------
+_AI_WRITTEN_PRICING_TEXT = ("pricing_commentary", "listing_strategy_notes", "listing_prep_notes")
 _COMP_AI_FIELDS = ("quality", "ai_quality_read", "ai_commentary", "strength", "material_issues")
 
 
@@ -334,11 +335,15 @@ async def prepare_update(db, report, comp_marks: Optional[dict], kitchen: Option
     for k, v in filled.items():
         if pricing.get(k) == v:
             pricing.pop(k, None)
+    # The written sections are always the AI's: the agent's own wording for them is kept apart (presentation.text,
+    # the Review step) and is untouched. Left in place they would state the OLD price next to the new value.
+    for k in _AI_WRITTEN_PRICING_TEXT:
+        pricing.pop(k, None)
     report.pricing = pricing
     comps = []
     for c in report.comparables or []:
         c = dict(c)
-        if not _is_blank(c.get("commentary")) and c.get("commentary") == c.get("ai_commentary"):
+        if not _is_blank(c.get("commentary")) and c.get("commentary") == c.get("ai_commentary") and not c.get("commentary_by_agent"):
             c["commentary"] = None
         for f in _COMP_AI_FIELDS:
             c.pop(f, None)
@@ -347,3 +352,25 @@ async def prepare_update(db, report, comp_marks: Optional[dict], kitchen: Option
     report.ai_analysis = None
     await db.commit()
     await db.refresh(report)
+
+
+def preview_update(report, comp_marks: Optional[dict]) -> dict:
+    """What a changed answer would do to the value, BEFORE the agent presses Update the value (owner 11/20 - one answer
+    can move it 10-15%). Free: the same placement rule the report used (cma_ai_service._seller_placement_check) run on
+    this report's own adjusted sales with the new answers. The finished report may land up to 3% either side of it."""
+    from app.services import cma_ai_service as ai
+    if getattr(report, "mode", None) == "buyer":
+        return {"ok": False}
+    est = ((report.pricing or {}).get("ai_estimate") or {})
+    anchor = ((est.get("valuation_trace") or {}).get("anchor")) or {}
+    subj = dict(report.subject or {})
+    sa = dict(subj.get("seller_answers") or {})
+    marks = {**{str(k): str(v) for k, v in (sa.get("comp_marks") or {}).items()},
+             **{str(k): str(v) for k, v in (comp_marks or {}).items() if str(v) in ai._COMP_MARKS}}
+    pc = ai._seller_placement_check({**subj, "seller_answers": {**sa, "comp_marks": marks}}, anchor, report.mode)
+    now = ai._as_float((report.pricing or {}).get("most_likely_value")) or ai._as_float(est.get("value"))
+    if not pc or not now:
+        return {"ok": False}
+    about = int(round(pc["target"] / 5000.0) * 5000)
+    return {"ok": True, "now": int(now), "about": about, "low": int(round(pc["allowed_low"], -3)), "high": int(round(pc["allowed_high"], -3)),
+            "change_pct": round((about / now - 1) * 100, 1)}

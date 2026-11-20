@@ -182,6 +182,12 @@ async def subject_from_listing(db: AsyncSession, listing_key: str) -> Optional[D
     for k, v in extra.items():
         if _missing_subject_fact(subject.get(k)) and not _missing_subject_fact(v):
             subject[k] = v
+    # its newest record is a SALE: that is the home's last sale (live 11/19, 215 Hoffecker: "Last sale: Not set")
+    if str(getattr(prop, "home_status", "") or "").upper().startswith(("CLOSED", "SOLD")) and getattr(prop, "mls_close_price", None):
+        if _missing_subject_fact(subject.get("last_sale_price")):
+            subject["last_sale_price"] = float(prop.mls_close_price)
+        if _missing_subject_fact(subject.get("last_sale_date")) and getattr(prop, "mls_close_date", None):
+            subject["last_sale_date"] = str(prop.mls_close_date)[:10]
     if prop.photos and len(prop.photos) > len(subject.get("photos") or []):
         subject["photos"] = [u for u in prop.photos if isinstance(u, str)]
     for k in ("water_source", "sewer", "heating", "cooling", "basement"):

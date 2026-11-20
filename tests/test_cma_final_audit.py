@@ -319,7 +319,8 @@ def test_details_it_could_not_find_are_listed_for_the_agent_to_check():
     assert msg.startswith("Review before sending: these details are in neither the listing text nor the MLS record")
     assert "check each against the photos" in msg and "carport roof covering" in msg and "quartz counters" in msg
     both = audit.agent_message([{"why": "Comp 3 carries a 24.7% share.", "sentence": "It carries little weight."}], unverified)
-    assert "the final read of this report noted - Comp 3 carries a 24.7% share." in both and "These details are in neither" in both
+    assert 'the final read of this report noted - (1) "It carries little weight." - Comp 3 carries a 24.7% share.' in both \
+        and "These details are in neither" in both
     assert audit.agent_message([], []) is None and audit.agent_message([]) is None
     many = audit.agent_message([], [dict(unverified[0], sentence=f"Sentence {i}.") for i in range(6)])
     assert "(+3 more)" in many and "Sentence 2." in many and "Sentence 3." not in many

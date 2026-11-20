@@ -184,7 +184,7 @@ def test_a_weaker_match_cannot_drag_the_value_off_the_same_homes():
                    for k, w, p in (("S1", .26, 1277000), ("S2", .12, 1271000), ("W1", .23, 1116000), ("W2", .20, 1146000), ("W3", .18, 989000))]}
     pc = ai._seller_placement_check(_marks(S1="same", S2="same", W1="worse", W2="worse", W3="worse"), a, "listing")
     assert pc["target"] == 1116000                                  # the strong not-as-nice comps still cap it, the weak one doesn't
-    assert pc["placement_words"] == "about the same as 2 and not as nice as 3"
+    assert pc["placement_words"] == "about the same as 2 of the comparable sales and not as nice as 3"
     # equal weights (the usual case): the bracket still holds exactly as before
     eq = _keyed_anchor([400000, 450000, 500000, 550000])
     assert ai._seller_placement_check(_marks(K0="worse", K2="same", K3="same"), eq, "listing")["target"] == 400000

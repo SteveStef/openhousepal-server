@@ -2947,7 +2947,7 @@ def _own_comp_notes(comparables) -> dict:
         if not isinstance(c, dict):
             continue
         mine = str(c.get("commentary") or "")
-        if mine.strip() and mine.strip() != str(c.get("ai_commentary") or "").strip():
+        if mine.strip() and (c.get("commentary_by_agent") or mine.strip() != str(c.get("ai_commentary") or "").strip()):
             out[str(c.get("listing_key") or c.get("id") or "")] = mine
     return out
 
@@ -2964,7 +2964,7 @@ def _keep_own_comp_notes(report, own: dict) -> None:
         if k in own:
             if str(c.get("commentary") or "") != own[k]:
                 touched.append(_title_address(c.get("street_address")) or f"Comp #{i + 1}")
-            c = {**c, "commentary": own[k]}
+            c = {**c, "commentary": own[k], "commentary_by_agent": True}
         comps.append(c)
     report.comparables = comps
     if not touched:
@@ -10923,14 +10923,16 @@ def _bracket_value(better: list, same: list, worse: list, base: float) -> float:
 
 
 def _marks_words(better: int, same: int, worse: int) -> str:
-    parts = []
-    if better:
-        parts.append(f"nicer than {better} of the comparable sales")
-    if same:
-        parts.append(f"about the same as {same}")
-    if worse:
-        parts.append(f"not as nice as {worse}")
-    return ", ".join(parts[:-1]) + (" and " if len(parts) > 1 else "") + parts[-1] if parts else ""
+    # the first part names what the counts are counting; one answer for every sale says "all" (live 11/19:
+    # "it is not as nice as 5" read like a number of something unnamed)
+    parts = [(lead, n) for lead, n in (("nicer than", better), ("about the same as", same), ("not as nice as", worse)) if n]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        lead, n = parts[0]
+        return f"{lead} all {n} of the comparable sales" if n > 1 else f"{lead} the one comparable sale"
+    words = [f"{parts[0][0]} {parts[0][1]} of the comparable sales"] + [f"{lead} {n}" for lead, n in parts[1:]]
+    return ", ".join(words[:-1]) + " and " + words[-1]
 
 
 def _seller_placement_check(subject: Optional[dict], anchor: Optional[dict], mode: Optional[str]) -> Optional[dict]:
@@ -10980,13 +10982,17 @@ def _seller_placement_check(subject: Optional[dict], anchor: Optional[dict], mod
                  "below the least expensive of them" if placement == "below_all" else
                  "level with the homes it matches" if sm else "between the homes it beats and the ones it doesn't")
         how = "comp_marks"
+        _used = [r[2] for r in rows if r[2] in marks]
+        source = ("photos" if _used and all(k in _ai_set for k in _used) else
+                  "agent" if not any(k in _ai_set for k in _used) else "mixed")
     else:
         if len(rows) < 3 or placement not in _PLACEMENT_WORDS:     # (marks on comps the value doesn't use)
             return None
         target = _placement_rule_value(placement, base, low, median, high)
         words, where, how = _PLACEMENT_WORDS[placement], _PLACEMENT_WHERE[placement], "placement"
+        source = "agent"
     return {
-        "placement": placement, "placement_words": words, "where": where, "how": how,
+        "placement": placement, "placement_words": words, "where": where, "how": how, "source": source,
         "comp_low": round(low), "comp_median": round(median), "comp_high": round(high),
         "sales_without_condition": round(base), "target": round(target),
         "allowed_low": round(target * (1 - _PLACEMENT_HOLD)), "allowed_high": round(target * (1 + _PLACEMENT_HOLD)),
@@ -13049,6 +13055,8 @@ def _strip_internal_data_refs(text: str) -> str:
 # clause used to be cut (rule audit 10/24)
 _ENGINE_TERM_RE = re.compile(
     r"\b(?:(?:location|valuation|comp|its|reduced|lower|full)\s+weights?"
+    # the label as a note ending: "Supporting weight." / "Supporting weight, tempered by the finish gap." (live 11/19)
+    r"|(?:supporting|strong|primary|secondary|limited|moderate|tempered)\s+weight\b"
     r"|(?:the|comp|comparable[- ]sales?|valuation|weighted)\s+anchors?"
     r"|anchor(?:ed|ing)?\s+(?:value|figure|to\s+the\s+(?:sales|comps|value)|on\s+the\s+(?:sales|comps))"
     r"|anchors?\s+(?:the|this)\s+(?:value|valuation))\b", re.IGNORECASE)
@@ -16823,23 +16831,28 @@ def _v10_auction_sentence(methodology: str, *, trace: Optional[dict]) -> tuple[s
 
 
 _PLACEMENT_MARK = "has been inside this home"
+_PLACEMENT_BASIS_MARK = "something sale records can't show"     # in every version of the sentence: added once
 
 
 def _placement_basis_text(pc: Optional[dict]) -> str:
     pc = pc or {}
     if pc.get("how") == "comp_marks":
-        return (f"The agent {_PLACEMENT_MARK} and compared it with each sale on condition and finishes - something sale "
-                f"records can't show: it is {pc.get('placement_words')}. Once each sale is adjusted to this home, the value "
-                f"is set {pc.get('where') or 'among them'}.")
+        # credit whoever gave the answers (11/19 live: AI-read answers were credited to the agent being inside)
+        who = {"photos": "This home was compared with each sale from its photos, which the agent confirmed show it as it is "
+                         "today, on condition and finishes",
+               "mixed": "The agent and the home's photos compared it with each sale on condition and finishes"
+               }.get(str(pc.get("source") or ""), f"The agent {_PLACEMENT_MARK} and compared it with each sale on condition and finishes")
+        return (f"{who} - {_PLACEMENT_BASIS_MARK}: it is {pc.get('placement_words')}. Once each sale is adjusted to this home, "
+                f"the value is set {pc.get('where') or 'among them'}.")
     return (f"The agent {_PLACEMENT_MARK} and places it {pc.get('placement_words') or 'among the comparable sales'} on "
-            "condition and finishes - something sale records can't show - so the value is set "
+            f"condition and finishes - {_PLACEMENT_BASIS_MARK} - so the value is set "
             f"{_PLACEMENT_WHERE.get(str(pc.get('placement')), 'where the agent places it')} once each sale is adjusted to this home.")
 
 
 def _v10_placement_sentence(methodology: str, *, trace: Optional[dict]) -> tuple[str, list[str]]:
     """Say plainly that where the home sits among the sales is the agent's own read (seller placement band, 11/18)."""
     pc = (trace or {}).get("placement_check") or {}
-    if not methodology or not pc.get("placement") or _PLACEMENT_MARK in methodology:
+    if not methodology or not pc.get("placement") or _PLACEMENT_BASIS_MARK in methodology:
         return methodology, []
     return methodology.rstrip() + " " + _placement_basis_text(pc), [
         "Methodology summary: said that where the home sits among the sales is the agent's own read of it."]
@@ -21768,6 +21781,11 @@ async def _generate_ai_analysis_impl(
     _apply_final_order(report)
     await _run_final_audit(db, report, owner_id, config, model)
     _keep_own_comp_notes(report, _own_notes)
+    if _seller_filled_pricing and isinstance(report.ai_analysis, dict):
+        # what this run filled, as it reads at the very END (later steps polish the wording) - Update the value
+        # takes back exactly these (cma_seller_prefill.prepare_update)
+        report.ai_analysis = {**report.ai_analysis, "seller_filled_pricing": {
+            k: (report.pricing or {}).get(k) for k in _seller_filled_pricing}}
     report.pricing = stamp_final_artifact_qa(
         subject=report.subject or {}, comparables=report.comparables or [], pricing=report.pricing or {},
         market_context=report.market_context or {}, improvements=report.improvements or [],

@@ -180,7 +180,9 @@ _ENGINE_SENTENCE_RE = re.compile(
 # is not a claim of fact. Flagged only as low-risk", "Garbled phrase; comp 3 is farthest comp but fine otherwise").
 # Only notes are dropped by this - a sentence the read actually fixes is never judged by these words.
 _WEAK_NOTE_RE = re.compile(
-    r"\bminor\b|\bmild\b|main issue none|\bfine otherwise\b|\bbut fine\b|,\s*fine\b|\bis fine\b|low[- ]risk|"
+    r"\bminor\b|\bmild\b|main issue none|\bfine otherwise\b|\bbut fine\b|[,;]\s*fine\b|\bis fine\b|low[- ]risk|"
+    # live 11/19: "...; fine, though ..." and "Fine against facts; ..." reached the agent
+    r"^\s*fine\b|\bfine,?\s+though\b|"
     r"not a claim of fact|\bis consistent\b|\bconsistent with\b|^\s*weak\b|^\s*hedged\b|only partly right|"
     r"\bunverified\.?$", re.I)
 # "Could not verify" about something a PHOTO shows. The reader is told not to raise these and still did on five of
@@ -436,11 +438,13 @@ def agent_message(for_agent: list, unverified: Optional[list] = None) -> Optiona
     parts = []
     if for_agent:
         bits = []
-        for n in for_agent[:MAX_AGENT_NOTES]:
-            q = f" (\"{n['sentence'][:140]}\")" if n.get("sentence") else ""
-            bits.append(f"{n['why']}{q}")
+        for i, n in enumerate(for_agent[:MAX_AGENT_NOTES], 1):
+            # numbered, the sentence first and then why (live 11/19: one run-on line was hard to read)
+            why = str(n.get("why") or "").strip().rstrip(".")
+            q = f"\"{n['sentence'][:140].strip()}\" - " if n.get("sentence") else ""
+            bits.append(f"({i}) {q}{why[:1].upper() + why[1:]}.")
         more = f" (+{len(for_agent) - MAX_AGENT_NOTES} more)" if len(for_agent) > MAX_AGENT_NOTES else ""
-        parts.append("the final read of this report noted - " + "; ".join(bits) + more + ".")
+        parts.append("the final read of this report noted - " + " ".join(bits) + more)
     if unverified:
         bits = [f"\"{u['sentence'][:140]}\" ({u['why'][:120].rstrip('.')})" for u in unverified[:MAX_AGENT_NOTES] if u.get("sentence")]
         if bits:

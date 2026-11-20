@@ -171,6 +171,23 @@ def price_points_off(ask_psf: Optional[float], price, sqft) -> float:
         return 0.0
 
 
+_NOT_ON_MARKET = ("closed", "sold", "expired", "withdrawn", "cancel", "off market", "off-market", "off_market", "terminated")
+
+
+def asking_price_now(subject: Optional[dict]) -> Optional[float]:
+    """The subject's asking price only while it is for sale (live 11/19: a home that sold in 2024 carried its old listing
+    price, and every comp's Match % was pulled toward it). Sold / expired / withdrawn / off market = no asking price.
+    Any status that isn't plainly off the market (active, coming soon, pending, under contract, unknown) keeps it."""
+    s = subject or {}
+    status = " ".join(str(s.get(k) or "") for k in ("mls_status", "home_status", "status")).lower()
+    if any(w in status for w in _NOT_ON_MARKET) and "active" not in status and "coming" not in status:
+        return None
+    try:
+        return float(s.get("list_price")) if s.get("list_price") not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 def apply_price_level(subject: dict, results: list, *, asking_price: Optional[float] = None, subject_sqft: Optional[float] = None) -> list:
     """The search results with price level inside each sale's Match %. Returns new candidate objects (the same
     order); a result that is not touched is returned as it is. Never raises - trouble = the plain scores."""

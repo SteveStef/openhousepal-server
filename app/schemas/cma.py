@@ -270,6 +270,8 @@ class CmaComparable(BaseModel):
     # overwritten; the frontend offers a one-click "Use this" that copies this into `commentary`,
     # still editable after.
     ai_commentary: Optional[str] = None
+    # The agent wrote or edited this comp's paragraph (11/19): no run may change it (cma_ai_service._own_comp_notes).
+    commentary_by_agent: Optional[bool] = None
 
 
 class CmaPricing(BaseModel):
@@ -381,6 +383,8 @@ class CmaAiAnalysisMeta(BaseModel):
     input_fingerprint: Optional[str] = None
     images_sent: Optional[Dict[str, List[str]]] = None
     warnings: List[str] = []
+    # made in the Save usage line (cma_save_usage) - Update the value uses the same line
+    save_usage: Optional[Dict[str, Any]] = None
 
 
 class CmaReportResponse(BaseModel):

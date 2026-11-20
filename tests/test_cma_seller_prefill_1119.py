@@ -318,3 +318,24 @@ def test_update_pending_flag_is_seller_only():
     buyer = SimpleNamespace(mode="buyer", subject={"seller_answers": {"update_pending": True}})
     assert ai.seller_update_pending(seller) and not ai.seller_update_pending(buyer)
     assert not ai.seller_update_pending(SimpleNamespace(mode="listing", subject={}))
+
+
+# ---- live test 11/19 night: the client's explanation credits whoever gave the answers -----------------------------
+def test_explanation_credits_the_photos_not_the_agent():
+    anchor = {"comps": [{"listing_key": k, "normalized_weight": 0.2, "size_adjusted_price": p, "status": "sold"}
+                        for k, p in (("A", 600000), ("B", 610000), ("C", 620000), ("D", 630000), ("E", 640000))]}
+    marks = {k: "worse" for k in "ABCDE"}
+    photos = ai._seller_placement_check({"seller_answers": {"comp_marks": marks, "ai_filled": list(marks)}}, anchor, "listing")
+    agent = ai._seller_placement_check({"seller_answers": {"comp_marks": marks}}, anchor, "listing")
+    mixed = ai._seller_placement_check({"seller_answers": {"comp_marks": marks, "ai_filled": ["A", "B"]}}, anchor, "listing")
+    assert (photos["source"], agent["source"], mixed["source"]) == ("photos", "agent", "mixed")
+    assert photos["placement_words"] == "not as nice as all 5 of the comparable sales"
+    tp, ta, tm = (ai._placement_basis_text(x) for x in (photos, agent, mixed))
+    assert "from its photos" in tp and "has been inside" not in tp
+    assert "has been inside this home" in ta
+    assert "The agent and the home's photos" in tm
+    # added once, whichever version is already in the text
+    m, _ = ai._v10_placement_sentence("Value notes. " + tp, trace={"placement_check": photos})
+    assert m.count("something sale records can't show") == 1
+    assert ai._marks_words(1, 0, 0) == "nicer than the one comparable sale"
+    assert ai._marks_words(1, 2, 2) == "nicer than 1 of the comparable sales, about the same as 2 and not as nice as 2"

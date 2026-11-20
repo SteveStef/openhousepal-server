@@ -70,7 +70,7 @@ async def search_cma_comparables(
     # For a listed home the Match % of each sale includes its price level (cma_comp_pick.apply_price_level)
     from app.services import cma_comp_pick
     _subj = payload.subject.model_dump() if payload.subject else {}
-    return cma_comp_pick.apply_price_level(_subj, results, asking_price=_subj.get("list_price"), subject_sqft=payload.subject_sqft)
+    return cma_comp_pick.apply_price_level(_subj, results, asking_price=cma_comp_pick.asking_price_now(_subj), subject_sqft=payload.subject_sqft)
 
 
 @router.post("/comparables/auto-search")
@@ -94,7 +94,7 @@ async def auto_search_cma_comparables(
     # the list still runs highest to lowest and the Comps step still picks the highest.
     from app.services import cma_comp_pick
     _subj = payload.subject.model_dump() if payload.subject else {}
-    results = cma_comp_pick.apply_price_level(_subj, out["results"], asking_price=_subj.get("list_price"),
+    results = cma_comp_pick.apply_price_level(_subj, out["results"], asking_price=cma_comp_pick.asking_price_now(_subj),
                                               subject_sqft=payload.subject_sqft)
     return {**out, "results": [c.model_dump() for c in results]}
 
@@ -700,6 +700,23 @@ class SellerUpdateRequest(BaseModel):
     kitchen: Optional[str] = None
     baths: Optional[str] = None
     save_usage: bool = False
+
+
+class SellerUpdatePreviewRequest(BaseModel):
+    comp_marks: dict = {}
+
+
+@router.post("/{report_id}/seller-update/preview")
+async def seller_update_preview(
+    report_id: str,
+    payload: SellerUpdatePreviewRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_mls_access),
+):
+    """What the changed answers would do to the value, before Update the value - free, no AI (cma_seller_prefill.preview_update)."""
+    from app.services import cma_seller_prefill as pf
+    rep = await service.get_report(db, current_user.id, report_id)
+    return pf.preview_update(rep, payload.comp_marks)
 
 
 @router.post("/{report_id}/seller-update", response_model=CmaReportResponse)
