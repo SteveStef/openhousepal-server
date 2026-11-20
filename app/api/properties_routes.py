@@ -873,6 +873,16 @@ async def _township_results(db: AsyncSession, query: str) -> list:
     return [f"{_nice_place(t[0])}, {t[1]}" for t in (await db.execute(stmt)).fetchall()]
 
 
+@router.get("/high-schools/public", dependencies=[])
+async def high_schools_in_districts_public(
+    districts: List[str] = Query(default=[]),
+    db: AsyncSession = Depends(get_db),
+):
+    """The client's own "Change your search" (owner, 11/19): the same list the agent's editor shows."""
+    from app.services.home_school_service import schools_in
+    return {"schools": await schools_in(db, [d for d in districts[:6] if d and len(d) <= 120])}
+
+
 @router.get("/townships/public", dependencies=[])
 async def search_townships_public(
     query: str = Query(..., min_length=1, max_length=100),

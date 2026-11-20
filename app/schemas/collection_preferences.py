@@ -1,8 +1,15 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Any, Optional
 from datetime import datetime
 
 class CollectionPreferencesBase(BaseModel):
+    # A list left empty in the database (NULL) means none picked - never a reason to fail (11/19: most live
+    # Showcases have counties NULL, so the client's live count in Change your search errored).
+    @field_validator('cities', 'townships', 'school_districts', 'high_schools', 'counties', mode='before', check_fields=False)
+    @classmethod
+    def _null_list_is_empty(cls, v):
+        return [] if v is None else v
+
     min_beds: Optional[int] = None
     max_beds: Optional[int] = None
     min_baths: Optional[float] = None
@@ -104,7 +111,7 @@ class ShowcaseSelfServePreferencesUpdate(BaseModel):
     """Narrow, visitor-facing subset of CollectionPreferencesUpdate - the public
     showcase page lets a visitor tune their own location/price/beds/baths and towns/
     school districts and townships (owner, 11/19), but not the remaining agent-only fields (property type flags,
-    sqft/acres, special features, high schools, must-haves)."""
+    sqft/acres, special features, must-haves)."""
     address: Optional[str] = None
     lat: Optional[float] = None
     long: Optional[float] = None
@@ -118,6 +125,7 @@ class ShowcaseSelfServePreferencesUpdate(BaseModel):
     cities: Optional[list[str]] = None
     townships: Optional[list[str]] = None
     school_districts: Optional[list[str]] = None
+    high_schools: Optional[list[str]] = None   # only counts together with a school district (home_school_service)
     # Still accepted so older pages don't 422, but the visitor save route drops it (and
     # show_match_score): only the agent changes which home matches are scored against.
     compare_property_listing_key: Optional[str] = None

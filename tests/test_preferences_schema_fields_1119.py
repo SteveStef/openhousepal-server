@@ -21,3 +21,11 @@ def test_update_form_fields_are_listed_once():
         names = [n.target.id for n in cls.body if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)]
         dup = {n for n in names if names.count(n) > 1}
         assert not dup, (cls.name, dup)
+
+
+def test_null_lists_in_the_database_mean_none_picked():
+    """67 of 73 live Showcases have counties NULL - reading one into the search form must not fail."""
+    from types import SimpleNamespace
+    row = SimpleNamespace(cities=None, townships=None, school_districts=None, high_schools=None, counties=None)
+    got = CollectionPreferencesBase.model_validate(row, from_attributes=True)
+    assert got.counties == [] and got.high_schools == [] and got.townships == []

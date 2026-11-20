@@ -1866,9 +1866,10 @@ async def update_shared_collection_preferences(
                 detail="This showcase needs either a search address or an area to search"
             )
 
-        # High schools the agent picked belong to the districts picked then - a client who changes the
-        # districts gets the whole of the new ones (the schools would otherwise leave no homes).
-        if ("school_districts" in payload and getattr(collection_obj.preferences, "high_schools", None)
+        # High schools belong to the districts picked then - a client who changes the districts without picking a
+        # school gets the whole of the new ones (the old schools would otherwise leave no homes). The window sends
+        # its own pick (owner, 11/19: clients choose the high school too), which wins.
+        if ("school_districts" in payload and "high_schools" not in payload and getattr(collection_obj.preferences, "high_schools", None)
                 and sorted(payload.get("school_districts") or []) != sorted(collection_obj.preferences.school_districts or [])):
             payload["high_schools"] = []
         # What they actually changed (read before the save overwrites it) - the window sends every field.
@@ -1886,6 +1887,11 @@ async def update_shared_collection_preferences(
         # On their lead's activity: what they changed it to, in words.
         from app.services.leads_service import log_showcase_activity
         changed = _describe_search_change(really_changed)
+        if "high_schools" in really_changed:
+            # which high school they picked, by name (the agent hears about it)
+            from app.services.home_school_service import names_for
+            hs_names = await names_for(db, list(really_changed.get("high_schools") or []))
+            changed.append({"label": "High school", "value": ", ".join(hs_names.values()) or "Any"})
         await log_showcase_activity(db, collection_obj.id, "showcase_search_changed", "Changed their Showcase search",
                                     raw_snapshot={"answers": changed} if changed else None)
         await _notify_search_changed(db, collection_obj, changed)

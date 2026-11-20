@@ -184,3 +184,10 @@ async def test_chat_makes_a_showcase_with_must_haves():
         finally:
             await db.execute(delete(User).where(User.id == agent.id))
             await db.commit()
+
+
+def test_client_save_carries_a_high_school_pick():
+    """Clients pick their own high school in Change your search (owner, 11/19) - the save keeps it."""
+    from app.schemas.collection_preferences import ShowcaseSelfServePreferencesUpdate
+    body = ShowcaseSelfServePreferencesUpdate(school_districts=["Downingtown Area, PA"], high_schools=["nces:1"]).model_dump(exclude_unset=True)
+    assert body["high_schools"] == ["nces:1"]
