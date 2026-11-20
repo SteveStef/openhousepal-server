@@ -520,15 +520,20 @@ async def _quick_key(db, property_id: str) -> Optional[str]:
             k, src, sure = spell.get(sp) or f"txt:{p.state}:{sp}", "bright", True
         elif p.lat is not None:
             box = NEAR_MILES / 69.0
+            # the same evidence the background pass uses: every listing around it (sold ones too) that names its
+            # school, spelled through what the pass learned (map index ix_properties_geo_point finds them)
             near_rows = (await db.execute(text(
-                "SELECT x.id, x.latitude, x.longitude, h.hs_key FROM home_schools h JOIN properties x ON x.id = h.property_id "
-                "WHERE h.state = :s AND h.district = :d AND h.hs_key IS NOT NULL AND (h.source = 'bright' OR h.sure) "
-                "AND x.latitude BETWEEN :a AND :b AND x.longitude BETWEEN :c AND :e"),
+                "SELECT x.id, x.latitude, x.longitude, x.high_school FROM properties x "
+                "WHERE point(x.longitude, x.latitude) <@ box(point(:c, :a), point(:e, :b)) "
+                "AND x.latitude BETWEEN :a AND :b AND x.longitude BETWEEN :c AND :e AND x.state = :s "
+                "AND upper(btrim(coalesce(x.school_district_name, ''))) = :d AND coalesce(btrim(x.high_school), '') <> '' LIMIT 400"),
                 {"s": p.state, "d": p.d, "a": p.lat - box, "b": p.lat + box,
                  "c": p.lng - box * 1.4, "e": p.lng + box * 1.4})).all()
             g = _Grid()
             for r in near_rows:
-                g.add(r.id, r.latitude, r.longitude, r.hs_key)
+                nsp = norm_school(r.high_school)
+                if nsp:
+                    g.add(r.id, r.latitude, r.longitude, spell.get(nsp) or f"txt:{p.state}:{nsp}")
             near = g.vote(p.lat, p.lng, skip=p.id)
             if map_key and near:
                 k, src, sure = (map_key, "map", True) if map_key == near else (near, "nearby", False)

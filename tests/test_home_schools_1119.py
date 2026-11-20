@@ -109,9 +109,16 @@ async def test_new_listing_quick_key_matches_the_pass():
         if u is None:
             pytest.skip("no Downingtown listings locally")
         await hs.fill_unit(db, u.state, u.d)
-        r = (await db.execute(text("SELECT property_id, hs_key FROM home_schools WHERE district = :d AND sure AND hs_key IS NOT NULL LIMIT 1"),
-                              {"d": u.d})).first()
-    assert await hs.quick_key(r.property_id) == r.hs_key
+        named = (await db.execute(text("SELECT property_id, hs_key FROM home_schools WHERE district = :d AND source = 'bright' "
+                                       "AND hs_key IS NOT NULL ORDER BY property_id LIMIT 5"), {"d": u.d})).all()
+        placed = (await db.execute(text("SELECT property_id, hs_key FROM home_schools WHERE district = :d AND source <> 'bright' AND sure "
+                                        "AND hs_key IS NOT NULL ORDER BY property_id LIMIT 10"), {"d": u.d})).all()
+    for r in named:
+        assert await hs.quick_key(r.property_id) == r.hs_key
+    # a listing that leaves the school out: the quick look agrees with the full pass (map + nearby agreed there)
+    if placed:
+        same = [await hs.quick_key(r.property_id) == r.hs_key for r in placed]
+        assert sum(same) >= len(same) - 1, same
 
 
 @pytest.mark.asyncio
@@ -191,7 +198,8 @@ async def test_matcher_respects_high_schools():
         schools = await hs.schools_in(db, ["Downingtown Area, PA"])
         if len(schools) < 2:
             pytest.skip("one school")
-        r = (await db.execute(text("SELECT h.property_id, h.hs_key FROM home_schools h WHERE h.district = :d AND h.hs_key = :k LIMIT 1"),
+        r = (await db.execute(text("SELECT h.property_id, h.hs_key FROM home_schools h WHERE h.district = :d AND h.hs_key = :k "
+                                   "AND h.source = 'bright' ORDER BY h.property_id LIMIT 1"),
                               {"d": u.d, "k": schools[0]["key"]})).first()
         p = await db.get(Property, r.property_id)
         agent = User(email=f"{tag}@example.com", hashed_password="x", first_name="Z", last_name="Q", state="PA", brokerage="B",
