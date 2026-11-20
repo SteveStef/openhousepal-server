@@ -99,3 +99,66 @@ async def test_save_puts_the_township_in_the_search():
             await db.execute(delete(Collection).where(Collection.id == c.id))
             await db.execute(delete(User).where(User.id == agent.id))
             await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_stars_come_only_from_the_current_must_haves():
+    """Owner 11/20: "starred means it's likely perfect, not just a match". New must-haves take off the stars the old
+    ones gave (never the agent's own); a school / township saved as a must-have before 11/20 drops on the next read
+    and its stars come off."""
+    import app.main  # noqa: F401
+    from datetime import datetime, timezone
+    from sqlalchemy import delete, insert, select
+    from app.database import AsyncSessionLocal
+    from app.models.database import Collection, CollectionPreferences, Property, PropertyInteraction, User, collection_properties
+    from app.services import showcase_smart_filter as sf
+    tag = f"zqst-{uuid.uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc)
+    orig = sf.schedule
+    sf.schedule = lambda cid: None                         # no AI reading in a test
+    async with AsyncSessionLocal() as db:
+        ids = (await db.execute(select(Property.id).where(Property.home_status == "ACTIVE-BRIGHT").limit(2))).scalars().all()
+        if len(ids) < 2:
+            pytest.skip("no listings locally")
+        ai_home, own_home = ids
+        agent = User(email=f"{tag}@example.com", hashed_password="x", first_name="Z", last_name="Q", state="PA", brokerage="B",
+                     mls_id=tag.upper(), plan_tier="IDX", subscription_status="ACTIVE")
+        db.add(agent)
+        await db.commit()
+        c = Collection(owner_id=agent.id, name="T", visitor_name="T", visitor_email=f"{tag}-c@example.com")
+        db.add(c)
+        await db.commit()
+        db.add(CollectionPreferences(collection_id=c.id, townships=[], cities=[], counties=[], school_districts=[],
+                                     ai_wants={"wants": ["Pool"], "state": "done", "ai_starred": {ai_home: now.isoformat()}}))
+        await db.execute(insert(collection_properties), [{"collection_id": c.id, "property_id": i} for i in ids])
+        for i in ids:
+            db.add(PropertyInteraction(collection_id=c.id, property_id=i, liked=False, disliked=False, agent_recommended_at=now))
+        await db.commit()
+        cid, aid = c.id, agent.id
+
+        async def stars():
+            rows = (await db.execute(select(PropertyInteraction.property_id, PropertyInteraction.agent_recommended_at)
+                                     .where(PropertyInteraction.collection_id == cid))).all()
+            return {p for p, at in rows if at is not None}
+        try:
+            st = await sf.save_wants(db, cid, ["Fenced yard"], user=None)
+            assert await stars() == {own_home}                 # the AI's Pool star came off; the agent's own stayed
+            assert st["ai_starred"] == {} and st["wants"] == ["Fenced yard"]
+            # an old school must-have (saved before 11/20) with an AI star
+            await db.execute(PropertyInteraction.__table__.update().where(PropertyInteraction.collection_id == cid,
+                                                                          PropertyInteraction.property_id == ai_home).values(agent_recommended_at=now))
+            await db.execute(CollectionPreferences.__table__.update().where(CollectionPreferences.collection_id == cid).values(
+                ai_wants={"wants": ["Downingtown East schools"], "state": "done", "ai_starred": {ai_home: now.isoformat()}}))
+            await db.commit()
+            out = await sf.run_for(cid)
+            assert out["wants"] == [] and out["state"] == "off", out
+            assert await stars() == {own_home}
+        finally:
+            sf.schedule = orig
+            await db.rollback()
+            await db.execute(delete(PropertyInteraction).where(PropertyInteraction.collection_id == cid))
+            await db.execute(collection_properties.delete().where(collection_properties.c.collection_id == cid))
+            await db.execute(delete(CollectionPreferences).where(CollectionPreferences.collection_id == cid))
+            await db.execute(delete(Collection).where(Collection.id == cid))
+            await db.execute(delete(User).where(User.id == aid))
+            await db.commit()

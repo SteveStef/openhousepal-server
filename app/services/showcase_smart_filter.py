@@ -186,9 +186,9 @@ _PLACE_RX = re.compile(r"^(?:(?:is |be |located |must be |homes? )?in(?: the)? )
 
 
 async def place_wants(db, wants: List[str]) -> Dict[str, Dict[str, Any]]:
-    """Must-haves that name a place ("In Uwchlan Township", "Chester Springs") - the listing's own township / town
-    says it exactly, so no AI reads them (free) and the star line says it plainly ("In Uwchlan Township"), not
-    "appears to" (owner, 11/19: Lisa - East homes only, the ones in Uwchlan starred)."""
+    """Words that name a place ("In Uwchlan Township", "Chester Springs"), found in the listings' own townships /
+    towns. Since 11/20 a place is never a must-have (it never stars a home) - split_filter_wants moves it into the
+    search's Townships / Towns filter."""
     from app.models.database import Property
     out: Dict[str, Dict[str, Any]] = {}
     for w in wants:
@@ -329,6 +329,19 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
         wants = clean_wants(st.get("wants"))
         if not wants:
             return st
+        feature, old_filters = await split_filter_wants(db, wants)
+        if old_filters:
+            # saved before 11/20 (Lisa's "Downingtown East schools"): a filter, never a star
+            await take_off_ai_stars(db, collection_id, st)
+            await db.execute(text("update collection_properties set ai_match = case when ai_match ? 'per' "
+                                  "then jsonb_build_object('per', ai_match->'per') else null end where collection_id = :c"), {"c": collection_id})
+            st = {**{k2: v2 for k2, v2 in st.items() if k2 not in ("matched", "read")}, "wants": feature,
+                  "state": "reading" if feature else "off", "at": datetime.now(timezone.utc).isoformat(),
+                  "phrases": {w2: p2 for w2, p2 in (st.get("phrases") or {}).items() if w2 in feature}}
+            await _set_state(db, prefs.id, st)
+            wants = feature
+            if not wants:
+                return st
         user = await db.get(User, coll.owner_id)
         from app.utils.auth import tier_has_mls
         if user is None or not (tier_has_mls(user.plan_tier) or user.is_admin):
@@ -366,8 +379,8 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
 
         config = await ai_config_service.get_config(db)
         homes = [p for p, _ in todo]
-        # A place ("In Uwchlan Township") is the listing's own township / town - checked here, free; the AI reads the rest.
-        places = await place_wants(db, wants)
+        # Places never star a home since 11/20 (they're search filters - dropped above); every must-have is a feature.
+        places: Dict[str, Dict[str, Any]] = {}
         read_wants = [w for w in wants if w not in places]
         est = reader.estimate_for(config, homes) * len(read_wants)
         left, limit = await reader.room(db, user, config)
@@ -502,6 +515,18 @@ async def showcase_home_count(db, collection_id: str) -> int:
         "and not exists (select 1 from property_interactions i where i.collection_id = cp.collection_id "
         "and i.property_id = cp.property_id and i.agent_removed_at is not null)"),
         {"c": collection_id, "s": list(FOR_SALE)})).scalar() or 0)
+
+
+async def take_off_ai_stars(db, collection_id: str, st: Dict[str, Any]) -> int:
+    """The must-haves changed: the stars the old ones gave come off (owner, 11/20: "starred means it's likely perfect,
+    not just a match"). Only the AI's own stars (ai_wants.ai_starred) - a star the agent gave or touched by hand
+    stays. The new must-haves star what fits them. Caller commits."""
+    ids = [i for i in (st.get("ai_starred") or {}) if i]
+    if ids:
+        await db.execute(text("update property_interactions set agent_recommended_at = null where collection_id = :c "
+                              "and property_id = any(:ids) and agent_recommended_at is not null"), {"c": collection_id, "ids": ids})
+    st["ai_starred"] = {}
+    return len(ids)
 
 
 async def ai_only_star_ids(db, collection_id: str, ids) -> set:
@@ -655,6 +680,7 @@ async def save_wants(db, collection_id: str, raw: Any, user=None) -> Dict[str, A
         st["phrases"] = {w: p for w, p in {**(old.get("phrases") or {}), **phrases}.items() if w in wants}
     if changed:
         st.pop("matched", None); st.pop("read", None)
+        await take_off_ai_stars(db, collection_id, st)
         # each home's answer per must-have stays (run_for reuses it - only new must-haves are read); the line goes
         await db.execute(text("update collection_properties set ai_match = case when ai_match ? 'per' "
                               "then jsonb_build_object('per', ai_match->'per') else null end where collection_id = :c"), {"c": collection_id})
