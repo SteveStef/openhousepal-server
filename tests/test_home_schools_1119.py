@@ -94,6 +94,10 @@ async def test_search_keeps_only_that_school_including_blank_listings():
         assert all(keys.get(p.id) in (east["key"], None) for p in east_homes)
         assert any(keys.get(p.id) == east["key"] for p in east_homes)
         unknown = await hs.unknown_school_ids(db, only, [p.id for p in east_homes])
+        # the card marks (owner, 11/20): East homes get the gold pill with the school's name, the rest the amber note
+        unk2, match = await hs.school_marks(db, only, [p.id for p in east_homes])
+        assert unk2 == unknown and set(match) == {p.id for p in east_homes if keys.get(p.id) == east["key"]}
+        assert set(match.values()) == {east["name"]}
         assert unknown == {p.id for p in east_homes if keys.get(p.id) is None}
         # a school alone (no district) never filters - it would pull in every unknown home anywhere
         no_district = SimpleNamespace(**{**base, "high_schools": [east["key"]]})

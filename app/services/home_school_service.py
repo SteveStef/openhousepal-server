@@ -876,6 +876,21 @@ async def unknown_school_ids(db, preferences, property_ids) -> set:
     return set(ids) - known
 
 
+async def school_marks(db, preferences, property_ids) -> Tuple[set, Dict[str, str]]:
+    """A high-school search's card marks (owner, 11/20): the homes whose school is unknown (amber note, district pill)
+    and {home: picked school's name} for the homes going to a picked school (the photo's pill shows it in gold)."""
+    from sqlalchemy import bindparam
+    ids = [i for i in (property_ids or []) if i]
+    picked = _picked(preferences)
+    if not ids or not picked:
+        return set(), {}
+    keyed = {r[0]: r[1] for r in (await db.execute(text(
+        "SELECT property_id, hs_key FROM home_schools WHERE property_id IN :ids AND hs_key IS NOT NULL").bindparams(
+        bindparam("ids", expanding=True)), {"ids": ids})).all()}
+    names = await names_for(db, picked)
+    return set(ids) - set(keyed), {p: names[k] for p, k in keyed.items() if k in picked and names.get(k)}
+
+
 async def schools_in(db, districts: List[str]) -> List[Dict[str, Any]]:
     """The high schools for sale homes in these districts ("Downingtown Area, PA" style names, matched like the
     search does): key, name, homes for sale, and how many of those the listing itself names. "unknown" = homes

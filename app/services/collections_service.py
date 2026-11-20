@@ -238,20 +238,21 @@ async def _ai_starred_ids(db, collection_id: str, smart_lookup: dict | None = No
     return set(v) if isinstance(v, dict) else set()
 
 
-async def _school_unknown_ids(db: AsyncSession, collection_id: str, property_ids) -> set:
-    """Homes in this Showcase's high-school search whose school can't be told (home_school_service)."""
+async def _school_marks(db: AsyncSession, collection_id: str, property_ids) -> tuple:
+    """In this Showcase's high-school search: the homes whose school can't be told, and {home: picked school's name}
+    for the homes going to a picked school (home_school_service.school_marks) - the card's amber note / gold pill."""
     try:
         from types import SimpleNamespace
-        from app.services.home_school_service import unknown_school_ids
+        from app.services.home_school_service import school_marks
         async with db.begin_nested():
             r = (await db.execute(text("select high_schools, school_districts from collection_preferences where collection_id = :c"),
                                   {"c": collection_id})).first()
             if not r or not r.high_schools:
-                return set()
-            return await unknown_school_ids(db, SimpleNamespace(high_schools=r.high_schools, school_districts=r.school_districts), property_ids)
+                return set(), {}
+            return await school_marks(db, SimpleNamespace(high_schools=r.high_schools, school_districts=r.school_districts), property_ids)
     except Exception:
-        logger.warning("school unknown lookup failed", exc_info=True)
-        return set()
+        logger.warning("school marks lookup failed", exc_info=True)
+        return set(), {}
 
 
 async def _hs_names(db: AsyncSession, keys) -> dict:
@@ -1751,7 +1752,7 @@ class CollectionsService:
                     smart_lookup[row.property_id] = smart_line(row.ai_match)
             sold_folder, back_on_market = sold_folder_split(collection.properties, filed_at_lookup)
             ai_starred_ids = await _ai_starred_ids(db, collection.id, smart_lookup)
-            school_unknown = await _school_unknown_ids(db, collection.id, [p.id for p in collection.properties])
+            school_unknown, school_match = await _school_marks(db, collection.id, [p.id for p in collection.properties])
 
             # Calculate "new" threshold (properties added in last 7 days)
             now = datetime.now(timezone.utc)
@@ -1876,6 +1877,8 @@ class CollectionsService:
                     'smartMatch': smart_lookup.get(prop.id),
                     # in a high-school search only because its school can't be told (owner, 11/19) - the card says so
                     'schoolUnknown': prop.id in school_unknown,
+                    # goes to the picked high school - the photo's pill names it in gold (owner, 11/20)
+                    'schoolMatch': school_match.get(prop.id),
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
                     'viewCount': interactions_lookup[prop.id].view_count if prop.id in interactions_lookup else 0,
                     # NEW for the buyer: in their Showcase less than NEW_PROPERTY_DAYS (the first fill
@@ -2307,7 +2310,7 @@ class CollectionsService:
                 smart_lookup[row.property_id] = smart_line(row.ai_match)
             sold_folder, back_on_market = sold_folder_split(collection.properties, filed_at_lookup)
             ai_starred_ids = await _ai_starred_ids(db, collection.id, smart_lookup)
-            school_unknown = await _school_unknown_ids(db, collection.id, [p.id for p in collection.properties])
+            school_unknown, school_match = await _school_marks(db, collection.id, [p.id for p in collection.properties])
 
             # Calculate "new" threshold (properties added in last 7 days)
             now = datetime.now(timezone.utc)
@@ -2455,6 +2458,8 @@ class CollectionsService:
                     'smartMatch': smart_lookup.get(prop.id),
                     # in a high-school search only because its school can't be told (owner, 11/19) - the card says so
                     'schoolUnknown': prop.id in school_unknown,
+                    # goes to the picked high school - the photo's pill names it in gold (owner, 11/20)
+                    'schoolMatch': school_match.get(prop.id),
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
                     'viewCount': interactions_lookup[prop.id].view_count if prop.id in interactions_lookup else 0,
                     'lastViewedAt': interactions_lookup[prop.id].last_viewed_at.isoformat() if prop.id in interactions_lookup and interactions_lookup[prop.id].last_viewed_at else None,
