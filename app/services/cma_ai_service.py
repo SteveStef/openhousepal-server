@@ -2939,6 +2939,46 @@ async def _run_final_audit(db: AsyncSession, report, owner_id: str, config: dict
         logger.warning("CMA final audit wrapper failed", extra={"report_id": getattr(report, "id", None)}, exc_info=True)
 
 
+def _own_comp_notes(comparables) -> dict:
+    """The comp paragraphs the agent wrote or edited themselves (owner 11/19): signed off - no run, check or rewrite
+    may change a word of them. Keyed by the comp's listing key (else its id)."""
+    out = {}
+    for c in comparables or []:
+        if not isinstance(c, dict):
+            continue
+        mine = str(c.get("commentary") or "")
+        if mine.strip() and mine.strip() != str(c.get("ai_commentary") or "").strip():
+            out[str(c.get("listing_key") or c.get("id") or "")] = mine
+    return out
+
+
+def _keep_own_comp_notes(report, own: dict) -> None:
+    """Puts every agent-written comp paragraph back exactly as the agent wrote it, at the very end of a run. Where a
+    step of the run would have changed one, the agent gets a private note to read it once more - never a change."""
+    if not own:
+        return
+    touched = []
+    comps = []
+    for i, c in enumerate(report.comparables or []):
+        k = str((c or {}).get("listing_key") or (c or {}).get("id") or "")
+        if k in own:
+            if str(c.get("commentary") or "") != own[k]:
+                touched.append(_title_address(c.get("street_address")) or f"Comp #{i + 1}")
+            c = {**c, "commentary": own[k]}
+        comps.append(c)
+    report.comparables = comps
+    if not touched:
+        return
+    names = ", ".join(touched[:3]) + (" and others" if len(touched) > 3 else "")
+    msg = (f"You wrote the paragraph for {names} yourself, so it was left exactly as you wrote it. The report's checks "
+           "would have changed it this time (its rating or a fact in it may have moved) - read it once more before you send.")
+    pricing = dict(report.pricing or {})
+    est = dict(pricing.get("ai_estimate") or {})
+    est["own_notes_review"] = {"message": msg, "comps": touched}
+    pricing["ai_estimate"] = est
+    report.pricing = pricing
+
+
 def _apply_final_order(report) -> None:
     """Best-effort - a re-order problem must never fail a finished, paid report."""
     try:
@@ -2994,41 +3034,57 @@ def _seller_answers_of(subject: Optional[dict]) -> dict:
 def _agent_walkthrough_text(subject: Optional[dict], *, for_prompt: bool = False, comps: Optional[list] = None) -> Optional[str]:
     """The agent's answers as plain facts. for_prompt adds how the AI must use them."""
     sa = _seller_answers_of(subject)
-    parts = []
+    # answers the report's own photo pass filled in (one-pass seller report, 11/19) are the photos', not the agent's
+    _ai = {str(x) for x in (sa.get("ai_filled") or [])}
+    parts, photo_parts = [], []
     pl = _PLACEMENT_WORDS.get(str(sa.get("placement") or ""))
     if pl:
         parts.append(f"On condition and finishes (size, age and lot aside) the agent places this home {pl}.")
     _marks = _comp_marks_of(subject)
     if _marks and comps:
         _say = {"better": "nicer than", "same": "about the same as", "worse": "not as nice as"}
-        _named = []
+        _named, _named_ai = [], []
         for _c in comps:
             _k = str((_c or {}).get("listing_key") or (_c or {}).get("id") or "")
             if _k in _marks and _c.get("is_included", True):
-                _named.append(f"{_say[_marks[_k]]} {_title_address(_c.get('street_address')) or 'one comp'}")
+                (_named_ai if _k in _ai else _named).append(
+                    f"{_say[_marks[_k]]} {_title_address(_c.get('street_address')) or 'one comp'}")
         if _named:
             parts.append("Compared one by one on condition and finishes, the agent says this home is " + "; ".join(_named) + ".")
+        if _named_ai:
+            photo_parts.append("Compared one by one on condition and finishes, this home is " + "; ".join(_named_ai) + ".")
     for key, label in (("kitchen", "Kitchen"), ("baths", "Bathrooms")):
         w = _ROOM_WORDS.get(str(sa.get(key) or ""))
         if w:
             yr = sa.get(f"{key}_year")
-            parts.append(f"{label}: {w}" + (f" in {int(yr)}" if yr and str(sa.get(key)) != "original" else "") + ".")
+            (photo_parts if key in _ai else parts).append(
+                f"{label}: {w}" + (f" in {int(yr)}" if yr and str(sa.get(key)) != "original" else "") + ".")
     rep = [x for x in (sa.get("replaced") or []) if isinstance(x, dict) and _REPLACED_WORDS.get(str(x.get("item")))]
     if rep:
         parts.append("Replaced: " + "; ".join(
             _REPLACED_WORDS[str(x["item"])] + " replaced" + (f" {int(x['year'])}" if x.get("year") else "") for x in rep) + ".")
-    if not parts:
+    if not parts and not photo_parts:
         return None
-    text = "Given by the agent who has walked the home: " + " ".join(parts)
-    if for_prompt:
-        text += (" These are facts about the home today, as reliable as the MLS record. Rate each comp's finish_quality, "
-                 "interior, kitchen and bathrooms against THIS, not against the listing photos alone. Credit an item "
-                 "to the agent ('the agent confirms', 'per the agent'), never to the listing.")
-        if pl or _marks:
-            text += (" Where the agent places the home among the comps decides where the value sits among the adjusted "
-                     "sales - do not pull it back to their middle. Rate each comp the agent compared to match the agent's "
-                     "answer for it.")
-    return text
+    texts = []
+    if parts:
+        text = "Given by the agent who has walked the home: " + " ".join(parts)
+        if for_prompt:
+            text += (" These are facts about the home today, as reliable as the MLS record. Rate each comp's finish_quality, "
+                     "interior, kitchen and bathrooms against THIS, not against the listing photos alone. Credit an item "
+                     "to the agent ('the agent confirms', 'per the agent'), never to the listing.")
+            if pl or _marks:
+                text += (" Where the agent places the home among the comps decides where the value sits among the adjusted "
+                         "sales - do not pull it back to their middle. Rate each comp the agent compared to match the agent's "
+                         "answer for it.")
+        texts.append(text)
+    if photo_parts:
+        text = ("Read from the home's photos, which the agent confirmed show it as it is today: " + " ".join(photo_parts))
+        if for_prompt:
+            text += (" Where these answers place the home among the comps decides where the value sits among the adjusted "
+                     "sales - do not pull it back to their middle. Credit them to the photos ('the photos show'), never "
+                     "to the agent.")
+        texts.append(text)
+    return " ".join(texts)
 
 
 def _subject_interior_documented(subject: Optional[dict]) -> bool:
@@ -10884,6 +10940,8 @@ def _seller_placement_check(subject: Optional[dict], anchor: Optional[dict], mod
         return None
     marks = _comp_marks_of(subject)
     placement = str(_seller_answers_of(subject).get("placement") or "")
+    _ai_set = {str(x) for x in (_seller_answers_of(subject).get("ai_filled") or [])}
+    marked = []
     if not marks and placement not in _PLACEMENT_WORDS:
         return None
     rows = []
@@ -10932,8 +10990,11 @@ def _seller_placement_check(subject: Optional[dict], anchor: Optional[dict], mod
         "comp_low": round(low), "comp_median": round(median), "comp_high": round(high),
         "sales_without_condition": round(base), "target": round(target),
         "allowed_low": round(target * (1 - _PLACEMENT_HOLD)), "allowed_high": round(target * (1 + _PLACEMENT_HOLD)),
-        "note": ("The agent who has walked the home compared it with the comparable sales: it is " + words + " on "
-                 "condition and finishes. The final value must sit between allowed_low and allowed_high."),
+        "note": (("Compared from its photos (the agent confirmed they show the home today)"
+                  if how == "comp_marks" and marked and all(r[2] in _ai_set for r in rows if r[2] in marks)
+                  else "The agent who has walked the home compared it with the comparable sales")
+                 + ": it is " + words + " on condition and finishes. The final value must sit between allowed_low and "
+                 "allowed_high."),
     }
 
 
@@ -11804,6 +11865,13 @@ def _evidence_strength(subject: Optional[dict], trace: Optional[dict], value, co
             "limited": "There is no asking price to check the sales against, and on past sales with both of these signs more "
                        "than half were off by more than 15%. Lean on the range, and on your own knowledge of the home.",
         }[level]
+        # Seller home placed from the comp-by-comp answers (11/19): the "sales and the table alone" figure is not
+        # this report's method any more. The label itself stays - the answered test is only 5 past sales.
+        if ((trace or {}).get("placement_check") or {}).get("how") == "comp_marks" and level == "fair":
+            record = ("There is no asking price to check the sales against, so the value was placed among the sales from "
+                      "the comp-by-comp answers (nicer, about the same, not as nice). On a small test of 5 past sales "
+                      "placed this way the average miss was about 4-5%, against about 11% from the sales and the "
+                      "adjustment table alone - make sure the answers fit the home as it is today, and lean on the range.")
     label = {"strong": "Strong evidence", "fair": "Fair evidence", "limited": "Limited evidence"}[level]
     why = ("; ".join(signs[:4])[:1].upper() + "; ".join(signs[:4])[1:] + ".") if signs else None
     return {"level": level, "label": label, "signs": signs, "listed": listed, "multi_family": multi,
@@ -14715,8 +14783,14 @@ def _packet_lock_identity(evidence_packet: dict) -> dict:
                                    "garage", "school_district", "renovation_condition")}
             | {"date": str(c.get("sale_date") or "")[:10], "q": c.get("better_worse_ratings") or {}}
             for c in (evidence_packet.get("comparables") or [])]
-    return {"subject": subj, "comps": sorted(rows, key=lambda r: str(r.get("comp_id"))),
-            "mode": evidence_packet.get("report_mode")}
+    out = {"subject": subj, "comps": sorted(rows, key=lambda r: str(r.get("comp_id"))),
+           "mode": evidence_packet.get("report_mode")}
+    # A seller home placed from the comp answers (11/19): a changed answer (Update the value) must give a new value.
+    # Only when present, so every other report's saved answer (all buyer reports) keeps its fingerprint.
+    _pc = evidence_packet.get("placement_check") or {}
+    if _pc.get("target"):
+        out["place"] = [_pc.get("how"), _pc.get("target"), _pc.get("placement_words")]
+    return out
 
 
 def _value_lock_fingerprint(identity: dict, *, model: str, mode: Optional[str] = None, extra=None) -> str:
@@ -14794,6 +14868,10 @@ async def _value_lock_put(db: AsyncSession, report_id, kind: str, fingerprint: s
 # read is kept here, per report, and the report itself uses it instead of reading the photos again - as long as
 # the comps, their facts and the photos are the same. Unlike the value locks above this is kept in an accuracy
 # test too: it never leaves its own report, which is bound to its own test.
+_SELLER_FILLED_PRICING_FIELDS = ("most_likely_value", "recommended_min", "recommended_max", "recommended_list_price",
+                                 "pricing_commentary", "listing_strategy_notes", "listing_prep_notes")
+
+
 def _seller_read_key(report_id) -> str:
     return f"cma_seller_read:{report_id}"
 
@@ -14805,13 +14883,23 @@ def _seller_photos_sig(subject: Optional[dict]) -> str:
                                       "p": [p for p in (s.get("photos") or []) if p]}, sort_keys=True).encode()).hexdigest()[:24]
 
 
-async def _seller_read_get(db: AsyncSession, report_id, fingerprint: str, order: Optional[list], photos_sig: str) -> Optional[dict]:
+async def _seller_read_get(db: AsyncSession, report_id, fingerprint: str, order: Optional[list], photos_sig: str,
+                           loose: bool = False) -> Optional[dict]:
+    """loose = an Update the value run: the report already ran once, so a comp's stored facts may have been filled in
+    since the read - the same comps (by MLS number) and the same photos are enough. The photos are never re-read."""
     if not report_id:
         return None
     got = await _reasoning_cache_get(db, _seller_read_key(report_id))
-    if isinstance(got, dict) and got.get("fp") == fingerprint and got.get("photos") == photos_sig and isinstance(got.get("raw"), dict):
+    if not (isinstance(got, dict) and got.get("photos") == photos_sig and isinstance(got.get("raw"), dict)):
+        return None
+    if got.get("fp") == fingerprint or (loose and sorted(map(str, got.get("order") or [])) == sorted(map(str, order or []))):
         return _lock_in_todays_order(got, order)
     return None
+
+
+def seller_update_pending(report) -> bool:
+    """A seller report the agent asked to re-make after changing an answer (cma_seller_prefill.start_update)."""
+    return getattr(report, "mode", None) != "buyer" and bool(_seller_answers_of(getattr(report, "subject", None)).get("update_pending"))
 
 
 async def _seller_read_put(db: AsyncSession, report_id, fingerprint: str, raw: dict, order: Optional[list], photos_sig: str) -> None:
@@ -20154,6 +20242,7 @@ async def _generate_ai_analysis_impl(
         _reasoning_holder = {}
     report = await cma_service._get_owned(db, owner_id, report_id)
     config = await ai_config_service.get_config(db)
+    _seller_filled_pricing: dict = {}   # what this run filled on a seller report (Update the value resets only these)
     _extra_usage: list = []
     _EXTRA_USAGE.set(_extra_usage)
 
@@ -20170,6 +20259,7 @@ async def _generate_ai_analysis_impl(
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Reading the photos first is for a seller report.")
         # the AI's own read, before the agent answers: nothing the agent said may steer it
         subject = {k: v for k, v in subject.items() if k != "seller_answers"}
+    _own_notes = _own_comp_notes(report.comparables)      # the agent's own comp paragraphs: never changed by this run
     comps = [c for c in (report.comparables or []) if c.get("is_included", True)]
     if len(comps) > MAX_COMPS:
         comps = sorted(comps, key=lambda c: c.get("match_score") or 0, reverse=True)[:MAX_COMPS]
@@ -20202,7 +20292,9 @@ async def _generate_ai_analysis_impl(
     # stop regardless of force_regenerate, matching the frontend which never shows the button
     # again after the first generation. Enforced here too since the frontend guard alone isn't
     # trustworthy against a direct API call.
-    if report.ai_analysis and _has_completed_ai_pricing(report):
+    # The one exception (owner 11/19): a seller report whose agent changed an answer on the finished report -
+    # "Update the value" (cma_seller_prefill.start_update) - re-makes it from the same photo read.
+    if report.ai_analysis and _has_completed_ai_pricing(report) and not seller_update_pending(report):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "This report already has an AI analysis - regenerating isn't available.")
 
     if not os.getenv("ANTHROPIC_API_KEY"):
@@ -20316,7 +20408,8 @@ async def _generate_ai_analysis_impl(
                                             model=model, mode=report.mode, extra={"photos": images_sent})
     # the photo read the seller Compare step already made for this report (cma_seller_prefill): used as it is
     _photos_sig = _seller_photos_sig(subject)
-    _seller_read = (await _seller_read_get(db, report_id, _comp_lock_fp, _lock_order(enriched_comps), _photos_sig)
+    _seller_read = (await _seller_read_get(db, report_id, _comp_lock_fp, _lock_order(enriched_comps), _photos_sig,
+                                           loose=seller_update_pending(report))
                     if report.mode != "buyer" else None)
     _comp_locked = None if (_seller_read or photo_read_only) else (
         await _value_lock_get(db, report_id, "comp", _comp_lock_fp, order=_lock_order(enriched_comps)))
@@ -20464,6 +20557,24 @@ async def _generate_ai_analysis_impl(
         return {"suggest": _pf.suggestions(result, enriched_subject.get("_photo_rooms_sent"), comps),
                 "cost_usd": round(cost + (_photo_sort_cost or 0.0), 4), "reused": _comp_from_cache,
                 "ok": bool(result.get("comps"))}
+    if seller_update_pending(report):
+        _sa_done = {k: v for k, v in _seller_answers_of(report.subject).items() if k != "update_pending"}
+        report.subject = {**report.subject, "seller_answers": _sa_done}
+        subject = {**subject, "seller_answers": _sa_done}
+        enriched_subject["seller_answers"] = _sa_done
+    if report.mode != "buyer" and result.get("comps") and not _seller_read:
+        # kept with the report so a later "Update the value" (an answer changed on the finished report) never
+        # reads the photos again - whether the AI or the agent gave the answers
+        await _seller_read_put(db, report_id, _comp_lock_fp, copy.deepcopy(result), _lock_order(enriched_comps), _photos_sig)
+    if report.mode != "buyer" and _seller_answers_of(report.subject).get("inside_photos") == "yes" and result.get("comps"):
+        # One-pass seller report (owner 11/19): the photos show the home today, so this same photo pass answers every
+        # comp and room the agent left blank - no separate read, no stop.
+        from app.services import cma_seller_prefill as _pf_fill
+        _filled_subject = _pf_fill.fill_blanks(report.subject, result, enriched_subject.get("_photo_rooms_sent"), comps)
+        if _filled_subject is not None:
+            report.subject = _filled_subject
+            subject = {**subject, "seller_answers": _filled_subject["seller_answers"]}
+            enriched_subject["seller_answers"] = _filled_subject["seller_answers"]
     if _seller_read and report.mode != "buyer" and _comp_marks_of(report.subject):
         # the agent overrode the photos on a comp: that comp's note now says what the agent said (text only)
         await _rewrite_overridden_comp_notes(model, result, _comp_marks_of(report.subject), comps)
@@ -21582,6 +21693,7 @@ async def _generate_ai_analysis_impl(
                 if offer_strategy_considerations:
                     new_pricing["offer_suggestion_notes"] = offer_strategy_considerations
         else:
+            _seller_blank_before = {_k for _k in _SELLER_FILLED_PRICING_FIELDS if _is_blank(new_pricing.get(_k))}
             # the value the report states everywhere else (418 Reedville Rd, test round 11/13: "Most likely value
             # $675,000" above text and a steps table that both said $673,000). The LIST price stays a round figure.
             if _is_blank(new_pricing.get("most_likely_value")):
@@ -21600,6 +21712,7 @@ async def _generate_ai_analysis_impl(
                 new_pricing["listing_strategy_notes"] = listing_strategy_considerations
             if _is_blank(new_pricing.get("listing_prep_notes")) and listing_prep_concerns:
                 new_pricing["listing_prep_notes"] = listing_prep_concerns
+            _seller_filled_pricing = {_k: new_pricing.get(_k) for _k in _seller_blank_before if not _is_blank(new_pricing.get(_k))}
         report.pricing = new_pricing
 
         # qa_flags/qa_blocking may have grown after ai_estimate was assembled above - keep in sync,
@@ -21637,6 +21750,7 @@ async def _generate_ai_analysis_impl(
         cost += _extra_cost
     report.ai_analysis = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "seller_filled_pricing": _seller_filled_pricing or None,
         "model": model,
         "reasoning_model": config.get("cma_reasoning_model"),
         "cost_usd": round(cost + _reasoning_cost + _photo_sort_cost, 4),
@@ -21653,6 +21767,7 @@ async def _generate_ai_analysis_impl(
     }
     _apply_final_order(report)
     await _run_final_audit(db, report, owner_id, config, model)
+    _keep_own_comp_notes(report, _own_notes)
     report.pricing = stamp_final_artifact_qa(
         subject=report.subject or {}, comparables=report.comparables or [], pricing=report.pricing or {},
         market_context=report.market_context or {}, improvements=report.improvements or [],
@@ -21745,6 +21860,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
     subject, _last_sale_flag = _drop_impossible_last_sale(report.subject or {})
     if _last_sale_flag:
         report.subject = subject
+    _own_notes = _own_comp_notes(report.comparables)      # the agent's own comp paragraphs: never changed
     comps = [c for c in (report.comparables or []) if c.get("is_included", True)]
     if not comps:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Add at least one comparable before recomputing.")
@@ -22405,6 +22521,7 @@ async def recompute_valuation(db: AsyncSession, owner_id: str, report_id: str, p
 
     _apply_final_order(report)
     await _run_final_audit(db, report, owner_id, config, model)
+    _keep_own_comp_notes(report, _own_notes)
     report.pricing = stamp_final_artifact_qa(
         subject=report.subject or {}, comparables=report.comparables or [], pricing=report.pricing or {},
         market_context=report.market_context or {}, improvements=report.improvements or [],

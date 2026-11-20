@@ -797,6 +797,28 @@ async def ai_copywrite(
     )
 
 
+class GrammarPassage(BaseModel):
+    id: str
+    text: str
+
+
+class GrammarFixRequest(BaseModel):
+    passages: List[GrammarPassage]
+    where: Optional[str] = None
+
+
+@router.post("/fix-grammar")
+async def ai_fix_grammar(
+    payload: GrammarFixRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
+):
+    """Fix grammar (11/19): spelling, grammar and wording only in what the agent typed - every fact, number and name
+    kept; each change shown before / after for the agent to pick. Small model, metered (grammar_fix_service)."""
+    from app.services.ai import grammar_fix_service
+    return await grammar_fix_service.fix_passages(db, current_user, [p.model_dump() for p in payload.passages], payload.where)
+
+
 @router.post("/compliance-check", response_model=ComplianceCheckResponse)
 async def ai_compliance_check(
     payload: ComplianceCheckRequest,

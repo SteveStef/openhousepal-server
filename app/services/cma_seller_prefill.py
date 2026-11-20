@@ -76,6 +76,34 @@ def suggestions(result: dict, rooms_sent: Optional[list], comps: list) -> dict:
             "rooms_missing": [k for k in ("kitchen", "baths") if k not in out]}
 
 
+def fill_blanks(subject: Optional[dict], result: dict, rooms_sent: Optional[list], comps: list) -> Optional[dict]:
+    """One-pass seller report (owner 11/19, "stupid simple"): the agent said the photos show the home as it is today
+    (seller_answers.inside_photos == "yes") and pressed Create - no separate read, no stop. The report's own photo
+    pass answers every comp and room the agent left blank; the agent's own answers are never touched. The ones the
+    AI filled are listed in ai_filled (the report credits them to the photos, not to the agent; the agent can change
+    any of them on the finished report - Update the value). Returns the new subject, or None when nothing to do."""
+    s = subject or {}
+    sa = dict(s.get("seller_answers") or {}) if isinstance(s.get("seller_answers"), dict) else {}
+    if sa.get("inside_photos") != "yes":
+        return None
+    sg = suggestions(result, rooms_sent, comps)
+    marks = {str(k): str(v) for k, v in (sa.get("comp_marks") or {}).items()} if isinstance(sa.get("comp_marks"), dict) else {}
+    filled = [str(x) for x in (sa.get("ai_filled") or [])]
+    for k, m in sg["comp_marks"].items():
+        if k not in marks:
+            marks[k] = m
+            filled.append(k)
+    for room in ("kitchen", "baths"):
+        if sg.get(room) and sa.get(room) in (None, "", "not_sure"):
+            sa[room] = sg[room]
+            filled.append(room)
+    sa["comp_marks"] = marks
+    sa["ai_filled"] = sorted(set(filled))
+    sa["ai_unread"] = [k for k in sg["unread"] if k not in marks]
+    sa["ai_rooms_missing"] = [r for r in sg["rooms_missing"] if sa.get(r) in (None, "", "not_sure")]
+    return {**s, "seller_answers": sa}
+
+
 def core_facts_missing(subject: Optional[dict], mode: Optional[str]) -> list:
     """A seller home typed in by hand (not on the MLS - Bright has no public records): the six facts the value is
     built on must be filled in before anything is spent (owner 11/19). Same list as the Home step's
@@ -250,3 +278,72 @@ async def _tell(owner_id: str, report_id: str, address: str, err: Optional[str])
             await db.commit()
     except Exception:  # noqa: BLE001
         logger.warning("Seller photo read notice failed", exc_info=True, extra={"report_id": report_id})
+
+
+# ---- Update the value (owner 11/19): an answer changed on the finished seller report -------------------------------
+_COMP_AI_FIELDS = ("quality", "ai_quality_read", "ai_commentary", "strength", "material_issues")
+
+
+async def prepare_update(db, report, comp_marks: Optional[dict], kitchen: Optional[str], baths: Optional[str]) -> None:
+    """The agent changed one or more answers on a finished seller report. Saves the new answers (they are the agent's
+    now, not the photos'), takes back ONLY what the report's AI wrote (the agent's own edits stay), and marks the
+    report so the next run re-makes it from the same photo read - the photos are never read again. The caller then
+    starts the run like Create AI Analysis does. Raises a plain-English HTTPException when it can't."""
+    from fastapi import HTTPException
+    from app.services.cma_ai_service import (_COMP_MARKS, _has_completed_ai_pricing, _is_blank, _reasoning_cache_get,
+                                             _seller_read_key)
+    if report.mode == "buyer":
+        raise HTTPException(status_code=400, detail="Changing the answers is for a seller report.")
+    if not (getattr(report, "ai_analysis", None) and _has_completed_ai_pricing(report)):
+        raise HTTPException(status_code=400, detail="Make the report first - then you can change an answer.")
+    if report.generation_status == "generating":
+        raise HTTPException(status_code=409, detail="This report is being made right now.")
+    if not isinstance(await _reasoning_cache_get(db, _seller_read_key(report.id)), dict):
+        raise HTTPException(status_code=409, detail="This report's photo read wasn't kept, so its answers can't be "
+                                                    "changed here. Start a new CMA for this home to use different answers.")
+    subj = dict(report.subject or {})
+    sa = dict(subj.get("seller_answers") or {})
+    marks = {str(k): str(v) for k, v in (sa.get("comp_marks") or {}).items()}
+    ai_set = {str(x) for x in (sa.get("ai_filled") or [])}
+    on_report = set(included_comp_keys(report.comparables))
+    changed = False
+    for k, v in (comp_marks or {}).items():
+        k, v = str(k), str(v)
+        if k not in on_report or v not in _COMP_MARKS:
+            raise HTTPException(status_code=422, detail="That answer isn't for one of this report's comps.")
+        if marks.get(k) != v:
+            marks[k], changed = v, True
+            ai_set.discard(k)
+    for room, val in (("kitchen", kitchen), ("baths", baths)):
+        if val is None:
+            continue
+        if val not in _ROOM_STATES:
+            raise HTTPException(status_code=422, detail="Pick original, updated or fully redone.")
+        if sa.get(room) != val:
+            sa[room], changed = val, True
+            ai_set.discard(room)
+    if not changed:
+        raise HTTPException(status_code=400, detail="Nothing changed - the report already uses these answers.")
+    sa.update(comp_marks=marks, ai_filled=sorted(ai_set), update_pending=True)
+    sa["ai_unread"] = [k for k in (sa.get("ai_unread") or []) if k not in marks]
+    sa["ai_rooms_missing"] = [r for r in (sa.get("ai_rooms_missing") or []) if sa.get(r) in (None, "", "not_sure")]
+    report.subject = {**subj, "seller_answers": sa}
+    # take back what the AI wrote; what the agent typed over it stays
+    filled = (report.ai_analysis or {}).get("seller_filled_pricing") or {}
+    pricing = {k: v for k, v in (report.pricing or {}).items() if k != "ai_estimate"}
+    for k, v in filled.items():
+        if pricing.get(k) == v:
+            pricing.pop(k, None)
+    report.pricing = pricing
+    comps = []
+    for c in report.comparables or []:
+        c = dict(c)
+        if not _is_blank(c.get("commentary")) and c.get("commentary") == c.get("ai_commentary"):
+            c["commentary"] = None
+        for f in _COMP_AI_FIELDS:
+            c.pop(f, None)
+        comps.append(c)
+    report.comparables = comps
+    report.ai_analysis = None
+    await db.commit()
+    await db.refresh(report)

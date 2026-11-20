@@ -137,6 +137,11 @@ class CmaSellerAnswers(BaseModel):
     inside_photos: Optional[Literal['yes', 'no']] = None
     ai_applied: Optional[str] = None
     kept: List[str] = []
+    # One-pass report (11/19): answers the report's own photo pass filled in (comp keys, 'kitchen', 'baths') - the
+    # report credits these to the photos; and what the photos couldn't answer (left blank, shown on the report).
+    ai_filled: List[str] = []
+    ai_unread: List[str] = []
+    ai_rooms_missing: List[str] = []
 
 
 CmaSubjectProperty.model_rebuild()

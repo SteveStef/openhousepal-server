@@ -695,6 +695,42 @@ async def generate_cma_ai_analysis(
             await release_cma_generation(report_id)
 
 
+class SellerUpdateRequest(BaseModel):
+    comp_marks: dict = {}
+    kitchen: Optional[str] = None
+    baths: Optional[str] = None
+    save_usage: bool = False
+
+
+@router.post("/{report_id}/seller-update", response_model=CmaReportResponse)
+async def seller_update_answers(
+    report_id: str,
+    payload: SellerUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_mls_access),
+    _broker: User = Depends(require_broker_authorization),
+):
+    """Update the value (owner 11/19): the agent changed an answer on a finished seller report. The new answers are
+    saved, only what the AI wrote is taken back, and the report is re-made from the same photo read - the photos are
+    not read again (cma_seller_prefill.prepare_update). Starts like Create AI Analysis; the page polls."""
+    from app.services import cma_seller_prefill as pf
+    import copy as _copy
+    rep = await service.get_report(db, current_user.id, report_id)
+    before = {f: _copy.deepcopy(getattr(rep, f)) for f in ("subject", "pricing", "comparables", "ai_analysis")}
+    await pf.prepare_update(db, rep, payload.comp_marks, payload.kitchen, payload.baths)
+    try:
+        return await generate_cma_ai_analysis(
+            report_id, CmaGenerateAiAnalysisRequest(include_map_images=True, background=True, save_usage=payload.save_usage),
+            db=db, current_user=current_user, _broker=_broker)
+    except HTTPException:
+        # not started (the monthly AI allowance, another run going...): the finished report comes back as it was
+        rep = await service.get_report(db, current_user.id, report_id)
+        for f, v in before.items():
+            setattr(rep, f, v)
+        await db.commit()
+        raise
+
+
 @router.get("/{report_id}/adjusted-sales-preview")
 async def cma_adjusted_sales_preview(
     report_id: str,
