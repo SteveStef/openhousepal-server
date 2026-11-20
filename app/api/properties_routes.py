@@ -695,6 +695,7 @@ async def get_area_shapes(
     cities: List[str] = Query(default=[]),
     school_districts: List[str] = Query(default=[]),
     counties: List[str] = Query(default=[]),
+    townships: List[str] = Query(default=[]),
     db: AsyncSession = Depends(get_db),
 ):
     """The real lines of the towns / school districts / counties a Showcase searches, for the
@@ -706,6 +707,7 @@ async def get_area_shapes(
     shapes: list[dict] = []
     async with httpx.AsyncClient(headers={"User-Agent": "OpenHousePal/1.0"}) as client:
         for kind, values, resolve in (("town", cities, boundary_service.town_shape),
+                                      ("township", townships, boundary_service.township_shape),
                                       ("school_district", school_districts, boundary_service.district_shape),
                                       ("county", counties, boundary_service.county_shape)):
             for value in values[:12]:
@@ -732,11 +734,13 @@ async def get_area_shapes_public(
     cities: List[str] = Query(default=[]),
     school_districts: List[str] = Query(default=[]),
     counties: List[str] = Query(default=[]),
+    townships: List[str] = Query(default=[]),
     db: AsyncSession = Depends(get_db),
 ):
     """The same lines for a CLIENT editing their own search (EditShowcaseCriteriaModal) - public
     Census data, cached per place; capped lower than the agent's."""
-    return await get_area_shapes(cities=cities[:6], school_districts=school_districts[:6], counties=counties[:4], db=db)
+    return await get_area_shapes(cities=cities[:6], school_districts=school_districts[:6], counties=counties[:4],
+                                 townships=townships[:6], db=db)
 
 
 @router.get("/home-areas/public", dependencies=[])

@@ -389,6 +389,36 @@ async def town_shape(db: AsyncSession, client: httpx.AsyncClient, value: str) ->
 
 
 
+async def township_shape(db: AsyncSession, client: httpx.AsyncClient, value: str) -> Optional[dict]:
+    """A Showcase township ("Uwchlan, PA" / "Uwchlan Township") = the Census county subdivision of that name (in
+    PA / NJ boroughs are subdivisions too). No state given: the state its listings are in. Cached like the others."""
+    name, state = _split_label(value)
+    base = re.sub(r"\s+(township|twp|borough|boro|town|city)$", "", (name or "").strip(), flags=re.I).strip()
+    if not base:
+        return None
+    if not state:
+        state = (await db.execute(select(Property.state).where(Property.township == base.upper()).group_by(Property.state)
+                                  .order_by(func.count().desc()).limit(1))).scalar()
+    fips = STATE_FIPS.get(state or "")
+    if not fips:
+        return None
+    ck = f"geo:twp:{state}:{base.lower()}"
+    hit = await _cache_get(db, ck)
+    if hit:
+        return hit.get("shape")
+    q = base.replace("'", "''").upper()
+    feats = await tiger(client, COUSUB, offset=0.0002, where=f"STATE='{fips}' AND UPPER(BASENAME)='{q}'")
+    # a working government first (FUNCSTAT A); the biggest when one name is used in two counties
+    feats.sort(key=lambda f: (f["attributes"].get("FUNCSTAT") != "A", -sum(len(r) for r in f["geometry"]["rings"])))
+    shape = None
+    if feats:
+        f = feats[0]
+        shape = {"kind": "township", "label": f["attributes"].get("NAME") or base.title(), "geoid": f["attributes"].get("GEOID"),
+                 "query": value, "rings": f["geometry"]["rings"]}
+    await _cache_put(db, ck, {"shape": shape})
+    return shape
+
+
 # ---------------------------------------------------------------- one home's surroundings
 # States whose townships are real local governments (taxes, zoning, trash) - elsewhere the Census
 # "county subdivisions" are just statistical, and an incorporated city / town is the government.

@@ -917,7 +917,7 @@ async def queue_showcase_ready(db: AsyncSession, collection_id: str, from_agent:
             vars_.update({
                 "agent_first": agent_first,
                 "homes_label": _plural(total, "home", "homes"),
-                "search_summary": search_summary(col.preferences, built) if col.preferences else "",
+                "search_summary": search_summary(col.preferences, built, await school_names_for(db, col.preferences)) if col.preferences else "",
                 "search_link": f"{vars_['collection_link']}?search=1",
             })
             template = SHARED_TEMPLATE
@@ -941,7 +941,7 @@ def _k(v) -> str:
     return f"${v / 1_000_000:.2f}".rstrip("0").rstrip(".") + "M" if v >= 1_000_000 else f"${round(v / 1000):,}k"
 
 
-def search_summary(prefs, built_around: str | None = None) -> str:
+def search_summary(prefs, built_around: str | None = None, high_schools: list | None = None) -> str:
     """What a Showcase search is now, in one plain line for the buyer's email:
     "Built around 12 Oak St · Within 6 mi · $400k-$600k · 3+ beds"."""
     parts: list[str] = []
@@ -956,6 +956,9 @@ def search_summary(prefs, built_around: str | None = None) -> str:
         parts.append(", ".join(towns[:3]) + (f" +{len(towns) - 3} more" if len(towns) > 3 else ""))
     if prefs.school_districts:
         parts.append(", ".join(prefs.school_districts[:2]) + (" school district" if len(prefs.school_districts) == 1 else " school districts"))
+        if high_schools:
+            # the high school(s) picked (names - school_names_for) - "Downingtown High School East Campus only"
+            parts.append(" or ".join(high_schools[:2]) + " only")
     if prefs.min_price and prefs.max_price:
         parts.append(f"{_k(prefs.min_price)}-{_k(prefs.max_price)}")
     elif prefs.max_price:
@@ -967,6 +970,21 @@ def search_summary(prefs, built_around: str | None = None) -> str:
     if prefs.min_baths:
         parts.append(f"{prefs.min_baths:g}+ baths")
     return " · ".join(parts)
+
+
+async def school_names_for(db: AsyncSession, prefs) -> list:
+    """The names of a search's picked high schools (only counted with a district - home_school_service)."""
+    keys = list(getattr(prefs, "high_schools", None) or [])
+    if not keys or not getattr(prefs, "school_districts", None):
+        return []
+    try:
+        from app.services.home_school_service import names_for
+        async with db.begin_nested():
+            got = await names_for(db, keys)
+        return [got[k] for k in keys if got.get(k)]
+    except Exception:
+        logger.warning("school names for the email failed", exc_info=True)
+        return []
 
 
 async def showcase_home_ids(db: AsyncSession, collection_id: str) -> set:
@@ -1009,7 +1027,7 @@ async def queue_search_changed(db: AsyncSession, collection_id: str, before_ids:
                 "Unsub": f"{frontend_url}/unsubscribe?email={quote(col.visitor_email, safe='')}",
                 "_audience": "buyer", "_collection_id": col.id, "_owner_id": col.owner_id, "_kind": "search", "_seq": __import__("time").time_ns(),
                 "_before_ids": sorted(before_ids), "_after_ids": sorted(after),
-                "_summary": search_summary(col.preferences, built),
+                "_summary": search_summary(col.preferences, built, await school_names_for(db, col.preferences)),
             }))
         await db.commit()
         return True

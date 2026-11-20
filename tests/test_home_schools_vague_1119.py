@@ -44,7 +44,7 @@ def test_district_name_is_not_a_school():
     stats, rows = hs._compute("PA", "DOWNINGTOWN AREA", ev, targets, MAP, False)
     got = {r["p"]: r for r in rows}
     assert "DOWNINGTOWN" in stats["vague"]
-    assert got["t-east"]["k"] == "nces:E" and got["t-east"]["src"] in ("map", "nearby")
+    assert got["t-east"]["k"] == "nces:E" and got["t-east"]["src"] in ("map", "nearby", "township")
     assert got["t-west"]["k"] == "nces:W" and got["t-west"]["src"] != "bright"
     assert got["t-named"]["k"] == "nces:E" and got["t-named"]["src"] == "bright"     # both spellings -> one school
     assert got["t-blank"]["k"] == "nces:W"
@@ -64,3 +64,35 @@ def test_school_search_needs_a_district():
     assert hs.search_filter(NS(high_schools=["nces:E"], school_districts=[])) is None
     assert hs.search_filter(NS(high_schools=[], school_districts=["Downingtown Area, PA"])) is None
     assert hs.search_filter(NS(high_schools=["nces:E"], school_districts=["Downingtown Area, PA"])) is not None
+
+
+def test_live_cases_spellings():
+    """From live data 11/19: a single-school district spelled short merges ("READING" = "READING SENIOR"); a typo merges
+    ("PENNSBURYE" -> "PENNSBURY"); a real school name stays the listing's answer even when the old map disagrees."""
+    ev = [NS(id=f"r{i}", latitude=40.30 + i * 0.001, longitude=-75.90, high_school="READING SENIOR") for i in range(20)] + \
+         [NS(id=f"s{i}", latitude=40.30 + i * 0.001, longitude=-75.901, high_school="Reading") for i in range(9)]
+    stats, rows = hs._compute("PA", "READING", ev, [NS(id="t", latitude=40.305, longitude=-75.90, high_school="READING")], hs._MapSchools([]), False)
+    assert rows[0]["k"] == "txt:PA:READING SENIOR" and rows[0]["src"] == "bright", (rows, stats)
+    ev = [NS(id=f"p{i}", latitude=40.20 + i * 0.001, longitude=-74.80, high_school="PENNSBURY") for i in range(30)] + \
+         [NS(id=f"q{i}", latitude=40.20 + i * 0.001, longitude=-74.801, high_school="PENNSBURYE") for i in range(10)]
+    stats, rows = hs._compute("PA", "PENNSBURY", ev, [NS(id="t", latitude=40.21, longitude=-74.80, high_school="Pennsburye")], hs._MapSchools([]), False)
+    assert rows[0]["k"] == "txt:PA:PENNSBURY", (rows, stats)
+    # a real school ("RIVER HILL") with homes split 73/20 on an old map stays what the listing says
+    ev = _homes()
+    for i in range(12):
+        ev.append(NS(id=f"rh{i}", latitude=40.01 + i * 0.006, longitude=-75.69 - (0.05 if i < 3 else 0), high_school="EASTERN VIEW"))
+    stats, rows = hs._compute("PA", "DOWNINGTOWN AREA", ev, [NS(id="t", latitude=40.03, longitude=-75.75, high_school="Eastern View")], MAP, False)
+    assert "EASTERN VIEW" not in stats["vague"] and rows[0]["src"] == "bright", (rows, stats)
+
+
+def test_home_at_the_township_line_goes_with_its_township():
+    """826 Williamsburg Blvd (live, 11/19): in Uwchlan (all East) but at the line - the listings just across it say West."""
+    ev = [NS(id=f"u{i}", latitude=40.02 + i * 0.004, longitude=-75.65, high_school="DOWNINGTOWN HS EAST CAMPUS", township="UWCHLAN") for i in range(14)] + \
+         [NS(id=f"w{i}", latitude=40.050 + i * 0.0004, longitude=-75.6995, high_school="DOWNINGTOWN HS WEST CAMPUS", township="DOWNINGTOWN") for i in range(10)]
+    target = NS(id="t", latitude=40.050, longitude=-75.6998, high_school="DOWNINGTOWN", township="UWCHLAN")
+    stats, rows = hs._compute("PA", "DOWNINGTOWN AREA", ev, [target], hs._MapSchools([]), False)
+    assert rows[0]["k"] == "txt:PA:DOWNINGTOWN HS EAST CAMPUS" and rows[0]["src"] == "township", (rows, stats)
+    # a split township (no 90% answer) falls back to the map / nearby homes
+    ev2 = ev + [NS(id=f"x{i}", latitude=40.03, longitude=-75.66, high_school="DOWNINGTOWN HS WEST CAMPUS", township="UWCHLAN") for i in range(4)]
+    stats, rows = hs._compute("PA", "DOWNINGTOWN AREA", ev2, [target], hs._MapSchools([]), False)
+    assert rows[0]["src"] != "township"

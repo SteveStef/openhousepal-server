@@ -53,7 +53,8 @@ async def test_fill_keeps_bright_first_and_places_blank_homes():
         rows = (await db.execute(text(
             "SELECT h.hs_key, h.hs_name, h.source, h.sure, p.high_school FROM home_schools h JOIN properties p ON p.id = h.property_id "
             "WHERE h.district = :d"), {"d": u.d})).all()
-        named = [r for r in rows if hs.norm_school(r.high_school)]
+        # listings that name a school (not just the district: "DOWNINGTOWN" is placed per home - 11/19 live data)
+        named = [r for r in rows if hs.norm_school(r.high_school) and any(w in (r.high_school or "").upper() for w in ("EAST", "WEST"))]
         assert named and all(r.source == "bright" and r.sure for r in named)
         # every spelling of the East campus lands on one key
         east = {r.hs_key for r in named if "EAST" in (r.high_school or "").upper()}
@@ -62,7 +63,7 @@ async def test_fill_keeps_bright_first_and_places_blank_homes():
         blank = [r for r in rows if not hs.norm_school(r.high_school)]
         if blank:
             assert sum(1 for r in blank if r.hs_key) / len(blank) > 0.8
-            assert all(r.source in ("map", "nearby") for r in blank if r.hs_key)
+            assert all(r.source in ("map", "nearby", "township") for r in blank if r.hs_key)
 
 
 @pytest.mark.asyncio

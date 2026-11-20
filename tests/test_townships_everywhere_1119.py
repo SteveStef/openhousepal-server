@@ -191,3 +191,28 @@ def test_client_save_carries_a_high_school_pick():
     from app.schemas.collection_preferences import ShowcaseSelfServePreferencesUpdate
     body = ShowcaseSelfServePreferencesUpdate(school_districts=["Downingtown Area, PA"], high_schools=["nces:1"]).model_dump(exclude_unset=True)
     assert body["high_schools"] == ["nces:1"]
+
+
+@pytest.mark.asyncio
+async def test_buyer_email_search_line_names_the_high_school():
+    """Lisa's "your search is now" email says East only, not just the district."""
+    import app.main  # noqa: F401
+    from app.database import AsyncSessionLocal
+    from app.services import home_school_service as hs
+    from app.services.showcase_digest_service import school_names_for, search_summary
+    async with AsyncSessionLocal() as db:
+        from sqlalchemy import text
+        r = (await db.execute(text("SELECT state, upper(btrim(school_district_name)) d FROM properties WHERE school_district_name ILIKE '%downingtown%' "
+                                   "AND home_status IN ('ACTIVE-BRIGHT','COMING SOON-BRIGHT') GROUP BY 1, 2 ORDER BY count(*) DESC LIMIT 1"))).first()
+        if r is None:
+            pytest.skip("no Downingtown listings locally")
+        await hs.fill_unit(db, r.state, r.d)
+        east = next(s for s in await hs.schools_in(db, ["Downingtown Area, PA"]) if "east" in s["name"].lower())
+        prefs = NS(search_polygon=None, address=None, diameter=None, cities=[], townships=[], school_districts=["Downingtown Area, PA"],
+                   high_schools=[east["key"]], min_price=850000, max_price=1500000, min_beds=3, min_baths=None)
+        names = await school_names_for(db, prefs)
+        line = search_summary(prefs, None, names)
+        assert "Downingtown High School East Campus only" in line and "Downingtown Area, PA school district" in line, line
+        # a school with no district is ignored here too
+        assert await school_names_for(db, NS(high_schools=[east["key"]], school_districts=[])) == []
+        assert "only" not in search_summary(NS(**{**vars(prefs), "high_schools": []}), None, [])

@@ -1342,12 +1342,12 @@ class PropertySyncService:
             if await home_school_service.anyone_searching_schools(db):
                 hs_key = await home_school_service.quick_key(prop["id"])
         if hs_key:
-            stmt = stmt.where(or_(no_hs_picked, CollectionPreferences.high_schools.contains([hs_key])))
+            # a school pick only counts with a district (home_school_service._picked) - same as the search
+            stmt = stmt.where(or_(no_hs_picked, no_district_picked, CollectionPreferences.high_schools.contains([hs_key])))
         # school unknown: it still joins (inside the picked district - district_ok above), and its card says so
 
         # 2. Financial & Size Match (with Smart Exemptions)
         # Types that don't always have traditional bed/bath data (Exempt from numeric filters)
-        exempt_types = ['LAND', 'FARM', 'COMMERCIAL', 'OTHER']
         numeric_conditions = []
 
         if price > 0:
@@ -1388,14 +1388,18 @@ class PropertySyncService:
         else:
             stmt = stmt.where(and_(func.coalesce(CollectionPreferences.min_acres, 0) <= 0, func.coalesce(CollectionPreferences.max_acres, 0) <= 0))
 
-        # Apply: (Is Exempt Type) OR (Matches all numeric filters)
-        if h_type_upper in exempt_types:
-            # If exempt, we only care about the price (if provided)
-            if price > 0:
-                stmt = stmt.where(and_(
-                    or_(CollectionPreferences.min_price == None, CollectionPreferences.min_price <= price),
-                    or_(CollectionPreferences.max_price == None, CollectionPreferences.max_price >= price)
-                ))
+        # Apply: (Is Exempt Type) OR (Matches all numeric filters). Land / farm / commercial are exempt only for a
+        # Showcase that picked that kind - the search's own rule (property_service.bed_filter_exempt_types); a
+        # 3-bedroom buyer who didn't ask for land never gets a vacant lot (owner 11/05; the matcher missed it, 11/19).
+        price_ok = and_(or_(CollectionPreferences.min_price == None, CollectionPreferences.min_price <= price),
+                        or_(CollectionPreferences.max_price == None, CollectionPreferences.max_price >= price)) if price > 0 else literal(True)
+        kind_picked = {"LAND": CollectionPreferences.is_lot_land == True,
+                       "FARM": or_(CollectionPreferences.is_lot_land == True, CollectionPreferences.is_farm == True),
+                       "COMMERCIAL": CollectionPreferences.is_commercial == True}.get(h_type_upper)
+        if h_type_upper == "OTHER":
+            stmt = stmt.where(price_ok)
+        elif kind_picked is not None:
+            stmt = stmt.where(or_(and_(kind_picked, price_ok), and_(*numeric_conditions)))
         else:
             # If not exempt (Residential, Condo, etc.), must match all numeric filters
             stmt = stmt.where(and_(*numeric_conditions))

@@ -206,7 +206,7 @@ async def _evidence(db, state: str, raw_names: Optional[List[str]] = None) -> Di
     """{normalized district: [rows that name a school]} for one state (or just these raw district names)."""
     from sqlalchemy import bindparam
     cut = await _sold_cut(db)
-    cols = "id, latitude, longitude, high_school, school_district_name"
+    cols = "id, latitude, longitude, high_school, school_district_name, township"
     cond = ("state = :s AND latitude IS NOT NULL AND longitude IS NOT NULL AND coalesce(btrim(high_school), '') <> '' "
             "AND is_manual IS NOT TRUE")
     if raw_names:
@@ -243,7 +243,7 @@ async def fill_unit(db, state: str, district: str, *, only_ids: Optional[Iterabl
         {"fs": FOR_SALE, "s": state, "d": district})).all()]
     if evidence is None:
         evidence = (await _evidence(db, state, raw or None)).get(district, []) if raw else []
-    tq = ("SELECT p.id, p.latitude, p.longitude, p.high_school FROM properties p WHERE p.state = :s AND p.home_status IN :fs "
+    tq = ("SELECT p.id, p.latitude, p.longitude, p.high_school, p.township FROM properties p WHERE p.state = :s AND p.home_status IN :fs "
           "AND p.is_manual IS NOT TRUE AND p.school_district_name IN :names")
     binds = [bindparam("fs", expanding=True), bindparam("names", expanding=True)]
     tparams: Dict[str, Any] = {"s": state, "fs": FOR_SALE, "names": raw or ["\x00"]}
@@ -280,6 +280,16 @@ def _fullest(spellings: Counter) -> str:
     return max(common, key=lambda s: (len(s.split()), len(s), spellings[s]))
 
 
+_NAME_FILLER = {"HS", "SENIOR", "SR", "AREA", "HIGH", "SCHOOL", "CAMPUS"}
+_SIDES = {"EAST", "WEST", "NORTH", "SOUTH", "CENTRAL", "NORTHEAST", "NORTHWEST", "SOUTHEAST", "SOUTHWEST"}
+RARE = 8      # fewer named homes than this, unplaced by the map: a stray spelling
+TWP_MIN, TWP_AGREE = 10, 0.9     # a township that all but agrees on its school
+
+
+def _twp(r) -> Optional[str]:
+    t = " ".join(str(getattr(r, "township", None) or "").upper().split())
+    return t or None
+
 _DISTRICT_WORDS_SKIP = {"AREA", "SCHOOL", "SCHOOLS", "DISTRICT", "SD", "PUBLIC", "COUNTY", "CITY", "THE", "OF", "TOWNSHIP", "TWP",
                         "HS", "UNIFIED", "REGIONAL", "CONSOLIDATED", "CO"}
 
@@ -301,6 +311,11 @@ def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapScho
             for sid, _n in maps.schools_at(r.latitude, r.longitude):
                 by_spell[sp][sid] += 1
             n_spell[sp] += 1
+    # spellings seen only on the homes being placed are judged too (a new "DOWNINGTOWN" is still just the district)
+    for t in targets:
+        tsp = norm_school(t.high_school)
+        if tsp and tsp not in spell_raw:
+            spell_raw[tsp][" ".join(str(t.high_school).split())] += 0
     # A district-wide school (a STEM / magnet academy any home may choose) holds every home too - of the schools
     # that hold most of a spelling's homes, the smallest area is the neighborhood school.
     area = {sid: (c - a) * (d - b) for sid, _n, a, b, c, d, _g in maps.shapes}
@@ -314,30 +329,85 @@ def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapScho
             small = min(good, key=lambda s: area.get(s, 0))
             wide |= {s for s in good if s != small}
     alias: Dict[str, str] = {}
-    vague: set = set()
+    spread: set = set()
+    dwords = set(re.findall(r"[A-Z0-9]+", district)) - _DISTRICT_WORDS_SKIP
+    zones = {sid for sid, *_ in maps.shapes if sid not in wide}
     for sp, c in by_spell.items():
         n = n_spell[sp]
         c = Counter({sid: k for sid, k in c.items() if sid not in wide})
         if n >= ALIAS_MIN and c:
             good = [sid for sid, k in c.items() if k / n >= ALIAS_AGREE]
-            if good:
+            only_district = not (set(sp.split()) - _NAME_FILLER - dwords)
+            if only_district and len(zones) >= 2 and max(c.values()) / n < 0.95:
+                # "DOWNINGTOWN" with 78% of its homes on the West side is still the district, not West (11/19 live data)
+                spread.add(sp)
+            elif good:
                 alias[sp] = f"nces:{min(good, key=lambda s: area.get(s, 0))}"
             else:
-                # its homes spread over two or more schools: it names the district ("DOWNINGTOWN"), not a school
                 shares = sorted((k / n for k in c.values()), reverse=True)
                 if len(shares) >= 2 and shares[1] >= 0.2:
-                    vague.add(sp)
-    # A value that's only the district's own name, in a district with more than one high school, says nothing either
-    dwords = set(re.findall(r"[A-Z0-9]+", district)) - _DISTRICT_WORDS_SKIP
-    real = {alias.get(sp) or f"txt:{state}:{sp}" for sp in spell_raw if sp not in vague}
-    if len(real) >= 2:
-        for sp in spell_raw:
-            if sp not in alias and set(sp.split()) - {"HS"} <= dwords:
-                vague.add(sp)
+                    spread.add(sp)
+
+    # Which spellings name a school, which only name the district, which are another spelling of a school (live data
+    # 11/19: "DOWNINGTOWN" is the district - homes on both sides; "LOWER MERION" 66/34 across two schools; but
+    # "READING" / "NORRISTOWN" are their district's one school, spelled short; "RIVER HILL" is a real school even
+    # where the 2015 map's lines are out of date).
+    words = {sp: set(sp.split()) - _NAME_FILLER for sp in spell_raw}
+    count = {sp: sum(v.values()) for sp, v in spell_raw.items()}
+    vague: set = set()
+    merged: Dict[str, str] = {}
+    # the same words but for "High School" / "Senior" / "Area" ("READING" = "READING SENIOR"): one school
+    for sp in spell_raw:
+        if sp in alias:
+            continue
+        twin = max((o for o in spell_raw if o != sp and words[o] == words[sp] and words[sp]),
+                   key=lambda o: (count[o], o), default=None)
+        if twin and (count[twin], twin) > (count[sp], sp):
+            merged[sp] = twin
+    for sp in spell_raw:
+        if sp in alias or not words[sp] or sp in merged:
+            continue
+        generic = not (words[sp] - dwords)          # nothing but the district's own name
+        supers = [o for o in spell_raw if o != sp and words[sp] < words[o]]
+        tops = [o for o in supers if not any(words[o] < words[x] for x in supers)]
+        if len(tops) >= 2 and len({alias.get(o) or o for o in tops}) >= 2:
+            vague.add(sp)                           # "DOWNINGTOWN" inside "... EAST CAMPUS" and "... WEST CAMPUS"
+        elif len(tops) == 1 and count[sp] <= count[tops[0]]:
+            merged[sp] = tops[0]                    # "READING" = "READING SENIOR" - the one school, spelled short
+        elif generic and sp in spread:
+            vague.add(sp)                           # "LOWER MERION": the district's name, homes in two schools
+    # typos of a more common spelling ("BATRAM" / "BARTRAM", "PENNSBURYE", "NORTHEAST" / "NORTH EAST")
+    from difflib import SequenceMatcher
+    common = sorted(spell_raw, key=lambda x: -count[x])
+    for sp in spell_raw:
+        if sp in alias or sp in vague or sp in merged:
+            continue
+        flat = sp.replace(" ", "")
+        for o in common:
+            if o == sp or count[o] < count[sp] or o in vague:
+                continue
+            if (_SIDES & words[sp]) == (_SIDES & words[o]) and len(flat) >= 5 and \
+                    SequenceMatcher(None, flat, o.replace(" ", "")).ratio() >= 0.88:
+                merged[sp] = o
+                break
+    # a rare stray spelling the map couldn't place, in a district with other schools, says little - placed like a blank
+    others = {alias.get(x) or x for x in spell_raw if x not in vague and x not in merged}
+    for sp in spell_raw:
+        if sp not in alias and sp not in merged and sp not in vague and count[sp] < RARE and len(others - {sp}) >= 2 and maps.shapes:
+            vague.add(sp)
+
+    def _root(sp: str) -> str:
+        seen = set()
+        while sp in merged and sp not in seen:
+            seen.add(sp)
+            sp = merged[sp]
+        return sp
+
     for rid in [rid for rid, sp in home_spell.items() if sp in vague]:
         del home_spell[rid]
 
     def key_of_spell(sp: str) -> str:
+        sp = _root(sp)
         return alias.get(sp) or f"txt:{state}:{sp}"
 
     names: Dict[str, Counter] = defaultdict(Counter)
@@ -349,10 +419,21 @@ def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapScho
     allowed = {k[5:] for k in alias.values()} if alias else None
 
     grid = _Grid()
+    twp_votes: Dict[str, Counter] = defaultdict(Counter)
     for r in ev:
         sp = home_spell.get(r.id)
         if sp:
             grid.add(r.id, r.latitude, r.longitude, key_of_spell(sp))
+            t = _twp(r)
+            if t:
+                twp_votes[t][key_of_spell(sp)] += 1
+    # A township whose named listings all but agree (90%+ of 10+) - school lines mostly follow township lines, so a
+    # home there goes to that school even when it sits at the edge and the listings across the line say otherwise.
+    twp_school: Dict[str, str] = {}
+    for t, c in twp_votes.items():
+        k, n = c.most_common(1)[0]
+        if sum(c.values()) >= TWP_MIN and n / sum(c.values()) >= TWP_AGREE:
+            twp_school[t] = k
 
     def map_key(lat, lng) -> Optional[str]:
         if not maps.shapes:
@@ -360,7 +441,9 @@ def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapScho
         sid = _pick_map(maps.schools_at(lat, lng), allowed, area)
         return f"nces:{sid}" if sid else None
 
-    def blank_answer(lat, lng, skip=None) -> Tuple[Optional[str], Optional[str], bool]:
+    def blank_answer(lat, lng, skip=None, twp=None) -> Tuple[Optional[str], Optional[str], bool]:
+        if twp and twp in twp_school:
+            return twp_school[twp], "township", True
         m, near = map_key(lat, lng), grid.vote(lat, lng, skip=skip)
         if m and near:
             return (m, "map", True) if m == near else (near, "nearby", False)
@@ -370,15 +453,15 @@ def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapScho
             return near, "nearby", False
         return None, None, False
 
-    stats: Dict[str, Any] = {"homes": len(targets), "bright": 0, "map": 0, "nearby": 0, "unknown": 0, "sure": 0,
-                             "vague": sorted(vague)}
+    stats: Dict[str, Any] = {"homes": len(targets), "bright": 0, "map": 0, "nearby": 0, "township": 0, "unknown": 0, "sure": 0,
+                             "vague": sorted(vague), "merged": dict(merged)}
     if evaluate:
         # Hide a sample of named homes' own answers and see what the other sources would have said.
         ok = Counter()
         for r in [r for r in ev if r.id in home_spell][::max(1, len(home_spell) // EVAL_SAMPLE)]:
             truth = key_of_spell(home_spell[r.id])
             m, near = map_key(r.latitude, r.longitude), grid.vote(r.latitude, r.longitude, skip=r.id)
-            k, src, sure = blank_answer(r.latitude, r.longitude, skip=r.id)
+            k, src, sure = blank_answer(r.latitude, r.longitude, skip=r.id, twp=_twp(r))
             ok[(src or "none", "right" if k == truth else ("wrong" if k else "none"), sure)] += 1
             if m and near and m != near:
                 ok[("disagree", "map right" if m == truth else ("near right" if near == truth else "neither"), False)] += 1
@@ -395,7 +478,7 @@ def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapScho
         if sp and sp not in vague:
             k, src, sure = key_of_spell(sp), "bright", True
         elif t.latitude is not None and t.longitude is not None:
-            k, src, sure = blank_answer(t.latitude, t.longitude)
+            k, src, sure = blank_answer(t.latitude, t.longitude, twp=_twp(t))
         else:
             k, src, sure = None, None, False
         stats[src or "unknown"] += 1
@@ -408,6 +491,15 @@ def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapScho
                 name = nice_name(map_names[k[5:]])
         rows.append({"p": t.id, "s": state, "d": district, "k": k, "n": name, "src": src, "sure": bool(k and sure),
                      "b": t.high_school, "bn": sp, "at": now})
+    # one name, two keys (a school the map lists twice, or a spelling it didn't place): one school - the bigger one
+    by_name: Dict[str, Counter] = defaultdict(Counter)
+    for r in rows:
+        if r["k"] and r["n"]:
+            by_name[r["n"].lower()][r["k"]] += 1
+    same = {k: c.most_common(1)[0][0] for c in by_name.values() if len(c) > 1 for k in c}
+    for r in rows:
+        if r["k"] in same:
+            r["k"] = same[r["k"]]
     return stats, rows
 
 
@@ -440,7 +532,7 @@ async def fill_night(run_seconds: Optional[float] = None) -> Dict[str, Any]:
             deadline = time.monotonic() + (run_seconds if run_seconds is not None else _NIGHT_SECONDS)
             async with AsyncSessionLocal() as db:
                 todo = (await db.execute(text(
-                    "SELECT p.id, p.latitude, p.longitude, p.high_school, p.state, upper(btrim(coalesce(p.school_district_name, ''))) AS d "
+                    "SELECT p.id, p.latitude, p.longitude, p.high_school, p.township, p.state, upper(btrim(coalesce(p.school_district_name, ''))) AS d "
                     "FROM properties p LEFT JOIN home_schools h ON h.property_id = p.id "
                     f"WHERE p.home_status IN :fs AND p.is_manual IS NOT TRUE AND p.state IS NOT NULL AND {_needs_work_sql()}"
                 ).bindparams(bindparam("fs", expanding=True)), {"fs": FOR_SALE})).all()
@@ -637,7 +729,7 @@ async def _quick_key(db, property_id: str) -> Optional[str]:
     from sqlalchemy import bindparam
     try:
         p = (await db.execute(text(
-            "SELECT id, state, upper(btrim(coalesce(school_district_name, ''))) AS d, latitude AS lat, longitude AS lng, high_school "
+            "SELECT id, state, upper(btrim(coalesce(school_district_name, ''))) AS d, latitude AS lat, longitude AS lng, high_school, township "
             "FROM properties WHERE id = :p"), {"p": property_id})).first()
         if not p or not p.state:
             return None
@@ -681,8 +773,20 @@ async def _quick_key(db, property_id: str) -> Optional[str]:
         map_sid = _pick_map(maps.schools_at(p.lat, p.lng), allowed, area) if maps.shapes else None
         map_key = f"nces:{map_sid}" if map_sid else None
         own = key_of(sp) if sp else None
+        # the home's own township, as the nightly pass counted it (for-sale homes there that name their school)
+        twp_key = None
+        if not own and _twp(p):
+            votes = (await db.execute(text(
+                "SELECT h.hs_key, count(*) n FROM home_schools h JOIN properties x ON x.id = h.property_id WHERE x.township = :t "
+                "AND h.state = :s AND h.district = :d AND h.source = 'bright' AND h.hs_key IS NOT NULL AND NOT h.quick GROUP BY 1 ORDER BY 2 DESC"),
+                {"t": p.township, "s": p.state, "d": p.d})).all()
+            total = sum(v.n for v in votes)
+            if votes and total >= TWP_MIN and votes[0].n / total >= TWP_AGREE:
+                twp_key = votes[0].hs_key
         if own:
             k, src, sure = own, "bright", True
+        elif twp_key:
+            k, src, sure = twp_key, "township", True
         elif p.lat is not None:
             g = _Grid()
             for r in near_rows:
