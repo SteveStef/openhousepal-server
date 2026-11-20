@@ -34,8 +34,9 @@ _running: set = set()       # collection ids reading right now (one run at a tim
 _again: set = set()         # asked again while running - one more pass when it ends
 
 
-def clean_wants(raw: Any) -> List[str]:
-    """The agent's must-haves: trimmed, no repeats, at most 3 of at most 60 characters."""
+def clean_wants(raw: Any, cap: Optional[int] = MAX_WANTS) -> List[str]:
+    """The agent's must-haves: trimmed, no repeats, at most 3 of at most 60 characters (cap=None: no limit on how
+    many - for the split into must-haves and search filters, which caps the must-haves afterwards)."""
     if isinstance(raw, dict):
         raw = raw.get("wants")
     if isinstance(raw, str):
@@ -45,7 +46,7 @@ def clean_wants(raw: Any) -> List[str]:
         w = " ".join(str(w or "").split())[:MAX_WANT_CHARS].strip(" .-")
         if w and w.lower() not in (x.lower() for x in out):
             out.append(w)
-    return out[:MAX_WANTS]
+    return out[:cap] if cap else out
 
 
 _TIDY_SYSTEM = (
@@ -195,6 +196,8 @@ async def place_wants(db, wants: List[str]) -> Dict[str, Dict[str, Any]]:
         m = _PLACE_RX.match(" ".join(w.split()))
         if not m:
             continue
+        if not m.group(2) and not re.match(r"^(?:(?:is |be |located |must be |homes? )?in\b)", w.strip(), re.I):
+            continue   # "Ocean view" matches Ocean View, DE - a feature unless it's said as a place (review 11/20)
         name, kind = m.group(1).strip(" ,.").upper(), (m.group(2) or "").lower()
         if len(name) < 3 or len(name.split()) > 4:
             continue
@@ -215,7 +218,7 @@ async def place_wants(db, wants: List[str]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-_SCHOOL_WANT = re.compile(r"\b(high\s*schools?|hs|schools?|school\s+district|district)\b", re.I)
+_SCHOOL_WANT = re.compile(r"\b(high\s*schools?|hs|schools?)\b", re.I)
 _NEAR_WORDS = re.compile(r"\b(walk|walking|walkable|near|nearby|close|bus|minutes?|mins?|drive|driving|across|blocks?|mile|miles)\b", re.I)
 
 
@@ -345,16 +348,25 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
         wants = clean_wants(st.get("wants"))
         if not wants:
             return st
-        feature, old_filters = await split_filter_wants(db, wants)
+        feature, old_filters = await split_filter_wants(db, wants, list(prefs.school_districts or []))
         if old_filters:
-            # saved before 11/20 (Lisa's "Downingtown East schools"): a filter, never a star
+            # saved before 11/20 (Lisa's "Downingtown East schools"): a filter, never a star - it moves into the
+            # search (East high school, Uwchlan township), so the client's wish is kept (review 11/20)
             await take_off_ai_stars(db, collection_id, st)
+            search_moved = await apply_filter_moves(db, prefs, old_filters)
             await db.execute(text("update collection_properties set ai_match = case when ai_match ? 'per' "
                                   "then jsonb_build_object('per', ai_match->'per') else null end where collection_id = :c"), {"c": collection_id})
             st = {**{k2: v2 for k2, v2 in st.items() if k2 not in ("matched", "read")}, "wants": feature,
                   "state": "reading" if feature else "off", "at": datetime.now(timezone.utc).isoformat(),
-                  "phrases": {w2: p2 for w2, p2 in (st.get("phrases") or {}).items() if w2 in feature}}
+                  "phrases": {w2: p2 for w2, p2 in (st.get("phrases") or {}).items() if w2 in feature}, "moved": old_filters}
             await _set_state(db, prefs.id, st)
+            if search_moved:
+                from app.services.collections_service import CollectionsService
+                try:
+                    await CollectionsService.repopulate_collection_from_preferences(db, collection_id, commit=True)
+                except Exception:
+                    logger.warning("refresh after an old must-have became a filter failed", exc_info=True)
+                    await db.rollback()
             wants = feature
             if not wants:
                 return st
@@ -688,7 +700,8 @@ async def save_wants(db, collection_id: str, raw: Any, user=None) -> Dict[str, A
     old = state_of(prefs)
     phrases = {}
     # townships / towns / schools are search filters, not must-haves (owner, 11/20) - checked before and after tidying
-    wants, moves = await split_filter_wants(db, wants, list(prefs.school_districts or []))
+    wants, moves = await split_filter_wants(db, clean_wants(raw, cap=None), list(prefs.school_districts or []))
+    wants = wants[:MAX_WANTS]
     if wants and user is not None:
         wants, phrases = await tidy_wants(db, user, wants, old.get("phrases"))
         wants, more = await split_filter_wants(db, clean_wants(wants), list(prefs.school_districts or []))

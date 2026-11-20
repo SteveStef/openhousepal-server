@@ -567,10 +567,11 @@ async def _p_new_showcase(db, user, a):
     # Must-haves right away (owner, 11/19: every way a Showcase is made can carry them) - same rules as set_showcase_must_haves
     from app.services.showcase_smart_filter import clean_wants, moves_line, split_filter_wants
     from app.utils.auth import tier_has_mls
-    wants = clean_wants(a.get("must_haves"))
+    wants = clean_wants(a.get("must_haves"), cap=None)
     if wants:
         # a township / town / school is a search filter, not a must-have (owner, 11/20)
         wants, moves = await split_filter_wants(db, wants, list(body.get("school_districts") or []))
+        wants = clean_wants(wants)   # then at most 3 must-haves
         for m in moves:
             if m["to"] in ("townships", "cities", "high_schools") and m.get("value"):
                 cur = list(body.get(m["to"]) or [])
@@ -708,8 +709,8 @@ async def _district_schools(db, districts: list) -> list:
     district the background pass hasn't reached yet."""
     from app.services import home_school_service as hs
     got = await hs.schools_in(db, districts)
-    if got or not districts:
-        return got
+    if any(o["key"] != "unknown" for o in got) or not districts:
+        return got   # ("unknown" alone = the background pass hasn't reached it yet - work it out now)
     for d in districts:
         name = str(d).split(",")[0].strip()
         rows = (await db.execute(select(Property.state, Property.school_district_name).where(
@@ -899,13 +900,15 @@ async def _p_showcase_must_haves(db, user, a):
     c = await _showcase_of(db, user, a)
     if not (tier_has_mls(user.plan_tier) or user.is_admin):
         raise ActionError("Must-haves read MLS listings - they're on the MLS plans.")
-    wants = clean_wants(a.get("wants"))
+    wants = clean_wants(a.get("wants"), cap=None)
     if not wants:
         raise ActionError(f"What should every starred home have? Up to {MAX_WANTS} features, like \"Pool\" or \"First-floor primary bedroom\".")
     pref = (await db.execute(select(CollectionPreferences).where(CollectionPreferences.collection_id == c.id))).scalar_one_or_none()
     had = clean_wants(state_of(pref).get("wants")) if pref is not None else []
     n = await showcase_home_count(db, c.id)
     read, moves = await split_filter_wants(db, wants, list(getattr(pref, "school_districts", None) or []))
+    read = read[:MAX_WANTS]
+    wants = read + [m["want"] for m in moves]
     kept = False
     if not read and moves and had:
         # Only a township / town / school was named ("make DASD East a must-have"): that goes into the search, and the

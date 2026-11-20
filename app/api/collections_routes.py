@@ -2132,7 +2132,7 @@ async def save_smart_filter(collection_id: str, body: SmartFilterUpdate, db: Asy
     from app.services.showcase_smart_filter import clean_wants, showcase_home_count, state_of
     from app.services.ai.ai_home_reader import READ_CAP
     from app.models.database import CollectionPreferences
-    wants = clean_wants(body.wants)
+    wants = clean_wants(body.wants, cap=None)   # save_wants splits off townships / schools, then keeps 3 must-haves
     if wants:
         # Same ceiling as the chat's listing reads (owner, 11/09): the AI reads every home, so a Showcase
         # over 300 homes is narrowed first. A Showcase whose must-haves are already on and unchanged
@@ -2203,6 +2203,16 @@ async def update_preferences_and_refresh(
 
         from app.services.showcase_digest_service import queue_search_changed, showcase_home_ids
         before_ids = await showcase_home_ids(db, collection_id)
+
+        # New school districts without a school pick (the quick Edit Showcase sends districts only): the old high
+        # school belongs to the old districts - left on, the Showcase would shrink to "School unknown" homes (review 11/20).
+        sent = getattr(preferences_update, "model_fields_set", set())
+        if "school_districts" in sent and "high_schools" not in sent:
+            from app.models.database import CollectionPreferences as _CP
+            cur = (await db.execute(select(_CP).where(_CP.collection_id == collection_id))).scalar_one_or_none()
+            if cur is not None and (cur.high_schools or []) and \
+                    sorted(preferences_update.school_districts or []) != sorted(cur.school_districts or []):
+                preferences_update.high_schools = []
 
         # Perform atomic update of preferences and properties
         result = await CollectionPreferencesService.update_preferences_and_refresh_properties(
