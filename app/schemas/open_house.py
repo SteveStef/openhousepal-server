@@ -158,6 +158,7 @@ class VisitorResponse(BaseModel):
     # Their Showcase (latest, any status) and whether it's starred (PUT /collections/{id}/favorite).
     showcase_id: Optional[str] = None
     showcase_starred: bool = False
+    showcase_must_haves: List[str] = []   # its must-haves - gold chips that open Edit Showcase at them (11/21)
     # Guest Pass activity: logged things + visits, and the last time (None = never opened it).
     pass_events: int = 0
     pass_last_at: Optional[datetime] = None

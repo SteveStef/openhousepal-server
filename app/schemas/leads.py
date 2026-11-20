@@ -70,6 +70,7 @@ class LeadShowcaseOut(BaseModel):
     last_active_at: Optional[datetime] = None
     emails_on: bool = True
     refine_message: Optional[str] = None
+    must_haves: List[str] = []      # the Showcase's must-haves (gold chips; showcase_smart_filter.wants_for)
     invite: Optional[dict] = None   # did they get their invite email (services/showcase_invite_status)
 
 

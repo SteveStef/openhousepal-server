@@ -289,6 +289,22 @@ def place_verdict(p, place: Dict[str, Any]) -> Dict[str, Any]:
     return {"v": "yes", "quote": "", "why": place["say"], "place": place["say"]} if v in place["values"] else {"v": "no", "quote": "", "why": ""}
 
 
+async def wants_for(db, collection_ids) -> Dict[str, List[str]]:
+    """{Showcase id: its must-haves} - one read, for lists that show them (visitor rows, the lead page)."""
+    ids = [i for i in (collection_ids or []) if i]
+    if not ids:
+        return {}
+    rows = (await db.execute(text("select collection_id, ai_wants from collection_preferences where collection_id = any(:ids)"),
+                             {"ids": ids})).all()
+    out: Dict[str, List[str]] = {}
+    for cid, st in rows:
+        st = st if isinstance(st, dict) else {}
+        w = clean_wants(st.get("wants")) if st.get("state") != "off" else []
+        if w:
+            out[cid] = w
+    return out
+
+
 def wants_key(wants: List[str]) -> str:
     return "|".join(sorted(w.lower() for w in wants))
 

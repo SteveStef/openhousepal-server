@@ -1312,6 +1312,8 @@ async def get_open_house_visitors(
                     .group_by(func.lower(func.trim(ScheduledEmail.recipient_email))))).all():
                 invite_at[em] = at
 
+        from app.services.showcase_smart_filter import wants_for
+        col_wants = await wants_for(db, [c.id for c in showcases.values()]) if showcases else {}
         out = []
         for visitor in visitors:
             col = showcases.get((visitor.email or "").strip().lower())
@@ -1331,6 +1333,7 @@ async def get_open_house_visitors(
                 contact_log=[{k: e.get(k) for k in ("at", "via", "what")} for e in (contact_logs.get(visitor.lead_id) or [])],
                 showcase_id=col.id if col else None,
                 showcase_starred=bool(col and col.favorited_at),
+                showcase_must_haves=col_wants.get(col.id, []) if col else [],
                 pass_events=ps.get("n", 0),
                 pass_actions=ps.get("actions", 0),
                 pass_new=ps.get("fresh", 0),

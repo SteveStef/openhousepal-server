@@ -162,3 +162,36 @@ async def test_stars_come_only_from_the_current_must_haves():
             await db.execute(delete(Collection).where(Collection.id == cid))
             await db.execute(delete(User).where(User.id == aid))
             await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_wants_for_lists_each_showcases_must_haves():
+    """Visitor rows + the lead page show a Showcase's must-haves as chips (11/21) - off means none."""
+    import app.main  # noqa: F401
+    from sqlalchemy import delete
+    from app.database import AsyncSessionLocal
+    from app.models.database import Collection, CollectionPreferences, User
+    from app.services import showcase_smart_filter as sf
+    tag = f"zqwf-{uuid.uuid4().hex[:8]}"
+    async with AsyncSessionLocal() as db:
+        agent = User(email=f"{tag}@example.com", hashed_password="x", first_name="Z", last_name="Q", state="PA", brokerage="B",
+                     mls_id=tag.upper(), plan_tier="IDX", subscription_status="ACTIVE")
+        db.add(agent)
+        await db.commit()
+        on = Collection(owner_id=agent.id, name="A", visitor_name="A", visitor_email=f"{tag}-a@example.com")
+        off = Collection(owner_id=agent.id, name="B", visitor_name="B", visitor_email=f"{tag}-b@example.com")
+        db.add_all([on, off])
+        await db.commit()
+        ids = (on.id, off.id, agent.id)
+        db.add_all([CollectionPreferences(collection_id=ids[0], ai_wants={"wants": ["Pool", "Fenced yard"], "state": "done"}),
+                    CollectionPreferences(collection_id=ids[1], ai_wants={"wants": ["Pool"], "state": "off"})])
+        await db.commit()
+        try:
+            got = await sf.wants_for(db, [ids[0], ids[1], "nope"])
+            assert got == {ids[0]: ["Pool", "Fenced yard"]}
+            assert await sf.wants_for(db, []) == {}
+        finally:
+            await db.execute(delete(CollectionPreferences).where(CollectionPreferences.collection_id.in_(ids[:2])))
+            await db.execute(delete(Collection).where(Collection.id.in_(ids[:2])))
+            await db.execute(delete(User).where(User.id == ids[2]))
+            await db.commit()

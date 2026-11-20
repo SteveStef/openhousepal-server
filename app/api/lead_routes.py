@@ -539,9 +539,14 @@ async def _enrich(db: AsyncSession, owner_id: str, leads: List[Lead], lead_outs:
                 lo.origin.came_from = came_cache[key]
 
 
-async def _showcases_out(lead: Lead, collections: List[Collection]) -> List[LeadShowcaseOut]:
+async def _showcases_out(lead: Lead, collections: List[Collection], db: Optional[AsyncSession] = None) -> List[LeadShowcaseOut]:
     out = []
-    for c in _match_collections(lead, collections):
+    mine = _match_collections(lead, collections)
+    wants: dict = {}
+    if db is not None and mine:
+        from app.services.showcase_smart_filter import wants_for
+        wants = await wants_for(db, [c.id for c in mine])
+    for c in mine:
         in_it = {p.id for p in (c.properties or [])}
         pis = [pi for pi in (c.property_interactions or []) if pi.property_id in in_it]
         out.append(LeadShowcaseOut(
@@ -550,7 +555,7 @@ async def _showcases_out(lead: Lead, collections: List[Collection]) -> List[Lead
             viewed=sum(1 for pi in (c.property_interactions or []) if (pi.view_count or 0) > 0), status=c.status,
             liked=sum(1 for pi in pis if pi.liked), disliked=sum(1 for pi in pis if pi.disliked),
             new_matches=CollectionsService.count_new_properties(c), last_active_at=c.last_visitor_activity_at,
-            emails_on=bool(c.notify_visitor), refine_message=c.refine_request_message,
+            emails_on=bool(c.notify_visitor), refine_message=c.refine_request_message, must_haves=wants.get(c.id, []),
         ))
     return out
 
@@ -562,7 +567,7 @@ async def _detail_out(db: AsyncSession, lead: Lead, owner_id: str) -> LeadDetail
     await _enrich(db, owner_id, [lead], [lead_out], collections)
     events = sorted(lead.events or [], key=lambda e: e.occurred_at, reverse=True)
     from app.services.tasks_service import lead_alerts
-    showcases = await _showcases_out(lead, collections)
+    showcases = await _showcases_out(lead, collections, db)
     if showcases:
         # Whether each Showcase's invite email ever reached them (owner, 11/01).
         from app.services.showcase_invite_status import invite_status
