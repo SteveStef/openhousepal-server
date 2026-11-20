@@ -345,6 +345,7 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
         if coll is None or prefs is None:
             return {}
         st = state_of(prefs)
+        owner_id, share_token = coll.owner_id, coll.share_token
         wants = clean_wants(st.get("wants"))
         if not wants:
             return st
@@ -353,6 +354,7 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
             # saved before 11/20 (Lisa's "Downingtown East schools"): a filter, never a star - it moves into the
             # search (East high school, Uwchlan township), so the client's wish is kept (review 11/20)
             await take_off_ai_stars(db, collection_id, st)
+            await db.refresh(prefs)   # the search as it is right now - an agent save a moment ago isn't overwritten
             search_moved = await apply_filter_moves(db, prefs, old_filters)
             await db.execute(text("update collection_properties set ai_match = case when ai_match ? 'per' "
                                   "then jsonb_build_object('per', ai_match->'per') else null end where collection_id = :c"), {"c": collection_id})
@@ -370,7 +372,7 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
             wants = feature
             if not wants:
                 return st
-        user = await db.get(User, coll.owner_id)
+        user = await db.get(User, owner_id)
         from app.utils.auth import tier_has_mls
         if user is None or not (tier_has_mls(user.plan_tier) or user.is_admin):
             return st
@@ -490,7 +492,7 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
             # their follow-up text names the must-haves - rebuild it now, not a minute from now (tasks_service)
             try:
                 from app.services.tasks_service import forget_pitch
-                forget_pitch(coll.share_token)
+                forget_pitch(share_token)
             except Exception:  # noqa: BLE001
                 pass
         except Exception:  # noqa: BLE001 - a failed read leaves the homes unread; the next save or listing tries again
