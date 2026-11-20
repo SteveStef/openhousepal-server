@@ -982,6 +982,8 @@ PITCH_TOKENS: dict[str, dict] = {
     "best_home": {"label": "Newest best match (only if listed in the last 3 weeks)", "kind": "property", "sample": "12 Oak St in Ardmore (4 bd / 2.5 ba, $650,000)"},
     "why_now": {"label": "How new it is", "kind": "property", "sample": "It just hit the market 2 days ago."},
     "showcase_link": {"label": "Showcase link", "kind": "link", "sample": "https://openhousepal.com/showcase/dana-k7q2"},
+    # Only when their Showcase has must-haves (owner, 11/21) - left out, it goes right after the home count.
+    "must_line": {"label": "What they must have (only if set)", "kind": "property", "sample": "2 of them have a pool and a fenced yard."},
     "first_name": {"label": "First name", "kind": "person", "sample": "Jane"},
     "my_name": {"label": "Your name", "kind": "you", "sample": ""},
 }
@@ -1821,6 +1823,12 @@ def _cached_pitch(token: str) -> Optional[tuple]:
     if hit is None or _time.monotonic() - hit[0] > _SHOWCASE_PITCH_TTL:
         return None
     return copy.deepcopy(hit[1])   # callers add to these dicts - never share them
+
+
+def forget_pitch(token: Optional[str]) -> None:
+    """Their Showcase just changed what the text says (must-haves read - owner, 11/21): rebuild it next time."""
+    if token:
+        _showcase_pitch_cache.pop(token, None)
 
 
 def _store_pitch(token: str, value: tuple) -> None:
@@ -4202,7 +4210,12 @@ def _sample_cases() -> dict:
 _SAMPLE_MESSAGE_TIMES = {"second_visit_request": None, "showing_request": None}
 
 
-def sample_event(owner: User, key: str, *, template: Optional[str] = None, pitch: Optional[str] = None, seller: bool = False) -> dict:
+SAMPLE_MUST = {"n": 2, "wants": ["Pool", "Fenced yard"],
+               "phrases": {"Pool": {"one": "has a pool", "many": "have a pool"}, "Fenced yard": {"one": "has a fenced yard", "many": "have a fenced yard"}}}
+
+
+def sample_event(owner: User, key: str, *, template: Optional[str] = None, pitch: Optional[str] = None, seller: bool = False,
+                 must: bool = False) -> dict:
     from types import SimpleNamespace
     from app.services.calendar_sync_service import _task_event_body
     if key not in _RULE_KEYS:
@@ -4234,7 +4247,15 @@ def sample_event(owner: User, key: str, *, template: Optional[str] = None, pitch
         if key in PITCH_RULES and src != SELLER_SOURCE and owner_has_showcases(owner):
             parts = {k: PITCH_TOKENS[k]["sample"] for k in ("home_count", "best_home", "why_now", "showcase_link")}
             parts.update(first_name="Jane", my_name=_my_name(owner))
-            pitch_text = render_pitch(pitch if isinstance(pitch, str) and pitch.strip() else settings["pitch"], parts)
+            ptpl = pitch if isinstance(pitch, str) and pitch.strip() else settings["pitch"]
+            if must:
+                # As it reads when their Showcase has must-haves (pitch_for): the default swaps to its must-have
+                # version; an agent's own keeps their words and gains the sentence after the count.
+                parts.update(_must_parts(14, None, SAMPLE_MUST))
+                if " ".join(ptpl.split()) == " ".join(DEFAULT_PITCHES[key].split()):
+                    ptpl = SMART_PITCHES.get(key, ptpl)
+                ptpl = _with_must(_count_words(ptpl, parts), parts)
+            pitch_text = render_pitch(ptpl, parts)
         if not pitch_text and src != SELLER_SOURCE:
             pitch_text = NO_SHOWCASE_CLOSING.get(key, "")
         msg = _tidy(msg.replace(SHOWCASE_MARKER, f"\n\n{pitch_text}\n\n" if pitch_text else ""))
@@ -4251,7 +4272,8 @@ def sample_event(owner: User, key: str, *, template: Optional[str] = None, pitch
                             contact_link=contact_url("sample"), lead_name="Jane", comments=comments, lead=lead,
                             details=details, prop=prop, message_override=message,
                             showcase_link=showcase_go_url("sample") if (prop or {}).get("where") == "showcase" else None)
-    return {"summary": body.get("summary", ""), "description": body.get("description", ""), "all_day": task.all_day}
+    return {"summary": body.get("summary", ""), "description": body.get("description", ""), "all_day": task.all_day,
+            "message": message}
 
 
 # ---------------------------------------------------------------- Showcase comments on a follow-up

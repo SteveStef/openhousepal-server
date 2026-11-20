@@ -168,7 +168,8 @@ async def preview_calendar_alert(
     code as the real event - with the message the agent is editing right now (unsaved)."""
     payload = payload if isinstance(payload, dict) else {}
     return tasks_service.sample_event(current_user, key, template=payload.get("template"),
-                                      pitch=payload.get("pitch"), seller=bool(payload.get("seller")))
+                                      pitch=payload.get("pitch"), seller=bool(payload.get("seller")),
+                                      must=bool(payload.get("must")))
 
 
 # Outlook can't colour single events through our API - it colours the whole calendar from a fixed

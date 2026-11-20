@@ -475,6 +475,12 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
             now_list = (await db.execute(text("select ai_wants->'ai_starred' from collection_preferences where id = :i"), {"i": prefs.id})).scalar()
             out["ai_starred"] = {**(now_list if isinstance(now_list, dict) else {}), **ai_starred}
             await _set_state(db, prefs.id, out)
+            # their follow-up text names the must-haves - rebuild it now, not a minute from now (tasks_service)
+            try:
+                from app.services.tasks_service import forget_pitch
+                forget_pitch(coll.share_token)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001 - a failed read leaves the homes unread; the next save or listing tries again
             logger.warning("showcase smart filter failed for %s", collection_id, exc_info=True)
             await db.rollback()
