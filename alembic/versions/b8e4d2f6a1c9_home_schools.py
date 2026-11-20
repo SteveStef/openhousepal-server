@@ -29,12 +29,16 @@ def upgrade():
         sa.Column("bright_hs", sa.String(), nullable=True),
         sa.Column("bright_norm", sa.String(), nullable=True),
         sa.Column("checked_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("quick", sa.Boolean(), nullable=False, server_default=sa.false()),
     )
     op.create_index("ix_home_schools_hs_key", "home_schools", ["hs_key"])
+    # a new listing's quick look: what its district's spellings mean
+    op.create_index("ix_home_schools_spelling", "home_schools", ["state", "district", "bright_norm"])
     op.add_column("collection_preferences", sa.Column("high_schools", postgresql.JSONB(), nullable=True))
 
 
 def downgrade():
     op.drop_column("collection_preferences", "high_schools")
+    op.drop_index("ix_home_schools_spelling", table_name="home_schools")
     op.drop_index("ix_home_schools_hs_key", table_name="home_schools")
     op.drop_table("home_schools")

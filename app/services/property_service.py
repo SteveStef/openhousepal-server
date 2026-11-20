@@ -311,8 +311,13 @@ class PropertyService:
             'BALTIMORE CITY': ['BALTIMORE CITY', 'BA', 'BA COUNTY'],
             'BALTIMORE COUNTY': ['BALTIMORE COUNTY', 'BC', 'BC COUNTY']
         }
-        name_upper = name.upper()
-        return mappings.get(name_upper, [name_upper, name])
+        name_upper = " ".join(name.upper().split())
+        if name_upper in mappings:
+            return mappings[name_upper]
+        # "Uwchlan Township" / "Uwchlan Twp" / "UWCHLAN" are one place (owner, 11/19: the search, the count and the
+        # new-listing match must agree). Listings store the bare name; older rows may keep a suffix.
+        root = re.sub(r'\s+(TOWNSHIP|TWP|BOROUGH|BORO|CITY|TOWN)$', '', name_upper).strip()
+        return list(dict.fromkeys([root, f"{root} TWP", f"{root} TOWNSHIP", f"{root} BORO", f"{root} BOROUGH", name_upper, name]))
 
     @staticmethod
     async def get_properties_by_preferences(
@@ -453,7 +458,7 @@ class PropertyService:
         if school_district_filters:
             filters.append(or_(*school_district_filters))
         # High schools narrow too (owner, 11/19) - Bright's answer or worked out (home_school_service).
-        _hs = home_school_service.search_filter(getattr(preferences, 'high_schools', None))
+        _hs = home_school_service.search_filter(preferences)
         if _hs is not None:
             filters.append(_hs)
 
@@ -679,13 +684,15 @@ class PropertyService:
                 root_name = re.sub(r'\s+(Township|Twp|Boro|Borough|City|Town)$', '', raw_name, flags=re.I).strip()
                 root_name = root_name.upper()
 
+                # same names as the search itself (get_township_search_values) - the count shown next to its homes
+                twp_names = PropertyService.get_township_search_values(root_name)
                 if pref_state:
                     place_filters.append(and_(
-                        Property.township == root_name,
+                        Property.township.in_(twp_names),
                         Property.state.ilike(pref_state)
                     ))
                 else:
-                    place_filters.append(Property.township == root_name)
+                    place_filters.append(Property.township.in_(twp_names))
 
         if preferences.school_districts:
             for sd_pref in preferences.school_districts:
@@ -751,7 +758,7 @@ class PropertyService:
         # School districts narrow the area - same as get_properties_by_preferences above.
         if school_district_filters:
             filters.append(or_(*school_district_filters))
-        _hs = home_school_service.search_filter(getattr(preferences, 'high_schools', None))
+        _hs = home_school_service.search_filter(preferences)
         if _hs is not None:
             filters.append(_hs)
 

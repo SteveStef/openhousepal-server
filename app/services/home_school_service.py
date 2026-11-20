@@ -8,7 +8,15 @@ Trust order:
    checked against nearby listings that name their school. The map's lines are from 2015-16, so where the
    homes around this one clearly say otherwise, those homes win - they reflect today's lines.
 3. Nearby listings alone (7 closest within 3/4 mile that name a school; 80% must agree) where the map has nothing.
-Otherwise the home's school stays unknown, and a high-school search leaves it out.
+Otherwise the home's school stays unknown: a high-school search (always inside a picked district) still shows it,
+with a "School unknown" note - nobody misses a home because the listing left the school out.
+
+A value that only names the district ("DOWNINGTOWN" in a district with an East and a West school) says nothing
+about the school: its homes are placed like blank ones.
+
+Load: a separate small table (the 12 GB properties table is never rewritten); evidence is read through indexes
+only (on-market listings + two years of sales); the big pass runs at night; by day only just-arrived listings get
+a quick look; a price change never redoes a home.
 
 Spellings: Bright writes one school many ways ("DOWNINGTOWN HIGH SCHOOL EAST CAMPUS", "DHS EAST"). Inside one
 district, a spelling whose homes sit inside one map school's lines (75%+ of 5+ homes) becomes that school, so
@@ -39,12 +47,10 @@ NEAR_MIN = 3
 NEAR_AGREE = 0.8
 ALIAS_MIN = 5
 ALIAS_AGREE = 0.75
-EVIDENCE_CAP = 40000
 ALIAS_SAMPLE = 40      # homes per spelling checked against the map
 EVAL_SAMPLE = 1500
-REFRESH_DAYS = 30
 _LOCK_KEY = 74_19_1119
-_RUN_SECONDS = 50
+_NIGHT_SECONDS = 420     # per 10-minute turn, at night only
 
 _JUNK = {"", "0", "00", "N/A", "NA", "NONE", "UNKNOWN", "NOT AVAILABLE", "NOT PROVIDED", "SEE REMARKS", "CALL SCHOOL BOARD",
          "CALL DISTRICT", "BUYER TO VERIFY", "VERIFY", "TBD", "OTHER", "CALL", "NO", "SEE SCHOOL DISTRICT"}
@@ -175,47 +181,114 @@ def _pick_map(at: List[Tuple[str, str]], allowed: Optional[set], area: Optional[
     return None
 
 
-async def fill_unit(db, state: str, district: str, *, only_ids: Optional[Iterable[str]] = None,
-                    write: bool = True, evaluate: bool = False) -> Dict[str, Any]:
-    """Work out the high school for every for-sale home in one (state, district). `district` is the
-    normalized Bright district name ('' = homes with no district: map only)."""
-    params = {"s": state, "d": district}
-    where = "p.state = :s AND upper(btrim(coalesce(p.school_district_name, ''))) = :d"
-    ev = (await db.execute(text(
-        f"SELECT p.id, p.latitude, p.longitude, p.high_school FROM properties p WHERE {where} "
-        f"AND p.latitude IS NOT NULL AND p.longitude IS NOT NULL AND coalesce(btrim(p.high_school), '') <> '' "
-        f"LIMIT {EVIDENCE_CAP}"), params)).all()
-    tq = (f"SELECT p.id, p.latitude, p.longitude, p.high_school FROM properties p WHERE {where} "
-          f"AND p.home_status IN :fs AND p.is_manual IS NOT TRUE")
-    tparams = {**params, "fs": FOR_SALE}
+# ---- evidence: the listings that name their school ---------------------------------------------------------
+# Read through indexes only (home_status + state, and the close-date index) and only the light columns - never the
+# whole district history: listings on the market now + homes sold in the last two years.
+LIVE = ("ACTIVE-BRIGHT", "COMING SOON-BRIGHT", "PENDING-BRIGHT", "ACTIVE UNDER CONTRACT-BRIGHT")
+SOLD_DAYS = 730
+_cut_cache: Dict[str, Any] = {}
+
+
+async def _sold_cut(db) -> str:
+    """Two years before the newest sale we hold ('YYYY-MM-DD') - the live site's 'now', and still right on an old copy."""
+    if _cut_cache.get("at") and time.monotonic() - _cut_cache["at"] < 6 * 3600:
+        return _cut_cache["cut"]
+    top = (await db.execute(text("SELECT max(mls_close_date) FROM properties"))).scalar()
+    try:
+        cut = (datetime.strptime(str(top)[:10], "%Y-%m-%d") - timedelta(days=SOLD_DAYS)).strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        cut = (datetime.now(timezone.utc) - timedelta(days=SOLD_DAYS)).strftime("%Y-%m-%d")
+    _cut_cache.update(at=time.monotonic(), cut=cut)
+    return cut
+
+
+async def _evidence(db, state: str, raw_names: Optional[List[str]] = None) -> Dict[str, list]:
+    """{normalized district: [rows that name a school]} for one state (or just these raw district names)."""
     from sqlalchemy import bindparam
-    stmt = text(tq).bindparams(bindparam("fs", expanding=True))
+    cut = await _sold_cut(db)
+    cols = "id, latitude, longitude, high_school, school_district_name"
+    cond = ("state = :s AND latitude IS NOT NULL AND longitude IS NOT NULL AND coalesce(btrim(high_school), '') <> '' "
+            "AND is_manual IS NOT TRUE")
+    if raw_names:
+        cond += " AND school_district_name IN :names"
+    q = text(f"SELECT {cols} FROM properties WHERE home_status IN :live AND {cond} "
+             f"UNION ALL SELECT {cols} FROM properties WHERE mls_close_date >= :cut AND home_status LIKE 'CLOSED%' AND {cond}")
+    q = q.bindparams(bindparam("live", expanding=True), *( [bindparam("names", expanding=True)] if raw_names else []))
+    params = {"s": state, "live": LIVE, "cut": cut, **({"names": list(raw_names)} if raw_names else {})}
+    out: Dict[str, list] = defaultdict(list)
+    seen = set()
+    for r in (await db.execute(q, params)).all():
+        if r.id not in seen:
+            seen.add(r.id)
+            out[norm_district(r.school_district_name)].append(r)
+    return out
+
+
+def _needs_work_sql() -> str:
+    """A for-sale home needs its school worked out: never done, Bright's school changed, the map just arrived
+    (checked_at NULL), it was a quick look on arrival, or it's unknown and a week old. A price change never."""
+    return ("(h.property_id IS NULL OR h.checked_at IS NULL OR h.quick "
+            " OR coalesce(h.bright_hs, '') IS DISTINCT FROM coalesce(p.high_school, '') "
+            " OR (h.hs_key IS NULL AND h.checked_at < now() - interval '7 days'))")
+
+
+async def fill_unit(db, state: str, district: str, *, only_ids: Optional[Iterable[str]] = None,
+                    write: bool = True, evaluate: bool = False, evidence: Optional[list] = None) -> Dict[str, Any]:
+    """Work out the high school for the for-sale homes of one (state, district). `district` is the normalized Bright
+    district name. Used by the nightly pass (evidence handed in) and on demand (chat, tests)."""
+    from sqlalchemy import bindparam
+    raw = [r[0] for r in (await db.execute(text(
+        "SELECT DISTINCT school_district_name FROM properties WHERE home_status IN :fs AND state = :s "
+        "AND upper(btrim(coalesce(school_district_name, ''))) = :d").bindparams(bindparam("fs", expanding=True)),
+        {"fs": FOR_SALE, "s": state, "d": district})).all()]
+    if evidence is None:
+        evidence = (await _evidence(db, state, raw or None)).get(district, []) if raw else []
+    tq = ("SELECT p.id, p.latitude, p.longitude, p.high_school FROM properties p WHERE p.state = :s AND p.home_status IN :fs "
+          "AND p.is_manual IS NOT TRUE AND p.school_district_name IN :names")
+    binds = [bindparam("fs", expanding=True), bindparam("names", expanding=True)]
+    tparams: Dict[str, Any] = {"s": state, "fs": FOR_SALE, "names": raw or ["\x00"]}
     if only_ids is not None:
-        stmt = text(tq + " AND p.id IN :ids").bindparams(bindparam("fs", expanding=True), bindparam("ids", expanding=True))
-        tparams["ids"] = list(only_ids)
-    targets = (await db.execute(stmt, tparams)).all()
+        tq += " AND p.id IN :ids"
+        binds.append(bindparam("ids", expanding=True))
+        tparams["ids"] = list(only_ids) or ["\x00"]
+    targets = (await db.execute(text(tq).bindparams(*binds), tparams)).all()
+    return await _fill(db, state, district, evidence, targets, write=write, evaluate=evaluate)
+
+
+async def _fill(db, state, district, evidence, targets, *, write=True, evaluate=False) -> Dict[str, Any]:
     if not targets and not evaluate:
         return {"homes": 0}
-
-    pts = [(r.latitude, r.longitude) for r in list(ev) + [t for t in targets if t.latitude is not None]]
+    pts = [(r.latitude, r.longitude) for r in list(evidence) + [t for t in targets if t.latitude is not None]]
     maps = await _MapSchools.load(db, state, [p[0] for p in pts], [p[1] for p in pts])
     # The number-crunching (map lines, nearby votes) runs off the event loop - the site keeps answering meanwhile.
-    stats, rows = await asyncio.to_thread(_compute, state, district, list(ev), list(targets), maps, evaluate)
+    stats, rows = await asyncio.to_thread(_compute, state, district, list(evidence), list(targets), maps, evaluate)
     if write and rows:
         await db.execute(text(
-            "INSERT INTO home_schools (property_id, state, district, hs_key, hs_name, source, sure, bright_hs, bright_norm, checked_at) "
-            "VALUES (:p, :s, :d, :k, :n, :src, :sure, :b, :bn, :at) "
+            "INSERT INTO home_schools (property_id, state, district, hs_key, hs_name, source, sure, bright_hs, bright_norm, checked_at, quick) "
+            "VALUES (:p, :s, :d, :k, :n, :src, :sure, :b, :bn, :at, false) "
             "ON CONFLICT (property_id) DO UPDATE SET state = EXCLUDED.state, district = EXCLUDED.district, hs_key = EXCLUDED.hs_key, "
             "hs_name = EXCLUDED.hs_name, source = EXCLUDED.source, sure = EXCLUDED.sure, bright_hs = EXCLUDED.bright_hs, "
-            "bright_norm = EXCLUDED.bright_norm, checked_at = EXCLUDED.checked_at"), rows)
+            "bright_norm = EXCLUDED.bright_norm, checked_at = EXCLUDED.checked_at, quick = false"), rows)
         await db.commit()
     return stats
+
+
+def _fullest(spellings: Counter) -> str:
+    """The name to show: the fullest of the common spellings ("Downingtown High School East Campus", not "DHS East")."""
+    total = sum(spellings.values()) or 1
+    common = [s for s, k in spellings.items() if k / total >= 0.15] or [spellings.most_common(1)[0][0]]
+    return max(common, key=lambda s: (len(s.split()), len(s), spellings[s]))
+
+
+_DISTRICT_WORDS_SKIP = {"AREA", "SCHOOL", "SCHOOLS", "DISTRICT", "SD", "PUBLIC", "COUNTY", "CITY", "THE", "OF", "TOWNSHIP", "TWP",
+                        "HS", "UNIFIED", "REGIONAL", "CONSOLIDATED", "CO"}
 
 
 def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapSchools", evaluate: bool) -> Tuple[Dict[str, Any], list]:
     map_names = {sid: name for sid, name, *_ in maps.shapes}
     # Bright spellings -> one school: where a sample of each spelling's homes sit on the map.
     by_spell: Dict[str, Counter] = defaultdict(Counter)
+    n_spell: Counter = Counter()
     spell_raw: Dict[str, Counter] = defaultdict(Counter)
     home_spell: Dict[str, str] = {}
     for r in ev:
@@ -224,26 +297,53 @@ def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapScho
             continue
         home_spell[r.id] = sp
         spell_raw[sp][" ".join(r.high_school.split())] += 1
-        if maps.shapes and by_spell[sp]["_n"] < ALIAS_SAMPLE:
+        if maps.shapes and n_spell[sp] < ALIAS_SAMPLE:
             for sid, _n in maps.schools_at(r.latitude, r.longitude):
                 by_spell[sp][sid] += 1
-            by_spell[sp]["_n"] += 1
+            n_spell[sp] += 1
     # A district-wide school (a STEM / magnet academy any home may choose) holds every home too - of the schools
     # that hold most of a spelling's homes, the smallest area is the neighborhood school.
     area = {sid: (c - a) * (d - b) for sid, _n, a, b, c, d, _g in maps.shapes}
-    alias: Dict[str, str] = {}
+    # Shapes that hold a spelling's homes together with a smaller shape are district-wide (STEM / magnet) - never a
+    # neighborhood school, so a spelling whose homes they hold says nothing by that alone.
+    wide: set = set()
     for sp, c in by_spell.items():
-        n = c.pop("_n", 0)
+        n = n_spell[sp]
+        good = [sid for sid, k in c.items() if n and k / n >= ALIAS_AGREE]
+        if len(good) >= 2:
+            small = min(good, key=lambda s: area.get(s, 0))
+            wide |= {s for s in good if s != small}
+    alias: Dict[str, str] = {}
+    vague: set = set()
+    for sp, c in by_spell.items():
+        n = n_spell[sp]
+        c = Counter({sid: k for sid, k in c.items() if sid not in wide})
         if n >= ALIAS_MIN and c:
             good = [sid for sid, k in c.items() if k / n >= ALIAS_AGREE]
             if good:
                 alias[sp] = f"nces:{min(good, key=lambda s: area.get(s, 0))}"
+            else:
+                # its homes spread over two or more schools: it names the district ("DOWNINGTOWN"), not a school
+                shares = sorted((k / n for k in c.values()), reverse=True)
+                if len(shares) >= 2 and shares[1] >= 0.2:
+                    vague.add(sp)
+    # A value that's only the district's own name, in a district with more than one high school, says nothing either
+    dwords = set(re.findall(r"[A-Z0-9]+", district)) - _DISTRICT_WORDS_SKIP
+    real = {alias.get(sp) or f"txt:{state}:{sp}" for sp in spell_raw if sp not in vague}
+    if len(real) >= 2:
+        for sp in spell_raw:
+            if sp not in alias and set(sp.split()) - {"HS"} <= dwords:
+                vague.add(sp)
+    for rid in [rid for rid, sp in home_spell.items() if sp in vague]:
+        del home_spell[rid]
 
     def key_of_spell(sp: str) -> str:
         return alias.get(sp) or f"txt:{state}:{sp}"
 
     names: Dict[str, Counter] = defaultdict(Counter)
     for sp, raws in spell_raw.items():
+        if sp in vague:
+            continue
         for raw, k in raws.items():
             names[key_of_spell(sp)][raw] += k
     allowed = {k[5:] for k in alias.values()} if alias else None
@@ -270,7 +370,8 @@ def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapScho
             return near, "nearby", False
         return None, None, False
 
-    stats: Dict[str, Any] = {"homes": len(targets), "bright": 0, "map": 0, "nearby": 0, "unknown": 0, "sure": 0}
+    stats: Dict[str, Any] = {"homes": len(targets), "bright": 0, "map": 0, "nearby": 0, "unknown": 0, "sure": 0,
+                             "vague": sorted(vague)}
     if evaluate:
         # Hide a sample of named homes' own answers and see what the other sources would have said.
         ok = Counter()
@@ -291,7 +392,7 @@ def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapScho
     rows = []
     for t in targets:
         sp = norm_school(t.high_school)
-        if sp:
+        if sp and sp not in vague:
             k, src, sure = key_of_spell(sp), "bright", True
         elif t.latitude is not None and t.longitude is not None:
             k, src, sure = blank_answer(t.latitude, t.longitude)
@@ -302,7 +403,7 @@ def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapScho
         name = None
         if k:
             if names.get(k):
-                name = nice_name(names[k].most_common(1)[0][0])
+                name = nice_name(_fullest(names[k]))
             elif k.startswith("nces:") and map_names.get(k[5:]):
                 name = nice_name(map_names[k[5:]])
         rows.append({"p": t.id, "s": state, "d": district, "k": k, "n": name, "src": src, "sure": bool(k and sure),
@@ -310,29 +411,25 @@ def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapScho
     return stats, rows
 
 
-async def units_to_fill(db, limit: int = 25) -> List[Tuple[str, str, int]]:
-    """(state, district, homes) with for-sale homes never worked out, whose Bright school changed, or a month old."""
-    from sqlalchemy import bindparam
-    rows = (await db.execute(text(
-        "SELECT p.state, upper(btrim(coalesce(p.school_district_name, ''))) AS d, count(*) AS n FROM properties p "
-        "LEFT JOIN home_schools h ON h.property_id = p.id "
-        "WHERE p.home_status IN :fs AND p.is_manual IS NOT TRUE AND p.state IS NOT NULL "
-        "AND (h.property_id IS NULL OR h.checked_at IS NULL OR coalesce(h.bright_hs, '') IS DISTINCT FROM coalesce(p.high_school, '') "
-        "     OR h.checked_at < now() - make_interval(days => :days)) "
-        "GROUP BY 1, 2 ORDER BY 3 DESC LIMIT :lim").bindparams(bindparam("fs", expanding=True)),
-        {"fs": FOR_SALE, "days": REFRESH_DAYS, "lim": limit})).all()
-    return [(r.state, r.d, r.n) for r in rows]
-
-
 def _quiet_hours() -> bool:
     from app.services import mls_mirror
     return mls_mirror._quiet_hours()
 
 
-async def fill_step(run_seconds: Optional[float] = None) -> Dict[str, Any]:
-    """One background pass: districts in turn until the time is up. One worker at a time (advisory lock)."""
+def _night() -> bool:
+    """05:00-10:30 UTC (midnight-5:30 AM Eastern in winter, 1-6:30 AM in summer): the big pass runs only then,
+    after the nightly backup and before agents start their day."""
+    now = datetime.now(timezone.utc)
+    m = now.hour * 60 + now.minute
+    return 5 * 60 <= m < 10 * 60 + 30
+
+
+async def fill_night(run_seconds: Optional[float] = None) -> Dict[str, Any]:
+    """The nightly pass: state by state, each state's evidence read once (two indexed reads), then district by
+    district until the time is up. One worker at a time (advisory lock)."""
+    from sqlalchemy import bindparam
     from app.database import AsyncSessionLocal, engine
-    done = {"units": 0, "homes": 0}
+    done = {"districts": 0, "homes": 0}
     async with engine.connect() as raw_lock:
         lockdb = await raw_lock.execution_options(isolation_level="AUTOCOMMIT")
         if not (await lockdb.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": _LOCK_KEY})).scalar():
@@ -340,19 +437,50 @@ async def fill_step(run_seconds: Optional[float] = None) -> Dict[str, Any]:
         try:
             if not (await lockdb.execute(text("SELECT to_regclass('home_schools')"))).scalar():
                 return {**done, "skipped": "migration not applied"}
-            deadline = time.monotonic() + (run_seconds if run_seconds is not None else _RUN_SECONDS)
+            deadline = time.monotonic() + (run_seconds if run_seconds is not None else _NIGHT_SECONDS)
             async with AsyncSessionLocal() as db:
-                units = await units_to_fill(db)
-            for state, district, _n in units:
+                todo = (await db.execute(text(
+                    "SELECT p.id, p.latitude, p.longitude, p.high_school, p.state, upper(btrim(coalesce(p.school_district_name, ''))) AS d "
+                    "FROM properties p LEFT JOIN home_schools h ON h.property_id = p.id "
+                    f"WHERE p.home_status IN :fs AND p.is_manual IS NOT TRUE AND p.state IS NOT NULL AND {_needs_work_sql()}"
+                ).bindparams(bindparam("fs", expanding=True)), {"fs": FOR_SALE})).all()
+            by_state: Dict[str, Dict[str, list]] = defaultdict(lambda: defaultdict(list))
+            for t in todo:
+                by_state[t.state][t.d].append(t)
+            for state, districts in sorted(by_state.items(), key=lambda kv: -sum(len(v) for v in kv[1].values())):
                 if time.monotonic() > deadline:
                     break
                 async with AsyncSessionLocal() as db:
-                    st = await fill_unit(db, state, district)
-                done["units"] += 1
-                done["homes"] += st.get("homes", 0)
+                    ev = await _evidence(db, state)
+                for d, targets in sorted(districts.items(), key=lambda kv: -len(kv[1])):
+                    if time.monotonic() > deadline:
+                        break
+                    async with AsyncSessionLocal() as db:
+                        st = await _fill(db, state, d, ev.get(d, []) if d else [], targets)
+                    done["districts"] += 1
+                    done["homes"] += st.get("homes", 0)
         finally:
             await lockdb.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _LOCK_KEY})
     return done
+
+
+async def fill_new(limit: int = 150) -> Dict[str, Any]:
+    """Daytime: only listings that just arrived (or whose listing just started naming its school) - found through
+    the modification-time index, a quick look each. Everything else waits for the night."""
+    from sqlalchemy import bindparam
+    from app.database import AsyncSessionLocal
+    async with AsyncSessionLocal() as db:
+        if not (await db.execute(text("SELECT to_regclass('home_schools')"))).scalar():
+            return {"homes": 0}
+        ids = [r[0] for r in (await db.execute(text(
+            "SELECT p.id FROM properties p LEFT JOIN home_schools h ON h.property_id = p.id "
+            "WHERE p.modification_timestamp > now() - interval '6 hours' AND p.home_status IN :fs AND p.is_manual IS NOT TRUE "
+            "AND (h.property_id IS NULL OR coalesce(h.bright_hs, '') IS DISTINCT FROM coalesce(p.high_school, '')) LIMIT :n"
+        ).bindparams(bindparam("fs", expanding=True)), {"fs": FOR_SALE, "n": limit})).all()]
+        for pid in ids:
+            await _quick_key(db, pid)
+            await db.commit()
+    return {"homes": len(ids)}
 
 
 SABS_URL = "https://nces.ed.gov/programs/edge/data/SABS_1516.zip"   # the official NCES file, public, free (584 MB)
@@ -394,7 +522,7 @@ async def scheduled_map_import():
     import sys
     import tempfile
     from app.database import AsyncSessionLocal, engine
-    if os.getenv("OHP_NCES_IMPORT", "on") == "off" or _quiet_hours():
+    if os.getenv("OHP_NCES_IMPORT", "on") == "off" or not _night():
         return
     async with engine.connect() as raw_lock:
         lockdb = await raw_lock.execution_options(isolation_level="AUTOCOMMIT")
@@ -456,20 +584,19 @@ async def scheduled_map_import():
 
 
 async def scheduled_fill():
-    """Every 10 minutes: new and changed for-sale homes get their high school (off during the nightly backup).
-    Waits for the school map to load first, so homes aren't all worked out twice."""
+    """Every 10 minutes (off during the nightly backup). Night: the big pass, several minutes a turn. Day: only the
+    listings that just arrived, a quick look each - the 5-minute Bright sync itself never waits on this."""
     if os.getenv("OHP_HOME_SCHOOLS", "on") == "off" or _quiet_hours():
         return
     try:
-        from app.database import AsyncSessionLocal
-        async with AsyncSessionLocal() as db:
-            if not await map_settled(db):
-                return
-    except Exception:
-        logger.warning("home schools: map check failed", exc_info=True)
-        return
-    try:
-        st = await fill_step()
+        if _night():
+            from app.database import AsyncSessionLocal
+            async with AsyncSessionLocal() as db:
+                if not await map_settled(db):
+                    return   # the map loads first tonight - homes aren't all worked out twice
+            st = await fill_night()
+        else:
+            st = await fill_new()
         if st.get("homes"):
             logger.info("home schools filled", extra={"stats": st})
     except Exception:
@@ -488,52 +615,80 @@ async def anyone_searching_schools(db) -> bool:
 
 
 async def quick_key(property_id: str) -> Optional[str]:
-    """One new listing's high school, right away, from what the background pass already knows about its district
-    (the spellings it learned, the for-sale homes around it) plus the map. Light: no district-wide read. Its own
-    session, so a failure here never touches the sync's work. The background pass redoes it properly soon after."""
+    """A listing's high school for the new-listing match. Already worked out (and Bright still says the same) =
+    that answer, nothing redone - a price change never repeats it. Otherwise a quick look (`_quick_key`). Its own
+    session, so a failure here never touches the sync's work."""
     from app.database import AsyncSessionLocal
     async with AsyncSessionLocal() as db:
+        have = (await db.execute(text(
+            "SELECT h.hs_key FROM home_schools h JOIN properties p ON p.id = h.property_id WHERE h.property_id = :p "
+            "AND coalesce(h.bright_hs, '') = coalesce(p.high_school, '') AND h.checked_at IS NOT NULL"), {"p": property_id})).first()
+        if have is not None:
+            return have.hs_key
         k = await _quick_key(db, property_id)
         await db.commit()
         return k
 
 
 async def _quick_key(db, property_id: str) -> Optional[str]:
+    """One home, a few small indexed reads: what its district's spellings mean (learned by the nightly pass), the
+    map at its spot, and the listings within 3/4 mile that name a school (map-point index). Marked quick - the next
+    night redoes it with the whole district in view."""
+    from sqlalchemy import bindparam
     try:
         p = (await db.execute(text(
             "SELECT id, state, upper(btrim(coalesce(school_district_name, ''))) AS d, latitude AS lat, longitude AS lng, high_school "
             "FROM properties WHERE id = :p"), {"p": property_id})).first()
         if not p or not p.state:
             return None
-        known = (await db.execute(text(
-            "SELECT bright_norm, hs_key, hs_name FROM home_schools WHERE state = :s AND district = :d AND source = 'bright' "
-            "AND hs_key IS NOT NULL"), {"s": p.state, "d": p.d})).all()
-        spell = {r.bright_norm: r.hs_key for r in known if r.bright_norm}
-        names = {r.hs_key: r.hs_name for r in known}
-        allowed = {k[5:] for k in spell.values() if k.startswith("nces:")} or None
-        maps = await _MapSchools.load(db, p.state, [p.lat], [p.lng]) if p.lat is not None else _MapSchools([])
-        area = {sid: (c - a) * (d - b) for sid, _n, a, b, c, d, _g in maps.shapes}
-        map_sid = _pick_map(maps.schools_at(p.lat, p.lng), allowed, area) if maps.shapes else None
-        map_key = f"nces:{map_sid}" if map_sid else None
         sp = norm_school(p.high_school)
-        if sp:
-            k, src, sure = spell.get(sp) or f"txt:{p.state}:{sp}", "bright", True
-        elif p.lat is not None:
+        near_rows = []
+        if p.lat is not None:
             box = NEAR_MILES / 69.0
-            # the same evidence the background pass uses: every listing around it (sold ones too) that names its
-            # school, spelled through what the pass learned (map index ix_properties_geo_point finds them)
             near_rows = (await db.execute(text(
                 "SELECT x.id, x.latitude, x.longitude, x.high_school FROM properties x "
                 "WHERE point(x.longitude, x.latitude) <@ box(point(:c, :a), point(:e, :b)) "
                 "AND x.latitude BETWEEN :a AND :b AND x.longitude BETWEEN :c AND :e AND x.state = :s "
                 "AND upper(btrim(coalesce(x.school_district_name, ''))) = :d AND coalesce(btrim(x.high_school), '') <> '' LIMIT 400"),
-                {"s": p.state, "d": p.d, "a": p.lat - box, "b": p.lat + box,
-                 "c": p.lng - box * 1.4, "e": p.lng + box * 1.4})).all()
+                {"s": p.state, "d": p.d, "a": p.lat - box, "b": p.lat + box, "c": p.lng - box * 1.4, "e": p.lng + box * 1.4})).all()
+        spells = {s for s in [sp, *(norm_school(r.high_school) for r in near_rows)] if s}
+        # what the nightly pass decided each spelling means: a school (source bright) or nothing (vague -> map / nearby)
+        learned: Dict[str, Optional[str]] = {}
+        names: Dict[str, str] = {}
+        if spells:
+            for r in (await db.execute(text(
+                    "SELECT bright_norm, source, hs_key, hs_name FROM home_schools WHERE state = :s AND district = :d AND bright_norm IN :sp "
+                    "AND NOT quick").bindparams(bindparam("sp", expanding=True)), {"s": p.state, "d": p.d, "sp": list(spells)})).all():
+                if r.source == "bright" and r.hs_key:
+                    learned[r.bright_norm] = r.hs_key
+                    names.setdefault(r.hs_key, r.hs_name)
+                else:
+                    learned.setdefault(r.bright_norm, None)
+        allowed = {k[5:] for k in (await db.execute(text(
+            "SELECT DISTINCT hs_key FROM home_schools WHERE state = :s AND district = :d AND source = 'bright' AND hs_key LIKE 'nces:%' "
+            "AND NOT quick"), {"s": p.state, "d": p.d})).scalars().all()} or None
+
+        def key_of(s: str) -> Optional[str]:
+            if s in learned:
+                return learned[s]          # None = a vague spelling (the district's name)
+            dwords = set(re.findall(r"[A-Z0-9]+", p.d)) - _DISTRICT_WORDS_SKIP
+            if allowed and len(allowed) >= 2 and set(s.split()) - {"HS"} <= dwords:
+                return None
+            return f"txt:{p.state}:{s}"
+
+        maps = await _MapSchools.load(db, p.state, [p.lat], [p.lng]) if p.lat is not None else _MapSchools([])
+        area = {sid: (c - a) * (d - b) for sid, _n, a, b, c, d, _g in maps.shapes}
+        map_sid = _pick_map(maps.schools_at(p.lat, p.lng), allowed, area) if maps.shapes else None
+        map_key = f"nces:{map_sid}" if map_sid else None
+        own = key_of(sp) if sp else None
+        if own:
+            k, src, sure = own, "bright", True
+        elif p.lat is not None:
             g = _Grid()
             for r in near_rows:
-                nsp = norm_school(r.high_school)
-                if nsp:
-                    g.add(r.id, r.latitude, r.longitude, spell.get(nsp) or f"txt:{p.state}:{nsp}")
+                nk = key_of(norm_school(r.high_school) or "")
+                if nk:
+                    g.add(r.id, r.latitude, r.longitude, nk)
             near = g.vote(p.lat, p.lng, skip=p.id)
             if map_key and near:
                 k, src, sure = (map_key, "map", True) if map_key == near else (near, "nearby", False)
@@ -542,15 +697,18 @@ async def _quick_key(db, property_id: str) -> Optional[str]:
         else:
             k, src, sure = None, None, False
         name = names.get(k) if k else None
+        if k and not name:
+            name = (await db.execute(text("SELECT hs_name FROM home_schools WHERE hs_key = :k AND hs_name IS NOT NULL LIMIT 1"),
+                                     {"k": k})).scalar()
         if k and not name and k.startswith("nces:"):
             name = next((nice_name(n) for sid, n, *_ in maps.shapes if f"nces:{sid}" == k), None)
-        if k and not name and sp:
+        if k and not name and own:
             name = nice_name(p.high_school)
         await db.execute(text(
-            "INSERT INTO home_schools (property_id, state, district, hs_key, hs_name, source, sure, bright_hs, bright_norm, checked_at) "
-            "VALUES (:p, :s, :d, :k, :n, :src, :sure, :b, :bn, now()) ON CONFLICT (property_id) DO UPDATE SET "
+            "INSERT INTO home_schools (property_id, state, district, hs_key, hs_name, source, sure, bright_hs, bright_norm, checked_at, quick) "
+            "VALUES (:p, :s, :d, :k, :n, :src, :sure, :b, :bn, now(), true) ON CONFLICT (property_id) DO UPDATE SET "
             "hs_key = EXCLUDED.hs_key, hs_name = EXCLUDED.hs_name, source = EXCLUDED.source, sure = EXCLUDED.sure, "
-            "bright_hs = EXCLUDED.bright_hs, bright_norm = EXCLUDED.bright_norm, checked_at = EXCLUDED.checked_at"),
+            "bright_hs = EXCLUDED.bright_hs, bright_norm = EXCLUDED.bright_norm, checked_at = EXCLUDED.checked_at, quick = true"),
             {"p": p.id, "s": p.state, "d": p.d, "k": k, "n": name, "src": src, "sure": bool(k and sure), "b": p.high_school, "bn": sp})
         return k
     except Exception:
@@ -561,29 +719,53 @@ async def _quick_key(db, property_id: str) -> Optional[str]:
 
 # ---- reading -----------------------------------------------------------------------------------------------
 
-def search_filter(keys: Optional[List[str]]):
-    """Showcase search: only homes whose high school is one of these (Bright's or worked out)."""
-    from sqlalchemy import select
+def _picked(preferences) -> List[str]:
+    """The high schools a search keeps - only together with a school district (owner, 11/19): a school alone would
+    let every 'school unknown' home in, from any town."""
+    keys = [k for k in (getattr(preferences, "high_schools", None) or []) if k]
+    return keys if keys and (getattr(preferences, "school_districts", None) or []) else []
+
+
+def search_filter(preferences):
+    """Showcase search: homes going to one of these high schools, plus the homes in the picked district(s) whose
+    school we can't tell (owner, 11/19: "I don't want people to miss out on homes because we don't have the school")
+    - the card says "School unknown". Two indexed lookups on home_schools."""
+    from sqlalchemy import exists, or_, select
     from app.models.database import HomeSchool, Property
-    keys = [k for k in (keys or []) if k]
+    keys = _picked(preferences)
     if not keys:
         return None
-    return Property.id.in_(select(HomeSchool.property_id).where(HomeSchool.hs_key.in_(keys)))
+    known = exists().where(HomeSchool.property_id == Property.id, HomeSchool.hs_key.isnot(None))
+    return or_(Property.id.in_(select(HomeSchool.property_id).where(HomeSchool.hs_key.in_(keys))), ~known)
+
+
+async def unknown_school_ids(db, preferences, property_ids) -> set:
+    """Of these homes, the ones in a high-school search only because their school is unknown (the card's note)."""
+    from sqlalchemy import bindparam
+    ids = [i for i in (property_ids or []) if i]
+    if not ids or not _picked(preferences):
+        return set()
+    known = {r[0] for r in (await db.execute(text(
+        "SELECT property_id FROM home_schools WHERE property_id IN :ids AND hs_key IS NOT NULL").bindparams(
+        bindparam("ids", expanding=True)), {"ids": ids})).all()}
+    return set(ids) - known
 
 
 async def schools_in(db, districts: List[str]) -> List[Dict[str, Any]]:
     """The high schools for sale homes in these districts ("Downingtown Area, PA" style names, matched like the
-    search does): key, name, homes for sale, and how many of those the listing itself names."""
+    search does): key, name, homes for sale, and how many of those the listing itself names. "unknown" = homes
+    there whose school can't be told (they stay in a school search, with a note)."""
     out: Dict[str, Dict[str, Any]] = {}
     for d in districts or []:
         parts = [s.strip() for s in str(d).split(",")]
         name, st = parts[0], (parts[1].upper() if len(parts) > 1 else None)
         q = ("SELECT h.hs_key, h.hs_name, count(*) AS n, count(*) FILTER (WHERE h.source = 'bright') AS named, "
-             "count(*) FILTER (WHERE h.sure) AS sure FROM home_schools h JOIN properties p ON p.id = h.property_id "
-             "WHERE h.hs_key IS NOT NULL AND p.home_status IN ('ACTIVE-BRIGHT', 'COMING SOON-BRIGHT') "
+             "count(*) FILTER (WHERE h.sure) AS sure FROM properties p LEFT JOIN home_schools h ON h.property_id = p.id "
+             "WHERE p.home_status IN ('ACTIVE-BRIGHT', 'COMING SOON-BRIGHT') AND p.is_manual IS NOT TRUE "
              "AND p.school_district_name ILIKE :d" + (" AND p.state = :s" if st else "") + " GROUP BY 1, 2")
         for r in (await db.execute(text(q), {"d": f"%{name}%", "s": st})).all():
-            o = out.setdefault(r.hs_key, {"key": r.hs_key, "name": r.hs_name, "homes": 0, "named": 0, "sure": 0, "_names": Counter()})
+            key = r.hs_key or "unknown"
+            o = out.setdefault(key, {"key": key, "name": r.hs_name or "School unknown", "homes": 0, "named": 0, "sure": 0, "_names": Counter()})
             o["homes"] += r.n
             o["named"] += r.named
             o["sure"] += r.sure
@@ -595,7 +777,8 @@ async def schools_in(db, districts: List[str]) -> List[Dict[str, Any]]:
             o["name"] = o["_names"].most_common(1)[0][0]
         o.pop("_names", None)
         res.append(o)
-    return sorted(res, key=lambda o: -o["homes"])
+    unknown = [o for o in res if o["key"] == "unknown"]
+    return sorted([o for o in res if o["key"] != "unknown"], key=lambda o: -o["homes"]) + unknown
 
 
 async def names_for(db, keys: List[str]) -> Dict[str, str]:
@@ -610,11 +793,3 @@ async def names_for(db, keys: List[str]) -> Dict[str, str]:
     for r in rows:
         out.setdefault(r.hs_key, r.hs_name)
     return out
-
-
-async def school_of(db, property_id: str) -> Optional[Dict[str, Any]]:
-    r = (await db.execute(text("SELECT hs_key, hs_name, source, sure FROM home_schools WHERE property_id = :p"),
-                          {"p": property_id})).first()
-    if not r or not r.hs_key:
-        return None
-    return {"key": r.hs_key, "name": r.hs_name, "source": r.source, "sure": bool(r.sure)}

@@ -238,6 +238,22 @@ async def _ai_starred_ids(db, collection_id: str, smart_lookup: dict | None = No
     return set(v) if isinstance(v, dict) else set()
 
 
+async def _school_unknown_ids(db: AsyncSession, collection_id: str, property_ids) -> set:
+    """Homes in this Showcase's high-school search whose school can't be told (home_school_service)."""
+    try:
+        from types import SimpleNamespace
+        from app.services.home_school_service import unknown_school_ids
+        async with db.begin_nested():
+            r = (await db.execute(text("select high_schools, school_districts from collection_preferences where collection_id = :c"),
+                                  {"c": collection_id})).first()
+            if not r or not r.high_schools:
+                return set()
+            return await unknown_school_ids(db, SimpleNamespace(high_schools=r.high_schools, school_districts=r.school_districts), property_ids)
+    except Exception:
+        logger.warning("school unknown lookup failed", exc_info=True)
+        return set()
+
+
 async def _hs_names(db: AsyncSession, keys) -> dict:
     """{key: "Downingtown High School East Campus"} for a Showcase's picked high schools (home_school_service)."""
     if not keys:
@@ -1231,6 +1247,7 @@ class CollectionsService:
             return []
 
         cities = to_string_list(answers_by_id.get("cities"))
+        townships = to_string_list(answers_by_id.get("townships"))
         school_districts = to_string_list(answers_by_id.get("school_districts"))
         counties = to_string_list(answers_by_id.get("county"))
         key_features = to_string_list(answers_by_id.get("key_features"))
@@ -1287,8 +1304,15 @@ class CollectionsService:
         min_price, max_price = sane(to_int(answers_by_id.get("budget_min")), 1, 500_000_000), sane(to_int(answers_by_id.get("budget_max")), 1, 500_000_000)
         if min_price and max_price and min_price > max_price:
             min_price, max_price = max_price, min_price
+        # Must-haves (owner, 11/19): the form's "Any must-haves?" (older forms: the key-features picks) - the AI stars
+        # the homes that have them all. Kept apart from the search; the caller saves them (showcase_smart_filter).
+        from app.services.showcase_smart_filter import clean_wants
+        wants = clean_wants(to_string_list(answers_by_id.get("must_haves")) or key_features)
         return {
             "cities": cities,
+            # only when the form asked (an older form without the question never wipes the agent's townships)
+            **({"townships": townships} if "townships" in answers_by_id else {}),
+            **({"_must_haves": wants} if wants else {}),
             "school_districts": school_districts,
             "county": ", ".join(counties) or None,
             "counties": counties,
@@ -1332,9 +1356,10 @@ class CollectionsService:
                 return None
 
             pref_fields = CollectionsService._preferences_from_showcase_form_answers(answers_by_id)
+            wants = pref_fields.pop("_must_haves", None)
             # "state" doesn't count: the form starts it on the agent's own state, so it's always there.
             if require_criteria and not any(pref_fields.get(k) for k in (
-                    "cities", "school_districts", "county", "counties", "min_price", "max_price", "min_beds", "search_polygon", "lat")):
+                    "cities", "townships", "school_districts", "county", "counties", "min_price", "max_price", "min_beds", "search_polygon", "lat")):
                 return None
             # Did they actually say what they want? (A note alone isn't a search, and neither is the state.)
             has_criteria = any(v for k, v in pref_fields.items() if k not in ("state", "special_features"))
@@ -1412,6 +1437,18 @@ class CollectionsService:
                 # Their link, in their inbox right away (not just on the thank-you page).
                 from app.services.showcase_digest_service import queue_showcase_ready
                 await queue_showcase_ready(db, collection.id)
+
+            if wants:
+                # Their must-haves star the homes that have them all - on the agent's AI usage, MLS plans only,
+                # with the same limits as the agent's own (300 homes, usage left) - save_wants checks them.
+                from app.utils.auth import tier_has_mls
+                if tier_has_mls(agent.plan_tier) or agent.is_admin:
+                    try:
+                        from app.services.showcase_smart_filter import save_wants
+                        await save_wants(db, collection.id, wants, user=agent)
+                    except Exception:
+                        logger.warning("form must-haves failed", exc_info=True)
+                        await db.rollback()
 
             matched_lead = await upsert_lead(
                 db,
@@ -1714,6 +1751,7 @@ class CollectionsService:
                     smart_lookup[row.property_id] = smart_line(row.ai_match)
             sold_folder, back_on_market = sold_folder_split(collection.properties, filed_at_lookup)
             ai_starred_ids = await _ai_starred_ids(db, collection.id, smart_lookup)
+            school_unknown = await _school_unknown_ids(db, collection.id, [p.id for p in collection.properties])
 
             # Calculate "new" threshold (properties added in last 7 days)
             now = datetime.now(timezone.utc)
@@ -1836,6 +1874,8 @@ class CollectionsService:
                     'aiStarred': prop.id in ai_starred_ids,
                     # "Appears to have: ..." - the smart filter found every must-have (owner, 11/09)
                     'smartMatch': smart_lookup.get(prop.id),
+                    # in a high-school search only because its school can't be told (owner, 11/19) - the card says so
+                    'schoolUnknown': prop.id in school_unknown,
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
                     'viewCount': interactions_lookup[prop.id].view_count if prop.id in interactions_lookup else 0,
                     # NEW for the buyer: in their Showcase less than NEW_PROPERTY_DAYS (the first fill
@@ -2267,6 +2307,7 @@ class CollectionsService:
                 smart_lookup[row.property_id] = smart_line(row.ai_match)
             sold_folder, back_on_market = sold_folder_split(collection.properties, filed_at_lookup)
             ai_starred_ids = await _ai_starred_ids(db, collection.id, smart_lookup)
+            school_unknown = await _school_unknown_ids(db, collection.id, [p.id for p in collection.properties])
 
             # Calculate "new" threshold (properties added in last 7 days)
             now = datetime.now(timezone.utc)
@@ -2412,6 +2453,8 @@ class CollectionsService:
                     'aiStarred': prop.id in ai_starred_ids,
                     # "Appears to have: ..." - the smart filter found every must-have (owner, 11/09)
                     'smartMatch': smart_lookup.get(prop.id),
+                    # in a high-school search only because its school can't be told (owner, 11/19) - the card says so
+                    'schoolUnknown': prop.id in school_unknown,
                     'viewed': prop.id in interactions_lookup,  # True if any interaction exists
                     'viewCount': interactions_lookup[prop.id].view_count if prop.id in interactions_lookup else 0,
                     'lastViewedAt': interactions_lookup[prop.id].last_viewed_at.isoformat() if prop.id in interactions_lookup and interactions_lookup[prop.id].last_viewed_at else None,

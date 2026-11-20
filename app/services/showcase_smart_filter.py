@@ -318,20 +318,41 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
         spent, tin, tout = 0.0, 0, 0
         ai_starred: Dict[str, str] = {}
         try:
-            got = dict(zip(read_wants, await asyncio.gather(*(reader.read(config, w, homes) for w in read_wants))))
-            for g in got.values():
+            # Cheapest way to the same stars (owner, 11/19): a star needs EVERY must-have, so the free place checks go
+            # first, then each AI must-have is read only for the homes that passed the ones before it; and each home's
+            # answer per must-have is kept, so changing the set only reads what's new.
+            per: Dict[str, Dict[str, dict]] = {}
+            for p, old in todo:
+                prev = old.get("per") if isinstance(old, dict) and isinstance(old.get("per"), dict) else {}
+                per[p.id] = {w.lower(): prev[w.lower()] for w in read_wants if w.lower() in prev}
+                for w in wants:
+                    if w in places:
+                        per[p.id][w.lower()] = place_verdict(p, places[w])
+            dead = lambda pid: any((x or {}).get("v") != "yes" for x in per[pid].values())  # noqa: E731
+            failed: set = set()
+            for w in read_wants:
+                need = [p for p in homes if p.id not in failed and not dead(p.id) and w.lower() not in per[p.id]]
+                if not need:
+                    continue
+                g = await reader.read(config, w, need)
                 spent += g["usd"]; tin += g["in"]; tout += g["out"]
-            failed = set().union(*(set(g["failed"]) for g in got.values()))
+                failed |= set(g["failed"])
+                for p in need:
+                    if p.id in set(g["read"]):
+                        x = g["verdicts"].get(p.id)
+                        per[p.id][w.lower()] = {"v": x["v"], "quote": x.get("quote") or "", "why": x.get("why") or ""} if x else {"v": "no"}
             now = datetime.now(timezone.utc)
             for p, old in todo:
                 if p.id in failed:
                     continue   # read again next time
-                vs = [place_verdict(p, places[w]) if w in places else got[w]["verdicts"].get(p.id) for w in wants]
+                vs = [per[p.id].get(w.lower()) for w in wants]
+                vs = [None if (x or {}).get("v") == "no" else x for x in vs]
                 v = _all_yes(vs)
                 found = [{"w": w, "q": (x or {}).get("quote") or "", "why": (x or {}).get("why") or "", **({"place": x["place"]} if x.get("place") else {})}
                          for w, x in zip(wants, vs) if x]
                 was_starred = isinstance(old, dict) and bool(old.get("starred"))
-                m = {"k": k, "v": v, "found": found if v == "yes" else [], "starred": was_starred, "at": now.isoformat()}
+                m = {"k": k, "v": v, "found": found if v == "yes" else [], "starred": was_starred, "at": now.isoformat(),
+                     "per": {wk: x for wk, x in per[p.id].items() if not (x or {}).get("place")}}
                 if v == "yes" and not was_starred:
                     row = (await db.execute(select(PropertyInteraction).where(and_(
                         PropertyInteraction.collection_id == collection_id, PropertyInteraction.property_id == p.id)))).scalar_one_or_none()
@@ -560,7 +581,9 @@ async def save_wants(db, collection_id: str, raw: Any, user=None) -> Dict[str, A
         st["phrases"] = {w: p for w, p in {**(old.get("phrases") or {}), **phrases}.items() if w in wants}
     if changed:
         st.pop("matched", None); st.pop("read", None)
-        await db.execute(text("update collection_properties set ai_match = null where collection_id = :c"), {"c": collection_id})
+        # each home's answer per must-have stays (run_for reuses it - only new must-haves are read); the line goes
+        await db.execute(text("update collection_properties set ai_match = case when ai_match ? 'per' "
+                              "then jsonb_build_object('per', ai_match->'per') else null end where collection_id = :c"), {"c": collection_id})
     await db.execute(text("update collection_preferences set ai_wants = cast(:v as jsonb) where id = :i"), {"v": json.dumps(st), "i": prefs.id})
     await db.commit()
     if wants:

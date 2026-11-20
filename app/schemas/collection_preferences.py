@@ -69,9 +69,9 @@ class CollectionPreferencesUpdate(BaseModel):
     address: Optional[str] = None
 
     cities: Optional[list[str]] = None
+    townships: Optional[list[str]] = None
     school_districts: Optional[list[str]] = None
     high_schools: Optional[list[str]] = None
-    school_districts: Optional[list[str]] = None
     county: Optional[str] = None
     counties: Optional[list[str]] = None
     state: Optional[str] = None
@@ -103,8 +103,8 @@ class CollectionPreferencesUpdate(BaseModel):
 class ShowcaseSelfServePreferencesUpdate(BaseModel):
     """Narrow, visitor-facing subset of CollectionPreferencesUpdate - the public
     showcase page lets a visitor tune their own location/price/beds/baths and towns/
-    school districts, but not the remaining agent-only fields (property type flags,
-    townships, sqft/acres, special features)."""
+    school districts and townships (owner, 11/19), but not the remaining agent-only fields (property type flags,
+    sqft/acres, special features, high schools, must-haves)."""
     address: Optional[str] = None
     lat: Optional[float] = None
     long: Optional[float] = None
@@ -116,6 +116,7 @@ class ShowcaseSelfServePreferencesUpdate(BaseModel):
     min_baths: Optional[float] = None
     max_baths: Optional[float] = None
     cities: Optional[list[str]] = None
+    townships: Optional[list[str]] = None
     school_districts: Optional[list[str]] = None
     # Still accepted so older pages don't 422, but the visitor save route drops it (and
     # show_match_score): only the agent changes which home matches are scored against.

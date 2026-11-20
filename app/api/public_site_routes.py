@@ -1393,7 +1393,10 @@ async def get_site_my_showcase(site_id: str, share_token: str, db: AsyncSession 
         "new_this_week": int(new),
         "criteria": {
             "cities": list(pref.cities or []) if pref else [],
+            "townships": list(pref.townships or []) if pref else [],
             "school_districts": list(pref.school_districts or []) if pref else [],
+            # their must-haves (the AI stars the homes that have them all) - shown so editing keeps them
+            "must_haves": list((pref.ai_wants or {}).get("wants") or []) if pref and isinstance(pref.ai_wants, dict) else [],
             "min_price": pref.min_price if pref else None, "max_price": pref.max_price if pref else None,
             "min_beds": pref.min_beds if pref else None, "min_baths": pref.min_baths if pref else None,
             "min_sqft": pref.min_sqft if pref else None,

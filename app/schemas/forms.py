@@ -3,7 +3,7 @@ from pydantic.alias_generators import to_camel
 from typing import Optional, List, Literal, Any
 from datetime import datetime
 
-QuestionType = Literal['short_text', 'long_text', 'email', 'phone', 'number', 'select', 'date', 'time', 'currency', 'multi_select', 'contact_group', 'statement', 'address_autocomplete', 'city_multiselect', 'school_district_multiselect', 'county_multiselect']
+QuestionType = Literal['short_text', 'long_text', 'email', 'phone', 'number', 'select', 'date', 'time', 'currency', 'multi_select', 'contact_group', 'statement', 'address_autocomplete', 'city_multiselect', 'school_district_multiselect', 'county_multiselect', 'township_multiselect', 'must_haves']
 # Question-page agent/property placement: 'top' = both together above the question, 'bottom' = both
 # together below the question, 'split' = property header above / agent footer below, 'split_reverse'
 # = agent header above / property footer below, 'integrated' = the whole flow (property, branding,

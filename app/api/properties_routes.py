@@ -654,22 +654,9 @@ async def search_townships(
     query: str = Query(..., min_length=1),
     db: AsyncSession = Depends(get_db)
 ):
-    """Autocomplete cities from the reference table"""
+    """Autocomplete townships from the reference table (filled from the listings) - "Upper Uwchlan, PA"."""
     try:
-        stmt = (
-            select(Township.name, Township.state)
-            .where(Township.name.ilike(f"%{query}%"))
-            .order_by(Township.name.asc())
-            .limit(10)
-        )
-
-        result = await db.execute(stmt)
-        townships = result.fetchall()
-
-        return {
-            "success": True,
-            "results": [f"{t[0]}, {t[1]}" for t in townships]
-        }
+        return {"success": True, "results": await _township_results(db, query)}
     except Exception as e:
         logger.error(f"City autocomplete failed: {e}")
         raise HTTPException(status_code=500, detail="Search failed")
@@ -872,6 +859,31 @@ async def search_cities_public(
         }
     except Exception as e:
         logger.error(f"Public city autocomplete failed: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
+
+
+def _nice_place(name: str) -> str:
+    """'UPPER UWCHLAN' -> 'Upper Uwchlan' (a township search box shows it like the towns box does)."""
+    return " ".join(w[:1].upper() + w[1:].lower() if not w.isdigit() else w for w in (name or "").split())
+
+
+async def _township_results(db: AsyncSession, query: str) -> list:
+    stmt = (select(Township.name, Township.state).where(Township.name.ilike(f"%{query}%"))
+            .order_by(Township.name.asc()).limit(10))
+    return [f"{_nice_place(t[0])}, {t[1]}" for t in (await db.execute(stmt)).fetchall()]
+
+
+@router.get("/townships/public", dependencies=[])
+async def search_townships_public(
+    query: str = Query(..., min_length=1, max_length=100),
+    db: AsyncSession = Depends(get_db)
+):
+    """Unauthenticated township autocomplete (owner, 11/19) - the Showcase forms, the IDX "Build your Showcase" and
+    the client's own "Change your search". Same reference table as /townships (filled from the listings)."""
+    try:
+        return {"success": True, "results": await _township_results(db, query)}
+    except Exception as e:
+        logger.error(f"Public township autocomplete failed: {e}")
         raise HTTPException(status_code=500, detail="Search failed")
 
 

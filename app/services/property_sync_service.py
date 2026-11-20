@@ -1343,8 +1343,7 @@ class PropertySyncService:
                 hs_key = await home_school_service.quick_key(prop["id"])
         if hs_key:
             stmt = stmt.where(or_(no_hs_picked, CollectionPreferences.high_schools.contains([hs_key])))
-        else:
-            stmt = stmt.where(no_hs_picked)
+        # school unknown: it still joins (inside the picked district - district_ok above), and its card says so
 
         # 2. Financial & Size Match (with Smart Exemptions)
         # Types that don't always have traditional bed/bath data (Exempt from numeric filters)

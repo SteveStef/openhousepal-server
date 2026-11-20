@@ -1947,6 +1947,9 @@ class HomeSchool(Base):
     bright_hs = Column(String, nullable=True)              # Bright's value when worked out (a change means redo)
     bright_norm = Column(String, nullable=True)
     checked_at = Column(DateTime(timezone=True), nullable=True)
+    quick = Column(Boolean, nullable=False, default=False)  # a new listing's quick look - the nightly pass redoes it
+
+    __table_args__ = (Index("ix_home_schools_spelling", "state", "district", "bright_norm"),)
 
 
 class City(Base):

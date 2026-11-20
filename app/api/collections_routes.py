@@ -61,6 +61,7 @@ class CreateCollectionWithPreferencesRequest(BaseModel):
     cities: Optional[list[str]] = None
     townships: Optional[list[str]] = None
     school_districts: Optional[list[str]] = None
+    high_schools: Optional[list[str]] = None   # only with school_districts (home_school_service)
     address: Optional[str] = None
     lat: Optional[float] = None
     long: Optional[float] = None
@@ -916,6 +917,7 @@ async def create_collection_with_preferences(
                 cities=request.cities or [],
                 townships=request.townships or [],
                 school_districts=request.school_districts or [],
+                high_schools=request.high_schools or [],
                 lat=latitude,
                 long=longitude,
                 address=request.address,  # Add missing address field
@@ -1684,7 +1686,7 @@ def _self_serve_payload(payload: dict, saved=None) -> dict:
         return saved.get(k) if isinstance(saved, dict) else getattr(saved, k, None) if saved is not None else None
     new_address = bool(payload.get('address')) and (
         saved is None or str(payload.get('address') or '').strip().lower() != str(_get('address') or '').strip().lower())
-    new_towns = bool(payload.get('cities')) and (saved is None or not _same_list(payload.get('cities'), _get('cities')))
+    new_towns = any(bool(payload.get(k)) and (saved is None or not _same_list(payload.get(k), _get(k))) for k in ('cities', 'townships'))
     if new_address or new_towns:
         payload['search_polygon'] = None
     # Areas add up (a circle OR a township OR a county), so a buyer who picks "within N miles"
@@ -1763,6 +1765,8 @@ def _describe_search_change(payload: dict) -> list:
         rows.append({"label": "Within", "value": f"{payload['diameter']:g} miles"})
     if "cities" in payload:
         rows.append({"label": "Towns", "value": ", ".join(_place(c).split(",")[0] for c in (payload.get("cities") or [])) or "Any"})
+    if "townships" in payload:
+        rows.append({"label": "Townships", "value": ", ".join(_place(c).split(",")[0] for c in (payload.get("townships") or [])) or "Any"})
     if "school_districts" in payload:
         rows.append({"label": "School districts", "value": ", ".join(_place(d) for d in (payload.get("school_districts") or [])) or "Any"})
     return rows

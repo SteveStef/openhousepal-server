@@ -74,6 +74,7 @@ def showcase_criteria_questions(gate_id: str, gate_values: List[str]) -> List[di
          "depends_on": dep, "section_title": "Your Home Search",
          "fields": [
              {"id": "cities", "type": "city_multiselect", "label": "Cities / Towns", "required": False},
+             {"id": "townships", "type": "township_multiselect", "label": "Townships", "required": False},
              {"id": "school_districts", "type": "school_district_multiselect", "label": "School Districts", "required": False},
              {"id": "county", "type": "county_multiselect", "label": "County", "required": False},
              {"id": "state", "type": "select", "label": "State", "required": False, "searchable": True, "options": US_STATE_NAMES},
@@ -104,7 +105,7 @@ def showcase_criteria_questions(gate_id: str, gate_values: List[str]) -> List[di
          ]},
         {"id": "home_type", "type": "multi_select", "label": "What type of property are you looking for?", "required": False, "locked": True,
          "depends_on": dep, "options": ["Single-family home", "Condo/Townhouse", "Multi-family", "Land", "Other"]},
-        {"id": "key_features", "type": "multi_select", "label": "What key features would you like?", "required": False, "locked": True,
+        {"id": "key_features", "type": "must_haves", "label": "Any must-haves? Up to 3 - we'll star the homes that have them all", "required": False, "locked": True,
          "depends_on": dep,
          "options": ["Pool", "Cul-de-sac", "First floor primary suite", "Garage", "Fenced yard", "Open floor plan", "Updated kitchen", "Waterfront", "Finished basement", "New construction"]},
     ]
@@ -547,6 +548,7 @@ DEFAULT_FORMS = {
              "depends_on": {"question_id": "has_agent", "values": ["No, I'm not working with an agent"]},
              "fields": [
                  {"id": "cities", "type": "city_multiselect", "label": "Cities / Towns", "required": False},
+                 {"id": "townships", "type": "township_multiselect", "label": "Townships", "required": False},
                  {"id": "school_districts", "type": "school_district_multiselect", "label": "School Districts", "required": False},
                  {"id": "county", "type": "county_multiselect", "label": "County", "required": False},
                  {"id": "state", "type": "select", "label": "State", "required": False, "searchable": True, "options": US_STATE_NAMES},
@@ -585,7 +587,7 @@ DEFAULT_FORMS = {
              "options": ["Single-family home", "Condo/Townhouse", "Multi-family", "Land", "Other"]},
             {"id": "notes", "type": "long_text", "label": "Anything else we should know?", "required": False, "locked": True,
              "depends_on": {"question_id": "has_agent", "values": ["No, I'm not working with an agent"]}},
-            {"id": "key_features", "type": "multi_select", "label": "What key features would you like?", "required": False, "locked": True,
+            {"id": "key_features", "type": "must_haves", "label": "Any must-haves? Up to 3 - we'll star the homes that have them all", "required": False, "locked": True,
              "depends_on": {"question_id": "has_agent", "values": ["No, I'm not working with an agent"]},
              "options": ["Pool", "Cul-de-sac", "First floor primary suite", "Garage", "Fenced yard", "Open floor plan", "Updated kitchen", "Waterfront", "Finished basement", "New construction"]},
         ],
@@ -667,6 +669,10 @@ def add_showcase_criteria(form_type: str, questions: List[dict]) -> Optional[Lis
     answer, which gates them), and drop their own questions those duplicate. Returns the new
     question list, or None when the form is already up to date. Used for the defaults below AND to
     upgrade forms agents created before this existed; safe to run on every load."""
+    if form_type == "showcase_request":
+        # its questions can't be edited - always today's (townships + must-haves reached it this way, 11/19)
+        want = [dict(q) for q in DEFAULT_FORMS["showcase_request"]["questions"]]
+        return want if list(questions or []) != want else None
     if form_type not in SHOWCASE_BUILDING_FORM_TYPES:
         return None
     out = [dict(q) for q in questions]
@@ -675,6 +681,19 @@ def add_showcase_criteria(form_type: str, questions: List[dict]) -> Optional[Lis
     if "sc_price_range" not in ids:
         out = _insert_showcase_block(form_type, out, ids)
         changed = True
+    # Forms made before 11/19: a Townships box in "Where are you looking?", and the key-features pick becomes the
+    # must-haves (the AI stars the homes that have them all).
+    for q in out:
+        if q.get("id") == "sc_area" and not any(f.get("id") == "townships" for f in q.get("fields") or []):
+            fields = [dict(f) for f in q.get("fields") or []]
+            at = next((i + 1 for i, f in enumerate(fields) if f.get("id") == "cities"), 0)
+            fields.insert(at, {"id": "townships", "type": "township_multiselect", "label": "Townships", "required": False})
+            q["fields"] = fields
+            changed = True
+        if q.get("id") == "key_features" and q.get("type") == "multi_select":
+            q["type"] = "must_haves"
+            q["label"] = "Any must-haves? Up to 3 - we'll star the homes that have them all"
+            changed = True
 
     if form_type == "how_can_i_help":
         i = next((n for n, q in enumerate(out) if q.get("id") == "buy_beds_baths"), None)
@@ -831,13 +850,7 @@ async def get_or_create_forms(db: AsyncSession, owner_id: str) -> List[AgentForm
             db.add(new_form)
             next_order += 1
 
-        try:
-            await db.commit()
-        except IntegrityError:
-            # Two requests made a brand-new agent's starter forms at the same moment (the Forms
-            # page / setup fire several calls at once) - the other one won; use its rows instead
-            # of answering with a 500 (Day 3 audit 11/18: uq_agent_forms_owner_slug).
-            await db.rollback()
+        await db.commit()
         result = await db.execute(select(AgentForm).where(AgentForm.owner_id == owner_id))
         all_forms = result.scalars().all()
 

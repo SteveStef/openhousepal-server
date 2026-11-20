@@ -89,7 +89,14 @@ async def test_search_keeps_only_that_school_including_blank_listings():
         assert 0 < len(east_homes) < len(all_homes)
         keys = dict((await db.execute(text("SELECT property_id, hs_key FROM home_schools WHERE property_id = ANY(:ids)"),
                                       {"ids": [p.id for p in east_homes]})).all())
-        assert all(keys.get(p.id) == east["key"] for p in east_homes)
+        # East homes, plus homes whose school can't be told (kept, marked "School unknown") - never a West home
+        assert all(keys.get(p.id) in (east["key"], None) for p in east_homes)
+        assert any(keys.get(p.id) == east["key"] for p in east_homes)
+        unknown = await hs.unknown_school_ids(db, only, [p.id for p in east_homes])
+        assert unknown == {p.id for p in east_homes if keys.get(p.id) is None}
+        # a school alone (no district) never filters - it would pull in every unknown home anywhere
+        no_district = SimpleNamespace(**{**base, "high_schools": [east["key"]]})
+        assert hs.search_filter(no_district) is None
         # the count the editor shows agrees with the homes it gets
         n = await property_service.get_properties_count_by_preferences(db, only)
         assert abs(n - len(east_homes)) <= max(2, len(east_homes) // 20)

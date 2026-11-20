@@ -564,12 +564,22 @@ async def _p_new_showcase(db, user, a):
     quiet = a.get("client_emails") is False
     body = {"name": f"{name}'s Showcase", "visitor_name": name, "visitor_email": email, "visitor_phone": _s(a.get("client_phone")),
             "visiting_reason": "buying", "has_agent": "no", "email_client": send and not quiet, **search}
+    # Must-haves right away (owner, 11/19: every way a Showcase is made can carry them) - same rules as set_showcase_must_haves
+    from app.services.showcase_smart_filter import clean_wants, place_wants
+    from app.utils.auth import tier_has_mls
+    wants = clean_wants(a.get("must_haves"))
+    if wants:
+        if not (tier_has_mls(user.plan_tier) or user.is_admin):
+            raise ActionError("Must-haves read MLS listings - they're on the MLS plans. Make it without them?")
+        free = await place_wants(db, wants)
+        lines.append(f"Must-haves: {', '.join(wants)} - homes that have all of them get the Recommended star"
+                     + (" (towns are checked free; the rest use a little AI usage)" if len(free) < len(wants) else " (checked free)"))
     lines = [f"Client: {name} ({email})"] + lines + ["Also adds them to your leads"]
     if quiet:
         lines.append("No emails to them for now - turn their emails on in the Showcase whenever you're ready")
     elif not send:
         lines.append("No welcome email now; they get new matches by email each day")
-    return Prepared(f"Make a Showcase for {name}", lines, {"body": body, "quiet": quiet},
+    return Prepared(f"Make a Showcase for {name}", lines, {"body": body, "quiet": quiet, "wants": wants},
                     warning=f"This emails {name} their Showcase right away." if send and not quiet else None)
 
 
@@ -591,6 +601,8 @@ async def _r_new_showcase(db, user, p):
     cid = (out or {}).get("id")
     if cid and p.get("quiet"):
         await _run_route(user, "PATCH", f"/collections/{cid}/notifications", {"notify_visitor": False, "notify_agent": True})
+    if cid and p.get("wants"):
+        await _run_route(user, "PUT", f"/collections/{cid}/smart-filter", {"wants": p["wants"]})
     share = None
     if cid:
         from app.services.showcase_links import showcase_path
@@ -600,7 +612,10 @@ async def _r_new_showcase(db, user, p):
 
 _simple("create_showcase", "Make a new Showcase (saved home search that updates itself) for a client - also adds them as a lead. Needs at least one town/township/school district. email_client=true emails them their Showcase now. client_emails=false when they say not to email the client (no emails at all until the agent turns them on; otherwise they get daily new-match emails).",
         _obj({"client_name": {"type": "string"}, "client_email": {"type": "string"}, "client_phone": {"type": "string"}, "email_client": {"type": "boolean"}, "client_emails": {"type": "boolean"},
-              "second_showcase": {"type": "boolean", "description": "Only when the agent says they want a second, separate Showcase for a client who already has one."}, **_SEARCH_PROPS},
+              "second_showcase": {"type": "boolean", "description": "Only when the agent says they want a second, separate Showcase for a client who already has one."},
+              "must_haves": {"type": "array", "items": {"type": "string"}, "maxItems": 3,
+                             "description": "Up to 3 things every starred home should have ('Pool', 'In Uwchlan Township') - wishes, not filters."},
+              **_SEARCH_PROPS},
              ["client_name"]), _p_new_showcase, _r_new_showcase, SHOWCASE)
 
 
@@ -711,7 +726,12 @@ async def _real_high_schools(db, search: dict, lines: list, districts: list) -> 
     asked = [x for x in (search.get("high_schools") or []) if str(x).strip()]
     if "high_schools" not in search and not districts:
         return
-    opts = await _district_schools(db, districts) if districts else []
+    if asked and not districts:
+        # a school only inside a district (owner, 11/19): otherwise every "school unknown" home anywhere would come in
+        raise ActionError("Which school district is that high school in? A high-school search keeps one district's homes.")
+    every = await _district_schools(db, districts) if districts else []
+    opts = [o for o in every if o["key"] != "unknown"]
+    unknown = next((o["homes"] for o in every if o["key"] == "unknown"), 0)
     keys, said = [], []
     for raw in asked:
         if str(raw).startswith(("nces:", "txt:")):
@@ -743,6 +763,9 @@ async def _real_high_schools(db, search: dict, lines: list, districts: list) -> 
         search["high_schools"] = keys
         lines[:] = [l for l in lines if not l.startswith("High school")]
         lines.append(("High school: " + "; ".join(said)) if said else "High school: any")
+        if keys and unknown:
+            lines.append(f"Plus {unknown} home{'s' if unknown != 1 else ''} in the district whose school can't be told - they stay in, "
+                         "marked “School unknown”, so nothing is missed")
     if not keys and len(opts) >= 2:
         parts = "; ".join(f"{o['name']}, {o['homes']} for sale" for o in opts[:6])
         lines.append(f"{', '.join(tidy_caps(str(d).split(',')[0]) for d in districts)} has {len(opts)} high schools ({parts}) - "
