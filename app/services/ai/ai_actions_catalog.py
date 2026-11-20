@@ -505,6 +505,9 @@ _SEARCH_PROPS = {
     "cities": {"type": "array", "items": {"type": "string"}, "description": "Towns as people say them (Bryn Mawr, Gladwyne, Wayne) - almost always this one."},
     "townships": {"type": "array", "items": {"type": "string"}, "description": "Only a township by its township name (Lower Merion, Radnor) - never a town like Bryn Mawr."},
     "school_districts": {"type": "array", "items": {"type": "string"}},
+    "high_schools": {"type": "array", "items": {"type": "string"}, "description": "Only homes going to these high schools, as people say them "
+                     "('Downingtown East', 'Conestoga') - for a district's side or one school. Keeps listings that leave the school blank too "
+                     "(placed by the government school map / nearby homes). Give the district as well. [] = any high school."},
     "is_single_family": {"type": "boolean"}, "is_town_house": {"type": "boolean"}, "is_condo": {"type": "boolean"}, "is_multi_family": {"type": "boolean"},
 }
 
@@ -551,6 +554,7 @@ async def _p_new_showcase(db, user, a):
         raise ActionError("Which towns, townships or school districts should their search cover?")
     await _towns_not_townships(db, search, lines)
     await _real_districts(db, search, lines)
+    await _real_high_schools(db, search, lines, search.get("school_districts") or [])
     count_line = await _match_preview(db, search)
     if count_line:
         lines.append(count_line.replace("After this change: ", "To start: "))
@@ -621,34 +625,6 @@ async def _towns_not_townships(db, search: dict, lines: list) -> None:
 _SIDE_WORDS = re.compile(r"\b(east|west|north|south|central)\b", re.I)
 
 
-async def _side_townships(db, district: str) -> dict:
-    """{"East": ["Uwchlan", "Upper Uwchlan", ...], "West": [...]} - the townships of a district whose listings (every
-    listing ever, sold ones too) name one side's high school at least 80% of the time, 20+ such listings. A plain
-    township search then keeps only that side - exact, even for a listing that leaves its high school blank
-    (owner, 11/19: Lisa's "DASD East" - about half the listings in her range had no high school)."""
-    rows = (await db.execute(select(Property.township, Property.high_school, func.count()).where(
-        Property.school_district_name == district, Property.township.isnot(None), Property.high_school.isnot(None))
-        .group_by(Property.township, Property.high_school))).all()
-    per: dict = {}
-    for twp, hs, n in rows:
-        s = next((m.group(1).title() for m in _SIDE_WORDS.finditer(hs or "") if m.group(1).upper() not in district.upper()), None)
-        if s:
-            per.setdefault(tidy_caps(twp), {}).setdefault(s, 0)
-            per[tidy_caps(twp)][s] += n
-    out: dict = {}
-    for twp, sides in sorted(per.items(), key=lambda kv: -sum(kv[1].values())):
-        total = sum(sides.values())
-        side, n = max(sides.items(), key=lambda kv: kv[1])
-        if total < 20:
-            continue
-        if n / total >= 0.8:
-            out.setdefault(side, []).append(twp)
-        elif n / total >= 0.55:
-            # split between high schools, mostly one side - named apart, never searched as if it were one side
-            out.setdefault("_split", []).append(f"{twp} (mostly {side})")
-    return out
-
-
 async def _real_districts(db, search: dict, lines: list) -> None:
     """School districts as the MLS names them (owner, 11/19: the chat saved "DASD East" - no listing has that
     district, so the Showcase would come back empty). "DASD" / "Downingtown Area SD" -> "DOWNINGTOWN AREA"; a
@@ -658,7 +634,7 @@ async def _real_districts(db, search: dict, lines: list) -> None:
     names = list(search.get("school_districts") or [])
     if not names:
         return
-    out, notes = [], []
+    out, notes, side_picks = [], [], []
     all_d = None
     for raw in names:
         # The whole name first: "West Chester Area", "North Penn", "Central Bucks" have a side word in their real name.
@@ -695,45 +671,82 @@ async def _real_districts(db, search: dict, lines: list) -> None:
         if found not in out:
             out.append(found)
         if side:
-            schools = (await db.execute(select(Property.high_school, func.count()).where(
-                Property.school_district_name == found, Property.high_school.ilike(f"%{side.group(1)}%"))
-                .group_by(Property.high_school).order_by(func.count().desc()).limit(1))).first()
-            school = tidy_caps(schools[0]) if schools else None
-            st = await _side_townships(db, found)
-            twps = st.get(side.group(1).title()) or []
-            split = [s for s in st.get("_split", []) if f"mostly {side.group(1).title()}" in s]
-            notes.append(f"“{side.group(1).title()}” isn't its own district, so this searches all of {tidy_caps(found)}"
-                         + (f". Its {side.group(1).lower()}-side townships (by their listings' high school): {', '.join(twps)} - "
-                            "search those to keep only that side (exact, even when a listing leaves the school out)" if twps else "")
-                         + (f". Split between schools: {', '.join(split)} - add it too and star the high school to tell them apart" if split else "")
-                         + (f". Or, to just star the homes zoned for {school}, make it a must-have" if school else ""))
-    # A district with more than one high school: name them, so a side ("DASD East") is one must-have away even
-    # when the district was asked for by its plain name (owner, 11/19: "I wish the AI was smart enough to make that
-    # recommendation").
-    for d in out:
-        if any(tidy_caps(d) in n for n in notes):
-            continue
-        rows = (await db.execute(select(Property.high_school, func.count()).where(
-            Property.school_district_name == d, Property.high_school.isnot(None), Property.home_status.in_(FOR_SALE))
-            .group_by(Property.high_school).order_by(func.count().desc()).limit(12))).all()
-        # Listings spell one school several ways ("DHS EAST", "DOWNINGTOWN HS EAST CAMPUS", "RADNOR H") - only real
-        # sides count (East / West...), each once; a district whose name has the side word ("West Chester") isn't split by it.
-        groups: dict = {}
-        for h, n in rows:
-            s = next((m for m in _SIDE_WORDS.finditer(h or "") if m.group(1).upper() not in d.upper()), None)
-            if not s:
-                continue
-            name, total = groups.get(s.group(1).title(), (tidy_caps(h), 0))
-            groups[s.group(1).title()] = (name, total + n)
-        if len(groups) >= 2:
-            twps = await _side_townships(db, d)
-            parts = [f"{k}: {name}, {n} for sale" + (f" - townships {', '.join(twps[k])}" if twps.get(k) else "") for k, (name, n) in groups.items()]
-            notes.append(f"{tidy_caps(d)} has {len(groups)} high schools ({'; '.join(parts)})"
-                         + (f"; split between them: {', '.join(twps['_split'])}" if twps.get("_split") else "")
-                         + " - to keep one side, search its townships; to just favor one, make its high school a must-have (starred)")
+            side_picks.append((found, side.group(1).title()))
     out = [tidy_caps(d) for d in out]   # "Downingtown Area", as the search editor shows it (matching ignores case)
     search["school_districts"] = out
     lines[:] = [l for l in lines if not l.startswith("School districts:")] + [f"School districts: {', '.join(tidy_caps(d) for d in out)}"] + notes
+    if side_picks:
+        # "DASD East" = Downingtown Area, East high school only (owner, 11/19 - Lisa)
+        search["high_schools"] = list(search.get("high_schools") or []) + [f"{side} ({tidy_caps(d)})" for d, side in side_picks]
+
+
+async def _district_schools(db, districts: list) -> list:
+    """The high schools of the for-sale homes in these districts (home_school_service) - worked out right now for a
+    district the background pass hasn't reached yet."""
+    from app.services import home_school_service as hs
+    got = await hs.schools_in(db, districts)
+    if got or not districts:
+        return got
+    for d in districts:
+        name = str(d).split(",")[0].strip()
+        rows = (await db.execute(select(Property.state, Property.school_district_name).where(
+            Property.school_district_name.ilike(f"%{name}%"), Property.home_status.in_(hs.FOR_SALE)).distinct().limit(6))).all()
+        for st, dn in rows:
+            if st and dn:
+                await hs.fill_unit(db, st, hs.norm_district(dn))
+    return await hs.schools_in(db, districts)
+
+
+_HS_FILLER = re.compile(r"\b(high|school|hs|senior|sr|campus|area|sd|district|the)\b", re.I)
+_HS_SIDES = {"east", "west", "north", "south", "central"}
+
+
+def _school_words(s: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9]+", _HS_FILLER.sub(" ", (s or "").lower())) if len(w) > 1}
+
+
+async def _real_high_schools(db, search: dict, lines: list, districts: list) -> None:
+    """High schools as the listings name them -> their keys (owner, 11/19: "search only populates homes that have or
+    most likely have Downingtown East"). A district with several high schools is named on the card either way."""
+    asked = [x for x in (search.get("high_schools") or []) if str(x).strip()]
+    if "high_schools" not in search and not districts:
+        return
+    opts = await _district_schools(db, districts) if districts else []
+    keys, said = [], []
+    for raw in asked:
+        if str(raw).startswith(("nces:", "txt:")):
+            hit = next((o for o in opts if o["key"] == raw), None)
+        else:
+            want = _school_words(re.sub(r"\(.*?\)", " ", str(raw)))
+            dist = _school_words(" ".join(re.findall(r"\((.*?)\)", str(raw))))
+            side = want & _HS_SIDES
+            scored = []
+            for o in opts:
+                have = _school_words(o["name"])
+                if side and not side <= have:
+                    continue
+                overlap = len((want - side) & have) + len(side)
+                if overlap or (side and dist & have):
+                    scored.append((overlap, o["homes"], o))
+            hit = max(scored, key=lambda t: (t[0], t[1]))[2] if scored else None
+        if not hit:
+            names = "; ".join(f"{o['name']} ({o['homes']} for sale)" for o in opts[:8])
+            raise ActionError(f"I couldn't match the high school “{raw}”" + (f" - the ones with homes for sale there: {names}" if names else
+                              " - which school district is it in?") + ".")
+        if hit["key"] not in keys:
+            keys.append(hit["key"])
+            placed = hit["homes"] - hit["named"]
+            said.append(f"{hit['name']} - {hit['homes']} for sale"
+                        + (f" ({placed} of them don't name a school in the listing, so the government school map and the homes around "
+                           "them place them)" if placed else ""))
+    if "high_schools" in search:
+        search["high_schools"] = keys
+        lines[:] = [l for l in lines if not l.startswith("High school")]
+        lines.append(("High school: " + "; ".join(said)) if said else "High school: any")
+    if not keys and len(opts) >= 2:
+        parts = "; ".join(f"{o['name']}, {o['homes']} for sale" for o in opts[:6])
+        lines.append(f"{', '.join(tidy_caps(str(d).split(',')[0]) for d in districts)} has {len(opts)} high schools ({parts}) - "
+                     "to keep only one, set high_schools (it keeps homes whose listing leaves the school out, too)")
 
 
 async def _match_preview(db, search: dict, pref=None, collection_id: Optional[str] = None) -> Optional[str]:
@@ -780,6 +793,11 @@ async def _p_showcase_search(db, user, a):
         raise ActionError("What should change in their search?")
     await _towns_not_townships(db, search, lines)
     await _real_districts(db, search, lines)
+    pref0 = (await db.execute(select(CollectionPreferences).where(CollectionPreferences.collection_id == c.id))).scalar_one_or_none()
+    # A new district set clears high schools picked for the old one (they'd leave no homes)
+    if "school_districts" in search and "high_schools" not in search and getattr(pref0, "high_schools", None):
+        search["high_schools"] = []
+    await _real_high_schools(db, search, lines, search.get("school_districts") or list(getattr(pref0, "school_districts", None) or []))
     # Towns replace a distance / drawn-area search - left in place, the old circle adds its homes on
     # top (owner, 10/31: Bryn Mawr + Gladwyne showed Penn Valley, Narberth, Bala Cynwyd, Ardmore).
     if any(k in search for k in ("cities", "townships")):
@@ -812,9 +830,12 @@ async def _r_showcase_search(db, user, p):
     return {"message": f"Search updated{f' - {n} homes match now' if n is not None else ''}.", "link": f"/showcases?showcase={p['collection_id']}"}
 
 _simple("update_showcase_search", "Change a Showcase's search (price, beds, baths, size, year built, towns, types). Only the fields given change. Use collection_id from list_showcases. "
-        "The search can't filter on words in a listing, a feature or a school - for those use set_showcase_must_haves (it stars the homes that have them), "
+        "The search can't filter on words in a listing or a feature - for those use set_showcase_must_haves (it stars the homes that have them), "
         "and say so in the same reply instead of saying it can't be done. Keep 'if possible' / 'ideally' wishes out of the search (they'd hide homes) - "
-        "make them must-haves. For a district's side or a school ('DASD East'), search the whole district and make the high school a must-have. "
+        "make them must-haves. For a district's side or one high school ('DASD East', 'only Conestoga'), set school_districts AND high_schools - "
+        "it keeps only homes going to that school, including listings that leave the school out (placed by the government school map and the "
+        "homes around them; the card says how many). A preferred town inside it ('if possible Uwchlan') is a must-have, which stars those homes "
+        "with a plain 'In Uwchlan Township' line (free, no AI reading) - never a town filter that hides the rest. "
         "Always say in your reply how many homes it will hold after the change (the card's 'After this change' line); when that's only a few, "
         "say so and suggest the wider search with must-haves starring the preferred town or school.",
         _obj({"collection_id": {"type": "string"}, **_SEARCH_PROPS}, ["collection_id"]), _p_showcase_search, _r_showcase_search, SHOWCASE)
@@ -841,28 +862,34 @@ async def _showcase_of(db, user, a) -> Collection:
 async def _p_showcase_must_haves(db, user, a):
     """Must-haves (owner, 11/19 - Lisa wanted "DASD East only"): the AI reads every home in the Showcase and stars the
     ones that have them all, like the search editor's Must-haves box. Same route, same limits, same AI usage."""
-    from app.services.showcase_smart_filter import MAX_WANTS, clean_wants, estimate, showcase_home_count, state_of
+    from app.services.showcase_smart_filter import MAX_WANTS, clean_wants, estimate, place_wants, showcase_home_count, state_of
     from app.utils.auth import tier_has_mls
     c = await _showcase_of(db, user, a)
     if not (tier_has_mls(user.plan_tier) or user.is_admin):
         raise ActionError("Must-haves read MLS listings - they're on the MLS plans.")
     wants = clean_wants(a.get("wants"))
     if not wants:
-        raise ActionError(f"What should every starred home have? Up to {MAX_WANTS} things, like \"Pool\" or \"Downingtown East high school\".")
+        raise ActionError(f"What should every starred home have? Up to {MAX_WANTS} things, like \"Pool\" or \"In Uwchlan Township\".")
     pref = (await db.execute(select(CollectionPreferences).where(CollectionPreferences.collection_id == c.id))).scalar_one_or_none()
     had = clean_wants(state_of(pref).get("wants")) if pref is not None else []
     n = await showcase_home_count(db, c.id)
-    est = await estimate(db, user, n, len(wants))
-    if n > est["cap"]:
+    places = await place_wants(db, wants)
+    read = [w for w in wants if w not in places]
+    est = await estimate(db, user, n, max(1, len(read)))
+    if read and n > est["cap"]:
         raise ActionError(f"{_sc_name(c)} has {n} homes - the AI reads every one, so narrow the search to {est['cap']} or fewer first.")
-    if not est["enough"]:
+    if read and not est["enough"]:
         raise ActionError("Not enough AI usage left this month to read those homes - it resets on your billing day.")
     lines = [f"Must-haves: {', '.join(wants)}"]
+    if places:
+        lines.append(f"{' / '.join(places[w]['say'] for w in places)}: checked from each listing's own township or town - exact, free, "
+                     "and the star line says it plainly")
     if had and [w.lower() for w in had] != [w.lower() for w in wants]:
         lines.append(f"Replaces: {', '.join(had)}")
     lines += ["Homes that have all of them get the Recommended star and a line saying so; the rest stay, without it",
-              (f"Reads {n} home{'s' if n != 1 else ''}" + (f" · uses ~{est['usage_percent']}% of AI usage" if est.get("usage_percent") else ""))
-              if n else "No homes for sale in it right now - new ones are read as they arrive"]
+              ((f"Reads {n} home{'s' if n != 1 else ''}" + (f" · uses ~{est['usage_percent']}% of AI usage" if est.get("usage_percent") else ""))
+               if read else f"Checks {n} home{'s' if n != 1 else ''} · no AI usage")
+              if n else "No homes for sale in it right now - new ones are checked as they arrive"]
     return Prepared(f"Star homes in {_sc_name(c)}", lines, {"collection_id": c.id, "body": {"wants": wants}},
                     warning=f"{c.visitor_name or 'Your client'} sees the stars too.")
 
@@ -875,10 +902,12 @@ async def _r_showcase_must_haves(db, user, p):
             "link": f"/showcases?showcase={p['collection_id']}"}
 
 _simple("set_showcase_must_haves",
-        "Set a Showcase's must-haves (up to 3, e.g. 'Pool', 'First-floor primary bedroom', 'Downingtown East high school', 'Mentions east side'): "
+        "Set a Showcase's must-haves (up to 3, e.g. 'Pool', 'First-floor primary bedroom', 'In Uwchlan Township'): "
         "the AI reads every home in it and stars the ones that have ALL of them (Recommended star + a line under the address - the client sees it); "
         "the others stay, unstarred. Use it whenever they want homes narrowed by something the search can't filter - words in the description, "
-        "features, a school (listings carry their elementary / middle / high school, so a school must-have is exact). It replaces the must-haves "
+        "features, a preferred town ('In Uwchlan Township' - checked from the listing's own township, free, and the line says it plainly). "
+        "To keep only one high school, use update_showcase_search high_schools instead (a must-have can't see a school the listing leaves out). "
+        "It replaces the must-haves "
         "already there - pass every one to keep. Uses a little AI usage (the card shows how much). Use collection_id from list_showcases, or the lead_id of the person.",
         _obj({"collection_id": {"type": "string"}, "lead_id": {"type": "string"}, "wants": {"type": "array", "items": {"type": "string"}, "maxItems": 3}}, ["wants"]),
         _p_showcase_must_haves, _r_showcase_must_haves, SHOWCASE)

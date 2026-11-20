@@ -7,6 +7,7 @@ from sqlalchemy import select, and_, or_, func, case
 from app.schemas.collection_preferences import CollectionPreferencesBase as CollectionPreferencesSchema
 from app.models.database import Property
 from app.services import mls_mirror
+from app.services import home_school_service
 from app.models.property import PropertySummaryResponse, PropertyDetailResponse
 from app.services.google_geocoding_service import ensure_google_rooftop_geocode
 from app.utils.same_home import dedupe_same_homes
@@ -451,6 +452,10 @@ class PropertyService:
         # the whole district.
         if school_district_filters:
             filters.append(or_(*school_district_filters))
+        # High schools narrow too (owner, 11/19) - Bright's answer or worked out (home_school_service).
+        _hs = home_school_service.search_filter(getattr(preferences, 'high_schools', None))
+        if _hs is not None:
+            filters.append(_hs)
 
         # 2. Status Filtering
         # Match exact BRIGHT statuses
@@ -746,6 +751,9 @@ class PropertyService:
         # School districts narrow the area - same as get_properties_by_preferences above.
         if school_district_filters:
             filters.append(or_(*school_district_filters))
+        _hs = home_school_service.search_filter(getattr(preferences, 'high_schools', None))
+        if _hs is not None:
+            filters.append(_hs)
 
         # 2. Status Filtering
         filters.append(or_(

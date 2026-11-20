@@ -18,6 +18,7 @@ class CollectionPreferencesBase(BaseModel):
     cities: list[str] = []
     townships: list[str] = []
     school_districts: list[str] = []
+    high_schools: list[str] = []
     county: Optional[str] = None
     counties: list[str] = []
     state: Optional[str] = None
@@ -68,7 +69,8 @@ class CollectionPreferencesUpdate(BaseModel):
     address: Optional[str] = None
 
     cities: Optional[list[str]] = None
-    townships: Optional[list[str]] = None
+    school_districts: Optional[list[str]] = None
+    high_schools: Optional[list[str]] = None
     school_districts: Optional[list[str]] = None
     county: Optional[str] = None
     counties: Optional[list[str]] = None

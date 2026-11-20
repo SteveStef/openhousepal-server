@@ -223,8 +223,10 @@ async def _ai_starred_ids(db, collection_id: str, smart_lookup: dict | None = No
     phrases = st.get("phrases") if isinstance(st.get("phrases"), dict) else {}
     for line in (smart_lookup or {}).values():
         if line and line.get("wants"):
-            its = [(phrases.get(w) or {}).get("it") for w in line["wants"]]
-            if all(its):
+            # places ("In Uwchlan Township") are facts the card says plainly - only the rest "appears to"
+            read = [w for w in line["wants"] if w not in (line.get("place_wants") or [])]
+            its = [(phrases.get(w) or {}).get("it") for w in read]
+            if read and all(its):
                 line["say"] = join_clauses(its)
             # the Send sheet's "Mention the must-haves" line: "This one is on a cul-de-sac." / "All 3 are ..."
             ones = [(phrases.get(w) or {}).get("one") for w in line["wants"]]
@@ -234,6 +236,19 @@ async def _ai_starred_ids(db, collection_id: str, smart_lookup: dict | None = No
                 line["many"] = join_clauses(manys)
     v = st.get("ai_starred")
     return set(v) if isinstance(v, dict) else set()
+
+
+async def _hs_names(db: AsyncSession, keys) -> dict:
+    """{key: "Downingtown High School East Campus"} for a Showcase's picked high schools (home_school_service)."""
+    if not keys:
+        return {}
+    try:
+        from app.services.home_school_service import names_for
+        async with db.begin_nested():    # a failure here must not spoil the rest of the page's reads
+            return await names_for(db, list(keys))
+    except Exception:
+        logger.warning("high school names failed", exc_info=True)
+        return {}
 
 
 async def engaged_home_ids(db: AsyncSession, collection_id: str, keep_viewed: bool = False) -> set:
@@ -451,6 +466,7 @@ class CollectionsService:
                         "cities": collection.preferences.cities,
                         "townships": collection.preferences.townships,
                         "school_districts": collection.preferences.school_districts,
+                        "high_schools": collection.preferences.high_schools,
                         "diameter": collection.preferences.diameter,
                         "special_features": collection.preferences.special_features,
                         "ai_wants": collection.preferences.ai_wants,
@@ -1027,6 +1043,8 @@ class CollectionsService:
                     "cities": collection.preferences.cities,
                     "townships": collection.preferences.townships,
                     "school_districts": collection.preferences.school_districts,
+                    "high_schools": collection.preferences.high_schools,
+                    "high_school_names": await _hs_names(db, collection.preferences.high_schools),
                     "diameter": collection.preferences.diameter,
                     "special_features": collection.preferences.special_features,
                     "ai_wants": collection.preferences.ai_wants,
@@ -1903,6 +1921,8 @@ class CollectionsService:
                     'cities': collection.preferences.cities,
                     'townships': collection.preferences.townships,
                     'school_districts': collection.preferences.school_districts,
+                    'high_schools': collection.preferences.high_schools,
+                    'high_school_names': await _hs_names(db, collection.preferences.high_schools),
                     'diameter': collection.preferences.diameter,
                     'special_features': collection.preferences.special_features,
                     'ai_wants': collection.preferences.ai_wants,

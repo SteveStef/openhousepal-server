@@ -980,7 +980,7 @@ Every follow-up's calendar event has links:
 1. Tap **Create** (or **+ Create a Showcase** when you have none).
 2. **About them:** Client's full name, Email, Phone (optional), Showcase name (filled in from the client's name - change it to anything). Switch **Email the client their Showcase** on to send them their link, what it looks for and a few homes as soon as you create it.
 3. Tap **Continue**, then answer **Why is the client looking?** (Looking to buy soon, Just browsing, Interested in area, Investment opportunity, Curious about property) and **Does the client have an agent?**
-4. Tap **Set the search area** and set the search on the map: price, Bedrooms & baths, Size, lot & age, **Towns**, **School districts**, **Counties**, a **Search center** with a radius, or **Draw a search area**; Property type; **Match score** ("Showing the % Match badge"); and a **Comparing to** home.
+4. Tap **Set the search area** and set the search on the map: price, Bedrooms & baths, Size, lot & age, **Towns**, **School districts** (then **High schools**: tap one to keep only homes going to it - homes whose listing leaves the school out are placed by the government school map and nearby homes), **Counties**, a **Search center** with a radius, or **Draw a search area**; Property type; **Match score** ("Showing the % Match badge"); and a **Comparing to** home.
 5. Tap **Create Showcase**. The client is added to your Leads.
 
 ### Open one Showcase

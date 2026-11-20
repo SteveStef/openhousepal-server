@@ -138,7 +138,7 @@ async def test_must_haves_card():
 
 
 @pytest.mark.asyncio
-async def test_district_names_resolve_and_sides_become_must_have_hint():
+async def test_district_names_resolve_and_sides_become_a_high_school():
     """'DASD East' isn't a district (11/19 replay saved it and the Showcase would have come back empty)."""
     import app.main  # noqa: F401
     from sqlalchemy import select
@@ -154,8 +154,8 @@ async def test_district_names_resolve_and_sides_become_must_have_hint():
             await _real_districts(db, search, lines)
             assert search["school_districts"] == ["Downingtown Area"], (raw, search)
             assert "School districts: Downingtown Area" in lines
-            side = [l for l in lines if "isn't its own district" in l]
-            assert bool(side) == ("East" in raw), (raw, lines)
+            # a side is the district plus that side's high school (resolved by _real_high_schools)
+            assert bool(search.get("high_schools")) == ("East" in raw), (raw, search)
         with pytest.raises(ActionError):
             await _real_districts(db, {"school_districts": ["Zzyzx Unified"]}, [])
 
@@ -176,4 +176,4 @@ async def test_side_words_inside_real_district_names():
             search, lines = {"school_districts": [raw]}, []
             await _real_districts(db, search, lines)
             assert search["school_districts"] == [want], (raw, search)
-            assert any("isn't its own district" in l for l in lines) == side, (raw, lines)
+            assert bool(search.get("high_schools")) == side, (raw, search)

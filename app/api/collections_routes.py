@@ -1862,6 +1862,11 @@ async def update_shared_collection_preferences(
                 detail="This showcase needs either a search address or an area to search"
             )
 
+        # High schools the agent picked belong to the districts picked then - a client who changes the
+        # districts gets the whole of the new ones (the schools would otherwise leave no homes).
+        if ("school_districts" in payload and getattr(collection_obj.preferences, "high_schools", None)
+                and sorted(payload.get("school_districts") or []) != sorted(collection_obj.preferences.school_districts or [])):
+            payload["high_schools"] = []
         # What they actually changed (read before the save overwrites it) - the window sends every field.
         really_changed = _only_changed(payload, collection_obj.preferences)
         update_result = await CollectionPreferencesService.update_preferences_and_refresh_properties(
@@ -2270,7 +2275,7 @@ async def rebuild_from_open_house(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That open house has no address to build a search from.")
     # As if it had been made from that open house: its circle, price and home type - not a town list,
     # a drawn area or another home to compare with that the search had before.
-    for f in ("cities", "townships", "school_districts", "counties", "search_polygon", "compare_property_listing_key"):
+    for f in ("cities", "townships", "school_districts", "high_schools", "counties", "search_polygon", "compare_property_listing_key"):
         setattr(prefs, f, None)
     prefs.show_match_score = True
     result = await CollectionsService.repopulate_collection_from_preferences(db, collection_id, commit=False, preferences=prefs, keep_viewed=True)

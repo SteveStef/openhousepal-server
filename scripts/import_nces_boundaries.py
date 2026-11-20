@@ -201,7 +201,8 @@ async def main() -> None:
         states = _parse_states(args.states)
         if not states:
             states = await _states_from_properties()
-        states = {state for state in states if state in BRIGHT_MLS_DEFAULT_STATES}
+            states = {state for state in states if state in BRIGHT_MLS_DEFAULT_STATES}
+        # states named on purpose are loaded as given (a new MLS in another state - home_school_service's import job)
 
     if not states:
         raise SystemExit("No states selected. Pass --states PA,MD or --all-states.")

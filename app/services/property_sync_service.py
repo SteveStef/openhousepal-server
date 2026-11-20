@@ -1051,7 +1051,7 @@ class PropertySyncService:
         smart_ids: list = []   # Showcases this new listing joined - their smart filter reads it (owner, 11/09)
         if event["type"] == "NEW_GLOBAL" or event.get("rematch"):
             discovered_collections = [
-                col for col in await self._discover_matching_collections(db, event["data"])
+                col for col in await self._discover_matching_collections(db, {**event["data"], "id": prop_id})
                 if owner_has_access(col.owner, SHOWCASE_ACCESS_TIERS)
             ]
             for col in discovered_collections:
@@ -1331,6 +1331,20 @@ class PropertySyncService:
         ))
         stmt = stmt.where(or_(*area_conditions))
         stmt = stmt.where(district_ok)
+
+        # High schools (owner, 11/19): a Showcase limited to some high schools only gets homes going to them -
+        # Bright's answer, else worked out from the school map / nearby listings (home_school_service). Only
+        # looked up when some live Showcase uses it.
+        no_hs_picked = _none_picked(CollectionPreferences.high_schools)
+        hs_key = None
+        if prop.get("id"):
+            from app.services import home_school_service
+            if await home_school_service.anyone_searching_schools(db):
+                hs_key = await home_school_service.quick_key(prop["id"])
+        if hs_key:
+            stmt = stmt.where(or_(no_hs_picked, CollectionPreferences.high_schools.contains([hs_key])))
+        else:
+            stmt = stmt.where(no_hs_picked)
 
         # 2. Financial & Size Match (with Smart Exemptions)
         # Types that don't always have traditional bed/bath data (Exempt from numeric filters)

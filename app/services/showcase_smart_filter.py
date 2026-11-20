@@ -182,6 +182,43 @@ async def catch_up_phrases() -> int:
     return done
 
 
+_PLACE_RX = re.compile(r"^(?:(?:is |be |located |must be |homes? )?in(?: the)? )?(.+?)(?:\s+(township|twp|borough|boro|town|city))?$", re.I)
+
+
+async def place_wants(db, wants: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Must-haves that name a place ("In Uwchlan Township", "Chester Springs") - the listing's own township / town
+    says it exactly, so no AI reads them (free) and the star line says it plainly ("In Uwchlan Township"), not
+    "appears to" (owner, 11/19: Lisa - East homes only, the ones in Uwchlan starred)."""
+    from app.models.database import Property
+    out: Dict[str, Dict[str, Any]] = {}
+    for w in wants:
+        m = _PLACE_RX.match(" ".join(w.split()))
+        if not m:
+            continue
+        name, kind = m.group(1).strip(" ,.").upper(), (m.group(2) or "").lower()
+        if len(name) < 3 or len(name.split()) > 4:
+            continue
+        nice = " ".join(x[:1] + x[1:].lower() for x in name.split())
+        if kind in ("", "township", "twp", "borough", "boro"):
+            hit = (await db.execute(select(Property.township).where(
+                Property.township.in_([name, f"{name} TWP", f"{name} TOWNSHIP", f"{name} BORO", f"{name} BOROUGH"])).limit(1))).scalar()
+            if hit:
+                word = {"twp": "Township", "boro": "Borough"}.get(kind, kind.title())
+                out[w] = {"field": "township", "values": {name, f"{name} TWP", f"{name} TOWNSHIP", f"{name} BORO", f"{name} BOROUGH"},
+                          "say": f"In {nice}" + (f" {word}" if word else (" Township" if hit.upper().endswith(("TWP", "TOWNSHIP")) else ""))}
+                continue
+        if kind in ("", "town", "city"):
+            hit = (await db.execute(select(Property.city).where(Property.city == name).limit(1))).scalar()
+            if hit:
+                out[w] = {"field": "city", "values": {name}, "say": f"In {nice}"}
+    return out
+
+
+def place_verdict(p, place: Dict[str, Any]) -> Dict[str, Any]:
+    v = (getattr(p, place["field"], None) or "").upper().strip()
+    return {"v": "yes", "quote": "", "why": place["say"], "place": place["say"]} if v in place["values"] else {"v": "no", "quote": "", "why": ""}
+
+
 def wants_key(wants: List[str]) -> str:
     return "|".join(sorted(w.lower() for w in wants))
 
@@ -259,34 +296,40 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
 
         config = await ai_config_service.get_config(db)
         homes = [p for p, _ in todo]
-        est = reader.estimate_for(config, homes) * len(wants)
+        # A place ("In Uwchlan Township") is the listing's own township / town - checked here, free; the AI reads the rest.
+        places = await place_wants(db, wants)
+        read_wants = [w for w in wants if w not in places]
+        est = reader.estimate_for(config, homes) * len(read_wants)
         left, limit = await reader.room(db, user, config)
-        if left is not None and est > left:
+        if read_wants and left is not None and est > left:
             out = {**st, "wants": wants, "state": "no_room", "left": len(todo), "at": datetime.now(timezone.utc).isoformat()}
             await _set_state(db, prefs.id, out)
             return out
         await _set_state(db, prefs.id, {**st, "wants": wants, "state": "reading", "left": len(todo), "at": datetime.now(timezone.utc).isoformat()})
-        try:
-            reservation = await reserve_global_and_emergency(
-                db, "chat_global", max(est, 0.01), config["chat_global_daily_cost_ceiling_usd"], config["chat_global_monthly_cost_ceiling_usd"], config)
-        except AIRateLimitExceeded:
-            out = {**st, "wants": wants, "state": "error", "left": len(todo), "at": datetime.now(timezone.utc).isoformat()}
-            await _set_state(db, prefs.id, out)
-            return out
+        reservation = None
+        if read_wants:
+            try:
+                reservation = await reserve_global_and_emergency(
+                    db, "chat_global", max(est, 0.01), config["chat_global_daily_cost_ceiling_usd"], config["chat_global_monthly_cost_ceiling_usd"], config)
+            except AIRateLimitExceeded:
+                out = {**st, "wants": wants, "state": "error", "left": len(todo), "at": datetime.now(timezone.utc).isoformat()}
+                await _set_state(db, prefs.id, out)
+                return out
         spent, tin, tout = 0.0, 0, 0
         ai_starred: Dict[str, str] = {}
         try:
-            got = await asyncio.gather(*(reader.read(config, w, homes) for w in wants))
-            for g in got:
+            got = dict(zip(read_wants, await asyncio.gather(*(reader.read(config, w, homes) for w in read_wants))))
+            for g in got.values():
                 spent += g["usd"]; tin += g["in"]; tout += g["out"]
-            failed = set().union(*(set(g["failed"]) for g in got))
+            failed = set().union(*(set(g["failed"]) for g in got.values()))
             now = datetime.now(timezone.utc)
             for p, old in todo:
                 if p.id in failed:
                     continue   # read again next time
-                vs = [g["verdicts"].get(p.id) for g in got]
+                vs = [place_verdict(p, places[w]) if w in places else got[w]["verdicts"].get(p.id) for w in wants]
                 v = _all_yes(vs)
-                found = [{"w": w, "q": (x or {}).get("quote") or "", "why": (x or {}).get("why") or ""} for w, x in zip(wants, vs) if x]
+                found = [{"w": w, "q": (x or {}).get("quote") or "", "why": (x or {}).get("why") or "", **({"place": x["place"]} if x.get("place") else {})}
+                         for w, x in zip(wants, vs) if x]
                 was_starred = isinstance(old, dict) and bool(old.get("starred"))
                 m = {"k": k, "v": v, "found": found if v == "yes" else [], "starred": was_starred, "at": now.isoformat()}
                 if v == "yes" and not was_starred:
@@ -318,7 +361,8 @@ async def run_for(collection_id: str) -> Dict[str, Any]:
             out = {**st, "wants": wants, "state": "error", "left": len(todo), "at": datetime.now(timezone.utc).isoformat()}
             await _set_state(db, prefs.id, out)
         finally:
-            await reconcile_budget(db, reservation, spent)
+            if reservation is not None:
+                await reconcile_budget(db, reservation, spent)
         if spent:
             await record_usage_event(db, user.id, None, config["model"], tin, tout, spent, 0, False, None, tool_names=["showcase_smart_filter"])
         return out
@@ -488,7 +532,10 @@ def match_line(m: Any) -> Optional[Dict[str, Any]]:
             marks.append({"want": f["w"], "words": hit.group(1).strip()})
     return {"wants": [f.get("w") for f in found if f.get("w")],
             "quotes": [f.get("q") for f in found if f.get("q")][:3],
-            "marks": marks[:MAX_WANTS]}
+            "marks": marks[:MAX_WANTS],
+            # places the listing itself says ("In Uwchlan Township") - shown as plain facts, not "appears to"
+            "facts": [f["place"] for f in found if f.get("place")],
+            "place_wants": [f.get("w") for f in found if f.get("place")]}
 
 
 async def save_wants(db, collection_id: str, raw: Any, user=None) -> Dict[str, Any]:

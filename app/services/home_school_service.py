@@ -1,0 +1,615 @@
+"""Every for-sale home's high school (owner, 11/19): Bright leaves it blank on about 70% of listings, so a
+"Downingtown East only" search silently missed most homes. Worked out once per home in the background, kept in
+home_schools, and read by the Showcase search as one indexed lookup - nothing runs while anyone searches.
+
+Trust order:
+1. Bright's own answer (the listing names its high school).
+2. The government school map (NCES attendance boundaries, nces_attendance_boundaries) where it covers the home,
+   checked against nearby listings that name their school. The map's lines are from 2015-16, so where the
+   homes around this one clearly say otherwise, those homes win - they reflect today's lines.
+3. Nearby listings alone (7 closest within 3/4 mile that name a school; 80% must agree) where the map has nothing.
+Otherwise the home's school stays unknown, and a high-school search leaves it out.
+
+Spellings: Bright writes one school many ways ("DOWNINGTOWN HIGH SCHOOL EAST CAMPUS", "DHS EAST"). Inside one
+district, a spelling whose homes sit inside one map school's lines (75%+ of 5+ homes) becomes that school, so
+every spelling lands on the same key ("nces:<school id>"). Spellings the map can't place keep their own key
+("txt:<STATE>:<name>").
+
+`sure` = Bright named it, or the map and the nearby homes agree. Unsure homes are still searched (they are
+the best answer there is), and the chat says so.
+"""
+import asyncio
+import logging
+import math
+import os
+import re
+import time
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from sqlalchemy import text
+
+logger = logging.getLogger(__name__)
+
+FOR_SALE = ("ACTIVE-BRIGHT", "COMING SOON-BRIGHT")
+NEAR_MILES = 0.75
+NEAR_K = 7
+NEAR_MIN = 3
+NEAR_AGREE = 0.8
+ALIAS_MIN = 5
+ALIAS_AGREE = 0.75
+EVIDENCE_CAP = 40000
+ALIAS_SAMPLE = 40      # homes per spelling checked against the map
+EVAL_SAMPLE = 1500
+REFRESH_DAYS = 30
+_LOCK_KEY = 74_19_1119
+_RUN_SECONDS = 50
+
+_JUNK = {"", "0", "00", "N/A", "NA", "NONE", "UNKNOWN", "NOT AVAILABLE", "NOT PROVIDED", "SEE REMARKS", "CALL SCHOOL BOARD",
+         "CALL DISTRICT", "BUYER TO VERIFY", "VERIFY", "TBD", "OTHER", "CALL", "NO", "SEE SCHOOL DISTRICT"}
+_JUNK_TIGHT = {j.replace(" ", "") for j in _JUNK}    # "N/A" -> "N A" -> "NA"
+
+
+def norm_school(name: Optional[str]) -> Optional[str]:
+    """One spelling per school name: upper case, no punctuation, "HIGH SCHOOL"/"H.S."/"SR HIGH" -> "HS"."""
+    s = re.sub(r"[^A-Z0-9 ]+", " ", (name or "").upper())
+    s = " ".join(s.split())
+    if s in _JUNK or s.replace(" ", "") in _JUNK_TIGHT or len(s) < 2:
+        return None
+    s = re.sub(r"\b(SENIOR HIGH SCHOOL|SR HIGH SCHOOL|SENIOR HIGH|SR HIGH|HIGH SCHOOL|H S|HIGH SCH|HIGH)\b", "HS", s)
+    s = re.sub(r"\bHS( HS)+\b", "HS", s)
+    s = re.sub(r"\b(SCHOOL|SCH)$", "", s).strip()
+    return s or None
+
+
+def norm_district(name: Optional[str]) -> str:
+    return " ".join((name or "").upper().split())
+
+
+def nice_name(raw: str) -> str:
+    """'DOWNINGTOWN HIGH SCHOOL EAST CAMPUS' -> 'Downingtown High School East Campus'; NCES 'HS' spelled out."""
+    s = " ".join((raw or "").split())
+    s = re.sub(r"\bH\.?S\.?$|\bHS\b", "High School", s, flags=re.I)
+    small = {"of", "and", "the", "at", "for"}
+    out = []
+    for i, w in enumerate(s.split(" ")):
+        lw = w.lower()
+        if i and lw in small:
+            out.append(lw)
+        elif re.fullmatch(r"[A-Za-z]{1,3}\.?", w) and w.isupper() and lw not in {"hs", "the", "east", "west"} and len(w) <= 2:
+            out.append(w)    # initials: "DC", "JR"
+        else:
+            out.append(w[:1].upper() + w[1:].lower())
+    return " ".join(out)
+
+
+def _miles(lat1, lng1, lat2, lng2) -> float:
+    dy = (lat1 - lat2) * 69.0
+    dx = (lng1 - lng2) * 69.0 * math.cos(math.radians(lat1))
+    return math.hypot(dx, dy)
+
+
+class _Grid:
+    """Nearby-listing lookups without a query per home: points bucketed by ~0.75 mi cells."""
+    CELL = 0.011
+
+    def __init__(self):
+        self.cells: Dict[Tuple[int, int], list] = defaultdict(list)
+
+    def add(self, pid, lat, lng, key):
+        self.cells[(int(lat / self.CELL), int(lng / self.CELL))].append((pid, lat, lng, key))
+
+    def vote(self, lat, lng, skip=None) -> Optional[str]:
+        cy, cx = int(lat / self.CELL), int(lng / self.CELL)
+        cand = []
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                for pid, plat, plng, key in self.cells.get((cy + dy, cx + dx), ()):
+                    if pid == skip:
+                        continue
+                    d = _miles(lat, lng, plat, plng)
+                    if d <= NEAR_MILES:
+                        cand.append((d, key))
+        cand.sort(key=lambda t: t[0])
+        near = [k for _, k in cand[:NEAR_K]]
+        if len(near) < NEAR_MIN:
+            return None
+        top, n = Counter(near).most_common(1)[0]
+        return top if n / len(near) >= NEAR_AGREE else None
+
+
+class _MapSchools:
+    """The government map's high-school shapes around one district, kept in memory for the whole pass."""
+
+    def __init__(self, shapes: list):
+        self.shapes = shapes    # (school_id, name, xmin, ymin, xmax, ymax, geometry)
+
+    @classmethod
+    async def load(cls, db, state: str, lats: List[float], lngs: List[float]) -> "_MapSchools":
+        from app.services.nces_school_assignment_service import wgs84_to_web_mercator
+        if not lats or not state:
+            return cls([])
+        x0, y0 = wgs84_to_web_mercator(min(lats), min(lngs))
+        x1, y1 = wgs84_to_web_mercator(max(lats), max(lngs))
+        rows = (await db.execute(text(
+            "SELECT school_id, school_name, bbox_xmin, bbox_ymin, bbox_xmax, bbox_ymax, geometry, grade_low, grade_high, level "
+            "FROM nces_attendance_boundaries WHERE state = :s AND bbox_xmin <= :x1 AND bbox_xmax >= :x0 "
+            "AND bbox_ymin <= :y1 AND bbox_ymax >= :y0"), {"s": state.upper(), "x0": x0, "x1": x1, "y0": y0, "y1": y1})).all()
+        shapes = []
+        for r in rows:
+            if not _serves_high(r.level, r.grade_low, r.grade_high):
+                continue
+            shapes.append((str(r.school_id), r.school_name, r.bbox_xmin, r.bbox_ymin, r.bbox_xmax, r.bbox_ymax, r.geometry))
+        return cls(shapes)
+
+    def schools_at(self, lat, lng) -> List[Tuple[str, str]]:
+        from app.services.nces_school_assignment_service import point_in_polygon_geometry, wgs84_to_web_mercator
+        x, y = wgs84_to_web_mercator(lat, lng)
+        out = []
+        for sid, name, a, b, c, d, geom in self.shapes:
+            if a <= x <= c and b <= y <= d and point_in_polygon_geometry(x, y, geom):
+                out.append((sid, name))
+        return out
+
+
+def _serves_high(level, lo, hi) -> bool:
+    from app.services.nces_school_assignment_service import grade_to_number
+    if str(level or "") == "3":
+        return True
+    a, b = grade_to_number(lo), grade_to_number(hi)
+    return a is not None and b is not None and a <= 10 <= b
+
+
+def _pick_map(at: List[Tuple[str, str]], allowed: Optional[set], area: Optional[Dict[str, float]] = None) -> Optional[str]:
+    """The map school for one spot. A district-wide school (a magnet / STEM academy every home could choose)
+    overlaps the real one - drop the schools no listing in the district names when we know them; otherwise the
+    smallest shape is the neighborhood school."""
+    ids = {sid for sid, _ in at}
+    if allowed is not None:
+        ids &= allowed
+    if len(ids) == 1:
+        return next(iter(ids))
+    if len(ids) > 1 and allowed is None and area:
+        return min(ids, key=lambda s: area.get(s, 0))
+    return None
+
+
+async def fill_unit(db, state: str, district: str, *, only_ids: Optional[Iterable[str]] = None,
+                    write: bool = True, evaluate: bool = False) -> Dict[str, Any]:
+    """Work out the high school for every for-sale home in one (state, district). `district` is the
+    normalized Bright district name ('' = homes with no district: map only)."""
+    params = {"s": state, "d": district}
+    where = "p.state = :s AND upper(btrim(coalesce(p.school_district_name, ''))) = :d"
+    ev = (await db.execute(text(
+        f"SELECT p.id, p.latitude, p.longitude, p.high_school FROM properties p WHERE {where} "
+        f"AND p.latitude IS NOT NULL AND p.longitude IS NOT NULL AND coalesce(btrim(p.high_school), '') <> '' "
+        f"LIMIT {EVIDENCE_CAP}"), params)).all()
+    tq = (f"SELECT p.id, p.latitude, p.longitude, p.high_school FROM properties p WHERE {where} "
+          f"AND p.home_status IN :fs AND p.is_manual IS NOT TRUE")
+    tparams = {**params, "fs": FOR_SALE}
+    from sqlalchemy import bindparam
+    stmt = text(tq).bindparams(bindparam("fs", expanding=True))
+    if only_ids is not None:
+        stmt = text(tq + " AND p.id IN :ids").bindparams(bindparam("fs", expanding=True), bindparam("ids", expanding=True))
+        tparams["ids"] = list(only_ids)
+    targets = (await db.execute(stmt, tparams)).all()
+    if not targets and not evaluate:
+        return {"homes": 0}
+
+    pts = [(r.latitude, r.longitude) for r in list(ev) + [t for t in targets if t.latitude is not None]]
+    maps = await _MapSchools.load(db, state, [p[0] for p in pts], [p[1] for p in pts])
+    # The number-crunching (map lines, nearby votes) runs off the event loop - the site keeps answering meanwhile.
+    stats, rows = await asyncio.to_thread(_compute, state, district, list(ev), list(targets), maps, evaluate)
+    if write and rows:
+        await db.execute(text(
+            "INSERT INTO home_schools (property_id, state, district, hs_key, hs_name, source, sure, bright_hs, bright_norm, checked_at) "
+            "VALUES (:p, :s, :d, :k, :n, :src, :sure, :b, :bn, :at) "
+            "ON CONFLICT (property_id) DO UPDATE SET state = EXCLUDED.state, district = EXCLUDED.district, hs_key = EXCLUDED.hs_key, "
+            "hs_name = EXCLUDED.hs_name, source = EXCLUDED.source, sure = EXCLUDED.sure, bright_hs = EXCLUDED.bright_hs, "
+            "bright_norm = EXCLUDED.bright_norm, checked_at = EXCLUDED.checked_at"), rows)
+        await db.commit()
+    return stats
+
+
+def _compute(state: str, district: str, ev: list, targets: list, maps: "_MapSchools", evaluate: bool) -> Tuple[Dict[str, Any], list]:
+    map_names = {sid: name for sid, name, *_ in maps.shapes}
+    # Bright spellings -> one school: where a sample of each spelling's homes sit on the map.
+    by_spell: Dict[str, Counter] = defaultdict(Counter)
+    spell_raw: Dict[str, Counter] = defaultdict(Counter)
+    home_spell: Dict[str, str] = {}
+    for r in ev:
+        sp = norm_school(r.high_school)
+        if not sp:
+            continue
+        home_spell[r.id] = sp
+        spell_raw[sp][" ".join(r.high_school.split())] += 1
+        if maps.shapes and by_spell[sp]["_n"] < ALIAS_SAMPLE:
+            for sid, _n in maps.schools_at(r.latitude, r.longitude):
+                by_spell[sp][sid] += 1
+            by_spell[sp]["_n"] += 1
+    # A district-wide school (a STEM / magnet academy any home may choose) holds every home too - of the schools
+    # that hold most of a spelling's homes, the smallest area is the neighborhood school.
+    area = {sid: (c - a) * (d - b) for sid, _n, a, b, c, d, _g in maps.shapes}
+    alias: Dict[str, str] = {}
+    for sp, c in by_spell.items():
+        n = c.pop("_n", 0)
+        if n >= ALIAS_MIN and c:
+            good = [sid for sid, k in c.items() if k / n >= ALIAS_AGREE]
+            if good:
+                alias[sp] = f"nces:{min(good, key=lambda s: area.get(s, 0))}"
+
+    def key_of_spell(sp: str) -> str:
+        return alias.get(sp) or f"txt:{state}:{sp}"
+
+    names: Dict[str, Counter] = defaultdict(Counter)
+    for sp, raws in spell_raw.items():
+        for raw, k in raws.items():
+            names[key_of_spell(sp)][raw] += k
+    allowed = {k[5:] for k in alias.values()} if alias else None
+
+    grid = _Grid()
+    for r in ev:
+        sp = home_spell.get(r.id)
+        if sp:
+            grid.add(r.id, r.latitude, r.longitude, key_of_spell(sp))
+
+    def map_key(lat, lng) -> Optional[str]:
+        if not maps.shapes:
+            return None
+        sid = _pick_map(maps.schools_at(lat, lng), allowed, area)
+        return f"nces:{sid}" if sid else None
+
+    def blank_answer(lat, lng, skip=None) -> Tuple[Optional[str], Optional[str], bool]:
+        m, near = map_key(lat, lng), grid.vote(lat, lng, skip=skip)
+        if m and near:
+            return (m, "map", True) if m == near else (near, "nearby", False)
+        if m:
+            return m, "map", False
+        if near:
+            return near, "nearby", False
+        return None, None, False
+
+    stats: Dict[str, Any] = {"homes": len(targets), "bright": 0, "map": 0, "nearby": 0, "unknown": 0, "sure": 0}
+    if evaluate:
+        # Hide a sample of named homes' own answers and see what the other sources would have said.
+        ok = Counter()
+        for r in [r for r in ev if r.id in home_spell][::max(1, len(home_spell) // EVAL_SAMPLE)]:
+            truth = key_of_spell(home_spell[r.id])
+            m, near = map_key(r.latitude, r.longitude), grid.vote(r.latitude, r.longitude, skip=r.id)
+            k, src, sure = blank_answer(r.latitude, r.longitude, skip=r.id)
+            ok[(src or "none", "right" if k == truth else ("wrong" if k else "none"), sure)] += 1
+            if m and near and m != near:
+                ok[("disagree", "map right" if m == truth else ("near right" if near == truth else "neither"), False)] += 1
+            if m:
+                ok[("map alone", "right" if m == truth else "wrong", False)] += 1
+            if near:
+                ok[("near alone", "right" if near == truth else "wrong", False)] += 1
+        stats["evaluate"] = ok
+
+    now = datetime.now(timezone.utc)
+    rows = []
+    for t in targets:
+        sp = norm_school(t.high_school)
+        if sp:
+            k, src, sure = key_of_spell(sp), "bright", True
+        elif t.latitude is not None and t.longitude is not None:
+            k, src, sure = blank_answer(t.latitude, t.longitude)
+        else:
+            k, src, sure = None, None, False
+        stats[src or "unknown"] += 1
+        stats["sure"] += 1 if (k and sure) else 0
+        name = None
+        if k:
+            if names.get(k):
+                name = nice_name(names[k].most_common(1)[0][0])
+            elif k.startswith("nces:") and map_names.get(k[5:]):
+                name = nice_name(map_names[k[5:]])
+        rows.append({"p": t.id, "s": state, "d": district, "k": k, "n": name, "src": src, "sure": bool(k and sure),
+                     "b": t.high_school, "bn": sp, "at": now})
+    return stats, rows
+
+
+async def units_to_fill(db, limit: int = 25) -> List[Tuple[str, str, int]]:
+    """(state, district, homes) with for-sale homes never worked out, whose Bright school changed, or a month old."""
+    from sqlalchemy import bindparam
+    rows = (await db.execute(text(
+        "SELECT p.state, upper(btrim(coalesce(p.school_district_name, ''))) AS d, count(*) AS n FROM properties p "
+        "LEFT JOIN home_schools h ON h.property_id = p.id "
+        "WHERE p.home_status IN :fs AND p.is_manual IS NOT TRUE AND p.state IS NOT NULL "
+        "AND (h.property_id IS NULL OR h.checked_at IS NULL OR coalesce(h.bright_hs, '') IS DISTINCT FROM coalesce(p.high_school, '') "
+        "     OR h.checked_at < now() - make_interval(days => :days)) "
+        "GROUP BY 1, 2 ORDER BY 3 DESC LIMIT :lim").bindparams(bindparam("fs", expanding=True)),
+        {"fs": FOR_SALE, "days": REFRESH_DAYS, "lim": limit})).all()
+    return [(r.state, r.d, r.n) for r in rows]
+
+
+def _quiet_hours() -> bool:
+    from app.services import mls_mirror
+    return mls_mirror._quiet_hours()
+
+
+async def fill_step(run_seconds: Optional[float] = None) -> Dict[str, Any]:
+    """One background pass: districts in turn until the time is up. One worker at a time (advisory lock)."""
+    from app.database import AsyncSessionLocal, engine
+    done = {"units": 0, "homes": 0}
+    async with engine.connect() as raw_lock:
+        lockdb = await raw_lock.execution_options(isolation_level="AUTOCOMMIT")
+        if not (await lockdb.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": _LOCK_KEY})).scalar():
+            return {**done, "skipped": "another worker"}
+        try:
+            if not (await lockdb.execute(text("SELECT to_regclass('home_schools')"))).scalar():
+                return {**done, "skipped": "migration not applied"}
+            deadline = time.monotonic() + (run_seconds if run_seconds is not None else _RUN_SECONDS)
+            async with AsyncSessionLocal() as db:
+                units = await units_to_fill(db)
+            for state, district, _n in units:
+                if time.monotonic() > deadline:
+                    break
+                async with AsyncSessionLocal() as db:
+                    st = await fill_unit(db, state, district)
+                done["units"] += 1
+                done["homes"] += st.get("homes", 0)
+        finally:
+            await lockdb.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _LOCK_KEY})
+    return done
+
+
+SABS_URL = "https://nces.ed.gov/programs/edge/data/SABS_1516.zip"   # the official NCES file, public, free (584 MB)
+SABS_BYTES = 583873446
+_IMPORT_LOCK = 74_19_1120
+_STATE_KEY = "nces_map_import"
+
+
+async def _import_state(db) -> Dict[str, Any]:
+    v = (await db.execute(text("SELECT value FROM system_settings WHERE key = :k"), {"k": _STATE_KEY})).scalar()
+    return v if isinstance(v, dict) else {}
+
+
+async def _set_import_state(db, st: Dict[str, Any]) -> None:
+    import json
+    await db.execute(text("INSERT INTO system_settings (key, value) VALUES (:k, cast(:v as jsonb)) "
+                          "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()"), {"k": _STATE_KEY, "v": json.dumps(st)})
+    await db.commit()
+
+
+async def map_settled(db) -> bool:
+    """The school map is loaded, or loading it was turned off / failed today - the fill doesn't wait for it then."""
+    if os.getenv("OHP_NCES_IMPORT", "on") == "off":
+        return True
+    if (await db.execute(text("SELECT 1 FROM nces_attendance_boundaries LIMIT 1"))).first():
+        return True
+    st = await _import_state(db)
+    failed = st.get("failed_at")
+    return bool(failed and datetime.fromisoformat(failed) > datetime.now(timezone.utc) - timedelta(days=1))
+
+
+async def scheduled_map_import():
+    """Once: the government school map (NCES attendance boundaries) for the states we have listings in. It was only
+    ever loaded on dev machines - without it, homes whose listing leaves the school out lean on nearby listings
+    alone. Downloads the official file to a temp folder, loads it in a separate process (the site keeps answering),
+    deletes the file. A failure waits a day before trying again."""
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    from app.database import AsyncSessionLocal, engine
+    if os.getenv("OHP_NCES_IMPORT", "on") == "off" or _quiet_hours():
+        return
+    async with engine.connect() as raw_lock:
+        lockdb = await raw_lock.execution_options(isolation_level="AUTOCOMMIT")
+        if not (await lockdb.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": _IMPORT_LOCK})).scalar():
+            return
+        zpath = None
+        try:
+            async with AsyncSessionLocal() as db:
+                if await map_settled(db):
+                    return
+                states = sorted(r[0] for r in (await db.execute(text(
+                    "SELECT DISTINCT state FROM properties WHERE home_status IN ('ACTIVE-BRIGHT', 'COMING SOON-BRIGHT') "
+                    "AND state IS NOT NULL AND length(state) = 2"))).all())
+            tmp = tempfile.gettempdir()
+            if not states or shutil.disk_usage(tmp).free < 3 * 1024 ** 3:
+                raise RuntimeError(f"no states ({states}) or under 3 GB free in {tmp}")
+            zpath = os.path.join(tmp, "SABS_1516.zip")
+            import httpx
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120, read=300), follow_redirects=True,
+                                         headers={"User-Agent": "OpenHousePal/1.0 (school map)"}) as client:
+                async with client.stream("GET", SABS_URL) as r:
+                    r.raise_for_status()
+                    with open(zpath + ".part", "wb") as f:
+                        async for chunk in r.aiter_bytes(1 << 20):
+                            f.write(chunk)
+            got = os.path.getsize(zpath + ".part")
+            if got != SABS_BYTES:
+                raise RuntimeError(f"school map file is {got} bytes, expected {SABS_BYTES}")
+            os.replace(zpath + ".part", zpath)
+            root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, os.path.join(root, "scripts", "import_nces_boundaries.py"), zpath, "--states", ",".join(states),
+                cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            _out, err = await proc.communicate()
+            if proc.returncode != 0:
+                raise RuntimeError(f"import failed: {(err or b'')[-500:].decode(errors='replace')}")
+            async with AsyncSessionLocal() as db:
+                n = (await db.execute(text("SELECT count(*) FROM nces_attendance_boundaries"))).scalar()
+                await _set_import_state(db, {"done_at": datetime.now(timezone.utc).isoformat(), "shapes": n, "states": states})
+                # homes worked out before the map was there: redo them with it
+                await db.execute(text("UPDATE home_schools SET checked_at = NULL WHERE source IS DISTINCT FROM 'bright'"))
+                await db.commit()
+            logger.info("school map loaded", extra={"shapes": n, "states": states})
+        except Exception as e:
+            logger.warning("school map import failed", exc_info=True)
+            try:
+                async with AsyncSessionLocal() as db:
+                    await _set_import_state(db, {"failed_at": datetime.now(timezone.utc).isoformat(), "error": str(e)[:500]})
+            except Exception:
+                pass
+        finally:
+            for pth in (zpath, (zpath + ".part") if zpath else None):
+                try:
+                    if pth and os.path.exists(pth):
+                        os.remove(pth)
+                except OSError:
+                    pass
+            await lockdb.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _IMPORT_LOCK})
+
+
+async def scheduled_fill():
+    """Every 10 minutes: new and changed for-sale homes get their high school (off during the nightly backup).
+    Waits for the school map to load first, so homes aren't all worked out twice."""
+    if os.getenv("OHP_HOME_SCHOOLS", "on") == "off" or _quiet_hours():
+        return
+    try:
+        from app.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as db:
+            if not await map_settled(db):
+                return
+    except Exception:
+        logger.warning("home schools: map check failed", exc_info=True)
+        return
+    try:
+        st = await fill_step()
+        if st.get("homes"):
+            logger.info("home schools filled", extra={"stats": st})
+    except Exception:
+        logger.warning("home schools fill failed", exc_info=True)
+
+
+async def anyone_searching_schools(db) -> bool:
+    """Is any live Showcase limited to high schools? (Then a new listing's school is worked out on arrival.)"""
+    try:
+        return bool((await db.execute(text(
+            "SELECT 1 FROM collection_preferences cp JOIN collections c ON c.id = cp.collection_id WHERE c.status = 'ACTIVE' "
+            "AND jsonb_typeof(cp.high_schools) = 'array' AND jsonb_array_length(cp.high_schools) > 0 LIMIT 1"))).first())
+    except Exception:
+        await db.rollback()
+        return False
+
+
+async def quick_key(property_id: str) -> Optional[str]:
+    """One new listing's high school, right away, from what the background pass already knows about its district
+    (the spellings it learned, the for-sale homes around it) plus the map. Light: no district-wide read. Its own
+    session, so a failure here never touches the sync's work. The background pass redoes it properly soon after."""
+    from app.database import AsyncSessionLocal
+    async with AsyncSessionLocal() as db:
+        k = await _quick_key(db, property_id)
+        await db.commit()
+        return k
+
+
+async def _quick_key(db, property_id: str) -> Optional[str]:
+    try:
+        p = (await db.execute(text(
+            "SELECT id, state, upper(btrim(coalesce(school_district_name, ''))) AS d, latitude AS lat, longitude AS lng, high_school "
+            "FROM properties WHERE id = :p"), {"p": property_id})).first()
+        if not p or not p.state:
+            return None
+        known = (await db.execute(text(
+            "SELECT bright_norm, hs_key, hs_name FROM home_schools WHERE state = :s AND district = :d AND source = 'bright' "
+            "AND hs_key IS NOT NULL"), {"s": p.state, "d": p.d})).all()
+        spell = {r.bright_norm: r.hs_key for r in known if r.bright_norm}
+        names = {r.hs_key: r.hs_name for r in known}
+        allowed = {k[5:] for k in spell.values() if k.startswith("nces:")} or None
+        maps = await _MapSchools.load(db, p.state, [p.lat], [p.lng]) if p.lat is not None else _MapSchools([])
+        area = {sid: (c - a) * (d - b) for sid, _n, a, b, c, d, _g in maps.shapes}
+        map_sid = _pick_map(maps.schools_at(p.lat, p.lng), allowed, area) if maps.shapes else None
+        map_key = f"nces:{map_sid}" if map_sid else None
+        sp = norm_school(p.high_school)
+        if sp:
+            k, src, sure = spell.get(sp) or f"txt:{p.state}:{sp}", "bright", True
+        elif p.lat is not None:
+            box = NEAR_MILES / 69.0
+            near_rows = (await db.execute(text(
+                "SELECT x.id, x.latitude, x.longitude, h.hs_key FROM home_schools h JOIN properties x ON x.id = h.property_id "
+                "WHERE h.state = :s AND h.district = :d AND h.hs_key IS NOT NULL AND (h.source = 'bright' OR h.sure) "
+                "AND x.latitude BETWEEN :a AND :b AND x.longitude BETWEEN :c AND :e"),
+                {"s": p.state, "d": p.d, "a": p.lat - box, "b": p.lat + box,
+                 "c": p.lng - box * 1.4, "e": p.lng + box * 1.4})).all()
+            g = _Grid()
+            for r in near_rows:
+                g.add(r.id, r.latitude, r.longitude, r.hs_key)
+            near = g.vote(p.lat, p.lng, skip=p.id)
+            if map_key and near:
+                k, src, sure = (map_key, "map", True) if map_key == near else (near, "nearby", False)
+            else:
+                k, src, sure = (map_key, "map", False) if map_key else ((near, "nearby", False) if near else (None, None, False))
+        else:
+            k, src, sure = None, None, False
+        name = names.get(k) if k else None
+        if k and not name and k.startswith("nces:"):
+            name = next((nice_name(n) for sid, n, *_ in maps.shapes if f"nces:{sid}" == k), None)
+        if k and not name and sp:
+            name = nice_name(p.high_school)
+        await db.execute(text(
+            "INSERT INTO home_schools (property_id, state, district, hs_key, hs_name, source, sure, bright_hs, bright_norm, checked_at) "
+            "VALUES (:p, :s, :d, :k, :n, :src, :sure, :b, :bn, now()) ON CONFLICT (property_id) DO UPDATE SET "
+            "hs_key = EXCLUDED.hs_key, hs_name = EXCLUDED.hs_name, source = EXCLUDED.source, sure = EXCLUDED.sure, "
+            "bright_hs = EXCLUDED.bright_hs, bright_norm = EXCLUDED.bright_norm, checked_at = EXCLUDED.checked_at"),
+            {"p": p.id, "s": p.state, "d": p.d, "k": k, "n": name, "src": src, "sure": bool(k and sure), "b": p.high_school, "bn": sp})
+        return k
+    except Exception:
+        logger.warning("home schools: new listing lookup failed", exc_info=True)
+        await db.rollback()
+        return None
+
+
+# ---- reading -----------------------------------------------------------------------------------------------
+
+def search_filter(keys: Optional[List[str]]):
+    """Showcase search: only homes whose high school is one of these (Bright's or worked out)."""
+    from sqlalchemy import select
+    from app.models.database import HomeSchool, Property
+    keys = [k for k in (keys or []) if k]
+    if not keys:
+        return None
+    return Property.id.in_(select(HomeSchool.property_id).where(HomeSchool.hs_key.in_(keys)))
+
+
+async def schools_in(db, districts: List[str]) -> List[Dict[str, Any]]:
+    """The high schools for sale homes in these districts ("Downingtown Area, PA" style names, matched like the
+    search does): key, name, homes for sale, and how many of those the listing itself names."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for d in districts or []:
+        parts = [s.strip() for s in str(d).split(",")]
+        name, st = parts[0], (parts[1].upper() if len(parts) > 1 else None)
+        q = ("SELECT h.hs_key, h.hs_name, count(*) AS n, count(*) FILTER (WHERE h.source = 'bright') AS named, "
+             "count(*) FILTER (WHERE h.sure) AS sure FROM home_schools h JOIN properties p ON p.id = h.property_id "
+             "WHERE h.hs_key IS NOT NULL AND p.home_status IN ('ACTIVE-BRIGHT', 'COMING SOON-BRIGHT') "
+             "AND p.school_district_name ILIKE :d" + (" AND p.state = :s" if st else "") + " GROUP BY 1, 2")
+        for r in (await db.execute(text(q), {"d": f"%{name}%", "s": st})).all():
+            o = out.setdefault(r.hs_key, {"key": r.hs_key, "name": r.hs_name, "homes": 0, "named": 0, "sure": 0, "_names": Counter()})
+            o["homes"] += r.n
+            o["named"] += r.named
+            o["sure"] += r.sure
+            if r.hs_name:
+                o["_names"][r.hs_name] += r.n
+    res = []
+    for o in out.values():
+        if o["_names"]:
+            o["name"] = o["_names"].most_common(1)[0][0]
+        o.pop("_names", None)
+        res.append(o)
+    return sorted(res, key=lambda o: -o["homes"])
+
+
+async def names_for(db, keys: List[str]) -> Dict[str, str]:
+    keys = [k for k in (keys or []) if k]
+    if not keys:
+        return {}
+    from sqlalchemy import bindparam
+    rows = (await db.execute(text(
+        "SELECT hs_key, hs_name, count(*) FROM home_schools WHERE hs_key IN :k AND hs_name IS NOT NULL GROUP BY 1, 2 ORDER BY 3 DESC"
+    ).bindparams(bindparam("k", expanding=True)), {"k": keys})).all()
+    out: Dict[str, str] = {}
+    for r in rows:
+        out.setdefault(r.hs_key, r.hs_name)
+    return out
+
+
+async def school_of(db, property_id: str) -> Optional[Dict[str, Any]]:
+    r = (await db.execute(text("SELECT hs_key, hs_name, source, sure FROM home_schools WHERE property_id = :p"),
+                          {"p": property_id})).first()
+    if not r or not r.hs_key:
+        return None
+    return {"key": r.hs_key, "name": r.hs_name, "source": r.source, "sure": bool(r.sure)}

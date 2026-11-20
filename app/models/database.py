@@ -1624,6 +1624,9 @@ class CollectionPreferences(Base):
     cities = Column(JSONB, nullable=True)
     townships = Column(JSONB, nullable=True)
     school_districts = Column(JSONB, nullable=True)  # New column for school district preferences
+    # Only homes going to these high schools (home_schools.hs_key list - Bright's answer or worked out, see
+    # services/home_school_service.py). Narrows whatever area was picked, like a district does.
+    high_schools = Column(JSONB, nullable=True)
     county = Column(String, nullable=True)  # Legacy single-value column, superseded by `counties` below
     counties = Column(JSONB, nullable=True)
     state = Column(String, nullable=True)
@@ -1928,6 +1931,23 @@ class NcesAttendanceBoundary(Base):
         UniqueConstraint('school_id', 'source_name', 'bbox_xmin', 'bbox_ymin', 'bbox_xmax', 'bbox_ymax', name='uq_nces_boundary_shape'),
         Index('ix_nces_boundaries_state_level_bbox', 'state', 'level', 'bbox_xmin', 'bbox_xmax', 'bbox_ymin', 'bbox_ymax'),
     )
+
+class HomeSchool(Base):
+    """Each for-sale home's high school: Bright's, else the government map / nearby listings
+    (services/home_school_service.py). Kept apart from properties so the big table is never rewritten."""
+    __tablename__ = "home_schools"
+
+    property_id = Column(String, ForeignKey("properties.id", ondelete="CASCADE"), primary_key=True)
+    state = Column(String, nullable=True)
+    district = Column(String, nullable=True)
+    hs_key = Column(String, index=True, nullable=True)     # "nces:<school id>" or "txt:<STATE>:<name>"; None = unknown
+    hs_name = Column(String, nullable=True)
+    source = Column(String, nullable=True)                 # bright | map | nearby
+    sure = Column(Boolean, nullable=False, default=False)  # Bright named it, or the map and nearby homes agree
+    bright_hs = Column(String, nullable=True)              # Bright's value when worked out (a change means redo)
+    bright_norm = Column(String, nullable=True)
+    checked_at = Column(DateTime(timezone=True), nullable=True)
+
 
 class City(Base):
     __tablename__ = "cities"

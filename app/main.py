@@ -95,6 +95,31 @@ async def lifespan(app: FastAPI):
         max_instances=1,
         coalesce=True,
     )
+    # Every for-sale home's high school - Bright's, else the school map / nearby listings (owner, 11/19).
+    from app.services import home_school_service
+    scheduler.add_job(
+        home_school_service.scheduled_fill,
+        "interval",
+        minutes=10,
+        next_run_time=_mm_dt.now() + _mm_td(minutes=4),
+        id="home_schools_fill",
+        name="Work out each for-sale home's high school",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    # Once: load the government school map where it was never loaded (then this only checks it's there).
+    scheduler.add_job(
+        home_school_service.scheduled_map_import,
+        "interval",
+        minutes=60,
+        next_run_time=_mm_dt.now() + _mm_td(minutes=6),
+        id="nces_map_import",
+        name="Load the government school map",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
 
     cache_hour = int(os.getenv("CACHE_CLEANUP_HOUR", 2))
     cache_mins = int(os.getenv("CACHE_CLEANUP_MINUTE", 0))

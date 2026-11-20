@@ -587,6 +587,18 @@ async def search_one_home_by_address(
         ]
     return {"success": True, **payload}
 
+@router.get("/high-schools", dependencies=[Depends(require_broker_authorization)])
+async def high_schools_in_districts(
+    districts: List[str] = Query(default=[]),
+    db: AsyncSession = Depends(get_db),
+):
+    """The high schools of the homes for sale in these districts (owner, 11/19) - for the Showcase search's
+    "Only these high schools" choice. homes = for sale now; named = how many listings name it themselves
+    (the rest were placed by the school map / nearby listings)."""
+    from app.services.home_school_service import schools_in
+    return {"schools": await schools_in(db, districts[:6])}
+
+
 @router.get("/school-districts", dependencies=[Depends(require_broker_authorization)])
 async def search_school_districts(
     query: str = Query(..., min_length=1),
