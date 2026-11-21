@@ -11,17 +11,22 @@ from app.schemas.studio import BrandKitResponse, BrandKitUpdate, MediaUploadResp
 from app.services import s3_service, storage_ledger_service
 from app.services.ai.ai_config_service import ai_config_service
 from app.utils.auth import get_current_active_user, require_active_plan
-from app.utils.image_validation import assert_valid_jpeg, clean_logo_png
+from app.utils.image_validation import assert_valid_jpeg, clean_logo_png, headshot_jpeg
 
 router = APIRouter(prefix="/studio", tags=["studio"])
 logger = logging.getLogger(__name__)
 
-# JPG only - PNG/WEBP uploads have been unreliable in practice, so every photo upload on the
-# site (brand kit logos, blog covers/media, design assets) is restricted to JPEG.
+# Photos are STORED as JPEG only - PNG/WEBP files were unreliable once stored (a PDF can't draw a WebP).
+# The agent may still pick a JPG, PNG, WebP or iPhone photo: upload_studio_media redraws it as an upright
+# JPEG (Day 12 audit, 11/19 - PNG/WebP were refused though the design editor, open house and invite
+# pickers offered them), which also drops the GPS location a phone hides in a photo - these go on public
+# blogs, designs, invites, open house pages and websites. Logos keep their own JPG/PNG rule.
 IMAGE_CONTENT_TYPES = {
     "image/jpeg": ".jpg",
 }
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
+PHOTO_UPLOAD_MAX_BYTES = 25 * 1024 * 1024   # a phone's full-size photo; it is shrunk on the way in
+PHOTO_MAX_SIDE = 3600                        # still sharp on a printed letter-size flyer (300 dpi)
 
 LOGO_FIELDS = {"personal", "team", "brokerage"}
 
@@ -181,25 +186,32 @@ async def upload_studio_media(
     """Shared media upload for Design Studio & Blogs (cover images, article images, design photos).
     category='brand_logo' (the IDX website's own logo) may also be a PNG, same as Brand Kit logos."""
     logo = category == "brand_logo"
-    if file.content_type not in (("image/jpeg", "image/png") if logo else ("image/jpeg",)):
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Please upload a JPG or PNG logo." if logo else "Please upload a JPG image.")
+    if logo and file.content_type not in ("image/jpeg", "image/png"):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Please upload a JPG or PNG logo.")
 
     contents = await file.read()
-    if len(contents) > IMAGE_MAX_BYTES:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Image must be 10MB or smaller.")
+    if len(contents) > (IMAGE_MAX_BYTES if logo else PHOTO_UPLOAD_MAX_BYTES):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail="Image must be 10MB or smaller." if logo else "That photo is over 25MB - try a smaller one.")
+    content_type = "image/jpeg"
     try:
-        if file.content_type == "image/png":
+        if logo and file.content_type == "image/png":
             contents = clean_logo_png(contents)
-            extension = ".png"
-        else:
+            extension, content_type = ".png", "image/png"
+        elif logo:
             assert_valid_jpeg(contents)
             extension = ".jpg"
+        else:
+            # what the browser says the file is doesn't matter - the bytes are checked and redrawn
+            contents = await asyncio.to_thread(headshot_jpeg, contents, PHOTO_MAX_SIDE)
+            extension = ".jpg"
     except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=str(e) if logo else "Please choose a JPG, PNG, WebP or iPhone photo.")
 
     cfg = await ai_config_service.get_config(db)
     await storage_ledger_service.enforce_cap(db, current_user.id, cfg, getattr(current_user, "plan_tier", None), len(contents))
-    url = await asyncio.to_thread(s3_service.upload_bytes, contents, "studio-media", extension, file.content_type)
+    url = await asyncio.to_thread(s3_service.upload_bytes, contents, "studio-media", extension, content_type)
     cat = category if category in ("blog", "design", "brand_logo") else "studio_media"
     await storage_ledger_service.record(db, current_user.id, cat, url, len(contents))
     return MediaUploadResponse(url=url)

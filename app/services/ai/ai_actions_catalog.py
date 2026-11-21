@@ -582,7 +582,7 @@ async def _p_new_showcase(db, user, a):
     if wants:
         if not (tier_has_mls(user.plan_tier) or user.is_admin):
             raise ActionError("Must-haves read MLS listings - they're on the MLS plans. Make it without them?")
-        lines.append(f"Must-haves: {', '.join(wants)} - homes that have all of them get the Recommended star (uses a little AI usage)")
+        lines.append(f"Must-haves: {', '.join(wants)} - homes that have all of them get a star that says what they have (uses a little AI usage)")
     lines = [f"Client: {name} ({email})"] + lines + ["Also adds them to your leads"]
     if quiet:
         lines.append("No emails to them for now - turn their emails on in the Showcase whenever you're ready")
@@ -926,7 +926,7 @@ async def _p_showcase_must_haves(db, user, a):
         lines.append(moves_line(moves) + " (a filter keeps only those homes)")
     if had and not same:
         lines.append(f"Replaces: {', '.join(had)}")
-    lines += ["Homes that have all of them get the Recommended star and a line saying so; the rest stay, without it",
+    lines += ["Homes that have all of them get a star saying what they have ('Has Pool'); the rest stay, without it",
               ((f"Reads {n} home{'s' if n != 1 else ''}" + (f" · uses ~{est['usage_percent']}% of AI usage" if est.get("usage_percent") else ""))
                if read and not same else f"Checks {n} home{'s' if n != 1 else ''} · no AI usage")
               if n else "No homes for sale in it right now - new ones are checked as they arrive"]
@@ -943,7 +943,7 @@ async def _r_showcase_must_haves(db, user, p):
 
 _simple("set_showcase_must_haves",
         "Set a Showcase's must-haves (up to 3 features, e.g. 'Pool', 'First-floor primary bedroom', '9 ft ceilings'): "
-        "the AI reads every home in it and stars the ones that have ALL of them (Recommended star + a line under the address - the client sees it); "
+        "the AI reads every home in it and stars the ones that have ALL of them (a star saying what the home has, e.g. 'Has Pool' - the client sees it); "
         "the others stay, unstarred. Use it whenever they want homes narrowed by something the search can't filter - words in the description, features. "
         "Never a township, town or school - those are search filters (update_showcase_search townships / cities / school_districts + high_schools); "
         "one passed here is moved into the search filter and the card says so (the must-haves already there stay). "

@@ -110,8 +110,11 @@ def compact_to_fit(data: Any, *, max_list: int = 15, max_str: int = 400, budget:
     return {**out, "_note": "Shortened to fit - ask about one item for its full details."} if isinstance(out, dict) else out
 
 
-async def lookup(user: User, path: str, params: Optional[dict] = None, **kw) -> Tuple[bool, Any]:
+async def lookup(user: User, path: str, params: Optional[dict] = None, shape=None, **kw) -> Tuple[bool, Any]:
+    from app.services.ai import ai_slim
     try:
-        return True, compact_to_fit(await call_as_agent(user, "GET", path, params=params), **kw)
+        data = await call_as_agent(user, "GET", path, params=params)
+        data = ai_slim.drop_none(shape(data) if shape else data)   # only what the model uses to answer (ai_slim, 11/19)
+        return True, compact_to_fit(data, **kw)
     except RouteError as e:
         return False, {"error": "lookup_failed", "message": str(e)}

@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.logging import get_logger
 from app.models.database import User
+from app.services.ai import ai_slim
 from app.services.ai import ai_actions, ai_showcase_cards, ai_tools, ai_ui_tools
 from app.services.ai.ai_config_service import ai_config_service
 from app.services.ai.ai_prompt_service import SYSTEM_PROMPT
@@ -321,6 +322,7 @@ async def run_turn(
     nudged = False
     promised = False
     listed = False
+    asked_message = False
     homes_nudged = False
     seen_homes: dict = {}  # listing_key -> "602 holywell" for every home a lookup returned this turn
     leads_nudged = False
@@ -331,7 +333,7 @@ async def run_turn(
         return any(r.get("record_type") == "leads" for r in all_refs)
 
     async def _run() -> str:
-        nonlocal nudged, promised, listed, homes_nudged, leads_nudged
+        nonlocal nudged, promised, listed, homes_nudged, leads_nudged, asked_message
         for _ in range(config["max_iterations"]):
             response = await _call_model()
             usage_state["input_tokens"] += response.usage.input_tokens
@@ -357,6 +359,14 @@ async def run_turn(
                     messages.append({"role": "assistant", "content": response.content})
                     messages.append({"role": "user", "content": ai_showcase_cards.LIST_NUDGE})
                     _progress(current_user.id, "Tidying the answer")
+                    continue
+                # "What should I say to <them> / the first one?" - their follow-up's own written message, never one it
+                # made up (A/B test 11/20: 2 of 3 replies wrote their own) - one reminder to read it if it didn't look.
+                if not asked_message and _ASKS_WHAT_TO_SAY.search(user_message or "") and "list_followups" not in usage_state["tool_names"]                         and usage_state["tool_call_count"] < config["max_tool_calls_per_turn"] - 1:
+                    asked_message = True
+                    messages.append({"role": "assistant", "content": response.content})
+                    messages.append({"role": "user", "content": ai_slim.WHAT_TO_SAY_NOTE})
+                    _progress(current_user.id, "Reading their follow-up")
                     continue
                 if not promised and _PROMISE.search((text or "").strip()[-220:]) and usage_state["tool_call_count"] < config["max_tool_calls_per_turn"] - 1:
                     promised = True
@@ -581,6 +591,8 @@ async def run_turn(
             all_refs.append(card)
     _howto_button(user_message, all_refs)
     # Word matches only (not enough AI usage left for AI reading): always said, never left to the model.
+    if showcase_cards:   # never its own checking steps ("none need to be greyed out") - A/B test 11/20
+        text = ai_showcase_cards.no_self_talk(text)
     if any(c.get("words_only") for c in showcase_cards.values()) and not re.search(r"AI usage|allowance", text or "", re.I):
         text = ("You're almost out of AI usage this month, so this was a quick word search instead of AI reading every listing - "
                 "some homes may be missed.\n\n" + (text or ""))
@@ -685,6 +697,10 @@ def _no_pretend_cards(text: str, refs: List[dict]) -> str:
 # so I'll show those as cards" - 11/02). Agents never need to hear it.
 _NARRATION = re.compile(r"[^.!?\n]*\b(?:in my context|my context|as (?:home |small |lead )?cards|show (?:them|those|these) (?:as|in) cards|"
                         r"I can show them|I'll show (?:them|those|these)\b)[^.!?\n]*[.!?]?[ \t]*", re.I)
+
+
+_ASKS_WHAT_TO_SAY = re.compile(r"\bwhat (?:should|do|would|can) I (?:say|write|send) (?:to|back to)\b|\bwhat (?:should|do|would|can) I (?:text|email|tell)\b"
+                               r"|\bwhat to (?:say|write) to\b|\bwhat to (?:text|email)\b", re.I)
 
 
 def _no_narration(text: str) -> str:

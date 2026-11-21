@@ -213,7 +213,9 @@ async def _search_leads(db: AsyncSession, current_user: User, args: dict, config
         since = datetime.now(timezone.utc) - timedelta(days=min(float(days), 366))
         leads_out = sorted((lo for lo in leads_out if lo.created_at and lo.created_at >= since), key=lambda lo: lo.created_at, reverse=True)
     shown = leads_out[:limit]
-    return {"results": [_lead_summary(lo) for lo in shown], "count": len(leads_out), "shown": len(shown)}
+    from app.services.ai import ai_slim
+    rows = [ai_slim.lead_row(_lead_summary(lo)) for lo in shown]   # yes/no flags only when yes (ai_slim, 11/19)
+    return {"results": rows, "count": len(leads_out), "shown": len(shown)}
 
 
 async def _get_lead_detail(db: AsyncSession, current_user: User, args: dict, config: dict) -> dict:
@@ -1006,7 +1008,8 @@ TOOL_DEFINITIONS = [
                 "represented": {"type": "string", "enum": ["yes", "no", "unknown", "all"]},
                 "search": {"type": "string", "description": "Free-text search over name/email/phone."},
                 "added_within_days": {"type": "integer", "description": "Only leads added in the last N days, newest first, with their true count - "
-                                      "'new leads this week' = 7, 'today' = 1, 'this month' = 30. count is the real total even when fewer are shown."},
+                                      "'new leads this week' = 7, 'today' = 1, 'this month' = 30, 'my newest leads' / 'the newest one' with no time given = 30 "
+                                      "(the newest is the first result). count is the real total even when fewer are shown."},
                 "limit": {"type": "integer"},
             },
         },

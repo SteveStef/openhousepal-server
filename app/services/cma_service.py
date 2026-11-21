@@ -567,10 +567,16 @@ COMPS_LOCKED_MESSAGE = ("The comps are locked once the AI has written this repor
                         "through the full analysis. To use different comps, start a new CMA for this home.")
 
 
+def _comp_key(c: dict) -> str:
+    """One comp, the same on both sides of a save: its MLS listing first. Older reports (before 10/19) stored comps
+    with no id of their own and the editor gives each one an id when it opens, so matching on the id first made
+    every comp look swapped - and any edit to a comp's wording was refused as "comps are locked" (Day 12 audit)."""
+    return str(c.get("listing_key") or c.get("id") or c.get("street_address") or "")
+
+
 def _comps_on_report(comparables) -> set:
-    """Which comps are ON a report (switched-off ones are not): by the comp's own id, else its listing."""
-    return {str(c.get("id") or c.get("listing_key") or c.get("street_address") or "")
-            for c in (comparables or []) if isinstance(c, dict) and c.get("is_included", True)}
+    """Which comps are ON a report (switched-off ones are not): by the comp's listing, else its own id."""
+    return {_comp_key(c) for c in (comparables or []) if isinstance(c, dict) and c.get("is_included", True)}
 
 
 RATINGS_LOCKED_MESSAGE = ("The ratings are locked once the AI has written this report - its value and its wording were "
@@ -589,8 +595,7 @@ def _comp_ratings(comparables) -> dict:
         if not isinstance(c, dict):
             continue
         q = c.get("quality") if isinstance(c.get("quality"), dict) else {}
-        key = str(c.get("id") or c.get("listing_key") or c.get("street_address") or "")
-        out[key] = (tuple((f, str(q.get(f))) for f in sorted(CmaQualityAssessment.model_fields) if q.get(f)),
+        out[_comp_key(c)] = (tuple((f, str(q.get(f))) for f in sorted(CmaQualityAssessment.model_fields) if q.get(f)),
                     _norm(c.get("strength")) if c.get("strength") else None)
     return out
 

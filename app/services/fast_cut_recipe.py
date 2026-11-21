@@ -369,6 +369,53 @@ def plan(motion: dict, fmt: str) -> dict:
             x["fromX"] = _cl(e + (0.05 if x["fromX"] > e else -0.05)) if x["fromX"] != e else e
             x.update(amt=0.6, ramp="steady")
 
+    # The words on screen lead the photos (owner 11/19: "the bedrooms and bathrooms title screen should show the bedrooms
+    # and then the bathrooms. The kitchen stuff can go first"): "Beds · Baths" sits on a bedroom when there is one, and
+    # the reel's other bedrooms follow it, then its bathrooms; what was there moves up into the places they left, in
+    # its own order. Every shot keeps its place and length on the beat; the opening, the closing and any other stat
+    # shot stay put; two different photos of one room may sit together, never the same photo twice in a row. An order
+    # the agent set themselves (the editor's shot board) is left exactly as it is.
+    pk = ("photo", "src", "depth", "sharpDepth", "kind", "move", "fromX", "toX", "focusX", "water", "sky", "fire", "fireBox", "_score", "_what")
+    sb = next((i for i, x in enumerate(shots) if x.get("fact") and ("Bed" in x["fact"]["label"] or "Bath" in x["fact"]["label"])), None)
+    if sb is not None and not custom:
+        payload = lambda x: {k: x[k] for k in pk if k in x}  # noqa: E731
+
+        def put(x: dict, v: dict) -> None:
+            for k in pk:
+                x.pop(k, None)
+            x.update(v)
+
+        mid = [i for i in range(1, len(shots) - 1) if i == sb or not shots[i].get("fact")]
+        beds_at = [i for i in mid if i != sb and shots[i]["kind"] == "bedroom"]
+        if shots[sb]["kind"] == "bathroom" and beds_at:     # beds first: the card goes on the nicest bedroom
+            j = max(beds_at, key=lambda i: shots[i]["_score"])
+            v_sb, v_j = payload(shots[sb]), payload(shots[j])
+            put(shots[sb], v_j)
+            put(shots[j], v_sb)
+            e = shots[sb]["toX"]                              # the card's shot moves gently
+            shots[sb]["fromX"] = _cl(e + (0.05 if shots[sb]["fromX"] > e else -0.05)) if shots[sb]["fromX"] != e else e
+        bb_at = [i for i in mid if i != sb and _GROUP.get(shots[i]["kind"]) == "bedbath"]
+        after = [i for i in mid if i > sb][:len(bb_at)]       # the places right after the card
+        if bb_at and after:
+            before = [(i, payload(shots[i])) for i in range(len(shots))]
+            order = sorted(bb_at, key=lambda i: (shots[i]["kind"] != "bedroom", i))[:len(after)]   # bedrooms, then bathrooms
+            moving = sorted(set(order) | set(after))
+            bb_vals = [payload(shots[i]) for i in order]
+            rest_vals = [payload(shots[i]) for i in moving if i not in order]
+            spots = [i for i in moving if i not in after]
+            for i, v in zip(after, bb_vals):
+                put(shots[i], v)
+            for i, v in zip(spots, rest_vals):
+                put(shots[i], v)
+            if any(shots[i]["photo"] == shots[i + 1]["photo"] for i in range(len(shots) - 1)):
+                for i, v in before:                          # never the same photo twice in a row: leave it as it was
+                    put(shots[i], v)
+            else:
+                for i in moving:                              # a one-beat shot barely travels (as in add())
+                    z = shots[i]
+                    if (z["end"] - z["start"]) <= b + 0.02 and abs(z["fromX"] - z["toX"]) > 0.06:
+                        z["fromX"] = _cl(z["toX"] + (0.06 if z["fromX"] > z["toX"] else -0.06))
+
     stats = " · ".join(x for x in [beds and f"{beds} Beds", baths and f"{baths} Baths", facts_in.get("sqft") and f"{facts_in['sqft']} Sq Ft"] if x)
     copy = motion.get("copy") or {}
     situation = motion.get("situation", "just_listed")

@@ -25,6 +25,7 @@ from app.services.mls_open_houses import open_houses_payload
 
 logger = logging.getLogger(__name__)
 
+HUB_SALES_CAP = 1000
 INACTIVE_STATUSES = {"CLOSED-BRIGHT", "EXPIRED-BRIGHT", "WITHDRAWN-BRIGHT", "CANCELED-BRIGHT", "OFF_MARKET-BRIGHT"}
 
 
@@ -35,6 +36,16 @@ def nice(text: Optional[str]) -> str:
     if not t or t != t.upper():
         return t
     return re.sub(r"[A-Za-z]+('[A-Za-z]+)?", lambda m: m.group(0).capitalize(), t.lower())
+
+
+def real_sqft(value) -> Optional[int]:
+    """MLS size, or None for an obvious typo (a Philadelphia sale listed at "1 sq ft", Day 9 audit) -
+    no home is under 100 square feet, so the card just leaves size off."""
+    try:
+        n = int(float(value or 0))
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 100 else None
 
 
 def _addr_key(address: Optional[str]) -> str:
@@ -56,7 +67,7 @@ def _listing_item(p: Property) -> dict:
         "source": "listing",
         "beds": p.bedrooms or None,
         "baths": p.bathrooms or None,
-        "sqft": p.living_area or None,
+        "sqft": real_sqft(p.living_area),
         "acres": p.lot_size_acres or None,
         # Upcoming Bright open houses, soonest first - the hub cards' "Open House" chip. Rebuilt
         # on every read, so a saved copy in the config never goes stale.
@@ -110,7 +121,10 @@ async def _merged_sales(db: AsyncSession, owner: User, saved: list) -> list:
     saved = [s for s in saved if isinstance(s, dict)]
     if not owner.mls_id:
         return saved
-    closed = await get_recent_sales(db, owner, limit=24)
+    # Every closed sale, not just the newest 24 (Day 9 audit, owner 11/19: "they should show everything") -
+    # Sold / Volume / Avg on the Hub, Studio > Site, setup and the signature count this whole list. The
+    # cap is only a guard (busiest agent in the mirror: 179 sales since 2016); pages show a few at a time.
+    closed = await get_recent_sales(db, owner, limit=HUB_SALES_CAP)
     seen_ids = {str(s.get("id")) for s in saved}
     seen_addrs = {_addr_key(s.get("address")) for s in saved}
     added = []
@@ -130,7 +144,7 @@ async def _merged_sales(db: AsyncSession, owner: User, saved: list) -> list:
             "sold_date": sold.isoformat() if hasattr(sold, "isoformat") else sold,
             "beds": sale.get("bedrooms"),
             "baths": sale.get("bathrooms"),
-            "sqft": sale.get("living_area"),
+            "sqft": real_sqft(sale.get("living_area")),
             "source": "bright",
             "visible": True,
         })

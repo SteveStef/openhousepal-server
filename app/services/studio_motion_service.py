@@ -833,8 +833,8 @@ async def estimate(db, user: User, photos: int, sharpen: bool, seconds: float = 
     # a Fast Cut prepares only the photos its plan shows: about 23 in 30 s, about 50 in a minute
     used = min(n, 25 if float(seconds or 30) < 45 else 51) if fast else n
     gpu = 0.0
-    if fast and gpu_prep.enabled():
-        # a Fast Cut's photos are prepared on our own Amazon graphics machine (measured 11/17: 22-23 photos in about
+    if gpu_prep.enabled():
+        # a Fast Cut's photos (and a Cinematic Video's, owner 11/19) are prepared on our own Amazon graphics machine (measured 11/17: 22-23 photos in about
         # 400 s, ~2.5 minutes of it starting up, at about $0.53 an hour) - split between the depth / clean-up and the sharpening
         gpu = vl.charge_usd((150.0 + 11.0 * used) / 3600.0 * 0.55, config)
         analyze = estimate_photo_sort_usd(config, n) + gpu * 0.5
@@ -908,6 +908,9 @@ async def estimate(db, user: User, photos: int, sharpen: bool, seconds: float = 
         "speed_save_ready_minutes": round(save_min), "speed_now_ready_minutes": round(now_min),
         "speed_save_ahead": save_ahead, "speed_now_ahead": now_ahead,
         "render_paused": bool(paid and would_refuse),
+        # how long getting the photos ready adds before the video maker starts: our Amazon graphics machine starts up
+        # (~2.5 min) then ~11 s a photo (measured 11/17); the photo service took ~20 s
+        "prep_seconds": round(150 + 11 * used) if gpu_prep.enabled() else 20,
         "photos": n, "analyze_usd": round(analyze, 4), "sharpen_usd": round(sharp, 4),
         "analyze_percent": pct(analyze), "sharpen_percent": pct(sharp), "month_percent": snap.get("percent"),
         "soft_capped": await studio_soft_capped(db, user.id, config, user.plan_tier),
@@ -1281,6 +1284,33 @@ def _listing_text(lp: Optional[dict]) -> str:
     return (facts + "\n" + "\n".join(bits)).strip()
 
 
+async def _reuse_earlier_reads(db, owner_id: str, asset_id: str, pool: list[dict]) -> int:
+    """The AI's read of a photo (room, label, focus...) is the same in every video of that home: a photo this agent
+    already had read in an earlier video project is copied over instead of paid for again (11/19 paid test: tapping
+    Video Creation three times for one home paid for the same 36-photo read three times). Returns how many."""
+    want = {it.get("source") for it in pool if not it.get("analyzed") and it.get("source")}
+    if not want:
+        return 0
+    rows = (await db.execute(
+        select(StudioMediaAsset.options).where(StudioMediaAsset.owner_id == owner_id, StudioMediaAsset.action == "motion",
+                                               StudioMediaAsset.id != asset_id)
+        .order_by(StudioMediaAsset.created_at.desc()).limit(40))).scalars().all()
+    earlier: dict[str, dict] = {}
+    for o in rows:
+        for it in (((o or {}).get("motion") or {}).get("pool") or []):
+            src = it.get("source") if isinstance(it, dict) else None
+            if src in want and it.get("analyzed") and src not in earlier:
+                earlier[src] = it
+    n = 0
+    for it in pool:
+        old = None if it.get("analyzed") else earlier.get(it.get("source"))
+        if old:
+            it.update({k: old[k] for k in _POOL_AI if k in old})
+            it["analyzed"] = True
+            n += 1
+    return n
+
+
 async def start_analysis(db, user: User, asset_id: str) -> StudioMediaAsset:
     asset = await _owned_motion(db, user.id, asset_id)
     opts = dict(asset.options or {})
@@ -1297,6 +1327,7 @@ async def start_analysis(db, user: User, asset_id: str) -> StudioMediaAsset:
     try:
         motion = dict(opts.get("motion") or {})
         pool = _ensure_pool(motion)
+        await _reuse_earlier_reads(db, user.id, asset_id, pool)
         if not any(not it.get("analyzed") for it in pool):
             # Nothing new to look at (no AI needed) - just make sure the picked photos are getting ready.
             if (opts.get("analysis") or {}).get("status") != "done":
@@ -1377,6 +1408,8 @@ def kick_prep(asset: StudioMediaAsset) -> None:
         return
     if fastcut.is_fast((asset.options or {}).get("motion") or {}):
         return   # a Fast Cut prepares its photos at Make, once the plan says which ones are in the video
+    if gpu_prep.enabled():
+        return   # a Cinematic Video's photos too: on our Amazon graphics machine at Make (owner 11/19), not the photo service
     if _needs_prep((asset.options or {}).get("motion") or {}):
         _PREP[asset.id] = asyncio.create_task(_run_prep(asset.id))
 
@@ -1759,10 +1792,13 @@ async def _gpu_prep(asset_id: str, owner_id: str, motion: dict) -> dict:
     """Fast Cut + Save usage: the planned photos that still need anything (clean copy, depth, sharpening) are prepared
     on one rented Amazon graphics machine (gpu_prep_service). The machine's id is kept on the render, so a restart
     waits for the same machine instead of renting another. Never raises: what it didn't finish is left for the photo
-    service."""
-    only = _fast_plan_ids(motion)
-    if only is None:
-        return motion
+    service. A Cinematic Video (owner 11/19: "make cinematic also on Amazon") sends every photo in it."""
+    if fastcut.is_fast(motion):
+        only = _fast_plan_ids(motion)
+        if only is None:
+            return motion
+    else:
+        only = {p.get("id") for p in motion.get("photos") or [] if not p.get("hidden")}
     todo, seen = [], set()
     for p in motion.get("photos") or []:
         if p.get("id") in only and not p.get("hidden") and p.get("source") not in seen and not (p.get("clean") and p.get("depth") and p.get("sharp")):
@@ -2260,6 +2296,11 @@ async def _run_render(asset_id: str, owner_id: str, reservation, resume_job: Opt
                 motion = await _gpu_prep(asset_id, owner_id, motion)
             if _needs_prep(motion):
                 await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "stage": "Getting your photos ready"}))
+        elif not job_id and gpu_prep.enabled() and _needs_prep(motion):
+            # a Cinematic Video: its photos (clean copy, depth map, sharpening) on our own Amazon graphics machine too
+            # (owner 11/19 - fal retired the depth models it used); whatever it couldn't do falls to the photo service below
+            await _patch(asset_id, lambda a, o: o.__setitem__("render", {**(o.get("render") or {}), "stage": "Getting your photos ready"}))
+            motion = await _gpu_prep(asset_id, owner_id, motion)
         if not job_id and _needs_prep(motion):
             # 0) photos picked moments ago may still be getting their depth maps (free)
             await _wait_for_prep(asset_id)

@@ -644,7 +644,7 @@ On Basic there are no Showcases (a "You're missing out right now" banner may sho
 
 ### Make a kit - No-MLS plans
 1. Type the street address and tap **Generate Kit** ("No Bright MLS needed").
-2. **Home details**: street address, city, state, ZIP, price, square feet, bedrooms, bathrooms, and your photos (JPG or PNG; tap **Make cover** on the one you want first).
+2. **Home details**: street address, city, state, ZIP, price, square feet, bedrooms, bathrooms, and your photos (JPG, PNG, WebP or iPhone photos; tap **Make cover** on the one you want first).
 3. Choose the cover photo, review the kit, set what happens after sign-in, and tap **Save & Finish**.
 No-MLS kits have no Similar Homes sheet and no Cheat Sheet (both are built from MLS data).
 
@@ -1408,4 +1408,4 @@ Copy **Your private forwarding address** and follow **How to forward from each p
 
 ### 12. Seller Net Sheet / Buyer Cash Needed
 
-These don't have their own page in the menu right now - old links to them open the **CMA** page instead. Net sheets you already shared still open for the people you sent them to.
+These were retired in October - old links to them open the **CMA** page instead, and links to net sheets or cash-needed sheets you shared earlier now show "page not found". For pricing a seller's home, use a CMA.

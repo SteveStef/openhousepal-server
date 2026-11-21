@@ -121,6 +121,17 @@ def mark_doubtful(cards: Dict[str, dict], args: dict) -> Dict[str, Any]:
 _ADDRESS = re.compile(r"\b\d{1,5}\s+(?:[NSEW]\.?\s+)?[A-Z][A-Za-z']+(?:\s+[A-Z][A-Za-z']+){0,2}\s+(?:Rd|Road|Ln|Lane|Dr|Drive|St|Street|Ave|Avenue|Ct|Court|Way|Pl|Place|Cir|Circle|Blvd|Pike|Trl|Trail|Ter|Xing|Pkwy|Run|Rdg|Hl|Hill)\b")
 
 
+# Its own checking steps said out loud ("so none need to be greyed out", "nothing to mark as not real", "I'm not marking
+# them as false matches") - the agent only needs the homes (A/B test 11/20). "2 aren't real matches" stays.
+_SELF_TALK = re.compile(r"[^.!?\n]*\b(?:none|nothing|no|not|don't|won't)\b[^.!?\n]{0,50}?"
+                        r"\b(?:to be gr[ae]yed|gr[ae]yed out|gr[ae]y out|to mark|marking|mark (?:as|any|them|it))\b[^.!?\n]*[.!?]?[ \t]*", re.I)
+
+
+def no_self_talk(text: str) -> str:
+    out = re.sub(r"\n{3,}", "\n\n", _SELF_TALK.sub("", text or "")).strip()
+    return out or text
+
+
 def lists_homes(text: str) -> bool:
     """More than 2 different street addresses in a reply = a text list of homes."""
     return len(set(m.group(0).lower() for m in _ADDRESS.finditer(text or ""))) > 2
@@ -129,7 +140,7 @@ def lists_homes(text: str) -> bool:
 LIST_NUDGE = ("(App note: the homes are already on the Showcase card under your reply, so don't list them. If some matches aren't real "
               "(a pool table, a community pool, room for a pool...), call mark_showcase_matches with them now - the card shows them "
               "greyed with your reason. Then reply again in 2-3 short lines: how many you checked, how many are real matches (name at "
-              "most 2), how many aren't, and that they can recommend, send or remove any of them on the card.)")
+              "most 2), how many aren't, and that they can recommend, send or remove any of them on the card. Talk to the agent only about the homes - never mention these steps, marking, greying or what you are or aren't doing on the card.)")
 
 
 CARD_NOTE = ("These homes ALREADY show under your reply as {name}'s Showcase card - photos, {what}, each with Recommend, Send and "
@@ -137,4 +148,4 @@ CARD_NOTE = ("These homes ALREADY show under your reply as {name}'s Showcase car
              "in 2-3 short lines: what you checked and how many {count_word}, the 1-2 strongest with a few quoted words if there are "
              "any, and that they can recommend, send or remove any of them right on the card. If some matches aren't real (e.g. 'no "
              "pool', a pool table, a community pool), call mark_showcase_matches with them and say only how many - never list them. To take homes out, use remove_showcase_homes "
-             "(off_market true for 'the sold / under contract ones' - never judge that from a short list).")
+             "(off_market true for 'the sold / under contract ones' - never judge that from a short list). Talk to the agent only about the homes - never mention these steps, marking, greying or what you are or aren't doing on the card.")

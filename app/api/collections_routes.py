@@ -155,25 +155,93 @@ async def _assert_visitor_can_act(db: AsyncSession, collection_id: str, property
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="That home isn't in this Showcase.")
 
 
-async def _agent_unsubscribe(db: AsyncSession, address: str, t: Optional[str], a: Optional[str] = None) -> Optional[dict]:
-    """Every unsubscribe link says which agent's email it was on (a = signed agent tag, t = the email's
-    id): only that agent's automatic emails stop (owner, 11/16). None for an old link that doesn't say -
-    the platform-wide list then, as before."""
+# Unsubscribe links need their code (owner, 11/19): a = signed agent tag, t = the email's own id. A link without
+# one - or with a wrong one - stops nothing, so nobody can unsubscribe someone else just by knowing their address.
+# The one exception is an address we were already emailing before codes were on EVERY link (the Gmail / Yahoo
+# Unsubscribe button had none until this change): their old emails must still unsubscribe them (CAN-SPAM), so a
+# code-less link from them stops every agent who had them before then. SET THIS TO THE DAY IT GOES LIVE.
+UNSUB_CODES_SINCE = datetime(2026, 11, 21, 12, 0, tzinfo=timezone.utc)   # 7 AM ET the morning after the push (pushed 11/20 night)
+UNSUB_NEEDS_CODE = ("This unsubscribe link is missing its security code. Use the Unsubscribe link at the bottom of "
+                    "your newest email from your agent - it stops their emails straight away.")
+
+
+async def _agent_of_link(db: AsyncSession, address: str, t: Optional[str], a: Optional[str]) -> Optional[User]:
+    """The agent a link's code names for this address, or None when the link has no valid code."""
     from app.models.database import ClientEmail
-    from app.services.client_email_service import unsubscribe_from_agent
     from app.services.email_service import agent_from_unsub_token
     owner_id = agent_from_unsub_token(a, address) if a else None
     if owner_id is None and t and len(t) <= 64:
         rec = await db.get(ClientEmail, t)
         if rec is not None and rec.owner_id and (rec.recipient_email or "").strip().lower() == address.strip().lower():
             owner_id = rec.owner_id
-    agent = await db.get(User, owner_id) if owner_id else None
+    return await db.get(User, owner_id) if owner_id else None
+
+
+async def _agents_before_codes(db: AsyncSession, address: str) -> list:
+    """Agents who had this address (a lead, a Showcase or a sent email) before codes were on every link - their
+    old code-less links still have to work. Empty when the address wasn't ours before then."""
+    from sqlalchemy import func as _f, select as _sel, union
+    from app.models.database import ClientEmail, Collection, Lead
+    addr = address.strip().lower()
+    q = union(
+        _sel(Lead.owner_id).where(_f.lower(Lead.email) == addr, Lead.created_at < UNSUB_CODES_SINCE),
+        _sel(Collection.owner_id).where(_f.lower(Collection.visitor_email) == addr, Collection.created_at < UNSUB_CODES_SINCE),
+        _sel(ClientEmail.owner_id).where(ClientEmail.recipient_email == addr, ClientEmail.created_at < UNSUB_CODES_SINCE),
+    )
+    return list(dict.fromkeys(r[0] for r in (await db.execute(q)).fetchall() if r[0]))
+
+
+async def _agent_unsubscribe(db: AsyncSession, address: str, t: Optional[str], a: Optional[str] = None) -> Optional[dict]:
+    """Only the coded part: the agent the link names stops emailing this address; None without a valid code."""
+    from app.services.client_email_service import unsubscribe_from_agent
+    agent = await _agent_of_link(db, address, t, a)
     if agent is None:
         return None
-    await unsubscribe_from_agent(db, owner_id, address)
-    name = f"{getattr(agent, 'first_name', '') or ''} {getattr(agent, 'last_name', '') or ''}".strip() or "this agent"
-    return {"success": True, "scope": "agent", "agent_name": name,
-            "message": f"Unsubscribed {address} from {name}'s emails."}
+    await unsubscribe_from_agent(db, agent.id, address)
+    name = _agent_name(agent)
+    return {"success": True, "scope": "agent", "agent_name": name, "message": f"Unsubscribed {address} from {name}'s emails."}
+
+
+def _agent_name(agent) -> str:
+    return f"{getattr(agent, 'first_name', '') or ''} {getattr(agent, 'last_name', '') or ''}".strip() or "your agent"
+
+
+async def _do_unsubscribe(db: AsyncSession, address: str, t: Optional[str], a: Optional[str]) -> Optional[dict]:
+    """Stops what the link may stop; None when it may stop nothing (no valid code and not an old address)."""
+    from app.services.client_email_service import unsubscribe_from_agent
+    coded = await _agent_unsubscribe(db, address, t, a)
+    if coded is not None:
+        return coded
+    owners = await _agents_before_codes(db, address)
+    if not owners:
+        return None
+    names = []
+    for oid in owners:
+        await unsubscribe_from_agent(db, oid, address)
+        ag = await db.get(User, oid)
+        if ag is not None:
+            names.append(_agent_name(ag))
+    return {"success": True, "scope": "agents", "agent_names": names,
+            "message": f"Unsubscribed {address} from " + (", ".join(names) or "these agents") + "."}
+
+
+@router.get("/unsubscribe/who")
+async def unsubscribe_who(
+    email: str = Query(..., max_length=320),
+    t: Optional[str] = Query(None, max_length=64),
+    a: Optional[str] = Query(None, max_length=120),
+    db: AsyncSession = Depends(get_db),
+):
+    """What the unsubscribe page shows before Confirm: whose emails this link stops. Changes nothing."""
+    address = email.strip()
+    agent = await _agent_of_link(db, address, t, a)
+    if agent is not None:
+        return {"ok": True, "scope": "agent", "agent_name": _agent_name(agent)}
+    owners = await _agents_before_codes(db, address)
+    if owners:
+        names = [_agent_name(ag) for ag in [await db.get(User, oid) for oid in owners] if ag is not None]
+        return {"ok": True, "scope": "agents", "agent_names": names}
+    return {"ok": False, "message": UNSUB_NEEDS_CODE}
 
 
 @router.post("/unsubscribe")
@@ -184,26 +252,19 @@ async def unsubscribe_visitor(
     a: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Adds the visitor's email to the blacklist to prevent future emails.
-    Used by the /unsubscribe page (the link in every buyer email's footer), which sends the address
-    as ?email=... - this used to require a JSON body only, so the page's Confirm button always
-    failed (422) and nobody could unsubscribe from the footer link. Body still accepted.
-    """
+    """The /unsubscribe page's Confirm (the link in every client email's footer). Only that agent's automatic
+    emails stop (owner, 11/16), and the link must carry its code (owner, 11/19) - see UNSUB_CODES_SINCE."""
     address = ((request.email if request else None) or email or "").strip()
     if "@" not in address:
         raise HTTPException(status_code=400, detail="That unsubscribe link is missing an email address.")
     try:
-        agent_only = await _agent_unsubscribe(db, address, t, a)
-        if agent_only is not None:
-            return agent_only
-        if await BlacklistService.blacklist_email(db, address):
-            from app.services.leads_service import log_unsubscribe
-            await log_unsubscribe(db, address)
-        return {"success": True, "message": f"Successfully unsubscribed {address}"}
+        done = await _do_unsubscribe(db, address, t, a)
     except Exception as e:
         logger.error(f"Error unsubscribing visitor {address}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Could not unsubscribe right now. Please try again.")
+    if done is None:
+        raise HTTPException(status_code=403, detail=UNSUB_NEEDS_CODE)
+    return done
 
 
 @router.post("/unsubscribe/one-click")
@@ -213,21 +274,16 @@ async def unsubscribe_one_click(
     a: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    RFC 8058 compliant one-click unsubscribe.
-    Gmail/Yahoo send a POST to this URL with the email in the query string.
-    """
+    """RFC 8058 one-click unsubscribe (Gmail / Yahoo's own Unsubscribe button POSTs here). Same rules as the
+    page: the header carries the agent code, and a code-less POST stops nothing unless it's an old address."""
     try:
-        if await _agent_unsubscribe(db, email, t, a) is not None:
-            return {"success": True}
-        if await BlacklistService.blacklist_email(db, email):
-            from app.services.leads_service import log_unsubscribe
-            await log_unsubscribe(db, email)
-        return {"success": True}
+        done = await _do_unsubscribe(db, email, t, a)
     except Exception as e:
         logger.error(f"One-click unsubscribe failed for {email}: {str(e)}")
-        # Return 200 anyway to satisfy mail servers, but log the error
         return {"success": False}
+    if done is None:
+        raise HTTPException(status_code=403, detail=UNSUB_NEEDS_CODE)
+    return {"success": True}
 
 
 @router.get("/", response_model=List[CollectionResponse], dependencies=[Depends(require_broker_authorization)])

@@ -390,7 +390,10 @@ class EmailService:
                 # RFC 8058 one-click (Gmail/Yahoo bulk-sender rule). The API serves /collections/...
                 # with no /api prefix - the old /api/collections/... address answered 404.
                 e = quote(to_email or "", safe="")
-                data["h:List-Unsubscribe"] = f"<{api_url.rstrip('/')}/collections/unsubscribe/one-click?email={e}>, <{client_url.rstrip('/')}/unsubscribe?email={e}>"
+                # The same agent code as the footer link (11/19): without it Gmail's own Unsubscribe button stopped
+                # EVERY agent's emails, and anyone could fake it.
+                tags = _unsub_params(template_variables)
+                data["h:List-Unsubscribe"] = f"<{api_url.rstrip('/')}/collections/unsubscribe/one-click?email={e}{tags}>, <{client_url.rstrip('/')}/unsubscribe?email={e}{tags}>"
                 data["h:List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
             elif template in OWN_UNSUBSCRIBE_TEMPLATES and template_variables.get("unsubscribe_url"):
                 data["h:List-Unsubscribe"] = f"<{template_variables['unsubscribe_url']}>"

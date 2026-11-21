@@ -255,13 +255,14 @@ def restates_card(text: str) -> bool:
 
 
 NUDGE = ("(App note: you wrote people from their leads out in text. Call show_leads with their lead_ids - grouped in the order to act "
-         "(e.g. \"I'd check in with\", \"Less likely\"), 1-3 short points each on why now - then reply in one or two short lines. Never "
+         "(e.g. \"I'd check in with\", \"Less likely\"; newest first under \"Newest first\" when they asked for their newest), 1-3 short points each on why now - then reply in one or two short lines, the first one answering exactly what they asked (a number they asked for, e.g. how many). Never "
          "list the people, how they came in, their agent or their status in text: the cards show all that.)")
 
 SHORTEN = ("(App note: those people already show as lead cards under your reply (name, how they came in, agent, status, your points, "
-           "Open lead). Write your reply again in one or two short lines - who to start with and why in a few words, at most two "
+           "Open lead). Write your reply again in one or two short lines: first the direct answer to what they asked (any number they asked for - how many leads, how many need attention - stays), then who to start with and why in a few words, at most two "
            "people named - with no list. Don't call show_leads again.)")
 
 SHORTEN_ONE = ("(App note: the lead card under your reply already shows their name, how they came in (with the open house or form and "
                "the date), whether they have an agent and their status. Write your reply again without any of that - only what matters "
+               "(their phone and email when you have them, anything they asked) "
                "beyond the card, in a few short lines, by name or 'they'. Don't call show_leads again.)")
